@@ -834,7 +834,7 @@ fn resolve_tool_candidates(
 
 fn checker_command(candidate: &ToolCandidate, resolved: String) -> String {
     match candidate.tool.as_str() {
-        "tsc" => resolved,
+        "tsc" | "tsgo" => resolved,
         "cargo" => "cargo".to_string(),
         "go" => "go".to_string(),
         _ => resolved,
