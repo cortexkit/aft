@@ -149,6 +149,12 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain(`Config loaded from ${fixture.projectConfigPath}`);
   });
 
+  test("accepts oxfmt formatter in config schema", () => {
+    expect(AftConfigSchema.parse({ formatter: { typescript: "oxfmt" } }).formatter).toEqual({
+      typescript: "oxfmt",
+    });
+  });
+
   // Audit v0.17 #17: project config CANNOT set `restrict_to_project_root`,
   // `url_fetch_allow_private`, or `max_callgraph_files`. These are user-only
   // because a hostile repo opening in OpenCode could otherwise weaken the

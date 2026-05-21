@@ -11,6 +11,7 @@ import { error, log, warn } from "./logger.js";
 
 export type Formatter =
   | "biome"
+  | "oxfmt"
   | "prettier"
   | "deno"
   | "ruff"
@@ -123,6 +124,7 @@ export interface AftConfig {
 
 const FormatterEnum = z.enum([
   "biome",
+  "oxfmt",
   "prettier",
   "deno",
   "ruff",

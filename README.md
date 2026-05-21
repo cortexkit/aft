@@ -311,7 +311,7 @@ instant cold starts and stays fresh via file watcher and mtime verification.
 - **Bash hoisting** — replaces the host's built-in `bash` with an AFT-backed shell that supports rewriter rules (`cat` → `read`, `grep` → `grep` tool, `cat >>` → edit append), per-command output compression (`git`/`cargo`/`npm`/`bun`/`pnpm`/`pytest`/`tsc`), background tasks via `background: true` with `bash_status`/`bash_kill` for control, and tree-sitter-based permission scanning (OpenCode)
 - **Inline diagnostics** — write and edit return LSP errors detected after the change
 - **UI metadata** — diff previews (`+N/-N`) and file paths surface in the harness UI (OpenCode desktop, Pi terminal renderer)
-- **Local tool discovery** — finds biome, prettier, tsc, pyright in `node_modules/.bin` automatically
+- **Local tool discovery** — finds biome, oxfmt, prettier, tsc, pyright in `node_modules/.bin` automatically
 
 ---
 
@@ -336,7 +336,7 @@ from "ran but partial":
   - `scope_warnings`, `no_files_matched_scope` — paths/globs that resolved to zero files
 - **Side-effect skips** — when the main work succeeded but a non-essential post-step was
   skipped, the response carries a `<step>_skipped_reason`. Approved values:
-  - `format_skipped_reason`: `unsupported_language` | `no_formatter_configured` | `formatter_not_installed` | `timeout` | `error`
+  - `format_skipped_reason`: `unsupported_language` | `no_formatter_configured` | `formatter_not_installed` | `formatter_excluded_path` | `timeout` | `error`
   - `validate_skipped_reason`: `unsupported_language` | `no_checker_configured` | `checker_not_installed` | `timeout` | `error`
 
 ### Hoisted tools
@@ -424,7 +424,7 @@ doesn't exist. Backs up any existing content before overwriting.
 ```
 
 Returns inline LSP diagnostics if type errors are introduced. Auto-formats using the project's
-configured formatter (biome, prettier, etc.).
+configured formatter (biome, oxfmt, prettier, etc.).
 
 For partial edits (find/replace), use `edit` instead.
 
@@ -1262,7 +1262,7 @@ The schema is identical across harnesses. Only file location differs.
 
   // Per-language formatter overrides (auto-detected from project config files if omitted)
   // Keys: "typescript", "python", "rust", "go"
-  // Values: "biome" | "prettier" | "deno" | "ruff" | "black" | "rustfmt" | "goimports" | "gofmt" | "none"
+  // Values: "biome" | "oxfmt" | "prettier" | "deno" | "ruff" | "black" | "rustfmt" | "goimports" | "gofmt" | "none"
   "formatter": {
     "typescript": "biome",
     "rust": "rustfmt"
@@ -1416,8 +1416,9 @@ The schema is identical across harnesses. Only file location differs.
 ```
 
 AFT auto-detects the formatter and checker from project config files (`biome.json` → biome,
-`.prettierrc` → prettier, `Cargo.toml` → rustfmt, `pyproject.toml` → ruff/black, `go.mod` →
-goimports). Local tool binaries (biome, prettier, tsc, pyright) are discovered in
+`.oxfmtrc.json` / `.oxfmtrc.jsonc` / `oxfmt.config.ts` → oxfmt, `.prettierrc` → prettier,
+`Cargo.toml` → rustfmt, `pyproject.toml` → ruff/black, `go.mod` → goimports). Local tool binaries
+(biome, oxfmt, prettier, tsc, pyright) are discovered in
 `node_modules/.bin` before falling back to the system PATH. You only need per-language overrides
 if auto-detection picks the wrong tool or you want to pin a specific formatter.
 

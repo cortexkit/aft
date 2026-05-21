@@ -567,6 +567,12 @@ describe("loadAftConfig", () => {
     expect(AftConfigSchema.safeParse({ formatter_timeout_secs: 0 }).success).toBe(false);
   });
 
+  test("accepts oxfmt formatter in Pi config schema", () => {
+    expect(AftConfigSchema.parse({ formatter: { typescript: "oxfmt" } }).formatter).toEqual({
+      typescript: "oxfmt",
+    });
+  });
+
   test("keeps user executable-origin lsp settings when project also sets every lsp key", () => {
     const fixture = createConfigFixture();
     writeFileSync(

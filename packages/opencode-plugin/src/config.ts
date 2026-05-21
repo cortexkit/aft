@@ -11,6 +11,7 @@ import { error, log, warn } from "./logger.js";
 
 const FormatterEnum = z.enum([
   "biome",
+  "oxfmt",
   "prettier",
   "deno",
   "ruff",

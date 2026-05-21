@@ -23,7 +23,7 @@ const SCHEMA_URL = "https://raw.githubusercontent.com/cortexkit/aft/master/asset
 function buildSchema(): Record<string, unknown> {
   const formatterEnum = {
     type: "string",
-    enum: ["biome", "prettier", "deno", "ruff", "black", "rustfmt", "goimports", "gofmt", "none"],
+    enum: ["biome", "oxfmt", "prettier", "deno", "ruff", "black", "rustfmt", "goimports", "gofmt", "none"],
   };
 
   const checkerEnum = {

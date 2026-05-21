@@ -103,7 +103,7 @@ pub struct Config {
     /// When "syntax", only tree-sitter parse check. When "full", runs type checker.
     pub validate_on_edit: Option<String>,
     /// Per-language formatter overrides. Keys: "typescript", "python", "rust", "go".
-    /// Values: "biome", "prettier", "deno", "ruff", "black", "rustfmt", "goimports", "gofmt", "none".
+    /// Values: "biome", "oxfmt", "prettier", "deno", "ruff", "black", "rustfmt", "goimports", "gofmt", "none".
     pub formatter: HashMap<String, String>,
     /// Per-language type checker overrides. Keys: "typescript", "python", "rust", "go".
     /// Values: "tsc", "biome", "pyright", "ruff", "cargo", "go", "staticcheck", "none".

@@ -533,7 +533,8 @@ fn configure_tool_candidate(tool: &str, source: &str, required: bool) -> Configu
 fn explicit_formatter_candidate(name: &str) -> Vec<ConfigureToolCandidate> {
     match name {
         "none" | "off" | "false" => Vec::new(),
-        "biome" | "prettier" | "deno" | "ruff" | "black" | "rustfmt" | "goimports" | "gofmt" => {
+        "biome" | "oxfmt" | "prettier" | "deno" | "ruff" | "black" | "rustfmt" | "goimports"
+        | "gofmt" => {
             vec![configure_tool_candidate(name, "formatter config", true)]
         }
         _ => Vec::new(),
@@ -563,6 +564,11 @@ fn formatter_candidates(
         LangId::TypeScript | LangId::JavaScript | LangId::Tsx => {
             if has_project_config(project_root, &["biome.json", "biome.jsonc"]) {
                 vec![configure_tool_candidate("biome", "biome.json", true)]
+            } else if has_project_config(
+                project_root,
+                &[".oxfmtrc.json", ".oxfmtrc.jsonc", "oxfmt.config.ts"],
+            ) {
+                vec![configure_tool_candidate("oxfmt", "oxfmt config", true)]
             } else if has_project_config(
                 project_root,
                 &[
@@ -2047,6 +2053,59 @@ mod tests {
             std::fs::canonicalize(temp.path()).unwrap()
         );
         assert_eq!(ctx.cache_role(), "main");
+    }
+
+    #[test]
+    fn configure_missing_tools_warns_for_explicit_oxfmt_formatter() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            project_root: Some(temp.path().to_path_buf()),
+            ..Config::default()
+        };
+        config
+            .formatter
+            .insert("typescript".to_string(), "oxfmt".to_string());
+        let candidates = super::formatter_candidates(crate::parser::LangId::TypeScript, &config);
+        assert_eq!(candidates.len(), 1);
+        let mut tool_cache = std::collections::HashMap::from([("oxfmt".to_string(), false)]);
+        let warning = super::missing_tool_warning(
+            "formatter_not_installed",
+            "typescript",
+            &candidates[0],
+            config.project_root.as_deref(),
+            &mut tool_cache,
+        )
+        .expect("expected missing oxfmt warning");
+
+        assert_eq!(warning.kind, "formatter_not_installed");
+        assert_eq!(warning.language, "typescript");
+        assert_eq!(warning.tool, "oxfmt");
+    }
+
+    #[test]
+    fn configure_missing_tools_warns_for_oxfmt_project_config() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join(".oxfmtrc.json"), "{}\n").unwrap();
+        let config = Config {
+            project_root: Some(temp.path().to_path_buf()),
+            ..Config::default()
+        };
+
+        let candidates = super::formatter_candidates(crate::parser::LangId::TypeScript, &config);
+        assert_eq!(candidates.len(), 1);
+        let mut tool_cache = std::collections::HashMap::from([("oxfmt".to_string(), false)]);
+        let warning = super::missing_tool_warning(
+            "formatter_not_installed",
+            "typescript",
+            &candidates[0],
+            config.project_root.as_deref(),
+            &mut tool_cache,
+        )
+        .expect("expected missing oxfmt warning");
+
+        assert_eq!(warning.kind, "formatter_not_installed");
+        assert_eq!(warning.language, "typescript");
+        assert_eq!(warning.tool, "oxfmt");
     }
 
     /// Shared mutex serializing the home-root tests below. Both tests

@@ -229,6 +229,87 @@ fn format_integration_formatter_not_installed() {
     assert!(status.success());
 }
 
+#[cfg(unix)]
+#[test]
+fn format_integration_oxfmt_config_runs_oxfmt() {
+    let dir = format_test_dir("oxfmt_config_runs");
+    fs::write(dir.join(".oxfmtrc.json"), "{}\n").unwrap();
+    let bin_dir = dir.join("node_modules").join(".bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let stub = bin_dir.join("oxfmt");
+    fs::write(
+        &stub,
+        "#!/bin/sh\nif [ \"$1\" = \"--write\" ]; then printf 'const x = 1;\n' > \"$2\"; fi\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let target = dir.join("format_oxfmt.ts");
+    let _ = fs::remove_file(&target);
+    let path = prepend_path(&std::ffi::OsString::new(), &dir);
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let cfg = aft.configure(&dir);
+    assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"fmt-3c","command":"write","file":"{}","content":"const   x=1;\n"}}"#,
+        target.display()
+    ));
+
+    assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
+    assert_eq!(
+        resp["formatted"], true,
+        "oxfmt should have formatted the file"
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "const x = 1;\n");
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn format_integration_oxfmt_ignored_path_reports_formatter_excluded_path() {
+    let dir = format_test_dir("oxfmt_ignored_path");
+    fs::write(dir.join(".oxfmtrc.json"), "{}\n").unwrap();
+    let bin_dir = dir.join("node_modules").join(".bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let stub = bin_dir.join("oxfmt");
+    fs::write(
+        &stub,
+        "#!/bin/sh\nprintf 'Expected at least one target file after applying ignore rules.\n' >&2\nexit 1\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let target = dir.join("format_oxfmt_ignored.ts");
+    let _ = fs::remove_file(&target);
+    let path = prepend_path(&std::ffi::OsString::new(), &dir);
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let cfg = aft.configure(&dir);
+    assert_eq!(cfg["success"], true, "configure should succeed: {:?}", cfg);
+
+    let resp = aft.send(&format!(
+        r#"{{"id":"fmt-3d","command":"write","file":"{}","content":"const   x=1;\n"}}"#,
+        target.display()
+    ));
+
+    assert_eq!(resp["success"], true, "write should succeed: {:?}", resp);
+    assert_eq!(resp["formatted"], false);
+    assert_eq!(
+        resp["format_skipped_reason"], "formatter_excluded_path",
+        "oxfmt ignored paths should report formatter_excluded_path: {:?}",
+        resp
+    );
+
+    let _ = fs::remove_file(&target);
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 /// add_import on a .rs file → verify response has formatted field.
 
 #[test]

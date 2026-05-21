@@ -489,6 +489,16 @@ fn formatter_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<To
                 }]
             } else if has_project_config(
                 project_root,
+                &[".oxfmtrc.json", ".oxfmtrc.jsonc", "oxfmt.config.ts"],
+            ) {
+                vec![ToolCandidate {
+                    tool: "oxfmt".to_string(),
+                    source: "oxfmt config".to_string(),
+                    args: vec!["--write".to_string(), file_str.to_string()],
+                    required: true,
+                }]
+            } else if has_project_config(
+                project_root,
                 &[
                     ".prettierrc",
                     ".prettierrc.json",
@@ -717,6 +727,12 @@ fn explicit_formatter_candidate(name: &str, file_str: &str) -> Vec<ToolCandidate
             ],
             required: true,
         }],
+        "oxfmt" => vec![ToolCandidate {
+            tool: name.to_string(),
+            source: "formatter config".to_string(),
+            args: vec!["--write".to_string(), file_str.to_string()],
+            required: true,
+        }],
         "prettier" => vec![ToolCandidate {
             tool: name.to_string(),
             source: "formatter config".to_string(),
@@ -929,6 +945,7 @@ pub(crate) fn install_hint(tool: &str) -> String {
         "biome" => {
             "Run `bun add -d --workspace-root @biomejs/biome` or install globally.".to_string()
         }
+        "oxfmt" => "Run `npm install -D oxfmt` or install globally.".to_string(),
         "prettier" => "Run `npm install -D prettier` or install globally.".to_string(),
         "tsc" => "Run `npm install -D typescript` or install globally.".to_string(),
         "pyright" | "pyright-langserver" => "Install: `npm install -g pyright`".to_string(),
@@ -1093,6 +1110,8 @@ fn has_pyproject_tool(project_root: Option<&Path>, tool_name: &str) -> bool {
 /// signal:
 /// - biome: `"No files were processed in the specified paths."`,
 ///   `"ignored by the configuration"`
+/// - oxfmt: `"Expected at least one target file"`,
+///   `"No files found matching the given patterns"`
 /// - prettier: `"No files matching the pattern were found"`
 /// - ruff: `"No Python files found under the given path(s)"`
 ///
@@ -1104,6 +1123,8 @@ fn formatter_excluded_path(stderr: &str) -> bool {
     let s = stderr.to_lowercase();
     s.contains("no files were processed")
         || s.contains("ignored by the configuration")
+        || s.contains("expected at least one target file")
+        || s.contains("no files found matching the given patterns")
         || s.contains("no files matching the pattern")
         || s.contains("no python files found")
 }
@@ -1814,6 +1835,32 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn detect_formatter_oxfmt_config_for_typescript_projects() {
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".oxfmtrc.json"), "{}\n").unwrap();
+        let bin_dir = dir.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let fake = bin_dir.join("oxfmt");
+        fs::write(&fake, "#!/bin/sh\necho 1.0.0").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = dir.path().join("src/app.ts");
+        let config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+
+        let (cmd, args) = detect_formatter(&path, LangId::TypeScript, &config).unwrap();
+        assert!(cmd.ends_with("oxfmt"), "expected oxfmt, got {cmd}");
+        assert_eq!(args[0], "--write");
+        assert!(args.iter().any(|arg| arg.ends_with("src/app.ts")));
+    }
+
     // Unix-only: `resolve_tool_uncached` checks `node_modules/.bin/<name>`
     // without trying Windows extensions (.cmd/.exe/.bat). Writing
     // `biome.cmd` would not be found by the resolver. A future product
@@ -1844,6 +1891,33 @@ mod tests {
         assert!(cmd.contains("biome"), "expected biome in cmd, got: {}", cmd);
         assert!(args.contains(&"format".to_string()));
         assert!(args.contains(&"--write".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_formatter_explicit_oxfmt_override() {
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let fake = bin_dir.join("oxfmt");
+        fs::write(&fake, "#!/bin/sh\necho 1.0.0").unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = Path::new("test.ts");
+        let mut config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+        config
+            .formatter
+            .insert("typescript".to_string(), "oxfmt".to_string());
+
+        let (cmd, args) = detect_formatter(path, LangId::TypeScript, &config).unwrap();
+        assert!(cmd.contains("oxfmt"), "expected oxfmt in cmd, got: {cmd}");
+        assert_eq!(args, vec!["--write".to_string(), "test.ts".to_string()]);
     }
 
     #[test]
@@ -1940,6 +2014,16 @@ mod tests {
     }
 
     #[test]
+    fn formatter_excluded_path_detects_oxfmt_messages() {
+        assert!(formatter_excluded_path(
+            "Expected at least one target file. All matched files may have been excluded by ignore rules."
+        ));
+        assert!(formatter_excluded_path(
+            "No files found matching the given patterns."
+        ));
+    }
+
+    #[test]
     fn formatter_excluded_path_detects_ruff_messages() {
         // Real ruff output when invoked outside its [tool.ruff] scope.
         let stderr = "warning: No Python files found under the given path(s).\n";
@@ -1953,6 +2037,7 @@ mod tests {
     fn formatter_excluded_path_is_case_insensitive() {
         assert!(formatter_excluded_path("NO FILES WERE PROCESSED"));
         assert!(formatter_excluded_path("Ignored By The Configuration"));
+        assert!(formatter_excluded_path("EXPECTED AT LEAST ONE TARGET FILE"));
     }
 
     #[test]
