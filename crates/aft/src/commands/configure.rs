@@ -543,7 +543,7 @@ fn explicit_formatter_candidate(name: &str) -> Vec<ConfigureToolCandidate> {
 fn explicit_checker_candidate(name: &str) -> Vec<ConfigureToolCandidate> {
     match name {
         "none" | "off" | "false" => Vec::new(),
-        "tsc" | "cargo" | "go" | "biome" | "pyright" | "ruff" | "staticcheck" => {
+        "tsc" | "tsgo" | "cargo" | "go" | "biome" | "pyright" | "ruff" | "staticcheck" => {
             vec![configure_tool_candidate(name, "checker config", true)]
         }
         _ => Vec::new(),

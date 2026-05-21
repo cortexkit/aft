@@ -28,7 +28,7 @@ function buildSchema(): Record<string, unknown> {
 
   const checkerEnum = {
     type: "string",
-    enum: ["tsc", "biome", "pyright", "ruff", "cargo", "go", "staticcheck", "none"],
+    enum: ["tsc", "tsgo", "biome", "pyright", "ruff", "cargo", "go", "staticcheck", "none"],
   };
 
   const lspServerEntry = {

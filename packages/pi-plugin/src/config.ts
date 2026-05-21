@@ -22,6 +22,7 @@ export type Formatter =
 
 export type Checker =
   | "tsc"
+  | "tsgo"
   | "biome"
   | "pyright"
   | "ruff"
@@ -135,6 +136,7 @@ const FormatterEnum = z.enum([
 
 const CheckerEnum = z.enum([
   "tsc",
+  "tsgo",
   "biome",
   "pyright",
   "ruff",

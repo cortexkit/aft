@@ -754,7 +754,7 @@ fn explicit_formatter_candidate(name: &str, file_str: &str) -> Vec<ToolCandidate
 fn explicit_checker_candidate(name: &str, file_str: &str) -> Vec<ToolCandidate> {
     match name {
         "none" | "off" | "false" => Vec::new(),
-        "tsc" => vec![ToolCandidate {
+        "tsc" | "tsgo" => vec![ToolCandidate {
             tool: name.to_string(),
             source: "checker config".to_string(),
             args: vec![
@@ -842,7 +842,7 @@ fn checker_command(candidate: &ToolCandidate, resolved: String) -> String {
 }
 
 fn checker_args(candidate: &ToolCandidate) -> Vec<String> {
-    if candidate.tool == "tsc" {
+    if candidate.tool == "tsc" || candidate.tool == "tsgo" {
         vec![
             "--noEmit".to_string(),
             "--pretty".to_string(),
@@ -931,6 +931,9 @@ pub(crate) fn install_hint(tool: &str) -> String {
         }
         "prettier" => "Run `npm install -D prettier` or install globally.".to_string(),
         "tsc" => "Run `npm install -D typescript` or install globally.".to_string(),
+        "tsgo" => {
+            "Run `npm install -D @typescript/native-preview` or install globally.".to_string()
+        }
         "pyright" | "pyright-langserver" => "Install: `npm install -g pyright`".to_string(),
         "ruff" => {
             "Install: `pip install ruff` or your Python package manager equivalent.".to_string()
@@ -1288,7 +1291,7 @@ pub struct ValidationError {
 /// flags ensure no output files are produced.
 ///
 /// Supported:
-/// - TypeScript/JavaScript/TSX → `npx tsc --noEmit` (fallback: `tsc --noEmit`)
+/// - TypeScript/JavaScript/TSX → `tsc --noEmit` (or `tsgo --noEmit` when explicitly configured)
 /// - Python → `pyright`
 /// - Rust → `cargo check`
 /// - Go → `go vet`
@@ -1318,7 +1321,7 @@ pub fn parse_checker_output(
         .and_then(|name| name.to_str())
         .unwrap_or(checker);
     match checker_name {
-        "npx" | "tsc" => parse_tsc_output(stdout, stderr, file),
+        "npx" | "tsc" | "tsgo" => parse_tsc_output(stdout, stderr, file),
         "pyright" => parse_pyright_output(stdout, file),
         "cargo" => parse_cargo_output(stdout, stderr, file),
         "go" => parse_go_vet_output(stderr, file),
@@ -2096,6 +2099,102 @@ mod tests {
             assert!(result.is_none());
         }
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_type_checker_defaults_to_tsc_for_typescript() {
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
+        let bin_dir = dir.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let fake_tsc = bin_dir.join("tsc");
+        fs::write(&fake_tsc, "#!/bin/sh\nexit 0").unwrap();
+        fs::set_permissions(&fake_tsc, fs::Permissions::from_mode(0o755)).unwrap();
+        let fake_tsgo = bin_dir.join("tsgo");
+        fs::write(&fake_tsgo, "#!/bin/sh\nexit 0").unwrap();
+        fs::set_permissions(&fake_tsgo, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = dir.path().join("src/app.ts");
+        let config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+
+        let (cmd, args) = detect_type_checker(&path, LangId::TypeScript, &config).unwrap();
+        assert!(cmd.ends_with("tsc"), "expected tsc by default, got: {cmd}");
+        assert_eq!(args, vec!["--noEmit", "--pretty", "false"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_type_checker_uses_tsgo_when_explicitly_configured() {
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
+        let bin_dir = dir.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let fake_tsgo = bin_dir.join("tsgo");
+        fs::write(&fake_tsgo, "#!/bin/sh\nexit 0").unwrap();
+        fs::set_permissions(&fake_tsgo, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = dir.path().join("src/app.ts");
+        let mut config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+        config
+            .checker
+            .insert("typescript".to_string(), "tsgo".to_string());
+
+        let (cmd, args) = detect_type_checker(&path, LangId::TypeScript, &config).unwrap();
+        assert!(cmd.ends_with("tsgo"), "expected tsgo, got: {cmd}");
+        assert_eq!(args, vec!["--noEmit", "--pretty", "false"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_full_explicit_tsgo_parses_diagnostics() {
+        let _guard = tool_cache_test_lock();
+        clear_tool_cache();
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let path = src_dir.join("app.ts");
+        fs::write(&path, "const value: number = 'nope';\n").unwrap();
+
+        let bin_dir = dir.path().join("node_modules").join(".bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let fake_tsgo = bin_dir.join("tsgo");
+        fs::write(
+            &fake_tsgo,
+            "#!/bin/sh\nif [ \"$1 $2 $3\" != \"--noEmit --pretty false\" ]; then echo \"bad args: $*\" >&2; exit 3; fi\nprintf '%s\n' \"src/app.ts(1,23): error TS2322: Type 'string' is not assignable to type 'number'.\"\nexit 2\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_tsgo, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut config = Config {
+            project_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+        config
+            .checker
+            .insert("typescript".to_string(), "tsgo".to_string());
+
+        let (errors, reason) = validate_full(&path, &config);
+        assert_eq!(reason, None);
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line, 1);
+        assert_eq!(errors[0].column, 23);
+        assert!(errors[0].message.contains("TS2322"));
+    }
+
     #[test]
     fn run_external_tool_capture_nonzero_not_error() {
         // `false` exits with code 1 — capture should still return Ok

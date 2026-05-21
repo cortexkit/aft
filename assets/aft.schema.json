@@ -52,6 +52,7 @@
         "type": "string",
         "enum": [
           "tsc",
+          "tsgo",
           "biome",
           "pyright",
           "ruff",

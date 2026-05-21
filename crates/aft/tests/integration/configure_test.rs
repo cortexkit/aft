@@ -123,6 +123,44 @@ fn configure_warns_for_missing_formatter_and_checker_tools() {
 }
 
 #[test]
+fn configure_warns_for_missing_explicit_tsgo_checker() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("app.ts"), "const x = 1;\n").unwrap();
+
+    let path = empty_path();
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+
+    let configure = aft.send(
+        &json!({
+            "id": "cfg-missing-tsgo",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir.path(),
+            "checker": {
+                "typescript": "tsgo"
+            }
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        configure["success"], true,
+        "configure should succeed: {configure:?}"
+    );
+    let configure = aft.merge_configure_warnings(configure);
+    let checker = warning_with_kind(&configure, "checker_not_installed", "tool", "tsgo")
+        .expect("missing tsgo warning");
+    assert_eq!(checker["language"], "typescript");
+    assert!(checker["hint"]
+        .as_str()
+        .unwrap()
+        .contains("@typescript/native-preview"));
+
+    let shutdown = aft.shutdown();
+    assert!(shutdown.success());
+}
+
+#[test]
 fn configure_only_warns_for_languages_present() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("app.ts"), "const x = 1;\n").unwrap();

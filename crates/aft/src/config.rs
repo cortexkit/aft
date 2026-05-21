@@ -106,7 +106,7 @@ pub struct Config {
     /// Values: "biome", "prettier", "deno", "ruff", "black", "rustfmt", "goimports", "gofmt", "none".
     pub formatter: HashMap<String, String>,
     /// Per-language type checker overrides. Keys: "typescript", "python", "rust", "go".
-    /// Values: "tsc", "biome", "pyright", "ruff", "cargo", "go", "staticcheck", "none".
+    /// Values: "tsc", "tsgo", "biome", "pyright", "ruff", "cargo", "go", "staticcheck", "none".
     pub checker: HashMap<String, String>,
     /// Whether to restrict file operations to within `project_root` (default: false).
     /// When true, write-capable commands reject paths outside the project root.

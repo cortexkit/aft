@@ -1270,7 +1270,7 @@ The schema is identical across harnesses. Only file location differs.
 
   // Per-language type checker overrides (auto-detected if omitted)
   // Keys: "typescript", "python", "rust", "go"
-  // Values: "tsc" | "biome" | "pyright" | "ruff" | "cargo" | "go" | "staticcheck" | "none"
+  // Values: "tsc" | "tsgo" | "biome" | "pyright" | "ruff" | "cargo" | "go" | "staticcheck" | "none"
   "checker": {
     "typescript": "biome"
   },
