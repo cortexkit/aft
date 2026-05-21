@@ -1654,7 +1654,6 @@ pub fn project_cache_key(project_root: &Path) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
-    let canonical_root = canonicalize_or_normalize(project_root);
 
     if let Some(root_commit) = run_git(project_root, &["rev-list", "--max-parents=0", "HEAD"]) {
         // Git repo identity is intentionally checkout-path independent. This
@@ -1664,6 +1663,7 @@ pub fn project_cache_key(project_root: &Path) -> String {
         hasher.update(root_commit.as_bytes());
     } else {
         // Non-git project identity is the canonical filesystem path.
+        let canonical_root = canonicalize_or_normalize(project_root);
         hasher.update(canonical_root.to_string_lossy().as_bytes());
     }
 
