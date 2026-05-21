@@ -252,7 +252,7 @@ fn parse_lsp_server(value: &Value, index: usize) -> Result<UserServerDef, String
     };
 
     let id = required_string(obj.get("id"), index, "id")?;
-    let extensions = required_string_array(obj.get("extensions"), index, "extensions")?;
+    let extensions = required_extension_array(obj.get("extensions"), index)?;
     let binary = required_string(obj.get("binary"), index, "binary")?;
     let args = optional_string_array(obj.get("args"), index, "args")?;
     let root_markers = optional_string_array(obj.get("root_markers"), index, "root_markers")?;
@@ -332,6 +332,14 @@ fn required_string_array(
     Ok(values)
 }
 
+fn required_extension_array(value: Option<&Value>, index: usize) -> Result<Vec<String>, String> {
+    let values = required_string_array(value, index, "extensions")?;
+    Ok(values
+        .into_iter()
+        .map(|value| value.trim_start_matches('.').to_string())
+        .collect())
+}
+
 fn optional_string_array(
     value: Option<&Value>,
     index: usize,
@@ -353,7 +361,7 @@ fn optional_string_array(
                 "configure: lsp_servers[{index}].{field}[{entry_index}] must be a string"
             ));
         };
-        values.push(raw.trim().trim_start_matches('.').to_string());
+        values.push(raw.trim().to_string());
     }
     Ok(values)
 }
@@ -2167,6 +2175,25 @@ mod tests {
         );
         // User config preserved.
         assert!(ctx.config().search_index);
+    }
+
+    #[test]
+    fn parse_lsp_server_preserves_dotted_root_markers() {
+        let value = json!([
+            {
+                "id": "oxlint-cli",
+                "extensions": [".ts", "tsx"],
+                "binary": "oxlint",
+                "args": ["--lsp", ".keep-dotted-arg"],
+                "root_markers": [".oxlintrc.json", ".oxlintrc"]
+            }
+        ]);
+
+        let servers = super::parse_lsp_servers(&value).expect("parse lsp servers");
+
+        assert_eq!(servers[0].extensions, vec!["ts", "tsx"]);
+        assert_eq!(servers[0].args, vec!["--lsp", ".keep-dotted-arg"]);
+        assert_eq!(servers[0].root_markers, vec![".oxlintrc.json", ".oxlintrc"]);
     }
 
     #[cfg(unix)]
