@@ -20,8 +20,8 @@ use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerKind};
 use crate::parser::{detect_language, LangId};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
-    build_path_filters, current_git_head, project_cache_key, resolve_cache_dir, walk_project_files,
-    CacheLock, SearchIndex,
+    build_path_filters, current_git_head, disk_cache_key, resolve_cache_dir_with_key,
+    walk_project_files, CacheLock, SearchIndex,
 };
 use crate::semantic_index::{SemanticIndex, SemanticIndexLock};
 use crate::{slog_info, slog_warn};
@@ -1462,10 +1462,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.set_degraded_reasons(degraded_reasons.clone());
 
     let storage_dir = ctx.config().storage_dir.clone();
+    let checkout_disk_key = disk_cache_key(&canonical_cache_root);
     let mut search_index_cache_reused = false;
 
     if search_index {
-        let cache_dir = resolve_cache_dir(&canonical_cache_root, storage_dir.as_deref());
+        let cache_dir = resolve_cache_dir_with_key(storage_dir.as_deref(), &checkout_disk_key);
         let current_head = current_git_head(&canonical_cache_root);
         let mut baseline = SearchIndex::read_from_disk(&cache_dir, &canonical_cache_root);
         search_index_cache_reused = baseline.is_some();
@@ -1489,7 +1490,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         let root_clone = canonical_cache_root.clone();
         let symbol_cache = ctx.symbol_cache();
         let symbol_storage = storage_dir.clone();
-        let symbol_project_key = project_cache_key(&canonical_cache_root);
+        let symbol_disk_key = checkout_disk_key.clone();
         let is_worktree_bridge_for_search = is_worktree_bridge;
         let session_id_for_bg = log_ctx::current_session();
         thread::spawn(move || {
@@ -1530,7 +1531,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                         let loaded_count = cache.load_from_disk_for_generation(
                             symbol_cache_generation,
                             storage_dir,
-                            &symbol_project_key,
+                            &symbol_disk_key,
                             &root_clone,
                         );
                         slog_info!("loaded symbol cache from disk: {} files", loaded_count);
@@ -1571,7 +1572,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             match crate::symbol_cache_disk::write_to_disk(
                                 &cache,
                                 storage_dir,
-                                &symbol_project_key,
+                                &symbol_disk_key,
                             ) {
                                 Ok(()) => {
                                     slog_info!("persisted symbol cache: {} files", cache.len());
@@ -1610,7 +1611,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
         let root_clone = canonical_cache_root.clone();
         let semantic_storage = storage_dir.clone();
-        let semantic_project_key = crate::search_index::project_cache_key(&canonical_cache_root);
+        let semantic_disk_key = checkout_disk_key.clone();
         let semantic_config = semantic_config.clone();
         let tx_progress = tx.clone();
         let is_worktree_bridge_for_semantic = is_worktree_bridge;
@@ -1638,7 +1639,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             .then(|| ())
                             .and_then(|_| semantic_storage.as_ref())
                             .and_then(|dir| {
-                                match SemanticIndexLock::acquire(dir, &semantic_project_key) {
+                                match SemanticIndexLock::acquire(dir, &semantic_disk_key) {
                                     Ok(lock) => Some(lock),
                                     Err(error) => {
                                         slog_warn!(
@@ -1653,7 +1654,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                         if let Some(ref dir) = semantic_storage {
                             if let Some(cached) = SemanticIndex::read_from_disk(
                                 dir,
-                                &semantic_project_key,
+                                &semantic_disk_key,
                                 &root_clone,
                                 is_worktree_bridge_for_semantic,
                                 Some(&fingerprint_key),
@@ -1723,8 +1724,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                             cached.set_fingerprint(fingerprint);
                                             if !is_worktree_bridge_for_semantic {
                                                 if let Some(ref dir) = semantic_storage {
-                                                    cached
-                                                        .write_to_disk(dir, &semantic_project_key);
+                                                    cached.write_to_disk(dir, &semantic_disk_key);
                                                 }
                                             }
                                         }
@@ -1810,7 +1810,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
                         if !is_worktree_bridge_for_semantic {
                             if let Some(ref dir) = semantic_storage {
-                                index.write_to_disk(dir, &semantic_project_key);
+                                index.write_to_disk(dir, &semantic_disk_key);
                             }
                         }
 

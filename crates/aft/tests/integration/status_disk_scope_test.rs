@@ -7,12 +7,12 @@
 //! displayed that cross-project total as if it were the current project's
 //! footprint (e.g. a 4 MB project showed 16 GB because a sibling project's
 //! cache was huge). Status must scope to the current project's slice using
-//! `project_cache_key(project_root)`.
+//! `disk_cache_key(project_root)`.
 
 use std::fs;
 use std::path::PathBuf;
 
-use aft::search_index::project_cache_key;
+use aft::search_index::{disk_cache_key, project_cache_key};
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -26,7 +26,7 @@ fn write_fake_cache_for_project(
     trigram_bytes: usize,
     semantic_bytes: usize,
 ) {
-    let key = project_cache_key(project_root);
+    let key = disk_cache_key(project_root);
 
     let trigram_dir = storage_root.join("index").join(&key);
     fs::create_dir_all(&trigram_dir).expect("create trigram dir");
@@ -58,8 +58,8 @@ fn status_disk_bytes_only_count_current_project() {
     // Ensure the two projects have distinct cache keys (they should, because
     // they have distinct canonical paths). Sanity check this — if it ever
     // fails the test logic falls apart.
-    let key_a = project_cache_key(&project_a);
-    let key_b = project_cache_key(&project_b);
+    let key_a = disk_cache_key(&project_a);
+    let key_b = disk_cache_key(&project_b);
     assert_ne!(
         key_a, key_b,
         "projects {project_a:?} and {project_b:?} unexpectedly share cache key {key_a}"
@@ -107,12 +107,10 @@ fn status_disk_bytes_only_count_current_project() {
          got {semantic} (sibling B has 5 MB which would be visible without scoping)"
     );
 
-    // The status response must also expose the project_cache_key so the
-    // host can correlate disk numbers with cache directories.
     assert_eq!(
         status["disk"]["project_cache_key"].as_str(),
-        Some(key_a.as_str()),
-        "status should include project_cache_key for the configured project"
+        Some(project_cache_key(&project_a).as_str()),
+        "status should retain durable project_cache_key"
     );
 }
 

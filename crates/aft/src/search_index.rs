@@ -1404,15 +1404,23 @@ pub fn lexical_score(index: &SearchIndex, query_trigrams: &[u32], file_id: u32) 
 }
 
 pub fn resolve_cache_dir(project_root: &Path, storage_dir: Option<&Path>) -> PathBuf {
+    let key = disk_cache_key(project_root);
+    resolve_cache_dir_with_key(storage_dir, &key)
+}
+
+pub(crate) fn resolve_cache_dir_with_key(
+    storage_dir: Option<&Path>,
+    disk_cache_key: &str,
+) -> PathBuf {
     // Respect AFT_CACHE_DIR for testing — prevents tests from polluting the user's storage
     if let Some(override_dir) = std::env::var_os("AFT_CACHE_DIR") {
         return PathBuf::from(override_dir)
             .join("index")
-            .join(project_cache_key(project_root));
+            .join(disk_cache_key);
     }
     // Use configured storage dir (from plugin, XDG-compliant)
     if let Some(dir) = storage_dir {
-        return dir.join("index").join(project_cache_key(project_root));
+        return dir.join("index").join(disk_cache_key);
     }
     // Fallback to ~/.cache/aft/ (legacy, for standalone binary usage).
     // On Windows `HOME` is typically unset, so try `USERPROFILE` next.
@@ -1425,7 +1433,7 @@ pub fn resolve_cache_dir(project_root: &Path, storage_dir: Option<&Path>) -> Pat
     home.join(".cache")
         .join("aft")
         .join("index")
-        .join(project_cache_key(project_root))
+        .join(disk_cache_key)
 }
 
 pub(crate) fn build_path_filters(
@@ -1646,19 +1654,74 @@ pub fn project_cache_key(project_root: &Path) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
+    let canonical_root = canonicalize_or_normalize(project_root);
 
     if let Some(root_commit) = run_git(project_root, &["rev-list", "--max-parents=0", "HEAD"]) {
-        // Git repo: root commit is the unique identity.
-        // Same repo cloned anywhere produces the same key.
+        // Git repo identity is intentionally checkout-path independent. This
+        // key is also used by DB-backed task/compression/status state, so keep
+        // it stable across clones/worktrees and use `disk_cache_key` for local
+        // on-disk search/semantic/symbol cache partitioning.
         hasher.update(root_commit.as_bytes());
     } else {
-        // Non-git project: use the canonical filesystem path as identity.
-        let canonical_root = canonicalize_or_normalize(project_root);
+        // Non-git project identity is the canonical filesystem path.
         hasher.update(canonical_root.to_string_lossy().as_bytes());
     }
 
     let digest = format!("{:x}", hasher.finalize());
     digest[..16].to_string()
+}
+
+pub fn disk_cache_key(project_root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    let Some(worktree_id) = linked_worktree_identity(project_root) else {
+        return project_cache_key(project_root);
+    };
+
+    let Some(root_commit) = run_git(project_root, &["rev-list", "--max-parents=0", "HEAD"]) else {
+        return project_cache_key(project_root);
+    };
+
+    let mut hasher = Sha256::new();
+    // Linked worktrees share the repo identity from `project_cache_key`, but
+    // their disk caches contain worktree-local paths, mtimes, generated files,
+    // and local edits. Include Git's worktree-private metadata path only for
+    // linked worktrees; ordinary clones keep the existing root-commit key.
+    hasher.update(b"git-disk-cache-v1\0");
+    hasher.update(root_commit.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(worktree_id.to_string_lossy().as_bytes());
+
+    let digest = format!("{:x}", hasher.finalize());
+    digest[..16].to_string()
+}
+
+fn linked_worktree_identity(project_root: &Path) -> Option<PathBuf> {
+    let git_dir = git_path(
+        project_root,
+        &["rev-parse", "--path-format=absolute", "--git-dir"],
+    )?;
+    let common_dir = git_path(
+        project_root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    if git_dir == common_dir {
+        return None;
+    }
+
+    let head_path = run_git(project_root, &["rev-parse", "--git-path", "HEAD"])?;
+    let path = PathBuf::from(head_path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        project_root.join(path)
+    };
+    Some(canonicalize_or_normalize(&path))
+}
+
+fn git_path(project_root: &Path, args: &[&str]) -> Option<PathBuf> {
+    let path = PathBuf::from(run_git(project_root, args)?);
+    Some(canonicalize_or_normalize(&path))
 }
 
 impl PathFilters {
@@ -2411,7 +2474,83 @@ mod tests {
     }
 
     #[test]
-    fn project_cache_key_includes_checkout_path() {
+    fn disk_cache_key_distinguishes_git_worktrees_but_project_key_does_not() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let source = dir.path().join("source");
+        fs::create_dir_all(&source).expect("create source repo dir");
+        fs::write(source.join("tracked.txt"), "content\n").expect("write tracked file");
+
+        assert!(Command::new("git")
+            .current_dir(&source)
+            .args(["init"])
+            .status()
+            .expect("init git repo")
+            .success());
+        assert!(Command::new("git")
+            .current_dir(&source)
+            .args(["add", "."])
+            .status()
+            .expect("git add")
+            .success());
+        assert!(Command::new("git")
+            .current_dir(&source)
+            .args([
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .status()
+            .expect("git commit")
+            .success());
+
+        let source_key = project_cache_key(&source);
+        assert_eq!(source_key.len(), 16);
+
+        let worktree = dir.path().join("worktree");
+        assert!(Command::new("git")
+            .current_dir(&source)
+            .args(["worktree", "add", "--detach"])
+            .arg(&worktree)
+            .arg("HEAD")
+            .status()
+            .expect("git worktree add")
+            .success());
+
+        let worktree_key = project_cache_key(&worktree);
+        assert_eq!(worktree_key.len(), 16);
+        assert_eq!(source_key, worktree_key);
+
+        let source_disk_key = disk_cache_key(&source);
+        let worktree_disk_key = disk_cache_key(&worktree);
+        assert_eq!(source_disk_key.len(), 16);
+        assert_eq!(worktree_disk_key.len(), 16);
+        assert_ne!(source_disk_key, worktree_disk_key);
+        assert_eq!(
+            resolve_cache_dir(&source, Some(dir.path())),
+            dir.path().join("index").join(&source_disk_key)
+        );
+    }
+
+    #[test]
+    fn non_git_disk_cache_key_uses_stable_canonical_path_identity() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+
+        let direct_key = disk_cache_key(&project);
+        let equivalent_key = disk_cache_key(&project.join(".").join("nested").join(".."));
+
+        assert_eq!(direct_key.len(), 16);
+        assert_eq!(direct_key, equivalent_key);
+        assert_eq!(project_cache_key(&project), direct_key);
+    }
+
+    #[test]
+    fn disk_cache_key_preserves_same_root_commit_clone_sharing() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let source = dir.path().join("source");
         fs::create_dir_all(&source).expect("create source repo dir");
@@ -2455,11 +2594,13 @@ mod tests {
 
         let source_key = project_cache_key(&source);
         let clone_key = project_cache_key(&clone);
-
         assert_eq!(source_key.len(), 16);
         assert_eq!(clone_key.len(), 16);
-        // Same repo (same root commit) → same cache key regardless of clone path
+        // Same repo (same root commit) → same project key regardless of clone path.
         assert_eq!(source_key, clone_key);
+        // Ordinary clones keep sharing disk caches; linked worktrees are the
+        // case that needs isolation.
+        assert_eq!(disk_cache_key(&source), disk_cache_key(&clone));
     }
 
     #[test]
