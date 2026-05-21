@@ -143,6 +143,7 @@ impl AppContext {
                 serde_json::json!({
                     "storage_dir": dir.display().to_string(),
                     "project_cache_key": project_key,
+                    "disk_cache_key": disk_key,
                     "trigram_disk_bytes": trigram_size,
                     "semantic_disk_bytes": semantic_size,
                 })
@@ -150,12 +151,14 @@ impl AppContext {
             (Some(dir), None) => serde_json::json!({
                 "storage_dir": dir.display().to_string(),
                 "project_cache_key": null,
+                "disk_cache_key": null,
                 "trigram_disk_bytes": 0,
                 "semantic_disk_bytes": 0,
             }),
             _ => serde_json::json!({
                 "storage_dir": null,
                 "project_cache_key": null,
+                "disk_cache_key": null,
                 "trigram_disk_bytes": 0,
                 "semantic_disk_bytes": 0,
             }),

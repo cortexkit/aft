@@ -112,6 +112,11 @@ fn status_disk_bytes_only_count_current_project() {
         Some(project_cache_key(&project_a).as_str()),
         "status should retain durable project_cache_key"
     );
+    assert_eq!(
+        status["disk"]["disk_cache_key"].as_str(),
+        Some(disk_cache_key(&project_a).as_str()),
+        "status should expose the disk key used for cache byte sizing"
+    );
 }
 
 #[test]
