@@ -23,7 +23,9 @@ use url::Url;
 
 const DEFAULT_DIMENSION: usize = 384;
 const MAX_ENTRIES: usize = 1_000_000;
-const MAX_DIMENSION: usize = 1024;
+// Covers high-dimensional backends such as OpenAI text-embedding-3-large (3072)
+// and common local models (4096) while keeping a bounded supported shape.
+const MAX_DIMENSION: usize = 4096;
 const F32_BYTES: usize = std::mem::size_of::<f32>();
 const HEADER_BYTES_V1: usize = 9;
 const HEADER_BYTES_V2: usize = 13;
@@ -176,6 +178,8 @@ fn validate_embedding_batch(
         return Ok(());
     };
     let expected_dimension = first_vector.len();
+    validate_embedding_dimension(expected_dimension)
+        .map_err(|error| format!("{context} returned {error}"))?;
     for (index, vector) in vectors.iter().enumerate() {
         if vector.len() != expected_dimension {
             return Err(format!(
@@ -183,6 +187,16 @@ fn validate_embedding_batch(
                 vector.len()
             ));
         }
+    }
+
+    Ok(())
+}
+
+fn validate_embedding_dimension(dimension: usize) -> Result<(), String> {
+    if dimension == 0 || dimension > MAX_DIMENSION {
+        return Err(format!(
+            "invalid embedding dimension: {dimension}; supported range is 1..={MAX_DIMENSION}"
+        ));
     }
 
     Ok(())
@@ -1837,9 +1851,7 @@ impl SemanticIndex {
 
         let dimension = read_u32(data, &mut pos)? as usize;
         let entry_count = read_u32(data, &mut pos)? as usize;
-        if dimension == 0 || dimension > MAX_DIMENSION {
-            return Err(format!("invalid embedding dimension: {}", dimension));
-        }
+        validate_embedding_dimension(dimension)?;
         if entry_count > MAX_ENTRIES {
             return Err(format!("too many semantic index entries: {}", entry_count));
         }
