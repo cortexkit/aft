@@ -1,0 +1,19 @@
+[filter]
+matches = ["docker"]
+description = "Compact Docker output; strip BuildKit progress chatter."
+
+[strip]
+patterns = [
+  '^#\d+ DONE', '^#\d+ CACHED', '^#\d+ \[', '^#\d+ writing image', '^#\d+ DONE \d', '^#\d+ resolve ', '^#\d+ extracting', '^#\d+ sha256:', '^#\d+ naming', '^#\d+ exporting', '^#\d+ transferring', '^Step \d+/\d+ : ', '^ ---> ', '^Removing intermediate container',
+]
+
+[truncate]
+line_max = 300
+
+[cap]
+max_lines = 100
+keep = "tail"
+
+[shortcircuit]
+when = '\A\s*\z'
+replacement = "docker: ok"

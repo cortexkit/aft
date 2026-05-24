@@ -1,0 +1,21 @@
+# Rust build artifacts (~23GB)
+target/
+
+# Node modules (will be installed inside container if needed)
+node_modules/
+dist/
+
+# Git history (not needed for build)
+.git/
+
+# Development artifacts
+.fastembed_cache/
+benchmarks/
+*.bench/
+.sisyphus/
+.opencode/dumps/
+.gsd/
+
+# OS files
+.DS_Store
+Thumbs.db

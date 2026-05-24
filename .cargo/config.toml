@@ -1,0 +1,18 @@
+# Cargo config for the AFT workspace.
+#
+# Lowers debug info from full DWARF to line tables only, which:
+#   - Preserves panic backtraces with file:line + function names
+#   - Preserves `dbg!()`, `tracing`/`log` file:line, profiler symbols
+#   - Drops variable inspection in step-through debuggers (lldb/gdb)
+#
+# Disk impact: ~50-70% smaller rlib/binary sizes in target/debug.
+# Compile impact: slightly faster link time, no codegen slowdown.
+#
+# If you need full variable inspection in lldb for a tricky issue, run with
+# RUSTFLAGS="-C debuginfo=2" cargo test ... for that session.
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"

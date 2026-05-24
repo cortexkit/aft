@@ -1,0 +1,4 @@
+fatal: [web2]: FAILED! => {"changed": false, "msg": "service not found"}
+PLAY RECAP *********************************************************************
+web1 : ok=10 changed=2 unreachable=0 failed=0
+web2 : ok=8 changed=1 unreachable=0 failed=1

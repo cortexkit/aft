@@ -1,0 +1,9 @@
+[project]
+name = "aft-search-benchmark"
+version = "0.1.0"
+description = "Manual AFT semantic search baseline harness"
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.pyright]
+pythonVersion = "3.9"

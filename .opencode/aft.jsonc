@@ -1,0 +1,31 @@
+// AFT plugin config for this project.
+// Auto-detection picks up biome.json (TS/JS) and Cargo.toml (Rust) from root.
+// This file makes it explicit and enables post-edit formatting/checking.
+{
+  "$schema": "https://raw.githubusercontent.com/cortexkit/aft/master/assets/aft.schema.json",
+  "hoist_builtin_tools": true,
+
+  // Format files automatically after every aft_edit operation
+  "format_on_edit": true,
+
+  // Auto-validate after edits: "syntax" (tree-sitter) or "full" (runs type checker)
+  "validate_on_edit": "syntax",
+
+  // Per-language formatter overrides (auto-detected if omitted)
+  "formatter": {
+    "typescript": "biome",
+    "rust": "rustfmt"
+  },
+
+  // Per-language checker overrides (auto-detected if omitted)
+  "checker": {
+    "typescript": "biome"
+  },
+
+  // Enable indexed search for grep and glob hoisting
+  "search_index": true
+
+  // Example: lower the call-graph file cap. Default is 20000 which this repo
+  // sits comfortably under — uncomment to experiment with tighter limits.
+  // "max_callgraph_files": 20000
+}

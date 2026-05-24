@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "ai-tokenizer": "1.0.6"
+  }
+}

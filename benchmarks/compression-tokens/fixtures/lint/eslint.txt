@@ -1,0 +1,11 @@
+
+/Users/ufukaltinok/Work/OSS/web/src/App.tsx
+  12:7   warning  'unused' is assigned a value but never used        @typescript-eslint/no-unused-vars
+  48:13  error    Unexpected any. Specify a different type           @typescript-eslint/no-explicit-any
+  93:5   error    React Hook useEffect has a missing dependency      react-hooks/exhaustive-deps
+
+/Users/ufukaltinok/Work/OSS/web/src/lib/api.ts
+  21:10  error    'ResponsePayload' is defined but never used        @typescript-eslint/no-unused-vars
+  77:3   warning  Unexpected console statement                       no-console
+
+✖ 5 problems (3 errors, 2 warnings)

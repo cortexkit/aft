@@ -1,0 +1,10 @@
+[filter]
+matches = ["ls"]
+description = "Compact ls listings; cap long directory output."
+
+[truncate]
+line_max = 300
+
+[cap]
+max_lines = 100
+keep = "tail"

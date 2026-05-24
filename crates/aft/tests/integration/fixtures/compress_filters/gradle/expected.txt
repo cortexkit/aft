@@ -1,0 +1,12 @@
+Starting a Gradle Daemon, 1 incompatible Daemon could not be reused
+> Task :app:compileJava
+Note: /app/src/Main.java uses unchecked or unsafe operations.
+> Task :app:test FAILED
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':app:test'.
+> There were failing tests.
+
+BUILD FAILED in 12s

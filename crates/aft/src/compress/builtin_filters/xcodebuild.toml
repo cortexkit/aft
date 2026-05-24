@@ -1,0 +1,16 @@
+[filter]
+matches = ["xcodebuild"]
+description = "Compact xcodebuild output; strip routine build steps."
+
+[strip]
+patterns = [
+  '^Build settings', '^=== ', '^\s+CompileC', '^\s+CompileSwift', '^\s+Ld', '^\s+CodeSign', '^\s+Touch', '^\s+ProcessInfoPlistFile', '^\s+CreateBuildDirectory', '^\s+MkDir', '^\s+Validate', '^\s+CopySwiftLibs', '^\s+RegisterExecutionPolicyException', '^\s+SetMode', '^\s+SetOwnerAndGroup', '^\s+CompileMaterials', '^\s+ProcessProductPackaging', '^\s+RegisterWithLaunchServices', '^\s+CompileXIB', '^\s+ProcessPCH', '^\s+WriteAuxiliaryFile',
+]
+
+[cap]
+max_lines = 100
+keep = "tail"
+
+[shortcircuit]
+when = '\A\s*\z'
+replacement = "xcodebuild: ok"

@@ -1,0 +1,21 @@
+[filter]
+matches = ["deno"]
+description = "Compact Deno output; strip download/watch noise and summarize clean checks."
+
+[strip]
+patterns = [
+  '^Download https?://.*$',
+  '^Watcher Process started\.$',
+  '^Watcher File change detected! Restarting!$',
+]
+
+[truncate]
+line_max = 240
+
+[cap]
+max_lines = 150
+keep = "middle"
+
+[shortcircuit]
+when = '^Check file://.* OK$'
+replacement = "deno check: ok"

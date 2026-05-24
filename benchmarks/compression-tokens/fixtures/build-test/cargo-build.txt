@@ -1,0 +1,13 @@
+   Compiling libc v0.2.177
+   Compiling proc-macro2 v1.0.101
+   Compiling unicode-ident v1.0.19
+   Compiling quote v1.0.41
+   Compiling serde_core v1.0.228
+   Compiling memchr v2.7.6
+   Compiling aho-corasick v1.1.3
+   Compiling regex-syntax v0.8.8
+   Compiling serde v1.0.228
+   Compiling regex-automata v0.4.13
+   Compiling tree-sitter v0.26.2
+   Compiling agent-file-tools v0.26.4 (/Users/ufukaltinok/Work/OSS/opencode-aft/crates/aft)
+    Finished `release` profile [optimized] target(s) in 38.74s

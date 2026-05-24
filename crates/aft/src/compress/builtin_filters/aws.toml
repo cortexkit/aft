@@ -1,0 +1,15 @@
+[filter]
+matches = ["aws"]
+description = "Compact AWS CLI output with conservative truncation for large JSON/table results."
+
+[strip]
+patterns = [
+  '^Initializing AWS CLI .*$'
+]
+
+[truncate]
+line_max = 500
+
+[cap]
+max_lines = 200
+keep = "middle"

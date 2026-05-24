@@ -1,0 +1,10 @@
+[filter]
+matches = ["tree"]
+description = "Compact tree output; keep top-level structure."
+
+[truncate]
+line_max = 300
+
+[cap]
+max_lines = 80
+keep = "head"

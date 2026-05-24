@@ -1,0 +1,12 @@
+{
+  "tool_surface": "recommended",
+  "format_on_edit": false,
+  // Search index must be enabled so AFT's hoisted `grep`/`glob` tools are
+  // registered. Without this, Pi falls back to its built-in `grep` which
+  // does not run AFT's external-directory permission ask. Tests that need
+  // to exercise AFT grep behavior (permission asks, brace-glob handling,
+  // multi-path support) require this to be true.
+  "search_index": true,
+  "semantic_search": false,
+  "auto_update": false
+}

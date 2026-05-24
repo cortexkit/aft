@@ -1,0 +1,243 @@
+[
+  {
+    "query": "useState",
+    "shape": "identifier",
+    "expected_top_files": [
+      "crates/aft/tests/fixtures/imports_ts.ts",
+      "crates/aft/src/commands/add_import.rs"
+    ],
+    "notes": "React hook identifier from the dogfood failure set; should find files that actually use or document it."
+  },
+  {
+    "query": "aft_safety_history",
+    "shape": "identifier",
+    "expected_top_files": [
+      "packages/opencode-plugin/src/tools/safety.ts"
+    ],
+    "notes": "Tool-shaped identifier for the safety history operation; currently represented as aft_safety op=history."
+  },
+  {
+    "query": "subagent_type",
+    "shape": "identifier",
+    "expected_top_files": [
+      "packages/opencode-plugin/src/tools/hoisted.ts",
+      "packages/opencode-plugin/src/tools/hoisted-internals.ts"
+    ],
+    "notes": "Dogfood identifier shape from agent/task tooling; expected files are the plugin's hoisted tool plumbing."
+  },
+  {
+    "query": "LSPManager",
+    "shape": "identifier",
+    "expected_top_files": [
+      "crates/aft/src/lsp/manager.rs",
+      "crates/aft/src/context.rs"
+    ],
+    "notes": "PascalCase manager identifier; Rust type is LspManager but users often query LSPManager."
+  },
+  {
+    "query": "handle_grep",
+    "shape": "identifier",
+    "expected_top_files": [
+      "crates/aft/src/commands/grep.rs"
+    ],
+    "notes": "Rust command handler identifier from the existing search benchmark."
+  },
+  {
+    "query": "BinaryBridge",
+    "shape": "identifier",
+    "expected_top_files": [
+      "packages/aft-bridge/src/bridge.ts"
+    ],
+    "notes": "TypeScript bridge class used by plugin transports."
+  },
+  {
+    "query": "validate_storage_dir",
+    "shape": "identifier",
+    "expected_top_files": [
+      "crates/aft/src/commands/configure.rs"
+    ],
+    "notes": "Snake-case Rust helper used during configure."
+  },
+  {
+    "query": "SemanticIndexFingerprint",
+    "shape": "identifier",
+    "expected_top_files": [
+      "crates/aft/src/semantic_index.rs",
+      "crates/aft/tests/integration/semantic_disk_test.rs"
+    ],
+    "notes": "Semantic cache fingerprint type."
+  },
+  {
+    "query": "renderSemanticResult",
+    "shape": "identifier",
+    "expected_top_files": [
+      "packages/pi-plugin/src/tools/semantic.ts"
+    ],
+    "notes": "camelCase renderer export in the Pi plugin."
+  },
+  {
+    "query": "trust_project",
+    "shape": "identifier",
+    "expected_top_files": [
+      "crates/aft/src/compress/trust.rs",
+      "crates/aft/src/commands/trust_filter_project.rs"
+    ],
+    "notes": "Filter trust helper used by project filter commands."
+  },
+  {
+    "query": "useState hook examples",
+    "shape": "mixed",
+    "expected_top_files": [
+      "crates/aft/tests/fixtures/imports_ts.ts",
+      "crates/aft/src/commands/add_import.rs"
+    ],
+    "notes": "Identifier plus natural words."
+  },
+  {
+    "query": "LSPManager initialization timeout",
+    "shape": "mixed",
+    "expected_top_files": [
+      "crates/aft/src/lsp/manager.rs",
+      "crates/aft/src/lsp/client.rs"
+    ],
+    "notes": "PascalCase identifier with behavior terms."
+  },
+  {
+    "query": "semantic_search unavailable renderer",
+    "shape": "mixed",
+    "expected_top_files": [
+      "packages/pi-plugin/src/tools/semantic.ts",
+      "packages/opencode-plugin/src/tools/semantic.ts"
+    ],
+    "notes": "Protocol command name plus UI behavior."
+  },
+  {
+    "query": "bash long running reminder config",
+    "shape": "mixed",
+    "expected_top_files": [
+      "crates/aft/src/commands/configure.rs",
+      "packages/pi-plugin/src/config.ts",
+      "crates/aft/src/config.rs"
+    ],
+    "notes": "Feature phrase plus config term."
+  },
+  {
+    "query": "workspace permission prompt flow",
+    "shape": "mixed",
+    "expected_top_files": [
+      "packages/opencode-plugin/src/tools/permissions.ts",
+      "crates/aft/src/bash_permissions/scan.rs"
+    ],
+    "notes": "Natural words anchored by permission terminology."
+  },
+  {
+    "query": "how does semantic indexing persist across configure runs",
+    "shape": "natural-language",
+    "expected_top_files": [
+      "crates/aft/src/commands/configure.rs",
+      "crates/aft/src/semantic_index.rs"
+    ],
+    "notes": "Conceptual query for semantic disk cache and configure orchestration."
+  },
+  {
+    "query": "where are background bash tasks restored after restart",
+    "shape": "natural-language",
+    "expected_top_files": [
+      "crates/aft/src/commands/configure.rs",
+      "crates/aft/src/bash_background/persistence.rs"
+    ],
+    "notes": "Conceptual query for replaying persisted background tasks."
+  },
+  {
+    "query": "how are configure warnings delivered asynchronously",
+    "shape": "natural-language",
+    "expected_top_files": [
+      "crates/aft/src/commands/configure.rs",
+      "packages/aft-bridge/src/bridge.ts"
+    ],
+    "notes": "Conceptual query for deferred configure warning push frames."
+  },
+  {
+    "query": "where does lsp diagnostic polling wait for server responses",
+    "shape": "natural-language",
+    "expected_top_files": [
+      "crates/aft/src/lsp/manager.rs",
+      "crates/aft/src/context.rs"
+    ],
+    "notes": "Conceptual query for LSP diagnostics waits."
+  },
+  {
+    "query": "how are imports organized after edits",
+    "shape": "natural-language",
+    "expected_top_files": [
+      "crates/aft/src/commands/organize_imports.rs",
+      "crates/aft/src/imports.rs"
+    ],
+    "notes": "Conceptual query for import management."
+  },
+  {
+    "query": "crates/aft/src/commands/grep.rs",
+    "shape": "path",
+    "expected_top_files": [
+      "crates/aft/src/commands/grep.rs"
+    ],
+    "notes": "Path-shaped query for the grep command implementation."
+  },
+  {
+    "query": "packages/opencode-plugin/src/tools/bash.ts",
+    "shape": "path",
+    "expected_top_files": [
+      "packages/opencode-plugin/src/tools/bash.ts"
+    ],
+    "notes": "Path-shaped query for the OpenCode bash tool wrapper."
+  },
+  {
+    "query": "packages/aft-bridge/src/bridge.ts",
+    "shape": "path",
+    "expected_top_files": [
+      "packages/aft-bridge/src/bridge.ts"
+    ],
+    "notes": "Path-shaped query for the TypeScript protocol bridge."
+  },
+  {
+    "query": "ERR_PNPM_",
+    "shape": "error-code",
+    "expected_top_files": [
+      "crates/aft/src/compress/pnpm.rs"
+    ],
+    "notes": "Error-prefix query for pnpm output compression."
+  },
+  {
+    "query": "process group already terminated",
+    "shape": "error-code",
+    "expected_top_files": [
+      "crates/aft/src/bash_background/registry.rs",
+      "crates/aft/src/bash_background/watchdog.rs"
+    ],
+    "notes": "Dogfood error-message shape for process lifecycle cleanup; expected files own background process termination."
+  },
+  {
+    "query": "AFT plugin entry point",
+    "shape": "generic-file",
+    "expected_top_files": [
+      "packages/opencode-plugin/src/index.ts"
+    ],
+    "notes": "Generic file role query where the target filename is index.ts."
+  },
+  {
+    "query": "command module exports list",
+    "shape": "generic-file",
+    "expected_top_files": [
+      "crates/aft/src/commands/mod.rs"
+    ],
+    "notes": "Generic file role query where the target filename is mod.rs."
+  },
+  {
+    "query": "crate public API modules",
+    "shape": "generic-file",
+    "expected_top_files": [
+      "crates/aft/src/lib.rs"
+    ],
+    "notes": "Generic file role query where the target filename is lib.rs."
+  }
+]

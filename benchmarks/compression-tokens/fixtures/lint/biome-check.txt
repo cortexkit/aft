@@ -1,0 +1,21 @@
+src/hooks/useSession.ts:14:7 lint/correctness/noUnusedVariables ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ✖ This variable is unused.
+
+    12 │ export function useSession() {
+    13 │   const [session, setSession] = useState<Session | null>(null);
+  > 14 │   const debugSession = session;
+       │       ^^^^^^^^^^^^
+    15 │   return session;
+    16 │ }
+
+src/components/Button.tsx format ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ✖ Formatter would have printed the following content:
+
+    8  8 │ export function Button(props: Props) {
+    9    │ - return <button className="btn" {...props}/>
+       9 │ + return <button className="btn" {...props} />;
+
+Checked 148 files in 121ms. No fixes applied.
+Found 2 errors.

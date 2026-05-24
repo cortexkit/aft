@@ -1,0 +1,2 @@
+/Users/me/App/Tests/AppTests.swift:42: error: XCTAssertEqual failed
+** BUILD FAILED **

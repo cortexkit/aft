@@ -1,0 +1,8 @@
+src/index.ts(12,24): error TS2307: Cannot find module './generated/client' or its corresponding type declarations.
+src/routes/users.ts(41,18): error TS2339: Property 'emailVerifiedAt' does not exist on type 'User'.
+src/routes/users.ts(42,9): error TS2322: Type 'string | undefined' is not assignable to type 'string'.
+  Type 'undefined' is not assignable to type 'string'.
+src/components/Profile.tsx(88,17): error TS2769: No overload matches this call.
+  Overload 1 of 2, '(props: LinkProps): Link', gave the following error.
+    Type '{ href: URL; children: string; }' is not assignable to type 'IntrinsicAttributes & LinkProps'.
+Found 4 errors in 3 files.

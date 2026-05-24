@@ -1,0 +1,1700 @@
+{
+  "aggregates": {
+    "by_shape": {
+      "error-code": {
+        "fixtures": 2,
+        "latency_ms_p50": 10.548,
+        "latency_ms_p95": 16.041,
+        "mrr_avg": 0.5,
+        "p_at_5_avg": 0.5,
+        "wins": 1
+      },
+      "generic-file": {
+        "fixtures": 3,
+        "latency_ms_p50": 7.474,
+        "latency_ms_p95": 12.717,
+        "mrr_avg": 0.0,
+        "p_at_5_avg": 0.0,
+        "wins": 0
+      },
+      "identifier": {
+        "fixtures": 10,
+        "latency_ms_p50": 8.443,
+        "latency_ms_p95": 91.301,
+        "mrr_avg": 0.6,
+        "p_at_5_avg": 0.6,
+        "wins": 6
+      },
+      "mixed": {
+        "fixtures": 5,
+        "latency_ms_p50": 5.329,
+        "latency_ms_p95": 16.308,
+        "mrr_avg": 0.54,
+        "p_at_5_avg": 0.8,
+        "wins": 4
+      },
+      "natural-language": {
+        "fixtures": 5,
+        "latency_ms_p50": 7.692,
+        "latency_ms_p95": 11.428,
+        "mrr_avg": 0.466667,
+        "p_at_5_avg": 0.6,
+        "wins": 3
+      },
+      "path": {
+        "fixtures": 3,
+        "latency_ms_p50": 10.867,
+        "latency_ms_p95": 24.626,
+        "mrr_avg": 1.0,
+        "p_at_5_avg": 1.0,
+        "wins": 3
+      }
+    },
+    "embedding_cache_hit_rate": null,
+    "latency_ms_p50": 8.443,
+    "latency_ms_p95": 24.626,
+    "mrr_avg": 0.536905,
+    "p_at_5_avg": 0.607143,
+    "total_fixtures": 28,
+    "wins": 17
+  },
+  "benchmark": "aft-search",
+  "binary": {
+    "path": "../../target/release/aft",
+    "sha256": "074631d3336cebbac01011117af29cff97e1fbde7d1d29c8e3f40fec81f77d48",
+    "version": "0.22.1"
+  },
+  "fixture_count": 28,
+  "fixtures_file": "fixtures.json",
+  "generated_at_unix": 1778750198,
+  "latency_note": "latency_ms values are wall-clock measurements from semantic_search request to response",
+  "mode": "baseline",
+  "project": {
+    "git_rev": "6eda1441f2d776702cb49d6f6a904e9a119fccd7",
+    "root": "../.."
+  },
+  "results": [
+    {
+      "expected_top_files": [
+        "crates/aft/tests/fixtures/imports_ts.ts",
+        "crates/aft/src/commands/add_import.rs"
+      ],
+      "first_match_rank": null,
+      "latency_ms": 91.301,
+      "mrr": 0.0,
+      "notes": "React hook identifier from the dogfood failure set; should find files that actually use or document it.",
+      "p_at_5": 0.0,
+      "query": "useState",
+      "shape": "identifier",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "crates/aft/tests/integration/honest_failures_test.rs",
+          "kind": "function",
+          "name": "remove_import_reports_removed_when_name_is_present",
+          "rank": 1,
+          "score": 0.432828,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/tests/integration/import_test.rs",
+          "kind": "function",
+          "name": "remove_import_specific_name_from_multi_ts",
+          "rank": 2,
+          "score": 0.428131,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/tests/integration/import_test.rs",
+          "kind": "function",
+          "name": "add_import_ts_dedup",
+          "rank": 3,
+          "score": 0.387059,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/lsp/client.rs",
+          "kind": "method",
+          "name": "state",
+          "rank": 4,
+          "score": 0.377212,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/tests/integration/honest_failures_test.rs",
+          "kind": "function",
+          "name": "remove_import_reports_not_removed_when_name_is_absent",
+          "rank": 5,
+          "score": 0.364455,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "packages/opencode-plugin/src/tools/safety.ts"
+      ],
+      "first_match_rank": null,
+      "latency_ms": 9.165,
+      "mrr": 0.0,
+      "notes": "Tool-shaped identifier for the safety history operation; currently represented as aft_safety op=history.",
+      "p_at_5": 0.0,
+      "query": "aft_safety_history",
+      "shape": "identifier",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "packages/aft-cli/src/lib/aft-bridge.ts",
+          "kind": "function",
+          "name": "handleLine",
+          "rank": 1,
+          "score": 0.518835,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/aft-cli/src/lib/aft-bridge.ts",
+          "kind": "interface",
+          "name": "AftResponse",
+          "rank": 2,
+          "score": 0.488906,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/aft-cli/src/adapters/types.ts",
+          "kind": "type_alias",
+          "name": "HarnessKind",
+          "rank": 3,
+          "score": 0.481405,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/aft-cli/src/lib/aft-bridge.ts",
+          "kind": "function",
+          "name": "sendAftRequests",
+          "rank": 4,
+          "score": 0.481092,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/aft-cli/src/lib/aft-bridge.ts",
+          "kind": "interface",
+          "name": "BridgeErrorContext",
+          "rank": 5,
+          "score": 0.471565,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "packages/opencode-plugin/src/tools/hoisted.ts",
+        "packages/opencode-plugin/src/tools/hoisted-internals.ts"
+      ],
+      "first_match_rank": null,
+      "latency_ms": 8.443,
+      "mrr": 0.0,
+      "notes": "Dogfood identifier shape from agent/task tooling; expected files are the plugin's hoisted tool plumbing.",
+      "p_at_5": 0.0,
+      "query": "subagent_type",
+      "shape": "identifier",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "packages/opencode-plugin/src/shared/subagent-detect.ts",
+          "kind": "interface",
+          "name": "SessionInfo",
+          "rank": 1,
+          "score": 0.419962,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/opencode-plugin/src/shared/subagent-detect.ts",
+          "kind": "interface",
+          "name": "CacheEntry",
+          "rank": 2,
+          "score": 0.402886,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/opencode-plugin/src/shared/subagent-detect.ts",
+          "kind": "variable",
+          "name": "cache",
+          "rank": 3,
+          "score": 0.364857,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/opencode-plugin/src/shared/subagent-detect.ts",
+          "kind": "variable",
+          "name": "CACHE_MAX_ENTRIES",
+          "rank": 4,
+          "score": 0.363896,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/opencode-plugin/src/shared/subagent-detect.ts",
+          "kind": "function",
+          "name": "_resetSubagentCacheForTest",
+          "rank": 5,
+          "score": 0.310401,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "crates/aft/src/lsp/manager.rs",
+        "crates/aft/src/context.rs"
+      ],
+      "first_match_rank": 1,
+      "latency_ms": 9.169,
+      "mrr": 1.0,
+      "notes": "PascalCase manager identifier; Rust type is LspManager but users often query LSPManager.",
+      "p_at_5": 1.0,
+      "query": "LSPManager",
+      "shape": "identifier",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "crates/aft/src/lsp/manager.rs",
+          "kind": "struct",
+          "name": "LspManager",
+          "rank": 1,
+          "score": 0.625254,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/tests/integration/lsp_manager_test.rs",
+          "kind": "function",
+          "name": "dropping_manager_untracks_pids_from_registry",
+          "rank": 2,
+          "score": 0.556136,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/tests/integration/lsp_diagnostics_test.rs",
+          "kind": "function",
+          "name": "manager_with_fake_server",
+          "rank": 3,
+          "score": 0.539291,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/aft-cli/src/lib/lsp-cache.ts",
+          "kind": "interface",
+          "name": "LspCacheReport",
+          "rank": 4,
+          "score": 0.499959,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/tests/integration/lsp_diagnostics_test.rs",
+          "kind": "function",
+          "name": "manager_with_fake_typescript_server",
+          "rank": 5,
+          "score": 0.497345,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "crates/aft/src/commands/grep.rs"
+      ],
+      "first_match_rank": 1,
+      "latency_ms": 6.274,
+      "mrr": 1.0,
+      "notes": "Rust command handler identifier from the existing search benchmark.",
+      "p_at_5": 1.0,
+      "query": "handle_grep",
+      "shape": "identifier",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "crates/aft/src/commands/grep.rs",
+          "kind": "function",
+          "name": "handle_grep",
+          "rank": 1,
+          "score": 0.536664,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/bash_rewrite/rules.rs",
+          "kind": "method",
+          "name": "matches",
+          "rank": 2,
+          "score": 0.523125,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/commands/grep.rs",
+          "kind": "function",
+          "name": "fallback_grep",
+          "rank": 3,
+          "score": 0.511973,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/bash_rewrite/rules.rs",
+          "kind": "method",
+          "name": "name",
+          "rank": 4,
+          "score": 0.497321,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/bash_rewrite/rules.rs",
+          "kind": "method",
+          "name": "rewrite",
+          "rank": 5,
+          "score": 0.473202,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "packages/aft-bridge/src/bridge.ts"
+      ],
+      "first_match_rank": 1,
+      "latency_ms": 8.493,
+      "mrr": 1.0,
+      "notes": "TypeScript bridge class used by plugin transports.",
+      "p_at_5": 1.0,
+      "query": "BinaryBridge",
+      "shape": "identifier",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "kind": "class",
+          "name": "BinaryBridge",
+          "rank": 1,
+          "score": 0.50657,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/aft-bridge/src/pool.ts",
+          "kind": "class",
+          "name": "BridgePool",
+          "rank": 2,
+          "score": 0.472487,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/aft-bridge/src/pool.ts",
+          "kind": "method",
+          "name": "replaceBinary",
+          "rank": 3,
+          "score": 0.447483,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "kind": "method",
+          "name": "pushStderrLine",
+          "rank": 4,
+          "score": 0.440059,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/pi-plugin/src/__tests__/bash.test.ts",
+          "kind": "function",
+          "name": "makeMockBridge",
+          "rank": 5,
+          "score": 0.430018,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "crates/aft/src/commands/configure.rs"
+      ],
+      "first_match_rank": 1,
+      "latency_ms": 6.575,
+      "mrr": 1.0,
+      "notes": "Snake-case Rust helper used during configure.",
+      "p_at_5": 1.0,
+      "query": "validate_storage_dir",
+      "shape": "identifier",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "crates/aft/src/commands/configure.rs",
+          "kind": "function",
+          "name": "validate_storage_dir",
+          "rank": 1,
+          "score": 0.668004,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/compress/trust.rs",
+          "kind": "function",
+          "name": "trust_path",
+          "rank": 2,
+          "score": 0.552908,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/compress/trust.rs",
+          "kind": "function",
+          "name": "is_project_trusted",
+          "rank": 3,
+          "score": 0.531452,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/tests/integration/format_test.rs",
+          "kind": "function",
+          "name": "validate_full_with_checker",
+          "rank": 4,
+          "score": 0.505667,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/compress/trust.rs",
+          "kind": "function",
+          "name": "save",
+          "rank": 5,
+          "score": 0.505246,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "crates/aft/src/semantic_index.rs",
+        "crates/aft/tests/integration/semantic_disk_test.rs"
+      ],
+      "first_match_rank": 1,
+      "latency_ms": 3.992,
+      "mrr": 1.0,
+      "notes": "Semantic cache fingerprint type.",
+      "p_at_5": 1.0,
+      "query": "SemanticIndexFingerprint",
+      "shape": "identifier",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "crates/aft/src/semantic_index.rs",
+          "kind": "struct",
+          "name": "SemanticIndexFingerprint",
+          "rank": 1,
+          "score": 0.677515,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/semantic_index.rs",
+          "kind": "method",
+          "name": "set_fingerprint",
+          "rank": 2,
+          "score": 0.640099,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/semantic_index.rs",
+          "kind": "method",
+          "name": "fingerprint",
+          "rank": 3,
+          "score": 0.62915,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/semantic_index.rs",
+          "kind": "method",
+          "name": "fingerprint",
+          "rank": 4,
+          "score": 0.621023,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/context.rs",
+          "kind": "method",
+          "name": "semantic_index_status",
+          "rank": 5,
+          "score": 0.580337,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "packages/pi-plugin/src/tools/semantic.ts"
+      ],
+      "first_match_rank": null,
+      "latency_ms": 12.643,
+      "mrr": 0.0,
+      "notes": "camelCase renderer export in the Pi plugin.",
+      "p_at_5": 0.0,
+      "query": "renderSemanticResult",
+      "shape": "identifier",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "packages/pi-plugin/src/tools/structure.ts",
+          "kind": "function",
+          "name": "renderTransformResult",
+          "rank": 1,
+          "score": 0.508934,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/pi-plugin/src/tools/safety.ts",
+          "kind": "function",
+          "name": "renderSafetyResult",
+          "rank": 2,
+          "score": 0.507488,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/pi-plugin/src/tools/render-helpers.ts",
+          "kind": "function",
+          "name": "renderErrorResult",
+          "rank": 3,
+          "score": 0.483191,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/pi-plugin/src/tools/render-helpers.ts",
+          "kind": "function",
+          "name": "renderTextResult",
+          "rank": 4,
+          "score": 0.469247,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/pi-plugin/src/tools/lsp.ts",
+          "kind": "function",
+          "name": "renderDiagnosticsResult",
+          "rank": 5,
+          "score": 0.461319,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "crates/aft/src/compress/trust.rs",
+        "crates/aft/src/commands/trust_filter_project.rs"
+      ],
+      "first_match_rank": 1,
+      "latency_ms": 5.057,
+      "mrr": 1.0,
+      "notes": "Filter trust helper used by project filter commands.",
+      "p_at_5": 1.0,
+      "query": "trust_project",
+      "shape": "identifier",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "crates/aft/src/compress/trust.rs",
+          "kind": "function",
+          "name": "is_project_trusted",
+          "rank": 1,
+          "score": 0.591247,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/compress/trust.rs",
+          "kind": "function",
+          "name": "untrust_project",
+          "rank": 2,
+          "score": 0.57495,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/compress/trust.rs",
+          "kind": "function",
+          "name": "trust_project",
+          "rank": 3,
+          "score": 0.545666,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/compress/trust.rs",
+          "kind": "struct",
+          "name": "TrustState",
+          "rank": 4,
+          "score": 0.492436,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/compress/trust.rs",
+          "kind": "function",
+          "name": "list_trusted",
+          "rank": 5,
+          "score": 0.481859,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "crates/aft/tests/fixtures/imports_ts.ts",
+        "crates/aft/src/commands/add_import.rs"
+      ],
+      "first_match_rank": 5,
+      "latency_ms": 5.329,
+      "mrr": 0.2,
+      "notes": "Identifier plus natural words.",
+      "p_at_5": 1.0,
+      "query": "useState hook examples",
+      "shape": "mixed",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "crates/aft/tests/integration/import_test.rs",
+          "kind": "function",
+          "name": "add_import_ts_dedup",
+          "rank": 1,
+          "score": 0.47016,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/opencode-plugin/src/shutdown-hooks.ts",
+          "kind": "function",
+          "name": "getState",
+          "rank": 2,
+          "score": 0.454389,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/pi-plugin/src/shutdown-hooks.ts",
+          "kind": "function",
+          "name": "getState",
+          "rank": 3,
+          "score": 0.452591,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/tests/integration/honest_failures_test.rs",
+          "kind": "function",
+          "name": "remove_import_reports_removed_when_name_is_present",
+          "rank": 4,
+          "score": 0.448725,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/tests/fixtures/imports_ts.ts",
+          "kind": "function",
+          "name": "App",
+          "rank": 5,
+          "score": 0.448507,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "crates/aft/src/lsp/manager.rs",
+        "crates/aft/src/lsp/client.rs"
+      ],
+      "first_match_rank": 2,
+      "latency_ms": 3.725,
+      "mrr": 0.5,
+      "notes": "PascalCase identifier with behavior terms.",
+      "p_at_5": 1.0,
+      "query": "LSPManager initialization timeout",
+      "shape": "mixed",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "crates/aft/tests/integration/lsp_manager_test.rs",
+          "kind": "function",
+          "name": "dropping_manager_untracks_pids_from_registry",
+          "rank": 1,
+          "score": 0.543729,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/lsp/manager.rs",
+          "kind": "method",
+          "name": "wait_for_diagnostics_default",
+          "rank": 2,
+          "score": 0.50578,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/pi-plugin/src/lsp-github-install.ts",
+          "kind": "function",
+          "name": "controlledTimeoutSignal",
+          "rank": 3,
+          "score": 0.4973,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/lsp/manager.rs",
+          "kind": "struct",
+          "name": "LspManager",
+          "rank": 4,
+          "score": 0.495193,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/lsp/manager.rs",
+          "kind": "method",
+          "name": "wait_for_diagnostics",
+          "rank": 5,
+          "score": 0.481303,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "packages/pi-plugin/src/tools/semantic.ts",
+        "packages/opencode-plugin/src/tools/semantic.ts"
+      ],
+      "first_match_rank": 1,
+      "latency_ms": 5.022,
+      "mrr": 1.0,
+      "notes": "Protocol command name plus UI behavior.",
+      "p_at_5": 1.0,
+      "query": "semantic_search unavailable renderer",
+      "shape": "mixed",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "packages/pi-plugin/src/tools/semantic.ts",
+          "kind": "function",
+          "name": "renderSemanticResult",
+          "rank": 1,
+          "score": 0.679038,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/commands/semantic_search.rs",
+          "kind": "function",
+          "name": "semantic_error_response",
+          "rank": 2,
+          "score": 0.653003,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/pi-plugin/src/tools/semantic.ts",
+          "kind": "function",
+          "name": "renderSemanticCall",
+          "rank": 3,
+          "score": 0.630197,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/pi-plugin/src/tools/semantic.ts",
+          "kind": "function",
+          "name": "buildSemanticSections",
+          "rank": 4,
+          "score": 0.598833,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/commands/semantic_search.rs",
+          "kind": "function",
+          "name": "handle_semantic_search",
+          "rank": 5,
+          "score": 0.589662,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "crates/aft/src/commands/configure.rs",
+        "packages/pi-plugin/src/config.ts",
+        "crates/aft/src/config.rs"
+      ],
+      "first_match_rank": null,
+      "latency_ms": 16.308,
+      "mrr": 0.0,
+      "notes": "Feature phrase plus config term.",
+      "p_at_5": 0.0,
+      "query": "bash long running reminder config",
+      "shape": "mixed",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "crates/aft/src/bash_background/registry.rs",
+          "kind": "method",
+          "name": "configure_long_running_reminders",
+          "rank": 1,
+          "score": 0.723465,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/bash_background/registry.rs",
+          "kind": "method",
+          "name": "maybe_emit_long_running_reminder",
+          "rank": 2,
+          "score": 0.616581,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/pi-plugin/src/bg-notifications.ts",
+          "kind": "function",
+          "name": "formatLongRunningReminder",
+          "rank": 3,
+          "score": 0.555332,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/tests/integration/bash_foreground_background_architecture_test.rs",
+          "kind": "function",
+          "name": "long_running_reminder_frame_fires_after_configured_interval",
+          "rank": 4,
+          "score": 0.548108,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/opencode-plugin/src/bg-notifications.ts",
+          "kind": "function",
+          "name": "formatLongRunningReminder",
+          "rank": 5,
+          "score": 0.533242,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "packages/opencode-plugin/src/tools/permissions.ts",
+        "crates/aft/src/bash_permissions/scan.rs"
+      ],
+      "first_match_rank": 1,
+      "latency_ms": 12.84,
+      "mrr": 1.0,
+      "notes": "Natural words anchored by permission terminology.",
+      "p_at_5": 1.0,
+      "query": "workspace permission prompt flow",
+      "shape": "mixed",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "packages/opencode-plugin/src/tools/permissions.ts",
+          "kind": "function",
+          "name": "askGlobPermission",
+          "rank": 1,
+          "score": 0.45952,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/opencode-plugin/src/tools/permissions.ts",
+          "kind": "function",
+          "name": "askGrepPermission",
+          "rank": 2,
+          "score": 0.447571,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/commands/bash.rs",
+          "kind": "function",
+          "name": "permissions_granted_cover",
+          "rank": 3,
+          "score": 0.438841,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/opencode-plugin/src/tools/permissions.ts",
+          "kind": "function",
+          "name": "workspacePattern",
+          "rank": 4,
+          "score": 0.435287,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/opencode-plugin/src/tools/permissions.ts",
+          "kind": "function",
+          "name": "askEditPermission",
+          "rank": 5,
+          "score": 0.432659,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "crates/aft/src/commands/configure.rs",
+        "crates/aft/src/semantic_index.rs"
+      ],
+      "first_match_rank": 1,
+      "latency_ms": 11.428,
+      "mrr": 1.0,
+      "notes": "Conceptual query for semantic disk cache and configure orchestration.",
+      "p_at_5": 1.0,
+      "query": "how does semantic indexing persist across configure runs",
+      "shape": "natural-language",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "crates/aft/src/semantic_index.rs",
+          "kind": "struct",
+          "name": "SemanticIndex",
+          "rank": 1,
+          "score": 0.544953,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/tests/integration/semantic_test.rs",
+          "kind": "function",
+          "name": "semantic_index_persists_across_configure_build_search_roundtrip",
+          "rank": 2,
+          "score": 0.542212,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/commands/configure.rs",
+          "kind": "function",
+          "name": "parse_semantic_config",
+          "rank": 3,
+          "score": 0.51053,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/semantic_index.rs",
+          "kind": "method",
+          "name": "from_config",
+          "rank": 4,
+          "score": 0.489795,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/context.rs",
+          "kind": "method",
+          "name": "semantic_index_status",
+          "rank": 5,
+          "score": 0.487669,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "crates/aft/src/commands/configure.rs",
+        "crates/aft/src/bash_background/persistence.rs"
+      ],
+      "first_match_rank": null,
+      "latency_ms": 9.586,
+      "mrr": 0.0,
+      "notes": "Conceptual query for replaying persisted background tasks.",
+      "p_at_5": 0.0,
+      "query": "where are background bash tasks restored after restart",
+      "shape": "natural-language",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "crates/aft/src/bash_background/registry.rs",
+          "kind": "method",
+          "name": "maybe_compress_snapshot",
+          "rank": 1,
+          "score": 0.552865,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/bash_background/registry.rs",
+          "kind": "method",
+          "name": "task_exit_path",
+          "rank": 2,
+          "score": 0.549109,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/bash_background/registry.rs",
+          "kind": "method",
+          "name": "running_tasks",
+          "rank": 3,
+          "score": 0.54795,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/tests/integration/bash_background_persistence_test.rs",
+          "kind": "function",
+          "name": "cleanup_finished_retains_undelivered_terminals",
+          "rank": 4,
+          "score": 0.539376,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/bash_background/registry.rs",
+          "kind": "method",
+          "name": "detach",
+          "rank": 5,
+          "score": 0.531163,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "crates/aft/src/commands/configure.rs",
+        "packages/aft-bridge/src/bridge.ts"
+      ],
+      "first_match_rank": null,
+      "latency_ms": 7.651,
+      "mrr": 0.0,
+      "notes": "Conceptual query for deferred configure warning push frames.",
+      "p_at_5": 0.0,
+      "query": "how are configure warnings delivered asynchronously",
+      "shape": "natural-language",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "packages/pi-plugin/src/notifications.ts",
+          "kind": "function",
+          "name": "deliverConfigureWarnings",
+          "rank": 1,
+          "score": 0.604041,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/tests/integration/configure_test.rs",
+          "kind": "function",
+          "name": "configure_warnings_wait_consumes_pending_frame_before_reading_stdout",
+          "rank": 2,
+          "score": 0.576222,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/opencode-plugin/src/notifications.ts",
+          "kind": "function",
+          "name": "deliverConfigureWarnings",
+          "rank": 3,
+          "score": 0.565895,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/tests/helpers/mod.rs",
+          "kind": "method",
+          "name": "merge_configure_warnings",
+          "rank": 4,
+          "score": 0.552923,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/tests/helpers/mod.rs",
+          "kind": "method",
+          "name": "wait_for_configure_warnings_frame",
+          "rank": 5,
+          "score": 0.542282,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "crates/aft/src/lsp/manager.rs",
+        "crates/aft/src/context.rs"
+      ],
+      "first_match_rank": 3,
+      "latency_ms": 7.692,
+      "mrr": 0.333333,
+      "notes": "Conceptual query for LSP diagnostics waits.",
+      "p_at_5": 1.0,
+      "query": "where does lsp diagnostic polling wait for server responses",
+      "shape": "natural-language",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "crates/aft/tests/integration/lsp_commands_test.rs",
+          "kind": "function",
+          "name": "wait_for_server",
+          "rank": 1,
+          "score": 0.655914,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/lsp/client.rs",
+          "kind": "struct",
+          "name": "ServerDiagnosticCapabilities",
+          "rank": 2,
+          "score": 0.629288,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/lsp/manager.rs",
+          "kind": "method",
+          "name": "wait_for_file_diagnostics",
+          "rank": 3,
+          "score": 0.623389,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/lsp/manager.rs",
+          "kind": "struct",
+          "name": "PostEditWaitOutcome",
+          "rank": 4,
+          "score": 0.618717,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/lsp/manager.rs",
+          "kind": "method",
+          "name": "wait_for_diagnostics_default",
+          "rank": 5,
+          "score": 0.60169,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "crates/aft/src/commands/organize_imports.rs",
+        "crates/aft/src/imports.rs"
+      ],
+      "first_match_rank": 1,
+      "latency_ms": 6.353,
+      "mrr": 1.0,
+      "notes": "Conceptual query for import management.",
+      "p_at_5": 1.0,
+      "query": "how are imports organized after edits",
+      "shape": "natural-language",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "crates/aft/src/imports.rs",
+          "kind": "function",
+          "name": "find_insertion_point",
+          "rank": 1,
+          "score": 0.531509,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/commands/organize_imports.rs",
+          "kind": "struct",
+          "name": "OrganizedImport",
+          "rank": 2,
+          "score": 0.530018,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/commands/organize_imports.rs",
+          "kind": "function",
+          "name": "handle_organize_imports",
+          "rank": 3,
+          "score": 0.516693,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/commands/organize_imports.rs",
+          "kind": "function",
+          "name": "organize",
+          "rank": 4,
+          "score": 0.516397,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/imports.rs",
+          "kind": "enum",
+          "name": "ImportGroup",
+          "rank": 5,
+          "score": 0.476076,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "crates/aft/src/commands/grep.rs"
+      ],
+      "first_match_rank": 1,
+      "latency_ms": 8.373,
+      "mrr": 1.0,
+      "notes": "Path-shaped query for the grep command implementation.",
+      "p_at_5": 1.0,
+      "query": "crates/aft/src/commands/grep.rs",
+      "shape": "path",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "crates/aft/src/commands/grep.rs",
+          "kind": "function",
+          "name": "fallback_search_file",
+          "rank": 1,
+          "score": 0.620555,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/commands/grep.rs",
+          "kind": "function",
+          "name": "line_starts",
+          "rank": 2,
+          "score": 0.617929,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/commands/grep.rs",
+          "kind": "function",
+          "name": "current_index_status",
+          "rank": 3,
+          "score": 0.604338,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/commands/grep.rs",
+          "kind": "function",
+          "name": "should_stop_fallback_search",
+          "rank": 4,
+          "score": 0.599492,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/parser.rs",
+          "kind": "method",
+          "name": "extract_symbols",
+          "rank": 5,
+          "score": 0.59702,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "packages/opencode-plugin/src/tools/bash.ts"
+      ],
+      "first_match_rank": 1,
+      "latency_ms": 24.626,
+      "mrr": 1.0,
+      "notes": "Path-shaped query for the OpenCode bash tool wrapper.",
+      "p_at_5": 1.0,
+      "query": "packages/opencode-plugin/src/tools/bash.ts",
+      "shape": "path",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "packages/opencode-plugin/src/tools/bash.ts",
+          "kind": "function",
+          "name": "createBashTool",
+          "rank": 1,
+          "score": 0.770223,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/opencode-plugin/src/tools/hoisted.ts",
+          "kind": "function",
+          "name": "hoistedTools",
+          "rank": 2,
+          "score": 0.768667,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/opencode-plugin/src/tools/bash.ts",
+          "kind": "variable",
+          "name": "z",
+          "rank": 3,
+          "score": 0.723537,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/opencode-plugin/src/tools/bash.ts",
+          "kind": "variable",
+          "name": "BASH_TRANSPORT_TIMEOUT_MS",
+          "rank": 4,
+          "score": 0.718686,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/opencode-plugin/src/tools/imports.ts",
+          "kind": "function",
+          "name": "importTools",
+          "rank": 5,
+          "score": 0.714664,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "packages/aft-bridge/src/bridge.ts"
+      ],
+      "first_match_rank": 1,
+      "latency_ms": 10.867,
+      "mrr": 1.0,
+      "notes": "Path-shaped query for the TypeScript protocol bridge.",
+      "p_at_5": 1.0,
+      "query": "packages/aft-bridge/src/bridge.ts",
+      "shape": "path",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "kind": "variable",
+          "name": "DEFAULT_BRIDGE_TIMEOUT_MS",
+          "rank": 1,
+          "score": 0.785945,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "kind": "method",
+          "name": "constructor",
+          "rank": 2,
+          "score": 0.757525,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "kind": "variable",
+          "name": "SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS",
+          "rank": 3,
+          "score": 0.751981,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/aft-bridge/src/bridge.ts",
+          "kind": "interface",
+          "name": "BridgeOptions",
+          "rank": 4,
+          "score": 0.751427,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/aft-cli/src/lib/aft-bridge.ts",
+          "kind": "function",
+          "name": "buildBridgeError",
+          "rank": 5,
+          "score": 0.750209,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "crates/aft/src/compress/pnpm.rs"
+      ],
+      "first_match_rank": 1,
+      "latency_ms": 16.041,
+      "mrr": 1.0,
+      "notes": "Error-prefix query for pnpm output compression.",
+      "p_at_5": 1.0,
+      "query": "ERR_PNPM_",
+      "shape": "error-code",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "crates/aft/src/compress/pnpm.rs",
+          "kind": "function",
+          "name": "pnpm_subcommand",
+          "rank": 1,
+          "score": 0.58294,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/compress/pnpm.rs",
+          "kind": "method",
+          "name": "compress",
+          "rank": 2,
+          "score": 0.582027,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/compress/pnpm.rs",
+          "kind": "method",
+          "name": "matches",
+          "rank": 3,
+          "score": 0.553312,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/compress/pnpm.rs",
+          "kind": "function",
+          "name": "compress_package",
+          "rank": 4,
+          "score": 0.53618,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/compress/pnpm.rs",
+          "kind": "function",
+          "name": "trim_trailing_lines",
+          "rank": 5,
+          "score": 0.518587,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "crates/aft/src/bash_background/registry.rs",
+        "crates/aft/src/bash_background/watchdog.rs"
+      ],
+      "first_match_rank": null,
+      "latency_ms": 10.548,
+      "mrr": 0.0,
+      "notes": "Dogfood error-message shape for process lifecycle cleanup; expected files own background process termination.",
+      "p_at_5": 0.0,
+      "query": "process group already terminated",
+      "shape": "error-code",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "crates/aft/src/format.rs",
+          "kind": "function",
+          "name": "kill_process_tree",
+          "rank": 1,
+          "score": 0.54378,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/format.rs",
+          "kind": "function",
+          "name": "isolate_in_process_group",
+          "rank": 2,
+          "score": 0.524763,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/tests/integration/bash_test.rs",
+          "kind": "function",
+          "name": "bash_timeout_terminates_shell_process_group_grandchild",
+          "rank": 3,
+          "score": 0.513823,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/format.rs",
+          "kind": "function",
+          "name": "isolate_in_process_group",
+          "rank": 4,
+          "score": 0.507179,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/bash_background/process.rs",
+          "kind": "function",
+          "name": "terminate_process",
+          "rank": 5,
+          "score": 0.493549,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "packages/opencode-plugin/src/index.ts"
+      ],
+      "first_match_rank": null,
+      "latency_ms": 7.474,
+      "mrr": 0.0,
+      "notes": "Generic file role query where the target filename is index.ts.",
+      "p_at_5": 0.0,
+      "query": "AFT plugin entry point",
+      "shape": "generic-file",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "packages/aft-cli/src/adapters/types.ts",
+          "kind": "type_alias",
+          "name": "HarnessKind",
+          "rank": 1,
+          "score": 0.546238,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/aft-cli/src/adapters/pi.ts",
+          "kind": "variable",
+          "name": "PLUGIN_NAME",
+          "rank": 2,
+          "score": 0.526331,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/aft-cli/src/commands/setup.ts",
+          "kind": "function",
+          "name": "printNextSteps",
+          "rank": 3,
+          "score": 0.492671,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/aft-bridge/src/protocol.ts",
+          "kind": "interface",
+          "name": "AftRequestEnvelope",
+          "rank": 4,
+          "score": 0.491923,
+          "source": "semantic"
+        },
+        {
+          "file": "packages/aft-cli/src/adapters/index.ts",
+          "kind": "function",
+          "name": "getAdaptersWithPluginRegistered",
+          "rank": 5,
+          "score": 0.474696,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "crates/aft/src/commands/mod.rs"
+      ],
+      "first_match_rank": null,
+      "latency_ms": 4.428,
+      "mrr": 0.0,
+      "notes": "Generic file role query where the target filename is mod.rs.",
+      "p_at_5": 0.0,
+      "query": "command module exports list",
+      "shape": "generic-file",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "crates/aft/src/commands/move_symbol.rs",
+          "kind": "function",
+          "name": "export_statement_has_wildcard",
+          "rank": 1,
+          "score": 0.465694,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/commands/move_symbol.rs",
+          "kind": "function",
+          "name": "find_export_keyword_start",
+          "rank": 2,
+          "score": 0.463109,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/parser.rs",
+          "kind": "function",
+          "name": "collect_export_ranges",
+          "rank": 3,
+          "score": 0.4385,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/commands/move_symbol.rs",
+          "kind": "function",
+          "name": "prepare_exported_symbol",
+          "rank": 4,
+          "score": 0.437681,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/tests/integration/outline_languages_test.rs",
+          "kind": "function",
+          "name": "outline_bash_symbols_include_functions",
+          "rank": 5,
+          "score": 0.427625,
+          "source": "semantic"
+        }
+      ]
+    },
+    {
+      "expected_top_files": [
+        "crates/aft/src/lib.rs"
+      ],
+      "first_match_rank": null,
+      "latency_ms": 12.717,
+      "mrr": 0.0,
+      "notes": "Generic file role query where the target filename is lib.rs.",
+      "p_at_5": 0.0,
+      "query": "crate public API modules",
+      "shape": "generic-file",
+      "source_counts": {
+        "semantic": 5
+      },
+      "top_results": [
+        {
+          "file": "crates/aft/src/context.rs",
+          "kind": "function",
+          "name": "path_error_response",
+          "rank": 1,
+          "score": 0.45209,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/main.rs",
+          "kind": "function",
+          "name": "dispatch",
+          "rank": 2,
+          "score": 0.420923,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/config.rs",
+          "kind": "method",
+          "name": "from_name",
+          "rank": 3,
+          "score": 0.418686,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/protocol.rs",
+          "kind": "method",
+          "name": "new",
+          "rank": 4,
+          "score": 0.414968,
+          "source": "semantic"
+        },
+        {
+          "file": "crates/aft/src/protocol.rs",
+          "kind": "struct",
+          "name": "PermissionAskFrame",
+          "rank": 5,
+          "score": 0.414596,
+          "source": "semantic"
+        }
+      ]
+    }
+  ],
+  "schema_version": 1,
+  "semantic_index": {
+    "backend": "fastembed",
+    "dimension": 384,
+    "entries": 4890,
+    "model": "all-MiniLM-L6-v2",
+    "status": "ready"
+  },
+  "top_k": 5
+}

@@ -1,0 +1,43 @@
+# AFT external search benchmark corpus manifest
+#
+# Modeled on Vera/eval/corpus.toml so AFT results remain comparable to
+# Vera's published 21-task suite. Repository names, URLs, and pinned
+# commits intentionally match Vera.
+#
+# Defines the test repositories used for benchmarking. Each repo is pinned
+# to a specific commit SHA for deterministic, reproducible evaluations.
+#
+# Languages covered: Rust, Python, TypeScript/JavaScript, polyglot (Go+TS+Rust)
+
+[corpus]
+version = 1
+description = "Vera evaluation corpus - diverse language coverage for code retrieval benchmarks"
+clone_root = ".bench/repos"
+
+[[repos]]
+name = "ripgrep"
+url = "https://github.com/BurntSushi/ripgrep.git"
+commit = "4519153e5e461527f4bca45b042fff45c4ec6fb9"
+language = "Rust"
+description = "High-performance regex search tool. Complex Rust codebase with extensive module structure."
+
+[[repos]]
+name = "flask"
+url = "https://github.com/pallets/flask.git"
+commit = "4cae5d8e411b1e69949d8fae669afeacbd3e5908"
+language = "Python"
+description = "Lightweight Python web framework. Clean Python with decorators, blueprints, and extension patterns."
+
+[[repos]]
+name = "fastify"
+url = "https://github.com/fastify/fastify.git"
+commit = "a22217f9420f70017a419d8e18b2a3141ab27989"
+language = "TypeScript"
+description = "Fast Node.js web framework. TypeScript/JavaScript with plugin architecture and schema validation."
+
+[[repos]]
+name = "turborepo"
+url = "https://github.com/vercel/turborepo.git"
+commit = "56b79ff5c1c9366593e9e68a922d997e2698c5f4"
+language = "Polyglot"
+description = "Monorepo build system. Polyglot codebase with Go, Rust, TypeScript - tests cross-language retrieval."

@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/aft", "crates/aft-tokenizer"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+# "unwind" instead of "abort" so catch_unwind works — required because
+# the ort crate panics (instead of returning Err) when dlopen fails on
+# an incompatible libonnxruntime.so. With "abort", that panic kills the
+# entire aft process and takes down all tools. With "unwind", the
+# catch_unwind in configure.rs catches it and degrades gracefully.
+panic = "unwind"

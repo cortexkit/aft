@@ -1,0 +1,414 @@
+#!/usr/bin/env bun
+/**
+ * Generates JSON Schema for aft.jsonc configuration.
+ *
+ * One schema covers both OpenCode (`~/.config/opencode/aft.jsonc`,
+ * `<project>/.opencode/aft.jsonc`) and Pi (`~/.pi/agent/aft.jsonc`,
+ * `<project>/.pi/aft.jsonc`) config files. They share the same surface, with
+ * a handful of fields that only apply to OpenCode noted in their descriptions.
+ *
+ * Source of truth is the Zod schema in `packages/opencode-plugin/src/config.ts`
+ * (and the matching TypeScript interfaces in `packages/pi-plugin/src/config.ts`).
+ * This file is hand-maintained alongside those schemas — if you add or rename
+ * a config field, update both the runtime schema AND this builder.
+ *
+ * Run: bun packages/opencode-plugin/scripts/build-schema.ts
+ * Output: assets/aft.schema.json
+ */
+
+import * as path from "node:path";
+
+const SCHEMA_URL = "https://raw.githubusercontent.com/cortexkit/aft/master/assets/aft.schema.json";
+
+function buildSchema(): Record<string, unknown> {
+  const formatterEnum = {
+    type: "string",
+    enum: [
+      "biome",
+      "oxfmt",
+      "prettier",
+      "deno",
+      "ruff",
+      "black",
+      "rustfmt",
+      "goimports",
+      "gofmt",
+      "none",
+    ],
+  };
+
+  const checkerEnum = {
+    type: "string",
+    enum: ["tsc", "tsgo", "biome", "pyright", "ruff", "cargo", "go", "staticcheck", "none"],
+  };
+
+  const lspServerEntry = {
+    type: "object",
+    properties: {
+      extensions: {
+        type: "array",
+        items: { type: "string", minLength: 1 },
+        minItems: 1,
+        description: "File extensions this server handles (e.g. ['.tf', '.tfvars']).",
+      },
+      binary: {
+        type: "string",
+        minLength: 1,
+        description: "LSP binary command (must be on PATH or absolute path).",
+      },
+      args: {
+        type: "array",
+        items: { type: "string" },
+        default: [],
+        description: "Extra command-line arguments passed to the LSP binary.",
+      },
+      root_markers: {
+        type: "array",
+        items: { type: "string", minLength: 1 },
+        default: [".git"],
+        description:
+          "Workspace root marker files. AFT walks up from each opened file looking for any of these.",
+      },
+      disabled: {
+        type: "boolean",
+        default: false,
+        description: "Disable this server entirely without removing the config block.",
+      },
+      env: {
+        type: "object",
+        additionalProperties: { type: "string" },
+        description: "Extra environment variables passed to the LSP server child process.",
+      },
+      initialization_options: {
+        description:
+          "JSON value passed as `initializationOptions` in the LSP `initialize` request.",
+      },
+    },
+    required: ["extensions", "binary"],
+    additionalProperties: false,
+  };
+
+  return {
+    $schema: "http://json-schema.org/draft-07/schema#",
+    $id: SCHEMA_URL,
+    title: "AFT Configuration",
+    description:
+      "Configuration schema for the @cortexkit/aft-opencode and @cortexkit/aft-pi plugins. Place as aft.jsonc in ~/.config/opencode/, <project>/.opencode/, ~/.pi/agent/, or <project>/.pi/.",
+    type: "object",
+    properties: {
+      $schema: { type: "string" },
+
+      format_on_edit: {
+        type: "boolean",
+        default: true,
+        description: "Auto-format files after edits with the language's configured formatter.",
+      },
+
+      formatter_timeout_secs: {
+        type: "integer",
+        minimum: 1,
+        maximum: 600,
+        default: 10,
+        description:
+          'Maximum seconds an external formatter is allowed to run before AFT kills it and reports `format_skipped_reason: "timeout"`. Raise for slow formatters in large projects.',
+      },
+
+      validate_on_edit: {
+        type: "string",
+        enum: ["syntax", "full"],
+        description:
+          "Auto-validate after edits: 'syntax' (tree-sitter parse check) or 'full' (also runs type checker).",
+      },
+
+      formatter: {
+        type: "object",
+        additionalProperties: formatterEnum,
+        description:
+          "Per-language formatter overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go').",
+      },
+
+      checker: {
+        type: "object",
+        additionalProperties: checkerEnum,
+        description:
+          "Per-language type checker overrides keyed by language (e.g. 'typescript', 'python', 'rust', 'go').",
+      },
+
+      hoist_builtin_tools: {
+        type: "boolean",
+        default: true,
+        description:
+          "Replace the host's built-in read/write/edit/apply_patch (OpenCode) or read/write/edit (Pi) tools with AFT's Rust implementations. Adds backup tracking, auto-formatting, inline diagnostics, and permission checks.",
+      },
+
+      tool_surface: {
+        type: "string",
+        enum: ["minimal", "recommended", "all"],
+        default: "recommended",
+        description:
+          "Tool surface level. 'minimal' = aft_outline+aft_zoom+aft_safety only. 'recommended' (default) adds hoisted read/write/edit/apply_patch + lsp_diagnostics + ast_grep + aft_import. 'all' adds aft_navigate, aft_delete, aft_move, aft_transform, aft_refactor.",
+      },
+
+      disabled_tools: {
+        type: "array",
+        items: { type: "string" },
+        description:
+          "Tool names to disable. Hoisted names ('read', 'edit') and aft-prefixed names both work. Applied after tool_surface filtering.",
+      },
+
+      restrict_to_project_root: {
+        type: "boolean",
+        default: false,
+        description:
+          "Restrict file operations to within project root. When true, write-capable commands reject paths outside project_root. Default: false (matches OpenCode built-in behavior).",
+      },
+
+      search_index: {
+        type: "boolean",
+        default: false,
+        description:
+          "Enable indexed search (trigram index) for grep and glob hoisting. Builds a per-project index for sub-100ms queries on large repos.",
+      },
+
+      semantic_search: {
+        type: "boolean",
+        default: false,
+        description:
+          "Enable semantic search via aft_search. Backend defaults to local fastembed; configurable via the `semantic` field.",
+      },
+
+      bash: {
+        oneOf: [
+          {
+            type: "boolean",
+            description:
+              "Shorthand: `true` enables hoisting with rewrite + compress + background all on; `false` disables AFT bash hoisting entirely and keeps the host's native bash.",
+          },
+          {
+            type: "object",
+            properties: {
+              rewrite: {
+                type: "boolean",
+                default: true,
+                description:
+                  "Rewrite common bash commands (cat, grep, find, sed, ls) into AFT tool calls for faster, formatted output.",
+              },
+              compress: {
+                type: "boolean",
+                default: true,
+                description:
+                  "Compress bash output via per-tool compressors (git, cargo, npm, bun, pnpm, pytest, tsc, eslint, biome, vitest, prettier, ruff, mypy, go, golangci-lint, playwright, next) plus TOML filter pipeline. Adds `[cmpaft]` marker.",
+              },
+              background: {
+                type: "boolean",
+                default: true,
+                description:
+                  "Allow agents to launch bash with `{ background: true }` for long-running tasks. Foreground bash always auto-promotes to background after 5s regardless of this flag.",
+              },
+              long_running_reminder_enabled: {
+                type: "boolean",
+                default: true,
+                description:
+                  "Periodically remind the agent that a background bash task is still running. When false, completion is delivered but mid-flight reminders are suppressed.",
+              },
+              long_running_reminder_interval_ms: {
+                type: "integer",
+                minimum: 1,
+                default: 600000,
+                description:
+                  "Interval in milliseconds between mid-flight reminders for a still-running background bash task.",
+              },
+            },
+            additionalProperties: false,
+          },
+        ],
+        description:
+          "Bash tool family (hoist + rewrite + compress + background execution). Default on for `tool_surface: recommended`/`all`, off for `minimal`. Replaces `experimental.bash.*` (still accepted for backward compat).",
+      },
+
+      experimental: {
+        type: "object",
+        properties: {
+          bash: {
+            type: "object",
+            properties: {
+              rewrite: {
+                type: "boolean",
+                default: false,
+                description:
+                  "Rewrite common bash commands (cat, grep, find, sed, ls) into AFT tool calls for faster, formatted output.",
+              },
+              compress: {
+                type: "boolean",
+                default: false,
+                description:
+                  "Compress bash output via per-tool compressors (git, cargo, npm, bun, pnpm, pytest, tsc, eslint, vitest, biome) plus TOML filter pipeline. Adds `[cmpaft]` marker.",
+              },
+              background: {
+                type: "boolean",
+                default: false,
+                description:
+                  "Allow agents to launch bash with `{ background: true }` for long-running tasks. Foreground bash always auto-promotes to background after 5s regardless of this flag.",
+              },
+              long_running_reminder_enabled: {
+                type: "boolean",
+                default: true,
+                description:
+                  "Periodically remind the agent that a background bash task is still running. When false, completion is delivered but mid-flight reminders are suppressed.",
+              },
+              long_running_reminder_interval_ms: {
+                type: "integer",
+                minimum: 1,
+                default: 600000,
+                description:
+                  "Interval in milliseconds between mid-flight reminders for a still-running background bash task.",
+              },
+            },
+            additionalProperties: false,
+            description:
+              "Experimental bash hoisting / rewrite / compression / background features.",
+          },
+          lsp_ty: {
+            type: "boolean",
+            default: false,
+            description:
+              "Use experimental Python `ty` type checker. Falls back to pyright if unavailable.",
+          },
+        },
+        additionalProperties: false,
+        description: "Experimental opt-in features. May change between releases.",
+      },
+
+      lsp: {
+        type: "object",
+        properties: {
+          servers: {
+            type: "object",
+            additionalProperties: lspServerEntry,
+            description:
+              "User-defined LSP server map keyed by server id (e.g. { 'terraform-ls': { ... } }).",
+          },
+          disabled: {
+            type: "array",
+            items: { type: "string", minLength: 1 },
+            description:
+              "Built-in LSP server ids to disable (e.g. ['python', 'biome']). See README for the full list.",
+          },
+          python: {
+            type: "string",
+            enum: ["pyright", "ty", "auto"],
+            default: "pyright",
+            description:
+              "Which Python LSP to use. 'ty' is experimental and falls back to pyright if unavailable.",
+          },
+          auto_install: {
+            type: "boolean",
+            default: true,
+            description:
+              "Auto-install npm-distributed and GitHub-release LSP servers when the project needs them. Set false to require manual install on PATH.",
+          },
+          grace_days: {
+            type: "integer",
+            minimum: 1,
+            default: 7,
+            description:
+              "Supply-chain grace window. AFT only installs versions that have been on the registry / GitHub releases for at least this many days. User pins via `lsp.versions` bypass this.",
+          },
+          versions: {
+            type: "object",
+            additionalProperties: { type: "string", minLength: 1 },
+            description:
+              "Per-package version pin map keyed by npm package or GitHub repo. Pins bypass the grace filter and any weekly version recheck (e.g. { 'typescript-language-server': '5.0.0', 'clangd/clangd': '21.1.0' }).",
+          },
+        },
+        additionalProperties: false,
+        description: "User-defined and built-in LSP server configuration.",
+      },
+
+      url_fetch_allow_private: {
+        type: "boolean",
+        default: false,
+        description:
+          "Allow `aft_outline`/`aft_zoom` URL fetches to request private/link-local hosts. Default: false (rejects RFC1918, loopback, and link-local).",
+      },
+
+      semantic: {
+        type: "object",
+        properties: {
+          backend: {
+            type: "string",
+            enum: ["fastembed", "openai_compatible", "ollama"],
+            default: "fastembed",
+            description:
+              "Embedding backend. 'fastembed' uses local ONNX runtime, 'openai_compatible' calls a configured OpenAI-style API, 'ollama' calls a local Ollama embedding endpoint.",
+          },
+          model: {
+            type: "string",
+            minLength: 1,
+            description:
+              "Model identifier passed to the backend. Defaults vary by backend (fastembed default: all-MiniLM-L6-v2).",
+          },
+          base_url: {
+            type: "string",
+            minLength: 1,
+            description:
+              "Base URL of the backend API endpoint. Required for openai_compatible. Default for ollama: http://localhost:11434.",
+          },
+          api_key_env: {
+            type: "string",
+            minLength: 1,
+            description:
+              "Environment variable name containing the API key (e.g. 'OPENAI_API_KEY'). Project-scoped configs cannot set this field — only user-scoped configs can.",
+          },
+          timeout_ms: {
+            type: "integer",
+            minimum: 1,
+            default: 25000,
+            description:
+              "Backend request timeout in milliseconds. Default 25000 keeps requests below the bridge transport timeout.",
+          },
+          max_batch_size: {
+            type: "integer",
+            minimum: 1,
+            description: "Maximum batch size used by the semantic embedding pipeline.",
+          },
+        },
+        additionalProperties: false,
+        description: "External semantic backend configuration for embedding and retrieval.",
+      },
+
+      max_callgraph_files: {
+        type: "integer",
+        minimum: 1,
+        default: 5000,
+        description:
+          "Maximum source files allowed for call-graph operations (callers, trace_to, trace_data, impact, refactor move). Projects above this size return `project_too_large` instead of attempting the reverse-index build. Does not affect grep, glob, read, edit, or any other tool.",
+      },
+
+      auto_update: {
+        type: "boolean",
+        default: true,
+        description:
+          "OpenCode only: auto-refresh the cached @cortexkit/aft-opencode package when a newer channel version is published. User-scoped only — project configs cannot disable updates silently.",
+      },
+    },
+    additionalProperties: false,
+  };
+}
+
+async function main() {
+  const rootDir = path.resolve(import.meta.dir, "..", "..", "..");
+  const assetsDir = path.join(rootDir, "assets");
+  const outputPath = path.join(assetsDir, "aft.schema.json");
+
+  const fs = await import("node:fs");
+  if (!fs.existsSync(assetsDir)) {
+    fs.mkdirSync(assetsDir, { recursive: true });
+  }
+
+  const schema = buildSchema();
+  await Bun.write(outputPath, `${JSON.stringify(schema, null, 2)}\n`);
+  console.log(`✓ JSON Schema generated: ${outputPath}`);
+}
+
+main();

@@ -1,0 +1,13 @@
+{
+  "name": "aft-benchmarks",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench": "bun run src/runner.ts",
+    "analyze": "bun run src/analyze.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}

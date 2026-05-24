@@ -1,0 +1,3175 @@
+{
+  "aggregate": {
+    "performance": {
+      "latency_ms_p50": 2.27,
+      "latency_ms_p95": 40.29,
+      "task_count": 21,
+      "zero_result_tasks": 0
+    },
+    "retrieval": {
+      "mrr": 0.462434,
+      "ndcg_at_10": 0.4672,
+      "precision_at_1": 0.333333,
+      "precision_at_10": 0.17619,
+      "precision_at_5": 0.238095,
+      "recall_at_1": 0.285714,
+      "recall_at_10": 0.575397,
+      "recall_at_5": 0.539683
+    }
+  },
+  "attribution": "Task definitions vendored from Vera (https://github.com/microsoft/Vera) eval/tasks at the local checkout used for this benchmark. Metric formulas in metrics.py mirror Vera/eval/src/metrics.rs and are implemented independently for AFT.",
+  "evaluated_task_count": 21,
+  "per_category": {
+    "config": {
+      "performance": {
+        "latency_ms_p50": 38.127,
+        "latency_ms_p95": 47.288,
+        "task_count": 4,
+        "zero_result_tasks": 0
+      },
+      "retrieval": {
+        "mrr": 0.0,
+        "ndcg_at_10": 0.0,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.0,
+        "precision_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.0,
+        "recall_at_5": 0.0
+      }
+    },
+    "cross_file": {
+      "performance": {
+        "latency_ms_p50": 2.059,
+        "latency_ms_p95": 4.153,
+        "task_count": 3,
+        "zero_result_tasks": 0
+      },
+      "retrieval": {
+        "mrr": 0.537037,
+        "ndcg_at_10": 0.449265,
+        "precision_at_1": 0.333333,
+        "precision_at_10": 0.133333,
+        "precision_at_5": 0.133333,
+        "recall_at_1": 0.166667,
+        "recall_at_10": 0.444444,
+        "recall_at_5": 0.277778
+      }
+    },
+    "disambiguation": {
+      "performance": {
+        "latency_ms_p50": 2.354,
+        "latency_ms_p95": 4.499,
+        "task_count": 3,
+        "zero_result_tasks": 0
+      },
+      "retrieval": {
+        "mrr": 0.227778,
+        "ndcg_at_10": 0.262883,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.1,
+        "precision_at_5": 0.133333,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.416667,
+        "recall_at_5": 0.333333
+      }
+    },
+    "intent": {
+      "performance": {
+        "latency_ms_p50": 1.911,
+        "latency_ms_p95": 3.922,
+        "task_count": 5,
+        "zero_result_tasks": 0
+      },
+      "retrieval": {
+        "mrr": 0.9,
+        "ndcg_at_10": 0.848815,
+        "precision_at_1": 0.8,
+        "precision_at_10": 0.5,
+        "precision_at_5": 0.64,
+        "recall_at_1": 0.7,
+        "recall_at_10": 0.9,
+        "recall_at_5": 0.9
+      }
+    },
+    "symbol_lookup": {
+      "performance": {
+        "latency_ms_p50": 2.127,
+        "latency_ms_p95": 4.041,
+        "task_count": 6,
+        "zero_result_tasks": 0
+      },
+      "retrieval": {
+        "mrr": 0.486111,
+        "ndcg_at_10": 0.571779,
+        "precision_at_1": 0.333333,
+        "precision_at_10": 0.083333,
+        "precision_at_5": 0.166667,
+        "recall_at_1": 0.333333,
+        "recall_at_10": 0.833333,
+        "recall_at_5": 0.833333
+      }
+    }
+  },
+  "per_task": [
+    {
+      "category": "config",
+      "description": "Find the workspace build configuration with member crates and dependencies",
+      "ground_truth": [
+        {
+          "file_path": "Cargo.toml",
+          "line_end": 117,
+          "line_start": 1,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 38.127,
+      "query": "Cargo.toml workspace configuration",
+      "repo": "ripgrep",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "crates/core/flags/doc/man.rs",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "man",
+          "rank": 1,
+          "score": 0.280692,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/regex/src/config.rs",
+          "kind": "method",
+          "line_end": 234,
+          "line_start": 231,
+          "name": "config",
+          "rank": 2,
+          "score": 0.279044,
+          "source": "semantic"
+        },
+        {
+          "file_path": "ci/utils.sh",
+          "kind": "function",
+          "line_end": 107,
+          "line_start": 100,
+          "name": "builder",
+          "rank": 3,
+          "score": 0.27898,
+          "source": "semantic"
+        },
+        {
+          "file_path": "ci/utils.sh",
+          "kind": "function",
+          "line_end": 17,
+          "line_start": 5,
+          "name": "cargo_out_dir",
+          "rank": 4,
+          "score": 0.278051,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/core/flags/defs.rs",
+          "kind": "method",
+          "line_end": 4290,
+          "line_start": 4288,
+          "name": "doc_short",
+          "rank": 5,
+          "score": 0.278015,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/globset/src/serde_impl.rs",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "serde_impl",
+          "rank": 6,
+          "score": 0.270538,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/core/search.rs",
+          "kind": "method",
+          "line_end": 59,
+          "line_start": 53,
+          "name": "new",
+          "rank": 7,
+          "score": 0.261511,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/searcher/src/testutil.rs",
+          "kind": "method",
+          "line_end": 677,
+          "line_start": 513,
+          "name": "configs",
+          "rank": 8,
+          "score": 0.260935,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/printer/src/hyperlink/mod.rs",
+          "kind": "method",
+          "line_end": 45,
+          "line_start": 42,
+          "name": "environment",
+          "rank": 9,
+          "score": 0.259911,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/ignore/src/walk.rs",
+          "kind": "method",
+          "line_end": 1028,
+          "line_start": 1002,
+          "name": "get_or_set_current_dir",
+          "rank": 10,
+          "score": 0.258874,
+          "source": "semantic"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 0.0,
+        "ndcg_at_10": 0.0,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.0,
+        "precision_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.0,
+        "recall_at_5": 0.0
+      },
+      "task_id": "config-001",
+      "zero_results": false
+    },
+    {
+      "category": "cross_file",
+      "description": "Find the Sink trait definition and its implementations in Standard and JSON printers across crates",
+      "ground_truth": [
+        {
+          "file_path": "crates/searcher/src/sink.rs",
+          "line_end": 223,
+          "line_start": 102,
+          "relevance": 2
+        },
+        {
+          "file_path": "crates/printer/src/standard.rs",
+          "line_end": 870,
+          "line_start": 763,
+          "relevance": 1
+        },
+        {
+          "file_path": "crates/printer/src/json.rs",
+          "line_end": 839,
+          "line_start": 719,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 2.011,
+      "query": "Sink trait and its implementations",
+      "repo": "ripgrep",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "crates/searcher/src/sink.rs",
+          "kind": "interface",
+          "line_end": 38,
+          "line_start": 10,
+          "name": "SinkError",
+          "rank": 1,
+          "score": 0.690637,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/searcher/src/sink.rs",
+          "kind": "interface",
+          "line_end": 223,
+          "line_start": 62,
+          "name": "Sink",
+          "rank": 2,
+          "score": 0.680083,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/searcher/src/sink.rs",
+          "kind": "struct",
+          "line_end": 373,
+          "line_start": 364,
+          "name": "SinkMatch",
+          "rank": 3,
+          "score": 0.56941,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/printer/src/util.rs",
+          "kind": "struct",
+          "line_end": 176,
+          "line_start": 156,
+          "name": "Sunk",
+          "rank": 4,
+          "score": 0.564787,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/searcher/src/sink.rs",
+          "kind": "struct",
+          "line_end": 449,
+          "line_start": 440,
+          "name": "SinkContext",
+          "rank": 5,
+          "score": 0.538616,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/searcher/src/testutil.rs",
+          "kind": "struct",
+          "line_end": 113,
+          "line_start": 108,
+          "name": "KitchenSink",
+          "rank": 6,
+          "score": 0.509563,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/printer/src/standard.rs",
+          "kind": "method",
+          "line_end": 896,
+          "line_start": 885,
+          "name": "new",
+          "rank": 7,
+          "score": 0.507206,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/printer/src/util.rs",
+          "kind": "method",
+          "line_end": 225,
+          "line_start": 209,
+          "name": "from_sink_context",
+          "rank": 8,
+          "score": 0.494714,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/printer/src/standard.rs",
+          "kind": "method",
+          "line_end": 943,
+          "line_start": 928,
+          "name": "sink",
+          "rank": 9,
+          "score": 0.491972,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/searcher/src/sink.rs",
+          "kind": "method",
+          "line_end": 425,
+          "line_start": 420,
+          "name": "bytes_range_in_buffer",
+          "rank": 10,
+          "score": 0.482673,
+          "source": "semantic"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 0.5,
+        "ndcg_at_10": 0.40303,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.1,
+        "precision_at_5": 0.2,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.333333,
+        "recall_at_5": 0.333333
+      },
+      "task_id": "cross-file-001",
+      "zero_results": false
+    },
+    {
+      "category": "disambiguation",
+      "description": "Ambiguous query matching multiple Config types across crates (searcher, printers, core)",
+      "ground_truth": [
+        {
+          "file_path": "crates/searcher/src/searcher/mod.rs",
+          "line_end": 186,
+          "line_start": 151,
+          "relevance": 2
+        },
+        {
+          "file_path": "crates/printer/src/standard.rs",
+          "line_end": 57,
+          "line_start": 36,
+          "relevance": 1
+        },
+        {
+          "file_path": "crates/printer/src/json.rs",
+          "line_end": 29,
+          "line_start": 25,
+          "relevance": 1
+        },
+        {
+          "file_path": "crates/core/search.rs",
+          "line_end": 25,
+          "line_start": 19,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 2.354,
+      "query": "Config",
+      "repo": "ripgrep",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "crates/regex/src/config.rs",
+          "kind": "method",
+          "line_end": 234,
+          "line_start": 231,
+          "name": "config",
+          "rank": 1,
+          "score": 0.570271,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/regex/src/config.rs",
+          "kind": "struct",
+          "line_end": 43,
+          "line_start": 15,
+          "name": "Config",
+          "rank": 2,
+          "score": 0.559374,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/printer/src/standard.rs",
+          "kind": "method",
+          "line_end": 1741,
+          "line_start": 1738,
+          "name": "config",
+          "rank": 3,
+          "score": 0.430241,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/printer/src/standard.rs",
+          "kind": "method",
+          "line_end": 1538,
+          "line_start": 1535,
+          "name": "config",
+          "rank": 4,
+          "score": 0.404107,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/printer/src/hyperlink/mod.rs",
+          "kind": "method",
+          "line_end": 91,
+          "line_start": 87,
+          "name": "into_config",
+          "rank": 5,
+          "score": 0.396059,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/printer/src/path.rs",
+          "kind": "struct",
+          "line_end": 18,
+          "line_start": 11,
+          "name": "Config",
+          "rank": 6,
+          "score": 0.394521,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/searcher/src/testutil.rs",
+          "kind": "method",
+          "line_end": 677,
+          "line_start": 513,
+          "name": "configs",
+          "rank": 7,
+          "score": 0.385386,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/core/flags/defs.rs",
+          "kind": "function",
+          "line_end": 4317,
+          "line_start": 4309,
+          "name": "test_no_config",
+          "rank": 8,
+          "score": 0.377358,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/printer/src/path.rs",
+          "kind": "method",
+          "line_end": 28,
+          "line_start": 21,
+          "name": "default",
+          "rank": 9,
+          "score": 0.364987,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/core/search.rs",
+          "kind": "struct",
+          "line_end": 25,
+          "line_start": 14,
+          "name": "Config",
+          "rank": 10,
+          "score": 0.352041,
+          "source": "hybrid"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 0.1,
+        "ndcg_at_10": 0.081161,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.1,
+        "precision_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.25,
+        "recall_at_5": 0.0
+      },
+      "task_id": "disambig-001",
+      "zero_results": false
+    },
+    {
+      "category": "intent",
+      "description": "Find the file type detection system including FileTypeDef, Types, and TypesBuilder",
+      "ground_truth": [
+        {
+          "file_path": "crates/ignore/src/types.rs",
+          "line_end": 310,
+          "line_start": 146,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 2.349,
+      "query": "file type detection and filtering",
+      "repo": "ripgrep",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "crates/ignore/src/types.rs",
+          "kind": "struct",
+          "line_end": 149,
+          "line_start": 140,
+          "name": "FileTypeDef",
+          "rank": 1,
+          "score": 0.605156,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/ignore/src/types.rs",
+          "kind": "struct",
+          "line_end": 181,
+          "line_start": 163,
+          "name": "Types",
+          "rank": 2,
+          "score": 0.567112,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/ignore/src/types.rs",
+          "kind": "method",
+          "line_end": 137,
+          "line_start": 129,
+          "name": "file_type_def",
+          "rank": 3,
+          "score": 0.563273,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/core/flags/defs.rs",
+          "kind": "method",
+          "line_end": 2153,
+          "line_start": 2146,
+          "name": "doc_long",
+          "rank": 4,
+          "score": 0.550937,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/ignore/src/types.rs",
+          "kind": "method",
+          "line_end": 390,
+          "line_start": 378,
+          "name": "select",
+          "rank": 5,
+          "score": 0.550315,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/core/search.rs",
+          "kind": "method",
+          "line_end": 161,
+          "line_start": 147,
+          "name": "binary_detection_explicit",
+          "rank": 6,
+          "score": 0.543551,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/ignore/src/types.rs",
+          "kind": "method",
+          "line_end": 404,
+          "line_start": 392,
+          "name": "negate",
+          "rank": 7,
+          "score": 0.540053,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/ignore/src/types.rs",
+          "kind": "method",
+          "line_end": 160,
+          "line_start": 157,
+          "name": "globs",
+          "rank": 8,
+          "score": 0.530529,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/core/haystack.rs",
+          "kind": "method",
+          "line_end": 159,
+          "line_start": 156,
+          "name": "is_file",
+          "rank": 9,
+          "score": 0.526044,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/ignore/src/walk.rs",
+          "kind": "method",
+          "line_end": 69,
+          "line_start": 64,
+          "name": "file_type",
+          "rank": 10,
+          "score": 0.521568,
+          "source": "semantic"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 1.0,
+        "ndcg_at_10": 1.0,
+        "precision_at_1": 1.0,
+        "precision_at_10": 0.3,
+        "precision_at_5": 0.4,
+        "recall_at_1": 1.0,
+        "recall_at_10": 1.0,
+        "recall_at_5": 1.0
+      },
+      "task_id": "intent-004",
+      "zero_results": false
+    },
+    {
+      "category": "symbol_lookup",
+      "description": "Find the Standard<W> printer struct in ripgrep's standard printer module",
+      "ground_truth": [
+        {
+          "file_path": "crates/printer/src/standard.rs",
+          "line_end": 484,
+          "line_start": 480,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 2.182,
+      "query": "Standard struct definition",
+      "repo": "ripgrep",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "crates/printer/src/standard.rs",
+          "kind": "struct",
+          "line_end": 882,
+          "line_start": 870,
+          "name": "StandardImpl",
+          "rank": 1,
+          "score": 0.518191,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/printer/src/standard.rs",
+          "kind": "struct",
+          "line_end": 101,
+          "line_start": 86,
+          "name": "StandardBuilder",
+          "rank": 2,
+          "score": 0.512595,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/printer/src/standard.rs",
+          "kind": "struct",
+          "line_end": 484,
+          "line_start": 466,
+          "name": "Standard",
+          "rank": 3,
+          "score": 0.499876,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/cli/src/wtr.rs",
+          "kind": "struct",
+          "line_end": 7,
+          "line_start": 5,
+          "name": "StandardStream",
+          "rank": 4,
+          "score": 0.493688,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/printer/src/standard.rs",
+          "kind": "struct",
+          "line_end": 650,
+          "line_start": 616,
+          "name": "StandardSink",
+          "rank": 5,
+          "score": 0.483687,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/ignore/src/types.rs",
+          "kind": "struct",
+          "line_end": 111,
+          "line_start": 96,
+          "name": "Glob",
+          "rank": 6,
+          "score": 0.482724,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/printer/src/json.rs",
+          "kind": "struct",
+          "line_end": 491,
+          "line_start": 115,
+          "name": "JSON",
+          "rank": 7,
+          "score": 0.472549,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/printer/src/standard.rs",
+          "kind": "struct",
+          "line_end": 57,
+          "line_start": 30,
+          "name": "Config",
+          "rank": 8,
+          "score": 0.460989,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/matcher/src/lib.rs",
+          "kind": "struct",
+          "line_end": 72,
+          "line_start": 43,
+          "name": "Match",
+          "rank": 9,
+          "score": 0.46012,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/ignore/src/overrides.rs",
+          "kind": "struct",
+          "line_end": 28,
+          "line_start": 15,
+          "name": "Glob",
+          "rank": 10,
+          "score": 0.451128,
+          "source": "semantic"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 0.333333,
+        "ndcg_at_10": 0.5,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.1,
+        "precision_at_5": 0.2,
+        "recall_at_1": 0.0,
+        "recall_at_10": 1.0,
+        "recall_at_5": 1.0
+      },
+      "task_id": "symbol-lookup-001",
+      "zero_results": false
+    },
+    {
+      "category": "symbol_lookup",
+      "description": "Find the Searcher struct that holds search configuration and buffers",
+      "ground_truth": [
+        {
+          "file_path": "crates/searcher/src/searcher/mod.rs",
+          "line_end": 625,
+          "line_start": 597,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 2.127,
+      "query": "Searcher struct definition",
+      "repo": "ripgrep",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "crates/searcher/src/searcher/mod.rs",
+          "kind": "struct",
+          "line_end": 625,
+          "line_start": 589,
+          "name": "Searcher",
+          "rank": 1,
+          "score": 0.776715,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/searcher/src/searcher/mod.rs",
+          "kind": "struct",
+          "line_end": 300,
+          "line_start": 289,
+          "name": "SearcherBuilder",
+          "rank": 2,
+          "score": 0.723865,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/searcher/src/searcher/mod.rs",
+          "kind": "struct",
+          "line_end": 185,
+          "line_start": 148,
+          "name": "Config",
+          "rank": 3,
+          "score": 0.708394,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/searcher/src/testutil.rs",
+          "kind": "struct",
+          "line_end": 222,
+          "line_start": 192,
+          "name": "SearcherTester",
+          "rank": 4,
+          "score": 0.669778,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/searcher/src/searcher/core.rs",
+          "kind": "struct",
+          "line_end": 37,
+          "line_start": 20,
+          "name": "Core",
+          "rank": 5,
+          "score": 0.648766,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/core/search.rs",
+          "kind": "struct",
+          "line_end": 174,
+          "line_start": 164,
+          "name": "SearchResult",
+          "rank": 6,
+          "score": 0.646873,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/searcher/src/searcher/mod.rs",
+          "kind": "struct",
+          "line_end": 55,
+          "line_start": 34,
+          "name": "BinaryDetection",
+          "rank": 7,
+          "score": 0.627173,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/core/search.rs",
+          "kind": "struct",
+          "line_end": 241,
+          "line_start": 224,
+          "name": "SearchWorker",
+          "rank": 8,
+          "score": 0.620995,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/core/search.rs",
+          "kind": "struct",
+          "line_end": 44,
+          "line_start": 39,
+          "name": "SearchWorkerBuilder",
+          "rank": 9,
+          "score": 0.616992,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/searcher/src/searcher/mod.rs",
+          "kind": "struct",
+          "line_end": 127,
+          "line_start": 120,
+          "name": "Encoding",
+          "rank": 10,
+          "score": 0.602418,
+          "source": "semantic"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 1.0,
+        "ndcg_at_10": 1.0,
+        "precision_at_1": 1.0,
+        "precision_at_10": 0.1,
+        "precision_at_5": 0.2,
+        "recall_at_1": 1.0,
+        "recall_at_10": 1.0,
+        "recall_at_5": 1.0
+      },
+      "task_id": "symbol-lookup-002",
+      "zero_results": false
+    },
+    {
+      "category": "symbol_lookup",
+      "description": "Find the SearchWorker struct that executes searches over haystacks",
+      "ground_truth": [
+        {
+          "file_path": "crates/core/search.rs",
+          "line_end": 241,
+          "line_start": 230,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 2.27,
+      "query": "SearchWorker struct",
+      "repo": "ripgrep",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "crates/core/search.rs",
+          "kind": "struct",
+          "line_end": 241,
+          "line_start": 224,
+          "name": "SearchWorker",
+          "rank": 1,
+          "score": 0.828528,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/core/search.rs",
+          "kind": "struct",
+          "line_end": 44,
+          "line_start": 39,
+          "name": "SearchWorkerBuilder",
+          "rank": 2,
+          "score": 0.819884,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/searcher/src/searcher/mod.rs",
+          "kind": "struct",
+          "line_end": 625,
+          "line_start": 589,
+          "name": "Searcher",
+          "rank": 3,
+          "score": 0.674836,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/searcher/src/searcher/mod.rs",
+          "kind": "struct",
+          "line_end": 300,
+          "line_start": 289,
+          "name": "SearcherBuilder",
+          "rank": 4,
+          "score": 0.66045,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/searcher/src/testutil.rs",
+          "kind": "struct",
+          "line_end": 222,
+          "line_start": 192,
+          "name": "SearcherTester",
+          "rank": 5,
+          "score": 0.609981,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/searcher/src/searcher/core.rs",
+          "kind": "struct",
+          "line_end": 37,
+          "line_start": 20,
+          "name": "Core",
+          "rank": 6,
+          "score": 0.576765,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/core/flags/hiargs.rs",
+          "kind": "method",
+          "line_end": 708,
+          "line_start": 690,
+          "name": "search_worker",
+          "rank": 7,
+          "score": 0.563942,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/searcher/src/testutil.rs",
+          "kind": "struct",
+          "line_end": 687,
+          "line_start": 680,
+          "name": "TesterConfig",
+          "rank": 8,
+          "score": 0.534097,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/core/haystack.rs",
+          "kind": "struct",
+          "line_end": 18,
+          "line_start": 14,
+          "name": "HaystackBuilder",
+          "rank": 9,
+          "score": 0.497856,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/printer/src/util.rs",
+          "kind": "struct",
+          "line_end": 176,
+          "line_start": 156,
+          "name": "Sunk",
+          "rank": 10,
+          "score": 0.490296,
+          "source": "semantic"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 1.0,
+        "ndcg_at_10": 1.0,
+        "precision_at_1": 1.0,
+        "precision_at_10": 0.1,
+        "precision_at_5": 0.2,
+        "recall_at_1": 1.0,
+        "recall_at_10": 1.0,
+        "recall_at_5": 1.0
+      },
+      "task_id": "symbol-lookup-005",
+      "zero_results": false
+    },
+    {
+      "category": "config",
+      "description": "Find the Python package configuration with dependencies, entry points, and tool settings",
+      "ground_truth": [
+        {
+          "file_path": "pyproject.toml",
+          "line_end": 100,
+          "line_start": 1,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 37.974,
+      "query": "pyproject.toml build configuration",
+      "repo": "flask",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "tests/test_config.py",
+          "kind": "function",
+          "line_end": 45,
+          "line_start": 38,
+          "name": "test_config_from_file_toml",
+          "rank": 1,
+          "score": 0.416335,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "tests/test_cli.py",
+          "kind": "function",
+          "line_end": 646,
+          "line_start": 642,
+          "name": "test_run_cert_no_ssl",
+          "rank": 2,
+          "score": 0.29547,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_cli.py",
+          "kind": "function",
+          "line_end": 600,
+          "line_start": 585,
+          "name": "test_run_cert_path",
+          "rank": 3,
+          "score": 0.278933,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/testing.py",
+          "kind": "class",
+          "line_end": 94,
+          "line_start": 27,
+          "name": "EnvironBuilder",
+          "rank": 4,
+          "score": 0.26964,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_basic.py",
+          "kind": "function",
+          "line_end": 1924,
+          "line_start": 1903,
+          "name": "test_run_from_config",
+          "rank": 5,
+          "score": 0.268346,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "src/flask/templating.py",
+          "kind": "method",
+          "line_end": 46,
+          "line_start": 42,
+          "name": "__init__",
+          "rank": 6,
+          "score": 0.260848,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/sansio/app.py",
+          "kind": "method",
+          "line_end": 493,
+          "line_start": 479,
+          "name": "make_config",
+          "rank": 7,
+          "score": 0.257386,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/conftest.py",
+          "kind": "function",
+          "line_end": 57,
+          "line_start": 54,
+          "name": "app_ctx",
+          "rank": 8,
+          "score": 0.255147,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/conftest.py",
+          "kind": "function",
+          "line_end": 121,
+          "line_start": 114,
+          "name": "site_packages",
+          "rank": 9,
+          "score": 0.250348,
+          "source": "semantic"
+        },
+        {
+          "file_path": "docs/conf.py",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "",
+          "rank": 10,
+          "score": 0.25,
+          "source": "lexical"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 0.0,
+        "ndcg_at_10": 0.0,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.0,
+        "precision_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.0,
+        "recall_at_5": 0.0
+      },
+      "task_id": "config-004",
+      "zero_results": false
+    },
+    {
+      "category": "cross_file",
+      "description": "Find blueprint class definition and where register_blueprint is called in the app",
+      "ground_truth": [
+        {
+          "file_path": "src/flask/blueprints.py",
+          "line_end": 128,
+          "line_start": 18,
+          "relevance": 1
+        },
+        {
+          "file_path": "src/flask/sansio/app.py",
+          "line_end": 593,
+          "line_start": 567,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 2.059,
+      "query": "Blueprint registration and route mounting",
+      "repo": "flask",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "tests/test_blueprints.py",
+          "kind": "function",
+          "line_end": 148,
+          "line_start": 131,
+          "name": "test_blueprint_url_defaults",
+          "rank": 1,
+          "score": 0.422503,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_basic.py",
+          "kind": "function",
+          "line_end": 1692,
+          "line_start": 1671,
+          "name": "test_inject_blueprint_url_defaults",
+          "rank": 2,
+          "score": 0.410981,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/sansio/blueprints.py",
+          "kind": "class",
+          "line_end": 692,
+          "line_start": 119,
+          "name": "Blueprint",
+          "rank": 3,
+          "score": 0.403006,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_blueprints.py",
+          "kind": "function",
+          "line_end": 1086,
+          "line_start": 1083,
+          "name": "test_self_registration",
+          "rank": 4,
+          "score": 0.400906,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/sansio/blueprints.py",
+          "kind": "method",
+          "line_end": 377,
+          "line_start": 273,
+          "name": "register",
+          "rank": 5,
+          "score": 0.400434,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/sansio/blueprints.py",
+          "kind": "method",
+          "line_end": 609,
+          "line_start": 608,
+          "name": "register_template_global",
+          "rank": 6,
+          "score": 0.398264,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/sansio/blueprints.py",
+          "kind": "method",
+          "line_end": 85,
+          "line_start": 41,
+          "name": "__init__",
+          "rank": 7,
+          "score": 0.395345,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/wrappers.py",
+          "kind": "method",
+          "line_end": 178,
+          "line_start": 161,
+          "name": "blueprint",
+          "rank": 8,
+          "score": 0.393908,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/blueprints.py",
+          "kind": "class",
+          "line_end": 128,
+          "line_start": 18,
+          "name": "Blueprint",
+          "rank": 9,
+          "score": 0.392713,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/blueprints.py",
+          "kind": "method",
+          "line_end": 102,
+          "line_start": 82,
+          "name": "send_static_file",
+          "rank": 10,
+          "score": 0.391812,
+          "source": "semantic"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 0.111111,
+        "ndcg_at_10": 0.184576,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.2,
+        "precision_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.5,
+        "recall_at_5": 0.0
+      },
+      "task_id": "cross-file-002",
+      "zero_results": false
+    },
+    {
+      "category": "disambiguation",
+      "description": "Ambiguous 'run' matching Flask.run() method and CLI run_command function",
+      "ground_truth": [
+        {
+          "file_path": "src/flask/app.py",
+          "line_end": 754,
+          "line_start": 632,
+          "relevance": 2
+        },
+        {
+          "file_path": "src/flask/cli.py",
+          "line_end": 994,
+          "line_start": 935,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 1.937,
+      "query": "run",
+      "repo": "flask",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "tests/test_testing.py",
+          "kind": "function",
+          "line_end": 335,
+          "line_start": 326,
+          "name": "test_cli_runner_class",
+          "rank": 1,
+          "score": 0.317513,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "tests/test_cli.py",
+          "kind": "function",
+          "line_end": 38,
+          "line_start": 36,
+          "name": "runner",
+          "rank": 2,
+          "score": 0.316855,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "examples/tutorial/tests/conftest.py",
+          "kind": "function",
+          "line_end": 44,
+          "line_start": 41,
+          "name": "runner",
+          "rank": 3,
+          "score": 0.304507,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "src/flask/app.py",
+          "kind": "method",
+          "line_end": 753,
+          "line_start": 632,
+          "name": "run",
+          "rank": 4,
+          "score": 0.303891,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_cli.py",
+          "kind": "function",
+          "line_end": 410,
+          "line_start": 398,
+          "name": "test_no_command_echo_loading_error",
+          "rank": 5,
+          "score": 0.276474,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "tests/test_basic.py",
+          "kind": "function",
+          "line_end": 1883,
+          "line_start": 1882,
+          "name": "run_simple_mock",
+          "rank": 6,
+          "score": 0.265461,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "tests/test_basic.py",
+          "kind": "function",
+          "line_end": 1887,
+          "line_start": 1878,
+          "name": "test_run_defaults",
+          "rank": 7,
+          "score": 0.260735,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "tests/test_testing.py",
+          "kind": "class",
+          "line_end": 331,
+          "line_start": 330,
+          "name": "SubRunner",
+          "rank": 8,
+          "score": 0.24461,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "src/flask/app.py",
+          "kind": "method",
+          "line_end": 828,
+          "line_start": 813,
+          "name": "test_cli_runner",
+          "rank": 9,
+          "score": 0.244481,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_appctx.py",
+          "kind": "function",
+          "line_end": 136,
+          "line_start": 116,
+          "name": "test_app_tearing_down_with_unhandled_exception",
+          "rank": 10,
+          "score": 0.224803,
+          "source": "hybrid"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 0.25,
+        "ndcg_at_10": 0.327395,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.1,
+        "precision_at_5": 0.2,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.5,
+        "recall_at_5": 0.5
+      },
+      "task_id": "disambig-002",
+      "zero_results": false
+    },
+    {
+      "category": "intent",
+      "description": "Find error handling logic including handle_http_exception, handle_user_exception, handle_exception, and abort",
+      "ground_truth": [
+        {
+          "file_path": "src/flask/app.py",
+          "line_end": 948,
+          "line_start": 830,
+          "relevance": 1
+        },
+        {
+          "file_path": "src/flask/helpers.py",
+          "line_end": 302,
+          "line_start": 281,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 1.911,
+      "query": "how are HTTP errors handled and returned to clients",
+      "repo": "flask",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "src/flask/app.py",
+          "kind": "method",
+          "line_end": 863,
+          "line_start": 830,
+          "name": "handle_http_exception",
+          "rank": 1,
+          "score": 0.508104,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_user_error_handler.py",
+          "kind": "method",
+          "line_end": 295,
+          "line_start": 283,
+          "name": "test_handle_generic",
+          "rank": 2,
+          "score": 0.43943,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_user_error_handler.py",
+          "kind": "method",
+          "line_end": 277,
+          "line_start": 274,
+          "name": "handle_http",
+          "rank": 3,
+          "score": 0.434506,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/app.py",
+          "kind": "method",
+          "line_end": 895,
+          "line_start": 865,
+          "name": "handle_user_exception",
+          "rank": 4,
+          "score": 0.431463,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_user_error_handler.py",
+          "kind": "method",
+          "line_end": 281,
+          "line_start": 269,
+          "name": "test_handle_generic_http",
+          "rank": 5,
+          "score": 0.427422,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/app.py",
+          "kind": "method",
+          "line_end": 948,
+          "line_start": 897,
+          "name": "handle_exception",
+          "rank": 6,
+          "score": 0.413148,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_basic.py",
+          "kind": "function",
+          "line_end": 942,
+          "line_start": 924,
+          "name": "test_error_handling_processing",
+          "rank": 7,
+          "score": 0.412374,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_basic.py",
+          "kind": "function",
+          "line_end": 921,
+          "line_start": 886,
+          "name": "test_error_handling",
+          "rank": 8,
+          "score": 0.397656,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_basic.py",
+          "kind": "function",
+          "line_end": 1015,
+          "line_start": 986,
+          "name": "test_http_error_subclass_handling",
+          "rank": 9,
+          "score": 0.385463,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_basic.py",
+          "kind": "function",
+          "line_end": 967,
+          "line_start": 956,
+          "name": "test_before_request_and_routing_errors",
+          "rank": 10,
+          "score": 0.385346,
+          "source": "semantic"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 1.0,
+        "ndcg_at_10": 0.613147,
+        "precision_at_1": 1.0,
+        "precision_at_10": 0.3,
+        "precision_at_5": 0.4,
+        "recall_at_1": 0.5,
+        "recall_at_10": 0.5,
+        "recall_at_5": 0.5
+      },
+      "task_id": "intent-001",
+      "zero_results": false
+    },
+    {
+      "category": "intent",
+      "description": "Find session and cookie implementation including SecureCookieSession and SessionInterface",
+      "ground_truth": [
+        {
+          "file_path": "src/flask/sessions.py",
+          "line_end": 385,
+          "line_start": 1,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 1.856,
+      "query": "session management and cookie handling",
+      "repo": "flask",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "src/flask/sessions.py",
+          "kind": "method",
+          "line_end": 247,
+          "line_start": 233,
+          "name": "should_set_cookie",
+          "rank": 1,
+          "score": 0.52494,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/sessions.py",
+          "kind": "class",
+          "line_end": 270,
+          "line_start": 100,
+          "name": "SessionInterface",
+          "rank": 2,
+          "score": 0.491833,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/sessions.py",
+          "kind": "class",
+          "line_end": 385,
+          "line_start": 284,
+          "name": "SecureCookieSessionInterface",
+          "rank": 3,
+          "score": 0.48101,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/sessions.py",
+          "kind": "class",
+          "line_end": 80,
+          "line_start": 57,
+          "name": "SecureCookieSession",
+          "rank": 4,
+          "score": 0.479936,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/sessions.py",
+          "kind": "method",
+          "line_end": 335,
+          "line_start": 323,
+          "name": "open_session",
+          "rank": 5,
+          "score": 0.453426,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_basic.py",
+          "kind": "function",
+          "line_end": 536,
+          "line_start": 498,
+          "name": "test_session_cookie_setting",
+          "rank": 6,
+          "score": 0.444621,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/sessions.py",
+          "kind": "method",
+          "line_end": 173,
+          "line_start": 171,
+          "name": "get_cookie_name",
+          "rank": 7,
+          "score": 0.43696,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/sessions.py",
+          "kind": "method",
+          "line_end": 213,
+          "line_start": 208,
+          "name": "get_cookie_samesite",
+          "rank": 8,
+          "score": 0.425419,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/sessions.py",
+          "kind": "method",
+          "line_end": 206,
+          "line_start": 202,
+          "name": "get_cookie_secure",
+          "rank": 9,
+          "score": 0.425251,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_reqctx.py",
+          "kind": "function",
+          "line_end": 277,
+          "line_start": 229,
+          "name": "test_session_dynamic_cookie_name",
+          "rank": 10,
+          "score": 0.420141,
+          "source": "semantic"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 1.0,
+        "ndcg_at_10": 1.0,
+        "precision_at_1": 1.0,
+        "precision_at_10": 0.8,
+        "precision_at_5": 1.0,
+        "recall_at_1": 1.0,
+        "recall_at_10": 1.0,
+        "recall_at_5": 1.0
+      },
+      "task_id": "intent-002",
+      "zero_results": false
+    },
+    {
+      "category": "intent",
+      "description": "Find the Jinja2 template rendering code including Environment, DispatchingJinjaLoader, and render_template",
+      "ground_truth": [
+        {
+          "file_path": "src/flask/templating.py",
+          "line_end": 212,
+          "line_start": 1,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 1.577,
+      "query": "template rendering pipeline",
+      "repo": "flask",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "src/flask/templating.py",
+          "kind": "function",
+          "line_end": 148,
+          "line_start": 136,
+          "name": "render_template",
+          "rank": 1,
+          "score": 0.524387,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/templating.py",
+          "kind": "function",
+          "line_end": 197,
+          "line_start": 181,
+          "name": "stream_template",
+          "rank": 2,
+          "score": 0.518768,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/templating.py",
+          "kind": "function",
+          "line_end": 160,
+          "line_start": 151,
+          "name": "render_template_string",
+          "rank": 3,
+          "score": 0.512878,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/templating.py",
+          "kind": "function",
+          "line_end": 133,
+          "line_start": 123,
+          "name": "_render",
+          "rank": 4,
+          "score": 0.505386,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/templating.py",
+          "kind": "function",
+          "line_end": 212,
+          "line_start": 200,
+          "name": "stream_template_string",
+          "rank": 5,
+          "score": 0.505136,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/templating.py",
+          "kind": "function",
+          "line_end": 178,
+          "line_start": 163,
+          "name": "_stream",
+          "rank": 6,
+          "score": 0.469624,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_signals.py",
+          "kind": "function",
+          "line_end": 22,
+          "line_start": 4,
+          "name": "test_template_rendered",
+          "rank": 7,
+          "score": 0.460301,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_signals.py",
+          "kind": "function",
+          "line_end": 47,
+          "line_start": 25,
+          "name": "test_before_render_template",
+          "rank": 8,
+          "score": 0.454838,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/type_check/typing_route.py",
+          "kind": "function",
+          "line_end": 88,
+          "line_start": 85,
+          "name": "return_template",
+          "rank": 9,
+          "score": 0.450202,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_templating.py",
+          "kind": "function",
+          "line_end": 197,
+          "line_start": 187,
+          "name": "test_template_filter_with_template",
+          "rank": 10,
+          "score": 0.450029,
+          "source": "semantic"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 1.0,
+        "ndcg_at_10": 1.0,
+        "precision_at_1": 1.0,
+        "precision_at_10": 0.6,
+        "precision_at_5": 1.0,
+        "recall_at_1": 1.0,
+        "recall_at_10": 1.0,
+        "recall_at_5": 1.0
+      },
+      "task_id": "intent-005",
+      "zero_results": false
+    },
+    {
+      "category": "symbol_lookup",
+      "description": "Find the main Flask application class definition",
+      "ground_truth": [
+        {
+          "file_path": "src/flask/app.py",
+          "line_end": 200,
+          "line_start": 109,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 1.875,
+      "query": "Flask class definition",
+      "repo": "flask",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "src/flask/cli.py",
+          "kind": "class",
+          "line_end": 688,
+          "line_start": 531,
+          "name": "FlaskGroup",
+          "rank": 1,
+          "score": 0.734909,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_config.py",
+          "kind": "class",
+          "line_end": 203,
+          "line_start": 202,
+          "name": "Flask",
+          "rank": 2,
+          "score": 0.690633,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/cli.py",
+          "kind": "class",
+          "line_end": 372,
+          "line_start": 293,
+          "name": "ScriptInfo",
+          "rank": 3,
+          "score": 0.685264,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/app.py",
+          "kind": "class",
+          "line_end": 1625,
+          "line_start": 109,
+          "name": "Flask",
+          "rank": 4,
+          "score": 0.681237,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_helpers.py",
+          "kind": "class",
+          "line_end": 193,
+          "line_start": 192,
+          "name": "MyFlask",
+          "rank": 5,
+          "score": 0.638251,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/templating.py",
+          "kind": "class",
+          "line_end": 46,
+          "line_start": 36,
+          "name": "Environment",
+          "rank": 6,
+          "score": 0.634888,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/wrappers.py",
+          "kind": "class",
+          "line_end": 219,
+          "line_start": 18,
+          "name": "Request",
+          "rank": 7,
+          "score": 0.629902,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_helpers.py",
+          "kind": "class",
+          "line_end": 225,
+          "line_start": 209,
+          "name": "TestNoImports",
+          "rank": 8,
+          "score": 0.629195,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_cli.py",
+          "kind": "class",
+          "line_end": 50,
+          "line_start": 49,
+          "name": "Module",
+          "rank": 9,
+          "score": 0.628357,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/views.py",
+          "kind": "class",
+          "line_end": 191,
+          "line_start": 138,
+          "name": "MethodView",
+          "rank": 10,
+          "score": 0.627657,
+          "source": "semantic"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 0.25,
+        "ndcg_at_10": 0.430677,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.1,
+        "precision_at_5": 0.2,
+        "recall_at_1": 0.0,
+        "recall_at_10": 1.0,
+        "recall_at_5": 1.0
+      },
+      "task_id": "symbol-lookup-003",
+      "zero_results": false
+    },
+    {
+      "category": "symbol_lookup",
+      "description": "Find the Blueprint class in Flask's blueprints module",
+      "ground_truth": [
+        {
+          "file_path": "src/flask/blueprints.py",
+          "line_end": 128,
+          "line_start": 18,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 1.756,
+      "query": "Blueprint class definition",
+      "repo": "flask",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "src/flask/sansio/blueprints.py",
+          "kind": "class",
+          "line_end": 692,
+          "line_start": 119,
+          "name": "Blueprint",
+          "rank": 1,
+          "score": 0.683535,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/sansio/blueprints.py",
+          "kind": "class",
+          "line_end": 116,
+          "line_start": 34,
+          "name": "BlueprintSetupState",
+          "rank": 2,
+          "score": 0.594195,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/blueprints.py",
+          "kind": "class",
+          "line_end": 128,
+          "line_start": 18,
+          "name": "Blueprint",
+          "rank": 3,
+          "score": 0.571093,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/sansio/blueprints.py",
+          "kind": "method",
+          "line_end": 665,
+          "line_start": 664,
+          "name": "from_blueprint",
+          "rank": 4,
+          "score": 0.540731,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/sansio/blueprints.py",
+          "kind": "method",
+          "line_end": 271,
+          "line_start": 255,
+          "name": "register_blueprint",
+          "rank": 5,
+          "score": 0.518137,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/sansio/blueprints.py",
+          "kind": "method",
+          "line_end": 242,
+          "line_start": 240,
+          "name": "wrapper",
+          "rank": 6,
+          "score": 0.511314,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/wrappers.py",
+          "kind": "method",
+          "line_end": 195,
+          "line_start": 180,
+          "name": "blueprints",
+          "rank": 7,
+          "score": 0.506353,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_async.py",
+          "kind": "class",
+          "line_end": 19,
+          "line_start": 18,
+          "name": "BlueprintError",
+          "rank": 8,
+          "score": 0.505023,
+          "source": "semantic"
+        },
+        {
+          "file_path": "tests/test_cli.py",
+          "kind": "function",
+          "line_end": 689,
+          "line_start": 649,
+          "name": "test_cli_blueprints",
+          "rank": 9,
+          "score": 0.501915,
+          "source": "semantic"
+        },
+        {
+          "file_path": "src/flask/sansio/blueprints.py",
+          "kind": "method",
+          "line_end": 85,
+          "line_start": 41,
+          "name": "__init__",
+          "rank": 10,
+          "score": 0.498637,
+          "source": "semantic"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 0.333333,
+        "ndcg_at_10": 0.5,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.1,
+        "precision_at_5": 0.2,
+        "recall_at_1": 0.0,
+        "recall_at_10": 1.0,
+        "recall_at_5": 1.0
+      },
+      "task_id": "symbol-lookup-004",
+      "zero_results": false
+    },
+    {
+      "category": "config",
+      "description": "Find the fastify package configuration with dependencies and scripts",
+      "ground_truth": [
+        {
+          "file_path": "package.json",
+          "line_end": 195,
+          "line_start": 1,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 40.29,
+      "query": "package.json dependencies and scripts",
+      "repo": "fastify",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "lib/plugin-utils.js",
+          "kind": "function",
+          "line_end": 78,
+          "line_start": 64,
+          "name": "checkDependencies",
+          "rank": 1,
+          "score": 0.496403,
+          "source": "semantic"
+        },
+        {
+          "file_path": "test/plugin.3.test.js",
+          "kind": "function",
+          "line_end": 246,
+          "line_start": 244,
+          "name": "dependency",
+          "rank": 2,
+          "score": 0.475237,
+          "source": "semantic"
+        },
+        {
+          "file_path": "test/plugin.3.test.js",
+          "kind": "function",
+          "line_end": 277,
+          "line_start": 275,
+          "name": "dependency",
+          "rank": 3,
+          "score": 0.475237,
+          "source": "semantic"
+        },
+        {
+          "file_path": "lib/plugin-utils.js",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "plugin-utils",
+          "rank": 4,
+          "score": 0.433092,
+          "source": "semantic"
+        },
+        {
+          "file_path": "lib/content-type-parser.js",
+          "kind": "function",
+          "line_end": 321,
+          "line_start": 311,
+          "name": "defaultJsonParser",
+          "rank": 5,
+          "score": 0.427537,
+          "source": "semantic"
+        },
+        {
+          "file_path": "lib/symbols.js",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "symbols",
+          "rank": 6,
+          "score": 0.414892,
+          "source": "semantic"
+        },
+        {
+          "file_path": "lib/context.js",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "context",
+          "rank": 7,
+          "score": 0.402615,
+          "source": "semantic"
+        },
+        {
+          "file_path": "lib/server.js",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "server",
+          "rank": 8,
+          "score": 0.398269,
+          "source": "semantic"
+        },
+        {
+          "file_path": "lib/content-type.js",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "content-type",
+          "rank": 9,
+          "score": 0.390715,
+          "source": "semantic"
+        },
+        {
+          "file_path": ".github/scripts/lint-ecosystem.js",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "lint-ecosystem",
+          "rank": 10,
+          "score": 0.384151,
+          "source": "semantic"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 0.0,
+        "ndcg_at_10": 0.0,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.0,
+        "precision_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.0,
+        "recall_at_5": 0.0
+      },
+      "task_id": "config-002",
+      "zero_results": false
+    },
+    {
+      "category": "intent",
+      "description": "Find validation logic for request schemas without exact identifier names",
+      "ground_truth": [
+        {
+          "file_path": "lib/validation.js",
+          "line_end": 280,
+          "line_start": 1,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 3.922,
+      "query": "request validation and schema enforcement",
+      "repo": "fastify",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "test/internals/handle-request.test.js",
+          "kind": "function",
+          "line_end": 23,
+          "line_start": 14,
+          "name": "schemaValidator",
+          "rank": 1,
+          "score": 0.467235,
+          "source": "semantic"
+        },
+        {
+          "file_path": "lib/validation.js",
+          "kind": "function",
+          "line_end": 247,
+          "line_start": 238,
+          "name": "validateAsyncHeaders",
+          "rank": 2,
+          "score": 0.466584,
+          "source": "semantic"
+        },
+        {
+          "file_path": "lib/validation.js",
+          "kind": "function",
+          "line_end": 116,
+          "line_start": 57,
+          "name": "compileSchemasForValidation",
+          "rank": 3,
+          "score": 0.45855,
+          "source": "semantic"
+        },
+        {
+          "file_path": "lib/schema-controller.js",
+          "kind": "method",
+          "line_end": 146,
+          "line_start": 135,
+          "name": "setupValidator",
+          "rank": 4,
+          "score": 0.454122,
+          "source": "semantic"
+        },
+        {
+          "file_path": "test/schema-validation.test.js",
+          "kind": "function",
+          "line_end": 338,
+          "line_start": 336,
+          "name": "anotherValidator",
+          "rank": 5,
+          "score": 0.449218,
+          "source": "semantic"
+        },
+        {
+          "file_path": "test/route.3.test.js",
+          "kind": "function",
+          "line_end": 22,
+          "line_start": 20,
+          "name": "validateHttpData",
+          "rank": 6,
+          "score": 0.435938,
+          "source": "semantic"
+        },
+        {
+          "file_path": "test/schema-special-usage.test.js",
+          "kind": "function",
+          "line_end": 665,
+          "line_start": 662,
+          "name": "schemaValidator",
+          "rank": 7,
+          "score": 0.432353,
+          "source": "semantic"
+        },
+        {
+          "file_path": "lib/validation.js",
+          "kind": "function",
+          "line_end": 55,
+          "line_start": 18,
+          "name": "compileSchemasForSerialization",
+          "rank": 8,
+          "score": 0.427346,
+          "source": "semantic"
+        },
+        {
+          "file_path": "lib/validation.js",
+          "kind": "function",
+          "line_end": 225,
+          "line_start": 216,
+          "name": "validateAsyncBody",
+          "rank": 9,
+          "score": 0.424132,
+          "source": "semantic"
+        },
+        {
+          "file_path": "lib/validation.js",
+          "kind": "function",
+          "line_end": 214,
+          "line_start": 205,
+          "name": "validateAsyncParams",
+          "rank": 10,
+          "score": 0.422212,
+          "source": "semantic"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 0.5,
+        "ndcg_at_10": 0.63093,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.5,
+        "precision_at_5": 0.4,
+        "recall_at_1": 0.0,
+        "recall_at_10": 1.0,
+        "recall_at_5": 1.0
+      },
+      "task_id": "intent-003",
+      "zero_results": false
+    },
+    {
+      "category": "config",
+      "description": "Find the root turbo.json with task pipeline definitions and build configuration",
+      "ground_truth": [
+        {
+          "file_path": "turbo.json",
+          "line_end": 87,
+          "line_start": 1,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 47.288,
+      "query": "turbo.json pipeline configuration",
+      "repo": "turborepo",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "crates/turborepo-turbo-json/bindings/Pipeline.ts",
+          "kind": "type_alias",
+          "line_end": 124,
+          "line_start": 3,
+          "name": "Pipeline",
+          "rank": 1,
+          "score": 0.835851,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-lib/src/turbo_json/loader.rs",
+          "kind": "method",
+          "line_end": 105,
+          "line_start": 89,
+          "name": "workspace_no_turbo_json",
+          "rank": 2,
+          "score": 0.780923,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-turbo-json/src/raw.rs",
+          "kind": "struct",
+          "line_end": 649,
+          "line_start": 500,
+          "name": "RawTaskDefinition",
+          "rank": 3,
+          "score": 0.777054,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-turbo-json/src/raw.rs",
+          "kind": "struct",
+          "line_end": 31,
+          "line_start": 23,
+          "name": "Pipeline",
+          "rank": 4,
+          "score": 0.773973,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-turbo-json/src/loader.rs",
+          "kind": "struct",
+          "line_end": 110,
+          "line_start": 104,
+          "name": "TurboJsonReader",
+          "rank": 5,
+          "score": 0.773409,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-config/src/turbo_json.rs",
+          "kind": "struct",
+          "line_end": 18,
+          "line_start": 16,
+          "name": "TurboJsonReader",
+          "rank": 6,
+          "score": 0.773298,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-turbo-json/src/loader.rs",
+          "kind": "method",
+          "line_end": 315,
+          "line_start": 300,
+          "name": "workspace_no_turbo_json",
+          "rank": 7,
+          "score": 0.764644,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-turbo-json/bindings/RawTurboJson.ts",
+          "kind": "type_alias",
+          "line_end": 142,
+          "line_start": 4,
+          "name": "RawTurboJson",
+          "rank": 8,
+          "score": 0.761253,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-lib/src/turbo_json/loader.rs",
+          "kind": "method",
+          "line_end": 71,
+          "line_start": 60,
+          "name": "workspace",
+          "rank": 9,
+          "score": 0.748111,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-turbo-json/bindings/Pipeline.ts",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "Pipeline",
+          "rank": 10,
+          "score": 0.740407,
+          "source": "semantic"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 0.0,
+        "ndcg_at_10": 0.0,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.0,
+        "precision_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.0,
+        "recall_at_5": 0.0
+      },
+      "task_id": "config-003",
+      "zero_results": false
+    },
+    {
+      "category": "cross_file",
+      "description": "Find TaskDefinition in Rust and its equivalent Pipeline interface in TypeScript - same concept across languages",
+      "ground_truth": [
+        {
+          "file_path": "crates/turborepo-types/src/lib.rs",
+          "line_end": 806,
+          "line_start": 750,
+          "relevance": 2
+        },
+        {
+          "file_path": "packages/turbo-types/src/types/config-v2.ts",
+          "line_end": 424,
+          "line_start": 266,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 4.153,
+      "query": "TaskDefinition configuration across languages",
+      "repo": "turborepo",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "crates/turborepo-types/src/lib.rs",
+          "kind": "struct",
+          "line_end": 799,
+          "line_start": 747,
+          "name": "TaskDefinition",
+          "rank": 1,
+          "score": 0.593226,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-engine/src/task_definition.rs",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "task_definition",
+          "rank": 2,
+          "score": 0.571359,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/turborepo-engine/src/task_definition.rs",
+          "kind": "interface",
+          "line_end": 35,
+          "line_start": 17,
+          "name": "TaskDefinitionFromProcessed",
+          "rank": 3,
+          "score": 0.560979,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/turborepo-types/src/lib.rs",
+          "kind": "interface",
+          "line_end": 906,
+          "line_start": 892,
+          "name": "TaskDefinitionExt",
+          "rank": 4,
+          "score": 0.549656,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-run-summary/src/task.rs",
+          "kind": "struct",
+          "line_end": 142,
+          "line_start": 127,
+          "name": "TaskSummaryTaskDefinition",
+          "rank": 5,
+          "score": 0.531107,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/turborepo-engine/src/lib.rs",
+          "kind": "interface",
+          "line_end": 65,
+          "line_start": 53,
+          "name": "TaskDefinitionInfo",
+          "rank": 6,
+          "score": 0.51901,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-engine/src/validate.rs",
+          "kind": "struct",
+          "line_end": 26,
+          "line_start": 18,
+          "name": "TaskDefinitionResult",
+          "rank": 7,
+          "score": 0.510584,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-run-summary/src/task.rs",
+          "kind": "struct",
+          "line_end": 125,
+          "line_start": 120,
+          "name": "TaskEnvConfiguration",
+          "rank": 8,
+          "score": 0.483911,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/turborepo-engine/src/builder.rs",
+          "kind": "struct",
+          "line_end": 918,
+          "line_start": 903,
+          "name": "TaskInheritanceResolver",
+          "rank": 9,
+          "score": 0.468642,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-engine/src/lib.rs",
+          "kind": "struct",
+          "line_end": 133,
+          "line_start": 125,
+          "name": "TaskInfo",
+          "rank": 10,
+          "score": 0.463623,
+          "source": "semantic"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 1.0,
+        "ndcg_at_10": 0.760188,
+        "precision_at_1": 1.0,
+        "precision_at_10": 0.1,
+        "precision_at_5": 0.2,
+        "recall_at_1": 0.5,
+        "recall_at_10": 0.5,
+        "recall_at_5": 0.5
+      },
+      "task_id": "cross-file-003",
+      "zero_results": false
+    },
+    {
+      "category": "disambiguation",
+      "description": "TaskDefinition exists as both a Rust struct and TypeScript Pipeline interface representing the same concept",
+      "ground_truth": [
+        {
+          "file_path": "crates/turborepo-types/src/lib.rs",
+          "line_end": 806,
+          "line_start": 750,
+          "relevance": 2
+        },
+        {
+          "file_path": "packages/turbo-types/src/types/config-v2.ts",
+          "line_end": 424,
+          "line_start": 266,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 4.499,
+      "query": "TaskDefinition",
+      "repo": "turborepo",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "crates/turborepo-run-summary/src/task.rs",
+          "kind": "struct",
+          "line_end": 142,
+          "line_start": 127,
+          "name": "TaskSummaryTaskDefinition",
+          "rank": 1,
+          "score": 0.650679,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/turborepo-types/src/lib.rs",
+          "kind": "interface",
+          "line_end": 906,
+          "line_start": 892,
+          "name": "TaskDefinitionExt",
+          "rank": 2,
+          "score": 0.639991,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-types/src/lib.rs",
+          "kind": "struct",
+          "line_end": 799,
+          "line_start": 747,
+          "name": "TaskDefinition",
+          "rank": 3,
+          "score": 0.629825,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-engine/src/task_definition.rs",
+          "kind": "file_summary",
+          "line_end": null,
+          "line_start": null,
+          "name": "task_definition",
+          "rank": 4,
+          "score": 0.629041,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/turborepo-engine/src/lib.rs",
+          "kind": "interface",
+          "line_end": 65,
+          "line_start": 53,
+          "name": "TaskDefinitionInfo",
+          "rank": 5,
+          "score": 0.609323,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-engine/src/task_definition.rs",
+          "kind": "interface",
+          "line_end": 35,
+          "line_start": 17,
+          "name": "TaskDefinitionFromProcessed",
+          "rank": 6,
+          "score": 0.605534,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/turborepo-engine/src/validate.rs",
+          "kind": "struct",
+          "line_end": 26,
+          "line_start": 18,
+          "name": "TaskDefinitionResult",
+          "rank": 7,
+          "score": 0.572452,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-run-summary/src/task_factory.rs",
+          "kind": "method",
+          "line_end": 77,
+          "line_start": 59,
+          "name": "task_summary",
+          "rank": 8,
+          "score": 0.561043,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/turborepo-run-summary/src/task_factory.rs",
+          "kind": "method",
+          "line_end": 94,
+          "line_start": 79,
+          "name": "single_task_summary",
+          "rank": 9,
+          "score": 0.543567,
+          "source": "hybrid"
+        },
+        {
+          "file_path": "crates/turborepo-run-summary/src/task.rs",
+          "kind": "method",
+          "line_end": 431,
+          "line_start": 375,
+          "name": "from",
+          "rank": 10,
+          "score": 0.539171,
+          "source": "hybrid"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 0.333333,
+        "ndcg_at_10": 0.380094,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.1,
+        "precision_at_5": 0.2,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.5,
+        "recall_at_5": 0.5
+      },
+      "task_id": "disambig-003",
+      "zero_results": false
+    },
+    {
+      "category": "symbol_lookup",
+      "description": "Find the Run struct, the main entry point for turbo run execution",
+      "ground_truth": [
+        {
+          "file_path": "crates/turborepo-lib/src/run/mod.rs",
+          "line_end": 100,
+          "line_start": 76,
+          "relevance": 1
+        }
+      ],
+      "latency_ms": 4.041,
+      "query": "Run struct definition",
+      "repo": "turborepo",
+      "result_count": 10,
+      "results": [
+        {
+          "file_path": "crates/turborepo-run-summary/src/tracker.rs",
+          "kind": "struct",
+          "line_end": 97,
+          "line_start": 88,
+          "name": "RunTracker",
+          "rank": 1,
+          "score": 0.613215,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-run-summary/src/observability/mod.rs",
+          "kind": "struct",
+          "line_end": 47,
+          "line_start": 39,
+          "name": "Handle",
+          "rank": 2,
+          "score": 0.553679,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-types/src/lib.rs",
+          "kind": "struct",
+          "line_end": 472,
+          "line_start": 462,
+          "name": "TaskArgs",
+          "rank": 3,
+          "score": 0.534161,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-lib/src/cli/mod.rs",
+          "kind": "struct",
+          "line_end": 1146,
+          "line_start": 1077,
+          "name": "RunArgs",
+          "rank": 4,
+          "score": 0.527486,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-ui/src/tui/task.rs",
+          "kind": "struct",
+          "line_end": 12,
+          "line_start": 9,
+          "name": "Running",
+          "rank": 5,
+          "score": 0.524756,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-run-summary/src/tracker.rs",
+          "kind": "struct",
+          "line_end": 86,
+          "line_start": 61,
+          "name": "RunSummary",
+          "rank": 6,
+          "score": 0.518153,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-task-executor/src/exec.rs",
+          "kind": "struct",
+          "line_end": 206,
+          "line_start": 164,
+          "name": "TaskExecutor",
+          "rank": 7,
+          "score": 0.515721,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-lib/src/opts.rs",
+          "kind": "struct",
+          "line_end": 301,
+          "line_start": 277,
+          "name": "RunOpts",
+          "rank": 8,
+          "score": 0.50244,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-lib/src/run/watch.rs",
+          "kind": "struct",
+          "line_end": 158,
+          "line_start": 155,
+          "name": "RunHandle",
+          "rank": 9,
+          "score": 0.499563,
+          "source": "semantic"
+        },
+        {
+          "file_path": "crates/turborepo-task-executor/src/lib.rs",
+          "kind": "struct",
+          "line_end": 72,
+          "line_start": 46,
+          "name": "ExecutorConfig",
+          "rank": 10,
+          "score": 0.492053,
+          "source": "semantic"
+        }
+      ],
+      "retrieval_metrics": {
+        "mrr": 0.0,
+        "ndcg_at_10": 0.0,
+        "precision_at_1": 0.0,
+        "precision_at_10": 0.0,
+        "precision_at_5": 0.0,
+        "recall_at_1": 0.0,
+        "recall_at_10": 0.0,
+        "recall_at_5": 0.0
+      },
+      "task_id": "symbol-lookup-006",
+      "zero_results": false
+    }
+  ],
+  "repo_statuses": {
+    "fastify": {
+      "cache_role": "main",
+      "canonical_root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_2efadcf0/benchmarks/aft-search/.bench/repos/fastify",
+      "checkpoints_total": 0,
+      "compression": {
+        "project": {
+          "compressed_tokens": 0,
+          "events": 0,
+          "original_tokens": 0,
+          "savings_tokens": 0
+        },
+        "session": {
+          "compressed_tokens": 0,
+          "events": 0,
+          "original_tokens": 0,
+          "savings_tokens": 0
+        }
+      },
+      "degraded": false,
+      "degraded_reasons": [],
+      "disk": {
+        "project_cache_key": "8759cdd6c4aa5d80",
+        "semantic_disk_bytes": 2061041,
+        "storage_dir": "/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/aft-vera-suite-ujjk48uj",
+        "trigram_disk_bytes": 2713200
+      },
+      "features": {
+        "format_on_edit": true,
+        "restrict_to_project_root": false,
+        "search_index": true,
+        "semantic_search": true,
+        "validate_on_edit": "off"
+      },
+      "id": "12",
+      "lsp_servers": 0,
+      "project_root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_2efadcf0/benchmarks/aft-search/.bench/repos/fastify",
+      "search_index": {
+        "files": 383,
+        "status": "ready",
+        "trigrams": 28096
+      },
+      "semantic_index": {
+        "backend": "fastembed",
+        "dimension": 384,
+        "entries": 1024,
+        "model": "all-MiniLM-L6-v2",
+        "status": "ready"
+      },
+      "session": {
+        "checkpoints": 0,
+        "id": "__default__",
+        "tracked_files": 0
+      },
+      "storage_dir": "/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/aft-vera-suite-ujjk48uj",
+      "success": true,
+      "symbol_cache": {
+        "local_entries": 342,
+        "warm_entries": 0
+      },
+      "version": "0.26.4"
+    },
+    "flask": {
+      "cache_role": "main",
+      "canonical_root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_2efadcf0/benchmarks/aft-search/.bench/repos/flask",
+      "checkpoints_total": 0,
+      "compression": {
+        "project": {
+          "compressed_tokens": 0,
+          "events": 0,
+          "original_tokens": 0,
+          "savings_tokens": 0
+        },
+        "session": {
+          "compressed_tokens": 0,
+          "events": 0,
+          "original_tokens": 0,
+          "savings_tokens": 0
+        }
+      },
+      "degraded": false,
+      "degraded_reasons": [],
+      "disk": {
+        "project_cache_key": "da72f15f5237a38e",
+        "semantic_disk_bytes": 3525156,
+        "storage_dir": "/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/aft-vera-suite-nowhpkvv",
+        "trigram_disk_bytes": 1834657
+      },
+      "features": {
+        "format_on_edit": true,
+        "restrict_to_project_root": false,
+        "search_index": true,
+        "semantic_search": true,
+        "validate_on_edit": "off"
+      },
+      "id": "25",
+      "lsp_servers": 0,
+      "project_root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_2efadcf0/benchmarks/aft-search/.bench/repos/flask",
+      "search_index": {
+        "files": 236,
+        "status": "ready",
+        "trigrams": 26144
+      },
+      "semantic_index": {
+        "backend": "fastembed",
+        "dimension": 384,
+        "entries": 1707,
+        "model": "all-MiniLM-L6-v2",
+        "status": "ready"
+      },
+      "session": {
+        "checkpoints": 0,
+        "id": "__default__",
+        "tracked_files": 0
+      },
+      "storage_dir": "/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/aft-vera-suite-nowhpkvv",
+      "success": true,
+      "symbol_cache": {
+        "local_entries": 112,
+        "warm_entries": 0
+      },
+      "version": "0.26.4"
+    },
+    "ripgrep": {
+      "cache_role": "main",
+      "canonical_root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_2efadcf0/benchmarks/aft-search/.bench/repos/ripgrep",
+      "checkpoints_total": 0,
+      "compression": {
+        "project": {
+          "compressed_tokens": 0,
+          "events": 0,
+          "original_tokens": 0,
+          "savings_tokens": 0
+        },
+        "session": {
+          "compressed_tokens": 0,
+          "events": 0,
+          "original_tokens": 0,
+          "savings_tokens": 0
+        }
+      },
+      "degraded": false,
+      "degraded_reasons": [],
+      "disk": {
+        "project_cache_key": "63f2cfdd159c07e1",
+        "semantic_disk_bytes": 5807460,
+        "storage_dir": "/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/aft-vera-suite-4y_dfnfe",
+        "trigram_disk_bytes": 2377404
+      },
+      "features": {
+        "format_on_edit": true,
+        "restrict_to_project_root": false,
+        "search_index": true,
+        "semantic_search": true,
+        "validate_on_edit": "off"
+      },
+      "id": "34",
+      "lsp_servers": 0,
+      "project_root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_2efadcf0/benchmarks/aft-search/.bench/repos/ripgrep",
+      "search_index": {
+        "files": 219,
+        "status": "ready",
+        "trigrams": 33742
+      },
+      "semantic_index": {
+        "backend": "fastembed",
+        "dimension": 384,
+        "entries": 2775,
+        "model": "all-MiniLM-L6-v2",
+        "status": "ready"
+      },
+      "session": {
+        "checkpoints": 0,
+        "id": "__default__",
+        "tracked_files": 0
+      },
+      "storage_dir": "/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/aft-vera-suite-4y_dfnfe",
+      "success": true,
+      "symbol_cache": {
+        "local_entries": 123,
+        "warm_entries": 0
+      },
+      "version": "0.26.4"
+    },
+    "turborepo": {
+      "cache_role": "main",
+      "canonical_root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_2efadcf0/benchmarks/aft-search/.bench/repos/turborepo",
+      "checkpoints_total": 0,
+      "compression": {
+        "project": {
+          "compressed_tokens": 0,
+          "events": 0,
+          "original_tokens": 0,
+          "savings_tokens": 0
+        },
+        "session": {
+          "compressed_tokens": 0,
+          "events": 0,
+          "original_tokens": 0,
+          "savings_tokens": 0
+        }
+      },
+      "degraded": false,
+      "degraded_reasons": [],
+      "disk": {
+        "project_cache_key": "ec943bf770082aa3",
+        "semantic_disk_bytes": 20985433,
+        "storage_dir": "/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/aft-vera-suite-cx7scmsb",
+        "trigram_disk_bytes": 24418969
+      },
+      "features": {
+        "format_on_edit": true,
+        "restrict_to_project_root": false,
+        "search_index": true,
+        "semantic_search": true,
+        "validate_on_edit": "off"
+      },
+      "id": "103",
+      "lsp_servers": 0,
+      "project_root": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_2efadcf0/benchmarks/aft-search/.bench/repos/turborepo",
+      "search_index": {
+        "files": 5703,
+        "status": "ready",
+        "trigrams": 98328
+      },
+      "semantic_index": {
+        "backend": "fastembed",
+        "dimension": 384,
+        "entries": 9853,
+        "model": "all-MiniLM-L6-v2",
+        "status": "ready"
+      },
+      "session": {
+        "checkpoints": 0,
+        "id": "__default__",
+        "tracked_files": 0
+      },
+      "storage_dir": "/var/folders/18/257zzylx4h1gbkcvs4cnpqqc0000gn/T/aft-vera-suite-cx7scmsb",
+      "success": true,
+      "symbol_cache": {
+        "local_entries": 3927,
+        "warm_entries": 0
+      },
+      "version": "0.26.4"
+    }
+  },
+  "skipped_repos": [],
+  "task_count": 21,
+  "timestamp": "2026-05-20T14:31:24.008844+00:00",
+  "tool_name": "aft_search",
+  "version_info": {
+    "binary_path": "/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/d4d1353f0512127b/bg_2efadcf0/target/release/aft",
+    "binary_sha256": "823ef7846881e807b2008f8ab2e15197ba9e85312de088a4c5f5f782990ed845",
+    "config": {
+      "experimental_search_index": true,
+      "experimental_semantic_search": true,
+      "relevance_mode": "line-overlap",
+      "reranker": false,
+      "top_k": 10
+    },
+    "corpus_version": 1,
+    "repo_shas": {
+      "fastify": "a22217f9420f70017a419d8e18b2a3141ab27989",
+      "flask": "4cae5d8e411b1e69949d8fae669afeacbd3e5908",
+      "ripgrep": "4519153e5e461527f4bca45b042fff45c4ec6fb9",
+      "turborepo": "56b79ff5c1c9366593e9e68a922d997e2698c5f4"
+    },
+    "tool_version": "0.26.4"
+  }
+}

@@ -1,0 +1,215 @@
+name: Bump OpenCode pin
+
+# Weekly cron + manual dispatch. Compares the version in
+# .github/opencode-version.txt against the latest published OpenCode release.
+# If they drift, opens a PR bumping the pin. The PR triggers the full Tests
+# workflow (Linux/macOS/Windows units + Linux/macOS/Windows E2E), so a bad
+# OpenCode release fails on the PR before merge instead of breaking main.
+#
+# Why this exists: all three E2E harnesses (Linux Docker, macOS native,
+# Windows native) read the pin from .github/opencode-version.txt to avoid
+# the GitHub API anonymous rate-limit on macOS runners (60 req/hr per
+# egress IP — repeatedly hit on shared macOS infra). Pinning is the right
+# call for stability, but pinning forever means we silently drift behind
+# upstream and miss real OpenCode regressions. This workflow is the
+# auto-refresh that closes the loop.
+#
+# This workflow uses `gh` with the default GITHUB_TOKEN which gets the
+# 1000 req/hr authenticated GitHub API budget, so it never hits the
+# anonymous rate limit the OpenCode installer does.
+#
+# IMPORTANT — `GITHUB_TOKEN` and downstream workflow triggers:
+# Per https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow,
+# events created by `GITHUB_TOKEN` (push, pull_request, etc.) do NOT
+# trigger new workflow runs. So opening this PR with `gh pr create` and
+# pushing the branch with the default token will NOT auto-run Tests.
+# `workflow_dispatch` and `repository_dispatch` are exceptions, so we
+# dispatch Tests explicitly after opening the PR. Tests' `workflow_dispatch`
+# input takes the branch ref so the run is gated on the bumped pin.
+#
+# If you want PR-driven runs (so Tests appears as a check on the PR
+# itself, not as a separate workflow_dispatch run), set the
+# `BUMP_OPENCODE_PAT` repo secret to a PAT with `repo` + `workflow` scope.
+# When present we use it for `git push` and `gh pr create`; PR events
+# from a PAT DO trigger downstream workflows.
+
+on:
+  schedule:
+    # Every Monday 06:00 UTC. Far enough from typical release Friday
+    # evenings that any urgent post-release fixes are usually in.
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    name: Check for OpenCode upstream drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read current pin
+        id: current
+        run: |
+          version=$(tr -d '[:space:]' < .github/opencode-version.txt)
+          if [ -z "$version" ]; then
+            echo "::error::.github/opencode-version.txt is empty"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Current pin: $version"
+
+      - name: Resolve latest OpenCode release
+        id: latest
+        env:
+          # gh uses GITHUB_TOKEN automatically; explicit env makes the auth
+          # boundary visible in logs and lets `gh` skip its login probe.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The OpenCode installer hits this same endpoint anonymously
+          # (see https://opencode.ai/install). With auth we get 1000 req/hr,
+          # so this never hits the rate limit that motivates the pin.
+          tag=$(gh api repos/anomalyco/opencode/releases/latest --jq '.tag_name')
+          if [ -z "$tag" ] || [ "$tag" = "null" ]; then
+            echo "::error::Failed to resolve latest OpenCode release tag"
+            exit 1
+          fi
+          # Strip leading 'v' if present (1.14.39 not v1.14.39).
+          version="${tag#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Latest release: $version (tag: $tag)"
+
+      - name: Compare versions
+        id: compare
+        run: |
+          if [ "${{ steps.current.outputs.version }}" = "${{ steps.latest.outputs.version }}" ]; then
+            echo "Pin is already at latest. Nothing to do."
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Drift: pin=${{ steps.current.outputs.version }} latest=${{ steps.latest.outputs.version }}"
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update pin file
+        if: steps.compare.outputs.drift == 'true'
+        run: |
+          echo "${{ steps.latest.outputs.version }}" > .github/opencode-version.txt
+
+      - name: Open PR
+        if: steps.compare.outputs.drift == 'true'
+        id: pr
+        env:
+          # Prefer a PAT if the repo owner has set one — PR events from a PAT
+          # actually trigger downstream workflows (Tests). Fall back to the
+          # default GITHUB_TOKEN, which works for opening the PR but won't
+          # auto-trigger Tests; the next step dispatches Tests explicitly.
+          GH_TOKEN: ${{ secrets.BUMP_OPENCODE_PAT || secrets.GITHUB_TOKEN }}
+          PAT_PRESENT: ${{ secrets.BUMP_OPENCODE_PAT != '' && 'yes' || '' }}
+        run: |
+          set -euo pipefail
+          old="${{ steps.current.outputs.version }}"
+          new="${{ steps.latest.outputs.version }}"
+          branch="ci/bump-opencode-${new}"
+
+          # If the bump branch already exists (we opened the same PR previously
+          # and it's still open / unmerged), just refresh it. Otherwise create
+          # a new branch.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Push using the same token we'll use for `gh pr create`. When PAT is
+          # set, this writes the branch as the PAT user and triggers PR events
+          # normally. With the default GITHUB_TOKEN, the push lands but won't
+          # trigger Tests via the `pull_request` event — see the dispatch step
+          # below.
+          remote_url="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git remote set-url origin "$remote_url"
+
+          git checkout -b "$branch"
+          git add .github/opencode-version.txt
+          git commit -m "ci(opencode): bump pinned OpenCode to v${new}
+
+          Auto-generated by .github/workflows/bump-opencode.yml.
+
+          Bumps .github/opencode-version.txt from ${old} -> ${new}.
+          All three E2E harnesses (Linux Docker, macOS native, Windows native)
+          read this file, so PR-time CI exercises the new OpenCode version on
+          every supported platform before merge. If any platform regresses,
+          the PR will fail and you'll know immediately."
+          git push -f origin "$branch"
+
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          # Surface PAT presence to downstream steps via this step's outputs
+          # so we don't have to re-evaluate the secret in another step (where
+          # secret-conditional logic is awkward).
+          if [ -n "${PAT_PRESENT:-}" ]; then
+            echo "trigger_note=_Tests is triggered automatically by the \`pull_request\` event (PAT in use)._" >> "$GITHUB_OUTPUT"
+            echo "needs_dispatch=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "trigger_note=_PR opened with \`GITHUB_TOKEN\`, which does NOT trigger downstream workflows. The bump job dispatches Tests separately via \`workflow_dispatch\` against this branch — look for the matching \"Tests\" run in the Actions tab. For PR-driven runs that appear as a check on this PR itself, set the \`BUMP_OPENCODE_PAT\` repo secret to a PAT with \`repo\` + \`workflow\` scope._" >> "$GITHUB_OUTPUT"
+            echo "needs_dispatch=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Open the PR (or surface the existing one if open). Body lists the
+          # release notes link so reviewer can scan upstream changes quickly.
+          existing=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number' || echo "")
+          if [ -n "$existing" ]; then
+            echo "PR already open: #$existing — branch was force-pushed."
+            exit 0
+          fi
+
+          gh pr create \
+            --head "$branch" \
+            --base main \
+            --title "ci(opencode): bump pinned OpenCode to v${new}" \
+            --body "$(cat <<EOF
+          Automated bump of \`.github/opencode-version.txt\` from \`${old}\` to \`${new}\`.
+
+          Upstream release notes: https://github.com/anomalyco/opencode/releases/tag/v${new}
+
+          ### What this changes
+
+          All three E2E harnesses now install OpenCode v${new}:
+
+          - \`tests/docker/Dockerfile.linux-x64\` (Linux Docker E2E)
+          - \`tests/macos-e2e/run.sh\` (macOS native E2E)
+          - \`tests/windows-e2e/run.ps1\` (Windows native E2E)
+
+          ### Merge gate
+
+          The Tests workflow on this PR exercises the new version against the
+          full E2E matrix. If any platform regresses, **do not merge** — file
+          an upstream issue or hold the bump until upstream fixes the
+          regression. Pin will stay at \`${old}\` until this PR is merged.
+
+          ${PAT_PRESENT:+_Tests runs automatically because this PR was opened with a PAT._}
+          ${PAT_PRESENT:-_PR opened with default \`GITHUB_TOKEN\`. Tests does not auto-run on \`pull_request\` here; the bump workflow dispatched Tests via \`workflow_dispatch\` against this branch instead — see the Actions tab. Set \`BUMP_OPENCODE_PAT\` secret for PR-driven Tests checks._}
+          EOF
+          )"
+
+      # When we don't have a PAT, the `pull_request` event from the bump PR
+      # won't trigger Tests. Dispatch it explicitly so the bumped pin still
+      # gets exercised end-to-end. Skipped when a PAT is configured because
+      # the PR-event trigger covers it.
+      - name: Dispatch Tests on bump branch (GITHUB_TOKEN fallback)
+        if: steps.compare.outputs.drift == 'true' && steps.pr.outputs.needs_dispatch == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch="${{ steps.pr.outputs.branch }}"
+          if [ -z "$branch" ]; then
+            echo "::warning::No bump branch recorded; skipping Tests dispatch."
+            exit 0
+          fi
+          # `workflow_dispatch` is the documented exception that lets
+          # GITHUB_TOKEN trigger another workflow run. The dispatched run
+          # appears in the Actions tab tagged to this branch but is NOT
+          # attached as a PR check. That's fine — the cron+human review
+          # is the merge gate, not branch protection.
+          gh workflow run tests.yml --ref "$branch" \
+            -f ref="$branch" \
+          || echo "::warning::Tests dispatch failed; trigger manually if needed."

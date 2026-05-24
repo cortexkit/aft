@@ -1,0 +1,6 @@
+STATUS  TITLE                                      WORKFLOW      BRANCH          EVENT       ID           ELAPSED  AGE
+X       feat: compression metrics spike            CI            feature/spike   pull_request 9887321801   6m12s    2m
+✓       chore: update lockfile                     CI            main            push        9887315520   4m33s    22m
+✓       release v0.26.4                            Release       main            workflow    9887023101   9m01s    3h
+X       test: flaky windows spawn fallback         CI            windows-fix     pull_request 9886900444   15m20s   5h
+✓       docs: v0.27 plan                           CI            main            push        9886120010   3m49s    1d

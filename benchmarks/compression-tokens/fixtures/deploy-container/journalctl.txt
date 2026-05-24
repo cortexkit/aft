@@ -1,0 +1,169 @@
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:04 aft-worker[2142]: debug span queue=background task_id=bg_0004 phase=compress chunk=4 elapsed_ms=84
+May 19 10:00:05 aft-worker[2142]: debug span queue=background task_id=bg_0005 phase=compress chunk=5 elapsed_ms=85
+May 19 10:00:06 aft-worker[2142]: debug span queue=background task_id=bg_0006 phase=compress chunk=6 elapsed_ms=86
+May 19 10:00:07 aft-worker[2142]: debug span queue=background task_id=bg_0007 phase=compress chunk=7 elapsed_ms=87
+May 19 10:00:08 aft-worker[2142]: debug span queue=background task_id=bg_0008 phase=compress chunk=8 elapsed_ms=88
+May 19 10:00:09 aft-worker[2142]: debug span queue=background task_id=bg_0009 phase=compress chunk=9 elapsed_ms=89
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:14 aft-worker[2142]: debug span queue=background task_id=bg_000e phase=compress chunk=14 elapsed_ms=94
+May 19 10:00:15 aft-worker[2142]: debug span queue=background task_id=bg_000f phase=compress chunk=15 elapsed_ms=95
+May 19 10:00:16 aft-worker[2142]: debug span queue=background task_id=bg_0010 phase=compress chunk=16 elapsed_ms=96
+May 19 10:00:17 aft-worker[2142]: debug span queue=background task_id=bg_0011 phase=compress chunk=17 elapsed_ms=97
+May 19 10:00:18 aft-worker[2142]: debug span queue=background task_id=bg_0012 phase=compress chunk=18 elapsed_ms=98
+May 19 10:00:19 aft-worker[2142]: debug span queue=background task_id=bg_0013 phase=compress chunk=19 elapsed_ms=99
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:24 aft-worker[2142]: debug span queue=background task_id=bg_0018 phase=compress chunk=24 elapsed_ms=104
+May 19 10:00:25 aft-worker[2142]: debug span queue=background task_id=bg_0019 phase=compress chunk=25 elapsed_ms=105
+May 19 10:00:26 aft-worker[2142]: debug span queue=background task_id=bg_001a phase=compress chunk=26 elapsed_ms=106
+May 19 10:00:27 aft-worker[2142]: debug span queue=background task_id=bg_001b phase=compress chunk=27 elapsed_ms=107
+May 19 10:00:28 aft-worker[2142]: debug span queue=background task_id=bg_001c phase=compress chunk=28 elapsed_ms=108
+May 19 10:00:29 aft-worker[2142]: debug span queue=background task_id=bg_001d phase=compress chunk=29 elapsed_ms=109
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:34 aft-worker[2142]: debug span queue=background task_id=bg_0022 phase=compress chunk=34 elapsed_ms=114
+May 19 10:00:35 aft-worker[2142]: debug span queue=background task_id=bg_0023 phase=compress chunk=35 elapsed_ms=115
+May 19 10:00:36 aft-worker[2142]: debug span queue=background task_id=bg_0024 phase=compress chunk=36 elapsed_ms=116
+May 19 10:00:37 aft-worker[2142]: debug span queue=background task_id=bg_0025 phase=compress chunk=37 elapsed_ms=117
+May 19 10:00:38 aft-worker[2142]: debug span queue=background task_id=bg_0026 phase=compress chunk=38 elapsed_ms=118
+May 19 10:00:39 aft-worker[2142]: debug span queue=background task_id=bg_0027 phase=compress chunk=39 elapsed_ms=119
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:44 aft-worker[2142]: debug span queue=background task_id=bg_002c phase=compress chunk=44 elapsed_ms=124
+May 19 10:00:45 aft-worker[2142]: debug span queue=background task_id=bg_002d phase=compress chunk=45 elapsed_ms=125
+May 19 10:00:46 aft-worker[2142]: debug span queue=background task_id=bg_002e phase=compress chunk=46 elapsed_ms=126
+May 19 10:00:47 aft-worker[2142]: debug span queue=background task_id=bg_002f phase=compress chunk=47 elapsed_ms=127
+May 19 10:00:48 aft-worker[2142]: debug span queue=background task_id=bg_0030 phase=compress chunk=48 elapsed_ms=128
+May 19 10:00:49 aft-worker[2142]: debug span queue=background task_id=bg_0031 phase=compress chunk=49 elapsed_ms=129
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:54 aft-worker[2142]: debug span queue=background task_id=bg_0036 phase=compress chunk=54 elapsed_ms=134
+May 19 10:00:55 aft-worker[2142]: debug span queue=background task_id=bg_0037 phase=compress chunk=55 elapsed_ms=135
+May 19 10:00:56 aft-worker[2142]: debug span queue=background task_id=bg_0038 phase=compress chunk=56 elapsed_ms=136
+May 19 10:00:57 aft-worker[2142]: debug span queue=background task_id=bg_0039 phase=compress chunk=57 elapsed_ms=137
+May 19 10:00:58 aft-worker[2142]: debug span queue=background task_id=bg_003a phase=compress chunk=58 elapsed_ms=138
+May 19 10:00:59 aft-worker[2142]: debug span queue=background task_id=bg_003b phase=compress chunk=59 elapsed_ms=139
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:01:04 aft-worker[2142]: debug span queue=background task_id=bg_0040 phase=compress chunk=64 elapsed_ms=144
+May 19 10:01:05 aft-worker[2142]: debug span queue=background task_id=bg_0041 phase=compress chunk=65 elapsed_ms=145
+May 19 10:01:06 aft-worker[2142]: debug span queue=background task_id=bg_0042 phase=compress chunk=66 elapsed_ms=146
+May 19 10:01:07 aft-worker[2142]: debug span queue=background task_id=bg_0043 phase=compress chunk=67 elapsed_ms=147
+May 19 10:01:08 aft-worker[2142]: debug span queue=background task_id=bg_0044 phase=compress chunk=68 elapsed_ms=148
+May 19 10:01:09 aft-worker[2142]: debug span queue=background task_id=bg_0045 phase=compress chunk=69 elapsed_ms=149
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:01:14 aft-worker[2142]: debug span queue=background task_id=bg_004a phase=compress chunk=74 elapsed_ms=154
+May 19 10:01:15 aft-worker[2142]: debug span queue=background task_id=bg_004b phase=compress chunk=75 elapsed_ms=155
+May 19 10:01:16 aft-worker[2142]: debug span queue=background task_id=bg_004c phase=compress chunk=76 elapsed_ms=156
+May 19 10:01:17 aft-worker[2142]: debug span queue=background task_id=bg_004d phase=compress chunk=77 elapsed_ms=157
+May 19 10:01:18 aft-worker[2142]: debug span queue=background task_id=bg_004e phase=compress chunk=78 elapsed_ms=158
+May 19 10:01:19 aft-worker[2142]: debug span queue=background task_id=bg_004f phase=compress chunk=79 elapsed_ms=159
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:01:24 aft-worker[2142]: debug span queue=background task_id=bg_0054 phase=compress chunk=84 elapsed_ms=164
+May 19 10:01:25 aft-worker[2142]: debug span queue=background task_id=bg_0055 phase=compress chunk=85 elapsed_ms=165
+May 19 10:01:26 aft-worker[2142]: debug span queue=background task_id=bg_0056 phase=compress chunk=86 elapsed_ms=166
+May 19 10:01:27 aft-worker[2142]: debug span queue=background task_id=bg_0057 phase=compress chunk=87 elapsed_ms=167
+May 19 10:01:28 aft-worker[2142]: debug span queue=background task_id=bg_0058 phase=compress chunk=88 elapsed_ms=168
+May 19 10:01:29 aft-worker[2142]: debug span queue=background task_id=bg_0059 phase=compress chunk=89 elapsed_ms=169
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:01:34 aft-worker[2142]: debug span queue=background task_id=bg_005e phase=compress chunk=94 elapsed_ms=174
+May 19 10:01:35 aft-worker[2142]: debug span queue=background task_id=bg_005f phase=compress chunk=95 elapsed_ms=175
+May 19 10:01:36 aft-worker[2142]: debug span queue=background task_id=bg_0060 phase=compress chunk=96 elapsed_ms=176
+May 19 10:01:37 aft-worker[2142]: debug span queue=background task_id=bg_0061 phase=compress chunk=97 elapsed_ms=177
+May 19 10:01:38 aft-worker[2142]: debug span queue=background task_id=bg_0062 phase=compress chunk=98 elapsed_ms=178
+May 19 10:01:39 aft-worker[2142]: debug span queue=background task_id=bg_0063 phase=compress chunk=99 elapsed_ms=179
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:01:44 aft-worker[2142]: debug span queue=background task_id=bg_0068 phase=compress chunk=104 elapsed_ms=184
+May 19 10:01:45 aft-worker[2142]: debug span queue=background task_id=bg_0069 phase=compress chunk=105 elapsed_ms=185
+May 19 10:01:46 aft-worker[2142]: debug span queue=background task_id=bg_006a phase=compress chunk=106 elapsed_ms=186
+May 19 10:01:47 aft-worker[2142]: debug span queue=background task_id=bg_006b phase=compress chunk=107 elapsed_ms=187
+May 19 10:01:48 aft-worker[2142]: debug span queue=background task_id=bg_006c phase=compress chunk=108 elapsed_ms=188
+May 19 10:01:49 aft-worker[2142]: debug span queue=background task_id=bg_006d phase=compress chunk=109 elapsed_ms=189
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:01:54 aft-worker[2142]: debug span queue=background task_id=bg_0072 phase=compress chunk=114 elapsed_ms=194
+May 19 10:01:55 aft-worker[2142]: debug span queue=background task_id=bg_0073 phase=compress chunk=115 elapsed_ms=195
+May 19 10:01:56 aft-worker[2142]: debug span queue=background task_id=bg_0074 phase=compress chunk=116 elapsed_ms=196
+May 19 10:01:57 aft-worker[2142]: debug span queue=background task_id=bg_0075 phase=compress chunk=117 elapsed_ms=197
+May 19 10:01:58 aft-worker[2142]: debug span queue=background task_id=bg_0076 phase=compress chunk=118 elapsed_ms=198
+May 19 10:01:59 aft-worker[2142]: debug span queue=background task_id=bg_0077 phase=compress chunk=119 elapsed_ms=199
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:02:04 aft-worker[2142]: debug span queue=background task_id=bg_007c phase=compress chunk=124 elapsed_ms=204
+May 19 10:02:05 aft-worker[2142]: debug span queue=background task_id=bg_007d phase=compress chunk=125 elapsed_ms=205
+May 19 10:02:06 aft-worker[2142]: debug span queue=background task_id=bg_007e phase=compress chunk=126 elapsed_ms=206
+May 19 10:02:07 aft-worker[2142]: debug span queue=background task_id=bg_007f phase=compress chunk=127 elapsed_ms=207
+May 19 10:02:08 aft-worker[2142]: debug span queue=background task_id=bg_0080 phase=compress chunk=128 elapsed_ms=208
+May 19 10:02:09 aft-worker[2142]: debug span queue=background task_id=bg_0081 phase=compress chunk=129 elapsed_ms=209
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:02:14 aft-worker[2142]: debug span queue=background task_id=bg_0086 phase=compress chunk=134 elapsed_ms=214
+May 19 10:02:15 aft-worker[2142]: debug span queue=background task_id=bg_0087 phase=compress chunk=135 elapsed_ms=215
+May 19 10:02:16 aft-worker[2142]: debug span queue=background task_id=bg_0088 phase=compress chunk=136 elapsed_ms=216
+May 19 10:02:17 aft-worker[2142]: debug span queue=background task_id=bg_0089 phase=compress chunk=137 elapsed_ms=217
+May 19 10:02:18 aft-worker[2142]: debug span queue=background task_id=bg_008a phase=compress chunk=138 elapsed_ms=218
+May 19 10:02:19 aft-worker[2142]: debug span queue=background task_id=bg_008b phase=compress chunk=139 elapsed_ms=219
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:02:24 aft-worker[2142]: debug span queue=background task_id=bg_0090 phase=compress chunk=144 elapsed_ms=224
+May 19 10:02:25 aft-worker[2142]: debug span queue=background task_id=bg_0091 phase=compress chunk=145 elapsed_ms=225
+May 19 10:02:26 aft-worker[2142]: debug span queue=background task_id=bg_0092 phase=compress chunk=146 elapsed_ms=226
+May 19 10:02:27 aft-worker[2142]: debug span queue=background task_id=bg_0093 phase=compress chunk=147 elapsed_ms=227
+May 19 10:02:28 aft-worker[2142]: debug span queue=background task_id=bg_0094 phase=compress chunk=148 elapsed_ms=228
+May 19 10:02:29 aft-worker[2142]: debug span queue=background task_id=bg_0095 phase=compress chunk=149 elapsed_ms=229
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:02:34 aft-worker[2142]: debug span queue=background task_id=bg_009a phase=compress chunk=154 elapsed_ms=234
+May 19 10:02:35 aft-worker[2142]: debug span queue=background task_id=bg_009b phase=compress chunk=155 elapsed_ms=235
+May 19 10:02:36 aft-worker[2142]: debug span queue=background task_id=bg_009c phase=compress chunk=156 elapsed_ms=236
+May 19 10:02:37 aft-worker[2142]: debug span queue=background task_id=bg_009d phase=compress chunk=157 elapsed_ms=237
+May 19 10:02:38 aft-worker[2142]: debug span queue=background task_id=bg_009e phase=compress chunk=158 elapsed_ms=238
+May 19 10:02:39 aft-worker[2142]: debug span queue=background task_id=bg_009f phase=compress chunk=159 elapsed_ms=239
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:00:02 aft-worker[2142]: processing bash completion stream bytes=184223 compressed=false
+May 19 10:02:44 aft-worker[2142]: debug span queue=background task_id=bg_00a4 phase=compress chunk=164 elapsed_ms=244
+May 19 10:02:45 aft-worker[2142]: debug span queue=background task_id=bg_00a5 phase=compress chunk=165 elapsed_ms=245
+May 19 10:02:46 aft-worker[2142]: debug span queue=background task_id=bg_00a6 phase=compress chunk=166 elapsed_ms=246
+May 19 10:02:47 aft-worker[2142]: debug span queue=background task_id=bg_00a7 phase=compress chunk=167 elapsed_ms=247
+May 19 10:02:48 aft-worker[2142]: debug span queue=background task_id=bg_00a8 phase=compress chunk=168 elapsed_ms=248
+May 19 10:02:49 aft-worker[2142]: debug span queue=background task_id=bg_00a9 phase=compress chunk=169 elapsed_ms=249

@@ -1,0 +1,14 @@
+[filter]
+matches = ["kubectl"]
+description = "Compact kubectl output; cap wide tables."
+
+[truncate]
+line_max = 300
+
+[cap]
+max_lines = 80
+keep = "tail"
+
+[shortcircuit]
+when = '\A\s*\z'
+replacement = "kubectl: no resources found"

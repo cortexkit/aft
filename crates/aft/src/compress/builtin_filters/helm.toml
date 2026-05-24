@@ -1,0 +1,11 @@
+[filter]
+matches = ["helm"]
+description = "Compact Helm output; cap long status or template output."
+
+[cap]
+max_lines = 150
+keep = "tail"
+
+[shortcircuit]
+when = '\A\s*\z'
+replacement = "helm: ok"

@@ -1,0 +1,19 @@
+[filter]
+matches = ["psql"]
+description = "Compact psql output; remove ASCII table borders and summarize empty results."
+
+[strip]
+patterns = [
+  '^\+-[-+]+\+$'
+]
+
+[truncate]
+line_max = 240
+
+[cap]
+max_lines = 200
+keep = "middle"
+
+[shortcircuit]
+when = '\A\(0 rows\)\z'
+replacement = "psql: (0 rows)"

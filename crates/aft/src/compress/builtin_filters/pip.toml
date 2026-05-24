@@ -1,0 +1,22 @@
+[filter]
+matches = ["pip", "pip3"]
+description = "Compact pip install output; preserve summaries, warnings, and errors."
+
+[strip]
+patterns = [
+  '^Looking in indexes: .*$' ,
+  '^Collecting\s+\S+.*$',
+  '^\s+Downloading\s+.*$',
+  '^\s*\[[= >.-]+\]\s+\S+/\S+.*$',
+]
+
+[truncate]
+line_max = 240
+
+[cap]
+max_lines = 100
+keep = "tail"
+
+[shortcircuit]
+when = '\ARequirement already satisfied: .*?(\nRequirement already satisfied: .*?)*\z'
+replacement = "pip: already satisfied"

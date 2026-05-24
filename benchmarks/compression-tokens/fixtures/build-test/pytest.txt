@@ -1,0 +1,30 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.12.4, pytest-8.3.3, pluggy-1.5.0
+rootdir: /Users/ufukaltinok/Work/OSS/example-service
+configfile: pyproject.toml
+plugins: anyio-4.6.0, asyncio-0.24.0, cov-5.0.0
+collected 146 items
+
+tests/test_api.py ......................                                  [ 15%]
+tests/test_auth.py .............F....                                     [ 27%]
+tests/test_cache.py ........................                              [ 43%]
+tests/test_cli.py .......................                                 [ 58%]
+tests/test_storage.py ...............................                     [ 79%]
+tests/test_workers.py ..............................                      [100%]
+
+=================================== FAILURES ===================================
+_______________________ test_refresh_token_rejects_reuse _______________________
+
+client = <httpx.AsyncClient object at 0x10b93e590>
+
+    async def test_refresh_token_rejects_reuse(client):
+        first = await client.post('/auth/refresh', json={'token': TOKEN})
+        second = await client.post('/auth/refresh', json={'token': TOKEN})
+>       assert second.status_code == 401
+E       assert 200 == 401
+E        +  where 200 = <Response [200 OK]>.status_code
+
+tests/test_auth.py:87: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_auth.py::test_refresh_token_rejects_reuse - assert 200 == 401
+======================== 1 failed, 145 passed in 9.41s =========================

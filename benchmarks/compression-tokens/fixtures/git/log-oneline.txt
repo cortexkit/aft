@@ -1,0 +1,10 @@
+e4e8f7e (HEAD -> feature/compress-metrics, origin/main) chore(release): v0.26.4
+9c4aa18 feat(compress): add builtin filters for kubectl and gh
+651bb01 fix(bash): preserve completion frames for background tasks
+37f9a72 test(compress): cover tsc pretty output
+0b51408 feat(compress): add biome compressor
+b11c850 docs: update v0.27 sqlite storage plan
+8a871dd refactor(config): normalize storage dir lookup
+4a1d7b8 feat(lsp): add pull diagnostics fallback
+f70c533 fix(imports): handle type-only namespace imports
+2c55219 perf(search): cap embedding batch memory

@@ -1,0 +1,602 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+jobs:
+  # All unit-level coverage (Linux, macOS, Windows cargo, Windows bash e2e).
+  # Defined as a reusable workflow so tests.yml shares the exact same
+  # workload. Release mode (strict=true) makes EVERY job blocking — including
+  # the Windows jobs that are non-blocking at PR time. If a Windows-only
+  # regression slipped past PR-time CI, this gate catches it before publish.
+  unit:
+    name: Unit
+    uses: ./.github/workflows/_unit-suite.yml
+    with:
+      strict: true
+
+  # Run the full E2E matrix (Linux Docker + Pi RPC + Windows native +
+  # macOS native) at release time. Reuses the same workflow tests.yml runs
+  # at PR time — single source of truth, so PR-time and release-time e2e
+  # can never drift. Build/publish jobs below `needs:` this job, so an e2e
+  # regression blocks the release.
+  e2e:
+    name: E2E
+    needs: unit
+    uses: ./.github/workflows/_e2e-suite.yml
+
+  publish-crates:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: [unit, e2e]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Sync Cargo.toml version to match the tag. Without this, `cargo publish`
+      # tries to publish whatever version is in HEAD's Cargo.toml — which is
+      # last-released-version on tag pushes (the tag does NOT carry a separate
+      # version commit; release.sh commits the version bump locally, but if
+      # someone retags HEAD without running release.sh, Cargo.toml stays
+      # stale). Mirrors the same step in publish-npm-platforms.
+      - name: Sync versions from tag
+        run: node scripts/version-sync.mjs --from-tag
+
+      - name: Publish to crates.io
+        # Allow re-runs of the same tag: treat "already exists" as success
+        # ONLY if the version we're publishing matches the tag. Otherwise the
+        # fallback silently masks the version-mismatch bug (we try to publish
+        # vN, it already exists, we say success even though we wanted vN+1).
+        #
+        # `agent-file-tools` depends on `aft-tokenizer` by path; cargo refuses
+        # to publish a crate whose path-only dep has no `version =`. Both
+        # crates therefore declare versions (synced by version-sync.mjs) and
+        # we publish `aft-tokenizer` first so `agent-file-tools` can resolve
+        # the published version on crates.io. The `--no-verify` flag on the
+        # tokenizer publish skips the build step (saves ~30s for a leaf crate
+        # with no consumers in workspace until `agent-file-tools` resolves it
+        # from crates.io after publish settles).
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(grep '^version' crates/aft/Cargo.toml | head -1 | sed -E 's/version = "([^"]+)"/\1/')
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME wants $TAG_VERSION but Cargo.toml has $CARGO_VERSION after version-sync. version-sync.mjs broken?"
+            exit 1
+          fi
+          # CRITICAL: use `true` (not `exit 0`) in the success branch of the
+          # || fallback. `exit 0` in `||` terminates the WHOLE script, so the
+          # second `cargo publish` is skipped silently when the first crate
+          # is already published — which is exactly the retag-recovery case
+          # this fallback exists for. (Repro: v0.28.1 retag — aft-tokenizer
+          # already existed, agent-file-tools never published.)
+          cargo publish --package aft-tokenizer \
+            || { ec=$?; cargo publish --package aft-tokenizer --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
+          # Wait briefly for the new tokenizer version to become visible on
+          # crates.io's sparse index before publishing `agent-file-tools` —
+          # otherwise the verify step in the second publish can race against
+          # index propagation and fail with "no matching package found".
+          sleep 30
+          cargo publish --package agent-file-tools \
+            || { ec=$?; cargo publish --package agent-file-tools --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  build-darwin-arm64:
+    name: Build macOS ARM64
+    runs-on: macos-latest
+    needs: [unit, e2e]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      # Safety net: if someone retags HEAD without running release.sh,
+      # Cargo.toml.version stays stale. Bake the tag's version into the
+      # binary before cargo build so `aft --version` matches what the
+      # plugin expects.
+      - name: Sync versions from tag
+        run: node scripts/version-sync.mjs --from-tag
+
+      - name: Build
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Strip binary
+        run: strip target/aarch64-apple-darwin/release/aft
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darwin-arm64
+          path: target/aarch64-apple-darwin/release/aft
+          if-no-files-found: error
+
+  build-darwin-x64:
+    name: Build macOS x64
+    runs-on: macos-latest
+    needs: [unit, e2e]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Sync versions from tag
+        run: node scripts/version-sync.mjs --from-tag
+
+      - name: Build
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Strip binary
+        run: strip target/x86_64-apple-darwin/release/aft
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darwin-x64
+          path: target/x86_64-apple-darwin/release/aft
+          if-no-files-found: error
+
+  build-linux-arm64:
+    name: Build Linux ARM64
+    runs-on: ubuntu-latest
+    needs: [unit, e2e]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Sync versions from tag
+        run: node scripts/version-sync.mjs --from-tag
+
+      - name: Install cross
+        run: cargo install cross --version 0.2.5 --locked
+
+      # Use gnu target (not musl) so dlopen works for ONNX Runtime loading.
+      # musl produces static binaries where dlopen is a stub that always fails.
+      - name: Build
+        run: cross build --release --target aarch64-unknown-linux-gnu
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: target/aarch64-unknown-linux-gnu/release/aft
+          if-no-files-found: error
+
+  build-linux-x64:
+    name: Build Linux x64
+    # Build on Ubuntu 22.04 to link against GLIBC 2.35 — compatible with
+    # Ubuntu 22.04 LTS (supported until 2027), Pop!OS 22.04, Debian 12+,
+    # and any distro with GLIBC >= 2.35. Using ubuntu-latest (24.04) would
+    # require GLIBC 2.39 and break older LTS users.
+    runs-on: ubuntu-22.04
+    needs: [unit, e2e]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Sync versions from tag
+        run: node scripts/version-sync.mjs --from-tag
+
+      # Native x64 build on Ubuntu runner — no cross-compilation needed.
+      # Uses gnu target (not musl) so dlopen works for ONNX Runtime loading.
+      - name: Build
+        run: cargo build --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: target/release/aft
+          if-no-files-found: error
+
+  build-win32-x64:
+    name: Build Windows x64
+    runs-on: windows-latest
+    needs: [unit, e2e]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Sync versions from tag
+        run: node scripts/version-sync.mjs --from-tag
+        shell: pwsh
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win32-x64
+          path: target/x86_64-pc-windows-msvc/release/aft.exe
+          if-no-files-found: error
+
+  build-win32-arm64:
+    name: Build Windows ARM64
+    # v0.28: native ARM64 binary. Host is windows-latest (x64) which
+    # cross-compiles to aarch64-pc-windows-msvc via the MSVC ARM64 cross
+    # toolchain bundled in the Visual Studio Build Tools on the runner.
+    runs-on: windows-latest
+    needs: [unit, e2e]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+
+      - name: Sync versions from tag
+        run: node scripts/version-sync.mjs --from-tag
+        shell: pwsh
+
+      - name: Build
+        run: cargo build --release --target aarch64-pc-windows-msvc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win32-arm64
+          path: target/aarch64-pc-windows-msvc/release/aft.exe
+          if-no-files-found: error
+
+  # npm publish runs AFTER github-release so that checksums.sha256 is already
+  # available on the GitHub release page when ensureBinary() runs during
+  # @cortexkit/aft-opencode@latest install.
+  publish-npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    needs:
+      - build-darwin-arm64
+      - build-darwin-x64
+      - build-linux-arm64
+      - build-linux-x64
+      - build-win32-arm64
+      - build-win32-x64
+      - github-release
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Ensure latest npm (for trusted publishing)
+        run: npm install -g npm@latest
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Download darwin-arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: darwin-arm64
+          path: packages/npm/darwin-arm64/bin
+
+      - name: Download darwin-x64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: darwin-x64
+          path: packages/npm/darwin-x64/bin
+
+      - name: Download linux-arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-arm64
+          path: packages/npm/linux-arm64/bin
+
+      - name: Download linux-x64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-x64
+          path: packages/npm/linux-x64/bin
+
+      - name: Download win32-x64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: win32-x64
+          path: packages/npm/win32-x64/bin
+
+      - name: Download win32-arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: win32-arm64
+          path: packages/npm/win32-arm64/bin
+
+      - name: Set binary permissions
+        run: |
+          chmod +x packages/npm/darwin-arm64/bin/aft
+          chmod +x packages/npm/darwin-x64/bin/aft
+          chmod +x packages/npm/linux-arm64/bin/aft
+          chmod +x packages/npm/linux-x64/bin/aft
+
+      - name: Sync versions from tag
+        run: node scripts/version-sync.mjs --from-tag
+
+      - name: Validate packages
+        run: node scripts/validate-packages.mjs
+
+      - name: Install bridge dependencies
+        run: bun install
+        working-directory: packages/aft-bridge
+
+      - name: Build aft-bridge
+        run: bun run build
+        working-directory: packages/aft-bridge
+
+      - name: Install plugin dependencies
+        run: bun install
+        working-directory: packages/opencode-plugin
+
+      - name: Build OpenCode plugin
+        run: bun run build
+        working-directory: packages/opencode-plugin
+
+      - name: Install Pi plugin dependencies
+        run: bun install
+        working-directory: packages/pi-plugin
+
+      - name: Build Pi plugin
+        run: bun run build
+        working-directory: packages/pi-plugin
+
+      - name: Install CLI dependencies
+        run: bun install
+        working-directory: packages/aft-cli
+
+      - name: Build CLI
+        run: bun run build
+        working-directory: packages/aft-cli
+
+      # Uses npm Trusted Publishing (OIDC) — configured per-package on npmjs.com
+      - name: Publish platform packages
+        run: |
+          set -euo pipefail
+
+          publish_or_skip() {
+            local pkg_dir="$1"
+            local pkg_name
+            local version
+            pkg_name=$(node -p "require('./${pkg_dir}/package.json').name")
+            version=$(node -p "require('./${pkg_dir}/package.json').version")
+
+            if npm view "${pkg_name}@${version}" version >/dev/null 2>&1; then
+              echo "::notice::${pkg_name}@${version} already published; skipping"
+              return 0
+            fi
+
+            npm publish --access public --provenance "$pkg_dir"
+          }
+
+          for pkg in darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-arm64 win32-x64; do
+            publish_or_skip "packages/npm/$pkg"
+          done
+
+      # aft-bridge MUST publish before the plugins, because @cortexkit/aft-opencode
+      # and @cortexkit/aft-pi depend on it. Plugins publish from local builds, so
+      # there's no install-time race here, but consumers installing @latest will
+      # need aft-bridge resolvable on npm.
+      #
+      # Tolerate `already published` so a re-run of the same tag (or the
+      # initial bootstrap publish that claims the package name with a
+      # token before Trusted Publishing is configured) doesn't fail the
+      # whole release. Mirrors the crates.io publish step above.
+      - name: Publish @cortexkit/aft-bridge
+        run: |
+          set -euo pipefail
+          PKG_NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "${PKG_NAME}@${VERSION}" version >/dev/null 2>&1; then
+            echo "::notice::${PKG_NAME}@${VERSION} already published; skipping"
+            exit 0
+          fi
+          npm publish --access public --provenance
+        working-directory: packages/aft-bridge
+
+      - name: Publish @cortexkit/aft-opencode
+        run: |
+          set -euo pipefail
+          PKG_NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "${PKG_NAME}@${VERSION}" version >/dev/null 2>&1; then
+            echo "::notice::${PKG_NAME}@${VERSION} already published; skipping"
+            exit 0
+          fi
+          npm publish --access public --provenance
+        working-directory: packages/opencode-plugin
+
+      - name: Publish @cortexkit/aft-pi
+        run: |
+          set -euo pipefail
+          PKG_NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "${PKG_NAME}@${VERSION}" version >/dev/null 2>&1; then
+            echo "::notice::${PKG_NAME}@${VERSION} already published; skipping"
+            exit 0
+          fi
+          npm publish --access public --provenance
+        working-directory: packages/pi-plugin
+
+      - name: Publish @cortexkit/aft (unified CLI)
+        run: |
+          set -euo pipefail
+          PKG_NAME=$(node -p "require('./package.json').name")
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "${PKG_NAME}@${VERSION}" version >/dev/null 2>&1; then
+            echo "::notice::${PKG_NAME}@${VERSION} already published; skipping"
+            exit 0
+          fi
+          npm publish --access public --provenance
+        working-directory: packages/aft-cli
+
+  # GitHub release must complete before npm publish so that checksums.sha256
+  # is available when freshly-installed @cortexkit/aft-opencode@latest triggers
+  # ensureBinary().  crates.io publish is also gated so that a failed crate
+  # publish blocks the release — no point shipping binaries if the Rust crate
+  # isn't available yet.
+  github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - build-darwin-arm64
+      - build-darwin-x64
+      - build-linux-arm64
+      - build-linux-x64
+      - build-win32-arm64
+      - build-win32-x64
+      - publish-crates
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          cp artifacts/darwin-arm64/aft release-assets/aft-darwin-arm64
+          cp artifacts/darwin-x64/aft release-assets/aft-darwin-x64
+          cp artifacts/linux-arm64/aft release-assets/aft-linux-arm64
+          cp artifacts/linux-x64/aft release-assets/aft-linux-x64
+          cp artifacts/win32-arm64/aft.exe release-assets/aft-win32-arm64.exe
+          cp artifacts/win32-x64/aft.exe release-assets/aft-win32-x64.exe
+          chmod +x release-assets/aft-*
+
+      - name: Generate checksums
+        run: |
+          cd release-assets
+          sha256sum aft-* > checksums.sha256
+          cat checksums.sha256
+
+      - name: Verify curated release notes exist
+        run: |
+          notes_file=".alfonso/release-notes/${GITHUB_REF_NAME}.md"
+          if [ ! -f "$notes_file" ]; then
+            echo "::error::Curated release notes missing: $notes_file"
+            echo "Draft them under .alfonso/release-notes/ before tagging the release."
+            exit 1
+          fi
+          echo "Using $notes_file as the release body."
+          wc -l "$notes_file"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: .alfonso/release-notes/${{ github.ref_name }}.md
+          files: release-assets/*
+
+  # Announce on Discord after the GitHub release is created.
+  #
+  # Why this lives here (not in discord-release.yml as `on: release: published`):
+  # GitHub Actions intentionally suppresses event-triggered workflow cascades
+  # from `GITHUB_TOKEN`-authored events. `softprops/action-gh-release@v2` uses
+  # the default `GITHUB_TOKEN`, so the `release: published` event it emits does
+  # not trigger downstream workflows. Inlining the Discord post here is the
+  # cleanest fix (vs rotating PATs for release creation).
+  #
+  # `continue-on-error: true` keeps Discord failures from rolling back a
+  # successful release — if the webhook is down, the announcement can be
+  # retried via `gh workflow run discord-release.yml ...`.
+  discord-announce:
+    name: Announce on Discord
+    runs-on: ubuntu-latest
+    # MUST wait for BOTH github-release AND publish-npm. Without `publish-npm`
+    # the announcement can fire while npm packages are still uploading,
+    # leaving users who click the release link unable to install the
+    # versions Discord just announced.
+    needs:
+      - github-release
+      - publish-npm
+    if: success()
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Read curated release notes
+        id: notes
+        run: |
+          notes_file=".alfonso/release-notes/${GITHUB_REF_NAME}.md"
+          if [ ! -f "$notes_file" ]; then
+            echo "::error::Curated release notes missing: $notes_file"
+            exit 1
+          fi
+          # Use a random delimiter to guard against any string in the notes
+          # accidentally matching the heredoc terminator. Also ensure the file
+          # ends with a newline so `cat`'s output doesn't glue onto the EOF
+          # marker (v0.26.3 release notes had no trailing newline, which
+          # produced "Matching delimiter not found" and skipped the Discord
+          # announcement entirely).
+          eof="EOF_$(openssl rand -hex 12)"
+          {
+            printf 'body<<%s\n' "$eof"
+            cat "$notes_file"
+            # Guarantee a newline before the closing delimiter, even if the
+            # file itself doesn't end with one.
+            printf '\n%s\n' "$eof"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post to Discord
+        uses: SethCohen/github-releases-to-discord@v1
+        with:
+          webhook_url: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
+          # Cortexkit teal — decimal value of #2C4A7C.
+          color: "2902140"
+          username: "AFT Releases"
+          # Reduce h1/h2 headings to fit Discord embed limits comfortably.
+          reduce_headings: true
+          # Keep PR/issue links — useful context in Discord.
+          remove_github_reference_links: false
+          footer_title: "Changelog"
+          footer_timestamp: true
+          release_name: ${{ github.ref_name }}
+          release_body: ${{ steps.notes.outputs.body }}
+          release_html_url: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}

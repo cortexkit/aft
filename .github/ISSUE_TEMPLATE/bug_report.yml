@@ -1,0 +1,60 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! To make debugging faster, please run:
+        ```
+        bunx @cortexkit/aft-opencode@latest doctor --issue
+        ```
+        and paste the generated report in the Diagnostics field below.
+
+  - type: input
+    id: title
+    attributes:
+      label: Short description
+      placeholder: "aft_search is not available even with experimental_semantic_search enabled"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the problem, what you expected, and what you observed.
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Paste the output of `bunx @cortexkit/aft-opencode@latest doctor --issue` here, or fill in the sections below manually.
+      render: markdown
+
+  - type: input
+    id: plugin_version
+    attributes:
+      label: Plugin version
+      placeholder: "0.11.0"
+
+  - type: input
+    id: binary_version
+    attributes:
+      label: AFT binary version
+      placeholder: "0.11.0"
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: "linux x64 / macOS arm64 / windows x64"
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log output (optional)
+      description: Contents of `/tmp/aft-plugin.log` (sanitized — remove your username/home path before pasting).
+      render: shell

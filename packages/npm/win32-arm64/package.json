@@ -1,0 +1,20 @@
+{
+  "name": "@cortexkit/aft-win32-arm64",
+  "version": "0.29.1",
+  "description": "AFT binary for Windows ARM64",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "preferUnplugged": true,
+  "bin": {
+    "aft": "bin/aft.exe"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cortexkit/aft"
+  }
+}

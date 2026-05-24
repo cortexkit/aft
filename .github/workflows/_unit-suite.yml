@@ -1,0 +1,245 @@
+name: Unit suite
+
+# Reusable workflow that runs all unit-level coverage (Linux, macOS, Windows
+# cargo, Windows bash e2e). Called by both tests.yml (PR / push-to-main) and
+# release.yml (tag push). Single source of truth — PR-time and release-time
+# unit jobs cannot drift.
+#
+# The `strict` input toggles whether currently-flaky Windows jobs gate the
+# caller:
+#   strict=false → PR mode. Windows cargo and Windows bash e2e are
+#     non-blocking (continue-on-error: true). Linux and macOS still block.
+#   strict=true  → release mode. ALL four jobs gate. A failure in any of
+#     them fails the called-workflow's overall status, blocking downstream
+#     `needs:` jobs in the caller (e2e, build-*, publish-*).
+#
+# The release pipeline runs in strict mode so we don't ship with known
+# regressions on any platform. Currently-flaky tests in the strict-only path
+# must be either fixed or explicitly excluded before release time, surfacing
+# real bugs rather than silently masking them.
+
+on:
+  workflow_call:
+    inputs:
+      strict:
+        description: "When true, all jobs gate the caller; when false, Windows jobs are continue-on-error"
+        type: boolean
+        default: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Rust + plugin unit tests on Linux (fast inner loop)
+  # ---------------------------------------------------------------------------
+  unit-linux:
+    name: Unit tests (Linux)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+
+      - name: Build aft-bridge dist (workspace consumers depend on it)
+        run: bun run --cwd packages/aft-bridge build
+
+      - name: Build pi-plugin dist (Pi RPC tests need it)
+        # tests/pi-rpc spawns real Pi processes that load
+        # packages/pi-plugin/dist/index.js. Build it before bun test recurses
+        # into that workspace.
+        run: bun run --cwd packages/pi-plugin build
+
+      - name: Cargo build (debug — needed by plugin e2e tests)
+        run: cargo build -p agent-file-tools
+
+      - name: Cargo test
+        run: cargo test --workspace
+
+      - name: Bun typecheck
+        run: bun run typecheck
+
+      - name: Bun lint
+        run: bun run lint
+
+      - name: Build all JS packages (release gate)
+        # Only at release time: every published JS package must build. At PR
+        # time, individual package builds run inside their own test scripts.
+        if: inputs.strict == true
+        run: bun run --filter '*' build
+
+      - name: Bun test (all packages)
+        run: bun run test
+        env:
+          # Tests don't need real cache locations — keep them out of the runner's
+          # ~/.cache to avoid cross-test pollution.
+          AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
+
+  # ---------------------------------------------------------------------------
+  # Rust + plugin tests on macOS
+  # Catches macOS-specific code paths: FSEvents watcher behavior (different
+  # coalescing latency from inotify), /var vs /private/var symlink
+  # canonicalization, broken-symlink-chain fallback, bash_background SIGTERM
+  # behavior, and Apple Silicon-specific Rust compilation. The build-darwin-*
+  # jobs in release.yml only run `cargo build` — this is the only place we
+  # actually execute tests on macOS in CI.
+  # ---------------------------------------------------------------------------
+  unit-macos:
+    name: Unit tests (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Intentionally NO Swatinem/rust-cache on macOS — rust-cache restore
+      # on macos-latest overwrites the just-installed ~/.cargo/bin/cargo
+      # shim with stale cached bytes, producing:
+      #   error: unexpected argument 'test' found
+      #   Usage: rustup-init[EXE] [OPTIONS]
+      # Observed in release runs 25839773442 and 25840332625. Cold cargo
+      # build is ~3min — acceptable.
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+
+      - name: Build aft-bridge dist (workspace consumers depend on it)
+        run: bun run --cwd packages/aft-bridge build
+
+      - name: Build pi-plugin dist (Pi RPC tests need it)
+        run: bun run --cwd packages/pi-plugin build
+
+      - name: Cargo build (debug — needed by plugin e2e tests)
+        run: cargo build -p agent-file-tools
+
+      - name: Cargo test
+        run: cargo test --workspace
+        env:
+          AFT_TEST_DIAG: "1"
+
+      - name: Bun typecheck
+        run: bun run typecheck
+
+      - name: Bun test (all packages)
+        run: bun run test
+        env:
+          AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
+
+  # ---------------------------------------------------------------------------
+  # Rust integration tests on Windows
+  # Catches platform-conditional code paths (#[cfg(target_os = "windows")])
+  # and Windows process/path/signal differences. Same suite as Linux but on a
+  # real Windows runner — does NOT spin up OpenCode, that's the e2e job.
+  #
+  # PR mode (strict=false): non-blocking. Many integration tests build NDJSON
+  # requests by hand-formatting paths via `r#"...{path.display()}..."#`,
+  # which produces invalid JSON on Windows because backslashes in
+  # `C:\Users\...` get parsed as escape sequences. Migrating ~150
+  # call sites to `serde_json::json!` is a separate cleanup; the
+  # production code path is platform-clean (538 lib tests pass on
+  # Windows runners, plus the Windows native E2E job covers the
+  # integration layer). Lib-only test scope below is the workaround.
+  #
+  # Release mode (strict=true): blocking. Forces us to keep the Windows
+  # lib-test surface green before shipping.
+  # ---------------------------------------------------------------------------
+  unit-windows-cargo:
+    name: Cargo test (Windows)
+    runs-on: windows-2022
+    timeout-minutes: 30
+    continue-on-error: ${{ inputs.strict != true }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cargo test (lib only — integration tests need JSON path-escape cleanup)
+        run: cargo test --workspace --lib
+        shell: pwsh
+
+  # ---------------------------------------------------------------------------
+  # Bash permission flow on Windows
+  # Scoped to bash.test.ts only: covers the runAsk + Effect runtime path on
+  # Windows for OS-parity peace of mind. The runAsk fix itself is platform-
+  # agnostic JavaScript semantics — Linux/macOS in the unit-linux and
+  # unit-macos jobs already cover that. Running the full plugin bun suite
+  # on Windows blocks on broader integration-harness JSON-path escape issues
+  # (see unit-windows-cargo comment), so we scope this to one test file.
+  #
+  # Why a real bun runner on Windows: this exercises the BinaryBridge
+  # spawning aft.exe over NDJSON via stdio on the Windows process model. It
+  # catches a class of bugs that Linux+macOS bun + Windows native E2E miss
+  # individually — Effect-runtime semantics under bun's Windows process
+  # spawn implementation.
+  #
+  # PR mode (strict=false): non-blocking.
+  # Release mode (strict=true): blocking.
+  # ---------------------------------------------------------------------------
+  unit-windows-bash:
+    name: Bash permission e2e (Windows)
+    runs-on: windows-2022
+    timeout-minutes: 20
+    continue-on-error: ${{ inputs.strict != true }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+        shell: pwsh
+
+      - name: Build aft-bridge dist (workspace consumers depend on it)
+        run: bun run --cwd packages/aft-bridge build
+
+      - name: Build pi-plugin dist (Pi RPC tests need it)
+        run: bun run --cwd packages/pi-plugin build
+        shell: pwsh
+
+      - name: Cargo build (debug — bash.test.ts spawns the real aft binary)
+        run: cargo build -p agent-file-tools
+        shell: pwsh
+
+      - name: Bun test (bash permission flow — full bridge + plugin + Rust)
+        run: bun test src/__tests__/e2e/bash.test.ts
+        working-directory: packages/opencode-plugin
+        shell: pwsh
+        env:
+          AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache

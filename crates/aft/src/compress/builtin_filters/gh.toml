@@ -1,0 +1,10 @@
+[filter]
+matches = ["gh"]
+description = "Compact GitHub CLI output; cap long lists."
+
+[truncate]
+line_max = 400
+
+[cap]
+max_lines = 80
+keep = "tail"

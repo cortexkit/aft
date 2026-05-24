@@ -1,0 +1,13 @@
+Enumerating objects: 18, done.
+Counting objects: 100% (18/18), done.
+Delta compression using up to 10 threads
+Compressing objects: 100% (12/12), done.
+Writing objects: 100% (12/12), 3.21 KiB | 3.21 MiB/s, done.
+Total 12 (delta 8), reused 0 (delta 0), pack-reused 0
+remote: Resolving deltas: 100% (8/8), completed with 5 local objects.
+remote: 
+remote: Create a pull request for 'feature/compress-metrics' on GitHub by visiting:
+remote:      https://github.com/cortexkit/aft/pull/new/feature/compress-metrics
+remote: 
+To github.com:cortexkit/aft.git
+ * [new branch]      feature/compress-metrics -> feature/compress-metrics

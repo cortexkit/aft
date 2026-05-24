@@ -1,0 +1,21 @@
+[filter]
+matches = ["uv"]
+description = "Compact uv output; strip progress decoration and summarize clean audits."
+
+[strip]
+patterns = [
+  '^[■▢▤].*$',
+  '^\s*[■▢▤].*$',
+  '^Downloading\s+.*$',
+]
+
+[truncate]
+line_max = 240
+
+[cap]
+max_lines = 100
+keep = "tail"
+
+[shortcircuit]
+when = '\AAudited (\d+) packages\z'
+replacement = "uv: audited packages"

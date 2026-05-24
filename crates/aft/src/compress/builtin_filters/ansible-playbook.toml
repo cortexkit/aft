@@ -1,0 +1,22 @@
+[filter]
+matches = ["ansible-playbook"]
+description = "Compact ansible-playbook output; strip successful task chatter."
+
+[strip]
+patterns = [
+  '^PLAY \[',
+  '^TASK \[',
+  '^META: ',
+  '^ok: ',
+  '^skipping: ',
+  '^changed: \[.*\] => \(item=',
+  '^changed: ',
+]
+
+[cap]
+max_lines = 100
+keep = "tail"
+
+[shortcircuit]
+when = '\A\s*\z'
+replacement = "ansible-playbook: ok"

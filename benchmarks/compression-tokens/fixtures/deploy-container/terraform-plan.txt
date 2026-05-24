@@ -1,0 +1,25 @@
+Terraform used the selected providers to generate the following execution plan. Resource actions are indicated with the following symbols:
+  + create
+  ~ update in-place
+  - destroy
+
+Terraform will perform the following actions:
+
+  # aws_cloudwatch_log_group.worker will be created
+  + resource "aws_cloudwatch_log_group" "worker" {
+      + arn               = (known after apply)
+      + id                = (known after apply)
+      + name              = "/ecs/aft-worker"
+      + retention_in_days = 14
+    }
+
+  # aws_ecs_service.api will be updated in-place
+  ~ resource "aws_ecs_service" "api" {
+      ~ desired_count = 2 -> 3
+        id            = "arn:aws:ecs:us-east-1:123456789012:service/aft/api"
+    }
+
+Plan: 1 to add, 1 to change, 0 to destroy.
+
+─────────────────────────────────────────────────────────────────────────────
+Note: You didn't use the -out option to save this plan, so Terraform can't guarantee to take exactly these actions if you run "terraform apply" now.

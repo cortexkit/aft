@@ -1,0 +1,10 @@
+Initializing the backend...
+Initializing provider plugins...
+Downloading registry.terraform.io/hashicorp/aws 5.0.0
+Provider registry.terraform.io/hashicorp/aws v5.0.0
+aws_instance.web: Refreshing state... [id=i-123]
+Refreshing state...
+
+No changes. Your infrastructure matches the configuration.
+
+Terraform has compared your real infrastructure against your configuration and found no differences, so no changes are needed.

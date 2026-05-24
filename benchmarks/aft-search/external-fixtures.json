@@ -1,0 +1,382 @@
+{
+  "attribution": "Task definitions vendored from Vera (https://github.com/microsoft/Vera) eval/tasks at the local checkout used for this benchmark. Metric formulas in metrics.py mirror Vera/eval/src/metrics.rs and are implemented independently for AFT.",
+  "source": "Vera/eval/tasks/*.json",
+  "task_count": 21,
+  "tasks": [
+    {
+      "id": "config-001",
+      "query": "Cargo.toml workspace configuration",
+      "category": "config",
+      "repo": "ripgrep",
+      "ground_truth": [
+        {
+          "file_path": "Cargo.toml",
+          "line_start": 1,
+          "line_end": 117,
+          "relevance": 1
+        }
+      ],
+      "description": "Find the workspace build configuration with member crates and dependencies"
+    },
+    {
+      "id": "config-002",
+      "query": "package.json dependencies and scripts",
+      "category": "config",
+      "repo": "fastify",
+      "ground_truth": [
+        {
+          "file_path": "package.json",
+          "line_start": 1,
+          "line_end": 195,
+          "relevance": 1
+        }
+      ],
+      "description": "Find the fastify package configuration with dependencies and scripts"
+    },
+    {
+      "id": "config-003",
+      "query": "turbo.json pipeline configuration",
+      "category": "config",
+      "repo": "turborepo",
+      "ground_truth": [
+        {
+          "file_path": "turbo.json",
+          "line_start": 1,
+          "line_end": 87,
+          "relevance": 1
+        }
+      ],
+      "description": "Find the root turbo.json with task pipeline definitions and build configuration"
+    },
+    {
+      "id": "config-004",
+      "query": "pyproject.toml build configuration",
+      "category": "config",
+      "repo": "flask",
+      "ground_truth": [
+        {
+          "file_path": "pyproject.toml",
+          "line_start": 1,
+          "line_end": 100,
+          "relevance": 1
+        }
+      ],
+      "description": "Find the Python package configuration with dependencies, entry points, and tool settings"
+    },
+    {
+      "id": "cross-file-001",
+      "query": "Sink trait and its implementations",
+      "category": "cross_file",
+      "repo": "ripgrep",
+      "ground_truth": [
+        {
+          "file_path": "crates/searcher/src/sink.rs",
+          "line_start": 102,
+          "line_end": 223,
+          "relevance": 2
+        },
+        {
+          "file_path": "crates/printer/src/standard.rs",
+          "line_start": 763,
+          "line_end": 870,
+          "relevance": 1
+        },
+        {
+          "file_path": "crates/printer/src/json.rs",
+          "line_start": 719,
+          "line_end": 839,
+          "relevance": 1
+        }
+      ],
+      "description": "Find the Sink trait definition and its implementations in Standard and JSON printers across crates"
+    },
+    {
+      "id": "cross-file-002",
+      "query": "Blueprint registration and route mounting",
+      "category": "cross_file",
+      "repo": "flask",
+      "ground_truth": [
+        {
+          "file_path": "src/flask/blueprints.py",
+          "line_start": 18,
+          "line_end": 128,
+          "relevance": 1
+        },
+        {
+          "file_path": "src/flask/sansio/app.py",
+          "line_start": 567,
+          "line_end": 593,
+          "relevance": 1
+        }
+      ],
+      "description": "Find blueprint class definition and where register_blueprint is called in the app"
+    },
+    {
+      "id": "cross-file-003",
+      "query": "TaskDefinition configuration across languages",
+      "category": "cross_file",
+      "repo": "turborepo",
+      "ground_truth": [
+        {
+          "file_path": "crates/turborepo-types/src/lib.rs",
+          "line_start": 750,
+          "line_end": 806,
+          "relevance": 2
+        },
+        {
+          "file_path": "packages/turbo-types/src/types/config-v2.ts",
+          "line_start": 266,
+          "line_end": 424,
+          "relevance": 1
+        }
+      ],
+      "description": "Find TaskDefinition in Rust and its equivalent Pipeline interface in TypeScript - same concept across languages"
+    },
+    {
+      "id": "disambig-001",
+      "query": "Config",
+      "category": "disambiguation",
+      "repo": "ripgrep",
+      "ground_truth": [
+        {
+          "file_path": "crates/searcher/src/searcher/mod.rs",
+          "line_start": 151,
+          "line_end": 186,
+          "relevance": 2
+        },
+        {
+          "file_path": "crates/printer/src/standard.rs",
+          "line_start": 36,
+          "line_end": 57,
+          "relevance": 1
+        },
+        {
+          "file_path": "crates/printer/src/json.rs",
+          "line_start": 25,
+          "line_end": 29,
+          "relevance": 1
+        },
+        {
+          "file_path": "crates/core/search.rs",
+          "line_start": 19,
+          "line_end": 25,
+          "relevance": 1
+        }
+      ],
+      "description": "Ambiguous query matching multiple Config types across crates (searcher, printers, core)"
+    },
+    {
+      "id": "disambig-002",
+      "query": "run",
+      "category": "disambiguation",
+      "repo": "flask",
+      "ground_truth": [
+        {
+          "file_path": "src/flask/app.py",
+          "line_start": 632,
+          "line_end": 754,
+          "relevance": 2
+        },
+        {
+          "file_path": "src/flask/cli.py",
+          "line_start": 935,
+          "line_end": 994,
+          "relevance": 1
+        }
+      ],
+      "description": "Ambiguous 'run' matching Flask.run() method and CLI run_command function"
+    },
+    {
+      "id": "disambig-003",
+      "query": "TaskDefinition",
+      "category": "disambiguation",
+      "repo": "turborepo",
+      "ground_truth": [
+        {
+          "file_path": "crates/turborepo-types/src/lib.rs",
+          "line_start": 750,
+          "line_end": 806,
+          "relevance": 2
+        },
+        {
+          "file_path": "packages/turbo-types/src/types/config-v2.ts",
+          "line_start": 266,
+          "line_end": 424,
+          "relevance": 1
+        }
+      ],
+      "description": "TaskDefinition exists as both a Rust struct and TypeScript Pipeline interface representing the same concept"
+    },
+    {
+      "id": "intent-001",
+      "query": "how are HTTP errors handled and returned to clients",
+      "category": "intent",
+      "repo": "flask",
+      "ground_truth": [
+        {
+          "file_path": "src/flask/app.py",
+          "line_start": 830,
+          "line_end": 948,
+          "relevance": 1
+        },
+        {
+          "file_path": "src/flask/helpers.py",
+          "line_start": 281,
+          "line_end": 302,
+          "relevance": 1
+        }
+      ],
+      "description": "Find error handling logic including handle_http_exception, handle_user_exception, handle_exception, and abort"
+    },
+    {
+      "id": "intent-002",
+      "query": "session management and cookie handling",
+      "category": "intent",
+      "repo": "flask",
+      "ground_truth": [
+        {
+          "file_path": "src/flask/sessions.py",
+          "line_start": 1,
+          "line_end": 385,
+          "relevance": 1
+        }
+      ],
+      "description": "Find session and cookie implementation including SecureCookieSession and SessionInterface"
+    },
+    {
+      "id": "intent-003",
+      "query": "request validation and schema enforcement",
+      "category": "intent",
+      "repo": "fastify",
+      "ground_truth": [
+        {
+          "file_path": "lib/validation.js",
+          "line_start": 1,
+          "line_end": 280,
+          "relevance": 1
+        }
+      ],
+      "description": "Find validation logic for request schemas without exact identifier names"
+    },
+    {
+      "id": "intent-004",
+      "query": "file type detection and filtering",
+      "category": "intent",
+      "repo": "ripgrep",
+      "ground_truth": [
+        {
+          "file_path": "crates/ignore/src/types.rs",
+          "line_start": 146,
+          "line_end": 310,
+          "relevance": 1
+        }
+      ],
+      "description": "Find the file type detection system including FileTypeDef, Types, and TypesBuilder"
+    },
+    {
+      "id": "intent-005",
+      "query": "template rendering pipeline",
+      "category": "intent",
+      "repo": "flask",
+      "ground_truth": [
+        {
+          "file_path": "src/flask/templating.py",
+          "line_start": 1,
+          "line_end": 212,
+          "relevance": 1
+        }
+      ],
+      "description": "Find the Jinja2 template rendering code including Environment, DispatchingJinjaLoader, and render_template"
+    },
+    {
+      "id": "symbol-lookup-001",
+      "query": "Standard struct definition",
+      "category": "symbol_lookup",
+      "repo": "ripgrep",
+      "ground_truth": [
+        {
+          "file_path": "crates/printer/src/standard.rs",
+          "line_start": 480,
+          "line_end": 484,
+          "relevance": 1
+        }
+      ],
+      "description": "Find the Standard<W> printer struct in ripgrep's standard printer module"
+    },
+    {
+      "id": "symbol-lookup-002",
+      "query": "Searcher struct definition",
+      "category": "symbol_lookup",
+      "repo": "ripgrep",
+      "ground_truth": [
+        {
+          "file_path": "crates/searcher/src/searcher/mod.rs",
+          "line_start": 597,
+          "line_end": 625,
+          "relevance": 1
+        }
+      ],
+      "description": "Find the Searcher struct that holds search configuration and buffers"
+    },
+    {
+      "id": "symbol-lookup-003",
+      "query": "Flask class definition",
+      "category": "symbol_lookup",
+      "repo": "flask",
+      "ground_truth": [
+        {
+          "file_path": "src/flask/app.py",
+          "line_start": 109,
+          "line_end": 200,
+          "relevance": 1
+        }
+      ],
+      "description": "Find the main Flask application class definition"
+    },
+    {
+      "id": "symbol-lookup-004",
+      "query": "Blueprint class definition",
+      "category": "symbol_lookup",
+      "repo": "flask",
+      "ground_truth": [
+        {
+          "file_path": "src/flask/blueprints.py",
+          "line_start": 18,
+          "line_end": 128,
+          "relevance": 1
+        }
+      ],
+      "description": "Find the Blueprint class in Flask's blueprints module"
+    },
+    {
+      "id": "symbol-lookup-005",
+      "query": "SearchWorker struct",
+      "category": "symbol_lookup",
+      "repo": "ripgrep",
+      "ground_truth": [
+        {
+          "file_path": "crates/core/search.rs",
+          "line_start": 230,
+          "line_end": 241,
+          "relevance": 1
+        }
+      ],
+      "description": "Find the SearchWorker struct that executes searches over haystacks"
+    },
+    {
+      "id": "symbol-lookup-006",
+      "query": "Run struct definition",
+      "category": "symbol_lookup",
+      "repo": "turborepo",
+      "ground_truth": [
+        {
+          "file_path": "crates/turborepo-lib/src/run/mod.rs",
+          "line_start": 76,
+          "line_end": 100,
+          "relevance": 1
+        }
+      ],
+      "description": "Find the Run struct, the main entry point for turbo run execution"
+    }
+  ]
+}

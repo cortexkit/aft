@@ -1,0 +1,85 @@
+name: Tests
+
+# PR-time gate: runs Rust + plugin unit tests, Linux Docker e2e, and Windows e2e
+# before merge. Tag pushes go through `release.yml` which independently runs the
+# build matrix and publishes — both workflows call the SAME reusable unit-suite
+# (`_unit-suite.yml`) and e2e-suite (`_e2e-suite.yml`) so PR-time and
+# release-time tests never drift.
+#
+# IMPORTANT: any change to bridge transport, bash spawning, ONNX install,
+# locking, or platform-conditional code paths SHOULD touch the matching
+# integration test or e2e scenario in `_e2e-suite.yml`. The Linux harness has
+# caught real regressions before; the Windows e2e is here to extend that
+# coverage to issue-#26-class Windows-specific bugs (bash timeouts, lock
+# recovery, path separators).
+
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "packages/**"
+      - "tests/**"
+      - "scripts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "package.json"
+      - "bun.lock"
+      - ".github/opencode-version.txt"
+      - ".github/workflows/tests.yml"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/_unit-suite.yml"
+      - ".github/workflows/_e2e-suite.yml"
+      - ".github/workflows/bump-opencode.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "crates/**"
+      - "packages/**"
+      - "tests/**"
+      - "scripts/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "package.json"
+      - "bun.lock"
+      - ".github/opencode-version.txt"
+      - ".github/workflows/tests.yml"
+      - ".github/workflows/release.yml"
+      - ".github/workflows/_unit-suite.yml"
+      - ".github/workflows/_e2e-suite.yml"
+      - ".github/workflows/bump-opencode.yml"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to test (branch name, tag, or commit SHA)"
+        required: false
+        type: string
+
+# Cancel in-flight runs for the same PR/branch when a new commit arrives.
+# Saves CI minutes and surfaces the latest result faster.
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # All unit-level coverage (Linux, macOS, Windows cargo, Windows bash e2e).
+  # Defined as a reusable workflow so release.yml shares the exact same
+  # workload. PR mode (strict=false): Windows jobs are non-blocking; Linux
+  # and macOS still block. See `_unit-suite.yml` for details.
+  # ---------------------------------------------------------------------------
+  unit:
+    name: Unit
+    uses: ./.github/workflows/_unit-suite.yml
+    with:
+      strict: false
+
+  # ---------------------------------------------------------------------------
+  # Linux Docker e2e + Pi RPC e2e + macOS native e2e + Windows native e2e.
+  # Reuses the same _e2e-suite.yml that release.yml calls. Gates on `unit`
+  # so e2e only runs when ALL blocking unit jobs (Linux + macOS) pass.
+  # ---------------------------------------------------------------------------
+  e2e:
+    name: E2E
+    needs: unit
+    uses: ./.github/workflows/_e2e-suite.yml

@@ -1,0 +1,124 @@
+FROM debian:bookworm-slim
+
+# Install system deps
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    ca-certificates \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 24 (for OpenCode + aimock)
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Bun
+RUN curl -fsSL https://bun.sh/install | bash
+ENV PATH="/root/.bun/bin:$PATH"
+
+# Install OpenCode at the version pinned by .github/opencode-version.txt.
+# The build context's pin file is COPY'd in and the value is passed via ARG
+# so all three E2E harnesses (Linux Docker, macOS native, Windows native)
+# share one source of truth. Bumps go through the auto-PR opened by
+# .github/workflows/bump-opencode.yml so a bad upstream release fails CI
+# on the PR before merge.
+ARG OPENCODE_VERSION
+COPY .github/opencode-version.txt /tmp/opencode-version.txt
+RUN OPENCODE_VERSION="${OPENCODE_VERSION:-$(tr -d '[:space:]' < /tmp/opencode-version.txt)}" && \
+    if [ -z "$OPENCODE_VERSION" ]; then echo "OPENCODE_VERSION must be set" >&2; exit 1; fi && \
+    echo "Installing OpenCode v${OPENCODE_VERSION}" && \
+    curl -fsSL https://opencode.ai/install | bash -s -- --version "$OPENCODE_VERSION" && \
+    rm /tmp/opencode-version.txt
+ENV PATH="/root/.opencode/bin:$PATH"
+
+# Install aimock globally
+# Pin aimock to a known-good version. 1.18.0 (published 2026-05-04) renamed
+# `mock.onTurn(...)` and broke our fixtures with `mock.onTurn is not a
+# function`. The Windows E2E harness pins the same version.
+RUN npm install -g @copilotkit/aimock@1.17.0
+
+# Git config for commits
+RUN git config --global user.email "test@test.com" && \
+    git config --global user.name "Test"
+
+# Create test project
+RUN mkdir -p /test/project && cd /test/project && git init && \
+    echo '{"name":"test","version":"1.0.0"}' > package.json && \
+    git add -A && git commit -m "init"
+
+# Create test source files
+COPY tests/docker/fixtures/sample-project/ /test/project/src/
+
+# Add test files to git
+RUN cd /test/project && git add -A && git commit -m "add source files"
+
+# Configure OpenCode
+RUN mkdir -p /root/.config/opencode
+
+# OpenCode global config — AFT plugin + aimock provider
+RUN echo '{ \
+  "$schema": "https://opencode.ai/config.json", \
+  "plugin": ["@cortexkit/aft-opencode@latest"], \
+  "provider": { \
+    "mock": { \
+      "api": "openai", \
+      "name": "aimock", \
+      "options": { "baseURL": "http://127.0.0.1:4010/v1" }, \
+      "models": { \
+        "mock-model": { \
+          "name": "Mock Model" \
+        } \
+      } \
+    } \
+  } \
+}' > /root/.config/opencode/opencode.json
+
+# AFT config — all experimental features ON (to trigger ONNX path)
+RUN echo '{ \
+  "experimental_search_index": true, \
+  "experimental_semantic_search": true \
+}' > /root/.config/opencode/aft.jsonc
+
+# TUI config
+RUN echo '{ \
+  "$schema": "https://opencode.ai/tui.json", \
+  "plugin": ["@cortexkit/aft-opencode@latest"] \
+}' > /root/.config/opencode/tui.json
+
+# Pre-install the AFT plugin + platform binary
+RUN mkdir -p /root/.cache/opencode/packages && \
+    cd /root/.cache/opencode/packages && \
+    npm install @cortexkit/aft-opencode@latest @cortexkit/aft-linux-x64@latest 2>/dev/null || true
+
+# Inject locally-built AFT binary (overrides npm binary for testing local changes)
+# Build this binary first: docker build -t aft-build-linux -f tests/docker/Dockerfile.build-linux .
+# Then extract: docker cp $(docker create aft-build-linux true):/build/target/release/aft /tmp/aft-linux-x64
+COPY tests/docker/fixtures/aft-linux-x64 /tmp/aft-local-binary
+RUN AFT_VER=$(cat /root/.cache/opencode/packages/node_modules/@cortexkit/aft-opencode/package.json 2>/dev/null | grep '"version"' | head -1 | sed 's/.*"version": *"//;s/".*//' || echo "0.11.2") && \
+    mkdir -p /root/.cache/aft/bin/v${AFT_VER} && \
+    cp /tmp/aft-local-binary /root/.cache/aft/bin/v${AFT_VER}/aft && \
+    chmod +x /root/.cache/aft/bin/v${AFT_VER}/aft && \
+    rm /tmp/aft-local-binary
+
+# Inject locally-built plugin dist (overrides npm plugin for testing local changes)
+# This ensures TypeScript-side fixes (like onnx-runtime.ts) are tested too
+COPY packages/opencode-plugin/dist/ /tmp/aft-plugin-dist/
+RUN PLUGIN_DIR=$(find /root/.cache/opencode/packages -path '*/node_modules/@cortexkit/aft-opencode/dist' -type d 2>/dev/null | head -1) && \
+    if [ -n "$PLUGIN_DIR" ]; then \
+      cp -r /tmp/aft-plugin-dist/* "$PLUGIN_DIR/"; \
+    fi && \
+    rm -rf /tmp/aft-plugin-dist
+
+# Set NODE_PATH so aimock global install is accessible via require()
+ENV NODE_PATH="/usr/lib/node_modules"
+
+# Copy test scripts and fixtures
+COPY tests/docker/test-e2e.sh /test/test-e2e.sh
+COPY tests/docker/mock-server.js /test/mock-server.js
+COPY tests/docker/fixtures/aimock/ /test/fixtures/
+RUN chmod +x /test/test-e2e.sh
+
+WORKDIR /test/project
+
+ENTRYPOINT ["/test/test-e2e.sh"]

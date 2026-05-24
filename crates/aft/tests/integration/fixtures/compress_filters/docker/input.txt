@@ -1,0 +1,16 @@
+#1 [internal] load build definition from Dockerfile
+#1 DONE 0.1s
+#2 [internal] load metadata for docker.io/library/alpine:latest
+#2 CACHED
+Step 1/4 : FROM alpine
+ ---> 123456abcdef
+Step 2/4 : RUN echo hi
+ ---> Running in abcdef
+Removing intermediate container abcdef
+#3 exporting to image
+#3 exporting layers
+#3 writing image sha256:abcdef1234567890
+#3 naming to docker.io/library/app:latest
+Successfully built abcdef123456
+Successfully tagged app:latest
+WARNING: image contains vulnerabilities

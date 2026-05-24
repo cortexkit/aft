@@ -1,0 +1,225 @@
+#1 [builder 2/12] RUN bun install --frozen-lockfile
+#1 CACHED
+#1 DONE 0.1s
+#2 [builder 3/12] RUN bun install --frozen-lockfile
+#2 CACHED
+#2 DONE 0.2s
+#3 [builder 4/12] RUN bun install --frozen-lockfile
+#3 CACHED
+#3 DONE 0.3s
+#4 [builder 5/12] RUN bun install --frozen-lockfile
+#4 CACHED
+#4 DONE 0.4s
+#5 [builder 6/12] RUN bun install --frozen-lockfile
+#5 CACHED
+#5 DONE 0.5s
+#6 [builder 7/12] RUN bun install --frozen-lockfile
+#6 CACHED
+#6 DONE 0.6s
+#7 [builder 8/12] RUN bun install --frozen-lockfile
+#7 CACHED
+#7 DONE 0.7s
+#8 [builder 9/12] RUN bun install --frozen-lockfile
+#8 CACHED
+#8 DONE 0.8s
+#9 [builder 10/12] RUN bun install --frozen-lockfile
+#9 CACHED
+#9 DONE 0.0s
+#10 [builder 11/12] RUN bun install --frozen-lockfile
+#10 CACHED
+#10 DONE 0.1s
+#11 [builder 12/12] RUN bun install --frozen-lockfile
+#11 CACHED
+#11 DONE 0.2s
+#12 [builder 1/12] RUN bun install --frozen-lockfile
+#12 CACHED
+#12 DONE 0.3s
+#13 [builder 2/12] RUN bun install --frozen-lockfile
+#13 CACHED
+#13 DONE 0.4s
+#14 [builder 3/12] RUN bun install --frozen-lockfile
+#14 CACHED
+#14 DONE 0.5s
+#15 [builder 4/12] RUN bun install --frozen-lockfile
+#15 CACHED
+#15 DONE 0.6s
+#16 [builder 5/12] RUN bun install --frozen-lockfile
+#16 CACHED
+#16 DONE 0.7s
+#17 [builder 6/12] RUN bun install --frozen-lockfile
+#17 CACHED
+#17 DONE 0.8s
+#18 [builder 7/12] RUN bun install --frozen-lockfile
+#18 CACHED
+#18 DONE 0.0s
+#19 [builder 8/12] RUN bun install --frozen-lockfile
+#19 CACHED
+#19 DONE 0.1s
+#20 [builder 9/12] RUN bun install --frozen-lockfile
+#20 CACHED
+#20 DONE 0.2s
+#21 [builder 10/12] RUN bun install --frozen-lockfile
+#21 CACHED
+#21 DONE 0.3s
+#22 [builder 11/12] RUN bun install --frozen-lockfile
+#22 CACHED
+#22 DONE 0.4s
+#23 [builder 12/12] RUN bun install --frozen-lockfile
+#23 CACHED
+#23 DONE 0.5s
+#24 [builder 1/12] RUN bun install --frozen-lockfile
+#24 CACHED
+#24 DONE 0.6s
+#25 [builder 2/12] RUN bun install --frozen-lockfile
+#25 CACHED
+#25 DONE 0.7s
+#26 [builder 3/12] RUN bun install --frozen-lockfile
+#26 CACHED
+#26 DONE 0.8s
+#27 [builder 4/12] RUN bun install --frozen-lockfile
+#27 CACHED
+#27 DONE 0.0s
+#28 [builder 5/12] RUN bun install --frozen-lockfile
+#28 CACHED
+#28 DONE 0.1s
+#29 [builder 6/12] RUN bun install --frozen-lockfile
+#29 CACHED
+#29 DONE 0.2s
+#30 [builder 7/12] RUN bun install --frozen-lockfile
+#30 CACHED
+#30 DONE 0.3s
+#31 [builder 8/12] RUN bun install --frozen-lockfile
+#31 CACHED
+#31 DONE 0.4s
+#32 [builder 9/12] RUN bun install --frozen-lockfile
+#32 CACHED
+#32 DONE 0.5s
+#33 [builder 10/12] RUN bun install --frozen-lockfile
+#33 CACHED
+#33 DONE 0.6s
+#34 [builder 11/12] RUN bun install --frozen-lockfile
+#34 CACHED
+#34 DONE 0.7s
+#35 [builder 12/12] RUN bun install --frozen-lockfile
+#35 CACHED
+#35 DONE 0.8s
+#36 [builder 1/12] RUN bun install --frozen-lockfile
+#36 CACHED
+#36 DONE 0.0s
+#37 [builder 2/12] RUN bun install --frozen-lockfile
+#37 CACHED
+#37 DONE 0.1s
+#38 [builder 3/12] RUN bun install --frozen-lockfile
+#38 CACHED
+#38 DONE 0.2s
+#39 [builder 4/12] RUN bun install --frozen-lockfile
+#39 CACHED
+#39 DONE 0.3s
+#40 [builder 5/12] RUN bun install --frozen-lockfile
+#40 CACHED
+#40 DONE 0.4s
+#41 [builder 6/12] RUN bun install --frozen-lockfile
+#41 CACHED
+#41 DONE 0.5s
+#42 [builder 7/12] RUN bun install --frozen-lockfile
+#42 CACHED
+#42 DONE 0.6s
+#43 [builder 8/12] RUN bun install --frozen-lockfile
+#43 CACHED
+#43 DONE 0.7s
+#44 [builder 9/12] RUN bun install --frozen-lockfile
+#44 CACHED
+#44 DONE 0.8s
+#45 [builder 10/12] RUN bun install --frozen-lockfile
+#45 CACHED
+#45 DONE 0.0s
+#46 [builder 11/12] RUN bun install --frozen-lockfile
+#46 CACHED
+#46 DONE 0.1s
+#47 [builder 12/12] RUN bun install --frozen-lockfile
+#47 CACHED
+#47 DONE 0.2s
+#48 [builder 1/12] RUN bun install --frozen-lockfile
+#48 CACHED
+#48 DONE 0.3s
+#49 [builder 2/12] RUN bun install --frozen-lockfile
+#49 CACHED
+#49 DONE 0.4s
+#50 [builder 3/12] RUN bun install --frozen-lockfile
+#50 CACHED
+#50 DONE 0.5s
+#51 [builder 4/12] RUN bun install --frozen-lockfile
+#51 CACHED
+#51 DONE 0.6s
+#52 [builder 5/12] RUN bun install --frozen-lockfile
+#52 CACHED
+#52 DONE 0.7s
+#53 [builder 6/12] RUN bun install --frozen-lockfile
+#53 CACHED
+#53 DONE 0.8s
+#54 [builder 7/12] RUN bun install --frozen-lockfile
+#54 CACHED
+#54 DONE 0.0s
+#55 [builder 8/12] RUN bun install --frozen-lockfile
+#55 CACHED
+#55 DONE 0.1s
+#56 [builder 9/12] RUN bun install --frozen-lockfile
+#56 CACHED
+#56 DONE 0.2s
+#57 [builder 10/12] RUN bun install --frozen-lockfile
+#57 CACHED
+#57 DONE 0.3s
+#58 [builder 11/12] RUN bun install --frozen-lockfile
+#58 CACHED
+#58 DONE 0.4s
+#59 [builder 12/12] RUN bun install --frozen-lockfile
+#59 CACHED
+#59 DONE 0.5s
+#60 [builder 1/12] RUN bun install --frozen-lockfile
+#60 CACHED
+#60 DONE 0.6s
+#61 [builder 2/12] RUN bun install --frozen-lockfile
+#61 CACHED
+#61 DONE 0.7s
+#62 [builder 3/12] RUN bun install --frozen-lockfile
+#62 CACHED
+#62 DONE 0.8s
+#63 [builder 4/12] RUN bun install --frozen-lockfile
+#63 CACHED
+#63 DONE 0.0s
+#64 [builder 5/12] RUN bun install --frozen-lockfile
+#64 CACHED
+#64 DONE 0.1s
+#65 [builder 6/12] RUN bun install --frozen-lockfile
+#65 CACHED
+#65 DONE 0.2s
+#66 [builder 7/12] RUN bun install --frozen-lockfile
+#66 CACHED
+#66 DONE 0.3s
+#67 [builder 8/12] RUN bun install --frozen-lockfile
+#67 CACHED
+#67 DONE 0.4s
+#68 [builder 9/12] RUN bun install --frozen-lockfile
+#68 CACHED
+#68 DONE 0.5s
+#69 [builder 10/12] RUN bun install --frozen-lockfile
+#69 CACHED
+#69 DONE 0.6s
+#70 [builder 11/12] RUN bun install --frozen-lockfile
+#70 CACHED
+#70 DONE 0.7s
+#71 [builder 12/12] RUN bun install --frozen-lockfile
+#71 CACHED
+#71 DONE 0.8s
+#72 [builder 1/12] RUN bun install --frozen-lockfile
+#72 CACHED
+#72 DONE 0.0s
+#73 [builder 2/12] RUN bun install --frozen-lockfile
+#73 CACHED
+#73 DONE 0.1s
+#74 [builder 3/12] RUN bun install --frozen-lockfile
+#74 CACHED
+#74 DONE 0.2s
+CONTAINER ID   IMAGE                           COMMAND                  CREATED          STATUS                    PORTS                    NAMES
+7c0e5247f0e9   postgres:16-alpine              "docker-entrypoint.s…"   2 hours ago      Up 2 hours (healthy)      0.0.0.0:5432->5432/tcp   aft-postgres-1
+0fbc584f915a   ghcr.io/cortexkit/worker:edge   "/usr/local/bin/work…"   31 minutes ago   Restarting (1) 10s ago                            aft-worker-1

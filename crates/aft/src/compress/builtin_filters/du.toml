@@ -1,0 +1,10 @@
+[filter]
+matches = ["du"]
+description = "Compact disk-usage listings."
+
+[truncate]
+line_max = 250
+
+[cap]
+max_lines = 60
+keep = "tail"

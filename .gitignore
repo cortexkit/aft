@@ -1,0 +1,83 @@
+
+# ── GSD baseline (auto-generated) ──
+.gsd/activity/
+.gsd/runtime/
+.gsd/worktrees/
+.gsd/auto.lock
+.gsd/metrics.json
+.gsd/completed-units.json
+.gsd/STATE.md
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+.env
+.env.*
+!.env.example
+node_modules/
+.next/
+dist/
+build/
+__pycache__/
+*.pyc
+.venv/
+venv/
+target/
+vendor/
+*.log
+coverage/
+.cache/
+tmp/
+
+
+# Added by cargo
+
+/target
+.sisyphus/
+local-ignore/
+
+# Nested lockfiles (root bun.lock is the source of truth)
+packages/opencode-plugin/package-lock.json
+ts-bench/
+
+# Benchmark configs (may contain API keys)
+benchmarks/configs/
+# OpenCode plugin install dir + per-session artifacts.
+# Track only the two config files we ship in the repo.
+.opencode/*
+!.opencode/aft.jsonc
+!.opencode/magic-context.jsonc
+codedb.snapshot
+benchmarks/search-bench-results.json
+
+# Docker E2E test artifacts (cross-compiled binary, not committed)
+tests/docker/fixtures/aft-linux-x64
+
+# E2E test fixture binary (locally-built aft, not committed)
+packages/pi-plugin/src/__tests__/e2e/fixtures/aft-bin
+packages/opencode-plugin/src/__tests__/e2e/fixtures/aft-bin
+
+# Platform-package binary payloads. CI builds and ships aft/aft.exe through
+# release.yml; the local bin/ may also hold a manually-staged binary when
+# bootstrapping a brand-new @cortexkit/aft-<platform> package (the first
+# publish can't go through Trusted Publishing because the package doesn't
+# exist on the registry yet). Binaries don't belong in git, but the empty
+# bin/.gitkeep files are tracked so the directory layout stays explicit.
+packages/npm/*/bin/aft
+packages/npm/*/bin/aft.exe
+# Ignore everything in .alfonso/ EXCEPT release-notes/ (CI reads from there).
+# Must use `.alfonso/*` rather than `.alfonso/` so git descends into the
+# directory and can re-include nested paths.
+.alfonso/*
+!.alfonso/release-notes/
+
+# Local smoke-test fixtures used during dogfooding investigations.
+# Findings get distilled into proper e2e tests under
+# packages/*/src/__tests__/e2e/; the throwaway smoke files don't ship.
+smoke-tests/
+.aft-windows-vm
+benchmarks/aft-search/.bench/

@@ -1,0 +1,21 @@
+{
+  "model": "mock-model",
+  "messages": [{ "role": "user", "content": "*" }],
+  "response": {
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [
+        {
+          "id": "call_outline_1",
+          "type": "function",
+          "function": {
+            "name": "aft_outline",
+            "arguments": "{\"directory\":\"src\"}"
+          }
+        }
+      ]
+    },
+    "finish_reason": "tool_calls"
+  }
+}

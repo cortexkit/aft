@@ -1,0 +1,18 @@
+Scope: all 7 workspace projects
+Lockfile is up to date, resolution step is skipped
+Packages: +821
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Progress: resolved 821, reused 814, downloaded 0, added 0
+Progress: resolved 821, reused 814, downloaded 0, added 138
+Progress: resolved 821, reused 814, downloaded 0, added 821, done
+
+dependencies:
++ @modelcontextprotocol/sdk 1.18.1
++ ai-tokenizer 1.0.6
++ zod 4.1.12
+
+devDependencies:
++ @biomejs/biome 2.4.7
++ typescript 5.8.3
+
+Done in 4.8s using pnpm v9.15.9

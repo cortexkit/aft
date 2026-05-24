@@ -1,0 +1,206 @@
+name: E2E Suite
+
+# Reusable workflow that runs the full E2E test matrix:
+#   - Linux Docker e2e   — OpenCode + plugin + binary stack against aimock
+#   - macOS native e2e   — same stack on a real macOS-arm64 runner
+#   - Windows native e2e — same stack on a real Windows runner (no containers)
+#
+# Called from:
+#   - tests.yml (PR + main push) — catches regressions at PR time
+#   - release.yml (tag push)     — gates build/publish on e2e success
+#
+# Single source of truth so PR-time and release-time e2e never drift.
+#
+# IMPORTANT: any change to bridge transport, bash spawning, ONNX install,
+# locking, or platform-conditional code paths SHOULD touch the matching
+# integration test or e2e scenario here. The Linux harness has caught real
+# regressions before; the Windows e2e covers issue-#26-class Windows-specific
+# bugs (bash timeouts, lock recovery, path separators); the macOS e2e covers
+# FSEvents watcher behavior, /var vs /private/var symlink canonicalization,
+# .dylib loading paths for ONNX, and Apple Silicon native codegen for aft.
+
+on:
+  workflow_call:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux Docker e2e — exercises the full OpenCode + plugin + binary stack
+  # against a deterministic aimock LLM.
+  # ---------------------------------------------------------------------------
+  e2e-linux:
+    name: E2E (Linux Docker)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # The E2E Dockerfile copies `packages/opencode-plugin/dist/` into the
+      # image, so we have to produce that on the runner first. The plugin
+      # depends on aft-bridge being built (workspace dependency).
+      - name: Install workspace deps + build plugin
+        run: |
+          bun install --frozen-lockfile
+          bun run --cwd packages/aft-bridge build
+          bun run --cwd packages/opencode-plugin build
+
+      - name: Build Linux x64 binary in Docker
+        run: |
+          docker build --platform linux/amd64 \
+            -t aft-build-linux \
+            -f tests/docker/Dockerfile.build-linux .
+
+      - name: Extract built binary
+        run: |
+          CID=$(docker create --platform linux/amd64 aft-build-linux true)
+          docker cp "$CID:/build/target/release/aft" tests/docker/fixtures/aft-linux-x64
+          docker rm "$CID"
+
+      - name: Build E2E test image
+        run: |
+          docker build --platform linux/amd64 \
+            -t aft-e2e-linux-x64 \
+            -f tests/docker/Dockerfile.linux-x64 .
+
+      - name: Run E2E test
+        run: docker run --rm --platform linux/amd64 aft-e2e-linux-x64
+
+  # ---------------------------------------------------------------------------
+  # Pi RPC e2e — exercises the real Pi runtime + AFT Pi plugin via RPC against
+  # aimock. Runs on Linux only for now; failures are blocking.
+  # ---------------------------------------------------------------------------
+  pi-rpc-e2e:
+    name: E2E (Pi RPC)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install workspace deps
+        run: bun install --frozen-lockfile
+
+      - name: Build AFT binary (Linux native)
+        run: cargo build --release -p agent-file-tools
+
+      - name: Build aft-bridge dist
+        run: bun run --cwd packages/aft-bridge build
+
+      - name: Build Pi plugin dist
+        run: bun run --cwd packages/pi-plugin build
+
+      - name: Run Pi RPC E2E suite
+        run: bun test
+        working-directory: tests/pi-rpc
+
+  # ---------------------------------------------------------------------------
+  # Windows native e2e — exercises the same OpenCode + plugin + binary stack
+  # on a real Windows runner. No containers. This is the only job that catches
+  # Windows-specific bugs at the integration level (bash spawning + timeout
+  # behavior — issue #26, ONNX install via tar.exe, file URI handling, lock
+  # recovery). Windows containers require a Windows Docker host and add no
+  # value over running natively on `windows-2022`.
+  # ---------------------------------------------------------------------------
+  e2e-windows:
+    name: E2E (Windows native)
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build AFT binary (Windows x64)
+        run: cargo build --release --target x86_64-pc-windows-msvc -p agent-file-tools
+        shell: pwsh
+
+      - name: Install workspace deps + build aft-bridge
+        run: |
+          bun install --frozen-lockfile
+          bun run --cwd packages/aft-bridge build
+        shell: pwsh
+
+      - name: Build OpenCode plugin dist
+        run: bun run --cwd packages/opencode-plugin build
+        shell: pwsh
+
+      - name: Run Windows E2E suite
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File tests/windows-e2e/run.ps1
+        shell: pwsh
+        env:
+          AFT_BINARY_PATH: ${{ github.workspace }}\target\x86_64-pc-windows-msvc\release\aft.exe
+          AFT_PLUGIN_DIST: ${{ github.workspace }}\packages\opencode-plugin\dist
+
+  # ---------------------------------------------------------------------------
+  # macOS native e2e — exercises the same OpenCode + plugin + binary stack on
+  # a real macOS-arm64 runner. No containers (GH Actions macOS runners can't
+  # run Docker reliably). Uses the same shared bash harness as Linux Docker
+  # via tests/macos-e2e/run.sh, which sets up host deps natively and then
+  # invokes tests/docker/test-e2e.sh with AFT_E2E_PLATFORM=macos.
+  #
+  # Catches: FSEvents watcher behavior, /var vs /private/var canonicalization,
+  # broken-symlink-chain fallback, .dylib loading, and Apple Silicon codegen.
+  # ---------------------------------------------------------------------------
+  e2e-macos:
+    name: E2E (macOS native)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Intentionally NO Swatinem/rust-cache on macOS.
+      # rust-cache restore on macos-latest overwrites the just-installed
+      # ~/.cargo/bin/cargo shim with stale cached bytes — the shim then
+      # misreads its own argv as if it were `rustup-init`:
+      #   error: unexpected argument 'build' found
+      #   Usage: rustup-init[EXE] [OPTIONS]
+      # Cold cargo build on macos-latest is ~3min — acceptable cost for
+      # release reliability. See release.yml test-macos for the same fix.
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build AFT binary (macOS native)
+        run: cargo build --release -p agent-file-tools
+
+      - name: Install workspace deps + build aft-bridge
+        run: |
+          bun install --frozen-lockfile
+          bun run --cwd packages/aft-bridge build
+
+      - name: Build OpenCode plugin dist
+        run: bun run --cwd packages/opencode-plugin build
+
+      - name: Run macOS E2E suite
+        run: bash tests/macos-e2e/run.sh
+        env:
+          AFT_BINARY_PATH: ${{ github.workspace }}/target/release/aft
+          AFT_PLUGIN_DIST: ${{ github.workspace }}/packages/opencode-plugin/dist

@@ -1,0 +1,66 @@
+# Manual Discord re-announce workflow.
+#
+# The primary path is `release.yml`'s `discord-announce` job which posts
+# to Discord automatically after `Create GitHub Release` completes — see
+# the comment block in release.yml for why we can't use the natural
+# `on: release: published` trigger (GitHub Actions suppresses workflow
+# cascades from GITHUB_TOKEN-authored events).
+#
+# This workflow is kept as a manual override for cases like:
+#   - Re-firing an announcement after a webhook outage
+#   - Posting about an external/manual release
+#   - Testing webhook formatting without cutting a release
+#
+# Fire via:
+#   gh workflow run discord-release.yml \
+#     -f release_name="v0.X.Y" \
+#     -f release_body="$(gh release view v0.X.Y --json body --jq .body)" \
+#     -f release_html_url="$(gh release view v0.X.Y --json url --jq .url)"
+#
+# Discord webhook URL lives as a repository secret:
+#   Settings → Secrets and variables → Actions → DISCORD_RELEASE_WEBHOOK_URL
+
+name: Discord Release Announcement (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_name:
+        description: Release title (e.g. v0.26.1)
+        required: true
+      release_body:
+        description: Release body markdown
+        required: true
+      release_html_url:
+        description: Release URL
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  announce:
+    name: Post to Discord
+    runs-on: ubuntu-latest
+    # Don't block the release pipeline on Discord delivery — if the webhook
+    # is down or misconfigured, the npm/crates/GitHub artifacts are already
+    # published and the announcement can be retried via workflow_dispatch.
+    continue-on-error: true
+    steps:
+      - name: GitHub Releases to Discord
+        uses: SethCohen/github-releases-to-discord@v1
+        with:
+          webhook_url: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
+          # Cortexkit teal — matches the brand. Decimal value of #2C4A7C.
+          color: "2902140"
+          username: "AFT Releases"
+          # Reduce h1/h2 headings to fit Discord embed limits comfortably.
+          reduce_headings: true
+          # Keep PR/issue links — they're useful context in Discord.
+          remove_github_reference_links: false
+          footer_title: "Changelog"
+          footer_timestamp: true
+          # Manual-trigger inputs (no-op when fired by release event).
+          release_name: ${{ inputs.release_name }}
+          release_body: ${{ inputs.release_body }}
+          release_html_url: ${{ inputs.release_html_url }}

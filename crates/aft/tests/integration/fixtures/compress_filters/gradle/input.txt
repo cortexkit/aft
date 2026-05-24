@@ -1,0 +1,19 @@
+Welcome to Gradle 8.7!
+Downloading https://services.gradle.org/distributions/gradle-8.7-bin.zip
+Download https://repo.maven.apache.org/maven2/com/acme/lib.pom
+Starting a Gradle Daemon, 1 incompatible Daemon could not be reused
+Daemon process will be stopped at the end of the build
+Picked up _JAVA_OPTIONS: -Xmx2g
+> Configure root project :
+> Configure project :app
+> Task :app:compileJava
+Note: /app/src/Main.java uses unchecked or unsafe operations.
+> Task :app:test FAILED
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':app:test'.
+> There were failing tests.
+
+BUILD FAILED in 12s

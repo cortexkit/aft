@@ -1,0 +1,10 @@
+{
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench": "bun run spike.ts"
+  },
+  "dependencies": {
+    "ai-tokenizer": "^1.0.6"
+  }
+}

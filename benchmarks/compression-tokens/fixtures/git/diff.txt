@@ -1,0 +1,22 @@
+diff --git a/crates/aft/src/compress/mod.rs b/crates/aft/src/compress/mod.rs
+index e2a94b1..8cbe201 100644
+--- a/crates/aft/src/compress/mod.rs
++++ b/crates/aft/src/compress/mod.rs
+@@ -84,6 +84,17 @@ pub fn compress_with_registry(command: &str, output: &str, registry: &FilterRegi
+     compress_with_registry(command, &output, &guard)
+ }
++
++#[cfg(test)]
++pub fn compress_for_spike(command: &str, output: &str) -> String {
++    let registry = toml_filter::build_registry(builtin_filters::ALL, None, None);
++    compress_with_registry(command, output, &registry)
++}
++
+ /// Thread-safe dispatch that does not need `AppContext`. Caller is responsible
+ /// for the `experimental_bash_compress` gate (the registry has no opinion).
+@@ -99,7 +110,7 @@ pub fn compress_with_registry(command: &str, output: &str, registry: &FilterRegi
+-    let compressors: [&dyn Compressor; 9] = [
++    let compressors: [&dyn Compressor; 10] = [
+         &GitCompressor,
+         &CargoCompressor,
+         &TscCompressor,

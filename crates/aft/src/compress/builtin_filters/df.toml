@@ -1,0 +1,10 @@
+[filter]
+matches = ["df"]
+description = "Compact disk-free tables."
+
+[truncate]
+line_max = 200
+
+[cap]
+max_lines = 50
+keep = "tail"

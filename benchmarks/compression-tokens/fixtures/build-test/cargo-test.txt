@@ -1,0 +1,30 @@
+   Compiling agent-file-tools v0.26.4 (/Users/ufukaltinok/Work/OSS/opencode-aft/crates/aft)
+warning: function `normalize_command` is never used
+   --> crates/aft/src/compress/git.rs:218:4
+    |
+218 | fn normalize_command(command: &str) -> String {
+    |    ^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` on by default
+warning: `agent-file-tools` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.42s
+     Running unittests src/lib.rs (target/debug/deps/aft-3e63e65b6f8e5a12)
+
+running 312 tests
+test compress::git::tests::status_short_preserves_branch ... ok
+test compress::cargo::tests::test_summary_keeps_failures ... ok
+test commands::bash::tests::try_spawn_with_login_shell ... ok
+test lsp::tests::pull_diagnostics_prefers_317 ... ok
+test imports::tests::organize_groups_external_before_internal ... ok
+test search_index::tests::incremental_cache_reuses_embeddings ... ok
+
+test result: ok. 312 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.86s
+
+     Running tests/compress_filters.rs (target/debug/deps/compress_filters-ea287c4a1a64c0e8)
+
+running 18 tests
+test builtin_filters_are_parseable ... ok
+test terraform_plan_filter_caps_middle ... ok
+test kubectl_get_pods_strips_age_noise ... ok
+
+test result: ok. 18 passed; 0 failed; finished in 0.09s

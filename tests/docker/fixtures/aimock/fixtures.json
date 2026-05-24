@@ -1,0 +1,21 @@
+{
+  "fixtures": [
+    {
+      "match": { "userMessage": ".*", "sequenceIndex": 0 },
+      "response": {
+        "toolCalls": [
+          {
+            "name": "aft_outline",
+            "arguments": "{\"directory\":\"src\"}"
+          }
+        ]
+      }
+    },
+    {
+      "match": { "userMessage": ".*", "sequenceIndex": 1 },
+      "response": {
+        "content": "I've explored the project structure. The src directory contains Python and TypeScript source files with functions and classes."
+      }
+    }
+  ]
+}

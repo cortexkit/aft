@@ -1,0 +1,17 @@
+[filter]
+matches = ["curl"]
+description = "Compact curl output; strip progress meter and verbose connection decoration."
+
+[strip]
+patterns = [
+  '%\s+\|\s+Total\s+%',
+  '^\s*%\s+Total\s+%.*$',
+  '^\* Connected to .*$' ,
+  '^\* Trying .*$' ,
+  '^\* TLS.*$' ,
+  '^\* SSL connection.*$' ,
+  '^\* using HTTP.*$'
+]
+
+[truncate]
+line_max = 1000

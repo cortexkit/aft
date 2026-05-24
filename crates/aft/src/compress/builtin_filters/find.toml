@@ -1,0 +1,14 @@
+[filter]
+matches = ["find"]
+description = "Compact find path output; report empty matches."
+
+[truncate]
+line_max = 400
+
+[cap]
+max_lines = 100
+keep = "tail"
+
+[shortcircuit]
+when = '\A\s*\z'
+replacement = "find: no matches"

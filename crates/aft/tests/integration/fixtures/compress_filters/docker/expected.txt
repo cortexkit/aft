@@ -1,0 +1,3 @@
+Successfully built abcdef123456
+Successfully tagged app:latest
+WARNING: image contains vulnerabilities

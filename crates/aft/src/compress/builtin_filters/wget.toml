@@ -1,0 +1,23 @@
+[filter]
+matches = ["wget"]
+description = "Compact wget output; strip progress and connection decoration."
+
+[strip]
+patterns = [
+  '^\s*\[\s*[<=>. ]+\].*$',
+  'K/s\s+eta',
+  '^Resolving .+\.\.\..*$',
+  '^Connecting to .+\.\.\..*$',
+  '^HTTP request sent, awaiting response\.\.\..*$'
+]
+
+[truncate]
+line_max = 240
+
+[cap]
+max_lines = 50
+keep = "tail"
+
+[shortcircuit]
+when = 'saved \[(\d+)/(\d+)\]'
+replacement = "wget: downloaded"

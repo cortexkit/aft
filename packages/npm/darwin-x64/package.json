@@ -1,0 +1,20 @@
+{
+  "name": "@cortexkit/aft-darwin-x64",
+  "version": "0.29.1",
+  "description": "AFT binary for macOS x64 (Intel)",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "preferUnplugged": true,
+  "bin": {
+    "aft": "bin/aft"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cortexkit/aft"
+  }
+}

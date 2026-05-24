@@ -1,0 +1,23 @@
+[filter]
+matches = ["gradle", "gradlew"]
+description = "Compact Gradle output; strip daemon and download chatter."
+
+[strip]
+patterns = [
+  '^Downloading',
+  '^Download ',
+  'Daemon process',
+  '^Picked up _JAVA_OPTIONS',
+  '^> Configure project',
+  '^> Configure root project',
+  '^Welcome to Gradle',
+  '^BUILD SUCCESSFUL.*%$',
+]
+
+[cap]
+max_lines = 100
+keep = "tail"
+
+[shortcircuit]
+when = '\A\s*\z'
+replacement = "gradle: ok"

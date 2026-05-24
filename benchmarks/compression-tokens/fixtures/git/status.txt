@@ -1,0 +1,6 @@
+## feature/compress-metrics...origin/feature/compress-metrics [ahead 3]
+ M crates/aft/src/compress/mod.rs
+ M crates/aft/src/commands/bash.rs
+ M Cargo.lock
+?? benchmarks/compression-tokens/
+?? tmp/spike-output.json

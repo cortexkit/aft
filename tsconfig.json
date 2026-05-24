@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["bun-types"],
+    "lib": ["ESNext"]
+  },
+  "include": ["scripts/**/*.ts", "scripts/**/*.mts"],
+  "exclude": ["node_modules", "packages", "benchmarks", "ts-bench", "**/dist", "target"]
+}
