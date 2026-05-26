@@ -1,4 +1,4 @@
-import { closeSync, existsSync, openSync, readSync, statSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readSync, statSync } from "node:fs";
 import type { HarnessAdapter } from "../adapters/types.js";
 import { type BinaryCacheInfo, getBinaryCacheInfo } from "./binary-cache.js";
 import { probeBinaryVersion } from "./binary-probe.js";
@@ -94,6 +94,18 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
   const aftFlags = (sanitizeValue(aftConfigRead.value ?? {}) as Record<string, unknown>) ?? {};
   const storage = adapter.getStorageDir();
   const logPath = adapter.getLogFile();
+
+  // Ensure the storage directory exists so diagnostics report useful info
+  // instead of "(not created)" on fresh installs. The storage directory is
+  // normally created lazily by the bridge on first tool call, but the doctor
+  // command is a read-only diagnostic that should still display it.
+  if (!existsSync(storage)) {
+    try {
+      mkdirSync(storage, { recursive: true });
+    } catch {
+      // best-effort — diagnostics can still report the path as (not created)
+    }
+  }
 
   const describeStorage =
     "describeStorageSubtrees" in adapter &&

@@ -30,7 +30,9 @@ const F32_BYTES: usize = std::mem::size_of::<f32>();
 const HEADER_BYTES_V1: usize = 9;
 const HEADER_BYTES_V2: usize = 13;
 const ONNX_RUNTIME_INSTALL_HINT: &str =
-    "ONNX Runtime not found. Install via: brew install onnxruntime (macOS) or apt install libonnxruntime (Linux).";
+    "ONNX Runtime not found. Install via: brew install onnxruntime (macOS), \
+     apt install libonnxruntime (Linux), or place onnxruntime.dll in your PATH (Windows). \
+     AFT can auto-download ONNX Runtime — run `npx @cortexkit/aft doctor` to diagnose.";
 
 const SEMANTIC_INDEX_VERSION_V1: u8 = 1;
 const SEMANTIC_INDEX_VERSION_V2: u8 = 2;
@@ -788,8 +790,42 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        // On Windows, skip pre-validation — let ort handle LoadLibrary
-        let _ = dylib_path;
+        // Validate ONNX Runtime availability on Windows by loading the DLL
+        // via LoadLibraryExW before the ort crate attempts its own LoadLibrary.
+        // This way we can produce a friendly error (with installation hints)
+        // instead of a raw LoadLibrary failure from deep inside fastembed.
+        let lib_name = dylib_path.as_deref().unwrap_or("onnxruntime.dll");
+
+        // Use kernel32 LoadLibraryExW for the validation — built-in, no
+        // crate dependency required.
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LoadLibraryExW(
+                lpLibFileName: *const u16,
+                hFile: *mut std::ffi::c_void,
+                dwFlags: u32,
+            ) -> *mut std::ffi::c_void;
+            fn FreeLibrary(hLibModule: *mut std::ffi::c_void) -> i32;
+        }
+
+        unsafe {
+            use std::os::windows::ffi::OsStrExt;
+            let wide: Vec<u16> = std::ffi::OsStr::new(lib_name)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+
+            let handle = LoadLibraryExW(wide.as_ptr(), std::ptr::null_mut(), 0);
+            if handle.is_null() {
+                let err = std::io::Error::last_os_error();
+                return Err(format!(
+                    "ONNX Runtime not found. LoadLibraryExW('{}') failed: {}. \
+                     Run `npx @cortexkit/aft doctor` to diagnose.",
+                    lib_name, err
+                ));
+            }
+            FreeLibrary(handle);
+        }
     }
 
     Ok(())

@@ -1,5 +1,5 @@
-import { execSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, renameSync } from "node:fs";
+import { execSync, spawnSync } from "node:child_process";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, renameSync, unlinkSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -55,6 +55,14 @@ function copyToVersionedCache(npmBinaryPath: string, knownVersion?: string): str
     if (process.platform !== "win32") {
       chmodSync(tmpPath, 0o755);
     }
+    // Atomic rename — unlink first on Windows where renameSync fails if target exists
+    if (process.platform === "win32" && existsSync(cachedPath)) {
+      try {
+        unlinkSync(cachedPath);
+      } catch {
+        // best-effort; renameSync will surface the error if unlink fails
+      }
+    }
     renameSync(tmpPath, cachedPath);
     log(`Copied npm binary to versioned cache: ${cachedPath}`);
     return cachedPath;
@@ -66,6 +74,22 @@ function copyToVersionedCache(npmBinaryPath: string, knownVersion?: string): str
 
 function normalizeBareVersion(version: string): string {
   return version.startsWith("v") ? version.slice(1) : version;
+}
+
+/**
+ * Compare two semver strings. Returns >0 if a > b, <0 if a < b, 0 if equal.
+ * Both versions must be bare (no leading "v").
+ */
+function compareSemver(a: string, b: string): number {
+  const aParts = a.split(".").map(Number);
+  const bParts = b.split(".").map(Number);
+  for (let i = 0; i < 3; i++) {
+    const av = aParts[i] ?? 0;
+    const bv = bParts[i] ?? 0;
+    if (av > bv) return 1;
+    if (av < bv) return -1;
+  }
+  return 0;
 }
 
 function homeDirFromEnv(env: ResolverEnv): string {
@@ -124,6 +148,60 @@ function parsePathLookupOutput(output: string): string[] {
 }
 
 /**
+ * Scan the versioned cache directory for the highest available binary version.
+ *
+ * Iterates over `<cacheDir>/v*/aft[.exe]` entries, reads each binary's version,
+ * and returns the one with the highest semantic version. This is the fallback
+ * when the exact plugin version isn't cached but a newer version was downloaded
+ * by `aft doctor --fix` or a previous `ensureBinary` call.
+ *
+ * @returns `{ path, version }` for the highest-versioned valid binary, or null.
+ */
+function findHighestCachedVersion(
+  cacheDir: string,
+  ext: string,
+): { path: string; version: string } | null {
+  try {
+    const entries = readdirSync(cacheDir, { withFileTypes: true });
+    let best: { path: string; version: string } | null = null;
+
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const tag = entry.name;
+      if (!tag.startsWith("v")) continue;
+
+      const binaryPath = join(cacheDir, tag, `aft${ext}`);
+      if (!existsSync(binaryPath)) continue;
+
+      const binaryVersion = readBinaryVersion(binaryPath);
+      if (binaryVersion === null) continue;
+
+      if (best === null) {
+        best = { path: binaryPath, version: binaryVersion };
+      } else {
+        // Compare semver strings
+        const current = best.version.split(".").map(Number);
+        const candidate = binaryVersion.split(".").map(Number);
+        let isHigher = false;
+        for (let i = 0; i < 3; i++) {
+          const a = current[i] ?? 0;
+          const b = candidate[i] ?? 0;
+          if (b > a) { isHigher = true; break; }
+          if (b < a) break;
+        }
+        if (isHigher) {
+          best = { path: binaryPath, version: binaryVersion };
+        }
+      }
+    }
+
+    return best;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Map the current `process.platform` and `process.arch` to the npm platform
  * package suffix (e.g. `"darwin-arm64"`, `"linux-x64"`).
  *
@@ -157,6 +235,10 @@ export function platformKey(
 /**
  * Locate the `aft` binary synchronously by checking (in order):
  * 1. Cached binary from previous auto-download (~/.cache/aft/bin/)
+ *    a. First, check for the **exact** requested version in cache.
+ *    b. Then, scan ALL cached versions and return the highest one (handles
+ *       the case where `aft doctor --fix` downloaded a newer version but the
+ *       plugin still resolves by its own older version).
  * 2. npm platform package via `require.resolve(@cortexkit/aft-<platform>/bin/aft)`
  * 3. PATH lookup via `which aft` (or `where aft` on Windows)
  * 4. ~/.cargo/bin/aft (Rust cargo install location)
@@ -171,9 +253,6 @@ export function findBinarySync(expectedVersion?: string): string | null {
   const ext = process.platform === "win32" ? ".exe" : "";
   const env = { ...process.env };
 
-  // 1. Check versioned cache for the requested version (or this package's own
-  // version as a fallback so direct callers without a host still benefit from
-  // the cache).
   const pluginVersion =
     expectedVersion ??
     (() => {
@@ -184,10 +263,35 @@ export function findBinarySync(expectedVersion?: string): string | null {
         return null;
       }
     })();
+
+  // 1. Check versioned cache — first exact version, then highest fallback.
   if (pluginVersion) {
     const tag = pluginVersion.startsWith("v") ? pluginVersion : `v${pluginVersion}`;
-    const versionCached = cachedBinaryPathFromEnv(tag, env, ext);
-    if (versionCached && isExpectedCachedBinary(versionCached, pluginVersion)) return versionCached;
+
+    // 1a. Exact version in cache.
+    const exactCached = cachedBinaryPathFromEnv(tag, env, ext);
+    if (exactCached && isExpectedCachedBinary(exactCached, pluginVersion)) return exactCached;
+
+    // 1b. Scan ALL cached versions for the highest available one. This handles
+    // the case where `aft doctor --fix` downloaded v0.30.3 but the plugin
+    // resolves by its own older version (v0.29.1). Preferring the newer binary
+    // is safe because the protocol is backwards compatible.
+    const cacheDir = cacheDirFromEnv(env);
+    const highestCached = findHighestCachedVersion(cacheDir, ext);
+    if (highestCached) {
+      const highestBare = normalizeBareVersion(highestCached.version);
+      // Only use the highest cached version if it's actually newer than the
+      // plugin version. A simple inequality check is not enough — the highest
+      // version in the cache could still be lower than the plugin's version
+      // (e.g. cache has v0.28.0 but plugin is v0.30.0). We never downgrade.
+      const pluginBare = normalizeBareVersion(pluginVersion);
+      if (compareSemver(highestBare, pluginBare) > 0) {
+        log(
+          `Using highest cached version ${highestCached.version} (plugin requested ${pluginVersion}) at ${highestCached.path}`,
+        );
+        return highestCached.path;
+      }
+    }
   }
 
   // 2. Check npm platform package — copy to versioned cache to avoid
@@ -257,7 +361,7 @@ export const __test__ = {
  * Locate the `aft` binary, with auto-download as a last resort.
  *
  * Resolution order:
- *   1. Cached binary (~/.cache/aft/bin/)
+ *   1. Cached binary (~/.cache/aft/bin/) — exact version, then highest available
  *   2. npm platform package (@cortexkit/aft-<platform>)
  *   3. PATH lookup (which aft)
  *   4. ~/.cargo/bin/aft

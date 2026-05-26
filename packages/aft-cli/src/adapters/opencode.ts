@@ -219,8 +219,17 @@ export class OpenCodeAdapter implements HarnessAdapter {
   }
 
   getStorageDir(): string {
-    const xdg = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
-    return join(xdg, "opencode", "storage", "plugin", "aft");
+    // Use the same CortexKit storage root as the AFT binary and migration code.
+    // The legacy path (~/.local/share/opencode/storage/plugin/aft on Unix)
+    // is only relevant for pre-v0.27 upgrades — after migration, data lives
+    // under the CortexKit root regardless of platform.
+    if (process.platform === "win32") {
+      const localAppData =
+        process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
+      return join(localAppData, "cortexkit", "aft");
+    }
+    const xdgData = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share");
+    return join(xdgData, "cortexkit", "aft");
   }
 
   getLogFile(): string {

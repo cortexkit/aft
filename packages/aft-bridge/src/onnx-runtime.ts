@@ -430,22 +430,87 @@ function findSystemOnnxRuntime(libName?: string): string | null {
       "/usr/lib/aarch64-linux-gnu",
       "/usr/local/lib",
     );
+  } else if (process.platform === "win32") {
+    // Common Windows install locations for ONNX Runtime
+    const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
+    const programFilesX86 = process.env["ProgramFiles(x86)"] ?? "C:\\Program Files (x86)";
+    searchPaths.push(
+      join(programFiles, "onnxruntime", "lib"),
+      join(programFiles, "Microsoft ONNX Runtime", "lib"),
+      join(programFiles, "Microsoft Machine Learning", "lib"),
+      join(programFilesX86, "onnxruntime", "lib"),
+      // Windows NuGet package layout:
+      //   <user>\.nuget\packages\microsoft.ml.onnxruntime\<version>\runtimes\win-{x64,arm64}\native\
+      // Scan all installed versions since we don't know which one is present.
+      ...(() => {
+        const nugetPaths: string[] = [];
+        const userProfile = process.env.USERPROFILE ?? "";
+        if (!userProfile) return nugetPaths;
+        const nugetPackageDir = join(userProfile, ".nuget", "packages", "microsoft.ml.onnxruntime");
+        if (!existsSync(nugetPackageDir)) return nugetPaths;
+        try {
+          for (const entry of readdirSync(nugetPackageDir, { withFileTypes: true })) {
+            if (!entry.isDirectory()) continue;
+            // Skip well-known non-version entries
+            if (entry.name === "__globalPackagesFolder" || entry.name.startsWith(".")) continue;
+            nugetPaths.push(
+              join(nugetPackageDir, entry.name, "runtimes", "win-x64", "native"),
+              join(nugetPackageDir, entry.name, "runtimes", "win-arm64", "native"),
+            );
+          }
+        } catch {
+          // best-effort scan
+        }
+        return nugetPaths;
+      })(),
+    );
+    // Also search PATH directories for onnxruntime.dll
+    const pathEnv = process.env.PATH ?? "";
+    for (const dir of pathEnv.split(";")) {
+      const trimmed = dir.trim();
+      if (!trimmed) continue;
+      searchPaths.push(trimmed);
+    }
   }
 
-  for (const dir of searchPaths) {
+  // Deduplicate paths while preserving order.
+  // On case-insensitive filesystems (Windows, macOS) normalize casing for
+  // comparison; on Linux the raw path casing is the authority.
+  const normalizeCase = process.platform === "win32" || process.platform === "darwin";
+  const seen = new Set<string>();
+  const uniquePaths = searchPaths.filter((p) => {
+    let key = resolve(p).replace(/[/\\]+$/, "");
+    if (normalizeCase) key = key.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  for (const dir of uniquePaths) {
     if (!existsSync(join(dir, libName))) continue;
 
-    // Reject system installs that the Rust pre-validator will refuse. Without
-    // this filter, a stale distro package (e.g. libonnxruntime1.9 on Ubuntu
-    // 22.04) shadows our auto-downloaded v1.24 forever and semantic search
-    // stays "failed" until the user hand-deletes the system library.
-    const version = detectOnnxVersion(dir, libName);
-    if (version && !isOnnxVersionCompatible(version)) {
-      warn(
-        `Skipping system ONNX Runtime at ${dir} (v${version}); AFT requires ` +
-          `v${REQUIRED_ORT_MAJOR}.${REQUIRED_ORT_MIN_MINOR}+. Falling through to AFT-managed download.`,
-      );
-      continue;
+    // Skip the version check for PATH entries — version-suffixed filenames
+    // are less common on Windows and we want PATH discovery to succeed.
+    let skipVersionCheck = false;
+    if (process.platform === "win32") {
+      // Only do version check for common install paths, not PATH entries
+      const isCommonPath = dir.includes("Program Files") || dir.includes("onnxruntime");
+      if (!isCommonPath) skipVersionCheck = true;
+    }
+
+    if (!skipVersionCheck) {
+      // Reject system installs that the Rust pre-validator will refuse. Without
+      // this filter, a stale distro package (e.g. libonnxruntime1.9 on Ubuntu
+      // 22.04) shadows our auto-downloaded v1.24 forever and semantic search
+      // stays "failed" until the user hand-deletes the system library.
+      const version = detectOnnxVersion(dir, libName);
+      if (version && !isOnnxVersionCompatible(version)) {
+        warn(
+          `Skipping system ONNX Runtime at ${dir} (v${version}); AFT requires ` +
+            `v${REQUIRED_ORT_MAJOR}.${REQUIRED_ORT_MIN_MINOR}+. Falling through to AFT-managed download.`,
+        );
+        continue;
+      }
     }
 
     return dir;

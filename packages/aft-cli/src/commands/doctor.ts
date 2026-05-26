@@ -1,4 +1,4 @@
-import { existsSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { HarnessAdapter } from "../adapters/types.js";
@@ -170,6 +170,48 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
   }
 
   if (hadProblems) {
+    // Build a focused issues summary so the user can distinguish diagnostics
+    // from problems that need action. Each bullet links the issue to a fix.
+    const issueBullets: string[] = [];
+    if (!report.binaryVersion) {
+      issueBullets.push(
+        "AFT binary not detected — run `aft doctor --fix` to download, or it will auto-install on first tool call.",
+      );
+    }
+    for (const h of report.harnesses) {
+      if (!h.hostInstalled) {
+        continue; // Already warned inline
+      }
+      if (!h.pluginRegistered) {
+        issueBullets.push(
+          `${h.displayName}: plugin not registered — run \`aft setup\` or \`aft doctor --fix\` to fix.`,
+        );
+      }
+      if (h.aftConfig.parseError) {
+        issueBullets.push(
+          `${h.displayName}: AFT config parse error — fix syntax in ${h.configPaths.aftConfig}.`,
+        );
+      }
+      if (h.onnxRuntime.required) {
+        if (!h.onnxRuntime.cachedPath && !h.onnxRuntime.systemPath) {
+          issueBullets.push(
+            `${h.displayName}: ONNX Runtime not installed (required for semantic search) — ${h.onnxRuntime.installHint}`,
+          );
+        }
+        if (h.onnxRuntime.cachedCompatible === false || h.onnxRuntime.systemCompatible === false) {
+          issueBullets.push(
+            `${h.displayName}: ONNX Runtime version incompatible — run \`aft doctor --fix\` to re-install.`,
+          );
+        }
+      }
+    }
+
+    if (issueBullets.length > 0) {
+      log.warn(`Issues found (${issueBullets.length}):`);
+      for (const bullet of issueBullets) {
+        log.error(`  ${bullet}`);
+      }
+    }
     note(
       "Run `aft setup` or `aft doctor --fix` to register AFT with any harness showing `plugin registered: no`. Run `aft doctor --fix` for ONNX Runtime issues or to download a missing aft binary.",
       "Tips",
@@ -177,7 +219,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
     outro("Done — some issues found.");
     return 1;
   }
-  outro("Everything looks good.");
+  log.success("Everything looks good.");
   return 0;
 }
 
