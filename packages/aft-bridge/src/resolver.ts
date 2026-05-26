@@ -150,12 +150,12 @@ function parsePathLookupOutput(output: string): string[] {
 /**
  * Scan the versioned cache directory for the highest available binary version.
  *
- * Iterates over `<cacheDir>/v*/aft[.exe]` entries, reads each binary's version,
+ * Iterates over versioned cache entries (e.g. `<cacheDir>/v0.30.0/aft`), reads each binary's version,
  * and returns the one with the highest semantic version. This is the fallback
  * when the exact plugin version isn't cached but a newer version was downloaded
  * by `aft doctor --fix` or a previous `ensureBinary` call.
  *
- * @returns `{ path, version }` for the highest-versioned valid binary, or null.
+ * @returns The path and version of the highest-versioned binary, or null.
  */
 function findHighestCachedVersion(
   cacheDir: string,
