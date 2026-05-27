@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
@@ -289,6 +291,7 @@ struct OutlineFileEntry {
     language: String,
     symbols: usize,
     bytes: u64,
+    git_status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -347,13 +350,14 @@ fn handle_outline_files_mode(
         } else {
             &dir_path
         };
+        let git_statuses = collect_git_statuses(&dir_path);
         let discovery = discover_outline_files_for_files_mode(&dir_path, ctx);
         walk_truncated |= discovery.walk_truncated;
         collection_truncated |= discovery.collection_truncated;
 
         for file in discovery.files {
             let file_path = PathBuf::from(file);
-            if let Some(entry) = outline_file_entry(&file_path, display_root, ctx) {
+            if let Some(entry) = outline_file_entry(&file_path, display_root, &git_statuses, ctx) {
                 file_entries.push(entry);
             }
         }
@@ -461,9 +465,35 @@ fn discover_outline_files_for_files_mode(
     discover_outline_files_with_options(directory, Some(&options))
 }
 
+fn collect_git_statuses(dir: &Path) -> HashMap<String, String> {
+    let output = match Command::new("git")
+        .args([
+            "-C",
+            &dir.to_string_lossy(),
+            "status",
+            "--porcelain",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return HashMap::new(),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut map = HashMap::new();
+    for line in stdout.lines() {
+        if line.len() >= 4 {
+            let status = line[..2].to_string();
+            let path = line[3..].to_string();
+            map.insert(path, status);
+        }
+    }
+    map
+}
+
 fn outline_file_entry(
     path: &Path,
     display_root: &Path,
+    git_statuses: &HashMap<String, String>,
     ctx: &AppContext,
 ) -> Option<OutlineFileEntry> {
     let metadata = std::fs::metadata(path).ok()?;
@@ -471,6 +501,10 @@ fn outline_file_entry(
         relative_path_from_root(path, display_root).unwrap_or_else(|| path_to_slash(path));
     let bytes = metadata.len();
     let detected_language = detect_language(path).map(language_id);
+    let git_status = git_statuses
+        .get(&rel_path)
+        .cloned()
+        .unwrap_or_else(|| "  ".to_string());
 
     if let Some(symbols) = cached_symbol_count(ctx, path, &metadata) {
         return Some(OutlineFileEntry {
@@ -478,6 +512,7 @@ fn outline_file_entry(
             language: detected_language.unwrap_or("unknown").to_string(),
             symbols,
             bytes,
+            git_status,
         });
     }
 
@@ -492,6 +527,7 @@ fn outline_file_entry(
             .to_string(),
             symbols: 0,
             bytes,
+            git_status,
         });
     };
 
@@ -501,6 +537,7 @@ fn outline_file_entry(
             language: "binary".to_string(),
             symbols: 0,
             bytes,
+            git_status,
         });
     }
 
@@ -510,6 +547,7 @@ fn outline_file_entry(
             language: language.to_string(),
             symbols: 0,
             bytes,
+            git_status,
         });
     }
 
@@ -524,6 +562,7 @@ fn outline_file_entry(
         language: language.to_string(),
         symbols,
         bytes,
+        git_status,
     })
 }
 
@@ -620,7 +659,8 @@ fn format_files_table(
 
     for entry in entries {
         let line = format!(
-            "{:<path_width$}  {:<language_width$} {:>5} syms {:>9} bytes\n",
+            "{} {:<path_width$}  {:<language_width$} {:>5} syms {:>9} bytes\n",
+            entry.git_status,
             entry.path,
             entry.language,
             entry.symbols,
