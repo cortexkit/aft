@@ -465,6 +465,46 @@ fn discover_outline_files_for_files_mode(
     discover_outline_files_with_options(directory, Some(&options))
 }
 
+fn unescape_porcelain_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('a') => out.push('\u{0007}'),
+                Some('b') => out.push('\u{0008}'),
+                Some('t') => out.push('\t'),
+                Some('n') => out.push('\n'),
+                Some('v') => out.push('\u{000b}'),
+                Some('f') => out.push('\u{000c}'),
+                Some('r') => out.push('\r'),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some(d @ '0'..='7') => {
+                    // octal escape \NNN
+                    let mut oct = d.to_digit(8).unwrap_or(0);
+                    let mut i = 0u32;
+                    while i < 2 {
+                        match chars.peek().copied() {
+                            Some(c @ '0'..='7') => {
+                                oct = oct * 8 + c.to_digit(8).unwrap_or(0);
+                                chars.next();
+                                i += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+                    out.push(char::from_u32(oct).unwrap_or('\u{fffd}'));
+                }
+                _ => {} // unknown escape — drop backslash, keep next char as-is
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn collect_git_statuses(dir: &Path) -> HashMap<String, String> {
     let output = match Command::new("git")
         .args([
@@ -489,13 +529,16 @@ fn collect_git_statuses(dir: &Path) -> HashMap<String, String> {
 
         // porcelain v1 format:
         //   "R  old -> new" — extract new path for rename/copy
-        //   "A  \"quoted\"" — strip surrounding quotes from special filenames
+        //   "A  \"quoted\"" — strip quotes and unescape special filenames
         let path = if raw.contains(" -> ") {
+            // rename/copy: take the target path
             raw.split(" -> ").last().unwrap_or(raw)
         } else {
             raw
         };
-        map.insert(path.trim_matches('"').to_string(), status);
+        // strip surrounding quotes and unescape C-style escapes
+        let path = path.trim_matches('"');
+        map.insert(unescape_porcelain_path(path), status);
     }
     map
 }
