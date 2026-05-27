@@ -108,7 +108,12 @@ fn delete_one_or_dir(
     }
 
     let path = match ctx.validate_path(&req.id, requested_path) {
-        Ok(path) => path,
+        Ok(path) => {
+            ctx.session_history()
+                .borrow_mut()
+                .record(req.session(), path.clone(), crate::session_history::FileOp::Delete);
+            path
+        }
         Err(resp) => return Err(resp),
     };
 

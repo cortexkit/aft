@@ -23,6 +23,7 @@ use crate::parser::{SharedSymbolCache, SymbolCache};
 use crate::protocol::{
     ConfigureWarningsFrame, ProgressFrame, PushFrame, StatusChangedFrame, StatusPayload,
 };
+use crate::session_history::{FileOp, SessionHistory};
 
 pub type ProgressSender = Arc<Box<dyn Fn(PushFrame) + Send + Sync>>;
 pub type SharedProgressSender = Arc<Mutex<Option<ProgressSender>>>;
@@ -379,6 +380,11 @@ pub struct AppContext {
     /// root is configured or when the project has no gitignore files; in that
     /// case the watcher falls back to a small hardcoded infra-directory skip.
     gitignore: RefCell<Option<Arc<ignore::gitignore::Gitignore>>>,
+    /// Per-session, in-memory, chronologically-ordered file-access history.
+    /// Records every `read`, `zoom`, `edit`, `write`, `delete`, and `move`
+    /// operation so the agent (or user) can answer "what files was I just
+    /// working on?" within the current session.
+    session_history: RefCell<SessionHistory>,
 }
 
 impl AppContext {
@@ -432,6 +438,7 @@ impl AppContext {
             filter_registry_loaded: std::sync::atomic::AtomicBool::new(false),
             bash_compress_flag: Arc::new(std::sync::atomic::AtomicBool::new(bash_compress_enabled)),
             gitignore: RefCell::new(None),
+            session_history: RefCell::new(SessionHistory::new()),
         }
     }
 
@@ -463,6 +470,53 @@ impl AppContext {
     /// skip list when no matcher is present.
     pub fn clear_gitignore(&self) {
         *self.gitignore.borrow_mut() = None;
+    }
+
+    /// Access the per-session file-access history store.
+    pub fn session_history(&self) -> &RefCell<SessionHistory> {
+        &self.session_history
+    }
+
+    /// Record a file read operation in session history.
+    pub fn record_file_read(&self, session: &str, path: &std::path::Path) {
+        self.session_history
+            .borrow_mut()
+            .record(session, path.to_path_buf(), FileOp::Read);
+    }
+
+    /// Record a file zoom operation in session history.
+    pub fn record_file_zoom(&self, session: &str, path: &std::path::Path) {
+        self.session_history
+            .borrow_mut()
+            .record(session, path.to_path_buf(), FileOp::Zoom);
+    }
+
+    /// Record a file edit operation in session history.
+    pub fn record_file_edit(&self, session: &str, path: &std::path::Path) {
+        self.session_history
+            .borrow_mut()
+            .record(session, path.to_path_buf(), FileOp::Edit);
+    }
+
+    /// Record a file write operation in session history.
+    pub fn record_file_write(&self, session: &str, path: &std::path::Path) {
+        self.session_history
+            .borrow_mut()
+            .record(session, path.to_path_buf(), FileOp::Write);
+    }
+
+    /// Record a file delete operation in session history.
+    pub fn record_file_delete(&self, session: &str, path: &std::path::Path) {
+        self.session_history
+            .borrow_mut()
+            .record(session, path.to_path_buf(), FileOp::Delete);
+    }
+
+    /// Record a file move operation in session history.
+    pub fn record_file_move(&self, session: &str, path: &std::path::Path) {
+        self.session_history
+            .borrow_mut()
+            .record(session, path.to_path_buf(), FileOp::Move);
     }
 
     pub fn rebuild_gitignore(&self) {

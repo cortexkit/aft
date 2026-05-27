@@ -110,7 +110,12 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         .map(|v| v as usize);
 
     let path = match resolve_file_or_url(req, ctx, file) {
-        Ok(path) => path,
+        Ok(path) => {
+            ctx.session_history()
+                .borrow_mut()
+                .record(req.session(), path.clone(), crate::session_history::FileOp::Zoom);
+            path
+        }
         Err(resp) => return resp,
     };
     if !path.exists() {

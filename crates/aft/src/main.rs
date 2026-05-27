@@ -452,6 +452,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "grep" => aft::commands::grep::handle_grep(&req, ctx),
         "semantic_search" => aft::commands::semantic_search::handle_semantic_search(&req, ctx),
         "status" => aft::commands::status::handle_status(&req, ctx),
+        "session_history" => handle_session_history(&req, ctx),
         "list_filters" => aft::commands::list_filters::handle_list_filters(&req, ctx),
         "trust_filter_project" => {
             aft::commands::trust_filter_project::handle_trust_filter_project(&req, ctx)
@@ -539,6 +540,24 @@ fn handle_snapshot(req: &RawRequest, ctx: &AppContext) -> Response {
         Ok(id) => Response::success(&req.id, serde_json::json!({ "backup_id": id })),
         Err(e) => Response::error(&req.id, e.code(), e.to_string()),
     }
+}
+
+fn handle_session_history(req: &RawRequest, ctx: &AppContext) -> Response {
+    let limit = req
+        .params
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50)
+        .min(200) as usize;
+    let session = req.session();
+    let entries = ctx.session_history().borrow().recent(session, limit);
+    Response::success(
+        &req.id,
+        serde_json::json!({
+            "entries": entries,
+            "count": entries.len(),
+        }),
+    )
 }
 
 fn write_response(ctx: &AppContext, response: &Response) -> io::Result<()> {

@@ -82,6 +82,7 @@ pub mod protocol;
 pub mod query_shape;
 pub mod search_index;
 pub mod semantic_index;
+pub mod session_history;
 pub mod symbol_cache_disk;
 pub mod symbols;
 pub mod url_fetch;

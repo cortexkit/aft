@@ -41,7 +41,12 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     let src_path = match ctx.validate_path(&req.id, Path::new(file)) {
-        Ok(path) => path,
+        Ok(path) => {
+            ctx.session_history()
+                .borrow_mut()
+                .record(req.session(), path.clone(), crate::session_history::FileOp::Move);
+            path
+        }
         Err(resp) => return resp,
     };
     let dst_path = match ctx.validate_path(&req.id, Path::new(destination)) {

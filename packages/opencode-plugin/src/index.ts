@@ -64,6 +64,7 @@ import { refactoringTools } from "./tools/refactoring.js";
 import { safetyTools } from "./tools/safety.js";
 import { searchTools } from "./tools/search.js";
 import { semanticTools } from "./tools/semantic.js";
+import { sessionTools } from "./tools/session.js";
 import { structureTools } from "./tools/structure.js";
 import type { PluginContext } from "./types.js";
 import { buildHintsFromConfig } from "./workflow-hints.js";
@@ -861,6 +862,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     ...(surface !== "minimal" && lspTools(ctx)),
     // Git conflicts: recommended+
     ...(surface !== "minimal" && conflictTools(ctx)),
+    // Session file history: always available
+    ...sessionTools(ctx),
   });
 
   // Remove all-only tools when surface is minimal or recommended

@@ -55,7 +55,12 @@ pub fn handle_read(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     let path = match ctx.validate_path(&req.id, Path::new(file)) {
-        Ok(path) => path,
+        Ok(path) => {
+            ctx.session_history()
+                .borrow_mut()
+                .record(req.session(), path.clone(), crate::session_history::FileOp::Read);
+            path
+        }
         Err(resp) => return resp,
     };
 
