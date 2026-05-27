@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_ENTRIES_PER_SESSION: usize = 50;
+const MAX_SESSIONS: usize = 100;
 
 /// The kind of file operation recorded in session history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -36,6 +37,8 @@ pub struct HistoryEntry {
 pub struct SessionHistory {
     /// session_id -> VecDeque of entries (newest first)
     sessions: std::collections::HashMap<String, VecDeque<HistoryEntry>>,
+    /// LRU order of session IDs — oldest at front, most recently used at back.
+    lru: VecDeque<String>,
 }
 
 impl Default for SessionHistory {
@@ -48,6 +51,25 @@ impl SessionHistory {
     pub fn new() -> Self {
         Self {
             sessions: std::collections::HashMap::new(),
+            lru: VecDeque::new(),
+        }
+    }
+
+    fn touch_session(&mut self, session: &str) {
+        // Move session to back (most recently used) in the LRU list.
+        if let Some(pos) = self.lru.iter().position(|s| s == session) {
+            self.lru.remove(pos);
+        }
+        self.lru.push_back(session.to_string());
+    }
+
+    fn evict_oldest_session(&mut self) {
+        while self.sessions.len() > MAX_SESSIONS {
+            if let Some(oldest) = self.lru.pop_front() {
+                self.sessions.remove(&oldest);
+            } else {
+                break;
+            }
         }
     }
 
@@ -55,11 +77,15 @@ impl SessionHistory {
     ///
     /// Entries are inserted at the front so iteration yields newest-first.
     /// When the per-session cap is exceeded, the oldest entry is dropped.
+    /// When the total session count exceeds MAX_SESSIONS, the least recently
+    /// used session is evicted entirely.
     pub fn record(&mut self, session: &str, path: PathBuf, op: FileOp) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+
+        let is_new = !self.sessions.contains_key(session);
 
         let queue = self.sessions.entry(session.to_string()).or_default();
         // Avoid duplicate consecutive entries for the same (path, op) — if
@@ -81,6 +107,13 @@ impl SessionHistory {
         while queue.len() > MAX_ENTRIES_PER_SESSION {
             queue.pop_back();
         }
+
+        // Only touch LRU on new-session creation, not on every record call.
+        // This prevents continuous reordering from keeping stale sessions alive.
+        if is_new {
+            self.touch_session(session);
+            self.evict_oldest_session();
+        }
     }
 
     /// Return recent history for a session, newest first, up to `limit`.
@@ -94,6 +127,15 @@ impl SessionHistory {
     /// Return ALL sessions that have recorded history (for diagnostics / status).
     pub fn known_sessions(&self) -> Vec<String> {
         self.sessions.keys().cloned().collect()
+    }
+
+    /// Close a session and free its memory. Returns the removed entries.
+    pub fn close_session(&mut self, session: &str) -> Vec<HistoryEntry> {
+        let entries = self.sessions.remove(session).map_or_else(Vec::new, |q| q.into());
+        if let Some(pos) = self.lru.iter().position(|s| s == session) {
+            self.lru.remove(pos);
+        }
+        entries
     }
 }
 

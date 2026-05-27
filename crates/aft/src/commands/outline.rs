@@ -530,8 +530,9 @@ fn collect_git_statuses(dir: &Path) -> HashMap<String, String> {
         // porcelain v1 format:
         //   "R  old -> new" — extract new path for rename/copy
         //   "A  \"quoted\"" — strip quotes and unescape special filenames
-        let path = if raw.contains(" -> ") {
-            // rename/copy: take the target path
+        let is_rename = status.starts_with('R') || status.starts_with('C');
+        let path = if is_rename {
+            // rename/copy: "R  old -> new" → take last segment
             raw.split(" -> ").last().unwrap_or(raw)
         } else {
             raw
