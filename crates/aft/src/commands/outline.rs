@@ -481,11 +481,21 @@ fn collect_git_statuses(dir: &Path) -> HashMap<String, String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut map = HashMap::new();
     for line in stdout.lines() {
-        if line.len() >= 4 {
-            let status = line[..2].to_string();
-            let path = line[3..].to_string();
-            map.insert(path, status);
+        if line.len() < 4 {
+            continue;
         }
+        let status = line[..2].to_string();
+        let raw = &line[3..]; // skip XY + space separator
+
+        // porcelain v1 format:
+        //   "R  old -> new" — extract new path for rename/copy
+        //   "A  \"quoted\"" — strip surrounding quotes from special filenames
+        let path = if raw.contains(" -> ") {
+            raw.split(" -> ").last().unwrap_or(raw)
+        } else {
+            raw
+        };
+        map.insert(path.trim_matches('"').to_string(), status);
     }
     map
 }
