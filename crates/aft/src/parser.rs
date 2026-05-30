@@ -3696,18 +3696,29 @@ fn yaml_scalar_text(source: &str, node: &Node) -> String {
         .to_string()
 }
 
-/// Find the first (shallowest) block/flow mapping at or under `node`.
+/// Find the mapping that is the direct payload of `node`, descending only
+/// through wrapper nodes (`document`, `block_node`, `flow_node`) rather than
+/// arbitrary nested mappings. This keeps detection anchored to the document's
+/// top-level mapping instead of latching onto a mapping buried inside a
+/// sequence or nested value.
 fn yaml_find_mapping<'a>(node: &Node<'a>) -> Option<Node<'a>> {
-    if node.kind() == "block_mapping" || node.kind() == "flow_mapping" {
-        return Some(*node);
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if let Some(found) = yaml_find_mapping(&child) {
-            return Some(found);
+    let mut current = *node;
+    loop {
+        match current.kind() {
+            "block_mapping" | "flow_mapping" => return Some(current),
+            "document" | "block_node" | "flow_node" => {
+                let mut cursor = current.walk();
+                let next = current
+                    .named_children(&mut cursor)
+                    .find(|child| !matches!(child.kind(), "tag" | "anchor"));
+                match next {
+                    Some(inner) => current = inner,
+                    None => return None,
+                }
+            }
+            _ => return None,
         }
     }
-    None
 }
 
 /// Look up a top-level key in a YAML mapping and return its value node.
@@ -3727,8 +3738,62 @@ fn yaml_get<'a>(mapping: &Node<'a>, source: &str, key: &str) -> Option<Node<'a>>
     None
 }
 
-/// Recursively collect `key=value` pairs for the given keys (e.g. image, port)
-/// to enrich embed_text for semantic search. Capped to avoid runaway output.
+/// Flatten a YAML value node to clean text for embed_text. Scalars return their
+/// trimmed text; block/flow sequences are joined as comma-separated scalar items
+/// (so `verbs: [get, list, watch]` becomes `get,list,watch` instead of raw
+/// multi-line `- get\n- list` text). Nested mappings are ignored here.
+fn yaml_unwrap<'a>(node: &Node<'a>) -> Node<'a> {
+    let mut current = *node;
+    while current.kind() == "block_node" || current.kind() == "flow_node" {
+        let mut cursor = current.walk();
+        let next = current
+            .named_children(&mut cursor)
+            .find(|child| !matches!(child.kind(), "tag" | "anchor"));
+        match next {
+            Some(inner) => current = inner,
+            None => break,
+        }
+    }
+    current
+}
+
+fn yaml_flatten_value(source: &str, node: &Node) -> String {
+    let node = &yaml_unwrap(node);
+    match node.kind() {
+        "block_sequence" | "flow_sequence" => {
+            let mut items = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                // block_sequence_item wraps a value; flow_sequence holds nodes directly.
+                let value = if child.kind() == "block_sequence_item" {
+                    child.named_child(0)
+                } else {
+                    Some(child)
+                };
+                if let Some(v) = value {
+                    let v = yaml_unwrap(&v);
+                    // Only flatten scalar leaves; skip mappings (handled elsewhere).
+                    if v.kind() != "block_mapping" && v.kind() != "flow_mapping" {
+                        let text = yaml_scalar_text(source, &v);
+                        if !text.is_empty() {
+                            items.push(text);
+                        }
+                    }
+                }
+            }
+            items.join(",")
+        }
+        // Mapping values (e.g. container `resources:` block) are not flattened
+        // here — their high-signal leaves (cpu/memory) are collected separately.
+        // Returning empty avoids dumping raw multi-line YAML into embed_text.
+        "block_mapping" | "flow_mapping" => String::new(),
+        _ => yaml_scalar_text(source, node),
+    }
+}
+
+/// Recursively collect `key=value` pairs for the given keys (e.g. image, cpu,
+/// memory, verbs) to enrich embed_text for semantic search. Sequence values are
+/// flattened to comma-joined scalars. Capped to avoid runaway output.
 fn yaml_collect_values(
     source: &str,
     node: &Node,
@@ -3746,7 +3811,7 @@ fn yaml_collect_values(
                 let key_text = yaml_scalar_text(source, &key_node);
                 if keys.contains(&key_text.as_str()) {
                     if let Some(value_node) = child.child_by_field_name("value") {
-                        let value_text = yaml_scalar_text(source, &value_node);
+                        let value_text = yaml_flatten_value(source, &value_node);
                         if !value_text.is_empty() && out.len() < cap {
                             out.push(format!("{}={}", key_text, value_text));
                         }
@@ -3758,11 +3823,64 @@ fn yaml_collect_values(
     }
 }
 
+/// Collect the `name:` field from every item of a `<parent_key>:` sequence of
+/// mappings. The bare `name` key is too generic to match globally (it collides
+/// with metadata/container names), so these are gathered by parent key and
+/// emitted as `<label>=A,B,...`. Handles k8s `env: [{name,value}]` and Argo
+/// Workflow `templates: [{name, ...}]`. Capped.
+fn yaml_collect_named_items(
+    source: &str,
+    node: &Node,
+    parent_key: &str,
+    label: &str,
+    out: &mut Vec<String>,
+    cap: usize,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if (child.kind() == "block_mapping_pair" || child.kind() == "flow_pair")
+            && child
+                .child_by_field_name("key")
+                .map(|k| yaml_scalar_text(source, &k))
+                .as_deref()
+                == Some(parent_key)
+        {
+            if let Some(seq) = child.child_by_field_name("value") {
+                let seq = yaml_unwrap(&seq);
+                let mut names = Vec::new();
+                let mut seq_cursor = seq.walk();
+                for item in seq.named_children(&mut seq_cursor) {
+                    let value = if item.kind() == "block_sequence_item" {
+                        item.named_child(0)
+                    } else {
+                        Some(item)
+                    };
+                    if let Some(v) = value {
+                        if let Some(map) = yaml_find_mapping(&v) {
+                            if let Some(name_node) = yaml_get(&map, source, "name") {
+                                let n = yaml_scalar_text(source, &name_node);
+                                if !n.is_empty() && names.len() < 16 {
+                                    names.push(n);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !names.is_empty() && out.len() < cap {
+                    out.push(format!("{}={}", label, names.join(",")));
+                }
+            }
+        }
+        yaml_collect_named_items(source, &child, parent_key, label, out, cap);
+    }
+}
+
 /// Tier 1: if a document is a Kubernetes resource (has both apiVersion + kind),
 /// emit one rich symbol named `<ns>/<Kind>/<name>` with enriched signature.
 /// Generalizes to arbitrary CRDs since apiVersion+kind is the CRD contract.
 fn yaml_k8s_resource_symbol(source: &str, doc: &Node, mapping: &Node) -> Option<Symbol> {
-    let api_version = yaml_get(mapping, source, "apiVersion").map(|n| yaml_scalar_text(source, &n))?;
+    let api_version =
+        yaml_get(mapping, source, "apiVersion").map(|n| yaml_scalar_text(source, &n))?;
     let kind = yaml_get(mapping, source, "kind").map(|n| yaml_scalar_text(source, &n))?;
     if api_version.is_empty() || kind.is_empty() {
         return None;
@@ -3770,10 +3888,23 @@ fn yaml_k8s_resource_symbol(source: &str, doc: &Node, mapping: &Node) -> Option<
 
     let (name, namespace) = match yaml_get(mapping, source, "metadata") {
         Some(meta) => match yaml_find_mapping(&meta) {
-            Some(meta_map) => (
-                yaml_get(&meta_map, source, "name").map(|n| yaml_scalar_text(source, &n)),
-                yaml_get(&meta_map, source, "namespace").map(|n| yaml_scalar_text(source, &n)),
-            ),
+            Some(meta_map) => {
+                // Prefer `name`; fall back to `generateName` (common in Argo
+                // Workflows submitted without a fixed name) so the symbol still
+                // carries an identifier instead of collapsing to bare <Kind>.
+                let name = yaml_get(&meta_map, source, "name")
+                    .map(|n| yaml_scalar_text(source, &n))
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        yaml_get(&meta_map, source, "generateName")
+                            .map(|n| yaml_scalar_text(source, &n))
+                            .filter(|s| !s.is_empty())
+                    });
+                (
+                    name,
+                    yaml_get(&meta_map, source, "namespace").map(|n| yaml_scalar_text(source, &n)),
+                )
+            }
             None => (None, None),
         },
         None => (None, None),
@@ -3793,15 +3924,39 @@ fn yaml_k8s_resource_symbol(source: &str, doc: &Node, mapping: &Node) -> Option<
     if let Some(n) = res_name.as_ref() {
         sig.push_str(&format!(" name={}", n));
     }
-    // Enrich with high-signal spec fields so intent queries match.
+    // Enrich with high-signal spec fields so intent queries match. Covers
+    // containers (image/ports), resource limits/requests (cpu/memory), RBAC
+    // rules (verbs/resources/apiGroups), and storage (volumeMounts mountPath).
     let mut extras = Vec::new();
     yaml_collect_values(
         source,
         mapping,
-        &["image", "containerPort", "port", "targetPort"],
+        &[
+            "image",
+            "containerPort",
+            "port",
+            "targetPort",
+            "cpu",
+            "memory",
+            "storage",
+            "verbs",
+            "resources",
+            "apiGroups",
+            "mountPath",
+            "replicas",
+            // Argo Workflow high-signal scalars.
+            "entrypoint",
+            "command",
+            "args",
+            "schedule",
+        ],
         &mut extras,
-        12,
+        24,
     );
+    // Sequence-of-mappings whose `name` key is ambiguous: collect by parent key.
+    // k8s env vars and Argo Workflow templates both use the `{name: ...}` shape.
+    yaml_collect_named_items(source, mapping, "env", "env", &mut extras, 24);
+    yaml_collect_named_items(source, mapping, "templates", "templates", &mut extras, 24);
     if !extras.is_empty() {
         sig.push(' ');
         sig.push_str(&extras.join(" "));
@@ -7256,5 +7411,203 @@ volumes:
         let symbols = parser.extract_symbols(&file).unwrap();
 
         assert_eq!(symbols.len(), 0, "Expected 0 symbols for empty YAML");
+    }
+
+    #[test]
+    fn extract_yaml_symbols_resource_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("deployment.yaml");
+        std::fs::write(
+            &file,
+            r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        image: myapp:1.0
+        resources:
+          limits:
+            cpu: "2"
+            memory: 1Gi
+          requests:
+            cpu: "1"
+            memory: 512Mi
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 1, "Expected 1 symbol for Deployment");
+        let sym = &symbols[0];
+        assert_eq!(sym.name, "Deployment/app");
+        let sig = sym.signature.as_ref().unwrap();
+        assert!(sig.contains("cpu="), "Signature should contain cpu= field");
+        assert!(
+            sig.contains("memory="),
+            "Signature should contain memory= field"
+        );
+    }
+
+    #[test]
+    fn extract_yaml_symbols_env_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("deployment.yaml");
+        std::fs::write(
+            &file,
+            r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        image: myapp:1.0
+        env:
+        - name: FOO
+          value: "bar"
+        - name: BAR
+          value: "baz"
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 1, "Expected 1 symbol for Deployment");
+        let sym = &symbols[0];
+        let sig = sym.signature.as_ref().unwrap();
+        assert!(
+            sig.contains("env=FOO,BAR"),
+            "Signature should contain env=FOO,BAR"
+        );
+    }
+
+    #[test]
+    fn extract_yaml_symbols_rbac_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("role.yaml");
+        std::fs::write(
+            &file,
+            r#"apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: reader
+rules:
+- apiGroups: [""]
+  resources: [pods, services]
+  verbs: [get, list, watch]
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 1, "Expected 1 symbol for Role");
+        let sym = &symbols[0];
+        let sig = sym.signature.as_ref().unwrap();
+        assert!(
+            sig.contains("verbs=get,list,watch"),
+            "Signature should contain verbs=get,list,watch"
+        );
+        assert!(
+            sig.contains("resources=pods,services"),
+            "Signature should contain resources=pods,services"
+        );
+    }
+
+    #[test]
+    fn extract_yaml_symbols_argo_workflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("workflow.yaml");
+        std::fs::write(
+            &file,
+            r#"apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: hello-world
+spec:
+  entrypoint: main
+  templates:
+  - name: main
+    container:
+      image: alpine:3.18
+      command: [echo]
+      args: ["hello"]
+  - name: print
+    container:
+      image: alpine:3.18
+      command: [echo]
+      args: ["world"]
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 1, "Expected 1 symbol for Workflow");
+        let sym = &symbols[0];
+        assert!(
+            sym.name.contains("Workflow"),
+            "Symbol name should contain Workflow"
+        );
+        let sig = sym.signature.as_ref().unwrap();
+        assert!(
+            sig.contains("entrypoint=main"),
+            "Signature should contain entrypoint=main"
+        );
+        assert!(
+            sig.contains("templates=main,print"),
+            "Signature should contain templates=main,print"
+        );
+        assert!(
+            sig.contains("image=alpine:3.18"),
+            "Signature should contain image=alpine:3.18"
+        );
+        assert!(
+            sig.contains("command=echo"),
+            "Signature should contain command=echo"
+        );
+    }
+
+    #[test]
+    fn extract_yaml_symbols_generatename_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("workflow.yaml");
+        std::fs::write(
+            &file,
+            r#"apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: hello-
+spec:
+  entrypoint: main
+  templates:
+  - name: main
+    container:
+      image: alpine:3.18
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 1, "Expected 1 symbol for Workflow");
+        let sym = &symbols[0];
+        assert!(
+            sym.name.contains("hello-"),
+            "Symbol name should contain generateName fallback 'hello-'"
+        );
     }
 }
