@@ -173,6 +173,7 @@ _Coming soon._
 | Zig | ✓ | ✓ | ✓ | ✓ | | |
 | Bash | ✓ | ✓ | | ✓ | | |
 | HTML / Markdown | ✓ | ✓ | | | | |
+| YAML (incl. Kubernetes) | ✓ | ✓ | — | — |
 | JSON | ✓ | ✓ | ✓ | | | |
 | Solidity | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | Vue | ✓ | ✓ | ✓ | ✓ | ✓ | |

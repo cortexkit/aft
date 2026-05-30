@@ -41,7 +41,8 @@ impl IndentStyle {
             | LangId::Json
             | LangId::Scala
             | LangId::Ruby
-            | LangId::Lua => IndentStyle::Spaces(2),
+            | LangId::Lua
+            | LangId::Yaml => IndentStyle::Spaces(2),
             LangId::Rust => IndentStyle::Spaces(4),
             LangId::Go => IndentStyle::Tabs,
             LangId::C | LangId::Cpp | LangId::Zig | LangId::CSharp | LangId::Bash => {

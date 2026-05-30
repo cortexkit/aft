@@ -198,6 +198,7 @@ fn language_key(path: &Path) -> &'static str {
         Some(LangId::Bash) => "bash",
         Some(LangId::Html) => "html",
         Some(LangId::Markdown) => "markdown",
+        Some(LangId::Yaml) => "yaml",
         Some(LangId::Solidity) => "solidity",
         Some(LangId::Vue) => "vue",
         Some(LangId::Json) => "json",

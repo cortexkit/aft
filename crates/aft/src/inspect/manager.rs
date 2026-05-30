@@ -1486,6 +1486,7 @@ fn language_name(language: crate::parser::LangId) -> &'static str {
         crate::parser::LangId::Bash => "bash",
         crate::parser::LangId::Html => "html",
         crate::parser::LangId::Markdown => "markdown",
+        crate::parser::LangId::Yaml => "yaml",
         crate::parser::LangId::Solidity => "solidity",
         crate::parser::LangId::Vue => "vue",
         crate::parser::LangId::Json => "json",

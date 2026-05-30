@@ -689,6 +689,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Perl => "perl",
         LangId::Html => "html",
         LangId::Markdown => "markdown",
+        LangId::Yaml => "yaml",
     }
 }
 
@@ -849,6 +850,7 @@ fn formatter_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<To
         | LangId::Perl => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
+        LangId::Yaml => Vec::new(),
     }
 }
 
@@ -963,6 +965,7 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
         | LangId::Perl => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
+        LangId::Yaml => Vec::new(),
     }
 }
 
@@ -1190,6 +1193,7 @@ fn placeholder_file_for_language(project_root: &Path, lang: LangId) -> PathBuf {
         LangId::Perl => "aft-tool-detection.pl",
         LangId::Html => "aft-tool-detection.html",
         LangId::Markdown => "aft-tool-detection.md",
+        LangId::Yaml => "aft-tool-detection.yaml",
     };
     project_root.join(filename)
 }

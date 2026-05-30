@@ -381,7 +381,8 @@ pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangI
         | LangId::Lua
         | LangId::Perl
         | LangId::Html
-        | LangId::Markdown => false,
+        | LangId::Markdown
+        | LangId::Yaml => false,
     }
 }
 

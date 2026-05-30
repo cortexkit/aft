@@ -2654,6 +2654,8 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "zsh"
                 | "sol"
                 | "vue"
+                | "yaml"
+                | "yml"
         )
     )
 }

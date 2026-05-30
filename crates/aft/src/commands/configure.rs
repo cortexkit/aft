@@ -708,6 +708,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Perl => "perl",
         LangId::Html => "html",
         LangId::Markdown => "markdown",
+        LangId::Yaml => "yaml",
     }
 }
 
@@ -856,7 +857,7 @@ fn formatter_candidates(
         | LangId::Php
         | LangId::Lua
         | LangId::Perl => Vec::new(),
-        LangId::Html | LangId::Markdown => Vec::new(),
+        LangId::Html | LangId::Markdown | LangId::Yaml => Vec::new(),
     }
 }
 
@@ -922,7 +923,7 @@ fn checker_candidates(lang: LangId, config: &crate::config::Config) -> Vec<Confi
         | LangId::Php
         | LangId::Lua
         | LangId::Perl => Vec::new(),
-        LangId::Html | LangId::Markdown => Vec::new(),
+        LangId::Html | LangId::Markdown | LangId::Yaml => Vec::new(),
     }
 }
 

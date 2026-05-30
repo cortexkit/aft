@@ -584,6 +584,7 @@ fn language_id(lang: LangId) -> &'static str {
         LangId::Bash => "bash",
         LangId::Html => "html",
         LangId::Markdown => "markdown",
+        LangId::Yaml => "yaml",
         LangId::Solidity => "solidity",
         LangId::Vue => "vue",
         LangId::Json => "json",

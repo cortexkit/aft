@@ -467,7 +467,8 @@ fn find_scope_container(
         | LangId::Lua
         | LangId::Perl
         | LangId::Html
-        | LangId::Markdown => {}
+        | LangId::Markdown
+        | LangId::Yaml => {}
     }
 
     (None, available)

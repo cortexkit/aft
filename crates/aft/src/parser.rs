@@ -586,6 +586,7 @@ pub enum LangId {
     Php,
     Lua,
     Perl,
+    Yaml,
 }
 
 /// Maps file extension to language identifier.
@@ -616,6 +617,7 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "php" => Some(LangId::Php),
         "lua" => Some(LangId::Lua),
         "pl" | "pm" | "t" => Some(LangId::Perl),
+        "yaml" | "yml" => Some(LangId::Yaml),
         _ => None,
     }
 }
@@ -647,6 +649,7 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::Php => tree_sitter_php::LANGUAGE_PHP.into(),
         LangId::Lua => tree_sitter_lua::LANGUAGE.into(),
         LangId::Perl => tree_sitter_perl::LANGUAGE.into(),
+        LangId::Yaml => tree_sitter_yaml::LANGUAGE.into(),
     }
 }
 
@@ -676,6 +679,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::Php => Some(PHP_QUERY),
         LangId::Lua => Some(LUA_QUERY),
         LangId::Perl => Some(PERL_QUERY),
+        LangId::Yaml => None, // YAML uses direct tree walking like JSON
     }
 }
 
@@ -748,7 +752,7 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         LangId::Php => Some(&*PHP_QUERY_CACHE),
         LangId::Lua => Some(&*LUA_QUERY_CACHE),
         LangId::Perl => Some(&*PERL_QUERY_CACHE),
-        LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json => None,
+        LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json | LangId::Yaml => None,
     };
 
     query
@@ -1260,6 +1264,9 @@ pub fn extract_symbols_from_tree(
     if lang == LangId::Json {
         return extract_json_symbols(source, &root);
     }
+    if lang == LangId::Yaml {
+        return extract_yaml_symbols(source, &root);
+    }
 
     let query = cached_query_for(lang)?.ok_or_else(|| AftError::InvalidRequest {
         message: format!("no query patterns implemented for {:?} yet", lang),
@@ -1285,7 +1292,7 @@ pub fn extract_symbols_from_tree(
         LangId::Php => extract_php_symbols(source, &root, query),
         LangId::Lua => extract_lua_symbols(source, &root, query),
         LangId::Perl => extract_perl_symbols(source, &root, query),
-        LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json => {
+        LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json | LangId::Yaml => {
             unreachable!("handled before query lookup")
         }
     }
@@ -1390,7 +1397,7 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
                 // Decorators are handled by decorated_definition capture
                 false
             }
-            LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json => false,
+            LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json | LangId::Yaml => false,
         };
 
         if should_include {
@@ -3677,6 +3684,188 @@ fn extract_json_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftErr
         });
     }
 
+    Ok(symbols)
+}
+
+/// Read a YAML scalar/key node as trimmed text, stripping surrounding quotes.
+fn yaml_scalar_text(source: &str, node: &Node) -> String {
+    node_text(source, node)
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .to_string()
+}
+
+/// Find the first (shallowest) block/flow mapping at or under `node`.
+fn yaml_find_mapping<'a>(node: &Node<'a>) -> Option<Node<'a>> {
+    if node.kind() == "block_mapping" || node.kind() == "flow_mapping" {
+        return Some(*node);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(found) = yaml_find_mapping(&child) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Look up a top-level key in a YAML mapping and return its value node.
+fn yaml_get<'a>(mapping: &Node<'a>, source: &str, key: &str) -> Option<Node<'a>> {
+    let mut cursor = mapping.walk();
+    for pair in mapping.named_children(&mut cursor) {
+        if pair.kind() != "block_mapping_pair" && pair.kind() != "flow_pair" {
+            continue;
+        }
+        let Some(key_node) = pair.child_by_field_name("key") else {
+            continue;
+        };
+        if yaml_scalar_text(source, &key_node) == key {
+            return pair.child_by_field_name("value");
+        }
+    }
+    None
+}
+
+/// Recursively collect `key=value` pairs for the given keys (e.g. image, port)
+/// to enrich embed_text for semantic search. Capped to avoid runaway output.
+fn yaml_collect_values(
+    source: &str,
+    node: &Node,
+    keys: &[&str],
+    out: &mut Vec<String>,
+    cap: usize,
+) {
+    if out.len() >= cap {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "block_mapping_pair" || child.kind() == "flow_pair" {
+            if let Some(key_node) = child.child_by_field_name("key") {
+                let key_text = yaml_scalar_text(source, &key_node);
+                if keys.contains(&key_text.as_str()) {
+                    if let Some(value_node) = child.child_by_field_name("value") {
+                        let value_text = yaml_scalar_text(source, &value_node);
+                        if !value_text.is_empty() && out.len() < cap {
+                            out.push(format!("{}={}", key_text, value_text));
+                        }
+                    }
+                }
+            }
+        }
+        yaml_collect_values(source, &child, keys, out, cap);
+    }
+}
+
+/// Tier 1: if a document is a Kubernetes resource (has both apiVersion + kind),
+/// emit one rich symbol named `<ns>/<Kind>/<name>` with enriched signature.
+/// Generalizes to arbitrary CRDs since apiVersion+kind is the CRD contract.
+fn yaml_k8s_resource_symbol(source: &str, doc: &Node, mapping: &Node) -> Option<Symbol> {
+    let api_version = yaml_get(mapping, source, "apiVersion").map(|n| yaml_scalar_text(source, &n))?;
+    let kind = yaml_get(mapping, source, "kind").map(|n| yaml_scalar_text(source, &n))?;
+    if api_version.is_empty() || kind.is_empty() {
+        return None;
+    }
+
+    let (name, namespace) = match yaml_get(mapping, source, "metadata") {
+        Some(meta) => match yaml_find_mapping(&meta) {
+            Some(meta_map) => (
+                yaml_get(&meta_map, source, "name").map(|n| yaml_scalar_text(source, &n)),
+                yaml_get(&meta_map, source, "namespace").map(|n| yaml_scalar_text(source, &n)),
+            ),
+            None => (None, None),
+        },
+        None => (None, None),
+    };
+
+    let res_name = name.clone().filter(|s| !s.is_empty());
+    let sym_name = match (&namespace, &res_name) {
+        (Some(ns), Some(n)) if !ns.is_empty() => format!("{}/{}/{}", ns, kind, n),
+        (_, Some(n)) => format!("{}/{}", kind, n),
+        _ => kind.clone(),
+    };
+
+    let mut sig = format!("apiVersion={} kind={}", api_version, kind);
+    if let Some(ns) = namespace.as_ref().filter(|s| !s.is_empty()) {
+        sig.push_str(&format!(" namespace={}", ns));
+    }
+    if let Some(n) = res_name.as_ref() {
+        sig.push_str(&format!(" name={}", n));
+    }
+    // Enrich with high-signal spec fields so intent queries match.
+    let mut extras = Vec::new();
+    yaml_collect_values(
+        source,
+        mapping,
+        &["image", "containerPort", "port", "targetPort"],
+        &mut extras,
+        12,
+    );
+    if !extras.is_empty() {
+        sig.push(' ');
+        sig.push_str(&extras.join(" "));
+    }
+
+    Some(Symbol {
+        name: sym_name,
+        kind: SymbolKind::Class,
+        range: node_range(doc),
+        signature: Some(sig),
+        scope_chain: vec![],
+        exported: true,
+        parent: None,
+    })
+}
+
+/// Tier 2: generic YAML — emit top-level mapping keys as Variable symbols
+/// (docker-compose services, CI jobs, Helm values.yaml, etc.).
+fn yaml_generic_keys(source: &str, mapping: &Node, symbols: &mut Vec<Symbol>) {
+    let mut cursor = mapping.walk();
+    for pair in mapping.named_children(&mut cursor) {
+        if pair.kind() != "block_mapping_pair" && pair.kind() != "flow_pair" {
+            continue;
+        }
+        let Some(key_node) = pair.child_by_field_name("key") else {
+            continue;
+        };
+        let name = yaml_scalar_text(source, &key_node);
+        if name.is_empty() {
+            continue;
+        }
+        symbols.push(Symbol {
+            name,
+            kind: SymbolKind::Variable,
+            range: node_range(&pair),
+            signature: None,
+            scope_chain: vec![],
+            exported: false,
+            parent: None,
+        });
+    }
+}
+
+/// Extract symbols from a YAML stream. Handles multi-document (`---`) streams:
+/// each document becomes a Kubernetes resource symbol (Tier 1) when it carries
+/// apiVersion+kind, otherwise its top-level keys are emitted (Tier 2). Helm/Go
+/// templated YAML that yields no parseable mapping degrades gracefully (the
+/// document is skipped rather than failing the whole file).
+fn extract_yaml_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
+    let mut symbols = Vec::new();
+    let mut cursor = root.walk();
+    for doc in root.named_children(&mut cursor) {
+        if doc.kind() != "document" {
+            continue;
+        }
+        let Some(mapping) = yaml_find_mapping(&doc) else {
+            continue;
+        };
+        if let Some(symbol) = yaml_k8s_resource_symbol(source, &doc, &mapping) {
+            symbols.push(symbol);
+        } else {
+            yaml_generic_keys(source, &mapping, &mut symbols);
+        }
+    }
     Ok(symbols)
 }
 
@@ -6949,5 +7138,123 @@ mod tests {
         assert!(symbols
             .iter()
             .any(|s| s.name == "Bar" && s.kind == SymbolKind::Interface));
+    }
+
+    #[test]
+    fn extract_yaml_symbols_k8s_resource() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("deployment.yaml");
+        std::fs::write(
+            &file,
+            r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx
+  namespace: web
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 1, "Expected 1 symbol for K8s Deployment");
+        let sym = &symbols[0];
+        assert_eq!(sym.name, "web/Deployment/nginx");
+        assert_eq!(sym.kind, SymbolKind::Class);
+        assert!(sym.exported);
+    }
+
+    #[test]
+    fn extract_yaml_symbols_k8s_no_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("service.yaml");
+        std::fs::write(
+            &file,
+            r#"apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-svc
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 1, "Expected 1 symbol for K8s Service");
+        let sym = &symbols[0];
+        assert_eq!(sym.name, "Service/nginx-svc");
+        assert_eq!(sym.kind, SymbolKind::Class);
+    }
+
+    #[test]
+    fn extract_yaml_symbols_multidoc() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("multidoc.yaml");
+        std::fs::write(
+            &file,
+            r#"apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: a
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: b
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 2, "Expected 2 symbols for multi-doc YAML");
+        assert!(symbols.iter().any(|s| s.name == "Deployment/a"));
+        assert!(symbols.iter().any(|s| s.name == "Service/b"));
+    }
+
+    #[test]
+    fn extract_yaml_symbols_generic_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("compose.yaml");
+        std::fs::write(
+            &file,
+            r#"version: "3"
+services:
+  web: {}
+volumes:
+  data: {}
+"#,
+        )
+        .unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        // Should have top-level keys: version, services, volumes
+        assert_eq!(symbols.len(), 3, "Expected 3 symbols for generic YAML");
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "version" && s.kind == SymbolKind::Variable));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "services" && s.kind == SymbolKind::Variable));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "volumes" && s.kind == SymbolKind::Variable));
+    }
+
+    #[test]
+    fn extract_yaml_symbols_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("empty.yaml");
+        std::fs::write(&file, "").unwrap();
+
+        let mut parser = FileParser::new();
+        let symbols = parser.extract_symbols(&file).unwrap();
+
+        assert_eq!(symbols.len(), 0, "Expected 0 symbols for empty YAML");
     }
 }
