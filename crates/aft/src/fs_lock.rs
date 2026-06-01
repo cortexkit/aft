@@ -537,12 +537,21 @@ fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
     match fs::rename(from, to) {
         Ok(()) => Ok(()),
         // Fall back to remove-then-rename only when the atomic replace is
-        // refused (e.g. the destination is briefly open by another handle).
-        // This preserves forward progress without the no-file window on the
-        // common path.
-        Err(_) => {
-            let _ = fs::remove_file(to);
-            fs::rename(from, to)
+        // refused AND the source temp file still exists. The destructive
+        // `remove_file(to)` must never run for a source-side failure (e.g.
+        // `from` was already consumed/lost, or an unrelated error): deleting
+        // the live destination there would leave the lock missing and trigger
+        // a terminal LockGone cascade in concurrent heartbeat readers — the
+        // exact race this function exists to avoid. When `from` is gone we
+        // cannot retry the rename anyway, so surface the original error and
+        // leave `to` intact.
+        Err(original) => {
+            if from.exists() {
+                let _ = fs::remove_file(to);
+                fs::rename(from, to)
+            } else {
+                Err(original)
+            }
         }
     }
 }
