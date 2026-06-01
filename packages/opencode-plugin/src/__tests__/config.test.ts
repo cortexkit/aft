@@ -242,6 +242,75 @@ describe("loadAftConfig", () => {
     expect(result.stderr).toContain("Ignoring auto_update from project config");
   });
 
+  // WSL2 / DrvFs fix: slow `aft` binary startup (~95-104s) exceeded the
+  // 30s default bridge timeout, causing repeated bridge respawns. The new
+  // `configure_timeout_ms` and `hang_timeout_threshold` fields are user-only
+  // (they govern bridge lifecycle, not project behavior) and must follow
+  // the same strict allowlist as `auto_update` / `max_callgraph_files`.
+  test("user config can set configure_timeout_ms and hang_timeout_threshold", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ configure_timeout_ms: 120000, hang_timeout_threshold: 10 }),
+    );
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({}));
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout) as Record<string, unknown>;
+    expect(config.configure_timeout_ms).toBe(120000);
+    expect(config.hang_timeout_threshold).toBe(10);
+    expect(result.stderr).not.toContain("configure_timeout_ms from project config");
+    expect(result.stderr).not.toContain("hang_timeout_threshold from project config");
+  });
+
+  test("project config cannot set configure_timeout_ms (strict allowlist)", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({}));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ configure_timeout_ms: 60000 }));
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout) as Record<string, unknown>;
+    expect(config.configure_timeout_ms).toBeUndefined();
+    expect(result.stderr).toContain("Ignoring configure_timeout_ms from project config");
+  });
+
+  test("project config cannot set hang_timeout_threshold (strict allowlist)", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(fixture.userConfigPath, JSON.stringify({}));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ hang_timeout_threshold: 5 }));
+
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    const config = JSON.parse(result.stdout) as Record<string, unknown>;
+    expect(config.hang_timeout_threshold).toBeUndefined();
+    expect(result.stderr).toContain("Ignoring hang_timeout_threshold from project config");
+  });
+
+  test("AftConfigSchema rejects non-positive configure_timeout_ms", () => {
+    expect(() => AftConfigSchema.parse({ configure_timeout_ms: 0 })).toThrow();
+    expect(() => AftConfigSchema.parse({ configure_timeout_ms: -1 })).toThrow();
+    expect(() => AftConfigSchema.parse({ configure_timeout_ms: 1.5 })).toThrow();
+    expect(AftConfigSchema.parse({ configure_timeout_ms: 120000 })).toBeDefined();
+  });
+
+  test("AftConfigSchema rejects non-positive hang_timeout_threshold", () => {
+    expect(() => AftConfigSchema.parse({ hang_timeout_threshold: 0 })).toThrow();
+    expect(() => AftConfigSchema.parse({ hang_timeout_threshold: -1 })).toThrow();
+    expect(() => AftConfigSchema.parse({ hang_timeout_threshold: 2.5 })).toThrow();
+    expect(AftConfigSchema.parse({ hang_timeout_threshold: 10 })).toBeDefined();
+  });
+
   // v0.27.2 bash graduation: nested `experimental.bash.*` legacy values are
   // migrated to the top-level `bash` block during load, and the resulting
   // in-memory config exposes them under `bash.*`. The user's on-disk file

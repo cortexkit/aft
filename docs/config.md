@@ -139,6 +139,19 @@ The schema is identical across harnesses. Only file location differs.
   // call-graph navigation on bigger projects.
   "max_callgraph_files": 5000,
 
+  // Request timeout in milliseconds passed to each bridge. The `aft` binary
+  // can take 60-120s to start on slow filesystems (WSL2 / DrvFs / network
+  // mounts); the previous 30000 default caused immediate configure timeouts
+  // followed by repeated bridge respawns ("works, drops, comes back" pattern).
+  // Default: 120000. USER-only. Must be a positive integer.
+  "configure_timeout_ms": 120000,
+
+  // Number of consecutive silent request timeouts tolerated before tearing
+  // down and respawning the bridge. Higher values are safer on slow
+  // filesystems; lower values recycle stale bridges faster. Default: 10.
+  // USER-only. Must be a positive integer.
+  "hang_timeout_threshold": 10,
+
   // Language servers used for post-edit diagnostics.
   //
   // Built-in servers (auto-registered when their binary is on PATH):

@@ -439,6 +439,18 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   } = {
     errorPrefix: "[aft-plugin]",
     minVersion: PLUGIN_VERSION,
+    // Per-bridge timeouts. `aft` binary startup is slow on WSL2 / DrvFs
+    // (~95-104s) and the bridge default of 30s causes an immediate
+    // configure timeout, followed by a second timeout, and then the
+    // bridge is torn down and respawned — producing the "AFT works,
+    // then drops, then comes back" cycle. Threading these from
+    // `aftConfig` lets users tune the bridge without rebuilding.
+    ...(aftConfig.configure_timeout_ms !== undefined && {
+      timeoutMs: aftConfig.configure_timeout_ms,
+    }),
+    ...(aftConfig.hang_timeout_threshold !== undefined && {
+      hangTimeoutThreshold: aftConfig.hang_timeout_threshold,
+    }),
     // Per-project configure overrides — fixes OpenCode Desktop /
     // `opencode serve` mode where one plugin instance serves many projects.
     // Without this, every bridge inherits the project config visible at

@@ -293,6 +293,20 @@ export const AftConfigSchema = z
     max_callgraph_files: z.number().int().positive().optional(),
     /** Auto-refresh OpenCode's cached @cortexkit/aft-opencode package when a newer channel version exists. */
     auto_update: z.boolean().optional(),
+    /**
+     * Request timeout in milliseconds passed to each bridge. Default: 120000.
+     * Set higher on slow filesystems (WSL2 / DrvFs / network mounts) where the
+     * `aft` binary may take 60-120s to start and the 30s default causes the
+     * bridge to time out and recycle repeatedly. Must be a positive integer.
+     */
+    configure_timeout_ms: z.number().int().positive().optional(),
+    /**
+     * Number of consecutive silent request timeouts tolerated before tearing
+     * down and respawning the bridge. Default: 10. Higher values are safer on
+     * slow filesystems; lower values recycle stale bridges faster. Must be a
+     * positive integer.
+     */
+    hang_timeout_threshold: z.number().int().positive().optional(),
   })
   .strict();
 
@@ -1201,6 +1215,8 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.url_fetch_allow_private !== undefined) stripped.push("url_fetch_allow_private");
   if (override.max_callgraph_files !== undefined) stripped.push("max_callgraph_files");
   if (override.auto_update !== undefined) stripped.push("auto_update");
+  if (override.configure_timeout_ms !== undefined) stripped.push("configure_timeout_ms");
+  if (override.hang_timeout_threshold !== undefined) stripped.push("hang_timeout_threshold");
   return stripped;
 }
 
