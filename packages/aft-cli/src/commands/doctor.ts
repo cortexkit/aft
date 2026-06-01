@@ -26,7 +26,6 @@ import {
 import { dirSize, formatBytes } from "../lib/fs-util.js";
 import { createGitHubIssue, isGhInstalled, openBrowser } from "../lib/github.js";
 import { resolveAdaptersForCommand } from "../lib/harness-select.js";
-import { capBodyToGithubLimit, extractRecentErrors } from "../lib/issue-body.js";
 import {
   capBodyToGithubLimit,
   extractRecentErrors,
