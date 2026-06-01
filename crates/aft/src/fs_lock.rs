@@ -527,8 +527,24 @@ fn atomic_write_lock_metadata(path: &Path, metadata: &LockMetadata) -> io::Resul
 
 #[cfg(windows)]
 fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
-    let _ = fs::remove_file(to);
-    fs::rename(from, to)
+    // std::fs::rename on Windows maps to MoveFileExW with
+    // MOVEFILE_REPLACE_EXISTING, which atomically replaces an existing
+    // destination. Try that FIRST: an unconditional `remove_file(to)` before
+    // the rename opens a window where `to` does not exist, and a concurrent
+    // reader (e.g. the heartbeat poll) landing in that gap reads NotFound ->
+    // LockGone (terminal) and kills the heartbeat thread. That race made
+    // heartbeat_survives_transient_malformed_and_recovers flaky on Windows CI.
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        // Fall back to remove-then-rename only when the atomic replace is
+        // refused (e.g. the destination is briefly open by another handle).
+        // This preserves forward progress without the no-file window on the
+        // common path.
+        Err(_) => {
+            let _ = fs::remove_file(to);
+            fs::rename(from, to)
+        }
+    }
 }
 
 #[cfg(not(windows))]
