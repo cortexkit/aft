@@ -536,23 +536,27 @@ fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
     // heartbeat_survives_transient_malformed_and_recovers flaky on Windows CI.
     match fs::rename(from, to) {
         Ok(()) => Ok(()),
-        // Fall back to remove-then-rename only when the atomic replace is
-        // refused AND the source temp file still exists. The destructive
-        // `remove_file(to)` must never run for a source-side failure (e.g.
-        // `from` was already consumed/lost, or an unrelated error): deleting
-        // the live destination there would leave the lock missing and trigger
-        // a terminal LockGone cascade in concurrent heartbeat readers — the
-        // exact race this function exists to avoid. When `from` is gone we
-        // cannot retry the rename anyway, so surface the original error and
-        // leave `to` intact.
-        Err(original) => {
-            if from.exists() {
-                let _ = fs::remove_file(to);
-                fs::rename(from, to)
-            } else {
-                Err(original)
+        // Fall back to a copy-over (NOT remove-then-rename) when the atomic
+        // replace is refused (e.g. the destination is briefly open by another
+        // handle, or AV/indexer holds the temp source). `fs::copy` opens `to`
+        // with create+truncate and overwrites its bytes in place — the
+        // destination path never stops existing, so a concurrent heartbeat
+        // poll can never read NotFound -> LockGone (terminal). The earlier
+        // remove-then-rename fallback left a window where, if the second
+        // rename also failed, `to` was permanently deleted; copy-over closes
+        // that race class entirely. Worst case a reader observes a partially
+        // written file and gets Malformed, which is transient and retried —
+        // never fatal. Best-effort cleanup of the temp source afterward.
+        Err(original) => match fs::copy(from, to) {
+            Ok(_) => {
+                let _ = fs::remove_file(from);
+                Ok(())
             }
-        }
+            // Both the atomic replace and the copy-over failed. Leave `to`
+            // untouched (copy create+truncate only proceeds once it can open
+            // the destination) and surface the original rename error.
+            Err(_) => Err(original),
+        },
     }
 }
 
