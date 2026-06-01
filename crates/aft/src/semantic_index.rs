@@ -2517,7 +2517,14 @@ fn build_embed_text(symbol: &Symbol, source: &str, file: &Path, project_root: &P
     );
 
     if let Some(sig) = &symbol.signature {
-        text.push_str(&format!(" signature:{}", sig));
+        // Cap the signature: structured parsers (e.g. YAML/Kubernetes) pack
+        // entire inline scripts (CronJob/Job `command:` bodies, multi-KB) into
+        // the signature. Appending it unbounded produces a single embed_text
+        // that overflows the embedding backend's physical batch (e.g. a
+        // llama.cpp server's 512-token cap), aborting the whole index build
+        // and silently degrading every search to lexical. 400 chars keeps the
+        // identifying head of the signature without blowing the budget.
+        text.push_str(&format!(" signature:{}", truncate_chars(sig, 400)));
     }
 
     // Add body snippet (first ~300 chars of symbol body)
@@ -2540,8 +2547,17 @@ fn build_embed_text(symbol: &Symbol, source: &str, file: &Path, project_root: &P
         text.push_str(&format!(" body:{}", snippet));
     }
 
-    text
+    // Final defense-in-depth clamp: no single embed_text may exceed the
+    // backend's per-input budget regardless of which field grew. Most
+    // backends cap a physical batch around 512 tokens; ~1600 chars stays
+    // comfortably under that for typical English/code (≈4 chars/token).
+    truncate_chars(&text, MAX_EMBED_TEXT_CHARS)
 }
+
+/// Upper bound on characters in a single chunk's `embed_text`. Keeps any one
+/// input below typical embedding-backend physical batch limits (~512 tokens)
+/// so an oversized symbol cannot abort the whole index build.
+const MAX_EMBED_TEXT_CHARS: usize = 1600;
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
@@ -2627,11 +2643,14 @@ pub fn build_file_summary_chunk(
         start_line: 0,
         end_line: 0,
         exported: false,
-        embed_text: format!(
-            "file:{rel_path} kind:file-summary name:{} parent:{parent_dir} doc:{doc} exports:{exports}",
-            file.file_stem()
-                .map(|stem| stem.to_string_lossy().to_string())
-                .unwrap_or_default()
+        embed_text: truncate_chars(
+            &format!(
+                "file:{rel_path} kind:file-summary name:{} parent:{parent_dir} doc:{doc} exports:{exports}",
+                file.file_stem()
+                    .map(|stem| stem.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            ),
+            MAX_EMBED_TEXT_CHARS,
         ),
         snippet,
     }
@@ -3832,6 +3851,31 @@ mod tests {
             chunks.is_empty(),
             "Heading symbols must be filtered out before embedding; got {} chunk(s)",
             chunks.len()
+        );
+    }
+
+    /// A symbol with an enormous signature (e.g. a YAML/Kubernetes CronJob
+    /// whose inline `command:` script is parsed into the signature) must not
+    /// produce an embed_text that overflows the embedding backend's physical
+    /// batch. Before the clamp, the unbounded `signature:` append created a
+    /// multi-KB input that aborted the whole index build and degraded every
+    /// search to lexical-only.
+    #[test]
+    fn build_embed_text_clamps_oversized_signature() {
+        let project_root = PathBuf::from("/proj");
+        let file = project_root.join("cronjob.yaml");
+        let huge_sig = "kubectl ".repeat(2000); // ~16 KB
+        let source = "apiVersion: batch/v1\nkind: CronJob\n";
+
+        let mut symbol = make_symbol(SymbolKind::Class, "cluster-janitor", 0, 1);
+        symbol.signature = Some(huge_sig);
+
+        let text = build_embed_text(&symbol, source, &file, &project_root);
+        assert!(
+            text.chars().count() <= MAX_EMBED_TEXT_CHARS,
+            "embed_text must be clamped to {} chars, got {}",
+            MAX_EMBED_TEXT_CHARS,
+            text.chars().count()
         );
     }
 
