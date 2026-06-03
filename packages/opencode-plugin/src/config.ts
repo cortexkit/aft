@@ -293,6 +293,10 @@ export const AftConfigSchema = z
     max_callgraph_files: z.number().int().positive().optional(),
     /** Auto-refresh OpenCode's cached @cortexkit/aft-opencode package when a newer channel version exists. */
     auto_update: z.boolean().optional(),
+    /** Bridge startup timeout in milliseconds. Default: 30000. Raise for slow environments (WSL/DrvFs). */
+    configure_timeout_ms: z.number().int().positive().optional(),
+    /** Consecutive request timeouts before bridge restart. Default: 2. Raise for slow environments. */
+    hang_timeout_threshold: z.number().int().positive().optional(),
   })
   .strict();
 

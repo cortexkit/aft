@@ -157,6 +157,8 @@ class BridgeReplacedDuringVersionCheck extends Error {
 export interface BridgeOptions {
   /** Request timeout in milliseconds. Default: 30000 */
   timeoutMs?: number;
+  /** Number of consecutive request timeouts before the bridge restarts. Default: 2 */
+  hangTimeoutThreshold?: number;
   /**
    * Extra environment variables to set on the spawned `aft` child process,
    * applied on top of the inherited `process.env` at spawn time. Use this to
@@ -338,6 +340,7 @@ export class BinaryBridge {
     this.binaryPath = binaryPath;
     this.cwd = cwd;
     this.timeoutMs = options?.timeoutMs ?? DEFAULT_BRIDGE_TIMEOUT_MS;
+    this.hangTimeoutThreshold = options?.hangTimeoutThreshold ?? BRIDGE_HANG_TIMEOUT_THRESHOLD;
     this.maxRestarts = options?.maxRestarts ?? 3;
     this.configOverrides = clampSemanticTimeout(configOverrides ?? {}, this.timeoutMs);
     this.minVersion = options?.minVersion;
@@ -633,7 +636,7 @@ export class BinaryBridge {
           const consecutiveTimeouts = this.consecutiveRequestTimeouts + 1;
           this.consecutiveRequestTimeouts = consecutiveTimeouts;
           const keepWarm =
-            childActiveSinceRequest || consecutiveTimeouts < BRIDGE_HANG_TIMEOUT_THRESHOLD;
+            childActiveSinceRequest || consecutiveTimeouts < this.hangTimeoutThreshold;
           const restartSuffix = keepWarm ? " — bridge kept warm" : " — restarting bridge";
           const timeoutMsg = `Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms${restartSuffix}`;
           if (requestSessionId) {

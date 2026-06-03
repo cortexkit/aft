@@ -561,6 +561,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       );
     },
   };
+  poolOptions.timeoutMs = aftConfig.configure_timeout_ms;
+  poolOptions.hangTimeoutThreshold = aftConfig.hang_timeout_threshold;
   const pool = new BridgePool(binaryPath, poolOptions, configOverrides);
   pool.setConfigureOverride("harness", "opencode");
   const ctx: PluginContext = {
