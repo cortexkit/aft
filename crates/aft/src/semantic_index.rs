@@ -1065,6 +1065,22 @@ pub struct EmbeddingEntry {
     vector: Vec<f32>,
 }
 
+/// Approximate payload footprint for the in-memory semantic index.
+///
+/// The estimate covers strings and embedding vectors that scale with project
+/// size. It intentionally does not try to model allocator or `HashMap` bucket
+/// overhead, which is platform-specific and better measured by profilers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SemanticMemoryEstimate {
+    pub indexed_files: usize,
+    pub entries: usize,
+    pub vector_bytes: u64,
+    pub snippet_bytes: u64,
+    pub embed_text_bytes: u64,
+    pub metadata_bytes: u64,
+    pub estimated_payload_bytes: u64,
+}
+
 /// The semantic index — stores embeddings for all symbols in a project
 #[derive(Debug, Clone)]
 pub struct SemanticIndex {
@@ -1152,6 +1168,72 @@ impl SemanticIndex {
         self.file_mtimes.len()
     }
 
+    /// Estimate project-size-dependent payload bytes held by this index.
+    pub fn memory_estimate(&self) -> SemanticMemoryEstimate {
+        let mut estimate = SemanticMemoryEstimate {
+            indexed_files: self.file_mtimes.len(),
+            entries: self.entries.len(),
+            ..SemanticMemoryEstimate::default()
+        };
+
+        for entry in &self.entries {
+            estimate.vector_bytes = estimate
+                .vector_bytes
+                .saturating_add((entry.vector.len() * std::mem::size_of::<f32>()) as u64);
+            estimate.snippet_bytes = estimate
+                .snippet_bytes
+                .saturating_add(entry.chunk.snippet.len() as u64);
+            estimate.embed_text_bytes = estimate
+                .embed_text_bytes
+                .saturating_add(entry.chunk.embed_text.len() as u64);
+            estimate.metadata_bytes = estimate
+                .metadata_bytes
+                .saturating_add(entry.chunk.name.len() as u64)
+                .saturating_add(entry.chunk.file.to_string_lossy().len() as u64);
+        }
+
+        estimate.estimated_payload_bytes = estimate
+            .vector_bytes
+            .saturating_add(estimate.snippet_bytes)
+            .saturating_add(estimate.embed_text_bytes)
+            .saturating_add(estimate.metadata_bytes);
+        estimate
+    }
+
+    /// Estimate the V6 cache payload size without allocating the serialized buffer.
+    pub fn serialized_size_estimate(&self) -> u64 {
+        let fingerprint_len = self
+            .fingerprint
+            .as_ref()
+            .map(|fingerprint| fingerprint.as_string().len() as u64)
+            .unwrap_or(0);
+        let mut total = 1 + 4 + 4 + 4 + fingerprint_len;
+
+        total += 4;
+        for (path, _mtime) in &self.file_mtimes {
+            let Some(relative) = cache_relative_path(&self.project_root, path) else {
+                continue;
+            };
+            let path_len = relative.to_string_lossy().len() as u64;
+            total += 4 + path_len + 8 + 4 + 8 + 32;
+        }
+
+        for entry in &self.entries {
+            let Some(relative) = cache_relative_path(&self.project_root, &entry.chunk.file) else {
+                continue;
+            };
+            total += 4 + relative.to_string_lossy().len() as u64;
+            total += 4 + entry.chunk.name.len() as u64;
+            total += 1;
+            total += 4 + 4 + 1;
+            total += 4 + entry.chunk.snippet.len() as u64;
+            total += 4 + entry.chunk.embed_text.len() as u64;
+            total += (entry.vector.len() * std::mem::size_of::<f32>()) as u64;
+        }
+
+        total
+    }
+
     /// Human-readable status label for the index.
     pub fn status_label(&self) -> &'static str {
         if self.entries.is_empty() {
@@ -1207,11 +1289,19 @@ impl SemanticIndex {
             }
         }
 
+        let embed_text_bytes: u64 = chunks
+            .iter()
+            .map(|chunk| chunk.embed_text.len() as u64)
+            .sum();
+        let snippet_bytes: u64 = chunks.iter().map(|chunk| chunk.snippet.len() as u64).sum();
+
         slog_info!(
-            "semantic collect: {} chunks from {} files in {} ms",
+            "semantic collect: {} chunks from {} files in {} ms (embed_text_bytes={}, snippet_bytes={})",
             chunks.len(),
             file_metadata.len(),
-            collect_started.elapsed().as_millis()
+            collect_started.elapsed().as_millis(),
+            embed_text_bytes,
+            snippet_bytes,
         );
 
         (chunks, file_metadata)
@@ -2041,7 +2131,10 @@ impl SemanticIndex {
                 .unwrap_or(Duration::ZERO)
                 .as_nanos()
         ));
+        let serialize_started = std::time::Instant::now();
         let bytes = self.to_bytes();
+        let serialize_ms = serialize_started.elapsed().as_millis();
+        let write_started = std::time::Instant::now();
         let write_result = (|| -> std::io::Result<()> {
             use std::io::Write;
             let mut file = fs::File::create(&tmp_path)?;
@@ -2049,6 +2142,7 @@ impl SemanticIndex {
             file.sync_all()?;
             Ok(())
         })();
+        let write_ms = write_started.elapsed().as_millis();
         if let Err(e) = write_result {
             slog_warn!("failed to write semantic index: {}", e);
             let _ = fs::remove_file(&tmp_path);
@@ -2059,10 +2153,14 @@ impl SemanticIndex {
             let _ = fs::remove_file(&tmp_path);
             return;
         }
+        let estimate = self.memory_estimate();
         slog_info!(
-            "semantic index persisted: {} entries, {:.1} KB",
+            "semantic index persisted: {} entries, {} cache bytes, {} payload bytes (serialize_ms={}, write_ms={})",
             self.entries.len(),
-            bytes.len() as f64 / 1024.0
+            bytes.len(),
+            estimate.estimated_payload_bytes,
+            serialize_ms,
+            write_ms,
         );
     }
 
@@ -2091,7 +2189,9 @@ impl SemanticIndex {
             return None;
         }
 
+        let read_started = std::time::Instant::now();
         let bytes = fs::read(&data_path).ok()?;
+        let read_ms = read_started.elapsed().as_millis();
         let version = bytes[0];
         if version != SEMANTIC_INDEX_VERSION_V6 {
             slog_info!(
@@ -2104,8 +2204,10 @@ impl SemanticIndex {
             }
             return None;
         }
+        let decode_started = std::time::Instant::now();
         match Self::from_bytes(&bytes, current_canonical_root) {
             Ok(index) => {
+                let decode_ms = decode_started.elapsed().as_millis();
                 if index.entries.is_empty() {
                     slog_info!("cached semantic index is empty, will rebuild");
                     if !is_worktree_bridge {
@@ -2126,9 +2228,14 @@ impl SemanticIndex {
                         return None;
                     }
                 }
+                let estimate = index.memory_estimate();
                 slog_info!(
-                    "loaded semantic index from disk: {} entries",
-                    index.entries.len()
+                    "loaded semantic index from disk: {} entries, {} cache bytes, {} payload bytes (read_ms={}, decode_ms={})",
+                    index.entries.len(),
+                    file_len,
+                    estimate.estimated_payload_bytes,
+                    read_ms,
+                    decode_ms,
                 );
                 Some(index)
             }
@@ -3140,6 +3247,7 @@ mod tests {
         });
 
         let bytes = index.to_bytes();
+        assert_eq!(index.serialized_size_estimate(), bytes.len() as u64);
         let restored = SemanticIndex::from_bytes(&bytes, &project_root).unwrap();
 
         assert_eq!(restored.entries.len(), 1);
@@ -3148,6 +3256,51 @@ mod tests {
         assert_eq!(restored.dimension, 4);
         assert_eq!(restored.backend_label(), Some("fastembed"));
         assert_eq!(restored.model_label(), Some("all-MiniLM-L6-v2"));
+    }
+
+    #[test]
+    fn memory_estimate_counts_scaling_payload_bytes() {
+        let project_root = test_project_root();
+        let file = project_root.join("src/main.rs");
+        let mut index = SemanticIndex::new(project_root.clone(), 4);
+        index.entries.push(EmbeddingEntry {
+            chunk: SemanticChunk {
+                file: file.clone(),
+                name: "handle_request".to_string(),
+                kind: SymbolKind::Function,
+                start_line: 10,
+                end_line: 25,
+                exported: true,
+                embed_text: "embed this function".to_string(),
+                snippet: "fn handle_request() {}".to_string(),
+            },
+            vector: vec![0.1, 0.2, 0.3, 0.4],
+        });
+        index
+            .file_mtimes
+            .insert(file.clone(), SystemTime::UNIX_EPOCH);
+
+        let estimate = index.memory_estimate();
+
+        assert_eq!(estimate.indexed_files, 1);
+        assert_eq!(estimate.entries, 1);
+        assert_eq!(estimate.vector_bytes, 4 * std::mem::size_of::<f32>() as u64);
+        assert_eq!(
+            estimate.embed_text_bytes,
+            "embed this function".len() as u64
+        );
+        assert_eq!(
+            estimate.snippet_bytes,
+            "fn handle_request() {}".len() as u64
+        );
+        assert!(estimate.metadata_bytes >= "handle_request".len() as u64);
+        assert_eq!(
+            estimate.estimated_payload_bytes,
+            estimate.vector_bytes
+                + estimate.embed_text_bytes
+                + estimate.snippet_bytes
+                + estimate.metadata_bytes
+        );
     }
 
     #[test]

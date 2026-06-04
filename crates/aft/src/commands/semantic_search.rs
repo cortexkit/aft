@@ -364,6 +364,7 @@ fn handle_semantic_or_hybrid_search(
             files,
             entries_done,
             entries_total,
+            ..
         } => {
             let mut detail = format!("Semantic index is still building (stage: {}).", stage);
             if let Some(files) = files {
@@ -1851,6 +1852,7 @@ mod tests {
             files: Some(1),
             entries_done: Some(0),
             entries_total: Some(1),
+            stats: None,
         };
 
         let response = response_value(handle_semantic_search(

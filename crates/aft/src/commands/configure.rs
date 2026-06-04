@@ -15,8 +15,8 @@ use std::collections::{HashMap, HashSet};
 use crate::callgraph::CallGraph;
 use crate::config::{SemanticBackend, SemanticBackendConfig, UserServerDef};
 use crate::context::{
-    AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent,
-    SemanticRefreshRequest, SemanticRefreshWorkerSlot,
+    AppContext, SemanticIndexEvent, SemanticIndexStatus, SemanticProgressStats,
+    SemanticRefreshEvent, SemanticRefreshRequest, SemanticRefreshWorkerSlot,
 };
 use crate::harness::Harness;
 use crate::log_ctx;
@@ -27,7 +27,9 @@ use crate::search_index::{
     build_path_filters, current_git_head, project_cache_key, resolve_cache_dir,
     walk_project_files_bounded_matching, CacheLock, SearchIndex,
 };
-use crate::semantic_index::{is_semantic_indexed_extension, SemanticIndex, SemanticIndexLock};
+use crate::semantic_index::{
+    is_semantic_indexed_extension, SemanticIndex, SemanticIndexLock, SemanticMemoryEstimate,
+};
 use crate::{slog_info, slog_warn};
 
 static WATCHER_GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -37,6 +39,39 @@ const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 250;
 const SEMANTIC_REFRESH_MAX_BATCH_PATHS: usize = 50;
 const MAX_SEMANTIC_TIMEOUT_MS: u64 = 120_000;
 const MAX_SEMANTIC_BATCH_SIZE: usize = 1_024;
+
+fn semantic_progress_stats_from_estimate(
+    estimate: SemanticMemoryEstimate,
+) -> SemanticProgressStats {
+    SemanticProgressStats {
+        indexed_files: Some(estimate.indexed_files),
+        entries: Some(estimate.entries),
+        vector_bytes: Some(estimate.vector_bytes),
+        snippet_bytes: Some(estimate.snippet_bytes),
+        embed_text_bytes: Some(estimate.embed_text_bytes),
+        metadata_bytes: Some(estimate.metadata_bytes),
+        estimated_payload_bytes: Some(estimate.estimated_payload_bytes),
+        cache_bytes: None,
+        clone_estimated_bytes: None,
+    }
+}
+
+fn semantic_clone_stats_from_estimate(estimate: SemanticMemoryEstimate) -> SemanticProgressStats {
+    SemanticProgressStats {
+        clone_estimated_bytes: Some(estimate.estimated_payload_bytes),
+        ..semantic_progress_stats_from_estimate(estimate)
+    }
+}
+
+fn semantic_progress_stats_with_cache(
+    index: &SemanticIndex,
+    cache_bytes: u64,
+) -> SemanticProgressStats {
+    SemanticProgressStats {
+        cache_bytes: Some(cache_bytes),
+        ..semantic_progress_stats_from_estimate(index.memory_estimate())
+    }
+}
 
 fn resolve_home_dir() -> Option<PathBuf> {
     let raw = std::env::var_os("HOME")
@@ -196,9 +231,18 @@ fn spawn_semantic_refresh_worker(
                                     summary.total_processed,
                                 );
                             }
+                            let clone_estimate = index.memory_estimate();
+                            let clone_started = Instant::now();
+                            let refreshed_index = index.clone();
+                            slog_info!(
+                                "semantic corpus refresh clone: {} entries, {} estimated payload bytes, {} ms",
+                                clone_estimate.entries,
+                                clone_estimate.estimated_payload_bytes,
+                                clone_started.elapsed().as_millis(),
+                            );
                             if event_tx
                                 .send(SemanticRefreshEvent::CorpusCompleted {
-                                    index: index.clone(),
+                                    index: refreshed_index,
                                     changed: summary.changed,
                                     added: summary.added,
                                     deleted: summary.deleted,
@@ -1934,6 +1978,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             files: None,
             entries_done: None,
             entries_total: None,
+            stats: None,
         };
         let (tx, rx): (
             crossbeam_channel::Sender<SemanticIndexEvent>,
@@ -1974,6 +2019,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             files: None,
                             entries_done: None,
                             entries_total: None,
+                            stats: None,
                         });
                         let mut model =
                             crate::semantic_index::EmbeddingModel::from_config(&semantic_config)?;
@@ -2034,6 +2080,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                     files: None,
                                     entries_done: None,
                                     entries_total: None,
+                                    stats: None,
                                 });
                                 let mut progress = |done: usize, total: usize| {
                                     let _ = tx_progress.send(SemanticIndexEvent::Progress {
@@ -2041,6 +2088,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                         files: None,
                                         entries_done: Some(done),
                                         entries_total: Some(total),
+                                        stats: None,
                                     });
                                 };
 
@@ -2079,6 +2127,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                             files: None,
                                             entries_done: Some(cached.entry_count()),
                                             entries_total: Some(cached.entry_count()),
+                                            stats: Some(semantic_progress_stats_with_cache(
+                                                &cached,
+                                                cached.serialized_size_estimate(),
+                                            )),
                                         });
                                         return Ok((cached, model));
                                     }
@@ -2104,6 +2156,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                     files: Some(files.len()),
                                     entries_done: None,
                                     entries_total: None,
+                                    stats: None,
                                 });
                                 files
                             }
@@ -2113,6 +2166,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                     files: Some(observed),
                                     entries_done: None,
                                     entries_total: None,
+                                    stats: None,
                                 });
                                 slog_warn!(
                                     "skipping semantic index: more than {} files exceeds limit of {}. \
@@ -2134,6 +2188,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             files: Some(files.len()),
                             entries_done: None,
                             entries_total: None,
+                            stats: None,
                         });
                         let mut progress = |done: usize, total: usize| {
                             let _ = tx_progress.send(SemanticIndexEvent::Progress {
@@ -2141,6 +2196,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                                 files: Some(files.len()),
                                 entries_done: Some(done),
                                 entries_total: Some(total),
+                                stats: None,
                             });
                         };
                         let index = SemanticIndex::build_with_progress(
@@ -2162,6 +2218,10 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                             files: Some(files.len()),
                             entries_done: Some(index.len()),
                             entries_total: Some(index.len()),
+                            stats: Some(semantic_progress_stats_with_cache(
+                                &index,
+                                index.serialized_size_estimate(),
+                            )),
                         });
 
                         if !is_worktree_bridge_for_semantic {
@@ -2176,7 +2236,22 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
 
                 let event = match build_result {
                     Ok(Ok((index, model))) => {
+                        let clone_estimate = index.memory_estimate();
+                        let clone_started = Instant::now();
                         let worker_index = index.clone();
+                        slog_info!(
+                            "semantic index clone for refresh worker: {} entries, {} estimated payload bytes, {} ms",
+                            clone_estimate.entries,
+                            clone_estimate.estimated_payload_bytes,
+                            clone_started.elapsed().as_millis(),
+                        );
+                        let _ = tx_progress.send(SemanticIndexEvent::Progress {
+                            stage: "starting_refresh_worker".to_string(),
+                            files: Some(clone_estimate.indexed_files),
+                            entries_done: Some(clone_estimate.entries),
+                            entries_total: Some(clone_estimate.entries),
+                            stats: Some(semantic_clone_stats_from_estimate(clone_estimate)),
+                        });
                         let worker_handle = spawn_semantic_refresh_worker(
                             root_clone.clone(),
                             worker_index,

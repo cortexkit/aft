@@ -1,7 +1,7 @@
 //! AFT status command — returns the current state of indexes, features, and configuration.
 
 use crate::context::AppContext;
-use crate::context::SemanticIndexStatus;
+use crate::context::{SemanticIndexStatus, SemanticProgressStats};
 use crate::db::compression_events::CompressionAggregate;
 use crate::protocol::{RawRequest, Response, StatusPayload, DEFAULT_SESSION_ID};
 
@@ -17,6 +17,23 @@ pub struct CompressionAggregateSerde {
     pub original_tokens: u64,
     pub compressed_tokens: u64,
     pub savings_tokens: u64,
+}
+
+fn semantic_progress_stats_json(stats: Option<SemanticProgressStats>) -> serde_json::Value {
+    let Some(stats) = stats else {
+        return serde_json::Value::Null;
+    };
+    serde_json::json!({
+        "indexed_files": stats.indexed_files,
+        "entries": stats.entries,
+        "vector_bytes": stats.vector_bytes,
+        "snippet_bytes": stats.snippet_bytes,
+        "embed_text_bytes": stats.embed_text_bytes,
+        "metadata_bytes": stats.metadata_bytes,
+        "estimated_payload_bytes": stats.estimated_payload_bytes,
+        "cache_bytes": stats.cache_bytes,
+        "clone_estimated_bytes": stats.clone_estimated_bytes,
+    })
 }
 
 impl From<CompressionAggregate> for CompressionAggregateSerde {
@@ -104,6 +121,7 @@ impl AppContext {
                         files,
                         entries_done,
                         entries_total,
+                        stats,
                     } => serde_json::json!({
                         "status": "loading",
                         "state": "loading",
@@ -112,6 +130,7 @@ impl AppContext {
                         "files": files,
                         "entries_done": entries_done,
                         "entries_total": entries_total,
+                        "stats": semantic_progress_stats_json(stats),
                         "backend": config.semantic_backend_label(),
                         "model": config.semantic.model.as_str(),
                     }),
@@ -296,7 +315,7 @@ fn dir_size_recursive(path: &std::path::Path) -> u64 {
 mod tests {
     use super::handle_status;
     use crate::config::Config;
-    use crate::context::AppContext;
+    use crate::context::{AppContext, SemanticIndexStatus, SemanticProgressStats};
     use crate::parser::TreeSitterProvider;
     use crate::protocol::RawRequest;
     use serde_json::json;
@@ -329,5 +348,41 @@ mod tests {
         ctx.set_cache_role(true, None);
         let response = handle_status(&request(), &ctx);
         assert_eq!(response.data["cache_role"], "worktree");
+    }
+
+    #[test]
+    fn status_exposes_semantic_progress_stats() {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        ctx.config_mut().semantic_search = true;
+        *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
+            stage: "persisting_index".to_string(),
+            files: Some(3),
+            entries_done: Some(5),
+            entries_total: Some(5),
+            stats: Some(SemanticProgressStats {
+                indexed_files: Some(3),
+                entries: Some(5),
+                vector_bytes: Some(7680),
+                snippet_bytes: Some(1200),
+                embed_text_bytes: Some(3400),
+                metadata_bytes: Some(260),
+                estimated_payload_bytes: Some(12540),
+                cache_bytes: Some(15000),
+                clone_estimated_bytes: None,
+            }),
+        };
+
+        let response = handle_status(&request(), &ctx);
+        let stats = &response.data["semantic_index"]["stats"];
+        assert_eq!(response.data["semantic_index"]["stage"], "persisting_index");
+        assert_eq!(stats["indexed_files"], 3);
+        assert_eq!(stats["entries"], 5);
+        assert_eq!(stats["vector_bytes"], 7680);
+        assert_eq!(stats["snippet_bytes"], 1200);
+        assert_eq!(stats["embed_text_bytes"], 3400);
+        assert_eq!(stats["metadata_bytes"], 260);
+        assert_eq!(stats["estimated_payload_bytes"], 12540);
+        assert_eq!(stats["cache_bytes"], 15000);
+        assert!(stats["clone_estimated_bytes"].is_null());
     }
 }

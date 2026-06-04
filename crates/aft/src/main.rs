@@ -1034,6 +1034,7 @@ fn refresh_corpus_after_ignore_change(ctx: &AppContext) {
                         files: Some(file_count),
                         entries_done: None,
                         entries_total: None,
+                        stats: None,
                     };
                     match sender.send(SemanticRefreshRequest::Corpus { current_files }) {
                         Ok(()) => {
@@ -1332,12 +1333,14 @@ fn drain_semantic_index_events(ctx: &AppContext) {
                 files,
                 entries_done,
                 entries_total,
+                stats,
             } => {
                 *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
                     stage,
                     files,
                     entries_done,
                     entries_total,
+                    stats,
                 };
                 // Push progress to the sidebar. Without this, a long rebuild
                 // (e.g. a slow local embedding backend re-indexing after a prior
@@ -1388,6 +1391,7 @@ fn drain_semantic_index_events(ctx: &AppContext) {
                         files: Some(file_count),
                         entries_done: None,
                         entries_total: None,
+                        stats: None,
                     };
                     let sent = ctx.semantic_refresh_sender().is_some_and(|sender| {
                         sender

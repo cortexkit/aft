@@ -168,6 +168,7 @@ pub enum SemanticIndexStatus {
         files: Option<usize>,
         entries_done: Option<usize>,
         entries_total: Option<usize>,
+        stats: Option<SemanticProgressStats>,
     },
     Ready {
         /// Files currently being re-embedded after recent edits. The index is
@@ -267,9 +268,27 @@ pub enum SemanticIndexEvent {
         files: Option<usize>,
         entries_done: Option<usize>,
         entries_total: Option<usize>,
+        stats: Option<SemanticProgressStats>,
     },
     Ready(SemanticIndex),
     Failed(String),
+}
+
+/// Optional diagnostic counters attached to semantic-index progress updates.
+///
+/// These are intentionally estimates: they expose payload/cache/clone pressure
+/// without requiring a platform-specific heap profiler in the Rust worker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SemanticProgressStats {
+    pub indexed_files: Option<usize>,
+    pub entries: Option<usize>,
+    pub vector_bytes: Option<u64>,
+    pub snippet_bytes: Option<u64>,
+    pub embed_text_bytes: Option<u64>,
+    pub metadata_bytes: Option<u64>,
+    pub estimated_payload_bytes: Option<u64>,
+    pub cache_bytes: Option<u64>,
+    pub clone_estimated_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

@@ -312,6 +312,7 @@ fn natural_language_auto_falls_back_to_grep_while_semantic_builds() {
         files: Some(1),
         entries_done: Some(0),
         entries_total: Some(1),
+        stats: None,
     };
 
     let response = response_value(handle_semantic_search(
@@ -570,6 +571,7 @@ fn lexical_only_fallback_reports_more_available_when_capped_or_over_top_k() {
         files: Some(210),
         entries_done: Some(0),
         entries_total: Some(210),
+        stats: None,
     };
 
     let response = response_value(handle_semantic_search(

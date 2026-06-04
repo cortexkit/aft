@@ -384,6 +384,7 @@ fn semantic_index_state(ctx: &AppContext) -> SubsystemState {
             files,
             entries_done,
             entries_total,
+            ..
         } => {
             let mut detail = stage;
             if let Some(files) = files {
@@ -453,12 +454,14 @@ fn drain_semantic_index_events(ctx: &AppContext) {
                 files,
                 entries_done,
                 entries_total,
+                stats,
             } => {
                 *ctx.semantic_index_status().borrow_mut() = SemanticIndexStatus::Building {
                     stage,
                     files,
                     entries_done,
                     entries_total,
+                    stats,
                 };
             }
             SemanticIndexEvent::Ready(index) => {
