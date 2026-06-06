@@ -4,7 +4,7 @@ import { error, getActiveLogger, log } from "./active-logger.js";
 import { BinaryBridge, type BridgeOptions } from "./bridge.js";
 import type { Logger, LogMeta } from "./logger.js";
 
-const DEFAULT_IDLE_TIMEOUT_MS = Infinity; // keep alive as long as the host is running
+const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 min instead of Infinity
 const DEFAULT_MAX_POOL_SIZE = 8;
 const CLEANUP_INTERVAL_MS = 60 * 1000; // check every minute
 

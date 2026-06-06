@@ -8,7 +8,7 @@ import type { Logger, LogMeta } from "./logger.js";
 import type { BgCompletion, StatusCompression } from "./protocol.js";
 
 const DEFAULT_BRIDGE_TIMEOUT_MS = 30_000;
-const BRIDGE_HANG_TIMEOUT_THRESHOLD = 2;
+const BRIDGE_HANG_TIMEOUT_THRESHOLD = 20;
 const SEMANTIC_TIMEOUT_SAFETY_MARGIN_MS = 5_000;
 const MAX_STDOUT_BUFFER = 64 * 1024 * 1024; // 64MB
 
@@ -633,7 +633,7 @@ export class BinaryBridge {
           const consecutiveTimeouts = this.consecutiveRequestTimeouts + 1;
           this.consecutiveRequestTimeouts = consecutiveTimeouts;
           const keepWarm =
-            childActiveSinceRequest || consecutiveTimeouts < BRIDGE_HANG_TIMEOUT_THRESHOLD;
+            childActiveSinceRequest || consecutiveTimeouts < BRIDGE_HANG_TIMEOUT_THRESHOLD || this.isAlive();
           const restartSuffix = keepWarm ? " — bridge kept warm" : " — restarting bridge";
           const timeoutMsg = `Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms${restartSuffix}`;
           if (requestSessionId) {
