@@ -21,7 +21,7 @@ import {
   handlePushedBgLongRunning,
   handlePushedPatternMatch,
 } from "./bg-notifications.js";
-import { loadAftConfig, resolveProjectOverridesForConfigure } from "./config.js";
+import { loadAftConfig, resolveBashConfig, resolveProjectOverridesForConfigure } from "./config.js";
 import {
   enqueueConfigureWarningsForSession,
   flushConfigureWarningsOnIdle,
@@ -518,6 +518,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // from that bridge, so draining/acking against a session-dir cache fallback
       // can target the wrong project on cold/stale cache.
       const sessionDir = bridge.getCwd();
+      const projectBashConfig = resolveBashConfig(loadAftConfig(sessionDir));
       void handlePushedBgCompletion(
         {
           ctx,
@@ -529,12 +530,17 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           // wake transport selection (anomalyco/opencode#28202).
           client: input.client,
           serverUrl: input.serverUrl?.toString(),
+          deferredCompletionFallbackMs: projectBashConfig.deferred_completion_fallback_ms,
+          wakeRetryMaxAttempts: projectBashConfig.wake_retry_max_attempts,
+          wakeDebounceStepMs: projectBashConfig.wake_debounce_step_ms,
+          wakeDebounceCapMs: projectBashConfig.wake_debounce_cap_ms,
         },
         completion,
       );
     },
     onBashLongRunning: (reminder, bridge) => {
       const sessionDir = bridge.getCwd();
+      const projectBashConfig = resolveBashConfig(loadAftConfig(sessionDir));
       void handlePushedBgLongRunning(
         {
           ctx,
@@ -544,12 +550,17 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           // wake transport selection.
           client: input.client,
           serverUrl: input.serverUrl?.toString(),
+          deferredCompletionFallbackMs: projectBashConfig.deferred_completion_fallback_ms,
+          wakeRetryMaxAttempts: projectBashConfig.wake_retry_max_attempts,
+          wakeDebounceStepMs: projectBashConfig.wake_debounce_step_ms,
+          wakeDebounceCapMs: projectBashConfig.wake_debounce_cap_ms,
         },
         reminder,
       );
     },
     onBashPatternMatch: (frame, bridge) => {
       const sessionDir = bridge.getCwd();
+      const projectBashConfig = resolveBashConfig(loadAftConfig(sessionDir));
       void handlePushedPatternMatch(
         {
           ctx,
@@ -557,6 +568,10 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
           sessionID: frame.session_id,
           client: input.client,
           serverUrl: input.serverUrl?.toString(),
+          deferredCompletionFallbackMs: projectBashConfig.deferred_completion_fallback_ms,
+          wakeRetryMaxAttempts: projectBashConfig.wake_retry_max_attempts,
+          wakeDebounceStepMs: projectBashConfig.wake_debounce_step_ms,
+          wakeDebounceCapMs: projectBashConfig.wake_debounce_cap_ms,
         },
         frame,
       );
@@ -977,12 +992,17 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       // for `-s` resumes from another folder.
       const sessionDir =
         (await getSessionDirectory(input.client, sessionID, input.directory)) ?? input.directory;
+      const projectBashConfig = resolveBashConfig(loadAftConfig(sessionDir));
       await handleIdleBgCompletions({
         ctx,
         directory: sessionDir,
         sessionID,
         client: input.client,
         serverUrl: input.serverUrl?.toString(),
+        deferredCompletionFallbackMs: projectBashConfig.deferred_completion_fallback_ms,
+        wakeRetryMaxAttempts: projectBashConfig.wake_retry_max_attempts,
+        wakeDebounceStepMs: projectBashConfig.wake_debounce_step_ms,
+        wakeDebounceCapMs: projectBashConfig.wake_debounce_cap_ms,
       });
       await flushConfigureWarningsOnIdle(sessionID);
     },

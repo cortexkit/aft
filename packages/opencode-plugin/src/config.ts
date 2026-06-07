@@ -168,6 +168,25 @@ const BashFeaturesSchema = z.object({
   long_running_reminder_enabled: z.boolean().optional(),
   long_running_reminder_interval_ms: z.number().int().positive().optional(),
   /**
+   * Safety-net delay before a completion that was deferred for same-turn
+   * delivery wakes the session without waiting for OpenCode session.idle.
+   * Default 500ms.
+   */
+  deferred_completion_fallback_ms: z.number().int().positive().optional(),
+  /**
+   * Maximum prompt-delivery retry attempts before wake delivery hard-stops
+   * and leaves completions pending for explicit in-turn drain. Default 5.
+   */
+  wake_retry_max_attempts: z.number().int().positive().optional(),
+  /**
+   * Initial wake debounce delay and retry backoff floor. Default 200ms.
+   */
+  wake_debounce_step_ms: z.number().int().positive().optional(),
+  /**
+   * Maximum wake debounce delay and retry backoff cap. Default 1000ms.
+   */
+  wake_debounce_cap_ms: z.number().int().positive().optional(),
+  /**
    * How long foreground bash blocks before auto-promoting the task to
    * background. Default 8000ms; values below the 5000ms floor are clamped up.
    */
@@ -460,6 +479,10 @@ export interface ResolvedBashConfig {
   background: boolean;
   /** See BashFeaturesSchema.subagent_background. Default false. */
   subagent_background: boolean;
+  deferred_completion_fallback_ms: number;
+  wake_retry_max_attempts: number;
+  wake_debounce_step_ms: number;
+  wake_debounce_cap_ms: number;
   long_running_reminder_enabled?: boolean;
   long_running_reminder_interval_ms?: number;
   /**
@@ -523,6 +546,14 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     FOREGROUND_WAIT_WINDOW_MIN_MS,
     rawForegroundWait ?? FOREGROUND_WAIT_WINDOW_DEFAULT_MS,
   );
+  const deferredCompletionFallbackMs =
+    typeof top === "object" && top !== null ? (top.deferred_completion_fallback_ms ?? 500) : 500;
+  const wakeRetryMaxAttempts =
+    typeof top === "object" && top !== null ? (top.wake_retry_max_attempts ?? 5) : 5;
+  const wakeDebounceStepMs =
+    typeof top === "object" && top !== null ? (top.wake_debounce_step_ms ?? 200) : 200;
+  const wakeDebounceCapMs =
+    typeof top === "object" && top !== null ? (top.wake_debounce_cap_ms ?? 1000) : 1000;
 
   const base: ResolvedBashConfig = {
     enabled: false,
@@ -533,6 +564,10 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     long_running_reminder_enabled: reminderEnabled,
     long_running_reminder_interval_ms: reminderInterval,
     foreground_wait_window_ms: foregroundWaitWindowMs,
+    deferred_completion_fallback_ms: deferredCompletionFallbackMs,
+    wake_retry_max_attempts: wakeRetryMaxAttempts,
+    wake_debounce_step_ms: wakeDebounceStepMs,
+    wake_debounce_cap_ms: wakeDebounceCapMs,
   };
 
   // Top-level wins over legacy when both are present.

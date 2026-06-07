@@ -1,5 +1,5 @@
 /**
- * Workaround helper for the OpenCode plugin promptAsync runner-split bug
+ * Workaround helper for OpenCode plugin wake delivery bug
  * (https://github.com/anomalyco/opencode/issues/28202).
  *
  * OpenCode's plugin-provided `input.client` is constructed with
@@ -13,22 +13,23 @@
  * user parent — what users see as duplicate "stop" messages after every
  * background-bash completion reminder.
  *
- * The workaround is to bypass `input.client` for the wake path and build
- * a separate `createOpencodeClient` configured to hit `input.serverUrl`
- * via `globalThis.fetch`. That client enters the same live listener the
- * UI uses, so the active session's `SessionRunState` is the one that
- * resolves `ensureRunning` and overlapping turns coalesce correctly.
+ * Workaround is to bypass `input.client` for wake path and build separate
+ * `createOpencodeClient` configured to hit `input.serverUrl` via
+ * `globalThis.fetch`. That client enters same live listener UI uses, so
+ * active session's `SessionRunState` is one that resolves `ensureRunning`
+ * and overlapping turns coalesce correctly. Live wake also uses sync
+ * `session.prompt(...)`, and resolution there is delivery proof that
+ * OpenCode listener accepted prompt work.
  *
  * The workaround only works when the live HTTP listener is actually
  * reachable. OpenCode Desktop (Electron+Node) and TUI launched with
  * `opencode --port 0` bind a real API listener; plain TUI binds an
  * internal-only listener that 404s for `/session/*`. We probe once at
  * plugin init and cache the result by `serverUrl`. When that server is
- * unreachable, the wake path silently uses the in-process
- * `input.client.session.promptAsync`, which keeps wakes flowing (at the
- * cost of the upstream duplicate-runner bug) instead of producing no
- * notification at all or nagging the user to relaunch with a different
- * flag.
+ * unreachable, wake path must fall back to plugin-provided in-process
+ * client. That fallback keeps wakes flowing, but only live listener path
+ * gives sync delivery proof; degraded `promptAsync` fallback may still
+ * acknowledge before OpenCode persists or handles prompt.
  *
  * Tracked upstream as anomalyco/opencode#28202. When OpenCode fixes the
  * runtime split, this helper and its single consumer in `bg-notifications.ts`
@@ -38,6 +39,7 @@
 import { createOpencodeClient } from "@opencode-ai/sdk";
 
 export type LiveServerClient = ReturnType<typeof createOpencodeClient>;
+type RequestHeaders = Record<string, string>;
 
 /**
  * Cache key is `${serverUrl}|${directory}`. Both are stable per OpenCode
@@ -74,6 +76,17 @@ function serverAuthHeaders(): Record<string, string> | undefined {
   };
 }
 
+function mergeHeaders(
+  base: RequestHeaders | undefined,
+  extra: RequestHeaders | undefined,
+): RequestHeaders | undefined {
+  if (!base && !extra) return undefined;
+  return {
+    ...(base ?? {}),
+    ...(extra ?? {}),
+  };
+}
+
 /**
  * Return a cached `createOpencodeClient` pointed at the live HTTP listener
  * for the given `(serverUrl, directory)` pair. One client object is reused
@@ -84,14 +97,26 @@ function serverAuthHeaders(): Record<string, string> | undefined {
  * but we set it on purpose so anyone reading this code (or grepping for the
  * bug fix) can see that we intentionally chose the live HTTP transport.
  */
-export function getLiveServerClient(serverUrl: string, directory: string): LiveServerClient {
+export function getLiveServerClient(
+  serverUrl: string,
+  directory: string,
+  headers?: RequestHeaders,
+): LiveServerClient {
+  if (headers && Object.keys(headers).length > 0) {
+    return createOpencodeClient({
+      baseUrl: serverUrl,
+      directory,
+      headers: mergeHeaders(serverAuthHeaders(), headers),
+      fetch: globalThis.fetch,
+    });
+  }
   const key = cacheKey(serverUrl, directory);
   const cached = clientCache.get(key);
   if (cached) return cached;
   const client = createOpencodeClient({
     baseUrl: serverUrl,
     directory,
-    headers: serverAuthHeaders(),
+    headers: mergeHeaders(serverAuthHeaders(), headers),
     fetch: globalThis.fetch,
   });
   clientCache.set(key, client);
@@ -122,9 +147,10 @@ let legacyLiveServerWakeAvailable = false;
 
 /**
  * Probe whether `serverUrl` serves OpenCode's HTTP API within `timeoutMs`.
- * Returns `true` only when `/session` proves the API is usable: any 2xx
- * response is reachable, and 401/403 also count as reachable because an
- * auth-protected listener still exists. Returns `false` for 404 (plain
+ * Returns `true` only when `/session` proves AFT can actually use API: only
+ * `res.ok` counts as reachable. 401/403 are rejected unless env-derived
+ * Authorization header makes response OK, because AFT cannot satisfy host
+ * `ServerAuth` by any other path. Returns `false` for 401/403/404 (plain
  * TUI's internal listener), 5xx, connection refused, DNS failure, timeout,
  * malformed URL, or undefined URL.
  *
@@ -153,7 +179,7 @@ export async function probeServerReachable(
       headers: serverAuthHeaders(),
       signal: controller.signal,
     });
-    reachable = res.ok || res.status === 401 || res.status === 403;
+    reachable = res.ok;
   } catch {
     reachable = false;
   } finally {
@@ -190,11 +216,12 @@ export function setLiveServerWakeAvailable(
 
 /**
  * Read the cached probe decision for `serverUrl`. `true` means the wake path
- * should use `getLiveServerClient(serverUrl, directory)` and POST through
- * the live HTTP listener. `false` means fall back to the in-process client
- * passed via plugin context (`input.client`).
+ * should use `getLiveServerClient(serverUrl, directory)` and wake through
+ * live HTTP listener with sync `session.prompt(...)`. `false` means fall
+ * back to in-process client passed via plugin context (`input.client`).
  */
-export function useLiveServerWake(serverUrl?: string): boolean {
+export function useLiveServerWake(serverUrl?: string, enabled = true): boolean {
+  if (!enabled) return false;
   if (!serverUrl) return legacyLiveServerWakeAvailable;
   return liveServerWakeAvailableByServerUrl.get(normalizeServerUrl(serverUrl)) ?? false;
 }

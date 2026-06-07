@@ -48,7 +48,11 @@ mock.module("../logger.js", () => ({
 // That's the post-v0.29 behavior introduced when we removed the
 // `--port 0` nudge — see shared/live-server-client.ts.
 let liveServerClient: unknown = null;
-let lastLiveServerArgs: { serverUrl: string; directory: string } | null = null;
+let lastLiveServerArgs: {
+  serverUrl: string;
+  directory: string;
+  headers?: Record<string, string>;
+} | null = null;
 let liveServerAvailable = true;
 // Per-URL availability map — must behave like the real
 // live-server-client implementation so the live-server-client unit
@@ -62,24 +66,37 @@ function normalizeServerUrl(serverUrl: string): string {
     return serverUrl;
   }
 }
+function serverAuthHeaders(): Record<string, string> | undefined {
+  const password = process.env.OPENCODE_SERVER_PASSWORD;
+  if (!password) return undefined;
+  const username = process.env.OPENCODE_SERVER_USERNAME ?? "opencode";
+  return {
+    Authorization: `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`,
+  };
+}
 function setTestLiveServerClient(client: unknown): void {
   liveServerClient = client;
 }
 function setTestLiveServerAvailable(available: boolean): void {
   liveServerAvailable = available;
 }
-function getLastLiveServerArgs(): { serverUrl: string; directory: string } | null {
+function getLastLiveServerArgs(): {
+  serverUrl: string;
+  directory: string;
+  headers?: Record<string, string>;
+} | null {
   return lastLiveServerArgs;
 }
 mock.module("../shared/live-server-client.js", () => ({
-  getLiveServerClient: (serverUrl: string, directory: string) => {
-    lastLiveServerArgs = { serverUrl, directory };
+  getLiveServerClient: (serverUrl: string, directory: string, headers?: Record<string, string>) => {
+    lastLiveServerArgs = { serverUrl, directory, ...(headers ? { headers } : {}) };
     if (!liveServerClient) {
       throw new Error("test did not configure a live-server client via setTestLiveServerClient()");
     }
     return liveServerClient;
   },
-  useLiveServerWake: (serverUrl?: string) => {
+  useLiveServerWake: (serverUrl?: string, enabled = true) => {
+    if (!enabled) return false;
     if (!serverUrl) return liveServerAvailable;
     const keyed = perUrlAvailability.get(normalizeServerUrl(serverUrl));
     if (keyed !== undefined) return keyed;
@@ -118,14 +135,17 @@ mock.module("../shared/live-server-client.js", () => ({
       perUrlAvailability.clear();
       return false;
     }
-    // Mirror the real implementation enough that the unit-test fetch stubs
-    // drive this code path correctly: hit the URL, accept 2xx/401/403,
-    // reject 404/5xx and network errors.
+    // Mirror real implementation enough that unit-test fetch stubs drive
+    // this code path correctly: hit URL, accept only 2xx, reject 401/403,
+    // 404/5xx, and network errors.
     let reachable = false;
     try {
       const probeUrl = new URL("/session", serverUrl).toString();
-      const res = await globalThis.fetch(probeUrl, { method: "GET" });
-      reachable = res.ok || res.status === 401 || res.status === 403;
+      const res = await globalThis.fetch(probeUrl, {
+        method: "GET",
+        headers: serverAuthHeaders(),
+      });
+      reachable = res.ok;
     } catch {
       reachable = false;
     }
@@ -152,6 +172,7 @@ afterAll(() => {
 });
 
 import {
+  DEFERRED_COMPLETION_FALLBACK_MS,
   __resetBgNotificationStateForTests,
   appendInTurnBgCompletions,
   consumeBgCompletion,
@@ -159,6 +180,7 @@ import {
   formatSystemReminder,
   handleIdleBgCompletions,
   handlePushedBgCompletion,
+  handlePushedBgLongRunning,
   ingestBgCompletions,
   markBgCompletionDelivered,
   markExplicitControl,
@@ -179,6 +201,7 @@ beforeEach(() => {
   sessionWarnSpy.mockClear();
   liveServerClient = null;
   lastLiveServerArgs = null;
+  perUrlAvailability.clear();
   // Default to live-server-available so existing tests keep exercising
   // the workaround path. Tests covering the fallback flip this to false.
   liveServerAvailable = true;
@@ -189,33 +212,46 @@ afterEach(() => {
 });
 
 /**
- * Configure the live-server client mock to return `{ session: { promptAsync } }`,
- * optionally with a `messages` stub so prompt-context resolution works.
+ * Configure live-server client mock. `prompt` is preferred wake method; tests
+ * may also provide `promptAsync` for compatibility assertions.
  */
-function installLiveServerClient(
-  promptAsync: (input: unknown) => Promise<unknown> | unknown,
-  messages?: unknown[],
-): void {
+function installLiveServerClient(options: {
+  prompt?: (input: unknown) => Promise<unknown> | unknown;
+  promptAsync?: (input: unknown) => Promise<unknown> | unknown;
+  messages?: unknown[];
+}): void {
   setTestLiveServerClient({
     session: {
-      promptAsync,
-      ...(messages !== undefined ? { messages: async () => ({ data: messages }) } : {}),
+      ...(options.prompt ? { prompt: options.prompt } : {}),
+      ...(options.promptAsync ? { promptAsync: options.promptAsync } : {}),
+      ...(options.messages !== undefined
+        ? { messages: async () => ({ data: options.messages }) }
+        : {}),
     },
   });
 }
 
 /**
- * Build a stub plugin-context client shaped like OpenCode's `input.client`.
- * Returned so individual tests can read `.session.promptAsync.mock.calls`
- * to assert whether the in-process wake fallback fired.
+ * Build stub plugin-context client shaped like OpenCode's `input.client`.
+ * Returned so tests can inspect `.session.prompt` / `.session.promptAsync`.
  */
 function makeClient(
-  promptAsync: ReturnType<typeof mock>,
+  methods: {
+    prompt?: ReturnType<typeof mock>;
+    promptAsync?: ReturnType<typeof mock>;
+  },
   messages?: unknown[],
-): { session: { promptAsync: typeof promptAsync; messages?: () => Promise<{ data: unknown[] }> } } {
+): {
+  session: {
+    prompt?: ReturnType<typeof mock>;
+    promptAsync?: ReturnType<typeof mock>;
+    messages?: () => Promise<{ data: unknown[] }>;
+  };
+} {
   return {
     session: {
-      promptAsync,
+      ...(methods.prompt ? { prompt: methods.prompt } : {}),
+      ...(methods.promptAsync ? { promptAsync: methods.promptAsync } : {}),
       ...(messages !== undefined ? { messages: async () => ({ data: messages }) } : {}),
     },
   };
@@ -258,7 +294,18 @@ describe("OpenCode background notifications", () => {
         },
       ]),
     ).toBe(
-      "<system-reminder>\n[BACKGROUND BASH COMPLETED]\n- task d2ed3a9e (exit 0, 1m 23s)\n- task 4f5b71c2 (timed out, 30s)\n</system-reminder>",
+      "<system-reminder>\n[BACKGROUND BASH FAILED]\n- task 4f5b71c2 (timed out, 30s)\n</system-reminder>\n<system-reminder>\n[BACKGROUND BASH COMPLETED]\n- task d2ed3a9e (exit 0, 1m 23s)\n</system-reminder>",
+    );
+  });
+
+  test("formats urgent failures separately from normal completions", () => {
+    expect(
+      formatSystemReminder([
+        { task_id: "ok-1", status: "completed", exit_code: 0, command: "true" },
+        { task_id: "fail-1", status: "failed", exit_code: 1, command: "false" },
+      ]),
+    ).toBe(
+      "<system-reminder>\n[BACKGROUND BASH FAILED]\n- task fail-1 (exit 1)\n</system-reminder>\n<system-reminder>\n[BACKGROUND BASH COMPLETED]\n- task ok-1 (exit 0)\n</system-reminder>",
     );
   });
 
@@ -420,14 +467,15 @@ describe("OpenCode background notifications", () => {
     ]);
   });
 
-  test("turn-end wake sends one promptAsync message with reminder", async () => {
+  test("turn-end wake uses live session.prompt, not promptAsync", async () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({
       success: true,
       bg_completions: [completion("task-1", "npm test")],
     }));
+    const prompt = mock(async () => {});
     const promptAsync = mock(async () => {});
-    installLiveServerClient(promptAsync);
+    installLiveServerClient({ prompt, promptAsync });
 
     await handleIdleBgCompletions({
       ctx,
@@ -436,10 +484,11 @@ describe("OpenCode background notifications", () => {
       client: {},
       serverUrl: TEST_SERVER_URL,
     });
-    await waitForMockCallCount(promptAsync, 1);
+    await waitForMockCallCount(prompt, 1);
 
-    expect(promptAsync).toHaveBeenCalledTimes(1);
-    const payload = promptAsync.mock.calls[0][0] as {
+    expect(prompt).toHaveBeenCalledTimes(1);
+    expect(promptAsync).toHaveBeenCalledTimes(0);
+    const payload = prompt.mock.calls[0][0] as {
       body: { noReply: boolean; parts: Array<{ text: string }> };
     };
     expect(payload.body.noReply).toBe(false);
@@ -449,7 +498,181 @@ describe("OpenCode background notifications", () => {
     expect(getLastLiveServerArgs()).toEqual({
       serverUrl: TEST_SERVER_URL,
       directory: "/tmp/project",
+      headers: expect.objectContaining({
+        "x-aft-delivery-id": expect.any(String),
+      }),
     });
+  });
+
+  test("turn-end wake preserves session method this binding for class-style prompt", async () => {
+    setTestLiveServerAvailable(false);
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({
+      success: true,
+      bg_completions: [completion("task-1", "npm test")],
+    }));
+
+    class BoundSession {
+      calls: Array<{
+        path: { id: string };
+        body: { parts: Array<{ text: string }> };
+        throwOnError?: boolean;
+      }> = [];
+
+      async prompt(input: {
+        path: { id: string };
+        body: { parts: Array<{ text: string }> };
+        throwOnError?: boolean;
+      }) {
+        if (!(this instanceof BoundSession)) {
+          throw new Error("prompt lost this binding");
+        }
+        this.calls.push(input);
+      }
+    }
+
+    const session = new BoundSession();
+    const fallbackClient = { session };
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
+
+    await waitUntil(() => session.calls.length === 1);
+    expect(session.calls).toHaveLength(1);
+    expect(session.calls[0]?.path.id).toBe("s1");
+    expect(session.calls[0]?.throwOnError).toBe(true);
+    expect(session.calls[0]?.body.parts[0]?.text).toContain("- task task-1 (exit 0)");
+    expect(
+      sessionWarnSpy.mock.calls.some((call) => String(call[1]).includes("lost this binding")),
+    ).toBe(false);
+  });
+
+  test("live prompt sdk-style non-2xx demotes live server, falls back, then acks fallback", async () => {
+    trackBgTask("s1", "task-1");
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-1", "npm test")] }
+        : { success: true, acked_task_ids: ["task-1"] },
+    );
+    const { ctx } = harness(send);
+    const fallbackPrompt = mock(async () => undefined);
+    const fallbackClient = makeClient({ prompt: fallbackPrompt });
+    const livePrompt = mock(async () => ({
+      error: { message: "missing route" },
+      response: { ok: false, status: 404, statusText: "Not Found" },
+    }));
+    installLiveServerClient({ prompt: livePrompt });
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
+    await waitForMockCallCount(fallbackPrompt, 1);
+
+    expect(livePrompt).toHaveBeenCalledTimes(1);
+    expect(fallbackPrompt).toHaveBeenCalledTimes(1);
+    expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(1);
+    const fallbackEvent = findTraceEvent("bash_completion_wake_live_server_fallback");
+    expect(fallbackEvent).toBeDefined();
+    expect(String(fallbackEvent?.error)).toContain("HTTP 404 Not Found");
+    expect(String(fallbackEvent?.error)).toContain("missing route");
+  });
+
+  test("in-process sdk-style non-2xx failure does not ack completion", async () => {
+    setTestLiveServerAvailable(false);
+    trackBgTask("s1", "task-1");
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-1", "npm test")] }
+        : { success: true, acked_task_ids: ["task-1"] },
+    );
+    const { ctx } = harness(send);
+    const prompt = mock(async () => ({
+      error: "bad request body",
+      response: { ok: false, status: 400, statusText: "Bad Request" },
+    }));
+    const fallbackClient = makeClient({ prompt });
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
+    await waitForMockCallCount(prompt, 1);
+
+    expect(send.mock.calls.some((call) => call[0] === "bash_ack_completions")).toBe(false);
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(1);
+    expect(sessionBgStates.get("s1")?.debounceTimer).not.toBeNull();
+    const errorEvent = findTraceEvent("bash_completion_wake_send_error");
+    expect(errorEvent).toBeDefined();
+    expect(String(errorEvent?.error)).toContain("HTTP 400 Bad Request");
+    expect(String(errorEvent?.error)).toContain("bad request body");
+  });
+
+  test("idle wake keeps debounce timer ref'd so autonomous completion reminder can fire", async () => {
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({
+      success: true,
+      bg_completions: [completion("task-1", "npm test")],
+    }));
+    const prompt = mock(async () => {});
+    installLiveServerClient({ prompt });
+
+    const unrefSpy = await withSetTimeoutUnrefSpy(async () => {
+      await handleIdleBgCompletions({
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: {},
+        serverUrl: TEST_SERVER_URL,
+      });
+    });
+
+    expect(unrefSpy).not.toBeNull();
+    expect(unrefSpy?.mock.calls).toHaveLength(0);
+    await waitForMockCallCount(prompt, 1);
+  });
+
+  test("live wake acks only after session.prompt resolves", async () => {
+    trackBgTask("s1", "task-1");
+    let resolvePrompt: (() => void) | undefined;
+    const prompt = mock(
+      () =>
+        new Promise<void>((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    );
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-1", "npm test")] }
+        : { success: true, acked_task_ids: ["task-1"] },
+    );
+    const { ctx } = harness(send);
+    installLiveServerClient({ prompt });
+
+    const wakePromise = handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: {},
+      serverUrl: TEST_SERVER_URL,
+    });
+    await waitForMockCallCount(prompt, 1);
+    expect(send.mock.calls.some((call) => call[0] === "bash_ack_completions")).toBe(false);
+
+    resolvePrompt?.();
+    await wakePromise;
+    await waitUntil(() => send.mock.calls.some((call) => call[0] === "bash_ack_completions"));
   });
 
   test("turn-end wake forwards resolved agent + model + variant to preserve prefix cache", async () => {
@@ -459,17 +682,20 @@ describe("OpenCode background notifications", () => {
       bg_completions: [completion("task-1", "npm test")],
     }));
     const promptAsync = mock(async () => {});
-    installLiveServerClient(promptAsync, [
-      {
-        info: {
-          role: "assistant",
-          agent: "build",
-          providerID: "anthropic",
-          modelID: "claude-opus-4-7",
-          variant: "thinking",
+    installLiveServerClient({
+      prompt: promptAsync,
+      messages: [
+        {
+          info: {
+            role: "assistant",
+            agent: "build",
+            providerID: "anthropic",
+            modelID: "claude-opus-4-7",
+            variant: "thinking",
+          },
         },
-      },
-    ]);
+      ],
+    });
 
     await handleIdleBgCompletions({
       ctx,
@@ -507,7 +733,7 @@ describe("OpenCode background notifications", () => {
     const promptAsync = mock(async () => {});
     // Empty session — no prior messages, so the resolver returns null and
     // the wake should go out without forging a fake model.
-    installLiveServerClient(promptAsync, []);
+    installLiveServerClient({ prompt: promptAsync, messages: [] });
 
     await handleIdleBgCompletions({
       ctx,
@@ -555,24 +781,6 @@ describe("OpenCode background notifications", () => {
     expect(state?.pendingCompletions).toHaveLength(0);
     expect(state?.pendingPatternMatches).toHaveLength(1);
     expect(state?.pendingPatternMatches[0]?.reason).toBe("task_exit");
-  });
-
-  test("emptying pending queues resets wake hard-stop retry state", () => {
-    trackBgTask("s1", "task-1");
-    ingestBgCompletions("s1", [completion("task-1", "npm test")]);
-    const state = sessionBgStates.get("s1");
-    expect(state?.pendingCompletions).toHaveLength(1);
-    if (!state) throw new Error("missing state");
-    state.retryDelayMs = 1000;
-    state.wakeRetryAttempts = 5;
-    state.wakeHardStopped = true;
-
-    consumeBgCompletion("s1", "task-1");
-
-    expect(state.pendingCompletions).toHaveLength(0);
-    expect(state.retryDelayMs).toBeNull();
-    expect(state.wakeRetryAttempts).toBe(0);
-    expect(state.wakeHardStopped).toBe(false);
   });
 
   test("markExplicitControl retroactively converts already-pending completion to pattern match", () => {
@@ -657,7 +865,7 @@ describe("OpenCode background notifications", () => {
     }));
     const { ctx } = harness(send);
     const promptAsync = mock(async () => {});
-    installLiveServerClient(promptAsync);
+    installLiveServerClient({ prompt: promptAsync });
     await handleIdleBgCompletions({
       ctx,
       directory: "/tmp/project",
@@ -691,7 +899,7 @@ describe("OpenCode background notifications", () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const promptAsync = mock(async () => {});
-    installLiveServerClient(promptAsync);
+    installLiveServerClient({ prompt: promptAsync });
 
     await handlePushedBgCompletion(
       {
@@ -708,6 +916,7 @@ describe("OpenCode background notifications", () => {
     expect(promptAsync).toHaveBeenCalledTimes(0);
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(1);
     expect(sessionBgStates.get("s1")?.debounceTimer).toBeNull();
+    expect(sessionBgStates.get("s1")?.deferredCompletionTimer).not.toBeNull();
 
     markTaskWaiting("s1", "task-1");
     await sleep(300);
@@ -716,10 +925,238 @@ describe("OpenCode background notifications", () => {
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
   });
 
+  test("same-turn deferred completion falls back without idle", async () => {
+    setTestLiveServerAvailable(false);
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    const promptAsync = mock(async () => {});
+    const fallbackClient = makeClient({ promptAsync });
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: fallbackClient,
+        serverUrl: TEST_SERVER_URL,
+      },
+      completion("task-1", "npm test"),
+    );
+    await sleep(300);
+
+    expect(promptAsync).toHaveBeenCalledTimes(0);
+    await waitForMockCallCount(promptAsync, 1, DEFERRED_COMPLETION_FALLBACK_MS + 1000);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
+    expect(sessionBgStates.get("s1")?.deferredCompletionTimer).toBeNull();
+  });
+
+  test("in-turn append drains deferred completion before fallback without duplicate wake", async () => {
+    setTestLiveServerAvailable(false);
+    trackBgTask("s1", "task-1");
+    const send = mock(async (command: string) =>
+      command === "bash_ack_completions"
+        ? { success: true, acked_task_ids: ["task-1"] }
+        : { success: true, bg_completions: [] },
+    );
+    const { ctx } = harness(send);
+    const promptAsync = mock(async () => {});
+    const fallbackClient = makeClient({ promptAsync });
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: fallbackClient,
+        serverUrl: TEST_SERVER_URL,
+      },
+      completion("task-1", "npm test"),
+    );
+
+    const output = { output: "tool output" };
+    await appendInTurnBgCompletions({ ctx, directory: "/tmp/project", sessionID: "s1" }, output);
+    await sleep(DEFERRED_COMPLETION_FALLBACK_MS + 150);
+
+    expect(output.output).toContain("task-1");
+    expect(promptAsync).toHaveBeenCalledTimes(0);
+    expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(1);
+  });
+
+  test("markTaskWaiting consumes deferred completion before fallback without duplicate wake", async () => {
+    setTestLiveServerAvailable(false);
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    const promptAsync = mock(async () => {});
+    const fallbackClient = makeClient({ promptAsync });
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: fallbackClient,
+        serverUrl: TEST_SERVER_URL,
+      },
+      completion("task-1", "npm test"),
+    );
+    markTaskWaiting("s1", "task-1");
+    await sleep(DEFERRED_COMPLETION_FALLBACK_MS + 150);
+
+    expect(promptAsync).toHaveBeenCalledTimes(0);
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
+    expect(sessionBgStates.get("s1")?.deferredCompletionTimer).toBeNull();
+  });
+
+  test("staggered deferred fallback wakes matured task only", async () => {
+    setTestLiveServerAvailable(false);
+    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    const promptAsync = mock(async () => {});
+    const fallbackClient = makeClient({ promptAsync });
+
+    trackBgTask("s1", "task-1");
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: fallbackClient,
+        serverUrl: TEST_SERVER_URL,
+      },
+      completion("task-1", "cmd-1"),
+    );
+    await sleep(250);
+
+    trackBgTask("s1", "task-2");
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: fallbackClient,
+        serverUrl: TEST_SERVER_URL,
+      },
+      completion("task-2", "cmd-2"),
+    );
+
+    await waitForMockCallCount(promptAsync, 1, DEFERRED_COMPLETION_FALLBACK_MS + 1000);
+    const firstText = (
+      promptAsync.mock.calls[0]?.[0] as { body: { parts: Array<{ text: string }> } }
+    ).body.parts[0].text;
+    expect(firstText).toContain("task-1");
+    expect(firstText).not.toContain("task-2");
+
+    await waitForMockCallCount(promptAsync, 2, DEFERRED_COMPLETION_FALLBACK_MS + 1000);
+    const secondText = (
+      promptAsync.mock.calls[1]?.[0] as { body: { parts: Array<{ text: string }> } }
+    ).body.parts[0].text;
+    expect(secondText).toContain("task-2");
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
+  });
+
+  test("buffered unknown completion promoted by trackBgTask gets deferred fallback", async () => {
+    setTestLiveServerAvailable(false);
+    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    const promptAsync = mock(async () => {});
+    const fallbackClient = makeClient({ promptAsync });
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: fallbackClient,
+        serverUrl: TEST_SERVER_URL,
+      },
+      completion("task-1", "npm test"),
+    );
+    trackBgTask("s1", "task-1");
+
+    expect(sessionBgStates.get("s1")?.deferredCompletionTimer).not.toBeNull();
+    await waitForMockCallCount(promptAsync, 1, DEFERRED_COMPLETION_FALLBACK_MS + 1000);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
+  });
+
+  test("trackBgTask buffered promotion resets hard-stop and wakes on fallback", async () => {
+    setTestLiveServerAvailable(false);
+    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    const promptAsync = mock(async () => {});
+    const fallbackClient = makeClient({ promptAsync });
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: fallbackClient,
+        serverUrl: TEST_SERVER_URL,
+      },
+      completion("task-1", "npm test"),
+    );
+
+    const state = sessionBgStates.get("s1");
+    expect(state).toBeDefined();
+    if (!state) throw new Error("missing session state");
+    state.wakeHardStopped = true;
+    state.wakeRetryAttempts = 5;
+    state.retryDelayMs = 1234;
+
+    trackBgTask("s1", "task-1");
+
+    expect(state.wakeHardStopped).toBe(false);
+    expect(state.wakeRetryAttempts).toBe(0);
+    expect(state.retryDelayMs).toBeNull();
+    await waitForMockCallCount(promptAsync, 1, DEFERRED_COMPLETION_FALLBACK_MS + 1000);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test("trackBgTask buffered promotion prunes stale long-running reminder for same task", async () => {
+    setTestLiveServerAvailable(false);
+    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    const promptAsync = mock(async () => {});
+    const fallbackClient = makeClient({ promptAsync });
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: fallbackClient,
+        serverUrl: TEST_SERVER_URL,
+      },
+      completion("task-1", "npm test"),
+    );
+
+    const state = sessionBgStates.get("s1");
+    expect(state).toBeDefined();
+    if (!state) throw new Error("missing session state");
+    state.pendingLongRunning.push({
+      task_id: "task-1",
+      session_id: "s1",
+      command: "npm test",
+      elapsed_ms: 30_000,
+    });
+
+    trackBgTask("s1", "task-1");
+
+    expect(state.pendingLongRunning).toHaveLength(0);
+    await waitForMockCallCount(promptAsync, 1, DEFERRED_COMPLETION_FALLBACK_MS + 1000);
+
+    const text = (promptAsync.mock.calls[0]?.[0] as { body: { parts: Array<{ text: string }> } })
+      .body.parts[0].text;
+    expect(text).toContain("[BACKGROUND BASH COMPLETED]");
+    expect(text).not.toContain("[BACKGROUND BASH STILL RUNNING]");
+    expect(text).not.toContain("still running after");
+  });
+
   test("buffers push completion received before task tracking", async () => {
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const promptAsync = mock(async () => {});
-    installLiveServerClient(promptAsync);
+    installLiveServerClient({ prompt: promptAsync });
 
     await handlePushedBgCompletion(
       {
@@ -747,6 +1184,122 @@ describe("OpenCode background notifications", () => {
     expect(text).toContain("- task task-1 (exit 0)");
   });
 
+  test("idle boundary promotes orphaned unknown completion and delivers it once", async () => {
+    const send = mock(async (command: string) =>
+      command === "bash_ack_completions"
+        ? { success: true, acked_task_ids: ["task-orphan"] }
+        : { success: true, bg_completions: [] },
+    );
+    const { ctx } = harness(send);
+    const promptAsync = mock(async () => {});
+    installLiveServerClient({ prompt: promptAsync });
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: {},
+        serverUrl: TEST_SERVER_URL,
+      },
+      completion("task-orphan", "npm test"),
+    );
+    await sleep(300);
+
+    expect(promptAsync).toHaveBeenCalledTimes(0);
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: {},
+      serverUrl: TEST_SERVER_URL,
+    });
+    await waitForMockCallCount(promptAsync, 1);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    const text = (promptAsync.mock.calls[0][0] as { body: { parts: Array<{ text: string }> } }).body
+      .parts[0].text;
+    expect(text).toContain("- task task-orphan (exit 0)");
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
+    expect(sessionBgStates.get("s1")?.unknownCompletions).toHaveLength(0);
+    expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(1);
+  });
+
+  test("buffered unknown completion respects late explicit-control promotion path", async () => {
+    const send = mock(async (command: string) =>
+      command === "bash_ack_completions"
+        ? { success: true, acked_task_ids: ["task-explicit"] }
+        : { success: true, bg_completions: [] },
+    );
+    const { ctx } = harness(send);
+    const output = { output: "watch registered" };
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: {},
+        serverUrl: TEST_SERVER_URL,
+      },
+      completion("task-explicit", "npm test"),
+    );
+
+    markExplicitControl("s1", "task-explicit", false);
+    await appendInTurnBgCompletions({ ctx, directory: "/tmp/project", sessionID: "s1" }, output);
+
+    expect(output.output).toContain("[BG BASH NOTIFY]");
+    expect(output.output).toContain("- task task-explicit exited:");
+    expect(output.output).not.toContain("[BACKGROUND BASH COMPLETED]");
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
+    expect(sessionBgStates.get("s1")?.pendingPatternMatches).toHaveLength(0);
+    expect(sessionBgStates.get("s1")?.unknownCompletions).toHaveLength(0);
+    expect(send).toHaveBeenCalledWith("bash_ack_completions", {
+      session_id: "s1",
+      task_ids: ["task-explicit"],
+    });
+  });
+
+  test("buffered unknown completion is dropped after markTaskWaiting consumed path", async () => {
+    const send = mock(async (command: string) =>
+      command === "bash_ack_completions"
+        ? { success: true, acked_task_ids: ["task-waiting"] }
+        : { success: true, bg_completions: [] },
+    );
+    const { ctx } = harness(send);
+    const promptAsync = mock(async () => {});
+    installLiveServerClient({ prompt: promptAsync });
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: {},
+        serverUrl: TEST_SERVER_URL,
+      },
+      completion("task-waiting", "npm test"),
+    );
+
+    markTaskWaiting("s1", "task-waiting");
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: {},
+      serverUrl: TEST_SERVER_URL,
+    });
+    await sleep(300);
+
+    expect(promptAsync).toHaveBeenCalledTimes(0);
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
+    expect(sessionBgStates.get("s1")?.pendingPatternMatches).toHaveLength(0);
+    expect(sessionBgStates.get("s1")?.unknownCompletions).toHaveLength(0);
+    expect(send.mock.calls.filter((call) => call[0] === "bash_ack_completions")).toHaveLength(0);
+  });
+
   test("failed wake keeps pending completions and retries", async () => {
     setTestLiveServerAvailable(false);
     trackBgTask("s1", "task-1");
@@ -754,7 +1307,7 @@ describe("OpenCode background notifications", () => {
     const promptAsync = mock(async () => {
       throw new Error("send failed");
     });
-    const fallbackClient = makeClient(promptAsync);
+    const fallbackClient = makeClient({ promptAsync });
     await handleIdleBgCompletions({
       ctx,
       directory: "/tmp/project",
@@ -787,7 +1340,7 @@ describe("OpenCode background notifications", () => {
     const promptAsync = mock(async () => {
       throw new Error("send failed");
     });
-    const fallbackClient = makeClient(promptAsync);
+    const fallbackClient = makeClient({ promptAsync });
     await handleIdleBgCompletions({
       ctx,
       directory: "/tmp/project",
@@ -816,6 +1369,285 @@ describe("OpenCode background notifications", () => {
     expect(sessionBgStates.get("s1")?.debounceTimer).toBeNull();
   });
 
+  test("timer reminder hard-stops, then same-task completion push recovers without still-running text", async () => {
+    setTestLiveServerAvailable(false);
+    let shouldFail = true;
+    const promptAsync = mock(async () => {
+      if (shouldFail) throw new Error("send failed");
+    });
+    const fallbackClient = makeClient({ promptAsync });
+    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    trackBgTask("s1", "task-1");
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
+    await handlePushedBgLongRunning(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: fallbackClient,
+        serverUrl: TEST_SERVER_URL,
+      },
+      { task_id: "task-1", session_id: "s1", command: "npm test", elapsed_ms: 30_000 },
+    );
+    await waitUntil(
+      () => promptAsync.mock.calls.length >= 5 && sessionBgStates.get("s1")?.debounceTimer === null,
+      10_000,
+    );
+    expect(sessionBgStates.get("s1")?.wakeHardStopped).toBe(true);
+
+    shouldFail = false;
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: fallbackClient,
+        serverUrl: TEST_SERVER_URL,
+      },
+      completion("task-1", "npm test"),
+    );
+    await waitForMockCallCount(promptAsync, 6, 2_000);
+
+    const text = (
+      promptAsync.mock.calls.at(-1)?.[0] as { body: { parts: Array<{ text: string }> } }
+    ).body.parts[0].text;
+    expect(text).toContain("[BACKGROUND BASH COMPLETED]");
+    expect(text).not.toContain("[BACKGROUND BASH STILL RUNNING]");
+    expect(sessionBgStates.get("s1")?.pendingLongRunning).toHaveLength(0);
+  });
+
+  test("timer reminder hard-stops, then urgent failure recovers immediately", async () => {
+    setTestLiveServerAvailable(false);
+    let shouldFail = true;
+    const promptAsync = mock(async () => {
+      if (shouldFail) throw new Error("send failed");
+    });
+    const fallbackClient = makeClient({ promptAsync });
+    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    trackBgTask("s1", "task-1");
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
+    await handlePushedBgLongRunning(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: fallbackClient,
+        serverUrl: TEST_SERVER_URL,
+      },
+      { task_id: "task-1", session_id: "s1", command: "npm test", elapsed_ms: 30_000 },
+    );
+    await waitUntil(
+      () => promptAsync.mock.calls.length >= 5 && sessionBgStates.get("s1")?.debounceTimer === null,
+      10_000,
+    );
+
+    shouldFail = false;
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: fallbackClient,
+        serverUrl: TEST_SERVER_URL,
+      },
+      { task_id: "task-1", status: "failed", exit_code: 1, command: "npm test" },
+    );
+    await waitForMockCallCount(promptAsync, 6, 500);
+
+    const text = (
+      promptAsync.mock.calls.at(-1)?.[0] as { body: { parts: Array<{ text: string }> } }
+    ).body.parts[0].text;
+    expect(text).toContain("[BACKGROUND BASH FAILED]");
+    expect(text).not.toContain("[BACKGROUND BASH STILL RUNNING]");
+  });
+
+  test("drained completion path also recovers after timer hard-stop", async () => {
+    setTestLiveServerAvailable(false);
+    let shouldFail = true;
+    let drainReturnsCompletion = false;
+    const promptAsync = mock(async () => {
+      if (shouldFail) throw new Error("send failed");
+    });
+    const fallbackClient = makeClient({ promptAsync });
+    const { ctx } = harness((command) => {
+      if (command === "bash_drain_completions") {
+        return {
+          success: true,
+          bg_completions: drainReturnsCompletion ? [completion("task-1", "npm test")] : [],
+        };
+      }
+      return { success: true, acked_task_ids: ["task-1"] };
+    });
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
+    await handlePushedBgLongRunning(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: fallbackClient,
+        serverUrl: TEST_SERVER_URL,
+      },
+      { task_id: "task-1", session_id: "s1", command: "npm test", elapsed_ms: 30_000 },
+    );
+    await waitUntil(
+      () => promptAsync.mock.calls.length >= 5 && sessionBgStates.get("s1")?.debounceTimer === null,
+      10_000,
+    );
+
+    shouldFail = false;
+    drainReturnsCompletion = true;
+    trackBgTask("s1", "task-1");
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
+    await waitForMockCallCount(promptAsync, 6, 2_000);
+
+    const text = (
+      promptAsync.mock.calls.at(-1)?.[0] as { body: { parts: Array<{ text: string }> } }
+    ).body.parts[0].text;
+    expect(text).toContain("[BACKGROUND BASH COMPLETED]");
+    expect(text).not.toContain("[BACKGROUND BASH STILL RUNNING]");
+  });
+
+  test("terminal completion prunes stale long-running state", async () => {
+    setTestLiveServerAvailable(false);
+    const promptAsync = mock(async () => {});
+    const fallbackClient = makeClient({ promptAsync });
+    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    trackBgTask("s1", "task-1");
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
+    await handlePushedBgLongRunning(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: fallbackClient,
+        serverUrl: TEST_SERVER_URL,
+      },
+      { task_id: "task-1", session_id: "s1", command: "npm test", elapsed_ms: 30_000 },
+    );
+    await waitForMockCallCount(promptAsync, 1, 2_000);
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: fallbackClient,
+        serverUrl: TEST_SERVER_URL,
+      },
+      completion("task-1", "npm test"),
+    );
+    await waitForMockCallCount(promptAsync, 2, 2_000);
+
+    const text = (
+      promptAsync.mock.calls.at(-1)?.[0] as { body: { parts: Array<{ text: string }> } }
+    ).body.parts[0].text;
+    expect(text).toContain("[BACKGROUND BASH COMPLETED]");
+    expect(text).not.toContain("still running after");
+    expect(sessionBgStates.get("s1")?.pendingLongRunning).toHaveLength(0);
+  });
+
+  test("long-running wake clears completion deferral so later completion push wakes again", async () => {
+    setTestLiveServerAvailable(false);
+    const promptAsync = mock(async () => {});
+    const fallbackClient = makeClient({ promptAsync });
+    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    trackBgTask("s1", "task-1");
+
+    await handlePushedBgLongRunning(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: fallbackClient,
+        serverUrl: TEST_SERVER_URL,
+      },
+      { task_id: "task-1", session_id: "s1", command: "npm test", elapsed_ms: 30_000 },
+    );
+    await waitForMockCallCount(promptAsync, 1, 2_000);
+
+    const firstText = (
+      promptAsync.mock.calls[0]?.[0] as { body: { parts: Array<{ text: string }> } }
+    ).body.parts[0].text;
+    expect(firstText).toContain("[BACKGROUND BASH STILL RUNNING]");
+    expect(firstText).not.toContain("[BACKGROUND BASH COMPLETED]");
+    expect(sessionBgStates.get("s1")?.wakeDeferredTaskIds.has("task-1")).toBe(false);
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: fallbackClient,
+        serverUrl: TEST_SERVER_URL,
+      },
+      completion("task-1", "npm test"),
+    );
+    await waitForMockCallCount(promptAsync, 2, 2_000);
+
+    const secondText = (
+      promptAsync.mock.calls[1]?.[0] as { body: { parts: Array<{ text: string }> } }
+    ).body.parts[0].text;
+    expect(secondText).toContain("[BACKGROUND BASH COMPLETED]");
+    expect(secondText).not.toContain("[BACKGROUND BASH STILL RUNNING]");
+  });
+
+  test("inline consume path also clears hard-stop and stale long-running state", () => {
+    trackBgTask("s1", "task-inline");
+    const state = sessionBgStates.get("s1");
+    expect(state).toBeDefined();
+
+    state!.pendingLongRunning.push({
+      task_id: "task-inline",
+      session_id: "s1",
+      command: "sleep 40",
+      elapsed_ms: 40_000,
+    });
+    state!.wakeHardStopped = true;
+    state!.wakeRetryAttempts = 5;
+    state!.retryDelayMs = 1000;
+
+    consumeBgCompletion("s1", "task-inline");
+
+    expect(state!.wakeHardStopped).toBe(false);
+    expect(state!.wakeRetryAttempts).toBe(0);
+    expect(state!.retryDelayMs).toBeNull();
+    expect(state!.pendingLongRunning).toHaveLength(0);
+  });
+
   test("post-idle push completion still wakes even when bridge is busy with non-agent RPC", async () => {
     // Regression: previously bailed on `isActive()` (bridge.hasPendingRequests())
     // which returned true for the TUI status poll, orphaning the completion when
@@ -824,7 +1656,7 @@ describe("OpenCode background notifications", () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const promptAsync = mock(async () => {});
-    installLiveServerClient(promptAsync);
+    installLiveServerClient({ prompt: promptAsync });
     await handleIdleBgCompletions({
       ctx,
       directory: "/tmp/project",
@@ -852,6 +1684,39 @@ describe("OpenCode background notifications", () => {
     expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(0);
   });
 
+  test("urgent terminal failure wakes without normal debounce delay", async () => {
+    setTestLiveServerAvailable(false);
+    trackBgTask("s1", "task-urgent");
+    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    const promptAsync = mock(async () => {});
+    const fallbackClient = makeClient({ promptAsync });
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
+
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: fallbackClient,
+        serverUrl: TEST_SERVER_URL,
+      },
+      { task_id: "task-urgent", status: "failed", exit_code: 1, command: "npm test" },
+    );
+    await waitForMockCallCount(promptAsync, 1, 250);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    const text = (promptAsync.mock.calls[0][0] as { body: { parts: Array<{ text: string }> } }).body
+      .parts[0].text;
+    expect(text).toContain("[BACKGROUND BASH FAILED]");
+    expect(text).not.toContain("[BACKGROUND BASH COMPLETED]");
+  });
+
   test("coalesces three idle completions into one notification", async () => {
     const responses = [
       { success: true, bg_completions: [completion("task-1", "one")] },
@@ -860,7 +1725,7 @@ describe("OpenCode background notifications", () => {
     ];
     const { ctx } = harness(() => responses.shift() ?? { success: true, bg_completions: [] });
     const promptAsync = mock(async () => {});
-    installLiveServerClient(promptAsync);
+    installLiveServerClient({ prompt: promptAsync });
 
     for (const taskId of ["task-1", "task-2", "task-3"]) trackBgTask("s1", taskId);
     await handleIdleBgCompletions({
@@ -911,7 +1776,7 @@ describe("OpenCode background notifications", () => {
       bg_completions: [completion(`task-${++index}`, `cmd-${index}`)],
     }));
     const promptAsync = mock(async () => {});
-    installLiveServerClient(promptAsync);
+    installLiveServerClient({ prompt: promptAsync });
     const started = Date.now();
 
     for (let task = 1; task <= 6; task++) trackBgTask("s1", `task-${task}`);
@@ -940,7 +1805,7 @@ describe("OpenCode background notifications", () => {
 
   test("second pushed background completion wakes without chat message reset", async () => {
     const promptAsync = mock(async () => {});
-    installLiveServerClient(promptAsync);
+    installLiveServerClient({ prompt: promptAsync });
     let responses: BridgeResponse[] = [
       { success: true, bg_completions: [completion("task-1", "one")] },
     ];
@@ -1057,22 +1922,22 @@ describe("OpenCode background notifications", () => {
   // path reads the cached decision via `useLiveServerWake()` each time
   // a reminder fires.
   //
-  // • `true`  — POST through `createOpencodeClient(input.serverUrl)`.
-  //             Works around anomalyco/opencode#28202 (no duplicate runs).
-  // • `false` — POST through `drainContext.client.session.promptAsync`.
-  //             Accepts the upstream bug so wakes still arrive instead
-  //             of being indefinitely queued + dropped via wake_hard_stop.
+  // • `true`  — wake through `createOpencodeClient(input.serverUrl)` using
+  //             live `session.prompt(...)` delivery proof.
+  // • `false` — fall back to `drainContext.client.session.prompt(...)`, or
+  //             degrade to `.promptAsync` only when prompt is missing.
 
-  test("live-server wake uses createOpencodeClient and tags trace as live-server", async () => {
+  test("live-server wake uses session.prompt and tags trace as live-server", async () => {
     setTestLiveServerAvailable(true);
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({
       success: true,
       bg_completions: [completion("task-1", "npm test")],
     }));
+    const livePrompt = mock(async () => {});
     const livePromptAsync = mock(async () => {});
-    installLiveServerClient(livePromptAsync);
-    const fallbackClient = makeClient(mock(async () => {}));
+    installLiveServerClient({ prompt: livePrompt, promptAsync: livePromptAsync });
+    const fallbackClient = makeClient({ promptAsync: mock(async () => {}) });
 
     await handleIdleBgCompletions({
       ctx,
@@ -1081,25 +1946,37 @@ describe("OpenCode background notifications", () => {
       client: fallbackClient,
       serverUrl: TEST_SERVER_URL,
     });
-    await waitForMockCallCount(livePromptAsync, 1);
+    await waitForMockCallCount(livePrompt, 1);
 
     // The live-server client was used; the fallback client was NOT.
-    expect(livePromptAsync).toHaveBeenCalledTimes(1);
+    expect(livePrompt).toHaveBeenCalledTimes(1);
+    expect(livePromptAsync).toHaveBeenCalledTimes(0);
     expect(fallbackClient.session.promptAsync).toHaveBeenCalledTimes(0);
 
-    const startMeta = findTraceEvent("bash_completion_wake_prompt_async_start");
+    const startMeta = findTraceEvent("bash_completion_wake_send_start");
     expect(startMeta).toBeDefined();
     expect(startMeta?.wake_client_path).toBe("live-server");
+    expect(startMeta?.wake_client_method).toBe("prompt");
     expect(typeof startMeta?.delivery_id).toBe("string");
+    expect(startMeta?.correlation_header).toBe("x-aft-delivery-id");
     expect(startMeta?.task_ids).toEqual(["task-1"]);
     // The factory saw the serverUrl + directory we configured.
     expect(getLastLiveServerArgs()).toEqual({
       serverUrl: TEST_SERVER_URL,
       directory: "/tmp/project",
+      headers: {
+        "x-aft-delivery-id": startMeta?.delivery_id as string,
+      },
     });
+
+    const okLogLine = sessionLogSpy.mock.calls.find(
+      (call) =>
+        (call[2] as { event?: string } | undefined)?.event === "bash_completion_wake_send_ok",
+    );
+    expect(okLogLine?.[1]).toContain("wake send resolved");
   });
 
-  test("live-server failure falls back in-process and demotes subsequent wakes", async () => {
+  test("live prompt failure falls back in-process and demotes subsequent wakes", async () => {
     setTestLiveServerAvailable(true);
     const responses: BridgeResponse[] = [
       { success: true, bg_completions: [completion("task-1", "npm test")] },
@@ -1111,11 +1988,11 @@ describe("OpenCode background notifications", () => {
         : { success: true, acked_task_ids: [] },
     );
     const { ctx } = harness(send);
-    const livePromptAsync = mock(async () => {
+    const livePrompt = mock(async () => {
       throw new Error("connect ECONNREFUSED 127.0.0.1");
     });
-    installLiveServerClient(livePromptAsync);
-    const fallbackClient = makeClient(mock(async () => {}));
+    installLiveServerClient({ prompt: livePrompt });
+    const fallbackClient = makeClient({ prompt: mock(async () => {}) });
 
     trackBgTask("s1", "task-1");
     await handleIdleBgCompletions({
@@ -1125,10 +2002,10 @@ describe("OpenCode background notifications", () => {
       client: fallbackClient,
       serverUrl: TEST_SERVER_URL,
     });
-    await waitForMockCallCount(fallbackClient.session.promptAsync, 1);
+    await waitForMockCallCount(fallbackClient.session.prompt!, 1);
 
-    expect(livePromptAsync).toHaveBeenCalledTimes(1);
-    expect(fallbackClient.session.promptAsync).toHaveBeenCalledTimes(1);
+    expect(livePrompt).toHaveBeenCalledTimes(1);
+    expect(fallbackClient.session.prompt).toHaveBeenCalledTimes(1);
     // Production code calls setLiveServerWakeAvailable(serverUrl, false)
     // (per-URL form), so check the per-URL availability map directly.
     expect(perUrlAvailability.get(normalizeServerUrl(TEST_SERVER_URL))).toBe(false);
@@ -1141,9 +2018,9 @@ describe("OpenCode background notifications", () => {
     const debugEvents = sessionDebugSpy.mock.calls.map(
       (call) => (call[2] as { event?: string } | undefined)?.event,
     );
-    expect(debugEvents).toContain("bash_completion_wake_prompt_async_error");
+    expect(debugEvents).toContain("bash_completion_wake_send_error");
     expect(debugEvents).toContain("bash_completion_wake_live_server_fallback");
-    expect(warnEvents).not.toContain("bash_completion_wake_prompt_async_error");
+    expect(warnEvents).not.toContain("bash_completion_wake_send_error");
     expect(warnEvents).not.toContain("bash_completion_wake_live_server_fallback");
 
     trackBgTask("s1", "task-2");
@@ -1154,13 +2031,38 @@ describe("OpenCode background notifications", () => {
       client: fallbackClient,
       serverUrl: TEST_SERVER_URL,
     });
-    await waitForMockCallCount(fallbackClient.session.promptAsync, 2);
+    await waitForMockCallCount(fallbackClient.session.prompt!, 2);
 
-    expect(livePromptAsync).toHaveBeenCalledTimes(1);
-    expect(fallbackClient.session.promptAsync).toHaveBeenCalledTimes(2);
+    expect(livePrompt).toHaveBeenCalledTimes(1);
+    expect(fallbackClient.session.prompt).toHaveBeenCalledTimes(2);
   });
 
-  test("in-process fallback wake uses drainContext.client and tags trace accordingly", async () => {
+  test("live client missing prompt does not call live promptAsync; falls back and demotes", async () => {
+    setTestLiveServerAvailable(true);
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({
+      success: true,
+      bg_completions: [completion("task-1", "npm test")],
+    }));
+    const livePromptAsync = mock(async () => {});
+    installLiveServerClient({ promptAsync: livePromptAsync });
+    const fallbackClient = makeClient({ prompt: mock(async () => {}) });
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
+    await waitForMockCallCount(fallbackClient.session.prompt!, 1);
+
+    expect(livePromptAsync).toHaveBeenCalledTimes(0);
+    expect(fallbackClient.session.prompt).toHaveBeenCalledTimes(1);
+    expect(perUrlAvailability.get(normalizeServerUrl(TEST_SERVER_URL))).toBe(false);
+  });
+
+  test("in-process fallback prefers prompt when available and tags trace accordingly", async () => {
     // When the live HTTP listener was unreachable at startup,
     // bg-notifications must use the plugin-provided in-process client so
     // wakes still arrive — at the cost of the upstream duplicate-runner
@@ -1173,8 +2075,11 @@ describe("OpenCode background notifications", () => {
       bg_completions: [completion("task-1", "npm test")],
     }));
     const livePromptAsync = mock(async () => {});
-    installLiveServerClient(livePromptAsync);
-    const fallbackClient = makeClient(mock(async () => {}));
+    installLiveServerClient({ prompt: livePromptAsync });
+    const fallbackClient = makeClient({
+      prompt: mock(async () => {}),
+      promptAsync: mock(async () => {}),
+    });
 
     await handleIdleBgCompletions({
       ctx,
@@ -1183,19 +2088,44 @@ describe("OpenCode background notifications", () => {
       client: fallbackClient,
       serverUrl: TEST_SERVER_URL,
     });
-    await waitForMockCallCount(fallbackClient.session.promptAsync, 1);
+    await waitForMockCallCount(fallbackClient.session.prompt!, 1);
 
     // The fallback client was used; the live-server factory was NOT
     // consulted at all (no probe of getLastLiveServerArgs).
-    expect(fallbackClient.session.promptAsync).toHaveBeenCalledTimes(1);
+    expect(fallbackClient.session.prompt).toHaveBeenCalledTimes(1);
+    expect(fallbackClient.session.promptAsync).toHaveBeenCalledTimes(0);
     expect(livePromptAsync).toHaveBeenCalledTimes(0);
     expect(getLastLiveServerArgs()).toBeNull();
 
-    const startMeta = findTraceEvent("bash_completion_wake_prompt_async_start");
+    const startMeta = findTraceEvent("bash_completion_wake_send_start");
     expect(startMeta).toBeDefined();
     expect(startMeta?.wake_client_path).toBe("in-process-fallback");
+    expect(startMeta?.wake_client_method).toBe("prompt");
     expect(typeof startMeta?.delivery_id).toBe("string");
     expect(startMeta?.task_ids).toEqual(["task-1"]);
+  });
+
+  test("in-process fallback uses promptAsync only if prompt missing", async () => {
+    setTestLiveServerAvailable(false);
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({
+      success: true,
+      bg_completions: [completion("task-1", "npm test")],
+    }));
+    const fallbackClient = makeClient({ promptAsync: mock(async () => {}) });
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: fallbackClient,
+      serverUrl: TEST_SERVER_URL,
+    });
+    await waitForMockCallCount(fallbackClient.session.promptAsync!, 1);
+
+    expect(findTraceEvent("bash_completion_wake_degraded_delivery")?.wake_client_method).toBe(
+      "promptAsync",
+    );
   });
 
   test("in-process fallback without client emits diagnostic and queues for retry", async () => {
@@ -1208,7 +2138,7 @@ describe("OpenCode background notifications", () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
     const livePromptAsync = mock(async () => {});
-    installLiveServerClient(livePromptAsync);
+    installLiveServerClient({ prompt: livePromptAsync });
     await handleIdleBgCompletions({
       ctx,
       directory: "/tmp/project",
@@ -1288,4 +2218,25 @@ async function waitUntil(
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withSetTimeoutUnrefSpy<T>(run: () => Promise<T>): Promise<ReturnType<typeof mock>> {
+  const originalSetTimeout = globalThis.setTimeout;
+  let unrefSpy: ReturnType<typeof mock> | null = null;
+  globalThis.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+    const timer = originalSetTimeout(handler, timeout, ...args);
+    if (timer && typeof (timer as NodeJS.Timeout).unref === "function") {
+      const realUnref = (timer as NodeJS.Timeout).unref.bind(timer as NodeJS.Timeout);
+      unrefSpy = mock((...unrefArgs: unknown[]) => realUnref(...unrefArgs));
+      (timer as NodeJS.Timeout).unref = unrefSpy as unknown as NodeJS.Timeout["unref"];
+    }
+    return timer;
+  }) as typeof globalThis.setTimeout;
+  try {
+    await run();
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
+  if (!unrefSpy) throw new Error("expected setTimeout to return timer with unref()");
+  return unrefSpy;
 }

@@ -157,6 +157,30 @@
               "minimum": 5000,
               "default": 8000,
               "description": "How long foreground bash blocks before auto-promoting the task to background, in milliseconds. Minimum 5000; values below the floor are clamped up."
+            },
+            "deferred_completion_fallback_ms": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 500,
+              "description": "Safety-net delay before a completion deferred for same-turn delivery wakes the session without waiting for OpenCode session.idle."
+            },
+            "wake_retry_max_attempts": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 5,
+              "description": "Maximum prompt-delivery retry attempts before wake delivery hard-stops and leaves completions pending for explicit in-turn drain."
+            },
+            "wake_debounce_step_ms": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 200,
+              "description": "Initial wake debounce delay and retry backoff floor for background-completion prompts."
+            },
+            "wake_debounce_cap_ms": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1000,
+              "description": "Maximum wake debounce delay and retry backoff cap for background-completion prompts."
             }
           },
           "additionalProperties": false

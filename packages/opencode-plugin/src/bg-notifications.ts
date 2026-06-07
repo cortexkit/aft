@@ -38,6 +38,8 @@ export interface BgCompletion {
   output_path?: string;
 }
 
+type ReminderClass = "completion" | "urgent_failure" | "timer" | "pattern_match";
+
 export interface PatternMatchEntry {
   task_id: string;
   session_id: string;
@@ -69,6 +71,7 @@ type SessionBgState = {
   firstCompletionAt: number | null;
   scheduledFireAt: number | null;
   scheduledCompletionCount: number;
+  scheduledReminderClass: ReminderClass | null;
   retryDelayMs: number | null;
   wakeRetryAttempts: number;
   wakeHardStopped: boolean;
@@ -82,6 +85,9 @@ type SessionBgState = {
    * append and the next session.idle still deliver normally.
    */
   wakeDeferredTaskIds: Set<string>;
+  deferredCompletionTimer: NodeJS.Timeout | null;
+  deferredCompletionDueByTask: Map<string, number>;
+  deferredCompletionContext: (DrainContext & { client: unknown }) | null;
   /**
    * Task IDs whose completions were consumed inline by an explicit
    * `bash_status({ exit: true, ... })` wait. The bash_completed push
@@ -107,7 +113,8 @@ export const sessionBgStates: Map<string, SessionBgState> = new Map();
 export const SESSION_BG_STATE_IDLE_TTL_MS = 60 * 60 * 1000;
 const DEBOUNCE_STEP_MS = 200;
 const DEBOUNCE_CAP_MS = 1000;
-const MAX_WAKE_SEND_ATTEMPTS = 5;
+export const DEFERRED_COMPLETION_FALLBACK_MS = 500;
+export const WAKE_RETRY_MAX_ATTEMPTS = 5;
 const UNKNOWN_COMPLETION_TTL_MS = 5000;
 const UNKNOWN_COMPLETION_CAP = 32;
 const DEFAULT_SESSION_ID = "__default__";
@@ -119,12 +126,13 @@ interface DrainContext {
   sessionID: string;
   /**
    * Plugin-provided OpenCode SDK client (`input.client`). The wake path
-   * uses this as a fallback when `useLiveServerWake()` is false — i.e.
-   * the live HTTP listener was unreachable when probed at plugin init,
-   * so `getLiveServerClient(...)` cannot be built. Falling back here
-   * accepts the upstream `promptAsync` runner-split bug
-   * (anomalyco/opencode#28202; duplicate "stop" messages) in exchange
-   * for wakes still arriving at all in plain-TUI sessions.
+   * uses this only as fallback when `useLiveServerWake()` is false or when
+   * live HTTP wake fails. Preferred wake path is live listener because
+   * synchronous `session.prompt(...)` resolution is our delivery proof that
+   * OpenCode accepted wake work. Fallback here keeps wakes flowing when live
+   * path is unavailable, but `promptAsync` still has false-ack semantics and
+   * upstream runner-split bug (anomalyco/opencode#28202; duplicate "stop"
+   * messages).
    *
    * Typed `unknown` because the real `@opencode-ai/sdk` `OpencodeClient`
    * has a narrower, generated `promptAsync` signature than the loose
@@ -142,13 +150,81 @@ interface DrainContext {
    * wake path falls back to `client` above; this URL is unused.
    */
   serverUrl?: string;
+  deferredCompletionFallbackMs?: number;
+  wakeRetryMaxAttempts?: number;
+  wakeDebounceStepMs?: number;
+  wakeDebounceCapMs?: number;
 }
 
 interface OpenCodeClient {
   session?: {
+    prompt?: (input: unknown) => Promise<unknown> | unknown;
     promptAsync?: (input: unknown) => Promise<unknown> | unknown;
     messages?: (input: { path: { id: string } }) => Promise<{ data?: unknown[] }>;
   };
+}
+
+interface WakeCorrelationMeta {
+  deliveryID: string;
+  requestHeaders?: Record<string, string>;
+}
+
+type SdkPromptResponseLike = {
+  error?: unknown;
+  response?: {
+    ok?: boolean;
+    status?: number;
+    statusText?: string;
+  };
+};
+
+function createWakeCorrelationMeta(
+  clientPath: "live-server" | "in-process-fallback",
+): WakeCorrelationMeta {
+  const deliveryID = `aftdel_${randomUUID()}`;
+  return {
+    deliveryID,
+    requestHeaders:
+      clientPath === "live-server"
+        ? {
+            "x-aft-delivery-id": deliveryID,
+          }
+        : undefined,
+  };
+}
+
+function formatWakePromptFailure(result: unknown): string | null {
+  if (!result || typeof result !== "object") return null;
+  const candidate = result as SdkPromptResponseLike & { request?: unknown };
+  const hasError = "error" in candidate && candidate.error != null;
+  const response = candidate.response;
+  const responseOk = response?.ok;
+  const hasBadResponse = responseOk === false;
+  if (!hasError && !hasBadResponse) return null;
+
+  const status = typeof response?.status === "number" ? response.status : undefined;
+  const statusText = typeof response?.statusText === "string" ? response.statusText : undefined;
+  let detail: string | undefined;
+  if (typeof candidate.error === "string") {
+    detail = candidate.error;
+  } else if (candidate.error instanceof Error) {
+    detail = candidate.error.message;
+  } else if (candidate.error != null) {
+    try {
+      detail = JSON.stringify(candidate.error);
+    } catch {
+      detail = String(candidate.error);
+    }
+  }
+
+  const parts = ["wake prompt returned error"];
+  if (status !== undefined) {
+    parts.push(`HTTP ${status}${statusText ? ` ${statusText}` : ""}`);
+  } else if (statusText) {
+    parts.push(statusText);
+  }
+  if (detail) parts.push(detail);
+  return parts.join(": ");
 }
 
 /**
@@ -163,7 +239,9 @@ export function consumeBgCompletion(sessionID: string | undefined, taskId: strin
   // entry there to drop it.
   const state = stateFor(sessionID);
   state.pendingCompletions = state.pendingCompletions.filter((c) => c.task_id !== taskId);
-  state.wakeDeferredTaskIds.delete(taskId);
+  prunePendingLongRunningForTask(state, taskId);
+  resetWakeHardStopForRecovery(state);
+  clearDeferredCompletionForTask(state, taskId);
   if (!state.consumedTaskIds.has(taskId)) {
     state.consumedTaskIds.add(taskId);
     state.consumedTaskOrder.push(taskId);
@@ -205,7 +283,7 @@ export async function markBgCompletionDelivered(
 export function markTaskWaiting(sessionID: string | undefined, taskId: string): void {
   const state = stateFor(sessionID);
   state.pendingCompletions = state.pendingCompletions.filter((c) => c.task_id !== taskId);
-  state.wakeDeferredTaskIds.delete(taskId);
+  clearDeferredCompletionForTask(state, taskId);
   if (state.consumedTaskIds.has(taskId)) {
     clearWakeTimerIfNoPending(state);
     return;
@@ -231,7 +309,7 @@ export function markTaskWaiting(sessionID: string | undefined, taskId: string): 
  */
 export function unmarkTaskWaiting(sessionID: string | undefined, taskId: string): void {
   const state = stateFor(sessionID);
-  state.wakeDeferredTaskIds.delete(taskId);
+  clearDeferredCompletionForTask(state, taskId);
   if (!state.consumedTaskIds.has(taskId)) return;
   state.consumedTaskIds.delete(taskId);
   const idx = state.consumedTaskOrder.indexOf(taskId);
@@ -247,11 +325,14 @@ export function trackBgTask(sessionID: string | undefined, taskId: string): void
     (entry) => entry.completion.task_id !== taskId,
   );
   if (buffered.length > 0) {
+    const seenTaskIds = new Set(state.pendingCompletions.map((pending) => pending.task_id));
     for (const entry of buffered) {
-      if (!state.pendingCompletions.some((pending) => pending.task_id === taskId)) {
-        state.pendingCompletions.push(entry.completion);
-      }
+      acceptTerminalCompletion(state, entry.completion);
+      if (seenTaskIds.has(entry.completion.task_id)) continue;
+      state.pendingCompletions.push(entry.completion);
+      seenTaskIds.add(entry.completion.task_id);
     }
+    scheduleDeferredCompletionFallback(state, taskId);
     return;
   }
   state.outstandingTaskIds.add(taskId);
@@ -275,8 +356,8 @@ export function markExplicitControl(
   if (idx >= 0) {
     const completion = state.pendingCompletions[idx];
     state.pendingCompletions.splice(idx, 1);
-    queuePendingPatternMatch(state, completionToExitPattern(completion, true));
-    state.wakeDeferredTaskIds.delete(taskId);
+    acceptTerminalExitPattern(state, completion);
+    clearDeferredCompletionForTask(state, taskId);
   }
 }
 
@@ -349,7 +430,7 @@ export function ingestBgCompletions(
     if (state.explicitControlTasks.has(completion.task_id)) {
       state.outstandingTaskIds.delete(completion.task_id);
       state.explicitControlTasks.delete(completion.task_id);
-      queuePendingPatternMatch(state, completionToExitPattern(completion, true));
+      acceptTerminalExitPattern(state, completion);
       continue;
     }
     if (!state.outstandingTaskIds.has(completion.task_id)) {
@@ -357,6 +438,7 @@ export function ingestBgCompletions(
       continue;
     }
     state.outstandingTaskIds.delete(completion.task_id);
+    acceptTerminalCompletion(state, completion);
     if (
       !state.pendingCompletions.some((pending) => pending.task_id === completion.task_id) &&
       !accepted.some((pending) => pending.task_id === completion.task_id)
@@ -372,7 +454,18 @@ export async function handlePushedBgCompletion(
   drainContext: DrainContext & { client: unknown },
   completion: unknown,
 ): Promise<void> {
+  const state = stateFor(drainContext.sessionID);
+  const taskId = isBgCompletion(completion) ? completion.task_id : undefined;
+  sessionDebug(drainContext.sessionID, `${LOG_PREFIX} push completion`, {
+    event: "bash_completion_push_ingress",
+    kind: "completion",
+    task_id: taskId ?? null,
+    deferred: taskId ? state.wakeDeferredTaskIds.has(taskId) : null,
+    outstanding: taskId ? state.outstandingTaskIds.has(taskId) : null,
+  });
   ingestBgCompletions(drainContext.sessionID, [completion]);
+  state.deferredCompletionContext = drainContext;
+  scheduleDeferredCompletionFallback(state, taskId);
   await triggerWakeIfPending(drainContext, true, false);
 }
 
@@ -380,8 +473,38 @@ export async function handlePushedBgLongRunning(
   drainContext: DrainContext & { client: unknown },
   reminder: BgLongRunningReminder,
 ): Promise<void> {
-  stateFor(drainContext.sessionID).pendingLongRunning.push(reminder);
+  const state = stateFor(drainContext.sessionID);
+  sessionDebug(drainContext.sessionID, `${LOG_PREFIX} push long-running`, {
+    event: "bash_completion_push_ingress",
+    kind: "long_running",
+    task_id: reminder.task_id,
+    deferred: state.wakeDeferredTaskIds.has(reminder.task_id),
+    outstanding: state.outstandingTaskIds.has(reminder.task_id),
+  });
+  state.pendingLongRunning.push(reminder);
   await triggerWakeIfPending(drainContext, true);
+}
+
+function resetWakeHardStopForRecovery(state: SessionBgState): void {
+  state.wakeHardStopped = false;
+  state.wakeRetryAttempts = 0;
+  state.retryDelayMs = null;
+}
+
+function prunePendingLongRunningForTask(state: SessionBgState, taskId: string): void {
+  state.pendingLongRunning = state.pendingLongRunning.filter(
+    (reminder) => reminder.task_id !== taskId,
+  );
+}
+
+function acceptTerminalCompletion(state: SessionBgState, completion: BgCompletion): void {
+  prunePendingLongRunningForTask(state, completion.task_id);
+  resetWakeHardStopForRecovery(state);
+}
+
+function acceptTerminalExitPattern(state: SessionBgState, completion: BgCompletion): void {
+  acceptTerminalCompletion(state, completion);
+  queuePendingPatternMatch(state, completionToExitPattern(completion, true));
 }
 
 export async function appendInTurnBgCompletions(
@@ -390,6 +513,7 @@ export async function appendInTurnBgCompletions(
 ): Promise<void> {
   if (!output) return;
   const state = stateFor(drainContext.sessionID);
+  promoteBufferedUnknownCompletions(state, Date.now());
   if (
     state.outstandingTaskIds.size === 0 &&
     state.pendingCompletions.length === 0 &&
@@ -428,7 +552,7 @@ export async function appendInTurnBgCompletions(
   );
   output.output = appendReminder(output.output ?? "", reminder);
   // Trace #7 of 7: reminder went out as part of an existing tool result
-  // instead of through promptAsync. NO wake_prompt_async_start event
+  // instead of through wake client call. NO bash_completion_wake_send_start event
   // accompanies this branch — that's the diagnostic signal that the
   // reminder reached the model via tool-result piggyback.
   sessionLog(drainContext.sessionID, `${LOG_PREFIX} in-turn append`, {
@@ -440,11 +564,10 @@ export async function appendInTurnBgCompletions(
   });
   state.pendingCompletions = [];
   for (const completion of deliveredCompletions) {
-    state.wakeDeferredTaskIds.delete(completion.task_id);
+    clearDeferredCompletionForTask(state, completion.task_id);
   }
   state.pendingLongRunning = [];
   state.pendingPatternMatches = [];
-  state.retryDelayMs = null;
   state.wakeRetryAttempts = 0;
   state.wakeHardStopped = false;
   await ackCompletions(drainContext, completionAcks);
@@ -453,13 +576,24 @@ export async function appendInTurnBgCompletions(
   // build an empty-body system-reminder ("[BACKGROUND BASH STILL RUNNING]"
   // with no bullets) since the timer reads `state.pendingLongRunning`
   // again at fire time.
-  clearWakeTimerIfNoPending(state);
+  if (state.debounceTimer) {
+    clearTimeout(state.debounceTimer);
+    state.debounceTimer = null;
+    state.firstCompletionAt = null;
+    state.scheduledFireAt = null;
+    state.scheduledCompletionCount = 0;
+    state.scheduledReminderClass = null;
+  }
 }
 
 export async function handleIdleBgCompletions(
   drainContext: DrainContext & { client: unknown },
 ): Promise<void> {
-  stateFor(drainContext.sessionID).wakeDeferredTaskIds.clear();
+  const state = stateFor(drainContext.sessionID);
+  state.deferredCompletionContext = drainContext;
+  promoteBufferedUnknownCompletions(state, Date.now());
+  state.wakeDeferredTaskIds.clear();
+  clearDeferredCompletionState(state);
   await triggerWakeIfPending(drainContext, false, true);
 }
 
@@ -484,7 +618,24 @@ async function triggerWakeIfPending(
     await drainCompletions(drainContext);
   }
   routeExplicitControlCompletions(state);
-  if (!hasWakeEligiblePending(state, includeDeferredCompletions)) return;
+  if (!hasWakeEligiblePending(state, includeDeferredCompletions)) {
+    const singleKnownTaskId =
+      state.pendingCompletions[0]?.task_id ??
+      state.pendingLongRunning[0]?.task_id ??
+      state.pendingPatternMatches[0]?.task_id ??
+      null;
+    sessionDebug(drainContext.sessionID, `${LOG_PREFIX} wake skipped; no eligible pending`, {
+      event: "bash_completion_wake_no_eligible_pending",
+      include_deferred_completions: includeDeferredCompletions,
+      pending_completions: state.pendingCompletions.length,
+      wake_eligible_completions: wakeEligibleCompletions(state, includeDeferredCompletions).length,
+      pending_long_running: state.pendingLongRunning.length,
+      pending_pattern_matches: state.pendingPatternMatches.length,
+      task_id: singleKnownTaskId,
+      deferred: singleKnownTaskId ? state.wakeDeferredTaskIds.has(singleKnownTaskId) : null,
+    });
+    return;
+  }
 
   scheduleWake(
     state,
@@ -513,9 +664,13 @@ async function triggerWakeIfPending(
       const sendPrompt = async (
         client: OpenCodeClient,
         clientPath: "live-server" | "in-process-fallback",
+        method: "prompt" | "promptAsync",
+        correlation: WakeCorrelationMeta = createWakeCorrelationMeta(clientPath),
       ): Promise<string> => {
-        if (typeof client.session?.promptAsync !== "function") {
-          throw new Error(`wake client.session.promptAsync is unavailable (path=${clientPath})`);
+        const promptMethod = client.session?.[method];
+        const session = client.session;
+        if (typeof promptMethod !== "function") {
+          throw new Error(`wake client.session.${method} is unavailable (path=${clientPath})`);
         }
         // Pass the previous turn's prompt context (agent + model + variant)
         // explicitly. OpenCode's `createUserMessage` resolves variant
@@ -539,28 +694,33 @@ async function triggerWakeIfPending(
         }
         if (promptContext?.variant) body.variant = promptContext.variant;
 
-        // Trace #3 of 7: about to call promptAsync. The deliveryID uniquely
-        // identifies this single promptAsync invocation across the rest of
+        // Trace #3 of 7: about to call wake client method. The deliveryID uniquely
+        // identifies this single wake invocation across the rest of
         // the trace chain (#3 start → #4 ok / #5 error → #6 ack_ok). One
         // deliveryID = one HTTP POST to OpenCode's session prompt endpoint.
         // When the DB shows multiple assistant children but logs show one
         // start event with this deliveryID, the duplication is downstream
         // of AFT.
-        const deliveryID = `aftdel_${randomUUID()}`;
+        const { deliveryID, requestHeaders } = correlation;
         const wakeMeta = {
           delivery_id: deliveryID,
+          correlation_header:
+            requestHeaders && Object.keys(requestHeaders).length > 0
+              ? Object.keys(requestHeaders)[0]
+              : null,
           attempt: state.wakeRetryAttempts + 1,
           task_ids: taskIDs,
           directory: drainContext.directory,
           reminder_sha256: hashReminder(reminder),
           reminder_chars: reminder.length,
-          // `live-server` = wake POSTed through `createOpencodeClient` aimed
-          // at `input.serverUrl` (anomalyco/opencode#28202 workaround, no
-          // duplicate runs). `in-process-fallback` = wake POSTed through
-          // `input.client.session.promptAsync` because the live listener
-          // wasn't reachable at startup or failed mid-session; this accepts
-          // the upstream bug so wakes still arrive instead of hard-stopping.
+          // `live-server` = wake sent through `createOpencodeClient` aimed at
+          // `input.serverUrl`; `prompt` resolution on this path is delivery
+          // proof that live listener accepted prompt. `in-process-fallback` =
+          // wake sent through plugin-provided client because live listener was
+          // unavailable or failed mid-session; this path prefers sync `prompt`
+          // too, but may degrade to `promptAsync` when older client shape lacks it.
           wake_client_path: clientPath,
+          wake_client_method: method,
           prompt_context: promptContext
             ? {
                 agent: promptContext.agent,
@@ -574,45 +734,56 @@ async function triggerWakeIfPending(
               }
             : null,
         };
-        sessionLog(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync start`, {
-          event: "bash_completion_wake_prompt_async_start",
+        sessionLog(drainContext.sessionID, `${LOG_PREFIX} wake send start`, {
+          event: "bash_completion_wake_send_start",
           ...wakeMeta,
         });
         try {
-          await client.session.promptAsync({
+          const result = await promptMethod.call(session, {
             path: { id: drainContext.sessionID },
             body,
+            throwOnError: true,
           });
+          const sdkFailure = formatWakePromptFailure(result);
+          if (sdkFailure) throw new Error(sdkFailure);
         } catch (err) {
-          // Trace #5 of 7: promptAsync rejected. Counted toward
-          // MAX_WAKE_SEND_ATTEMPTS by the catch in scheduleWake unless a
+          // Trace #5 of 7: wake client method rejected. Counted toward
+          // wake_retry_max_attempts by the catch in scheduleWake unless a
           // live-server failure can be delivered by the in-process fallback
           // below. Re-throw so the retry/fallback path runs.
           const logPromptError = clientPath === "live-server" ? sessionDebug : sessionWarn;
-          logPromptError(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync error`, {
-            event: "bash_completion_wake_prompt_async_error",
+          logPromptError(drainContext.sessionID, `${LOG_PREFIX} wake send error`, {
+            event: "bash_completion_wake_send_error",
             delivery_id: deliveryID,
             attempt: state.wakeRetryAttempts + 1,
             task_ids: taskIDs,
             wake_client_path: clientPath,
+            wake_client_method: method,
             error: err instanceof Error ? err.message : String(err),
           });
           throw err;
         }
-        // Trace #4 of 7: promptAsync resolved. OpenCode has accepted the
-        // synthetic user message and will run the agent turn. A subsequent
-        // assistant child with finish="stop" should appear in OpenCode's
-        // DB for this parent user message; if MORE than one appears for
-        // the same parent + reminder_sha256, the duplication is in the
-        // OpenCode runner, not in AFT (only one promptAsync call exists
-        // with this deliveryID in the log).
-        sessionLog(drainContext.sessionID, `${LOG_PREFIX} wake promptAsync ok`, {
-          event: "bash_completion_wake_prompt_async_ok",
+        // Trace #4 of 7: wake client method resolved. For live-server `prompt`,
+        // this is delivery proof that OpenCode accepted wake on live listener.
+        // For degraded `promptAsync`, resolution is weaker transport-only proof.
+        sessionLog(drainContext.sessionID, `${LOG_PREFIX} wake send resolved`, {
+          event: "bash_completion_wake_send_ok",
           delivery_id: deliveryID,
           attempt: state.wakeRetryAttempts + 1,
           task_ids: taskIDs,
           wake_client_path: clientPath,
+          wake_client_method: method,
         });
+        if (method === "promptAsync") {
+          sessionWarn(drainContext.sessionID, `${LOG_PREFIX} wake degraded delivery`, {
+            event: "bash_completion_wake_degraded_delivery",
+            delivery_id: deliveryID,
+            attempt: state.wakeRetryAttempts + 1,
+            task_ids: taskIDs,
+            wake_client_path: clientPath,
+            wake_client_method: method,
+          });
+        }
         return deliveryID;
       };
 
@@ -624,12 +795,25 @@ async function triggerWakeIfPending(
       // in-process client before spending the scheduler retry budget.
       if (useLiveServerWake(drainContext.serverUrl) && drainContext.serverUrl) {
         try {
+          const { deliveryID, requestHeaders } = createWakeCorrelationMeta("live-server");
           const liveClient = getLiveServerClient(
             drainContext.serverUrl,
             drainContext.directory,
+            requestHeaders,
           ) as OpenCodeClient;
-          const deliveryID = await sendPrompt(liveClient, "live-server");
-          await ackCompletions(drainContext, deliveredCompletions, deliveryID);
+          const deliveryIDResolved = await sendPrompt(liveClient, "live-server", "prompt", {
+            deliveryID,
+            requestHeaders,
+          });
+          if (deliveryIDResolved !== deliveryID) {
+            sessionDebug(drainContext.sessionID, `${LOG_PREFIX} delivery correlation mismatch`, {
+              event: "bash_completion_wake_delivery_correlation_mismatch",
+              expected_delivery_id: deliveryID,
+              actual_delivery_id: deliveryIDResolved,
+              wake_client_path: "live-server",
+            });
+          }
+          await ackCompletions(drainContext, deliveredCompletions, deliveryIDResolved);
           return;
         } catch (err) {
           setLiveServerWakeAvailable(drainContext.serverUrl, false);
@@ -650,7 +834,13 @@ async function triggerWakeIfPending(
             },
           );
           const fallbackClient = getInProcessClient();
-          const deliveryID = await sendPrompt(fallbackClient, "in-process-fallback");
+          const fallbackMethod =
+            typeof fallbackClient.session?.prompt === "function" ? "prompt" : "promptAsync";
+          const deliveryID = await sendPrompt(
+            fallbackClient,
+            "in-process-fallback",
+            fallbackMethod,
+          );
           // This delivery succeeded by switching transports; do not carry
           // over retry attempts spent on the now-demoted live-server path.
           state.retryDelayMs = null;
@@ -662,31 +852,35 @@ async function triggerWakeIfPending(
       }
 
       const fallbackClient = getInProcessClient();
-      const deliveryID = await sendPrompt(fallbackClient, "in-process-fallback");
+      const fallbackMethod =
+        typeof fallbackClient.session?.prompt === "function" ? "prompt" : "promptAsync";
+      const deliveryID = await sendPrompt(fallbackClient, "in-process-fallback", fallbackMethod);
       await ackCompletions(drainContext, deliveredCompletions, deliveryID);
     },
     (err, hardStopped) => {
       sessionWarn(
         drainContext.sessionID,
         hardStopped
-          ? `${LOG_PREFIX} wake send failed ${MAX_WAKE_SEND_ATTEMPTS} times; stopping retries: ${err instanceof Error ? err.message : String(err)}`
+          ? `${LOG_PREFIX} wake send failed ${(drainContext.wakeRetryMaxAttempts ?? WAKE_RETRY_MAX_ATTEMPTS)} times; stopping retries: ${err instanceof Error ? err.message : String(err)}`
           : `${LOG_PREFIX} wake send failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     },
     drainContext.sessionID,
     includeDeferredCompletions,
+    drainContext.wakeRetryMaxAttempts ?? WAKE_RETRY_MAX_ATTEMPTS,
+    drainContext.wakeDebounceStepMs ?? DEBOUNCE_STEP_MS,
+    drainContext.wakeDebounceCapMs ?? DEBOUNCE_CAP_MS,
   );
 }
 
 export function formatSystemReminder(completions: readonly BgCompletion[]): string {
-  const bullets = completions.map((completion) => formatCompletion(completion)).join("\n");
-  // Only point at bash_status when at least one completion is truncated;
-  // for fully-captured short outputs the agent already has the full result.
-  const anyTruncated = completions.some((c) => c.output_truncated === true);
-  const tail = anyTruncated
-    ? `\n\nFor truncated tasks, use bash_status({ taskId: "..." }) to retrieve full output.`
-    : "";
-  return `<system-reminder>\n[BACKGROUND BASH COMPLETED]\n${bullets}${tail}\n</system-reminder>`;
+  const urgent = completions.filter(isUrgentCompletion);
+  const normal = completions.filter((completion) => !isUrgentCompletion(completion));
+  const sections: string[] = [];
+  if (urgent.length > 0) sections.push(renderCompletionSection("BACKGROUND BASH FAILED", urgent));
+  if (normal.length > 0)
+    sections.push(renderCompletionSection("BACKGROUND BASH COMPLETED", normal));
+  return sections.join("\n");
 }
 
 export function formatLongRunningReminder(reminders: readonly BgLongRunningReminder[]): string {
@@ -743,6 +937,7 @@ export function extractSessionID(value: unknown): string | undefined {
 export function __resetBgNotificationStateForTests(): void {
   for (const state of sessionBgStates.values()) {
     if (state.debounceTimer) clearTimeout(state.debounceTimer);
+    if (state.deferredCompletionTimer) clearTimeout(state.deferredCompletionTimer);
   }
   sessionBgStates.clear();
 }
@@ -760,7 +955,12 @@ async function drainCompletions({ ctx, directory, sessionID }: DrainContext): Pr
       return;
     }
     state.forcedDrainCompleted = true;
-    ingestDrainedBgCompletions(sessionID, response.bg_completions);
+    const accepted = ingestDrainedBgCompletions(sessionID, response.bg_completions);
+    sessionDebug(sessionID, `${LOG_PREFIX} drain ok`, {
+      event: "bash_completion_drain_ok",
+      accepted_count: accepted.length,
+      accepted_task_ids: accepted.map((completion) => completion.task_id),
+    });
   } catch (err) {
     sessionWarn(
       sessionID,
@@ -832,20 +1032,95 @@ function wakeEligibleCompletions(
 
 function clearWakeTimerIfNoPending(state: SessionBgState): void {
   if (
-    state.pendingCompletions.length > 0 ||
-    state.pendingLongRunning.length > 0 ||
-    state.pendingPatternMatches.length > 0
+    state.pendingCompletions.length === 0 &&
+    state.pendingLongRunning.length === 0 &&
+    state.pendingPatternMatches.length === 0 &&
+    state.debounceTimer
   ) {
+    clearTimeout(state.debounceTimer);
+    state.debounceTimer = null;
+    state.firstCompletionAt = null;
+    state.scheduledFireAt = null;
+    state.scheduledCompletionCount = 0;
+    state.scheduledReminderClass = null;
+  }
+  if (state.pendingCompletions.length === 0) clearDeferredCompletionState(state);
+}
+
+function clearDeferredCompletionTimer(state: SessionBgState): void {
+  if (state.deferredCompletionTimer) clearTimeout(state.deferredCompletionTimer);
+  state.deferredCompletionTimer = null;
+}
+
+function clearDeferredCompletionState(state: SessionBgState): void {
+  clearDeferredCompletionTimer(state);
+  state.deferredCompletionDueByTask.clear();
+}
+
+function clearDeferredCompletionForTask(state: SessionBgState, taskId: string): void {
+  state.wakeDeferredTaskIds.delete(taskId);
+  state.deferredCompletionDueByTask.delete(taskId);
+  if (state.deferredCompletionDueByTask.size === 0) {
+    clearDeferredCompletionTimer(state);
     return;
   }
-  if (state.debounceTimer) clearTimeout(state.debounceTimer);
-  state.debounceTimer = null;
-  state.firstCompletionAt = null;
-  state.scheduledFireAt = null;
-  state.scheduledCompletionCount = 0;
-  state.retryDelayMs = null;
-  state.wakeRetryAttempts = 0;
-  state.wakeHardStopped = false;
+  scheduleDeferredCompletionFallback(state);
+}
+
+function scheduleDeferredCompletionFallback(
+  state: SessionBgState,
+  taskId?: string,
+  now = Date.now(),
+): void {
+  if (taskId) {
+    const pending = state.pendingCompletions.some((completion) => completion.task_id === taskId);
+    if (!pending || !state.wakeDeferredTaskIds.has(taskId)) {
+      state.deferredCompletionDueByTask.delete(taskId);
+    } else {
+      const fallbackMs =
+        state.deferredCompletionContext?.deferredCompletionFallbackMs ??
+        DEFERRED_COMPLETION_FALLBACK_MS;
+      state.deferredCompletionDueByTask.set(taskId, now + fallbackMs);
+    }
+  }
+
+  for (const dueTaskId of [...state.deferredCompletionDueByTask.keys()]) {
+    if (
+      !state.wakeDeferredTaskIds.has(dueTaskId) ||
+      !state.pendingCompletions.some((completion) => completion.task_id === dueTaskId)
+    ) {
+      state.deferredCompletionDueByTask.delete(dueTaskId);
+    }
+  }
+
+  if (state.deferredCompletionDueByTask.size === 0 || !state.deferredCompletionContext) {
+    clearDeferredCompletionTimer(state);
+    return;
+  }
+
+  const nextDueAt = Math.min(...state.deferredCompletionDueByTask.values());
+  const delay = Math.max(0, nextDueAt - now);
+  clearDeferredCompletionTimer(state);
+  state.deferredCompletionTimer = setTimeout(() => {
+    const fireNow = Date.now();
+    const maturedTaskIds: string[] = [];
+    for (const [dueTaskId, dueAt] of state.deferredCompletionDueByTask) {
+      if (dueAt <= fireNow) maturedTaskIds.push(dueTaskId);
+    }
+    for (const maturedTaskId of maturedTaskIds) {
+      state.deferredCompletionDueByTask.delete(maturedTaskId);
+      state.wakeDeferredTaskIds.delete(maturedTaskId);
+    }
+    if (state.deferredCompletionDueByTask.size === 0) {
+      state.deferredCompletionTimer = null;
+    } else {
+      scheduleDeferredCompletionFallback(state, undefined, fireNow);
+    }
+    if (maturedTaskIds.length === 0) return;
+    const context = state.deferredCompletionContext;
+    if (!context) return;
+    void triggerWakeIfPending(context, true, false);
+  }, delay);
 }
 
 function scheduleWake(
@@ -854,8 +1129,19 @@ function scheduleWake(
   onSendFailure: (err: unknown, hardStopped: boolean) => void,
   sessionID?: string,
   includeDeferredCompletions = true,
+  maxWakeSendAttempts = WAKE_RETRY_MAX_ATTEMPTS,
+  debounceStepMs = DEBOUNCE_STEP_MS,
+  debounceCapMs = DEBOUNCE_CAP_MS,
 ): void {
-  if (state.wakeHardStopped) return;
+  if (state.wakeHardStopped) {
+    sessionDebug(sessionID, `${LOG_PREFIX} wake hard-stopped`, {
+      event: "bash_completion_wake_hard_stopped",
+      pending_completions: state.pendingCompletions.length,
+      pending_long_running: state.pendingLongRunning.length,
+      pending_pattern_matches: state.pendingPatternMatches.length,
+    });
+    return;
+  }
   // Race model: JS state changes are synchronous; awaits only happen before scheduling
   // drains and during final prompt delivery. Multiple hook invocations can interleave
   // only at those awaits, so we gate timer extension on the pending completion count.
@@ -864,20 +1150,27 @@ function scheduleWake(
     wakeEligibleCompletions(state, includeDeferredCompletions).length +
     state.pendingLongRunning.length +
     state.pendingPatternMatches.length;
-  if (state.debounceTimer && pendingCount <= state.scheduledCompletionCount) {
+  const reminderClass = reminderClassForPending(state, includeDeferredCompletions);
+  if (!reminderClass) return;
+  if (
+    state.debounceTimer &&
+    pendingCount <= state.scheduledCompletionCount &&
+    reminderPriority(reminderClass) <= reminderPriority(state.scheduledReminderClass)
+  ) {
     return;
   }
   if (state.firstCompletionAt === null) {
     state.firstCompletionAt = now;
-    state.scheduledFireAt = now + DEBOUNCE_STEP_MS;
+    state.scheduledFireAt = now + debounceDelayForReminderClass(reminderClass, debounceStepMs);
   } else {
     const previousFireAt = state.scheduledFireAt ?? now;
-    state.scheduledFireAt = Math.min(
-      previousFireAt + DEBOUNCE_STEP_MS,
-      state.firstCompletionAt + DEBOUNCE_CAP_MS,
-    );
+    state.scheduledFireAt =
+      reminderClass === "urgent_failure"
+        ? now
+        : Math.min(previousFireAt + debounceStepMs, state.firstCompletionAt + debounceCapMs);
   }
   state.scheduledCompletionCount = pendingCount;
+  state.scheduledReminderClass = reminderClass;
 
   if (state.debounceTimer) clearTimeout(state.debounceTimer);
   const delay = state.retryDelayMs ?? Math.max(0, (state.scheduledFireAt ?? now) - now);
@@ -885,7 +1178,7 @@ function scheduleWake(
   // Trace #1 of 7 for the wake-delivery chain. Pairs with bash_completion_wake_fire.
   // When the OpenCode DB later shows N assistant children for one parent
   // user message, the matching count of wake_scheduled / wake_fire /
-  // wake_prompt_async_start events for the same task_ids tells us whether
+  // wake_send_start events for same task_ids tells us whether
   // AFT submitted the prompt once or N times. See
   // .alfonso/incident-reports/2026-05-21-bash-reminder-duplicate-runs.md.
   sessionLog(sessionID, `${LOG_PREFIX} wake scheduled`, {
@@ -905,6 +1198,7 @@ function scheduleWake(
     state.firstCompletionAt = null;
     state.scheduledFireAt = null;
     state.scheduledCompletionCount = 0;
+    state.scheduledReminderClass = null;
     // Defensive: if another path (e.g. appendInTurnBgCompletions) drained the
     // pending arrays between schedule and fire and didn't cancel us, just
     // skip — don't ship an empty "[BACKGROUND BASH STILL RUNNING]" shell.
@@ -921,9 +1215,9 @@ function scheduleWake(
     );
 
     // Trace #2 of 7: timer actually fired and we captured a non-empty
-    // pending set. The matching wake_prompt_async_start MUST follow within
-    // ~milliseconds — its absence means sendWake threw synchronously
-    // before reaching client.session.promptAsync.
+    // pending set. Matching wake_send_start MUST follow within
+    // ~milliseconds — absence means sendWake threw synchronously
+    // before reaching client.session.prompt / promptAsync.
     sessionLog(sessionID, `${LOG_PREFIX} wake fire`, {
       event: "bash_completion_wake_fire",
       task_ids: pending.map((c) => c.task_id),
@@ -934,10 +1228,12 @@ function scheduleWake(
     });
 
     const deliveredTaskIds = new Set(pending.map((completion) => completion.task_id));
+    const longRunningTaskIds = new Set(pendingLongRunning.map((reminder) => reminder.task_id));
     state.pendingCompletions = state.pendingCompletions.filter(
       (completion) => !deliveredTaskIds.has(completion.task_id),
     );
-    for (const taskId of deliveredTaskIds) state.wakeDeferredTaskIds.delete(taskId);
+    for (const taskId of deliveredTaskIds) clearDeferredCompletionForTask(state, taskId);
+    for (const taskId of longRunningTaskIds) clearDeferredCompletionForTask(state, taskId);
     state.pendingLongRunning = [];
     state.pendingPatternMatches = [];
     const completionAcks = completionAcksForDelivery(pending, pendingPatternMatches);
@@ -946,24 +1242,33 @@ function scheduleWake(
         state.retryDelayMs = null;
         state.wakeRetryAttempts = 0;
         state.wakeHardStopped = false;
+        state.scheduledReminderClass = null;
       })
       .catch((err) => {
         state.pendingCompletions = [...pending, ...state.pendingCompletions];
         state.pendingLongRunning = [...pendingLongRunning, ...state.pendingLongRunning];
         state.pendingPatternMatches = [...pendingPatternMatches, ...state.pendingPatternMatches];
         state.wakeRetryAttempts += 1;
-        if (state.wakeRetryAttempts >= MAX_WAKE_SEND_ATTEMPTS) {
+        if (state.wakeRetryAttempts >= maxWakeSendAttempts) {
           state.retryDelayMs = null;
           state.wakeHardStopped = true;
           onSendFailure(err, true);
           return;
         }
-        state.retryDelayMs = Math.min((delay || DEBOUNCE_STEP_MS) * 2, DEBOUNCE_CAP_MS);
+        state.retryDelayMs = Math.min((delay || debounceStepMs) * 2, debounceCapMs);
         onSendFailure(err, false);
-        scheduleWake(state, sendWake, onSendFailure, sessionID, includeDeferredCompletions);
+        scheduleWake(
+          state,
+          sendWake,
+          onSendFailure,
+          sessionID,
+          includeDeferredCompletions,
+          maxWakeSendAttempts,
+          debounceStepMs,
+          debounceCapMs,
+        );
       });
   }, delay);
-  state.debounceTimer.unref?.();
 }
 
 function _getSessionState(sessionID: string | undefined): SessionBgState | undefined {
@@ -987,12 +1292,16 @@ function stateFor(sessionID: string | undefined): SessionBgState {
       firstCompletionAt: null,
       scheduledFireAt: null,
       scheduledCompletionCount: 0,
+      scheduledReminderClass: null,
       retryDelayMs: null,
       wakeRetryAttempts: 0,
       wakeHardStopped: false,
       forcedDrainCompleted: false,
       unknownCompletions: [],
       wakeDeferredTaskIds: new Set(),
+      deferredCompletionTimer: null,
+      deferredCompletionDueByTask: new Map(),
+      deferredCompletionContext: null,
       consumedTaskIds: new Set(),
       consumedTaskOrder: [],
       lastSeenAt: now,
@@ -1016,12 +1325,13 @@ function ingestDrainedBgCompletions(
     state.outstandingTaskIds.delete(completion.task_id);
     if (state.explicitControlTasks.has(completion.task_id)) {
       state.explicitControlTasks.delete(completion.task_id);
-      queuePendingPatternMatch(state, completionToExitPattern(completion, true));
+      acceptTerminalExitPattern(state, completion);
       continue;
     }
     // Suppress completions for tasks already consumed inline by a
     // bash_status wait (same dedupe as ingestBgCompletions push path).
     if (state.consumedTaskIds.has(completion.task_id)) continue;
+    acceptTerminalCompletion(state, completion);
     if (
       !state.pendingCompletions.some((pending) => pending.task_id === completion.task_id) &&
       !accepted.some((pending) => pending.task_id === completion.task_id)
@@ -1039,6 +1349,7 @@ function cleanupIdleSessionStates(now: number): void {
     if (state.outstandingTaskIds.size > 0) continue;
     if (state.lastSeenAt >= cutoff) continue;
     if (state.debounceTimer) clearTimeout(state.debounceTimer);
+    clearDeferredCompletionState(state);
     sessionBgStates.delete(sessionID);
   }
 }
@@ -1059,6 +1370,36 @@ function pruneUnknownCompletions(state: SessionBgState, now: number): void {
   state.unknownCompletions = state.unknownCompletions.filter(
     (entry) => now - entry.receivedAt <= UNKNOWN_COMPLETION_TTL_MS,
   );
+}
+
+function promoteBufferedUnknownCompletions(state: SessionBgState, now: number): void {
+  pruneUnknownCompletions(state, now);
+  if (state.unknownCompletions.length === 0) return;
+
+  const remaining: Array<{ completion: BgCompletion; receivedAt: number }> = [];
+  const promoted: BgCompletion[] = [];
+  const seenTaskIds = new Set(state.pendingCompletions.map((pending) => pending.task_id));
+
+  for (const entry of state.unknownCompletions) {
+    const completion = entry.completion;
+    state.outstandingTaskIds.delete(completion.task_id);
+
+    if (state.consumedTaskIds.has(completion.task_id)) continue;
+
+    if (state.explicitControlTasks.has(completion.task_id)) {
+      state.explicitControlTasks.delete(completion.task_id);
+      acceptTerminalExitPattern(state, completion);
+      continue;
+    }
+
+    acceptTerminalCompletion(state, completion);
+    if (seenTaskIds.has(completion.task_id)) continue;
+    promoted.push(completion);
+    seenTaskIds.add(completion.task_id);
+  }
+
+  state.unknownCompletions = remaining;
+  if (promoted.length > 0) state.pendingCompletions.push(...promoted);
 }
 
 function completionToExitPattern(
@@ -1130,6 +1471,52 @@ function formatCompletion(completion: BgCompletion): string {
   const header = `- task ${completion.task_id} (${status}${duration ? `, ${duration}` : ""})`;
   const previewBlock = formatOutputPreview(completion);
   return previewBlock ? `${header}\n${previewBlock}` : header;
+}
+
+function isUrgentCompletion(completion: BgCompletion): boolean {
+  return ["failed", "timed_out", "timeout", "killed"].includes(completion.status);
+}
+
+function renderCompletionSection(header: string, completions: readonly BgCompletion[]): string {
+  const bullets = completions.map((completion) => formatCompletion(completion)).join("\n");
+  const anyTruncated = completions.some((c) => c.output_truncated === true);
+  const tail = anyTruncated
+    ? `\n\nFor truncated tasks, use bash_status({ taskId: "..." }) to retrieve full output.`
+    : "";
+  return `<system-reminder>\n[${header}]\n${bullets}${tail}\n</system-reminder>`;
+}
+
+function reminderClassForPending(
+  state: SessionBgState,
+  includeDeferredCompletions: boolean,
+): ReminderClass | null {
+  const completions = wakeEligibleCompletions(state, includeDeferredCompletions);
+  if (completions.some(isUrgentCompletion)) return "urgent_failure";
+  if (state.pendingLongRunning.length > 0) return "timer";
+  if (completions.length > 0) return "completion";
+  if (state.pendingPatternMatches.length > 0) return "pattern_match";
+  return null;
+}
+
+function reminderPriority(reminderClass: ReminderClass | null): number {
+  switch (reminderClass) {
+    case "urgent_failure":
+      return 3;
+    case "timer":
+      return 2;
+    case "completion":
+    case "pattern_match":
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+function debounceDelayForReminderClass(
+  reminderClass: ReminderClass,
+  debounceStepMs = DEBOUNCE_STEP_MS,
+): number {
+  return reminderClass === "urgent_failure" ? 0 : debounceStepMs;
 }
 
 function formatOutputPreview(completion: BgCompletion): string {

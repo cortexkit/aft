@@ -198,4 +198,22 @@ describe("resolveBashConfig", () => {
     );
     expect(r.long_running_reminder_interval_ms).toBe(1000);
   });
+
+  test("wake delivery tuning on top-level carries through", () => {
+    const r = resolveBashConfig(
+      cfg({
+        bash: {
+          deferred_completion_fallback_ms: 750,
+          wake_retry_max_attempts: 3,
+          wake_debounce_step_ms: 100,
+          wake_debounce_cap_ms: 900,
+        },
+      }),
+    );
+    expect(r.deferred_completion_fallback_ms).toBe(750);
+    expect(r.wake_retry_max_attempts).toBe(3);
+    expect(r.wake_debounce_step_ms).toBe(100);
+    expect(r.wake_debounce_cap_ms).toBe(900);
+  });
+
 });
