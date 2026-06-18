@@ -41,19 +41,24 @@ pub(crate) fn parse_perl_imports(source: &str, tree: &Tree) -> ImportBlock {
 
 fn parse_perl_import_statement(source: &str, node: &Node) -> Option<ImportStatement> {
     match node.kind() {
-        "use_no_statement" => parse_perl_use_no_statement(source, node),
-        "use_parent_statement" => {
-            parse_perl_keyword_module_statement(source, node, PERL_USE_KIND, "parent")
+        // `use`/`no` pragmas — including `use parent ...` and `use constant ...`
+        // — all parse as a single `use_statement`. The leading `use`/`no`
+        // keyword carries the kind and the `module` field carries the pragma
+        // name ("parent", "constant", or an ordinary module), so no per-pragma
+        // special-casing is needed.
+        "use_statement" => parse_perl_use_statement(source, node),
+        // `require Foo;` parses as an expression statement wrapping a
+        // `require_expression`.
+        "expression_statement" => {
+            let require = find_direct_child(node, "require_expression")?;
+            let module_node = first_named_child(&require)?;
+            build_perl_import(source, node, &module_node, PERL_REQUIRE_KIND)
         }
-        "use_constant_statement" => {
-            parse_perl_keyword_module_statement(source, node, PERL_USE_KIND, "constant")
-        }
-        "require_statement" => parse_perl_require_statement(source, node),
         _ => None,
     }
 }
 
-fn parse_perl_use_no_statement(source: &str, node: &Node) -> Option<ImportStatement> {
+fn parse_perl_use_statement(source: &str, node: &Node) -> Option<ImportStatement> {
     let import_kind = if find_direct_child(node, PERL_USE_KIND).is_some() {
         PERL_USE_KIND
     } else if find_direct_child(node, PERL_NO_KIND).is_some() {
@@ -61,23 +66,8 @@ fn parse_perl_use_no_statement(source: &str, node: &Node) -> Option<ImportStatem
     } else {
         return None;
     };
-    let module_node = find_direct_child(node, "package_name")?;
+    let module_node = node.child_by_field_name("module")?;
     build_perl_import(source, node, &module_node, import_kind)
-}
-
-fn parse_perl_keyword_module_statement(
-    source: &str,
-    node: &Node,
-    import_kind: &str,
-    module_child_kind: &str,
-) -> Option<ImportStatement> {
-    let module_node = find_direct_child(node, module_child_kind)?;
-    build_perl_import(source, node, &module_node, import_kind)
-}
-
-fn parse_perl_require_statement(source: &str, node: &Node) -> Option<ImportStatement> {
-    let module_node = find_direct_child(node, "package_name")?;
-    build_perl_import(source, node, &module_node, PERL_REQUIRE_KIND)
 }
 
 fn build_perl_import(
@@ -93,8 +83,16 @@ fn build_perl_import(
 
     let raw_args = raw_args_after_module(source, statement, module_node)?;
     let modifiers = perl_arg_modifiers(&raw_args);
-    let raw_text = source[statement.byte_range()].to_string();
-    let byte_range = statement.byte_range();
+    // `use_statement` spans its own terminating `;`, but an `expression_statement`
+    // (e.g. `require Foo;`) does not — the `;` is a following sibling. Extend the
+    // range through it so organize/remove replaces the whole statement and leaves
+    // no stray semicolon behind.
+    let end_byte = match statement.next_sibling() {
+        Some(next) if next.kind() == ";" => next.end_byte(),
+        _ => statement.end_byte(),
+    };
+    let raw_text = source[statement.start_byte()..end_byte].to_string();
+    let byte_range = statement.start_byte()..end_byte;
     let group = classify_group_perl(&module_path);
 
     Some(ImportStatement {
@@ -148,6 +146,22 @@ fn find_direct_child<'tree>(node: &Node<'tree>, kind: &str) -> Option<Node<'tree
         loop {
             let child = cursor.node();
             if child.kind() == kind {
+                return Some(child);
+            }
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    None
+}
+
+fn first_named_child<'tree>(node: &Node<'tree>) -> Option<Node<'tree>> {
+    let mut cursor = node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            let child = cursor.node();
+            if child.is_named() {
                 return Some(child);
             }
             if !cursor.goto_next_sibling() {
@@ -272,9 +286,11 @@ mod tests {
     }
 
     /// Grammar fixture: lock the exact tree-sitter-perl node kinds this parser
-    /// depends on. The current grammar represents plain `use` and `no` pragmas
-    /// as `use_no_statement`, specialized pragmas as `use_parent_statement` /
-    /// `use_constant_statement`, and runtime requires as `require_statement`.
+    /// depends on. This grammar represents every `use`/`no` pragma (plain or
+    /// specialized like `use parent` / `use constant`) as a single
+    /// `use_statement` with a `module` field and a leading `use`/`no` keyword
+    /// token, and runtime `require` as an `expression_statement` wrapping a
+    /// `require_expression`.
     #[test]
     fn perl_grammar_node_kinds_are_stable() {
         let src = "use Foo::Bar;\nuse Foo qw(a b);\nuse parent -norequire, 'Base';\nuse constant PI => 3.14;\nrequire Foo;\nno warnings;\nno strict 'refs';\n";
@@ -298,20 +314,11 @@ mod tests {
 
         for required in [
             "source_file",
-            "use_no_statement",
-            "use_parent_statement",
-            "use_constant_statement",
-            "require_statement",
-            "package_name",
-            "word_list_qw",
-            "no_require",
-            "string_single_quoted",
-            "fat_comma",
-            "floating_point",
-            "parent",
-            "constant",
+            "use_statement",
+            "expression_statement",
+            "require_expression",
+            "package",
             "use",
-            "require",
             "no",
             ";",
         ] {

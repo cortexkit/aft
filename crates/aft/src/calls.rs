@@ -40,15 +40,7 @@ pub fn call_node_kinds(lang: LangId) -> Vec<&'static str> {
             "nullsafe_member_call_expression",
             "scoped_call_expression",
         ],
-        LangId::Perl => vec![
-            "call_expression_recursive",
-            "call_expression_with_args_with_brackets",
-            "call_expression_with_bareword",
-            "call_expression_with_spaced_args",
-            "call_expression_with_sub",
-            "call_expression_with_variable",
-            "method_invocation",
-        ],
+        LangId::Perl => vec!["function_call_expression", "method_call_expression"],
         LangId::Lua => vec!["function_call"],
         LangId::C | LangId::Cpp | LangId::Zig => vec!["call_expression"],
         LangId::CSharp => vec!["invocation_expression"],
@@ -206,6 +198,11 @@ fn callee_node<'a>(node: &tree_sitter::Node<'a>) -> Option<tree_sitter::Node<'a>
         "jsx_opening_element" | "jsx_self_closing_element" => node
             .child_by_field_name("name")
             .or_else(|| node.named_child(0)),
+        // Perl method call `$obj->method(...)`: the callee is the `method`
+        // field, not the leading invocant that `child(0)` would return.
+        "method_call_expression" => node
+            .child_by_field_name("method")
+            .or_else(|| node.child_by_field_name("function")),
         _ => node
             .child_by_field_name("function")
             .or_else(|| node.child(0)),

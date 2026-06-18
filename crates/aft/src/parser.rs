@@ -598,17 +598,22 @@ const LUA_QUERY: &str = r#"
 const PERL_QUERY: &str = r#"
 ;; packages and subroutines
 (package_statement
-  (package_name) @package.name) @package.def
-(function_definition
-  name: (identifier) @fn.name) @fn.def
-(function_definition_without_sub
-  name: (identifier) @fn.name) @fn.def
+  name: (package) @package.name) @package.def
+(subroutine_declaration_statement
+  name: (bareword) @fn.name) @fn.def
+(method_declaration_statement
+  name: (bareword) @fn.name) @fn.def
 
-;; constants / lexical variables
-(use_constant_statement
-  constant: (identifier) @var.name) @var.def
+;; constants: `use constant NAME => ...;` — the `constant` pragma is filtered in
+;; Rust (the tree-sitter binding does not evaluate `#eq?` predicates).
+(use_statement
+  module: (package) @const.pragma
+  (list_expression (autoquoted_bareword) @const.name)) @const.def
+
+;; lexical / package variables: capture the sigil-bearing variable node so the
+;; symbol name matches `$counter`, not the bare `counter`.
 (variable_declaration
-  variable_name: (_) @var.name) @var.def
+  variable: (_) @var.name) @var.def
 "#;
 
 /// Supported language identifier.
@@ -5829,7 +5834,7 @@ fn perl_package_name(source: &str, node: &Node) -> Option<String> {
 
     loop {
         let child = cursor.node();
-        if child.kind() == "package_name" {
+        if child.kind() == "package" {
             return Some(node_text(source, &child).to_string());
         }
         if !cursor.goto_next_sibling() {
@@ -5887,6 +5892,9 @@ fn extract_perl_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<
         let mut fn_def_node = None;
         let mut var_name_node = None;
         let mut var_def_node = None;
+        let mut const_pragma_node = None;
+        let mut const_name_node = None;
+        let mut const_def_node = None;
 
         for cap in m.captures {
             let Some(&name) = capture_names.get(cap.index as usize) else {
@@ -5899,7 +5907,23 @@ fn extract_perl_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<
                 "fn.def" => fn_def_node = Some(cap.node),
                 "var.name" => var_name_node = Some(cap.node),
                 "var.def" => var_def_node = Some(cap.node),
+                "const.pragma" => const_pragma_node = Some(cap.node),
+                "const.name" => const_name_node = Some(cap.node),
+                "const.def" => const_def_node = Some(cap.node),
                 _ => {}
+            }
+        }
+
+        // `use constant NAME => ...;` defines a constant. Our grammar parses every
+        // `use`/`no` pragma as a generic `use_statement`, so gate on the pragma
+        // module text to avoid treating e.g. `use parent -norequire, ...` as a
+        // constant definition.
+        if let (Some(pragma_node), Some(name_node), Some(def_node)) =
+            (const_pragma_node, const_name_node, const_def_node)
+        {
+            if node_text(source, &pragma_node) == "constant" {
+                var_name_node = Some(name_node);
+                var_def_node = Some(def_node);
             }
         }
 
