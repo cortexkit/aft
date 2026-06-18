@@ -50,6 +50,12 @@ pub fn run(args: Vec<OsString>) -> Result<(), WarmupError> {
         );
     }
 
+    // Resolve ONNX Runtime from the plugin-managed cache so `aft warmup`
+    // can build the semantic index without the plugin setting ORT_DYLIB_PATH.
+    if args.areas.semantic {
+        try_set_ort_dylib_path(&storage_dir);
+    }
+
     let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
     configure(&ctx, &root, &storage_dir, args.areas, args.force)?;
 
@@ -249,9 +255,30 @@ fn warmup_storage_dir() -> PathBuf {
     if let Some(value) = std::env::var_os("AFT_STORAGE_DIR") {
         return PathBuf::from(value);
     }
-    // Same CortexKit shared data root the plugins inject — warming here must
+    // Same CortexKit shared data root the plugins inject - warming here must
     // land in the storage universe real sessions will read from.
     aft::bash_background::storage_dir(None)
+}
+
+/// Set `ORT_DYLIB_PATH` from a cached ONNX Runtime library if not already set.
+fn try_set_ort_dylib_path(storage_dir: &std::path::Path) {
+    if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+        return;
+    }
+    let lib_name = if cfg!(target_os = "macos") {
+        "libonnxruntime.dylib"
+    } else if cfg!(target_os = "windows") {
+        "onnxruntime.dll"
+    } else {
+        "libonnxruntime.so"
+    };
+    let ort_dir = storage_dir.join("onnxruntime").join("1.24.4");
+    for candidate in [ort_dir.join(lib_name), ort_dir.join("lib").join(lib_name)] {
+        if candidate.is_file() {
+            std::env::set_var("ORT_DYLIB_PATH", &candidate);
+            break;
+        }
+    }
 }
 
 /// Build the `configure` params for a warmup run.
@@ -898,5 +925,34 @@ mod tests {
         let err = WarmupArgs::parse(args(&["--root", "/tmp/x", "--only"])).unwrap_err();
         assert_eq!(err.exit_code(), 2);
         assert!(err.to_string().contains("--only requires a value"));
+    }
+
+    #[test]
+    fn try_set_ort_dylib_path_finds_cached_library() {
+        use std::sync::Mutex;
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap();
+        std::env::remove_var("ORT_DYLIB_PATH");
+
+        let temp = tempfile::tempdir().unwrap();
+        let lib_name = if cfg!(target_os = "macos") {
+            "libonnxruntime.dylib"
+        } else if cfg!(target_os = "windows") {
+            "onnxruntime.dll"
+        } else {
+            "libonnxruntime.so"
+        };
+        let ort_dir = temp.path().join("onnxruntime").join("1.24.4");
+        std::fs::create_dir_all(&ort_dir).unwrap();
+        let lib_path = ort_dir.join(lib_name);
+        std::fs::write(&lib_path, b"fake").unwrap();
+
+        try_set_ort_dylib_path(temp.path());
+
+        assert_eq!(
+            std::env::var_os("ORT_DYLIB_PATH"),
+            Some(lib_path.as_os_str().to_owned())
+        );
+        std::env::remove_var("ORT_DYLIB_PATH");
     }
 }

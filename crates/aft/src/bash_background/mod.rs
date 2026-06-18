@@ -159,7 +159,7 @@ pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {
     if let Some(dir) = std::env::var_os("AFT_CACHE_DIR") {
         return PathBuf::from(dir).join("aft");
     }
-    // Default to the CortexKit shared data root — the SAME location the
+    // Default to the CortexKit shared data root - the SAME location the
     // plugins inject as `storage_dir` on every configure. Before this, the
     // fallback was the pre-migration `~/.cache/aft`, which only plugin-less
     // invocations ever hit; once the daemon-supervised module became such an
