@@ -814,6 +814,150 @@ fn edit_match_no_match() {
     assert!(status.success());
 }
 
+// Regression for #132: edit_match must treat literal paths with brackets as
+// single-file edits, not glob patterns. Brackets (`[]`) are glob metacharacters,
+// so the old character-detection heuristic misclassified real file paths.
+#[test]
+fn edit_match_handles_brackets_in_literal_path() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let subdir = dir.path().join("[another]");
+    fs::create_dir_all(&subdir).unwrap();
+    let target = subdir.join("file.ts");
+    fs::write(&target, "const value = OLD;\n").unwrap();
+
+    let req = serde_json::json!({
+        "id": "em-brackets",
+        "command": "edit_match",
+        "file": target.display().to_string(),
+        "match": "OLD",
+        "replacement": "NEW"
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(
+        resp["success"], true,
+        "edit_match should succeed for path with brackets: {:?}",
+        resp
+    );
+    assert_eq!(resp["replacements"], 1);
+    let content = fs::read_to_string(&target).unwrap();
+    assert!(
+        content.contains("NEW"),
+        "replacement should apply: {}",
+        content
+    );
+    assert!(
+        !content.contains("OLD"),
+        "original text should be gone: {}",
+        content
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+// Sanity check: parentheses are also called out in the issue, but they are
+// not glob metacharacters, so they were never misclassified. This test only
+// ensures literal paths containing them remain single-file edits.
+#[test]
+fn edit_match_handles_parentheses_in_literal_path() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let subdir = dir.path().join("(something)");
+    fs::create_dir_all(&subdir).unwrap();
+    let target = subdir.join("file.ts");
+    fs::write(&target, "const value = OLD;\n").unwrap();
+
+    let req = serde_json::json!({
+        "id": "em-parens",
+        "command": "edit_match",
+        "file": target.display().to_string(),
+        "match": "OLD",
+        "replacement": "NEW"
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(
+        resp["success"], true,
+        "edit_match should succeed for path with parentheses: {:?}",
+        resp
+    );
+    assert_eq!(resp["replacements"], 1);
+    let content = fs::read_to_string(&target).unwrap();
+    assert!(
+        content.contains("NEW"),
+        "replacement should apply: {}",
+        content
+    );
+    assert!(
+        !content.contains("OLD"),
+        "original text should be gone: {}",
+        content
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+// Regression for #132: relative paths with brackets must also be treated as
+// literal single-file edits when resolved against the configured project root.
+#[test]
+fn edit_match_handles_brackets_in_relative_literal_path() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let subdir = root.join("[another]");
+    fs::create_dir_all(&subdir).unwrap();
+    let target = subdir.join("file.ts");
+    fs::write(&target, "const value = OLD;\n").unwrap();
+
+    let configure = aft.send(
+        &serde_json::json!({
+            "id": "cfg-restrict",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root.to_string_lossy(),
+            "config": user_config(serde_json::json!({ "restrict_to_project_root": true }))
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure should succeed: {configure:?}"
+    );
+
+    let req = serde_json::json!({
+        "id": "em-brackets-relative",
+        "command": "edit_match",
+        "file": "[another]/file.ts",
+        "match": "OLD",
+        "replacement": "NEW"
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(
+        resp["success"], true,
+        "edit_match should succeed for relative path with brackets: {:?}",
+        resp
+    );
+    assert_eq!(resp["replacements"], 1);
+    let content = fs::read_to_string(&target).unwrap();
+    assert!(
+        content.contains("NEW"),
+        "replacement should apply: {}",
+        content
+    );
+    assert!(
+        !content.contains("OLD"),
+        "original text should be gone: {}",
+        content
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
 // ============================================================================
 // batch command tests
 // ============================================================================

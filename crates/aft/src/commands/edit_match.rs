@@ -82,8 +82,12 @@ pub fn handle_edit_match(req: &RawRequest, ctx: &AppContext) -> Response {
     // sequences before the string reaches us. Adding unescape_str on top caused
     // double-interpretation that corrupted source code with literal escapes.
 
-    // Detect glob pattern
-    if is_glob_pattern(file) {
+    // Detect glob pattern. Prefer the literal interpretation when the path
+    // already exists on disk, even if its name contains glob metacharacters
+    // such as `[`, `]`, `*`, `?`, or `{`. This prevents files in directories
+    // with brackets (e.g. `src/[another]/file.rs`) from being misclassified as
+    // globs.
+    if should_treat_as_glob(file, ctx) {
         return handle_glob_edit_match(req, ctx, file, match_str, replacement, &op_id);
     }
 
@@ -366,6 +370,36 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
 /// Returns true if the file path contains glob characters.
 fn is_glob_pattern(path: &str) -> bool {
     path.contains('*') || path.contains('?') || path.contains('{') || path.contains('[')
+}
+
+/// Returns true when `file` should be treated as a glob pattern rather than a
+/// literal path. A path that exists on disk is always treated literally, even
+/// if its name contains glob metacharacters such as `[`, `]`, `*`, `?`, or `{`.
+/// This defends against directories or files with brackets in their
+/// names being misclassified as glob patterns (see issue #132).
+///
+/// Resolution mirrors `ctx.validate_path` so the literal-vs-glob decision stays
+/// consistent with the single-file path handler's interpretation.
+fn should_treat_as_glob(file: &str, ctx: &AppContext) -> bool {
+    if !is_glob_pattern(file) {
+        return false;
+    }
+    match ctx.validate_path("literal-check", Path::new(file)) {
+        Ok(candidate) => !candidate.exists(),
+        Err(resp)
+            if resp.data.get("code").and_then(|c| c.as_str()) == Some("path_outside_root") =>
+        {
+            false
+        }
+        Err(resp) => {
+            log::debug!(
+                "edit_match: validate_path failed for '{}', treating as glob: {:?}",
+                file,
+                resp.data
+            );
+            true
+        }
+    }
 }
 
 /// Handle a glob-based multi-file edit_match.
