@@ -393,11 +393,11 @@ fn should_treat_as_glob(file: &str, ctx: &AppContext) -> bool {
         }
         Err(resp) => {
             log::debug!(
-                "edit_match: validate_path failed for '{}', treating as glob: {:?}",
+                "edit_match: validate_path failed for '{}', deferring to single-file handler: {:?}",
                 file,
                 resp.data
             );
-            true
+            false
         }
     }
 }
