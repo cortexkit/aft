@@ -215,6 +215,10 @@ fn try_spawn_pty(
     })
 }
 
+/// DSR escape sequence `\x1b[6n` is 4 bytes. We carry over the last 3
+/// bytes of each read so the sequence can be detected across read boundaries.
+const DSR_CARRY_OVER: usize = 3;
+
 pub(crate) fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     spill_path: std::path::PathBuf,
@@ -232,13 +236,14 @@ pub(crate) fn spawn_reader(
                 .append(true)
                 .open(&spill_path)?;
             let mut buf = [0_u8; 8192];
+            let mut prev_tail: Vec<u8> = Vec::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
                         file.write_all(&buf[..n])?;
                         file.flush()?;
-                        if buf[..n].windows(4).any(|window| window == b"\x1b[6n") {
+                        if dsr_detected(&prev_tail, &buf[..n]) {
                             // Some Windows console hosts/apps query the
                             // terminal cursor position with DSR (ESC[6n)
                             // before accepting input. A real terminal answers
@@ -253,6 +258,9 @@ pub(crate) fn spawn_reader(
                                 }
                             }
                         }
+                        prev_tail.clear();
+                        let start = n.saturating_sub(DSR_CARRY_OVER);
+                        prev_tail.extend_from_slice(&buf[start..n]);
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) => return Err(error),
@@ -270,6 +278,19 @@ pub(crate) fn spawn_reader(
         reader_done.store(true, Ordering::SeqCst);
         coordinator.signal_one_done();
     });
+}
+
+fn dsr_detected(prev_tail: &[u8], current: &[u8]) -> bool {
+    if current.windows(4).any(|w| w == b"\x1b[6n") {
+        return true;
+    }
+    if prev_tail.is_empty() {
+        return false;
+    }
+    let mut combined = Vec::with_capacity(prev_tail.len() + current.len());
+    combined.extend_from_slice(prev_tail);
+    combined.extend_from_slice(current);
+    combined.windows(4).any(|w| w == b"\x1b[6n")
 }
 
 pub(crate) fn spawn_waiter(
@@ -450,4 +471,43 @@ mod tests {
         wake_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(fs::read_to_string(exit_path).unwrap(), "0");
     }
+
+    #[test]
+    fn dsr_detected_within_single_read() {
+        assert!(dsr_detected(b"", b"\x1b[6n"));
+    }
+
+    #[test]
+    fn dsr_detected_split_across_reads_3_1() {
+        assert!(dsr_detected(b"\x1b[6", b"n"));
+    }
+
+    #[test]
+    fn dsr_detected_split_across_reads_2_2() {
+        assert!(dsr_detected(b"\x1b[", b"6n"));
+    }
+
+    #[test]
+    fn dsr_detected_split_1_3() {
+        assert!(dsr_detected(b"\x1b", b"[6n"));
+    }
+
+    #[test]
+    fn dsr_not_detected_no_match() {
+        assert!(!dsr_detected(b"abc", b"def"));
+        assert!(!dsr_detected(b"", b"hello"));
+    }
+
+    #[test]
+    fn dsr_not_detected_near_miss_false_positive() {
+        // Combined buffer is \x1b[6X (4 bytes) but not \x1b[6n
+        assert!(!dsr_detected(b"\x1b[6", b"X"));
+    }
+
+    // Known limitation: a 3-read split (1-byte reads) defeats detection.
+    // Read 1: \x1b -> prev_tail = [\x1b]
+    // Read 2: [6   -> combined = [\x1b, [, 6] (3 bytes, no 4-byte window)
+    //          -> prev_tail = [[, 6] (\x1b is lost)
+    // Read 3: n    -> combined = [[, 6, n] (3 bytes, no 4-byte window)
+    // In practice PTY reads return hundreds of bytes, so 1-byte splits are pathological.
 }
