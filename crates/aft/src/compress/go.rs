@@ -119,7 +119,11 @@ fn looks_like_golangci_json_root(output: &str) -> bool {
 }
 
 fn go_subcommand(command: &str) -> Option<String> {
-    command.split_whitespace().nth(1).map(|s| s.to_string())
+    command
+        .split_whitespace()
+        .nth(1)
+        .filter(|s| !crate::compress::is_shell_boundary(s))
+        .map(|s| s.to_string())
 }
 
 fn compress_test(output: &str) -> String {
@@ -550,5 +554,20 @@ src/bar.go:3:8: ineffectual assignment (ineffassign)
         assert!(compressed.contains("fail_test.go:10"));
         assert!(compressed.contains("FAIL\texample.com/pkg\t0.999s"));
         assert!(compressed.len() * 10 < raw.len());
+    }
+
+    #[test]
+    fn go_subcommand_returns_none_for_pipe_as_second_token() {
+        assert_eq!(go_subcommand("go | grep x"), None);
+    }
+
+    #[test]
+    fn go_subcommand_returns_subcommand_when_before_pipe() {
+        assert_eq!(go_subcommand("go test | grep FAIL").as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn go_subcommand_unaffected_without_metacharacters() {
+        assert_eq!(go_subcommand("go build ./...").as_deref(), Some("build"));
     }
 }

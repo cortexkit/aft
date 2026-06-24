@@ -74,6 +74,9 @@ fn git_subcommand(command: &str) -> Option<String> {
         if token.starts_with('-') || token.contains('=') {
             continue;
         }
+        if crate::compress::is_shell_boundary(token) {
+            return None;
+        }
         return Some(token.to_string());
     }
     None
@@ -98,6 +101,9 @@ fn git_subcommand_after(command: &str, subcommand: &str) -> Option<String> {
         }
         if token.starts_with('-') || token.contains('=') {
             continue;
+        }
+        if crate::compress::is_shell_boundary(token) {
+            return None;
         }
         return Some(token.to_string());
     }
@@ -939,5 +945,46 @@ mod tests {
         assert!(compressed.contains("UNIQUE_BODY_MARKER_needle_xyz"));
         assert!(!compressed.contains("... more commits"));
         assert!(compressed.len() < raw.len());
+    }
+
+    #[test]
+    fn git_subcommand_returns_none_for_pipe_before_subcommand() {
+        assert_eq!(git_subcommand("git --no-pager | grep log"), None);
+    }
+
+    #[test]
+    fn git_subcommand_returns_subcommand_when_before_pipe() {
+        assert_eq!(git_subcommand("git log | grep fix").as_deref(), Some("log"));
+    }
+
+    #[test]
+    fn git_subcommand_returns_none_for_redirect_before_subcommand() {
+        assert_eq!(git_subcommand("git --no-pager > out.log"), None);
+    }
+
+    #[test]
+    fn git_subcommand_unaffected_without_metacharacters() {
+        assert_eq!(git_subcommand("git log --oneline").as_deref(), Some("log"));
+    }
+
+    #[test]
+    fn git_subcommand_after_returns_none_for_pipe() {
+        assert_eq!(git_subcommand_after("git stash | grep outputs", "stash"), None);
+    }
+
+    #[test]
+    fn git_subcommand_after_returns_action_when_before_pipe() {
+        assert_eq!(
+            git_subcommand_after("git stash list | grep wip", "stash").as_deref(),
+            Some("list")
+        );
+    }
+
+    #[test]
+    fn git_subcommand_after_unaffected_without_metacharacters() {
+        assert_eq!(
+            git_subcommand_after("git stash drop", "stash").as_deref(),
+            Some("drop")
+        );
     }
 }

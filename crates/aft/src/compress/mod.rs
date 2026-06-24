@@ -623,7 +623,95 @@ pub fn normalize_command_for_dispatch(command: &str) -> Option<String> {
     }
 
     if changed {
+        if let Some(last) = split_on_top_level_pipe(&current) {
+            return Some(last);
+        }
         Some(current)
+    } else {
+        split_on_top_level_pipe(command)
+    }
+}
+
+/// Returns true if the token is a shell metacharacter that acts as a
+/// command boundary (`|`, `;`, `&&`, `||`, `>`, `<`). Subcommand parsers
+/// use this to avoid returning these as subcommand names.
+pub fn is_shell_boundary(token: &str) -> bool {
+    matches!(token, "|" | ";" | "&&" | "||" | ">" | "<")
+}
+
+/// Quote-aware splitter that returns the last stage after a top-level `|`.
+/// Handles single quotes, double quotes, and backslash escapes. Bails
+/// (returns `None`) on backticks, `$()` command substitution, and
+/// process substitution `<(` / `>(` so callers fall back to generic handling.
+fn split_on_top_level_pipe(command: &str) -> Option<String> {
+    let bytes = command.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut last_pipe_end = 0;
+
+    let mut i = 0;
+    while i < bytes.len() {
+        let ch = bytes[i];
+
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+
+        if ch == b'\\' && !in_single {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+
+        if in_single {
+            if ch == b'\'' {
+                in_single = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if in_double {
+            if ch == b'"' {
+                in_double = false;
+            } else if ch == b'`' || (ch == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(') {
+                return None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if ch == b'\'' {
+            in_single = true;
+        } else if ch == b'"' {
+            in_double = true;
+        } else if ch == b'`' {
+            return None;
+        } else if ch == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+            return None;
+        } else if (ch == b'<' || ch == b'>') && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+            return None;
+        } else if ch == b'|' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'|' {
+                i += 2;
+                continue;
+            }
+            last_pipe_end = i + 1;
+        }
+
+        i += 1;
+    }
+
+    if last_pipe_end > 0 {
+        let last_stage = command[last_pipe_end..].trim();
+        if last_stage.is_empty() {
+            None
+        } else {
+            Some(last_stage.to_string())
+        }
     } else {
         None
     }
@@ -1395,5 +1483,75 @@ mod normalize_command_tests {
             compress_with_registry("timeout 30 cargo build", output, &empty_registry());
         // CargoCompressor for build/check/run preserves the structure.
         assert!(compressed.contains("Compiling") || compressed.contains("Finished"));
+    }
+
+    #[test]
+    fn normalize_splits_pipe_and_takes_last_stage() {
+        assert_eq!(
+            normalize_command_for_dispatch("git log | grep fix").as_deref(),
+            Some("grep fix")
+        );
+    }
+
+    #[test]
+    fn normalize_cd_prefix_then_pipe_takes_last_stage() {
+        assert_eq!(
+            normalize_command_for_dispatch("cd /repo && git log | grep fix").as_deref(),
+            Some("grep fix")
+        );
+    }
+
+    #[test]
+    fn normalize_no_pipe_returns_none() {
+        assert_eq!(normalize_command_for_dispatch("git log"), None);
+    }
+
+    #[test]
+    fn normalize_quoted_pipe_not_split() {
+        assert_eq!(normalize_command_for_dispatch("grep \"a|b\" file.txt"), None);
+    }
+
+    #[test]
+    fn normalize_command_substitution_bails() {
+        assert_eq!(
+            normalize_command_for_dispatch("echo $(cmd | cmd) | grep x"),
+            None
+        );
+    }
+
+    #[test]
+    fn normalize_double_pipe_not_split() {
+        assert_eq!(normalize_command_for_dispatch("git log || echo fail"), None);
+    }
+
+    #[test]
+    fn normalize_multi_pipe_returns_last_stage() {
+        assert_eq!(
+            normalize_command_for_dispatch("git log | grep fix | head -5").as_deref(),
+            Some("head -5")
+        );
+    }
+
+    #[test]
+    fn normalize_process_substitution_bails() {
+        assert_eq!(
+            normalize_command_for_dispatch("cat <(echo a | cat) | grep x"),
+            None
+        );
+    }
+
+    #[test]
+    fn piped_cargo_test_grep_preserves_failed() {
+        let grep_output = "test foo ... FAILED\n";
+        let compressed = compress_with_registry(
+            "cargo test | grep FAIL",
+            grep_output,
+            &empty_registry(),
+        );
+        assert!(
+            compressed.text.contains("FAILED"),
+            "grep-filtered FAILED must survive, got: {}",
+            compressed.text
+        );
     }
 }

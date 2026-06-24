@@ -56,6 +56,9 @@ fn cargo_subcommand(command: &str) -> Option<String> {
         if token.starts_with('-') {
             continue;
         }
+        if crate::compress::is_shell_boundary(token) {
+            return None;
+        }
         return Some(token.to_string());
     }
     None
@@ -269,5 +272,20 @@ mod tests {
         assert!(!result.text.contains("---- case_20 stdout ----"));
         assert!(result.had_inner_drop);
         assert!(!result.offset_hint_eligible);
+    }
+
+    #[test]
+    fn cargo_subcommand_returns_none_for_pipe_before_subcommand() {
+        assert_eq!(cargo_subcommand("cargo --verbose | grep error"), None);
+    }
+
+    #[test]
+    fn cargo_subcommand_returns_subcommand_when_before_pipe() {
+        assert_eq!(cargo_subcommand("cargo test | grep FAIL").as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn cargo_subcommand_unaffected_without_metacharacters() {
+        assert_eq!(cargo_subcommand("cargo test --release").as_deref(), Some("test"));
     }
 }
