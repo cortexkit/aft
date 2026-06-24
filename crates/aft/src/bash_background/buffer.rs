@@ -79,6 +79,7 @@ impl BgBuffer {
                         if was_over_cap {
                             let keep_from = output.len().saturating_sub(max_bytes);
                             output.drain(..keep_from);
+                            output = align_start_to_utf8(output);
                         }
                         (
                             String::from_utf8_lossy(&output).into_owned(),
@@ -269,7 +270,11 @@ pub(crate) fn read_file_tail(path: &Path, max_bytes: usize) -> io::Result<(Vec<u
     }
     let mut bytes = Vec::with_capacity(read_len as usize);
     file.read_to_end(&mut bytes)?;
-    Ok((bytes, len > max_bytes as u64))
+    let truncated = len > max_bytes as u64;
+    if truncated {
+        bytes = align_start_to_utf8(bytes);
+    }
+    Ok((bytes, truncated))
 }
 
 fn read_file_bounded(path: &Path, max_bytes: usize) -> io::Result<BoundedRead> {
@@ -405,6 +410,10 @@ fn read_file_range(path: &Path, start: u64, len: u64) -> io::Result<Vec<u8>> {
     let mut limited = file.take(len);
     let mut bytes = Vec::with_capacity(len as usize);
     limited.read_to_end(&mut bytes)?;
+    if start > 0 {
+        bytes = align_start_to_utf8(bytes);
+    }
+    bytes = align_end_to_utf8(bytes);
     Ok(bytes)
 }
 
@@ -434,6 +443,7 @@ fn truncate_front(path: &Path, retain_bytes: u64) -> io::Result<bool> {
     file.seek(SeekFrom::End(-(retain_bytes as i64)))?;
     let mut tail = Vec::with_capacity(retain_bytes as usize);
     file.read_to_end(&mut tail)?;
+    let tail = align_start_to_utf8(tail);
     let tmp = path.with_extension(format!(
         "{}.tmp",
         path.extension()
@@ -443,4 +453,184 @@ fn truncate_front(path: &Path, retain_bytes: u64) -> io::Result<bool> {
     fs::write(&tmp, tail)?;
     fs::rename(&tmp, path)?;
     Ok(true)
+}
+
+fn align_start_to_utf8(mut bytes: Vec<u8>) -> Vec<u8> {
+    let mut start = 0;
+    while start < bytes.len() && (bytes[start] & 0xC0) == 0x80 {
+        start += 1;
+    }
+    if start > 0 {
+        bytes.drain(..start);
+    }
+    bytes
+}
+
+fn align_end_to_utf8(mut bytes: Vec<u8>) -> Vec<u8> {
+    while !bytes.is_empty() {
+        let last = bytes.len() - 1;
+        if bytes[last] < 0x80 {
+            break;
+        }
+        let lead_pos = if (bytes[last] & 0xC0) == 0x80 {
+            let mut pos = last;
+            while pos > 0 && (bytes[pos] & 0xC0) == 0x80 {
+                pos -= 1;
+            }
+            if (bytes[pos] & 0xC0) == 0xC0 {
+                pos
+            } else {
+                bytes.pop();
+                continue;
+            }
+        } else {
+            last
+        };
+        let lead = bytes[lead_pos];
+        debug_assert!(lead >= 0xC0, "lead byte must be >= 0xC0, got {lead:#x}");
+        let expected = if lead < 0xE0 {
+            1
+        } else if lead < 0xF0 {
+            2
+        } else {
+            3
+        };
+        if last - lead_pos >= expected {
+            break;
+        }
+        bytes.truncate(lead_pos);
+    }
+    bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Regression tests for UTF-8 splitting at byte boundaries ---
+    // CORRECT behavior: read_file_tail should not split UTF-8 characters.
+    // These tests FAIL when the bug is present.
+
+    #[test]
+    fn read_file_tail_should_not_split_utf8_character() {
+        // "AAAA€" = 7 bytes (4 ASCII + 3-byte €).
+        // 2-byte tail reads bytes [5,6] = 0x82 0xAC - incomplete trailing
+        // bytes of €. from_utf8_lossy produces U+FFFD.
+        // CORRECT: no replacement character should appear.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout");
+        std::fs::write(&path, "AAAA€".as_bytes()).unwrap();
+        let (bytes, _truncated) = read_file_tail(&path, 2).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "read_file_tail should not produce replacement characters, got: {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn truncate_front_should_not_split_utf8_character() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout");
+        std::fs::write(&path, "AAAA€".as_bytes()).unwrap();
+        truncate_front(&path, 2).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "truncate_front should not produce replacement characters, got: {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn read_file_tail_should_not_split_4byte_utf8() {
+        // "AAAA😀" = 4 + 4 = 8 bytes. 2-byte tail reads bytes [6,7] = incomplete.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout");
+        std::fs::write(&path, "AAAA😀".as_bytes()).unwrap();
+        let (bytes, _truncated) = read_file_tail(&path, 2).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "read_file_tail should not produce replacement characters for 4-byte chars, got: {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn read_file_range_end_boundary_should_not_split_utf8() {
+        // "AAAA€" = 7 bytes. read_file_range(path, 0, 5) reads bytes [0..5].
+        // byte 4 = 0xE2 (lead of €), byte 5 = 0x82 (continuation) — not included.
+        // End at byte 5 splits after the lead byte. align_end_to_utf8 should trim it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout");
+        std::fs::write(&path, "AAAA€".as_bytes()).unwrap();
+        let bytes = read_file_range(&path, 0, 5).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "read_file_range should not produce replacement characters at end boundary, got: {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn ascii_content_unaffected_by_alignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout");
+        let content = b"hello world\nline two\n";
+        std::fs::write(&path, content).unwrap();
+        let (bytes, truncated) = read_file_tail(&path, 10).unwrap();
+        assert!(truncated);
+        assert_eq!(bytes, b"\nline two\n");
+    }
+
+    #[test]
+    fn read_file_range_start_boundary_should_not_split_utf8() {
+        // "Hello€World" = 5 + 3 + 5 = 13 bytes.
+        // read_file_range(path, 5, 4) reads bytes [5..9]:
+        // bytes 5-7 = € (0xE2 0x82 0xAC), byte 8 = 'W'.
+        // Start at byte 5 = 0xE2 (lead byte) — aligned, no split.
+        // End at byte 9 = 'o' — aligned, no split.
+        // But read_file_range(path, 6, 2) reads bytes [6..8]:
+        // byte 6 = 0x82 (continuation), byte 7 = 0xAC (continuation).
+        // Start at byte 6 splits inside €. align_start_to_utf8 should skip.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout");
+        std::fs::write(&path, b"Hello\xe2\x82\xacWorld").unwrap();
+        let bytes = read_file_range(&path, 6, 2).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "read_file_range with start>0 should not produce replacement characters, got: {:?}",
+            text
+        );
+    }
+
+    // --- Regression test for stdout/stderr interleaving ---
+    // This test documents the limitation: stdout always comes before stderr
+    // in the combined output, regardless of temporal write order.
+    // It does not assert correct interleaving (that would require a redesign)
+    // but verifies the current behavior is what we expect.
+
+    #[test]
+    fn read_tail_puts_stdout_before_stderr() {
+        // Write stdout and stderr to separate files, then verify
+        // the combined output has stdout content before stderr content.
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_path = dir.path().join("stdout");
+        let stderr_path = dir.path().join("stderr");
+        std::fs::write(&stdout_path, b"stdout-line\n").unwrap();
+        std::fs::write(&stderr_path, b"stderr-line\n").unwrap();
+        let buffer = BgBuffer::new(stdout_path, stderr_path);
+        let (text, _) = buffer.read_tail(1024);
+        let stdout_pos = text.find("stdout-line").unwrap();
+        let stderr_pos = text.find("stderr-line").unwrap();
+        assert!(
+            stdout_pos < stderr_pos,
+            "stdout should come before stderr in combined output"
+        );
+    }
 }
