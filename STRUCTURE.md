@@ -50,7 +50,7 @@ opencode-aft/
 **`crates/aft/src/commands/`:**
 - Purpose: Add one handler file per protocol command.
 - Contains: ~60 command-specific request parsing and response generation modules
-- Key files: `crates/aft/src/commands/tool_call.rs`, `crates/aft/src/commands/read.rs`, `crates/aft/src/commands/write.rs`, `crates/aft/src/commands/hashline.rs`, `crates/aft/src/commands/apply_patch.rs`, `crates/aft/src/commands/bash_orchestrate.rs`, `crates/aft/src/commands/bash_wait_detach.rs`, `crates/aft/src/commands/outline.rs`, `crates/aft/src/commands/zoom.rs`, `crates/aft/src/commands/bash.rs`, `crates/aft/src/commands/grep.rs`, `crates/aft/src/commands/semantic_search.rs`, `crates/aft/src/commands/configure.rs`
+- Key files: `crates/aft/src/commands/tool_call.rs`, `crates/aft/src/commands/read.rs`, `crates/aft/src/commands/write.rs`, `crates/aft/src/commands/hashline.rs`, `crates/aft/src/commands/apply_patch.rs`, `crates/aft/src/commands/bash_orchestrate.rs`, `crates/aft/src/commands/bash_wait_detach.rs`, `crates/aft/src/commands/outline.rs`, `crates/aft/src/commands/zoom.rs`, `crates/aft/src/commands/gather.rs`, `crates/aft/src/commands/bash.rs`, `crates/aft/src/commands/grep.rs`, `crates/aft/src/commands/semantic_search.rs`, `crates/aft/src/commands/configure.rs`
 
 **`crates/aft/src/compress/`:**
 - Purpose: Provide tiered output compression for hoisted bash commands.
@@ -124,7 +124,7 @@ opencode-aft/
 
 **`packages/opencode-plugin/src/tools/`:**
 - Purpose: Group OpenCode tool definitions by capability area.
-- Contains: Thin adapters for hoisted (advertising `filePath` on OpenCode for read/write/edit to honor host UI header display contract), reading, import, navigation, refactor, safety, bash, conflict, AST, search, semantic, and inspect tools; permissions and internals helpers
+- Contains: Thin adapters for hoisted (advertising `filePath` on OpenCode for read/write/edit to honor host UI header display contract), reading, import, navigation, refactor, safety, bash, conflict, AST, search, semantic, gather, and inspect tools; permissions and internals helpers
 - Key files: `packages/opencode-plugin/src/tools/_shared.ts`, `packages/opencode-plugin/src/tools/hoisted.ts`, `packages/opencode-plugin/src/tools/reading.ts`, `packages/opencode-plugin/src/tools/refactoring.ts`, `packages/opencode-plugin/src/tools/bash.ts`, `packages/opencode-plugin/src/tools/inspect.ts`, `packages/opencode-plugin/src/tools/search.ts`
 
 **`packages/pi-plugin/`:**

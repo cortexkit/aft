@@ -43,6 +43,7 @@ mod extract_function_test;
 mod extract_tokens_test;
 mod format_test;
 mod fs_lock_audit_test;
+mod gather_test;
 mod grep_glob_multi_path_test;
 mod grep_glob_test;
 mod honest_failures_test;

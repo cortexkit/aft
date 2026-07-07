@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import type { PluginContext } from "../shared/types.js";
 import { astTools } from "../tools/ast.js";
 import { conflictTools } from "../tools/conflicts.js";
+import { gatherTools } from "../tools/gather.js";
 import { aftPrefixedTools, hoistedTools } from "../tools/hoisted.js";
 import { importTools } from "../tools/imports.js";
 import { inspectTools } from "../tools/inspect.js";
@@ -105,5 +106,50 @@ describe("tool surface transport invariance", () => {
     expect((first as string).length).toBeGreaterThan(0);
     // Nothing transport-shaped may appear in the injected prompt text.
     expect(first as string).not.toMatch(/subc|ndjson|daemon|transport/i);
+  });
+
+  test("gather advertises path and maps it to the internal filePath transport key", async () => {
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const ctx = {
+      pool: {
+        getBridge: () => ({
+          async toolCall(
+            _sessionId: string | undefined,
+            name: string,
+            args: Record<string, unknown>,
+          ) {
+            calls.push({ name, args });
+            return { success: true, text: "context pack" };
+          },
+        }),
+      },
+      client: {},
+      config: { tool_surface: "all" },
+      storageDir: "/tmp/aft-surface-test",
+      isProjectEnabled: () => true,
+    } as never;
+    const tool = gatherTools(ctx).aft_gather_context;
+
+    expect(Object.hasOwn(tool.args, "path")).toBe(true);
+    expect(Object.hasOwn(tool.args, "filePath")).toBe(false);
+
+    await tool.execute(
+      { symbol: "handle_zoom", path: "src/commands/zoom.rs", includeTests: true },
+      {
+        directory: process.cwd(),
+      } as never,
+    );
+
+    const internalPathKey = ["file", "Path"].join("");
+    expect(calls).toEqual([
+      {
+        name: "gather",
+        args: {
+          symbol: "handle_zoom",
+          [internalPathKey]: "src/commands/zoom.rs",
+          includeTests: true,
+        },
+      },
+    ]);
   });
 });

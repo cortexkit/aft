@@ -278,6 +278,35 @@
     ],
     "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock')."
   },
+  "gather": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "question": {
+        "description": "Natural-language question to seed the pack via semantic search. Mutually exclusive with 'symbol'+'path'.",
+        "type": "string"
+      },
+      "symbol": {
+        "description": "Symbol name for impact-seeded mode. Requires 'path'. Mutually exclusive with 'question'.",
+        "type": "string"
+      },
+      "path": {
+        "description": "Path to the source file for impact-seeded mode. Required when 'symbol' is provided. Mutually exclusive with 'question'.",
+        "type": "string"
+      },
+      "budget": {
+        "description": "Output line budget for the pack (default 400, max 800). Budget-excluded candidates are listed as stubs.",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 800
+      },
+      "includeTests": {
+        "description": "Include test files in callers/paths. Defaults to false; tests are hidden.",
+        "type": "boolean"
+      }
+    },
+    "description": "Assemble a deterministic 'context pack' — ranked, deduped, budgeted verbatim code evidence — in ONE call instead of a multi-turn search→outline→zoom→callgraph chain. Returns code bodies with file:line headers, not conclusions.\n\nTwo modes (mutually exclusive):\n- question mode: `{ question: \"how does X work?\" }` — semantic-search-seeded. Ranks seeds by search score.\n- symbol mode: `{ symbol: \"handle_zoom\", path: \"src/commands/zoom.rs\" }` — impact-seeded (blast-radius callers + callees).\n\nOptional: `budget` (default 400 lines, max 800). When the budget is exhausted, remaining candidates appear as one-line stubs under '## Beyond budget (zoom to expand)'.\n\nUse when: the agent would otherwise need 4-6 serial tools to gather code context around a question or symbol. NOT for quick single-symbol reads (use aft_zoom)."
+  },
   "outline": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",

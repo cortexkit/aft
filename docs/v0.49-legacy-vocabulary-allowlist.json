@@ -25,6 +25,15 @@
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
+      "path": "ARCHITECTURE.md",
+      "location": "line 115, column 400",
+      "line": 115,
+      "column": 400,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
       "path": "STRUCTURE.md",
       "location": "line 127, column 53",
       "line": 127,
@@ -92,6 +101,42 @@
       "location": "line 104, column 37",
       "line": 104,
       "column": 37,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/commands/gather.rs",
+      "location": "line 93, column 41",
+      "line": 93,
+      "column": 41,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/commands/gather.rs",
+      "location": "line 102, column 92",
+      "line": 102,
+      "column": 92,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/commands/gather.rs",
+      "location": "line 1014, column 18",
+      "line": 1014,
+      "column": 18,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/commands/gather.rs",
+      "location": "line 1025, column 23",
+      "line": 1025,
+      "column": 23,
       "token": "filePath",
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
@@ -350,8 +395,8 @@
     },
     {
       "path": "crates/aft/src/subc/manifest.rs",
-      "location": "line 360, column 53",
-      "line": 360,
+      "location": "line 363, column 53",
+      "line": 363,
       "column": 53,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -359,8 +404,8 @@
     },
     {
       "path": "crates/aft/src/subc/manifest.rs",
-      "location": "line 365, column 38",
-      "line": 365,
+      "location": "line 368, column 38",
+      "line": 368,
       "column": 38,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -368,8 +413,8 @@
     },
     {
       "path": "crates/aft/src/subc/manifest.rs",
-      "location": "line 366, column 57",
-      "line": 366,
+      "location": "line 369, column 57",
+      "line": 369,
       "column": 57,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -611,8 +656,8 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 1168, column 18",
-      "line": 1168,
+      "location": "line 1170, column 18",
+      "line": 1170,
       "column": 18,
       "token": "toFile",
       "class": "rust-compatibility",
@@ -620,8 +665,8 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 1658, column 77",
-      "line": 1658,
+      "location": "line 1660, column 77",
+      "line": 1660,
       "column": 77,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -629,8 +674,8 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 1706, column 79",
-      "line": 1706,
+      "location": "line 1708, column 79",
+      "line": 1708,
       "column": 79,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -638,8 +683,44 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 2166, column 39",
-      "line": 2166,
+      "location": "line 1867, column 92",
+      "line": 1867,
+      "column": 92,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "location": "line 1872, column 48",
+      "line": 1872,
+      "column": 48,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "location": "line 1877, column 73",
+      "line": 1877,
+      "column": 73,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "location": "line 1890, column 14",
+      "line": 1890,
+      "column": 14,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "location": "line 2218, column 39",
+      "line": 2218,
       "column": 39,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -647,8 +728,35 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 2213, column 56",
-      "line": 2213,
+      "location": "line 2250, column 26",
+      "line": 2250,
+      "column": 26,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "location": "line 2252, column 32",
+      "line": 2252,
+      "column": 32,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "location": "line 2256, column 15",
+      "line": 2256,
+      "column": 15,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "location": "line 2281, column 56",
+      "line": 2281,
       "column": 56,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -656,8 +764,8 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 2258, column 42",
-      "line": 2258,
+      "location": "line 2326, column 42",
+      "line": 2326,
       "column": 42,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -665,8 +773,8 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 2263, column 42",
-      "line": 2263,
+      "location": "line 2331, column 42",
+      "line": 2331,
       "column": 42,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -674,8 +782,8 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 2400, column 42",
-      "line": 2400,
+      "location": "line 2468, column 42",
+      "line": 2468,
       "column": 42,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -683,8 +791,8 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 2407, column 64",
-      "line": 2407,
+      "location": "line 2475, column 64",
+      "line": 2475,
       "column": 64,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -692,8 +800,8 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 2411, column 41",
-      "line": 2411,
+      "location": "line 2479, column 41",
+      "line": 2479,
       "column": 41,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -701,8 +809,8 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 2417, column 62",
-      "line": 2417,
+      "location": "line 2485, column 62",
+      "line": 2485,
       "column": 62,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -710,8 +818,8 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 2422, column 14",
-      "line": 2422,
+      "location": "line 2490, column 14",
+      "line": 2490,
       "column": 14,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -719,8 +827,8 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 2436, column 14",
-      "line": 2436,
+      "location": "line 2504, column 14",
+      "line": 2504,
       "column": 14,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -728,8 +836,8 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 2501, column 22",
-      "line": 2501,
+      "location": "line 2569, column 22",
+      "line": 2569,
       "column": 22,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -737,8 +845,8 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 2513, column 22",
-      "line": 2513,
+      "location": "line 2581, column 22",
+      "line": 2581,
       "column": 22,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -746,8 +854,8 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 2523, column 22",
-      "line": 2523,
+      "location": "line 2591, column 22",
+      "line": 2591,
       "column": 22,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -755,8 +863,8 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 2533, column 22",
-      "line": 2533,
+      "location": "line 2601, column 22",
+      "line": 2601,
       "column": 22,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -764,8 +872,8 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 2543, column 22",
-      "line": 2543,
+      "location": "line 2611, column 22",
+      "line": 2611,
       "column": 22,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -773,8 +881,8 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 2553, column 22",
-      "line": 2553,
+      "location": "line 2621, column 22",
+      "line": 2621,
       "column": 22,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -782,9 +890,63 @@
     },
     {
       "path": "crates/aft/src/subc_translate.rs",
-      "location": "line 2628, column 18",
-      "line": 2628,
+      "location": "line 2696, column 18",
+      "line": 2696,
       "column": 18,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "location": "line 2896, column 39",
+      "line": 2896,
+      "column": 39,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "location": "line 2914, column 34",
+      "line": 2914,
+      "column": 34,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "location": "line 2916, column 73",
+      "line": 2916,
+      "column": 73,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "location": "line 2920, column 49",
+      "line": 2920,
+      "column": 49,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "location": "line 2929, column 18",
+      "line": 2929,
+      "column": 18,
+      "token": "filePath",
+      "class": "rust-compatibility",
+      "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
+    },
+    {
+      "path": "crates/aft/src/subc_translate.rs",
+      "location": "line 2941, column 34",
+      "line": 2941,
+      "column": 34,
       "token": "filePath",
       "class": "rust-compatibility",
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
@@ -1376,6 +1538,24 @@
       "token": "filePath",
       "class": "compatibility-fixture",
       "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
+    },
+    {
+      "path": "crates/aft/tests/integration/gather_test.rs",
+      "location": "line 83, column 74",
+      "line": 83,
+      "column": 74,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "crates/aft/tests/integration/gather_test.rs",
+      "location": "line 99, column 77",
+      "line": 99,
+      "column": 77,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
       "path": "crates/aft/tests/integration/subc_bridge_test.rs",
@@ -2036,8 +2216,8 @@
     },
     {
       "path": "docs/v0.49-unified-tool-surface-inventory.json",
-      "location": "line 430, column 80",
-      "line": 430,
+      "location": "line 432, column 80",
+      "line": 432,
       "column": 80,
       "token": "filePath",
       "class": "normative_inventory",
@@ -2045,8 +2225,8 @@
     },
     {
       "path": "docs/v0.49-unified-tool-surface-inventory.json",
-      "location": "line 431, column 79",
-      "line": 431,
+      "location": "line 433, column 79",
+      "line": 433,
       "column": 79,
       "token": "filePath",
       "class": "normative_inventory",
@@ -2054,8 +2234,8 @@
     },
     {
       "path": "docs/v0.49-unified-tool-surface-inventory.json",
-      "location": "line 432, column 81",
-      "line": 432,
+      "location": "line 434, column 81",
+      "line": 434,
       "column": 81,
       "token": "filePath",
       "class": "normative_inventory",
@@ -2063,8 +2243,8 @@
     },
     {
       "path": "docs/v0.49-unified-tool-surface-inventory.json",
-      "location": "line 432, column 202",
-      "line": 432,
+      "location": "line 434, column 202",
+      "line": 434,
       "column": 202,
       "token": "filePath",
       "class": "normative_inventory",
@@ -2072,8 +2252,8 @@
     },
     {
       "path": "docs/v0.49-unified-tool-surface-inventory.json",
-      "location": "line 433, column 77",
-      "line": 433,
+      "location": "line 435, column 77",
+      "line": 435,
       "column": 77,
       "token": "toFile",
       "class": "normative_inventory",
@@ -2081,8 +2261,8 @@
     },
     {
       "path": "docs/v0.49-unified-tool-surface-inventory.json",
-      "location": "line 434, column 80",
-      "line": 434,
+      "location": "line 436, column 80",
+      "line": 436,
       "column": 80,
       "token": "toFile",
       "class": "normative_inventory",
@@ -2090,8 +2270,8 @@
     },
     {
       "path": "docs/v0.49-unified-tool-surface-inventory.json",
-      "location": "line 434, column 201",
-      "line": 434,
+      "location": "line 436, column 201",
+      "line": 436,
       "column": 201,
       "token": "toFile",
       "class": "normative_inventory",
@@ -2974,6 +3154,13 @@
       "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
     },
     {
+      "path": "packages/opencode-plugin/src/__tests__/tool-surface-transport-invariant.test.ts",
+      "location": "file-level",
+      "token": "filePath",
+      "class": "compatibility-fixture",
+      "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
+    },
+    {
       "path": "packages/opencode-plugin/src/__tests__/tools.test.ts",
       "location": "file-level",
       "token": "filePath",
@@ -3174,6 +3361,15 @@
       "location": "line 229, column 22",
       "line": 229,
       "column": 22,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "packages/opencode-plugin/src/tools/gather.ts",
+      "location": "line 79, column 30",
+      "line": 79,
+      "column": 30,
       "token": "filePath",
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."

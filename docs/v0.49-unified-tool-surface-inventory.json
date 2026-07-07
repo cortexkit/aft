@@ -204,7 +204,7 @@
       {"id": "SUBC-CAP-V049-002", "bind": "untrusted/MCP", "stage": "before manifest-schema validation", "required": true, "status": "contractual; implementation owned by later slice"}
     ],
     "artifact_capabilities": [
-      {"id": "SUBC-CAP-V049-003", "capability": "21 bare manifest names are serialized in fixed order", "evidence": "BARE_TOOL_ORDER in packages/opencode-plugin/src/subc-tool-schemas.ts", "status": "checked"},
+      {"id": "SUBC-CAP-V049-003", "capability": "22 bare manifest names are serialized in fixed order", "evidence": "BARE_TOOL_ORDER in packages/opencode-plugin/src/subc-tool-schemas.ts", "status": "checked"},
       {"id": "SUBC-CAP-V049-004", "capability": "schemas are loaded by Rust manifest translation", "evidence": "crates/aft/src/subc/manifest.rs include_str!", "status": "checked"},
       {"id": "SUBC-CAP-V049-005", "capability": "schema bytes can be regenerated from host definitions", "evidence": "packages/opencode-plugin/scripts/build-tool-schemas.ts", "status": "checked; regeneration prohibited in S0"},
       {"id": "SUBC-CAP-V049-006", "capability": "trusted and untrusted binds share canonical compatibility rules", "evidence": "v0.49 specification contract", "status": "target; boundary tests owned by later slices"}
@@ -218,6 +218,7 @@
       {"id": "SUBC-TOOL-V049-006", "name": "grep", "preview": "not a mutation"},
       {"id": "SUBC-TOOL-V049-007", "name": "glob", "preview": "not a mutation"},
       {"id": "SUBC-TOOL-V049-008", "name": "search", "preview": "not a mutation"},
+      {"id": "SUBC-TOOL-V049-022", "name": "gather", "preview": "not a mutation"},
       {"id": "SUBC-TOOL-V049-009", "name": "outline", "preview": "not a mutation"},
       {"id": "SUBC-TOOL-V049-010", "name": "zoom", "preview": "not a mutation"},
       {"id": "SUBC-TOOL-V049-011", "name": "inspect", "preview": "not a mutation"},
@@ -309,7 +310,7 @@
     "checked_expected_sets": {
       "REG-V049-OC-MIN": ["aft_outline", "aft_safety", "aft_zoom"],
       "REG-V049-OC-REC": ["aft_conflicts", "aft_import", "aft_inspect", "aft_outline", "aft_safety", "aft_search", "aft_zoom", "apply_patch", "ast_grep_replace", "ast_grep_search", "bash", "bash_kill", "bash_status", "bash_watch", "bash_write", "edit", "glob", "grep", "read", "write"],
-      "REG-V049-OC-ALL": ["aft_callgraph", "aft_conflicts", "aft_delete", "aft_import", "aft_inspect", "aft_move", "aft_outline", "aft_refactor", "aft_safety", "aft_search", "aft_zoom", "apply_patch", "ast_grep_replace", "ast_grep_search", "bash", "bash_kill", "bash_status", "bash_watch", "bash_write", "edit", "glob", "grep", "read", "write"],
+      "REG-V049-OC-ALL": ["aft_callgraph", "aft_conflicts", "aft_delete", "aft_gather_context", "aft_import", "aft_inspect", "aft_move", "aft_outline", "aft_refactor", "aft_safety", "aft_search", "aft_zoom", "apply_patch", "ast_grep_replace", "ast_grep_search", "bash", "bash_kill", "bash_status", "bash_watch", "bash_write", "edit", "glob", "grep", "read", "write"],
       "REG-V049-PI-MIN": ["aft_outline", "aft_safety", "aft_zoom"],
       "REG-V049-PI-REC": ["aft_conflicts", "aft_import", "aft_inspect", "aft_outline", "aft_safety", "aft_search", "aft_zoom", "ast_grep_replace", "ast_grep_search", "bash", "bash_kill", "bash_status", "bash_watch", "bash_write", "edit", "grep", "read", "write"],
       "REG-V049-PI-ALL": ["aft_callgraph", "aft_conflicts", "aft_delete", "aft_import", "aft_inspect", "aft_move", "aft_outline", "aft_refactor", "aft_safety", "aft_search", "aft_zoom", "ast_grep_replace", "ast_grep_search", "bash", "bash_kill", "bash_status", "bash_watch", "bash_write", "edit", "grep", "read", "write"]
@@ -319,7 +320,8 @@
       {"id": "HOSTONLY-V049-002", "harness": "opencode", "tool": "aft_bash", "reason": "only used when built-in bash hoisting is disabled", "owning_test": "packages/opencode-plugin/src/__tests__/tool-surface-transport-invariant.test.ts"},
       {"id": "HOSTONLY-V049-003", "harness": "opencode", "tool": "aft_read/aft_write/aft_edit/aft_apply_patch", "reason": "prefixed fallback when built-in hoisting is disabled", "owning_test": "packages/opencode-plugin/src/__tests__/tool-surface-transport-invariant.test.ts"},
       {"id": "HOSTONLY-V049-004", "harness": "opencode", "tool": "apply_patch", "reason": "OpenCode replaces a built-in tool that Pi does not expose on its agent surface", "owning_test": "packages/opencode-plugin/src/__tests__/registration-parity.test.ts"},
-      {"id": "HOSTONLY-V049-005", "harness": "opencode", "tool": "glob", "reason": "OpenCode's indexed search branch has no paired Pi registration", "owning_test": "packages/opencode-plugin/src/__tests__/registration-parity.test.ts"}
+      {"id": "HOSTONLY-V049-005", "harness": "opencode", "tool": "glob", "reason": "OpenCode's indexed search branch has no paired Pi registration", "owning_test": "packages/opencode-plugin/src/__tests__/registration-parity.test.ts"},
+      {"id": "HOSTONLY-V049-006", "harness": "opencode", "tool": "aft_gather_context", "reason": "context-pack tool has no paired Pi registration", "owning_test": "packages/opencode-plugin/src/__tests__/registration-parity.test.ts"}
     ]
   },
   "shared_tool_inventory": {

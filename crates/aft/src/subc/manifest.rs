@@ -26,6 +26,7 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
             | "zoom"
             | "inspect"
             | "callgraph"
+            | "gather"
             | "conflicts"
             | "ast_search"
             | "ast_replace"
@@ -129,8 +130,8 @@ pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
         | "lsp_find_references"
         | "lsp_prepare_rename" => Some(Lane::SerialLspStatus),
 
-        "semantic_search" | "search" | "callgraph" | "callers" | "impact" | "call_tree"
-        | "trace_to" | "trace_to_symbol" | "trace_data" | "inspect_tier2_run" => {
+        "semantic_search" | "search" | "callgraph" | "gather" | "callers" | "impact"
+        | "call_tree" | "trace_to" | "trace_to_symbol" | "trace_data" | "inspect_tier2_run" => {
             Some(Lane::HeavyInit)
         }
 
@@ -237,6 +238,7 @@ pub(super) fn build_manifest() -> ModuleManifest {
                 tool("grep", ExecutionMode::Pure),
                 tool("glob", ExecutionMode::Pure),
                 tool("search", ExecutionMode::Pure),
+                tool("gather", ExecutionMode::Pure),
                 tool("outline", ExecutionMode::Pure),
                 tool("zoom", ExecutionMode::Pure),
                 tool("inspect", ExecutionMode::Pure),
@@ -300,6 +302,7 @@ mod tests {
         "grep",
         "glob",
         "search",
+        "gather",
         "outline",
         "zoom",
         "inspect",

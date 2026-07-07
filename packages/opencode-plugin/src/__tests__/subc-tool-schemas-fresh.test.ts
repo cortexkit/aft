@@ -17,7 +17,7 @@ describe("subc tool schemas artifact", () => {
   });
 
   test("all bare names present with object schemas", () => {
-    expect(SUBC_BARE_TOOL_NAMES).toHaveLength(21);
+    expect(SUBC_BARE_TOOL_NAMES).toHaveLength(22);
     const parsed = JSON.parse(fs.readFileSync(ARTIFACT_PATH, "utf8")) as Record<
       string,
       Record<string, unknown>

@@ -26,6 +26,7 @@ pub mod edit_history;
 pub mod edit_match;
 pub mod edit_symbol;
 pub mod extract_function;
+pub mod gather;
 pub mod glob;
 pub mod grep;
 pub mod hashline;

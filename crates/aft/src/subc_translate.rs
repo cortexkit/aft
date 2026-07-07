@@ -853,6 +853,7 @@ pub(crate) fn supports_tool(bare_name: &str) -> bool {
             | "import"
             | "refactor"
             | "safety"
+            | "gather"
     )
 }
 
@@ -945,6 +946,7 @@ pub fn subc_translate_owned_with_context(
         "zoom" => translate_zoom(agent_args, project_root),
         "inspect" => translate_inspect(agent_args, project_root),
         "callgraph" => translate_callgraph(agent_args, project_root),
+        "gather" => translate_gather(agent_args, project_root),
         "conflicts" => translate_conflicts(agent_args),
         "ast_search" => translate_ast_search(agent_args),
         "ast_replace" => translate_ast_replace(agent_args),
@@ -1846,6 +1848,56 @@ fn translate_safety(args: Value, project_root: &Path) -> Result<Translated, Tran
     })
 }
 
+fn translate_gather(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let has_question = map_in
+        .get("question")
+        .and_then(Value::as_str)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let has_symbol = map_in
+        .get("symbol")
+        .and_then(Value::as_str)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let has_file_path = gather_file_path(&map_in).is_some();
+
+    if has_question && (has_symbol || has_file_path) {
+        return Err(invalid_request(
+            "aft_gather_context: provide exactly ONE mode — either 'question' OR 'symbol'+'filePath'",
+        ));
+    }
+    if has_symbol != has_file_path {
+        return Err(invalid_request(
+            "aft_gather_context: 'symbol' and 'filePath' must be provided together",
+        ));
+    }
+    if !has_question && !has_symbol && !has_file_path {
+        return Err(invalid_request(
+            "aft_gather_context: provide either 'question' or 'symbol'+'filePath'",
+        ));
+    }
+
+    let mut out = Map::new();
+    for key in &["question", "symbol", "budget", "includeTests"] {
+        if let Some(value) = map_in.get(*key) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    if let Some(file_path) = gather_file_path(&map_in) {
+        let resolved = resolve_path_from_project_root(project_root, file_path);
+        out.insert(
+            "filePath".to_string(),
+            Value::String(resolved.to_string_lossy().into_owned()),
+        );
+    }
+
+    Ok(Translated {
+        command: "gather".into(),
+        args: out,
+    })
+}
+
 fn insert_non_empty_array(out: &mut Map<String, Value>, map_in: &Map<String, Value>, key: &str) {
     if let Some(value) = map_in.get(key) {
         if let Some(items) = value.as_array() {
@@ -2189,6 +2241,22 @@ fn translate_zoom_targets(
         out.push(Value::Object(target_out));
     }
     Ok(out)
+}
+
+/// Read gather's file argument under either spelling.
+///
+/// The tool schema advertises `path`, matching `zoom` and `grep`, so an MCP
+/// client reading the manifest sends that. The OpenCode adapter renames its own
+/// `path` parameter to `filePath` before calling the bridge, so first-party
+/// traffic arrives under the internal spelling. Accepting only one silently
+/// breaks the other: reading `filePath` alone made every schema-conformant
+/// symbol-mode call fail the together-check, since neither the presence test
+/// nor the copy-to-output step could see the argument.
+fn gather_file_path(map_in: &Map<String, Value>) -> Option<&str> {
+    ["path", "filePath"]
+        .into_iter()
+        .find_map(|key| map_in.get(key).and_then(Value::as_str))
+        .filter(|value| !value.is_empty())
 }
 
 fn translate_zoom(args: Value, project_root: &Path) -> Result<Translated, TranslateError> {
@@ -2824,6 +2892,128 @@ mod tests {
         assert!(translated.args.get("hint").is_none());
     }
 
+    /// The schema advertises `path`, so this is what a manifest-reading client
+    /// actually sends. Testing only `filePath` masked a bug where every
+    /// schema-conformant symbol-mode call failed the together-check.
+    #[test]
+    fn gather_accepts_the_schema_advertised_path_key() {
+        let project_root = Path::new("/project");
+        let translated = subc_translate_owned(
+            "gather",
+            serde_json::json!({
+                "symbol": "target",
+                "path": "src/foo.rs"
+            }),
+            project_root,
+        )
+        .expect("schema-advertised 'path' must be accepted");
+
+        assert_eq!(translated.command, "gather");
+        let expected = resolve_path_from_project_root(project_root, "src/foo.rs");
+        assert_eq!(
+            translated.args.get("filePath").and_then(Value::as_str),
+            Some(expected.to_string_lossy().as_ref()),
+            "'path' must resolve and be written out under the internal 'filePath' key"
+        );
+    }
+
+    /// The OpenCode adapter renames `path` to `filePath` before calling the
+    /// bridge, so first-party traffic arrives under the internal spelling.
+    #[test]
+    fn gather_resolves_relative_file_path_from_project_root() {
+        let project_root = Path::new("/project");
+        let translated = subc_translate_owned(
+            "gather",
+            serde_json::json!({
+                "symbol": "target",
+                "filePath": "src/foo.rs"
+            }),
+            project_root,
+        )
+        .expect("valid gather symbol mode");
+
+        assert_eq!(translated.command, "gather");
+        // Build the expectation with the platform's own separator: on Windows
+        // `join` yields `\project\src\foo.rs`, so a hardcoded forward-slash
+        // literal fails there while the resolution is correct.
+        let expected = resolve_path_from_project_root(project_root, "src/foo.rs");
+        assert_eq!(
+            translated.args.get("filePath").and_then(Value::as_str),
+            Some(expected.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn gather_preserves_include_tests() {
+        let translated = subc_translate_owned(
+            "gather",
+            serde_json::json!({
+                "symbol": "target",
+                "path": "src/foo.rs",
+                "includeTests": true
+            }),
+            Path::new("/project"),
+        )
+        .expect("valid gather symbol mode");
+
+        assert_eq!(
+            translated.args.get("includeTests").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    /// Every key the schema advertises must be readable by the translator.
+    /// Derived from the embedded schema rather than hardcoded, so adding a
+    /// parameter without wiring it fails here instead of in production.
+    #[test]
+    fn gather_translator_reads_every_schema_advertised_key() {
+        let schemas: Map<String, Value> =
+            serde_json::from_str(include_str!("subc_tool_schemas.json"))
+                .expect("embedded subc tool schemas must parse");
+        let advertised: Vec<String> = schemas
+            .get("gather")
+            .and_then(|schema| schema.get("properties"))
+            .and_then(Value::as_object)
+            .expect("gather schema must advertise properties")
+            .keys()
+            .cloned()
+            .collect();
+
+        assert!(
+            advertised.contains(&"path".to_string()),
+            "schema is expected to advertise 'path'; update this test if it is renamed"
+        );
+
+        for key in &advertised {
+            let mut args = Map::new();
+            match key.as_str() {
+                "question" => {
+                    args.insert("question".into(), Value::String("how does x work".into()));
+                }
+                "symbol" | "path" => {
+                    args.insert("symbol".into(), Value::String("target".into()));
+                    args.insert("path".into(), Value::String("src/foo.rs".into()));
+                }
+                "budget" => {
+                    args.insert("question".into(), Value::String("q".into()));
+                    args.insert("budget".into(), Value::from(200));
+                }
+                "includeTests" => {
+                    args.insert("question".into(), Value::String("q".into()));
+                    args.insert("includeTests".into(), Value::Bool(true));
+                }
+                other => panic!("unhandled advertised gather key '{other}' — wire it here"),
+            }
+
+            let translated =
+                subc_translate_owned("gather", Value::Object(args), Path::new("/project"))
+                    .unwrap_or_else(|error| {
+                        panic!("advertised key '{key}' was rejected by the translator: {error:?}")
+                    });
+            assert_eq!(translated.command, "gather");
+        }
+    }
+
     // supports_tool() gates whether run_tool_call translates or passes a name
     // through as a native command. If a translate arm is added but the
     // allowlist isn't updated, that tool would silently bypass translation and
@@ -2852,6 +3042,7 @@ mod tests {
             "import",
             "refactor",
             "safety",
+            "gather",
         ] {
             // Every name the allowlist claims support for must actually
             // translate (not return unsupported_tool). A no-arg call may fail

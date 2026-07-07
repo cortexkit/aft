@@ -10,6 +10,7 @@ import { tool } from "@opencode-ai/plugin";
 import { astTools } from "./tools/ast.js";
 import { createBashTool } from "./tools/bash.js";
 import { conflictTools } from "./tools/conflicts.js";
+import { gatherTools } from "./tools/gather.js";
 import { createReadTool, hoistedTools } from "./tools/hoisted.js";
 import { importTools } from "./tools/imports.js";
 import { inspectTools } from "./tools/inspect.js";
@@ -41,6 +42,7 @@ const BARE_TOOL_ORDER = [
   "grep",
   "glob",
   "search",
+  "gather",
   "outline",
   "zoom",
   "inspect",
@@ -105,6 +107,7 @@ export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, 
     throw new Error("searchTools must expose grep/glob or aft_grep/aft_glob");
   }
   const search = semanticTools(ctx).aft_search;
+  const gather = gatherTools(ctx).aft_gather_context;
   const reading = readingTools(ctx);
   const outline = reading.aft_outline;
   const zoom = reading.aft_zoom;
@@ -119,6 +122,7 @@ export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, 
   const safety = safetyTools(ctx).aft_safety;
   if (
     !search ||
+    !gather ||
     !outline ||
     !zoom ||
     !inspect ||
@@ -155,6 +159,7 @@ export function buildSubcToolSchemas(): Record<SubcBareToolName, Record<string, 
     grep: argsToJsonSchema(grepTool),
     glob: argsToJsonSchema(globTool),
     search: argsToJsonSchema(search),
+    gather: argsToJsonSchema(gather),
     outline: argsToJsonSchema(outline),
     zoom: argsToJsonSchema(zoom),
     inspect: argsToJsonSchema(inspect),
