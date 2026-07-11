@@ -257,6 +257,7 @@ fn is_core_agent_tool(bare_name: &str) -> bool {
             | "import"
             | "refactor"
             | "safety"
+            | "check"
     )
 }
 
@@ -314,6 +315,7 @@ pub fn format_response_with_context(
         "import" => format_import(data, ctx),
         "refactor" => format_refactor(data, ctx),
         "safety" => format_safety(data, ctx),
+        "check" => format_check_response(data),
         _ => unreachable!("core agent tools are exhaustive"),
     }
 }
@@ -911,6 +913,47 @@ fn format_edit_response(data: &Value) -> String {
     append_lsp_error_lines(&mut result, data, false);
     append_lsp_server_notes(&mut result, data);
     result
+}
+
+fn format_check_response(data: &Value) -> String {
+    let file = data
+        .get("file")
+        .and_then(Value::as_str)
+        .unwrap_or("(unknown)");
+    let count = data
+        .get("error_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+
+    if let Some(reason) = data.get("skipped_reason").and_then(Value::as_str) {
+        return format!("Checked {file} - validation skipped ({reason}).");
+    }
+
+    if count == 0 {
+        return format!("Checked {file} - no errors found.");
+    }
+
+    let mut output = format!("Checked {file} - {count} error(s):\n");
+    if let Some(errors) = data.get("errors").and_then(Value::as_array) {
+        let lines = errors
+            .iter()
+            .map(|e| {
+                let line = e
+                    .get("line")
+                    .and_then(Value::as_u64)
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "undefined".to_string());
+                let message = e
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("undefined");
+                format!("  Line {line}: {message}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        output.push_str(&lines);
+    }
+    output
 }
 
 fn format_glob_skip_reasons_note(reasons: Option<&Value>) -> Option<String> {
@@ -2774,5 +2817,55 @@ mod status_memory_tests {
         );
         assert!(rendered.contains("/repo: 3.0 MiB (semantic 2.0 MiB, trigram 1.0 MiB"));
         assert!(!rendered.contains("\"memory\""));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn temp_file(name: &str) -> String {
+        let dir = tempfile::tempdir().expect("tempdir");
+        dir.path().join(name).to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn format_check_response_with_errors() {
+        let file = temp_file("check_test.py");
+        let data = json!({
+            "file": file,
+            "error_count": 2,
+            "errors": [
+                { "line": 1, "message": "F401: `os` imported but unused" },
+                { "line": 2, "message": "F401: `sys` imported but unused" }
+            ]
+        });
+        let text = format_check_response(&data);
+        assert!(text.contains("check_test.py"));
+        assert!(text.contains("2 error(s)"));
+        assert!(text.contains("Line 1: F401"));
+        assert!(text.contains("Line 2: F401"));
+    }
+
+    #[test]
+    fn format_check_response_no_errors() {
+        let file = temp_file("check_test.py");
+        let data = json!({ "file": file, "error_count": 0 });
+        let text = format_check_response(&data);
+        assert!(text.contains("no errors found"));
+    }
+
+    #[test]
+    fn format_check_response_skipped() {
+        let file = temp_file("check_test.py");
+        let data = json!({
+            "file": file,
+            "error_count": 0,
+            "skipped_reason": "no_checker_configured"
+        });
+        let text = format_check_response(&data);
+        assert!(text.contains("validation skipped"));
+        assert!(text.contains("no_checker_configured"));
     }
 }

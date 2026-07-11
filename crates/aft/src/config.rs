@@ -101,6 +101,12 @@ pub struct InspectConfig {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct CheckConfig {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct InspectDuplicatesConfig {
     pub expected_mirrors: Vec<[String; 2]>,
 }
@@ -206,6 +212,7 @@ pub struct Config {
     pub search_index_max_file_size: u64,
     pub semantic: SemanticBackendConfig,
     pub inspect: InspectConfig,
+    pub check: CheckConfig,
     pub backup: BackupConfig,
     /// Enable Astral ty as an experimental Python LSP server (default: false).
     pub experimental_lsp_ty: bool,
@@ -288,6 +295,7 @@ impl Default for Config {
             search_index_max_file_size: 1_048_576,
             semantic: SemanticBackendConfig::default(),
             inspect: InspectConfig::default(),
+            check: CheckConfig::default(),
             backup: BackupConfig::default(),
             experimental_lsp_ty: false,
             lsp_servers: Vec::new(),

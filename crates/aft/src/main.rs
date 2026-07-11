@@ -703,6 +703,7 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "inline_symbol" => aft::commands::inline_symbol::handle_inline_symbol(&req, ctx),
         "inspect" => aft::commands::inspect::handle_inspect(&req, ctx),
         "inspect_tier2_run" => aft::commands::inspect::handle_inspect_tier2_run(&req, ctx),
+        "check" => aft::commands::check::handle_check(&req, ctx),
         "git_conflicts" => aft::commands::conflicts::handle_git_conflicts(ctx, &req),
         "ast_search" => aft::commands::ast_search::handle_ast_search(&req, ctx),
         "ast_replace" => aft::commands::ast_replace::handle_ast_replace(&req, ctx),

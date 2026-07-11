@@ -17,6 +17,7 @@ pub mod batch;
 pub mod call_tree;
 pub mod callers;
 pub mod callgraph_store_adapter;
+pub mod check;
 pub mod checkpoint;
 pub mod configure;
 pub mod conflicts;

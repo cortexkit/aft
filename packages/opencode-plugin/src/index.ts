@@ -81,6 +81,7 @@ import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { instrumentToolMap } from "./tool-perf.js";
 import { astTools } from "./tools/ast.js";
 import { bashToolDescription } from "./tools/bash.js";
+import { createCheckTool } from "./tools/check.js";
 import { conflictTools } from "./tools/conflicts.js";
 import { aftPrefixedTools, hoistedTools } from "./tools/hoisted.js";
 import { importTools } from "./tools/imports.js";
@@ -1013,6 +1014,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     ...(surface !== "minimal" && astTools(ctx)),
     ...(surface !== "minimal" && aftConfig.semantic_search === true && semanticTools(ctx)),
     ...(inspectToolSurfaceEnabled(aftConfig) && inspectTools(ctx)),
+    ...(aftConfig.check?.enabled === true &&
+      Object.keys(aftConfig.checker ?? {}).length > 0 && { aft_check: createCheckTool(ctx) }),
     // Indexed search tools: recommended+ and opt-in
     ...(surface !== "minimal" && aftConfig.search_index === true && searchTools(ctx)),
     ...refactoringTools(ctx),

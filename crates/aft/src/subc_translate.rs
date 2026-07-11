@@ -195,6 +195,7 @@ pub fn subc_translate_with_context(
         "outline" => translate_outline(agent_args, project_root),
         "zoom" => translate_zoom(agent_args, project_root),
         "inspect" => translate_inspect(agent_args, project_root),
+        "check" => translate_check(agent_args, project_root),
         "callgraph" => translate_callgraph(agent_args, project_root),
         "conflicts" => translate_conflicts(agent_args),
         "ast_search" => translate_ast_search(agent_args),
@@ -1582,6 +1583,23 @@ fn translate_inspect(args: &Value, project_root: &Path) -> Result<Translated, Tr
 
     Ok(Translated {
         command: "inspect".into(),
+        args: out,
+    })
+}
+
+fn translate_check(args: &Value, project_root: &Path) -> Result<Translated, TranslateError> {
+    let map_in = agent_args_map(args);
+    let file_path = map_in
+        .get("filePath")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid_request("'filePath' is required"))?;
+
+    let mut out = Map::new();
+    insert_resolved_file(&mut out, project_root, file_path);
+
+    Ok(Translated {
+        command: "check".into(),
         args: out,
     })
 }

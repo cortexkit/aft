@@ -12,8 +12,8 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
 use crate::config::{
-    BackupConfig, Config, InspectConfig, SemanticBackend, SemanticBackendConfig, UserServerDef,
-    MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
+    BackupConfig, CheckConfig, Config, InspectConfig, SemanticBackend, SemanticBackendConfig,
+    UserServerDef, MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
 use crate::jsonc::strip_jsonc;
 
@@ -91,6 +91,7 @@ pub struct RawAftConfig {
     #[serde(deserialize_with = "deserialize_opt_usize")]
     pub callgraph_chunk_size: Option<usize>,
     pub inspect: Option<RawInspect>,
+    pub check: Option<RawCheck>,
     pub backup: Option<RawBackup>,
     pub bash: Option<RawBash>,
     pub experimental: Option<RawExperimental>,
@@ -368,6 +369,18 @@ impl RawInspect {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RawCheck {
+    pub enabled: Option<bool>,
+}
+
+impl RawCheck {
+    fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+    }
+}
+
 /// Only `expected_mirrors` survives here: `lower_bound`, `discard_cost`, and
 /// `anonymize` were accepted-but-never-read knobs (the scanner hardcodes its
 /// cost bounds and anonymization rules), so they were removed from the schema
@@ -573,6 +586,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.inspect.is_some() {
         base.inspect = override_config.inspect;
     }
+    if override_config.check.is_some() {
+        base.check = override_config.check;
+    }
     if override_config.backup.is_some() {
         base.backup = override_config.backup;
     }
@@ -640,6 +656,7 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     base.experimental = merge_experimental_config(base.experimental.clone(), project.experimental);
     base.bash = merge_bash_config(base.bash.clone(), project.bash);
     base.inspect = merge_inspect_config(base.inspect.clone(), project.inspect);
+    base.check = merge_check_config(base.check.clone(), project.check);
 }
 
 fn merge_formatter_map(
@@ -855,6 +872,18 @@ fn merge_inspect_config(
     (!inspect.is_empty()).then_some(inspect)
 }
 
+fn merge_check_config(
+    base: Option<RawCheck>,
+    override_check: Option<RawCheck>,
+) -> Option<RawCheck> {
+    let Some(override_check) = override_check else {
+        return base;
+    };
+    let mut check = base.unwrap_or_default();
+    check.enabled = override_check.enabled.or(check.enabled);
+    (!check.is_empty()).then_some(check)
+}
+
 fn merge_inspect_duplicates(
     base: Option<RawInspectDuplicates>,
     override_duplicates: Option<RawInspectDuplicates>,
@@ -998,6 +1027,7 @@ fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     }
     config.semantic = resolve_semantic_config(raw.semantic.as_ref());
     config.inspect = resolve_inspect_config(raw.inspect.as_ref());
+    config.check = resolve_check_config(raw.check.as_ref());
     config.backup = resolve_backup_config(raw.backup.as_ref());
     resolve_lsp_config(raw, config);
     resolve_bash_fields(raw, config);
@@ -1054,6 +1084,16 @@ fn resolve_inspect_config(raw: Option<&RawInspect>) -> InspectConfig {
         inspect.duplicates.expected_mirrors = expected_mirrors;
     }
     inspect
+}
+
+fn resolve_check_config(raw: Option<&RawCheck>) -> CheckConfig {
+    let mut check = CheckConfig::default();
+    if let Some(raw) = raw {
+        if let Some(enabled) = raw.enabled {
+            check.enabled = enabled;
+        }
+    }
+    check
 }
 
 fn resolve_backup_config(raw: Option<&RawBackup>) -> BackupConfig {
@@ -2032,5 +2072,29 @@ mod tests {
             result.config.formatter.get("rust").map(String::as_str),
             Some("rustfmt")
         );
+    }
+
+    #[test]
+    fn check_config_defaults_to_disabled() {
+        let result = resolve_config(&[tier("user", r#"{ "tool_surface": "all" }"#)]);
+        assert!(!result.config.check.enabled);
+    }
+
+    #[test]
+    fn check_config_enabled_via_user_tier() {
+        let result = resolve_config(&[tier(
+            "user",
+            r#"{ "check": { "enabled": true } }"#,
+        )]);
+        assert!(result.config.check.enabled);
+    }
+
+    #[test]
+    fn check_config_project_tier_overrides_user() {
+        let result = resolve_config(&[
+            tier("user", r#"{ "check": { "enabled": true } }"#),
+            tier("project", r#"{ "check": { "enabled": false } }"#),
+        ]);
+        assert!(!result.config.check.enabled);
     }
 }

@@ -327,6 +327,8 @@ export const AftConfigSchema = z.preprocess(
       callgraph_chunk_size: z.number().optional(),
       /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
       inspect: InspectConfigSchema.optional(),
+      /** On-demand type checker validation. Disabled by default; set check.enabled=true to expose aft_check. */
+      check: z.object({ enabled: z.boolean().optional() }).optional(),
       /** Undo backup config. User-only: project config cannot disable or shrink a user's safety net. */
       backup: BackupConfigSchema.optional(),
       /**
@@ -497,6 +499,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   Object.assign(overrides, resolveLspConfigForConfigure(config));
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   if (config.inspect !== undefined) overrides.inspect = config.inspect;
+  if (config.check !== undefined) overrides.check = config.check;
   if (config.backup !== undefined) overrides.backup = config.backup;
 
   return overrides;
@@ -1241,6 +1244,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   "callgraph_store",
   "callgraph_chunk_size",
   "inspect",
+  "check",
   "experimental",
   // Graduated bash family (v0.27.2). Same reasoning as `experimental`:
   // project-settable so users can opt out per-repo (e.g. `bash: false` in
