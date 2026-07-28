@@ -367,8 +367,11 @@ fn drain_runtime_events_and_write_pending(
     registry: &RuntimeRegistry,
     pending: &mut PendingResponses,
 ) -> io::Result<usize> {
+    let ctx = registry.current();
+    let mut written = write_ready_pending(ctx, pending)?;
     drain_runtime_events(registry);
-    write_ready_pending(registry.current(), pending)
+    written += write_ready_pending(ctx, pending)?;
+    Ok(written)
 }
 
 fn write_ready_pending(ctx: &AppContext, pending: &mut PendingResponses) -> io::Result<usize> {
@@ -381,8 +384,11 @@ fn drain_runtime_events_and_write_pending_to_writer(
     pending: &mut PendingResponses,
     writer: &mut impl Write,
 ) -> io::Result<usize> {
+    let ctx = registry.current();
+    let mut written = write_ready_pending_to_writer(ctx, pending, writer)?;
     drain_runtime_events(registry);
-    write_ready_pending_to_writer(registry.current(), pending, writer)
+    written += write_ready_pending_to_writer(ctx, pending, writer)?;
+    Ok(written)
 }
 
 #[cfg(test)]
@@ -1278,9 +1284,58 @@ mod pending_response_tests {
             0
         );
         assert_eq!(drain_frames.load(Ordering::SeqCst), 1);
-        assert_eq!(poll_calls.get(), 1);
+        assert_eq!(poll_calls.get(), 2);
         assert!(writer.is_empty());
         assert!(!pending.is_empty());
+    }
+
+    #[test]
+    fn tick_flushes_ready_pending_before_runtime_maintenance() {
+        let root = TempDir::new().unwrap();
+        let registry = make_runtime_registry(root.path());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_for_drain = Arc::clone(&events);
+        registry
+            .current()
+            .set_progress_sender(Some(Arc::new(Box::new(move |_| {
+                events_for_drain.lock().unwrap().push("drain");
+            }))));
+        let generation = registry.current().advance_configure_generation();
+        registry
+            .current()
+            .configure_warnings_sender()
+            .send((
+                generation,
+                ConfigureWarningsFrame {
+                    frame_type: "configure_warnings",
+                    session_id: Some("session-order".to_string()),
+                    project_root: root.path().display().to_string(),
+                    warnings: Vec::new(),
+                },
+            ))
+            .unwrap();
+
+        let events_for_pending = Arc::clone(&events);
+        let mut pending = PendingResponses::default();
+        pending.register(PendingResponse {
+            request_id: "pending-order".to_string(),
+            session_id: "session-order".to_string(),
+            attach_command: "bash".to_string(),
+            poll: Box::new(move |_| {
+                events_for_pending.lock().unwrap().push("pending");
+                Some(Response::success("pending-order", serde_json::json!({})))
+            }),
+        });
+        let mut writer = Vec::new();
+
+        assert_eq!(
+            drain_runtime_events_and_write_pending_to_writer(&registry, &mut pending, &mut writer)
+                .unwrap(),
+            1
+        );
+        assert_eq!(*events.lock().unwrap(), ["pending", "drain"]);
+        assert_eq!(line_values(&writer).len(), 1);
+        assert!(pending.is_empty());
     }
 
     #[test]
