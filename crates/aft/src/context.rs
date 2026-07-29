@@ -5442,7 +5442,7 @@ impl AppContext {
     pub fn lsp_notify_file_changed(&self, file_path: &Path, content: &str) {
         let config = self.config();
         if let Some(mut lsp) = self.lsp_manager.try_lock() {
-            if let Err(e) = lsp.notify_file_changed(file_path, content, &config) {
+            if let Err(e) = lsp.notify_file_changed_if_running(file_path, content, &config) {
                 crate::slog_warn!("sync error for {}: {}", file_path.display(), e);
             }
         }

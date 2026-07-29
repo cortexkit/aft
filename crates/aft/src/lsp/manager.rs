@@ -370,6 +370,23 @@ impl LspManager {
             .successful
     }
 
+    fn running_server_keys_for_file(&self, file_path: &Path, config: &Config) -> Vec<ServerKey> {
+        let mut keys = Vec::new();
+        for def in servers_for_file(file_path, config) {
+            let Some(root) = def.workspace_root_for_file(file_path) else {
+                continue;
+            };
+            let key = ServerKey {
+                kind: def.kind.clone(),
+                root,
+            };
+            if self.clients.contains_key(&key) {
+                keys.push(key);
+            }
+        }
+        keys
+    }
+
     /// Detailed version of [`ensure_server_for_file`] that records every
     /// matching server's outcome (`Ok` / `NoRootMarker` / `BinaryNotInstalled`
     /// / `SpawnFailed`).
@@ -628,6 +645,32 @@ impl LspManager {
     ) -> Result<Vec<(ServerKey, i32)>, LspError> {
         let canonical_path = canonicalize_for_lsp(file_path)?;
         let server_keys = self.ensure_server_for_file(&canonical_path, config);
+        self.notify_file_changed_for_server_keys(canonical_path, content, server_keys)
+    }
+
+    /// Notify only LSP servers that are already running for this file.
+    ///
+    /// Post-write notifications are best-effort and must not make a mutation
+    /// wait for cold server startup. Explicit LSP requests use
+    /// [`Self::notify_file_changed_versioned`] and retain lazy startup.
+    pub fn notify_file_changed_if_running(
+        &mut self,
+        file_path: &Path,
+        content: &str,
+        config: &Config,
+    ) -> Result<(), LspError> {
+        let canonical_path = canonicalize_for_lsp(file_path)?;
+        let server_keys = self.running_server_keys_for_file(&canonical_path, config);
+        self.notify_file_changed_for_server_keys(canonical_path, content, server_keys)
+            .map(|_| ())
+    }
+
+    fn notify_file_changed_for_server_keys(
+        &mut self,
+        canonical_path: PathBuf,
+        content: &str,
+        server_keys: Vec<ServerKey>,
+    ) -> Result<Vec<(ServerKey, i32)>, LspError> {
         if server_keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -2153,7 +2196,10 @@ mod failure_hint_tests {
 
 #[cfg(test)]
 mod diagnostic_capacity_tests {
+    use std::fs;
+
     use super::LspManager;
+    use crate::config::Config;
 
     // The lsp.diagnostic_cache_size config knob must actually take effect:
     // set_diagnostic_capacity (called at AppContext construction with the config
@@ -2177,6 +2223,20 @@ mod diagnostic_capacity_tests {
         manager.insert_failed_spawn_for_test();
         assert_eq!(manager.clear_failed_spawns(), 1);
         assert_eq!(manager.clear_failed_spawns(), 0);
+    }
+
+    #[test]
+    fn post_write_notification_does_not_start_a_cold_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("main.ts");
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        fs::write(&file, "export const value = 1;\n").unwrap();
+
+        let mut manager = LspManager::new();
+        manager
+            .notify_file_changed_if_running(&file, "export const value = 1;\n", &Config::default())
+            .unwrap();
+        assert!(manager.clients.is_empty());
     }
 }
 
