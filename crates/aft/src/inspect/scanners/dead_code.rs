@@ -596,10 +596,10 @@ fn materialize_dead_code_contributions(
     for (key, calls) in &outbound_calls_by_caller_file {
         for call in calls.iter().take(4) {
             eprintln!(
-                "PROBE2 outbound key = {} | caller_file = {} | callee = {}",
+                "PROBE2 outbound key = {} | caller_file = {} | target = {}",
                 key.display(),
                 call.caller_file.display(),
-                call.callee_name
+                call.target
             );
         }
     }
