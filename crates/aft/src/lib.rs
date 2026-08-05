@@ -291,3 +291,5 @@ mod tests {
         assert_eq!(cfg.type_checker_timeout_secs, 30);
     }
 }
+
+// A/B probe marker: empty behavioral change to trigger the Tests workflow.
