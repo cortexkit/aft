@@ -584,6 +584,26 @@ fn materialize_dead_code_contributions(
         group_outbound_calls_by_caller_file(project_root, &snapshot.outbound_calls);
     let oxc_by_file = oxc_verdicts_by_file(project_root, snapshot, &parsed, public_api_files);
 
+    // CI probe instrumentation (probe branch only): dump the verdict inputs
+    // for the Cargo-bin liveness decision.
+    eprintln!("PROBE2 verdict project_root = {}", project_root.display());
+    for f in &liveness_root_files {
+        eprintln!("PROBE2 liveness_root_rel = {f}");
+    }
+    for (f, exports) in &executable_root_exports_by_file {
+        eprintln!("PROBE2 exec_root_rel = {f} exports = {exports:?}");
+    }
+    for (key, calls) in &outbound_calls_by_caller_file {
+        for call in calls.iter().take(4) {
+            eprintln!(
+                "PROBE2 outbound key = {} | caller_file = {} | callee = {}",
+                key.display(),
+                call.caller_file.display(),
+                call.callee_name
+            );
+        }
+    }
+
     parsed
         .into_iter()
         .map(|mut contribution| {
