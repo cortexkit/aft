@@ -784,7 +784,20 @@ fn insert_resolved_entry_point(
 
 fn contains_path(paths: &BTreeSet<PathBuf>, file: &Path) -> bool {
     let snapshot = snapshot_path(file);
-    paths.contains(&snapshot) || paths.contains(&normalize_path(file))
+    let hit = paths.contains(&snapshot) || paths.contains(&normalize_path(file));
+    if !hit {
+        // CI probe instrumentation (probe branch only).
+        eprintln!("PROBE contains_path MISS for {}", file.display());
+        eprintln!("PROBE   snapshot form = {}", snapshot.display());
+        eprintln!(
+            "PROBE   normalize form = {}",
+            normalize_path(file).display()
+        );
+        for p in paths.iter() {
+            eprintln!("PROBE   set entry = {}", p.display());
+        }
+    }
+    hit
 }
 
 fn snapshot_path(path: &Path) -> PathBuf {

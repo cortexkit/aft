@@ -277,6 +277,16 @@ fn outbound_calls_from_store(
 
 fn entry_points_for_files(project_root: &Path, files: &[PathBuf]) -> BTreeSet<PathBuf> {
     let resolved_entry_points = crate::inspect::resolve_entry_points(project_root);
+    // CI probe instrumentation (probe branch only): name every path spelling
+    // feeding the membership decision so the Windows-only miss is attributable.
+    eprintln!("PROBE projection root = {}", project_root.display());
+    for file in files {
+        eprintln!(
+            "PROBE file = {} | is_entry_point = {}",
+            file.display(),
+            resolved_entry_points.is_entry_point(file)
+        );
+    }
     files
         .iter()
         .filter(|file| resolved_entry_points.is_entry_point(file))
