@@ -1902,6 +1902,7 @@ struct NameMatchRef {
     caller_file: String,
     caller_symbol: String,
     caller_signature: Option<String>,
+    receiver_expression: String,
     receiver: String,
     method_name: String,
     colon_dispatch: bool,
@@ -1915,6 +1916,8 @@ struct NameMatchCandidate {
     file_path: String,
     scoped_name: String,
     kind: String,
+    // Nodes persist tree-sitter's zero-based rows; dispatch AST helpers use one-based lines.
+    start_line: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -8815,17 +8818,39 @@ fn insert_method_dispatch_edges(
             }
         };
 
-        if let Some(receiver_type) =
-            infer_receiver_type(project_root, &reference, &mut source_cache)
-        {
-            let Some(candidate) =
-                select_type_match_candidate(&reference, candidates.as_slice(), &receiver_type)
-            else {
+        match infer_receiver_type_state(project_root, &reference, &mut source_cache) {
+            ReceiverTypeInference::Known(receiver_type) => {
+                let Some(candidate) =
+                    select_type_match_candidate(&reference, candidates.as_slice(), &receiver_type)
+                else {
+                    continue;
+                };
+                insert_method_dispatch_edge(tx, &reference, &candidate, PROVENANCE_TYPE_MATCH)?;
+                inserted += 1;
                 continue;
-            };
-            insert_method_dispatch_edge(tx, &reference, &candidate, PROVENANCE_TYPE_MATCH)?;
-            inserted += 1;
-            continue;
+            }
+            ReceiverTypeInference::RustDirectSelfField {
+                receiver_type,
+                declaration_file,
+                module_scope,
+            } => {
+                let Some(candidate) = select_rust_direct_self_field_candidate(
+                    project_root,
+                    &reference,
+                    candidates.as_slice(),
+                    &receiver_type,
+                    &declaration_file,
+                    &module_scope,
+                    &mut source_cache,
+                ) else {
+                    continue;
+                };
+                insert_method_dispatch_edge(tx, &reference, &candidate, PROVENANCE_TYPE_MATCH)?;
+                inserted += 1;
+                continue;
+            }
+            ReceiverTypeInference::KnownButUnresolved => continue,
+            ReceiverTypeInference::Unknown => {}
         }
 
         if method_name_match_denylisted(&reference.method_name) {
@@ -9046,7 +9071,7 @@ fn name_match_ref_from_parts(
 ) -> Option<NameMatchRef> {
     let caller_node = caller_node?;
     let full_ref = full_ref?;
-    let (receiver, member, colon_dispatch) = parse_method_dispatch(&full_ref)?;
+    let (receiver_expression, receiver, member, colon_dispatch) = parse_method_dispatch(&full_ref)?;
     let method_name = if member.is_empty() {
         short_name.as_deref()?.to_string()
     } else {
@@ -9058,6 +9083,7 @@ fn name_match_ref_from_parts(
         caller_file,
         caller_symbol,
         caller_signature,
+        receiver_expression,
         receiver,
         method_name,
         colon_dispatch,
@@ -9066,7 +9092,7 @@ fn name_match_ref_from_parts(
     })
 }
 
-fn parse_method_dispatch(full_ref: &str) -> Option<(String, String, bool)> {
+fn parse_method_dispatch(full_ref: &str) -> Option<(String, String, String, bool)> {
     let dot = full_ref.rfind('.').map(|index| (index, 1usize, false));
     let colon = full_ref.rfind("::").map(|index| (index, 2usize, true));
     let arrow = full_ref.rfind("->").map(|index| (index, 2usize, false));
@@ -9081,12 +9107,18 @@ fn parse_method_dispatch(full_ref: &str) -> Option<(String, String, bool)> {
     if member_start >= full_ref.len() {
         return None;
     }
-    let receiver = last_name_segment(&full_ref[..delimiter]);
+    let receiver_expression = full_ref[..delimiter].trim();
+    let receiver = last_name_segment(receiver_expression).trim();
     let member = &full_ref[member_start..];
     if receiver.is_empty() || member.is_empty() {
         return None;
     }
-    Some((receiver.to_string(), member.to_string(), colon_dispatch))
+    Some((
+        receiver_expression.to_string(),
+        receiver.to_string(),
+        member.to_string(),
+        colon_dispatch,
+    ))
 }
 
 fn last_name_segment(value: &str) -> &str {
@@ -9102,7 +9134,7 @@ fn load_name_match_candidates(
     lang: &str,
 ) -> Result<Vec<NameMatchCandidate>> {
     let mut stmt = tx.prepare(
-        "SELECT n.id, n.file_path, n.scoped_name, n.kind
+        "SELECT n.id, n.file_path, n.scoped_name, n.kind, n.start_line
          FROM nodes n JOIN files f ON f.path = n.file_path
          WHERE n.name = ?1
            AND f.lang = ?2
@@ -9115,6 +9147,7 @@ fn load_name_match_candidates(
             file_path: row.get(1)?,
             scoped_name: row.get(2)?,
             kind: row.get(3)?,
+            start_line: (row.get::<_, i64>(4)?.max(0) as u32).saturating_add(1),
         })
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -9128,21 +9161,53 @@ struct ParsedDispatchSource {
 
 type DispatchSourceCache = HashMap<(String, String), Option<ParsedDispatchSource>>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReceiverTypeInference {
+    Unknown,
+    Known(String),
+    RustDirectSelfField {
+        receiver_type: String,
+        declaration_file: String,
+        module_scope: Vec<(usize, usize)>,
+    },
+    KnownButUnresolved,
+}
+
+#[cfg(test)]
 fn infer_receiver_type(
     project_root: &Path,
     reference: &NameMatchRef,
     source_cache: &mut DispatchSourceCache,
 ) -> Option<String> {
+    match infer_receiver_type_state(project_root, reference, source_cache) {
+        ReceiverTypeInference::Known(receiver_type)
+        | ReceiverTypeInference::RustDirectSelfField { receiver_type, .. } => Some(receiver_type),
+        ReceiverTypeInference::Unknown | ReceiverTypeInference::KnownButUnresolved => None,
+    }
+}
+
+fn infer_receiver_type_state(
+    project_root: &Path,
+    reference: &NameMatchRef,
+    source_cache: &mut DispatchSourceCache,
+) -> ReceiverTypeInference {
+    let known = |receiver_type| ReceiverTypeInference::Known(receiver_type);
     match reference.lang.as_str() {
-        "rust" => infer_rust_receiver_type(reference),
+        "rust" => infer_rust_receiver_type(project_root, reference, source_cache),
         "java" => {
             infer_java_like_receiver_type(project_root, reference, LangId::Java, source_cache)
+                .map(known)
+                .unwrap_or(ReceiverTypeInference::Unknown)
         }
         "kotlin" => {
             infer_java_like_receiver_type(project_root, reference, LangId::Kotlin, source_cache)
+                .map(known)
+                .unwrap_or(ReceiverTypeInference::Unknown)
         }
-        "cpp" => infer_cpp_receiver_type(project_root, reference, source_cache),
-        _ => None,
+        "cpp" => infer_cpp_receiver_type(project_root, reference, source_cache)
+            .map(known)
+            .unwrap_or(ReceiverTypeInference::Unknown),
+        _ => ReceiverTypeInference::Unknown,
     }
 }
 
@@ -9165,10 +9230,26 @@ fn parsed_dispatch_source<'a>(
     lang: LangId,
     source_cache: &'a mut DispatchSourceCache,
 ) -> Option<&'a ParsedDispatchSource> {
-    let key = (reference.caller_file.clone(), reference.lang.clone());
+    parsed_dispatch_source_for_file(
+        project_root,
+        &reference.caller_file,
+        &reference.lang,
+        lang,
+        source_cache,
+    )
+}
+
+fn parsed_dispatch_source_for_file<'a>(
+    project_root: &Path,
+    file_path: &str,
+    lang_label: &str,
+    lang: LangId,
+    source_cache: &'a mut DispatchSourceCache,
+) -> Option<&'a ParsedDispatchSource> {
+    let key = (file_path.to_string(), lang_label.to_string());
     source_cache
         .entry(key)
-        .or_insert_with(|| parse_dispatch_source(project_root, &reference.caller_file, lang))
+        .or_insert_with(|| parse_dispatch_source(project_root, file_path, lang))
         .as_ref()
 }
 
@@ -9972,19 +10053,200 @@ fn is_code_ident_char(ch: char) -> bool {
     ch == '_' || ch.is_ascii_alphanumeric()
 }
 
-fn infer_rust_receiver_type(reference: &NameMatchRef) -> Option<String> {
+fn infer_rust_receiver_type(
+    project_root: &Path,
+    reference: &NameMatchRef,
+    source_cache: &mut DispatchSourceCache,
+) -> ReceiverTypeInference {
     if matches!(reference.receiver.as_str(), "self" | "Self") {
-        return enclosing_type_from_scoped_name(&reference.caller_symbol);
+        return enclosing_type_from_scoped_name(&reference.caller_symbol)
+            .map(ReceiverTypeInference::Known)
+            .unwrap_or(ReceiverTypeInference::Unknown);
     }
 
     if reference.colon_dispatch && rust_receiver_looks_type_like(&reference.receiver) {
-        return Some(reference.receiver.clone());
+        return ReceiverTypeInference::Known(reference.receiver.clone());
     }
 
-    reference
+    if let Some(receiver_type) = reference
         .caller_signature
         .as_deref()
         .and_then(|signature| rust_parameter_type(signature, &reference.receiver))
+    {
+        return ReceiverTypeInference::Known(receiver_type);
+    }
+
+    infer_rust_direct_self_field_receiver_type(project_root, reference, source_cache)
+}
+
+fn infer_rust_direct_self_field_receiver_type(
+    project_root: &Path,
+    reference: &NameMatchRef,
+    source_cache: &mut DispatchSourceCache,
+) -> ReceiverTypeInference {
+    if reference.colon_dispatch {
+        return ReceiverTypeInference::Unknown;
+    }
+    let Some(field_name) = rust_direct_self_field_name(&reference.receiver_expression) else {
+        return ReceiverTypeInference::Unknown;
+    };
+    if field_name != reference.receiver {
+        return ReceiverTypeInference::Unknown;
+    }
+
+    let Some(impl_type) = enclosing_type_from_scoped_name(&reference.caller_symbol) else {
+        return ReceiverTypeInference::Unknown;
+    };
+    let Some(struct_name) = rust_direct_nominal_type_name(&impl_type) else {
+        return ReceiverTypeInference::KnownButUnresolved;
+    };
+    let Some(parsed) = parsed_dispatch_source(project_root, reference, LangId::Rust, source_cache)
+    else {
+        return ReceiverTypeInference::Unknown;
+    };
+    let Some(impl_node) =
+        find_enclosing_rust_impl_node(parsed.tree.root_node(), reference.line.max(1))
+    else {
+        return ReceiverTypeInference::Unknown;
+    };
+    if impl_node.child_by_field_name("trait").is_some()
+        || impl_node.child_by_field_name("type_parameters").is_some()
+    {
+        return ReceiverTypeInference::KnownButUnresolved;
+    }
+    let Some(impl_target) = impl_node.child_by_field_name("type") else {
+        return ReceiverTypeInference::KnownButUnresolved;
+    };
+    if impl_target.kind() != "type_identifier"
+        || node_text(impl_target, &parsed.source) != impl_type
+    {
+        return ReceiverTypeInference::KnownButUnresolved;
+    }
+
+    let module_scope = rust_module_scope(impl_node);
+    let Some(struct_node) = find_unique_rust_struct(
+        parsed.tree.root_node(),
+        &parsed.source,
+        struct_name,
+        &module_scope,
+    ) else {
+        return ReceiverTypeInference::KnownButUnresolved;
+    };
+    let Some(field_type) = rust_struct_field_type_node(struct_node, &parsed.source, field_name)
+    else {
+        return ReceiverTypeInference::KnownButUnresolved;
+    };
+    if field_type.kind() != "type_identifier" {
+        return ReceiverTypeInference::KnownButUnresolved;
+    }
+    let field_type_name = node_text(field_type, &parsed.source);
+    if find_unique_rust_struct(
+        parsed.tree.root_node(),
+        &parsed.source,
+        field_type_name,
+        &module_scope,
+    )
+    .is_none()
+    {
+        return ReceiverTypeInference::KnownButUnresolved;
+    }
+
+    ReceiverTypeInference::RustDirectSelfField {
+        receiver_type: field_type_name.to_string(),
+        declaration_file: reference.caller_file.clone(),
+        module_scope,
+    }
+}
+
+fn rust_direct_self_field_name(receiver_expression: &str) -> Option<&str> {
+    let (base, field) = receiver_expression.split_once('.')?;
+    let base = base.trim();
+    let field = field.trim();
+    (base == "self" && rust_direct_nominal_type_name(field).is_some()).then_some(field)
+}
+
+fn rust_direct_nominal_type_name(value: &str) -> Option<&str> {
+    let name = value.rsplit("::").next()?.trim();
+    (!name.is_empty()
+        && !name.chars().next().is_some_and(|ch| ch.is_ascii_digit())
+        && name.chars().all(is_rust_ident_char))
+    .then_some(name)
+}
+
+fn find_enclosing_rust_impl_node<'tree>(
+    root: tree_sitter::Node<'tree>,
+    line: u32,
+) -> Option<tree_sitter::Node<'tree>> {
+    let mut best = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if !node_contains_line(node, line) {
+            continue;
+        }
+        if node.kind() == "impl_item" {
+            best = tighter_node(best, node);
+        }
+        push_named_children(node, &mut stack);
+    }
+    best
+}
+
+fn rust_module_scope(node: tree_sitter::Node<'_>) -> Vec<(usize, usize)> {
+    let mut scope = Vec::new();
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "mod_item" {
+            scope.push((parent.start_byte(), parent.end_byte()));
+        }
+        current = parent.parent();
+    }
+    scope.reverse();
+    scope
+}
+
+fn find_unique_rust_struct<'tree>(
+    root: tree_sitter::Node<'tree>,
+    source: &str,
+    expected_name: &str,
+    module_scope: &[(usize, usize)],
+) -> Option<tree_sitter::Node<'tree>> {
+    let mut found = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "struct_item"
+            && rust_module_scope(node) == module_scope
+            && node.child_by_field_name("type_parameters").is_none()
+            && declaration_name(node, source) == Some(expected_name)
+        {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(node);
+        }
+        push_named_children(node, &mut stack);
+    }
+    found
+}
+
+fn rust_struct_field_type_node<'tree>(
+    struct_node: tree_sitter::Node<'tree>,
+    source: &str,
+    field_name: &str,
+) -> Option<tree_sitter::Node<'tree>> {
+    let fields = struct_node.child_by_field_name("body")?;
+    if fields.kind() != "field_declaration_list" {
+        return None;
+    }
+    for index in 0..fields.named_child_count() {
+        let field = fields.named_child(index as u32)?;
+        if field.kind() != "field_declaration"
+            || declaration_name(field, source) != Some(field_name)
+        {
+            continue;
+        }
+        return field.child_by_field_name("type");
+    }
+    None
 }
 
 fn rust_receiver_looks_type_like(receiver: &str) -> bool {
@@ -10181,6 +10443,76 @@ fn rust_base_type_ident(ty: &str) -> Option<String> {
 
 fn is_rust_ident_char(ch: char) -> bool {
     ch == '_' || ch.is_ascii_alphanumeric()
+}
+
+fn select_rust_direct_self_field_candidate(
+    project_root: &Path,
+    reference: &NameMatchRef,
+    candidates: &[NameMatchCandidate],
+    receiver_type: &str,
+    declaration_file: &str,
+    declaration_scope: &[(usize, usize)],
+    source_cache: &mut DispatchSourceCache,
+) -> Option<NameMatchCandidate> {
+    let eligible = candidates
+        .iter()
+        .filter(|candidate| candidate.node_id != reference.caller_node)
+        .filter(|candidate| {
+            type_candidate_matches(candidate, receiver_type, &reference.method_name)
+        })
+        .filter(|candidate| {
+            rust_direct_self_field_candidate_matches_scope(
+                project_root,
+                candidate,
+                receiver_type,
+                declaration_file,
+                declaration_scope,
+                source_cache,
+            )
+        })
+        .collect::<Vec<_>>();
+    match eligible.as_slice() {
+        [candidate] => Some((**candidate).clone()),
+        _ => None,
+    }
+}
+
+fn rust_direct_self_field_candidate_matches_scope(
+    project_root: &Path,
+    candidate: &NameMatchCandidate,
+    receiver_type: &str,
+    declaration_file: &str,
+    declaration_scope: &[(usize, usize)],
+    source_cache: &mut DispatchSourceCache,
+) -> bool {
+    if candidate.file_path != declaration_file {
+        return false;
+    }
+    let Some(parsed) = parsed_dispatch_source_for_file(
+        project_root,
+        &candidate.file_path,
+        "rust",
+        LangId::Rust,
+        source_cache,
+    ) else {
+        return false;
+    };
+    let Some(impl_node) =
+        find_enclosing_rust_impl_node(parsed.tree.root_node(), candidate.start_line)
+    else {
+        return false;
+    };
+    if impl_node.child_by_field_name("trait").is_some()
+        || impl_node.child_by_field_name("type_parameters").is_some()
+    {
+        return false;
+    }
+    let Some(impl_target) = impl_node.child_by_field_name("type") else {
+        return false;
+    };
+    impl_target.kind() == "type_identifier"
+        && node_text(impl_target, &parsed.source) == receiver_type
+        && rust_module_scope(impl_node) == declaration_scope
 }
 
 fn select_type_match_candidate(
@@ -14456,6 +14788,239 @@ void handle() {
     }
 
     #[test]
+    fn rust_direct_self_field_name_trims_separator_whitespace() {
+        for receiver_expression in ["self .engine", "self. engine", "self . engine"] {
+            assert_eq!(
+                rust_direct_self_field_name(receiver_expression),
+                Some("engine")
+            );
+        }
+    }
+
+    #[test]
+    fn rust_direct_self_field_receiver_type_is_conservative() {
+        let source = r#"struct Engine;
+
+struct Car {
+    engine: Engine,
+}
+
+impl Car {
+    fn run(&self) {
+        self.engine.start();
+    }
+}
+
+struct NestedCar {
+    engine: Engine,
+}
+
+impl NestedCar {
+    fn run(&self) {
+        self.inner.engine.start();
+    }
+}
+
+struct WrappedCar {
+    engine: Option<Engine>,
+}
+
+impl WrappedCar {
+    fn run(&self) {
+        self.engine.start(); // wrapped
+    }
+}
+
+struct GenericCar<T> {
+    engine: T,
+}
+
+impl<T> GenericCar<T> {
+    fn run(&self) {
+        self.engine.start(); // generic
+    }
+}
+
+type EngineAlias = Engine;
+
+struct AliasCar {
+    engine: EngineAlias,
+}
+
+impl AliasCar {
+    fn run(&self) {
+        self.engine.start(); // alias
+    }
+}
+"#;
+        let dir = tempdir().expect("temp dir");
+        let root = dir.path();
+        write_fixture(root, "src/lib.rs", source);
+        let mut cache = DispatchSourceCache::new();
+
+        let mut direct = reference(
+            "rust",
+            "src/lib.rs",
+            "Car::run",
+            "engine",
+            "start",
+            line_of(source, "self.engine.start()"),
+        );
+        direct.receiver_expression = "self.engine".to_string();
+        assert_eq!(
+            infer_receiver_type(root, &direct, &mut cache).as_deref(),
+            Some("Engine")
+        );
+
+        let mut mismatched_impl_target = direct.clone();
+        mismatched_impl_target.caller_symbol = "other::Car::run".to_string();
+        assert!(infer_receiver_type(root, &mismatched_impl_target, &mut cache).is_none());
+
+        let mut nested = reference(
+            "rust",
+            "src/lib.rs",
+            "NestedCar::run",
+            "engine",
+            "start",
+            line_of(source, "self.inner.engine.start()"),
+        );
+        nested.receiver_expression = "self.inner.engine".to_string();
+        assert!(infer_receiver_type(root, &nested, &mut cache).is_none());
+
+        let mut wrapped = reference(
+            "rust",
+            "src/lib.rs",
+            "WrappedCar::run",
+            "engine",
+            "start",
+            line_of(source, "self.engine.start(); // wrapped"),
+        );
+        wrapped.receiver_expression = "self.engine".to_string();
+        assert!(infer_receiver_type(root, &wrapped, &mut cache).is_none());
+
+        let mut generic = reference(
+            "rust",
+            "src/lib.rs",
+            "GenericCar::run",
+            "engine",
+            "start",
+            line_of(source, "self.engine.start(); // generic"),
+        );
+        generic.receiver_expression = "self.engine".to_string();
+        assert!(infer_receiver_type(root, &generic, &mut cache).is_none());
+
+        let mut alias = reference(
+            "rust",
+            "src/lib.rs",
+            "AliasCar::run",
+            "engine",
+            "start",
+            line_of(source, "self.engine.start(); // alias"),
+        );
+        alias.receiver_expression = "self.engine".to_string();
+        assert!(infer_receiver_type(root, &alias, &mut cache).is_none());
+    }
+
+    #[test]
+    fn rust_direct_self_reference_field_receiver_is_not_inferred() {
+        let source = r#"struct Engine;
+
+struct Car {
+    engine: &'static Engine,
+}
+
+impl Car {
+    fn run(&self) {
+        self.engine.start();
+    }
+}
+"#;
+        let dir = tempdir().expect("temp dir");
+        let root = dir.path();
+        write_fixture(root, "src/lib.rs", source);
+        let mut cache = DispatchSourceCache::new();
+        let mut reference = reference(
+            "rust",
+            "src/lib.rs",
+            "Car::run",
+            "engine",
+            "start",
+            line_of(source, "self.engine.start()"),
+        );
+        reference.receiver_expression = "self.engine".to_string();
+
+        assert!(infer_receiver_type(root, &reference, &mut cache).is_none());
+    }
+
+    #[test]
+    fn rust_trait_impl_self_field_receiver_is_not_inferred() {
+        let source = r#"trait Drive {
+    fn run(&self);
+}
+
+struct Engine;
+
+struct Car {
+    engine: Engine,
+}
+
+impl Drive for Car {
+    fn run(&self) {
+        self.engine.start();
+    }
+}
+"#;
+        let dir = tempdir().expect("temp dir");
+        let root = dir.path();
+        write_fixture(root, "src/lib.rs", source);
+        let mut cache = DispatchSourceCache::new();
+        let mut reference = reference(
+            "rust",
+            "src/lib.rs",
+            "Car::run",
+            "engine",
+            "start",
+            line_of(source, "self.engine.start()"),
+        );
+        reference.receiver_expression = "self.engine".to_string();
+
+        assert!(infer_receiver_type(root, &reference, &mut cache).is_none());
+    }
+
+    #[test]
+    fn rust_self_field_does_not_bind_struct_from_another_module() {
+        let source = r#"struct Engine;
+
+mod unrelated {
+    struct Car {
+        engine: Engine,
+    }
+}
+
+impl Car {
+    fn run(&self) {
+        self.engine.start();
+    }
+}
+"#;
+        let dir = tempdir().expect("temp dir");
+        let root = dir.path();
+        write_fixture(root, "src/lib.rs", source);
+        let mut cache = DispatchSourceCache::new();
+        let mut reference = reference(
+            "rust",
+            "src/lib.rs",
+            "Car::run",
+            "engine",
+            "start",
+            line_of(source, "self.engine.start()"),
+        );
+        reference.receiver_expression = "self.engine".to_string();
+
+        assert!(infer_receiver_type(root, &reference, &mut cache).is_none());
+    }
+
+    #[test]
     fn unknown_java_receiver_still_uses_name_match_fallback() {
         let source = r#"class EntryPoint {
     void handle() {
@@ -14500,6 +15065,7 @@ class OnlyService {
             caller_file: caller_file.to_string(),
             caller_symbol: caller_symbol.to_string(),
             caller_signature: None,
+            receiver_expression: receiver.to_string(),
             receiver: receiver.to_string(),
             method_name: method_name.to_string(),
             colon_dispatch: false,
@@ -14514,6 +15080,7 @@ class OnlyService {
             file_path: "src/targets.fixture".to_string(),
             scoped_name: scoped_name.to_string(),
             kind: "method".to_string(),
+            start_line: 1,
         }
     }
 

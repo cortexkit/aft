@@ -224,6 +224,274 @@ pub fn noisy_stdlib_calls() {
 }
 
 #[test]
+fn rust_direct_self_field_with_stdlib_type_does_not_name_match_project_method() {
+    let dir = tempdir().unwrap();
+    let root = canonical_root(dir.path());
+    write_file(
+        &root.join("main.rs"),
+        r#"mod other;
+
+use std::path::PathBuf;
+
+struct Holder {
+    path: PathBuf,
+}
+
+impl Holder {
+    fn check(&self) {
+        let _ = self. path.as_path();
+    }
+}
+
+fn main() {
+    let holder = Holder {
+        path: PathBuf::from("."),
+    };
+    holder.check();
+}
+"#,
+    );
+    write_file(
+        &root.join("other.rs"),
+        r#"pub struct PrinterPath;
+
+impl PrinterPath {
+    pub fn as_path(&self) {}
+}
+"#,
+    );
+
+    let store = build_store(&root, "rust-stdlib-field-method", &project_files(&root));
+    let tree = json(callgraph_store_adapter::call_tree_result(
+        &store,
+        &root.join("main.rs"),
+        "Holder::check",
+        1,
+        true,
+    ));
+    assert!(
+        tree["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|child| child["name"] != "PrinterPath::as_path"),
+        "PathBuf::as_path must not resolve to the unrelated project method: {tree:#}"
+    );
+
+    let callers = json(callgraph_store_adapter::callers_result(
+        &store,
+        &root.join("other.rs"),
+        "PrinterPath::as_path",
+        1,
+        true,
+    ));
+    assert!(
+        flattened_callers(&callers)
+            .iter()
+            .all(|entry| entry["symbol"] != "Holder::check"),
+        "PrinterPath::as_path must not report Holder::check as a caller: {callers:#}"
+    );
+}
+
+#[test]
+fn rust_direct_self_field_resolves_by_declared_type() {
+    let dir = tempdir().unwrap();
+    let root = canonical_root(dir.path());
+    write_file(
+        &root.join("src/lib.rs"),
+        r#"struct Engine;
+
+impl Engine {
+    fn start(&self) {}
+}
+
+struct Unrelated;
+
+impl Unrelated {
+    fn start(&self) {}
+}
+
+struct Car {
+    engine: Engine,
+}
+
+impl Car {
+    fn run(&self) {
+        self.engine.start();
+    }
+}
+"#,
+    );
+
+    let store = build_store(&root, "rust-direct-self-field", &project_files(&root));
+    let tree = json(callgraph_store_adapter::call_tree_result(
+        &store,
+        &root.join("src/lib.rs"),
+        "Car::run",
+        1,
+        true,
+    ));
+    let children = tree["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1, "call_tree: {tree:#}");
+    let child = &children[0];
+    assert_eq!(child["name"], "Engine::start", "call_tree: {tree:#}");
+    assert_eq!(child["approximate"], false, "call_tree: {tree:#}");
+    assert_eq!(child["resolved_by"], "type_match", "call_tree: {tree:#}");
+
+    let callers = json(callgraph_store_adapter::callers_result(
+        &store,
+        &root.join("src/lib.rs"),
+        "Engine::start",
+        1,
+        true,
+    ));
+    let entries = flattened_callers(&callers);
+    assert_eq!(entries.len(), 1, "callers: {callers:#}");
+    assert_eq!(entries[0]["symbol"], "Car::run");
+    assert_eq!(entries[0]["approximate"], false, "callers: {callers:#}");
+    assert_eq!(
+        entries[0]["resolved_by"], "type_match",
+        "callers: {callers:#}"
+    );
+}
+
+#[test]
+fn rust_scoped_field_type_does_not_match_unrelated_same_named_method() {
+    let dir = tempdir().unwrap();
+    let root = canonical_root(dir.path());
+    write_file(
+        &root.join("src/actual.rs"),
+        r#"pub struct Engine;
+"#,
+    );
+    write_file(
+        &root.join("src/unrelated.rs"),
+        r#"pub struct Engine;
+
+impl Engine {
+    pub fn start(&self) {}
+}
+"#,
+    );
+    write_file(
+        &root.join("src/lib.rs"),
+        r#"mod actual;
+mod unrelated;
+
+struct Car {
+    engine: actual::Engine,
+}
+
+impl Car {
+    fn run(&self) {
+        self.engine.start();
+    }
+}
+"#,
+    );
+
+    let store = build_store(&root, "rust-scoped-field-type", &project_files(&root));
+    let tree = json(callgraph_store_adapter::call_tree_result(
+        &store,
+        &root.join("src/lib.rs"),
+        "Car::run",
+        1,
+        true,
+    ));
+    assert!(
+        tree["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|child| child["name"] != "Engine::start"),
+        "unresolved actual::Engine must not match unrelated Engine::start: {tree:#}"
+    );
+
+    let callers = json(callgraph_store_adapter::callers_result(
+        &store,
+        &root.join("src/unrelated.rs"),
+        "Engine::start",
+        1,
+        true,
+    ));
+    assert!(
+        flattened_callers(&callers)
+            .iter()
+            .all(|entry| entry["symbol"] != "Car::run"),
+        "unrelated Engine::start must not report Car::run as a caller: {callers:#}"
+    );
+}
+
+#[test]
+fn rust_imported_field_type_does_not_match_unrelated_same_named_method() {
+    let dir = tempdir().unwrap();
+    let root = canonical_root(dir.path());
+    write_file(
+        &root.join("src/actual.rs"),
+        r#"pub struct Engine;
+"#,
+    );
+    write_file(
+        &root.join("src/unrelated.rs"),
+        r#"pub struct Engine;
+
+impl Engine {
+    pub fn start(&self) {}
+}
+"#,
+    );
+    write_file(
+        &root.join("src/lib.rs"),
+        r#"mod actual;
+mod unrelated;
+
+use actual::Engine;
+
+struct Car {
+    engine: Engine,
+}
+
+impl Car {
+    fn run(&self) {
+        self.engine.start();
+    }
+}
+"#,
+    );
+
+    let store = build_store(&root, "rust-imported-field-type", &project_files(&root));
+    let tree = json(callgraph_store_adapter::call_tree_result(
+        &store,
+        &root.join("src/lib.rs"),
+        "Car::run",
+        1,
+        true,
+    ));
+    assert!(
+        tree["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|child| child["name"] != "Engine::start"),
+        "imported Engine must not match unrelated Engine::start: {tree:#}"
+    );
+
+    let callers = json(callgraph_store_adapter::callers_result(
+        &store,
+        &root.join("src/unrelated.rs"),
+        "Engine::start",
+        1,
+        true,
+    ));
+    assert!(
+        flattened_callers(&callers)
+            .iter()
+            .all(|entry| entry["symbol"] != "Car::run"),
+        "unrelated Engine::start must not report Car::run as a caller: {callers:#}"
+    );
+}
+
+#[test]
 fn rust_known_self_type_without_method_does_not_fall_back_to_name_match() {
     let dir = tempdir().unwrap();
     let root = canonical_root(dir.path());
@@ -455,6 +723,69 @@ export function entry(permissionRuleEngine: PermissionRuleEngine) {
     assert_eq!(
         billing_edges, 0,
         "receiver scoring should not cross-edge to BillingRuleEngine"
+    );
+}
+
+#[test]
+fn rust_nested_same_named_type_does_not_match_root_field_type() {
+    let dir = tempdir().unwrap();
+    let root = canonical_root(dir.path());
+    write_file(
+        &root.join("src/lib.rs"),
+        r#"struct Engine;
+
+struct Car {
+    engine: Engine,
+}
+
+impl Car {
+    fn run(&self) {
+        self.engine.start();
+    }
+}
+
+mod nested {
+    pub struct Engine;
+
+    impl Engine {
+        pub fn start(&self) {}
+    }
+}
+"#,
+    );
+
+    let store = build_store(
+        &root,
+        "rust-nested-same-named-field-type",
+        &project_files(&root),
+    );
+    let tree = json(callgraph_store_adapter::call_tree_result(
+        &store,
+        &root.join("src/lib.rs"),
+        "Car::run",
+        1,
+        true,
+    ));
+    let precise_tree_edge = tree["children"].as_array().unwrap().iter().any(|child| {
+        child["name"] == "Engine::start"
+            && child["resolved_by"] == "type_match"
+            && child["approximate"] == false
+    });
+    let callers = json(callgraph_store_adapter::callers_result(
+        &store,
+        &root.join("src/lib.rs"),
+        "Engine::start",
+        1,
+        true,
+    ));
+    let precise_reverse_edge = flattened_callers(&callers).iter().any(|entry| {
+        entry["symbol"] == "Car::run"
+            && entry["resolved_by"] == "type_match"
+            && entry["approximate"] == false
+    });
+    assert!(
+        !precise_tree_edge && !precise_reverse_edge,
+        "root Engine field must not precisely match nested Engine::start; call_tree: {tree:#}; callers: {callers:#}"
     );
 }
 
