@@ -61,12 +61,10 @@ struct StoredCheckpointFile {
     path: String,
     #[serde(rename = "kind")]
     kind: String,
-    /// Unix-style permission mode bits (e.g. 0o644). Only meaningful on
-    /// unix/windows; other platforms use `readonly`.
+    /// Unix-style permission mode bits (e.g. 0o644). The source of truth for
+    /// re-applying permissions on restore (see [`permission_from_mode`]).
     #[serde(default)]
     mode: u32,
-    #[serde(default)]
-    readonly: bool,
     /// Relative path of the raw-bytes blob under the checkpoint dir, for
     /// regular files only.
     #[serde(default)]
@@ -80,6 +78,9 @@ struct StoredCheckpointFile {
 /// On-disk representation of a checkpoint (manifest.json).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredCheckpoint {
+    /// Raw session id — on-disk dir names are sanitized+hashed, so the
+    /// manifest carries the authoritative session key for hydration.
+    session: String,
     name: String,
     created_at: u64,
     files: Vec<StoredCheckpointFile>,
@@ -497,27 +498,33 @@ impl CheckpointStore {
             !session_cps.is_empty()
         });
         // Mirror the on-disk store: drop persisted checkpoints that aged out.
+        // Compute the set of still-alive on-disk dirs first (no borrow of
+        // `self` inside the traversal below).
+        let mut alive_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for (session, cps) in &self.checkpoints {
+            for name in cps.keys() {
+                alive_dirs.insert(self.checkpoint_dir(session, name));
+            }
+        }
         if let Ok(session_entries) = fs::read_dir(&self.storage_root) {
             for session_entry in session_entries.flatten() {
                 if !session_entry.path().is_dir() {
                     continue;
                 }
-                let session = session_entry.file_name().to_string_lossy().to_string();
-                let alive: std::collections::HashSet<String> = self
-                    .checkpoints
-                    .get(&session)
-                    .map(|cps| cps.keys().cloned().collect())
-                    .unwrap_or_default();
                 if let Ok(cp_entries) = fs::read_dir(session_entry.path()) {
+                    let mut session_empty = true;
                     for cp_entry in cp_entries.flatten() {
                         let cp_path = cp_entry.path();
                         if !cp_path.is_dir() {
                             continue;
                         }
-                        let cp_name = cp_entry.file_name().to_string_lossy().to_string();
-                        if !alive.contains(&cp_name) {
+                        session_empty = false;
+                        if !alive_dirs.contains(&cp_path) {
                             let _ = fs::remove_dir_all(&cp_path);
                         }
+                    }
+                    if session_empty {
+                        let _ = fs::remove_dir_all(session_entry.path());
                     }
                 }
             }
@@ -529,10 +536,20 @@ impl CheckpointStore {
     // -------------------------------------------------------------------
 
     /// Directory where a checkpoint's durable payload lives.
+    ///
+    /// The dir components are `sanitize(name)-<shorthash>`: sanitizing
+    /// guards path traversal while the hash suffix disambiguates names that
+    /// sanitize to the same string (e.g. `a/b` vs `a_b`), so two distinct
+    /// checkpoints can never map to the same on-disk dir and silently
+    /// overwrite each other on hydration.
     fn checkpoint_dir(&self, session: &str, name: &str) -> PathBuf {
         self.storage_root
-            .join(sanitize_for_path(session))
-            .join(sanitize_for_path(name))
+            .join(format!(
+                "{}-{}",
+                sanitize_for_path(session),
+                short_hash(session)
+            ))
+            .join(format!("{}-{}", sanitize_for_path(name), short_hash(name)))
     }
 
     /// Persist one checkpoint (already in the in-memory map) to disk.
@@ -548,6 +565,18 @@ impl CheckpointStore {
             message: format!("failed to create checkpoint dir: {error}"),
         })?;
 
+        // Drop orphaned blobs from a previous snapshot with the same name
+        // (an overwrite with fewer files would otherwise leave stale blob-N
+        // files behind). We are under the mutation lock, so this is safe.
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let file_name = entry.file_name().to_string_lossy().to_string();
+                if file_name.starts_with("blob-") && file_name.ends_with(".bin") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+
         let mut stored_files: Vec<StoredCheckpointFile> = Vec::new();
         let mut blob_index = 0usize;
         let mut paths: Vec<&PathBuf> = checkpoint.file_contents.keys().collect();
@@ -558,7 +587,6 @@ impl CheckpointStore {
                 path: path.display().to_string(),
                 kind: String::new(),
                 mode: permission_mode(&file.permissions),
-                readonly: file.permissions.readonly(),
                 blob: None,
                 target: None,
                 target_is_dir: false,
@@ -587,6 +615,7 @@ impl CheckpointStore {
         }
 
         let stored = StoredCheckpoint {
+            session: session.to_string(),
             name: checkpoint.name.clone(),
             created_at: checkpoint.created_at,
             files: stored_files,
@@ -618,7 +647,6 @@ impl CheckpointStore {
             if !session_entry.path().is_dir() {
                 continue;
             }
-            let session = session_entry.file_name().to_string_lossy().to_string();
             let Ok(cp_entries) = fs::read_dir(session_entry.path()) else {
                 continue;
             };
@@ -686,14 +714,19 @@ impl CheckpointStore {
                     );
                     continue;
                 }
-                self.checkpoints.entry(session.clone()).or_default().insert(
-                    stored.name.clone(),
-                    Checkpoint {
-                        name: stored.name,
-                        file_contents,
-                        created_at: stored.created_at,
-                    },
-                );
+                // Use the manifest's authoritative session id, not the
+                // (sanitized+hashed) on-disk dir name.
+                self.checkpoints
+                    .entry(stored.session.clone())
+                    .or_default()
+                    .insert(
+                        stored.name.clone(),
+                        Checkpoint {
+                            name: stored.name,
+                            file_contents,
+                            created_at: stored.created_at,
+                        },
+                    );
             }
         }
     }
@@ -738,6 +771,20 @@ fn sanitize_for_path(component: &str) -> String {
     out
 }
 
+/// Deterministic 64-bit FNV-1a hash, hex-encoded (8 chars).
+///
+/// Used to disambiguate on-disk dir names after sanitization. Implemented
+/// inline (no `DefaultHasher`, whose algorithm is not stable across Rust
+/// releases) so hydrated dir names always match.
+fn short_hash(s: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for byte in s.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+    }
+    format!("{:08x}", hash)
+}
+
 #[cfg(unix)]
 fn permission_mode(permissions: &fs::Permissions) -> u32 {
     use std::os::unix::fs::PermissionsExt;
@@ -752,7 +799,11 @@ fn permission_mode(permissions: &fs::Permissions) -> u32 {
 
 #[cfg(not(any(unix, windows)))]
 fn permission_mode(permissions: &fs::Permissions) -> u32 {
-    if permissions.readonly() { 0o444 } else { 0o644 }
+    if permissions.readonly() {
+        0o444
+    } else {
+        0o644
+    }
 }
 
 #[cfg(unix)]
@@ -1051,9 +1102,12 @@ mod tests {
                     &backup_store,
                 )
                 .unwrap();
-            // On-disk layout: <root>/<session>/<name>/manifest.json + blob-0.bin
-            let cp_dir = storage.path().join(DEFAULT_SESSION_ID).join("durable");
-            assert!(cp_dir.join("manifest.json").exists(), "manifest must be written");
+            // On-disk layout: <root>/<session>-<hash>/<name>-<hash>/{manifest.json, blob-0.bin}
+            let cp_dir = store.checkpoint_dir(DEFAULT_SESSION_ID, "durable");
+            assert!(
+                cp_dir.join("manifest.json").exists(),
+                "manifest must be written"
+            );
             assert!(cp_dir.join("blob-0.bin").exists(), "blob must be written");
         } // drop store — simulates bridge shutdown
 
@@ -1068,6 +1122,89 @@ mod tests {
         fs::write(&path, "durable-modified").unwrap();
         store.restore(DEFAULT_SESSION_ID, "durable").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "durable-original");
+    }
+
+    #[test]
+    fn sanitize_blocks_traversal_and_collides_disambiguated() {
+        // Every separator/NUL is replaced with '_' — no component can ever
+        // contain a path separator, so traversal is impossible regardless of
+        // embedded ".." (which survives only as harmless text inside a name).
+        assert_eq!(sanitize_for_path("../../etc/passwd"), "___.._etc_passwd");
+        assert_eq!(sanitize_for_path(".."), "__");
+        assert_eq!(sanitize_for_path("/abs/path"), "_abs_path");
+        assert_eq!(sanitize_for_path("\\win\\path"), "_win_path");
+        assert_eq!(sanitize_for_path("a/b"), "a_b");
+        assert_eq!(sanitize_for_path("a\\b"), "a_b");
+        assert_eq!(sanitize_for_path(""), "_");
+        // Sanitized output must never contain a separator.
+        for probe in [
+            "../../etc/passwd",
+            "..",
+            "/abs/path",
+            "\\win\\path",
+            "a/b",
+            "a\\b",
+        ] {
+            let out = sanitize_for_path(probe);
+            assert!(
+                !out.contains('/') && !out.contains('\\'),
+                "unsafe output {out}"
+            );
+        }
+
+        // Distinct names that sanitize identically get distinct dirs via hash.
+        let (p, _d) = temp_file("cp_collision.txt", "x");
+        let storage = tempfile::tempdir().unwrap();
+        let mut store = CheckpointStore::with_lock_path(
+            storage.path().join("checkpoint.lock"),
+            CHECKPOINT_LOCK_TIMEOUT,
+        );
+        let backup = BackupStore::new();
+        store
+            .create(DEFAULT_SESSION_ID, "a/b", vec![p.clone()], &backup)
+            .unwrap();
+        store
+            .create(DEFAULT_SESSION_ID, "a_b", vec![p.clone()], &backup)
+            .unwrap();
+        assert_ne!(
+            store.checkpoint_dir(DEFAULT_SESSION_ID, "a/b"),
+            store.checkpoint_dir(DEFAULT_SESSION_ID, "a_b")
+        );
+        assert_eq!(store.list(DEFAULT_SESSION_ID).len(), 2);
+    }
+
+    #[test]
+    fn delete_and_cleanup_mirror_to_disk() {
+        let (p, _d) = temp_file("cp_mirror.txt", "x");
+        let storage = tempfile::tempdir().unwrap();
+        let lock_path = storage.path().join("checkpoint.lock");
+        let backup = BackupStore::new();
+
+        {
+            let mut store =
+                CheckpointStore::with_lock_path(lock_path.clone(), CHECKPOINT_LOCK_TIMEOUT);
+            store
+                .create(DEFAULT_SESSION_ID, "keep", vec![p.clone()], &backup)
+                .unwrap();
+            store
+                .create(DEFAULT_SESSION_ID, "drop", vec![p.clone()], &backup)
+                .unwrap();
+            assert!(store.checkpoint_dir(DEFAULT_SESSION_ID, "drop").exists());
+
+            // delete mirrors to disk
+            assert!(store.delete(DEFAULT_SESSION_ID, "drop"));
+            assert!(!store.checkpoint_dir(DEFAULT_SESSION_ID, "drop").exists());
+            assert!(store.checkpoint_dir(DEFAULT_SESSION_ID, "keep").exists());
+        }
+
+        // Fresh store over the same root: only "keep" hydrates.
+        let store = CheckpointStore::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT);
+        let names: Vec<String> = store
+            .list(DEFAULT_SESSION_ID)
+            .into_iter()
+            .map(|i| i.name)
+            .collect();
+        assert_eq!(names, vec!["keep".to_string()]);
     }
 
     #[test]
