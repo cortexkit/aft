@@ -497,6 +497,56 @@ describe("SubcTransport Rd reconnect", () => {
     expect(client.routeOpens.length).toBe(2); // route re-opened
     expect(calls).toBe(2); // exactly two underlying requests — no auto-retry
   });
+
+  test("a route GOODBYE carrying kind=outcome_unknown KEEPS the client until the classifier reads it", async () => {
+    // A module restart sends GOODBYE to every route on the connection, so a
+    // mid-request call rejects with a SubcError (the raw request() path never
+    // produces a managed SubcCallError). isConsumerReconnectTransient reaches
+    // `err instanceof SubcCallError` first, so today that error is
+    // non-transient: route dropped, client KEPT, next call re-opens on the
+    // same connection.
+    //
+    // The fixture carries `kind` even though today's SubcError has only
+    // `code`. That is the point, and it is what makes this more than a
+    // restatement of the timeout test above: cortexkit/subconscious#6 proposes
+    // moving `kind` onto SubcError, and a route GOODBYE is outcome-unknown by
+    // construction (the daemon sends it after the drain wait regardless of
+    // execution status — see the disposition in error-contract.ts). So this is
+    // the error shape the SDK will hand us post-#6. The behaviour flip does not
+    // come from the error changing; it comes from the classifier starting to
+    // READ this field. Modelling the field now is what lets that flip land as a
+    // red test instead of as a live reconnect-policy change on an SDK bump.
+    //
+    // Characterization, not endorsement — the flip is probably correct. When it
+    // lands, flip the assertions and keep the test.
+    let calls = 0;
+    let madeClients = 0;
+    const goodbye = Object.assign(new SubcError("route closed by subc (GOODBYE)"), {
+      kind: "outcome_unknown",
+    });
+    const client = new FakeClient(async () => {
+      calls += 1;
+      if (calls === 1) throw goodbye;
+      return envelope({ id: "r", success: true, text: "after-restart" });
+    });
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => {
+        madeClients += 1;
+        return client;
+      },
+    });
+    const t = pool.getBridge(TEST_PROJECT_ROOT);
+
+    await expect(t.toolCall("s", "edit", {})).rejects.toBeInstanceOf(SubcError);
+    expect(client.closed).toBe(0); // client kept — reading `kind` would make this 1
+    const result = await t.toolCall("s", "edit", {});
+    expect(result.text).toBe("after-restart");
+    expect(madeClients).toBe(1); // never reconnected — reading `kind` would make this 2
+    expect(client.routeOpens.length).toBe(2); // route re-opened on the same client
+    expect(calls).toBe(2); // no in-place retry: a GOODBYE mid-call is outcome-unknown
+  });
 });
 
 describe("SubcTransport reply envelope (B-#7)", () => {
