@@ -805,6 +805,113 @@ fn same_root_path_param_is_byte_identical_to_default_search() {
 }
 
 #[test]
+fn non_git_same_root_path_param_is_byte_identical_to_default_search() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let (project, _source_file, _source) = project_with_needle();
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+
+    let without_path = response_value(handle_semantic_search(
+        &request_with("needle_symbol", Some("literal")),
+        &ctx,
+    ));
+    let with_path = response_value(handle_semantic_search(
+        &request_with_path("needle_symbol", Some("literal"), project.path()),
+        &ctx,
+    ));
+
+    assert_eq!(
+        serde_json::to_vec(&with_path).expect("serialize with path"),
+        serde_json::to_vec(&without_path).expect("serialize without path"),
+        "non-Git same-root path must preserve the default response byte-for-byte"
+    );
+}
+
+#[test]
+fn non_git_dot_path_param_is_byte_identical_to_default_search() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let (project, _source_file, _source) = project_with_needle();
+    let ctx = test_context(project.path());
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+
+    let without_path = response_value(handle_semantic_search(
+        &request_with("needle_symbol", Some("literal")),
+        &ctx,
+    ));
+    let with_path = response_value(handle_semantic_search(
+        &request_with_path("needle_symbol", Some("literal"), Path::new(".")),
+        &ctx,
+    ));
+
+    assert_eq!(
+        serde_json::to_vec(&with_path).expect("serialize with path"),
+        serde_json::to_vec(&without_path).expect("serialize without path"),
+        "non-Git dot path must preserve the default response byte-for-byte"
+    );
+}
+
+#[test]
+fn restricted_paths_keep_same_root_local_and_refuse_external_root() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let (session_project, _source_file, _source) = project_with_needle();
+    let (external_project, _source_file, _source) = git_project_with_needle();
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(session_project.path().to_path_buf()),
+            restrict_to_project_root: true,
+            ..Config::default()
+        },
+    );
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+
+    let without_path = response_value(handle_semantic_search(
+        &request_with("needle_symbol", Some("literal")),
+        &ctx,
+    ));
+    let same_root = response_value(handle_semantic_search(
+        &request_with_path("needle_symbol", Some("literal"), session_project.path()),
+        &ctx,
+    ));
+
+    assert_eq!(
+        serde_json::to_vec(&same_root).expect("serialize same-root response"),
+        serde_json::to_vec(&without_path).expect("serialize default response"),
+        "path restriction must still allow the configured non-Git root"
+    );
+
+    let external_root = response_value(handle_semantic_search(
+        &request_with_path("needle_symbol", Some("literal"), external_project.path()),
+        &ctx,
+    ));
+
+    assert_eq!(external_root["success"], false);
+    assert_eq!(external_root["code"], "path_outside_root");
+}
+
+#[test]
+fn external_non_git_path_still_returns_not_a_git_root() {
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let session_project = tempfile::tempdir().expect("session project");
+    let external_project = tempfile::tempdir().expect("external project");
+    let ctx = test_context(session_project.path());
+
+    let response = response_value(handle_semantic_search(
+        &request_with_path("needle_symbol", Some("literal"), external_project.path()),
+        &ctx,
+    ));
+
+    assert_eq!(response["success"], false);
+    assert_eq!(response["code"], "not_a_git_root");
+}
+
+#[test]
 fn external_ignore_rule_mismatch_keeps_drift_in_metadata_only() {
     let _git_env = crate::test_helpers::hermetic_git_env_guard();
     let (owner_project, _owner_source, _source) = git_project_with_needle();

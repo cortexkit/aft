@@ -67,18 +67,21 @@ pub(crate) fn resolve_git_root_from_user_path(
 
     let existing = nearest_existing_parent(&requested)
         .ok_or_else(|| GitRootResolutionError::PathNotFound(requested.clone()))?;
+
+    // `nearest_existing_parent` returns an `fs::canonicalize` result, which on
+    // Windows is a verbatim (`\\?\C:\...`) path. Normalize before comparing the
+    // requested directory with the configured root so aliases such as `.` and
+    // symlinks remain local without requiring the workspace itself to be Git.
+    let existing = crate::inspect::job::canonicalize_normalized(&existing);
+    if existing == crate::inspect::job::canonicalize_normalized(project_root) {
+        return Ok(project_root.to_path_buf());
+    }
+
     let git_base = if existing.is_file() {
         existing.parent().unwrap_or(&existing).to_path_buf()
     } else {
         existing
     };
-    // `nearest_existing_parent` returns an `fs::canonicalize` result, which on
-    // Windows is a verbatim (`\?\C:\...`) path. `git_toplevel` passes it to
-    // `Command::current_dir`, and `CreateProcess` rejects verbatim paths as
-    // `lpCurrentDirectory` (the same Win32 limitation that breaks LSP spawns in
-    // #174). Strip the prefix here so the git probe spawns under a non-verbatim
-    // cwd. On Unix `canonicalize_normalized` is identity-equivalent.
-    let git_base = crate::inspect::job::canonicalize_normalized(&git_base);
     git_toplevel(&git_base).map_err(|error| match error.as_str() {
         "not_a_git_root" => GitRootResolutionError::NotAGitRoot,
         _ => GitRootResolutionError::Other(error),
