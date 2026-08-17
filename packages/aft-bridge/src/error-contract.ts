@@ -12,7 +12,11 @@ import {
   SubcError,
 } from "@cortexkit/subc-client";
 
-import { BridgeTransportUnavailableError, isBridgeTransportTimeout } from "./bridge.js";
+import {
+  BridgeTransportUnavailableError,
+  BridgeTransportUnknownOutcomeError,
+  isBridgeTransportTimeout,
+} from "./bridge.js";
 import {
   SubcRootGenerationExpiredError,
   SubcRootReapedError,
@@ -72,6 +76,10 @@ export const BASH_TRANSPORT_DISPOSITION =
 export const SUBC_MODULE_RESTART_DISPOSITION =
   "The AFT daemon module restarted while this call was in flight, so its outcome is UNKNOWN: it may or may not have executed. Verify actual state before re-running, and never blind-retry a mutation.";
 
+/** Agent-facing guidance for a standalone request whose write outcome is unknown. */
+export const BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION =
+  "The standalone AFT transport failed after this call may have been sent, so its outcome is UNKNOWN: it may or may not have executed. Verify actual state before re-running, and never blind-retry a mutation.";
+
 /**
  * A route GOODBYE delivered against an in-flight request.
  *
@@ -115,6 +123,7 @@ export function isBashTransportDeadError(error: unknown): error is Error {
   if (!(error instanceof Error) || hasEngineResponse(error) || isRouteGoodbyeError(error)) {
     return false;
   }
+  if (error instanceof BridgeTransportUnknownOutcomeError) return false;
 
   return (
     error instanceof BridgeTransportUnavailableError ||
@@ -132,13 +141,20 @@ function isTransportClassError(error: unknown): boolean {
 
 /**
  * Append agent-facing recovery guidance without changing the original error
- * object, class, code, or retry behavior. Two dispositions exist: a route
- * GOODBYE appends the unknown-outcome guidance on EVERY command (checked
- * first), and bash transport failures append the re-run guidance. Commands
- * matching neither retain their errors untouched.
+ * object, class, code, or retry behavior. Unknown-outcome errors append safety
+ * guidance on every command; proven bash transport failures append re-run
+ * guidance. Commands matching neither retain their errors untouched.
  */
 export function adaptToolError(command: string, error: unknown): unknown {
   if (!(error instanceof Error)) return error;
+
+  if (error instanceof BridgeTransportUnknownOutcomeError) {
+    if (error.message.includes(BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION)) return error;
+    error.message = error.message
+      ? `${error.message} ${BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION}`
+      : BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION;
+    return error;
+  }
 
   // Checked before the bash branch, and applied to every command: a GOODBYE'd
   // call has an unknown outcome, so BASH_TRANSPORT_DISPOSITION's "no task was

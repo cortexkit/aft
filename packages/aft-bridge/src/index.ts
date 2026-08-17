@@ -47,6 +47,7 @@ export {
   BinaryBridge,
   BridgeTransportTimeoutError,
   BridgeTransportUnavailableError,
+  BridgeTransportUnknownOutcomeError,
   compareSemver,
   isBridgeTransportTimeout,
   tagStderrLine,
@@ -103,6 +104,7 @@ export {
   type AftToolErrorCause,
   adaptToolError,
   BASH_TRANSPORT_DISPOSITION,
+  BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION,
   isBashTransportDeadError,
   toolErrorFromResponse,
 } from "./error-contract.js";

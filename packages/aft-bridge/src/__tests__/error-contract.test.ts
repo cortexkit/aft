@@ -10,12 +10,14 @@ import {
 import {
   BridgeTransportTimeoutError,
   BridgeTransportUnavailableError,
+  BridgeTransportUnknownOutcomeError,
   isBridgeTransportTimeout,
 } from "../bridge.js";
 import {
   AftToolError,
   adaptToolError,
   BASH_TRANSPORT_DISPOSITION,
+  BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION,
   isBashTransportDeadError,
   SUBC_MODULE_RESTART_DISPOSITION,
 } from "../error-contract.js";
@@ -111,6 +113,10 @@ describe("isBashTransportDeadError", () => {
       }),
     ],
     ["route GOODBYE with unknown outcome", routeGoodbyeError()],
+    [
+      "standalone write with unknown outcome",
+      new BridgeTransportUnknownOutcomeError("write failed"),
+    ],
     ["live bridge request timeout", new BridgeTransportTimeoutError("bash", 100, "bridge busy")],
     ["ordinary tool failure", new Error("command failed")],
   ];
@@ -172,6 +178,17 @@ describe("adaptToolError", () => {
     adaptToolError("bash", original);
 
     expect(original.message).toContain(SUBC_MODULE_RESTART_DISPOSITION);
+    expect(original.message).not.toContain(BASH_TRANSPORT_DISPOSITION);
+  });
+
+  test("an outcome-unknown standalone write never gets bash re-run guidance", () => {
+    const original = new BridgeTransportUnknownOutcomeError("stdin write failed");
+
+    adaptToolError("bash", original);
+
+    expect(original.message).toContain(BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION);
+    expect(original.message).toContain("UNKNOWN");
+    expect(original.message).toContain("never blind-retry a mutation");
     expect(original.message).not.toContain(BASH_TRANSPORT_DISPOSITION);
   });
 
