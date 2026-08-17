@@ -1590,7 +1590,9 @@ export class BinaryBridge implements AftProjectTransport {
     // sibling in-flight requests now instead of leaving them parked until their
     // own independent timers fire.
     this.rejectAllPending(
-      new Error(`${this.errorPrefix} bridge killed during sibling timeout — request aborted`),
+      new BridgeTransportUnknownOutcomeError(
+        `${this.errorPrefix} bridge killed during sibling timeout — request aborted`,
+      ),
     );
     // Forget outstanding background task ids: their removal hooks died with
     // the child (foreground polls were just rejected and won't resume, and a

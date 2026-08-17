@@ -6,7 +6,11 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setActiveLogger } from "../active-logger.js";
-import { BinaryBridge, isBridgeTransportTimeout } from "../bridge.js";
+import {
+  BinaryBridge,
+  BridgeTransportUnknownOutcomeError,
+  isBridgeTransportTimeout,
+} from "../bridge.js";
 import type { Logger, LogMeta } from "../logger.js";
 import { BridgePool } from "../pool.js";
 
@@ -508,20 +512,20 @@ process.stdin.on("data", (chunk) => {
         () => "resolved",
         (err) => String(err instanceof Error ? err.message : err),
       );
-      const siblingResult = bridge.send("sibling", {}, { timeoutMs: 1_000 }).then(
+      const siblingResult = bridge.send("sibling", {}, { timeoutMs: 1_000 }).then<unknown>(
         () => "resolved",
-        (err) => String(err instanceof Error ? err.message : err),
+        (err) => err,
       );
 
       const [second, sibling] = (await Promise.race([
         Promise.all([secondResult, siblingResult]),
-        new Promise<[string, string]>((resolve) =>
+        new Promise<[string, unknown]>((resolve) =>
           setTimeout(() => resolve(["pending", "pending"]), 200),
         ),
-      ])) as [string, string];
+      ])) as [string, unknown];
 
       expect(second).toMatch(/timed out|aborted/);
-      expect(sibling).toContain("sibling timeout");
+      expect(sibling).toBeInstanceOf(BridgeTransportUnknownOutcomeError);
       expect(bridge.isAlive()).toBe(false);
       expect(testBridge.configured).toBe(false);
     } finally {
