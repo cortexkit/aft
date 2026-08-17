@@ -924,7 +924,7 @@ pub(crate) fn process_alive(_pid: u32) -> bool {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{mpsc, Arc, Barrier};
 
     fn test_config() -> LockConfig {
         LockConfig {
@@ -1058,13 +1058,27 @@ mod tests {
     #[test]
     fn try_acquire_once_never_waits_behind_live_owner() {
         let (_dir, path) = test_lock_path();
-        let _guard = acquire_with_config(&path, None, test_config()).expect("acquire lock");
-        let started = Instant::now();
+        let guard = acquire_with_config(&path, None, test_config()).expect("acquire lock");
+        let contender_path = path.clone();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let contender = std::thread::spawn(move || {
+            tx.send(try_acquire_once(&contender_path))
+                .expect("result receiver should remain open");
+        });
 
-        let result = try_acquire_once(&path);
+        let result = match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(result) => result,
+            Err(error) => {
+                drop(guard);
+                contender
+                    .join()
+                    .expect("contender should exit after owner drop");
+                panic!("try-acquire blocked behind the live owner: {error}");
+            }
+        };
 
+        contender.join().expect("contender should exit");
         assert!(matches!(result, Err(AcquireError::Timeout)));
-        assert!(started.elapsed() < Duration::from_millis(250));
     }
 
     #[test]
