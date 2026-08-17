@@ -1,6 +1,7 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import type { ChildProcess } from "node:child_process";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -135,6 +136,85 @@ process.stdin.on("data", (chunk) => {
     try {
       const response = await bridge.send("version");
       expect(response.version).toBe("1.2.3 🚀");
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
+  test("respawns when child stdin closes before process exit", async () => {
+    const script = writeExecutable(
+      "closed-stdin.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+setInterval(() => {}, 1_000);
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    process.stdout.write(JSON.stringify({ id: req.id, success: true, warnings: [], pid: process.pid }) + "\\n");
+  }
+});
+`,
+    );
+    const bridge = new BinaryBridge(script, workDir, { timeoutMs: 5_000, maxRestarts: 0 });
+    const testBridge = bridge as unknown as { process: ChildProcess | null };
+
+    try {
+      const first = await bridge.send("ping");
+      const firstPid = first.pid;
+      const staleChild = testBridge.process;
+      if (!staleChild?.stdin) throw new Error("bridge child stdin is unavailable");
+
+      const closed = new Promise<void>((resolve) => staleChild.stdin?.once("close", resolve));
+      staleChild.stdin.destroy();
+      await closed;
+
+      expect(staleChild.exitCode).toBeNull();
+      const second = await bridge.send("ping");
+      expect(second.pid).not.toBe(firstPid);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
+  test("invalidates the child after an asynchronous stdin write failure", async () => {
+    const script = writeExecutable(
+      "write-error.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    process.stdout.write(JSON.stringify({ id: req.id, success: true, warnings: [], pid: process.pid }) + "\\n");
+  }
+});
+`,
+    );
+    const bridge = new BinaryBridge(script, workDir, { timeoutMs: 5_000, maxRestarts: 0 });
+    const testBridge = bridge as unknown as { process: ChildProcess | null };
+
+    try {
+      const first = await bridge.send("ping");
+      const staleChild = testBridge.process;
+      if (!staleChild?.stdin) throw new Error("bridge child stdin is unavailable");
+
+      staleChild.stdin.write = ((_chunk: unknown, callback?: (error?: Error | null) => void) => {
+        queueMicrotask(() => callback?.(new Error("simulated EPIPE")));
+        return false;
+      }) as typeof staleChild.stdin.write;
+
+      await expect(bridge.send("mutate")).rejects.toThrow("simulated EPIPE");
+      const second = await bridge.send("ping");
+      expect(second.pid).not.toBe(first.pid);
     } finally {
       await bridge.shutdown();
     }

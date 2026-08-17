@@ -576,6 +576,21 @@ export class BinaryBridge implements AftProjectTransport {
     return this.process !== null && this.process.exitCode === null && !this.process.killed;
   }
 
+  private invalidateTransportProcess(error: BridgeTransportUnavailableError): void {
+    const proc = this.process;
+    if (!proc) return;
+
+    this.process = null;
+    this.spawnedBinaryFingerprint = null;
+    if (proc.exitCode === null && !proc.killed) {
+      proc.kill("SIGKILL");
+    }
+    this.clearRestartResetTimer();
+    this.configured = false;
+    this.outstandingBackgroundTaskIds.clear();
+    this.rejectAllPending(error);
+  }
+
   hasPendingRequests(): boolean {
     return this.pending.size > 0;
   }
@@ -876,6 +891,7 @@ export class BinaryBridge implements AftProjectTransport {
       const keepBridgeOnTimeout = passive || options?.keepBridgeOnTimeout === true;
       let requestSentAt = Date.now();
 
+      const child = this.process;
       const response = await new Promise<Record<string, unknown>>((resolve, reject) => {
         const timer = setTimeout(() => {
           const entry = this.pending.get(id);
@@ -931,31 +947,31 @@ export class BinaryBridge implements AftProjectTransport {
 
         this.pending.set(id, { resolve, reject, timer, onProgress: options?.onProgress, command });
 
-        if (!this.process?.stdin?.writable) {
+        if (!child?.stdin?.writable) {
           this.pending.delete(id);
           clearTimeout(timer);
-          reject(
-            new BridgeTransportUnavailableError(
-              `${this.errorPrefix} stdin not writable for command "${command}"`,
-            ),
+          const error = new BridgeTransportUnavailableError(
+            `${this.errorPrefix} stdin not writable for command "${command}"`,
           );
+          reject(error);
+          if (this.process === child) this.invalidateTransportProcess(error);
           return;
         }
 
         requestSentAt = Date.now();
-        this.process.stdin.write(line, (err) => {
+        child.stdin.write(line, (err) => {
           if (err) {
+            const error = new BridgeTransportUnavailableError(
+              `${this.errorPrefix} Failed to write to stdin: ${err.message}`,
+              { cause: err },
+            );
             const entry = this.pending.get(id);
             if (entry) {
               this.pending.delete(id);
               clearTimeout(entry.timer);
-              entry.reject(
-                new BridgeTransportUnavailableError(
-                  `${this.errorPrefix} Failed to write to stdin: ${err.message}`,
-                  { cause: err },
-                ),
-              );
+              entry.reject(error);
             }
+            if (this.process === child) this.invalidateTransportProcess(error);
           }
         });
       });
@@ -1178,7 +1194,12 @@ export class BinaryBridge implements AftProjectTransport {
   }
 
   private ensureSpawned(triggeringSessionId?: string): void {
-    if (this.isAlive()) return;
+    if (this.isAlive() && this.process?.stdin?.writable) return;
+    if (this.process !== null) {
+      this.invalidateTransportProcess(
+        new BridgeTransportUnavailableError(`${this.errorPrefix} Child stdin is not writable`),
+      );
+    }
     this.spawnProcess(triggeringSessionId);
   }
 
