@@ -220,6 +220,155 @@ process.stdin.on("data", (chunk) => {
     }
   });
 
+  test("ignores stale child stdout end after replacement owns the buffer", async () => {
+    const script = writeExecutable(
+      "stale-stdout.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+setInterval(() => {}, 1_000);
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    process.stdout.write(JSON.stringify({ id: req.id, success: true, warnings: [], pid: process.pid }) + "\\n");
+  }
+});
+`,
+    );
+    const bridge = new BinaryBridge(script, workDir, { timeoutMs: 5_000, maxRestarts: 0 });
+    const testBridge = bridge as unknown as {
+      process: ChildProcess | null;
+      stdoutBuffer: string;
+    };
+
+    try {
+      await bridge.send("ping");
+      const staleChild = testBridge.process;
+      if (!staleChild?.stdin) throw new Error("bridge child stdin is unavailable");
+
+      const closed = new Promise<void>((resolve) => staleChild.stdin?.once("close", resolve));
+      staleChild.stdin.destroy();
+      await closed;
+      await bridge.send("ping");
+
+      testBridge.stdoutBuffer = '{"id":"replacement"';
+      staleChild.stdout?.emit("end");
+      expect(testBridge.stdoutBuffer).toBe('{"id":"replacement"');
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
+  test("does not carry configure completion across child generations", async () => {
+    const script = writeExecutable(
+      "configure-generation.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+let configured = false;
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    if (req.command === "configure") configured = true;
+    process.stdout.write(JSON.stringify({
+      id: req.id,
+      success: true,
+      warnings: [],
+      configured,
+      pid: process.pid,
+    }) + "\\n");
+  }
+});
+`,
+    );
+    const bridge = new BinaryBridge(script, workDir, { timeoutMs: 5_000, maxRestarts: 0 });
+    const testBridge = bridge as unknown as {
+      process: ChildProcess | null;
+      deliverConfigureWarnings: () => Promise<void>;
+    };
+    let releaseWarnings: (() => void) | undefined;
+    let warningsEntered: (() => void) | undefined;
+    const warningGate = new Promise<void>((resolve) => {
+      releaseWarnings = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      warningsEntered = resolve;
+    });
+    testBridge.deliverConfigureWarnings = async () => {
+      warningsEntered?.();
+      await warningGate;
+    };
+
+    try {
+      const first = bridge.send("ping");
+      await entered;
+      const staleChild = testBridge.process;
+      if (!staleChild?.stdin) throw new Error("bridge child stdin is unavailable");
+
+      const closed = new Promise<void>((resolve) => staleChild.stdin?.once("close", resolve));
+      staleChild.stdin.destroy();
+      await closed;
+      const second = bridge.send("ping");
+      releaseWarnings?.();
+      await Promise.allSettled([first, second]);
+
+      const third = await bridge.send("ping");
+      expect(third.configured).toBe(true);
+    } finally {
+      releaseWarnings?.();
+      await bridge.shutdown();
+    }
+  });
+
+  test("invalidates the child when stdin write throws synchronously", async () => {
+    const script = writeExecutable(
+      "sync-write-error.js",
+      `#!/usr/bin/env node
+process.stdin.setEncoding("utf8");
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  let newline;
+  while ((newline = buffer.indexOf("\\n")) !== -1) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    const req = JSON.parse(line);
+    process.stdout.write(JSON.stringify({ id: req.id, success: true, warnings: [], pid: process.pid }) + "\\n");
+  }
+});
+`,
+    );
+    const bridge = new BinaryBridge(script, workDir, { timeoutMs: 5_000, maxRestarts: 0 });
+    const testBridge = bridge as unknown as {
+      process: ChildProcess | null;
+      pending: Map<string, unknown>;
+    };
+
+    try {
+      const first = await bridge.send("ping");
+      const staleChild = testBridge.process;
+      if (!staleChild?.stdin) throw new Error("bridge child stdin is unavailable");
+      staleChild.stdin.write = (() => {
+        throw new Error("synchronous write failure");
+      }) as typeof staleChild.stdin.write;
+
+      await expect(bridge.send("mutate")).rejects.toThrow("synchronous write failure");
+      expect(testBridge.pending.size).toBe(0);
+      const second = await bridge.send("ping");
+      expect(second.pid).not.toBe(first.pid);
+    } finally {
+      await bridge.shutdown();
+    }
+  });
+
   test("single timeout with child stdout activity keeps bridge warm and sibling alive", async () => {
     const script = writeExecutable(
       "alive-starvation.js",

@@ -248,6 +248,14 @@ export class BridgeTransportUnavailableError extends Error {
   }
 }
 
+/** The transport failed after a request may have been written to the child. */
+export class BridgeTransportUnknownOutcomeError extends BridgeTransportUnavailableError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "BridgeTransportUnknownOutcomeError";
+  }
+}
+
 /** Type guard for a transport-timeout rejection (bridge busy, retryable). */
 export function isBridgeTransportTimeout(err: unknown): err is BridgeTransportTimeoutError {
   return err instanceof Error && (err as { code?: unknown }).code === "transport_timeout";
@@ -588,7 +596,11 @@ export class BinaryBridge implements AftProjectTransport {
     this.clearRestartResetTimer();
     this.configured = false;
     this.outstandingBackgroundTaskIds.clear();
-    this.rejectAllPending(error);
+    this.rejectAllPending(
+      error instanceof BridgeTransportUnknownOutcomeError
+        ? error
+        : new BridgeTransportUnknownOutcomeError(error.message, { cause: error }),
+    );
   }
 
   hasPendingRequests(): boolean {
@@ -808,6 +820,14 @@ export class BinaryBridge implements AftProjectTransport {
       if (!this.configured) {
         if (command !== "configure" && command !== "version") {
           if (!this._configurePromise) {
+            const configuringChild = this.process;
+            const requireConfiguringChild = (): void => {
+              if (this.process !== configuringChild) {
+                throw new BridgeTransportUnavailableError(
+                  `${this.errorPrefix} Bridge process changed during configure; retry on replacement`,
+                );
+              }
+            };
             // First caller — create the configure promise.
             // All parallel callers await this same promise.
             //
@@ -829,6 +849,7 @@ export class BinaryBridge implements AftProjectTransport {
                   },
                   implicitTransportOptions,
                 );
+                requireConfiguringChild();
                 if (configResult.success === false) {
                   throw new Error(
                     `${this.errorPrefix} Configure failed: ${configResult.message ?? "unknown error"}`,
@@ -838,7 +859,9 @@ export class BinaryBridge implements AftProjectTransport {
                 // and relayed through stderr → plugin log. No need to re-log here
                 // (doing so would just duplicate the same line in aft-plugin.log).
                 await this.deliverConfigureWarnings(configResult, params, options);
+                requireConfiguringChild();
                 await this.checkVersion(implicitTransportOptions);
+                requireConfiguringChild();
                 // Re-check liveness after version check — checkVersion() swallows
                 // errors as best-effort, so the bridge may have died without throwing.
                 if (!this.isAlive()) {
@@ -959,21 +982,27 @@ export class BinaryBridge implements AftProjectTransport {
         }
 
         requestSentAt = Date.now();
-        child.stdin.write(line, (err) => {
-          if (err) {
-            const error = new BridgeTransportUnavailableError(
-              `${this.errorPrefix} Failed to write to stdin: ${err.message}`,
-              { cause: err },
-            );
-            const entry = this.pending.get(id);
-            if (entry) {
-              this.pending.delete(id);
-              clearTimeout(entry.timer);
-              entry.reject(error);
-            }
-            if (this.process === child) this.invalidateTransportProcess(error);
+        const handleWriteFailure = (cause: unknown): void => {
+          const writeError = cause instanceof Error ? cause : new Error(String(cause));
+          const error = new BridgeTransportUnknownOutcomeError(
+            `${this.errorPrefix} Failed to write to stdin: ${writeError.message}`,
+            { cause: writeError },
+          );
+          const entry = this.pending.get(id);
+          if (entry) {
+            this.pending.delete(id);
+            clearTimeout(entry.timer);
+            entry.reject(error);
           }
-        });
+          if (this.process === child) this.invalidateTransportProcess(error);
+        };
+        try {
+          child.stdin.write(line, (err) => {
+            if (err) handleWriteFailure(err);
+          });
+        } catch (err) {
+          handleWriteFailure(err);
+        }
       });
 
       if (
@@ -1305,9 +1334,11 @@ export class BinaryBridge implements AftProjectTransport {
 
     const stdoutDecoder = new StringDecoder("utf8");
     child.stdout?.on("data", (chunk: Buffer) => {
+      if (this.process !== currentChild) return;
       this.onStdoutData(stdoutDecoder.write(chunk));
     });
     child.stdout?.on("end", () => {
+      if (this.process !== currentChild) return;
       const remaining = stdoutDecoder.end();
       if (remaining) this.onStdoutData(remaining);
       this.flushStdoutBuffer();
@@ -1315,9 +1346,11 @@ export class BinaryBridge implements AftProjectTransport {
 
     const stderrDecoder = new StringDecoder("utf8");
     child.stderr?.on("data", (chunk: Buffer) => {
+      if (this.process !== currentChild) return;
       this.onStderrData(stderrDecoder.write(chunk));
     });
     child.stderr?.on("end", () => {
+      if (this.process !== currentChild) return;
       const remaining = stderrDecoder.end();
       if (remaining) this.onStderrData(remaining);
       this.flushStderrBuffer();
@@ -1351,7 +1384,7 @@ export class BinaryBridge implements AftProjectTransport {
         this.configured = false;
         this.clearRestartResetTimer();
         this.rejectAllPending(
-          new BridgeTransportUnavailableError(`${this.errorPrefix} Binary killed by ${signal}`),
+          new BridgeTransportUnknownOutcomeError(`${this.errorPrefix} Binary killed by ${signal}`),
         );
         return;
       }
@@ -1622,7 +1655,7 @@ export class BinaryBridge implements AftProjectTransport {
     }
 
     this.rejectAllPending(
-      new BridgeTransportUnavailableError(
+      new BridgeTransportUnknownOutcomeError(
         `${this.errorPrefix} Binary crashed (restarts: ${this._restartCount})${cause ? `: ${cause.message}` : ""} (see ${this.getLogFilePathVia()})`,
         { cause },
       ),
