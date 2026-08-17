@@ -1060,20 +1060,31 @@ mod tests {
         let (_dir, path) = test_lock_path();
         let guard = acquire_with_config(&path, None, test_config()).expect("acquire lock");
         let contender_path = path.clone();
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
         let contender = std::thread::spawn(move || {
-            tx.send(try_acquire_once(&contender_path))
-                .expect("result receiver should remain open");
+            let _ = started_tx.send(());
+            let _ = result_tx.send(try_acquire_once(&contender_path));
         });
 
-        let result = match rx.recv_timeout(Duration::from_secs(5)) {
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("contender should start");
+        let result = match result_rx.recv_timeout(Duration::from_secs(2)) {
             Ok(result) => result,
-            Err(error) => {
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                contender.join().expect("contender should not panic");
+                panic!("contender exited without reporting a result");
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
                 drop(guard);
-                contender
-                    .join()
-                    .expect("contender should exit after owner drop");
-                panic!("try-acquire blocked behind the live owner: {error}");
+                match result_rx.recv_timeout(Duration::from_secs(1)) {
+                    Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        let _ = contender.join();
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                panic!("try-acquire blocked behind the live owner");
             }
         };
 
