@@ -61,7 +61,7 @@ const SearchParams = Type.Object(
     path: Type.Optional(
       Type.String({
         description:
-          "Search a different project root (absolute or ~ path). Requires that project to have been indexed by AFT.",
+          "Only set this to search a different Git project (absolute or ~ path). Omit it for the current configured workspace, including non-Git workspace roots; this is not a subdirectory filter. Unindexed external projects use a bounded lexical fallback.",
       }),
     ),
   },
