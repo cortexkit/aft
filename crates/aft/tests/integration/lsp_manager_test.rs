@@ -447,10 +447,14 @@ fn test_custom_server_env_and_initialization_options_reach_spawned_server() {
 fn astro_uses_the_nearest_project_typescript_sdk() {
     let temp_dir = tempdir().unwrap();
     let root = temp_dir.path().join("workspace");
-    let member = root.join("apps/site");
-    let page = member.join("src/page.astro");
-    let root_tsdk = root.join("node_modules/typescript/lib");
-    let member_tsdk = member.join("node_modules/typescript/lib");
+    let member = root.join("apps").join("site");
+    let page = member.join("src").join("page.astro");
+    // Build the expected tsdk exactly as find_project_typescript_sdk does
+    // (component-wise joins). A single join("node_modules/typescript/lib")
+    // keeps its embedded forward slashes on Windows, so the comparison would
+    // hold a mixed-separator path the production walk never produces.
+    let root_tsdk = root.join("node_modules").join("typescript").join("lib");
+    let member_tsdk = member.join("node_modules").join("typescript").join("lib");
     fs::create_dir_all(page.parent().unwrap()).unwrap();
     fs::create_dir_all(&root_tsdk).unwrap();
     fs::create_dir_all(&member_tsdk).unwrap();
