@@ -2997,9 +2997,8 @@ impl CallGraphStore {
         let mut profile = RefreshFilesProfile::default();
         self.verify_writer_lease()?;
         let mut conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        ensure_database_ready(&conn)?;
         let total_changes_before = conn.total_changes();
-        let tx = conn.transaction()?;
-        ensure_database_ready(&tx)?;
         let mut changed = Vec::new();
         let mut surface_changed = BTreeSet::new();
         let mut deleted = BTreeSet::new();
@@ -3009,28 +3008,25 @@ impl CallGraphStore {
         let mut selected_ref_ids = BTreeSet::new();
         let mut selected_refs_by_caller = BTreeMap::new();
         let mut changed_extracts: HashMap<String, FileExtract> = HashMap::new();
+        let mut fresh_metadata = BTreeMap::new();
 
         for input in changed_files {
             let abs_path = normalize_file_path(&self.project_root, input)?;
             let rel_path = relative_path(&self.project_root, &abs_path);
             changed.push(rel_path.clone());
-            let old_row = load_file_row(&tx, &rel_path)?;
+            let old_row = load_file_row(&conn, &rel_path)?;
             if !abs_path.exists() {
-                if old_row.is_some() {
+                if old_row.is_some() && deleted.insert(rel_path.clone()) {
                     surface_changed.insert(rel_path.clone());
-                    deleted.insert(rel_path.clone());
                     let started = Instant::now();
-                    let dependent_refs = ref_ids_depending_on(&tx, &self.project_root, &rel_path)?;
+                    let dependent_refs =
+                        ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
                     profile.dependency_selection += started.elapsed();
                     record_dependent_refs(
                         &mut selected_ref_ids,
                         &mut selected_refs_by_caller,
                         dependent_refs,
                     );
-                    let started = Instant::now();
-                    delete_file_rows(&tx, &rel_path)?;
-                    clear_backend_state_for_file(&tx, &self.project_root, &rel_path)?;
-                    profile.row_deletes += started.elapsed();
                 }
                 continue;
             }
@@ -3042,32 +3038,29 @@ impl CallGraphStore {
                         new_mtime,
                         new_size,
                     } => {
-                        update_file_fresh_metadata(
-                            &tx,
-                            &self.project_root,
-                            &rel_path,
-                            &row.freshness.content_hash,
-                            new_mtime,
-                            new_size,
-                        )?;
+                        fresh_metadata.insert(
+                            rel_path.clone(),
+                            FileFreshness {
+                                content_hash: row.freshness.content_hash,
+                                mtime: new_mtime,
+                                size: new_size,
+                            },
+                        );
                         continue;
                     }
                     FreshnessVerdict::Deleted => {
-                        surface_changed.insert(rel_path.clone());
-                        deleted.insert(rel_path.clone());
-                        let started = Instant::now();
-                        let dependent_refs =
-                            ref_ids_depending_on(&tx, &self.project_root, &rel_path)?;
-                        profile.dependency_selection += started.elapsed();
-                        record_dependent_refs(
-                            &mut selected_ref_ids,
-                            &mut selected_refs_by_caller,
-                            dependent_refs,
-                        );
-                        let started = Instant::now();
-                        delete_file_rows(&tx, &rel_path)?;
-                        clear_backend_state_for_file(&tx, &self.project_root, &rel_path)?;
-                        profile.row_deletes += started.elapsed();
+                        if deleted.insert(rel_path.clone()) {
+                            surface_changed.insert(rel_path.clone());
+                            let started = Instant::now();
+                            let dependent_refs =
+                                ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
+                            profile.dependency_selection += started.elapsed();
+                            record_dependent_refs(
+                                &mut selected_ref_ids,
+                                &mut selected_refs_by_caller,
+                                dependent_refs,
+                            );
+                        }
                         continue;
                     }
                     FreshnessVerdict::Stale => {}
@@ -3084,7 +3077,7 @@ impl CallGraphStore {
             if surface_is_changed {
                 surface_changed.insert(rel_path.clone());
                 let started = Instant::now();
-                let dependent_refs = ref_ids_depending_on(&tx, &self.project_root, &rel_path)?;
+                let dependent_refs = ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
                 profile.dependency_selection += started.elapsed();
                 record_dependent_refs(
                     &mut selected_ref_ids,
@@ -3119,6 +3112,24 @@ impl CallGraphStore {
             }
         }
 
+        let tx = conn.transaction()?;
+        for (rel_path, freshness) in fresh_metadata {
+            update_file_fresh_metadata(
+                &tx,
+                &self.project_root,
+                &rel_path,
+                &freshness.content_hash,
+                freshness.mtime,
+                freshness.size,
+            )?;
+        }
+        for rel_path in &deleted {
+            let started = Instant::now();
+            delete_file_rows(&tx, rel_path)?;
+            clear_backend_state_for_file(&tx, &self.project_root, rel_path)?;
+            profile.row_deletes += started.elapsed();
+        }
+
         let started = Instant::now();
         let index = ProjectIndex::from_db_and_callers(
             &tx,
@@ -3128,87 +3139,93 @@ impl CallGraphStore {
         )?;
         profile.index_load += started.elapsed();
 
-        for rel_path in &candidate_own_refresh {
-            let Some(extract) = changed_extracts.get(rel_path) else {
-                continue;
-            };
-            if !write_amplification_baseline_enabled()
-                && stored_extract_matches(&tx, rel_path, extract, &index)?
-            {
-                unchanged_extracts += 1;
-                update_file_fresh_metadata(
-                    &tx,
-                    &self.project_root,
-                    rel_path,
-                    &extract.freshness.content_hash,
-                    extract.freshness.mtime,
-                    extract.freshness.size,
-                )?;
-                continue;
-            }
-
-            own_refresh.insert(rel_path.clone());
-            let started = Instant::now();
-            delete_file_rows(&tx, rel_path)?;
-            profile.row_deletes += started.elapsed();
-            let started = Instant::now();
-            insert_file_extract(&tx, &self.project_root, extract)?;
-            profile.row_inserts += started.elapsed();
-        }
-
-        let dependency_callers = touched_callers
-            .iter()
-            .filter(|rel_path| {
-                !deleted.contains(*rel_path) && !candidate_own_refresh.contains(*rel_path)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        for rel_path in dependency_callers {
-            let Some(extract) = caller_extracts.get(&rel_path) else {
-                continue;
-            };
-            if stored_node_ids_match_extract(&tx, &rel_path, extract)? {
-                continue;
-            }
-
-            own_refresh.insert(rel_path.clone());
-            let started = Instant::now();
-            delete_file_rows(&tx, &rel_path)?;
-            profile.row_deletes += started.elapsed();
-            let started = Instant::now();
-            insert_file_extract(&tx, &self.project_root, extract)?;
-            profile.row_inserts += started.elapsed();
-        }
-        let started = Instant::now();
-        for rel_path in &touched_callers {
-            if deleted.contains(rel_path) {
-                continue;
-            }
-            let Some(extract) = caller_extracts.get(rel_path) else {
-                continue;
-            };
-            if own_refresh.contains(rel_path) {
-                delete_refs_for_caller(&tx, rel_path)?;
-                for raw_ref in &extract.raw_refs {
-                    let resolved = resolve_ref(raw_ref.clone(), &index)?;
-                    insert_resolved_ref(&tx, &resolved)?;
+        let workspace_root = self.project_root.display().to_string();
+        {
+            let mut inserts = ColdBuildInsertStatements::new(&tx)?;
+            for rel_path in &candidate_own_refresh {
+                let Some(extract) = changed_extracts.get(rel_path) else {
+                    continue;
+                };
+                if !write_amplification_baseline_enabled()
+                    && stored_extract_matches(&tx, rel_path, extract, &index)?
+                {
+                    unchanged_extracts += 1;
+                    update_file_fresh_metadata(
+                        &tx,
+                        &self.project_root,
+                        rel_path,
+                        &extract.freshness.content_hash,
+                        extract.freshness.mtime,
+                        extract.freshness.size,
+                    )?;
+                    continue;
                 }
-                continue;
+
+                own_refresh.insert(rel_path.clone());
+                let started = Instant::now();
+                delete_file_rows(&tx, rel_path)?;
+                clear_backend_state_for_file(&tx, &self.project_root, rel_path)?;
+                profile.row_deletes += started.elapsed();
+                let started = Instant::now();
+                insert_file_extract_prepared(&mut inserts, &workspace_root, extract)?;
+                profile.row_inserts += started.elapsed();
             }
 
-            let selected_for_caller = selected_refs_by_caller
-                .get(rel_path)
+            let dependency_callers = touched_callers
+                .iter()
+                .filter(|rel_path| {
+                    !deleted.contains(*rel_path) && !candidate_own_refresh.contains(*rel_path)
+                })
                 .cloned()
-                .unwrap_or_default();
-            delete_ref_ids(&tx, &selected_for_caller)?;
-            for raw_ref in &extract.raw_refs {
-                if selected_for_caller.contains(&raw_ref.ref_id) {
-                    let resolved = resolve_ref(raw_ref.clone(), &index)?;
-                    insert_resolved_ref(&tx, &resolved)?;
+                .collect::<Vec<_>>();
+            for rel_path in dependency_callers {
+                let Some(extract) = caller_extracts.get(&rel_path) else {
+                    continue;
+                };
+                if stored_node_ids_match_extract(&tx, &rel_path, extract)? {
+                    continue;
+                }
+
+                own_refresh.insert(rel_path.clone());
+                let started = Instant::now();
+                delete_file_rows(&tx, &rel_path)?;
+                clear_backend_state_for_file(&tx, &self.project_root, &rel_path)?;
+                profile.row_deletes += started.elapsed();
+                let started = Instant::now();
+                insert_file_extract_prepared(&mut inserts, &workspace_root, extract)?;
+                profile.row_inserts += started.elapsed();
+            }
+            let started = Instant::now();
+            for rel_path in &touched_callers {
+                if deleted.contains(rel_path) {
+                    continue;
+                }
+                let Some(extract) = caller_extracts.get(rel_path) else {
+                    continue;
+                };
+                if own_refresh.contains(rel_path) {
+                    delete_refs_for_caller(&tx, rel_path)?;
+                    for raw_ref in &extract.raw_refs {
+                        let resolved = resolve_ref(raw_ref.clone(), &index)?;
+                        insert_resolved_ref_prepared(&mut inserts, &resolved)?;
+                    }
+                    continue;
+                }
+
+                let selected_for_caller = selected_refs_by_caller
+                    .get(rel_path)
+                    .cloned()
+                    .unwrap_or_default();
+                delete_ref_ids(&tx, &selected_for_caller)?;
+                for raw_ref in &extract.raw_refs {
+                    if selected_for_caller.contains(&raw_ref.ref_id) {
+                        let resolved = resolve_ref(raw_ref.clone(), &index)?;
+                        insert_resolved_ref_prepared(&mut inserts, &resolved)?;
+                    }
                 }
             }
+            profile.ref_resolution += started.elapsed();
         }
-        profile.ref_resolution += started.elapsed();
 
         let started = Instant::now();
         delete_method_dispatch_edges_for_callers(&tx, &own_refresh)?;
@@ -6079,6 +6096,7 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             provenance   TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_dispatch_hints_method ON dispatch_hints(method_name);
+        CREATE INDEX IF NOT EXISTS idx_dispatch_hints_file ON dispatch_hints(file);
 
         CREATE TABLE IF NOT EXISTS type_ref_names (
             name TEXT PRIMARY KEY
@@ -6233,6 +6251,7 @@ fn drop_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
          DROP INDEX IF EXISTS idx_edges_target_file_symbol;
          DROP INDEX IF EXISTS idx_edges_ref_id;
          DROP INDEX IF EXISTS idx_dispatch_hints_method;
+         DROP INDEX IF EXISTS idx_dispatch_hints_file;
          DROP INDEX IF EXISTS idx_backend_file_state_file;",
     )?;
     Ok(())
@@ -6254,6 +6273,7 @@ fn create_cold_build_secondary_indexes(tx: &Transaction<'_>) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_edges_target_file_symbol ON edges(target_file, target_symbol, kind);
          CREATE INDEX IF NOT EXISTS idx_edges_ref_id ON edges(ref_id, kind);
          CREATE INDEX IF NOT EXISTS idx_dispatch_hints_method ON dispatch_hints(method_name);
+         CREATE INDEX IF NOT EXISTS idx_dispatch_hints_file ON dispatch_hints(file);
          CREATE INDEX IF NOT EXISTS idx_backend_file_state_file ON backend_file_state(file_path, backend);",
     )?;
     Ok(())
@@ -8896,6 +8916,7 @@ fn insert_resolved_ref_prepared(
     Ok(())
 }
 
+#[cfg(test)]
 fn insert_file_extract(
     tx: &Transaction<'_>,
     project_root: &Path,
@@ -8976,6 +8997,7 @@ fn insert_file_extract(
     Ok(())
 }
 
+#[cfg(test)]
 fn insert_file_dependencies(
     tx: &Transaction<'_>,
     file_path: &str,
@@ -8998,6 +9020,7 @@ fn ref_provenance(raw: &RawRef) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn insert_resolved_ref(tx: &Transaction<'_>, resolved: &ResolvedRef) -> Result<()> {
     let raw = &resolved.raw;
     debug_assert!(resolved.dependencies.is_superset(&raw.dependencies));
@@ -11065,8 +11088,8 @@ fn clear_backend_state_for_file(
     Ok(())
 }
 
-fn load_file_row(tx: &Transaction<'_>, rel_path: &str) -> Result<Option<FileRow>> {
-    tx.query_row(
+fn load_file_row(conn: &Connection, rel_path: &str) -> Result<Option<FileRow>> {
+    conn.query_row(
         "SELECT surface_fingerprint, content_hash, mtime_ns, size FROM files WHERE path = ?1",
         params![rel_path],
         |row| {
@@ -11415,11 +11438,11 @@ struct DependentRefSelection {
 }
 
 fn ref_ids_depending_on(
-    tx: &Transaction<'_>,
+    conn: &Connection,
     project_root: &Path,
     rel_path: &str,
 ) -> Result<Vec<DependentRefSelection>> {
-    let mut stmt = tx.prepare(
+    let mut stmt = conn.prepare(
         "SELECT DISTINCT r.ref_id, r.kind, r.caller_file, r.module_path, r.target_file
          FROM refs r
          WHERE r.caller_file IN (
@@ -11512,9 +11535,11 @@ fn delete_refs_for_caller(tx: &Transaction<'_>, rel_path: &str) -> Result<()> {
 }
 
 fn delete_ref_ids(tx: &Transaction<'_>, ref_ids: &BTreeSet<String>) -> Result<()> {
+    let mut delete_edges = tx.prepare("DELETE FROM edges WHERE ref_id = ?1")?;
+    let mut delete_refs = tx.prepare("DELETE FROM refs WHERE ref_id = ?1")?;
     for ref_id in ref_ids {
-        tx.execute("DELETE FROM edges WHERE ref_id = ?1", params![ref_id])?;
-        tx.execute("DELETE FROM refs WHERE ref_id = ?1", params![ref_id])?;
+        delete_edges.execute(params![ref_id])?;
+        delete_refs.execute(params![ref_id])?;
     }
     Ok(())
 }
