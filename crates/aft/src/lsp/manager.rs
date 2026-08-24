@@ -553,7 +553,7 @@ impl LspManager {
                     );
                     continue;
                 }
-                if self.resolve_binary(&definition, config).is_err() {
+                if self.resolve_binary(&definition, &key.root, config).is_err() {
                     producer_failures.insert(
                         key.clone(),
                         ApplicableServerFailure {
@@ -2433,7 +2433,7 @@ impl LspManager {
     ) -> Result<LspClient, LspError> {
         let initialization_options =
             initialization_options_for_spawn(def, source_file, root, config)?;
-        let binary = self.resolve_binary(def, config)?;
+        let binary = self.resolve_binary(def, root, config)?;
 
         // Merge the server-defined env with our test-injected env.
         // `extra_env` is empty in production; tests use it to drive fake
@@ -2477,7 +2477,12 @@ impl LspManager {
         Ok(client)
     }
 
-    fn resolve_binary(&self, def: &ServerDef, config: &Config) -> Result<PathBuf, LspError> {
+    fn resolve_binary(
+        &self,
+        def: &ServerDef,
+        root: &Path,
+        config: &Config,
+    ) -> Result<PathBuf, LspError> {
         if let Some(path) = self.binary_overrides.get(&def.kind) {
             if path.exists() {
                 return Ok(path.clone());
@@ -2501,17 +2506,10 @@ impl LspManager {
         }
 
         // Layered resolution:
-        //   1. <project_root>/node_modules/.bin/<binary>
-        //   2. config.lsp_paths_extra (plugin auto-install cache, etc.)
-        //   3. PATH via `which`
-        resolve_lsp_binary(
-            &def.binary,
-            config.project_root.as_deref(),
-            &config.lsp_paths_extra,
-        )
+        resolve_lsp_binary(&def.binary, Some(root), &config.lsp_paths_extra)
         .ok_or_else(|| {
             LspError::NotFound(format!(
-                "language server binary '{}' not found in node_modules/.bin, lsp_paths_extra, or PATH",
+                "language server binary '{}' not found in the workspace virtualenv, node_modules/.bin, lsp_paths_extra, or PATH",
                 def.binary
             ))
         })

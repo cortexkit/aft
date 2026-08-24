@@ -111,20 +111,22 @@ fn inspect_server(
     canonical: &Path,
     config: &crate::config::Config,
 ) -> serde_json::Value {
+    let workspace_root = match attempt.map(|attempt| &attempt.result) {
+        Some(ServerAttemptResult::Ok { server_key }) => Some(server_key.root.clone()),
+        _ => {
+            def.workspace_root_for_file_with_project_root(canonical, config.project_root.as_deref())
+        }
+    };
     let binary_path = resolve_lsp_binary(
         &def.binary,
-        config.project_root.as_deref(),
+        workspace_root.as_deref(),
         &config.lsp_paths_extra,
     );
     let binary_source = classify_binary_source(
         &binary_path,
-        config.project_root.as_deref(),
+        workspace_root.as_deref(),
         &config.lsp_paths_extra,
     );
-    let workspace_root = match attempt.map(|attempt| &attempt.result) {
-        Some(ServerAttemptResult::Ok { server_key }) => Some(server_key.root.clone()),
-        _ => def.workspace_root_for_file(canonical),
-    };
     let spawn_status = attempt
         .map(|attempt| spawn_status(&attempt.result))
         .unwrap_or_else(|| "not_attempted".to_string());
@@ -154,6 +156,9 @@ fn classify_binary_source(
     };
 
     if let Some(root) = project_root {
+        if path.starts_with(root.join(".venv")) || path.starts_with(root.join("venv")) {
+            return "project_virtualenv";
+        }
         if path.starts_with(root.join("node_modules").join(".bin")) {
             return "project_node_modules";
         }

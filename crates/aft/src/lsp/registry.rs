@@ -10,11 +10,12 @@ use crate::lsp::roots::{
 /// Resolve an LSP binary name to a full path.
 ///
 /// Resolution order (mirrors `format::resolve_tool` for formatters/checkers):
-/// 1. `<project_root>/node_modules/.bin/<binary>` — project devDependency
-/// 2. Each path in `extra_paths` joined with `<binary>` — plugin-supplied
+/// 1. `<project_root>/.venv` or `<project_root>/venv` — Python project tool
+/// 2. `<project_root>/node_modules/.bin/<binary>` — project devDependency
+/// 3. Each path in `extra_paths` joined with `<binary>` — plugin-supplied
 ///    auto-install cache locations such as
 ///    `~/.cache/aft/lsp-packages/<pkg>/node_modules/.bin/`
-/// 3. PATH via [`which::which`]
+/// 4. PATH via [`which::which`]
 ///
 /// On Windows, candidate directories are also probed with `.cmd`, `.exe`,
 /// and `.bat` extensions because npm-installed shims often use `.cmd`.
@@ -24,7 +25,22 @@ pub fn resolve_lsp_binary(
     project_root: Option<&Path>,
     extra_paths: &[PathBuf],
 ) -> Option<PathBuf> {
-    // 1. Project-local node_modules/.bin
+    // 1. Project-local Python virtual environment.
+    if let Some(root) = project_root {
+        if let Some(found) = probe_project_virtualenv(root, binary) {
+            return Some(found);
+        }
+    }
+
+    resolve_lsp_binary_outside_virtualenv(binary, project_root, extra_paths)
+}
+
+fn resolve_lsp_binary_outside_virtualenv(
+    binary: &str,
+    project_root: Option<&Path>,
+    extra_paths: &[PathBuf],
+) -> Option<PathBuf> {
+    // 2. Project-local node_modules/.bin
     if let Some(root) = project_root {
         let local_bin = root.join("node_modules").join(".bin");
         if let Some(found) = probe_dir(&local_bin, binary) {
@@ -32,15 +48,28 @@ pub fn resolve_lsp_binary(
         }
     }
 
-    // 2. Plugin-supplied extra paths (auto-install cache, etc.)
+    // 3. Plugin-supplied extra paths (auto-install cache, etc.)
     for dir in extra_paths {
         if let Some(found) = probe_dir(dir, binary) {
             return Some(found);
         }
     }
 
-    // 3. PATH fallback
+    // 4. PATH fallback
     which::which(binary).ok()
+}
+
+fn probe_project_virtualenv(root: &Path, binary: &str) -> Option<PathBuf> {
+    [root.join(".venv"), root.join("venv")]
+        .into_iter()
+        .find_map(|virtualenv| {
+            let bin_dir = if cfg!(windows) {
+                virtualenv.join("Scripts")
+            } else {
+                virtualenv.join("bin")
+            };
+            probe_dir(&bin_dir, binary)
+        })
 }
 
 /// Check `dir/<binary>` and (on Windows) `dir/<binary>.cmd|.exe|.bat`.
@@ -639,12 +668,102 @@ pub fn servers_for_file(path: &Path, config: &Config) -> Vec<ServerDef> {
         .and_then(|ext| ext.to_str())
         .unwrap_or_default();
 
-    resolved_servers(config)
+    let matching = resolved_servers(config)
         .into_iter()
         .filter(|server| !is_disabled(server, config))
-        .filter(|server| config.experimental_lsp_ty || server.kind != ServerKind::Ty)
         .filter(|server| server.matches_extension(extension))
-        .collect()
+        .collect::<Vec<_>>();
+
+    if !matches!(extension.to_ascii_lowercase().as_str(), "py" | "pyi") {
+        return matching
+            .into_iter()
+            .filter(|server| config.experimental_lsp_ty || server.kind != ServerKind::Ty)
+            .collect();
+    }
+
+    select_python_servers(path, config, matching)
+}
+
+fn select_python_servers(
+    path: &Path,
+    config: &Config,
+    mut matching: Vec<ServerDef>,
+) -> Vec<ServerDef> {
+    let python = matching
+        .iter()
+        .position(|server| server.kind == ServerKind::Python)
+        .map(|position| matching.remove(position));
+    let ty = matching
+        .iter()
+        .position(|server| server.kind == ServerKind::Ty)
+        .map(|position| matching.remove(position));
+
+    match (python, ty) {
+        (Some(python), Some(ty)) if config.experimental_lsp_ty => {
+            matching.extend([python, ty]);
+        }
+        (Some(python), Some(ty)) => {
+            matching.push(select_python_server(path, config, ty, python));
+        }
+        (Some(python), None) => matching.push(python),
+        (None, Some(ty)) if config.experimental_lsp_ty => matching.push(ty),
+        (None, Some(_)) | (None, None) => {}
+    }
+
+    matching
+}
+
+fn select_python_server(
+    path: &Path,
+    config: &Config,
+    ty: ServerDef,
+    pyright: ServerDef,
+) -> ServerDef {
+    let basedpyright = (pyright.binary == "pyright-langserver").then(|| ServerDef {
+        kind: ServerKind::Python,
+        name: "BasedPyright".to_string(),
+        extensions: pyright.extensions.clone(),
+        binary: "basedpyright-langserver".to_string(),
+        args: pyright.args.clone(),
+        root_markers: pyright.root_markers.clone(),
+        priority_root_markers: pyright.priority_root_markers.clone(),
+        env: pyright.env.clone(),
+        initialization_options: pyright.initialization_options.clone(),
+    });
+    let mut candidates = vec![ty, pyright];
+    if let Some(basedpyright) = basedpyright {
+        candidates.push(basedpyright);
+    }
+
+    for candidate in &candidates {
+        let Some(root) = candidate
+            .workspace_root_for_file_with_project_root(path, config.project_root.as_deref())
+        else {
+            continue;
+        };
+        if probe_project_virtualenv(&root, &candidate.binary).is_some() {
+            return candidate.clone();
+        }
+    }
+
+    for candidate in &candidates {
+        let Some(root) = candidate
+            .workspace_root_for_file_with_project_root(path, config.project_root.as_deref())
+        else {
+            continue;
+        };
+        if resolve_lsp_binary_outside_virtualenv(
+            &candidate.binary,
+            Some(&root),
+            &config.lsp_paths_extra,
+        )
+        .is_some()
+        {
+            return candidate.clone();
+        }
+    }
+
+    candidates.swap_remove(1)
 }
 
 /// Resolve the full server set after applying user overrides.
@@ -1463,6 +1582,153 @@ mod tests {
             resolved.as_deref(),
             Some(local_bin.join("pyright-langserver").as_path())
         );
+    }
+
+    #[test]
+    fn resolve_lsp_binary_prefers_project_virtualenv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let extra = tmp.path().join("extra");
+        let virtualenv_bin = if cfg!(windows) {
+            project.join(".venv").join("Scripts")
+        } else {
+            project.join(".venv").join("bin")
+        };
+        touch_exe(&virtualenv_bin.join("ty"));
+        touch_exe(&extra.join("ty"));
+
+        let resolved = resolve_lsp_binary("ty", Some(&project), &[extra]);
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some(virtualenv_bin.join("ty").as_path())
+        );
+    }
+
+    #[test]
+    fn python_auto_prefers_ty_from_nested_project_virtualenv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repository = tmp.path();
+        let backend = repository.join("backend");
+        let source = backend.join("app").join("main.py");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(backend.join("pyproject.toml"), "[project]\nname = 'demo'\n").unwrap();
+        let virtualenv_bin = if cfg!(windows) {
+            backend.join(".venv").join("Scripts")
+        } else {
+            backend.join(".venv").join("bin")
+        };
+        touch_exe(&virtualenv_bin.join("ty"));
+        let config = Config {
+            project_root: Some(repository.to_path_buf()),
+            ..Config::default()
+        };
+
+        let servers = servers_for_file(&source, &config);
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].kind, ServerKind::Ty);
+        assert_eq!(servers[0].binary, "ty");
+    }
+
+    #[test]
+    fn python_auto_uses_local_basedpyright_when_it_is_the_only_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let source = project.join("main.py");
+        std::fs::write(project.join("pyproject.toml"), "[project]\nname = 'demo'\n").unwrap();
+        let virtualenv_bin = if cfg!(windows) {
+            project.join(".venv").join("Scripts")
+        } else {
+            project.join(".venv").join("bin")
+        };
+        touch_exe(&virtualenv_bin.join("basedpyright-langserver"));
+        let config = Config {
+            project_root: Some(project.to_path_buf()),
+            ..Config::default()
+        };
+
+        let servers = servers_for_file(&source, &config);
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].kind, ServerKind::Python);
+        assert_eq!(servers[0].name, "BasedPyright");
+        assert_eq!(servers[0].binary, "basedpyright-langserver");
+    }
+
+    #[test]
+    fn python_auto_prefers_virtualenv_pyright_over_cached_ty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let source = project.join("main.py");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("pyproject.toml"), "[project]\nname = 'demo'\n").unwrap();
+        let virtualenv_bin = if cfg!(windows) {
+            project.join(".venv").join("Scripts")
+        } else {
+            project.join(".venv").join("bin")
+        };
+        touch_exe(&virtualenv_bin.join("pyright-langserver"));
+        let cache = tmp.path().join("cache");
+        touch_exe(&cache.join("ty"));
+        let config = Config {
+            project_root: Some(project.clone()),
+            lsp_paths_extra: vec![cache],
+            ..Config::default()
+        };
+
+        let servers = servers_for_file(&source, &config);
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].kind, ServerKind::Python);
+        assert_eq!(servers[0].binary, "pyright-langserver");
+    }
+
+    #[test]
+    fn python_auto_prefers_ty_when_only_global_candidates_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let source = project.join("main.py");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("pyproject.toml"), "[project]\nname = 'demo'\n").unwrap();
+        let cache = tmp.path().join("cache");
+        touch_exe(&cache.join("ty"));
+        touch_exe(&cache.join("pyright-langserver"));
+        let config = Config {
+            project_root: Some(project.clone()),
+            lsp_paths_extra: vec![cache],
+            ..Config::default()
+        };
+
+        let servers = servers_for_file(&source, &config);
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].kind, ServerKind::Ty);
+    }
+
+    #[test]
+    fn explicitly_disabled_ty_forces_pyright() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let source = project.join("main.py");
+        std::fs::write(project.join("pyproject.toml"), "[project]\nname = 'demo'\n").unwrap();
+        let virtualenv_bin = if cfg!(windows) {
+            project.join(".venv").join("Scripts")
+        } else {
+            project.join(".venv").join("bin")
+        };
+        touch_exe(&virtualenv_bin.join("ty"));
+        let config = Config {
+            project_root: Some(project.to_path_buf()),
+            disabled_lsp: std::collections::HashSet::from(["ty".to_string()]),
+            ..Config::default()
+        };
+
+        let servers = servers_for_file(&source, &config);
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].kind, ServerKind::Python);
+        assert_eq!(servers[0].binary, "pyright-langserver");
     }
 
     #[test]
