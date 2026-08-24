@@ -969,12 +969,7 @@ fn configured_lsp_binary_resolves(
         }
     }
 
-    resolve_lsp_binary(
-        &configured.binary,
-        project_root,
-        &config.lsp_paths_extra,
-    )
-    .is_some()
+    resolve_lsp_binary(&configured.binary, project_root, &config.lsp_paths_extra).is_some()
 }
 
 fn lsp_missing_hint(binary: &str) -> String {
