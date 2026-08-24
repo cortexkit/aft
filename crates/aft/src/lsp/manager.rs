@@ -24,7 +24,7 @@ use crate::lsp::pull_params::{
     AftDocumentDiagnosticParams, AftDocumentDiagnosticRequest, AftWorkspaceDiagnosticParams,
     AftWorkspaceDiagnosticRequest,
 };
-use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerDef, ServerKind};
+use crate::lsp::registry::{resolve_server_binary, servers_for_file, ServerDef, ServerKind};
 use crate::lsp::roots::ServerKey;
 use crate::lsp::LspError;
 use crate::slog_error;
@@ -2505,12 +2505,15 @@ impl LspManager {
             )));
         }
 
-        // Layered resolution:
-        resolve_lsp_binary(&def.binary, Some(root), &config.lsp_paths_extra)
-        .ok_or_else(|| {
+        resolve_server_binary(def, Some(root), config).ok_or_else(|| {
+            let searched = if matches!(def.kind, ServerKind::Python | ServerKind::Ty) {
+                "the workspace virtualenv, node_modules/.bin, lsp_paths_extra, or PATH"
+            } else {
+                "node_modules/.bin, lsp_paths_extra, or PATH"
+            };
             LspError::NotFound(format!(
-                "language server binary '{}' not found in the workspace virtualenv, node_modules/.bin, lsp_paths_extra, or PATH",
-                def.binary
+                "language server binary '{}' not found in {searched}",
+                def.binary,
             ))
         })
     }
