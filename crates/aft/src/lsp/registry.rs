@@ -51,21 +51,17 @@ pub fn resolve_server_binary(
     config: &Config,
 ) -> Option<PathBuf> {
     let python_family = matches!(server.kind, ServerKind::Python | ServerKind::Ty);
-    let resolution_root = if python_family {
-        workspace_root.or(config.project_root.as_deref())
-    } else {
-        config.project_root.as_deref()
-    };
 
     if python_family {
-        if let Some(root) = resolution_root {
+        if let Some(root) = workspace_root.or(config.project_root.as_deref()) {
             if let Some(found) = probe_project_virtualenv(root, &server.binary) {
                 return Some(found);
             }
         }
     }
 
-    resolve_lsp_binary(&server.binary, resolution_root, &config.lsp_paths_extra)
+    let project_root = config.project_root.as_deref().or(workspace_root);
+    resolve_lsp_binary(&server.binary, project_root, &config.lsp_paths_extra)
 }
 
 fn probe_project_virtualenv(root: &Path, binary: &str) -> Option<PathBuf> {
@@ -1568,6 +1564,33 @@ mod tests {
         assert_eq!(
             resolved.as_deref(),
             Some(virtualenv_bin.join("pyright-langserver").as_path())
+        );
+    }
+
+    #[test]
+    fn python_resolver_falls_back_to_project_root_node_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let workspace = project.join("backend");
+        let project_bin = project.join("node_modules").join(".bin");
+        let hoisted = if cfg!(windows) {
+            project_bin.join("pyright-langserver.cmd")
+        } else {
+            project_bin.join("pyright-langserver")
+        };
+        touch_exe(&hoisted);
+        let server = builtin_servers()
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Python)
+            .unwrap();
+        let config = Config {
+            project_root: Some(project.to_path_buf()),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            resolve_server_binary(&server, Some(&workspace), &config),
+            Some(hoisted)
         );
     }
 
