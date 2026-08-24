@@ -204,10 +204,7 @@ fn lsp_inspect_reports_nested_python_virtualenv_binary() {
     std::fs::copy(&fake_server, &installed_server).unwrap();
     warm_executable(&installed_server, &["--stdio"]);
 
-    let mut aft = AftProcess::spawn_with_env(&[
-        ("AFT_FAKE_LSP_PULL", std::ffi::OsStr::new("1")),
-        ("PATH", empty_path().as_os_str()),
-    ]);
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", empty_path().as_os_str())]);
     let configure = aft.send(
         &json!({
             "id": "cfg-nested-python-lsp",
@@ -242,7 +239,12 @@ fn lsp_inspect_reports_nested_python_virtualenv_binary() {
         installed_server.display().to_string()
     );
     assert_eq!(servers[0]["spawn_status"], "ok");
-    assert_eq!(response["diagnostics_count"], 1);
+    assert_eq!(response["diagnostics_complete"], false);
+    assert_eq!(response["diagnostics_gaps"][0]["server_id"], "python");
+    assert_eq!(
+        response["diagnostics_gaps"][0]["reason"],
+        "pull_not_supported"
+    );
 
     let shutdown = aft.shutdown();
     assert!(shutdown.success());
