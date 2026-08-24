@@ -33,19 +33,19 @@ managed ONNX cache so the next bridge launch redownloads. Each step asks confirm
 before mutating state.
 
 **`doctor lsp <file>`** — Per-file LSP triage. Shows which servers AFT registered for the
-file's extension, where each binary resolves (project `node_modules/.bin` → `lsp_paths_extra`
-→ `PATH` → not found), whether the workspace root marker resolves walking up from the file,
-the spawn outcome, and the diagnostics returned (if any). Use this when `lsp_diagnostics`
-returns `total: 0` and you can't tell whether the file is genuinely clean or no server ever
-spawned. Pass `--harness opencode` or `--harness pi` if you have both plugins installed and
-need to disambiguate. Example output:
+file's extension, where each binary resolves (Python workspace virtualenv, project
+`node_modules/.bin`, `lsp_paths_extra`, `PATH`, or not found), whether the workspace root marker
+resolves walking up from the file, the spawn outcome, and the diagnostics returned (if any). Use
+this when `lsp_diagnostics` returns `total: 0` and you can't tell whether the file is genuinely
+clean or no server ever spawned. Pass `--harness opencode` or `--harness pi` if you have both
+plugins installed and need to disambiguate. Example output:
 
 ```
 $ npx @cortexkit/aft@latest doctor lsp ./python/main.py
 
 Server attempts:
   ✗ ty
-    Binary: ty (NOT FOUND on PATH or in lsp_paths_extra)
+    Binary: ty (NOT FOUND in workspace virtualenv, node_modules/.bin, lsp_paths_extra, or PATH)
     Workspace root: /repo/python (markers: requirements.txt)
     Status: binary not installed
     Action: Install with `uv tool install ty` or `pip install ty`.
