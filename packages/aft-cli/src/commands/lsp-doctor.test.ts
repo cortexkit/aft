@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { HarnessAdapter, HarnessConfigPaths } from "../adapters/types.js";
 import type { AftRequest } from "../lib/aft-bridge.js";
-import { findProjectRootForFile, runLspDoctor } from "./lsp.js";
+import { findProjectRootForFile, renderLspInspection, runLspDoctor } from "./lsp.js";
 
 function makeAdapter(configDir: string): HarnessAdapter {
   const configPaths: HarnessConfigPaths = {
@@ -120,5 +120,22 @@ describe("doctor lsp project root detection", () => {
     const outside = tempRoot("aft-lsp-fallback-");
     const looseFile = join(tempRoot("aft-lsp-loose-"), "src", "main.py");
     expect(findProjectRootForFile(looseFile, outside)).toBe(outside);
+  });
+});
+
+describe("doctor lsp diagnostics completeness", () => {
+  test("does not render a push-only empty snapshot as checked clean", () => {
+    const rendered = renderLspInspection("main.py", {
+      success: true,
+      diagnostics_complete: false,
+      diagnostics_gaps: [{ server_id: "python", reason: "pull_not_supported" }],
+      diagnostics_count: 0,
+      diagnostics: [],
+    });
+
+    expect(rendered).toContain("Diagnostics incomplete (0 observed):");
+    expect(rendered).toContain("(none observed yet)");
+    expect(rendered).toContain("Gap: python: pull_not_supported");
+    expect(rendered).not.toContain("Diagnostics (0 found):");
   });
 });

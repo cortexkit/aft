@@ -32,6 +32,8 @@ export interface LspInspectResponse {
   disabled_lsp?: string[];
   lsp_paths_extra?: string[];
   matching_servers?: LspServerInspection[];
+  diagnostics_complete?: boolean;
+  diagnostics_gaps?: Array<{ server_id: string; reason: string }>;
   diagnostics_count?: number;
   diagnostics?: LspDiagnostic[];
   typescript_package_warning?: string;
@@ -223,14 +225,23 @@ export function renderLspInspection(inputFile: string, response: LspInspectRespo
 
   const diagnostics = response.diagnostics ?? [];
   lines.push("");
-  lines.push(`Diagnostics (${response.diagnostics_count ?? diagnostics.length} found):`);
+  const diagnosticsComplete = response.diagnostics_complete !== false;
+  const observed = response.diagnostics_count ?? diagnostics.length;
+  lines.push(
+    diagnosticsComplete
+      ? `Diagnostics (${observed} found):`
+      : `Diagnostics incomplete (${observed} observed):`,
+  );
   if (diagnostics.length === 0) {
-    lines.push("  (none)");
+    lines.push(diagnosticsComplete ? "  (none)" : "  (none observed yet)");
   }
   for (const diagnostic of diagnostics) {
     lines.push(
       `  ${diagnostic.file}:${diagnostic.line}:${diagnostic.column} [${diagnostic.severity}] ${diagnostic.message}`,
     );
+  }
+  for (const gap of response.diagnostics_gaps ?? []) {
+    lines.push(`  Gap: ${gap.server_id}: ${gap.reason}`);
   }
 
   return lines.join("\n");
