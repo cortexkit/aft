@@ -494,9 +494,9 @@ function buildSchema(): Record<string, unknown> {
           python: {
             type: "string",
             enum: ["pyright", "ty", "auto"],
-            default: "pyright",
+            default: "auto",
             description:
-              "Which Python LSP to use. 'ty' is experimental and falls back to pyright if unavailable.",
+              "Which Python LSP to use. 'auto' stays on Pyright while ty is experimental; select 'ty' explicitly to opt in without fallback.",
           },
           diagnostics_on_edit: {
             type: "boolean",
