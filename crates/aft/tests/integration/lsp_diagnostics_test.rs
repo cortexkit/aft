@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -210,7 +211,15 @@ fn config_change_type(params: &serde_json::Value, suffix: &str) -> i64 {
 }
 
 fn pyright_langserver_available() -> bool {
-    which::which("pyright-langserver").is_ok()
+    pyright_langserver_path().is_some()
+}
+
+fn pyright_langserver_path() -> Option<PathBuf> {
+    which::which("pyright-langserver").ok().or_else(|| {
+        std::env::var_os("AFT_TEST_PYRIGHT_LANGSERVER")
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+    })
 }
 
 fn pyright_extra_paths_workspace() -> (tempfile::TempDir, PathBuf, PathBuf, String) {
@@ -374,6 +383,66 @@ fn pyright_uses_pyrightconfig_extra_paths_above_nearer_requirements_marker() {
     assert!(
         !has_fakepkg_missing_import(&resolved_diagnostics),
         "pyright should honor pyrightconfig.json extraPaths from the selected workspace root; diagnostics: {resolved_diagnostics:?}"
+    );
+}
+
+#[test]
+fn pyright_uses_nested_workspace_virtualenv_for_imports() {
+    let Some(pyright) = pyright_langserver_path() else {
+        eprintln!(
+            "skipping nested virtualenv test: pyright-langserver not on PATH or AFT_TEST_PYRIGHT_LANGSERVER"
+        );
+        return;
+    };
+    let Ok(python) = which::which("python3").or_else(|_| which::which("python")) else {
+        eprintln!("skipping nested virtualenv test: Python interpreter not on PATH");
+        return;
+    };
+
+    let temp_dir = tempdir().expect("tempdir");
+    let repository = temp_dir.path().join("repository");
+    let backend = repository.join("backend");
+    let source = backend.join("app").join("main.py");
+    let virtualenv = backend.join(".venv");
+    fs::create_dir_all(source.parent().unwrap()).expect("create source directory");
+    fs::write(backend.join("pyproject.toml"), "[project]\nname = 'demo'\n")
+        .expect("write pyproject");
+    let status = Command::new(python)
+        .args(["-m", "venv"])
+        .arg(&virtualenv)
+        .status()
+        .expect("run python -m venv");
+    if !status.success() {
+        eprintln!("skipping nested virtualenv test: python -m venv failed");
+        return;
+    }
+    let virtualenv_python = if cfg!(windows) {
+        virtualenv.join("Scripts").join("python.exe")
+    } else {
+        virtualenv.join("bin").join("python")
+    };
+    let site_packages = Command::new(&virtualenv_python)
+        .args(["-c", "import site; print(site.getsitepackages()[0])"])
+        .output()
+        .expect("query virtualenv site-packages");
+    assert!(site_packages.status.success());
+    let fake_package =
+        PathBuf::from(String::from_utf8(site_packages.stdout).unwrap().trim()).join("fakepkg");
+    fs::create_dir_all(&fake_package).expect("create fake package");
+    fs::write(fake_package.join("__init__.py"), "VALUE = 1\n").expect("write fake package");
+    let source_text = "import fakepkg\n\nVALUE = fakepkg.VALUE\n";
+    fs::write(&source, source_text).expect("write source");
+    let config = Config {
+        project_root: Some(repository),
+        lsp_paths_extra: vec![pyright.parent().unwrap().to_path_buf()],
+        ..Config::default()
+    };
+
+    let diagnostics = pyright_diagnostics_for(&source, source_text, &config);
+
+    assert!(
+        !has_fakepkg_missing_import(&diagnostics),
+        "Pyright should resolve packages from the nested workspace virtualenv: {diagnostics:?}"
     );
 }
 

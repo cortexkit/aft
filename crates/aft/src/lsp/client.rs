@@ -299,14 +299,11 @@ impl LspClient {
                         // - workspace/configuration expects Vec<Value> (one per item)
                         // - Everything else gets null (safe default for registration/progress)
                         let response_value = if method == "workspace/configuration" {
-                            // Return an array of null configs — one per requested item.
-                            // Servers fall back to filesystem config (tsconfig, pyrightconfig, etc.)
-                            let item_count = params
-                                .as_ref()
-                                .and_then(|p| p.get("items"))
-                                .and_then(|items| items.as_array())
-                                .map_or(1, |arr| arr.len());
-                            serde_json::Value::Array(vec![serde_json::Value::Null; item_count])
+                            workspace_configuration_response(
+                                &reader_kind,
+                                &reader_root,
+                                params.as_ref(),
+                            )
                         } else {
                             serde_json::Value::Null
                         };
@@ -878,6 +875,50 @@ fn record_watched_file_registration(
     }
 }
 
+fn workspace_configuration_response(
+    kind: &ServerKind,
+    root: &Path,
+    params: Option<&Value>,
+) -> Value {
+    let items = params
+        .and_then(|params| params.get("items"))
+        .and_then(Value::as_array);
+    let python_path = (kind == &ServerKind::Python)
+        .then(|| project_python_path(root))
+        .flatten();
+
+    Value::Array(match items {
+        Some(items) => items
+            .iter()
+            .map(|item| {
+                if item.get("section").and_then(Value::as_str) == Some("python") {
+                    if let Some(path) = &python_path {
+                        return json!({ "pythonPath": path });
+                    }
+                }
+                Value::Null
+            })
+            .collect(),
+        None => vec![Value::Null],
+    })
+}
+
+fn project_python_path(root: &Path) -> Option<PathBuf> {
+    [root.join(".venv"), root.join("venv")]
+        .into_iter()
+        .find_map(|virtualenv| {
+            if cfg!(windows) {
+                let candidate = virtualenv.join("Scripts").join("python.exe");
+                return candidate.is_file().then_some(candidate);
+            }
+
+            ["python", "python3"]
+                .into_iter()
+                .map(|binary| virtualenv.join("bin").join(binary))
+                .find(|candidate| candidate.is_file())
+        })
+}
+
 /// Parse `ServerDiagnosticCapabilities` from a re-serialized
 /// `ServerCapabilities` JSON value.
 ///
@@ -1005,5 +1046,47 @@ mod tests {
         assert!(caps.refresh_support);
         // No diagnosticProvider → pull still false
         assert!(!caps.pull_diagnostics);
+    }
+
+    #[test]
+    fn pyright_configuration_uses_workspace_virtualenv_interpreter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let python = if cfg!(windows) {
+            root.join(".venv").join("Scripts").join("python.exe")
+        } else {
+            root.join(".venv").join("bin").join("python")
+        };
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::write(&python, []).unwrap();
+        let params = json!({
+            "items": [
+                { "section": "python" },
+                { "section": "pyright" }
+            ]
+        });
+
+        let response = workspace_configuration_response(&ServerKind::Python, root, Some(&params));
+
+        assert_eq!(response[0]["pythonPath"], python.display().to_string());
+        assert!(response[1].is_null());
+    }
+
+    #[test]
+    fn ty_configuration_does_not_receive_pyright_interpreter_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let python = if cfg!(windows) {
+            root.join(".venv").join("Scripts").join("python.exe")
+        } else {
+            root.join(".venv").join("bin").join("python")
+        };
+        std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+        std::fs::write(python, []).unwrap();
+        let params = json!({ "items": [{ "section": "python" }] });
+
+        let response = workspace_configuration_response(&ServerKind::Ty, root, Some(&params));
+
+        assert!(response[0].is_null());
     }
 }
