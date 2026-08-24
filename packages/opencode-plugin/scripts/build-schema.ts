@@ -469,7 +469,7 @@ function buildSchema(): Record<string, unknown> {
             type: "boolean",
             default: false,
             description:
-              "Use experimental Python `ty` type checker. Falls back to pyright if unavailable.",
+              "Run the experimental Python `ty` type checker alongside Pyright. Use lsp.python = 'ty' to select ty exclusively.",
           },
         },
         additionalProperties: false,
