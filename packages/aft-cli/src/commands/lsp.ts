@@ -302,7 +302,11 @@ function childDirs(path: string): string[] {
 
 function formatBinary(server: LspServerInspection): string {
   if (!server.binary_path) {
-    return `${server.binary_name} (NOT FOUND in workspace virtualenv, node_modules/.bin, lsp_paths_extra, or PATH)`;
+    const locations =
+      server.kind === "python" || server.kind === "ty"
+        ? "workspace virtualenv, node_modules/.bin, lsp_paths_extra, or PATH"
+        : "node_modules/.bin, lsp_paths_extra, or PATH";
+    return `${server.binary_name} (NOT FOUND in ${locations})`;
   }
   return `${server.binary_path} (found via ${server.binary_source})`;
 }
