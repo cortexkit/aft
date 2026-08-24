@@ -339,8 +339,9 @@ canonical shape is the top-level `bash` block shown above. `experimental` now ho
 ## Language servers (LSP)
 
 AFT runs language servers in-process for post-edit diagnostics and on-demand `lsp_diagnostics`
-calls. Servers are spawned lazily — only when a file matching their extensions is touched, and
-only if their binary is on `PATH`.
+calls. Servers are spawned lazily, only when a file matching their extensions is touched. Binary
+resolution prefers the selected nested workspace's `.venv` or `venv`, then its
+`node_modules/.bin`, AFT's managed cache, and finally `PATH`.
 
 **Built-in servers** (auto-registered, no config needed):
 
@@ -353,10 +354,13 @@ only if their binary is on `PATH`.
 | bash-language-server | `.sh .bash .zsh` | `bash-language-server` |
 | yaml-language-server | `.yaml .yml` | `yaml-language-server` |
 
-**Experimental:** `ty` (Astral's Python type checker) — gated behind
-`experimental.lsp_ty: true` or `lsp.python: "ty"`. When enabled, ty runs alongside Pyright
-unless you also disable Pyright via `lsp.disabled: ["python"]` (or use `lsp.python: "ty"`
-which does both automatically).
+**Python selection:** `lsp.python` defaults to `"auto"`. Auto runs exactly one producer and checks
+the nested Python workspace before global tools, in this order: `ty`, Pyright, BasedPyright. A
+workspace-local candidate always wins over a global candidate. BasedPyright occupies the existing
+`python` producer slot and is selected only when `basedpyright-langserver` is already installed;
+AFT does not auto-install it. Set `lsp.python: "ty"` or `"pyright"` to force that producer without
+fallback. The legacy `experimental.lsp_ty: true` setting still runs ty alongside Pyright unless
+Pyright is disabled.
 
 **Registering a custom server:** add it under `lsp.servers` in your config. The example
 configuration above shows registering `tinymist` for Typst files. Required fields per server:

@@ -297,8 +297,8 @@ pub struct Config {
     /// The plugin populates these from its own auto-install cache (e.g.
     /// `~/.cache/aft/lsp-packages/<pkg>/node_modules/.bin/`) so a binary AFT
     /// installed itself is discoverable without needing it on PATH.
-    /// Resolution order: `<project_root>/node_modules/.bin/<bin>` →
-    /// `lsp_paths_extra/<bin>` (in order) → PATH via `which`.
+    /// Resolution order: workspace `.venv`/`venv` →
+    /// workspace `node_modules/.bin` → `lsp_paths_extra` → PATH.
     pub lsp_paths_extra: Vec<PathBuf>,
     /// Binary names the hosting plugin knows how to auto-install.
     ///
