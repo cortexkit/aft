@@ -461,6 +461,117 @@ fn configure_warns_for_missing_builtin_and_custom_lsp_binaries() {
 }
 
 #[test]
+fn configure_finds_pyright_in_nested_workspace_virtualenv() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = dir.path().join("backend");
+    std::fs::create_dir_all(backend.join("app")).unwrap();
+    std::fs::write(backend.join("pyproject.toml"), "[project]\nname = 'demo'\n").unwrap();
+    std::fs::write(backend.join("app").join("main.py"), "print('ok')\n").unwrap();
+    let virtualenv_bin = if cfg!(windows) {
+        backend.join(".venv").join("Scripts")
+    } else {
+        backend.join(".venv").join("bin")
+    };
+    std::fs::create_dir_all(&virtualenv_bin).unwrap();
+    let binary = if cfg!(windows) {
+        virtualenv_bin.join("pyright-langserver.exe")
+    } else {
+        virtualenv_bin.join("pyright-langserver")
+    };
+    std::fs::write(binary, []).unwrap();
+
+    let path = empty_path();
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let configure = aft.send(
+        &json!({
+            "id": "cfg-nested-python-lsp",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir.path(),
+            "lsp_auto_install_binaries": ["pyright-langserver"],
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+    let configure = aft.merge_configure_warnings(configure);
+    assert!(
+        warning_with_kind(
+            &configure,
+            "lsp_binary_missing",
+            "binary",
+            "pyright-langserver",
+        )
+        .is_none(),
+        "nested virtualenv binary should suppress the missing warning: {configure:?}"
+    );
+
+    let shutdown = aft.shutdown();
+    assert!(shutdown.success());
+}
+
+#[test]
+fn configure_deduplicates_nested_python_builtin_override() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = dir.path().join("backend");
+    std::fs::create_dir_all(backend.join("app")).unwrap();
+    std::fs::write(backend.join("pyproject.toml"), "[project]\nname = 'demo'\n").unwrap();
+    std::fs::write(backend.join("app").join("main.py"), "print('ok')\n").unwrap();
+    let virtualenv_bin = if cfg!(windows) {
+        backend.join(".venv").join("Scripts")
+    } else {
+        backend.join(".venv").join("bin")
+    };
+    std::fs::create_dir_all(&virtualenv_bin).unwrap();
+    let binary_name = "nested-pyright";
+    let binary = if cfg!(windows) {
+        virtualenv_bin.join(format!("{binary_name}.exe"))
+    } else {
+        virtualenv_bin.join(binary_name)
+    };
+    std::fs::write(binary, []).unwrap();
+
+    let path = empty_path();
+    let mut aft = AftProcess::spawn_with_env(&[("PATH", path.as_os_str())]);
+    let configure = aft.send(
+        &json!({
+            "id": "cfg-nested-python-override",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir.path(),
+            "lsp_auto_install_binaries": [binary_name],
+            "config": user_config(serde_json::json!({
+                "lsp": {
+                    "servers": {
+                        "python": {
+                            "binary": binary_name,
+                            "root_markers": ["pyproject.toml"]
+                        }
+                    }
+                }
+            }))
+        })
+        .to_string(),
+    );
+
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+    let configure = aft.merge_configure_warnings(configure);
+    assert!(
+        warning_with_kind(&configure, "lsp_binary_missing", "binary", binary_name,).is_none(),
+        "file-driven resolution should deduplicate the raw override: {configure:?}"
+    );
+
+    let shutdown = aft.shutdown();
+    assert!(shutdown.success());
+}
+
+#[test]
 fn configure_does_not_warn_for_file_discovered_non_auto_installable_lsp() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("Program.cs"), "class Program {}\n").unwrap();

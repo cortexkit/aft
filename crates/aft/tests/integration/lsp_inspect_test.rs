@@ -179,3 +179,135 @@ fn lsp_inspect_reports_custom_server_ok_with_diagnostics() {
     let shutdown = aft.shutdown();
     assert!(shutdown.success());
 }
+
+#[test]
+fn lsp_inspect_reports_nested_python_virtualenv_binary() {
+    let dir = tempdir().unwrap();
+    let backend = dir.path().join("backend");
+    let file = backend.join("app").join("main.py");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(backend.join("pyproject.toml"), "[project]\nname = 'demo'\n").unwrap();
+    std::fs::write(&file, "print('ok')\n").unwrap();
+
+    let fake_server = fake_server_path();
+    let virtualenv_bin = if cfg!(windows) {
+        backend.join(".venv").join("Scripts")
+    } else {
+        backend.join(".venv").join("bin")
+    };
+    std::fs::create_dir_all(&virtualenv_bin).unwrap();
+    let installed_server = if cfg!(windows) {
+        virtualenv_bin.join("pyright-langserver.exe")
+    } else {
+        virtualenv_bin.join("pyright-langserver")
+    };
+    std::fs::copy(&fake_server, &installed_server).unwrap();
+    warm_executable(&installed_server, &["--stdio"]);
+
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("AFT_FAKE_LSP_PULL", std::ffi::OsStr::new("1")),
+        ("PATH", empty_path().as_os_str()),
+    ]);
+    let configure = aft.send(
+        &json!({
+            "id": "cfg-nested-python-lsp",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": dir.path(),
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+
+    let response = aft.send(
+        &json!({
+            "id": "inspect-nested-python-lsp",
+            "command": "lsp_inspect",
+            "file": file,
+        })
+        .to_string(),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:?}");
+    let servers = response["matching_servers"].as_array().unwrap();
+    assert_eq!(servers.len(), 1, "response: {response:?}");
+    assert_eq!(servers[0]["id"], "python");
+    assert_eq!(servers[0]["binary_source"], "project_virtualenv");
+    assert_eq!(servers[0]["workspace_root"], backend.display().to_string());
+    assert_eq!(
+        servers[0]["binary_path"],
+        installed_server.display().to_string()
+    );
+    assert_eq!(servers[0]["spawn_status"], "ok");
+    assert_eq!(response["diagnostics_count"], 1);
+
+    let shutdown = aft.shutdown();
+    assert!(shutdown.success());
+}
+
+#[test]
+fn lsp_inspect_classifies_non_python_binary_against_project_root() {
+    let dir = tempdir().unwrap();
+    let repository = dir.path().join("repository");
+    let package = repository.join("packages").join("app");
+    let file = package.join("main.ts");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("package.json"), "{\"name\":\"app\"}\n").unwrap();
+    std::fs::write(&file, "export const value = 1;\n").unwrap();
+
+    let fake_server = fake_server_path();
+    let project_bin = repository.join("node_modules").join(".bin");
+    std::fs::create_dir_all(&project_bin).unwrap();
+    let installed_server = if cfg!(windows) {
+        project_bin.join("typescript-language-server.exe")
+    } else {
+        project_bin.join("typescript-language-server")
+    };
+    std::fs::copy(&fake_server, &installed_server).unwrap();
+    warm_executable(&installed_server, &["--stdio"]);
+
+    let mut aft = AftProcess::spawn_with_env(&[("AFT_FAKE_LSP_PULL", std::ffi::OsStr::new("1"))]);
+    let configure = aft.send(
+        &json!({
+            "id": "cfg-nested-typescript-lsp",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": repository,
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+
+    let response = aft.send(
+        &json!({
+            "id": "inspect-nested-typescript-lsp",
+            "command": "lsp_inspect",
+            "file": file,
+        })
+        .to_string(),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:?}");
+    let server = response["matching_servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|server| server["id"] == "typescript")
+        .expect("TypeScript server inspection");
+    assert_eq!(server["binary_source"], "project_node_modules");
+    assert_eq!(server["workspace_root"], package.display().to_string());
+    assert_eq!(
+        server["binary_path"],
+        installed_server.display().to_string()
+    );
+    assert_eq!(server["spawn_status"], "ok");
+
+    let shutdown = aft.shutdown();
+    assert!(shutdown.success());
+}

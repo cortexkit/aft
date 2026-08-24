@@ -22,7 +22,9 @@ use crate::context::{
 };
 use crate::harness::Harness;
 use crate::log_ctx;
-use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerKind};
+use crate::lsp::registry::{
+    resolve_lsp_binary, resolve_server_binary, servers_for_file, ServerKind,
+};
 use crate::parser::{detect_language, LangId, SharedSymbolCache};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
@@ -948,6 +950,33 @@ fn is_custom_server(kind: &ServerKind) -> bool {
     matches!(kind, ServerKind::Custom(_))
 }
 
+fn configured_lsp_binary_resolves(
+    configured: &crate::config::UserServerDef,
+    files: &[PathBuf],
+    config: &crate::config::Config,
+) -> bool {
+    let project_root = config.project_root.as_deref();
+    for file in files {
+        if let Some(server) = servers_for_file(file, config).into_iter().find(|server| {
+            server.kind.id_str() == configured.id && server.binary == configured.binary
+        }) {
+            let workspace_root = if matches!(server.kind, ServerKind::Python | ServerKind::Ty) {
+                server.workspace_root_for_file_with_project_root(file, project_root)
+            } else {
+                project_root.map(Path::to_path_buf)
+            };
+            return resolve_server_binary(&server, workspace_root.as_deref(), config).is_some();
+        }
+    }
+
+    resolve_lsp_binary(
+        &configured.binary,
+        project_root,
+        &config.lsp_paths_extra,
+    )
+    .is_some()
+}
+
 fn lsp_missing_hint(binary: &str) -> String {
     crate::format::install_hint(binary)
 }
@@ -1321,20 +1350,31 @@ fn detect_missing_tools_for_languages(
 
 fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config) -> Vec<Value> {
     let mut warnings = Vec::new();
-    let mut seen = HashSet::new();
-    let mut resolved_binaries = HashSet::new();
-    let mut missing_binaries = HashSet::new();
+    let mut seen_resolutions = HashSet::new();
+    let mut file_driven_servers = HashSet::new();
+    let mut seen_explicit_servers = HashSet::new();
+    let mut warned_binaries = HashSet::new();
 
     let project_root = config.project_root.as_deref();
-    let extra_paths = &config.lsp_paths_extra;
 
     for file in files {
         for server in servers_for_file(&file, config) {
+            let workspace_root = if matches!(server.kind, ServerKind::Python | ServerKind::Ty) {
+                server.workspace_root_for_file_with_project_root(file, project_root)
+            } else {
+                project_root.map(Path::to_path_buf)
+            };
+            let identity = (server.kind.id_str().to_string(), server.binary.clone());
             if is_custom_server(&server.kind)
-                || !seen.insert((server.kind.id_str().to_string(), server.binary.clone()))
+                || !seen_resolutions.insert((
+                    server.kind.id_str().to_string(),
+                    server.binary.clone(),
+                    workspace_root.clone(),
+                ))
             {
                 continue;
             }
+            file_driven_servers.insert(identity);
 
             if !config.lsp_auto_install_binaries.contains(&server.binary) {
                 continue;
@@ -1344,15 +1384,9 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
                 continue;
             }
 
-            if !resolved_binaries.contains(&server.binary) {
-                if resolve_lsp_binary(&server.binary, project_root, extra_paths).is_some() {
-                    resolved_binaries.insert(server.binary.clone());
-                } else {
-                    missing_binaries.insert(server.binary.clone());
-                }
-            }
-
-            if missing_binaries.contains(&server.binary) {
+            if resolve_server_binary(&server, workspace_root.as_deref(), config).is_none()
+                && warned_binaries.insert(server.binary.clone())
+            {
                 warnings.push(json!({
                     "kind": "lsp_binary_missing",
                     "server": server.binary,
@@ -1372,7 +1406,11 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
             continue;
         }
 
-        if server.disabled || !seen.insert((server.id.clone(), server.binary.clone())) {
+        let identity = (server.id.clone(), server.binary.clone());
+        if server.disabled
+            || file_driven_servers.contains(&identity)
+            || !seen_explicit_servers.insert(identity)
+        {
             continue;
         }
 
@@ -1380,15 +1418,9 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
             continue;
         }
 
-        if !resolved_binaries.contains(&server.binary) {
-            if resolve_lsp_binary(&server.binary, project_root, extra_paths).is_some() {
-                resolved_binaries.insert(server.binary.clone());
-            } else {
-                missing_binaries.insert(server.binary.clone());
-            }
-        }
-
-        if missing_binaries.contains(&server.binary) {
+        if !configured_lsp_binary_resolves(server, files, config)
+            && warned_binaries.insert(server.binary.clone())
+        {
             warnings.push(json!({
                 "kind": "lsp_binary_missing",
                 "server": server.id,

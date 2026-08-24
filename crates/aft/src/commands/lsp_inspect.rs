@@ -5,7 +5,7 @@ use serde::Deserialize;
 use crate::context::AppContext;
 use crate::lsp::diagnostics::StoredDiagnostic;
 use crate::lsp::manager::{PullFileOutcome, ServerAttempt, ServerAttemptResult};
-use crate::lsp::registry::{resolve_lsp_binary, servers_for_file, ServerDef};
+use crate::lsp::registry::{resolve_server_binary, servers_for_file, ServerDef, ServerKind};
 use crate::protocol::{RawRequest, Response};
 
 #[derive(Debug, Deserialize)]
@@ -117,16 +117,14 @@ fn inspect_server(
             def.workspace_root_for_file_with_project_root(canonical, config.project_root.as_deref())
         }
     };
-    let binary_path = resolve_lsp_binary(
-        &def.binary,
-        workspace_root.as_deref(),
-        &config.lsp_paths_extra,
-    );
-    let binary_source = classify_binary_source(
-        &binary_path,
-        workspace_root.as_deref(),
-        &config.lsp_paths_extra,
-    );
+    let binary_path = resolve_server_binary(def, workspace_root.as_deref(), config);
+    let resolution_root = if matches!(def.kind, ServerKind::Python | ServerKind::Ty) {
+        workspace_root.as_deref()
+    } else {
+        config.project_root.as_deref()
+    };
+    let binary_source =
+        classify_binary_source(&binary_path, resolution_root, &config.lsp_paths_extra);
     let spawn_status = attempt
         .map(|attempt| spawn_status(&attempt.result))
         .unwrap_or_else(|| "not_attempted".to_string());
