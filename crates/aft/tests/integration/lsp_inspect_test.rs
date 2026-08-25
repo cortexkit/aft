@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde_json::json;
 use tempfile::tempdir;
 
-use super::helpers::{user_config, warm_executable, AftProcess};
+use super::helpers::{canonicalize_like_product, user_config, warm_executable, AftProcess};
 
 fn empty_path() -> std::ffi::OsString {
     std::ffi::OsString::new()
@@ -233,10 +233,15 @@ fn lsp_inspect_reports_nested_python_virtualenv_binary() {
     assert_eq!(servers.len(), 1, "response: {response:?}");
     assert_eq!(servers[0]["id"], "python");
     assert_eq!(servers[0]["binary_source"], "project_virtualenv");
-    assert_eq!(servers[0]["workspace_root"], backend.display().to_string());
+    assert_eq!(
+        servers[0]["workspace_root"],
+        canonicalize_like_product(&backend).display().to_string()
+    );
     assert_eq!(
         servers[0]["binary_path"],
-        installed_server.display().to_string()
+        canonicalize_like_product(&installed_server)
+            .display()
+            .to_string()
     );
     assert_eq!(servers[0]["spawn_status"], "ok");
     assert_eq!(response["diagnostics_complete"], false);
@@ -300,10 +305,15 @@ fn lsp_inspect_classifies_nested_python_node_modules_binary() {
     assert_eq!(response["success"], true, "inspect failed: {response:?}");
     let server = &response["matching_servers"][0];
     assert_eq!(server["binary_source"], "project_node_modules");
-    assert_eq!(server["workspace_root"], backend.display().to_string());
+    assert_eq!(
+        server["workspace_root"],
+        canonicalize_like_product(&backend).display().to_string()
+    );
     assert_eq!(
         server["binary_path"],
-        installed_server.display().to_string()
+        canonicalize_like_product(&installed_server)
+            .display()
+            .to_string()
     );
     assert_eq!(server["spawn_status"], "ok");
 
@@ -364,7 +374,10 @@ fn lsp_inspect_classifies_non_python_binary_against_project_root() {
         .find(|server| server["id"] == "typescript")
         .expect("TypeScript server inspection");
     assert_eq!(server["binary_source"], "project_node_modules");
-    assert_eq!(server["workspace_root"], package.display().to_string());
+    assert_eq!(
+        server["workspace_root"],
+        canonicalize_like_product(&package).display().to_string()
+    );
     assert_eq!(
         server["binary_path"],
         installed_server.display().to_string()
