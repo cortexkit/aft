@@ -686,7 +686,7 @@ impl LspManager {
                     return client.state() != ServerState::Ready;
                 }
                 !self.failed_spawns.contains_key(&key)
-                    && self.resolve_binary(&definition, config).is_ok()
+                    && self.resolve_binary(&definition, &key.root, config).is_ok()
             })
     }
 
