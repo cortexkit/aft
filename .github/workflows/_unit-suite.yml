@@ -245,6 +245,13 @@ jobs:
 
       - uses: taiki-e/install-action@nextest
 
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Install Pyright integration dependency
+        run: npm install --global pyright@1.1.411
+
       - uses: actions/download-artifact@v4
         with:
           name: linux-nextest-archive
