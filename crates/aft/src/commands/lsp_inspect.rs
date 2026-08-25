@@ -185,6 +185,9 @@ fn classify_binary_source(
         if path.starts_with(root.join(".venv")) || path.starts_with(root.join("venv")) {
             return "project_virtualenv";
         }
+        if path.starts_with(root.join("node_modules").join(".bin")) {
+            return "project_node_modules";
+        }
     }
     if let Some(root) = project_root {
         if path.starts_with(root.join("node_modules").join(".bin")) {

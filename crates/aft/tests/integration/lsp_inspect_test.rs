@@ -251,6 +251,67 @@ fn lsp_inspect_reports_nested_python_virtualenv_binary() {
 }
 
 #[test]
+fn lsp_inspect_classifies_nested_python_node_modules_binary() {
+    let dir = tempdir().unwrap();
+    let repository = dir.path().join("repository");
+    let backend = repository.join("backend");
+    let file = backend.join("app").join("main.py");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(backend.join("pyproject.toml"), "[project]\nname = 'demo'\n").unwrap();
+    std::fs::write(&file, "print('ok')\n").unwrap();
+
+    let nested_bin = backend.join("node_modules").join(".bin");
+    std::fs::create_dir_all(&nested_bin).unwrap();
+    let installed_server = if cfg!(windows) {
+        nested_bin.join("pyright-langserver.exe")
+    } else {
+        nested_bin.join("pyright-langserver")
+    };
+    std::fs::copy(fake_server_path(), &installed_server).unwrap();
+    warm_executable(&installed_server, &["--stdio"]);
+
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("AFT_FAKE_LSP_PULL", std::ffi::OsStr::new("1")),
+        ("PATH", empty_path().as_os_str()),
+    ]);
+    let configure = aft.send(
+        &json!({
+            "id": "cfg-nested-python-node-lsp",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": repository,
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+
+    let response = aft.send(
+        &json!({
+            "id": "inspect-nested-python-node-lsp",
+            "command": "lsp_inspect",
+            "file": file,
+        })
+        .to_string(),
+    );
+
+    assert_eq!(response["success"], true, "inspect failed: {response:?}");
+    let server = &response["matching_servers"][0];
+    assert_eq!(server["binary_source"], "project_node_modules");
+    assert_eq!(server["workspace_root"], backend.display().to_string());
+    assert_eq!(
+        server["binary_path"],
+        installed_server.display().to_string()
+    );
+    assert_eq!(server["spawn_status"], "ok");
+
+    let shutdown = aft.shutdown();
+    assert!(shutdown.success());
+}
+
+#[test]
 fn lsp_inspect_classifies_non_python_binary_against_project_root() {
     let dir = tempdir().unwrap();
     let repository = dir.path().join("repository");
