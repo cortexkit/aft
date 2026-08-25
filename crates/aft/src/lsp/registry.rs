@@ -43,8 +43,8 @@ pub fn resolve_lsp_binary(
     which::which(binary).ok()
 }
 
-/// Resolve a server binary, adding nested virtualenv lookup only for Python
-/// producers while preserving the generic resolver for every other language.
+/// Resolve a server binary, adding nested Python workspace lookup before the
+/// configured project-root resolver used by every other language.
 pub fn resolve_server_binary(
     server: &ServerDef,
     workspace_root: Option<&Path>,
@@ -56,6 +56,15 @@ pub fn resolve_server_binary(
         if let Some(root) = workspace_root.or(config.project_root.as_deref()) {
             if let Some(found) = probe_project_virtualenv(root, &server.binary) {
                 return Some(found);
+            }
+        }
+        if let Some(root) = workspace_root {
+            if config.project_root.as_deref() != Some(root) {
+                if let Some(found) =
+                    probe_dir(&root.join("node_modules").join(".bin"), &server.binary)
+                {
+                    return Some(found);
+                }
             }
         }
     }
@@ -1591,6 +1600,36 @@ mod tests {
         assert_eq!(
             resolve_server_binary(&server, Some(&workspace), &config),
             Some(hoisted)
+        );
+    }
+
+    #[test]
+    fn python_resolver_prefers_workspace_node_modules_over_project_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path();
+        let workspace = project.join("backend");
+        let workspace_bin = workspace.join("node_modules").join(".bin");
+        let project_bin = project.join("node_modules").join(".bin");
+        let binary_name = if cfg!(windows) {
+            "pyright-langserver.cmd"
+        } else {
+            "pyright-langserver"
+        };
+        let nested = workspace_bin.join(binary_name);
+        touch_exe(&nested);
+        touch_exe(&project_bin.join(binary_name));
+        let server = builtin_servers()
+            .into_iter()
+            .find(|server| server.kind == ServerKind::Python)
+            .unwrap();
+        let config = Config {
+            project_root: Some(project.to_path_buf()),
+            ..Config::default()
+        };
+
+        assert_eq!(
+            resolve_server_binary(&server, Some(&workspace), &config),
+            Some(nested)
         );
     }
 
