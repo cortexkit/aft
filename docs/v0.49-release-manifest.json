@@ -3,7 +3,7 @@
   "artifact_id": "ART-V049-S6-RELEASE-MANIFEST-001",
   "artifact_version": "0.49.0",
   "manifest_id": "MAN-V049-S6-RELEASE-001",
-  "source_commit": "aa2e6aef954e9b3a6ecd12e82c0b4212d2f54a29",
+  "source_commit": "83d64bf6a23facd53fc0538e4a73f79fba913723",
   "source_surface_manifest": "docs/v0.49-agent-surface-manifest.json",
   "distribution_manifest": "MAN-V049-DISTRIBUTION-ARTIFACTS-001",
   "hash_rule": "Hash exact UTF-8 bytes and binary bytes; do not normalize newlines, reserialize JSON, or use test-only normalization.",
