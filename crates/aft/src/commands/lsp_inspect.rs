@@ -63,6 +63,12 @@ pub fn handle_lsp_inspect(req: &RawRequest, ctx: &AppContext) -> Response {
                 Ok(results) => results,
                 Err(err) => {
                     crate::slog_warn!("[lsp_inspect] pull_file_diagnostics failed: {err}");
+                    let server_ids = outcomes
+                        .successful
+                        .iter()
+                        .map(|server_key| server_key.kind.id_str().to_string())
+                        .collect::<Vec<_>>();
+                    diagnostics_gaps.extend(pull_failure_gaps(&server_ids, &err.to_string()));
                     Vec::new()
                 }
             }
@@ -212,6 +218,18 @@ fn pull_status(outcome: &PullFileOutcome) -> String {
     }
 }
 
+fn pull_failure_gaps(server_ids: &[String], reason: &str) -> Vec<serde_json::Value> {
+    server_ids
+        .iter()
+        .map(|server_id| {
+            serde_json::json!({
+                "server_id": server_id,
+                "reason": format!("pull_failed: {reason}"),
+            })
+        })
+        .collect()
+}
+
 fn collect_file_diagnostics(ctx: &AppContext, canonical: &Path) -> Vec<StoredDiagnostic> {
     let lsp = ctx.lsp();
     lsp.get_diagnostics_for_file(canonical)
@@ -258,4 +276,16 @@ fn sorted_disabled_lsp(disabled: &std::collections::HashSet<String>) -> Vec<Stri
 
 fn normalize_query_path(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn top_level_pull_failure_produces_incomplete_gaps() {
+        let gaps = super::pull_failure_gaps(&["python".to_string()], "didOpen failed");
+
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0]["server_id"], "python");
+        assert_eq!(gaps[0]["reason"], "pull_failed: didOpen failed");
+    }
 }
