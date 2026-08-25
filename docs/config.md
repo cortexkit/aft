@@ -359,9 +359,10 @@ only if their binary can be resolved from project `node_modules/.bin`, AFT's man
 `experimental.lsp_ty: true` or `lsp.python: "ty"`. When enabled, ty runs alongside Pyright
 unless you also disable Pyright via `lsp.disabled: ["python"]` (or use `lsp.python: "ty"`
 which does both automatically). Python-family servers first look for their binary in the selected
-nested workspace's `.venv` or `venv`, before falling back to workspace `node_modules/.bin`, AFT's
-managed cache, and `PATH`. While ty remains alpha, `lsp.python: "auto"` stays on Pyright rather
-than silently changing diagnostic semantics based on which binaries happen to be installed.
+nested workspace's `.venv` or `venv`, then its `node_modules/.bin`, the configured project root's
+`node_modules/.bin`, AFT's managed cache, and `PATH`. While ty remains alpha,
+`lsp.python: "auto"` stays on Pyright rather than silently changing diagnostic semantics based on
+which binaries happen to be installed.
 For Pyright, AFT also returns the selected virtualenv interpreter through Pyright's
 `workspace/configuration` request so imports resolve against that environment.
 Project-local language-server binaries and the interpreter selected for Pyright can execute with
