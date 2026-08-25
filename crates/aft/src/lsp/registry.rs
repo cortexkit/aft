@@ -69,7 +69,14 @@ pub fn resolve_server_binary(
         }
     }
 
-    let project_root = config.project_root.as_deref().or(workspace_root);
+    // Python-family may fall back to the workspace root when no project root
+    // is configured; every other language keeps the pre-existing ladder rooted
+    // strictly at the configured project root.
+    let project_root = if python_family {
+        config.project_root.as_deref().or(workspace_root)
+    } else {
+        config.project_root.as_deref()
+    };
     resolve_lsp_binary(&server.binary, project_root, &config.lsp_paths_extra)
 }
 
@@ -1684,6 +1691,28 @@ mod tests {
         assert_eq!(
             resolved.as_deref(),
             Some(repository_bin.join("typescript-language-server").as_path())
+        );
+    }
+
+    #[test]
+    fn non_python_without_project_root_ignores_workspace_node_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("backend");
+        let workspace_bin = workspace.join("node_modules").join(".bin");
+        touch_exe(&workspace_bin.join("typescript-language-server"));
+        let config = Config::default();
+        let server = builtin_servers()
+            .into_iter()
+            .find(|server| server.kind == ServerKind::TypeScript)
+            .unwrap();
+
+        // The generic ladder stays rooted at the configured project root only;
+        // with none configured it must not adopt the workspace root. (A PATH
+        // install may still resolve, so assert on provenance, not absence.)
+        let resolved = resolve_server_binary(&server, Some(&workspace), &config);
+        assert!(
+            resolved.map_or(true, |path| !path.starts_with(&workspace)),
+            "generic resolution must not adopt the workspace root"
         );
     }
 

@@ -885,7 +885,11 @@ fn workspace_configuration_response(
         .and_then(Value::as_array);
     let python_path = (kind == &ServerKind::Python)
         .then(|| project_python_path(root))
-        .flatten();
+        .flatten()
+        // Lossy on purpose: PathBuf's Serialize rejects non-UTF-8 bytes and a
+        // panic here would wedge the reader thread mid-handshake. A lossy
+        // interpreter path degrades one exotic workspace instead.
+        .map(|path| path.to_string_lossy().into_owned());
 
     Value::Array(match items {
         Some(items) => items

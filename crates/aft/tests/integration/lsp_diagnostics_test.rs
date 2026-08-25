@@ -412,10 +412,9 @@ fn pyright_uses_nested_workspace_virtualenv_for_imports() {
         .arg(&virtualenv)
         .status()
         .expect("run python -m venv");
-    if !status.success() {
-        eprintln!("skipping nested virtualenv test: python -m venv failed");
-        return;
-    }
+    // A present-but-broken Python is an environment failure, not a missing
+    // prerequisite: fail loud so the CI lane cannot go vacuously green.
+    assert!(status.success(), "python -m venv failed");
     let virtualenv_python = if cfg!(windows) {
         virtualenv.join("Scripts").join("python.exe")
     } else {
