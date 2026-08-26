@@ -225,8 +225,11 @@ if phase_enabled lib; then
       cargo nextest run --workspace --lib --bins --profile unit -- \
         --skip platform_verifier_tls_client_subprocess
   else
-    run_phase "cargo test --workspace --lib --bins --quiet" \
-      cargo test --workspace --lib --bins --quiet -- \
+    # PROBE (branch-only): serial, named output - the log's last started test
+    # is the one terminating the process on Windows.
+    run_phase "cargo test --workspace --lib --bins (serial probe)" \
+      cargo test --workspace --lib --bins -- \
+        --test-threads=1 \
         --skip platform_verifier_tls_client_subprocess
   fi
 fi
