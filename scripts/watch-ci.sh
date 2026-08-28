@@ -18,6 +18,14 @@ set -uo pipefail
 
 REPO="${REPO:-cortexkit/aft}"
 RID="${1:-}"
+# The only positional is a numeric run id. A flag-shaped or non-numeric arg
+# (e.g. a misremembered --sha invocation) would otherwise become the "run id",
+# drive `gh run view` into poll-error, and spin this watch forever - hanging
+# any chain that expects it to exit and notify.
+if [ -n "$RID" ] && ! [[ "$RID" =~ ^[0-9]+$ ]]; then
+  echo "watch-ci: run id must be numeric (got '$RID'); pass nothing to watch HEAD's run" >&2
+  exit 2
+fi
 if [ -z "$RID" ]; then
   # Grabbing the newest run right after a push races run creation and latches
   # a stale (often already-failed) run. Resolve the run FOR THE LOCAL HEAD SHA,

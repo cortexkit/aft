@@ -3195,14 +3195,18 @@ mod tests {
             translated.args.get("shell"),
             Some(&Value::String("powershell".into()))
         );
-        // Join through PathBuf so the expected string carries the platform's
-        // native separator (Windows resolves this as /project\scripts).
-        let expected_workdir = Path::new("/project").join("scripts");
+        // Compare as paths, not strings: the product re-joins every component
+        // with the native separator (Windows renders \project\scripts), so no
+        // single expected literal is right on both platforms. Path equality is
+        // component-based and separator-agnostic.
+        let workdir = translated
+            .args
+            .get("workdir")
+            .and_then(Value::as_str)
+            .expect("workdir must translate");
         assert_eq!(
-            translated.args.get("workdir"),
-            Some(&Value::String(
-                expected_workdir.to_string_lossy().into_owned()
-            ))
+            Path::new(workdir),
+            Path::new("/project").join("scripts").as_path()
         );
     }
 
