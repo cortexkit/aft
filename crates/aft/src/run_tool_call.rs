@@ -399,7 +399,9 @@ fn raw_request_from_translated(
     }
 
     params.remove("id");
-    params.remove("command");
+    if command != "bash" {
+        params.remove("command");
+    }
     params.remove("session_id");
     let lsp_hints = params.remove("lsp_hints").filter(|value| !value.is_null());
 
@@ -670,6 +672,34 @@ mod tests {
                 .expect_err("legacy path rejects the duplicate alias");
 
             assert_eq!(direct_error, legacy_error);
+        }
+
+        #[test]
+        fn direct_raw_request_preserves_bash_command_param() {
+            let params = object(json!({
+                "command": "echo standalone-tool-call-ok",
+                "background": false,
+            }));
+            let ctx = context(false);
+            let request = raw_request_from_translated("bash".to_string(), params, &ctx)
+                .expect("bash request");
+
+            assert_eq!(request.command, "bash");
+            assert_eq!(
+                request.params.get("command").and_then(Value::as_str),
+                Some("echo standalone-tool-call-ok")
+            );
+        }
+
+        #[test]
+        fn direct_raw_request_still_strips_command_param_for_non_bash_tools() {
+            let params = object(json!({"command": "agent-supplied-command"}));
+            let ctx = context(false);
+            let request = raw_request_from_translated("read".to_string(), params, &ctx)
+                .expect("read request");
+
+            assert_eq!(request.command, "read");
+            assert!(request.params.get("command").is_none());
         }
     }
 }

@@ -193,6 +193,66 @@ fn agent_supplied_argument_preview_is_ignored_and_normal_tool_call_mutates() {
 }
 
 #[test]
+fn tool_call_bash_preserves_command_argument_for_standalone_dispatch() {
+    let dir = tempfile::tempdir().expect("temp project");
+    let root = dir.path();
+
+    let mut aft = AftProcess::spawn();
+    let configure = aft.configure(root);
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:#}"
+    );
+
+    let response = send_tool_call(
+        &mut aft,
+        "bash-command-envelope",
+        "bash",
+        json!({
+            "command": "echo standalone-tool-call-ok",
+            "compressed": false,
+        }),
+        false,
+    );
+    assert_eq!(response["success"], true, "response: {response:#}");
+    let task_id = response["task_id"].as_str().expect("bash task id");
+    let started = std::time::Instant::now();
+    let completed = loop {
+        let status = aft.send(
+            &json!({
+                "id": "bash-command-envelope-status",
+                "session_id": SESSION_ID,
+                "command": "bash_status",
+                "params": { "task_id": task_id },
+            })
+            .to_string(),
+        );
+        assert_eq!(status["success"], true, "status: {status:#}");
+        match status["status"].as_str().unwrap_or_default() {
+            "completed" => break status,
+            "failed" | "killed" | "timed_out" => {
+                panic!("bash task ended unsuccessfully: {status:#}")
+            }
+            _ => {}
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "timed out waiting for bash task: {status:#}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    assert!(
+        completed["output_preview"]
+            .as_str()
+            .is_some_and(|text| text.contains("standalone-tool-call-ok")),
+        "completed bash output missing sentinel: {completed:#}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn tool_call_bash_wait_rejects_stringified_background_and_pty() {
     let dir = tempfile::tempdir().expect("temp project");
     let root = dir.path();
