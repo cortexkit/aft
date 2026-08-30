@@ -792,6 +792,12 @@ fn dispatch_liveness_metrics(executor: &Executor) -> Value {
             },
             "interactive_reserve": snapshot.interactive_reserve,
             "maintenance_cap": snapshot.maintenance_cap,
+            "interactive_queue_cap": snapshot.interactive_queue_cap,
+            "interactive_actor_queue_cap": snapshot.interactive_actor_queue_cap,
+            "maintenance_queue_cap": snapshot.maintenance_queue_cap,
+            "interactive_admission_rejections": snapshot.interactive_admission_rejections,
+            "maintenance_admission_rejections": snapshot.maintenance_admission_rejections,
+            "deadline_expiries": snapshot.deadline_expiries,
         }),
         None => json!({ "scheduler_busy": true }),
     }
@@ -1263,6 +1269,7 @@ mod tests {
             actor_cap: 1,
             heavy_permits: 1,
             drr_quantum: 1,
+            ..crate::executor::ExecutorConfig::default()
         });
         let (_dir, root) = test_root("health-tier2-first-scan");
         let mut config = crate::config::Config::default();
@@ -1346,6 +1353,7 @@ mod tests {
             actor_cap: 1,
             heavy_permits: 1,
             drr_quantum: 1,
+            ..crate::executor::ExecutorConfig::default()
         });
         let (_dir, root) = test_root("health-callgraph-repair-rate");
         assert!(executor.register_actor(root.clone(), test_ctx()));
@@ -1405,6 +1413,7 @@ mod tests {
             actor_cap: 1,
             heavy_permits: 2,
             drr_quantum: 1,
+            ..crate::executor::ExecutorConfig::default()
         });
         let (_dir_a, root_a) = test_root("health-liveness-a");
         let (_dir_b, root_b) = test_root("health-liveness-b");
@@ -1484,6 +1493,7 @@ mod tests {
             actor_cap: 1,
             heavy_permits: 1,
             drr_quantum: 1,
+            ..crate::executor::ExecutorConfig::default()
         });
         let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
         let app = crate::context::App::default_shared();
@@ -1548,6 +1558,7 @@ mod tests {
             actor_cap: 1,
             heavy_permits: 1,
             drr_quantum: 1,
+            ..crate::executor::ExecutorConfig::default()
         });
         let app = crate::context::App::default_shared();
         let report = test_health_report(
@@ -1574,6 +1585,7 @@ mod tests {
             actor_cap: 1,
             heavy_permits: 1,
             drr_quantum: 1,
+            ..crate::executor::ExecutorConfig::default()
         });
         let (_dir, root) = test_root("health-mutating-lock");
         let ctx = test_ctx();
@@ -1624,6 +1636,7 @@ mod tests {
                 actor_cap: 64,
                 heavy_permits: 1,
                 drr_quantum: 1,
+                ..crate::executor::ExecutorConfig::default()
             });
             let mut dirs = Vec::with_capacity(root_count);
             for index in 0..root_count {
@@ -1739,6 +1752,7 @@ mod tests {
             actor_cap: 1,
             heavy_permits: 1,
             drr_quantum: 1,
+            ..crate::executor::ExecutorConfig::default()
         });
         let (_dir, root) = test_root("health-snapshot-age-coverage");
         assert!(executor.register_actor(root.clone(), test_ctx()));
@@ -1782,6 +1796,7 @@ mod tests {
             actor_cap: 64,
             heavy_permits: 1,
             drr_quantum: 1,
+            ..crate::executor::ExecutorConfig::default()
         });
         let mut dirs = Vec::new();
         for index in 0..50 {

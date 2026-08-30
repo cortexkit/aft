@@ -7,8 +7,8 @@ use crate::helpers::{fixture_path, AftProcess};
 use serde_json::Value;
 use std::ffi::OsStr;
 use std::fs;
-use std::path::Path;
-use tempfile::tempdir;
+use std::path::{Path, PathBuf};
+use tempfile::{tempdir, TempDir};
 
 fn configure_project(aft: &mut AftProcess, root: &Path) {
     let resp = aft.send(&format!(
@@ -16,6 +16,21 @@ fn configure_project(aft: &mut AftProcess, root: &Path) {
         crate::helpers::json_string(&root.display())
     ));
     assert_eq!(resp["success"], true, "configure should succeed: {resp:?}");
+}
+
+/// Copy the callgraph fixture outside this checkout's linked worktree.
+/// The binary correctly treats linked worktrees as read-only, while these
+/// tests need a writer-capable synthetic project for cold-build assertions.
+fn callgraph_fixture() -> (TempDir, PathBuf) {
+    let source = fixture_path("callgraph");
+    let temp = tempdir().expect("create callgraph fixture copy");
+    for entry in fs::read_dir(source).expect("read callgraph fixture") {
+        let entry = entry.expect("read callgraph fixture entry");
+        fs::copy(entry.path(), temp.path().join(entry.file_name()))
+            .expect("copy callgraph fixture file");
+    }
+    let root = temp.path().to_path_buf();
+    (temp, root)
 }
 
 fn path_text_ends_with(path: &str, suffix: &str) -> bool {
@@ -35,7 +50,7 @@ fn flattened_caller_entries(resp: &Value) -> Vec<&Value> {
 #[test]
 fn callgraph_configure_sets_project_root() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     let resp = aft.send(&format!(
@@ -89,7 +104,7 @@ fn callgraph_call_tree_without_configure() {
 #[test]
 fn callgraph_cross_file_tree() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     // Configure first
@@ -182,7 +197,7 @@ fn callgraph_cross_file_tree() {
 #[test]
 fn callgraph_depth_limit_truncates() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
@@ -243,7 +258,7 @@ fn callgraph_call_tree_rejects_path_outside_project_root() {
 #[test]
 fn callgraph_unknown_symbol_error() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
@@ -270,7 +285,7 @@ fn callgraph_unknown_symbol_error() {
 #[test]
 fn callgraph_aliased_import_resolution() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
@@ -331,7 +346,7 @@ fn callgraph_callers_without_configure() {
 #[test]
 fn callgraph_callers_cross_file() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     // Configure first
@@ -392,7 +407,7 @@ fn callgraph_callers_cross_file() {
 #[test]
 fn callgraph_callers_empty_result() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
@@ -421,7 +436,7 @@ fn callgraph_callers_empty_result() {
 #[test]
 fn callgraph_callers_recursive() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
@@ -1877,7 +1892,7 @@ fn callgraph_trace_to_not_configured() {
 #[test]
 fn callgraph_trace_to_symbol_not_found() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
@@ -1907,7 +1922,7 @@ fn callgraph_trace_to_symbol_not_found() {
 #[test]
 fn callgraph_trace_to_single_path() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
@@ -1967,7 +1982,7 @@ fn callgraph_trace_to_single_path() {
 #[test]
 fn callgraph_trace_to_multi_path() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
@@ -2035,7 +2050,7 @@ fn callgraph_trace_to_multi_path() {
 #[test]
 fn callgraph_trace_to_no_entry_points() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
@@ -2144,7 +2159,7 @@ fn callgraph_impact_not_configured() {
 #[test]
 fn callgraph_impact_symbol_not_found() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
@@ -2177,7 +2192,7 @@ fn callgraph_impact_symbol_not_found() {
 #[test]
 fn callgraph_impact_multi_caller() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
@@ -2300,7 +2315,7 @@ fn callgraph_trace_data_not_configured() {
 #[test]
 fn callgraph_trace_data_symbol_not_found() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
@@ -2334,7 +2349,7 @@ fn callgraph_trace_data_symbol_not_found() {
 #[test]
 fn callgraph_trace_data_assignment_tracking() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
@@ -2404,7 +2419,7 @@ fn sink_parameter_hop(hops: &[Value]) -> Option<&Value> {
 #[test]
 fn callgraph_trace_data_kills_only_dominating_straight_line_overwrites() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
@@ -2457,7 +2472,7 @@ fn callgraph_trace_data_kills_only_dominating_straight_line_overwrites() {
 #[test]
 fn callgraph_trace_data_cross_file() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
@@ -2527,7 +2542,7 @@ fn callgraph_trace_data_cross_file() {
 #[test]
 fn callgraph_trace_data_approximation() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     aft.send(&format!(
@@ -2566,7 +2581,7 @@ fn callgraph_trace_data_approximation() {
 #[test]
 fn callgraph_navigation_rejects_paths_outside_project_root() {
     let mut aft = AftProcess::spawn();
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     let outside = tempfile::tempdir().expect("create outside temp dir");
@@ -2635,7 +2650,7 @@ fn callgraph_navigation_rejects_paths_outside_project_root() {
 fn callgraph_ops_return_building_then_ready_async() {
     // Disable the inline-wait window so the cold build is fully asynchronous.
     let mut aft = AftProcess::spawn_with_env(&[("AFT_CALLGRAPH_BUILD_WAIT_MS", OsStr::new("0"))]);
-    let fixtures = fixture_path("callgraph");
+    let (_fixture, fixtures) = callgraph_fixture();
     let root = fixtures.display().to_string();
 
     let resp = aft.send(&format!(

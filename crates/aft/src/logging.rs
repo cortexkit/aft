@@ -583,6 +583,12 @@ struct ExecutorSample {
     maintenance_queued: usize,
     interactive_oldest_ms: Option<u64>,
     maintenance_oldest_ms: Option<u64>,
+    interactive_queue_cap: usize,
+    interactive_actor_queue_cap: usize,
+    maintenance_queue_cap: usize,
+    interactive_admission_rejections: u64,
+    maintenance_admission_rejections: u64,
+    deadline_expiries: u64,
 }
 
 static PERF: LazyLock<PerfMetrics> = LazyLock::new(PerfMetrics::default);
@@ -749,6 +755,12 @@ pub fn perf_tick(executor: Option<&Executor>) {
                 maintenance_queued: snapshot.maintenance.queued,
                 interactive_oldest_ms: snapshot.interactive.oldest_age_ms,
                 maintenance_oldest_ms: snapshot.maintenance.oldest_age_ms,
+                interactive_queue_cap: snapshot.interactive_queue_cap,
+                interactive_actor_queue_cap: snapshot.interactive_actor_queue_cap,
+                maintenance_queue_cap: snapshot.maintenance_queue_cap,
+                interactive_admission_rejections: snapshot.interactive_admission_rejections,
+                maintenance_admission_rejections: snapshot.maintenance_admission_rejections,
+                deadline_expiries: snapshot.deadline_expiries,
             })
     });
 
@@ -831,7 +843,7 @@ pub fn perf_tick(executor: Option<&Executor>) {
     };
     let sample = sample.unwrap_or_default();
     crate::slog_info!(
-        "perf tick: watcher={{ingested:{},paths:{},dropped:{}}} drains={} tier2=[{}] semantic={{collects:{},files:{},chunks:{},ms:{}}} callgraph_invalidations={} executor_completed={{interactive:{},maintenance:{}}} oldest_queued_ms={{interactive:{},maintenance:{}}} {} file_log_dropped={}",
+        "perf tick: watcher={{ingested:{},paths:{},dropped:{}}} drains={} tier2=[{}] semantic={{collects:{},files:{},chunks:{},ms:{}}} callgraph_invalidations={} executor_completed={{interactive:{},maintenance:{}}} oldest_queued_ms={{interactive:{},maintenance:{}}} queue_bounds={{interactive:{},interactive_actor:{},maintenance:{}}} admission_rejections={{interactive:{},maintenance:{}}} deadline_expiries={} {} file_log_dropped={}",
         watcher_ingested,
         watcher_paths,
         watcher_dropped,
@@ -846,6 +858,12 @@ pub fn perf_tick(executor: Option<&Executor>) {
         completed_maintenance,
         format_optional_ms(sample.interactive_oldest_ms),
         format_optional_ms(sample.maintenance_oldest_ms),
+        sample.interactive_queue_cap,
+        sample.interactive_actor_queue_cap,
+        sample.maintenance_queue_cap,
+        sample.interactive_admission_rejections,
+        sample.maintenance_admission_rejections,
+        sample.deadline_expiries,
         format_tool_call_summary(new_tool_calls, tool_calls),
         file_lines_dropped,
     );

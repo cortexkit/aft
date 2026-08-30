@@ -86,6 +86,12 @@ const INTERACTIVE_WRITER_PROMOTION_AGE: Duration = Duration::from_secs(6);
 /// metadata instead of only the generic `waiting_on_readers` diagnosis.
 const READER_STUCK_CENSUS_AGE: Duration = Duration::from_secs(60);
 
+/// Process-wide queue bounds. These are safety-policy limits, not throughput
+/// tuning constants: the per-actor interactive cap matches
+/// [`SCHEDULER_EVENT_BATCH_CAP`], the process interactive cap reserves four
+/// actor batches for the release storm's default four-root topology, and the
+/// process maintenance cap admits two complete legacy per-actor maintenance
+/// queues while preventing aggregate growth across standing roots.
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
     pub pool_size: usize,
@@ -93,6 +99,9 @@ pub struct ExecutorConfig {
     pub actor_cap: usize,
     pub heavy_permits: usize,
     pub drr_quantum: isize,
+    pub interactive_queue_cap: usize,
+    pub interactive_actor_queue_cap: usize,
+    pub maintenance_queue_cap: usize,
 }
 
 impl Default for ExecutorConfig {
@@ -111,6 +120,9 @@ impl Default for ExecutorConfig {
             actor_cap,
             heavy_permits,
             drr_quantum: 1,
+            interactive_queue_cap: 256,
+            interactive_actor_queue_cap: 64,
+            maintenance_queue_cap: 1024,
         }
     }
 }
@@ -125,6 +137,9 @@ struct EffectiveConfig {
     deficit_cap: isize,
     interactive_reserve: usize,
     maintenance_cap: usize,
+    interactive_queue_cap: usize,
+    interactive_actor_queue_cap: usize,
+    maintenance_queue_cap: usize,
 }
 
 impl ExecutorConfig {
@@ -155,6 +170,11 @@ impl ExecutorConfig {
             deficit_cap,
             interactive_reserve,
             maintenance_cap,
+            interactive_queue_cap: self.interactive_queue_cap.max(1),
+            interactive_actor_queue_cap: self.interactive_actor_queue_cap.max(1),
+            maintenance_queue_cap: self
+                .maintenance_queue_cap
+                .max(2usize.saturating_mul(MAINTENANCE_QUEUE_CAP)),
         }
     }
 }
@@ -198,6 +218,14 @@ pub struct DispatchLivenessSnapshot {
     pub running: DispatchRunningSnapshot,
     pub interactive_reserve: usize,
     pub maintenance_cap: usize,
+    /// Configured queue caps (process and per-actor interactive).
+    pub interactive_queue_cap: usize,
+    pub interactive_actor_queue_cap: usize,
+    pub maintenance_queue_cap: usize,
+    /// Cumulative typed admission rejections and deadline expiries.
+    pub interactive_admission_rejections: u64,
+    pub maintenance_admission_rejections: u64,
+    pub deadline_expiries: u64,
 }
 
 /// Scheduler-owned mirror read by health probes without taking the actor map
@@ -211,6 +239,9 @@ struct DispatchLivenessAtomics {
     maintenance_oldest_enqueued_ms_plus_one: AtomicU64,
     interactive_running: AtomicUsize,
     maintenance_running: AtomicUsize,
+    interactive_admission_rejections: AtomicU64,
+    maintenance_admission_rejections: AtomicU64,
+    deadline_expiries: AtomicU64,
 }
 
 impl DispatchLivenessAtomics {
@@ -223,6 +254,9 @@ impl DispatchLivenessAtomics {
             maintenance_oldest_enqueued_ms_plus_one: AtomicU64::new(0),
             interactive_running: AtomicUsize::new(0),
             maintenance_running: AtomicUsize::new(0),
+            interactive_admission_rejections: AtomicU64::new(0),
+            maintenance_admission_rejections: AtomicU64::new(0),
+            deadline_expiries: AtomicU64::new(0),
         }
     }
 
@@ -263,6 +297,12 @@ impl DispatchLivenessAtomics {
             .store(snapshot.interactive.queued, Ordering::Release);
         self.maintenance_queued
             .store(snapshot.maintenance.queued, Ordering::Release);
+        self.interactive_admission_rejections
+            .store(snapshot.interactive_admission_rejections, Ordering::Relaxed);
+        self.maintenance_admission_rejections
+            .store(snapshot.maintenance_admission_rejections, Ordering::Relaxed);
+        self.deadline_expiries
+            .store(snapshot.deadline_expiries, Ordering::Relaxed);
     }
 
     fn snapshot(&self, config: &EffectiveConfig) -> DispatchLivenessSnapshot {
@@ -295,6 +335,16 @@ impl DispatchLivenessAtomics {
             },
             interactive_reserve: config.interactive_reserve,
             maintenance_cap: config.maintenance_cap,
+            interactive_queue_cap: config.interactive_queue_cap,
+            interactive_actor_queue_cap: config.interactive_actor_queue_cap,
+            maintenance_queue_cap: config.maintenance_queue_cap,
+            interactive_admission_rejections: self
+                .interactive_admission_rejections
+                .load(Ordering::Relaxed),
+            maintenance_admission_rejections: self
+                .maintenance_admission_rejections
+                .load(Ordering::Relaxed),
+            deadline_expiries: self.deadline_expiries.load(Ordering::Relaxed),
         }
     }
 }
@@ -666,17 +716,59 @@ impl Executor {
     pub fn remove_actor(&self, root_id: &ProjectRootId) {
         let removed = {
             let mut state = self.inner.state.lock();
+            let removed = Self::take_actor(&mut state, root_id);
             state.actor_order.retain(|actor_root| actor_root != root_id);
-            state.actors.remove(root_id)
+            removed
         };
-        if let Some(actor) = removed.as_ref() {
+        if let Some((actor, settled)) = removed {
+            for (_job_class, queued) in settled {
+                queued
+                    .completion
+                    .send(actor_fatal_response(queued.request_id));
+            }
             let app = actor.ctx.app();
             crate::root_cache::unregister_live_scope(&actor.ctx.storage_dir(), root_id.as_path());
             app.unregister_memory_context(root_id.as_path(), &actor.ctx);
             app.actor_root_unregistered();
         }
-        drop(removed);
         self.wake_scheduler();
+    }
+
+    /// Defensive actor extraction: drain all queued jobs, release their
+    /// capacity buckets, and return the actor with the settled jobs. Unexpected
+    /// queued work at extraction time receives `actor_fatal`.
+    fn take_actor(
+        state: &mut SchedulerState,
+        root_id: &ProjectRootId,
+    ) -> Option<(ActorState, Vec<(JobClass, QueuedJob)>)> {
+        let mut actor = state.actors.remove(root_id)?;
+        let mut settled = actor
+            .interactive
+            .fail_queued_jobs()
+            .into_iter()
+            .map(|job| (JobClass::Interactive, job))
+            .collect::<Vec<_>>();
+        settled.extend(
+            actor
+                .maintenance
+                .fail_queued_jobs()
+                .into_iter()
+                .map(|job| (JobClass::Maintenance, job)),
+        );
+        state.process_counts.interactive = state.process_counts.interactive.saturating_sub(
+            settled
+                .iter()
+                .filter(|(c, _)| *c == JobClass::Interactive)
+                .count(),
+        );
+        state.process_counts.maintenance = state.process_counts.maintenance.saturating_sub(
+            settled
+                .iter()
+                .filter(|(c, _)| *c == JobClass::Maintenance)
+                .count(),
+        );
+        state.debug_assert_counts_match(root_id);
+        Some((actor, settled))
     }
 
     /// Return true only when the actor has no queued or running executor work.
@@ -702,12 +794,18 @@ impl Executor {
             if !state.actors.get(root_id).is_some_and(ActorState::is_idle) {
                 return false;
             }
+            let removed = Self::take_actor(&mut state, root_id);
             state.actor_order.retain(|actor_root| actor_root != root_id);
-            state.actors.remove(root_id)
+            removed
         };
-        let Some(actor) = removed else {
+        let Some((actor, settled)) = removed else {
             return false;
         };
+        for (_job_class, queued) in settled {
+            queued
+                .completion
+                .send(actor_fatal_response(queued.request_id.clone()));
+        }
         let app = actor.ctx.app();
         crate::root_cache::unregister_live_scope(&actor.ctx.storage_dir(), root_id.as_path());
         app.unregister_memory_context(root_id.as_path(), &actor.ctx);
@@ -726,14 +824,28 @@ impl Executor {
     /// cancelled job receives a normal completion so its caller can settle
     /// bookkeeping through the same path as an executed job.
     pub fn cancel_queued_maintenance(&self, root_id: &ProjectRootId) -> usize {
-        let cancelled = {
+        let (cancelled, settled) = {
             let mut state = self.inner.state.lock();
-            state
-                .actors
-                .get_mut(root_id)
-                .map(|actor| actor.maintenance.cancel_queued_jobs())
-                .unwrap_or(0)
+            match state.actors.get_mut(root_id) {
+                Some(actor) => {
+                    let drained = actor.maintenance.cancel_queued_jobs();
+                    state.process_counts.maintenance = state
+                        .process_counts
+                        .maintenance
+                        .saturating_sub(drained.len());
+                    state.debug_assert_counts_match(root_id);
+                    (drained.len(), drained)
+                }
+                None => (0, Vec::new()),
+            }
         };
+        for queued in settled {
+            queued.completion.send(Response::error(
+                queued.request_id,
+                "maintenance_cancelled",
+                "maintenance cancelled because the actor has no bound routes",
+            ));
+        }
         if cancelled > 0 {
             self.wake_scheduler();
         }
@@ -824,29 +936,62 @@ impl Executor {
         request_id: String,
         job: ExecutorJob,
     ) -> oneshot::Receiver<Response> {
+        self.submit_async_with_deadline(root_id, lane, request_id, job, None)
+    }
+
+    /// [`Self::submit_async`] carrying an optional absolute local request
+    /// deadline; `None` preserves the deadline-less contract.
+    pub fn submit_async_with_deadline(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        job: ExecutorJob,
+        deadline: Option<Instant>,
+    ) -> oneshot::Receiver<Response> {
         let (completion_tx, completion_rx) = oneshot::channel();
-        self.submit_with_completion(
+        self.submit_with_completion_cancellable(
             root_id,
             JobClass::Interactive,
             lane,
             request_id,
             job,
             CompletionSender::Async(completion_tx),
+            None,
+            None,
+            deadline,
         );
         completion_rx
     }
 
-    /// Submit an interactive job with an exact-job cancellation token.
-    ///
+    /// Submit an interactive job with an exact-job cancellation token and an
+    /// optional queue-scoped request deadline.
     /// The returned token cancels THIS job only (queued: removed and settled
     /// with `request_cancelled`; running: signalled cooperatively). The job
-    /// observes the token via [`current_job_cancellation`].
+    /// observes the token via [`current_job_cancellation`]. An elapsed
+    /// deadline rejects admission or prunes the queued job with
+    /// `request_deadline_exceeded`; once dispatched, a job is never
+    /// auto-cancelled by its deadline.
     pub fn submit_cancellable_async(
         &self,
         root_id: ProjectRootId,
         lane: Lane,
         request_id: String,
         job: ExecutorJob,
+    ) -> (oneshot::Receiver<Response>, JobCancellation) {
+        self.submit_cancellable_async_with_deadline(root_id, lane, request_id, job, None)
+    }
+
+    /// [`Self::submit_cancellable_async`] carrying an absolute local request
+    /// deadline. `None` preserves the deadline-less contract for standalone,
+    /// internal, and test callers.
+    pub fn submit_cancellable_async_with_deadline(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        job: ExecutorJob,
+        deadline: Option<Instant>,
     ) -> (oneshot::Receiver<Response>, JobCancellation) {
         let cancellation = JobCancellation::new();
         let (completion_tx, completion_rx) = oneshot::channel();
@@ -859,6 +1004,7 @@ impl Executor {
             CompletionSender::Async(completion_tx),
             Some(cancellation.clone()),
             None,
+            deadline,
         );
         (completion_rx, cancellation)
     }
@@ -887,8 +1033,12 @@ impl Executor {
                     _ => JobCancelOutcome::NotFound,
                 };
             };
-            match actor.remove_queued_cancellable(token) {
-                Some(queued) => (JobCancelOutcome::QueuedRemoved, Some(queued)),
+            let removed = actor.remove_queued_cancellable(token);
+            if let Some((job_class, _)) = removed.as_ref() {
+                state.account_dequeue(root_id, *job_class);
+            }
+            let outcome = match removed {
+                Some((_job_class, queued)) => (JobCancelOutcome::QueuedRemoved, Some(queued)),
                 None => match observed {
                     // The seal won the race: the job commits and finishes.
                     JOB_CANCEL_STATE_COMMITTED => (JobCancelOutcome::RunningCommitted, None),
@@ -901,7 +1051,9 @@ impl Executor {
                     // Already cancelled by an earlier call and no longer queued.
                     _ => (JobCancelOutcome::NotFound, None),
                 },
-            }
+            };
+            state.debug_assert_counts_match(root_id);
+            outcome
         };
         if let Some(queued) = settled {
             queued.completion.send(Response::error(
@@ -953,6 +1105,7 @@ impl Executor {
             CompletionSender::Async(completion_tx),
             None,
             coalesce_key,
+            None,
         );
         completion_rx
     }
@@ -967,7 +1120,7 @@ impl Executor {
         completion: CompletionSender,
     ) {
         self.submit_with_completion_cancellable(
-            root_id, job_class, lane, request_id, job, completion, None, None,
+            root_id, job_class, lane, request_id, job, completion, None, None, None,
         );
     }
 
@@ -982,17 +1135,30 @@ impl Executor {
         completion: CompletionSender,
         cancellation: Option<JobCancellation>,
         maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
+        deadline: Option<Instant>,
     ) {
         let command = job_command(job_class, lane);
         let mut job = Some(job);
         let mut completion = Some(completion);
-        let mut duplicate_victims = Vec::new();
 
-        let response = {
+        let (response, duplicate_victims) = {
             let mut state = self.inner.state.lock();
-            match state.actors.get_mut(&root_id) {
+            // Snapshot config values before the actor borrow so depth checks
+            // can read caps without aliasing `state`.
+            let (interactive_actor_cap, interactive_process_cap, maintenance_process_cap) = (
+                state.config.interactive_actor_queue_cap,
+                state.config.interactive_queue_cap,
+                state.config.maintenance_queue_cap,
+            );
+            let mut process_counts = state.process_counts;
+            let mut rejection_deltas = (0u64, 0u64, 0u64);
+            let mut duplicate_victims_local: Vec<QueuedJob> = Vec::new();
+            let admission = match state.actors.get_mut(&root_id) {
                 Some(actor) if actor.fatal => Some(actor_fatal_response(request_id.clone())),
                 Some(actor) => {
+                    // Admission order: maintenance coalescing/dedupe first,
+                    // then an already-expired interactive deadline, then the
+                    // per-actor class cap, then the process class cap.
                     let mut admission_error = None;
                     if job_class == JobClass::Maintenance {
                         if maintenance_coalesce_key
@@ -1002,34 +1168,99 @@ impl Executor {
                                 request_id.clone(),
                                 "maintenance drain coalesced behind an identical queued drain",
                             ));
-                        } else {
+                        } else if actor.maintenance.queued_count() >= MAINTENANCE_QUEUE_CAP {
+                            duplicate_victims_local =
+                                actor.maintenance.remove_duplicate_maintenance_jobs();
+                            process_counts.maintenance = process_counts
+                                .maintenance
+                                .saturating_sub(duplicate_victims_local.len());
                             if actor.maintenance.queued_count() >= MAINTENANCE_QUEUE_CAP {
-                                duplicate_victims =
-                                    actor.maintenance.remove_duplicate_maintenance_jobs();
+                                admission_error = Some(maintenance_backpressure_response(
+                                    request_id.clone(),
+                                    "actor",
+                                    actor.maintenance.queued_count(),
+                                    MAINTENANCE_QUEUE_CAP,
+                                ));
+                                rejection_deltas.1 += 1;
                             }
-                            if actor.maintenance.queued_count() >= MAINTENANCE_QUEUE_CAP {
-                                admission_error =
-                                    Some(maintenance_backpressure_response(request_id.clone()));
+                        }
+                    } else if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        admission_error =
+                            Some(request_deadline_exceeded_response(request_id.clone()));
+                        rejection_deltas.2 += 1;
+                    }
+
+                    if admission_error.is_none() {
+                        let (actor_cap, process_cap, actor_depth, process_depth) = match job_class {
+                            JobClass::Interactive => (
+                                interactive_actor_cap,
+                                interactive_process_cap,
+                                actor.interactive_queued_count,
+                                process_counts.interactive,
+                            ),
+                            JobClass::Maintenance => (
+                                MAINTENANCE_QUEUE_CAP,
+                                maintenance_process_cap,
+                                actor.maintenance.queued_count(),
+                                process_counts.maintenance,
+                            ),
+                        };
+                        let scope = if actor_depth >= actor_cap {
+                            Some(("actor", actor_depth, actor_cap))
+                        } else if process_depth >= process_cap {
+                            Some(("global", process_depth, process_cap))
+                        } else {
+                            None
+                        };
+                        if let Some((queue_scope, queue_depth, queue_cap)) = scope {
+                            admission_error = Some(match job_class {
+                                JobClass::Interactive => interactive_backpressure_response(
+                                    request_id.clone(),
+                                    queue_scope,
+                                    queue_depth,
+                                    queue_cap,
+                                ),
+                                JobClass::Maintenance => maintenance_backpressure_response(
+                                    request_id.clone(),
+                                    if queue_scope == "global" {
+                                        "global"
+                                    } else {
+                                        "per-actor"
+                                    },
+                                    queue_depth,
+                                    queue_cap,
+                                ),
+                            });
+                            match job_class {
+                                JobClass::Interactive => rejection_deltas.0 += 1,
+                                JobClass::Maintenance => rejection_deltas.1 += 1,
                             }
                         }
                     }
 
                     if admission_error.is_none() {
-                        actor.push_job(
-                            job_class,
-                            lane,
-                            QueuedJob {
-                                job: job.take().expect("executor job already queued"),
-                                completion: completion
-                                    .take()
-                                    .expect("executor completion already queued"),
-                                request_id: request_id.clone(),
-                                command,
-                                queued_at: Instant::now(),
-                                cancellation: cancellation.clone(),
-                                maintenance_coalesce_key,
-                            },
-                        );
+                        let queued = QueuedJob {
+                            job: job.take().expect("executor job already queued"),
+                            completion: completion
+                                .take()
+                                .expect("executor completion already queued"),
+                            request_id: request_id.clone(),
+                            command,
+                            queued_at: Instant::now(),
+                            deadline,
+                            cancellation: cancellation.clone(),
+                            maintenance_coalesce_key,
+                        };
+                        actor.push_job(job_class, lane, queued);
+                        match job_class {
+                            JobClass::Interactive => {
+                                process_counts.interactive += 1;
+                                actor.interactive_queued_count += 1;
+                            }
+                            JobClass::Maintenance => {
+                                process_counts.maintenance += 1;
+                            }
+                        }
                     }
                     admission_error
                 }
@@ -1038,14 +1269,37 @@ impl Executor {
                     "actor_not_registered",
                     "executor actor is not registered",
                 )),
-            }
+            };
+            state.process_counts = process_counts;
+            state.interactive_admission_rejections = state
+                .interactive_admission_rejections
+                .saturating_add(rejection_deltas.0);
+            state.maintenance_admission_rejections = state
+                .maintenance_admission_rejections
+                .saturating_add(rejection_deltas.1);
+            state.deadline_expiries = state.deadline_expiries.saturating_add(rejection_deltas.2);
+            state.debug_assert_counts_match(&root_id);
+            self.inner
+                .dispatch_liveness
+                .record(&state.dispatch_liveness_snapshot());
+            let duplicate_victims: Vec<(JobClass, QueuedJob)> = duplicate_victims_local
+                .into_iter()
+                .map(|victim| (JobClass::Maintenance, victim))
+                .collect();
+            (admission, duplicate_victims)
         };
 
-        for victim in duplicate_victims {
-            victim.completion.send(maintenance_cancelled_response(
-                victim.request_id,
-                "duplicate maintenance drain removed to preserve queue capacity",
-            ));
+        for (victim_class, victim) in duplicate_victims {
+            let response = match victim_class {
+                JobClass::Maintenance => maintenance_cancelled_response(
+                    victim.request_id,
+                    "duplicate maintenance drain removed to preserve queue capacity",
+                ),
+                JobClass::Interactive => {
+                    interactive_backpressure_response(victim.request_id, "actor", 0, 0)
+                }
+            };
+            victim.completion.send(response);
         }
 
         if let Some(response) = response {
@@ -1102,6 +1356,18 @@ impl Executor {
             .state
             .try_lock()
             .map(|state| state.mutating_job_state_label(root_id, request_id))
+    }
+
+    pub fn interactive_queue_cap(&self) -> usize {
+        self.inner.config.interactive_queue_cap
+    }
+
+    pub fn interactive_actor_queue_cap(&self) -> usize {
+        self.inner.config.interactive_actor_queue_cap
+    }
+
+    pub fn maintenance_queue_cap(&self) -> usize {
+        self.inner.config.maintenance_queue_cap
     }
 
     /// Snapshot RouteBind blockers without waiting on scheduler state. The subc
@@ -1216,6 +1482,15 @@ impl Drop for ExecutorInner {
     }
 }
 
+/// Pending (not running) job counts per process class, plus per-actor
+/// interactive queue depth. These counts are the admission authority for the
+/// class queue caps; `ClassQueues::order.len()` is only a debug cross-check.
+#[derive(Debug, Default, Clone, Copy)]
+struct QueuedClassCounts {
+    interactive: usize,
+    maintenance: usize,
+}
+
 struct SchedulerState {
     actors: HashMap<ProjectRootId, ActorState>,
     actor_order: Vec<ProjectRootId>,
@@ -1224,7 +1499,11 @@ struct SchedulerState {
     interactive_inflight: usize,
     maintenance_inflight: usize,
     config: EffectiveConfig,
+    process_counts: QueuedClassCounts,
     running_jobs: HashMap<(ProjectRootId, String), RunningJob>,
+    interactive_admission_rejections: u64,
+    maintenance_admission_rejections: u64,
+    deadline_expiries: u64,
 }
 
 impl SchedulerState {
@@ -1237,8 +1516,94 @@ impl SchedulerState {
             interactive_inflight: 0,
             maintenance_inflight: 0,
             config,
+            process_counts: QueuedClassCounts::default(),
             running_jobs: HashMap::new(),
+            interactive_admission_rejections: 0,
+            maintenance_admission_rejections: 0,
+            deadline_expiries: 0,
         }
+    }
+
+    /// Release one queued job's capacity before its completion settles.
+    fn account_dequeue(&mut self, root_id: &ProjectRootId, job_class: JobClass) {
+        match job_class {
+            JobClass::Interactive => {
+                self.process_counts.interactive = self.process_counts.interactive.saturating_sub(1);
+                if let Some(actor) = self.actors.get_mut(root_id) {
+                    actor.interactive_queued_count =
+                        actor.interactive_queued_count.saturating_sub(1);
+                }
+            }
+            JobClass::Maintenance => {
+                self.process_counts.maintenance = self.process_counts.maintenance.saturating_sub(1);
+            }
+        }
+        self.debug_assert_counts_match(root_id);
+    }
+
+    /// Debug-only invariant: the mutable counters equal the recomputed queue
+    /// sums for one actor and the process.
+    fn debug_assert_counts_match(&self, root_id: &ProjectRootId) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        if let Some(actor) = self.actors.get(root_id) {
+            debug_assert_eq!(
+                actor.interactive.class_queues_len(),
+                actor.interactive_queued_count,
+                "interactive actor queue count drift for {}",
+                root_id.as_path().display()
+            );
+        }
+        let recomputed: QueuedClassCounts = self
+            .actors
+            .values()
+            .map(|actor| QueuedClassCounts {
+                interactive: actor.interactive.class_queues_len(),
+                maintenance: actor.maintenance.class_queues_len(),
+            })
+            .fold(QueuedClassCounts::default(), |mut total, one| {
+                total.interactive += one.interactive;
+                total.maintenance += one.maintenance;
+                total
+            });
+        debug_assert_eq!(
+            self.process_counts.interactive, recomputed.interactive,
+            "process interactive pending count drift"
+        );
+        debug_assert_eq!(
+            self.process_counts.maintenance, recomputed.maintenance,
+            "process maintenance pending count drift"
+        );
+    }
+    /// Prune elapsed-deadline interactive jobs from every lane at the start of
+    /// a scheduler turn, release their capacity, and return them so the caller
+    /// settles each with `request_deadline_exceeded`. Maintenance jobs carry no
+    /// client deadline.
+    fn prune_elapsed_deadline_jobs(&mut self, now: Instant) -> Vec<(ProjectRootId, QueuedJob)> {
+        let mut pruned = Vec::new();
+        let roots: Vec<ProjectRootId> = self.actors.keys().cloned().collect();
+        for root_id in roots {
+            let Some(actor) = self.actors.get_mut(&root_id) else {
+                continue;
+            };
+            let drained = actor.interactive.prune_elapsed(now);
+            if drained.is_empty() {
+                continue;
+            }
+            self.process_counts.interactive = self
+                .process_counts
+                .interactive
+                .saturating_sub(drained.len());
+            actor.interactive_queued_count =
+                actor.interactive_queued_count.saturating_sub(drained.len());
+            self.deadline_expiries = self.deadline_expiries.saturating_add(drained.len() as u64);
+            for job in drained {
+                pruned.push((root_id.clone(), job));
+            }
+            self.debug_assert_counts_match(&root_id);
+        }
+        pruned
     }
 
     fn dispatch_liveness_snapshot(&self) -> DispatchLivenessSnapshot {
@@ -1259,6 +1624,12 @@ impl SchedulerState {
             },
             interactive_reserve: self.config.interactive_reserve,
             maintenance_cap: self.config.maintenance_cap,
+            interactive_queue_cap: self.config.interactive_queue_cap,
+            interactive_actor_queue_cap: self.config.interactive_actor_queue_cap,
+            maintenance_queue_cap: self.config.maintenance_queue_cap,
+            interactive_admission_rejections: self.interactive_admission_rejections,
+            maintenance_admission_rejections: self.maintenance_admission_rejections,
+            deadline_expiries: self.deadline_expiries,
         }
     }
 
@@ -1474,6 +1845,8 @@ struct ActorState {
     deficit: isize,
     interactive: ClassQueues,
     maintenance: ClassQueues,
+    /// Mirror of the interactive queue depth; the per-actor class cap authority.
+    interactive_queued_count: usize,
     fatal: bool,
 }
 
@@ -1492,6 +1865,7 @@ impl ActorState {
             deficit: 0,
             interactive: ClassQueues::new(),
             maintenance: ClassQueues::new(),
+            interactive_queued_count: 0,
             fatal: false,
         }
     }
@@ -1542,9 +1916,23 @@ impl ActorState {
         }
     }
 
-    fn fail_queued_jobs(&mut self) {
-        self.interactive.fail_queued_jobs();
-        self.maintenance.fail_queued_jobs();
+    /// Drain every queued job and settle with `actor_fatal`, returning the
+    /// drained jobs per class so the caller releases capacity before sending
+    /// completions.
+    fn fail_queued_jobs(&mut self) -> Vec<(JobClass, QueuedJob)> {
+        let mut drained: Vec<(JobClass, QueuedJob)> = self
+            .interactive
+            .fail_queued_jobs()
+            .into_iter()
+            .map(|job| (JobClass::Interactive, job))
+            .collect();
+        drained.extend(
+            self.maintenance
+                .fail_queued_jobs()
+                .into_iter()
+                .map(|job| (JobClass::Maintenance, job)),
+        );
+        drained
     }
 
     fn has_queued_mutating_job(&self, request_id: &str) -> bool {
@@ -1552,10 +1940,20 @@ impl ActorState {
             || self.maintenance.has_queued_mutating_job(request_id)
     }
 
-    fn remove_queued_cancellable(&mut self, token: &JobCancellation) -> Option<QueuedJob> {
+    /// Remove the queued job carrying this token, returning its class so the
+    /// caller releases the right capacity bucket.
+    fn remove_queued_cancellable(
+        &mut self,
+        token: &JobCancellation,
+    ) -> Option<(JobClass, QueuedJob)> {
         self.interactive
             .remove_cancellable(token)
-            .or_else(|| self.maintenance.remove_cancellable(token))
+            .map(|job| (JobClass::Interactive, job))
+            .or_else(|| {
+                self.maintenance
+                    .remove_cancellable(token)
+                    .map(|job| (JobClass::Maintenance, job))
+            })
     }
 
     fn oldest_queued_writer_at(&self) -> Option<Instant> {
@@ -1619,9 +2017,7 @@ impl ClassQueues {
     /// never barrier the actor), then remaining lanes in arrival order.
     /// Maintenance keeps strict arrival order via `front_lane`.
     fn next_interactive_lane(&self, now: Instant) -> Option<Lane> {
-        let starved_writer = self.mutating.iter().any(|job| {
-            now.saturating_duration_since(job.queued_at) >= INTERACTIVE_WRITER_PROMOTION_AGE
-        });
+        let starved_writer = self.has_urgent_writer(now);
         if starved_writer {
             // Also stops NEW readers from being admitted on this actor while
             // the promoted writer waits for in-flight readers to drain.
@@ -1636,6 +2032,70 @@ impl ClassQueues {
             .find(|lane| *lane != Lane::PureRead)
     }
 
+    /// Deadline-aware urgency for queued interactive writers, replacing the
+    /// fixed writer-only promotion test while retaining its fallback: a
+    /// deadline-bearing writer is urgent when its remaining budget is at or
+    /// below its queue age (or the promotion-age floor); a deadline-less
+    /// writer becomes urgent at the promotion age.
+    fn has_urgent_writer(&self, now: Instant) -> bool {
+        self.mutating.iter().any(|job| {
+            let age = now.saturating_duration_since(job.queued_at);
+            match job.deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(now);
+                    remaining <= age.max(INTERACTIVE_WRITER_PROMOTION_AGE)
+                }
+                None => age >= INTERACTIVE_WRITER_PROMOTION_AGE,
+            }
+        })
+    }
+
+    /// Remove interactive jobs whose queue deadline has elapsed, preserving
+    /// survivor order in both the ladder and the lane queues.
+    fn prune_elapsed(&mut self, now: Instant) -> Vec<QueuedJob> {
+        let mut drained = Vec::new();
+        for lane in [
+            Lane::PureRead,
+            Lane::SerialLspStatus,
+            Lane::HeavyInit,
+            Lane::Mutating,
+            Lane::MaintenanceCommit,
+        ] {
+            let queue = self.queue_mut(lane);
+            let mut index = 0;
+            while index < queue.len() {
+                if queue[index]
+                    .deadline
+                    .is_some_and(|deadline| now >= deadline)
+                {
+                    if let Some(job) = queue.remove(index) {
+                        drained.push(job);
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        if drained.is_empty() {
+            return drained;
+        }
+        // Rebuild the ladder from the survivors; each lane queue is FIFO, so
+        // the per-lane counts are the ladder multiplicities.
+        self.order.clear();
+        for lane in [
+            Lane::PureRead,
+            Lane::SerialLspStatus,
+            Lane::HeavyInit,
+            Lane::Mutating,
+            Lane::MaintenanceCommit,
+        ] {
+            for _ in 0..self.queue(lane).len() {
+                self.order.push_back(lane);
+            }
+        }
+        drained
+    }
+
     fn pop_front_job(&mut self, lane: Lane) -> Option<QueuedJob> {
         // Keep `order` consistent with per-lane queues when admission picks a
         // lane other than the arrival-order head: remove the FIRST occurrence
@@ -1647,6 +2107,18 @@ impl ClassQueues {
 
     fn queued_count(&self) -> usize {
         self.order.len()
+    }
+
+    /// Debug cross-check source for the class counters. The sum of lane queue
+    /// lengths must equal `order.len()`; both prove the pending job count.
+    fn class_queues_len(&self) -> usize {
+        let lane_sum = self.pure_reads.len()
+            + self.lsp_status.len()
+            + self.heavy_init.len()
+            + self.mutating.len()
+            + self.maintenance_commit.len();
+        debug_assert_eq!(self.order.len(), lane_sum, "order ladder out of sync");
+        lane_sum
     }
 
     fn has_maintenance_coalesce_key(&self, key: MaintenanceCoalesceKey) -> bool {
@@ -1702,22 +2174,26 @@ impl ClassQueues {
             .and_then(|lane| self.queue(lane).front().map(|job| job.queued_at))
     }
 
-    fn fail_queued_jobs(&mut self) {
+    fn fail_queued_jobs(&mut self) -> Vec<QueuedJob> {
+        let mut drained = Vec::new();
+        drained.extend(self.pure_reads.drain(..));
+        drained.extend(self.lsp_status.drain(..));
+        drained.extend(self.heavy_init.drain(..));
+        drained.extend(self.mutating.drain(..));
+        drained.extend(self.maintenance_commit.drain(..));
         self.order.clear();
-        fail_queued_job_queue(&mut self.pure_reads);
-        fail_queued_job_queue(&mut self.lsp_status);
-        fail_queued_job_queue(&mut self.heavy_init);
-        fail_queued_job_queue(&mut self.mutating);
-        fail_queued_job_queue(&mut self.maintenance_commit);
+        drained
     }
 
-    fn cancel_queued_jobs(&mut self) -> usize {
+    fn cancel_queued_jobs(&mut self) -> Vec<QueuedJob> {
+        let mut drained = Vec::new();
+        drained.extend(self.pure_reads.drain(..));
+        drained.extend(self.lsp_status.drain(..));
+        drained.extend(self.heavy_init.drain(..));
+        drained.extend(self.mutating.drain(..));
+        drained.extend(self.maintenance_commit.drain(..));
         self.order.clear();
-        cancel_queued_job_queue(&mut self.pure_reads)
-            + cancel_queued_job_queue(&mut self.lsp_status)
-            + cancel_queued_job_queue(&mut self.heavy_init)
-            + cancel_queued_job_queue(&mut self.mutating)
-            + cancel_queued_job_queue(&mut self.maintenance_commit)
+        drained
     }
 
     fn has_queued_mutating_job(&self, request_id: &str) -> bool {
@@ -1800,6 +2276,10 @@ struct QueuedJob {
     request_id: String,
     command: String,
     queued_at: Instant,
+    /// Queue-scoped request budget. `None` means no deadline (standalone,
+    /// internal, and test callers). Elapsed deadlines reject admission and
+    /// prune queued jobs; a dispatched job is never auto-cancelled.
+    deadline: Option<Instant>,
     cancellation: Option<JobCancellation>,
     maintenance_coalesce_key: Option<MaintenanceCoalesceKey>,
 }
@@ -1814,24 +2294,56 @@ fn lane_index(lane: Lane) -> usize {
     }
 }
 
-fn fail_queued_job_queue(queue: &mut VecDeque<QueuedJob>) {
-    for queued in queue.drain(..) {
-        queued
-            .completion
-            .send(actor_fatal_response(queued.request_id));
-    }
+fn maintenance_backpressure_response(
+    request_id: impl Into<String>,
+    queue_scope: &str,
+    queue_depth: usize,
+    queue_cap: usize,
+) -> Response {
+    Response::error_with_data(
+        request_id,
+        "maintenance_backpressure",
+        format!("maintenance queue reached its {queue_scope} capacity of {queue_cap} jobs"),
+        serde_json::json!({
+            "retryable": true,
+            "queue_class": "maintenance",
+            "queue_scope": queue_scope,
+            "queue_depth": queue_depth,
+            "queue_cap": queue_cap,
+        }),
+    )
 }
 
-fn cancel_queued_job_queue(queue: &mut VecDeque<QueuedJob>) -> usize {
-    let cancelled = queue.len();
-    for queued in queue.drain(..) {
-        queued.completion.send(Response::error(
-            queued.request_id,
-            "maintenance_cancelled",
-            "maintenance cancelled because the actor has no bound routes",
-        ));
-    }
-    cancelled
+fn interactive_backpressure_response(
+    request_id: impl Into<String>,
+    queue_scope: &str,
+    queue_depth: usize,
+    queue_cap: usize,
+) -> Response {
+    Response::error_with_data(
+        request_id,
+        "executor_backpressure",
+        format!("interactive queue reached its {queue_scope} capacity of {queue_cap} jobs"),
+        serde_json::json!({
+            "retryable": true,
+            "queue_class": "interactive",
+            "queue_scope": queue_scope,
+            "queue_depth": queue_depth,
+            "queue_cap": queue_cap,
+        }),
+    )
+}
+
+fn request_deadline_exceeded_response(request_id: impl Into<String>) -> Response {
+    Response::error_with_data(
+        request_id,
+        "request_deadline_exceeded",
+        "request deadline elapsed before execution",
+        serde_json::json!({
+            "retryable": false,
+            "phase": "queue",
+        }),
+    )
 }
 
 fn job_command(job_class: JobClass, lane: Lane) -> String {
@@ -1843,18 +2355,6 @@ fn maintenance_cancelled_response(
     message: impl Into<String>,
 ) -> Response {
     Response::error(request_id, "maintenance_cancelled", message)
-}
-
-fn maintenance_backpressure_response(request_id: impl Into<String>) -> Response {
-    Response::error_with_data(
-        request_id,
-        "maintenance_backpressure",
-        format!("maintenance queue reached its per-actor capacity of {MAINTENANCE_QUEUE_CAP} jobs"),
-        serde_json::json!({
-            "retryable": true,
-            "queue_cap": MAINTENANCE_QUEUE_CAP,
-        }),
-    )
 }
 
 fn actor_fatal_response(request_id: impl Into<String>) -> Response {
@@ -1945,6 +2445,7 @@ fn scheduler_loop(
     completed_maintenance: Arc<AtomicU64>,
     dispatch_liveness: Arc<DispatchLivenessAtomics>,
 ) {
+    let mut expired_completions: Vec<QueuedJob> = Vec::new();
     while let Ok(event) = event_rx.recv() {
         let shutdown;
         {
@@ -1958,9 +2459,19 @@ fn scheduler_loop(
             );
 
             if !shutdown {
+                // Prune elapsed interactive deadlines at the start of every
+                // turn, release their capacity, then continue dispatch. The
+                // settled completions are sent after the lock is released.
+                let pruned = state.prune_elapsed_deadline_jobs(Instant::now());
                 dispatch_runnable(&mut state, &heavy, &run_tx, &nonrunnable_dispatches);
+                expired_completions.extend(pruned.into_iter().map(|(_, job)| job));
             }
             dispatch_liveness.record(&state.dispatch_liveness_snapshot());
+        }
+
+        for job in expired_completions.drain(..) {
+            job.completion
+                .send(request_deadline_exceeded_response(job.request_id));
         }
 
         if shutdown {
@@ -2059,7 +2570,13 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) {
 
         if panicked && lane == Lane::Mutating {
             actor.fatal = true;
-            actor.fail_queued_jobs();
+            let drained = actor.fail_queued_jobs();
+            for (job_class, queued) in drained {
+                state.account_dequeue(&root_id, job_class);
+                queued
+                    .completion
+                    .send(actor_fatal_response(queued.request_id));
+            }
         }
     }
 
@@ -2135,36 +2652,48 @@ fn dispatch_runnable_class(
         let root_id = state.actor_order[state.cursor].clone();
         state.cursor = (state.cursor + 1) % state.actor_order.len();
 
+        let mut fatal_drained: Vec<(JobClass, QueuedJob)> = Vec::new();
         let run_job = {
             let Some(actor) = state.actors.get_mut(&root_id) else {
                 continue;
             };
 
             if actor.fatal {
-                actor.fail_queued_jobs();
+                fatal_drained = actor.fail_queued_jobs();
                 actor.deficit = 0;
-                continue;
-            }
-
-            if !actor.has_queued_jobs() {
+                None
+            } else if !actor.has_queued_jobs() {
                 actor.deficit = 0;
-                continue;
+                None
+            } else if actor.has_queued_jobs_for(job_class) {
+                actor.deficit =
+                    (actor.deficit + state.config.drr_quantum).min(state.config.deficit_cap);
+                if actor.deficit < JOB_COST {
+                    continue;
+                }
+                try_admit_actor(&root_id, actor, job_class, &state.config, heavy)
+            } else {
+                None
             }
-
-            if !actor.has_queued_jobs_for(job_class) {
-                continue;
-            }
-
-            actor.deficit =
-                (actor.deficit + state.config.drr_quantum).min(state.config.deficit_cap);
-            if actor.deficit < JOB_COST {
-                continue;
-            }
-
-            try_admit_actor(&root_id, actor, job_class, &state.config, heavy)
         };
 
+        if !fatal_drained.is_empty() {
+            let drained_by_class = fatal_drained.iter().map(|(c, _)| *c).collect::<Vec<_>>();
+            for job_class in drained_by_class {
+                state.account_dequeue(&root_id, job_class);
+            }
+            state.debug_assert_counts_match(&root_id);
+            for (_job_class, queued) in fatal_drained {
+                queued
+                    .completion
+                    .send(actor_fatal_response(queued.request_id));
+            }
+            continue;
+        }
         if let Some(run_job) = run_job {
+            // The pop happened inside try_admit_actor: release the queued
+            // capacity bucket before the dispatch send.
+            state.account_dequeue(&root_id, job_class);
             state.running_jobs.insert(
                 (run_job.root_id.clone(), run_job.request_id.clone()),
                 RunningJob {
@@ -2261,9 +2790,10 @@ fn try_admit_actor(
         return None;
     }
 
-    let promoted_writer_waiting = actor.oldest_queued_writer_at().is_some_and(|queued_at| {
-        Instant::now().saturating_duration_since(queued_at) >= INTERACTIVE_WRITER_PROMOTION_AGE
-    });
+    let promoted_writer_waiting = job_class == JobClass::Interactive
+        && actor
+            .class_queues(JobClass::Interactive)
+            .has_urgent_writer(Instant::now());
     if promoted_writer_waiting && matches!(lane, Lane::PureRead | Lane::SerialLspStatus) {
         actor.reader_admissions_while_promoted_writer_waited = actor
             .reader_admissions_while_promoted_writer_waited
@@ -2271,7 +2801,6 @@ fn try_admit_actor(
     }
 
     let queued = actor.pop_front_job(job_class, lane)?;
-    actor.deficit -= JOB_COST;
     if let Some(cancellation) = queued.cancellation.as_ref() {
         cancellation.mark_running();
     }
@@ -2321,8 +2850,9 @@ fn try_admit_actor(
 
 fn worker_loop(run_rx: Receiver<RunJob>, event_tx: Sender<SchedulerEvent>) {
     while let Ok(mut run_job) = run_rx.recv() {
-        let response =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_lane_job(&mut run_job)));
+        let response = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_lane_job_with_priority(&mut run_job)
+        }));
         let panicked = response.is_err();
         let response = match response {
             Ok(response) => response,
@@ -2345,6 +2875,22 @@ fn worker_loop(run_rx: Receiver<RunJob>, event_tx: Sender<SchedulerEvent>) {
             panicked,
         };
         let _ = event_tx.send(SchedulerEvent::Completed(completion));
+    }
+}
+/// Dispatch one lane job, demoting the worker thread to background OS
+/// priority while heavy maintenance lanes execute. Reader lanes keep the
+/// thread at normal priority so interactive requests win the OS scheduler.
+fn run_lane_job_with_priority(run_job: &mut RunJob) -> Response {
+    match run_job.lane {
+        Lane::PureRead | Lane::SerialLspStatus => run_lane_job(run_job),
+        // Mutating stays at normal priority: the lane is reserved for
+        // configure and user-initiated tool mutations. Only cold builds
+        // (HeavyInit) and background subsystem drains (MaintenanceCommit)
+        // are deferrable maintenance work.
+        Lane::HeavyInit | Lane::MaintenanceCommit => {
+            crate::thread_priority::with_background(|| run_lane_job(run_job))
+        }
+        Lane::Mutating => run_lane_job(run_job),
     }
 }
 

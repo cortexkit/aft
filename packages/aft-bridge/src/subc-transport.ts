@@ -160,6 +160,14 @@ export interface SubcTransportPoolOptions {
   /** Handshake timeout forwarded to SubcClient.connect. */
   handshakeTimeoutMs?: number;
   /**
+   * Pool default request budget in milliseconds. When neither the caller nor
+   * the tool adapter supplies a timeout, every route request derives one
+   * absolute deadline from this value at entry and never restarts it across
+   * connection, route-open, backoff, or stale-route retry. A direct pool that
+   * omits this (tests) carries no deadline metadata.
+   */
+  defaultTimeoutMs?: number;
+  /**
    * Connection factory seam. Defaults to the real `SubcClient.connect`. Tests
    * inject a fake to exercise route caching / Rd reconnect without a daemon.
    */
@@ -863,7 +871,9 @@ class SubcTransport implements AftProjectTransport {
     // orchestrated bash passes its wait-aware budget as transportTimeoutMs, and
     // dropping it here would cap long tool executions at the subc client's
     // default unary deadline while the command keeps running module-side.
-    const timeoutMs = options.transportTimeoutMs ?? options.timeoutMs;
+    // The pool default budget applies when the caller supplied neither.
+    const timeoutMs =
+      options.transportTimeoutMs ?? options.timeoutMs ?? this.pool.poolDefaultTimeoutMs;
     const onProgress = (options as { onProgress?: RequestOptions["onProgress"] }).onProgress;
     return { preview, timeoutMs, onProgress };
   }
@@ -878,6 +888,7 @@ export class SubcTransportPool implements AftTransportPool {
   readonly harness: string;
   private readonly connectionFile: string;
   private readonly handshakeTimeoutMs?: number;
+  private readonly defaultTimeoutMs?: number;
   private readonly consumerIdentity: ConsumerIdentity | null | undefined;
   private readonly connectFn: (opts: {
     connectionFile: string;
@@ -937,6 +948,7 @@ export class SubcTransportPool implements AftTransportPool {
     this.connectionFile = options.connectionFile;
     this.harness = options.harness;
     this.handshakeTimeoutMs = options.handshakeTimeoutMs;
+    this.defaultTimeoutMs = options.defaultTimeoutMs;
     this.consumerIdentity = options.consumerIdentity;
     this.connectFn = options.connect ?? ((opts) => SubcClient.connect(opts));
     this.onBgEventsNudge = options.onBgEventsNudge;
@@ -989,6 +1001,11 @@ export class SubcTransportPool implements AftTransportPool {
       this.lifecycleRegistration.deregister();
     }
     this.lifecycleRegistration = registration;
+  }
+
+  /** Pool default request budget; `undefined` means no deadline metadata. */
+  get poolDefaultTimeoutMs(): number | undefined {
+    return this.defaultTimeoutMs;
   }
 
   /** Construction helper for wrappers that own the registration sequence. */
@@ -1482,7 +1499,57 @@ export class SubcTransportPool implements AftTransportPool {
     return this.rootReapedError(record);
   }
 
-  /** Open or reuse a route while guarding every lifecycle boundary. */
+  /** Race a shared wait against THIS caller's remaining request budget.
+   *
+   * The underlying promise (shared connect, shared route opening, pooled
+   * backoff timer) is NEVER cancelled or invalidated by one caller's expiry:
+   * late settlement is observed via a detached handler so it can still cache
+   * the client/route, and an unhandled rejection cannot occur.
+   */
+  private awaitWithinRequestBudget(
+    wait: Promise<unknown>,
+    remaining: number | undefined,
+    phase: string,
+  ): Promise<unknown> {
+    if (remaining === undefined || !Number.isFinite(remaining)) return wait;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () =>
+          reject(
+            new SubcCallError(
+              "not_sent",
+              `request deadline elapsed while waiting for ${phase}`,
+              "request_deadline_exceeded_before_send",
+            ),
+          ),
+        Math.max(0, Math.ceil(remaining)),
+      );
+    });
+    return Promise.race([wait, timeoutPromise]).finally(() => {
+      clearTimeout(timer);
+      // Observe late settlement of the shared wait: the loser of the race must
+      // neither cache nothing nor surface an unhandled rejection. The shared
+      // client/route itself is never invalidated by this caller's expiry.
+      wait.then(
+        () => undefined,
+        () => undefined,
+      );
+    });
+  }
+
+  /**
+   * Open or reuse a route while guarding every lifecycle boundary.
+   *
+   * One absolute local request deadline is derived at entry from the exact
+   * precedence `transportTimeoutMs ?? timeoutMs ?? pool.defaultTimeoutMs` and
+   * never restarts: connection, route open, reload-window backoff, stale-route
+   * retry backoff, and the request itself all draw down the same budget.
+   * Immediately before each `client.request` attempt the remaining budget is
+   * recomputed and stamped as top-level `deadline_ms_remaining` on the request
+   * body (arguments are never mutated), and the same remaining value becomes
+   * the request's `RequestOptions.timeoutMs`.
+   */
   async routeRequest(
     identity: BindIdentity,
     body: Record<string, unknown>,
@@ -1490,6 +1557,13 @@ export class SubcTransportPool implements AftTransportPool {
     onProgress?: RequestOptions["onProgress"],
     expectedGeneration?: RootGeneration,
   ): Promise<unknown> {
+    const effectiveTimeoutMs = timeoutMs ?? this.defaultTimeoutMs;
+    const deadlineMs = Number.isFinite(effectiveTimeoutMs)
+      ? Date.now() + (effectiveTimeoutMs as number)
+      : undefined;
+    const remainingMs = (): number | undefined =>
+      deadlineMs === undefined ? undefined : deadlineMs - Date.now();
+
     const root = asCanonicalRootPath(identity.project_root);
     let generation = expectedGeneration;
     if (this.lifecycleEnabled()) {
@@ -1505,7 +1579,11 @@ export class SubcTransportPool implements AftTransportPool {
     try {
       let client: SubcClientLike;
       try {
-        client = await this.ensureClient();
+        client = (await this.awaitWithinRequestBudget(
+          this.ensureClient(),
+          remainingMs(),
+          "connection",
+        )) as SubcClientLike;
         this.assertRecordLive(record);
       } catch (error) {
         throw this.annotateReapError(error, record);
@@ -1514,12 +1592,21 @@ export class SubcTransportPool implements AftTransportPool {
       const openRoute = async (): Promise<{ route: RouteHandle; entry: RouteEntry }> => {
         try {
           this.assertRecordLive(record);
-          const opened = await this.routeHandle(client, identity, record);
+          const opened = (await this.awaitWithinRequestBudget(
+            this.routeHandle(client, identity, record),
+            remainingMs(),
+            "route-open",
+          )) as { route: RouteHandle; entry: RouteEntry };
           this.assertRecordLive(record);
           return opened;
         } catch (error) {
           if (this.isReapInduced(record)) throw this.annotateReapError(error, record);
           if (error instanceof RouteTornDownError) throw error;
+          if (error instanceof SubcCallError && error.kind === "not_sent") {
+            // Caller-scoped budget expiry: the shared connect/open is healthy
+            // and must survive for other callers, so it is never dropped here.
+            throw error;
+          }
           if (
             isConsumerReconnectTransient(error) &&
             this.isCurrentSession(key, record) &&
@@ -1546,7 +1633,7 @@ export class SubcTransportPool implements AftTransportPool {
               throw reloadWindowExhaustedError(error);
             }
             reloadWaitedMs += delayMs;
-            await wait;
+            await this.awaitWithinRequestBudget(wait, remainingMs(), "reload-window");
           }
         }
       };
@@ -1582,7 +1669,27 @@ export class SubcTransportPool implements AftTransportPool {
 
       const requestOnRoute = async (route: RouteHandle): Promise<unknown> => {
         this.assertRecordLive(record);
-        const reply = await client.request(route, body, { timeoutMs, onProgress });
+        // Immediately before bytes go on the wire: recompute the remaining
+        // budget from the unchanged absolute deadline. If none remains, the
+        // request is PROVABLY not sent.
+        const remaining = remainingMs();
+        if (remaining !== undefined && remaining <= 0) {
+          throw new SubcCallError(
+            "not_sent",
+            "request deadline elapsed before the request could be sent",
+            "request_deadline_exceeded_before_send",
+          );
+        }
+        const requestTimeoutMs =
+          remaining !== undefined ? Math.max(1, Math.floor(remaining)) : timeoutMs;
+        const deadlineBody =
+          remaining === undefined || !Number.isFinite(remaining)
+            ? body
+            : { ...body, deadline_ms_remaining: Math.max(0, Math.floor(remaining)) };
+        const reply = await client.request(route, deadlineBody, {
+          timeoutMs: requestTimeoutMs,
+          onProgress,
+        });
         // A legacy closeSession may intentionally let an already-delivered reply
         // settle. It must not mutate shared state or recreate a subscription.
         if (!this.isCurrentSession(key, record)) {
@@ -1600,13 +1707,22 @@ export class SubcTransportPool implements AftTransportPool {
         return await requestOnRoute(routeAndEntry.route);
       } catch (error) {
         if (this.isReapInduced(record)) throw this.annotateReapError(error, record);
+        if (error instanceof SubcCallError && error.kind === "not_sent") {
+          // Caller-scoped budget expiry: the request provably never went out,
+          // so the shared client/route state stays untouched for other callers.
+          throw error;
+        }
         if (
           isRouteProvenAbsentError(error) &&
           this.isCurrentSession(key, record) &&
           this.client === client
         ) {
           clearRouteEntry(routeAndEntry.entry);
-          await this.waitForRouteReopenBackoff().wait;
+          await this.awaitWithinRequestBudget(
+            this.waitForRouteReopenBackoff().wait,
+            remainingMs(),
+            "stale-route-backoff",
+          );
           routeAndEntry = await openRouteAfterReloadWindow();
           try {
             const reply = await requestOnRoute(routeAndEntry.route);

@@ -115,9 +115,36 @@ const RELIABLE_WRITER_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(250);
 
 const DISPATCH_PATH_BIND_WARN_AFTER: Duration = Duration::from_secs(6);
 const ROUTE_BIND_DEADLINE: Duration = Duration::from_secs(12);
+/// Upper bound on a caller-supplied `deadline_ms_remaining`. Covers the
+/// production bash maximum (30 minutes) plus its 10-second transport margin
+/// without permitting `Instant` overflow.
+pub(crate) const MAX_REQUEST_DEADLINE_REMAINING: Duration = Duration::from_secs(31 * 60);
+
+/// Convert ingress transport deadline metadata into one absolute local
+/// `Instant`. Zero is rejected with logical `request_deadline_exceeded`; values
+/// above the cap are clamped to the cap. `None` passes through unchanged.
+pub(crate) fn normalize_request_deadline(
+    deadline_ms_remaining: Option<u64>,
+    request_id: &str,
+) -> Result<Option<Instant>, Response> {
+    match deadline_ms_remaining {
+        None => Ok(None),
+        Some(0) => Err(Response::error_with_data(
+            request_id,
+            "request_deadline_exceeded",
+            "request deadline already elapsed at ingress",
+            serde_json::json!({
+                "retryable": false,
+                "phase": "queue",
+            }),
+        )),
+        Some(ms) => Ok(Some(
+            Instant::now() + Duration::from_millis(ms).min(MAX_REQUEST_DEADLINE_REMAINING),
+        )),
+    }
+}
 
 /// Small bounded memory of completed task ids used to suppress stale lossy
-/// long-running reminders that arrive after their reliable completion event.
 const COMPLETED_TASK_SUPPRESSION_MAX: usize = 4096;
 
 /// Bash foreground orchestration polls detached tasks with short read-lane jobs.
@@ -487,9 +514,15 @@ fn submit_active_tool_call(
     request_id: String,
     detach_policy: RouteDetachPolicy,
     job: crate::executor::ExecutorJob,
+    deadline: Option<Instant>,
 ) -> oneshot::Receiver<Response> {
-    let (rx, cancellation) =
-        executor.submit_cancellable_async(root_id.clone(), lane, request_id, job);
+    let (rx, cancellation) = executor.submit_cancellable_async_with_deadline(
+        root_id.clone(),
+        lane,
+        request_id,
+        job,
+        deadline,
+    );
     active
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -860,6 +893,10 @@ struct PendingBashAsk {
     cancel: bash::BashWaitCancel,
     grants: Vec<String>,
     expires_at: Instant,
+    /// The caller's absolute request deadline, captured at ingress before
+    /// permission elicitation. Checked again on an allowed reply before any
+    /// spawn bookkeeping or executor submission.
+    request_deadline: Option<Instant>,
 }
 
 impl RootMeta {
@@ -1896,6 +1933,43 @@ async fn handle_bash_elicitation_reply(
     };
 
     if frame.header.ty == FrameType::Response && bash_elicitation_reply_is_allow(&frame.body) {
+        // The request deadline is checked BEFORE bash-wait bookkeeping and
+        // before any executor submission: an expired permission answer must
+        // prove that no bash command started.
+        if let Some(deadline) = pending.request_deadline {
+            if Instant::now() >= deadline {
+                let response = Response::error_with_data(
+                    pending.request_id.clone(),
+                    "request_deadline_exceeded",
+                    "request deadline elapsed during permission elicitation",
+                    serde_json::json!({
+                        "retryable": false,
+                        "phase": "queue",
+                    }),
+                );
+                let completion = bash::bash_deadline_exceeded_completion(
+                    pending.route,
+                    pending.tool_corr,
+                    pending.tool_flags,
+                    pending.tool_ver,
+                    pending.root,
+                    pending.request_id,
+                    pending.format_context,
+                    response,
+                );
+                bash::handle_bash_deferred_completion(
+                    tx,
+                    completion,
+                    routes,
+                    live_roots,
+                    route_bash_cancels,
+                    shutdown,
+                    metrics,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
         if routes.contains_key(&key.route) {
             bash::submit_deferred_bash(
                 executor,
@@ -1918,6 +1992,7 @@ async fn handle_bash_elicitation_reply(
                 pending.spawn_principal,
                 pending.edit_slot_survives,
                 Some(pending.grants),
+                pending.request_deadline,
             );
             return Ok(());
         }
@@ -4410,16 +4485,22 @@ async fn handle_control_request(
                 meta.maintenance_queued_kinds.clear();
                 meta.maintenance_pending = meta.maintenance_jobs_in_flight > 0;
             }
-            let (configure_rx, configure_cancellation) = executor.submit_cancellable_async(
-                bind_root_id.clone(),
-                Lane::Mutating,
-                configure_request_id.clone(),
-                Box::new(move |ctx| {
-                    log_ctx::with_session(Some(configure_session.clone()), || {
-                        dispatch(configure_req, ctx)
-                    })
-                }),
-            );
+            // One bind timestamp feeds both the 12-second expiry contract and
+            // the queue deadline: constructing the pending bind and its
+            // started_at once keeps the two clocks identical.
+            let bind_started_at = Instant::now();
+            let (configure_rx, configure_cancellation) = executor
+                .submit_cancellable_async_with_deadline(
+                    bind_root_id.clone(),
+                    Lane::Mutating,
+                    configure_request_id.clone(),
+                    Box::new(move |ctx| {
+                        log_ctx::with_session(Some(configure_session.clone()), || {
+                            dispatch(configure_req, ctx)
+                        })
+                    }),
+                    Some(bind_started_at + ROUTE_BIND_DEADLINE),
+                );
             pending_binds.insert(
                 route_id,
                 PendingBind {
@@ -4427,7 +4508,7 @@ async fn handle_control_request(
                     inserted_new_actor,
                     cancelled: false,
                     configure_request_id: configure_request_id.clone(),
-                    started_at: Instant::now(),
+                    started_at: bind_started_at,
                     warned_half_deadline: false,
                     deadline_reported: false,
                     corr: frame.header.corr,
@@ -4753,13 +4834,42 @@ async fn handle_tool_call(
     };
     let bare_name = call.name;
     let arguments = strip_agent_preview_arg_owned(call.arguments);
+    let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
+    // Convert the caller's remaining budget into ONE absolute local deadline
+    // before permission elicitation or executor admission. Zero is rejected
+    // here with the logical response; values above the cap clamp to the cap.
+    let request_deadline = match normalize_request_deadline(call.deadline_ms_remaining, &request_id)
+    {
+        Ok(deadline) => deadline,
+        Err(response) => {
+            let text = crate::subc_format::format_response_with_context(
+                &bare_name,
+                &response,
+                &crate::subc_format::FormatContext::from_tool_call(
+                    &bare_name,
+                    &arguments,
+                    identity.project_root.as_path(),
+                ),
+            );
+            let result = ToolCallResult { text, response };
+            let response_frame = build_tool_response_frame_with_limit(
+                frame.header.ver,
+                route_id,
+                frame.header.corr,
+                frame.header.flags,
+                &result,
+                identity.trust,
+                tool_response_body_limit,
+            )?;
+            return send_reliable_writer_frame(tx, metrics, response_frame, "tool response").await;
+        }
+    };
     let format_context = crate::subc_format::FormatContext::from_tool_call(
         &bare_name,
         &arguments,
         identity.project_root.as_path(),
     );
 
-    let request_id = format!("subc-{}-{}", frame.header.channel, frame.header.corr);
     let bind_trust = identity.trust;
     let diagnostics_on_edit = live_roots
         .get(&identity.root)
@@ -4947,6 +5057,7 @@ async fn handle_tool_call(
                     cancel,
                     grants: plan.grants,
                     expires_at: Instant::now() + bash_elicitation_timeout(),
+                    request_deadline,
                 },
             );
             return send_reliable_writer_frame(tx, metrics, ask_frame, "bash elicitation request")
@@ -4993,6 +5104,7 @@ async fn handle_tool_call(
             identity.spawn_principal.clone(),
             call.edit_slot_survives,
             None,
+            request_deadline,
         );
         return Ok(());
     }
@@ -5133,8 +5245,8 @@ async fn handle_tool_call(
             request_id.clone(),
             RouteDetachPolicy::CancelOnDetach,
             job,
+            request_deadline,
         );
-
         let completion_tx = tx.clone();
         let completion_shutdown = Arc::clone(shutdown);
         let completion_metrics = Arc::clone(metrics);
@@ -5323,6 +5435,7 @@ async fn handle_tool_call(
         request_id.clone(),
         RouteDetachPolicy::RetainForReplay,
         job,
+        request_deadline,
     );
     let completion_tx = tx.clone();
     let completion_shutdown = Arc::clone(shutdown);
@@ -5667,6 +5780,12 @@ struct ToolCallRequest {
     /// apply fail with not-found.
     #[serde(default)]
     preview: bool,
+    /// Transport metadata generated by `SubcTransportPool`: the caller's
+    /// remaining request budget in milliseconds. Trusted only as a time
+    /// budget, never as scheduling authority; untrusted binds get the same
+    /// cap while the server keeps owning lane and trust restrictions.
+    #[serde(default)]
+    deadline_ms_remaining: Option<u64>,
 }
 
 #[cfg(test)]
@@ -6113,6 +6232,7 @@ pub(crate) mod test_support {
             actor_cap: 2,
             heavy_permits: 1,
             drr_quantum: 1,
+            ..crate::executor::ExecutorConfig::default()
         }));
         let (_dir, root) = test_root("cancelled-interactive-search");
         executor.register_actor(root.clone(), test_ctx());
@@ -6209,6 +6329,7 @@ pub(crate) mod test_support {
                     "cancelled at search checkpoint",
                 )
             }),
+            None,
         );
         tracked_started_rx
             .recv_timeout(Duration::from_secs(1))
@@ -6245,6 +6366,7 @@ pub(crate) mod test_support {
                     "cancelled for terminal-emitting teardown",
                 )
             }),
+            None,
         );
         terminal_started_rx
             .recv_timeout(Duration::from_secs(1))

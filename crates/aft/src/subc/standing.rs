@@ -199,19 +199,18 @@ impl StandingActor {
                     serde_json::json!({"standing": true, "entry": literal_path, "admitted": false}),
                 );
             };
-            let Some(permit) =
-                crate::cold_build_limiter::acquire_standing_while_cancellable_with_limiter(
-                    &ctx.cold_build_limiter(),
-                    "standing maintenance pass",
-                    format!("standing:{}", literal_path),
-                    admission.publication.admission_epoch,
-                    || !admission.cancellation_requested(),
-                    || {
-                        crate::executor::current_job_cancelled()
-                            || admission.cancellation_requested()
-                    },
-                )
-            else {
+            // Nonblocking standing admission: lifecycle admission stays inside
+            // this serialized maintenance job, but the cold-build acquire is
+            // immediate. When no slot is available the pass YIELDS — returning
+            // without advancing publication state — and the 250ms standing
+            // tick resubmits the coalesced pass. A yielded pass therefore never
+            // occupies a maintenance worker waiting for a cold slot, so heavy
+            // standing indexing cannot consume interactive reader capacity.
+            let Some(permit) = crate::cold_build_limiter::try_acquire_standing_with_limiter(
+                &ctx.cold_build_limiter(),
+                format!("standing:{}", literal_path),
+                admission.publication.admission_epoch,
+            ) else {
                 return crate::protocol::Response::success(
                     response_request_id,
                     serde_json::json!({"standing": true, "entry": literal_path, "admitted": false, "yielded": true}),

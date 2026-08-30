@@ -198,6 +198,7 @@ async function createConcreteAftTransportPool(
       onBgEventsNudge: opts.onBgEventsNudge,
       onBgEventsNudgeRef: opts.onBgEventsNudgeRef,
       lifecycleDemandCheck: opts.subcLifecycleDemandCheck ?? ((root) => existsSync(root)),
+      defaultTimeoutMs: opts.poolOptions.timeoutMs ?? 30_000,
     });
   }
   return new BridgePool(opts.binaryPath, opts.poolOptions, opts.configOverrides);

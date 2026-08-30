@@ -44,6 +44,9 @@ static INSPECT_POOL: LazyLock<Arc<rayon::ThreadPool>> = LazyLock::new(|| {
             .stack_size(8 * 1024 * 1024)
             .start_handler(|_| {
                 INSPECT_THREAD_COUNT.fetch_add(1, Ordering::SeqCst);
+                // Inspect workers are pure background maintenance: let
+                // interactive readers win the OS scheduler on CPU and I/O.
+                crate::thread_priority::demote_background();
             })
             .exit_handler(|_| {
                 INSPECT_THREAD_COUNT.fetch_sub(1, Ordering::SeqCst);

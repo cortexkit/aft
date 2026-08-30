@@ -1335,6 +1335,7 @@ fn bridge_executor_config() -> ExecutorConfig {
         actor_cap: 3,
         heavy_permits: 2,
         drr_quantum: 1,
+        ..ExecutorConfig::default()
     }
 }
 
@@ -2466,6 +2467,7 @@ fn subc_bridge_rejects_malformed_fed_harness_on_bind() {
         actor_cap: 2,
         heavy_permits: 1,
         drr_quantum: 1,
+        ..ExecutorConfig::default()
     }));
     let user_config_path = storage.path().join("nonexistent-user-aft.jsonc");
 
@@ -2918,6 +2920,7 @@ fn subc_rejects_forwarded_configure_tool_call_in_production() {
         actor_cap: 2,
         heavy_permits: 1,
         drr_quantum: 1,
+        ..ExecutorConfig::default()
     }));
     let user_config_path = storage.path().join("nonexistent-user-aft.jsonc");
 

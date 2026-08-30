@@ -238,6 +238,10 @@ pub(super) fn submit_deferred_bash(
     spawn_principal: crate::sandbox_spawn::AuthenticatedPrincipal,
     edit_slot_survives: Option<bool>,
     permissions_granted: Option<Vec<String>>,
+    // Absolute request deadline captured at ingress. Checked before spawn
+    // bookkeeping; each queued executor phase carries the same deadline and a
+    // phase already running may finish after the deadline (queue-scoped rule).
+    request_deadline: Option<Instant>,
 ) {
     let (spawn_control_tx, spawn_control_rx) = oneshot::channel::<BashSpawnControl>();
     let (spawn_text_tx, spawn_text_rx) = oneshot::channel::<String>();
@@ -246,7 +250,9 @@ pub(super) fn submit_deferred_bash(
     let session_for_spawn = session_id.clone();
     let project_root_for_spawn = project_root.clone();
     let format_context_for_spawn = format_context.clone();
-    let spawn_rx = executor.submit_async(
+    // The spawn submission carries the exact absolute ingress deadline; the
+    // executor rejects or prunes the queued phase when it elapses.
+    let spawn_rx = executor.submit_async_with_deadline(
         root_for_spawn,
         Lane::Mutating,
         request_id.clone(),
@@ -254,6 +260,29 @@ pub(super) fn submit_deferred_bash(
             log_ctx::with_session(Some(session_for_spawn.clone()), || {
                 let mut spawn_text_tx = Some(spawn_text_tx);
                 let mut spawn_control_tx = Some(spawn_control_tx);
+
+                // Queue-scoped rule: if the budget expired before the spawn
+                // phase even started, no command may begin.
+                if request_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    let response = crate::protocol::Response::error_with_data(
+                        request_id_for_spawn.clone(),
+                        "request_deadline_exceeded",
+                        "request deadline elapsed before bash could start",
+                        serde_json::json!({
+                            "retryable": false,
+                            "phase": "queue",
+                        }),
+                    );
+                    return finish_bash_spawn_immediate(
+                        response,
+                        ctx,
+                        &session_for_spawn,
+                        &format_context_for_spawn,
+                        &mut spawn_text_tx,
+                        &mut spawn_control_tx,
+                        false,
+                    );
+                }
 
                 if matches!(bind_trust, BindTrust::Untrusted) && permissions_granted.is_none() {
                     let response = bash_denied_untrusted_response(request_id_for_spawn.clone());
@@ -421,6 +450,7 @@ pub(super) fn submit_deferred_bash(
                 response
             })
         }),
+        request_deadline,
     );
 
     let executor = Arc::clone(executor);
@@ -493,6 +523,7 @@ pub(super) fn submit_deferred_bash(
                     detach_on_user_message,
                     format_context,
                     cancel,
+                    request_deadline,
                 )
                 .await;
             }
@@ -540,6 +571,7 @@ async fn run_deferred_bash_wait(
     detach_on_user_message: bool,
     format_context: crate::subc_format::FormatContext,
     cancel: BashWaitCancel,
+    request_deadline: Option<Instant>,
 ) {
     loop {
         tokio::select! {
@@ -578,7 +610,9 @@ async fn run_deferred_bash_wait(
                 let storage_for_poll = storage_dir.clone();
                 let project_root_for_poll = project_root.clone();
                 let format_context_for_poll = format_context.clone();
-                let poll_rx = executor.submit_async(
+                // Each queued poll phase carries the same absolute request
+                // deadline; a phase already running may finish after it.
+                let poll_rx = executor.submit_async_with_deadline(
                     root_for_poll,
                     Lane::PureRead,
                     request_id.clone(),
@@ -706,6 +740,7 @@ async fn run_deferred_bash_wait(
                             }
                         })
                     }),
+                    request_deadline,
                 );
                 let poll_response = await_executor_response(poll_rx, request_id.clone()).await;
                 let _ = send_counted_channel(
@@ -753,6 +788,7 @@ async fn run_deferred_bash_wait(
                             timeout,
                             wait_window_ms,
                             format_context.clone(),
+                            request_deadline,
                         )
                         .await;
                         let fatal = response_is_fatal_panic(&result.response);
@@ -787,13 +823,16 @@ async fn submit_bash_promote(
     timeout: Option<u64>,
     wait_window_ms: u64,
     format_context: crate::subc_format::FormatContext,
+    request_deadline: Option<Instant>,
 ) -> ToolCallResult {
     let (text_tx, text_rx) = oneshot::channel::<String>();
     let request_id_for_promote = request_id.clone();
     let task_id_for_promote = task_id.clone();
     let session_for_promote = session_id.clone();
     let format_context_for_promote = format_context.clone();
-    let promote_rx = executor.submit_async(
+    // The promote phase carries the same absolute request deadline. If it
+    // elapsed while queued, the executor settles with request_deadline_exceeded.
+    let promote_rx = executor.submit_async_with_deadline(
         root,
         Lane::Mutating,
         request_id.clone(),
@@ -832,6 +871,7 @@ async fn submit_bash_promote(
                 response
             })
         }),
+        request_deadline,
     );
     let response = await_executor_response(promote_rx, request_id).await;
     let text = text_rx.await.unwrap_or_else(|_| {
@@ -937,6 +977,31 @@ pub(super) fn bash_denied_untrusted_completion(
     format_context: crate::subc_format::FormatContext,
 ) -> BashDeferredCompletion {
     let response = bash_denied_untrusted_response(request_id.clone());
+    BashDeferredCompletion {
+        route,
+        corr,
+        flags,
+        ver,
+        root,
+        request_id,
+        result: Some(bash_result_from_response(response, &format_context)),
+        fatal: false,
+    }
+}
+
+/// A deadline-expired deferred bash completion: the request budget elapsed
+/// before any command could start, so the response proves non-execution.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn bash_deadline_exceeded_completion(
+    route: RouteChannel,
+    corr: u64,
+    flags: Flags,
+    ver: u8,
+    root: ProjectRootId,
+    request_id: String,
+    format_context: crate::subc_format::FormatContext,
+    response: crate::protocol::Response,
+) -> BashDeferredCompletion {
     BashDeferredCompletion {
         route,
         corr,

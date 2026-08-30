@@ -1172,7 +1172,10 @@ impl RefreshWorker {
         let thread_shared = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("aft-callgraph-refresh".to_string())
-            .spawn(move || callgraph_refresh_worker_loop(&thread_shared))
+            .spawn(move || {
+                crate::thread_priority::demote_background();
+                callgraph_refresh_worker_loop(&thread_shared)
+            })
             .expect("failed to spawn callgraph refresh worker");
         Arc::new(Self {
             shared,
@@ -8489,6 +8492,11 @@ fn build_extracts_parallel(project_root: &Path, files: &[PathBuf]) -> BuildExtra
         .num_threads(build_pool_size())
         .thread_name(|index| format!("aft-callgraph-build-{index}"))
         .stack_size(8 * 1024 * 1024)
+        .start_handler(|_| {
+            // Callgraph builds are background maintenance: keep interactive
+            // reads ahead in the OS scheduler (CPU and I/O).
+            crate::thread_priority::demote_background();
+        })
         .build()
     {
         Ok(pool) => pool.install(run),
