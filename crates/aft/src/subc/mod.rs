@@ -8343,6 +8343,7 @@ mod tests {
                 actor_cap: 1,
                 heavy_permits: 1,
                 drr_quantum: 1,
+                ..crate::executor::ExecutorConfig::default()
             },
             "pool=2 actor_cap=1",
         )
@@ -8354,6 +8355,7 @@ mod tests {
                 actor_cap: 3,
                 heavy_permits: 3,
                 drr_quantum: 1,
+                ..crate::executor::ExecutorConfig::default()
             },
             "pool=4 actor_cap=3",
         )
