@@ -3193,6 +3193,7 @@ fn schedule_artifact_loads(
         let symbol_cache = ctx.symbol_cache();
         let symbol_storage = storage_dir.clone();
         let symbol_project_key = project_key.clone();
+        let search_project_key = project_key.clone();
         let is_worktree_bridge_for_search = is_worktree_bridge;
         let search_loads_shared_artifacts_read_only =
             is_worktree_bridge_for_search || ctx.shared_artifacts_read_only();
@@ -3403,11 +3404,35 @@ fn schedule_artifact_loads(
                 // Borrow-only / worktree roots never persist, overlay or not.
                 // `write_to_disk` also fail-closes via artifact_write_allowed.
                 if generation_current() && !is_worktree_bridge_for_search && persist_to_disk {
-                    let published =
-                        search_persist_epoch_flag.run_if_current(search_persist_epoch, || {
-                            let head = index.stored_git_head().map(str::to_owned);
-                            index.write_to_disk(&cache_dir, head.as_deref())
-                        });
+                    // Standing-root search builders publish into this same
+                    // cache dir under a root-keyed WriterLease; hold the same
+                    let search_lease = crate::root_cache::WriterLease::acquire_shared(
+                        crate::root_cache::RootCacheDomain::Index,
+                        &cache_dir,
+                        &search_project_key,
+                        &root_for_search,
+                    );
+                    let published = match search_lease {
+                        Ok(Some(_lease)) => {
+                            search_persist_epoch_flag.run_if_current(search_persist_epoch, || {
+                                let head = index.stored_git_head().map(str::to_owned);
+                                index.write_to_disk(&cache_dir, head.as_deref())
+                            })
+                        }
+                        Ok(None) => {
+                            slog_info!(
+                                "search index persistence skipped: writer lease not allowed"
+                            );
+                            None
+                        }
+                        Err(error) => {
+                            slog_warn!(
+                                "search index persistence writer lease unavailable: {}",
+                                error
+                            );
+                            None
+                        }
+                    };
                     persistence_succeeded = published == Some(true);
                     if published.is_none() {
                         slog_info!(
@@ -4075,6 +4100,33 @@ fn schedule_artifact_loads(
                         );
                         return false;
                     }
+                    // A standing-root builder publishes into the same
+                    // semantic cache dir through a root-keyed WriterLease.
+                    // Acquire the same lease here so session-driven and
+                    // standing publications cannot interleave over one
+                    // directory.
+                    let semantic_cache_dir = dir.join("semantic").join(&semantic_project_key);
+                    let _standing_lease = match crate::root_cache::WriterLease::acquire_shared(
+                        crate::root_cache::RootCacheDomain::Index,
+                        &semantic_cache_dir,
+                        &semantic_project_key,
+                        &root_clone,
+                    ) {
+                        Ok(Some(lease)) => Some(lease),
+                        Ok(None) => {
+                            slog_info!(
+                                "semantic index persistence skipped for {reason}: writer lease not allowed"
+                            );
+                            return false;
+                        }
+                        Err(error) => {
+                            slog_warn!(
+                                "semantic index persistence writer lease unavailable for {reason}: {}",
+                                error
+                            );
+                            return false;
+                        }
+                    };
                     let Ok(_cache_lock) =
                         SemanticIndexLock::acquire(dir, &semantic_project_key, &root_clone)
                     else {

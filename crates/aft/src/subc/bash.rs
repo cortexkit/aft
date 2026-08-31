@@ -46,6 +46,9 @@ struct BashTranslatedSettings {
     wait: bool,
     block_to_completion: bool,
     timeout: Option<u64>,
+    /// Client-bounded foreground wait window (ms). Pi sends this so the
+    /// Rust-side promotion window cannot exceed the client's request budget.
+    foreground_wait_ms: Option<u64>,
 }
 
 enum BashSpawnControl {
@@ -82,6 +85,10 @@ fn bash_settings_from_translated(args: &serde_json::Map<String, Value>) -> BashT
             .and_then(Value::as_bool)
             .unwrap_or(false),
         timeout: args.get("timeout").and_then(Value::as_u64),
+        foreground_wait_ms: args
+            .get("foreground_wait_ms")
+            .and_then(Value::as_u64)
+            .filter(|ms| *ms > 0),
     }
 }
 
@@ -418,6 +425,7 @@ pub(super) fn submit_deferred_bash(
                         ctx.config().foreground_wait_window_ms,
                         settings.timeout,
                         settings.wait,
+                        settings.foreground_wait_ms,
                     );
                 let deadline = Instant::now() + Duration::from_millis(wait_window_ms);
                 let storage_dir =
@@ -751,6 +759,49 @@ async fn run_deferred_bash_wait(
                 .await;
                 match poll_control_rx.await.unwrap_or(BashPollControl::Done) {
                     BashPollControl::Done => {
+                        // If the executor rejected the poll after the request
+                        // deadline elapsed, the command is still running with
+                        // wait-mode bookkeeping registered. Promote it to a
+                        // background task instead of leaking the registration
+                        // and delivering a bare deadline error.
+                        if poll_was_deadline_rejected(&poll_response) {
+                            if let Some(ctx) = executor.actor_context(&root) {
+                                if detach_on_user_message {
+                                    ctx.bash_background()
+                                        .end_wait_mode_session(&session_id, &task_id);
+                                } else {
+                                    ctx.bash_background()
+                                        .unregister_foreground_task(&session_id, &task_id);
+                                }
+                            }
+                            let result = submit_bash_promote(
+                                &executor,
+                                root.clone(),
+                                request_id.clone(),
+                                task_id.clone(),
+                                session_id.clone(),
+                                timeout,
+                                wait_window_ms,
+                                format_context.clone(),
+                                None,
+                            )
+                            .await;
+                            let fatal = response_is_fatal_panic(&result.response);
+                            send_bash_deferred_completion(
+                                &completion_tx,
+                                &metrics,
+                                route,
+                                corr,
+                                flags,
+                                ver,
+                                root,
+                                request_id,
+                                Some(result),
+                                fatal,
+                            )
+                            .await;
+                            break;
+                        }
                         let text = poll_text_rx.await.unwrap_or_else(|_| {
                             crate::subc_format::format_response_with_context(
                                 "bash",
@@ -878,6 +929,13 @@ async fn submit_bash_promote(
         crate::subc_format::format_response_with_context("bash", &response, &format_context)
     });
     ToolCallResult { text, response }
+}
+
+/// True when a poll-phase executor response proves the request budget
+/// elapsed before the poll could be admitted (queued rejection or prune).
+/// The command may still be running, so the caller must promote it.
+fn poll_was_deadline_rejected(response: &Response) -> bool {
+    response.data.get("code").and_then(Value::as_str) == Some("request_deadline_exceeded")
 }
 
 #[allow(clippy::too_many_arguments)]

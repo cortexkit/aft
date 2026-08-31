@@ -1184,6 +1184,17 @@ fn translate_bash(args: Value, project_root: &Path) -> Result<Translated, Transl
         "block_to_completion".to_string(),
         Value::Bool(block_to_completion),
     );
+    if let Some(foreground_wait_ms) = coerce_optional_int_result(
+        map_in.get("foreground_wait_ms"),
+        "foreground_wait_ms",
+        1,
+        MAX_SAFE_INTEGER,
+    )? {
+        out.insert(
+            "foreground_wait_ms".to_string(),
+            Value::Number(foreground_wait_ms.into()),
+        );
+    }
 
     if let Some(permissions_granted) = map_in.get("permissions_granted") {
         out.insert(

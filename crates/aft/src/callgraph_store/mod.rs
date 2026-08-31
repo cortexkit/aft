@@ -76,6 +76,8 @@ const COLD_BUILD_EXTRACT_BATCH_BYTES: u64 = 32 * 1024 * 1024;
 const COLD_BUILD_RESOLVE_WINDOW: usize = 20_000;
 const STAGED_COMMITTED_EXTRACTED_BYTES: &str = "committed_extracted_bytes";
 const STAGED_RESOLVE_CURSOR: &str = "resolve_cursor";
+const STAGED_DISPATCH_CURSOR_FILE: &str = "dispatch_cursor_file";
+const STAGED_DISPATCH_COMPLETED_FILES: &str = "dispatch_completed_files";
 const STAGED_BUILD_PHASE: &str = "staged_build_phase";
 const STAGED_CORPUS_FINGERPRINT: &str = "staged_corpus_fingerprint";
 
@@ -3903,12 +3905,65 @@ impl CallGraphStore {
         }
 
         ensure_cold_build_current("resolution", resolved_refs, total_refs)?;
+        // Dispatch edges are inserted per-slice so a slice budget exhaustion
+        // cannot roll back work inside the publication transaction. Each
+        // chunk commits its own cursor before the final publish.
+        if staged_build_phase(&conn)?.as_deref() != Some("dispatching") {
+            let total_changes_before = conn.total_changes();
+            let tx = conn.transaction()?;
+            set_staged_build_phase(&tx, "dispatching")?;
+            set_staged_string(&tx, STAGED_DISPATCH_CURSOR_FILE, "")?;
+            set_staged_u64(&tx, STAGED_DISPATCH_COMPLETED_FILES, 0)?;
+            tx.commit()?;
+            self.record_commit(total_changes_before, &conn);
+            ensure_cold_build_current("method-dispatch-phase", 1, 1)?;
+        }
+        let total_dispatch_files = query_count(
+            &conn,
+            "SELECT COUNT(*) FROM (SELECT DISTINCT caller_file FROM refs)",
+        )? as usize;
+        let mut dispatch_completed = staged_u64(&conn, STAGED_DISPATCH_COMPLETED_FILES)? as usize;
+        let mut dispatch_after_file =
+            staged_string(&conn, STAGED_DISPATCH_CURSOR_FILE)?.unwrap_or_default();
+        loop {
+            let caller_files = {
+                let mut statement = conn.prepare(
+                    "SELECT DISTINCT caller_file
+                     FROM refs
+                     WHERE caller_file > ?1
+                     ORDER BY caller_file
+                     LIMIT ?2",
+                )?;
+                let rows = statement
+                    .query_map(params![dispatch_after_file, batch_files as i64], |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                rows.collect::<std::result::Result<BTreeSet<_>, _>>()?
+            };
+            let Some(last_file) = caller_files.last().cloned() else {
+                break;
+            };
+            self.verify_writer_lease()?;
+            let total_changes_before = conn.total_changes();
+            let tx = conn.transaction()?;
+            insert_method_dispatch_edges(&tx, &self.project_root, Some(&caller_files))?;
+            set_staged_string(&tx, STAGED_DISPATCH_CURSOR_FILE, &last_file)?;
+            set_staged_u64(
+                &tx,
+                STAGED_DISPATCH_COMPLETED_FILES,
+                (dispatch_completed + caller_files.len()) as u64,
+            )?;
+            tx.commit()?;
+            self.record_commit(total_changes_before, &conn);
+            dispatch_after_file = last_file;
+            dispatch_completed += caller_files.len();
+            ensure_cold_build_current("method-dispatch", dispatch_completed, total_dispatch_files)?;
+        }
+
         note_cold_build_phase("publication");
         self.verify_writer_lease()?;
         let total_changes_before = conn.total_changes();
         let tx = conn.transaction()?;
-        let _supplemental_edge_count =
-            insert_method_dispatch_edges_chunked(&tx, &self.project_root, batch_files)?;
         set_meta_ready(&tx, true)?;
         set_staged_build_phase(&tx, "ready")?;
         tx.execute("DELETE FROM staging_file_inventory", [])?;
@@ -11148,48 +11203,6 @@ fn insert_method_dispatch_edges(
         insert_method_dispatch_edge(tx, &reference, &candidate, PROVENANCE_NAME_MATCH)?;
         inserted += 1;
     }
-    Ok(inserted)
-}
-
-fn insert_method_dispatch_edges_chunked(
-    tx: &Transaction<'_>,
-    project_root: &Path,
-    chunk_size: usize,
-) -> Result<usize> {
-    let total_files = query_count(
-        tx,
-        "SELECT COUNT(*) FROM (SELECT DISTINCT caller_file FROM refs)",
-    )? as usize;
-    let mut completed_files = 0usize;
-    ensure_cold_build_current("method-dispatch", completed_files, total_files)?;
-    let mut inserted = 0usize;
-    let mut after_file = String::new();
-    loop {
-        let caller_files = {
-            let mut statement = tx.prepare(
-                "SELECT DISTINCT caller_file
-                 FROM refs
-                 WHERE caller_file > ?1
-                 ORDER BY caller_file
-                 LIMIT ?2",
-            )?;
-            let rows = statement
-                .query_map(params![after_file, chunk_size.max(1) as i64], |row| {
-                    row.get::<_, String>(0)
-                })?;
-            rows.collect::<std::result::Result<BTreeSet<_>, _>>()?
-        };
-        let Some(last_file) = caller_files.last().cloned() else {
-            break;
-        };
-        inserted += insert_method_dispatch_edges(tx, project_root, Some(&caller_files))?;
-        after_file = last_file;
-        completed_files = completed_files
-            .saturating_add(caller_files.len())
-            .min(total_files);
-        ensure_cold_build_current("method-dispatch", completed_files, total_files)?;
-    }
-    ensure_cold_build_current("method-dispatch", completed_files, total_files)?;
     Ok(inserted)
 }
 

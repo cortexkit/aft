@@ -939,48 +939,90 @@ impl SearchIndex {
         max_file_size: u64,
         cache_dir: &Path,
     ) -> std::io::Result<SearchBuildSliceOutcome> {
+        Self::resume_cold_build_slice_sized(root, max_file_size, cache_dir, SEARCH_SLICE_FILES)
+    }
+
+    pub(crate) fn resume_cold_build_slice_sized(
+        root: &Path,
+        max_file_size: u64,
+        cache_dir: &Path,
+        slice_size: usize,
+    ) -> std::io::Result<SearchBuildSliceOutcome> {
         fs::create_dir_all(cache_dir)?;
         let staging_dir = cache_dir.join(SEARCH_STAGING_DIR);
         let manifest_path = staging_dir.join(SEARCH_STAGING_MANIFEST);
         let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let ignore_fingerprint = ignore_rules_fingerprint(&canonical_root);
-        let filters = PathFilters::default();
-        let paths = walk_project_files(&canonical_root, &filters);
-        let corpus_fingerprint =
-            search_corpus_fingerprint(&canonical_root, &ignore_fingerprint, max_file_size, &paths);
-        let mut manifest = load_search_staging_manifest(&manifest_path)
-            .filter(|manifest| {
-                manifest.version == SEARCH_STAGING_VERSION
-                    && manifest.corpus_fingerprint == corpus_fingerprint
-                    && manifest.canonical_root == canonical_root
-                    && manifest.ignore_fingerprint == ignore_fingerprint
-                    && manifest.max_file_size == max_file_size
-                    && manifest.paths == paths
-                    && manifest.cursor <= manifest.paths.len()
-                    && manifest.files.len() == manifest.cursor
-            })
-            .unwrap_or_else(|| {
-                let _ = fs::remove_dir_all(&staging_dir);
-                SearchStagingManifest {
-                    version: SEARCH_STAGING_VERSION,
-                    corpus_fingerprint: corpus_fingerprint.clone(),
-                    canonical_root: canonical_root.clone(),
-                    ignore_fingerprint: ignore_fingerprint.clone(),
+        let existing = load_search_staging_manifest(&manifest_path).filter(|manifest| {
+            manifest.version == SEARCH_STAGING_VERSION
+                && manifest.canonical_root == canonical_root
+                && manifest.cursor <= manifest.paths.len()
+                && manifest.files.len() == manifest.cursor
+        });
+        // Fresh start (or structurally invalid staging): walk and fingerprint
+        // the full corpus once to seed the manifest. Mid-build slices skip the
+        // walk and continue from the staged manifest; the publication slice
+        // re-validates the corpus before publishing.
+        let manifest_valid_mid_build = existing
+            .as_ref()
+            .is_some_and(|manifest| manifest.cursor > 0 && manifest.cursor < manifest.paths.len());
+        let mut manifest = match existing {
+            Some(manifest) if manifest_valid_mid_build => manifest,
+            _ => {
+                let ignore_fingerprint = ignore_rules_fingerprint(&canonical_root);
+                let filters = PathFilters::default();
+                let paths = walk_project_files(&canonical_root, &filters);
+                let corpus_fingerprint = search_corpus_fingerprint(
+                    &canonical_root,
+                    &ignore_fingerprint,
                     max_file_size,
-                    paths: paths.clone(),
-                    cursor: 0,
-                    spill_seq: 0,
-                    files: Vec::new(),
+                    &paths,
+                );
+                let compatible = load_search_staging_manifest(&manifest_path).filter(|manifest| {
+                    manifest.version == SEARCH_STAGING_VERSION
+                        && manifest.corpus_fingerprint == corpus_fingerprint
+                        && manifest.canonical_root == canonical_root
+                        && manifest.ignore_fingerprint == ignore_fingerprint
+                        && manifest.max_file_size == max_file_size
+                        && manifest.paths == paths
+                        && manifest.cursor <= manifest.paths.len()
+                        && manifest.files.len() == manifest.cursor
+                });
+                match compatible {
+                    Some(manifest) => manifest,
+                    None => {
+                        let _ = fs::remove_dir_all(&staging_dir);
+                        SearchStagingManifest {
+                            version: SEARCH_STAGING_VERSION,
+                            corpus_fingerprint,
+                            canonical_root: canonical_root.clone(),
+                            ignore_fingerprint,
+                            max_file_size,
+                            paths,
+                            cursor: 0,
+                            spill_seq: 0,
+                            files: Vec::new(),
+                        }
+                    }
                 }
-            });
+            }
+        };
         fs::create_dir_all(&staging_dir)?;
 
         if manifest.cursor < manifest.paths.len() {
-            let end = (manifest.cursor + SEARCH_SLICE_FILES).min(manifest.paths.len());
+            let end = (manifest.cursor + slice_size).min(manifest.paths.len());
             let mut block = Vec::new();
             for path in &manifest.paths[manifest.cursor..end] {
-                let file_id = u32::try_from(manifest.files.len())
-                    .map_err(|_| std::io::Error::other("too many files to index"))?;
+                // Publication compacts ids over included entries only, so
+                // spill ids must be allocated the same way: excluded entries
+                // never consume an id.
+                let file_id = u32::try_from(
+                    manifest
+                        .files
+                        .iter()
+                        .filter(|staged| staged.included)
+                        .count(),
+                )
+                .map_err(|_| std::io::Error::other("too many files to index"))?;
                 match prepare_search_path(path, max_file_size) {
                     PreparedSearchPath::Indexed(file) => {
                         let trigram_count =
@@ -1031,6 +1073,25 @@ impl SearchIndex {
             }
             manifest.cursor = end;
             write_search_staging_manifest(&manifest_path, &manifest)?;
+            return Ok(SearchBuildSliceOutcome::Yielded);
+        }
+
+        // Publication slice: the corpus fingerprint only covers path, size,
+        // and mtime, so an edit that preserves both would silently publish
+        // stale postings. Re-hash every staged included file and restart the
+        // build when any content no longer matches its staged hash.
+        let ignore_fingerprint = ignore_rules_fingerprint(&canonical_root);
+        let filters = PathFilters::default();
+        let paths = walk_project_files(&canonical_root, &filters);
+        let corpus_fingerprint =
+            search_corpus_fingerprint(&canonical_root, &ignore_fingerprint, max_file_size, &paths);
+        let corpus_unchanged = manifest.corpus_fingerprint == corpus_fingerprint
+            && manifest.ignore_fingerprint == ignore_fingerprint
+            && manifest.max_file_size == max_file_size
+            && manifest.paths == paths
+            && staged_contents_match_disk(&manifest.files);
+        if !corpus_unchanged {
+            let _ = fs::remove_dir_all(&staging_dir);
             return Ok(SearchBuildSliceOutcome::Yielded);
         }
 
@@ -3419,6 +3480,19 @@ fn build_postings_header_bytes(plan: &CacheWritePlan) -> std::io::Result<Vec<u8>
         .into_inner()
         .map_err(|error| std::io::Error::other(error.to_string()))?
         .into_inner())
+}
+
+/// Re-hashes every staged included file against disk. The corpus
+/// fingerprint covers only path, size, and mtime, so an edit that preserves
+/// both can otherwise resume stale postings.
+fn staged_contents_match_disk(staged_files: &[SearchStagingFile]) -> bool {
+    staged_files
+        .iter()
+        .filter(|staged| staged.included && staged.indexed)
+        .all(|staged| match fs::read(&staged.path) {
+            Ok(content) => cache_freshness::hash_bytes(&content).as_bytes() == &staged.content_hash,
+            Err(_) => false,
+        })
 }
 
 fn build_lookup_section_bytes(lookup_entries: &[LookupEntry]) -> std::io::Result<Vec<u8>> {
@@ -8524,6 +8598,71 @@ mod tests {
             serial_grep.files_with_matches,
             parallel_grep.files_with_matches
         );
+    }
+
+    #[test]
+    fn resumable_search_spill_ids_skip_excluded_entries() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        let cache = dir.path().join("cache");
+        fs::create_dir_all(&project).expect("create project");
+        // First entry is a binary (unindexed but included — it participates
+        // in the published file table without postings), remaining are
+        // indexable text. Skipped entries never consume an id; the critical
+        // invariant is that grep works on the text files regardless.
+        fs::write(project.join("000_blob.bin"), [0u8; 64]).expect("write binary");
+        for index in 0..5 {
+            fs::write(
+                project.join(format!("file_{index:03}.rs")),
+                format!("pub fn marker_{index}() {{ println!(\"id_marker_{index}\"); }}\n"),
+            )
+            .expect("write source");
+        }
+        while SearchIndex::resume_cold_build_slice(&project, DEFAULT_MAX_FILE_SIZE, &cache)
+            .expect("resume slice")
+            == SearchBuildSliceOutcome::Yielded
+        {}
+        let published = SearchIndex::read_from_disk(&cache, &project).expect("published index");
+        let result = published.grep("id_marker_4", true, &[], &[], &project, 10);
+    }
+
+    fn resumable_search_restarts_when_content_changes_without_metadata_change() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        let cache = dir.path().join("cache");
+        fs::create_dir_all(&project).expect("create project");
+        // Two files so the build spans two slices of one file each: the
+        // first slice stages stale content under a valid corpus fingerprint.
+        fs::write(project.join("a.rs"), "fn stale() {}\n").expect("write a");
+        fs::write(project.join("b.rs"), "fn stable() {}\n").expect("write b");
+        assert_eq!(
+            SearchIndex::resume_cold_build_slice_sized(&project, DEFAULT_MAX_FILE_SIZE, &cache, 1,)
+                .expect("first slice"),
+            SearchBuildSliceOutcome::Yielded
+        );
+        // Rewrite file a with identical size and restored mtime: the corpus
+        // fingerprint stays identical, but staged content is now stale.
+        let metadata = fs::metadata(project.join("a.rs")).expect("stat");
+        fs::write(project.join("a.rs"), "fn fresh() {}\n").expect("rewrite a");
+        let mtime = filetime::FileTime::from_last_modification_time(&metadata);
+        filetime::set_file_mtime(project.join("a.rs"), mtime).expect("restore mtime");
+        // The next slice reaches publication and must detect the stale
+        // staged content, reset staging, and yield for a fresh build.
+        assert_eq!(
+            SearchIndex::resume_cold_build_slice_sized(&project, DEFAULT_MAX_FILE_SIZE, &cache, 1,)
+                .expect("publication slice"),
+            SearchBuildSliceOutcome::Yielded
+        );
+        // Draining the fresh build publishes content that matches disk.
+        while SearchIndex::resume_cold_build_slice(&project, DEFAULT_MAX_FILE_SIZE, &cache)
+            .expect("drain slices")
+            == SearchBuildSliceOutcome::Yielded
+        {}
+        let published = SearchIndex::read_from_disk(&cache, &project).expect("published index");
+        let fresh = published.grep("fresh", true, &[], &[], &project, 10);
+        assert_eq!(fresh.total_matches, 1);
+        let stale = published.grep("stale", true, &[], &[], &project, 10);
+        assert_eq!(stale.total_matches, 0);
     }
 
     #[test]

@@ -581,6 +581,7 @@ export function registerBashTool(
             foreground_orchestrate: true,
             block_to_completion: blockToCompletion,
             wait: serverWait,
+            foreground_wait_ms: boundedForegroundWaitMs,
             sandbox: params.sandbox,
             ...(isPowerShell ? { shell: "powershell" } : {}),
           },

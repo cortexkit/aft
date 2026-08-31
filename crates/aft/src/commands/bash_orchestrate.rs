@@ -22,6 +22,9 @@ struct BashOrchestrateParams {
     background: bool,
     pty: bool,
     timeout: Option<u64>,
+    /// Client-bounded foreground wait window (ms), sent by Pi so the
+    /// promotion window cannot exceed the client's request budget.
+    foreground_wait_ms: Option<u64>,
 }
 
 /// Port of `packages/aft-bridge/src/bash-format.ts` `formatForegroundResult` (lines 8-25).
@@ -145,6 +148,7 @@ pub fn build_bash_outcome(
         ctx.config().foreground_wait_window_ms,
         params.timeout,
         params.wait,
+        params.foreground_wait_ms,
     );
     let deadline = Instant::now() + Duration::from_millis(wait_window_ms);
     let block_to_completion = params.block_to_completion || params.wait;
@@ -411,11 +415,12 @@ pub(crate) fn select_foreground_wait_window_ms(
     configured: u64,
     timeout: Option<u64>,
     wait: bool,
+    request_wait_ms: Option<u64>,
 ) -> u64 {
     if wait {
         timeout.unwrap_or(DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS)
     } else {
-        resolve_foreground_wait_window_ms(configured)
+        resolve_foreground_wait_window_ms(configured).min(request_wait_ms.unwrap_or(u64::MAX))
     }
 }
 
@@ -573,12 +578,32 @@ mod tests {
     #[test]
     fn select_foreground_wait_window_uses_timeout_budget_for_wait_true() {
         assert_eq!(
-            select_foreground_wait_window_ms(8_000, Some(250), true),
+            select_foreground_wait_window_ms(8_000, Some(250), true, None),
             250
         );
         assert_eq!(
-            select_foreground_wait_window_ms(8_000, None, true),
+            select_foreground_wait_window_ms(8_000, None, true, None),
             DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn select_foreground_wait_window_caps_to_client_request_budget() {
+        // Pi's 24s request budget must cap the promotion window even when
+        // the server config allows a longer foreground wait.
+        assert_eq!(
+            select_foreground_wait_window_ms(60_000, Some(120_000), false, Some(24_000)),
+            24_000
+        );
+        // The server-configured window still wins when it is shorter.
+        assert_eq!(
+            select_foreground_wait_window_ms(8_000, Some(120_000), false, Some(24_000)),
+            8_000
+        );
+        // Without a client bound the configured window is used unchanged.
+        assert_eq!(
+            select_foreground_wait_window_ms(60_000, None, false, None),
+            60_000
         );
     }
 
