@@ -73,9 +73,14 @@ opencode-aft/
 - Key files: `crates/aft/src/lsp/manager.rs`, `crates/aft/src/lsp/client.rs`, `crates/aft/src/lsp/diagnostics.rs`, `crates/aft/src/lsp/roots.rs`, `crates/aft/src/lsp/child_registry.rs`
 
 **`crates/aft/src/executor/`:**
-- Purpose: Orchestrate background maintenance, interactive tools, and job queues.
-- Contains: Actor scheduler, job classes and priority queues, worker thread loop, and cooperative cancellation tokens.
+- Purpose: Orchestrate bounded background maintenance and interactive tool queues across project-root actors.
+- Contains: Process-wide and per-actor capacity accounting, interactive and maintenance job classes, reader-first admission, deadline-aware writer promotion, queue-deadline pruning, deficit round-robin actor scheduling, worker lanes, dispatch telemetry, and cooperative cancellation tokens.
 - Key files: `crates/aft/src/executor/mod.rs`, `crates/aft/src/executor/tests.rs`
+
+**Standing-root scheduling and resource control:**
+- Purpose: Share cold-build slots fairly across standing roots without making a developer laptop unresponsive.
+- Contains: Process-wide deficit round-robin root scheduling, balanced and performance resource policies, pressure sampling with hysteresis, durable slice coordination, and cross-platform background thread priority control.
+- Key files: `crates/aft/src/standing_scheduler.rs`, `crates/aft/src/resource_policy.rs`, `crates/aft/src/subc/standing.rs`, `crates/aft/src/thread_priority.rs`
 
 **`crates/aft/src/bash_background/`:**
 - Purpose: Manage background bash tasks, PTY sessions, async pattern watches, and output compression.
