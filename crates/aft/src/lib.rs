@@ -46,6 +46,10 @@
 // Response::error instead of panicking. Confirmed zero .unwrap()/.expect() in
 // production error paths as of v0.6.3 audit.
 
+#[cfg(not(test))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod agent_child_env;
 pub mod alert_records;
 pub mod alert_state;

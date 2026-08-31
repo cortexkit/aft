@@ -3602,8 +3602,7 @@ where
                     next_standing_pass_at = tokio::time::Instant::now()
                         + standing::STANDING_MAINTENANCE_INTERVAL;
                 }
-                // Scan and trim allocator arenas on a detached thread. On glibc,
-                // mallinfo2() walks every arena under allocator locks, so the
+                // Sample and collect mimalloc pages on a detached thread. The
                 // transport thread must only evaluate the scan cadence here.
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
                 {
