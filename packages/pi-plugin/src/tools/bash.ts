@@ -538,7 +538,7 @@ export function registerBashTool(
       const effectiveTimeout =
         requestedWait || effectiveBackground || backgroundDisabled
           ? timeout
-          : resolveBashKillTimeout(timeout, foregroundWaitMs);
+          : resolveBashKillTimeout(timeout, boundedForegroundWaitMs);
 
       // Build spawn context for potential hook modification
       let spawnContext: BashSpawnContext = {

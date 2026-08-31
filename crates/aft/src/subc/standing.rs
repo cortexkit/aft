@@ -149,10 +149,14 @@ impl StandingActor {
     pub(super) fn begin_session_bind(&self, ctx: &AppContext) {
         let snapshot = ctx.config();
         let snapshot = snapshot.as_ref().clone();
-        if let Err(error) = self.roots.reconcile(&snapshot) {
-            log::warn!("standing roots bind reconciliation refused: {error}");
-            return;
-        }
+        let report = match self.roots.reconcile(&snapshot) {
+            Ok(report) => report,
+            Err(error) => {
+                log::warn!("standing roots bind reconciliation refused: {error}");
+                return;
+            }
+        };
+        self.retire_removed_actors(&report.removed);
         *self.reconciled_config.lock() = Some(StandingReconcileKey::from_config(&snapshot));
         let Some(session_root) = ctx
             .canonical_cache_root_opt()
@@ -206,13 +210,21 @@ impl StandingActor {
         self.resume_entries_without_bound_session(&entries);
         self.reconcile_schedule(entries);
         self.drain_completed_slices();
-        if matches!(
-            self.schedule
-                .lock()
-                .resource_gate
-                .observe(snapshot.index.resource_policy, sample_resources(),),
-            AdmissionDecision::Admit
-        ) {
+        let decision = self
+            .schedule
+            .lock()
+            .resource_gate
+            .observe(snapshot.index.resource_policy, sample_resources());
+        {
+            let mut schedule = self.schedule.lock();
+            schedule.resource_policy = snapshot.index.resource_policy.as_str().to_string();
+            schedule.pause_reason = match decision {
+                AdmissionDecision::Admit => None,
+                AdmissionDecision::Paused(reason) => Some(format!("{reason:?}").to_lowercase()),
+            };
+            Self::publish_schedule_telemetry(&schedule);
+        }
+        if decision == AdmissionDecision::Admit {
             self.dispatch_ready_slices(&snapshot);
         }
     }
@@ -463,9 +475,21 @@ impl StandingActor {
                     permit.admission_epoch,
                 )
             } else if kind == IndexKind::Semantic {
-                build_missing_semantic_after_strict_check(ctx, &entry)
+                build_missing_semantic_after_strict_check(
+                    ctx,
+                    &roots,
+                    &entry,
+                    &admission,
+                    permit.admission_epoch,
+                )
             } else {
-                (false, true)
+                build_missing_callgraph_after_strict_check(
+                    ctx,
+                    &roots,
+                    &entry,
+                    &admission,
+                    permit.admission_epoch,
+                )
             };
             if kind_complete {
                 if let Err(error) = roots.record_strict_verification(&literal_path, kind) {
@@ -662,11 +686,18 @@ fn build_missing_search_after_strict_check(
 
 fn build_missing_semantic_after_strict_check(
     ctx: &AppContext,
+    roots: &StandingRoots,
     entry: &StandingRootEntry,
+    admission: &crate::standing_roots::StandingBuildAdmission,
+    permit_epoch: u64,
 ) -> (bool, bool) {
+    if admission.cancellation_requested() || crate::executor::current_job_cancelled() {
+        return (false, true);
+    }
     let config = ctx.config();
     let semantic_config = config.semantic.clone();
     let storage_dir = config.storage_dir.clone();
+    let configure_generation = ctx.configure_generation();
     drop(config);
     let Some(storage_dir) = storage_dir else {
         return (false, true);
@@ -685,23 +716,105 @@ fn build_missing_semantic_after_strict_check(
             return (false, true);
         }
     };
-    match crate::semantic_index::SemanticIndex::resume_cold_build_slice(
-        &entry.resolved_target,
-        &files,
-        &mut model,
-        &semantic_config,
-        &storage_dir,
+    let cache_dir = storage_dir.join("semantic").join(&entry.artifact_key);
+    let lease = match crate::root_cache::WriterLease::acquire_shared(
+        crate::root_cache::RootCacheDomain::Index,
+        &cache_dir,
         &entry.artifact_key,
+        &entry.resolved_target,
     ) {
-        Ok(crate::semantic_index::SemanticBuildSliceOutcome::Complete) => (true, false),
-        Ok(crate::semantic_index::SemanticBuildSliceOutcome::Yielded) => (false, true),
-        Err(error) => {
-            log::warn!("standing semantic slice failed: {}", error);
-            (false, true)
-        }
+        Ok(Some(lease)) => lease,
+        Ok(None) | Err(_) => return (false, true),
+    };
+    let outcome = roots
+        .publish_if_current(
+            &entry.literal_path,
+            admission.publication,
+            &lease,
+            || true,
+            || {
+                permit_epoch == admission.publication.admission_epoch
+                    && ctx.configure_generation() == configure_generation
+                    && !admission.cancellation_requested()
+            },
+            || {
+                crate::semantic_index::SemanticIndex::resume_cold_build_slice(
+                    &entry.resolved_target,
+                    &files,
+                    &mut model,
+                    &semantic_config,
+                    &storage_dir,
+                    &entry.artifact_key,
+                )
+                .is_ok()
+            },
+        )
+        .ok()
+        .flatten();
+    match outcome {
+        Some(true) => (true, false),
+        Some(false) | None => (false, true),
     }
 }
 
+fn build_missing_callgraph_after_strict_check(
+    ctx: &AppContext,
+    roots: &StandingRoots,
+    entry: &StandingRootEntry,
+    admission: &crate::standing_roots::StandingBuildAdmission,
+    permit_epoch: u64,
+) -> (bool, bool) {
+    if admission.cancellation_requested() || crate::executor::current_job_cancelled() {
+        return (false, true);
+    }
+    let config = ctx.config();
+    let storage_dir = config.storage_dir.clone();
+    let configure_generation = ctx.configure_generation();
+    drop(config);
+    let Some(storage_dir) = storage_dir else {
+        return (false, true);
+    };
+    let files = crate::callgraph::walk_project_files(&entry.resolved_target).collect::<Vec<_>>();
+    let cache_dir = storage_dir.join("callgraph").join(&entry.artifact_key);
+    let lease = match crate::root_cache::WriterLease::acquire_shared(
+        crate::root_cache::RootCacheDomain::Callgraph,
+        &cache_dir,
+        &entry.artifact_key,
+        &entry.resolved_target,
+    ) {
+        Ok(Some(lease)) => lease,
+        Ok(None) | Err(_) => return (false, true),
+    };
+    let outcome = roots
+        .publish_if_current(
+            &entry.literal_path,
+            admission.publication,
+            &lease,
+            || true,
+            || {
+                permit_epoch == admission.publication.admission_epoch
+                    && ctx.configure_generation() == configure_generation
+                    && !admission.cancellation_requested()
+            },
+            || {
+                matches!(
+                    crate::callgraph_store::CallGraphStore::resume_cold_build_slice_with_lease(
+                        cache_dir.clone(),
+                        entry.resolved_target.clone(),
+                        &files,
+                        0,
+                    ),
+                    Ok(crate::callgraph_store::ColdBuildSlice::Complete { .. })
+                )
+            },
+        )
+        .ok()
+        .flatten();
+    match outcome {
+        Some(true) => (true, false),
+        Some(false) | None => (false, true),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

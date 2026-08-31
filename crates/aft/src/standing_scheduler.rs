@@ -28,9 +28,10 @@ where
         I: IntoIterator<Item = K>,
     {
         let keys = keys.into_iter().collect::<Vec<_>>();
-        self.queue.retain(|key| keys.contains(key));
-        self.deficits.retain(|key, _| keys.contains(key));
-        self.in_flight.retain(|key| keys.contains(key));
+        let active = keys.iter().cloned().collect::<HashSet<_>>();
+        self.queue.retain(|key| active.contains(key));
+        self.deficits.retain(|key, _| active.contains(key));
+        self.in_flight.retain(|key| active.contains(key));
         for key in keys {
             if !self.deficits.contains_key(&key) {
                 self.deficits.insert(key.clone(), 0);

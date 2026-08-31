@@ -2054,45 +2054,20 @@ impl ClassQueues {
     /// survivor order in both the ladder and the lane queues.
     fn prune_elapsed(&mut self, now: Instant) -> Vec<QueuedJob> {
         let mut drained = Vec::new();
-        for lane in [
-            Lane::PureRead,
-            Lane::SerialLspStatus,
-            Lane::HeavyInit,
-            Lane::Mutating,
-            Lane::MaintenanceCommit,
-        ] {
-            let queue = self.queue_mut(lane);
-            let mut index = 0;
-            while index < queue.len() {
-                if queue[index]
-                    .deadline
-                    .is_some_and(|deadline| now >= deadline)
-                {
-                    if let Some(job) = queue.remove(index) {
-                        drained.push(job);
-                    }
-                } else {
-                    index += 1;
-                }
+        let mut surviving_order = VecDeque::with_capacity(self.order.len());
+        while let Some(lane) = self.order.pop_front() {
+            let Some(job) = self.queue_mut(lane).pop_front() else {
+                debug_assert!(false, "order ladder references an empty lane");
+                continue;
+            };
+            if job.deadline.is_some_and(|deadline| now >= deadline) {
+                drained.push(job);
+            } else {
+                self.queue_mut(lane).push_back(job);
+                surviving_order.push_back(lane);
             }
         }
-        if drained.is_empty() {
-            return drained;
-        }
-        // Rebuild the ladder from the survivors; each lane queue is FIFO, so
-        // the per-lane counts are the ladder multiplicities.
-        self.order.clear();
-        for lane in [
-            Lane::PureRead,
-            Lane::SerialLspStatus,
-            Lane::HeavyInit,
-            Lane::Mutating,
-            Lane::MaintenanceCommit,
-        ] {
-            for _ in 0..self.queue(lane).len() {
-                self.order.push_back(lane);
-            }
-        }
+        self.order = surviving_order;
         drained
     }
 

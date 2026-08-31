@@ -85,26 +85,16 @@ impl ResourceAdmissionGate {
 }
 
 fn pause_reason(snapshot: ResourceSnapshot) -> Option<PauseReason> {
-    match snapshot.power {
-        PowerState::BatterySaving => return Some(PauseReason::BatterySaving),
-        PowerState::Unknown => return Some(PauseReason::UnknownPower),
-        PowerState::External | PowerState::Battery | PowerState::NoBattery => {}
+    if snapshot.power == PowerState::BatterySaving {
+        return Some(PauseReason::BatterySaving);
     }
-    match snapshot.memory_pressure {
-        SignalState::High => return Some(PauseReason::MemoryPressure),
-        SignalState::Unknown => return Some(PauseReason::UnknownMemoryPressure),
-        SignalState::Healthy => {}
+    if snapshot.memory_pressure == SignalState::High {
+        return Some(PauseReason::MemoryPressure);
     }
-    match snapshot.io_pressure {
-        SignalState::High => return Some(PauseReason::IoPressure),
-        SignalState::Unknown => return Some(PauseReason::UnknownIoPressure),
-        SignalState::Healthy => {}
+    if snapshot.io_pressure == SignalState::High {
+        return Some(PauseReason::IoPressure);
     }
-    match snapshot.cpu_pressure {
-        SignalState::High => Some(PauseReason::CpuPressure),
-        SignalState::Unknown => Some(PauseReason::UnknownCpuPressure),
-        SignalState::Healthy => None,
-    }
+    (snapshot.cpu_pressure == SignalState::High).then_some(PauseReason::CpuPressure)
 }
 
 #[cfg(target_os = "linux")]
@@ -163,8 +153,10 @@ fn sample_linux_power_at(root: &std::path::Path) -> PowerState {
         PowerState::NoBattery
     } else if battery_capacity.is_some_and(|capacity| capacity <= 10) {
         PowerState::BatterySaving
-    } else {
+    } else if battery_capacity.is_some() {
         PowerState::Battery
+    } else {
+        PowerState::Unknown
     }
 }
 
@@ -244,13 +236,17 @@ mod tests {
     }
 
     #[test]
-    fn balanced_reports_unknown_portable_pressure_conservatively() {
+    fn balanced_admits_when_portable_signals_are_unavailable() {
         let mut gate = ResourceAdmissionGate::default();
-        let mut unknown = healthy();
-        unknown.io_pressure = SignalState::Unknown;
+        let unknown = ResourceSnapshot {
+            power: PowerState::Unknown,
+            cpu_pressure: SignalState::Unknown,
+            memory_pressure: SignalState::Unknown,
+            io_pressure: SignalState::Unknown,
+        };
         assert_eq!(
             gate.observe(IndexResourcePolicy::Balanced, unknown),
-            AdmissionDecision::Paused(PauseReason::UnknownIoPressure)
+            AdmissionDecision::Admit
         );
     }
 
@@ -370,5 +366,8 @@ mod tests {
 
         std::fs::write(battery.join("capacity"), "5\n").unwrap();
         assert_eq!(sample_linux_power_at(dir.path()), PowerState::BatterySaving);
+
+        std::fs::remove_file(battery.join("capacity")).unwrap();
+        assert_eq!(sample_linux_power_at(dir.path()), PowerState::Unknown);
     }
 }
