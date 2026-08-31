@@ -362,8 +362,8 @@
 **MemoryEstimate / MemorySnapshot:**
 - Purpose: Track, attribute, and report process-wide and subsystem-specific memory usage.
 - Location: `crates/aft/src/memory.rs`
-- Pattern: Diagnostic structures and mimalloc collection hooks.
-- Contains: Subsystem memory estimation helpers, SQLite allocator query bindings (`sqlite3_memory_used`), mimalloc committed/requested byte telemetry, platform-specific resident set size (RSS), and macOS kernel physical footprint (`phys_footprint_bytes` via `proc_pid_rusage RUSAGE_INFO_V4`) queries. Periodic allocator slack scans and forced collection run on the detached background-priority `aft-mem-relief` thread. Transport and stdin ticks only perform a cheap cadence check.
+- Pattern: Diagnostic structures with dual-domain idle reclamation.
+- Contains: Subsystem memory estimation helpers, SQLite allocator query bindings (`sqlite3_memory_used`), mimalloc committed/requested byte telemetry for Rust-owned heap allocations, platform-specific resident set size (RSS), and macOS kernel physical footprint (`phys_footprint_bytes` via `proc_pid_rusage RUSAGE_INFO_V4`) queries. Native libraries such as SQLite, tree-sitter, and ONNX Runtime can allocate through the platform allocator instead of Rust `GlobalAlloc`; mimalloc statistics therefore do not represent the full process. Idle relief runs `mi_collect(true)` plus the platform relief primitive (`malloc_trim(0)` on glibc or `malloc_zone_pressure_relief` on macOS) on the detached background-priority `aft-mem-relief` thread. Transport and stdin ticks only perform a cheap cadence check. The fleet health memory field names and byte units remain stable across allocator backends.
 
 **FleetStatusClient:**
 - Purpose: Publish AFT's project-scoped status segment to the fleet status-holder plane (`prefrontal-core`).

@@ -1510,11 +1510,24 @@ mod tests {
         // No actors registered: ready rollup with zero roots and process totals.
         assert_eq!(memory.get("status").and_then(Value::as_str), Some("ready"));
         assert_eq!(memory.get("roots_total").and_then(Value::as_u64), Some(0));
-        assert!(memory.get("total_attributed_bytes").is_some());
-        assert!(memory.get("rss_bytes").is_some());
-        assert!(memory
-            .get("allocator_slack_bytes")
-            .is_some_and(Value::is_u64));
+        for key in [
+            "total_attributed_bytes",
+            "sqlite_bytes",
+            "allocator_slack_bytes",
+        ] {
+            assert!(
+                memory.get(key).is_some_and(Value::is_u64),
+                "memory.{key} must remain an unsigned byte count"
+            );
+        }
+        for key in ["rss_bytes", "phys_footprint_bytes"] {
+            assert!(
+                memory
+                    .get(key)
+                    .is_some_and(|value| value.is_u64() || value.is_null()),
+                "memory.{key} must remain an optional unsigned byte count"
+            );
+        }
         assert!(memory
             .get("allocator_slack_measured")
             .is_some_and(Value::is_boolean));

@@ -646,6 +646,67 @@ fn allocator_memory_snapshot() -> AllocatorMemorySnapshot {
 unsafe extern "C" {
     fn mi_collect(force: bool);
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocatorReliefCoverage {
+    pub mimalloc: bool,
+    pub platform_allocator: bool,
+}
+
+pub const fn allocator_relief_coverage() -> AllocatorReliefCoverage {
+    AllocatorReliefCoverage {
+        mimalloc: true,
+        platform_allocator: cfg!(any(
+            target_os = "macos",
+            all(target_os = "linux", target_env = "gnu")
+        )),
+    }
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+type MallocTrimFn = unsafe extern "C" fn(libc::size_t) -> libc::c_int;
+
+/// Resolve glibc's optional trimming primitive without a link-time dependency.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn resolved_malloc_trim() -> Option<MallocTrimFn> {
+    use std::sync::OnceLock;
+    static MALLOC_TRIM: OnceLock<Option<MallocTrimFn>> = OnceLock::new();
+    MALLOC_TRIM
+        .get_or_init(|| {
+            let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"malloc_trim".as_ptr()) };
+            if symbol.is_null() {
+                None
+            } else {
+                // SAFETY: glibc declares malloc_trim as `int (size_t)`.
+                Some(unsafe { std::mem::transmute::<*mut libc::c_void, MallocTrimFn>(symbol) })
+            }
+        })
+        .as_ref()
+        .copied()
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn malloc_zone_pressure_relief(zone: *mut libc::malloc_zone_t, goal: usize) -> usize;
+}
+
+fn relieve_platform_allocator_pressure() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        return usize_to_u64(unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) });
+    }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        if let Some(malloc_trim) = resolved_malloc_trim() {
+            // SAFETY: resolved_malloc_trim validated the symbol's C ABI.
+            unsafe { malloc_trim(0) };
+        }
+        return 0;
+    }
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
+    {
+        0
+    }
+}
 
 /// Allocator slack (mapped-but-unused arena bytes) above which opportunistic
 /// pressure relief is worth the zone-lock contention it briefly causes.
@@ -706,13 +767,15 @@ pub fn spawn_allocator_slack_scan_if_due(
         .is_ok()
 }
 
-/// Ask mimalloc to return all unused pages after a process-wide idle gate.
-/// Callers own that gate because forced collection can add latency.
+/// Ask both allocator domains to return unused pages after a process-wide idle
+/// gate. Rust allocations use mimalloc. Native libraries can still allocate
+/// through the platform allocator, so its relief primitive remains necessary.
 pub fn relieve_allocator_pressure() -> AllocatorPressureRelief {
     let rss_before_bytes = process_rss_bytes();
     let allocator_before = allocator_memory_snapshot();
     // SAFETY: `mi_collect` is provided by the linked mimalloc global allocator.
     unsafe { mi_collect(true) };
+    let platform_released = relieve_platform_allocator_pressure();
     let allocator_after = allocator_memory_snapshot();
     let rss_after_bytes = process_rss_bytes();
     let allocator_released = allocator_before
@@ -724,7 +787,7 @@ pub fn relieve_allocator_pressure() -> AllocatorPressureRelief {
         .zip(rss_after_bytes)
         .map(|(before, after)| before.saturating_sub(after))
         .unwrap_or(0);
-    let bytes_released = allocator_released.max(rss_released);
+    let bytes_released = allocator_released.max(platform_released).max(rss_released);
     AllocatorPressureRelief {
         bytes_released,
         rss_before_bytes,
@@ -813,6 +876,19 @@ mod tests {
         assert!(snapshot.bytes_in_use.is_some());
         assert!(snapshot.size_allocated.is_some());
         assert!(snapshot.retained_slack_bytes.is_some());
+    }
+    #[test]
+    fn pressure_relief_covers_rust_and_native_allocators() {
+        let coverage = allocator_relief_coverage();
+        assert!(coverage.mimalloc);
+        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
+        assert!(coverage.platform_allocator);
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn glibc_native_relief_is_runtime_resolved() {
+        assert!(resolved_malloc_trim().is_some());
     }
 
     #[test]
