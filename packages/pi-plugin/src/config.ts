@@ -124,6 +124,7 @@ export interface IndexRootConfig {
 }
 
 export interface IndexConfig {
+  resource_policy?: "balanced" | "performance";
   roots?: IndexRootConfig[];
 }
 
@@ -521,6 +522,7 @@ const IndexRootSchema = z
   }));
 
 const IndexConfigSchema = z.object({
+  resource_policy: z.enum(["balanced", "performance"]).optional(),
   roots: z.array(IndexRootSchema).optional(),
 });
 

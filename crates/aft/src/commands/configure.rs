@@ -1683,7 +1683,7 @@ fn delay_symbol_prewarm_for_debug() {
     thread::sleep(Duration::from_millis(delay_ms));
 }
 
-fn walk_semantic_project_files_bounded(
+pub(crate) fn walk_semantic_project_files_bounded(
     root: &Path,
     max_files: usize,
 ) -> Result<Vec<PathBuf>, usize> {

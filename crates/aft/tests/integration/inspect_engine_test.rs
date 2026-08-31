@@ -102,7 +102,10 @@ fn interleaving_worker(
         let is_large = job.project_root == large_root;
         if is_large {
             large_started.store(true, Ordering::SeqCst);
-            thread::sleep(Duration::from_millis(800));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !small_finished.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
             large_finished.store(true, Ordering::SeqCst);
         } else {
             small_interleaved.store(!large_finished.load(Ordering::SeqCst), Ordering::SeqCst);

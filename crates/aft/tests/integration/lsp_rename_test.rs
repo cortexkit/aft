@@ -49,11 +49,17 @@ fn rust_workspace_with_file() -> (tempfile::TempDir, PathBuf) {
     (temp_dir, main_rs)
 }
 
-fn app_context_with_fake_lsp() -> AppContext {
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+fn app_context_with_fake_lsp() -> (AppContext, tempfile::TempDir) {
+    let storage = tempdir().expect("checkpoint storage tempdir");
+    let mut config = Config::default();
+    config.storage_dir = Some(storage.path().to_path_buf());
+    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
     ctx.lsp()
         .override_binary(ServerKind::Rust, fake_server_path());
-    ctx
+    ctx.checkpoint()
+        .lock()
+        .set_storage_dir_for_harness(storage.path().to_path_buf(), aft::harness::Harness::Pi);
+    (ctx, storage)
 }
 
 fn collect_event<F>(ctx: &AppContext, predicate: F) -> Option<LspEvent>
@@ -103,7 +109,7 @@ fn file_uri(path: &Path) -> String {
 #[test]
 fn test_prepare_rename_success() {
     let (_temp_dir, main_rs) = rust_workspace_with_file();
-    let ctx = app_context_with_fake_lsp();
+    let (ctx, _storage) = app_context_with_fake_lsp();
 
     let req: RawRequest = serde_json::from_value(serde_json::json!({
         "id": "prepare-1",
@@ -129,7 +135,7 @@ fn test_prepare_rename_success() {
 #[test]
 fn test_rename_applies_changes() {
     let (_temp_dir, main_rs) = rust_workspace_with_file();
-    let ctx = app_context_with_fake_lsp();
+    let (ctx, _storage) = app_context_with_fake_lsp();
 
     let req: RawRequest = serde_json::from_value(serde_json::json!({
         "id": "rename-1",
@@ -161,7 +167,7 @@ fn test_rename_applies_changes() {
 #[test]
 fn test_rename_rollback_on_failure() {
     let (_temp_dir, main_rs) = rust_workspace_with_file();
-    let ctx = app_context_with_fake_lsp();
+    let (ctx, _storage) = app_context_with_fake_lsp();
     let original = fs::read_to_string(&main_rs).expect("read original file");
 
     let req: RawRequest = serde_json::from_value(serde_json::json!({
@@ -194,7 +200,7 @@ fn test_rename_rollback_on_failure() {
 #[test]
 fn test_rename_rollback_on_failure_when_backups_disabled() {
     let (_temp_dir, main_rs) = rust_workspace_with_file();
-    let ctx = app_context_with_fake_lsp();
+    let (ctx, _storage) = app_context_with_fake_lsp();
     ctx.backup().lock().set_policy(BackupPolicy {
         enabled: false,
         ..BackupPolicy::default()
@@ -227,7 +233,7 @@ fn test_rename_rollback_on_failure_when_backups_disabled() {
 #[test]
 fn test_rename_notifies_lsp() {
     let (_temp_dir, main_rs) = rust_workspace_with_file();
-    let ctx = app_context_with_fake_lsp();
+    let (ctx, _storage) = app_context_with_fake_lsp();
     let expected_uri = file_uri(&main_rs);
 
     let req: RawRequest = serde_json::from_value(serde_json::json!({

@@ -1029,6 +1029,11 @@ pub(super) fn build_health_report(
         "dispatch_liveness".to_string(),
         dispatch_liveness_metrics(executor),
     );
+    metrics.insert(
+        "standing_scheduler".to_string(),
+        serde_json::to_value(crate::standing_scheduler::telemetry())
+            .unwrap_or_else(|_| json!({ "unavailable": true })),
+    );
     let mut dispatch_path = dispatch_path_metrics.snapshot(pending_binds);
     if let Some(dispatch_path) = dispatch_path.as_object_mut() {
         dispatch_path.insert("mutating_lanes".to_string(), mutating_lanes);
@@ -1825,6 +1830,7 @@ mod tests {
                     path: root.display().to_string(),
                     indexes: vec![crate::config::IndexKind::Search],
                 }],
+                ..crate::config::IndexConfig::default()
             },
             ..crate::config::Config::default()
         }
