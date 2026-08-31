@@ -21,6 +21,12 @@ struct SemanticBuildCache {
     model: CachedSemanticModel,
 }
 
+#[derive(Clone)]
+struct CallgraphBuildCache {
+    resolved_target: PathBuf,
+    files: Arc<Vec<PathBuf>>,
+}
+
 use crate::config::{Config, IndexKind};
 use crate::context::{App, AppContext};
 use crate::executor::{Executor, Lane, MaintenanceCoalesceKey};
@@ -103,6 +109,7 @@ pub(super) struct StandingActor {
     owned_actors: Mutex<HashMap<String, (ProjectRootId, bool)>>,
     schedule: Mutex<StandingScheduleState>,
     semantic_cache: Arc<Mutex<HashMap<String, SemanticBuildCache>>>,
+    callgraph_cache: Arc<Mutex<HashMap<String, CallgraphBuildCache>>>,
 }
 
 impl StandingActor {
@@ -116,6 +123,7 @@ impl StandingActor {
             owned_actors: Mutex::new(HashMap::new()),
             schedule: Mutex::new(StandingScheduleState::default()),
             semantic_cache: Arc::new(Mutex::new(HashMap::new())),
+            callgraph_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -268,6 +276,7 @@ impl StandingActor {
                 .get(&entry.literal_path)
                 .is_some_and(|previous| previous.indexes != entry.indexes);
             if selection_changed {
+                schedule.queue.reconfigure(&entry.literal_path);
                 schedule.next_kind.insert(entry.literal_path.clone(), 0);
             } else {
                 schedule
@@ -317,6 +326,26 @@ impl StandingActor {
             })
             .collect::<Vec<_>>();
         for (key, generation, response, elapsed) in completed {
+            if schedule.queue.generation(&key) != Some(generation) {
+                if schedule
+                    .pending
+                    .get(&key)
+                    .is_some_and(|pending| pending.generation == generation)
+                {
+                    schedule.pending.remove(&key);
+                }
+                schedule
+                    .queue
+                    .complete_generation(key, generation, 1, true);
+                continue;
+            }
+            if schedule
+                .pending
+                .get(&key)
+                .is_none_or(|pending| pending.generation != generation)
+            {
+                continue;
+            }
             schedule.pending.remove(&key);
             let has_more = response
                 .data
@@ -428,7 +457,11 @@ impl StandingActor {
 
     fn retire_removed_actors(&self, removed: &[String]) {
         let mut owned = self.owned_actors.lock();
+        let mut semantic_cache = self.semantic_cache.lock();
+        let mut callgraph_cache = self.callgraph_cache.lock();
         for literal_path in removed {
+            semantic_cache.remove(literal_path);
+            callgraph_cache.remove(literal_path);
             if let Some((root_id, owned_here)) = owned.remove(literal_path) {
                 self.executor.cancel_queued_maintenance(&root_id);
                 if let Some(ctx) = self.executor.actor_context(&root_id) {
@@ -454,6 +487,7 @@ impl StandingActor {
             .get(&entry.literal_path)
             .unwrap_or(&0);
         let semantic_cache = Arc::clone(&self.semantic_cache);
+        let callgraph_cache = Arc::clone(&self.callgraph_cache);
         let selected = IndexKind::ALL
             .iter()
             .copied()
@@ -517,6 +551,7 @@ impl StandingActor {
                     &entry,
                     &admission,
                     permit.admission_epoch,
+                    &callgraph_cache,
                 )
             };
             if kind_complete {
@@ -812,17 +847,19 @@ fn build_missing_semantic_after_strict_check(
                     &storage_dir,
                     &entry.artifact_key,
                 )
-                .is_ok()
+                .ok()
             },
         )
         .ok()
+        .flatten()
         .flatten();
-    if outcome == Some(true) {
-        // Force a fresh inventory at the start of the next complete build.
-        cache.lock().remove(&entry.literal_path);
-        (true, false)
-    } else {
-        (false, true)
+    match outcome {
+        Some(crate::semantic_index::SemanticBuildSliceOutcome::Complete) => {
+            // Force a fresh inventory at the start of the next complete build.
+            cache.lock().remove(&entry.literal_path);
+            (true, false)
+        }
+        Some(crate::semantic_index::SemanticBuildSliceOutcome::Yielded) | None => (false, true),
     }
 }
 
@@ -832,6 +869,7 @@ fn build_missing_callgraph_after_strict_check(
     entry: &StandingRootEntry,
     admission: &crate::standing_roots::StandingBuildAdmission,
     permit_epoch: u64,
+    cache: &Arc<Mutex<HashMap<String, CallgraphBuildCache>>>,
 ) -> (bool, bool) {
     if admission.cancellation_requested() || crate::executor::current_job_cancelled() {
         return (false, true);
@@ -843,7 +881,24 @@ fn build_missing_callgraph_after_strict_check(
     let Some(storage_dir) = storage_dir else {
         return (false, true);
     };
-    let files = crate::callgraph::walk_project_files(&entry.resolved_target).collect::<Vec<_>>();
+    let files = {
+        let mut cache = cache.lock();
+        let needs_refresh = cache
+            .get(&entry.literal_path)
+            .is_none_or(|cached| cached.resolved_target != entry.resolved_target);
+        if needs_refresh {
+            let files = crate::callgraph::walk_project_files(&entry.resolved_target)
+                .collect::<Vec<_>>();
+            cache.insert(
+                entry.literal_path.clone(),
+                CallgraphBuildCache {
+                    resolved_target: entry.resolved_target.clone(),
+                    files: Arc::new(files),
+                },
+            );
+        }
+        Arc::clone(&cache.get(&entry.literal_path).expect("cache inserted").files)
+    };
     let cache_dir = storage_dir.join("callgraph").join(&entry.artifact_key);
     let lease = match crate::root_cache::WriterLease::acquire_shared(
         crate::root_cache::RootCacheDomain::Callgraph,
@@ -880,7 +935,10 @@ fn build_missing_callgraph_after_strict_check(
         .ok()
         .flatten();
     match outcome {
-        Some(true) => (true, false),
+        Some(true) => {
+            cache.lock().remove(&entry.literal_path);
+            (true, false)
+        }
         Some(false) | None => (false, true),
     }
 }

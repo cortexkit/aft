@@ -3893,15 +3893,27 @@ async fn recv_prioritized_frame(
             };
         }
         if lane.consecutive_control >= CONTROL_BURST_LIMIT {
-            // Bound the control burst: after CONTROL_BURST_LIMIT consecutive
-            // control frames, await data first so sustained control traffic
-            // (pings/acks) cannot starve data frames.
+            // Prefer one ready data frame after a control burst, but keep
+            // polling control so an idle data lane cannot block heartbeats.
             lane.consecutive_control = 0;
-            match data_rx.recv().await {
-                Some(frame) => return Some(frame),
-                None => {
-                    lane.data_closed = true;
-                    continue;
+            tokio::select! {
+                biased;
+                frame = data_rx.recv() => match frame {
+                    Some(frame) => return Some(frame),
+                    None => {
+                        lane.data_closed = true;
+                        continue;
+                    }
+                },
+                frame = control_rx.recv() => match frame {
+                    Some(frame) => {
+                        lane.consecutive_control = 1;
+                        return Some(frame);
+                    }
+                    None => {
+                        lane.control_closed = true;
+                        continue;
+                    }
                 }
             }
         }
@@ -6876,6 +6888,56 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(frame.frame.header.ty, FrameType::Request);
+    }
+
+    #[tokio::test]
+    async fn control_lane_remains_live_after_burst_when_data_is_idle() {
+        let (control_tx, mut control_rx) = mpsc::channel(CONTROL_BURST_LIMIT + 1);
+        let (_data_tx, mut data_rx) = mpsc::channel(1);
+        for seq in 0..CONTROL_BURST_LIMIT {
+            control_tx
+                .send(Ok(DecodedFrame {
+                    frame: Frame::build(
+                        FrameType::Ping,
+                        control_flags(),
+                        0,
+                        0,
+                        seq as u64,
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                    phase_trace: PhaseTrace::new(Instant::now()),
+                }))
+                .await
+                .unwrap();
+        }
+
+        let mut lane = PrioritizedFrameLane::default();
+        for _ in 0..CONTROL_BURST_LIMIT {
+            let frame = recv_prioritized_frame(&mut control_rx, &mut data_rx, &mut lane)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(frame.frame.header.ty, FrameType::Ping);
+        }
+
+        control_tx
+            .send(Ok(DecodedFrame {
+                frame: Frame::build(FrameType::Ping, control_flags(), 0, 0, 99, Vec::new())
+                    .unwrap(),
+                phase_trace: PhaseTrace::new(Instant::now()),
+            }))
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(
+            Duration::from_millis(100),
+            recv_prioritized_frame(&mut control_rx, &mut data_rx, &mut lane),
+        )
+        .await
+        .expect("control traffic must remain live while the data lane is idle")
+        .unwrap()
+        .unwrap();
+        assert_eq!(frame.frame.header.ty, FrameType::Ping);
     }
 
     #[tokio::test]

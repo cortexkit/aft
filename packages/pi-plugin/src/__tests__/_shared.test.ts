@@ -109,7 +109,7 @@ describe("tool shared helpers", () => {
 
   test("callToolCall emits visible progress while a tool remains pending", async () => {
     let release!: () => void;
-    const pending = new Promise<void>(resolve => {
+    const pending = new Promise<void>((resolve) => {
       release = resolve;
     });
     const updates: unknown[] = [];
@@ -119,7 +119,7 @@ describe("tool shared helpers", () => {
     });
 
     const call = callToolCall(bridge, "inspect", {}, makeExtContext(), {
-      onUpdate: update => updates.push(update),
+      onUpdate: (update) => updates.push(update),
       progressIntervalMs: 5,
     });
     await Bun.sleep(12);

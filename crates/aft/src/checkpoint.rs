@@ -21,6 +21,8 @@ const MAX_NAMED_CHECKPOINTS_PER_SESSION: usize = 20;
 /// work interruptions without becoming permanent storage.
 const NAMED_CHECKPOINT_RETENTION_DAYS: u64 = 14;
 const NAMED_CHECKPOINT_RETENTION_SECS: u64 = NAMED_CHECKPOINT_RETENTION_DAYS * 24 * 60 * 60;
+const CHECKPOINT_SCOPE_MARKER: &str = ".last-used";
+const CHECKPOINT_SCOPE_GC_LOCK: &str = ".scope-gc.lock";
 const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 const UNBOUND_HARNESS_SEGMENT: &str = "unbound";
 
@@ -323,37 +325,45 @@ impl CheckpointStore {
 
     fn acquire_mutation_lock(&self) -> Result<CheckpointLockGuard, AftError> {
         let scope_dir = self.lock_path.parent().map(Path::to_path_buf);
+        let scopes_dir = scope_dir.as_deref().and_then(Path::parent);
+        if let Some(parent) = scopes_dir {
+            fs::create_dir_all(parent).map_err(|error| AftError::IoError {
+                path: parent.display().to_string(),
+                message: format!("failed to create checkpoint scopes directory: {error}"),
+            })?;
+        }
+        // Serialize scope creation with stale-scope reclamation. This closes
+        // the create_dir_all-to-lock race without retaining empty scopes forever.
+        let _gc_lock = scopes_dir
+            .map(|parent| fs_lock::try_acquire(&parent.join(CHECKPOINT_SCOPE_GC_LOCK), self.lock_timeout))
+            .transpose()
+            .map_err(|error| AftError::IoError {
+                path: scopes_dir.unwrap_or(Path::new(".")).display().to_string(),
+                message: format!("failed to acquire checkpoint scope maintenance lock: {error}"),
+            })?;
         if let Some(parent) = scope_dir.as_deref() {
             fs::create_dir_all(parent).map_err(|error| AftError::IoError {
                 path: parent.display().to_string(),
                 message: format!("failed to create checkpoint lock directory: {error}"),
             })?;
+            let marker = parent.join(CHECKPOINT_SCOPE_MARKER);
+            fs::write(&marker, current_timestamp().to_string()).map_err(|error| AftError::IoError {
+                path: marker.display().to_string(),
+                message: format!("failed to refresh checkpoint scope marker: {error}"),
+            })?;
         }
 
-        let acquire_result = match fs_lock::try_acquire(&self.lock_path, self.lock_timeout) {
-            // A releasing peer removes the empty lock scope after its heartbeat
-            // exits. It can win the tiny interval after our create_dir_all and
-            // before lock creation, so recreate once and retry the acquisition.
-            Err(fs_lock::AcquireError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-                if let Some(parent) = scope_dir.as_deref() {
-                    fs::create_dir_all(parent).map_err(|error| AftError::IoError {
-                        path: parent.display().to_string(),
-                        message: format!("failed to recreate checkpoint lock directory: {error}"),
-                    })?;
-                }
-                fs_lock::try_acquire(&self.lock_path, self.lock_timeout)
+        let guard = fs_lock::try_acquire(&self.lock_path, self.lock_timeout).map_err(|error| {
+            match error {
+                fs_lock::AcquireError::Timeout => AftError::IoError {
+                    path: self.lock_path.display().to_string(),
+                    message: "timed out acquiring checkpoint mutation lock".to_string(),
+                },
+                fs_lock::AcquireError::Io(error) => AftError::IoError {
+                    path: self.lock_path.display().to_string(),
+                    message: format!("failed to acquire checkpoint mutation lock: {error}"),
+                },
             }
-            result => result,
-        };
-        let guard = acquire_result.map_err(|error| match error {
-            fs_lock::AcquireError::Timeout => AftError::IoError {
-                path: self.lock_path.display().to_string(),
-                message: "timed out acquiring checkpoint mutation lock".to_string(),
-            },
-            fs_lock::AcquireError::Io(error) => AftError::IoError {
-                path: self.lock_path.display().to_string(),
-                message: format!("failed to acquire checkpoint mutation lock: {error}"),
-            },
         })?;
 
         Ok(CheckpointLockGuard { guard: Some(guard) })
@@ -727,10 +737,9 @@ impl CheckpointStore {
         if let Some(checkpoints_dir) = self.durable_checkpoints_dir() {
             sweep_expired_durable_checkpoints(&checkpoints_dir, now);
         }
-        // Empty scope dirs are intentionally retained: another process may
-        // hold a scope-dir lock between create_dir_all and its first
-        // checkpoint write, so sweeping "empty" dirs deletes concurrently
-        // in-use scopes. Real data expires via sweep_expired_durable_checkpoints.
+        if let Some(storage_dir) = self.storage_dir.as_ref() {
+            sweep_expired_checkpoint_scopes(&storage_dir.join("checkpoints"), now);
+        }
         Ok(())
     }
 
@@ -919,6 +928,36 @@ impl CheckpointStore {
 
     pub fn session_is_empty(&self, session: &str) -> bool {
         self.checkpoints.get(session).is_none_or(HashMap::is_empty)
+    }
+}
+
+fn sweep_expired_checkpoint_scopes(scopes_dir: &Path, now: u64) {
+    let Ok(_gc_lock) = fs_lock::try_acquire_once(&scopes_dir.join(CHECKPOINT_SCOPE_GC_LOCK)) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(scopes_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let scope = entry.path();
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let marker = scope.join(CHECKPOINT_SCOPE_MARKER);
+        let used_at = fs::read_to_string(&marker)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(now);
+        if now.saturating_sub(used_at) < NAMED_CHECKPOINT_RETENTION_SECS {
+            continue;
+        }
+        let lock_path = scope.join("checkpoint.lock");
+        let Ok(lock) = fs_lock::try_acquire_once(&lock_path) else {
+            continue;
+        };
+        drop(lock);
+        let _ = fs::remove_file(marker);
+        let _ = fs::remove_dir(scope);
     }
 }
 

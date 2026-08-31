@@ -6,8 +6,9 @@ pub struct DeficitRoundRobin<K> {
     quantum: u64,
     queue: VecDeque<K>,
     deficits: HashMap<K, i128>,
-    in_flight: HashSet<K>,
+    in_flight: HashMap<K, u64>,
     generations: HashMap<K, u64>,
+    next_generation: u64,
 }
 
 impl<K> DeficitRoundRobin<K>
@@ -20,8 +21,9 @@ where
             quantum,
             queue: VecDeque::new(),
             deficits: HashMap::new(),
-            in_flight: HashSet::new(),
+            in_flight: HashMap::new(),
             generations: HashMap::new(),
+            next_generation: 0,
         }
     }
 
@@ -33,14 +35,14 @@ where
         let active = keys.iter().cloned().collect::<HashSet<_>>();
         self.queue.retain(|key| active.contains(key));
         self.deficits.retain(|key, _| active.contains(key));
-        self.in_flight.retain(|key| active.contains(key));
+        // Keep in-flight generations until their completion arrives. A root
+        // removed and re-added while a slice runs must not dispatch twice.
         for key in keys {
             if !self.deficits.contains_key(&key) {
                 self.deficits.insert(key.clone(), 0);
-                self.generations
-                    .entry(key.clone())
-                    .and_modify(|generation| *generation = generation.saturating_add(1))
-                    .or_insert(0);
+                let generation = self.next_generation;
+                self.next_generation = self.next_generation.saturating_add(1);
+                self.generations.insert(key.clone(), generation);
                 self.queue.push_back(key);
             }
         }
@@ -59,8 +61,9 @@ where
                 continue;
             };
             *deficit += i128::from(self.quantum);
-            if *deficit >= 0 {
-                self.in_flight.insert(key.clone());
+            if *deficit >= 0 && !self.in_flight.contains_key(&key) {
+                let generation = self.generations.get(&key).copied().unwrap_or(0);
+                self.in_flight.insert(key.clone(), generation);
                 return Some(key);
             }
             self.queue.push_back(key);
@@ -74,28 +77,51 @@ where
             .then(|| self.generations.get(key).copied().unwrap_or(0))
     }
 
-    pub fn complete_generation(&mut self, key: K, generation: u64, cost: u64, has_more: bool) {
-        if self.generation(&key) != Some(generation) {
+    pub fn reconfigure(&mut self, key: &K) {
+        if !self.deficits.contains_key(key) {
             return;
         }
-        self.complete(key, cost, has_more);
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        self.generations.insert(key.clone(), generation);
+    }
+
+    pub fn complete_generation(&mut self, key: K, generation: u64, cost: u64, has_more: bool) {
+        if self.in_flight.get(&key).copied() != Some(generation) {
+            return;
+        }
+        self.in_flight.remove(&key);
+        if self.generation(&key) != Some(generation) {
+            if self.deficits.contains_key(&key) {
+                if !self.queue.contains(&key) {
+                    self.queue.push_back(key);
+                }
+            } else {
+                self.generations.remove(&key);
+            }
+            return;
+        }
+        self.complete_active(key, cost, has_more);
     }
 
     pub fn complete(&mut self, key: K, cost: u64, has_more: bool) {
-        if !self.in_flight.remove(&key) {
+        if self.in_flight.remove(&key).is_none() {
             return;
         }
+        self.complete_active(key, cost, has_more);
+    }
+
+    fn complete_active(&mut self, key: K, cost: u64, has_more: bool) {
         if let Some(deficit) = self.deficits.get_mut(&key) {
             *deficit -= i128::from(cost);
         }
         if has_more {
-            // Only requeue roots that still have a deficits entry; a
-            // reconcile may have removed the root while its slice ran.
             if self.deficits.contains_key(&key) {
                 self.queue.push_back(key);
             }
         } else {
             self.deficits.remove(&key);
+            self.generations.remove(&key);
         }
     }
 
@@ -244,5 +270,19 @@ mod tests {
         scheduler.complete_generation("a", old_generation, 100, false);
         assert_eq!(scheduler.generation(&"a"), Some(new_generation));
         assert!(scheduler.deficits.contains_key("a"));
+    }
+
+    #[test]
+    fn stale_completion_prunes_removed_generation_tombstone() {
+        let mut scheduler = DeficitRoundRobin::new(100);
+        scheduler.reconcile(["a", "b"]);
+        assert_eq!(scheduler.next(), Some("a"));
+        let generation = scheduler.generation(&"a").unwrap();
+        scheduler.reconcile(["b"]);
+
+        scheduler.complete_generation("a", generation, 100, true);
+
+        assert!(!scheduler.generations.contains_key("a"));
+        assert!(!scheduler.in_flight.contains_key("a"));
     }
 }

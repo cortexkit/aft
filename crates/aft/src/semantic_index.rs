@@ -2105,20 +2105,41 @@ fn append_semantic_chunks(path: &Path, chunks: &[SemanticChunk]) -> Result<(), S
     file.sync_data().map_err(|error| error.to_string())
 }
 
-fn read_semantic_chunks(path: &Path, count: usize) -> Result<Vec<SemanticChunk>, String> {
-    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
-    let chunks = text
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_str(line).map_err(|error| error.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
-    if chunks.len() != count {
+fn read_semantic_chunk_range(
+    path: &Path,
+    start: usize,
+    end: usize,
+    total: usize,
+) -> Result<Vec<SemanticChunk>, String> {
+    if start > end || end > total {
+        return Err("semantic staging chunk range is invalid".to_string());
+    }
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut chunks = Vec::with_capacity(end - start);
+    let mut count = 0usize;
+    for line in std::io::BufRead::lines(BufReader::new(file)) {
+        let line = line.map_err(|error| error.to_string())?;
+        if line.is_empty() {
+            continue;
+        }
+        if count >= start && count < end {
+            chunks.push(serde_json::from_str(&line).map_err(|error| error.to_string())?);
+        }
+        count = count.saturating_add(1);
+    }
+    if count != total {
         return Err(format!(
-            "semantic staging chunk segment count mismatch: expected {count}, got {}",
-            chunks.len()
+            "semantic staging chunk segment count mismatch: expected {total}, got {count}"
         ));
     }
     Ok(chunks)
+}
+
+fn read_semantic_chunks(path: &Path, count: usize) -> Result<Vec<SemanticChunk>, String> {
+    read_semantic_chunk_range(path, 0, count, count)
 }
 
 fn append_semantic_vectors(
@@ -2149,6 +2170,9 @@ fn read_semantic_vectors(
     count: usize,
     dimension: usize,
 ) -> Result<Vec<Vec<f32>>, String> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
     let bytes = fs::read(path).map_err(|error| error.to_string())?;
     let record_bytes = dimension
         .checked_mul(std::mem::size_of::<f32>())
@@ -3017,10 +3041,15 @@ impl SemanticIndex {
         }
 
         if manifest.embed_cursor < manifest.chunks_count {
-            let chunks = read_semantic_chunks(&chunks_path, manifest.chunks_count)?;
             let end =
                 (manifest.embed_cursor + model.max_batch_size().max(1)).min(manifest.chunks_count);
-            let texts = chunks[manifest.embed_cursor..end]
+            let chunks = read_semantic_chunk_range(
+                &chunks_path,
+                manifest.embed_cursor,
+                end,
+                manifest.chunks_count,
+            )?;
+            let texts = chunks
                 .iter()
                 .map(|chunk| chunk.embed_text.clone())
                 .collect();
@@ -3097,8 +3126,13 @@ impl SemanticIndex {
             return Err("failed to publish resumable semantic index".to_string());
         }
         fs::remove_file(&staging_path).map_err(|error| error.to_string())?;
-        fs::remove_file(&chunks_path).map_err(|error| error.to_string())?;
-        fs::remove_file(&vectors_path).map_err(|error| error.to_string())?;
+        for path in [&chunks_path, &vectors_path] {
+            if let Err(error) = fs::remove_file(path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(error.to_string());
+                }
+            }
+        }
         Ok(SemanticBuildSliceOutcome::Complete)
     }
 

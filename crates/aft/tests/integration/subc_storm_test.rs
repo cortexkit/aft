@@ -1740,10 +1740,9 @@ async fn drive_standing_yield_daemon(input: FakeDaemonInput) {
                 request_id.clone(),
                 Box::new(move |_| {
                     // Mirrors the production standing pass shape: an immediate,
-                    // non-waiting cold-build attempt. Whether the global
-                    // limiter hands out a slot depends on concurrent module
-                    // maintenance; the pass must finish promptly either way
-                    // and never block a maintenance worker on cold admission.
+                    // non-waiting cold-build attempt. This test holds both cold
+                    // permits, so every pass must yield promptly and must never
+                    // block a maintenance worker on cold admission.
                     let permit = aft::cold_build_limiter::try_acquire();
                     let yielded = permit.is_none();
                     if yielded {

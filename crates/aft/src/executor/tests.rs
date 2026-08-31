@@ -2579,23 +2579,39 @@ fn interactive_queue_cap_returns_typed_backpressure_per_actor_and_global() {
     executor.register_actor(root_b.clone(), test_ctx());
     executor.register_actor(root_c.clone(), test_ctx());
 
-    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
-    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-    let blocker = executor.submit(
+    let (started_tx, started_rx) = crossbeam_channel::bounded(2);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(2);
+    let blocker_a_started = started_tx.clone();
+    let blocker_a_release = release_rx.clone();
+    let blocker_a = executor.submit(
         root_a.clone(),
         Lane::Mutating,
-        "interactive-cap-blocker".to_string(),
+        "interactive-cap-blocker-a".to_string(),
         Box::new(move |_| {
-            started_tx.send(()).expect("signal blocker start");
-            release_rx
+            blocker_a_started.send(()).expect("signal blocker a start");
+            blocker_a_release
                 .recv_timeout(Duration::from_secs(5))
-                .expect("release blocker");
-            ok("interactive-cap-blocker")
+                .expect("release blocker a");
+            ok("interactive-cap-blocker-a")
         }),
     );
-    started_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("blocker starts");
+    let blocker_b = executor.submit(
+        root_b.clone(),
+        Lane::Mutating,
+        "interactive-cap-blocker-b".to_string(),
+        Box::new(move |_| {
+            started_tx.send(()).expect("signal blocker b start");
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release blocker b");
+            ok("interactive-cap-blocker-b")
+        }),
+    );
+    for _ in 0..2 {
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("both effective workers start blockers");
+    }
 
     let queued_a = executor.submit_async(
         root_a.clone(),
@@ -2630,13 +2646,10 @@ fn interactive_queue_cap_returns_typed_backpressure_per_actor_and_global() {
     assert!(!response.success);
     assert_eq!(response.data["queue_scope"], "actor");
 
-    release_tx.send(()).expect("release blocker");
-    assert!(
-        blocker
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .success
-    );
+    release_tx.send(()).expect("release blocker a");
+    release_tx.send(()).expect("release blocker b");
+    assert!(blocker_a.recv_timeout(Duration::from_secs(5)).unwrap().success);
+    assert!(blocker_b.recv_timeout(Duration::from_secs(5)).unwrap().success);
     assert!(recv_async(queued_a, "queued a").success);
     assert!(recv_async(queued_b, "queued b").success);
 }
@@ -2746,15 +2759,29 @@ fn queue_accounting_tracks_dispatch_cancellation_and_actor_retirement() {
         .expect("liveness snapshot after cancel");
     assert_eq!(snapshot.interactive.queued, 0);
 
-    release_tx.send(()).expect("release blocker");
-    assert!(recv_async(blocker, "blocker completion").success);
+    let retirement_rx = executor.submit_async(
+        root.clone(),
+        Lane::PureRead,
+        "accounting-retirement-queued".to_string(),
+        Box::new(|_| ok("accounting-retirement-queued")),
+    );
+    let snapshot = executor
+        .try_dispatch_liveness_snapshot()
+        .expect("liveness before actor retirement");
+    assert_eq!(snapshot.interactive.queued, 1);
 
     executor.remove_actor(&root);
+    let retirement_response = recv_async(retirement_rx, "retired queued completion");
+    assert!(!retirement_response.success);
+    assert_eq!(retirement_response.data["code"], "actor_fatal");
     let snapshot = executor
         .try_dispatch_liveness_snapshot()
         .expect("liveness after removal");
     assert_eq!(snapshot.interactive.queued, 0);
     assert_eq!(snapshot.maintenance.queued, 0);
+
+    release_tx.send(()).expect("release blocker");
+    assert!(recv_async(blocker, "blocker completion").success);
 
     let (_replacement_dir, replacement_root) = test_root("accounting-replacement");
     executor.register_actor(replacement_root.clone(), test_ctx());

@@ -878,7 +878,8 @@ class SubcTransport implements AftProjectTransport {
       options.transportTimeoutMs ?? options.timeoutMs ?? this.pool.poolDefaultTimeoutMs;
     const executionDeadlineMs = options.executionDeadlineMs;
     const onProgress = options.onProgress
-      ? (body: Uint8Array) => options.onProgress?.({ kind: "stdout", text: new TextDecoder().decode(body) })
+      ? (body: Uint8Array) =>
+          options.onProgress?.({ kind: "stdout", text: new TextDecoder().decode(body) })
       : undefined;
     return { preview, timeoutMs, executionDeadlineMs, onProgress };
   }
@@ -1689,7 +1690,8 @@ export class SubcTransportPool implements AftTransportPool {
           remaining !== undefined ? Math.max(1, Math.floor(remaining)) : timeoutMs;
         const requestedExecutionDeadline = body.deadline_ms_remaining;
         const serverDeadline =
-          typeof requestedExecutionDeadline === "number" && Number.isFinite(requestedExecutionDeadline)
+          typeof requestedExecutionDeadline === "number" &&
+          Number.isFinite(requestedExecutionDeadline)
             ? Math.min(remaining ?? requestedExecutionDeadline, requestedExecutionDeadline)
             : remaining;
         const deadlineBody =

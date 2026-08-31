@@ -59,12 +59,14 @@ mod imp {
     #[derive(Clone, Copy)]
     pub struct PreviousPriority {
         scheduler: c_int,
+        scheduler_param: libc::sched_param,
         io_priority: c_int,
     }
 
     pub fn demote() -> PreviousPriority {
         let previous = PreviousPriority {
             scheduler: unsafe { libc::sched_getscheduler(0) },
+            scheduler_param: scheduler_param(),
             io_priority: unsafe {
                 syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, tid()) as c_int
             },
@@ -75,7 +77,7 @@ mod imp {
     }
 
     pub fn restore(previous: PreviousPriority) {
-        cpu_policy(previous.scheduler);
+        cpu_policy(previous.scheduler, previous.scheduler_param);
         if !io_set(IOPRIO_WHO_PROCESS, tid(), previous.io_priority) {
             warn_once("io", &std::io::Error::last_os_error().to_string());
         }
@@ -103,10 +105,16 @@ mod imp {
         }
     }
 
-    fn cpu_policy(policy: c_int) {
+    fn scheduler_param() -> libc::sched_param {
         let mut param = unsafe { std::mem::zeroed::<libc::sched_param>() };
-        param.sched_priority = 0;
-        let rc = unsafe { libc::sched_setscheduler(0, policy, &param) };
+        if unsafe { libc::sched_getparam(0, &mut param) } != 0 {
+            warn_once("cpu", &std::io::Error::last_os_error().to_string());
+        }
+        param
+    }
+
+    fn cpu_policy(policy: c_int, mut param: libc::sched_param) {
+        let rc = unsafe { libc::sched_setscheduler(0, policy, &mut param) };
         if rc != 0 {
             warn_once("cpu", &std::io::Error::last_os_error().to_string());
         }

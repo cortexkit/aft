@@ -11,11 +11,11 @@ import type {
 } from "@cortexkit/aft-bridge";
 import {
   adaptToolError,
+  timeoutForCommand as bridgeTimeoutForCommand,
   formatBridgeErrorMessage,
   isBashTransportDeadError,
   prepareCanonicalEditArguments,
   prepareCanonicalPathArguments,
-  timeoutForCommand as bridgeTimeoutForCommand,
 } from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
@@ -44,8 +44,7 @@ function piTransportOptions(
   options: BridgeRequestOptions = {},
 ): BridgeRequestOptions {
   const { timeoutMs: callerTimeoutMs, ...rest } = options;
-  const requested =
-    rest.transportTimeoutMs ?? callerTimeoutMs ?? bridgeTimeoutForCommand(command);
+  const requested = rest.transportTimeoutMs ?? callerTimeoutMs ?? bridgeTimeoutForCommand(command);
   const transportTimeoutMs = Math.min(
     requested ?? PI_TOOL_TRANSPORT_TIMEOUT_MS,
     PI_TOOL_TRANSPORT_TIMEOUT_MS,

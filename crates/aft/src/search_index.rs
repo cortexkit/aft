@@ -59,7 +59,7 @@ static TRANSIENT_SEARCH_CACHE_SWEEP_CURSORS: OnceLock<Mutex<HashMap<PathBuf, Str
     OnceLock::new();
 static TRANSIENT_SEARCH_CACHE_BUILD_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
     OnceLock::new();
-const SEARCH_STAGING_VERSION: u32 = 1;
+const SEARCH_STAGING_VERSION: u32 = 2;
 const SEARCH_STAGING_MANIFEST: &str = "search-staging-v1.json";
 const SEARCH_STAGING_DIR: &str = "search-staging-v1";
 const SEARCH_SLICE_FILES: usize = 32;
@@ -79,6 +79,7 @@ struct SearchStagingManifest {
     max_file_size: u64,
     paths: Vec<PathBuf>,
     cursor: usize,
+    validation_cursor: usize,
     spill_seq: usize,
     files: Vec<SearchStagingFile>,
 }
@@ -957,6 +958,7 @@ impl SearchIndex {
                 && manifest.canonical_root == canonical_root
                 && manifest.cursor <= manifest.paths.len()
                 && manifest.files.len() == manifest.cursor
+                && manifest.validation_cursor <= manifest.files.len()
         });
         // Fresh start (or structurally invalid staging): walk and fingerprint
         // the full corpus once to seed the manifest. Mid-build slices skip the
@@ -999,6 +1001,7 @@ impl SearchIndex {
                             max_file_size,
                             paths,
                             cursor: 0,
+                            validation_cursor: 0,
                             spill_seq: 0,
                             files: Vec::new(),
                         }
@@ -1076,10 +1079,19 @@ impl SearchIndex {
             return Ok(SearchBuildSliceOutcome::Yielded);
         }
 
-        // Publication slice: the corpus fingerprint only covers path, size,
-        // and mtime, so an edit that preserves both would silently publish
-        // stale postings. Re-hash every staged included file and restart the
-        // build when any content no longer matches its staged hash.
+        // Publication validation is itself sliced. Re-hash only one bounded
+        // file window per turn so large roots cannot monopolize a cold slot.
+        if manifest.validation_cursor < manifest.files.len() {
+            let end = (manifest.validation_cursor + slice_size).min(manifest.files.len());
+            if !staged_contents_match_disk(&manifest.files[manifest.validation_cursor..end]) {
+                let _ = fs::remove_dir_all(&staging_dir);
+                return Ok(SearchBuildSliceOutcome::Yielded);
+            }
+            manifest.validation_cursor = end;
+            write_search_staging_manifest(&manifest_path, &manifest)?;
+            return Ok(SearchBuildSliceOutcome::Yielded);
+        }
+
         let ignore_fingerprint = ignore_rules_fingerprint(&canonical_root);
         let filters = PathFilters::default();
         let paths = walk_project_files(&canonical_root, &filters);
@@ -1088,8 +1100,7 @@ impl SearchIndex {
         let corpus_unchanged = manifest.corpus_fingerprint == corpus_fingerprint
             && manifest.ignore_fingerprint == ignore_fingerprint
             && manifest.max_file_size == max_file_size
-            && manifest.paths == paths
-            && staged_contents_match_disk(&manifest.files);
+            && manifest.paths == paths;
         if !corpus_unchanged {
             let _ = fs::remove_dir_all(&staging_dir);
             return Ok(SearchBuildSliceOutcome::Yielded);
@@ -8633,10 +8644,10 @@ mod tests {
         let project = dir.path().join("project");
         let cache = dir.path().join("cache");
         fs::create_dir_all(&project).expect("create project");
-        // Two files so the build spans two slices of one file each: the
-        // first slice stages stale content under a valid corpus fingerprint.
-        fs::write(project.join("a.rs"), "fn stale() {}\n").expect("write a");
+        // Write b first so a has the newest mtime and is deterministically
+        // selected by the newest-first first slice.
         fs::write(project.join("b.rs"), "fn stable() {}\n").expect("write b");
+        fs::write(project.join("a.rs"), "fn stale() {}\n").expect("write a");
         assert_eq!(
             SearchIndex::resume_cold_build_slice_sized(&project, DEFAULT_MAX_FILE_SIZE, &cache, 1,)
                 .expect("first slice"),
