@@ -41,13 +41,17 @@ where
     }
 
     pub fn next(&mut self) -> Option<K> {
-        if self.queue.is_empty() {
-            return None;
-        }
         let rounds = self.queue.len();
         for _ in 0..rounds {
-            let key = self.queue.pop_front()?;
-            let deficit = self.deficits.get_mut(&key)?;
+            let Some(key) = self.queue.pop_front() else {
+                return None;
+            };
+            // A key can sit in the queue without a deficits entry when a
+            // reconcile removed its root after complete() requeued it. Skip
+            // the stale key instead of aborting the whole dispatch turn.
+            let Some(deficit) = self.deficits.get_mut(&key) else {
+                continue;
+            };
             *deficit += i128::from(self.quantum);
             if *deficit >= 0 {
                 self.in_flight.insert(key.clone());
@@ -66,7 +70,11 @@ where
             *deficit -= i128::from(cost);
         }
         if has_more {
-            self.queue.push_back(key);
+            // Only requeue roots that still have a deficits entry; a
+            // reconcile may have removed the root while its slice ran.
+            if self.deficits.contains_key(&key) {
+                self.queue.push_back(key);
+            }
         } else {
             self.deficits.remove(&key);
         }
@@ -177,5 +185,29 @@ mod tests {
         };
         publish_telemetry(expected.clone());
         assert_eq!(telemetry(), expected);
+    }
+
+    #[test]
+    fn next_skips_stale_queued_keys_without_aborting_dispatch() {
+        let mut scheduler = DeficitRoundRobin::new(100);
+        scheduler.reconcile(["a", "b"]);
+        assert_eq!(scheduler.next(), Some("a"));
+        // Simulate a reconcile removing "a" after complete() requeued it:
+        // the queue holds "a" but deficits no longer contains it.
+        scheduler.deficits.remove("a");
+        // next() must skip the stale "a" and still dispatch "b".
+        assert_eq!(scheduler.next(), Some("b"));
+    }
+
+    #[test]
+    fn complete_ignores_requeue_for_removed_root() {
+        let mut scheduler = DeficitRoundRobin::new(100);
+        scheduler.reconcile(["a", "b"]);
+        assert_eq!(scheduler.next(), Some("a"));
+        // Root "a" is removed while its slice runs.
+        scheduler.deficits.remove("a");
+        scheduler.complete("a", 10, true);
+        // "a" must not be requeued without a deficits entry.
+        assert!(!scheduler.queue.contains(&"a"));
     }
 }

@@ -2925,6 +2925,7 @@ where
     let (data_reader_tx, mut data_reader_rx) =
         mpsc::channel::<Result<DecodedFrame, SubcError>>(256);
     let reader_task = spawn_reader_task(read, control_reader_tx, data_reader_tx);
+    let mut reader_lane = PrioritizedFrameLane::default();
     let shutdown = Arc::new(Notify::new());
     // Drain-tick deadline is tracked manually and checked at the TOP of every
     // loop turn rather than as an Interval select arm: the select below is
@@ -3172,7 +3173,11 @@ where
                 log::warn!("subc attach: fatal executor response requested teardown");
                 break Ok(ModuleLoopExit::SkipSearchFlush);
             }
-            maybe_frame = recv_prioritized_frame(&mut control_reader_rx, &mut data_reader_rx) => {
+            maybe_frame = recv_prioritized_frame(
+                &mut control_reader_rx,
+                &mut data_reader_rx,
+                &mut reader_lane,
+            ) => {
                 let frame = match maybe_frame {
                     None => {
                         log::info!("subc attach: daemon closed connection");
@@ -3849,14 +3854,74 @@ where
     })
 }
 
+/// Cap on consecutive control frames before the reader lane checks data, so
+/// sustained control traffic cannot starve data frames under the biased
+/// select.
+const CONTROL_BURST_LIMIT: usize = 8;
+
+#[derive(Default)]
+struct PrioritizedFrameLane {
+    control_closed: bool,
+    data_closed: bool,
+    consecutive_control: usize,
+}
+
 async fn recv_prioritized_frame(
     control_rx: &mut mpsc::Receiver<Result<DecodedFrame, SubcError>>,
     data_rx: &mut mpsc::Receiver<Result<DecodedFrame, SubcError>>,
+    lane: &mut PrioritizedFrameLane,
 ) -> Option<Result<DecodedFrame, SubcError>> {
-    tokio::select! {
-        biased;
-        frame = control_rx.recv() => frame,
-        frame = data_rx.recv() => frame,
+    loop {
+        // Once a lane is closed it can never produce again; drain the other
+        // lane before declaring EOF so buffered frames are not dropped.
+        if lane.control_closed {
+            return match data_rx.recv().await {
+                Some(frame) => Some(frame),
+                None => {
+                    lane.data_closed = true;
+                    None
+                }
+            };
+        }
+        if lane.data_closed {
+            return match control_rx.recv().await {
+                Some(frame) => Some(frame),
+                None => {
+                    lane.control_closed = true;
+                    None
+                }
+            };
+        }
+        if lane.consecutive_control >= CONTROL_BURST_LIMIT {
+            // Bound the control burst: after CONTROL_BURST_LIMIT consecutive
+            // control frames, await data first so sustained control traffic
+            // (pings/acks) cannot starve data frames.
+            lane.consecutive_control = 0;
+            match data_rx.recv().await {
+                Some(frame) => return Some(frame),
+                None => {
+                    lane.data_closed = true;
+                    continue;
+                }
+            }
+        }
+        tokio::select! {
+            biased;
+            frame = control_rx.recv() => match frame {
+                Some(frame) => {
+                    lane.consecutive_control += 1;
+                    return Some(frame);
+                }
+                None => {
+                    lane.control_closed = true;
+                    continue;
+                }
+            },
+            frame = data_rx.recv() => {
+                lane.consecutive_control = 0;
+                return frame;
+            }
+        }
     }
 }
 
@@ -6742,9 +6807,10 @@ mod tests {
         write_frame(&mut daemon, &ping).await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut lane = PrioritizedFrameLane::default();
         let priority = tokio::time::timeout(
             Duration::from_secs(1),
-            recv_prioritized_frame(&mut priority_rx, &mut data_rx),
+            recv_prioritized_frame(&mut priority_rx, &mut data_rx, &mut lane),
         )
         .await
         .expect("priority frame timeout")
@@ -6752,12 +6818,100 @@ mod tests {
         .expect("priority ingress error");
         assert_eq!(priority.frame.header.ty, FrameType::Ping);
 
-        let data = recv_prioritized_frame(&mut priority_rx, &mut data_rx)
+        let data = recv_prioritized_frame(&mut priority_rx, &mut data_rx, &mut lane)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(data.frame.header.ty, FrameType::Request);
         reader.abort();
+    }
+
+    #[tokio::test]
+    async fn sustained_control_traffic_does_not_starve_data_frames() {
+        let (control_tx, mut control_rx) = mpsc::channel(CONTROL_BURST_LIMIT + 2);
+        let (data_tx, mut data_rx) = mpsc::channel(1);
+        for seq in 0..=CONTROL_BURST_LIMIT {
+            control_tx
+                .send(Ok(DecodedFrame {
+                    frame: Frame::build(
+                        FrameType::Ping,
+                        control_flags(),
+                        0,
+                        0,
+                        seq as u64,
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                    phase_trace: PhaseTrace::new(Instant::now()),
+                }))
+                .await
+                .unwrap();
+        }
+        data_tx
+            .send(Ok(DecodedFrame {
+                frame: Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    1,
+                    1,
+                    99,
+                    br#"{}"#.to_vec(),
+                )
+                .unwrap(),
+                phase_trace: PhaseTrace::new(Instant::now()),
+            }))
+            .await
+            .unwrap();
+
+        let mut lane = PrioritizedFrameLane::default();
+        for _ in 0..CONTROL_BURST_LIMIT {
+            let frame = recv_prioritized_frame(&mut control_rx, &mut data_rx, &mut lane)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(frame.frame.header.ty, FrameType::Ping);
+        }
+        let frame = recv_prioritized_frame(&mut control_rx, &mut data_rx, &mut lane)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.frame.header.ty, FrameType::Request);
+    }
+
+    #[tokio::test]
+    async fn closed_control_lane_drains_buffered_data_before_eof() {
+        let (control_tx, mut control_rx) = mpsc::channel(1);
+        let (data_tx, mut data_rx) = mpsc::channel(1);
+        drop(control_tx);
+        data_tx
+            .send(Ok(DecodedFrame {
+                frame: Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    1,
+                    1,
+                    1,
+                    br#"{}"#.to_vec(),
+                )
+                .unwrap(),
+                phase_trace: PhaseTrace::new(Instant::now()),
+            }))
+            .await
+            .unwrap();
+        drop(data_tx);
+
+        let mut lane = PrioritizedFrameLane::default();
+        let frame = recv_prioritized_frame(&mut control_rx, &mut data_rx, &mut lane)
+            .await
+            .expect("buffered data must drain")
+            .unwrap();
+        assert_eq!(frame.frame.header.ty, FrameType::Request);
+        assert!(
+            recv_prioritized_frame(&mut control_rx, &mut data_rx, &mut lane)
+                .await
+                .is_none(),
+            "EOF only after both lanes drain"
+        );
     }
 
     #[test]

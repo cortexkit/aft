@@ -1757,8 +1757,10 @@ async fn drive_standing_yield_daemon(input: FakeDaemonInput) {
         ));
     }
 
-    // All passes complete (yield) even though cold slots stay saturated.
-    for (receiver, _yielded) in receivers {
+    // All passes complete (yield) even though cold slots stay saturated, and
+    // every pass must actually observe the yield — both permits are held by
+    // this test, so try_acquire cannot succeed.
+    for (receiver, yielded) in receivers {
         let response = tokio::time::timeout(Duration::from_secs(5), receiver)
             .await
             .expect("standing pass yields instead of waiting")
@@ -1766,6 +1768,14 @@ async fn drive_standing_yield_daemon(input: FakeDaemonInput) {
         assert!(
             response.success,
             "a standing pass answers success without blocking on cold admission"
+        );
+        assert!(
+            response.data.get("yielded").and_then(Value::as_bool) == Some(true),
+            "standing pass must yield while both cold permits are held"
+        );
+        assert!(
+            yielded.load(std::sync::atomic::Ordering::Acquire),
+            "yield probe must confirm try_acquire returned None"
         );
     }
 

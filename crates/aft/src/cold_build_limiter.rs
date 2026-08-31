@@ -162,6 +162,12 @@ pub(crate) fn try_acquire_standing_with_limiter(
     request_id: impl Into<String>,
     admission_epoch: u64,
 ) -> Option<StandingColdBuildPermit> {
+    // Mirror the blocking path's yield: standing try-admission defers the
+    // final slot to any already-queued interactive or ordinary maintenance
+    // waiter instead of jumping the queue.
+    if limiter.has_non_standing_waiters() {
+        return None;
+    }
     let request = ColdBuildAdmissionRequest::new(request_id, ColdBuildAdmissionClass::Standing);
     try_acquire_classified_with_limiter(limiter, &request).map(|permit| StandingColdBuildPermit {
         _permit: permit,
@@ -732,6 +738,56 @@ mod tests {
             limiter.available.load(Ordering::Acquire),
             1,
             "releasing the consumed build permit must restore the limiter slot"
+        );
+    }
+
+    #[test]
+    fn standing_try_admission_yields_to_non_standing_waiters() {
+        let limiter = test_limiter(1);
+        let holder = limiter.try_acquire().expect("hold the only slot");
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Queue a non-standing waiter behind the held slot.
+        let waiter_limiter = Arc::clone(&limiter);
+        let waiter_cancel = Arc::clone(&cancelled);
+        let waiter = std::thread::spawn(move || {
+            let _permit = acquire_blocking_while_cancellable_with_limiter(
+                &waiter_limiter,
+                "yield-test",
+                ColdBuildAdmissionRequest::new("maintenance", ColdBuildAdmissionClass::Maintenance),
+                || true,
+                || waiter_cancel.load(Ordering::SeqCst),
+            );
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !limiter.has_non_standing_waiters() {
+            assert!(
+                Instant::now() < deadline,
+                "maintenance waiter must register"
+            );
+            std::thread::yield_now();
+        }
+        // Standing try-admission must yield while the waiter is queued.
+        assert!(
+            try_acquire_standing_with_limiter(&limiter, "standing-yield", 0).is_none(),
+            "standing try-admission must defer to queued non-standing waiters"
+        );
+        cancelled.store(true, Ordering::SeqCst);
+        drop(holder);
+        waiter.join().expect("waiter exits after cancellation");
+    }
+
+    #[test]
+    fn standing_try_admission_takes_slot_without_waiters() {
+        let limiter = test_limiter(1);
+        let permit = try_acquire_standing_with_limiter(&limiter, "standing-free", 7);
+        assert!(
+            permit.is_some(),
+            "standing takes a free slot with no waiters"
+        );
+        assert_eq!(
+            limiter.available.load(Ordering::Acquire),
+            0,
+            "standing permit occupies the slot"
         );
     }
 }

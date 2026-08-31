@@ -727,16 +727,10 @@ impl CheckpointStore {
         if let Some(checkpoints_dir) = self.durable_checkpoints_dir() {
             sweep_expired_durable_checkpoints(&checkpoints_dir, now);
         }
-        if let Some(checkpoints_root) = self.lock_path.parent().and_then(Path::parent) {
-            // Fail-closed guard: the sweep root is DERIVED from lock_path depth, and a
-            // caller with a nonstandard (shallower) lock path would resolve this to an
-            // unrelated directory - in tests, the OS temp root itself, where removing
-            // "empty scope dirs" deletes other processes' freshly created temp dirs.
-            // Only a directory actually named `checkpoints` is a legitimate sweep root.
-            if checkpoints_root.file_name() == Some(std::ffi::OsStr::new("checkpoints")) {
-                sweep_empty_scope_dirs(checkpoints_root);
-            }
-        }
+        // Empty scope dirs are intentionally retained: another process may
+        // hold a scope-dir lock between create_dir_all and its first
+        // checkpoint write, so sweeping "empty" dirs deletes concurrently
+        // in-use scopes. Real data expires via sweep_expired_durable_checkpoints.
         Ok(())
     }
 
@@ -1475,31 +1469,10 @@ fn rollback_created_dirs(dirs: &[PathBuf]) -> bool {
     ok
 }
 
-/// Remove one project scope directory without ever deleting its contents.
-/// Another process may acquire the lock or create a file between inspection and
-/// removal, so every failure is intentionally ignored.
-fn remove_empty_scope_dir(scope_dir: &Path) {
-    let _ = fs::remove_dir(scope_dir);
-}
-
-/// Sweep only the direct children of the checkpoints root. Scope directories
-/// contain lockfiles, not durable checkpoint data, so an empty one is safe to
-/// remove while a non-empty one is left untouched by `remove_dir`.
-fn sweep_empty_scope_dirs(checkpoints_root: &Path) {
-    let entries = match fs::read_dir(checkpoints_root) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            remove_empty_scope_dir(&entry.path());
-        }
-    }
-}
+// The empty-scope-dir sweep (remove_empty_scope_dir + sweep_empty_scope_dirs)
+// was removed: it raced concurrent scope creation between create_dir_all and
+// lock acquisition. Empty scope dirs are harmless and expire naturally with
+// their session data via sweep_expired_durable_checkpoints.
 
 fn current_timestamp() -> u64 {
     std::time::SystemTime::now()
@@ -1980,16 +1953,16 @@ mod tests {
         assert_eq!(store.list(DEFAULT_SESSION_ID).unwrap()[0].name, "recent");
         assert!(store.list("other").unwrap().is_empty());
     }
-
     #[test]
-    fn cleanup_sweeps_empty_scope_dirs_but_keeps_live_lock_scope() {
+    fn cleanup_retains_empty_scope_dirs_and_live_lock_scope() {
+        // The empty-scope sweep was removed because it raced concurrent
+        // scope creation (create_dir_all vs lock acquisition). Cleanup must
+        // now leave scope directories in place regardless of emptiness.
         let dir = tempfile::tempdir().unwrap();
         let checkpoints_root = dir.path().join("checkpoints");
         let empty_a = checkpoints_root.join("empty-a");
-        let empty_b = checkpoints_root.join("empty-b");
         let live_scope = checkpoints_root.join("live-scope");
         fs::create_dir_all(&empty_a).unwrap();
-        fs::create_dir_all(&empty_b).unwrap();
         fs::create_dir_all(&live_scope).unwrap();
         fs::write(live_scope.join("checkpoint.lock"), "live lock").unwrap();
 
@@ -1999,30 +1972,9 @@ mod tests {
         let mut store = CheckpointStore::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT);
         store.cleanup();
 
-        assert!(!empty_a.exists());
-        assert!(!empty_b.exists());
+        assert!(empty_a.is_dir(), "empty scope dirs must be retained");
         assert!(live_scope.is_dir());
         assert!(live_scope.join("checkpoint.lock").is_file());
-    }
-
-    #[test]
-    fn cleanup_ignores_non_empty_scope_dir_removal_failure() {
-        let dir = tempfile::tempdir().unwrap();
-        let checkpoints_root = dir.path().join("checkpoints");
-        let scope_dir = checkpoints_root.join("racing-scope");
-        fs::create_dir_all(&scope_dir).unwrap();
-        // Model the post-race state where a concurrent lock acquisition adds
-        // this file after the root readdir but before remove_dir.
-        fs::write(scope_dir.join("checkpoint.lock"), "lock appeared").unwrap();
-
-        let lock_path = checkpoints_root
-            .join("current-scope")
-            .join("checkpoint.lock");
-        let mut store = CheckpointStore::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT);
-        store.cleanup();
-
-        assert!(scope_dir.is_dir());
-        assert!(scope_dir.join("checkpoint.lock").is_file());
     }
 
     #[test]
