@@ -224,15 +224,32 @@ impl StandingActor {
             .map(|entry| entry.literal_path.clone())
             .collect::<Vec<_>>();
         schedule.queue.reconcile(keys.iter().cloned());
+        Self::reconcile_kind_cursors(&mut schedule, &entries);
         schedule.entries = entries
             .into_iter()
             .map(|entry| (entry.literal_path.clone(), entry))
             .collect();
-        schedule.next_kind.retain(|key, _| keys.contains(key));
-        for key in keys {
-            schedule.next_kind.entry(key).or_insert(0);
-        }
         Self::publish_schedule_telemetry(&schedule);
+    }
+
+    fn reconcile_kind_cursors(schedule: &mut StandingScheduleState, entries: &[StandingRootEntry]) {
+        schedule
+            .next_kind
+            .retain(|key, _| entries.iter().any(|entry| entry.literal_path == *key));
+        for entry in entries {
+            let selection_changed = schedule
+                .entries
+                .get(&entry.literal_path)
+                .is_some_and(|previous| previous.indexes != entry.indexes);
+            if selection_changed {
+                schedule.next_kind.insert(entry.literal_path.clone(), 0);
+            } else {
+                schedule
+                    .next_kind
+                    .entry(entry.literal_path.clone())
+                    .or_insert(0);
+            }
+        }
     }
 
     fn publish_schedule_telemetry(schedule: &StandingScheduleState) {
@@ -717,6 +734,29 @@ mod tests {
             indexes: vec![IndexKind::Search],
         });
         assert!(key.requires_reconcile(&config));
+    }
+
+    #[test]
+    fn index_selection_change_resets_kind_cursor() {
+        let mut schedule = StandingScheduleState::default();
+        let mut entry = StandingRootEntry {
+            literal_path: "/tmp/root".to_string(),
+            resolved_target: std::path::PathBuf::from("/tmp/root"),
+            resolved_git_toplevel: None,
+            scoped_relative_path: None,
+            artifact_key: "root".to_string(),
+            indexes: vec![IndexKind::Search, IndexKind::Semantic],
+            config_order: 0,
+        };
+        schedule
+            .entries
+            .insert(entry.literal_path.clone(), entry.clone());
+        schedule.next_kind.insert(entry.literal_path.clone(), 1);
+
+        entry.indexes = vec![IndexKind::Search];
+        StandingActor::reconcile_kind_cursors(&mut schedule, std::slice::from_ref(&entry));
+
+        assert_eq!(schedule.next_kind.get(&entry.literal_path), Some(&0));
     }
 
     #[test]
