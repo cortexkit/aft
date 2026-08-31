@@ -5,7 +5,7 @@
 import { existsSync } from "node:fs";
 import type {
   AftProjectTransport,
-  BridgeRequestOptions,
+  AftTransportOptions,
   ToolCallOptions,
   ToolCallResult,
 } from "@cortexkit/aft-bridge";
@@ -41,8 +41,8 @@ export interface PiToolCallOptions<TDetails = Record<string, unknown>> extends T
 
 function piTransportOptions(
   command: string,
-  options: BridgeRequestOptions = {},
-): BridgeRequestOptions {
+  options: AftTransportOptions = {},
+): AftTransportOptions {
   const { timeoutMs: callerTimeoutMs, ...rest } = options;
   const requested = rest.transportTimeoutMs ?? callerTimeoutMs ?? bridgeTimeoutForCommand(command);
   const transportTimeoutMs = Math.min(
@@ -167,7 +167,7 @@ export async function callBridge(
   command: string,
   params: Record<string, unknown> = {},
   extCtx?: ExtensionContext,
-  options?: BridgeRequestOptions,
+  options?: AftTransportOptions,
 ): Promise<Record<string, unknown>> {
   const merged: Record<string, unknown> = { ...params };
   const sessionId = extCtx ? resolveSessionId(extCtx) : undefined;

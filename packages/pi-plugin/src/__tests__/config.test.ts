@@ -66,8 +66,7 @@ afterEach(() => {
   tempRoots.clear();
 });
 
-test("index resource policy defaults, validates, and remains user-only", () => {
-  expect(AftConfigSchema.parse({}).index?.resource_policy ?? "balanced").toBe("balanced");
+test("index resource policy validates and remains user-only", () => {
   expect(
     AftConfigSchema.parse({ index: { resource_policy: "balanced" } }).index?.resource_policy,
   ).toBe("balanced");

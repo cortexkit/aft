@@ -334,9 +334,7 @@ impl StandingActor {
                 {
                     schedule.pending.remove(&key);
                 }
-                schedule
-                    .queue
-                    .complete_generation(key, generation, 1, true);
+                schedule.queue.complete_generation(key, generation, 1, true);
                 continue;
             }
             if schedule
@@ -887,8 +885,8 @@ fn build_missing_callgraph_after_strict_check(
             .get(&entry.literal_path)
             .is_none_or(|cached| cached.resolved_target != entry.resolved_target);
         if needs_refresh {
-            let files = crate::callgraph::walk_project_files(&entry.resolved_target)
-                .collect::<Vec<_>>();
+            let files =
+                crate::callgraph::walk_project_files(&entry.resolved_target).collect::<Vec<_>>();
             cache.insert(
                 entry.literal_path.clone(),
                 CallgraphBuildCache {
@@ -897,7 +895,12 @@ fn build_missing_callgraph_after_strict_check(
                 },
             );
         }
-        Arc::clone(&cache.get(&entry.literal_path).expect("cache inserted").files)
+        Arc::clone(
+            &cache
+                .get(&entry.literal_path)
+                .expect("cache inserted")
+                .files,
+        )
     };
     let cache_dir = storage_dir.join("callgraph").join(&entry.artifact_key);
     let lease = match crate::root_cache::WriterLease::acquire_shared(

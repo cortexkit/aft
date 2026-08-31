@@ -1932,6 +1932,40 @@ describe("SubcTransportPool request budget (deadline_ms_remaining)", () => {
     expect(firstStamp).toBeGreaterThan(retryStamp);
   });
 
+  test("a not-sent stale-route retry preserves the reopened shared route", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    let requestAttempts = 0;
+    const originalRequest = client.request.bind(client);
+    client.request = async (route, body, options) => {
+      requestAttempts += 1;
+      if (requestAttempts === 1) {
+        client.requests.push({ route, channel: route.channel, body, options });
+        throw new SubcError("unknown channel", "unknown_channel");
+      }
+      if (requestAttempts === 2) {
+        throw new SubcCallError(
+          "not_sent",
+          "request deadline elapsed before the request could be sent",
+          "request_deadline_exceeded_before_send",
+        );
+      }
+      return originalRequest(route, body, options);
+    };
+    const pool = poolWithDefault(client, 30_000);
+
+    await expect(pool.getBridge(TEST_PROJECT_ROOT).toolCall("s", "read", {})).rejects.toMatchObject(
+      {
+        kind: "not_sent",
+        code: "request_deadline_exceeded_before_send",
+      },
+    );
+    const opensAfterExpiredCaller = client.routeOpens.length;
+
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("s", "read", {});
+    expect(client.routeOpens.length).toBe(opensAfterExpiredCaller);
+    expect(requestAttempts).toBe(3);
+  });
+
   test("the route open race observes late settlement without invalidating the shared route", async () => {
     const gate = Promise.withResolvers<void>();
     const releaseOpen: () => void = () => gate.resolve();

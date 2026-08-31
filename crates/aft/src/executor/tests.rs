@@ -551,6 +551,70 @@ fn drr_fairness() {
 }
 
 #[test]
+fn drr_charges_only_successful_dispatches() {
+    let executor = test_executor(1, 1, 1, 1);
+    let (_dir_a, root_a) = test_root("drr-charge-a");
+    let (_dir_b, root_b) = test_root("drr-charge-b");
+    executor.register_actor(root_a.clone(), test_ctx());
+    executor.register_actor(root_b.clone(), test_ctx());
+
+    let (started_tx, started_rx) = crossbeam_channel::bounded(2);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(2);
+    let first_started = started_tx.clone();
+    let first_release = release_rx.clone();
+    let first = executor.submit(
+        root_a.clone(),
+        Lane::PureRead,
+        "drr-charge-a-1".to_string(),
+        Box::new(move |_| {
+            first_started.send("a1").expect("signal first start");
+            first_release.recv().expect("release first");
+            ok("a1")
+        }),
+    );
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first actor starts");
+
+    let second_started = started_tx.clone();
+    let second = executor.submit(
+        root_a,
+        Lane::PureRead,
+        "drr-charge-a-2".to_string(),
+        Box::new(move |_| {
+            second_started.send("a2").expect("signal second start");
+            ok("a2")
+        }),
+    );
+    let third = executor.submit(
+        root_b,
+        Lane::PureRead,
+        "drr-charge-b-1".to_string(),
+        Box::new(move |_| {
+            started_tx.send("b1").expect("signal third start");
+            ok("b1")
+        }),
+    );
+    release_tx.send(()).expect("release first");
+
+    assert_eq!(
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("next fair dispatch"),
+        "b1",
+        "a blocked admission must not consume deficit and earn an extra turn"
+    );
+    for handle in [first, second, third] {
+        assert!(
+            handle
+                .recv_timeout(Duration::from_secs(2))
+                .expect("completion")
+                .success
+        );
+    }
+}
+
+#[test]
 fn heavy_bound() {
     let executor = test_executor(6, 3, 5, 2);
     let job_count = 6;
@@ -2561,6 +2625,57 @@ fn queued_deadline_job_is_pruned_and_counted_at_next_turn() {
 }
 
 #[test]
+fn queued_deadline_wakes_scheduler_without_external_event() {
+    let executor = test_executor(2, 1, 1, 1);
+    let (_dir, root) = test_root("deadline-self-wake");
+    executor.register_actor(root.clone(), test_ctx());
+
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let blocker = executor.submit(
+        root.clone(),
+        Lane::Mutating,
+        "deadline-self-wake-blocker".to_string(),
+        Box::new(move |_| {
+            started_tx.send(()).expect("signal blocker start");
+            release_rx.recv().expect("release blocker");
+            ok("blocker")
+        }),
+    );
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("blocker starts");
+
+    let executed = Arc::new(AtomicUsize::new(0));
+    let executed_probe = Arc::clone(&executed);
+    let (rx, _token) = executor.submit_cancellable_async_with_deadline(
+        root,
+        Lane::PureRead,
+        "deadline-self-wake-victim".to_string(),
+        Box::new(move |_| {
+            executed_probe.fetch_add(1, Ordering::AcqRel);
+            ok("victim")
+        }),
+        Some(Instant::now() + Duration::from_millis(75)),
+    );
+
+    let response = rx
+        .blocking_recv()
+        .expect("deadline completion without another scheduler event");
+    assert!(!response.success);
+    assert_eq!(response.data["code"], "request_deadline_exceeded");
+    assert_eq!(executed.load(Ordering::Acquire), 0);
+
+    release_tx.send(()).expect("release blocker");
+    assert!(
+        blocker
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocker completion")
+            .success
+    );
+}
+
+#[test]
 fn interactive_queue_cap_returns_typed_backpressure_per_actor_and_global() {
     let executor = Executor::with_config(ExecutorConfig {
         pool_size: 1,
@@ -2648,8 +2763,18 @@ fn interactive_queue_cap_returns_typed_backpressure_per_actor_and_global() {
 
     release_tx.send(()).expect("release blocker a");
     release_tx.send(()).expect("release blocker b");
-    assert!(blocker_a.recv_timeout(Duration::from_secs(5)).unwrap().success);
-    assert!(blocker_b.recv_timeout(Duration::from_secs(5)).unwrap().success);
+    assert!(
+        blocker_a
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .success
+    );
+    assert!(
+        blocker_b
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .success
+    );
     assert!(recv_async(queued_a, "queued a").success);
     assert!(recv_async(queued_b, "queued b").success);
 }

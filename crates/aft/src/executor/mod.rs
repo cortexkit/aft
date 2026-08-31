@@ -1606,6 +1606,13 @@ impl SchedulerState {
         pruned
     }
 
+    fn next_queued_deadline(&self) -> Option<Instant> {
+        self.actors
+            .values()
+            .filter_map(|actor| actor.interactive.earliest_deadline())
+            .min()
+    }
+
     fn dispatch_liveness_snapshot(&self) -> DispatchLivenessSnapshot {
         let now = Instant::now();
         let mut interactive = QueueSnapshotAccumulator::default();
@@ -2050,6 +2057,19 @@ impl ClassQueues {
         })
     }
 
+    fn earliest_deadline(&self) -> Option<Instant> {
+        [
+            &self.pure_reads,
+            &self.lsp_status,
+            &self.heavy_init,
+            &self.mutating,
+            &self.maintenance_commit,
+        ]
+        .into_iter()
+        .flat_map(|queue| queue.iter().filter_map(|job| job.deadline))
+        .min()
+    }
+
     /// Remove interactive jobs whose queue deadline has elapsed, preserving
     /// survivor order in both the ladder and the lane queues.
     fn prune_elapsed(&mut self, now: Instant) -> Vec<QueuedJob> {
@@ -2421,7 +2441,22 @@ fn scheduler_loop(
     dispatch_liveness: Arc<DispatchLivenessAtomics>,
 ) {
     let mut expired_completions: Vec<QueuedJob> = Vec::new();
-    while let Ok(event) = event_rx.recv() {
+    loop {
+        let next_deadline = state.lock().next_queued_deadline();
+        let event = match next_deadline {
+            Some(deadline) => {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                match event_rx.recv_timeout(wait) {
+                    Ok(event) => event,
+                    Err(RecvTimeoutError::Timeout) => SchedulerEvent::Wake,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            None => match event_rx.recv() {
+                Ok(event) => event,
+                Err(_) => break,
+            },
+        };
         let shutdown;
         {
             let mut state = state.lock();
@@ -2687,10 +2722,14 @@ fn dispatch_runnable_class(
                 JobClass::Maintenance => state.maintenance_inflight += 1,
             }
             made_progress = true;
+            let dispatched_root = run_job.root_id.clone();
             if run_tx.send(run_job).is_err() {
                 nonrunnable_dispatches.fetch_add(1, Ordering::AcqRel);
                 *dispatch_failed = true;
                 return made_progress;
+            }
+            if let Some(actor) = state.actors.get_mut(&dispatched_root) {
+                actor.deficit = actor.deficit.saturating_sub(JOB_COST);
             }
         }
     }

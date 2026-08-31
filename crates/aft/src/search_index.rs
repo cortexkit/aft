@@ -1145,6 +1145,10 @@ impl SearchIndex {
                     .collect(),
             ),
         };
+        if validate_search_spill_segments(&staging_dir, manifest.spill_seq, files.len()).is_err() {
+            let _ = fs::remove_dir_all(&staging_dir);
+            return Ok(SearchBuildSliceOutcome::Yielded);
+        }
         let mut sources: Vec<Box<dyn PostingRecordSource>> = (0..manifest.spill_seq)
             .map(|seq| SpillSegmentSource::open(&staging_dir.join(format!("segment.{seq:06}.bin"))))
             .collect::<std::io::Result<Vec<_>>>()?
@@ -3038,6 +3042,32 @@ impl PostingRecordSource for SpillSegmentSource {
             loc_mask: masks[1],
         }))
     }
+}
+
+fn validate_search_spill_segments(
+    staging_dir: &Path,
+    spill_seq: usize,
+    file_count: usize,
+) -> std::io::Result<()> {
+    use std::io::BufRead;
+
+    for seq in 0..spill_seq {
+        let path = staging_dir.join(format!("segment.{seq:06}.bin"));
+        let mut source = SpillSegmentSource::open(&path)?;
+        while let Some(record) = source.next_record()? {
+            if usize::try_from(record.file_id).unwrap_or(usize::MAX) >= file_count {
+                return Err(std::io::Error::other(
+                    "search spill references an invalid file id",
+                ));
+            }
+        }
+        if source.remaining_in_group != 0 || !source.reader.fill_buf()?.is_empty() {
+            return Err(std::io::Error::other(
+                "search spill has inconsistent record framing",
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct BaseRecordSource {
@@ -8738,6 +8768,49 @@ mod tests {
         let restarted = load_search_staging_manifest(&manifest).expect("replacement manifest");
         assert_eq!(restarted.cursor, SEARCH_SLICE_FILES);
         assert_eq!(restarted.files.len(), SEARCH_SLICE_FILES);
+    }
+
+    #[test]
+    fn resumable_search_discards_missing_spill_before_publication() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        let cache = dir.path().join("cache");
+        fs::create_dir_all(&project).expect("create project");
+        for index in 0..40 {
+            fs::write(
+                project.join(format!("file_{index:03}.rs")),
+                format!("fn marker_{index}() {{}}\n"),
+            )
+            .expect("write source");
+        }
+
+        loop {
+            let outcome =
+                SearchIndex::resume_cold_build_slice(&project, DEFAULT_MAX_FILE_SIZE, &cache)
+                    .expect("prepare slice");
+            let manifest = load_search_staging_manifest(
+                &cache.join(SEARCH_STAGING_DIR).join(SEARCH_STAGING_MANIFEST),
+            )
+            .expect("staging manifest");
+            assert_eq!(outcome, SearchBuildSliceOutcome::Yielded);
+            if manifest.cursor == manifest.paths.len()
+                && manifest.validation_cursor == manifest.files.len()
+            {
+                break;
+            }
+        }
+
+        let staging_dir = cache.join(SEARCH_STAGING_DIR);
+        fs::remove_file(staging_dir.join("segment.000000.bin")).expect("remove spill segment");
+        assert_eq!(
+            SearchIndex::resume_cold_build_slice(&project, DEFAULT_MAX_FILE_SIZE, &cache)
+                .expect("recover corrupt staging"),
+            SearchBuildSliceOutcome::Yielded
+        );
+        assert!(
+            load_search_staging_manifest(&staging_dir.join(SEARCH_STAGING_MANIFEST)).is_none(),
+            "invalid staging manifest must be discarded"
+        );
     }
 
     #[test]

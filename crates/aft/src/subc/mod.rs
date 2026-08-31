@@ -894,8 +894,8 @@ struct PendingBashAsk {
     grants: Vec<String>,
     expires_at: Instant,
     /// The caller's absolute request deadline, captured at ingress before
-    /// permission elicitation. Checked again on an allowed reply before any
-    /// spawn bookkeeping or executor submission.
+    /// permission elicitation. The maintenance tick settles the ask at this
+    /// deadline, and an allowed reply checks it again before any spawn.
     request_deadline: Option<Instant>,
 }
 
@@ -1803,6 +1803,47 @@ async fn settle_pending_bash_ask_denied(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn settle_pending_bash_ask_deadline_exceeded(
+    tx: &WriterSender,
+    pending: PendingBashAsk,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
+    shutdown: &Arc<Notify>,
+    metrics: &DispatchPathMetrics,
+) -> Result<(), SubcError> {
+    let response = Response::error_with_data(
+        pending.request_id.clone(),
+        "request_deadline_exceeded",
+        "request deadline elapsed during permission elicitation",
+        serde_json::json!({
+            "retryable": false,
+            "phase": "queue",
+        }),
+    );
+    let completion = bash::bash_deadline_exceeded_completion(
+        pending.route,
+        pending.tool_corr,
+        pending.tool_flags,
+        pending.tool_ver,
+        pending.root,
+        pending.request_id,
+        pending.format_context,
+        response,
+    );
+    bash::handle_bash_deferred_completion(
+        tx,
+        completion,
+        routes,
+        live_roots,
+        route_bash_cancels,
+        shutdown,
+        metrics,
+    )
+    .await
+}
+
 fn take_pending_bash_asks_for_route(
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     route: RouteChannel,
@@ -1885,25 +1926,43 @@ async fn expire_pending_bash_asks(
     let now = Instant::now();
     let expired = pending_bash_asks
         .iter()
-        .filter_map(|(key, pending)| (pending.expires_at <= now).then_some(*key))
+        .filter_map(|(key, pending)| {
+            let request_expired = pending
+                .request_deadline
+                .is_some_and(|deadline| deadline <= now);
+            (request_expired || pending.expires_at <= now).then_some((*key, request_expired))
+        })
         .collect::<Vec<_>>();
-    for key in expired {
+    for (key, request_expired) in expired {
         if let Some(pending) = pending_bash_asks.remove(&key) {
             log::debug!(
                 "subc attach: bash elicitation request {} on route {} expired fail-closed",
                 key.corr,
                 pending.route
             );
-            settle_pending_bash_ask_denied(
-                tx,
-                pending,
-                routes,
-                live_roots,
-                route_bash_cancels,
-                shutdown,
-                metrics,
-            )
-            .await?;
+            if request_expired {
+                settle_pending_bash_ask_deadline_exceeded(
+                    tx,
+                    pending,
+                    routes,
+                    live_roots,
+                    route_bash_cancels,
+                    shutdown,
+                    metrics,
+                )
+                .await?;
+            } else {
+                settle_pending_bash_ask_denied(
+                    tx,
+                    pending,
+                    routes,
+                    live_roots,
+                    route_bash_cancels,
+                    shutdown,
+                    metrics,
+                )
+                .await?;
+            }
         }
     }
     Ok(())
@@ -1936,39 +1995,21 @@ async fn handle_bash_elicitation_reply(
         // The request deadline is checked BEFORE bash-wait bookkeeping and
         // before any executor submission: an expired permission answer must
         // prove that no bash command started.
-        if let Some(deadline) = pending.request_deadline {
-            if Instant::now() >= deadline {
-                let response = Response::error_with_data(
-                    pending.request_id.clone(),
-                    "request_deadline_exceeded",
-                    "request deadline elapsed during permission elicitation",
-                    serde_json::json!({
-                        "retryable": false,
-                        "phase": "queue",
-                    }),
-                );
-                let completion = bash::bash_deadline_exceeded_completion(
-                    pending.route,
-                    pending.tool_corr,
-                    pending.tool_flags,
-                    pending.tool_ver,
-                    pending.root,
-                    pending.request_id,
-                    pending.format_context,
-                    response,
-                );
-                bash::handle_bash_deferred_completion(
-                    tx,
-                    completion,
-                    routes,
-                    live_roots,
-                    route_bash_cancels,
-                    shutdown,
-                    metrics,
-                )
-                .await?;
-                return Ok(());
-            }
+        if pending
+            .request_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            settle_pending_bash_ask_deadline_exceeded(
+                tx,
+                pending,
+                routes,
+                live_roots,
+                route_bash_cancels,
+                shutdown,
+                metrics,
+            )
+            .await?;
+            return Ok(());
         }
         if routes.contains_key(&key.route) {
             bash::submit_deferred_bash(
@@ -6883,6 +6924,58 @@ mod tests {
                 .unwrap();
             assert_eq!(frame.frame.header.ty, FrameType::Ping);
         }
+        let frame = recv_prioritized_frame(&mut control_rx, &mut data_rx, &mut lane)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.frame.header.ty, FrameType::Request);
+    }
+
+    #[tokio::test]
+    async fn ready_data_frame_dispatches_immediately_after_control_burst() {
+        let (control_tx, mut control_rx) = mpsc::channel(CONTROL_BURST_LIMIT + 2);
+        let (data_tx, mut data_rx) = mpsc::channel(1);
+        for seq in 0..=CONTROL_BURST_LIMIT {
+            control_tx
+                .send(Ok(DecodedFrame {
+                    frame: Frame::build(
+                        FrameType::Ping,
+                        control_flags(),
+                        0,
+                        0,
+                        seq as u64,
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                    phase_trace: PhaseTrace::new(Instant::now()),
+                }))
+                .await
+                .unwrap();
+        }
+
+        let mut lane = PrioritizedFrameLane::default();
+        for _ in 0..CONTROL_BURST_LIMIT {
+            recv_prioritized_frame(&mut control_rx, &mut data_rx, &mut lane)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        data_tx
+            .send(Ok(DecodedFrame {
+                frame: Frame::build(
+                    FrameType::Request,
+                    control_flags(),
+                    1,
+                    1,
+                    99,
+                    br#"{}"#.to_vec(),
+                )
+                .unwrap(),
+                phase_trace: PhaseTrace::new(Instant::now()),
+            }))
+            .await
+            .unwrap();
+
         let frame = recv_prioritized_frame(&mut control_rx, &mut data_rx, &mut lane)
             .await
             .unwrap()

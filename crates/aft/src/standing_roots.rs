@@ -1142,6 +1142,33 @@ mod tests {
     }
 
     #[test]
+    fn session_owned_root_stays_parked_until_unbind_resumes_it() {
+        let storage = tempdir().unwrap();
+        let root_dir = tempdir().unwrap();
+        let roots = StandingRoots::default();
+        let cfg = config(
+            storage.path(),
+            vec![root(root_dir.path(), vec![IndexKind::Search])],
+        );
+        roots.reconcile(&cfg).unwrap();
+        let literal = root_dir.path().to_str().unwrap();
+
+        roots.begin_case_a_bind(literal).unwrap();
+        assert!(
+            roots.admit_build(literal).is_none(),
+            "a bound session must park standing artifact work"
+        );
+
+        roots
+            .resume_after_session(literal, &[IndexKind::Search])
+            .unwrap();
+        assert!(
+            roots.admit_build(literal).is_some(),
+            "session unbind must reopen standing artifact work"
+        );
+    }
+
+    #[test]
     fn configuration_add_modify_and_remove_mint_boundaries_and_delete_rows() {
         let storage = tempdir().unwrap();
         let root_dir = tempdir().unwrap();

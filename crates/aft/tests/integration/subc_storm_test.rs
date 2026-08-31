@@ -1778,8 +1778,8 @@ async fn drive_standing_yield_daemon(input: FakeDaemonInput) {
         );
     }
 
-    // A PureRead with a finite deadline finishes well inside its budget while
-    // standing work keeps cycling; health replies stay fast.
+    // A PureRead with a finite deadline finishes well inside its budget after
+    // standing passes yield under saturated cold capacity.
     let read_root_id = ProjectRootId::from_path(&session.root1).expect("read root id");
     let started = Instant::now();
     let (read_tx, read_rx) = tokio::sync::oneshot::channel();
@@ -1808,8 +1808,8 @@ async fn drive_standing_yield_daemon(input: FakeDaemonInput) {
         "read latency stayed inside the request budget"
     );
 
-    // The nonblocking health mirror must be observable without contention:
-    // pending depths stay under the configured caps while standing work runs.
+    // The nonblocking health mirror remains observable without contention,
+    // and pending depths stay under the configured caps.
     let liveness = executor
         .try_dispatch_liveness_snapshot()
         .expect("nonblocking dispatch liveness under standing saturation");
@@ -1822,7 +1822,7 @@ async fn drive_standing_yield_daemon(input: FakeDaemonInput) {
         "pending maintenance depth stayed under the process cap"
     );
 
-    // Release the cold permits; standing passes can acquire again.
+    // Release the cold permits and confirm nonblocking cold admission recovers.
     drop(permit_a);
     drop(permit_b);
     let resumed = aft::cold_build_limiter::try_acquire();

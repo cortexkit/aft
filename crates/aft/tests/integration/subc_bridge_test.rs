@@ -2366,6 +2366,17 @@ fn subc_bridge_untrusted_bash_elicitation_ttl_denies_and_settles() {
 }
 
 #[test]
+fn subc_bridge_untrusted_bash_elicitation_request_deadline_settles() {
+    run_subc_bridge_test_with_env(
+        "subc_bridge_untrusted_bash_elicitation_request_deadline_settles",
+        Duration::from_secs(45),
+        || vec![set_test_bash_elicitation_ttl_ms(5_000)],
+        drive_bash_elicitation_request_deadline_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_untrusted_bash_elicitation_goodbye_sweeps_pending() {
     run_subc_bridge_test(
         "subc_bridge_untrusted_bash_elicitation_goodbye_sweeps_pending",
@@ -6830,6 +6841,60 @@ async fn drive_bash_elicitation_ttl_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+async fn drive_bash_elicitation_request_deadline_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_untrusted_elicitation_route(&mut stream, 1, 101, &root1).await;
+
+    let touched = root1.join("elicitation-request-deadline.txt");
+    send_tool_call_with_deadline(
+        &mut stream,
+        1,
+        302,
+        "bash",
+        json!({ "command": touch_command(&touched), "compressed": false }),
+        150,
+    )
+    .await;
+    let (ask_corr, _) = expect_bash_elicitation_request(&mut stream, 1, "touch").await;
+    let frame = read_frame_within(
+        &mut stream,
+        Duration::from_secs(2),
+        "request deadline response",
+    )
+    .await
+    .expect("pending ask should settle at the request deadline");
+    assert_eq!(frame.header.channel, 1);
+    assert_eq!(frame.header.corr, 302);
+    assert_untrusted_tool_error(
+        &frame,
+        "request deadline elapsed during permission elicitation",
+        "request deadline",
+    );
+    assert!(!touched.exists(), "expired ask must not spawn");
+
+    send_bash_elicitation_reply(
+        &mut stream,
+        1,
+        ask_corr,
+        json!({ "action": "accept", "content": { "decision": "allow" } }),
+    )
+    .await;
+    assert_no_response_frame_within(
+        &mut stream,
+        Duration::from_millis(300),
+        "late allow after request deadline",
+    )
+    .await;
+    assert!(
+        !touched.exists(),
+        "late allow after deadline must be ignored"
+    );
+
+    send_connection_goodbye(&mut stream).await;
+}
+
 async fn drive_bash_elicitation_goodbye_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream, root1, ..
@@ -8804,6 +8869,34 @@ async fn send_tool_call(
     arguments: Value,
 ) {
     send_tool_call_epoch(stream, channel, 1, corr, name, arguments).await;
+}
+
+async fn send_tool_call_with_deadline(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    name: &str,
+    arguments: Value,
+    deadline_ms_remaining: u64,
+) {
+    let body = json!({
+        "name": name,
+        "arguments": arguments,
+        "deadline_ms_remaining": deadline_ms_remaining,
+    });
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            channel,
+            1,
+            corr,
+            serde_json::to_vec(&body).expect("tool call body"),
+        )
+        .expect("tool call frame"),
+    )
+    .await;
 }
 
 async fn send_registered_tool_call(

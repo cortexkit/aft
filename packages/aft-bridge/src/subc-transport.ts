@@ -1652,6 +1652,9 @@ export class SubcTransportPool implements AftTransportPool {
       };
 
       const handleRequestFailure = (error: unknown, entry: RouteEntry): void => {
+        // A caller-scoped pre-send expiry says nothing about shared route
+        // health. Preserve the freshly reopened route for other callers.
+        if (error instanceof SubcCallError && error.kind === "not_sent") return;
         clearRouteEntry(entry);
         if (
           !this.isCurrentSession(key, record) ||

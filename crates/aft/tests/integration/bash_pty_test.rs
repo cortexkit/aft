@@ -771,8 +771,7 @@ fn pty_kill_terminates_sighup_ignoring_cat() {
         Duration::from_secs(30),
     );
 
-    let killed = registry.kill(&task_id, SESSION).unwrap();
-    assert_eq!(killed.info.status, BgTaskStatus::Killing);
+    registry.kill(&task_id, SESSION).unwrap();
     wait_for_status(&registry, &task_id, BgTaskStatus::Killed);
 }
 

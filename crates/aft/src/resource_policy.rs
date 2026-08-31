@@ -143,7 +143,11 @@ fn sample_linux_power_at(root: &std::path::Path) -> PowerState {
             Some("Battery") => {
                 found_battery = true;
                 if let Ok(value) = std::fs::read_to_string(path.join("capacity")) {
-                    battery_capacity = value.trim().parse::<u8>().ok().or(battery_capacity);
+                    if let Ok(capacity) = value.trim().parse::<u8>() {
+                        battery_capacity = Some(
+                            battery_capacity.map_or(capacity, |current: u8| current.min(capacity)),
+                        );
+                    }
                 }
             }
             _ => {}
@@ -367,7 +371,15 @@ mod tests {
         std::fs::write(battery.join("capacity"), "5\n").unwrap();
         assert_eq!(sample_linux_power_at(dir.path()), PowerState::BatterySaving);
 
+        let second_battery = dir.path().join("BAT1");
+        std::fs::create_dir(&second_battery).unwrap();
+        std::fs::write(second_battery.join("type"), "Battery\n").unwrap();
+        std::fs::write(second_battery.join("capacity"), "90\n").unwrap();
+        assert_eq!(sample_linux_power_at(dir.path()), PowerState::BatterySaving);
+
         std::fs::remove_file(battery.join("capacity")).unwrap();
+        assert_eq!(sample_linux_power_at(dir.path()), PowerState::Battery);
+        std::fs::remove_file(second_battery.join("capacity")).unwrap();
         assert_eq!(sample_linux_power_at(dir.path()), PowerState::Unknown);
     }
 }

@@ -121,10 +121,10 @@ impl EmbeddingRequestPolicy {
     }
 }
 
-const SEMANTIC_STAGING_VERSION: u32 = 2;
-const SEMANTIC_STAGING_FILE: &str = "semantic-staging-v2.json";
-const SEMANTIC_STAGING_CHUNKS_FILE: &str = "semantic-staging-chunks-v2.jsonl";
-const SEMANTIC_STAGING_VECTORS_FILE: &str = "semantic-staging-vectors-v2.bin";
+const SEMANTIC_STAGING_VERSION: u32 = 3;
+const SEMANTIC_STAGING_FILE: &str = "semantic-staging-v3.json";
+const SEMANTIC_STAGING_CHUNKS_FILE: &str = "semantic-staging-chunks-v3.jsonl";
+const SEMANTIC_STAGING_VECTORS_FILE: &str = "semantic-staging-vectors-v3.bin";
 const SEMANTIC_COLLECT_SLICE_FILES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +143,7 @@ struct SemanticStagingManifest {
     collect_cursor: usize,
     embed_cursor: usize,
     chunks_count: usize,
+    chunk_offsets: Vec<u64>,
     metadata: Vec<SemanticStagingMetadata>,
     vectors_count: usize,
 }
@@ -2091,16 +2092,29 @@ fn write_semantic_staging(path: &Path, manifest: &SemanticStagingManifest) -> Re
     crate::fs_lock::rename_over(&temporary, path).map_err(|error| error.to_string())
 }
 
-fn append_semantic_chunks(path: &Path, chunks: &[SemanticChunk]) -> Result<(), String> {
+fn append_semantic_chunks(
+    path: &Path,
+    chunks: &[SemanticChunk],
+    offsets: &mut Vec<u64>,
+) -> Result<(), String> {
     use std::io::Write;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|error| error.to_string())?;
+    let mut offset = file.metadata().map_err(|error| error.to_string())?.len();
+    if offsets.is_empty() {
+        offsets.push(offset);
+    }
     for chunk in chunks {
-        serde_json::to_writer(&mut file, chunk).map_err(|error| error.to_string())?;
+        let bytes = serde_json::to_vec(chunk).map_err(|error| error.to_string())?;
+        file.write_all(&bytes).map_err(|error| error.to_string())?;
         file.write_all(b"\n").map_err(|error| error.to_string())?;
+        offset = offset
+            .checked_add(u64::try_from(bytes.len() + 1).map_err(|error| error.to_string())?)
+            .ok_or_else(|| "semantic staging chunk offset overflow".to_string())?;
+        offsets.push(offset);
     }
     file.sync_data().map_err(|error| error.to_string())
 }
@@ -2109,37 +2123,37 @@ fn read_semantic_chunk_range(
     path: &Path,
     start: usize,
     end: usize,
-    total: usize,
+    offsets: &[u64],
 ) -> Result<Vec<SemanticChunk>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let total = offsets.len().saturating_sub(1);
     if start > end || end > total {
         return Err("semantic staging chunk range is invalid".to_string());
     }
-    if total == 0 {
+    if start == end {
         return Ok(Vec::new());
     }
-    let file = fs::File::open(path).map_err(|error| error.to_string())?;
-    let mut chunks = Vec::with_capacity(end - start);
-    let mut count = 0usize;
-    for line in std::io::BufRead::lines(BufReader::new(file)) {
-        let line = line.map_err(|error| error.to_string())?;
-        if line.is_empty() {
-            continue;
-        }
-        if count >= start && count < end {
-            chunks.push(serde_json::from_str(&line).map_err(|error| error.to_string())?);
-        }
-        count = count.saturating_add(1);
-    }
-    if count != total {
-        return Err(format!(
-            "semantic staging chunk segment count mismatch: expected {total}, got {count}"
-        ));
-    }
-    Ok(chunks)
+    let start_offset = offsets[start];
+    let byte_len = offsets[end]
+        .checked_sub(start_offset)
+        .ok_or_else(|| "semantic staging chunk offsets are invalid".to_string())?;
+    let byte_len = usize::try_from(byte_len)
+        .map_err(|_| "semantic staging chunk range is too large".to_string())?;
+    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
+    file.seek(SeekFrom::Start(start_offset))
+        .map_err(|error| error.to_string())?;
+    let mut bytes = vec![0; byte_len];
+    file.read_exact(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).map_err(|error| error.to_string()))
+        .collect()
 }
 
-fn read_semantic_chunks(path: &Path, count: usize) -> Result<Vec<SemanticChunk>, String> {
-    read_semantic_chunk_range(path, 0, count, count)
+fn read_semantic_chunks(path: &Path, offsets: &[u64]) -> Result<Vec<SemanticChunk>, String> {
+    read_semantic_chunk_range(path, 0, offsets.len().saturating_sub(1), offsets)
 }
 
 fn append_semantic_vectors(
@@ -2973,11 +2987,15 @@ impl SemanticIndex {
         fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
 
         let valid_segment_lengths = |manifest: &SemanticStagingManifest| {
-            let chunks_valid = fs::read_to_string(&chunks_path)
-                .map(|text| {
-                    text.lines().filter(|line| !line.is_empty()).count() == manifest.chunks_count
-                })
-                .unwrap_or(manifest.chunks_count == 0);
+            let offsets_valid = manifest.chunk_offsets.len() == manifest.chunks_count + 1
+                && manifest.chunk_offsets.first() == Some(&0)
+                && manifest
+                    .chunk_offsets
+                    .windows(2)
+                    .all(|window| window[0] <= window[1]);
+            let chunks_valid = fs::metadata(&chunks_path)
+                .map(|metadata| manifest.chunk_offsets.last() == Some(&metadata.len()))
+                .unwrap_or(manifest.chunks_count == 0 && manifest.chunk_offsets == [0]);
             let vector_bytes = manifest
                 .vectors_count
                 .saturating_mul(fingerprint.dimension)
@@ -2985,7 +3003,7 @@ impl SemanticIndex {
             let vectors_valid = fs::metadata(&vectors_path)
                 .map(|metadata| metadata.len() == u64::try_from(vector_bytes).unwrap_or(u64::MAX))
                 .unwrap_or(manifest.vectors_count == 0);
-            chunks_valid && vectors_valid
+            offsets_valid && chunks_valid && vectors_valid
         };
         let mut manifest = load_semantic_staging(&staging_path)
             .filter(|manifest| {
@@ -3010,6 +3028,7 @@ impl SemanticIndex {
                     collect_cursor: 0,
                     embed_cursor: 0,
                     chunks_count: 0,
+                    chunk_offsets: vec![0],
                     metadata: Vec::new(),
                     vectors_count: 0,
                 }
@@ -3019,7 +3038,7 @@ impl SemanticIndex {
             let end = (manifest.collect_cursor + SEMANTIC_COLLECT_SLICE_FILES).min(files.len());
             let (chunks, metadata) =
                 Self::collect_chunks(&canonical_root, &files[manifest.collect_cursor..end]);
-            append_semantic_chunks(&chunks_path, &chunks)?;
+            append_semantic_chunks(&chunks_path, &chunks, &mut manifest.chunk_offsets)?;
             manifest.chunks_count += chunks.len();
             manifest
                 .metadata
@@ -3047,7 +3066,7 @@ impl SemanticIndex {
                 &chunks_path,
                 manifest.embed_cursor,
                 end,
-                manifest.chunks_count,
+                &manifest.chunk_offsets,
             )?;
             let texts = chunks
                 .iter()
@@ -3073,7 +3092,7 @@ impl SemanticIndex {
             return Ok(SemanticBuildSliceOutcome::Yielded);
         }
 
-        let chunks = read_semantic_chunks(&chunks_path, manifest.chunks_count)?;
+        let chunks = read_semantic_chunks(&chunks_path, &manifest.chunk_offsets)?;
         let vectors =
             read_semantic_vectors(&vectors_path, manifest.vectors_count, fingerprint.dimension)?;
         let file_metadata = manifest
@@ -7749,6 +7768,46 @@ public class Greeter {
             .entries
             .iter()
             .any(|entry| entry.chunk.name == "old_symbol"));
+    }
+
+    #[test]
+    fn semantic_chunk_range_seeks_without_parsing_preceding_records() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("chunks.jsonl");
+        let chunks = vec![
+            SemanticChunk {
+                file: PathBuf::from("first.rs"),
+                name: "first".to_string(),
+                qualified_name: None,
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 1,
+                exported: false,
+                embed_text: "first".to_string(),
+                snippet: "fn first() {}".to_string(),
+            },
+            SemanticChunk {
+                file: PathBuf::from("second.rs"),
+                name: "second".to_string(),
+                qualified_name: None,
+                kind: SymbolKind::Function,
+                start_line: 0,
+                end_line: 1,
+                exported: false,
+                embed_text: "second".to_string(),
+                snippet: "fn second() {}".to_string(),
+            },
+        ];
+        let mut offsets = vec![0];
+        append_semantic_chunks(&path, &chunks, &mut offsets).expect("append chunks");
+        let mut bytes = fs::read(&path).expect("read chunks");
+        bytes[0] = b'!';
+        fs::write(&path, bytes).expect("corrupt preceding record");
+
+        let selected = read_semantic_chunk_range(&path, 1, 2, &offsets).expect("read range");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "second");
     }
 
     #[test]

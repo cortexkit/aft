@@ -334,8 +334,10 @@ impl CheckpointStore {
         }
         // Serialize scope creation with stale-scope reclamation. This closes
         // the create_dir_all-to-lock race without retaining empty scopes forever.
-        let _gc_lock = scopes_dir
-            .map(|parent| fs_lock::try_acquire(&parent.join(CHECKPOINT_SCOPE_GC_LOCK), self.lock_timeout))
+        let gc_lock = scopes_dir
+            .map(|parent| {
+                fs_lock::try_acquire(&parent.join(CHECKPOINT_SCOPE_GC_LOCK), self.lock_timeout)
+            })
             .transpose()
             .map_err(|error| AftError::IoError {
                 path: scopes_dir.unwrap_or(Path::new(".")).display().to_string(),
@@ -347,24 +349,30 @@ impl CheckpointStore {
                 message: format!("failed to create checkpoint lock directory: {error}"),
             })?;
             let marker = parent.join(CHECKPOINT_SCOPE_MARKER);
-            fs::write(&marker, current_timestamp().to_string()).map_err(|error| AftError::IoError {
-                path: marker.display().to_string(),
-                message: format!("failed to refresh checkpoint scope marker: {error}"),
+            fs::write(&marker, current_timestamp().to_string()).map_err(|error| {
+                AftError::IoError {
+                    path: marker.display().to_string(),
+                    message: format!("failed to refresh checkpoint scope marker: {error}"),
+                }
             })?;
         }
+        // The GC lock protects scope creation only. Release it before waiting
+        // for the per-scope mutation lock so unrelated scopes can progress.
+        drop(gc_lock);
 
-        let guard = fs_lock::try_acquire(&self.lock_path, self.lock_timeout).map_err(|error| {
-            match error {
-                fs_lock::AcquireError::Timeout => AftError::IoError {
-                    path: self.lock_path.display().to_string(),
-                    message: "timed out acquiring checkpoint mutation lock".to_string(),
+        let guard =
+            fs_lock::try_acquire(&self.lock_path, self.lock_timeout).map_err(
+                |error| match error {
+                    fs_lock::AcquireError::Timeout => AftError::IoError {
+                        path: self.lock_path.display().to_string(),
+                        message: "timed out acquiring checkpoint mutation lock".to_string(),
+                    },
+                    fs_lock::AcquireError::Io(error) => AftError::IoError {
+                        path: self.lock_path.display().to_string(),
+                        message: format!("failed to acquire checkpoint mutation lock: {error}"),
+                    },
                 },
-                fs_lock::AcquireError::Io(error) => AftError::IoError {
-                    path: self.lock_path.display().to_string(),
-                    message: format!("failed to acquire checkpoint mutation lock: {error}"),
-                },
-            }
-        })?;
+            )?;
 
         Ok(CheckpointLockGuard { guard: Some(guard) })
     }
@@ -708,6 +716,13 @@ impl CheckpointStore {
             .map(|session_dir| session_dir.join(name))
     }
 
+    fn checkpoint_scopes_dir(&self) -> Option<PathBuf> {
+        let scope_dir = self.lock_path.parent()?;
+        let scopes_dir = scope_dir.parent()?;
+        (scopes_dir.file_name().and_then(|name| name.to_str()) == Some("checkpoints"))
+            .then(|| scopes_dir.to_path_buf())
+    }
+
     fn run_process_maintenance_once_locked(&mut self) -> Result<(), AftError> {
         let Some(storage_dir) = self.storage_dir.clone() else {
             return Ok(());
@@ -737,8 +752,8 @@ impl CheckpointStore {
         if let Some(checkpoints_dir) = self.durable_checkpoints_dir() {
             sweep_expired_durable_checkpoints(&checkpoints_dir, now);
         }
-        if let Some(storage_dir) = self.storage_dir.as_ref() {
-            sweep_expired_checkpoint_scopes(&storage_dir.join("checkpoints"), now);
+        if let Some(scopes_dir) = self.checkpoint_scopes_dir() {
+            sweep_expired_checkpoint_scopes(&scopes_dir, now);
         }
         Ok(())
     }
@@ -1953,6 +1968,63 @@ mod tests {
         assert!(
             scope_dir.is_dir(),
             "released lock scope must remain durable"
+        );
+    }
+    #[test]
+    fn mutation_wait_releases_scope_gc_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoints_root = dir.path().join("checkpoints");
+        let scope_dir = checkpoints_root.join("project-scope");
+        fs::create_dir_all(&scope_dir).unwrap();
+        let lock_path = scope_dir.join("checkpoint.lock");
+        let held_scope_lock = fs_lock::try_acquire_once(&lock_path).unwrap();
+        let store = CheckpointStore::with_lock_path(lock_path, Duration::from_secs(2));
+
+        let waiter = std::thread::spawn(move || store.acquire_mutation_lock());
+        let marker = scope_dir.join(CHECKPOINT_SCOPE_MARKER);
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(marker.exists(), "waiter must finish scope creation");
+        let gc_lock = fs_lock::try_acquire_once(&checkpoints_root.join(CHECKPOINT_SCOPE_GC_LOCK));
+        assert!(
+            gc_lock.is_ok(),
+            "a waiter on one scope must not retain the global GC lock"
+        );
+
+        drop(gc_lock);
+        drop(held_scope_lock);
+        assert!(waiter.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn cleanup_sweeps_the_lock_paths_checkpoint_scope_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkpoints_root = dir.path().join("checkpoints");
+        let expired_scope = checkpoints_root.join("expired-scope");
+        fs::create_dir_all(&expired_scope).unwrap();
+        fs::write(
+            expired_scope.join(CHECKPOINT_SCOPE_MARKER),
+            current_timestamp()
+                .saturating_sub(NAMED_CHECKPOINT_RETENTION_SECS)
+                .saturating_sub(1)
+                .to_string(),
+        )
+        .unwrap();
+        let lock_path = checkpoints_root
+            .join("current-scope")
+            .join("checkpoint.lock");
+        let mut store = CheckpointStore::with_lock_path(lock_path, CHECKPOINT_LOCK_TIMEOUT);
+        store.storage_dir = Some(dir.path().join("different-storage-root"));
+
+        store.cleanup_locked().unwrap();
+
+        assert!(
+            !expired_scope.exists(),
+            "cleanup must derive the scope root from the mutation lock path"
         );
     }
 
