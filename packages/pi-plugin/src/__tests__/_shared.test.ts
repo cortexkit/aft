@@ -48,7 +48,7 @@ describe("tool shared helpers", () => {
     expect(requested).toEqual([projectRoot]);
   });
 
-  test("callBridge propagates session id, warning client, and long-command timeout", async () => {
+  test("callBridge caps every synchronous transport request below Pi's hard deadline", async () => {
     const { bridge, calls } = makeMockBridge((_command, params) => ({ success: true, params }));
     const extCtx = makeExtContext(projectRoot, "pi-session-123");
 
@@ -58,11 +58,13 @@ describe("tool shared helpers", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].command).toBe("grep");
     expect(calls[0].params).toEqual({ pattern: "needle", session_id: "pi-session-123" });
-    expect(calls[0].options?.timeoutMs).toBe(60_000);
+    expect(calls[0].options?.timeoutMs).toBe(25_000);
+    expect(calls[0].options?.transportTimeoutMs).toBe(25_000);
+    expect(calls[0].options?.executionDeadlineMs).toBe(24_000);
     expect(calls[0].options?.configureWarningClient).toBe(extCtx);
   });
 
-  test("callBridge keeps explicit transport options while preserving default timeout", async () => {
+  test("callBridge caps explicit transport options at the Pi deadline", async () => {
     const { bridge, calls } = makeMockBridge(() => ({ success: true }));
 
     await callBridge(bridge, "bash", { command: "sleep 60" }, makeExtContext(), {
@@ -70,7 +72,8 @@ describe("tool shared helpers", () => {
       keepBridgeOnTimeout: true,
     });
 
-    expect(calls[0].options?.transportTimeoutMs).toBe(70_000);
+    expect(calls[0].options?.transportTimeoutMs).toBe(25_000);
+    expect(calls[0].options?.executionDeadlineMs).toBe(24_000);
     expect(calls[0].options?.keepBridgeOnTimeout).toBe(true);
     expect(calls[0].options?.configureWarningClient).toBeDefined();
   });
@@ -101,6 +104,29 @@ describe("tool shared helpers", () => {
       preview: true,
     });
     expect(calls[0].options?.configureWarningClient).toBe(extCtx);
+    expect(calls[0].options?.executionDeadlineMs).toBe(24_000);
+  });
+
+  test("callToolCall emits visible progress while a tool remains pending", async () => {
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const updates: unknown[] = [];
+    const { bridge } = makeMockBridge(async () => {
+      await pending;
+      return { success: true, text: "ok" };
+    });
+
+    const call = callToolCall(bridge, "inspect", {}, makeExtContext(), {
+      onUpdate: update => updates.push(update),
+      progressIntervalMs: 5,
+    });
+    await Bun.sleep(12);
+    release();
+    await call;
+
+    expect(updates.length).toBeGreaterThan(0);
   });
 
   test("callBridge throws Rust error messages instead of exposing failure payloads", async () => {

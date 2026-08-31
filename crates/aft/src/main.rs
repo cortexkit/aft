@@ -212,11 +212,10 @@ fn main() {
     const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
     const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
     let mut pending = PendingResponses::default();
-    // Opportunistic allocator relief: rate-limit stamp for the slack check that
-    // runs on the periodic drain wake (threshold + spacing live in memory.rs so
-    // subc and standalone share one policy).
+    // Rate-limit stamp for detached allocator slack scans. The stdin loop
+    // performs only a cheap cadence comparison on each periodic drain wake.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let mut last_slack_relief: Option<std::time::Instant> = None;
+    let mut last_slack_scan: Option<std::time::Instant> = None;
     let (line_tx, line_rx) = mpsc::channel::<io::Result<String>>();
     let mut graceful_stdin_shutdown = false;
     thread::spawn(move || {
@@ -252,8 +251,8 @@ fn main() {
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
                 {
                     let now = std::time::Instant::now();
-                    if aft::memory::spawn_allocator_slack_relief_if_due(last_slack_relief, now) {
-                        last_slack_relief = Some(now);
+                    if aft::memory::spawn_allocator_slack_scan_if_due(last_slack_scan, now) {
+                        last_slack_scan = Some(now);
                     }
                 }
                 if shutdown_requested.load(Ordering::SeqCst) {

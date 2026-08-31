@@ -15,7 +15,7 @@ import {
   isBashTransportDeadError,
   prepareCanonicalEditArguments,
   prepareCanonicalPathArguments,
-  timeoutForCommand,
+  timeoutForCommand as bridgeTimeoutForCommand,
 } from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
@@ -29,6 +29,31 @@ import type { PluginContext } from "../types.js";
 type TextContent = { type: "text"; text: string; textSignature?: string };
 type ImageContent = { type: "image"; data: string; mimeType: string };
 type ContentBlock = TextContent | ImageContent;
+
+export const PI_TOOL_TRANSPORT_TIMEOUT_MS = 25_000;
+export const PI_TOOL_EXECUTION_TIMEOUT_MS = 24_000;
+const DEFAULT_PROGRESS_INTERVAL_MS = 5_000;
+
+export interface PiToolCallOptions<TDetails = Record<string, unknown>> extends ToolCallOptions {
+  onUpdate?: (update: AgentToolResult<TDetails>) => void;
+  progressIntervalMs?: number;
+}
+
+function piTransportOptions(
+  command: string,
+  options: BridgeRequestOptions = {},
+): BridgeRequestOptions {
+  const requested = options.transportTimeoutMs ?? bridgeTimeoutForCommand(command);
+  const transportTimeoutMs = Math.min(requested ?? PI_TOOL_TRANSPORT_TIMEOUT_MS, PI_TOOL_TRANSPORT_TIMEOUT_MS);
+  return {
+    ...options,
+    transportTimeoutMs,
+    executionDeadlineMs: Math.min(
+      options.executionDeadlineMs ?? PI_TOOL_EXECUTION_TIMEOUT_MS,
+      PI_TOOL_EXECUTION_TIMEOUT_MS,
+    ),
+  };
+}
 
 /**
  * Optional integer field schema for Pi tool parameters.
@@ -140,16 +165,14 @@ export async function callBridge(
   extCtx?: ExtensionContext,
   options?: BridgeRequestOptions,
 ): Promise<Record<string, unknown>> {
-  const timeoutMs = timeoutForCommand(command);
   const merged: Record<string, unknown> = { ...params };
   const sessionId = extCtx ? resolveSessionId(extCtx) : undefined;
   if (sessionId) {
     merged.session_id = sessionId;
   }
   const sendOptions = {
-    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...piTransportOptions(command, options),
     configureWarningClient: extCtx,
-    ...options,
   };
   let response: Record<string, unknown>;
   try {
@@ -180,12 +203,12 @@ export async function callBridge(
  * timeout, forwards warnings, gathers any follow-up data, and returns the raw
  * response plus the text summary the model will receive.
  */
-export async function callToolCall(
+export async function callToolCall<TDetails = Record<string, unknown>>(
   bridge: AftProjectTransport,
   name: string,
   rawArgs: Record<string, unknown> = {},
   extCtx?: ExtensionContext,
-  options?: ToolCallOptions,
+  options?: PiToolCallOptions<TDetails>,
 ): Promise<ToolCallResult> {
   return callToolCallForSession(
     bridge,
@@ -203,30 +226,37 @@ export async function callToolCall(
  * session manager again after an await, because another active session can
  * become current between preflight, preview, and apply.
  */
-export async function callToolCallForSession(
+export async function callToolCallForSession<TDetails = Record<string, unknown>>(
   bridge: AftProjectTransport,
   name: string,
   rawArgs: Record<string, unknown>,
   sessionId: string | undefined,
   extCtx?: ExtensionContext,
-  options?: ToolCallOptions,
+  options?: PiToolCallOptions<TDetails>,
 ): Promise<ToolCallResult> {
-  const timeoutMs = timeoutForCommand(name);
   const sendOptions = {
-    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...piTransportOptions(name, options),
     configureWarningClient: extCtx,
-    ...options,
   };
+  const startedAt = Date.now();
+  const progressTimer = options?.onUpdate
+    ? setInterval(() => {
+        const elapsedMs = Date.now() - startedAt;
+        options.onUpdate?.(
+          textResult(`${name} is still running (${Math.max(1, Math.floor(elapsedMs / 1000))}s)`, {
+            tool: name,
+            elapsed_ms: elapsedMs,
+          }) as AgentToolResult<TDetails>,
+        );
+      }, options.progressIntervalMs ?? DEFAULT_PROGRESS_INTERVAL_MS)
+    : undefined;
   let response: ToolCallResult;
   try {
-    response = await bridge.toolCall(
-      sessionId,
-      name,
-      rawArgs,
-      Object.keys(sendOptions).length > 0 ? sendOptions : undefined,
-    );
+    response = await bridge.toolCall(sessionId, name, rawArgs, sendOptions);
   } catch (error) {
     throw adaptToolError(name, error);
+  } finally {
+    if (progressTimer) clearInterval(progressTimer);
   }
   ingestBgCompletions(sessionId, response.bg_completions);
   return response;

@@ -540,7 +540,7 @@ export function registerHoistedTools(
           _toolCallId: string,
           params: Static<typeof ReadParams>,
           _signal,
-          _onUpdate,
+          onUpdate,
           extCtx,
         ) {
           const bridge = bridgeFor(ctx, extCtx.cwd);
@@ -572,7 +572,7 @@ export function registerHoistedTools(
           if (limit !== undefined) rawArgs.limit = limit;
           const visionCapability = visionCapabilityForPiModel(extCtx);
           if (visionCapability !== undefined) rawArgs.vision_capability = visionCapability;
-          const response = await callToolCall(bridge, "read", rawArgs, extCtx);
+          const response = await callToolCall(bridge, "read", rawArgs, extCtx, { onUpdate });
           if (response.success === false) {
             throw new Error(response.text || response.message || "read failed");
           }
@@ -628,7 +628,7 @@ export function registerHoistedTools(
           _toolCallId: string,
           params: Static<typeof WriteParams>,
           _signal,
-          _onUpdate,
+          onUpdate,
           extCtx,
         ) {
           const filePathArg = mutationFilePathArg(params);
@@ -647,7 +647,7 @@ export function registerHoistedTools(
             filePath: filePathArg,
             content: params.content,
           };
-          const response = await callToolCall(bridge, "write", rawArgs, extCtx);
+          const response = await callToolCall(bridge, "write", rawArgs, extCtx, { onUpdate });
           if (response.success === false) {
             throw toolErrorFromResponse("write", response);
           }
@@ -678,7 +678,7 @@ export function registerHoistedTools(
         _toolCallId: string,
         params: Static<typeof HashlineEditParams>,
         _signal,
-        _onUpdate,
+        onUpdate,
         extCtx,
       ) {
         const bridge = bridgeFor(ctx, extCtx.cwd);
@@ -690,6 +690,7 @@ export function registerHoistedTools(
           rawArgs,
           sessionId,
           extCtx,
+          { onUpdate },
         );
         if (preflight.success === false) throw toolErrorFromResponse("edit", preflight);
         for (const target of [
@@ -706,9 +707,12 @@ export function registerHoistedTools(
         }
         const preview = await callToolCallForSession(bridge, "edit", rawArgs, sessionId, extCtx, {
           preview: true,
+          onUpdate,
         });
         if (preview.success === false) throw toolErrorFromResponse("edit", preview);
-        const response = await callToolCallForSession(bridge, "edit", rawArgs, sessionId, extCtx);
+        const response = await callToolCallForSession(bridge, "edit", rawArgs, sessionId, extCtx, {
+          onUpdate,
+        });
         if (response.success === false) throw toolErrorFromResponse("edit", response);
         return buildMutationResult(response);
       },
@@ -735,7 +739,7 @@ export function registerHoistedTools(
           _toolCallId: string,
           params: Static<typeof EditParams>,
           _signal,
-          _onUpdate,
+          onUpdate,
           extCtx,
         ) {
           const argsRecord = params as Record<string, unknown>;
@@ -766,7 +770,7 @@ export function registerHoistedTools(
             if (argsRecord[key] !== undefined) rawArgs[key] = argsRecord[key];
           }
 
-          const response = await callToolCall(bridge, "edit", rawArgs, extCtx);
+          const response = await callToolCall(bridge, "edit", rawArgs, extCtx, { onUpdate });
           if (response.success === false) {
             throw toolErrorFromResponse("edit", response);
           }
@@ -796,7 +800,7 @@ export function registerHoistedTools(
           _toolCallId: string,
           params: Static<typeof GrepParams>,
           _signal,
-          _onUpdate,
+          onUpdate,
           extCtx,
         ) {
           const bridge = bridgeFor(ctx, extCtx.cwd);
@@ -817,7 +821,7 @@ export function registerHoistedTools(
           }
           if (params.include) req.include = params.include;
 
-          const response = await callToolCall(bridge, "grep", req, extCtx);
+          const response = await callToolCall(bridge, "grep", req, extCtx, { onUpdate });
           if (response.success === false) {
             throw new Error(response.text || response.message || "grep failed");
           }

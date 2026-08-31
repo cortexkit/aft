@@ -703,54 +703,49 @@ unsafe extern "C" {
 /// pressure relief is worth the zone-lock contention it briefly causes.
 pub const ALLOCATOR_SLACK_RELIEF_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Minimum spacing between opportunistic relief passes so a workload that
-/// legitimately cycles through large allocations does not thrash the allocator.
-pub const ALLOCATOR_SLACK_RELIEF_MIN_INTERVAL: std::time::Duration =
+/// Minimum spacing between allocator slack scans.
+///
+/// Linux `mallinfo2()` walks every glibc arena under allocator locks. Keep that
+/// work off the transport thread and do not repeat it on each maintenance tick.
+pub const ALLOCATOR_SLACK_SCAN_MIN_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(300);
 
-/// Decide whether an opportunistic allocator relief pass is due.
-///
-/// Pure so the policy is unit-testable: fires only when the allocator reports
-/// at least the threshold of retained slack AND the previous pass is old
-/// enough. Callers own actually measuring the snapshot and running the pass.
-pub fn allocator_slack_relief_due(
-    retained_slack_bytes: Option<u64>,
-    last_relief: Option<std::time::Instant>,
+/// Decide whether an allocator slack scan is due.
+pub fn allocator_slack_scan_due(
+    last_scan: Option<std::time::Instant>,
     now: std::time::Instant,
 ) -> bool {
-    let Some(slack) = retained_slack_bytes else {
-        return false;
-    };
-    if slack < ALLOCATOR_SLACK_RELIEF_THRESHOLD_BYTES {
-        return false;
-    }
-    match last_relief {
+    match last_scan {
         None => true,
-        Some(at) => now.duration_since(at) >= ALLOCATOR_SLACK_RELIEF_MIN_INTERVAL,
+        Some(at) => now.duration_since(at) >= ALLOCATOR_SLACK_SCAN_MIN_INTERVAL,
     }
 }
 
-/// Opportunistically return unused allocator pages when slack is large, even
-/// while sessions are active. The whole-process idle sweep only fires when
-/// every root has been quiet, so one long-lived chatty session used to block
-/// reclamation for the process lifetime (observed: 5.1 GB RSS over ~600 MB of
-/// live data). Runs the relief on a detached thread because allocator trimming
-/// walks allocator state under its lock and must not stall the dispatch loop or
-/// health probes.
+/// Decide whether an opportunistic allocator relief pass is due for a measured
+/// slack value.
+pub fn allocator_slack_relief_due(retained_slack_bytes: Option<u64>) -> bool {
+    retained_slack_bytes.is_some_and(|slack| slack >= ALLOCATOR_SLACK_RELIEF_THRESHOLD_BYTES)
+}
+
+/// Measure allocator slack and return unused pages from a detached thread.
 ///
-/// Returns true when a pass was spawned (caller records the timestamp).
+/// Returns true when a scan was spawned. The caller records that time so its
+/// frequent transport or stdin tick performs only a cheap cadence comparison.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub fn spawn_allocator_slack_relief_if_due(
-    last_relief: Option<std::time::Instant>,
+pub fn spawn_allocator_slack_scan_if_due(
+    last_scan: Option<std::time::Instant>,
     now: std::time::Instant,
 ) -> bool {
-    let slack = allocator_memory_snapshot().retained_slack_bytes;
-    if !allocator_slack_relief_due(slack, last_relief, now) {
+    if !allocator_slack_scan_due(last_scan, now) {
         return false;
     }
     std::thread::Builder::new()
         .name("aft-mem-relief".to_string())
         .spawn(|| {
+            let slack = allocator_memory_snapshot().retained_slack_bytes;
+            if !allocator_slack_relief_due(slack) {
+                return;
+            }
             let relief = relieve_allocator_pressure();
             log::info!(
                 "allocator slack relief: released={} allocator_slack_bytes_before={:?} allocator_slack_bytes_after={:?} rss_bytes_before={:?} rss_bytes_after={:?}",
@@ -878,26 +873,26 @@ mod tests {
     }
 
     #[test]
-    fn slack_relief_fires_on_large_slack_and_respects_spacing() {
+    fn slack_relief_requires_large_measured_slack() {
+        let threshold = ALLOCATOR_SLACK_RELIEF_THRESHOLD_BYTES;
+        assert!(!allocator_slack_relief_due(None));
+        assert!(!allocator_slack_relief_due(Some(threshold - 1)));
+        assert!(allocator_slack_relief_due(Some(threshold)));
+    }
+
+    #[test]
+    fn slack_scan_runs_once_per_interval() {
         use std::time::{Duration, Instant};
         let now = Instant::now();
-        let big = Some(ALLOCATOR_SLACK_RELIEF_THRESHOLD_BYTES);
-        // Unknown slack (allocator stats unavailable) never fires.
-        assert!(!allocator_slack_relief_due(None, None, now));
-        // Below threshold never fires.
-        assert!(!allocator_slack_relief_due(
-            Some(ALLOCATOR_SLACK_RELIEF_THRESHOLD_BYTES - 1),
-            None,
+        assert!(allocator_slack_scan_due(None, now));
+        assert!(!allocator_slack_scan_due(
+            Some(now - Duration::from_secs(10)),
             now
         ));
-        // At threshold with no prior pass fires.
-        assert!(allocator_slack_relief_due(big, None, now));
-        // A recent pass suppresses the next one...
-        let recent = now - Duration::from_secs(10);
-        assert!(!allocator_slack_relief_due(big, Some(recent), now));
-        // ...until the minimum spacing has elapsed.
-        let stale = now - ALLOCATOR_SLACK_RELIEF_MIN_INTERVAL;
-        assert!(allocator_slack_relief_due(big, Some(stale), now));
+        assert!(allocator_slack_scan_due(
+            Some(now - ALLOCATOR_SLACK_SCAN_MIN_INTERVAL),
+            now
+        ));
     }
 
     #[test]

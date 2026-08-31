@@ -28,6 +28,25 @@ static LAST_STANDING_VERIFY_STRATEGY: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 const STANDING_SERVICE_QUANTUM_MS: u64 = 250;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StandingReconcileKey {
+    storage_dir: Option<std::path::PathBuf>,
+    roots: Vec<crate::config::IndexRootConfig>,
+}
+
+impl StandingReconcileKey {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            storage_dir: config.storage_dir.clone(),
+            roots: config.index.roots.clone(),
+        }
+    }
+
+    fn requires_reconcile(&self, config: &Config) -> bool {
+        self != &Self::from_config(config)
+    }
+}
+
 struct PendingStandingSlice {
     receiver: tokio::sync::oneshot::Receiver<crate::protocol::Response>,
     started_at: Instant,
@@ -66,6 +85,7 @@ pub(super) struct StandingActor {
     executor: Arc<Executor>,
     roots: StandingRoots,
     observed_config: Mutex<Config>,
+    reconciled_config: Mutex<Option<StandingReconcileKey>>,
     /// Root ids registered solely to host unbound standing work. Session actors
     /// are never removed by this owner.
     owned_actors: Mutex<HashMap<String, (ProjectRootId, bool)>>,
@@ -79,6 +99,7 @@ impl StandingActor {
             executor,
             roots: StandingRoots::default(),
             observed_config: Mutex::new(Config::default()),
+            reconciled_config: Mutex::new(None),
             owned_actors: Mutex::new(HashMap::new()),
             schedule: Mutex::new(StandingScheduleState::default()),
         }
@@ -87,8 +108,12 @@ impl StandingActor {
     /// Startup reconciliation is intentionally direct and empty until subc has
     /// observed a user-tier configuration snapshot from a successful RouteBind.
     pub(super) fn reconcile_at_startup(&self) {
-        if let Err(error) = self.roots.reconcile(&Config::default()) {
-            log::warn!("standing roots startup reconciliation failed: {error}");
+        let config = Config::default();
+        match self.roots.reconcile(&config) {
+            Ok(_) => {
+                *self.reconciled_config.lock() = Some(StandingReconcileKey::from_config(&config))
+            }
+            Err(error) => log::warn!("standing roots startup reconciliation failed: {error}"),
         }
     }
 
@@ -128,6 +153,7 @@ impl StandingActor {
             log::warn!("standing roots bind reconciliation refused: {error}");
             return;
         }
+        *self.reconciled_config.lock() = Some(StandingReconcileKey::from_config(&snapshot));
         let Some(session_root) = ctx
             .canonical_cache_root_opt()
             .or_else(|| snapshot.project_root.clone())
@@ -157,16 +183,28 @@ impl StandingActor {
     pub(super) fn tick(&self) {
         self.observe_config_snapshot();
         let snapshot = self.observed_config.lock().clone();
-        let report = match self.roots.reconcile(&snapshot) {
-            Ok(report) => report,
-            Err(error) => {
-                log::warn!("standing roots reconciliation refused: {error}");
-                return;
-            }
+        let reconcile_key = StandingReconcileKey::from_config(&snapshot);
+        let entries = if self
+            .reconciled_config
+            .lock()
+            .as_ref()
+            .is_none_or(|previous| previous.requires_reconcile(&snapshot))
+        {
+            let report = match self.roots.reconcile(&snapshot) {
+                Ok(report) => report,
+                Err(error) => {
+                    log::warn!("standing roots reconciliation refused: {error}");
+                    return;
+                }
+            };
+            self.retire_removed_actors(&report.removed);
+            *self.reconciled_config.lock() = Some(reconcile_key);
+            report.active_entries
+        } else {
+            self.roots.entries()
         };
-        self.retire_removed_actors(&report.removed);
-        self.resume_entries_without_bound_session(&report.active_entries);
-        self.reconcile_schedule(report.active_entries);
+        self.resume_entries_without_bound_session(&entries);
+        self.reconcile_schedule(entries);
         self.drain_completed_slices();
         if matches!(
             self.schedule
@@ -657,6 +695,28 @@ mod tests {
             STANDING_MAINTENANCE_INTERVAL,
             super::super::DRAIN_TICK_PERIOD
         );
+    }
+
+    #[test]
+    fn unchanged_standing_config_does_not_require_reconciliation() {
+        let mut config = Config::default();
+        config.storage_dir = Some(std::path::PathBuf::from("/tmp/aft-standing-test"));
+        config.index.roots.push(crate::config::IndexRootConfig {
+            path: "/tmp/root".to_string(),
+            indexes: vec![IndexKind::Search],
+        });
+
+        let key = StandingReconcileKey::from_config(&config);
+        assert!(!key.requires_reconcile(&config));
+
+        config.index.resource_policy = crate::config::IndexResourcePolicy::Performance;
+        assert!(!key.requires_reconcile(&config));
+
+        config.index.roots.push(crate::config::IndexRootConfig {
+            path: "/tmp/root-two".to_string(),
+            indexes: vec![IndexKind::Search],
+        });
+        assert!(key.requires_reconcile(&config));
     }
 
     #[test]

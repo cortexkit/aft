@@ -225,17 +225,18 @@ describe("Pi aft_inspect surface", () => {
     expect(calls[0]?.command).toBe("tool_call");
   });
 
-  test("uses the default diagnostics deadline plus transport headroom", async () => {
+  test("caps the default diagnostics and transport deadlines below Pi's hard limit", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => freshTerminal());
     registerInspectTool(api, makePluginContext(bridge));
 
     await executeTool(tools.get("aft_inspect")!, {}, makeExtContext(projectRoot, "pi-session"));
 
-    expect(calls[0]?.options).toMatchObject({ transportTimeoutMs: 150_000 });
+    expect(calls[0]?.params.arguments).toMatchObject({ diagnostics_timeout_ms: 24_000 });
+    expect(calls[0]?.options).toMatchObject({ transportTimeoutMs: 25_000 });
   });
 
-  test("sends explicit inspect arguments with the configured diagnostics budget", async () => {
+  test("caps configured inspect diagnostics budgets below Pi's hard limit", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => freshTerminal());
     registerInspectTool(
@@ -253,8 +254,9 @@ describe("Pi aft_inspect surface", () => {
       sections: "todos",
       scope: ["src", "tests"],
       topK: 9,
+      diagnostics_timeout_ms: 24_000,
     });
-    expect(calls[0]?.options).toMatchObject({ transportTimeoutMs: 210_000 });
+    expect(calls[0]?.options).toMatchObject({ transportTimeoutMs: 25_000 });
     expect(calls[0]?.options).not.toHaveProperty("keepBridgeOnTimeout");
   });
 

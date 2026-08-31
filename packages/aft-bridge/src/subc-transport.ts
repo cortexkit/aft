@@ -811,11 +811,12 @@ class SubcTransport implements AftProjectTransport {
     options?: ToolCallOptions,
   ): Promise<ToolCallResult> {
     this.assertCurrent();
-    const { preview, timeoutMs, onProgress } = this.splitOptions(options);
+    const { preview, timeoutMs, executionDeadlineMs, onProgress } = this.splitOptions(options);
     const body: Record<string, unknown> = { name, arguments: rawArgs };
     const editSlotSurvives = this.pool.getEditSlotSurvives();
     if (editSlotSurvives !== undefined) body.edit_slot_survives = editSlotSurvives;
     if (preview === true) body.preview = true;
+    if (executionDeadlineMs !== undefined) body.deadline_ms_remaining = executionDeadlineMs;
     const reply = await this.pool.routeRequest(
       this.identityFor(sessionId),
       body,
@@ -863,6 +864,7 @@ class SubcTransport implements AftProjectTransport {
   private splitOptions(options?: ToolCallOptions): {
     preview?: boolean;
     timeoutMs?: number;
+    executionDeadlineMs?: number;
     onProgress?: RequestOptions["onProgress"];
   } {
     if (!options) return {};
@@ -874,8 +876,11 @@ class SubcTransport implements AftProjectTransport {
     // The pool default budget applies when the caller supplied neither.
     const timeoutMs =
       options.transportTimeoutMs ?? options.timeoutMs ?? this.pool.poolDefaultTimeoutMs;
-    const onProgress = (options as { onProgress?: RequestOptions["onProgress"] }).onProgress;
-    return { preview, timeoutMs, onProgress };
+    const executionDeadlineMs = options.executionDeadlineMs;
+    const onProgress = options.onProgress
+      ? (body: Uint8Array) => options.onProgress?.({ kind: "stdout", text: new TextDecoder().decode(body) })
+      : undefined;
+    return { preview, timeoutMs, executionDeadlineMs, onProgress };
   }
 }
 
@@ -1682,10 +1687,15 @@ export class SubcTransportPool implements AftTransportPool {
         }
         const requestTimeoutMs =
           remaining !== undefined ? Math.max(1, Math.floor(remaining)) : timeoutMs;
+        const requestedExecutionDeadline = body.deadline_ms_remaining;
+        const serverDeadline =
+          typeof requestedExecutionDeadline === "number" && Number.isFinite(requestedExecutionDeadline)
+            ? Math.min(remaining ?? requestedExecutionDeadline, requestedExecutionDeadline)
+            : remaining;
         const deadlineBody =
-          remaining === undefined || !Number.isFinite(remaining)
+          serverDeadline === undefined || !Number.isFinite(serverDeadline)
             ? body
-            : { ...body, deadline_ms_remaining: Math.max(0, Math.floor(remaining)) };
+            : { ...body, deadline_ms_remaining: Math.max(0, Math.floor(serverDeadline)) };
         const reply = await client.request(route, deadlineBody, {
           timeoutMs: requestTimeoutMs,
           onProgress,

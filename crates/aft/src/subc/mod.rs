@@ -2920,8 +2920,11 @@ where
     // stream (the next read would parse a body byte as a frame header). A
     // dedicated reader task owns the socket, reads whole frames sequentially, and
     // forwards them over a channel; the loop selects on the cancel-safe `recv()`.
-    let (reader_tx, mut reader_rx) = mpsc::channel::<Result<DecodedFrame, SubcError>>(256);
-    let reader_task = spawn_reader_task(read, reader_tx);
+    let (control_reader_tx, mut control_reader_rx) =
+        mpsc::channel::<Result<DecodedFrame, SubcError>>(32);
+    let (data_reader_tx, mut data_reader_rx) =
+        mpsc::channel::<Result<DecodedFrame, SubcError>>(256);
+    let reader_task = spawn_reader_task(read, control_reader_tx, data_reader_tx);
     let shutdown = Arc::new(Notify::new());
     // Drain-tick deadline is tracked manually and checked at the TOP of every
     // loop turn rather than as an Interval select arm: the select below is
@@ -2939,10 +2942,10 @@ where
     // this existing maintenance timer arm and never create a standing timer.
     standing_actor.reconcile_at_startup();
     let mut next_standing_pass_at = tokio::time::Instant::now();
-    // Rate-limit stamp for opportunistic allocator slack relief (checked on the
-    // maintenance tick; policy shared with standalone via memory.rs).
+    // Rate-limit stamp for detached allocator slack scans. The maintenance
+    // tick performs only a cheap cadence comparison on the transport thread.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let mut last_slack_relief: Option<std::time::Instant> = None;
+    let mut last_slack_scan: Option<std::time::Instant> = None;
     let (maintenance_tx, mut maintenance_rx) = mpsc::channel::<MaintenanceCompletion>(256);
     let (bash_deferred_tx, mut bash_deferred_rx) =
         mpsc::channel::<bash::BashDeferredCompletion>(256);
@@ -3169,7 +3172,7 @@ where
                 log::warn!("subc attach: fatal executor response requested teardown");
                 break Ok(ModuleLoopExit::SkipSearchFlush);
             }
-            maybe_frame = reader_rx.recv() => {
+            maybe_frame = recv_prioritized_frame(&mut control_reader_rx, &mut data_reader_rx) => {
                 let frame = match maybe_frame {
                     None => {
                         log::info!("subc attach: daemon closed connection");
@@ -3599,20 +3602,17 @@ where
                     next_standing_pass_at = tokio::time::Instant::now()
                         + standing::STANDING_MAINTENANCE_INTERVAL;
                 }
-                // Opportunistic allocator relief, independent of the idle
-                // sweep: the sweep's whole-process idle gate never opens while
-                // any session stays active, which let freed warm-up arenas sit
-                // resident for the process lifetime (5.1 GB RSS over ~600 MB
-                // live). Slack threshold + spacing live in memory.rs; the pass
-                // itself runs on a detached thread.
+                // Scan and trim allocator arenas on a detached thread. On glibc,
+                // mallinfo2() walks every arena under allocator locks, so the
+                // transport thread must only evaluate the scan cadence here.
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
                 {
                     let now_std = std::time::Instant::now();
-                    if crate::memory::spawn_allocator_slack_relief_if_due(
-                        last_slack_relief,
+                    if crate::memory::spawn_allocator_slack_scan_if_due(
+                        last_slack_scan,
                         now_std,
                     ) {
-                        last_slack_relief = Some(now_std);
+                        last_slack_scan = Some(now_std);
                     }
                 }
                 next_maintenance_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
@@ -3798,7 +3798,8 @@ where
 
 fn spawn_reader_task<R>(
     mut read: R,
-    tx: mpsc::Sender<Result<DecodedFrame, SubcError>>,
+    control_tx: mpsc::Sender<Result<DecodedFrame, SubcError>>,
+    data_tx: mpsc::Sender<Result<DecodedFrame, SubcError>>,
 ) -> JoinHandle<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -3807,16 +3808,18 @@ where
         loop {
             match read_frame(&mut read).await {
                 Ok(Some(frame)) => {
+                    let is_control = frame.header.channel == 0;
                     let decoded = DecodedFrame {
                         frame,
                         phase_trace: PhaseTrace::new(Instant::now()),
                     };
+                    let tx = if is_control { &control_tx } else { &data_tx };
                     if tx.send(Ok(decoded)).await.is_err() {
                         return;
                     }
                 }
                 Ok(None) => {
-                    // EOF: let the loop observe channel close as "daemon closed".
+                    // EOF: let the loop observe both channel closures as "daemon closed".
                     return;
                 }
                 Err(error) => {
@@ -3838,12 +3841,23 @@ where
                             return;
                         }
                     }
-                    let _ = tx.send(Err(SubcError::FrameIo(error))).await;
+                    let _ = control_tx.send(Err(SubcError::FrameIo(error))).await;
                     return;
                 }
             }
         }
     })
+}
+
+async fn recv_prioritized_frame(
+    control_rx: &mut mpsc::Receiver<Result<DecodedFrame, SubcError>>,
+    data_rx: &mut mpsc::Receiver<Result<DecodedFrame, SubcError>>,
+) -> Option<Result<DecodedFrame, SubcError>> {
+    tokio::select! {
+        biased;
+        frame = control_rx.recv() => frame,
+        frame = data_rx.recv() => frame,
+    }
 }
 
 async fn finish_writer_task(
@@ -6705,6 +6719,45 @@ mod tests {
                 source: io::Error::new(kind, "constructed auth failure"),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn reader_routes_control_frames_around_buffered_data_frames() {
+        let (mut daemon, module) = tokio::io::duplex(16 * 1024);
+        let (priority_tx, mut priority_rx) = mpsc::channel(4);
+        let (data_tx, mut data_rx) = mpsc::channel(4);
+        let reader = spawn_reader_task(module, priority_tx, data_tx);
+
+        let data = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            7,
+            1,
+            1,
+            br#"{}"#.to_vec(),
+        )
+        .unwrap();
+        let ping = Frame::build(FrameType::Ping, control_flags(), 0, 0, 2, Vec::new()).unwrap();
+        write_frame(&mut daemon, &data).await.unwrap();
+        write_frame(&mut daemon, &ping).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let priority = tokio::time::timeout(
+            Duration::from_secs(1),
+            recv_prioritized_frame(&mut priority_rx, &mut data_rx),
+        )
+        .await
+        .expect("priority frame timeout")
+        .expect("priority ingress closed")
+        .expect("priority ingress error");
+        assert_eq!(priority.frame.header.ty, FrameType::Ping);
+
+        let data = recv_prioritized_frame(&mut priority_rx, &mut data_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(data.frame.header.ty, FrameType::Request);
+        reader.abort();
     }
 
     #[test]

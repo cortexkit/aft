@@ -366,6 +366,8 @@ export interface BridgeRequestOptions {
   abortSignal?: AbortSignal;
   /** Per-call transport timeout in milliseconds. Defaults to the bridge-wide timeout. */
   transportTimeoutMs?: number;
+  /** Optional server execution budget stamped on tool_call request metadata. */
+  executionDeadlineMs?: number;
   /**
    * Skip bridge-hang escalation for this request.
    *
@@ -771,6 +773,10 @@ export class BinaryBridge implements AftProjectTransport {
     }
     const { preview, ...sendOptions } = options ?? {};
     if (preview === true) params.preview = true;
+    const requestBudgetMs = sendOptions.executionDeadlineMs ?? sendOptions.transportTimeoutMs;
+    if (requestBudgetMs !== undefined && Number.isFinite(requestBudgetMs)) {
+      params.deadline_ms_remaining = Math.max(0, Math.floor(requestBudgetMs));
+    }
     return (await this.send(
       "tool_call",
       params,

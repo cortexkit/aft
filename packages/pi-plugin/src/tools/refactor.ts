@@ -133,7 +133,7 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
         _toolCallId: string,
         params: Static<typeof RefactorParams>,
         _signal,
-        _onUpdate,
+        onUpdate,
         extCtx,
       ) {
         // Per-op required-field validation using isEmptyParam so empty strings
@@ -195,7 +195,7 @@ export function registerRefactorTool(pi: ExtensionAPI, ctx: PluginContext): void
         if (startLine !== undefined) rawArgs.startLine = startLine;
         if (endLine !== undefined) rawArgs.endLine = endLine;
         if (callSiteLine !== undefined) rawArgs.callSiteLine = callSiteLine;
-        const response = await callToolCall(bridge, "refactor", rawArgs, extCtx);
+        const response = await callToolCall(bridge, "refactor", rawArgs, extCtx, { onUpdate });
         if (response.success === false) {
           throw new Error(response.text || response.message || `${params.op} failed`);
         }

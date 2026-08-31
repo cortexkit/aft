@@ -180,7 +180,7 @@ export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void 
         _toolCallId: string,
         params: Static<typeof ImportParams>,
         _signal,
-        _onUpdate,
+        onUpdate,
         extCtx,
       ) {
         if ((params.op === "add" || params.op === "remove") && isEmptyParam(params.module)) {
@@ -203,7 +203,7 @@ export function registerImportTools(pi: ExtensionAPI, ctx: PluginContext): void 
         if (params.typeOnly !== undefined) rawArgs.typeOnly = params.typeOnly;
         if (params.validate !== undefined) rawArgs.validate = params.validate;
 
-        const response = await callToolCall(bridge, "import", rawArgs, extCtx);
+        const response = await callToolCall(bridge, "import", rawArgs, extCtx, { onUpdate });
         if (response.success === false) {
           throw new Error(response.text || response.message || `${params.op} failed`);
         }

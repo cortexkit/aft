@@ -89,7 +89,7 @@ export function registerConflictsTool(pi: ExtensionAPI, ctx: PluginContext): voi
       description:
         "Show all git merge conflicts across the repository — returns line-numbered conflict regions with context for every conflicted file in a single call.",
       parameters: ConflictsParams,
-      async execute(_toolCallId: string, params, _signal, _onUpdate, extCtx) {
+      async execute(_toolCallId: string, params, _signal, onUpdate, extCtx) {
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const reqParams: Record<string, unknown> = {};
         const path = (params as { path?: unknown })?.path;
@@ -102,7 +102,7 @@ export function registerConflictsTool(pi: ExtensionAPI, ctx: PluginContext): voi
           });
           reqParams.path = await resolvePathArg(extCtx.cwd, path);
         }
-        const response = await callToolCall(bridge, "conflicts", reqParams, extCtx);
+        const response = await callToolCall(bridge, "conflicts", reqParams, extCtx, { onUpdate });
         if (response.success === false) {
           throw new Error(response.text || response.message || "conflicts failed");
         }
