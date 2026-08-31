@@ -271,11 +271,18 @@ impl StandingActor {
             .next_kind
             .retain(|key, _| entries.iter().any(|entry| entry.literal_path == *key));
         for entry in entries {
-            let selection_changed = schedule
-                .entries
-                .get(&entry.literal_path)
-                .is_some_and(|previous| previous.indexes != entry.indexes);
-            if selection_changed {
+            let identity_changed =
+                schedule
+                    .entries
+                    .get(&entry.literal_path)
+                    .is_some_and(|previous| {
+                        previous.resolved_target != entry.resolved_target
+                            || previous.resolved_git_toplevel != entry.resolved_git_toplevel
+                            || previous.scoped_relative_path != entry.scoped_relative_path
+                            || previous.artifact_key != entry.artifact_key
+                            || previous.indexes != entry.indexes
+                    });
+            if identity_changed {
                 schedule.queue.reconfigure(&entry.literal_path);
                 schedule.next_kind.insert(entry.literal_path.clone(), 0);
             } else {
@@ -1000,6 +1007,37 @@ mod tests {
         StandingActor::reconcile_kind_cursors(&mut schedule, std::slice::from_ref(&entry));
 
         assert_eq!(schedule.next_kind.get(&entry.literal_path), Some(&0));
+    }
+
+    #[test]
+    fn identity_change_resets_kind_cursor_and_scheduler_generation() {
+        let mut schedule = StandingScheduleState::default();
+        let mut entry = StandingRootEntry {
+            literal_path: "/tmp/root".to_string(),
+            resolved_target: std::path::PathBuf::from("/tmp/old-target"),
+            resolved_git_toplevel: None,
+            scoped_relative_path: None,
+            artifact_key: "old-key".to_string(),
+            indexes: vec![IndexKind::Search],
+            config_order: 0,
+        };
+        schedule.queue.reconcile([entry.literal_path.clone()]);
+        schedule
+            .entries
+            .insert(entry.literal_path.clone(), entry.clone());
+        schedule.next_kind.insert(entry.literal_path.clone(), 1);
+        let old_generation = schedule.queue.generation(&entry.literal_path).unwrap();
+
+        entry.resolved_target = std::path::PathBuf::from("/tmp/new-target");
+        entry.artifact_key = "new-key".to_string();
+        StandingActor::reconcile_kind_cursors(&mut schedule, std::slice::from_ref(&entry));
+
+        assert_eq!(schedule.next_kind.get(&entry.literal_path), Some(&0));
+        assert_ne!(
+            schedule.queue.generation(&entry.literal_path),
+            Some(old_generation),
+            "a replacement must fence completion from the former target"
+        );
     }
 
     #[test]
