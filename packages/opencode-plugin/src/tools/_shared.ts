@@ -21,6 +21,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type {
   AftProjectTransport,
+  AftTransportOptions,
   BridgeRequestOptions,
   ToolCallOptions,
   ToolCallResult,
@@ -240,7 +241,7 @@ export async function callBridge(
   runtime: ToolRuntime,
   command: string,
   params: Record<string, unknown> = {},
-  options?: BridgeRequestOptions,
+  options?: AftTransportOptions,
 ): Promise<Record<string, unknown>> {
   // Resolve the session's stored project directory once on first call —
   // OpenCode sets `runtime.directory = process.cwd()` even for resumed
@@ -254,11 +255,17 @@ export async function callBridge(
   if (runtime.sessionID) {
     merged.session_id = runtime.sessionID;
   }
-  const timeoutMs = timeoutForCommand(command);
+  // One canonical budget field: caller `transportTimeoutMs` (if any) wins,
+  // otherwise the command budget. A caller-provided `timeoutMs` is consumed
+  // as an override input but never re-emitted — bridge.ts resolves
+  // `transportTimeoutMs ?? timeoutMs`, so emitting both fields lets the
+  // legacy alias silently shadow the winner.
+  const { timeoutMs: callerTimeoutMs, ...restOptions } = options ?? {};
+  const timeoutMs = restOptions.transportTimeoutMs ?? callerTimeoutMs ?? timeoutForCommand(command);
   const sendOptions = {
-    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(timeoutMs !== undefined ? { transportTimeoutMs: timeoutMs } : {}),
     configureWarningClient: ctx.client,
-    ...options,
+    ...restOptions,
   };
   markBridgeStart();
   let response: Awaited<ReturnType<AftProjectTransport["send"]>>;
@@ -300,13 +307,13 @@ export async function callToolCall(
     await getSessionDirectory(ctx.client, runtime.sessionID, runtime.directory);
   }
 
-  const timeoutMs = timeoutForCommand(name);
+  const { timeoutMs: callerTimeoutMs, ...restOptions } = options ?? {};
+  const timeoutMs = restOptions.transportTimeoutMs ?? callerTimeoutMs ?? timeoutForCommand(name);
   const sendOptions = {
-    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(timeoutMs !== undefined ? { transportTimeoutMs: timeoutMs } : {}),
     configureWarningClient: ctx.client,
-    ...options,
+    ...restOptions,
   };
-  markBridgeStart();
   let response: Awaited<ReturnType<AftProjectTransport["toolCall"]>>;
   try {
     response = await bridgeFor(ctx, runtime).toolCall(

@@ -43,13 +43,18 @@ function piTransportOptions(
   command: string,
   options: BridgeRequestOptions = {},
 ): BridgeRequestOptions {
-  const requested = options.transportTimeoutMs ?? bridgeTimeoutForCommand(command);
-  const transportTimeoutMs = Math.min(requested ?? PI_TOOL_TRANSPORT_TIMEOUT_MS, PI_TOOL_TRANSPORT_TIMEOUT_MS);
+  const { timeoutMs: callerTimeoutMs, ...rest } = options;
+  const requested =
+    rest.transportTimeoutMs ?? callerTimeoutMs ?? bridgeTimeoutForCommand(command);
+  const transportTimeoutMs = Math.min(
+    requested ?? PI_TOOL_TRANSPORT_TIMEOUT_MS,
+    PI_TOOL_TRANSPORT_TIMEOUT_MS,
+  );
   return {
-    ...options,
+    ...rest,
     transportTimeoutMs,
     executionDeadlineMs: Math.min(
-      options.executionDeadlineMs ?? PI_TOOL_EXECUTION_TIMEOUT_MS,
+      rest.executionDeadlineMs ?? PI_TOOL_EXECUTION_TIMEOUT_MS,
       PI_TOOL_EXECUTION_TIMEOUT_MS,
     ),
   };

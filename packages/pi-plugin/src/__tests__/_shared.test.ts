@@ -58,7 +58,7 @@ describe("tool shared helpers", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].command).toBe("grep");
     expect(calls[0].params).toEqual({ pattern: "needle", session_id: "pi-session-123" });
-    expect(calls[0].options?.timeoutMs).toBe(25_000);
+    expect(calls[0].options?.timeoutMs).toBeUndefined();
     expect(calls[0].options?.transportTimeoutMs).toBe(25_000);
     expect(calls[0].options?.executionDeadlineMs).toBe(24_000);
     expect(calls[0].options?.configureWarningClient).toBe(extCtx);
