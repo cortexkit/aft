@@ -22,13 +22,22 @@ fn configure_project(aft: &mut AftProcess, root: &Path) {
 /// The binary correctly treats linked worktrees as read-only, while these
 /// tests need a writer-capable synthetic project for cold-build assertions.
 fn callgraph_fixture() -> (TempDir, PathBuf) {
+    fn copy_dir_recursive(source: &Path, destination: &Path) {
+        fs::create_dir_all(destination).expect("create callgraph fixture directory");
+        for entry in fs::read_dir(source).expect("read callgraph fixture") {
+            let entry = entry.expect("read callgraph fixture entry");
+            let target = destination.join(entry.file_name());
+            if entry.file_type().expect("read fixture entry type").is_dir() {
+                copy_dir_recursive(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).expect("copy callgraph fixture file");
+            }
+        }
+    }
+
     let source = fixture_path("callgraph");
     let temp = tempdir().expect("create callgraph fixture copy");
-    for entry in fs::read_dir(source).expect("read callgraph fixture") {
-        let entry = entry.expect("read callgraph fixture entry");
-        fs::copy(entry.path(), temp.path().join(entry.file_name()))
-            .expect("copy callgraph fixture file");
-    }
+    copy_dir_recursive(&source, temp.path());
     let root = temp.path().to_path_buf();
     (temp, root)
 }

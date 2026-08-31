@@ -8624,8 +8624,10 @@ mod tests {
         {}
         let published = SearchIndex::read_from_disk(&cache, &project).expect("published index");
         let result = published.grep("id_marker_4", true, &[], &[], &project, 10);
+        assert_eq!(result.total_matches, 1);
     }
 
+    #[test]
     fn resumable_search_restarts_when_content_changes_without_metadata_change() {
         let dir = tempfile::tempdir().expect("create temp dir");
         let project = dir.path().join("project");

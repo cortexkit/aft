@@ -121,8 +121,10 @@ impl EmbeddingRequestPolicy {
     }
 }
 
-const SEMANTIC_STAGING_VERSION: u32 = 1;
-const SEMANTIC_STAGING_FILE: &str = "semantic-staging-v1.json";
+const SEMANTIC_STAGING_VERSION: u32 = 2;
+const SEMANTIC_STAGING_FILE: &str = "semantic-staging-v2.json";
+const SEMANTIC_STAGING_CHUNKS_FILE: &str = "semantic-staging-chunks-v2.jsonl";
+const SEMANTIC_STAGING_VECTORS_FILE: &str = "semantic-staging-vectors-v2.bin";
 const SEMANTIC_COLLECT_SLICE_FILES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,9 +142,9 @@ struct SemanticStagingManifest {
     corpus_fingerprint: String,
     collect_cursor: usize,
     embed_cursor: usize,
-    chunks: Vec<SemanticChunk>,
+    chunks_count: usize,
     metadata: Vec<SemanticStagingMetadata>,
-    vectors: Vec<Vec<f32>>,
+    vectors_count: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2089,6 +2091,88 @@ fn write_semantic_staging(path: &Path, manifest: &SemanticStagingManifest) -> Re
     crate::fs_lock::rename_over(&temporary, path).map_err(|error| error.to_string())
 }
 
+fn append_semantic_chunks(path: &Path, chunks: &[SemanticChunk]) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    for chunk in chunks {
+        serde_json::to_writer(&mut file, chunk).map_err(|error| error.to_string())?;
+        file.write_all(b"\n").map_err(|error| error.to_string())?;
+    }
+    file.sync_data().map_err(|error| error.to_string())
+}
+
+fn read_semantic_chunks(path: &Path, count: usize) -> Result<Vec<SemanticChunk>, String> {
+    let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let chunks = text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if chunks.len() != count {
+        return Err(format!(
+            "semantic staging chunk segment count mismatch: expected {count}, got {}",
+            chunks.len()
+        ));
+    }
+    Ok(chunks)
+}
+
+fn append_semantic_vectors(
+    path: &Path,
+    vectors: &[Vec<f32>],
+    dimension: usize,
+) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    for vector in vectors {
+        if vector.len() != dimension {
+            return Err("semantic staging vector dimension mismatch".to_string());
+        }
+        for value in vector {
+            file.write_all(&value.to_le_bytes())
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    file.sync_data().map_err(|error| error.to_string())
+}
+
+fn read_semantic_vectors(
+    path: &Path,
+    count: usize,
+    dimension: usize,
+) -> Result<Vec<Vec<f32>>, String> {
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    let record_bytes = dimension
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| "semantic staging vector size overflow".to_string())?;
+    let expected = count
+        .checked_mul(record_bytes)
+        .ok_or_else(|| "semantic staging vector size overflow".to_string())?;
+    if bytes.len() != expected {
+        return Err(format!(
+            "semantic staging vector segment length mismatch: expected {expected}, got {}",
+            bytes.len()
+        ));
+    }
+    Ok(bytes
+        .chunks_exact(record_bytes)
+        .map(|record| {
+            record
+                .chunks_exact(std::mem::size_of::<f32>())
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("f32 byte width")))
+                .collect()
+        })
+        .collect())
+}
+
 /// The semantic index — stores embeddings for all symbols in a project.
 /// Borrow-only roots retain only a root path plus an Arc to immutable relative data.
 #[derive(Debug, Clone)]
@@ -2860,7 +2944,25 @@ impl SemanticIndex {
         let corpus_fingerprint = semantic_corpus_fingerprint(&canonical_root, files, &fingerprint);
         let dir = storage_dir.join("semantic").join(project_key);
         let staging_path = dir.join(SEMANTIC_STAGING_FILE);
+        let chunks_path = dir.join(SEMANTIC_STAGING_CHUNKS_FILE);
+        let vectors_path = dir.join(SEMANTIC_STAGING_VECTORS_FILE);
         fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+
+        let valid_segment_lengths = |manifest: &SemanticStagingManifest| {
+            let chunks_valid = fs::read_to_string(&chunks_path)
+                .map(|text| {
+                    text.lines().filter(|line| !line.is_empty()).count() == manifest.chunks_count
+                })
+                .unwrap_or(manifest.chunks_count == 0);
+            let vector_bytes = manifest
+                .vectors_count
+                .saturating_mul(fingerprint.dimension)
+                .saturating_mul(std::mem::size_of::<f32>());
+            let vectors_valid = fs::metadata(&vectors_path)
+                .map(|metadata| metadata.len() == u64::try_from(vector_bytes).unwrap_or(u64::MAX))
+                .unwrap_or(manifest.vectors_count == 0);
+            chunks_valid && vectors_valid
+        };
         let mut manifest = load_semantic_staging(&staging_path)
             .filter(|manifest| {
                 manifest.version == SEMANTIC_STAGING_VERSION
@@ -2868,31 +2970,33 @@ impl SemanticIndex {
                     && manifest.corpus_fingerprint == corpus_fingerprint
                     && manifest.files == files
                     && manifest.collect_cursor <= files.len()
-                    && manifest.embed_cursor <= manifest.chunks.len()
-                    && manifest.vectors.len() == manifest.embed_cursor
-                    && manifest
-                        .vectors
-                        .iter()
-                        .all(|vector| vector.len() == fingerprint.dimension)
+                    && manifest.embed_cursor <= manifest.chunks_count
+                    && manifest.vectors_count == manifest.embed_cursor
+                    && valid_segment_lengths(manifest)
             })
-            .unwrap_or(SemanticStagingManifest {
-                version: SEMANTIC_STAGING_VERSION,
-                canonical_root: canonical_root.clone(),
-                fingerprint: fingerprint.clone(),
-                files: files.to_vec(),
-                corpus_fingerprint,
-                collect_cursor: 0,
-                embed_cursor: 0,
-                chunks: Vec::new(),
-                metadata: Vec::new(),
-                vectors: Vec::new(),
+            .unwrap_or_else(|| {
+                let _ = fs::remove_file(&chunks_path);
+                let _ = fs::remove_file(&vectors_path);
+                SemanticStagingManifest {
+                    version: SEMANTIC_STAGING_VERSION,
+                    canonical_root: canonical_root.clone(),
+                    fingerprint: fingerprint.clone(),
+                    files: files.to_vec(),
+                    corpus_fingerprint,
+                    collect_cursor: 0,
+                    embed_cursor: 0,
+                    chunks_count: 0,
+                    metadata: Vec::new(),
+                    vectors_count: 0,
+                }
             });
 
         if manifest.collect_cursor < files.len() {
             let end = (manifest.collect_cursor + SEMANTIC_COLLECT_SLICE_FILES).min(files.len());
             let (chunks, metadata) =
                 Self::collect_chunks(&canonical_root, &files[manifest.collect_cursor..end]);
-            manifest.chunks.extend(chunks);
+            append_semantic_chunks(&chunks_path, &chunks)?;
+            manifest.chunks_count += chunks.len();
             manifest
                 .metadata
                 .extend(metadata.into_iter().map(|(path, metadata)| {
@@ -2912,10 +3016,11 @@ impl SemanticIndex {
             return Ok(SemanticBuildSliceOutcome::Yielded);
         }
 
-        if manifest.embed_cursor < manifest.chunks.len() {
+        if manifest.embed_cursor < manifest.chunks_count {
+            let chunks = read_semantic_chunks(&chunks_path, manifest.chunks_count)?;
             let end =
-                (manifest.embed_cursor + model.max_batch_size().max(1)).min(manifest.chunks.len());
-            let texts = manifest.chunks[manifest.embed_cursor..end]
+                (manifest.embed_cursor + model.max_batch_size().max(1)).min(manifest.chunks_count);
+            let texts = chunks[manifest.embed_cursor..end]
                 .iter()
                 .map(|chunk| chunk.embed_text.clone())
                 .collect();
@@ -2926,16 +3031,22 @@ impl SemanticIndex {
                 .any(|vector| vector.len() != fingerprint.dimension)
             {
                 let _ = fs::remove_file(&staging_path);
+                let _ = fs::remove_file(&chunks_path);
+                let _ = fs::remove_file(&vectors_path);
                 return Err(
                     "embedding dimension changed during resumable semantic build".to_string(),
                 );
             }
-            manifest.vectors.extend(vectors);
+            append_semantic_vectors(&vectors_path, &vectors, fingerprint.dimension)?;
             manifest.embed_cursor = end;
+            manifest.vectors_count = end;
             write_semantic_staging(&staging_path, &manifest)?;
             return Ok(SemanticBuildSliceOutcome::Yielded);
         }
 
+        let chunks = read_semantic_chunks(&chunks_path, manifest.chunks_count)?;
+        let vectors =
+            read_semantic_vectors(&vectors_path, manifest.vectors_count, fingerprint.dimension)?;
         let file_metadata = manifest
             .metadata
             .iter()
@@ -2953,10 +3064,9 @@ impl SemanticIndex {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let entries = manifest
-            .chunks
+        let entries = chunks
             .into_iter()
-            .zip(manifest.vectors)
+            .zip(vectors)
             .map(|(chunk, vector)| EmbeddingEntry::new(chunk, vector))
             .collect::<Vec<_>>();
         let mut index = Self {
@@ -2987,6 +3097,8 @@ impl SemanticIndex {
             return Err("failed to publish resumable semantic index".to_string());
         }
         fs::remove_file(&staging_path).map_err(|error| error.to_string())?;
+        fs::remove_file(&chunks_path).map_err(|error| error.to_string())?;
+        fs::remove_file(&vectors_path).map_err(|error| error.to_string())?;
         Ok(SemanticBuildSliceOutcome::Complete)
     }
 

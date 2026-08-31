@@ -7,6 +7,7 @@ pub struct DeficitRoundRobin<K> {
     queue: VecDeque<K>,
     deficits: HashMap<K, i128>,
     in_flight: HashSet<K>,
+    generations: HashMap<K, u64>,
 }
 
 impl<K> DeficitRoundRobin<K>
@@ -20,6 +21,7 @@ where
             queue: VecDeque::new(),
             deficits: HashMap::new(),
             in_flight: HashSet::new(),
+            generations: HashMap::new(),
         }
     }
 
@@ -35,6 +37,10 @@ where
         for key in keys {
             if !self.deficits.contains_key(&key) {
                 self.deficits.insert(key.clone(), 0);
+                self.generations
+                    .entry(key.clone())
+                    .and_modify(|generation| *generation = generation.saturating_add(1))
+                    .or_insert(0);
                 self.queue.push_back(key);
             }
         }
@@ -60,6 +66,19 @@ where
             self.queue.push_back(key);
         }
         None
+    }
+
+    pub fn generation(&self, key: &K) -> Option<u64> {
+        self.deficits
+            .contains_key(key)
+            .then(|| self.generations.get(key).copied().unwrap_or(0))
+    }
+
+    pub fn complete_generation(&mut self, key: K, generation: u64, cost: u64, has_more: bool) {
+        if self.generation(&key) != Some(generation) {
+            return;
+        }
+        self.complete(key, cost, has_more);
     }
 
     pub fn complete(&mut self, key: K, cost: u64, has_more: bool) {
@@ -209,5 +228,21 @@ mod tests {
         scheduler.complete("a", 10, true);
         // "a" must not be requeued without a deficits entry.
         assert!(!scheduler.queue.contains(&"a"));
+    }
+
+    #[test]
+    fn stale_completion_cannot_mutate_readded_root_generation() {
+        let mut scheduler = DeficitRoundRobin::new(100);
+        scheduler.reconcile(["a", "b"]);
+        assert_eq!(scheduler.next(), Some("a"));
+        let old_generation = scheduler.generation(&"a").unwrap();
+        scheduler.reconcile(["b"]);
+        scheduler.reconcile(["a", "b"]);
+        let new_generation = scheduler.generation(&"a").unwrap();
+        assert_ne!(new_generation, old_generation);
+
+        scheduler.complete_generation("a", old_generation, 100, false);
+        assert_eq!(scheduler.generation(&"a"), Some(new_generation));
+        assert!(scheduler.deficits.contains_key("a"));
     }
 }

@@ -123,6 +123,7 @@ pub mod subc_config;
 pub mod subc_format;
 pub mod subc_translate;
 pub mod symbol_cache_disk;
+pub mod symbol_diff;
 pub mod symbols;
 pub mod synapse_embed;
 pub mod thread_priority;

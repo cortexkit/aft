@@ -32,6 +32,7 @@
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 thread_local! {
     static WARNED: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static PRIORITIES: std::cell::RefCell<Vec<imp::PreviousPriority>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -55,14 +56,29 @@ mod imp {
     use super::warn_once;
     use libc::{c_int, c_long, syscall};
 
-    pub fn demote() {
-        cpu_idle();
-        io_idle();
+    #[derive(Clone, Copy)]
+    pub struct PreviousPriority {
+        scheduler: c_int,
+        io_priority: c_int,
     }
 
-    pub fn restore() {
-        cpu_other();
-        io_best_effort();
+    pub fn demote() -> PreviousPriority {
+        let previous = PreviousPriority {
+            scheduler: unsafe { libc::sched_getscheduler(0) },
+            io_priority: unsafe {
+                syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, tid()) as c_int
+            },
+        };
+        cpu_idle();
+        io_idle();
+        previous
+    }
+
+    pub fn restore(previous: PreviousPriority) {
+        cpu_policy(previous.scheduler);
+        if !io_set(IOPRIO_WHO_PROCESS, tid(), previous.io_priority) {
+            warn_once("io", &std::io::Error::last_os_error().to_string());
+        }
     }
 
     /// SCHED_IDLE is not bound by the `libc` crate on gnu/musl; the value is a
@@ -74,7 +90,6 @@ mod imp {
     pub(super) const SCHED_OTHER: c_int = 0;
 
     pub(super) const IOPRIO_CLASS_IDLE: c_int = 3;
-    pub(super) const IOPRIO_CLASS_BE: c_int = 2;
     pub(super) const IOPRIO_WHO_PROCESS: c_int = 1;
     const IOPRIO_CLASS_SHIFT: c_int = 13;
     const IOPRIO_NICE_SHIFT: c_int = 0;
@@ -88,10 +103,10 @@ mod imp {
         }
     }
 
-    fn cpu_other() {
+    fn cpu_policy(policy: c_int) {
         let mut param = unsafe { std::mem::zeroed::<libc::sched_param>() };
         param.sched_priority = 0;
-        let rc = unsafe { libc::sched_setscheduler(0, SCHED_OTHER, &param) };
+        let rc = unsafe { libc::sched_setscheduler(0, policy, &param) };
         if rc != 0 {
             warn_once("cpu", &std::io::Error::last_os_error().to_string());
         }
@@ -119,31 +134,39 @@ mod imp {
             warn_once("io", &std::io::Error::last_os_error().to_string());
         }
     }
-
-    fn io_best_effort() {
-        if !io_set(IOPRIO_WHO_PROCESS, tid(), io_prio(IOPRIO_CLASS_BE, 0)) {
-            warn_once("io", &std::io::Error::last_os_error().to_string());
-        }
-    }
 }
 
 #[cfg(target_os = "macos")]
 mod imp {
     use super::warn_once;
 
-    pub fn demote() {
+    #[derive(Clone, Copy)]
+    pub struct PreviousPriority {
+        qos: libc::qos_class_t,
+        relative_priority: libc::c_int,
+    }
+
+    pub fn demote() -> PreviousPriority {
+        let mut relative_priority = 0;
+        let qos =
+            unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), &mut relative_priority) };
         let rc =
             unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
         if rc != 0 {
-            warn_once("cpu", &std::io::Error::last_os_error().to_string());
+            warn_once("cpu", &format!("pthread error {rc}"));
+        }
+        PreviousPriority {
+            qos,
+            relative_priority,
         }
     }
 
-    pub fn restore() {
-        let rc =
-            unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_DEFAULT, 0) };
+    pub fn restore(previous: PreviousPriority) {
+        let rc = unsafe {
+            libc::pthread_set_qos_class_self_np(previous.qos, previous.relative_priority)
+        };
         if rc != 0 {
-            warn_once("cpu", &std::io::Error::last_os_error().to_string());
+            warn_once("cpu", &format!("pthread error {rc}"));
         }
     }
 }
@@ -157,6 +180,7 @@ mod imp {
 
     extern "system" {
         fn GetCurrentThread() -> *mut core::ffi::c_void;
+        fn GetThreadPriority(hThread: *mut core::ffi::c_void) -> i32;
         fn SetThreadPriority(hThread: *mut core::ffi::c_void, nPriority: i32) -> i32;
     }
 
@@ -166,33 +190,47 @@ mod imp {
         unsafe { SetThreadPriority(GetCurrentThread(), level) != 0 }
     }
 
-    pub fn demote() {
+    #[derive(Clone, Copy)]
+    pub struct PreviousPriority(i32);
+
+    pub fn demote() -> PreviousPriority {
+        let previous = PreviousPriority(unsafe { GetThreadPriority(GetCurrentThread()) });
         if !set(THREAD_PRIORITY_LOWEST) {
-            warn_once("cpu", &format!("win32 error {}", std::process::id()));
+            warn_once("cpu", &std::io::Error::last_os_error().to_string());
         }
+        previous
     }
 
-    pub fn restore() {
-        if !set(THREAD_PRIORITY_NORMAL) {
-            warn_once("cpu", &format!("win32 error {}", std::process::id()));
+    pub fn restore(previous: PreviousPriority) {
+        if !set(previous.0) {
+            warn_once("cpu", &std::io::Error::last_os_error().to_string());
         }
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod imp {
-    pub fn demote() {}
-    pub fn restore() {}
+    #[derive(Clone, Copy)]
+    pub struct PreviousPriority;
+    pub fn demote() -> PreviousPriority {
+        PreviousPriority
+    }
+    pub fn restore(_: PreviousPriority) {}
 }
 
 /// Denote the current thread (CPU and I/O) for background maintenance.
 pub fn demote_background() {
-    imp::demote();
+    let previous = imp::demote();
+    PRIORITIES.with(|priorities| priorities.borrow_mut().push(previous));
 }
 
 /// Restore normal priority for the current thread after maintenance work.
 pub fn restore_default() {
-    imp::restore();
+    PRIORITIES.with(|priorities| {
+        if let Some(previous) = priorities.borrow_mut().pop() {
+            imp::restore(previous);
+        }
+    });
 }
 /// Restores normal priority when the guard drops, including on panic unwind.
 struct BackgroundGuard;
@@ -215,8 +253,7 @@ pub fn with_background<R>(f: impl FnOnce() -> R) -> R {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::imp::{
-        io_prio, tid, IOPRIO_CLASS_BE, IOPRIO_CLASS_IDLE, IOPRIO_WHO_PROCESS, SCHED_IDLE,
-        SCHED_OTHER,
+        io_prio, tid, IOPRIO_CLASS_IDLE, IOPRIO_WHO_PROCESS, SCHED_IDLE, SCHED_OTHER,
     };
     use super::{demote_background, restore_default, with_background};
     use libc::{c_int, syscall};
@@ -236,6 +273,7 @@ mod tests {
             SCHED_OTHER,
             "test precondition: thread starts in SCHED_OTHER (policy codes may vary; SCHED_OTHER=0)"
         );
+        let initial_io_priority = io_priority();
 
         demote_background();
 
@@ -258,9 +296,9 @@ mod tests {
             "restore moves thread back to SCHED_OTHER"
         );
         assert_eq!(
-            io_priority() & !0x7f,
-            io_prio(IOPRIO_CLASS_BE, 0) & !0x7f,
-            "restore moves thread back to IOPRIO_CLASS_BE"
+            io_priority(),
+            initial_io_priority,
+            "restore returns the thread to its exact prior IO priority"
         );
     }
 

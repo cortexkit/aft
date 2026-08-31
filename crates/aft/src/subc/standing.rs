@@ -5,10 +5,21 @@
 //! submitted through the existing executor's coalescable maintenance lane.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex as SyncMutex};
 use std::time::Instant;
 
 use parking_lot::Mutex;
+
+type CachedSemanticModel = Arc<SyncMutex<Option<crate::semantic_index::EmbeddingModel>>>;
+
+#[derive(Clone)]
+struct SemanticBuildCache {
+    config_key: String,
+    files_key: String,
+    files: Arc<Vec<PathBuf>>,
+    model: CachedSemanticModel,
+}
 
 use crate::config::{Config, IndexKind};
 use crate::context::{App, AppContext};
@@ -50,6 +61,7 @@ impl StandingReconcileKey {
 struct PendingStandingSlice {
     receiver: tokio::sync::oneshot::Receiver<crate::protocol::Response>,
     started_at: Instant,
+    generation: u64,
 }
 
 struct StandingScheduleState {
@@ -90,6 +102,7 @@ pub(super) struct StandingActor {
     /// are never removed by this owner.
     owned_actors: Mutex<HashMap<String, (ProjectRootId, bool)>>,
     schedule: Mutex<StandingScheduleState>,
+    semantic_cache: Arc<Mutex<HashMap<String, SemanticBuildCache>>>,
 }
 
 impl StandingActor {
@@ -102,6 +115,7 @@ impl StandingActor {
             reconciled_config: Mutex::new(None),
             owned_actors: Mutex::new(HashMap::new()),
             schedule: Mutex::new(StandingScheduleState::default()),
+            semantic_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -283,9 +297,15 @@ impl StandingActor {
             .pending
             .iter_mut()
             .filter_map(|(key, pending)| match pending.receiver.try_recv() {
-                Ok(response) => Some((key.clone(), response, pending.started_at.elapsed())),
+                Ok(response) => Some((
+                    key.clone(),
+                    pending.generation,
+                    response,
+                    pending.started_at.elapsed(),
+                )),
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Some((
                     key.clone(),
+                    pending.generation,
                     crate::protocol::Response::error(
                         "standing",
                         "standing_slice_closed",
@@ -296,7 +316,7 @@ impl StandingActor {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
             })
             .collect::<Vec<_>>();
-        for (key, response, elapsed) in completed {
+        for (key, generation, response, elapsed) in completed {
             schedule.pending.remove(&key);
             let has_more = response
                 .data
@@ -328,13 +348,15 @@ impl StandingActor {
                 schedule.yielded_slices = schedule.yielded_slices.saturating_add(1);
             }
             Self::publish_schedule_telemetry(&schedule);
-            schedule.queue.complete(key, cost, has_more);
+            schedule
+                .queue
+                .complete_generation(key, generation, cost, has_more);
         }
     }
 
     fn dispatch_ready_slices(&self, snapshot: &Config) {
         loop {
-            let entry = {
+            let (entry, generation) = {
                 let mut schedule = self.schedule.lock();
                 if schedule.pending.len() >= crate::cold_build_limiter::limit() {
                     return;
@@ -342,11 +364,14 @@ impl StandingActor {
                 let Some(key) = schedule.queue.next() else {
                     return;
                 };
+                let generation = schedule.queue.generation(&key).unwrap_or(0);
                 let Some(entry) = schedule.entries.get(&key).cloned() else {
-                    schedule.queue.complete(key, 1, false);
+                    schedule
+                        .queue
+                        .complete_generation(key, generation, 1, false);
                     continue;
                 };
-                entry
+                (entry, generation)
             };
             let Some(receiver) = self.submit_entry_slice(entry.clone(), snapshot) else {
                 self.schedule
@@ -361,6 +386,7 @@ impl StandingActor {
                 PendingStandingSlice {
                     receiver,
                     started_at: Instant::now(),
+                    generation,
                 },
             );
             Self::publish_schedule_telemetry(&schedule);
@@ -427,6 +453,7 @@ impl StandingActor {
             .next_kind
             .get(&entry.literal_path)
             .unwrap_or(&0);
+        let semantic_cache = Arc::clone(&self.semantic_cache);
         let selected = IndexKind::ALL
             .iter()
             .copied()
@@ -481,6 +508,7 @@ impl StandingActor {
                     &entry,
                     &admission,
                     permit.admission_epoch,
+                    &semantic_cache,
                 )
             } else {
                 build_missing_callgraph_after_strict_check(
@@ -690,6 +718,7 @@ fn build_missing_semantic_after_strict_check(
     entry: &StandingRootEntry,
     admission: &crate::standing_roots::StandingBuildAdmission,
     permit_epoch: u64,
+    cache: &Arc<Mutex<HashMap<String, SemanticBuildCache>>>,
 ) -> (bool, bool) {
     if admission.cancellation_requested() || crate::executor::current_job_cancelled() {
         return (false, true);
@@ -702,20 +731,9 @@ fn build_missing_semantic_after_strict_check(
     let Some(storage_dir) = storage_dir else {
         return (false, true);
     };
-    let files = match crate::commands::configure::walk_semantic_project_files_bounded(
-        &entry.resolved_target,
-        semantic_config.max_files,
-    ) {
-        Ok(files) => files,
-        Err(_) => return (false, true),
-    };
-    let mut model = match crate::semantic_index::EmbeddingModel::from_config(&semantic_config) {
-        Ok(model) => model,
-        Err(error) => {
-            log::warn!("standing semantic model initialization failed: {}", error);
-            return (false, true);
-        }
-    };
+
+    // Deny borrow-only roots before creating staging state or constructing an
+    // embedding model. The writer lease is the artifact-level authority.
     let cache_dir = storage_dir.join("semantic").join(&entry.artifact_key);
     let lease = match crate::root_cache::WriterLease::acquire_shared(
         crate::root_cache::RootCacheDomain::Index,
@@ -726,6 +744,54 @@ fn build_missing_semantic_after_strict_check(
         Ok(Some(lease)) => lease,
         Ok(None) | Err(_) => return (false, true),
     };
+
+    let config_key = serde_json::to_string(&semantic_config).unwrap_or_default();
+    let files_key = format!(
+        "{}:{}:{}",
+        config_key, semantic_config.max_files, entry.artifact_key
+    );
+    let cached = {
+        let mut cache = cache.lock();
+        let needs_refresh = cache
+            .get(&entry.literal_path)
+            .is_none_or(|cached| cached.config_key != config_key || cached.files_key != files_key);
+        if needs_refresh {
+            let files = match crate::commands::configure::walk_semantic_project_files_bounded(
+                &entry.resolved_target,
+                semantic_config.max_files,
+            ) {
+                Ok(files) => Arc::new(files),
+                Err(_) => return (false, true),
+            };
+            cache.insert(
+                entry.literal_path.clone(),
+                SemanticBuildCache {
+                    config_key: config_key.clone(),
+                    files_key: files_key.clone(),
+                    files,
+                    model: Arc::new(SyncMutex::new(None)),
+                },
+            );
+        }
+        cache
+            .get(&entry.literal_path)
+            .cloned()
+            .expect("cache inserted")
+    };
+    let mut model_guard = cached
+        .model
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    if model_guard.is_none() {
+        match crate::semantic_index::EmbeddingModel::from_config(&semantic_config) {
+            Ok(model) => *model_guard = Some(model),
+            Err(error) => {
+                log::warn!("standing semantic model initialization failed: {}", error);
+                return (false, true);
+            }
+        }
+    }
+    let model = model_guard.as_mut().expect("model initialized");
     let outcome = roots
         .publish_if_current(
             &entry.literal_path,
@@ -740,8 +806,8 @@ fn build_missing_semantic_after_strict_check(
             || {
                 crate::semantic_index::SemanticIndex::resume_cold_build_slice(
                     &entry.resolved_target,
-                    &files,
-                    &mut model,
+                    &cached.files,
+                    model,
                     &semantic_config,
                     &storage_dir,
                     &entry.artifact_key,
@@ -751,9 +817,12 @@ fn build_missing_semantic_after_strict_check(
         )
         .ok()
         .flatten();
-    match outcome {
-        Some(true) => (true, false),
-        Some(false) | None => (false, true),
+    if outcome == Some(true) {
+        // Force a fresh inventory at the start of the next complete build.
+        cache.lock().remove(&entry.literal_path);
+        (true, false)
+    } else {
+        (false, true)
     }
 }
 

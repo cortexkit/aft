@@ -2562,87 +2562,83 @@ fn queued_deadline_job_is_pruned_and_counted_at_next_turn() {
 
 #[test]
 fn interactive_queue_cap_returns_typed_backpressure_per_actor_and_global() {
-    // pool 2 / actor_cap 1: one running blocker per actor, then the per-actor
-    // interactive cap admits 2 more; the next is rejected with the actor scope.
-    // A second actor's global budget is sized so its first overflow reports the
-    // global scope.
-    let executor = test_executor(2, 1, 1, 1);
+    let executor = Executor::with_config(ExecutorConfig {
+        pool_size: 1,
+        read_cap: 1,
+        actor_cap: 1,
+        heavy_permits: 1,
+        drr_quantum: 1,
+        interactive_queue_cap: 2,
+        interactive_actor_queue_cap: 1,
+        ..ExecutorConfig::default()
+    });
     let (_dir_a, root_a) = test_root("interactive-cap-a");
+    let (_dir_b, root_b) = test_root("interactive-cap-b");
+    let (_dir_c, root_c) = test_root("interactive-cap-c");
     executor.register_actor(root_a.clone(), test_ctx());
+    executor.register_actor(root_b.clone(), test_ctx());
+    executor.register_actor(root_c.clone(), test_ctx());
 
-    let (blocker_started_tx, blocker_started_rx) = crossbeam_channel::bounded(1);
-    let (release_blocker_tx, release_blocker_rx) = crossbeam_channel::bounded(1);
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
     let blocker = executor.submit(
         root_a.clone(),
         Lane::Mutating,
         "interactive-cap-blocker".to_string(),
         Box::new(move |_| {
-            blocker_started_tx.send(()).expect("signal blocker start");
-            release_blocker_rx
+            started_tx.send(()).expect("signal blocker start");
+            release_rx
                 .recv_timeout(Duration::from_secs(5))
-                .expect("release interactive blocker");
+                .expect("release blocker");
             ok("interactive-cap-blocker")
         }),
     );
-    blocker_started_rx
+    started_rx
         .recv_timeout(Duration::from_secs(2))
-        .expect("interactive blocker starts");
+        .expect("blocker starts");
 
-    let executed = Arc::new(AtomicUsize::new(0));
-    let mut admitted = Vec::new();
-    for _ in 0..executor.interactive_actor_queue_cap() {
-        let executed_probe = Arc::clone(&executed);
-        admitted.push(executor.submit_async(
-            root_a.clone(),
-            Lane::PureRead,
-            "interactive-cap-admitted".to_string(),
-            Box::new(move |_| {
-                executed_probe.fetch_add(1, Ordering::AcqRel);
-                ok("interactive-cap-admitted")
-            }),
-        ));
-    }
-    let overflow = executor.submit_async(
+    let queued_a = executor.submit_async(
+        root_a.clone(),
+        Lane::Mutating,
+        "queued-a".to_string(),
+        Box::new(|_| ok("queued-a")),
+    );
+    let queued_b = executor.submit_async(
+        root_b.clone(),
+        Lane::Mutating,
+        "queued-b".to_string(),
+        Box::new(|_| ok("queued-b")),
+    );
+    let global_overflow = executor.submit_async(
+        root_c,
+        Lane::Mutating,
+        "global-overflow".to_string(),
+        Box::new(|_| ok("global-overflow")),
+    );
+    let response = recv_async(global_overflow, "global overflow");
+    assert!(!response.success);
+    assert_eq!(response.data["code"], "executor_backpressure");
+    assert_eq!(response.data["queue_scope"], "global");
+
+    let actor_overflow = executor.submit_async(
         root_a,
         Lane::PureRead,
-        "interactive-cap-overflow".to_string(),
-        Box::new(|_| ok("interactive-cap-overflow")),
+        "actor-overflow".to_string(),
+        Box::new(|_| ok("actor-overflow")),
     );
+    let response = recv_async(actor_overflow, "actor overflow");
+    assert!(!response.success);
+    assert_eq!(response.data["queue_scope"], "actor");
 
-    let overflow_response = recv_async(overflow, "interactive backpressure completion");
-    assert!(!overflow_response.success);
-    assert_eq!(overflow_response.data["code"], "executor_backpressure");
-    assert_eq!(overflow_response.data["retryable"], serde_json::json!(true));
-    assert_eq!(
-        overflow_response.data["queue_class"],
-        serde_json::json!("interactive")
-    );
-    assert_eq!(
-        overflow_response.data["queue_scope"],
-        serde_json::json!("actor")
-    );
-    assert_eq!(executed.load(Ordering::Acquire), 0);
-
-    release_blocker_tx
-        .send(())
-        .expect("release interactive blocker");
+    release_tx.send(()).expect("release blocker");
     assert!(
         blocker
             .recv_timeout(Duration::from_secs(5))
-            .expect("blocker completes")
+            .unwrap()
             .success
     );
-    for receiver in admitted {
-        assert!(
-            recv_async(receiver, "admitted interactive completion").success,
-            "admitted interactive job must execute"
-        );
-    }
-    assert_eq!(
-        executed.load(Ordering::Acquire),
-        executor.interactive_actor_queue_cap(),
-        "every admitted interactive job must execute exactly once"
-    );
+    assert!(recv_async(queued_a, "queued a").success);
+    assert!(recv_async(queued_b, "queued b").success);
 }
 
 #[test]
@@ -2759,6 +2755,22 @@ fn queue_accounting_tracks_dispatch_cancellation_and_actor_retirement() {
         .expect("liveness after removal");
     assert_eq!(snapshot.interactive.queued, 0);
     assert_eq!(snapshot.maintenance.queued, 0);
+
+    let (_replacement_dir, replacement_root) = test_root("accounting-replacement");
+    executor.register_actor(replacement_root.clone(), test_ctx());
+    assert!(
+        recv_async(
+            executor.submit_async(
+                replacement_root,
+                Lane::PureRead,
+                "accounting-replacement".to_string(),
+                Box::new(|_| ok("accounting-replacement")),
+            ),
+            "replacement actor completion",
+        )
+        .success,
+        "actor retirement must release process-wide interactive capacity"
+    );
 }
 
 #[test]
@@ -2795,16 +2807,21 @@ fn dispatched_job_is_not_auto_cancelled_after_deadline_passes() {
     let (_dir, root) = test_root("dispatched-not-cancelled");
     executor.register_actor(root.clone(), test_ctx());
 
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
     let (rx, _token) = executor.submit_cancellable_async_with_deadline(
         root,
         Lane::PureRead,
         "late-runner".to_string(),
-        Box::new(|_| {
+        Box::new(move |_| {
+            started_tx.send(()).expect("signal dispatched job start");
             thread::sleep(Duration::from_millis(150));
             ok("late-runner")
         }),
         Some(Instant::now() + Duration::from_millis(20)),
     );
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("job dispatches before deadline");
     let response = recv_async(rx, "late runner completion");
     assert!(
         response.success,
@@ -2839,7 +2856,7 @@ fn deadline_aware_writer_urgency_matches_budget_boundaries() {
         // 12s budget queued at 6s: halfway point reached.
         Case {
             label: "halfway urgency",
-            deadline: Some(now + Duration::from_secs(6)),
+            deadline: Some(now + Duration::from_secs(12)),
             now_offset_ms: 6_000,
             expect_urgent: true,
         },

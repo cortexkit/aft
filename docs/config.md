@@ -133,13 +133,13 @@ The backup store treats its on-disk tree as authoritative across processes; dele
   // Default: false
   "search_index": false,
 
-  // Background index admission policy. Default: "balanced".
+  // Background index admission policy. USER-only. Default: "balanced".
   // "balanced" pauses new standing-root slices on battery saving, memory or I/O
   // pressure, and resumes only after consecutive healthy samples. "performance"
   // ignores battery and pressure admission while retaining bounded concurrency,
   // fair root rotation, slice checkpoints, and background OS thread priority.
   "index": {
-    "resource_policy": "balanced"    // "balanced" | "performance"
+    "resource_policy": "balanced" // "balanced" | "performance"
   },
 
   // Linked-worktree RAM overlay for the trigram index. Default: false.
