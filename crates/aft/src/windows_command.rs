@@ -27,11 +27,22 @@ pub(crate) fn is_batch_file(path: &Path) -> bool {
 /// Callers that add their own child environment must not override these values,
 /// because `cmd.exe` expands the command tail using them.
 #[cfg(windows)]
-pub(crate) fn is_batch_internal_env(key: &str) -> bool {
-    key.eq_ignore_ascii_case(BATCH_COMMAND_ENV)
-        || key
-            .to_ascii_uppercase()
-            .starts_with(BATCH_ARGUMENT_ENV_PREFIX)
+pub(crate) fn is_batch_internal_env(key: &str, argument_count: usize) -> bool {
+    if key.eq_ignore_ascii_case(BATCH_COMMAND_ENV) {
+        return true;
+    }
+
+    let Some(suffix) = key.get(BATCH_ARGUMENT_ENV_PREFIX.len()..) else {
+        return false;
+    };
+    if !key[..BATCH_ARGUMENT_ENV_PREFIX.len()].eq_ignore_ascii_case(BATCH_ARGUMENT_ENV_PREFIX) {
+        return false;
+    }
+
+    suffix
+        .parse::<usize>()
+        .ok()
+        .is_some_and(|index| index < argument_count && suffix == index.to_string())
 }
 
 /// Build a safe `cmd.exe` invocation for a `.cmd`/`.bat` shim.
@@ -49,7 +60,12 @@ where
 {
     use std::os::windows::process::CommandExt;
 
-    let command_path = binary.to_string_lossy();
+    let command_path = binary.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "batch path cannot be represented safely for cmd.exe",
+        )
+    })?;
     if command_path.contains(['\0', '\r', '\n', '"']) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -60,7 +76,12 @@ where
     let mut command_line = format!("\"\"%{BATCH_COMMAND_ENV}%\"");
     let mut argument_env = Vec::new();
     for (index, arg) in args.into_iter().enumerate() {
-        let arg = arg.as_ref().to_string_lossy();
+        let arg = arg.as_ref().to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "batch argument cannot be represented safely for cmd.exe",
+            )
+        })?;
         if arg.contains(['\0', '\r', '\n', '"']) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -72,7 +93,7 @@ where
         command_line.push('%');
         command_line.push_str(&name);
         command_line.push_str("%\"");
-        argument_env.push((name, arg.into_owned()));
+        argument_env.push((name, arg.to_owned()));
     }
     command_line.push('"');
 
@@ -128,8 +149,23 @@ mod tests {
 
     #[test]
     fn launcher_environment_names_are_reserved() {
-        assert!(is_batch_internal_env("AFT_BATCH_COMMAND"));
-        assert!(is_batch_internal_env("aft_batch_argument_0"));
-        assert!(!is_batch_internal_env("AFT_BATCH_OTHER"));
+        assert!(is_batch_internal_env("AFT_BATCH_COMMAND", 1));
+        assert!(is_batch_internal_env("aft_batch_argument_0", 1));
+        assert!(!is_batch_internal_env("AFT_BATCH_ARGUMENT_1", 1));
+        assert!(!is_batch_internal_env("AFT_BATCH_ARGUMENT_00", 1));
+        assert!(!is_batch_internal_env("AFT_BATCH_OTHER", 1));
+    }
+
+    #[test]
+    fn batch_command_rejects_non_unicode_arguments() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let shim = temp.path().join("formatter.cmd");
+        let invalid = std::ffi::OsString::from_wide(&[0xd800]);
+
+        let error = batch_command(&shim, [invalid]).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 }

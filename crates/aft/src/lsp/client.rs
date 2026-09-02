@@ -195,7 +195,7 @@ impl LspClient {
             .stderr(Stdio::piped());
         for (key, value) in env {
             #[cfg(windows)]
-            if is_batch_file && crate::windows_command::is_batch_internal_env(key) {
+            if is_batch_file && crate::windows_command::is_batch_internal_env(key, args.len()) {
                 crate::slog_warn!(
                     "ignoring reserved batch-shim environment variable {key} for LSP server"
                 );
