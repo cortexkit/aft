@@ -1224,6 +1224,7 @@ exec "$@"
     #[cfg(unix)]
     #[test]
     fn permission_retry_reclassified_as_first_party_resolves_native_plan() {
+        let _env_lock = crate::test_env::process_env_lock();
         use crate::sandbox_spawn::{
             clear_sandbox_spawn_test_seam, install_sandbox_spawn_test_seam,
             sandbox_spawn_test_observations, with_authenticated_principal, AuthenticatedPrincipal,

@@ -4060,6 +4060,7 @@ mod tests {
         expected["body"] = wire["body"].clone();
         expected["manifest_version"] = json!(manifest.manifest_version);
         expected["rung_as_of_unix_secs"] = json!(determination.record.as_of_unix_secs);
+        expected["repository"] = wire["repository"].clone();
         expected["metadata"]["pid"] = json!(std::process::id());
         expected["metadata"]
             .as_object_mut()

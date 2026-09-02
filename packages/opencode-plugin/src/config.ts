@@ -117,6 +117,7 @@ const IndexRootSchema = z
   }));
 
 const IndexConfigSchema = z.object({
+  resource_policy: z.enum(["balanced", "performance"]).optional(),
   roots: z.array(IndexRootSchema).optional(),
 });
 

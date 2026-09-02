@@ -153,23 +153,19 @@ pub(crate) struct StandingColdBuildPermit {
     pub(crate) admission_epoch: u64,
 }
 
-/// Standing performs the same waiter inspection before initial acquisition and
-/// checkpoint reacquisition because both call this one function. It declines
-/// immediately when an interactive or normal-maintenance waiter is visible.
-pub(crate) fn acquire_standing_while_cancellable_with_limiter(
+/// Immediate standing admission without waiter registration, preserving the
+/// lifecycle admission epoch. Used by standing passes that can defer rejected
+/// work to their next tick: a yielded pass never occupies a worker waiting for
+/// a cold slot. No equivalent epoch-preserving immediate API existed before.
+pub(crate) fn try_acquire_standing_with_limiter(
     limiter: &Arc<ColdBuildLimiter>,
-    kind: &str,
     request_id: impl Into<String>,
     admission_epoch: u64,
-    admitted: impl Fn() -> bool,
-    cancelled: impl Fn() -> bool,
 ) -> Option<StandingColdBuildPermit> {
     let request = ColdBuildAdmissionRequest::new(request_id, ColdBuildAdmissionClass::Standing);
-    acquire_blocking_while_inner(limiter, kind, Some(&request), admitted, cancelled).map(|permit| {
-        StandingColdBuildPermit {
-            _permit: permit,
-            admission_epoch,
-        }
+    try_acquire_classified_with_limiter(limiter, &request).map(|permit| StandingColdBuildPermit {
+        _permit: permit,
+        admission_epoch,
     })
 }
 
@@ -587,49 +583,6 @@ mod tests {
             limiter.admission_events().is_empty(),
             "cancelled work must not emit a successful admission"
         );
-    }
-
-    #[test]
-    fn standing_yields_before_initial_and_checkpoint_reacquisition_when_non_standing_waits() {
-        let limiter = test_limiter(1);
-        let non_standing_waiter =
-            AdmissionWaiter::register(&limiter, ColdBuildAdmissionClass::Maintenance);
-
-        assert!(acquire_standing_while_cancellable_with_limiter(
-            &limiter,
-            "standing-initial",
-            "standing-initial",
-            41,
-            || true,
-            || false,
-        )
-        .is_none());
-
-        drop(non_standing_waiter);
-        let first = acquire_standing_while_cancellable_with_limiter(
-            &limiter,
-            "standing-checkpoint",
-            "standing-checkpoint",
-            41,
-            || true,
-            || false,
-        )
-        .expect("standing may acquire once ordinary waiters clear");
-        assert_eq!(first.admission_epoch, 41);
-        drop(first);
-
-        let non_standing_waiter =
-            AdmissionWaiter::register(&limiter, ColdBuildAdmissionClass::InspectTriggered);
-        assert!(acquire_standing_while_cancellable_with_limiter(
-            &limiter,
-            "standing-reacquire",
-            "standing-reacquire",
-            41,
-            || true,
-            || false,
-        )
-        .is_none());
-        drop(non_standing_waiter);
     }
 
     #[test]

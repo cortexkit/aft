@@ -245,7 +245,7 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
     expect(nonConfigureCommands(bridgeCalls)).toEqual(["bash"]);
   });
 
-  test("wait true returns a long foreground command directly", async () => {
+  test("wait true promotes unfinished work before Pi's deadline", async () => {
     const { h, bash, bridgeCalls } = await pluginHarness({ experimental_bash_background: true });
 
     const result = await withEnv({ AFT_TEST_FOREGROUND_WAIT_MS: "25" }, async () =>
@@ -256,12 +256,12 @@ maybeDescribe("e2e bash command (Pi adapter + bridge + Rust)", () => {
       }),
     );
 
-    expect(result.output).toContain("waited\n");
-    expect(result.output).not.toContain("promoted to background");
+    expect(result.output).toContain("promoted to background");
+    expect(result.details.task_id).toMatch(/^bash-[a-f0-9]{16}$/);
     expect(nonConfigureCommands(bridgeCalls)).toEqual(["bash"]);
     expect(bridgeCalls[0].params).toMatchObject({
-      wait: true,
-      block_to_completion: true,
+      wait: false,
+      block_to_completion: false,
       timeout: 5_000,
     });
   }, 30_000);

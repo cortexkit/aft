@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 
@@ -13,8 +14,10 @@ use crate::config::{Config, IndexKind};
 use crate::context::{App, AppContext};
 use crate::executor::{Executor, Lane, MaintenanceCoalesceKey};
 use crate::path_identity::ProjectRootId;
+use crate::resource_policy::{sample_resources, AdmissionDecision, ResourceAdmissionGate};
 use crate::root_cache;
 use crate::standing_roots::{StandingRootEntry, StandingRoots};
+use crate::standing_scheduler::DeficitRoundRobin;
 
 /// The standing cadence is intentionally the same arm cadence that already
 /// drives `due_maintenance_jobs`; no standing timer or scheduler is created.
@@ -23,15 +26,70 @@ pub(super) const STANDING_MAINTENANCE_INTERVAL: std::time::Duration = super::DRA
 #[cfg(test)]
 static LAST_STANDING_VERIFY_STRATEGY: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
+const STANDING_SERVICE_QUANTUM_MS: u64 = 250;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct StandingReconcileKey {
+    storage_dir: Option<std::path::PathBuf>,
+    roots: Vec<crate::config::IndexRootConfig>,
+}
+
+impl StandingReconcileKey {
+    fn from_config(config: &Config) -> Self {
+        Self {
+            storage_dir: config.storage_dir.clone(),
+            roots: config.index.roots.clone(),
+        }
+    }
+
+    fn requires_reconcile(&self, config: &Config) -> bool {
+        self != &Self::from_config(config)
+    }
+}
+
+struct PendingStandingSlice {
+    receiver: tokio::sync::oneshot::Receiver<crate::protocol::Response>,
+    started_at: Instant,
+}
+
+struct StandingScheduleState {
+    queue: DeficitRoundRobin<String>,
+    entries: HashMap<String, StandingRootEntry>,
+    next_kind: HashMap<String, usize>,
+    pending: HashMap<String, PendingStandingSlice>,
+    resource_gate: ResourceAdmissionGate,
+    completed_slices: u64,
+    yielded_slices: u64,
+    pause_reason: Option<String>,
+    resource_policy: String,
+}
+
+impl Default for StandingScheduleState {
+    fn default() -> Self {
+        Self {
+            queue: DeficitRoundRobin::new(STANDING_SERVICE_QUANTUM_MS),
+            entries: HashMap::new(),
+            next_kind: HashMap::new(),
+            pending: HashMap::new(),
+            resource_gate: ResourceAdmissionGate::default(),
+            completed_slices: 0,
+            yielded_slices: 0,
+            pause_reason: None,
+            resource_policy: "balanced".to_string(),
+        }
+    }
+}
 
 pub(super) struct StandingActor {
     app: Arc<App>,
     executor: Arc<Executor>,
     roots: StandingRoots,
     observed_config: Mutex<Config>,
+    reconciled_config: Mutex<Option<StandingReconcileKey>>,
     /// Root ids registered solely to host unbound standing work. Session actors
     /// are never removed by this owner.
     owned_actors: Mutex<HashMap<String, (ProjectRootId, bool)>>,
+    schedule: Mutex<StandingScheduleState>,
 }
 
 impl StandingActor {
@@ -41,15 +99,21 @@ impl StandingActor {
             executor,
             roots: StandingRoots::default(),
             observed_config: Mutex::new(Config::default()),
+            reconciled_config: Mutex::new(None),
             owned_actors: Mutex::new(HashMap::new()),
+            schedule: Mutex::new(StandingScheduleState::default()),
         }
     }
 
     /// Startup reconciliation is intentionally direct and empty until subc has
     /// observed a user-tier configuration snapshot from a successful RouteBind.
     pub(super) fn reconcile_at_startup(&self) {
-        if let Err(error) = self.roots.reconcile(&Config::default()) {
-            log::warn!("standing roots startup reconciliation failed: {error}");
+        let config = Config::default();
+        match self.roots.reconcile(&config) {
+            Ok(_) => {
+                *self.reconciled_config.lock() = Some(StandingReconcileKey::from_config(&config))
+            }
+            Err(error) => log::warn!("standing roots startup reconciliation failed: {error}"),
         }
     }
 
@@ -89,6 +153,7 @@ impl StandingActor {
             log::warn!("standing roots bind reconciliation refused: {error}");
             return;
         }
+        *self.reconciled_config.lock() = Some(StandingReconcileKey::from_config(&snapshot));
         let Some(session_root) = ctx
             .canonical_cache_root_opt()
             .or_else(|| snapshot.project_root.clone())
@@ -114,25 +179,179 @@ impl StandingActor {
             }
         }
     }
-
-    /// Reconcile the observed snapshot and enqueue one coalesced pass per root.
-    /// Entry order and `search`, `semantic`, `callgraph` kind order are retained
-    /// by `StandingRoots::entries` and `IndexKind::ALL` respectively.
+    /// Reconcile configured roots, collect completed slices, and fill available slots.
     pub(super) fn tick(&self) {
         self.observe_config_snapshot();
         let snapshot = self.observed_config.lock().clone();
-        let report = match self.roots.reconcile(&snapshot) {
-            Ok(report) => report,
-            Err(error) => {
-                log::warn!("standing roots reconciliation refused: {error}");
-                return;
-            }
+        let reconcile_key = StandingReconcileKey::from_config(&snapshot);
+        let entries = if self
+            .reconciled_config
+            .lock()
+            .as_ref()
+            .is_none_or(|previous| previous.requires_reconcile(&snapshot))
+        {
+            let report = match self.roots.reconcile(&snapshot) {
+                Ok(report) => report,
+                Err(error) => {
+                    log::warn!("standing roots reconciliation refused: {error}");
+                    return;
+                }
+            };
+            self.retire_removed_actors(&report.removed);
+            *self.reconciled_config.lock() = Some(reconcile_key);
+            report.active_entries
+        } else {
+            self.roots.entries()
         };
+        self.resume_entries_without_bound_session(&entries);
+        self.reconcile_schedule(entries);
+        self.drain_completed_slices();
+        if matches!(
+            self.schedule
+                .lock()
+                .resource_gate
+                .observe(snapshot.index.resource_policy, sample_resources(),),
+            AdmissionDecision::Admit
+        ) {
+            self.dispatch_ready_slices(&snapshot);
+        }
+    }
 
-        self.retire_removed_actors(&report.removed);
-        self.resume_entries_without_bound_session(&report.active_entries);
-        for entry in report.active_entries {
-            self.submit_entry_pass(entry, &snapshot);
+    fn reconcile_schedule(&self, entries: Vec<StandingRootEntry>) {
+        let mut schedule = self.schedule.lock();
+        let keys = entries
+            .iter()
+            .map(|entry| entry.literal_path.clone())
+            .collect::<Vec<_>>();
+        schedule.queue.reconcile(keys.iter().cloned());
+        Self::reconcile_kind_cursors(&mut schedule, &entries);
+        schedule.entries = entries
+            .into_iter()
+            .map(|entry| (entry.literal_path.clone(), entry))
+            .collect();
+        Self::publish_schedule_telemetry(&schedule);
+    }
+
+    fn reconcile_kind_cursors(schedule: &mut StandingScheduleState, entries: &[StandingRootEntry]) {
+        schedule
+            .next_kind
+            .retain(|key, _| entries.iter().any(|entry| entry.literal_path == *key));
+        for entry in entries {
+            let selection_changed = schedule
+                .entries
+                .get(&entry.literal_path)
+                .is_some_and(|previous| previous.indexes != entry.indexes);
+            if selection_changed {
+                schedule.next_kind.insert(entry.literal_path.clone(), 0);
+            } else {
+                schedule
+                    .next_kind
+                    .entry(entry.literal_path.clone())
+                    .or_insert(0);
+            }
+        }
+    }
+
+    fn publish_schedule_telemetry(schedule: &StandingScheduleState) {
+        crate::standing_scheduler::publish_telemetry(
+            crate::standing_scheduler::StandingSchedulerTelemetry {
+                queued_roots: schedule.queue.len().saturating_sub(schedule.pending.len()),
+                running_slices: schedule.pending.len(),
+                completed_slices: schedule.completed_slices,
+                yielded_slices: schedule.yielded_slices,
+                pause_reason: schedule.pause_reason.clone(),
+                resource_policy: schedule.resource_policy.clone(),
+            },
+        );
+    }
+
+    fn drain_completed_slices(&self) {
+        let mut schedule = self.schedule.lock();
+        let completed = schedule
+            .pending
+            .iter_mut()
+            .filter_map(|(key, pending)| match pending.receiver.try_recv() {
+                Ok(response) => Some((key.clone(), response, pending.started_at.elapsed())),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => Some((
+                    key.clone(),
+                    crate::protocol::Response::error(
+                        "standing",
+                        "standing_slice_closed",
+                        "standing slice response channel closed",
+                    ),
+                    pending.started_at.elapsed(),
+                )),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+            })
+            .collect::<Vec<_>>();
+        for (key, response, elapsed) in completed {
+            schedule.pending.remove(&key);
+            let has_more = response
+                .data
+                .get("has_more")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            let kind_complete = response
+                .data
+                .get("kind_complete")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if kind_complete {
+                let next = schedule.next_kind.get(&key).copied().unwrap_or(0) + 1;
+                schedule.next_kind.insert(key.clone(), next);
+            }
+            if !has_more {
+                schedule.next_kind.insert(key.clone(), 0);
+            }
+            let cost = u64::try_from(elapsed.as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1);
+            schedule.completed_slices = schedule.completed_slices.saturating_add(1);
+            if response
+                .data
+                .get("yielded")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                schedule.yielded_slices = schedule.yielded_slices.saturating_add(1);
+            }
+            Self::publish_schedule_telemetry(&schedule);
+            schedule.queue.complete(key, cost, has_more);
+        }
+    }
+
+    fn dispatch_ready_slices(&self, snapshot: &Config) {
+        loop {
+            let entry = {
+                let mut schedule = self.schedule.lock();
+                if schedule.pending.len() >= crate::cold_build_limiter::limit() {
+                    return;
+                }
+                let Some(key) = schedule.queue.next() else {
+                    return;
+                };
+                let Some(entry) = schedule.entries.get(&key).cloned() else {
+                    schedule.queue.complete(key, 1, false);
+                    continue;
+                };
+                entry
+            };
+            let Some(receiver) = self.submit_entry_slice(entry.clone(), snapshot) else {
+                self.schedule
+                    .lock()
+                    .queue
+                    .complete(entry.literal_path, 1, true);
+                continue;
+            };
+            let mut schedule = self.schedule.lock();
+            schedule.pending.insert(
+                entry.literal_path,
+                PendingStandingSlice {
+                    receiver,
+                    started_at: Instant::now(),
+                },
+            );
+            Self::publish_schedule_telemetry(&schedule);
         }
     }
 
@@ -184,86 +403,106 @@ impl StandingActor {
         }
     }
 
-    fn submit_entry_pass(&self, entry: StandingRootEntry, snapshot: &Config) {
-        let Some(root_id) = self.ensure_actor(&entry, snapshot) else {
-            return;
+    fn submit_entry_slice(
+        &self,
+        entry: StandingRootEntry,
+        snapshot: &Config,
+    ) -> Option<tokio::sync::oneshot::Receiver<crate::protocol::Response>> {
+        let root_id = self.ensure_actor(&entry, snapshot)?;
+        let kind_index = *self
+            .schedule
+            .lock()
+            .next_kind
+            .get(&entry.literal_path)
+            .unwrap_or(&0);
+        let selected = IndexKind::ALL
+            .iter()
+            .copied()
+            .enumerate()
+            .skip(kind_index)
+            .find(|(_, kind)| entry.indexes.contains(kind));
+        let Some((kind_index, kind)) = selected else {
+            return None;
         };
+
         let roots = self.roots.clone();
         let literal_path = entry.literal_path.clone();
-        let executor_request_id = format!("subc-standing-pass-{}", entry.literal_path);
+        let executor_request_id = format!("subc-standing-slice-{}-{}", literal_path, kind.as_str());
         let response_request_id = executor_request_id.clone();
         let job = Box::new(move |ctx: &AppContext| {
             let Some(admission) = roots.admit_build(&literal_path) else {
                 return crate::protocol::Response::success(
                     response_request_id,
-                    serde_json::json!({"standing": true, "entry": literal_path, "admitted": false}),
+                    serde_json::json!({"standing": true, "entry": literal_path, "admitted": false, "has_more": true}),
                 );
             };
-            let Some(permit) =
-                crate::cold_build_limiter::acquire_standing_while_cancellable_with_limiter(
-                    &ctx.cold_build_limiter(),
-                    "standing maintenance pass",
-                    format!("standing:{}", literal_path),
-                    admission.publication.admission_epoch,
-                    || !admission.cancellation_requested(),
-                    || {
-                        crate::executor::current_job_cancelled()
-                            || admission.cancellation_requested()
-                    },
-                )
-            else {
+            let Some(permit) = crate::cold_build_limiter::try_acquire_standing_with_limiter(
+                &ctx.cold_build_limiter(),
+                format!("standing:{}", literal_path),
+                admission.publication.admission_epoch,
+            ) else {
                 return crate::protocol::Response::success(
                     response_request_id,
-                    serde_json::json!({"standing": true, "entry": literal_path, "admitted": false, "yielded": true}),
+                    serde_json::json!({"standing": true, "entry": literal_path, "admitted": false, "yielded": true, "has_more": true}),
                 );
             };
             debug_assert_eq!(
                 permit.admission_epoch,
                 admission.publication.admission_epoch
             );
-            for kind in IndexKind::ALL {
-                if !entry.indexes.contains(&kind) {
-                    continue;
-                }
-                if crate::executor::current_job_cancelled() {
-                    break;
-                }
-                // A strict plan is selected unconditionally at a standing pass
-                // boundary. The artifact-specific loader/build code consumes the
-                // plan when a resident or disk artifact is present; a failed or
-                // interrupted attempt intentionally leaves the durable flag set.
-                let verified = strict_verify_current_state(ctx, &entry, kind)
-                    || (kind == IndexKind::Search
-                        && build_missing_search_after_strict_check(
-                            ctx,
-                            &roots,
-                            &entry,
-                            &admission,
-                            permit.admission_epoch,
-                        ));
-                if verified {
-                    if let Err(error) = roots.record_strict_verification(&literal_path, kind) {
-                        log::warn!(
-                            "standing strict verification outcome could not commit for {} {}: {}",
-                            literal_path,
-                            kind.as_str(),
-                            error
-                        );
-                    }
+            let (kind_complete, yielded) = if crate::executor::current_job_cancelled() {
+                (false, true)
+            } else if strict_verify_current_state(ctx, &entry, kind) {
+                (true, false)
+            } else if kind == IndexKind::Search {
+                build_missing_search_after_strict_check(
+                    ctx,
+                    &roots,
+                    &entry,
+                    &admission,
+                    permit.admission_epoch,
+                )
+            } else if kind == IndexKind::Semantic {
+                build_missing_semantic_after_strict_check(ctx, &entry)
+            } else {
+                (false, true)
+            };
+            if kind_complete {
+                if let Err(error) = roots.record_strict_verification(&literal_path, kind) {
+                    log::warn!(
+                        "standing strict verification outcome could not commit for {} {}: {}",
+                        literal_path,
+                        kind.as_str(),
+                        error
+                    );
                 }
             }
+            let has_later_kind = entry.indexes.iter().any(|candidate| {
+                IndexKind::ALL
+                    .iter()
+                    .position(|kind| kind == candidate)
+                    .is_some_and(|index| index > kind_index)
+            });
+            let has_more = !kind_complete || has_later_kind;
             crate::protocol::Response::success(
                 response_request_id,
-                serde_json::json!({"standing": true, "entry": literal_path}),
+                serde_json::json!({
+                    "standing": true,
+                    "entry": literal_path,
+                    "kind": kind.as_str(),
+                    "kind_complete": kind_complete,
+                    "yielded": yielded,
+                    "has_more": has_more,
+                }),
             )
         });
-        let _ = self.executor.submit_coalescable_maintenance_async(
+        Some(self.executor.submit_coalescable_maintenance_async(
             root_id,
             Lane::MaintenanceCommit,
             executor_request_id,
             MaintenanceCoalesceKey::StandingPass,
             job,
-        );
+        ))
     }
 
     fn ensure_actor(&self, entry: &StandingRootEntry, snapshot: &Config) -> Option<ProjectRootId> {
@@ -371,9 +610,9 @@ fn build_missing_search_after_strict_check(
     entry: &StandingRootEntry,
     admission: &crate::standing_roots::StandingBuildAdmission,
     permit_epoch: u64,
-) -> bool {
+) -> (bool, bool) {
     if admission.cancellation_requested() || crate::executor::current_job_cancelled() {
-        return false;
+        return (false, true);
     }
     let config = ctx.config();
     let cache_dir = crate::search_index::resolve_cache_dir_with_key(
@@ -382,13 +621,7 @@ fn build_missing_search_after_strict_check(
     );
     let max_file_size = config.search_index_max_file_size;
     drop(config);
-    let before_fingerprint = root_fingerprint(&entry.resolved_target);
     let configure_generation = ctx.configure_generation();
-    let mut index = crate::search_index::SearchIndex::build_with_limit_to_cache_dir(
-        &entry.resolved_target,
-        max_file_size,
-        &cache_dir,
-    );
     let lease = match crate::root_cache::WriterLease::acquire_shared(
         crate::root_cache::RootCacheDomain::Index,
         &cache_dir,
@@ -396,39 +629,77 @@ fn build_missing_search_after_strict_check(
         &entry.resolved_target,
     ) {
         Ok(Some(lease)) => lease,
-        Ok(None) | Err(_) => return false,
+        Ok(None) | Err(_) => return (false, true),
     };
-    roots
+    let outcome = roots
         .publish_if_current(
             &entry.literal_path,
             admission.publication,
             &lease,
-            || root_fingerprint(&entry.resolved_target) == before_fingerprint,
+            || true,
             || {
                 permit_epoch == admission.publication.admission_epoch
                     && ctx.configure_generation() == configure_generation
                     && !admission.cancellation_requested()
             },
             || {
-                index.write_to_disk(
+                crate::search_index::SearchIndex::resume_cold_build_slice(
+                    &entry.resolved_target,
+                    max_file_size,
                     &cache_dir,
-                    crate::search_index::current_git_head(&entry.resolved_target).as_deref(),
                 )
+                .ok()
             },
         )
         .ok()
         .flatten()
-        .unwrap_or(false)
+        .flatten();
+    match outcome {
+        Some(crate::search_index::SearchBuildSliceOutcome::Complete) => (true, false),
+        Some(crate::search_index::SearchBuildSliceOutcome::Yielded) | None => (false, true),
+    }
 }
 
-fn root_fingerprint(root: &std::path::Path) -> Option<(u64, Option<u128>)> {
-    let metadata = std::fs::metadata(root).ok()?;
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|time| time.as_nanos());
-    Some((metadata.len(), modified))
+fn build_missing_semantic_after_strict_check(
+    ctx: &AppContext,
+    entry: &StandingRootEntry,
+) -> (bool, bool) {
+    let config = ctx.config();
+    let semantic_config = config.semantic.clone();
+    let storage_dir = config.storage_dir.clone();
+    drop(config);
+    let Some(storage_dir) = storage_dir else {
+        return (false, true);
+    };
+    let files = match crate::commands::configure::walk_semantic_project_files_bounded(
+        &entry.resolved_target,
+        semantic_config.max_files,
+    ) {
+        Ok(files) => files,
+        Err(_) => return (false, true),
+    };
+    let mut model = match crate::semantic_index::EmbeddingModel::from_config(&semantic_config) {
+        Ok(model) => model,
+        Err(error) => {
+            log::warn!("standing semantic model initialization failed: {}", error);
+            return (false, true);
+        }
+    };
+    match crate::semantic_index::SemanticIndex::resume_cold_build_slice(
+        &entry.resolved_target,
+        &files,
+        &mut model,
+        &semantic_config,
+        &storage_dir,
+        &entry.artifact_key,
+    ) {
+        Ok(crate::semantic_index::SemanticBuildSliceOutcome::Complete) => (true, false),
+        Ok(crate::semantic_index::SemanticBuildSliceOutcome::Yielded) => (false, true),
+        Err(error) => {
+            log::warn!("standing semantic slice failed: {}", error);
+            (false, true)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -441,6 +712,51 @@ mod tests {
             STANDING_MAINTENANCE_INTERVAL,
             super::super::DRAIN_TICK_PERIOD
         );
+    }
+
+    #[test]
+    fn unchanged_standing_config_does_not_require_reconciliation() {
+        let mut config = Config::default();
+        config.storage_dir = Some(std::path::PathBuf::from("/tmp/aft-standing-test"));
+        config.index.roots.push(crate::config::IndexRootConfig {
+            path: "/tmp/root".to_string(),
+            indexes: vec![IndexKind::Search],
+        });
+
+        let key = StandingReconcileKey::from_config(&config);
+        assert!(!key.requires_reconcile(&config));
+
+        config.index.resource_policy = crate::config::IndexResourcePolicy::Performance;
+        assert!(!key.requires_reconcile(&config));
+
+        config.index.roots.push(crate::config::IndexRootConfig {
+            path: "/tmp/root-two".to_string(),
+            indexes: vec![IndexKind::Search],
+        });
+        assert!(key.requires_reconcile(&config));
+    }
+
+    #[test]
+    fn index_selection_change_resets_kind_cursor() {
+        let mut schedule = StandingScheduleState::default();
+        let mut entry = StandingRootEntry {
+            literal_path: "/tmp/root".to_string(),
+            resolved_target: std::path::PathBuf::from("/tmp/root"),
+            resolved_git_toplevel: None,
+            scoped_relative_path: None,
+            artifact_key: "root".to_string(),
+            indexes: vec![IndexKind::Search, IndexKind::Semantic],
+            config_order: 0,
+        };
+        schedule
+            .entries
+            .insert(entry.literal_path.clone(), entry.clone());
+        schedule.next_kind.insert(entry.literal_path.clone(), 1);
+
+        entry.indexes = vec![IndexKind::Search];
+        StandingActor::reconcile_kind_cursors(&mut schedule, std::slice::from_ref(&entry));
+
+        assert_eq!(schedule.next_kind.get(&entry.literal_path), Some(&0));
     }
 
     #[test]

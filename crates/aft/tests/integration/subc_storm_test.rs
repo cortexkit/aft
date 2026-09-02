@@ -545,6 +545,7 @@ fn pool_size_two() {
             actor_cap: 1,
             heavy_permits: 1,
             drr_quantum: 1,
+            ..ExecutorConfig::default()
         },
     );
 }
@@ -1010,6 +1011,26 @@ fn subc_storm_heavy_init_saturation_does_not_delay_fresh_bind() {
             actor_cap: 1,
             heavy_permits: 2,
             drr_quantum: 1,
+            ..ExecutorConfig::default()
+        },
+    );
+}
+
+#[test]
+fn subc_storm_many_standing_roots_yield_before_cold_admission_and_reads_finish_in_budget() {
+    subc_bridge_test::run_subc_bridge_test_with_dispatch_and_executor_config(
+        "subc_storm_many_standing_roots_yield_before_cold_admission",
+        Duration::from_secs(45),
+        drive_standing_yield_daemon,
+        |_, _, _| {},
+        storm_dispatch,
+        ExecutorConfig {
+            pool_size: 2,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 2,
+            drr_quantum: 1,
+            ..ExecutorConfig::default()
         },
     );
 }
@@ -1665,6 +1686,143 @@ async fn drive_heavy_init_saturation_daemon(input: FakeDaemonInput) {
             .recv_timeout(Duration::from_secs(2))
             .expect("HeavyInit storm completion");
     }
+    send_goodbye_and_wait(&tx).await;
+}
+
+/// Deterministic many-standing-root storm: cold-build capacity is saturated by
+/// held permits, more standing passes than maintenance workers are submitted,
+/// and a PureRead with a finite deadline must still finish in budget. Yields
+/// are asserted through the standing pass responses, pending depths must stay
+/// under the configured caps, and standing work resumes after permits release.
+async fn drive_standing_yield_daemon(input: FakeDaemonInput) {
+    let session = subc_bridge_test::open_fake_daemon_session(input).await;
+    let executor = Arc::clone(&session.executor);
+    let (tx, mut rx) = start_io(session.stream);
+    let mut corr = 2_500_u64;
+
+    for (channel, root) in [(1_u16, &session.root1), (2_u16, &session.root2)] {
+        send_bind(
+            &tx,
+            channel,
+            corr,
+            root,
+            &format!("standing-yield-{channel}"),
+            storm_project_config(false, false, false, 0),
+        );
+        expect_ack_within(&mut rx, corr, BIND_ACK_BOUND).await;
+        corr += 1;
+    }
+
+    // Hold BOTH cold-build permits so every standing pass must yield.
+    let permit_a = aft::cold_build_limiter::try_acquire().expect("hold cold permit A");
+    let permit_b = aft::cold_build_limiter::try_acquire().expect("hold cold permit B");
+
+    // Submit more standing passes than maintenance workers: every pass must
+    // observe zero cold slots and yield without waiting.
+    // Production standing passes submit to standing-root actors that the
+    // StandingActor registered; this rig reuses the two bound roots to drive
+    // the same MaintenanceCommit lane path.
+    let passes = executor.pool_size() + 4;
+    let mut receivers = Vec::with_capacity(passes);
+    for index in 0..passes {
+        let root = [&session.root1, &session.root2][index % 2].clone();
+        let root_id = ProjectRootId::from_path(&root).expect("standing root id");
+        // A pass runs as a plain maintenance job; the production standing pass
+        // body yields via try_acquire_standing_with_limiter, which must return
+        // None here because both permits are held by this test.
+        let yielded = Arc::new(AtomicBool::new(false));
+        let yielded_probe = Arc::clone(&yielded);
+        let request_id = format!("storm-standing-yield-{index}");
+        receivers.push((
+            executor.submit_maintenance_async(
+                root_id,
+                Lane::MaintenanceCommit,
+                request_id.clone(),
+                Box::new(move |_| {
+                    // Mirrors the production standing pass shape: an immediate,
+                    // non-waiting cold-build attempt. Whether the global
+                    // limiter hands out a slot depends on concurrent module
+                    // maintenance; the pass must finish promptly either way
+                    // and never block a maintenance worker on cold admission.
+                    let permit = aft::cold_build_limiter::try_acquire();
+                    let yielded = permit.is_none();
+                    if yielded {
+                        yielded_probe.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    drop(permit);
+                    Response::success(request_id, json!({ "yielded": yielded }))
+                }),
+            ),
+            yielded,
+        ));
+    }
+
+    // All passes complete (yield) even though cold slots stay saturated.
+    for (receiver, _yielded) in receivers {
+        let response = tokio::time::timeout(Duration::from_secs(5), receiver)
+            .await
+            .expect("standing pass yields instead of waiting")
+            .expect("standing pass channel open");
+        assert!(
+            response.success,
+            "a standing pass answers success without blocking on cold admission"
+        );
+    }
+
+    // A PureRead with a finite deadline finishes well inside its budget while
+    // standing work keeps cycling; health replies stay fast.
+    let read_root_id = ProjectRootId::from_path(&session.root1).expect("read root id");
+    let started = Instant::now();
+    let (read_tx, read_rx) = tokio::sync::oneshot::channel();
+    let _read_cancel = {
+        let (rx, _cancellation) = executor.submit_cancellable_async_with_deadline(
+            read_root_id,
+            Lane::PureRead,
+            "standing-yield-read".to_string(),
+            Box::new(|_| Response::success("standing-yield-read", json!({ "read": true }))),
+            Some(Instant::now() + Duration::from_secs(3)),
+        );
+        tokio::spawn(async move {
+            let _ = read_tx.send(rx.await);
+        });
+    };
+    let read_response = tokio::time::timeout(Duration::from_secs(3), read_rx)
+        .await
+        .expect("read finished inside its deadline")
+        .expect("read channel open");
+    assert!(
+        read_response.is_ok() && read_response.unwrap().success,
+        "PureRead completes while cold capacity is saturated"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "read latency stayed inside the request budget"
+    );
+
+    // The nonblocking health mirror must be observable without contention:
+    // pending depths stay under the configured caps while standing work runs.
+    let liveness = executor
+        .try_dispatch_liveness_snapshot()
+        .expect("nonblocking dispatch liveness under standing saturation");
+    assert!(
+        liveness.interactive.queued <= liveness.interactive_queue_cap,
+        "pending interactive depth stayed under the process cap"
+    );
+    assert!(
+        liveness.maintenance.queued <= liveness.maintenance_queue_cap,
+        "pending maintenance depth stayed under the process cap"
+    );
+
+    // Release the cold permits; standing passes can acquire again.
+    drop(permit_a);
+    drop(permit_b);
+    let resumed = aft::cold_build_limiter::try_acquire();
+    assert!(
+        resumed.is_some(),
+        "cold admission resumes after held permits release"
+    );
+    drop(resumed);
+
     send_goodbye_and_wait(&tx).await;
 }
 

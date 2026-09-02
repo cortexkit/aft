@@ -1,7 +1,8 @@
-use std::alloc::{GlobalAlloc, Layout, System};
+use mimalloc::MiMalloc;
+use std::alloc::{GlobalAlloc, Layout};
 use std::cell::Cell;
 
-struct CountingAllocator;
+struct CountingAllocator(MiMalloc);
 
 thread_local! {
     static COUNTING: Cell<bool> = const { Cell::new(false) };
@@ -11,21 +12,21 @@ thread_local! {
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         record_allocation();
-        unsafe { System.alloc(layout) }
+        unsafe { self.0.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
+        unsafe { self.0.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         record_allocation();
-        unsafe { System.realloc(ptr, layout, new_size) }
+        unsafe { self.0.realloc(ptr, layout, new_size) }
     }
 }
 
 #[global_allocator]
-static GLOBAL: CountingAllocator = CountingAllocator;
+static GLOBAL: CountingAllocator = CountingAllocator(MiMalloc);
 
 fn record_allocation() {
     if COUNTING.try_with(Cell::get).unwrap_or(false) {

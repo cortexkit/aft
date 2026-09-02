@@ -32,6 +32,7 @@ crossbeam-channel = "0.5"
 parking_lot = "0.12"
 portable-pty = "0.9"
 libc = "0.2"
+mimalloc = { version = "0.1.52", features = ["extended"] }
 getrandom = "0.3"
 tree-sitter = "0.26"
 tree-sitter-typescript = "0.23.2"

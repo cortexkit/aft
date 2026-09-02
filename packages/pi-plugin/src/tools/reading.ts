@@ -356,7 +356,7 @@ export function registerReadingTools(
           _toolCallId: string,
           params: Static<typeof OutlineParams>,
           _signal,
-          _onUpdate,
+          onUpdate,
           extCtx,
         ) {
           const bridge = bridgeFor(ctx, extCtx.cwd);
@@ -392,7 +392,7 @@ export function registerReadingTools(
             }
           }
 
-          const response = await callToolCall(bridge, "outline", rawArgs, extCtx);
+          const response = await callToolCall(bridge, "outline", rawArgs, extCtx, { onUpdate });
           if (response.success === false) {
             throw new Error(response.text || response.message || "outline failed");
           }
@@ -432,7 +432,7 @@ export function registerReadingTools(
           _toolCallId: string,
           params: Static<typeof ZoomParams>,
           _signal,
-          _onUpdate,
+          onUpdate,
           extCtx,
         ) {
           const bridge = bridgeFor(ctx, extCtx.cwd);
@@ -506,7 +506,7 @@ export function registerReadingTools(
             if (contextLines !== undefined) rawArgs.contextLines = contextLines;
             if (wantCallgraph) rawArgs.callgraph = true;
 
-            const response = await callToolCall(bridge, "zoom", rawArgs, extCtx);
+            const response = await callToolCall(bridge, "zoom", rawArgs, extCtx, { onUpdate });
             if (response.success === false) {
               throw new Error(response.text || response.message || "zoom failed");
             }
@@ -535,7 +535,7 @@ export function registerReadingTools(
           if (contextLines !== undefined) rawArgs.contextLines = contextLines;
           if (wantCallgraph) rawArgs.callgraph = true;
 
-          const response = await callToolCall(bridge, "zoom", rawArgs, extCtx);
+          const response = await callToolCall(bridge, "zoom", rawArgs, extCtx, { onUpdate });
           if (response.success === false) {
             throw new Error(response.text || response.message || "zoom failed");
           }

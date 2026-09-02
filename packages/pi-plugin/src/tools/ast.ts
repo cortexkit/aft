@@ -308,7 +308,7 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         _toolCallId: string,
         params: Static<typeof SearchParams>,
         _signal,
-        _onUpdate,
+        onUpdate,
         extCtx,
       ) {
         const paths = await resolveAstPaths(extCtx, params.paths);
@@ -325,7 +325,7 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         if (!isEmptyParam(paths)) rawArgs.paths = paths;
         if (!isEmptyParam(params.globs)) rawArgs.globs = params.globs;
         if (params.contextLines !== undefined) rawArgs.contextLines = params.contextLines;
-        const response = await callToolCall(bridge, "ast_search", rawArgs, extCtx);
+        const response = await callToolCall(bridge, "ast_search", rawArgs, extCtx, { onUpdate });
         if (response.success === false) {
           throw new Error(response.text || response.message || "ast_search failed");
         }
@@ -351,7 +351,7 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         _toolCallId: string,
         params: Static<typeof ReplaceParams>,
         _signal,
-        _onUpdate,
+        onUpdate,
         extCtx,
       ) {
         const paths = await resolveAstPaths(extCtx, params.paths);
@@ -368,7 +368,7 @@ export function registerAstTools(pi: ExtensionAPI, ctx: PluginContext, surface: 
         if (!isEmptyParam(params.globs)) rawArgs.globs = params.globs;
         // Coerce at the boundary: dryRun "true" must stay preview-only (coerceBoolean).
         rawArgs.dryRun = coerceBoolean(params.dryRun);
-        const response = await callToolCall(bridge, "ast_replace", rawArgs, extCtx);
+        const response = await callToolCall(bridge, "ast_replace", rawArgs, extCtx, { onUpdate });
         if (response.success === false) {
           throw new Error(response.text || response.message || "ast_replace failed");
         }

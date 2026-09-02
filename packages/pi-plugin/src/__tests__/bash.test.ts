@@ -481,7 +481,7 @@ describe("bash tool adapter", () => {
     expect(bashCall[2].transportTimeoutMs).toBe(25_000);
   });
 
-  test("wait true forwards foreground wait mode and scales transport timeout", async () => {
+  test("wait true remains bounded and promotes unfinished work", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
     const calls: unknown[] = [];
@@ -521,13 +521,13 @@ describe("bash tool adapter", () => {
     expect(calls.map((call) => (call as [string])[0])).toEqual(["bash"]);
     const bashCall = calls[0] as [string, Record<string, unknown>, Record<string, unknown>];
     expect(bashCall[1]).toMatchObject({
-      wait: true,
-      block_to_completion: true,
+      wait: false,
+      block_to_completion: false,
       timeout: 250,
       background: false,
       notify_on_completion: false,
     });
-    expect(bashCall[2].transportTimeoutMs).toBe(10_250);
+    expect(bashCall[2].transportTimeoutMs).toBe(25_000);
   });
 
   test("wait true rejects background and pty contradictions", async () => {
@@ -656,7 +656,7 @@ describe("bash tool adapter", () => {
     expect(bashCall[2].transportTimeoutMs).toBe(10_050);
   });
 
-  test("background disabled foreground command is block-to-completion on the server", async () => {
+  test("background-disabled foreground command still promotes before Pi's deadline", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
     const calls: unknown[] = [];
@@ -701,8 +701,8 @@ describe("bash tool adapter", () => {
     expect(bashParams.notify_on_completion).toBe(false);
     expect(bashParams.pty).toBe(false);
     expect(bashParams.timeout).toBe(25);
-    expect(bashParams.block_to_completion).toBe(true);
-    expect(bashCall[2].transportTimeoutMs).toBe(10_025);
+    expect(bashParams.block_to_completion).toBe(false);
+    expect(bashCall[2].transportTimeoutMs).toBe(25_000);
   });
 
   test("async bash_watch registration does not add synthetic outstanding task", async () => {
@@ -1177,7 +1177,7 @@ describe("bash tool adapter", () => {
     ]);
     for (const call of calls as Array<[string, Record<string, unknown>, Record<string, unknown>]>) {
       expect(call[2].keepBridgeOnTimeout).toBe(true);
-      expect(call[2].transportTimeoutMs).toBe(30_000);
+      expect(call[2].transportTimeoutMs).toBe(25_000);
     }
   });
 
@@ -1208,7 +1208,7 @@ describe("bash tool adapter", () => {
       expect(calls.some((call) => (call as [string])[0] === "bash_regex_match")).toBe(false);
       const callArgs = calls[0] as [string, Record<string, unknown>, Record<string, unknown>];
       expect(callArgs[2].keepBridgeOnTimeout).toBe(true);
-      expect(callArgs[2].transportTimeoutMs).toBe(30_000);
+      expect(callArgs[2].transportTimeoutMs).toBe(25_000);
     } finally {
       await rm(join(outputPath, ".."), { recursive: true, force: true });
     }

@@ -296,6 +296,7 @@ Adding a command means implementing it in Rust (`crates/aft/src/commands/`) and 
 ---
 
 ## Documentation
+- [Architecture for new contributors](docs/architecture-for-contributors.md): a visual guide to the request path and main code areas
 
 - [Tool reference](docs/tools.md): complete documentation for every tool
 - [Configuration](docs/config.md): config schema, LSP, auto-install

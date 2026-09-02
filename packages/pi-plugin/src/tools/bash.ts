@@ -62,24 +62,18 @@ function resolveForegroundWaitMs(configured: number): number {
   }
   return configured;
 }
-// Baseline bridge transport budget for bash-family control calls. The main
-// orchestrated bash tool overrides this per request because Rust may hold the
-// final response until the foreground wait window or hard-kill cap elapses.
-const BASH_TRANSPORT_TIMEOUT_MS = 30_000;
-const DEFAULT_HARD_TIMEOUT_MS = 30 * 60 * 1000;
-// The margin gives Rust time to promote or finalize the task and deliver the
-// final response after the server's foreground wait window or hard kill timeout.
-const BASH_TRANSPORT_MARGIN_MS = 10_000;
+// Pi hard-fails a tool call at 30 seconds. Keep every synchronous bash request
+// below that boundary. Rust promotes unfinished foreground work to background.
+const BASH_TRANSPORT_TIMEOUT_MS = 25_000;
+const PI_BASH_FOREGROUND_LIMIT_MS = 24_000;
 
 function orchestratedTransportTimeoutMs(
-  blockToCompletion: boolean,
-  wait: boolean,
-  effectiveTimeout: number | undefined,
+  _blockToCompletion: boolean,
+  _wait: boolean,
+  _effectiveTimeout: number | undefined,
   foregroundWaitMs: number,
 ): number {
-  const waitBudget =
-    blockToCompletion || wait ? (effectiveTimeout ?? DEFAULT_HARD_TIMEOUT_MS) : foregroundWaitMs;
-  return waitBudget + BASH_TRANSPORT_MARGIN_MS;
+  return Math.min(foregroundWaitMs + 10_000, BASH_TRANSPORT_TIMEOUT_MS);
 }
 
 // Background task completion metadata shape (from Track D)
@@ -526,10 +520,13 @@ export function registerBashTool(
       if (requestedWait && rawRequestedBackground) {
         throw new Error("wait:true cannot be used with background:true.");
       }
-      // Coerce at the boundary: stringified pty/background flags (coerceBoolean).
       const requestedPty = !backgroundDisabled && rawRequestedPty;
       const effectiveBackground = !backgroundDisabled && (rawRequestedBackground || requestedPty);
-      const blockToCompletion = backgroundDisabled || requestedWait;
+      // Pi cannot safely attach to a tool for 30 seconds. Preserve explicit
+      // background behavior, but promote every unfinished foreground command.
+      const blockToCompletion = false;
+      const serverWait = false;
+      const boundedForegroundWaitMs = Math.min(foregroundWaitMs, PI_BASH_FOREGROUND_LIMIT_MS);
       // Hard-kill timeout sent to the bridge. For an EXPLICIT background task a
       // small `timeout` is a legitimate kill cap, so honor it verbatim. For the
       // FOREGROUND auto-promote path a `timeout` below the foreground wait
@@ -583,7 +580,7 @@ export function registerBashTool(
             pty_cols: ptyCols,
             foreground_orchestrate: true,
             block_to_completion: blockToCompletion,
-            wait: requestedWait,
+            wait: serverWait,
             sandbox: params.sandbox,
             ...(isPowerShell ? { shell: "powershell" } : {}),
           },
@@ -591,9 +588,9 @@ export function registerBashTool(
           {
             transportTimeoutMs: orchestratedTransportTimeoutMs(
               blockToCompletion,
-              requestedWait,
+              serverWait,
               effectiveTimeout,
-              foregroundWaitMs,
+              boundedForegroundWaitMs,
             ),
             onProgress: ({ text }) => {
               streamed += text;

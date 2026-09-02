@@ -14,10 +14,11 @@ use serde_json::{Map, Value};
 
 use crate::config::{
     expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GhShimConfig, GitConfig,
-    IndexConfig, IndexKind, IndexRootConfig, InspectConfig, SandboxConfig, SemanticBackend,
-    SemanticBackendConfig, UserServerDef, WorktreeConfig, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
-    MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS,
-    MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
+    IndexConfig, IndexKind, IndexResourcePolicy, IndexRootConfig, InspectConfig, SandboxConfig,
+    SemanticBackend, SemanticBackendConfig, UserServerDef, WorktreeConfig,
+    DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+    MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
 use crate::harness::Harness;
 use crate::jsonc::strip_jsonc;
@@ -519,6 +520,7 @@ pub struct RawSandbox {
 #[serde(default)]
 pub struct RawIndex {
     pub roots: Option<Vec<RawIndexRoot>>,
+    pub resource_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -1237,6 +1239,14 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     {
         push_drop(dropped, "index.roots", tier, USER_ONLY_REASON);
     }
+    if raw
+        .index
+        .as_ref()
+        .and_then(|index| index.resource_policy.as_ref())
+        .is_some()
+    {
+        push_drop(dropped, "index.resource_policy", tier, USER_ONLY_REASON);
+    }
     if let Some(sandbox) = &raw.sandbox {
         // enabled:true is an accepted project-tier hardening opt-in (merged by
         // merge_project_sandbox); only the weakening direction is dropped.
@@ -1369,8 +1379,28 @@ fn resolve_index_config(raw: Option<&RawIndex>, warnings: &mut Vec<ConfigWarning
     let Some(raw) = raw else {
         return IndexConfig::default();
     };
+
+    let resource_policy = match raw.resource_policy.as_deref() {
+        None => IndexResourcePolicy::Balanced,
+        Some(name) => IndexResourcePolicy::from_name(name).unwrap_or_else(|| {
+            warnings.push(ConfigWarning {
+                code: "invalid_index_resource_policy",
+                key: "index.resource_policy",
+                tier: "user".to_string(),
+                value: name.to_string(),
+                message: format!(
+                    "Invalid index.resource_policy {name:?}; valid values: balanced, performance"
+                ),
+            });
+            IndexResourcePolicy::Balanced
+        }),
+    };
+
     let Some(roots) = raw.roots.as_ref() else {
-        return IndexConfig::default();
+        return IndexConfig {
+            resource_policy,
+            ..IndexConfig::default()
+        };
     };
 
     let home = std::env::var_os("HOME")
@@ -1448,12 +1478,16 @@ fn resolve_index_config(raw: Option<&RawIndex>, warnings: &mut Vec<ConfigWarning
                     value: position.to_string(),
                     message,
                 });
-                return IndexConfig::default();
+                return IndexConfig {
+                    resource_policy,
+                    ..IndexConfig::default()
+                };
             }
         }
     }
 
     IndexConfig {
+        resource_policy,
         roots: normalized_roots,
     }
 }
@@ -2897,6 +2931,58 @@ mod tests {
             Some(std::path::PathBuf::from("/tmp/proj"))
         );
         assert!(config.search_index);
+    }
+
+    #[test]
+    fn index_resource_policy_defaults_validates_and_is_user_only() {
+        let omitted = resolve_config(&[]);
+        assert_eq!(
+            omitted.config.index.resource_policy,
+            IndexResourcePolicy::Balanced
+        );
+
+        for (name, expected) in [
+            ("balanced", IndexResourcePolicy::Balanced),
+            ("performance", IndexResourcePolicy::Performance),
+        ] {
+            let result = resolve_config(&[tier(
+                "user",
+                &format!(r#"{{ "index": {{ "resource_policy": "{name}" }} }}"#),
+            )]);
+            assert_eq!(result.config.index.resource_policy, expected);
+        }
+
+        let invalid = resolve_config(&[tier(
+            "user",
+            r#"{ "index": { "resource_policy": "unlimited" } }"#,
+        )]);
+        assert_eq!(
+            invalid.config.index.resource_policy,
+            IndexResourcePolicy::Balanced
+        );
+        assert!(invalid
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "invalid_index_resource_policy"));
+
+        let project = resolve_config(&[
+            tier(
+                "user",
+                r#"{ "index": { "resource_policy": "performance" } }"#,
+            ),
+            tier(
+                "project",
+                r#"{ "index": { "resource_policy": "balanced" } }"#,
+            ),
+        ]);
+        assert_eq!(
+            project.config.index.resource_policy,
+            IndexResourcePolicy::Performance
+        );
+        assert!(project
+            .dropped
+            .iter()
+            .any(|entry| entry.key == "index.resource_policy" && entry.tier == "project"));
     }
 
     #[test]

@@ -23,7 +23,7 @@ use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use url::Url;
 
 const DEFAULT_DIMENSION: usize = 384;
@@ -119,6 +119,38 @@ impl EmbeddingRequestPolicy {
             Self::Query(budget) => Some(Duration::from_millis(budget.timeout_ms)),
         }
     }
+}
+
+const SEMANTIC_STAGING_VERSION: u32 = 1;
+const SEMANTIC_STAGING_FILE: &str = "semantic-staging-v1.json";
+const SEMANTIC_COLLECT_SLICE_FILES: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SemanticBuildSliceOutcome {
+    Yielded,
+    Complete,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SemanticStagingManifest {
+    version: u32,
+    canonical_root: PathBuf,
+    fingerprint: SemanticIndexFingerprint,
+    files: Vec<PathBuf>,
+    corpus_fingerprint: String,
+    collect_cursor: usize,
+    embed_cursor: usize,
+    chunks: Vec<SemanticChunk>,
+    metadata: Vec<SemanticStagingMetadata>,
+    vectors: Vec<Vec<f32>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SemanticStagingMetadata {
+    path: PathBuf,
+    modified_nanos: u128,
+    size: u64,
+    content_hash: [u8; 32],
 }
 
 pub struct SemanticIndexLock {
@@ -1822,7 +1854,7 @@ pub fn format_embedding_init_error(error: impl Display) -> String {
 }
 
 /// A chunk of code ready for embedding — derived from a Symbol with context enrichment
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SemanticChunk {
     /// Absolute file path
     pub file: PathBuf,
@@ -2019,6 +2051,42 @@ fn borrowed_artifact_identity(data_path: &Path) -> Result<(String, blake3::Hash)
         .map_err(|error| error.to_string())?;
     let fingerprint = String::from_utf8(fingerprint).map_err(|error| error.to_string())?;
     Ok((fingerprint, artifact_content_hash))
+}
+fn semantic_corpus_fingerprint(
+    root: &Path,
+    files: &[PathBuf],
+    fingerprint: &SemanticIndexFingerprint,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(root.to_string_lossy().as_bytes());
+    hasher.update(&serde_json::to_vec(fingerprint).unwrap_or_default());
+    for path in files {
+        hasher.update(path.to_string_lossy().as_bytes());
+        if let Ok(metadata) = fs::metadata(path) {
+            hasher.update(&metadata.len().to_le_bytes());
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_nanos());
+            hasher.update(&modified.to_le_bytes());
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn load_semantic_staging(path: &Path) -> Option<SemanticStagingManifest> {
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+fn write_semantic_staging(path: &Path, manifest: &SemanticStagingManifest) -> Result<(), String> {
+    let temporary = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec(manifest).map_err(|error| error.to_string())?;
+    fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
+    fs::File::open(&temporary)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| error.to_string())?;
+    crate::fs_lock::rename_over(&temporary, path).map_err(|error| error.to_string())
 }
 
 /// The semantic index — stores embeddings for all symbols in a project.
@@ -2777,6 +2845,149 @@ impl SemanticIndex {
             Option::<&mut fn(usize, usize)>::None,
             &mut should_continue,
         )
+    }
+    pub(crate) fn resume_cold_build_slice(
+        project_root: &Path,
+        files: &[PathBuf],
+        model: &mut SemanticEmbeddingModel,
+        config: &SemanticBackendConfig,
+        storage_dir: &Path,
+        project_key: &str,
+    ) -> Result<SemanticBuildSliceOutcome, String> {
+        let canonical_root =
+            fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+        let fingerprint = model.fingerprint(config)?;
+        let corpus_fingerprint = semantic_corpus_fingerprint(&canonical_root, files, &fingerprint);
+        let dir = storage_dir.join("semantic").join(project_key);
+        let staging_path = dir.join(SEMANTIC_STAGING_FILE);
+        fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let mut manifest = load_semantic_staging(&staging_path)
+            .filter(|manifest| {
+                manifest.version == SEMANTIC_STAGING_VERSION
+                    && manifest.canonical_root == canonical_root
+                    && manifest.corpus_fingerprint == corpus_fingerprint
+                    && manifest.files == files
+                    && manifest.collect_cursor <= files.len()
+                    && manifest.embed_cursor <= manifest.chunks.len()
+                    && manifest.vectors.len() == manifest.embed_cursor
+                    && manifest
+                        .vectors
+                        .iter()
+                        .all(|vector| vector.len() == fingerprint.dimension)
+            })
+            .unwrap_or(SemanticStagingManifest {
+                version: SEMANTIC_STAGING_VERSION,
+                canonical_root: canonical_root.clone(),
+                fingerprint: fingerprint.clone(),
+                files: files.to_vec(),
+                corpus_fingerprint,
+                collect_cursor: 0,
+                embed_cursor: 0,
+                chunks: Vec::new(),
+                metadata: Vec::new(),
+                vectors: Vec::new(),
+            });
+
+        if manifest.collect_cursor < files.len() {
+            let end = (manifest.collect_cursor + SEMANTIC_COLLECT_SLICE_FILES).min(files.len());
+            let (chunks, metadata) =
+                Self::collect_chunks(&canonical_root, &files[manifest.collect_cursor..end]);
+            manifest.chunks.extend(chunks);
+            manifest
+                .metadata
+                .extend(metadata.into_iter().map(|(path, metadata)| {
+                    SemanticStagingMetadata {
+                        path,
+                        modified_nanos: metadata
+                            .mtime
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or(Duration::ZERO)
+                            .as_nanos(),
+                        size: metadata.size,
+                        content_hash: *metadata.content_hash.as_bytes(),
+                    }
+                }));
+            manifest.collect_cursor = end;
+            write_semantic_staging(&staging_path, &manifest)?;
+            return Ok(SemanticBuildSliceOutcome::Yielded);
+        }
+
+        if manifest.embed_cursor < manifest.chunks.len() {
+            let end =
+                (manifest.embed_cursor + model.max_batch_size().max(1)).min(manifest.chunks.len());
+            let texts = manifest.chunks[manifest.embed_cursor..end]
+                .iter()
+                .map(|chunk| chunk.embed_text.clone())
+                .collect();
+            let vectors = model.embed(texts)?;
+            validate_embedding_batch(&vectors, end - manifest.embed_cursor, "embedding backend")?;
+            if vectors
+                .iter()
+                .any(|vector| vector.len() != fingerprint.dimension)
+            {
+                let _ = fs::remove_file(&staging_path);
+                return Err(
+                    "embedding dimension changed during resumable semantic build".to_string(),
+                );
+            }
+            manifest.vectors.extend(vectors);
+            manifest.embed_cursor = end;
+            write_semantic_staging(&staging_path, &manifest)?;
+            return Ok(SemanticBuildSliceOutcome::Yielded);
+        }
+
+        let file_metadata = manifest
+            .metadata
+            .iter()
+            .map(|metadata| {
+                let seconds =
+                    u64::try_from(metadata.modified_nanos / 1_000_000_000).unwrap_or(u64::MAX);
+                let nanos = u32::try_from(metadata.modified_nanos % 1_000_000_000).unwrap_or(0);
+                (
+                    metadata.path.clone(),
+                    IndexedFileMetadata {
+                        mtime: UNIX_EPOCH + Duration::new(seconds, nanos),
+                        size: metadata.size,
+                        content_hash: blake3::Hash::from_bytes(metadata.content_hash),
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let entries = manifest
+            .chunks
+            .into_iter()
+            .zip(manifest.vectors)
+            .map(|(chunk, vector)| EmbeddingEntry::new(chunk, vector))
+            .collect::<Vec<_>>();
+        let mut index = Self {
+            entries,
+            file_mtimes: file_metadata
+                .iter()
+                .map(|(path, metadata)| (path.clone(), metadata.mtime))
+                .collect(),
+            file_sizes: file_metadata
+                .iter()
+                .map(|(path, metadata)| (path.clone(), metadata.size))
+                .collect(),
+            any_missing_sizes: false,
+            file_hashes: file_metadata
+                .into_iter()
+                .map(|(path, metadata)| (path, metadata.content_hash))
+                .collect(),
+            dimension: fingerprint.dimension,
+            fingerprint: Some(fingerprint),
+            project_root: canonical_root,
+            deferred_files: HashSet::new(),
+            shared_base: None,
+            #[cfg(test)]
+            removal_retain_passes: 0,
+        };
+        index.materialize_shared_base();
+        if !index.write_to_disk(storage_dir, project_key) {
+            return Err("failed to publish resumable semantic index".to_string());
+        }
+        fs::remove_file(&staging_path).map_err(|error| error.to_string())?;
+        Ok(SemanticBuildSliceOutcome::Complete)
     }
 
     /// Build the semantic index and report embedding progress using entry counts.
@@ -5579,6 +5790,60 @@ mod tests {
         (format!("http://{}", addr), handle)
     }
 
+    fn start_resumable_embedding_server(
+        expected_requests: usize,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind resumable server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = thread::spawn(move || {
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().expect("accept embedding request");
+                let mut bytes = Vec::new();
+                let mut buffer = [0u8; 4096];
+                let (header_end, content_length) = loop {
+                    let count = stream.read(&mut buffer).expect("read embedding request");
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(position) =
+                        bytes.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let headers = String::from_utf8_lossy(&bytes[..position + 4]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= position + 4 + length {
+                            break (position + 4, length);
+                        }
+                    }
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&bytes[header_end..header_end + content_length])
+                        .expect("embedding request JSON");
+                let input_count = request
+                    .get("input")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(1, Vec::len);
+                let data = (0..input_count).map(|index| {
+                    serde_json::json!({"embedding": [1.0, index as f32, 0.25], "index": index})
+                }).collect::<Vec<_>>();
+                let body = serde_json::json!({"data": data}).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write embedding response");
+            }
+        });
+        (format!("http://{addr}"), handle)
+    }
+
     fn start_truncated_body_server(attempts: usize) -> (String, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind truncated test server");
         listener
@@ -7338,6 +7603,125 @@ public class Greeter {
             .entries
             .iter()
             .any(|entry| entry.chunk.name == "old_symbol"));
+    }
+
+    #[test]
+    fn resumable_semantic_build_yields_rejects_stale_state_and_matches_monolithic_corpus() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("project dir");
+        for index in 0..35 {
+            fs::write(
+                project.join(format!("file_{index:03}.rs")),
+                format!("pub fn marker_{index}() {{ println!(\"semantic_resume_{index}\"); }}\n"),
+            )
+            .expect("write fixture");
+        }
+        let files = (0..35)
+            .map(|index| project.join(format!("file_{index:03}.rs")))
+            .collect::<Vec<_>>();
+        let (base_url, server) = start_resumable_embedding_server(2);
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "resume-test".to_string(),
+            base_url: Some(base_url),
+            max_batch_size: 256,
+            ..Default::default()
+        };
+        let mut model = SemanticEmbeddingModel::from_config(&config).expect("model");
+        assert_eq!(
+            SemanticIndex::resume_cold_build_slice(
+                &project,
+                &files,
+                &mut model,
+                &config,
+                dir.path(),
+                "resume"
+            )
+            .expect("collect slice"),
+            SemanticBuildSliceOutcome::Yielded,
+        );
+        let staging = dir
+            .path()
+            .join("semantic/resume")
+            .join(SEMANTIC_STAGING_FILE);
+        assert!(staging.exists());
+        fs::write(&staging, b"corrupt").expect("corrupt staging");
+        assert_eq!(
+            SemanticIndex::resume_cold_build_slice(
+                &project,
+                &files,
+                &mut model,
+                &config,
+                dir.path(),
+                "resume"
+            )
+            .expect("replacement collect slice"),
+            SemanticBuildSliceOutcome::Yielded,
+        );
+        assert_eq!(
+            SemanticIndex::resume_cold_build_slice(
+                &project,
+                &files,
+                &mut model,
+                &config,
+                dir.path(),
+                "resume"
+            )
+            .expect("final collect slice"),
+            SemanticBuildSliceOutcome::Yielded,
+        );
+        assert_eq!(
+            SemanticIndex::resume_cold_build_slice(
+                &project,
+                &files,
+                &mut model,
+                &config,
+                dir.path(),
+                "resume"
+            )
+            .expect("embedding slice"),
+            SemanticBuildSliceOutcome::Yielded,
+        );
+        assert_eq!(
+            SemanticIndex::resume_cold_build_slice(
+                &project,
+                &files,
+                &mut model,
+                &config,
+                dir.path(),
+                "resume"
+            )
+            .expect("publish slice"),
+            SemanticBuildSliceOutcome::Complete,
+        );
+        server.join().expect("embedding server");
+        let fingerprint = model.fingerprint(&config).expect("fingerprint").as_string();
+        let actual = SemanticIndex::read_from_disk(
+            dir.path(),
+            "resume",
+            &project,
+            false,
+            Some(&fingerprint),
+        )
+        .expect("published semantic index");
+        let mut embedder = RecordingEmbedder::default();
+        let expected =
+            SemanticIndex::build(&project, &files, &mut |texts| embedder.embed(texts), 256)
+                .expect("monolithic index");
+        assert_eq!(actual.len(), expected.len());
+        let actual_names = actual
+            .entries
+            .iter()
+            .map(|entry| (&entry.chunk.file, &entry.chunk.name))
+            .collect::<Vec<_>>();
+        let expected_names = expected
+            .entries
+            .iter()
+            .map(|entry| (&entry.chunk.file, &entry.chunk.name))
+            .collect::<Vec<_>>();
+        assert_eq!(actual_names, expected_names);
+        assert!(!staging.exists());
     }
 
     #[test]

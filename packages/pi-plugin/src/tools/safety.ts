@@ -191,7 +191,7 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
         _toolCallId: string,
         params: Static<typeof SafetyParams>,
         _signal,
-        _onUpdate,
+        onUpdate,
         extCtx,
       ) {
         if (params.op === "history" && !params.path) {
@@ -253,7 +253,7 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
         if (filePath) rawArgs.filePath = filePath;
         if (params.name) rawArgs.name = params.name;
         if (files) rawArgs.files = files;
-        const response = await callToolCall(bridge, "safety", rawArgs, extCtx);
+        const response = await callToolCall(bridge, "safety", rawArgs, extCtx, { onUpdate });
         if (response.success === false) {
           throw new Error(response.text || response.message || `${params.op} failed`);
         }

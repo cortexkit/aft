@@ -915,6 +915,34 @@ describe("loadAftConfig", () => {
     }
   });
 
+  test("index resource policy defaults, validates, and remains user-only", () => {
+    expect(AftConfigSchema.parse({}).index?.resource_policy ?? "balanced").toBe("balanced");
+    expect(
+      AftConfigSchema.parse({ index: { resource_policy: "balanced" } }).index?.resource_policy,
+    ).toBe("balanced");
+    expect(
+      AftConfigSchema.parse({ index: { resource_policy: "performance" } }).index?.resource_policy,
+    ).toBe("performance");
+    expect(AftConfigSchema.safeParse({ index: { resource_policy: "unlimited" } }).success).toBe(
+      false,
+    );
+
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ index: { resource_policy: "performance" } }),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ index: { resource_policy: "balanced" } }),
+    );
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: join(fixture.root, "home"),
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    expect(JSON.parse(result.stdout).index.resource_policy).toBe("performance");
+  });
+
   test("strict schema still rejects keys outside both harnesses", () => {
     expect(AftConfigSchema.safeParse({ genuinely_unknown_key: true }).success).toBe(false);
   });

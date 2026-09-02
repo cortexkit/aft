@@ -149,8 +149,20 @@ process.stdin.on("data", (chunk) => {
 
     try {
       await Promise.all([
-        pool.toolCall(workDir, { sessionID: "session-a" }, "read", { path: "sample.ts" }),
-        pool.toolCall(workDir, { sessionID: "session-b" }, "read", { path: "sample.ts" }),
+        pool.toolCall(
+          workDir,
+          { sessionID: "session-a" },
+          "read",
+          { path: "sample.ts" },
+          { transportTimeoutMs: 24_000 },
+        ),
+        pool.toolCall(
+          workDir,
+          { sessionID: "session-b" },
+          "read",
+          { path: "sample.ts" },
+          { transportTimeoutMs: 24_000 },
+        ),
       ]);
 
       const requests = readFileSync(requestsPath, "utf8")
@@ -166,11 +178,20 @@ process.stdin.on("data", (chunk) => {
           .map((request) => ({
             session_id: request.session_id,
             edit_slot_survives: request.edit_slot_survives,
+            deadline_ms_remaining: request.deadline_ms_remaining,
           }))
           .sort((left, right) => String(left.session_id).localeCompare(String(right.session_id))),
       ).toEqual([
-        { session_id: "session-a", edit_slot_survives: true },
-        { session_id: "session-b", edit_slot_survives: true },
+        {
+          session_id: "session-a",
+          edit_slot_survives: true,
+          deadline_ms_remaining: 24_000,
+        },
+        {
+          session_id: "session-b",
+          edit_slot_survives: true,
+          deadline_ms_remaining: 24_000,
+        },
       ]);
 
       const carrierLogs = logs.filter(({ message }) =>

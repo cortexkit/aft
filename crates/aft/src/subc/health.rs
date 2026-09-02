@@ -792,6 +792,12 @@ fn dispatch_liveness_metrics(executor: &Executor) -> Value {
             },
             "interactive_reserve": snapshot.interactive_reserve,
             "maintenance_cap": snapshot.maintenance_cap,
+            "interactive_queue_cap": snapshot.interactive_queue_cap,
+            "interactive_actor_queue_cap": snapshot.interactive_actor_queue_cap,
+            "maintenance_queue_cap": snapshot.maintenance_queue_cap,
+            "interactive_admission_rejections": snapshot.interactive_admission_rejections,
+            "maintenance_admission_rejections": snapshot.maintenance_admission_rejections,
+            "deadline_expiries": snapshot.deadline_expiries,
         }),
         None => json!({ "scheduler_busy": true }),
     }
@@ -1022,6 +1028,11 @@ pub(super) fn build_health_report(
     metrics.insert(
         "dispatch_liveness".to_string(),
         dispatch_liveness_metrics(executor),
+    );
+    metrics.insert(
+        "standing_scheduler".to_string(),
+        serde_json::to_value(crate::standing_scheduler::telemetry())
+            .unwrap_or_else(|_| json!({ "unavailable": true })),
     );
     let mut dispatch_path = dispatch_path_metrics.snapshot(pending_binds);
     if let Some(dispatch_path) = dispatch_path.as_object_mut() {
@@ -1263,6 +1274,7 @@ mod tests {
             actor_cap: 1,
             heavy_permits: 1,
             drr_quantum: 1,
+            ..crate::executor::ExecutorConfig::default()
         });
         let (_dir, root) = test_root("health-tier2-first-scan");
         let mut config = crate::config::Config::default();
@@ -1346,6 +1358,7 @@ mod tests {
             actor_cap: 1,
             heavy_permits: 1,
             drr_quantum: 1,
+            ..crate::executor::ExecutorConfig::default()
         });
         let (_dir, root) = test_root("health-callgraph-repair-rate");
         assert!(executor.register_actor(root.clone(), test_ctx()));
@@ -1405,6 +1418,7 @@ mod tests {
             actor_cap: 1,
             heavy_permits: 2,
             drr_quantum: 1,
+            ..crate::executor::ExecutorConfig::default()
         });
         let (_dir_a, root_a) = test_root("health-liveness-a");
         let (_dir_b, root_b) = test_root("health-liveness-b");
@@ -1484,6 +1498,7 @@ mod tests {
             actor_cap: 1,
             heavy_permits: 1,
             drr_quantum: 1,
+            ..crate::executor::ExecutorConfig::default()
         });
         let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
         let app = crate::context::App::default_shared();
@@ -1495,11 +1510,24 @@ mod tests {
         // No actors registered: ready rollup with zero roots and process totals.
         assert_eq!(memory.get("status").and_then(Value::as_str), Some("ready"));
         assert_eq!(memory.get("roots_total").and_then(Value::as_u64), Some(0));
-        assert!(memory.get("total_attributed_bytes").is_some());
-        assert!(memory.get("rss_bytes").is_some());
-        assert!(memory
-            .get("allocator_slack_bytes")
-            .is_some_and(Value::is_u64));
+        for key in [
+            "total_attributed_bytes",
+            "sqlite_bytes",
+            "allocator_slack_bytes",
+        ] {
+            assert!(
+                memory.get(key).is_some_and(Value::is_u64),
+                "memory.{key} must remain an unsigned byte count"
+            );
+        }
+        for key in ["rss_bytes", "phys_footprint_bytes"] {
+            assert!(
+                memory
+                    .get(key)
+                    .is_some_and(|value| value.is_u64() || value.is_null()),
+                "memory.{key} must remain an optional unsigned byte count"
+            );
+        }
         assert!(memory
             .get("allocator_slack_measured")
             .is_some_and(Value::is_boolean));
@@ -1548,6 +1576,7 @@ mod tests {
             actor_cap: 1,
             heavy_permits: 1,
             drr_quantum: 1,
+            ..crate::executor::ExecutorConfig::default()
         });
         let app = crate::context::App::default_shared();
         let report = test_health_report(
@@ -1574,6 +1603,7 @@ mod tests {
             actor_cap: 1,
             heavy_permits: 1,
             drr_quantum: 1,
+            ..crate::executor::ExecutorConfig::default()
         });
         let (_dir, root) = test_root("health-mutating-lock");
         let ctx = test_ctx();
@@ -1624,6 +1654,7 @@ mod tests {
                 actor_cap: 64,
                 heavy_permits: 1,
                 drr_quantum: 1,
+                ..crate::executor::ExecutorConfig::default()
             });
             let mut dirs = Vec::with_capacity(root_count);
             for index in 0..root_count {
@@ -1739,6 +1770,7 @@ mod tests {
             actor_cap: 1,
             heavy_permits: 1,
             drr_quantum: 1,
+            ..crate::executor::ExecutorConfig::default()
         });
         let (_dir, root) = test_root("health-snapshot-age-coverage");
         assert!(executor.register_actor(root.clone(), test_ctx()));
@@ -1782,6 +1814,7 @@ mod tests {
             actor_cap: 64,
             heavy_permits: 1,
             drr_quantum: 1,
+            ..crate::executor::ExecutorConfig::default()
         });
         let mut dirs = Vec::new();
         for index in 0..50 {
@@ -1810,6 +1843,7 @@ mod tests {
                     path: root.display().to_string(),
                     indexes: vec![crate::config::IndexKind::Search],
                 }],
+                ..crate::config::IndexConfig::default()
             },
             ..crate::config::Config::default()
         }

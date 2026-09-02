@@ -157,7 +157,7 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
           _toolCallId: string,
           params: Static<typeof DeleteParams>,
           _signal,
-          _onUpdate,
+          onUpdate,
           extCtx,
         ) {
           // Coerce at the boundary: some hosts deliver `files` as a bare string
@@ -180,17 +180,12 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
           const bridge = bridgeFor(ctx, extCtx.cwd);
           // Single batched call so every file shares one op_id; one
           // `aft_safety undo` then restores the whole delete atomically.
-          const response = await callToolCall(
-            bridge,
-            "delete",
-            {
-              files,
-              // Coerce at the boundary, like `files`: a stringified "true" from the
-              // model must not silently drop the flag (see coerceBoolean).
-              recursive: coerceBoolean(params.recursive),
-            },
-            extCtx,
-          );
+          const response = await callToolCall(bridge, "delete", {
+            files,
+            // Coerce at the boundary, like `files`: a stringified "true" from the
+            // model must not silently drop the flag (see coerceBoolean).
+            recursive: coerceBoolean(params.recursive),
+          }, extCtx, { onUpdate });
           if (response.success === false) {
             throw new Error(response.text || response.message || "delete failed");
           }
@@ -234,7 +229,7 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
           _toolCallId: string,
           params: Static<typeof MoveParams>,
           _signal,
-          _onUpdate,
+          onUpdate,
           extCtx,
         ) {
           const filePath = await resolvePathArg(extCtx.cwd, params.path as string);
@@ -247,15 +242,10 @@ export function registerFsTools(pi: ExtensionAPI, ctx: PluginContext, surface: F
           }
 
           const bridge = bridgeFor(ctx, extCtx.cwd);
-          const response = await callToolCall(
-            bridge,
-            "move",
-            {
-              filePath: params.path,
-              destination: params.destination,
-            },
-            extCtx,
-          );
+          const response = await callToolCall(bridge, "move", {
+            filePath: params.path,
+            destination: params.destination,
+          }, extCtx, { onUpdate });
           if (response.success === false) {
             throw new Error(response.text || response.message || "move failed");
           }

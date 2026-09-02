@@ -47,7 +47,10 @@ use serde_json::Value;
 fn config(storage: &Path, roots: Vec<IndexRootConfig>) -> Config {
     Config {
         storage_dir: Some(storage.to_path_buf()),
-        index: IndexConfig { roots },
+        index: IndexConfig {
+            roots,
+            ..IndexConfig::default()
+        },
         ..Config::default()
     }
 }

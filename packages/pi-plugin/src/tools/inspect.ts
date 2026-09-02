@@ -11,7 +11,14 @@ import type {
 import { type Static, Type } from "typebox";
 import { resolveInspectDiagnosticsTimeoutMs } from "../config.js";
 import type { PluginContext } from "../types.js";
-import { bridgeFor, callToolCall, isEmptyParam, textResult } from "./_shared.js";
+import {
+  bridgeFor,
+  callToolCall,
+  isEmptyParam,
+  PI_TOOL_EXECUTION_TIMEOUT_MS,
+  PI_TOOL_TRANSPORT_TIMEOUT_MS,
+  textResult,
+} from "./_shared.js";
 import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
 import {
   asNumber,
@@ -27,9 +34,9 @@ import {
   renderToolCall,
 } from "./render-helpers.js";
 
-// The Rust diagnostics phase may block until its configured deadline. Keep the
-// transport alive long enough to receive that terminal response.
-const INSPECT_TRANSPORT_HEADROOM_MS = 30_000;
+// Keep Rust's phase deadline below the Pi transport deadline so inspect can
+// return an honest terminal with completed phases instead of a host timeout.
+const INSPECT_DIAGNOSTICS_TIMEOUT_MS = PI_TOOL_EXECUTION_TIMEOUT_MS;
 
 const InspectParams = Type.Object({
   sections: Type.Optional(
@@ -464,18 +471,23 @@ export function registerInspectTool(pi: ExtensionAPI, ctx: PluginContext): void 
       "Use when: starting work on unfamiliar code, after multi-edit batches to check diagnostics, before a refactor, before review, or to verify cleanup completeness.\n\n" +
       "Treat `dead_code` as a hint, not proof: reachability is call-based, so symbols reached only via method dispatch or referenced only in type position may be false positives — verify before deleting.",
     parameters: InspectParams,
-    async execute(_toolCallId, params: Static<typeof InspectParams>, _signal, _onUpdate, extCtx) {
+    async execute(_toolCallId, params: Static<typeof InspectParams>, _signal, onUpdate, extCtx) {
       const bridge = bridgeFor(ctx, extCtx.cwd);
       const sections = normalizeStringOrArray(params.sections);
       const scope = await resolveAndGateScope(extCtx, ctx, normalizeStringOrArray(params.scope));
       const topK = validateOptionalTopK(params.topK);
-      const rawArgs: Record<string, unknown> = {};
+      const rawArgs: Record<string, unknown> = {
+        diagnostics_timeout_ms: Math.min(
+          resolveInspectDiagnosticsTimeoutMs(ctx.config),
+          INSPECT_DIAGNOSTICS_TIMEOUT_MS,
+        ),
+      };
       if (sections !== undefined) rawArgs.sections = sections;
       if (scope !== undefined) rawArgs.scope = scope;
       if (topK !== undefined) rawArgs.topK = topK;
       const response = await callToolCall(bridge, "inspect", rawArgs, extCtx, {
-        transportTimeoutMs:
-          resolveInspectDiagnosticsTimeoutMs(ctx.config) + INSPECT_TRANSPORT_HEADROOM_MS,
+        transportTimeoutMs: PI_TOOL_TRANSPORT_TIMEOUT_MS,
+        onUpdate,
       });
       const terminal = parseInspectTerminal(response);
       if (terminal) return textResult(renderInspectTerminal(terminal, response.text), response);

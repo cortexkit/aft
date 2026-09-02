@@ -1683,7 +1683,7 @@ fn delay_symbol_prewarm_for_debug() {
     thread::sleep(Duration::from_millis(delay_ms));
 }
 
-fn walk_semantic_project_files_bounded(
+pub(crate) fn walk_semantic_project_files_bounded(
     root: &Path,
     max_files: usize,
 ) -> Result<Vec<PathBuf>, usize> {
@@ -8395,7 +8395,14 @@ mod tests {
 
     #[test]
     fn detect_missing_tools_still_warns_explicit_formatter_when_format_on_edit_disabled() {
+        let _env_lock = crate::test_env::process_env_lock();
         let temp = tempfile::tempdir().unwrap();
+        let empty_path = temp.path().join("empty-path");
+        std::fs::create_dir(&empty_path).unwrap();
+        let _path_guard = EnvVarGuard::set("PATH", empty_path.to_str().unwrap());
+        let _home_guard = EnvVarGuard::set("HOME", temp.path().to_str().unwrap());
+        let _userprofile_guard = EnvVarGuard::set("USERPROFILE", temp.path().to_str().unwrap());
+        let _well_known_guard = EnvVarGuard::set("AFT_DISABLE_WELL_KNOWN_LOOKUP", "1");
         let mut config = Config {
             project_root: Some(temp.path().to_path_buf()),
             format_on_edit: false,

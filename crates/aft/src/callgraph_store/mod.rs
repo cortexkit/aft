@@ -623,6 +623,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static REFRESH_COMMIT_ADMISSION: std::cell::RefCell<Option<(SubcLifecycleAdmission, Arc<std::sync::atomic::AtomicU64>, u64)>> =
         const { std::cell::RefCell::new(None) };
+    static COLD_BUILD_SLICE_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 mod dead_code_projection;
@@ -711,6 +712,21 @@ impl Drop for PublishAdmissionGuard {
     }
 }
 
+struct ColdBuildSliceBudgetGuard {
+    previous: Option<usize>,
+}
+
+impl Drop for ColdBuildSliceBudgetGuard {
+    fn drop(&mut self) {
+        COLD_BUILD_SLICE_BUDGET.with(|slot| slot.set(self.previous));
+    }
+}
+
+fn with_cold_build_slice_budget<R>(budget: usize, run: impl FnOnce() -> R) -> R {
+    let previous = COLD_BUILD_SLICE_BUDGET.with(|slot| slot.replace(Some(budget.max(1))));
+    let _guard = ColdBuildSliceBudgetGuard { previous };
+    run()
+}
 pub(crate) fn with_publish_epoch<R>(
     epoch: crate::root_cache::ArtifactPublishEpoch,
     expected: u64,
@@ -724,16 +740,31 @@ pub(crate) fn with_publish_epoch<R>(
 fn ensure_cold_build_current(stage: &'static str, completed: usize, total: usize) -> Result<()> {
     notify_cold_build_slice_observer(stage, completed, total);
     let admission = PUBLISH_ADMISSION.with(|slot| slot.borrow().clone());
-    if admission.is_none_or(|(epoch, expected)| epoch.is_current(expected)) {
-        return Ok(());
+    if admission.is_some_and(|(epoch, expected)| !epoch.is_current(expected)) {
+        crate::slog_info!(
+            "callgraph cold build superseded, stopping after {}/{} ({})",
+            completed,
+            total,
+            stage
+        );
+        return Err(CallGraphStoreError::Superseded);
     }
-    crate::slog_info!(
-        "callgraph cold build superseded, stopping after {}/{} ({})",
-        completed,
-        total,
-        stage
-    );
-    Err(CallGraphStoreError::Superseded)
+    let exhausted = COLD_BUILD_SLICE_BUDGET.with(|slot| match slot.get() {
+        Some(remaining) if completed > 0 && remaining <= 1 => true,
+        Some(remaining) if completed > 0 => {
+            slot.set(Some(remaining - 1));
+            false
+        }
+        _ => false,
+    });
+    if exhausted {
+        return Err(CallGraphStoreError::SliceProgress {
+            phase: stage.to_string(),
+            completed,
+            total,
+        });
+    }
+    Ok(())
 }
 
 fn publish_if_current<R>(publish: impl FnOnce() -> Result<R>) -> Result<R> {
@@ -815,6 +846,11 @@ pub enum CallGraphStoreError {
     Suspended(crate::build_breaker::BuildSuspension),
     Superseded,
     StaleFiles(Vec<String>),
+    SliceProgress {
+        phase: String,
+        completed: usize,
+        total: usize,
+    },
 }
 
 impl CallGraphStoreError {
@@ -860,6 +896,14 @@ impl fmt::Display for CallGraphStoreError {
             Self::Superseded => {
                 write!(formatter, "callgraph store build superseded before publish")
             }
+            Self::SliceProgress {
+                phase,
+                completed,
+                total,
+            } => write!(
+                formatter,
+                "callgraph cold-build slice completed: {phase} {completed}/{total}"
+            ),
             Self::StaleFiles(files) => {
                 write!(
                     formatter,
@@ -1172,7 +1216,10 @@ impl RefreshWorker {
         let thread_shared = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("aft-callgraph-refresh".to_string())
-            .spawn(move || callgraph_refresh_worker_loop(&thread_shared))
+            .spawn(move || {
+                crate::thread_priority::demote_background();
+                callgraph_refresh_worker_loop(&thread_shared)
+            })
             .expect("failed to spawn callgraph refresh worker");
         Arc::new(Self {
             shared,
@@ -1904,6 +1951,20 @@ pub struct IncrementalStats {
     pub dependency_selected_refs: usize,
     pub refreshed_own_files: usize,
     pub unchanged_extract_files: usize,
+}
+
+#[derive(Debug)]
+pub enum ColdBuildSlice {
+    Progress {
+        phase: String,
+        completed: usize,
+        total: usize,
+    },
+    Complete {
+        store: CallGraphStore,
+        stats: ColdBuildStats,
+    },
+    Superseded,
 }
 
 /// Phase timings for the copy-based incremental refresh benchmark.
@@ -2881,6 +2942,37 @@ impl CallGraphStore {
         )
     }
 
+    pub fn resume_cold_build_slice_with_lease(
+        callgraph_dir: PathBuf,
+        project_root: PathBuf,
+        files: &[PathBuf],
+        chunk_size: usize,
+    ) -> Result<ColdBuildSlice> {
+        let result = with_cold_build_slice_budget(1, || {
+            Self::cold_build_with_lease_chunked_inner(
+                callgraph_dir,
+                project_root,
+                files,
+                chunk_size,
+                false,
+            )
+        });
+        match result {
+            Ok((store, stats)) => Ok(ColdBuildSlice::Complete { store, stats }),
+            Err(CallGraphStoreError::SliceProgress {
+                phase,
+                completed,
+                total,
+            }) => Ok(ColdBuildSlice::Progress {
+                phase,
+                completed,
+                total,
+            }),
+            Err(CallGraphStoreError::Superseded) => Ok(ColdBuildSlice::Superseded),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn force_cold_build_with_lease_chunked(
         callgraph_dir: PathBuf,
         project_root: PathBuf,
@@ -3584,7 +3676,6 @@ impl CallGraphStore {
             &module_resolution_memo,
         )
     }
-
     #[cfg(test)]
     fn cold_build_chunked_with_resolution_memo_for_test(
         &self,
@@ -8489,6 +8580,11 @@ fn build_extracts_parallel(project_root: &Path, files: &[PathBuf]) -> BuildExtra
         .num_threads(build_pool_size())
         .thread_name(|index| format!("aft-callgraph-build-{index}"))
         .stack_size(8 * 1024 * 1024)
+        .start_handler(|_| {
+            // Callgraph builds are background maintenance: keep interactive
+            // reads ahead in the OS scheduler (CPU and I/O).
+            crate::thread_priority::demote_background();
+        })
         .build()
     {
         Ok(pool) => pool.install(run),

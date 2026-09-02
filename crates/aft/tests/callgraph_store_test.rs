@@ -897,6 +897,7 @@ fn root_keyed_configure_migrates_newest_superseded_legacy_generation() {
     ctx.set_canonical_cache_root(root.clone());
     aft::root_cache::configure_artifact_access(&root, &artifact_cache_key_for_test(&root), false);
     ctx.set_cache_role(false, None);
+    ctx.isolate_cold_build_limiter_for_test(1);
 
     let fallback = ctx
         .ensure_callgraph_store()
@@ -1360,6 +1361,7 @@ fn root_keyed_migration_redoes_partial_copy_without_valid_manifest() {
     retry_ctx.set_canonical_cache_root(root.clone());
     aft::root_cache::configure_artifact_access(&root, &artifact_cache_key_for_test(&root), false);
     retry_ctx.set_cache_role(false, None);
+    retry_ctx.isolate_cold_build_limiter_for_test(1);
     let fallback = retry_ctx.ensure_callgraph_store().unwrap().unwrap();
     assert!(fallback.is_legacy_fallback());
     wait_for_root_keyed_callgraph(&retry_ctx, Duration::from_secs(20));
@@ -1444,6 +1446,7 @@ fn root_keyed_migration_uses_sqlite_backup_for_only_current_legacy_generation() 
     ctx.set_harness(Harness::Opencode);
     ctx.set_canonical_cache_root(root.clone());
     aft::root_cache::configure_artifact_access(&root, &artifact_cache_key_for_test(&root), false);
+    ctx.isolate_cold_build_limiter_for_test(1);
     ctx.set_cache_role(false, None);
     let fallback = ctx.ensure_callgraph_store().unwrap().unwrap();
     assert!(fallback.is_legacy_fallback());
@@ -2134,6 +2137,7 @@ fn root_keyed_test_context(root: &Path, storage: &Path, worktree: bool) -> AppCo
     let project_key = artifact_cache_key_for_test(root);
     aft::root_cache::configure_artifact_access(root, &project_key, worktree);
     ctx.set_cache_role(worktree, None);
+    ctx.isolate_cold_build_limiter_for_test(1);
     ctx
 }
 

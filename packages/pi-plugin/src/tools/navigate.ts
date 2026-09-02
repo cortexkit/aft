@@ -137,7 +137,7 @@ export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void
       description:
         "Answer code-relationship questions from a real call graph — instead of grep + read chains. Reach for this whenever the question is about how symbols connect. Use aft_zoom with `callgraph:true` for one-level forward calls-out while reading source; use aft_callgraph only for reverse callers or multi-level traces so you do not double-fetch the same relationships. All ops require both `path` and `symbol`. Use `callers` for call sites (before renaming/signature changes), `impact` for blast radius (what breaks if a symbol changes), `call_tree` for what a function calls, `trace_to` for how execution reaches a symbol from entry points, `trace_to_symbol` for the shortest path from one symbol to another (requires `toSymbol`; if ambiguous, the error returns candidate files — retry with `toPath`), `trace_data` to follow a value across assignments/params. Markers: ~ = edge resolved by name only (may point at the wrong same-named symbol); [unresolved] = callee not resolved to a definition, so the location shown is the call site. Unmarked edges are resolved exactly. By default, unresolved external/stdlib leaf calls in call_tree are collapsed into one summary per parent; pass includeUnresolved=true to show every unresolved edge individually.",
       parameters: navigateParamsSchema(),
-      async execute(_toolCallId: string, params: NavigateArgs, _signal, _onUpdate, extCtx) {
+      async execute(_toolCallId: string, params: NavigateArgs, _signal, onUpdate, extCtx) {
         if (isEmptyParam(params.path)) {
           throw new Error(`op='${params.op}' requires a \`path\``);
         }
@@ -178,7 +178,7 @@ export function registerNavigateTool(pi: ExtensionAPI, ctx: PluginContext): void
           rawArgs.includeTests = coerceBoolean(params.includeTests);
         if (!isEmptyParam(params.includeUnresolved))
           rawArgs.includeUnresolved = coerceBoolean(params.includeUnresolved);
-        const response = await callToolCall(bridge, "callgraph", rawArgs, extCtx);
+        const response = await callToolCall(bridge, "callgraph", rawArgs, extCtx, { onUpdate });
         if (response.success === false) {
           const code = typeof response.code === "string" ? response.code : "";
           const text = response.text || formatBridgeErrorMessage(params.op, response, rawArgs);

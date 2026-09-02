@@ -53,6 +53,33 @@ impl IndexKind {
         }
     }
 }
+/// Host resource policy for standing index maintenance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexResourcePolicy {
+    /// Pause new background slices when authoritative host signals report pressure.
+    #[default]
+    Balanced,
+    /// Ignore host pressure admission while preserving concurrency and correctness bounds.
+    Performance,
+}
+
+impl IndexResourcePolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Balanced => "balanced",
+            Self::Performance => "performance",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "balanced" => Some(Self::Balanced),
+            "performance" => Some(Self::Performance),
+            _ => None,
+        }
+    }
+}
 
 /// One user-configured root whose literal path spelling is its durable identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +94,7 @@ pub struct IndexRootConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IndexConfig {
+    pub resource_policy: IndexResourcePolicy,
     pub roots: Vec<IndexRootConfig>,
 }
 

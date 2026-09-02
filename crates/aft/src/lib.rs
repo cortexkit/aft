@@ -46,6 +46,10 @@
 // Response::error instead of panicking. Confirmed zero .unwrap()/.expect() in
 // production error paths as of v0.6.3 audit.
 
+#[cfg(not(test))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod agent_child_env;
 pub mod alert_records;
 pub mod alert_state;
@@ -105,6 +109,7 @@ pub mod protocol;
 pub mod pty_render;
 pub mod query_shape;
 pub mod readonly_artifacts;
+pub mod resource_policy;
 pub mod response_finalize;
 pub mod root_cache;
 pub mod run_tool_call;
@@ -116,14 +121,15 @@ pub mod scoped_key;
 pub mod search_index;
 pub mod semantic_index;
 pub mod standing_roots;
+pub mod standing_scheduler;
 pub mod subc;
 pub mod subc_config;
 pub mod subc_format;
 pub mod subc_translate;
 pub mod symbol_cache_disk;
-pub mod symbol_diff;
 pub mod symbols;
 pub mod synapse_embed;
+pub mod thread_priority;
 pub mod tool_path;
 pub mod url_fetch;
 pub(crate) mod walk_boundary;

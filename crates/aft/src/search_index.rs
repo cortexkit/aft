@@ -59,6 +59,40 @@ static TRANSIENT_SEARCH_CACHE_SWEEP_CURSORS: OnceLock<Mutex<HashMap<PathBuf, Str
     OnceLock::new();
 static TRANSIENT_SEARCH_CACHE_BUILD_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
     OnceLock::new();
+const SEARCH_STAGING_VERSION: u32 = 1;
+const SEARCH_STAGING_MANIFEST: &str = "search-staging-v1.json";
+const SEARCH_STAGING_DIR: &str = "search-staging-v1";
+const SEARCH_SLICE_FILES: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SearchBuildSliceOutcome {
+    Yielded,
+    Complete,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SearchStagingManifest {
+    version: u32,
+    corpus_fingerprint: String,
+    canonical_root: PathBuf,
+    ignore_fingerprint: String,
+    max_file_size: u64,
+    paths: Vec<PathBuf>,
+    cursor: usize,
+    spill_seq: usize,
+    files: Vec<SearchStagingFile>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SearchStagingFile {
+    path: PathBuf,
+    size: u64,
+    modified_nanos: u128,
+    content_hash: [u8; 32],
+    indexed: bool,
+    included: bool,
+    trigram_count: u32,
+}
 
 #[cfg(debug_assertions)]
 thread_local! {
@@ -900,6 +934,156 @@ impl SearchIndex {
             }
         }
     }
+    pub(crate) fn resume_cold_build_slice(
+        root: &Path,
+        max_file_size: u64,
+        cache_dir: &Path,
+    ) -> std::io::Result<SearchBuildSliceOutcome> {
+        fs::create_dir_all(cache_dir)?;
+        let staging_dir = cache_dir.join(SEARCH_STAGING_DIR);
+        let manifest_path = staging_dir.join(SEARCH_STAGING_MANIFEST);
+        let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let ignore_fingerprint = ignore_rules_fingerprint(&canonical_root);
+        let filters = PathFilters::default();
+        let paths = walk_project_files(&canonical_root, &filters);
+        let corpus_fingerprint =
+            search_corpus_fingerprint(&canonical_root, &ignore_fingerprint, max_file_size, &paths);
+        let mut manifest = load_search_staging_manifest(&manifest_path)
+            .filter(|manifest| {
+                manifest.version == SEARCH_STAGING_VERSION
+                    && manifest.corpus_fingerprint == corpus_fingerprint
+                    && manifest.canonical_root == canonical_root
+                    && manifest.ignore_fingerprint == ignore_fingerprint
+                    && manifest.max_file_size == max_file_size
+                    && manifest.paths == paths
+                    && manifest.cursor <= manifest.paths.len()
+                    && manifest.files.len() == manifest.cursor
+            })
+            .unwrap_or_else(|| {
+                let _ = fs::remove_dir_all(&staging_dir);
+                SearchStagingManifest {
+                    version: SEARCH_STAGING_VERSION,
+                    corpus_fingerprint: corpus_fingerprint.clone(),
+                    canonical_root: canonical_root.clone(),
+                    ignore_fingerprint: ignore_fingerprint.clone(),
+                    max_file_size,
+                    paths: paths.clone(),
+                    cursor: 0,
+                    spill_seq: 0,
+                    files: Vec::new(),
+                }
+            });
+        fs::create_dir_all(&staging_dir)?;
+
+        if manifest.cursor < manifest.paths.len() {
+            let end = (manifest.cursor + SEARCH_SLICE_FILES).min(manifest.paths.len());
+            let mut block = Vec::new();
+            for path in &manifest.paths[manifest.cursor..end] {
+                let file_id = u32::try_from(manifest.files.len())
+                    .map_err(|_| std::io::Error::other("too many files to index"))?;
+                match prepare_search_path(path, max_file_size) {
+                    PreparedSearchPath::Indexed(file) => {
+                        let trigram_count =
+                            u32::try_from(file.trigram_map.len()).unwrap_or(u32::MAX);
+                        for (trigram, filter) in file.trigram_map {
+                            block.push(SpillRecord {
+                                trigram,
+                                file_id,
+                                next_mask: filter.next_mask,
+                                loc_mask: filter.loc_mask,
+                            });
+                        }
+                        manifest.files.push(search_staging_file(
+                            path,
+                            file.metadata,
+                            file.content_hash,
+                            true,
+                            true,
+                            trigram_count,
+                        ));
+                    }
+                    PreparedSearchPath::Unindexed(metadata) => {
+                        manifest.files.push(search_staging_file(
+                            path,
+                            metadata,
+                            cache_freshness::zero_hash(),
+                            false,
+                            true,
+                            0,
+                        ))
+                    }
+                    PreparedSearchPath::Skipped => manifest.files.push(search_staging_file(
+                        path,
+                        SearchFileMetadata {
+                            size: 0,
+                            modified: UNIX_EPOCH,
+                        },
+                        cache_freshness::zero_hash(),
+                        false,
+                        false,
+                        0,
+                    )),
+                }
+            }
+            if !block.is_empty() {
+                flush_spill_segment(&staging_dir, manifest.spill_seq, &mut block)?;
+                manifest.spill_seq += 1;
+            }
+            manifest.cursor = end;
+            write_search_staging_manifest(&manifest_path, &manifest)?;
+            return Ok(SearchBuildSliceOutcome::Yielded);
+        }
+
+        let mut files = Vec::with_capacity(manifest.files.len());
+        let mut path_to_id = HashMap::with_capacity(manifest.files.len());
+        let mut unindexed_files = HashSet::new();
+        let mut file_trigram_count = Vec::with_capacity(manifest.files.len());
+        for staged in manifest.files.iter().filter(|staged| staged.included) {
+            let file_id = u32::try_from(files.len())
+                .map_err(|_| std::io::Error::other("too many files to index"))?;
+            let seconds = u64::try_from(staged.modified_nanos / 1_000_000_000).unwrap_or(u64::MAX);
+            let nanos = u32::try_from(staged.modified_nanos % 1_000_000_000).unwrap_or(0);
+            files.push(FileEntry {
+                path: staged.path.clone(),
+                size: staged.size,
+                modified: UNIX_EPOCH + Duration::new(seconds, nanos),
+                content_hash: blake3::Hash::from_bytes(staged.content_hash),
+            });
+            path_to_id.insert(staged.path.clone(), file_id);
+            if !staged.indexed {
+                unindexed_files.insert(file_id);
+            }
+            file_trigram_count.push(staged.trigram_count);
+        }
+        let plan = CacheWritePlan {
+            project_root: canonical_root.clone(),
+            git_head: current_git_head(&canonical_root),
+            ignore_fingerprint,
+            max_file_size,
+            files: files.clone(),
+            path_to_id: path_to_id.clone(),
+            unindexed_files: unindexed_files.clone(),
+            file_trigram_count: file_trigram_count.clone(),
+            id_map: Arc::new(
+                (0..files.len())
+                    .filter_map(|id| {
+                        let id = u32::try_from(id).ok()?;
+                        Some((id, id))
+                    })
+                    .collect(),
+            ),
+        };
+        let mut sources: Vec<Box<dyn PostingRecordSource>> = (0..manifest.spill_seq)
+            .map(|seq| SpillSegmentSource::open(&staging_dir.join(format!("segment.{seq:06}.bin"))))
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|source| Box::new(source) as Box<dyn PostingRecordSource>)
+            .collect();
+        let base = write_cache_file_from_sources(cache_dir, &plan, &mut sources)?;
+        drop(base);
+        fs::remove_dir_all(&staging_dir)?;
+        Ok(SearchBuildSliceOutcome::Complete)
+    }
 
     fn build_in_memory(root: &Path, max_file_size: u64, started: Instant) -> Self {
         let project_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
@@ -951,6 +1135,11 @@ impl SearchIndex {
             .num_threads(pool_size)
             .thread_name(|index| format!("aft-search-build-{index}"))
             .stack_size(8 * 1024 * 1024)
+            .start_handler(|_| {
+                // Search builds are background maintenance. Keep transport and
+                // interactive reader threads ahead in the OS CPU and I/O schedulers.
+                crate::thread_priority::demote_background();
+            })
             .build()
         {
             Ok(pool) => Some(pool),
@@ -2883,6 +3072,11 @@ fn build_streaming_index(
         .num_threads(pool_size)
         .thread_name(|index| format!("aft-search-build-{index}"))
         .stack_size(8 * 1024 * 1024)
+        .start_handler(|_| {
+            // One large root can keep every search worker busy for seconds.
+            // Demote each worker so concurrent roots cannot starve SubC control traffic.
+            crate::thread_priority::demote_background();
+        })
         .build()
         .ok();
 
@@ -3245,8 +3439,74 @@ fn build_lookup_section_bytes(lookup_entries: &[LookupEntry]) -> std::io::Result
         .map_err(|error| std::io::Error::other(error.to_string()))?
         .into_inner();
     let checksum = crc32fast::hash(&lookup_blob);
+
     lookup_blob.extend_from_slice(&checksum.to_le_bytes());
     Ok(lookup_blob)
+}
+fn search_staging_file(
+    path: &Path,
+    metadata: SearchFileMetadata,
+    content_hash: blake3::Hash,
+    indexed: bool,
+    included: bool,
+    trigram_count: u32,
+) -> SearchStagingFile {
+    let modified_nanos = metadata
+        .modified
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_nanos();
+    SearchStagingFile {
+        path: path.to_path_buf(),
+        size: metadata.size,
+        modified_nanos,
+        content_hash: *content_hash.as_bytes(),
+        indexed,
+        included,
+        trigram_count,
+    }
+}
+
+fn search_corpus_fingerprint(
+    root: &Path,
+    ignore_fingerprint: &str,
+    max_file_size: u64,
+    paths: &[PathBuf],
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(root.to_string_lossy().as_bytes());
+    hasher.update(ignore_fingerprint.as_bytes());
+    hasher.update(&max_file_size.to_le_bytes());
+    for path in paths {
+        hasher.update(path.to_string_lossy().as_bytes());
+        if let Ok(metadata) = fs::metadata(path) {
+            hasher.update(&metadata.len().to_le_bytes());
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_nanos());
+            hasher.update(&modified.to_le_bytes());
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn load_search_staging_manifest(path: &Path) -> Option<SearchStagingManifest> {
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+fn write_search_staging_manifest(
+    path: &Path,
+    manifest: &SearchStagingManifest,
+) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(manifest).map_err(std::io::Error::other)?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, bytes)?;
+    File::open(&temporary)?.sync_all()?;
+    fs::rename(&temporary, path)?;
+    sync_parent_dir(path);
+    Ok(())
 }
 
 fn build_file_trigram_count_extension(counts: &[u32]) -> std::io::Result<Vec<u8>> {
@@ -8264,6 +8524,68 @@ mod tests {
             serial_grep.files_with_matches,
             parallel_grep.files_with_matches
         );
+    }
+
+    #[test]
+    fn resumable_search_build_yields_then_matches_monolithic_results() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        let cache = dir.path().join("cache");
+        fs::create_dir_all(&project).expect("create project");
+        for index in 0..70 {
+            fs::write(
+                project.join(format!("file_{index:03}.rs")),
+                format!("pub fn marker_{index}() {{ println!(\"resume_marker_{index}\"); }}\n"),
+            )
+            .expect("write source");
+        }
+        let expected = SearchIndex::build_with_limit(&project, DEFAULT_MAX_FILE_SIZE);
+        let first = SearchIndex::resume_cold_build_slice(&project, DEFAULT_MAX_FILE_SIZE, &cache)
+            .expect("first slice");
+        assert_eq!(first, SearchBuildSliceOutcome::Yielded);
+        assert!(!cache.join("cache.bin").exists());
+
+        let mut slices = 1;
+        while SearchIndex::resume_cold_build_slice(&project, DEFAULT_MAX_FILE_SIZE, &cache)
+            .expect("resume slice")
+            == SearchBuildSliceOutcome::Yielded
+        {
+            slices += 1;
+        }
+        assert!(slices >= 2);
+        let actual = SearchIndex::read_from_disk(&cache, &project).expect("published index");
+        let expected_result = expected.grep("resume_marker_37", true, &[], &[], &project, 10);
+        let actual_result = actual.grep("resume_marker_37", true, &[], &[], &project, 10);
+        assert_eq!(expected_result.matches, actual_result.matches);
+        assert_eq!(expected_result.total_matches, actual_result.total_matches);
+    }
+
+    #[test]
+    fn resumable_search_rejects_corrupt_and_changed_staging() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        let cache = dir.path().join("cache");
+        fs::create_dir_all(&project).expect("create project");
+        for index in 0..40 {
+            fs::write(project.join(format!("file_{index:03}.rs")), "fn old() {}\n")
+                .expect("write source");
+        }
+        assert_eq!(
+            SearchIndex::resume_cold_build_slice(&project, DEFAULT_MAX_FILE_SIZE, &cache)
+                .expect("first slice"),
+            SearchBuildSliceOutcome::Yielded
+        );
+        let manifest = cache.join(SEARCH_STAGING_DIR).join(SEARCH_STAGING_MANIFEST);
+        fs::write(&manifest, b"not-json").expect("corrupt manifest");
+        fs::write(project.join("file_000.rs"), "fn changed() {}\n").expect("change corpus");
+        assert_eq!(
+            SearchIndex::resume_cold_build_slice(&project, DEFAULT_MAX_FILE_SIZE, &cache)
+                .expect("restart slice"),
+            SearchBuildSliceOutcome::Yielded
+        );
+        let restarted = load_search_staging_manifest(&manifest).expect("replacement manifest");
+        assert_eq!(restarted.cursor, SEARCH_SLICE_FILES);
+        assert_eq!(restarted.files.len(), SEARCH_SLICE_FILES);
     }
 
     #[test]

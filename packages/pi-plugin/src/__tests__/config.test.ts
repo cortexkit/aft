@@ -66,6 +66,34 @@ afterEach(() => {
   tempRoots.clear();
 });
 
+  test("index resource policy defaults, validates, and remains user-only", () => {
+    expect(AftConfigSchema.parse({}).index?.resource_policy ?? "balanced").toBe("balanced");
+    expect(
+      AftConfigSchema.parse({ index: { resource_policy: "balanced" } }).index?.resource_policy,
+    ).toBe("balanced");
+    expect(
+      AftConfigSchema.parse({ index: { resource_policy: "performance" } }).index?.resource_policy,
+    ).toBe("performance");
+    expect(AftConfigSchema.safeParse({ index: { resource_policy: "unlimited" } }).success).toBe(
+      false,
+    );
+
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ index: { resource_policy: "performance" } }),
+    );
+    writeFileSync(
+      fixture.projectConfigPath,
+      JSON.stringify({ index: { resource_policy: "balanced" } }),
+    );
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    expect(JSON.parse(result.stdout).index.resource_policy).toBe("performance");
+  });
+
 describe("loadAftConfig", () => {
   test("gh_read honors only the user tier and warns for project overrides", () => {
     const fixture = createConfigFixture();

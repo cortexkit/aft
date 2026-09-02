@@ -360,7 +360,11 @@ describe("SubcTransport.toolCall", () => {
         timeoutMs: 60_000,
       },
     );
-    expect(client.requests[0]?.options?.timeoutMs).toBe(905_000);
+    const bashDeadlineMs = client.requests[0]?.options?.timeoutMs;
+    expect(bashDeadlineMs).toBeNumber();
+    expect(bashDeadlineMs).toBeGreaterThan(0);
+    expect(bashDeadlineMs).toBeLessThanOrEqual(905_000);
+    expect(client.requests[0]?.body.deadline_ms_remaining).toBe(bashDeadlineMs);
 
     // Plain per-command override still applies when no orchestrated budget.
     await t.toolCall("s", "grep", { query: "x" }, { timeoutMs: 60_000 });
@@ -1817,5 +1821,138 @@ describe("SubcTransportPool lifecycle", () => {
     const { pool } = poolWith(client);
     expect(() => pool.setConfigureOverride("k", "v")).not.toThrow();
     await expect(pool.replaceBinary("/new/path")).resolves.toBe("/new/path");
+  });
+});
+
+describe("SubcTransportPool request budget (deadline_ms_remaining)", () => {
+  function poolWithDefault(client: FakeClient, defaultTimeoutMs?: number): SubcTransportPool {
+    return new SubcTransportPool({
+      connectionFile: "/tmp/fake-subc-connection.json",
+      harness: "opencode",
+      defaultTimeoutMs,
+      connect: async () => client,
+    });
+  }
+
+  test("a direct pool with no finite default and no call timeout omits deadline metadata", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    const pool = poolWithDefault(client, undefined);
+
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("s", "read", { path: "a.ts" });
+    await tick();
+
+    expect(client.requests.length).toBe(1);
+    expect(client.requests[0].body).not.toHaveProperty("deadline_ms_remaining");
+    expect(client.requests[0].options?.timeoutMs).toBeUndefined();
+  });
+
+  test("the pool default stamps top-level deadline_ms_remaining and request timeout without mutating arguments", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    const pool = poolWithDefault(client, 30_000);
+    const args = { path: "a.ts" };
+
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("s", "read", args);
+    await tick();
+
+    expect(client.requests.length).toBe(1);
+    const body = client.requests[0].body as Record<string, unknown>;
+    const deadline = body.deadline_ms_remaining;
+    expect(typeof deadline).toBe("number");
+    expect(deadline as number).toBeGreaterThan(25_000);
+    expect(deadline as number).toBeLessThanOrEqual(30_000);
+    // Arguments are passed through untouched and gain no scheduling fields.
+    expect(body.arguments).toEqual({ path: "a.ts" });
+    expect(body).not.toHaveProperty("priority");
+    expect(body).not.toHaveProperty("lane");
+    expect(client.requests[0].options?.timeoutMs).toBeGreaterThan(25_000);
+    expect(client.requests[0].options?.timeoutMs).toBeLessThanOrEqual(30_000);
+  });
+
+  test("a caller timeout overrides the pool default with exact precedence", async () => {
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    const pool = poolWithDefault(client, 30_000);
+
+    await pool
+      .getBridge(TEST_PROJECT_ROOT)
+      .toolCall("s", "read", { path: "a.ts" }, { timeoutMs: 5_000 });
+    await tick();
+
+    expect(client.requests.length).toBe(1);
+    const deadline = (client.requests[0].body as Record<string, unknown>)
+      .deadline_ms_remaining as number;
+    expect(deadline).toBeLessThanOrEqual(5_000);
+    expect(deadline).toBeGreaterThan(4_000);
+  });
+
+  test("an expired budget before send returns the provable not-sent error", async () => {
+    // Hold the route open so the caller's only way out is the budget race
+    // firing while bytes are provably still unsent.
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    client.routeOpenGate = Promise.withResolvers<void>().promise;
+    const pool = poolWithDefault(client, 10);
+
+    await expect(
+      pool.getBridge(TEST_PROJECT_ROOT).toolCall("s", "read", { path: "a.ts" }),
+    ).rejects.toMatchObject({
+      kind: "not_sent",
+      code: "request_deadline_exceeded_before_send",
+    });
+  });
+
+  test("a stale-route retry draws down the same budget across backoff and resend", async () => {
+    // The first request proves the route absent (unknown_channel), the pooled
+    // reopen backoff waits ~100ms, then the retry sends on a fresh channel.
+    // The resent body's stamped budget must be lower than the first stamp by
+    // roughly the backoff delay — the budget never restarts.
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    let requestAttempts = 0;
+    const originalRequest = client.request.bind(client);
+    client.request = async (route, body, options) => {
+      requestAttempts += 1;
+      if (requestAttempts === 1) {
+        client.requests.push({ route, channel: route.channel, body, options });
+        throw new SubcError("unknown channel", "unknown_channel");
+      }
+      return originalRequest(route, body, options);
+    };
+    const pool = poolWithDefault(client, 30_000);
+
+    const reply = await pool.getBridge(TEST_PROJECT_ROOT).toolCall("s", "read", {});
+    expect(reply.success).toBe(true);
+    expect(requestAttempts).toBe(2);
+    expect(client.requests.length).toBe(2);
+
+    const firstStamp = (client.requests[0].body as Record<string, unknown>)
+      .deadline_ms_remaining as number;
+    const retryStamp = (client.requests[1].body as Record<string, unknown>)
+      .deadline_ms_remaining as number;
+    expect(firstStamp).toBeGreaterThan(0);
+    expect(retryStamp).toBeGreaterThan(0);
+    // Both draw the same absolute deadline; the retry saw the backoff wait.
+    expect(firstStamp).toBeGreaterThan(retryStamp);
+  });
+
+  test("the route open race observes late settlement without invalidating the shared route", async () => {
+    const gate = Promise.withResolvers<void>();
+    const releaseOpen: () => void = () => gate.resolve();
+    const client = new FakeClient(async () => envelope({ id: "r", success: true, text: "" }));
+    client.routeOpenGate = gate.promise;
+    const pool = poolWithDefault(client, 5_000);
+
+    const fast = pool
+      .getBridge(TEST_PROJECT_ROOT)
+      .toolCall("s", "read", { path: "a.ts" }, { timeoutMs: 50 });
+    await expect(fast).rejects.toMatchObject({
+      kind: "not_sent",
+      code: "request_deadline_exceeded_before_send",
+    });
+    // Settle the shared open late. When the SAME session retries, it reuses
+    // the cached (now-settled) route entry rather than opening a new channel —
+    // the first caller's expiry never invalidated the shared open.
+    releaseOpen();
+    await tick();
+    await pool.getBridge(TEST_PROJECT_ROOT).toolCall("s", "read", {});
+    expect(client.routeOpens.length).toBe(1);
+    expect(client.requests.length).toBe(1);
   });
 });

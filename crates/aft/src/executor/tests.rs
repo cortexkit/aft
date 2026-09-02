@@ -55,6 +55,7 @@ fn test_executor(
         actor_cap,
         heavy_permits,
         drr_quantum: 1,
+        ..ExecutorConfig::default()
     })
 }
 
@@ -1986,6 +1987,7 @@ fn starved_bind_promotes_over_pure_reads() {
         completion: CompletionSender::Sync(tx.clone()),
         queued_at: now - INTERACTIVE_WRITER_PROMOTION_AGE - Duration::from_secs(1),
         cancellation: None,
+        deadline: None,
         maintenance_coalesce_key: None,
     };
     let read_job = QueuedJob {
@@ -1995,6 +1997,7 @@ fn starved_bind_promotes_over_pure_reads() {
         completion: CompletionSender::Sync(tx),
         queued_at: now,
         cancellation: None,
+        deadline: None,
         maintenance_coalesce_key: None,
     };
     // Read arrived FIRST in arrival order; the starved bind must still win.
@@ -2028,6 +2031,7 @@ fn fresh_bind_does_not_preempt_pure_reads() {
             completion: CompletionSender::Sync(tx.clone()),
             queued_at: now,
             cancellation: None,
+            deadline: None,
             maintenance_coalesce_key: None,
         },
     );
@@ -2041,6 +2045,7 @@ fn fresh_bind_does_not_preempt_pure_reads() {
             completion: CompletionSender::Sync(tx),
             queued_at: now,
             cancellation: None,
+            deadline: None,
             maintenance_coalesce_key: None,
         },
     );
@@ -2071,6 +2076,7 @@ fn maintenance_defers_to_queued_interactive_mutating_anywhere_in_queue() {
             completion: CompletionSender::Sync(tx.clone()),
             queued_at: Instant::now(),
             cancellation: None,
+            deadline: None,
             maintenance_coalesce_key: None,
         },
     );
@@ -2084,6 +2090,7 @@ fn maintenance_defers_to_queued_interactive_mutating_anywhere_in_queue() {
             completion: CompletionSender::Sync(tx),
             queued_at: Instant::now(),
             cancellation: None,
+            deadline: None,
             maintenance_coalesce_key: None,
         },
     );
@@ -2397,6 +2404,7 @@ fn remove_cancellable_removes_matching_lane_order_occurrence_not_first() {
             completion: CompletionSender::Sync(tx.clone()),
             queued_at: Instant::now(),
             cancellation: None,
+            deadline: None,
             maintenance_coalesce_key: None,
         },
     );
@@ -2410,6 +2418,7 @@ fn remove_cancellable_removes_matching_lane_order_occurrence_not_first() {
             completion: CompletionSender::Sync(tx.clone()),
             queued_at: Instant::now(),
             cancellation: None,
+            deadline: None,
             maintenance_coalesce_key: None,
         },
     );
@@ -2423,13 +2432,15 @@ fn remove_cancellable_removes_matching_lane_order_occurrence_not_first() {
             completion: CompletionSender::Sync(tx),
             queued_at: Instant::now(),
             cancellation: Some(m2_token.clone()),
+            deadline: None,
             maintenance_coalesce_key: None,
         },
     );
 
-    let removed = actor
+    let (removed_class, removed) = actor
         .remove_queued_cancellable(&m2_token)
         .expect("m2 removed");
+    assert_eq!(removed_class, JobClass::Interactive);
     assert_eq!(removed.request_id, "m2");
 
     // Arrival-order head must still be M1's lane, and popping in order must
@@ -2483,5 +2494,394 @@ fn cancel_and_seal_race_has_exactly_one_winner() {
             );
             assert!(token.cancel_requested_before_commit());
         }
+    }
+}
+
+#[test]
+fn queued_deadline_job_is_pruned_and_counted_at_next_turn() {
+    // A queued job whose deadline elapses while blocked must be settled by the
+    // scheduler (not executed) and counted as a deadline expiry.
+    let executor = test_executor(2, 1, 1, 1);
+    let (_dir, root) = test_root("prune-queued");
+    executor.register_actor(root.clone(), test_ctx());
+
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let blocker = executor.submit(
+        root.clone(),
+        Lane::Mutating,
+        "prune-blocker".to_string(),
+        Box::new(move |_| {
+            started_tx.send(()).expect("signal start");
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release");
+            ok("prune-blocker")
+        }),
+    );
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("prune blocker starts");
+
+    // A queued reader with an already-tight deadline; the writer blocker holds
+    // the actor so this job stays queued until the next scheduler turn prunes it.
+    let executed = Arc::new(AtomicUsize::new(0));
+    let executed_probe = Arc::clone(&executed);
+    let (rx, _token) = executor.submit_cancellable_async_with_deadline(
+        root.clone(),
+        Lane::PureRead,
+        "prune-victim".to_string(),
+        Box::new(move |_| {
+            executed_probe.fetch_add(1, Ordering::AcqRel);
+            ok("prune-victim")
+        }),
+        Some(Instant::now() + Duration::from_millis(50)),
+    );
+    // Let the victim's deadline elapse while the blocker still holds the actor.
+    // Releasing the blocker then gives the scheduler a completion event; the
+    // next turn prunes the elapsed victim and settles it with
+    // request_deadline_exceeded instead of executing it.
+    thread::sleep(Duration::from_millis(120));
+
+    // Releasing the blocker completes the writer; the completion event wakes
+    // the scheduler and the next turn prunes the elapsed victim, settling it
+    // with request_deadline_exceeded instead of executing it.
+    release_tx.send(()).expect("release prune blocker");
+    assert!(
+        blocker
+            .recv_timeout(Duration::from_secs(5))
+            .expect("prune blocker completes")
+            .success
+    );
+
+    let response = recv_async(rx, "pruned job completion");
+    assert!(!response.success);
+    assert_eq!(response.data["code"], "request_deadline_exceeded");
+    assert_eq!(executed.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn interactive_queue_cap_returns_typed_backpressure_per_actor_and_global() {
+    // pool 2 / actor_cap 1: one running blocker per actor, then the per-actor
+    // interactive cap admits 2 more; the next is rejected with the actor scope.
+    // A second actor's global budget is sized so its first overflow reports the
+    // global scope.
+    let executor = test_executor(2, 1, 1, 1);
+    let (_dir_a, root_a) = test_root("interactive-cap-a");
+    executor.register_actor(root_a.clone(), test_ctx());
+
+    let (blocker_started_tx, blocker_started_rx) = crossbeam_channel::bounded(1);
+    let (release_blocker_tx, release_blocker_rx) = crossbeam_channel::bounded(1);
+    let blocker = executor.submit(
+        root_a.clone(),
+        Lane::Mutating,
+        "interactive-cap-blocker".to_string(),
+        Box::new(move |_| {
+            blocker_started_tx.send(()).expect("signal blocker start");
+            release_blocker_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release interactive blocker");
+            ok("interactive-cap-blocker")
+        }),
+    );
+    blocker_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("interactive blocker starts");
+
+    let executed = Arc::new(AtomicUsize::new(0));
+    let mut admitted = Vec::new();
+    for _ in 0..executor.interactive_actor_queue_cap() {
+        let executed_probe = Arc::clone(&executed);
+        admitted.push(executor.submit_async(
+            root_a.clone(),
+            Lane::PureRead,
+            "interactive-cap-admitted".to_string(),
+            Box::new(move |_| {
+                executed_probe.fetch_add(1, Ordering::AcqRel);
+                ok("interactive-cap-admitted")
+            }),
+        ));
+    }
+    let overflow = executor.submit_async(
+        root_a,
+        Lane::PureRead,
+        "interactive-cap-overflow".to_string(),
+        Box::new(|_| ok("interactive-cap-overflow")),
+    );
+
+    let overflow_response = recv_async(overflow, "interactive backpressure completion");
+    assert!(!overflow_response.success);
+    assert_eq!(overflow_response.data["code"], "executor_backpressure");
+    assert_eq!(overflow_response.data["retryable"], serde_json::json!(true));
+    assert_eq!(
+        overflow_response.data["queue_class"],
+        serde_json::json!("interactive")
+    );
+    assert_eq!(
+        overflow_response.data["queue_scope"],
+        serde_json::json!("actor")
+    );
+    assert_eq!(executed.load(Ordering::Acquire), 0);
+
+    release_blocker_tx
+        .send(())
+        .expect("release interactive blocker");
+    assert!(
+        blocker
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocker completes")
+            .success
+    );
+    for receiver in admitted {
+        assert!(
+            recv_async(receiver, "admitted interactive completion").success,
+            "admitted interactive job must execute"
+        );
+    }
+    assert_eq!(
+        executed.load(Ordering::Acquire),
+        executor.interactive_actor_queue_cap(),
+        "every admitted interactive job must execute exactly once"
+    );
+}
+
+#[test]
+fn coalesced_maintenance_skips_capacity_and_dedupe_releases_capacity() {
+    // A coalesced duplicate does not consume new capacity and is answered with
+    // the ordinary maintenance_cancelled coalesce response. When the per-actor
+    // cap is full, a duplicate removal frees exactly one slot for the next job.
+    let executor = test_executor(2, 1, 1, 1);
+    let (_dir, root) = test_root("coalesce-capacity");
+    executor.register_actor(root.clone(), test_ctx());
+
+    let (blocker_started_tx, blocker_started_rx) = crossbeam_channel::bounded(1);
+    let (release_blocker_tx, release_blocker_rx) = crossbeam_channel::bounded(1);
+    let blocker = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::MaintenanceCommit,
+        "coalesce-cap-blocker".to_string(),
+        Box::new(move |_| {
+            blocker_started_tx.send(()).expect("signal blocker start");
+            release_blocker_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release blocker");
+            ok("coalesce-cap-blocker")
+        }),
+    );
+    blocker_started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("blocker starts");
+
+    // Queue the first drain, then submit a duplicate. The duplicate coalesces
+    // behind the identical queued drain and settles immediately with the
+    // ordinary coalesce response without consuming new capacity.
+    let first = executor.submit_coalescable_maintenance_async(
+        root.clone(),
+        Lane::MaintenanceCommit,
+        "watcher-drain".to_string(),
+        MaintenanceCoalesceKey::WatcherDrain,
+        Box::new(|_| ok("watcher-drain")),
+    );
+    let coalesced_second = executor.submit_coalescable_maintenance_async(
+        root.clone(),
+        Lane::MaintenanceCommit,
+        "watcher-drain".to_string(),
+        MaintenanceCoalesceKey::WatcherDrain,
+        Box::new(|_| ok("watcher-drain")),
+    );
+    let coalesced_response = recv_async(coalesced_second, "coalesced duplicate completion");
+    assert!(!coalesced_response.success);
+    assert_eq!(coalesced_response.data["code"], "maintenance_cancelled");
+
+    release_blocker_tx
+        .send(())
+        .expect("release coalesce blocker");
+    assert!(recv_async(blocker, "coalesce blocker completion").success);
+    assert!(
+        recv_async(first, "first coalescable drain").success,
+        "the first coalescable drain executes after the blocker drains"
+    );
+}
+
+#[test]
+fn queue_accounting_tracks_dispatch_cancellation_and_actor_retirement() {
+    // Depths must return to zero after dispatch, queued cancellation, and
+    // actor removal; liveness mirrors the same numbers without contention.
+    let executor = test_executor(1, 1, 1, 1);
+    let (_dir, root) = test_root("accounting");
+    executor.register_actor(root.clone(), test_ctx());
+
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let blocker = executor.submit_async(
+        root.clone(),
+        Lane::Mutating,
+        "accounting-blocker".to_string(),
+        Box::new(move |_| {
+            started_tx.send(()).expect("signal start");
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release");
+            ok("accounting-blocker")
+        }),
+    );
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("blocker starts");
+
+    let (queued_rx, queued_token) = executor.submit_cancellable_async(
+        root.clone(),
+        Lane::PureRead,
+        "accounting-queued".to_string(),
+        Box::new(|_| ok("accounting-queued")),
+    );
+    let snapshot = executor
+        .try_dispatch_liveness_snapshot()
+        .expect("liveness snapshot");
+    assert_eq!(snapshot.interactive.queued, 1);
+
+    assert_eq!(
+        executor.cancel_job(&root, &queued_token),
+        JobCancelOutcome::QueuedRemoved
+    );
+    assert!(!recv_async(queued_rx, "queued cancel completion").success);
+    let snapshot = executor
+        .try_dispatch_liveness_snapshot()
+        .expect("liveness snapshot after cancel");
+    assert_eq!(snapshot.interactive.queued, 0);
+
+    release_tx.send(()).expect("release blocker");
+    assert!(recv_async(blocker, "blocker completion").success);
+
+    executor.remove_actor(&root);
+    let snapshot = executor
+        .try_dispatch_liveness_snapshot()
+        .expect("liveness after removal");
+    assert_eq!(snapshot.interactive.queued, 0);
+    assert_eq!(snapshot.maintenance.queued, 0);
+}
+
+#[test]
+fn already_expired_deadline_rejects_admission_with_request_deadline_exceeded() {
+    let executor = test_executor(2, 1, 1, 1);
+    let (_dir, root) = test_root("expired-admission");
+    executor.register_actor(root.clone(), test_ctx());
+
+    let executed = Arc::new(AtomicUsize::new(0));
+    let executed_probe = Arc::clone(&executed);
+    let (rx, _token) = executor.submit_cancellable_async_with_deadline(
+        root,
+        Lane::PureRead,
+        "expired-admission-job".to_string(),
+        Box::new(move |_| {
+            executed_probe.fetch_add(1, Ordering::AcqRel);
+            ok("expired-admission-job")
+        }),
+        Some(Instant::now() - Duration::from_secs(1)),
+    );
+    let response = recv_async(rx, "expired admission completion");
+    assert!(!response.success);
+    assert_eq!(response.data["code"], "request_deadline_exceeded");
+    assert_eq!(response.data["retryable"], serde_json::json!(false));
+    assert_eq!(response.data["phase"], serde_json::json!("queue"));
+    assert_eq!(executed.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn dispatched_job_is_not_auto_cancelled_after_deadline_passes() {
+    // Once popped, a job runs to completion even if its deadline elapses
+    // mid-execution; the queue-scoped rule keeps dispatched work authoritative.
+    let executor = test_executor(2, 1, 1, 1);
+    let (_dir, root) = test_root("dispatched-not-cancelled");
+    executor.register_actor(root.clone(), test_ctx());
+
+    let (rx, _token) = executor.submit_cancellable_async_with_deadline(
+        root,
+        Lane::PureRead,
+        "late-runner".to_string(),
+        Box::new(|_| {
+            thread::sleep(Duration::from_millis(150));
+            ok("late-runner")
+        }),
+        Some(Instant::now() + Duration::from_millis(20)),
+    );
+    let response = recv_async(rx, "late runner completion");
+    assert!(
+        response.success,
+        "a dispatched job must complete despite an elapsed deadline"
+    );
+}
+
+#[test]
+fn deadline_aware_writer_urgency_matches_budget_boundaries() {
+    struct Case {
+        label: &'static str,
+        deadline: Option<Instant>,
+        now_offset_ms: u64,
+        expect_urgent: bool,
+    }
+    let now = Instant::now();
+    let cases = [
+        // Budget <= 6s: urgent immediately (remaining <= promotion-age floor).
+        Case {
+            label: "small budget immediate urgency",
+            deadline: Some(now + Duration::from_secs(6)),
+            now_offset_ms: 0,
+            expect_urgent: true,
+        },
+        // 12s RouteBind budget, queued for ~0ms: urgency at 6s age. Not urgent yet.
+        Case {
+            label: "halfway not reached",
+            deadline: Some(now + Duration::from_secs(12)),
+            now_offset_ms: 0,
+            expect_urgent: false,
+        },
+        // 12s budget queued at 6s: halfway point reached.
+        Case {
+            label: "halfway urgency",
+            deadline: Some(now + Duration::from_secs(6)),
+            now_offset_ms: 6_000,
+            expect_urgent: true,
+        },
+        // Deadline-less writers fall back to the promotion age.
+        Case {
+            label: "deadline-less below promotion age",
+            deadline: None,
+            now_offset_ms: 5_999,
+            expect_urgent: false,
+        },
+        Case {
+            label: "deadline-less at promotion age",
+            deadline: None,
+            now_offset_ms: 6_000,
+            expect_urgent: true,
+        },
+    ];
+    for case in cases {
+        let mut actor = ActorState::new(test_ctx());
+        let (tx, _rx) = crossbeam_channel::bounded::<Response>(1);
+        actor.push_job(
+            JobClass::Interactive,
+            Lane::Mutating,
+            QueuedJob {
+                request_id: "bind".to_string(),
+                command: "executor::Interactive::Mutating".to_string(),
+                job: Box::new(|_ctx| ok("bind")),
+                completion: CompletionSender::Sync(tx),
+                queued_at: now,
+                deadline: case.deadline,
+                cancellation: None,
+                maintenance_coalesce_key: None,
+            },
+        );
+        let probe_now = now + Duration::from_millis(case.now_offset_ms);
+        assert_eq!(
+            actor
+                .class_queues(JobClass::Interactive)
+                .has_urgent_writer(probe_now),
+            case.expect_urgent,
+            "urgency boundary failed: {}",
+            case.label
+        );
     }
 }

@@ -240,24 +240,19 @@ pub struct CheckpointStore {
     blob_counter: AtomicU64,
 }
 
-/// Owns a checkpoint mutation lock and removes its project scope directory after
-/// the filesystem lock has released. The directory scopes only the transient
-/// lockfile; durable checkpoint bytes live under the harness namespace instead.
+/// Owns a checkpoint mutation lock.
+///
+/// The lock scope directory is durable. Removing it after each owner releases
+/// the lock races another process between its `create_dir_all` and exclusive
+/// lock-file creation.
 struct CheckpointLockGuard {
     guard: Option<fs_lock::LockGuard>,
-    scope_dir: Option<PathBuf>,
 }
 
 impl Drop for CheckpointLockGuard {
     fn drop(&mut self) {
-        // LockGuard::drop must join the heartbeat before removing the lockfile.
-        // Drop it first, then make the best-effort directory cleanup so a new
-        // owner can keep the scope directory when it races this release.
         if let Some(guard) = self.guard.take() {
             drop(guard);
-        }
-        if let Some(scope_dir) = &self.scope_dir {
-            remove_empty_scope_dir(scope_dir);
         }
     }
 }
@@ -361,10 +356,7 @@ impl CheckpointStore {
             },
         })?;
 
-        Ok(CheckpointLockGuard {
-            guard: Some(guard),
-            scope_dir,
-        })
+        Ok(CheckpointLockGuard { guard: Some(guard) })
     }
 
     /// Create a checkpoint by reading the given files, scoped to `session`.
@@ -1933,7 +1925,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_lock_scope_is_removed_after_release() {
+    fn checkpoint_lock_scope_remains_after_release() {
         let dir = tempfile::tempdir().unwrap();
         let scope_dir = dir.path().join("checkpoints").join("project-scope");
         let lock_path = scope_dir.join("checkpoint.lock");
@@ -1946,7 +1938,10 @@ mod tests {
             .create(DEFAULT_SESSION_ID, "released", vec![path], &backup_store)
             .unwrap();
 
-        assert!(!scope_dir.exists(), "released lock scope should be removed");
+        assert!(
+            scope_dir.is_dir(),
+            "released lock scope must remain durable"
+        );
     }
 
     #[test]
@@ -2264,6 +2259,47 @@ mod tests {
 
         store.restore(DEFAULT_SESSION_ID, "locked").unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+    }
+
+    #[test]
+    fn concurrent_checkpoint_stores_keep_shared_lock_scope_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("locks").join("checkpoint.lock");
+        let file = dir.path().join("shared.txt");
+        fs::write(&file, "content").unwrap();
+        let start = Arc::new(std::sync::Barrier::new(3));
+
+        let workers = (0..2)
+            .map(|worker| {
+                let lock_path = lock_path.clone();
+                let file = file.clone();
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    let mut store =
+                        CheckpointStore::with_lock_path(lock_path, Duration::from_secs(2));
+                    let backup = BackupStore::new();
+                    start.wait();
+                    for iteration in 0..100 {
+                        store
+                            .create(
+                                DEFAULT_SESSION_ID,
+                                &format!("worker-{worker}-{iteration}"),
+                                vec![file.clone()],
+                                &backup,
+                            )
+                            .expect("shared checkpoint lock scope must remain available");
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        for worker in workers {
+            worker.join().expect("checkpoint worker");
+        }
+        assert!(
+            lock_path.parent().unwrap().is_dir(),
+            "shared lock scope must remain stable between owners"
+        );
     }
 
     #[cfg(unix)]
