@@ -599,8 +599,11 @@ fn ruff_format_available_uncached(project_root: Option<&Path>) -> bool {
         Some(command) => command,
         None => return false,
     };
-    let output = match crate::effective_path::new_command(&command)
-        .arg("--version")
+    let mut version_command = match external_tool_command(&command, &["--version"]) {
+        Ok(command) => command,
+        Err(_) => return false,
+    };
+    let output = match version_command
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()

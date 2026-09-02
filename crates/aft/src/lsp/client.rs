@@ -194,6 +194,13 @@ impl LspClient {
             // actionable diagnostics without risking pipe-buffer deadlock.
             .stderr(Stdio::piped());
         for (key, value) in env {
+            #[cfg(windows)]
+            if is_batch_file && crate::windows_command::is_batch_internal_env(key) {
+                crate::slog_warn!(
+                    "ignoring reserved batch-shim environment variable {key} for LSP server"
+                );
+                continue;
+            }
             command.env(key, value);
         }
 
