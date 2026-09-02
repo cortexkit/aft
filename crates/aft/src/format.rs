@@ -152,6 +152,25 @@ fn kill_process_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
+/// Build the command used by formatter and checker subprocesses.
+fn external_tool_command(command: &str, args: &[&str]) -> Result<Command, FormatError> {
+    #[cfg(windows)]
+    if crate::windows_command::is_batch_file(Path::new(command)) {
+        return crate::windows_command::batch_command(
+            Path::new(command),
+            args.iter().map(|arg| std::ffi::OsStr::new(*arg)),
+        )
+        .map_err(|error| FormatError::Failed {
+            tool: command.to_string(),
+            stderr: error.to_string(),
+        });
+    }
+
+    let mut cmd = crate::effective_path::new_command(command);
+    cmd.args(args);
+    Ok(cmd)
+}
+
 /// Spawn a subprocess and wait for completion with timeout protection.
 ///
 /// Polls `try_wait()` at 50ms intervals. On timeout, kills the child process
@@ -163,8 +182,8 @@ pub fn run_external_tool(
     working_dir: Option<&Path>,
     timeout_secs: u32,
 ) -> Result<ExternalToolResult, FormatError> {
-    let mut cmd = crate::effective_path::new_command(command);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut cmd = external_tool_command(command, args)?;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -1615,8 +1634,8 @@ pub fn run_external_tool_capture(
     working_dir: Option<&Path>,
     timeout_secs: u32,
 ) -> Result<ExternalToolResult, FormatError> {
-    let mut cmd = crate::effective_path::new_command(command);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut cmd = external_tool_command(command, args)?;
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
@@ -2425,6 +2444,19 @@ mod tests {
         let res = result.unwrap();
         assert_eq!(res.exit_code, 0);
         assert!(res.stdout.contains("hello"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_external_tool_invokes_npm_style_batch_shim() {
+        let temp = tempfile::tempdir().unwrap();
+        let shim = temp.path().join("formatter shim.cmd");
+        std::fs::write(&shim, "@echo off\r\necho %~1\r\n").unwrap();
+
+        let result =
+            run_external_tool(shim.to_str().unwrap(), &["--stdin-filepath"], None, 5).unwrap();
+
+        assert_eq!(result.stdout.trim(), "--stdin-filepath");
     }
 
     #[cfg(unix)]
