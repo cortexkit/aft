@@ -301,3 +301,4 @@ Adding a command means implementing it in Rust (`crates/aft/src/commands/`) and 
 - [Configuration](docs/config.md): config schema, LSP, auto-install
 - [CLI commands](docs/cli.md): setup, doctor, and cache management
 - [Benchmarks](docs/benchmarks.md): search-index methodology *(numbers being finalized)*
+
