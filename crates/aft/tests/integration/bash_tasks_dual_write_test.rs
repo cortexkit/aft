@@ -1,7 +1,6 @@
 #![cfg(unix)]
 
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -15,6 +14,8 @@ use aft::db::bash_tasks::{upsert_bash_task, BashTaskRow};
 use aft::db::TrackedConnection as Connection;
 use aft::harness::Harness;
 use filetime::{set_file_mtime, FileTime};
+
+use super::helpers::ReleaseOnDrop;
 
 const SESSION: &str = "dual-write-session";
 
@@ -130,9 +131,10 @@ fn wait_for_file(path: &Path) {
 
 fn hold_until_release_command(marker: &Path, release: &Path) -> String {
     format!(
-        "printf ready > {}; while [ ! -f {} ]; do sleep 0.05; done",
+        "printf ready > {}; polls=0; while [ ! -f {} ] && [ \"$polls\" -lt 6000 ]; do sleep 0.05; polls=$((polls + 1)); done; if [ ! -f {} ]; then printf 'gate-timeout\\n'; fi",
         shell_quote_path(marker),
-        shell_quote_path(release)
+        shell_quote_path(release),
+        shell_quote_path(release),
     )
 }
 
@@ -272,6 +274,9 @@ fn bash_tasks_dual_write_status_transitions_update_db_row() {
 
     let marker = project.path().join("dual-write-running.alive");
     let release = project.path().join("dual-write-running.release");
+    // Declare after both TempDirs: Rust drops locals in reverse declaration order,
+    // so this guard writes the sentinel before either TempDir removes its directory.
+    let _release_guard = ReleaseOnDrop::new(release.clone());
     let command = hold_until_release_command(&marker, &release);
     let task_id = spawn_task(&registry, storage.path(), project.path(), &command);
     wait_for_file(&marker);
@@ -279,7 +284,7 @@ fn bash_tasks_dual_write_status_transitions_update_db_row() {
     assert!(running.pid.is_some());
     assert!(running.completed_at.is_none());
 
-    fs::write(&release, "").expect("release background task");
+    drop(_release_guard);
     let completed = wait_for_status(&conn, "opencode", SESSION, &task_id, "completed");
     assert_eq!(completed.exit_code, Some(0));
     assert!(completed.pid.is_none());

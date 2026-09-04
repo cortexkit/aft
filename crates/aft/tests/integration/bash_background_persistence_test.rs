@@ -17,7 +17,7 @@ use aft::bash_background::{BgTaskRegistry, BgTaskStatus};
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::{user_config, AftProcess, ReleaseOnDrop};
 
 const SESSION: &str = "persist-session";
 
@@ -174,14 +174,6 @@ fn persisted_watch_rows(
     let conn = rusqlite::Connection::open(storage.join("aft.db")).expect("open watch database");
     aft::db::bash_watches::list_bash_pattern_watches_for_task(&conn, "opencode", session, task_id)
         .expect("read persisted watch rows")
-}
-
-struct StopTaskOnDrop(PathBuf);
-
-impl Drop for StopTaskOnDrop {
-    fn drop(&mut self) {
-        let _ = fs::write(&self.0, b"stop");
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1156,7 +1148,14 @@ fn spawn_detached_survives_parent_restart() {
     // it. A fixed-duration sleep races the restart under CI load, so gate the
     // task's exit on a sentinel file the test controls instead.
     let stop_file = project.path().join("stop-detached-task");
-    let command = format!("until [ -e '{}' ]; do sleep 0.1; done", stop_file.display());
+    // Declare after both TempDirs: Rust drops locals in reverse declaration order,
+    // so this guard writes the sentinel before either TempDir removes its directory.
+    let _stop_guard = ReleaseOnDrop::new(stop_file.clone());
+    let command = format!(
+        "polls=0; while [ ! -e '{}' ] && [ \"$polls\" -lt 6000 ]; do sleep 0.1; polls=$((polls + 1)); done; if [ ! -e '{}' ]; then printf 'gate-timeout\\n'; fi",
+        stop_file.display(),
+        stop_file.display(),
+    );
 
     let task_id = {
         let mut aft = AftProcess::spawn();
@@ -1175,7 +1174,7 @@ fn spawn_detached_survives_parent_restart() {
     );
     assert_eq!(running["status"], "running");
 
-    std::fs::write(&stop_file, b"stop").unwrap();
+    drop(_stop_guard);
     let completed = wait_for_status(&mut aft, SESSION, &task_id, "completed");
     assert_eq!(completed["exit_code"], 0);
     assert!(aft.shutdown().success());
@@ -1361,11 +1360,17 @@ fn unacked_once_watch_replays_after_unread_rearm_crash_until_ack() {
     let storage = spawn_storage_dir("storage");
     let release = project.path().join("release-once-watch");
     let stop = project.path().join("stop-once-watch");
-    let _stop_guard = StopTaskOnDrop(stop.clone());
+    // Declare both guards after the TempDirs: Rust drops locals in reverse
+    // declaration order, so they write their sentinels before either TempDir
+    // removes the directory during unwinding.
+    let _release_guard = ReleaseOnDrop::new(release.clone());
+    let _stop_guard = ReleaseOnDrop::new(stop.clone());
     let command = format!(
-        "until [ -e {} ]; do sleep 0.05; done; printf '%s\\n' '{}'; until [ -e {} ]; do sleep 0.05; done",
+        "polls=0; while [ ! -e {} ] && [ \"$polls\" -lt 6000 ]; do sleep 0.05; polls=$((polls + 1)); done; if [ ! -e {} ]; then printf 'gate-timeout\\n'; exit 0; fi; printf '%s\\n' '{}'; polls=0; while [ ! -e {} ] && [ \"$polls\" -lt 6000 ]; do sleep 0.05; polls=$((polls + 1)); done; if [ ! -e {} ]; then printf 'gate-timeout\\n'; fi",
+        shell_quote_path(&release),
         shell_quote_path(&release),
         MATCH_TEXT,
+        shell_quote_path(&stop),
         shell_quote_path(&stop),
     );
 
@@ -1379,7 +1384,7 @@ fn unacked_once_watch_replays_after_unread_rearm_crash_until_ack() {
             "watch registration failed: {registered:?}"
         );
 
-        fs::write(&release, b"release").unwrap();
+        drop(_release_guard);
         let frame = wait_for_pattern_frame(&mut aft, &task_id);
         assert_eq!(frame["match_text"], MATCH_TEXT);
         assert_eq!(frame["once"], true);
@@ -1543,7 +1548,7 @@ fn unacked_once_watch_replays_after_unread_rearm_crash_until_ack() {
         "background child died before release"
     );
 
-    fs::write(&stop, b"stop").unwrap();
+    drop(_stop_guard);
     let completed = wait_for_status(&mut phase_four, SESSION, &task_id, "completed");
     assert_eq!(completed["exit_code"], 0);
     let final_ack = ack(&mut phase_four, SESSION, &task_id);

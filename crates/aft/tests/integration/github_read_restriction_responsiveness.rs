@@ -26,7 +26,7 @@ use aft::protocol::RawRequest;
 use serde_json::json;
 use url::Url;
 
-use super::helpers::AftProcess;
+use super::helpers::{AftProcess, ReleaseOnDrop};
 
 const RESOURCE: &str = "issue://owner/repo/7";
 const AMBIENT_OPERATOR_CREDENTIAL: &str = "ghp_operator_ambient_credential";
@@ -638,6 +638,9 @@ fn slow_github_fetch_does_not_block_sibling_status_or_ordinary_read_on_standalon
     let bin_dir = fixture.path().join("bin");
     let slow_started = fixture.path().join("slow-gh-started");
     let slow_release = fixture.path().join("slow-gh-release");
+    // Declare after the fixture TempDir: Rust drops locals in reverse declaration
+    // order, so this guard writes the sentinel before the TempDir removes its directory.
+    let _release_guard = ReleaseOnDrop::new(slow_release.clone());
     fs::create_dir_all(&bin_dir).expect("create slow-gh bin directory");
     // The fetch blocks on a release file rather than a sleep so the pending
     // window is gated, not timed: siblings answering while the release file is
@@ -725,6 +728,6 @@ printf '%s\n' '{"number":7,"title":"slow fixture","state":"OPEN","body":"slow bo
         !slow_release.exists(),
         "release file must not exist before the test creates it"
     );
-    fs::write(&slow_release, "").expect("release the slow gh fixture");
+    drop(_release_guard);
     assert!(aft.shutdown().success());
 }

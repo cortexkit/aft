@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::{user_config, AftProcess, ReleaseOnDrop};
 
 fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
@@ -72,24 +72,22 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(not(windows))]
 fn release_gate_command(release: &Path, text: &str) -> String {
+    const MAX_POLLS: usize = 6_000;
+    let release = shell_quote(&release.display().to_string());
     format!(
-        "while [ ! -f {} ]; do sleep 0.05; done; printf '%s\\n' {}",
-        shell_quote(&release.display().to_string()),
+        "polls=0; while [ ! -f {release} ] && [ \"$polls\" -lt {MAX_POLLS} ]; do sleep 0.05; polls=$((polls + 1)); done; if [ -f {release} ]; then printf '%s\\n' {}; else printf '%s\\n' 'gate-timeout'; fi",
         shell_quote(text)
     )
 }
 
 #[cfg(windows)]
 fn release_gate_command(release: &Path, text: &str) -> String {
+    const MAX_POLLS: usize = 6_000;
+    let release = shell_quote(&release.display().to_string());
     format!(
-        "while (-not (Test-Path -LiteralPath {})) {{ Start-Sleep -Milliseconds 50 }}; Write-Output {}",
-        shell_quote(&release.display().to_string()),
+        "$polls = 0; while ((-not (Test-Path -LiteralPath {release})) -and ($polls -lt {MAX_POLLS})) {{ Start-Sleep -Milliseconds 50; $polls++ }}; if (Test-Path -LiteralPath {release}) {{ Write-Output {} }} else {{ Write-Output 'gate-timeout' }}",
         shell_quote(text)
     )
-}
-
-fn release_task(path: &Path) {
-    fs::write(path, "go").expect("release watch task");
 }
 
 fn wait_for_pattern_frame(aft: &mut AftProcess, task_id: &str) -> Value {
@@ -105,6 +103,43 @@ fn wait_for_pattern_frame(aft: &mut AftProcess, task_id: &str) -> Value {
             "timed out waiting for pattern frame"
         );
     }
+}
+
+#[test]
+fn release_guard_unblocks_gated_child_after_panic() {
+    let mut aft = AftProcess::spawn();
+    let dir = configure_background(&mut aft);
+    let release = dir.path().join("panic-release");
+    let mut child_pid = None;
+    let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Declare after the TempDir: Rust drops locals in reverse declaration order,
+        // so this guard writes the sentinel before the TempDir removes its directory.
+        let _release_guard = ReleaseOnDrop::new(release.clone());
+        let task_id = spawn(&mut aft, &release_gate_command(&release, "panic-child"));
+        let running = status(&mut aft, &task_id);
+        assert_eq!(
+            running["status"], "running",
+            "task exited early: {running:?}"
+        );
+        child_pid = Some(running["child_pid"].as_u64().expect("gated task child PID") as u32);
+        panic!("intentional panic after spawning gated task");
+    }));
+
+    assert!(panic_result.is_err());
+    let child_pid = child_pid.expect("panic test recorded child PID");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while aft::bash_background::process::is_process_alive(child_pid) {
+        assert!(
+            Instant::now() < deadline,
+            "gated child {child_pid} survived ReleaseOnDrop"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        release.exists(),
+        "panic guard must write the release sentinel"
+    );
+    assert!(aft.shutdown().success());
 }
 
 fn status(aft: &mut AftProcess, task_id: &str) -> Value {
@@ -168,11 +203,14 @@ fn pattern_match_emits_push_frame() {
     let mut aft = AftProcess::spawn();
     let dir = configure_background(&mut aft);
     let release = dir.path().join("pattern-release");
+    // Declare after the TempDir: Rust drops locals in reverse declaration order,
+    // so this guard writes the sentinel before the TempDir removes its directory.
+    let _release_guard = ReleaseOnDrop::new(release.clone());
     let command = release_gate_command(&release, "READY");
     let task_id = spawn(&mut aft, &command);
     let response = notify(&mut aft, &task_id, json!({ "pattern": "READY" }));
     assert_eq!(response["success"], true, "notify failed: {response:?}");
-    release_task(&release);
+    drop(_release_guard);
     let frame = wait_for_pattern_frame(&mut aft, &task_id);
     assert_eq!(frame["match_text"], "READY");
     assert_eq!(frame["once"], true);
@@ -187,8 +225,12 @@ fn pattern_match_offset_counts_original_bytes_before_invalid_utf8() {
     let release = dir.path().join("invalid-utf8-release");
     let payload = dir.path().join("invalid-utf8-output");
     fs::write(&payload, b"\xffREADY\n").unwrap();
+    // Declare after the TempDir: Rust drops locals in reverse declaration order,
+    // so this guard writes the sentinel before the TempDir removes its directory.
+    let _release_guard = ReleaseOnDrop::new(release.clone());
     let command = format!(
-        "while [ ! -f {} ]; do sleep 0.05; done; cat {}",
+        "polls=0; while [ ! -f {} ] && [ \"$polls\" -lt 6000 ]; do sleep 0.05; polls=$((polls + 1)); done; if [ -f {} ]; then cat {}; else printf '%s\\n' 'gate-timeout'; fi",
+        shell_quote(&release.display().to_string()),
         shell_quote(&release.display().to_string()),
         shell_quote(&payload.display().to_string()),
     );
@@ -196,7 +238,7 @@ fn pattern_match_offset_counts_original_bytes_before_invalid_utf8() {
     let response = notify(&mut aft, &task_id, json!({ "pattern": "READY" }));
     assert_eq!(response["success"], true, "notify failed: {response:?}");
 
-    release_task(&release);
+    drop(_release_guard);
     let frame = wait_for_pattern_frame(&mut aft, &task_id);
 
     assert_eq!(frame["match_text"], "READY");
@@ -227,11 +269,14 @@ fn regex_pattern_matches_with_capture() {
     let mut aft = AftProcess::spawn();
     let dir = configure_background(&mut aft);
     let release = dir.path().join("regex-release");
+    // Declare after the TempDir: Rust drops locals in reverse declaration order,
+    // so this guard writes the sentinel before the TempDir removes its directory.
+    let _release_guard = ReleaseOnDrop::new(release.clone());
     let command = release_gate_command(&release, "port 3000");
     let task_id = spawn(&mut aft, &command);
     let response = notify(&mut aft, &task_id, json!({ "regex": "port (\\d+)" }));
     assert_eq!(response["success"], true, "notify failed: {response:?}");
-    release_task(&release);
+    drop(_release_guard);
     let frame = wait_for_pattern_frame(&mut aft, &task_id);
     assert_eq!(frame["match_text"], "port 3000");
     assert!(aft.shutdown().success());
@@ -242,11 +287,14 @@ fn final_output_scan_emits_pattern_before_completion_on_exit_race() {
     let mut aft = AftProcess::spawn();
     let dir = configure_background(&mut aft);
     let release = dir.path().join("exit-race-release");
+    // Declare after the TempDir: Rust drops locals in reverse declaration order,
+    // so this guard writes the sentinel before the TempDir removes its directory.
+    let _release_guard = ReleaseOnDrop::new(release.clone());
     let command = release_gate_command(&release, "ready-now");
     let task_id = spawn(&mut aft, &command);
     let response = notify(&mut aft, &task_id, json!({ "pattern": "ready-now" }));
     assert_eq!(response["success"], true, "notify failed: {response:?}");
-    release_task(&release);
+    drop(_release_guard);
 
     let started = Instant::now();
     loop {
@@ -274,11 +322,14 @@ fn watch_controlled_exit_emits_exit_safety_net_not_completion() {
     let mut aft = AftProcess::spawn();
     let dir = configure_background(&mut aft);
     let release = dir.path().join("exit-safety-release");
+    // Declare after the TempDir: Rust drops locals in reverse declaration order,
+    // so this guard writes the sentinel before the TempDir removes its directory.
+    let _release_guard = ReleaseOnDrop::new(release.clone());
     let command = release_gate_command(&release, "never-matches-output");
     let task_id = spawn(&mut aft, &command);
     let response = notify(&mut aft, &task_id, json!({ "pattern": "not-present" }));
     assert_eq!(response["success"], true, "notify failed: {response:?}");
-    release_task(&release);
+    drop(_release_guard);
 
     let started = Instant::now();
     loop {
@@ -327,6 +378,9 @@ fn erased_watch_target_emits_tombstone_and_terminalizes_watch() {
     let mut aft = AftProcess::spawn();
     let dir = configure_background(&mut aft);
     let release = dir.path().join("erased-watch-release");
+    // Declare after the TempDir: Rust drops locals in reverse declaration order,
+    // so this guard writes the sentinel before the TempDir removes its directory.
+    let _release_guard = ReleaseOnDrop::new(release.clone());
     let task_id = spawn(
         &mut aft,
         &release_gate_command(&release, "never-reached-erased-watch"),
@@ -383,8 +437,8 @@ fn erased_watch_target_emits_tombstone_and_terminalizes_watch() {
         )
         .unwrap();
     assert_eq!(remaining, 0, "acked tombstone must be terminally removed");
+    drop(_release_guard);
 
-    release_task(&release);
     assert!(aft.shutdown().success());
 }
 
@@ -393,6 +447,9 @@ fn bash_status_distinguishes_erased_watched_task_from_never_existing_task() {
     let mut aft = AftProcess::spawn();
     let dir = configure_background(&mut aft);
     let release = dir.path().join("erased-status-release");
+    // Declare after the TempDir: Rust drops locals in reverse declaration order,
+    // so this guard writes the sentinel before the TempDir removes its directory.
+    let _release_guard = ReleaseOnDrop::new(release.clone());
     let task_id = spawn(
         &mut aft,
         &release_gate_command(&release, "never-reached-erased-status"),
@@ -432,8 +489,8 @@ fn bash_status_distinguishes_erased_watched_task_from_never_existing_task() {
         .as_str()
         .unwrap()
         .contains("row was erased"));
+    drop(_release_guard);
 
-    release_task(&release);
     assert!(aft.shutdown().success());
 }
 

@@ -38,6 +38,8 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
+use super::helpers::ReleaseOnDrop;
+
 static BRIDGE_STATE: OnceLock<Mutex<Option<Arc<BridgeState>>>> = OnceLock::new();
 static BRIDGE_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -3851,6 +3853,10 @@ async fn drive_bash_lane_nonoccupancy_daemon(input: FakeDaemonInput) {
     bind_route1(&mut stream, &root1).await;
     let marker = root1.join("lane-bash-started");
     let release = root1.join("lane-bash-release");
+    // The root TempDir is owned by the enclosing bridge harness. Declare this
+    // guard after its path is bound so it releases the child before that owner
+    // removes the directory during unwinding.
+    let _release_guard = ReleaseOnDrop::new(release.clone());
     send_tool_call(
         &mut stream,
         1,
@@ -3898,7 +3904,7 @@ async fn drive_bash_lane_nonoccupancy_daemon(input: FakeDaemonInput) {
 
     // Release only after both sibling responses. If the bash wait occupied an
     // executor lane, neither response could satisfy this ordering proof.
-    std::fs::write(&release, b"release").expect("release lane bash task");
+    drop(_release_guard);
     let bash = read_frame_timeout(&mut stream, "lane bash final response").await;
     assert_eq!(bash.header.corr, 107);
     let text = tool_result_text(&bash);
@@ -6878,15 +6884,17 @@ fn hold_bash_until_release_command(
         // timeout on Windows CI). Same pattern as bash_background_test.rs's
         // cross_platform_hold_until_release_command.
         format!(
-            "Set-Content -NoNewline -Path \"{}\" -Value started; while (-not (Test-Path \"{}\")) {{ Start-Sleep -Milliseconds 50 }}; Write-Output '{}'",
+            "Set-Content -NoNewline -Path \"{}\" -Value started; $polls = 0; while ((-not (Test-Path \"{}\")) -and ($polls -lt 6000)) {{ Start-Sleep -Milliseconds 50; $polls++ }}; if (Test-Path \"{}\") {{ Write-Output '{}' }} else {{ Write-Output 'gate-timeout' }}",
             shell_path(marker),
+            shell_path(release),
             shell_path(release),
             terminal_text,
         )
     } else {
         format!(
-            "printf started > \"{}\"; until [ -e \"{}\" ]; do sleep 0.05; done; printf '{}\\n'",
+            "printf started > \"{}\"; polls=0; until [ -e \"{}\" ] || [ \"$polls\" -ge 6000 ]; do sleep 0.05; polls=$((polls + 1)); done; if [ -e \"{}\" ]; then printf '{}\\n'; else printf 'gate-timeout\\n'; fi",
             shell_path(marker),
+            shell_path(release),
             shell_path(release),
             terminal_text,
         )

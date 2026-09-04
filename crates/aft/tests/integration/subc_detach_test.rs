@@ -10,6 +10,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+
+use super::helpers::ReleaseOnDrop;
 use subc_protocol::session::{ModuleControlRequest, ModuleControlResponse};
 use subc_protocol::{
     BindIdentity, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Principal,
@@ -42,6 +44,9 @@ fn subc_background_bash_survives_module_process_group_restart() {
 
         let ready = project.path().join("bg.ready");
         let stop = project.path().join("bg.stop");
+        // Declare after all TempDirs: Rust drops locals in reverse declaration
+        // order, so this guard writes the sentinel before any TempDir removes its directory.
+        let _stop_guard = ReleaseOnDrop::new(stop.clone());
         let command = sentinel_command(&ready, &stop);
 
         let mut first_module = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
@@ -99,7 +104,7 @@ fn subc_background_bash_survives_module_process_group_restart() {
         );
         assert_process_alive(child_pid, "rehydrated background child");
 
-        std::fs::write(&stop, "stop\n").expect("write stop sentinel");
+        drop(_stop_guard);
         let completed = wait_for_status(&mut stream, 31, &task_id, "completed").await;
         assert_eq!(completed["exit_code"], 0, "task should exit cleanly: {completed}");
         let output = completed["output_preview"].as_str().unwrap_or_default();
@@ -475,7 +480,7 @@ fn extract_task_id(frame: &Frame) -> String {
 
 fn sentinel_command(ready: &Path, stop: &Path) -> String {
     format!(
-        "printf 'sentinel-started\\n'; touch {ready}; while [ ! -f {stop} ]; do sleep 0.05; done; printf 'sentinel-stopped\\n'",
+        "printf 'sentinel-started\\n'; touch {ready}; polls=0; while [ ! -f {stop} ] && [ \"$polls\" -lt 6000 ]; do sleep 0.05; polls=$((polls + 1)); done; if [ -f {stop} ]; then printf 'sentinel-stopped\\n'; else printf 'gate-timeout\\n'; fi",
         ready = shell_quote(ready),
         stop = shell_quote(stop),
     )

@@ -16,6 +16,25 @@ pub(crate) use shared_test_env::{
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+
+/// Releases a shell fixture when its owning test scope unwinds.
+///
+/// Several integration fixtures keep a child shell behind a sentinel file.
+/// Writing that file during unwinding lets the child exit before its temporary
+/// directory is removed.
+pub struct ReleaseOnDrop(pub PathBuf);
+
+impl ReleaseOnDrop {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self(path.into())
+    }
+}
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, b"release");
+    }
+}
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     mpsc::{self, Receiver, RecvTimeoutError},

@@ -4,7 +4,7 @@
 #[allow(unused_imports)]
 pub use crate::test_helpers::{
     canonicalize_like_product, cargo_manifest_dir, disable_in_process_file_watcher, fixture_path,
-    user_config, user_config_tier, warm_executable, AftProcess,
+    user_config, user_config_tier, warm_executable, AftProcess, ReleaseOnDrop,
 };
 
 pub fn json_string(value: &impl std::fmt::Display) -> String {

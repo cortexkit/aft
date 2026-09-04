@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::{user_config, AftProcess, ReleaseOnDrop};
 
 #[cfg(unix)]
 fn process_exists(pid: i32) -> bool {
@@ -233,17 +233,19 @@ fn wait_for_file(path: &Path) {
 
 fn hold_until_release_command(marker: &Path, release: &Path) -> String {
     format!(
-        "printf ready > {}; while [ ! -f {} ]; do sleep 0.05; done",
+        "printf ready > {}; polls=0; while [ ! -f {} ] && [ \"$polls\" -lt 6000 ]; do sleep 0.05; polls=$((polls + 1)); done; if [ ! -f {} ]; then printf 'gate-timeout\\n'; fi",
         shell_quote_path(marker),
-        shell_quote_path(release)
+        shell_quote_path(release),
+        shell_quote_path(release),
     )
 }
 
 fn cross_platform_hold_until_release_command(marker: &Path, release: &Path) -> String {
     if cfg!(windows) {
         format!(
-            "Set-Content -NoNewline -Path {} -Value ready; while (-not (Test-Path {})) {{ Start-Sleep -Milliseconds 50 }}",
+            "Set-Content -NoNewline -Path {} -Value ready; $polls = 0; while ((-not (Test-Path {})) -and ($polls -lt 6000)) {{ Start-Sleep -Milliseconds 50; $polls++ }}; if (-not (Test-Path {})) {{ Write-Output 'gate-timeout' }}",
             cmd_quote_path(marker),
+            cmd_quote_path(release),
             cmd_quote_path(release)
         )
     } else {
@@ -556,6 +558,9 @@ fn background_spawn_status_running_and_completion() {
     let dir = configure_background(&mut aft);
     let marker = dir.path().join("spawn-running.alive");
     let release = dir.path().join("spawn-running.release");
+    // Declare after the TempDir: Rust drops locals in reverse declaration order,
+    // so this guard writes the sentinel before the TempDir removes its directory.
+    let _release_guard = ReleaseOnDrop::new(release.clone());
     let command = hold_until_release_command(&marker, &release);
 
     let task_id = spawn_bg(&mut aft, "spawn-running", &command);
@@ -567,7 +572,7 @@ fn background_spawn_status_running_and_completion() {
     );
     assert_eq!(running["status"], "running");
 
-    std::fs::write(&release, "").expect("release background task");
+    drop(_release_guard);
     let completed = wait_for_status(&mut aft, &task_id, "completed");
     assert_eq!(completed["exit_code"], 0);
     assert!(completed["duration_ms"].is_u64());
@@ -1050,6 +1055,9 @@ fn background_completion_delivery_is_scoped_by_session_id() {
     let dir = configure_background(&mut aft);
     let marker = dir.path().join("session-a-started");
     let release = dir.path().join("session-a-release");
+    // Declare after the TempDir: Rust drops locals in reverse declaration order,
+    // so this guard writes the sentinel before the TempDir removes its directory.
+    let _release_guard = ReleaseOnDrop::new(release.clone());
     let command = cross_platform_hold_until_release_command(&marker, &release);
 
     let spawn = aft.send(
@@ -1064,7 +1072,7 @@ fn background_completion_delivery_is_scoped_by_session_id() {
     assert_eq!(spawn["success"], true, "spawn failed: {spawn:?}");
     let task_id = spawn["task_id"].as_str().unwrap().to_string();
     wait_for_file(&marker);
-    std::fs::write(&release, "release").expect("release session A task");
+    drop(_release_guard);
 
     // The completion frame is emitted only after the authoritative completion
     // queue has admitted the task. Query the foreign session after that event,
