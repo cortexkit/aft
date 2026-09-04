@@ -72,6 +72,26 @@ fn main() {
         }
     }
 
+    // The detached helper must not initialize PATH: it probes in its own
+    // process and writes a cache for a later serving process to apply.
+    if std::env::args().nth(1).as_deref() == Some("--probe-login-shell-path") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match cli::probe_login_shell_path::parse_cache_path(args) {
+            Ok(cache_path) => {
+                if let Err(error) = aft::effective_path::refresh_login_shell_path_cache(&cache_path)
+                {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     // Handle --version before starting the normal application.
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("aft {}", env!("CARGO_PKG_VERSION"));
@@ -122,6 +142,7 @@ fn main() {
     aft::agent_child_env::scrub_inherited_process_markers();
 
     aft::logging::init();
+    aft::effective_path::log_startup_probe_result();
 
     if std::env::args().nth(1).as_deref() == Some("profile") {
         #[cfg(any(target_os = "macos", target_os = "linux"))]

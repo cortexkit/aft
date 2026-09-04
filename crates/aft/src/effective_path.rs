@@ -15,10 +15,12 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::process::{Command, Stdio};
 #[cfg(unix)]
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 #[cfg(unix)]
@@ -34,8 +36,20 @@ static EFFECTIVE_PATH: OnceLock<OsString> = OnceLock::new();
 #[derive(Clone, Debug)]
 struct PathState {
     path: &'static OsStr,
-    is_fallback: bool,
-    last_probe_attempt: Option<Instant>,
+    source: ProbeSource,
+    shell: String,
+    elapsed: Duration,
+    cache_path: PathBuf,
+    refresh_started: bool,
+    log_emitted: bool,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeSource {
+    Cache,
+    Probe,
+    Timeout,
 }
 
 #[cfg(unix)]
@@ -43,6 +57,10 @@ static EFFECTIVE_PATH_STATE: std::sync::Mutex<Option<PathState>> = std::sync::Mu
 
 #[cfg(unix)]
 const LOGIN_SHELL_PATH_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(unix)]
+const LOGIN_SHELL_PATH_PROBE_TOTAL_BUDGET: Duration = Duration::from_secs(4);
+#[cfg(unix)]
+const EFFECTIVE_PATH_CACHE_SCHEMA: u32 = 1;
 
 /// Compute and export AFT's process PATH.
 ///
@@ -58,9 +76,40 @@ pub fn initialize_process_path() -> &'static OsStr {
         if path != OsStr::new("") && std::env::var_os("PATH").as_deref() != Some(path) {
             std::env::set_var("PATH", path);
         }
+        spawn_cached_path_refresh();
     }
 
     path
+}
+
+/// Emit the single startup record after logging has been initialized.
+///
+/// PATH discovery runs before the logger and before threads, so this is split
+/// from [`initialize_process_path`] rather than delaying the environment write.
+pub fn log_startup_probe_result() {
+    #[cfg(unix)]
+    {
+        let mut guard = EFFECTIVE_PATH_STATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        if state.log_emitted {
+            return;
+        }
+        state.log_emitted = true;
+        let source = match state.source {
+            ProbeSource::Cache => "cache",
+            ProbeSource::Probe => "probe",
+            ProbeSource::Timeout => "timeout",
+        };
+        log::info!(
+            "login-shell PATH probe: source={source} shell={} elapsed_ms={}",
+            state.shell,
+            state.elapsed.as_millis()
+        );
+    }
 }
 
 /// Create a new `Command` with the effective PATH set on Unix.
@@ -97,104 +146,76 @@ pub fn effective_path() -> &'static OsStr {
     // the spawned test binary is a production build.
     // "0" reads as unset so the PATH feature's own integration tests can
     // opt back in to probing under a test harness that defaults the seam on.
-    if std::env::var_os("AFT_TEST_RAW_PATH").is_some_and(|v| v != "0" && !v.is_empty()) {
+    if std::env::var_os("AFT_TEST_RAW_PATH").is_some_and(|value| value != "0" && !value.is_empty())
+    {
         static RAW: OnceLock<OsString> = OnceLock::new();
         return RAW
             .get_or_init(|| std::env::var_os("PATH").unwrap_or_default())
             .as_os_str();
     }
+
     let mut guard = EFFECTIVE_PATH_STATE
         .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let state_opt = guard.clone();
-    if let Some(state) = state_opt {
-        if state.is_fallback {
-            let now = Instant::now();
-            let should_retry = state
-                .last_probe_attempt
-                .map(|last| now.duration_since(last) >= Duration::from_secs(60))
-                .unwrap_or(true);
-
-            if should_retry {
-                let last_attempt = Some(now);
-                let mut temp_state = state.clone();
-                temp_state.last_probe_attempt = last_attempt;
-                *guard = Some(temp_state);
-                drop(guard);
-
-                let new_path_opt = probe_login_shell_path();
-
-                let mut guard = EFFECTIVE_PATH_STATE
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                if let Some(new_path) = new_path_opt {
-                    write_login_path_memo(&new_path);
-                    let current = std::env::var_os("PATH").unwrap_or_default();
-                    let merged = merge_current_and_login_path(&current, &new_path);
-                    let home = std::env::var_os("HOME");
-                    let enriched =
-                        append_missing_standard_dirs(&merged, home.as_deref(), |dir| dir.is_dir());
-                    let leaked: &'static OsStr = Box::leak(enriched.into_boxed_os_str());
-                    let new_state = PathState {
-                        path: leaked,
-                        is_fallback: false,
-                        last_probe_attempt: None,
-                    };
-                    *guard = Some(new_state);
-                    return leaked;
-                } else {
-                    let memo_path_opt = read_login_path_memo();
-                    if let Some(mut current_state) = guard.clone() {
-                        current_state.last_probe_attempt = Some(Instant::now());
-                        if let Some(memo_path) = memo_path_opt {
-                            let current = std::env::var_os("PATH").unwrap_or_default();
-                            let merged = merge_current_and_login_path(&current, &memo_path);
-                            let home = std::env::var_os("HOME");
-                            let enriched =
-                                append_missing_standard_dirs(&merged, home.as_deref(), |dir| {
-                                    dir.is_dir()
-                                });
-                            let leaked: &'static OsStr = Box::leak(enriched.into_boxed_os_str());
-                            current_state.path = leaked;
-                            current_state.is_fallback = false;
-                        }
-                        *guard = Some(current_state);
-                        return guard.as_ref().unwrap().path;
-                    }
-                }
-            }
-        }
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(state) = guard.as_ref() {
         return state.path;
     }
 
+    let started = Instant::now();
     let current = std::env::var_os("PATH").unwrap_or_default();
     let home = std::env::var_os("HOME");
+    // Use the normal process-state resolver. It is available before the app is
+    // constructed, so no early XDG-only fallback can split this cache from AFT's
+    // configured storage root.
+    let cache_path = crate::bash_background::storage_dir(None).join("effective-path.json");
+    let candidates = login_shell_candidates();
 
-    let mut is_fallback = false;
-    let mut last_probe_attempt = None;
+    let (login_path, source, shell) = read_effective_path_cache(&cache_path)
+        .filter(|cache| cache_matches_current_shell(cache, &candidates))
+        .map(|cache| {
+            (
+                cache.path.map(OsString::from),
+                ProbeSource::Cache,
+                cache.shell,
+            )
+        })
+        .unwrap_or_else(|| {
+            let result = probe_login_shell_path();
+            let cache = EffectivePathCache {
+                schema: EFFECTIVE_PATH_CACHE_SCHEMA,
+                shell: result.shell.to_string_lossy().into_owned(),
+                path: result
+                    .path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                probed_at_unix: unix_timestamp_secs(),
+                inputs: shell_startup_inputs(&result.shell),
+            };
+            let _ = write_effective_path_cache(&cache_path, &cache);
+            let source = if result.path.is_some() {
+                ProbeSource::Probe
+            } else {
+                ProbeSource::Timeout
+            };
+            (result.path, source, cache.shell)
+        });
 
-    // Probe every startup: a daemon PATH can contain the usual system and
-    // package-manager directories while still omitting entries added by an
-    // interactive shell rc file.
-    let path = if let Some(login_path) = probe_login_shell_path() {
-        write_login_path_memo(&login_path);
-        merge_current_and_login_path(&current, &login_path)
-    } else if let Some(memo_path) = read_login_path_memo() {
-        merge_current_and_login_path(&current, &memo_path)
-    } else {
-        is_fallback = true;
-        last_probe_attempt = Some(Instant::now());
-        current.to_os_string()
-    };
-
-    let enriched = append_missing_standard_dirs(&path, home.as_deref(), |dir| dir.is_dir());
-    let leaked: &'static OsStr = Box::leak(enriched.into_boxed_os_str());
+    let merged = login_path
+        .as_deref()
+        .map(|path| merge_current_and_login_path(&current, path))
+        .unwrap_or_else(|| current.clone());
+    let enriched = append_missing_standard_dirs(&merged, home.as_deref(), |dir| dir.is_dir());
+    let path = Box::leak(enriched.into_boxed_os_str());
     *guard = Some(PathState {
-        path: leaked,
-        is_fallback,
-        last_probe_attempt,
+        path,
+        source,
+        shell,
+        elapsed: started.elapsed(),
+        cache_path,
+        refresh_started: false,
+        log_emitted: false,
     });
-    leaked
+    path
 }
 
 #[cfg(windows)]
@@ -261,26 +282,58 @@ where
 }
 
 #[cfg(unix)]
-fn probe_login_shell_path() -> Option<OsString> {
+#[derive(Debug)]
+struct LoginPathProbe {
+    shell: PathBuf,
+    path: Option<OsString>,
+}
+
+#[cfg(unix)]
+fn probe_login_shell_path() -> LoginPathProbe {
     let candidates = login_shell_candidates();
+    let fallback_shell = candidates
+        .first()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("/bin/sh"));
+    let deadline = Instant::now() + LOGIN_SHELL_PATH_PROBE_TOTAL_BUDGET;
+
     for shell in candidates {
-        let Some(path) = probe_login_shell_path_once(&shell, LOGIN_SHELL_PATH_PROBE_TIMEOUT) else {
-            continue;
-        };
-        if login_path_is_acceptable(&path) {
-            return Some(path);
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let timeout = LOGIN_SHELL_PATH_PROBE_TIMEOUT.min(deadline.saturating_duration_since(now));
+        if let Some(path) = probe_login_shell_path_once(&shell, timeout) {
+            if login_path_is_acceptable(&path) {
+                // Cache against the requested shell, not a fallback that happened
+                // to answer this probe. Otherwise a hanging $SHELL would pay its
+                // timeout again on every launch before the fallback can be reused.
+                return LoginPathProbe {
+                    shell: fallback_shell,
+                    path: Some(path),
+                };
+            }
         }
     }
-    None
+
+    LoginPathProbe {
+        shell: fallback_shell,
+        path: None,
+    }
 }
 
 #[cfg(unix)]
 fn login_shell_candidates() -> Vec<PathBuf> {
-    if cfg!(test) {
-        if let Some(val) = std::env::var_os("AFT_TEST_LOGIN_SHELL_CANDIDATES") {
-            return std::env::split_paths(&val).collect();
+    // This runtime seam lets integration tests exercise the production binary
+    // with a deterministic shell. Normal launches still use SHELL and fall back
+    // to the common interactive shells below.
+    if let Some(value) = std::env::var_os("AFT_TEST_LOGIN_SHELL_CANDIDATES") {
+        let candidates = std::env::split_paths(&value).collect::<Vec<_>>();
+        if !candidates.is_empty() {
+            return candidates;
         }
     }
+
     let mut candidates = Vec::new();
     if let Some(shell) = std::env::var_os("SHELL").filter(|value| !value.is_empty()) {
         candidates.push(PathBuf::from(shell));
@@ -342,7 +395,10 @@ fn probe_login_shell_path_once(shell: &Path, timeout: Duration) -> Option<OsStri
         use std::io::Read;
         match stdout.read(&mut buf) {
             Ok(0) => {
-                let wait_deadline = Instant::now() + Duration::from_secs(1);
+                // EOF can arrive before a shell-startup child exits. Keep the
+                // existing one-second reap grace, but never let it overrun the
+                // caller's per-candidate share of the total startup budget.
+                let wait_deadline = (Instant::now() + Duration::from_secs(1)).min(deadline);
                 loop {
                     match child.try_wait() {
                         Ok(Some(_)) => break,
@@ -364,9 +420,7 @@ fn probe_login_shell_path_once(shell: &Path, timeout: Duration) -> Option<OsStri
             Ok(n) => {
                 output_bytes.extend_from_slice(&buf[..n]);
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No data available right now
-            }
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => {
                 kill_login_shell_probe(&mut child);
                 return None;
@@ -379,7 +433,7 @@ fn probe_login_shell_path_once(shell: &Path, timeout: Duration) -> Option<OsStri
                     match stdout.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => output_bytes.extend_from_slice(&buf[..n]),
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             break;
                         }
                         Err(_) => break,
@@ -404,17 +458,10 @@ fn probe_login_shell_path_once(shell: &Path, timeout: Duration) -> Option<OsStri
 }
 
 #[cfg(unix)]
-fn probe_shell_flags(shell: &Path) -> &'static str {
-    let name = shell.file_name().and_then(|name| name.to_str());
-    if name.is_some_and(|name| name.eq_ignore_ascii_case("zsh")) {
-        // zsh login shells read .zprofile/.zlogin, while interactive shells
-        // read .zshrc; both modes are needed to reproduce a terminal PATH.
-        "-lic"
-    } else {
-        // bash -lc reads the login startup files (which conventionally source
-        // .bashrc), and fish -lc reads config.fish without needing -i.
-        "-lc"
-    }
+fn probe_shell_flags(_shell: &Path) -> &'static str {
+    // Login and interactive modes together cover the startup files that may
+    // contribute PATH entries, including bash's .bashrc and zsh's .zshrc.
+    "-lic"
 }
 
 #[cfg(unix)]
@@ -468,7 +515,7 @@ fn login_path_is_acceptable(path: &OsStr) -> bool {
 
     if bytes.contains(&b' ') {
         let mut abs_count = 0;
-        for part in bytes.split(|&b| b == b' ') {
+        for part in bytes.split(|&byte| byte == b' ') {
             if part.first() == Some(&b'/') {
                 abs_count += 1;
             }
@@ -500,31 +547,186 @@ fn merge_current_and_login_path(current_path: &OsStr, login_path: &OsStr) -> OsS
 }
 
 #[cfg(unix)]
-#[derive(Serialize, Deserialize)]
-struct LoginPathMemo {
-    login_path: String,
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct EffectivePathInput {
+    file: String,
+    mtime_ns: Option<i128>,
+    size: Option<u64>,
 }
 
 #[cfg(unix)]
-fn read_login_path_memo() -> Option<OsString> {
-    let memo_path = crate::bash_background::storage_dir(None).join("login-path-memo.json");
-    let content = std::fs::read_to_string(&memo_path).ok()?;
-    let memo: LoginPathMemo = serde_json::from_str(&content).ok()?;
-    Some(OsString::from(memo.login_path))
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct EffectivePathCache {
+    schema: u32,
+    shell: String,
+    path: Option<String>,
+    probed_at_unix: u64,
+    inputs: Vec<EffectivePathInput>,
 }
 
 #[cfg(unix)]
-fn write_login_path_memo(path: &OsStr) {
-    let memo_path = crate::bash_background::storage_dir(None).join("login-path-memo.json");
-    if let Some(parent) = memo_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+fn read_effective_path_cache(path: &Path) -> Option<EffectivePathCache> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+#[cfg(unix)]
+fn write_effective_path_cache(path: &Path, cache: &EffectivePathCache) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    let memo = LoginPathMemo {
-        login_path: path.to_string_lossy().into_owned(),
+    let content = serde_json::to_vec(cache).map_err(std::io::Error::other)?;
+    let temporary = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("effective-path.json"),
+        std::process::id()
+    ));
+    let result = (|| {
+        std::fs::write(&temporary, content)?;
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn cache_matches_current_shell(cache: &EffectivePathCache, candidates: &[PathBuf]) -> bool {
+    let Some(current_shell) = candidates.first() else {
+        return false;
     };
-    if let Ok(content) = serde_json::to_string(&memo) {
-        let _ = std::fs::write(&memo_path, content);
+    cache.schema == EFFECTIVE_PATH_CACHE_SCHEMA
+        && cache.shell == current_shell.to_string_lossy()
+        && cache.inputs == shell_startup_inputs(current_shell)
+        && cache
+            .path
+            .as_deref()
+            .map(|path| login_path_is_acceptable(OsStr::new(path)))
+            .unwrap_or(true)
+}
+
+#[cfg(unix)]
+fn shell_startup_inputs(shell: &Path) -> Vec<EffectivePathInput> {
+    let name = shell.file_name().and_then(|name| name.to_str());
+    let is_zsh = name.is_some_and(|name| name.eq_ignore_ascii_case("zsh"));
+    let mut files = if is_zsh {
+        vec![
+            PathBuf::from("/etc/zshenv"),
+            PathBuf::from("/etc/zprofile"),
+            PathBuf::from("/etc/zshrc"),
+        ]
+    } else {
+        vec![PathBuf::from("/etc/profile")]
+    };
+    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+        let home = PathBuf::from(home);
+        let names: &[&str] = if is_zsh {
+            &[".zshenv", ".zprofile", ".zshrc"]
+        } else {
+            &[".bash_profile", ".bash_login", ".profile", ".bashrc"]
+        };
+        files.extend(names.iter().map(|name| home.join(name)));
     }
+    files
+        .into_iter()
+        .map(|file| match std::fs::metadata(&file) {
+            Ok(metadata) => EffectivePathInput {
+                file: file.to_string_lossy().into_owned(),
+                mtime_ns: Some(
+                    i128::from(metadata.mtime()) * 1_000_000_000
+                        + i128::from(metadata.mtime_nsec()),
+                ),
+                size: Some(metadata.len()),
+            },
+            Err(_) => EffectivePathInput {
+                file: file.to_string_lossy().into_owned(),
+                mtime_ns: None,
+                size: None,
+            },
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Refresh a cache from the helper process without mutating its environment.
+#[cfg(unix)]
+pub fn refresh_login_shell_path_cache(cache_path: &Path) -> Result<(), String> {
+    let result = probe_login_shell_path();
+    let cache = EffectivePathCache {
+        schema: EFFECTIVE_PATH_CACHE_SCHEMA,
+        shell: result.shell.to_string_lossy().into_owned(),
+        path: result
+            .path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        probed_at_unix: unix_timestamp_secs(),
+        inputs: shell_startup_inputs(&result.shell),
+    };
+    write_effective_path_cache(cache_path, &cache)
+        .map_err(|error| format!("write {}: {error}", cache_path.display()))
+}
+
+#[cfg(not(unix))]
+pub fn refresh_login_shell_path_cache(_cache_path: &std::path::Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_cached_path_refresh() {
+    // Integration tests point this seam at a deliberately sleeping shell and
+    // assert the serving binary does not run it on a cache hit. Production
+    // launches do not set the seam and always refresh through the helper.
+    if std::env::var_os("AFT_TEST_LOGIN_SHELL_CANDIDATES").is_some() {
+        return;
+    }
+
+    let cache_path = {
+        let mut guard = EFFECTIVE_PATH_STATE
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        if state.source != ProbeSource::Cache || state.refresh_started {
+            return;
+        }
+        state.refresh_started = true;
+        state.cache_path.clone()
+    };
+
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = Command::new(executable);
+    command
+        .arg("--probe-login-shell-path")
+        .arg(cache_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // Run the cache-refresh helper independently so it can finish after the
+    // serving process exits. Its shell probe still enforces the per-candidate
+    // timeout and kills the probe process group when necessary.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let _ = command.spawn();
 }
 
 #[cfg(test)]
@@ -578,12 +780,12 @@ mod tests {
     }
 
     #[test]
-    fn probe_shell_flags_match_shell_startup_conventions() {
+    fn probe_shell_flags_cover_login_and_interactive_startup_files() {
         assert_eq!(probe_shell_flags(Path::new("/bin/zsh")), "-lic");
-        assert_eq!(probe_shell_flags(Path::new("/bin/bash")), "-lc");
+        assert_eq!(probe_shell_flags(Path::new("/bin/bash")), "-lic");
         assert_eq!(
             probe_shell_flags(Path::new("/opt/homebrew/bin/fish")),
-            "-lc"
+            "-lic"
         );
     }
 
@@ -669,6 +871,30 @@ eval "$2"
     }
 
     #[test]
+    fn inline_probe_total_budget_caps_multiple_hanging_candidates() {
+        let _guard = crate::test_env::process_env_lock();
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let first = dir.path().join("first-shell");
+        let second = dir.path().join("second-shell");
+        write_executable_shim(&first, "#!/bin/sh\nsleep 10\n");
+        write_executable_shim(&second, "#!/bin/sh\nsleep 10\n");
+        let candidates = std::env::join_paths([&first, &second]).unwrap();
+        let _candidates_guard = EnvVarGuard::set(
+            "AFT_TEST_LOGIN_SHELL_CANDIDATES",
+            candidates.to_str().unwrap(),
+        );
+
+        let started = Instant::now();
+        let result = probe_login_shell_path();
+
+        assert!(result.path.is_none());
+        assert!(
+            started.elapsed() < Duration::from_millis(4500),
+            "two hanging candidates exceeded the four-second total budget"
+        );
+    }
+
+    #[test]
     fn login_shell_probe_times_out() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let shell = dir.path().join("slow-login-shell");
@@ -706,16 +932,28 @@ eval "$2"
     }
 
     #[test]
-    fn test_memo_written_and_read() {
+    fn effective_path_cache_round_trips_and_rejects_changed_inputs() {
         let _guard = crate::test_env::process_env_lock();
         let temp = tempfile::tempdir().unwrap();
-        let _cache_guard = EnvVarGuard::set("AFT_CACHE_DIR", temp.path().to_str().unwrap());
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _home_guard = EnvVarGuard::set("HOME", home.to_str().unwrap());
+        let shell = PathBuf::from("/bin/bash");
+        let cache_path = temp.path().join("effective-path.json");
+        let cache = EffectivePathCache {
+            schema: EFFECTIVE_PATH_CACHE_SCHEMA,
+            shell: shell.to_string_lossy().into_owned(),
+            path: Some("/custom/bin:/usr/bin:/bin".to_string()),
+            probed_at_unix: unix_timestamp_secs(),
+            inputs: shell_startup_inputs(&shell),
+        };
 
-        let test_path = OsStr::new("/opt/homebrew/bin:/usr/bin:/bin");
-        write_login_path_memo(test_path);
+        write_effective_path_cache(&cache_path, &cache).unwrap();
+        let restored = read_effective_path_cache(&cache_path).unwrap();
+        assert!(cache_matches_current_shell(&restored, &[shell.clone()]));
 
-        let read_path = read_login_path_memo().unwrap();
-        assert_eq!(read_path, test_path);
+        fs::write(home.join(".bashrc"), "export PATH=changed\n").unwrap();
+        assert!(!cache_matches_current_shell(&restored, &[shell]));
     }
 
     #[test]

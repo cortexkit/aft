@@ -57,6 +57,8 @@ Set `AFT_STORAGE_DIR` to place AFT's SQLite databases, WALs, writer leases, and 
 Storage resolution is identical for plugins, standalone binaries, and warmup:
 `AFT_STORAGE_DIR` (explicit override) > `XDG_DATA_HOME/cortexkit/aft` when set > the platform data directory (`~/.local/share/cortexkit/aft` on POSIX, or `%LOCALAPPDATA%/cortexkit/aft` on Windows with its documented fallbacks). The statfs-based root key refuses to combine storage roots from different filesystems, preventing a local override from silently sharing indexes with the old NFS root.
 
+AFT caches the login-shell PATH probe in `<storage_dir>/effective-path.json`. The cache records the shell startup files and is invalidated when one is created, removed, or changes size or modification time. A cached timeout stores a null PATH, so a blocked shell profile delays only the first launch after its startup files change; AFT refreshes the cache in a detached helper for a later launch.
+
 ## Uninstall paths
 
 Delete the user and project config files listed above, then delete the data roots below. A non-empty environment override takes precedence over the corresponding default.

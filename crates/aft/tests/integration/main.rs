@@ -44,6 +44,7 @@ mod durable_restart_test;
 mod edit_append_test;
 mod edit_match_test;
 mod edit_test;
+mod effective_path_cache_test;
 mod error_path_test;
 mod executable_warm_test;
 mod exported_boost_test;
