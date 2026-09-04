@@ -3,6 +3,9 @@
 //! This module deliberately accepts a manifest plus immutable blob payloads rather
 //! than a checkout root.  Extraction is content-addressed and path-free; binding a
 //! blob to a manifest path and resolving its cross-file references happens here.
+//! The existing resolver uses String file identities. Non-UTF-8 source members
+//! remain in byte-addressed facts but are reported as unbound rather than being
+//! converted lossily; supporting them requires a separate resolver identity change.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -10,16 +13,18 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use tree_sitter::Parser;
 
+use super::facts::{BlobKey, FactPaths, ManifestFacts, ProjectFacts};
 use crate::callgraph::{self, FileCallData, SymbolMeta};
-use crate::imports::{specifier_imported_name, specifier_local_name};
+use crate::imports::{ImportBlock, ImportForm, ImportGroup, ImportKind, ImportStatement};
 use crate::parser::{grammar_for, LangId};
 use crate::symbols::SymbolKind;
 use crate::views::{Manifest, ManifestEntry, RelPath};
+use std::collections::HashMap;
+use std::path::Path;
+use std::rc::Rc;
+use std::sync::Arc;
 
 const TOP_LEVEL_SYMBOL: &str = "<top-level>";
-const SOURCE_EXTENSIONS: &[&str] = &[
-    "ts", "tsx", "js", "jsx", "mts", "cts", "mjs", "cjs", "rs", "py", "go",
-];
 
 /// An error raised while decoding or assembling manifest-addressed callgraph data.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,6 +101,8 @@ pub enum BlobRefKind {
     ValueRef,
     Import,
     Module,
+    Reexport,
+    ExportAlias,
 }
 
 /// An unresolved reference extracted from one source blob.
@@ -111,6 +118,12 @@ pub struct BlobRef {
     pub line: u32,
     pub byte_start: usize,
     pub byte_end: usize,
+    pub path_override: Option<String>,
+    pub local_name: Option<String>,
+    pub requested_name: Option<String>,
+    pub namespace_alias: Option<String>,
+    pub wildcard: bool,
+    pub import_kind: Option<String>,
 }
 
 /// A parsed import retained in the blob so binding can resolve aliases without
@@ -122,6 +135,11 @@ pub struct BlobImport {
     pub names: Vec<String>,
     pub default_import: Option<String>,
     pub namespace_import: Option<String>,
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub raw_text: String,
+    pub type_only: bool,
+    pub side_effect: bool,
 }
 
 /// Path-free parse output stored for a regular source file.
@@ -132,6 +150,8 @@ pub struct ParseBlob {
     pub ast_nodes: Vec<AstPreorderNode>,
     pub symbols: Vec<BlobSymbol>,
     pub default_export_symbol: Option<String>,
+    pub exported_symbols: Vec<String>,
+    pub callable_symbols: Vec<String>,
     pub imports: Vec<BlobImport>,
     pub refs: Vec<BlobRef>,
 }
@@ -168,16 +188,59 @@ impl CallgraphBlob {
             .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(language.to_string()))?;
         let extractor_version = extractor_version.into();
         let ast_nodes = ast_preorder_nodes(source, lang)?;
-        let data = callgraph::build_file_data_from_source_with_lang(
+        let mut data = callgraph::build_file_data_from_source_with_lang(
             std::path::Path::new("__callgraph_blob__"),
             source,
             lang,
         )
         .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
+        if lang == LangId::Rust {
+            super::extend_rust_imports_with_nested_uses(source, &mut data);
+        }
         let symbols = blob_symbols(source, &data, &ast_nodes);
         let imports = blob_imports(&data, &ast_nodes);
         let mut refs = blob_refs(source, &data, &ast_nodes);
         refs.extend(rust_module_refs(source, lang, &ast_nodes));
+        let empty =
+            Manifest::new([]).map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
+        let reader = |_: &BlobKey| None;
+        let empty_facts = ManifestFacts {
+            manifest: &empty,
+            blobs: &reader,
+        };
+        let paths = FactPaths {
+            root: Path::new("/"),
+            facts: &empty_facts,
+        };
+        let file = Path::new("/__callgraph_blob__");
+        let mut structural =
+            super::collect_reexport_refs(paths.root, file, "__callgraph_blob__", source, &paths)
+                .raw_refs;
+        structural.extend(
+            super::collect_source_less_export_alias_refs("__callgraph_blob__", source).raw_refs,
+        );
+        if lang == LangId::Rust {
+            structural.extend(
+                super::collect_rust_pub_use_reexport_refs(
+                    paths.root,
+                    file,
+                    "__callgraph_blob__",
+                    &data.import_block.imports,
+                    &super::LineIndex::new(source),
+                    &paths,
+                )
+                .raw_refs,
+            );
+        }
+        refs.extend(
+            structural
+                .into_iter()
+                .map(|raw| structural_ref(raw, &ast_nodes)),
+        );
+        let mut exported_symbols = data.exported_symbols.clone();
+        exported_symbols.sort();
+        let mut callable_symbols = data.calls_by_symbol.keys().cloned().collect::<Vec<_>>();
+        callable_symbols.sort();
         refs.sort_by(|left, right| {
             (
                 left.ordinal,
@@ -208,6 +271,8 @@ impl CallgraphBlob {
             ast_nodes,
             symbols,
             default_export_symbol: data.default_export_symbol,
+            exported_symbols,
+            callable_symbols,
             imports,
             refs,
         }))
@@ -294,6 +359,7 @@ impl DerivedRow {
 pub struct JoinResult {
     pub rows: BTreeSet<DerivedRow>,
     pub resolution_order: Vec<CallerRefKey>,
+    pub unbound_non_utf8_paths: Vec<Vec<u8>>,
 }
 
 impl JoinResult {
@@ -326,571 +392,6 @@ pub struct IncrementalJoinResult {
     pub result: JoinResult,
     pub re_resolved: BTreeSet<CallerRefKey>,
     pub full_re_resolve: bool,
-}
-
-/// Resolves the current view solely from its manifest and manifest-addressed
-/// payloads.  Entries are traversed in manifest byte order and references in
-/// `(caller blob key, ref ordinal, caller path)` order.
-pub fn join_manifest(
-    manifest: &Manifest,
-    blobs: &impl ManifestBlobReader,
-) -> Result<JoinResult, ManifestJoinError> {
-    let state = JoinState::from_manifest(manifest, blobs)?;
-    let mut work = Vec::new();
-    for file in state.files.values() {
-        for raw in &file.blob.refs {
-            work.push((
-                CallerRefKey {
-                    caller_blob_key: file.blob_key.clone(),
-                    ref_ordinal: raw.ordinal,
-                    caller_path: file.path.clone(),
-                },
-                raw,
-            ));
-        }
-    }
-    work.sort_by(|left, right| left.0.cmp(&right.0));
-
-    let mut rows = BTreeSet::new();
-    let mut resolution_order = Vec::with_capacity(work.len());
-    for (key, raw) in work {
-        resolution_order.push(key.clone());
-        rows.insert(resolve_blob_ref(&state, &key, raw));
-    }
-    Ok(JoinResult {
-        rows,
-        resolution_order,
-    })
-}
-
-/// Reassembles only rows affected by manifest changes. A changed source binding
-/// refreshes its own references, prior references targeting a changed or removed
-/// manifest path refresh through the reverse target index, and a changed
-/// configuration or ignore input refreshes all rows. Lockfiles carry
-/// `resolution_input = false`, so a lockfile-only change does not require a full
-/// re-resolution.
-pub fn join_manifest_incremental(
-    previous_manifest: &Manifest,
-    previous: &JoinResult,
-    current_manifest: &Manifest,
-    blobs: &impl ManifestBlobReader,
-) -> Result<IncrementalJoinResult, ManifestJoinError> {
-    let changed_paths = changed_manifest_paths(previous_manifest, current_manifest);
-    let full_re_resolve = changed_paths.iter().any(|path| {
-        manifest_resolution_input(previous_manifest, path)
-            || manifest_resolution_input(current_manifest, path)
-    });
-    let fresh = join_manifest(current_manifest, blobs)?;
-    let current_by_key = fresh
-        .rows
-        .iter()
-        .cloned()
-        .map(|row| (row.ref_key(), row))
-        .collect::<BTreeMap<_, _>>();
-    let previous_by_key = previous
-        .rows
-        .iter()
-        .cloned()
-        .map(|row| (row.ref_key(), row))
-        .collect::<BTreeMap<_, _>>();
-
-    let mut re_resolved = BTreeSet::new();
-    if full_re_resolve {
-        re_resolved.extend(fresh.resolution_order.iter().cloned());
-    } else {
-        for key in &fresh.resolution_order {
-            if changed_paths.contains(&key.caller_path) {
-                re_resolved.insert(key.clone());
-            }
-        }
-        for row in &previous.rows {
-            if row
-                .target_path
-                .as_ref()
-                .is_some_and(|path| changed_paths.contains(path))
-                && current_by_key.contains_key(&row.ref_key())
-            {
-                re_resolved.insert(row.ref_key());
-            }
-        }
-    }
-
-    let mut rows = BTreeSet::new();
-    for key in &fresh.resolution_order {
-        if !re_resolved.contains(key) {
-            if let Some(previous_row) = previous_by_key.get(key) {
-                rows.insert(previous_row.clone());
-                continue;
-            }
-        }
-        if let Some(row) = current_by_key.get(key) {
-            rows.insert(row.clone());
-        }
-    }
-
-    Ok(IncrementalJoinResult {
-        result: JoinResult {
-            rows,
-            resolution_order: fresh.resolution_order,
-        },
-        re_resolved,
-        full_re_resolve,
-    })
-}
-
-#[derive(Clone)]
-struct FileBinding {
-    path: Vec<u8>,
-    blob_key: String,
-    blob: ParseBlob,
-}
-
-#[derive(Clone)]
-enum ManifestMember {
-    File,
-    Symlink(Vec<u8>),
-    Gitlink,
-    Other,
-}
-
-#[derive(Default)]
-struct ConfigInputs {
-    ts_paths: Vec<TsPathRule>,
-    packages: Vec<PackageRoot>,
-}
-
-struct TsPathRule {
-    config_dir: Vec<u8>,
-    base_url: String,
-    alias: String,
-    targets: Vec<String>,
-}
-
-struct PackageRoot {
-    name: String,
-    root: Vec<u8>,
-}
-
-struct JoinState {
-    files: BTreeMap<Vec<u8>, FileBinding>,
-    members: BTreeMap<Vec<u8>, ManifestMember>,
-    config: ConfigInputs,
-}
-
-impl JoinState {
-    fn from_manifest(
-        manifest: &Manifest,
-        blobs: &impl ManifestBlobReader,
-    ) -> Result<Self, ManifestJoinError> {
-        let mut decoded = BTreeMap::<String, CallgraphBlob>::new();
-        let mut files = BTreeMap::new();
-        let mut members = BTreeMap::new();
-        let mut config = ConfigInputs::default();
-
-        for (rel_path, entry) in manifest.entries() {
-            let path = rel_path.as_bytes().to_vec();
-            match entry {
-                ManifestEntry::Regular {
-                    planes,
-                    resolution_input,
-                    ..
-                } => {
-                    let Some(key) = planes.callgraph.as_deref() else {
-                        members.insert(path, ManifestMember::Other);
-                        continue;
-                    };
-                    let blob = decoded_blob(&mut decoded, blobs, key)?;
-                    match blob {
-                        CallgraphBlob::Parse(parse) if !resolution_input => {
-                            files.insert(
-                                path.clone(),
-                                FileBinding {
-                                    path: path.clone(),
-                                    blob_key: key.to_string(),
-                                    blob: parse.clone(),
-                                },
-                            );
-                            members.insert(path, ManifestMember::File);
-                        }
-                        CallgraphBlob::Config(config_blob) if *resolution_input => {
-                            add_config_input(&mut config, &path, &config_blob)?;
-                            members.insert(path, ManifestMember::Other);
-                        }
-                        CallgraphBlob::Config(_) => {
-                            members.insert(path, ManifestMember::Other);
-                        }
-                        CallgraphBlob::Parse(_) => {
-                            return Err(ManifestJoinError::InvalidConfig {
-                                path,
-                                reason: "resolution input must use language=config".to_string(),
-                            });
-                        }
-                    }
-                }
-                ManifestEntry::Synthetic { planes, .. } => {
-                    let blob = decoded_blob(&mut decoded, blobs, &planes.callgraph)?;
-                    let Some(config_blob) = blob.config_source() else {
-                        return Err(ManifestJoinError::InvalidConfig {
-                            path,
-                            reason: "synthetic input must use language=config".to_string(),
-                        });
-                    };
-                    add_config_input(&mut config, &path, config_blob)?;
-                    members.insert(rel_path.as_bytes().to_vec(), ManifestMember::Other);
-                }
-                ManifestEntry::Symlink { target_bytes } => {
-                    members.insert(
-                        path,
-                        ManifestMember::Symlink(target_bytes.as_bytes().to_vec()),
-                    );
-                }
-                ManifestEntry::Gitlink { .. } => {
-                    members.insert(path, ManifestMember::Gitlink);
-                }
-            }
-        }
-
-        config.ts_paths.sort_by(|left, right| {
-            (&left.config_dir, &left.alias, &left.targets).cmp(&(
-                &right.config_dir,
-                &right.alias,
-                &right.targets,
-            ))
-        });
-        config
-            .packages
-            .sort_by(|left, right| (&left.name, &left.root).cmp(&(&right.name, &right.root)));
-        Ok(Self {
-            files,
-            members,
-            config,
-        })
-    }
-
-    fn resolve_module(&self, caller_path: &[u8], module_path: &str) -> Option<&FileBinding> {
-        if module_path.starts_with('.') {
-            return self.resolve_file_like(&join_manifest_path(
-                &parent_path(caller_path),
-                module_path.as_bytes(),
-            ));
-        }
-        if module_path.starts_with('/') {
-            return None;
-        }
-
-        for rule in &self.config.ts_paths {
-            let Some(capture) = ts_path_capture(&rule.alias, module_path) else {
-                continue;
-            };
-            for target in &rule.targets {
-                let target = target.replace('*', capture);
-                let base = join_manifest_path(&rule.config_dir, rule.base_url.as_bytes());
-                if let Some(file) =
-                    self.resolve_file_like(&join_manifest_path(&base, target.as_bytes()))
-                {
-                    return Some(file);
-                }
-            }
-        }
-
-        for package in &self.config.packages {
-            let Some(suffix) = package_suffix(module_path, &package.name) else {
-                continue;
-            };
-            let base = join_manifest_path(&package.root, suffix.as_bytes());
-            if let Some(file) = self.resolve_file_like(&base) {
-                return Some(file);
-            }
-            if suffix.is_empty() {
-                let source_root = join_manifest_path(&package.root, b"src");
-                if let Some(file) = self.resolve_file_like(&source_root) {
-                    return Some(file);
-                }
-            }
-        }
-        None
-    }
-
-    fn resolve_file_like(&self, base: &[u8]) -> Option<&FileBinding> {
-        if let Some(file) = self.resolve_member_file(base) {
-            return Some(file);
-        }
-        if !base.contains(&b'.') {
-            for extension in SOURCE_EXTENSIONS {
-                let mut candidate = base.to_vec();
-                candidate.push(b'.');
-                candidate.extend_from_slice(extension.as_bytes());
-                if let Some(file) = self.resolve_member_file(&candidate) {
-                    return Some(file);
-                }
-            }
-        }
-        for extension in SOURCE_EXTENSIONS {
-            let mut candidate = base.to_vec();
-            if !candidate.is_empty() {
-                candidate.push(b'/');
-            }
-            candidate.extend_from_slice(b"index.");
-            candidate.extend_from_slice(extension.as_bytes());
-            if let Some(file) = self.resolve_member_file(&candidate) {
-                return Some(file);
-            }
-        }
-        None
-    }
-
-    fn resolve_member_file(&self, candidate: &[u8]) -> Option<&FileBinding> {
-        let mut current = normalize_manifest_path(candidate);
-        let mut seen = BTreeSet::new();
-        while seen.insert(current.clone()) {
-            if let Some(ManifestMember::File) = self.members.get(&current) {
-                return self.files.get(&current);
-            }
-            if matches!(self.members.get(&current), Some(ManifestMember::Gitlink)) {
-                return None;
-            }
-            if let Some(ManifestMember::Symlink(target)) = self.members.get(&current) {
-                current = join_manifest_path(&parent_path(&current), target);
-                continue;
-            }
-
-            let mut rewritten = None;
-            for split in slash_positions(&current) {
-                let prefix = &current[..split];
-                let Some(ManifestMember::Symlink(target)) = self.members.get(prefix) else {
-                    continue;
-                };
-                let mut target_path = join_manifest_path(&parent_path(prefix), target);
-                if split < current.len() {
-                    target_path.push(b'/');
-                    target_path.extend_from_slice(&current[split + 1..]);
-                }
-                rewritten = Some(target_path);
-                break;
-            }
-            let Some(next) = rewritten else {
-                return None;
-            };
-            current = next;
-        }
-        None
-    }
-}
-
-fn decoded_blob(
-    decoded: &mut BTreeMap<String, CallgraphBlob>,
-    blobs: &impl ManifestBlobReader,
-    key: &str,
-) -> Result<CallgraphBlob, ManifestJoinError> {
-    if let Some(blob) = decoded.get(key) {
-        return Ok(blob.clone());
-    }
-    let bytes = blobs
-        .read_callgraph_blob(key)?
-        .ok_or_else(|| ManifestJoinError::MissingBlob(key.to_string()))?;
-    let blob = CallgraphBlob::from_bytes(&bytes)?;
-    decoded.insert(key.to_string(), blob.clone());
-    Ok(blob)
-}
-
-fn add_config_input(
-    inputs: &mut ConfigInputs,
-    path: &[u8],
-    blob: &ConfigBlob,
-) -> Result<(), ManifestJoinError> {
-    if blob.language != "config" {
-        return Err(ManifestJoinError::InvalidConfig {
-            path: path.to_vec(),
-            reason: "configuration blob language must be config".to_string(),
-        });
-    }
-    let path_text = String::from_utf8_lossy(path);
-    if path_text.ends_with("tsconfig.json")
-        || path_text.contains("/tsconfig.")
-        || path_text.ends_with("jsconfig.json")
-    {
-        let value: serde_json::Value = serde_json::from_slice(&blob.source).map_err(|error| {
-            ManifestJoinError::InvalidConfig {
-                path: path.to_vec(),
-                reason: error.to_string(),
-            }
-        })?;
-        let compiler_options = value
-            .get("compilerOptions")
-            .and_then(serde_json::Value::as_object);
-        let base_url = compiler_options
-            .and_then(|options| options.get("baseUrl"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(".");
-        if let Some(paths) = compiler_options
-            .and_then(|options| options.get("paths"))
-            .and_then(serde_json::Value::as_object)
-        {
-            for (alias, targets) in paths {
-                let Some(targets) = targets.as_array() else {
-                    continue;
-                };
-                let targets = targets
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>();
-                if !targets.is_empty() {
-                    inputs.ts_paths.push(TsPathRule {
-                        config_dir: parent_path(path),
-                        base_url: base_url.to_string(),
-                        alias: alias.clone(),
-                        targets,
-                    });
-                }
-            }
-        }
-    } else if path_text.ends_with("package.json") {
-        let value: serde_json::Value = serde_json::from_slice(&blob.source).map_err(|error| {
-            ManifestJoinError::InvalidConfig {
-                path: path.to_vec(),
-                reason: error.to_string(),
-            }
-        })?;
-        if let Some(name) = value.get("name").and_then(serde_json::Value::as_str) {
-            inputs.packages.push(PackageRoot {
-                name: name.to_string(),
-                root: parent_path(path),
-            });
-        }
-    } else if path_text.ends_with("Cargo.toml") {
-        let source = std::str::from_utf8(&blob.source).map_err(|error| {
-            ManifestJoinError::InvalidConfig {
-                path: path.to_vec(),
-                reason: error.to_string(),
-            }
-        })?;
-        let value: toml::Value =
-            toml::from_str(source).map_err(|error| ManifestJoinError::InvalidConfig {
-                path: path.to_vec(),
-                reason: error.to_string(),
-            })?;
-        if let Some(name) = value
-            .get("package")
-            .and_then(toml::Value::as_table)
-            .and_then(|package| package.get("name"))
-            .and_then(toml::Value::as_str)
-        {
-            inputs.packages.push(PackageRoot {
-                name: name.replace('-', "_"),
-                root: parent_path(path),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn resolve_blob_ref(state: &JoinState, key: &CallerRefKey, raw: &BlobRef) -> DerivedRow {
-    let target = state
-        .files
-        .get(&key.caller_path)
-        .and_then(|caller| match raw.kind {
-            BlobRefKind::Import | BlobRefKind::Module => raw
-                .module_path
-                .as_deref()
-                .and_then(|module| state.resolve_module(&caller.path, module))
-                .map(|file| (file.path.clone(), None)),
-            BlobRefKind::Call | BlobRefKind::ValueRef => resolve_callable_ref(state, caller, raw),
-        });
-    let status = if target.is_some() {
-        ResolutionStatus::Resolved
-    } else {
-        ResolutionStatus::Unresolved
-    };
-    DerivedRow {
-        caller_blob_key: key.caller_blob_key.clone(),
-        ref_ordinal: key.ref_ordinal,
-        caller_path: key.caller_path.clone(),
-        kind: raw.kind,
-        status,
-        target_path: target.as_ref().map(|(path, _)| path.clone()),
-        target_symbol: target.and_then(|(_, symbol)| symbol),
-    }
-}
-
-fn resolve_callable_ref(
-    state: &JoinState,
-    caller: &FileBinding,
-    raw: &BlobRef,
-) -> Option<(Vec<u8>, Option<String>)> {
-    let short_name = raw.short_name.as_deref()?;
-    let full_ref = raw.full_ref.as_deref().unwrap_or(short_name);
-
-    if let Some((namespace, member)) = full_ref.split_once('.') {
-        if let Some(import) = caller
-            .blob
-            .imports
-            .iter()
-            .find(|import| import.namespace_import.as_deref() == Some(namespace))
-        {
-            if let Some(target) = state.resolve_module(&caller.path, &import.module_path) {
-                return Some((
-                    target.path.clone(),
-                    exported_symbol(target, member).or_else(|| Some(member.to_string())),
-                ));
-            }
-        }
-    }
-
-    for import in &caller.blob.imports {
-        if let Some(specifier) = import
-            .names
-            .iter()
-            .find(|specifier| specifier_local_name(specifier) == short_name)
-        {
-            if let Some(target) = state.resolve_module(&caller.path, &import.module_path) {
-                let requested = specifier_imported_name(specifier);
-                return Some((
-                    target.path.clone(),
-                    exported_symbol(target, requested).or_else(|| Some(requested.to_string())),
-                ));
-            }
-        }
-        if import.default_import.as_deref() == Some(short_name) {
-            if let Some(target) = state.resolve_module(&caller.path, &import.module_path) {
-                let symbol = target
-                    .blob
-                    .default_export_symbol
-                    .clone()
-                    .or_else(|| Some("default".to_string()));
-                return Some((target.path.clone(), symbol));
-            }
-        }
-    }
-
-    for import in &caller.blob.imports {
-        if let Some(target) = state.resolve_module(&caller.path, &import.module_path) {
-            if let Some(symbol) = exported_symbol(target, short_name) {
-                return Some((target.path.clone(), Some(symbol)));
-            }
-        }
-    }
-
-    caller
-        .blob
-        .symbols
-        .iter()
-        .find(|symbol| symbol.name == short_name || symbol.scoped_name == full_ref)
-        .map(|symbol| (caller.path.clone(), Some(symbol.scoped_name.clone())))
-}
-
-fn exported_symbol(binding: &FileBinding, requested: &str) -> Option<String> {
-    if requested == "default" {
-        return binding.blob.default_export_symbol.clone();
-    }
-    binding
-        .blob
-        .symbols
-        .iter()
-        .find(|symbol| {
-            symbol.exported && (symbol.name == requested || symbol.scoped_name == requested)
-        })
-        .map(|symbol| symbol.scoped_name.clone())
 }
 
 fn changed_manifest_paths(previous: &Manifest, current: &Manifest) -> BTreeSet<Vec<u8>> {
@@ -1082,6 +583,11 @@ fn blob_imports(data: &FileCallData, ast_nodes: &[AstPreorderNode]) -> Vec<BlobI
             names: import.names.clone(),
             default_import: import.default_import.clone(),
             namespace_import: import.namespace_import.clone(),
+            byte_start: import.byte_range.start,
+            byte_end: import.byte_range.end,
+            raw_text: import.raw_text.clone(),
+            type_only: import.kind == ImportKind::Type,
+            side_effect: import.kind == ImportKind::SideEffect,
         })
         .collect::<Vec<_>>();
     imports.sort_by(|left, right| {
@@ -1118,6 +624,12 @@ fn blob_refs(source: &str, data: &FileCallData, ast_nodes: &[AstPreorderNode]) -
             line: line_for_byte(source, import.byte_range.start),
             byte_start: import.byte_range.start,
             byte_end: import.byte_range.end,
+            path_override: None,
+            local_name: None,
+            requested_name: None,
+            namespace_alias: import.namespace_import.clone(),
+            wildcard: super::import_is_wildcard(import),
+            import_kind: None,
         });
     }
     refs
@@ -1139,6 +651,12 @@ fn call_ref(
         line: call.line,
         byte_start: call.byte_start,
         byte_end: call.byte_end,
+        path_override: None,
+        local_name: None,
+        requested_name: None,
+        namespace_alias: None,
+        wildcard: false,
+        import_kind: None,
     }
 }
 
@@ -1173,6 +691,13 @@ fn rust_module_refs(source: &str, lang: LangId, ast_nodes: &[AstPreorderNode]) -
                     line: node.start_position().row as u32 + 1,
                     byte_start: node.start_byte(),
                     byte_end: node.end_byte(),
+                    path_override: super::rust_module_path_override(source, node)
+                        .map(str::to_string),
+                    local_name: None,
+                    requested_name: None,
+                    namespace_alias: None,
+                    wildcard: false,
+                    import_kind: None,
                 });
             }
         }
@@ -1232,118 +757,9 @@ fn unqualified_symbol_name(scoped_name: &str) -> &str {
     scoped_name.rsplit("::").next().unwrap_or(scoped_name)
 }
 
-fn parent_path(path: &[u8]) -> Vec<u8> {
-    path.rsplitn(2, |byte| *byte == b'/')
-        .nth(1)
-        .map_or_else(Vec::new, |parent| parent.to_vec())
-}
-
-fn join_manifest_path(base: &[u8], tail: &[u8]) -> Vec<u8> {
-    let mut joined = base.to_vec();
-    if !joined.is_empty() && !tail.is_empty() {
-        joined.push(b'/');
-    }
-    joined.extend_from_slice(tail);
-    normalize_manifest_path(&joined)
-}
-
-fn normalize_manifest_path(path: &[u8]) -> Vec<u8> {
-    let mut parts = Vec::<&[u8]>::new();
-    for part in path.split(|byte| *byte == b'/') {
-        match part {
-            b"" | b"." => {}
-            b".." => {
-                parts.pop();
-            }
-            _ => parts.push(part),
-        }
-    }
-    let mut normalized = Vec::new();
-    for part in parts {
-        if !normalized.is_empty() {
-            normalized.push(b'/');
-        }
-        normalized.extend_from_slice(part);
-    }
-    normalized
-}
-
-fn slash_positions(path: &[u8]) -> impl Iterator<Item = usize> + '_ {
-    path.iter()
-        .enumerate()
-        .filter_map(|(index, byte)| (*byte == b'/').then_some(index))
-}
-
-fn ts_path_capture<'a>(alias: &str, module_path: &'a str) -> Option<&'a str> {
-    match alias.split_once('*') {
-        Some((prefix, suffix))
-            if module_path.starts_with(prefix) && module_path.ends_with(suffix) =>
-        {
-            let end = module_path.len().saturating_sub(suffix.len());
-            Some(&module_path[prefix.len()..end])
-        }
-        None if alias == module_path => Some(""),
-        _ => None,
-    }
-}
-
-fn package_suffix(module_path: &str, package_name: &str) -> Option<String> {
-    if module_path == package_name {
-        return Some(String::new());
-    }
-    module_path
-        .strip_prefix(package_name)
-        .and_then(|suffix| suffix.strip_prefix('/'))
-        .map(str::to_string)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::views::{ManifestEntry, RegularPlanes};
-
-    #[derive(Default)]
-    struct MemoryBlobs(BTreeMap<String, Vec<u8>>);
-
-    impl ManifestBlobReader for MemoryBlobs {
-        fn read_callgraph_blob(
-            &self,
-            full_key: &str,
-        ) -> Result<Option<Vec<u8>>, ManifestJoinError> {
-            Ok(self.0.get(full_key).cloned())
-        }
-    }
-
-    fn source_entry(key: &str) -> ManifestEntry {
-        ManifestEntry::Regular {
-            mode: 0o100644,
-            planes: RegularPlanes {
-                semantic: None,
-                callgraph: Some(key.to_string()),
-            },
-            resolution_input: false,
-        }
-    }
-
-    fn config_entry(key: &str) -> ManifestEntry {
-        ManifestEntry::Regular {
-            mode: 0o100644,
-            planes: RegularPlanes {
-                semantic: None,
-                callgraph: Some(key.to_string()),
-            },
-            resolution_input: true,
-        }
-    }
-
-    fn put_parse(blobs: &mut MemoryBlobs, key: &str, source: &str, language: &str) {
-        let payload = CallgraphBlob::extract(source, language, "join-test-v1")
-            .unwrap()
-            .to_bytes()
-            .unwrap();
-        blobs.0.insert(key.to_string(), payload);
-    }
-
     #[test]
     fn blob_ordinals_are_tree_sitter_preorder_positions() {
         let source = "export function run() { return helper(); }\nfunction helper() {}\n";
@@ -1373,338 +789,505 @@ mod tests {
             .find(|node| node.ordinal == helper.ordinal)
             .unwrap();
         assert!(node.byte_start <= helper.byte_start && node.byte_end >= helper.byte_end);
-    }
-
-    #[test]
-    fn join_uses_manifest_entries_blobs_and_symlink_targets() {
-        let mut blobs = MemoryBlobs::default();
-        put_parse(
-            &mut blobs,
-            "caller",
-            "import { target } from './link'; export function caller() { target(); }",
-            "typescript",
-        );
-        put_parse(
-            &mut blobs,
-            "target",
-            "export function target() {}",
-            "typescript",
-        );
-        let manifest = Manifest::new([
-            (
-                RelPath::new(b"src/caller.ts".to_vec()).unwrap(),
-                source_entry("caller"),
-            ),
-            (
-                RelPath::new(b"src/link.ts".to_vec()).unwrap(),
-                ManifestEntry::Symlink {
-                    target_bytes: b"target.ts".as_slice().into(),
-                },
-            ),
-            (
-                RelPath::new(b"src/target.ts".to_vec()).unwrap(),
-                source_entry("target"),
-            ),
-            (
-                RelPath::new(b"vendor".to_vec()).unwrap(),
-                ManifestEntry::Gitlink {
-                    oid: "0123456789012345678901234567890123456789".to_string(),
-                },
-            ),
-        ])
-        .unwrap();
-
-        let joined = join_manifest(&manifest, &blobs).unwrap();
-        assert!(joined.rows.iter().any(|row| {
-            row.caller_path == b"src/caller.ts"
-                && row.target_path.as_deref() == Some(b"src/target.ts".as_slice())
-                && row.target_symbol.as_deref() == Some("target")
-        }));
-    }
-
-    #[test]
-    fn equal_manifests_have_equal_logical_rows_despite_blob_insertion_order() {
-        let mut first = MemoryBlobs::default();
-        let mut second = MemoryBlobs::default();
-        for (blobs, keys) in [
-            (&mut first, ["caller", "target"]),
-            (&mut second, ["target", "caller"]),
-        ] {
-            for key in keys {
-                let source = if key == "caller" {
-                    "import { target } from './target'; export function caller() { target(); }"
-                } else {
-                    "export function target() {}"
-                };
-                put_parse(blobs, key, source, "typescript");
+        assert_eq!(node.kind, "call_expression");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&grammar_for(LangId::TypeScript))
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let mut cursor = tree.walk();
+        let mut expected = Vec::new();
+        'preorder: loop {
+            let node = cursor.node();
+            expected.push(AstPreorderNode {
+                ordinal: expected.len() as u32,
+                kind: node.kind().to_string(),
+                byte_start: node.start_byte(),
+                byte_end: node.end_byte(),
+            });
+            if cursor.goto_first_child() {
+                continue;
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    break 'preorder;
+                }
             }
         }
-        let first_manifest = Manifest::new([
-            (
-                RelPath::new(b"src/caller.ts".to_vec()).unwrap(),
-                source_entry("caller"),
-            ),
-            (
-                RelPath::new(b"src/target.ts".to_vec()).unwrap(),
-                source_entry("target"),
-            ),
-        ])
-        .unwrap();
-        let second_manifest = Manifest::new([
-            (
-                RelPath::new(b"src/target.ts".to_vec()).unwrap(),
-                source_entry("target"),
-            ),
-            (
-                RelPath::new(b"src/caller.ts".to_vec()).unwrap(),
-                source_entry("caller"),
-            ),
-        ])
-        .unwrap();
-        let first = join_manifest(&first_manifest, &first).unwrap();
-        let second = join_manifest(&second_manifest, &second).unwrap();
-        assert_eq!(first.rows, second.rows);
-        assert_eq!(
-            first.canonical_serialization(),
-            second.canonical_serialization()
-        );
-        assert!(first
-            .resolution_order
-            .windows(2)
-            .all(|pair| pair[0] <= pair[1]));
-    }
-
-    #[test]
-    fn incremental_join_limits_target_invalidation_and_resolves_config_from_blobs() {
-        let mut blobs = MemoryBlobs::default();
-        put_parse(
-            &mut blobs,
-            "caller-a",
-            "import { target } from '@/target'; export function callerA() { target(); }",
-            "typescript",
-        );
-        put_parse(
-            &mut blobs,
-            "caller-b",
-            "export function callerB() { helperB(); } function helperB() {}",
-            "typescript",
-        );
-        put_parse(
-            &mut blobs,
-            "target-old",
-            "export function target() { helper(); } function helper() {}",
-            "typescript",
-        );
-        put_parse(
-            &mut blobs,
-            "target-new",
-            "export function target() { helper(); return; } function helper() {}",
-            "typescript",
-        );
-        blobs.0.insert(
-            "config".to_string(),
-            CallgraphBlob::config(
-                br#"{"compilerOptions": {"baseUrl": ".", "paths": {"@/*": ["src/*"]}}}"#,
-                "join-test-v1",
-            )
-            .to_bytes()
-            .unwrap(),
-        );
-        blobs.0.insert(
-            "config-new".to_string(),
-            CallgraphBlob::config(
-                br#"{"compilerOptions": {"baseUrl": ".", "paths": {"@/*": ["src/*"]}}}"#,
-                "join-test-v1",
-            )
-            .to_bytes()
-            .unwrap(),
-        );
-        let previous_manifest = Manifest::new([
-            (
-                RelPath::new(b"src/caller-a.ts".to_vec()).unwrap(),
-                source_entry("caller-a"),
-            ),
-            (
-                RelPath::new(b"src/caller-b.ts".to_vec()).unwrap(),
-                source_entry("caller-b"),
-            ),
-            (
-                RelPath::new(b"src/target.ts".to_vec()).unwrap(),
-                source_entry("target-old"),
-            ),
-            (
-                RelPath::new(b"tsconfig.json".to_vec()).unwrap(),
-                config_entry("config"),
-            ),
-            (
-                RelPath::new(b"Cargo.lock".to_vec()).unwrap(),
-                ManifestEntry::Regular {
-                    mode: 0o100644,
-                    planes: RegularPlanes {
-                        semantic: None,
-                        callgraph: None,
-                    },
-                    resolution_input: false,
-                },
-            ),
-        ])
-        .unwrap();
-        let previous = join_manifest(&previous_manifest, &blobs).unwrap();
-        assert!(previous.rows.iter().any(|row| {
-            row.caller_path == b"src/caller-a.ts"
-                && row.target_path.as_deref() == Some(b"src/target.ts".as_slice())
-        }));
-
-        let current_manifest = Manifest::new([
-            (
-                RelPath::new(b"src/caller-a.ts".to_vec()).unwrap(),
-                source_entry("caller-a"),
-            ),
-            (
-                RelPath::new(b"src/caller-b.ts".to_vec()).unwrap(),
-                source_entry("caller-b"),
-            ),
-            (
-                RelPath::new(b"src/target.ts".to_vec()).unwrap(),
-                source_entry("target-new"),
-            ),
-            (
-                RelPath::new(b"tsconfig.json".to_vec()).unwrap(),
-                config_entry("config"),
-            ),
-            (
-                RelPath::new(b"Cargo.lock".to_vec()).unwrap(),
-                ManifestEntry::Regular {
-                    mode: 0o100644,
-                    planes: RegularPlanes {
-                        semantic: None,
-                        callgraph: None,
-                    },
-                    resolution_input: false,
-                },
-            ),
-        ])
-        .unwrap();
-        let incremental =
-            join_manifest_incremental(&previous_manifest, &previous, &current_manifest, &blobs)
-                .unwrap();
-        assert!(!incremental.full_re_resolve);
-        assert!(incremental
-            .re_resolved
-            .iter()
-            .any(|key| key.caller_path == b"src/target.ts"));
-        assert!(incremental
-            .re_resolved
-            .iter()
-            .any(|key| key.caller_path == b"src/caller-a.ts"));
-        assert!(!incremental
-            .re_resolved
-            .iter()
-            .any(|key| key.caller_path == b"src/caller-b.ts"));
-
-        let config_changed = Manifest::new([
-            (
-                RelPath::new(b"src/caller-a.ts".to_vec()).unwrap(),
-                source_entry("caller-a"),
-            ),
-            (
-                RelPath::new(b"src/caller-b.ts".to_vec()).unwrap(),
-                source_entry("caller-b"),
-            ),
-            (
-                RelPath::new(b"src/target.ts".to_vec()).unwrap(),
-                source_entry("target-new"),
-            ),
-            (
-                RelPath::new(b"tsconfig.json".to_vec()).unwrap(),
-                config_entry("config-new"),
-            ),
-            (
-                RelPath::new(b"Cargo.lock".to_vec()).unwrap(),
-                ManifestEntry::Regular {
-                    mode: 0o100644,
-                    planes: RegularPlanes {
-                        semantic: None,
-                        callgraph: None,
-                    },
-                    resolution_input: false,
-                },
-            ),
-        ])
-        .unwrap();
-        let full = join_manifest_incremental(
-            &current_manifest,
-            &incremental.result,
-            &config_changed,
-            &blobs,
-        )
-        .unwrap();
-        assert!(full.full_re_resolve);
-        assert_eq!(full.re_resolved.len(), full.result.resolution_order.len());
-    }
-
-    #[test]
-    fn lockfile_only_change_does_not_force_resolution() {
-        let mut blobs = MemoryBlobs::default();
-        put_parse(
-            &mut blobs,
-            "caller",
-            "export function caller() { helper(); } function helper() {}",
-            "typescript",
-        );
-        for key in ["lock-old", "lock-new"] {
-            blobs.0.insert(
-                key.to_string(),
-                CallgraphBlob::config(b"lockfile", "join-test-v1")
-                    .to_bytes()
-                    .unwrap(),
-            );
-        }
-        let lock = |key: &str| ManifestEntry::Regular {
-            mode: 0o100644,
-            planes: RegularPlanes {
-                semantic: None,
-                callgraph: Some(key.to_string()),
-            },
-            resolution_input: false,
-        };
-        let previous_manifest = Manifest::new([
-            (
-                RelPath::new(b"src/caller.ts".to_vec()).unwrap(),
-                source_entry("caller"),
-            ),
-            (
-                RelPath::new(b"Cargo.lock".to_vec()).unwrap(),
-                lock("lock-old"),
-            ),
-        ])
-        .unwrap();
-        let current_manifest = Manifest::new([
-            (
-                RelPath::new(b"src/caller.ts".to_vec()).unwrap(),
-                source_entry("caller"),
-            ),
-            (
-                RelPath::new(b"Cargo.lock".to_vec()).unwrap(),
-                lock("lock-new"),
-            ),
-        ])
-        .unwrap();
-        let previous = join_manifest(&previous_manifest, &blobs).unwrap();
-        let incremental =
-            join_manifest_incremental(&previous_manifest, &previous, &current_manifest, &blobs)
-                .unwrap();
-        assert!(!incremental.full_re_resolve);
-        assert!(incremental.re_resolved.is_empty());
-        assert_eq!(incremental.result.rows, previous.rows);
-    }
-
-    #[test]
-    fn join_does_not_probe_live_files() {
-        let source = include_str!("join.rs");
-        let filesystem = ["std::", "fs"].concat();
-        let normalization = ["canonical", "ize"].concat();
-        assert!(!source.contains(&filesystem));
-        assert!(!source.contains(&normalization));
+        assert_eq!(parse.ast_nodes, expected);
     }
 }
+
+fn structural_ref(raw: super::RawRef, nodes: &[AstPreorderNode]) -> BlobRef {
+    BlobRef {
+        ordinal: ordinal_for_range(nodes, raw.byte_start, raw.byte_end),
+        kind: if raw.kind == "export_alias" {
+            BlobRefKind::ExportAlias
+        } else {
+            BlobRefKind::Reexport
+        },
+        caller_symbol: raw.caller_symbol,
+        short_name: raw.short_name,
+        full_ref: raw.full_ref,
+        module_path: raw.module_path,
+        line: raw.line,
+        byte_start: raw.byte_start,
+        byte_end: raw.byte_end,
+        path_override: None,
+        local_name: raw.local_name,
+        requested_name: raw.requested_name,
+        namespace_alias: raw.namespace_alias,
+        wildcard: raw.wildcard,
+        import_kind: raw.import_kind,
+    }
+}
+
+fn bound_name(name: &str, path: &str) -> String {
+    name.replace(
+        "<default:__callgraph_blob__>",
+        &format!(
+            "<default:{}>",
+            Path::new(path)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        ),
+    )
+}
+
+impl ParseBlob {
+    fn file_data(&self, path: &str) -> Result<FileCallData, ManifestJoinError> {
+        let lang = language_id(&self.language)
+            .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(self.language.clone()))?;
+        let mut calls_by_symbol: HashMap<String, Vec<callgraph::CallSite>> = HashMap::new();
+        let mut value_refs_by_symbol: HashMap<String, Vec<callgraph::CallSite>> = HashMap::new();
+        for raw in &self.refs {
+            let map = match raw.kind {
+                BlobRefKind::Call => &mut calls_by_symbol,
+                BlobRefKind::ValueRef => &mut value_refs_by_symbol,
+                _ => continue,
+            };
+            let Some(caller) = &raw.caller_symbol else {
+                continue;
+            };
+            map.entry(bound_name(caller, path))
+                .or_default()
+                .push(callgraph::CallSite {
+                    callee_name: raw.short_name.clone().unwrap_or_default(),
+                    full_callee: raw.full_ref.clone().unwrap_or_default(),
+                    line: raw.line,
+                    byte_start: raw.byte_start,
+                    byte_end: raw.byte_end,
+                });
+        }
+        for symbol in &self.callable_symbols {
+            calls_by_symbol.entry(bound_name(symbol, path)).or_default();
+        }
+        let mut symbol_metadata = HashMap::new();
+        for symbol in &self.symbols {
+            let kind = match symbol.kind.as_str() {
+                "function" => SymbolKind::Function,
+                "method" => SymbolKind::Method,
+                "class" => SymbolKind::Class,
+                "struct" => SymbolKind::Struct,
+                "interface" => SymbolKind::Interface,
+                "enum" => SymbolKind::Enum,
+                "type_alias" => SymbolKind::TypeAlias,
+                "heading" => SymbolKind::Heading,
+                "file_summary" => SymbolKind::FileSummary,
+                _ => SymbolKind::Variable,
+            };
+            symbol_metadata.insert(
+                bound_name(&symbol.scoped_name, path),
+                SymbolMeta {
+                    kind,
+                    exported: symbol.exported,
+                    signature: symbol.signature.clone(),
+                    line: symbol.start_line + 1,
+                    range: crate::symbols::Range {
+                        start_line: symbol.start_line,
+                        start_col: symbol.start_col,
+                        end_line: symbol.end_line,
+                        end_col: symbol.end_col,
+                    },
+                    entry_point_attribute: None,
+                },
+            );
+        }
+        let imports = self
+            .imports
+            .iter()
+            .map(|import| ImportStatement {
+                module_path: import.module_path.clone(),
+                names: import.names.clone(),
+                default_import: import.default_import.clone(),
+                namespace_import: import.namespace_import.clone(),
+                kind: if import.type_only {
+                    ImportKind::Type
+                } else if import.side_effect {
+                    ImportKind::SideEffect
+                } else {
+                    ImportKind::Value
+                },
+                group: ImportGroup::Internal,
+                byte_range: import.byte_start..import.byte_end,
+                raw_text: import.raw_text.clone(),
+                form: if lang == LangId::Rust {
+                    ImportForm::RustUse {
+                        visibility: import.default_import.clone(),
+                        named: import.names.clone(),
+                    }
+                } else {
+                    ImportForm::Es {
+                        default_import: import.default_import.clone(),
+                        namespace_import: import.namespace_import.clone(),
+                        named: import.names.clone(),
+                        type_only: import.type_only,
+                        side_effect: import.side_effect,
+                        attribute_clause: None,
+                        attribute_type: None,
+                    }
+                },
+            })
+            .collect::<Vec<_>>();
+        Ok(FileCallData {
+            calls_by_symbol,
+            value_refs_by_symbol,
+            symbol_metadata,
+            exported_symbols: self
+                .exported_symbols
+                .iter()
+                .map(|s| bound_name(s, path))
+                .collect(),
+            default_export_symbol: self
+                .default_export_symbol
+                .as_ref()
+                .map(|s| bound_name(s, path)),
+            import_block: ImportBlock {
+                imports,
+                byte_range: None,
+            },
+            lang,
+        })
+    }
+
+    fn bind(
+        &self,
+        path: &str,
+        facts: &FactPaths<'_>,
+    ) -> Result<super::FileExtract, ManifestJoinError> {
+        let data = self.file_data(path)?;
+        let nodes = self
+            .symbols
+            .iter()
+            .map(|symbol| {
+                let scoped_name = bound_name(&symbol.scoped_name, path);
+                super::NodeRecord {
+                    id: format!("{path}:{}:{scoped_name}", symbol.ordinal),
+                    file_path: path.to_string(),
+                    name: bound_name(&symbol.name, path),
+                    scoped_name,
+                    kind: symbol.kind.clone(),
+                    range: crate::symbols::Range {
+                        start_line: symbol.start_line,
+                        start_col: symbol.start_col,
+                        end_line: symbol.end_line,
+                        end_col: symbol.end_col,
+                    },
+                    range_ordinal: symbol.ordinal,
+                    signature: symbol.signature.clone(),
+                    exported: symbol.exported,
+                    is_default_export: symbol.is_default_export,
+                    is_type_like: false,
+                    is_callgraph_entry_point: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        let abs = facts.root.join(path);
+        let mut raw_refs = Vec::new();
+        for raw in &self.refs {
+            let dependencies = if raw.kind == BlobRefKind::Module {
+                super::rust_external_module_target(
+                    &abs,
+                    raw.path_override.as_deref(),
+                    raw.module_path.as_deref().unwrap_or_default(),
+                    facts,
+                )
+                .and_then(|p| facts.canonical(&p))
+                .map(|p| super::relative_path(facts.root, &p))
+                .into_iter()
+                .collect()
+            } else if let Some(module) = &raw.module_path {
+                super::module_dependencies(facts.root, &abs, module, facts)
+            } else {
+                BTreeSet::new()
+            };
+            let caller_symbol = raw
+                .caller_symbol
+                .as_ref()
+                .map(|name| bound_name(name, path));
+            let caller_node = caller_symbol.as_ref().and_then(|name| {
+                nodes
+                    .iter()
+                    .find(|n| &n.scoped_name == name)
+                    .map(|n| n.id.clone())
+            });
+            raw_refs.push(super::RawRef {
+                ref_id: format!("{path}:{}:{:?}", raw.ordinal, raw.kind),
+                caller_node,
+                caller_symbol,
+                caller_file: path.to_string(),
+                kind: match raw.kind {
+                    BlobRefKind::Call => "call",
+                    BlobRefKind::ValueRef => "value_ref",
+                    BlobRefKind::Import => "import",
+                    BlobRefKind::Module => "module",
+                    BlobRefKind::Reexport => "reexport",
+                    BlobRefKind::ExportAlias => "export_alias",
+                }
+                .to_string(),
+                short_name: raw.short_name.clone(),
+                full_ref: raw.full_ref.clone(),
+                module_path: raw.module_path.clone(),
+                import_kind: raw.import_kind.clone(),
+                local_name: raw.local_name.clone(),
+                requested_name: raw.requested_name.clone(),
+                namespace_alias: raw.namespace_alias.clone(),
+                wildcard: raw.wildcard,
+                line: raw.line,
+                byte_start: raw.byte_start,
+                byte_end: raw.byte_end,
+                dependencies,
+            });
+        }
+        Ok(super::FileExtract {
+            rel_path: path.to_string(),
+            freshness: crate::cache_freshness::FileFreshness {
+                mtime: std::time::UNIX_EPOCH,
+                size: 0,
+                content_hash: crate::cache_freshness::zero_hash(),
+            },
+            lang: data.lang,
+            data,
+            nodes,
+            raw_refs,
+            dispatch_hints: Vec::new(),
+            surface_fingerprint: String::new(),
+        })
+    }
+}
+
+/// A manifest-backed index is the ordinary resolver index with different facts.
+type ManifestProjectIndex<'a> = super::ProjectIndex<'a>;
+
+impl JoinResult {
+    pub fn from_manifest(
+        manifest: &Manifest,
+        blobs: &impl ManifestBlobReader,
+    ) -> Result<Self, ManifestJoinError> {
+        let loaded = manifest_payloads(manifest, blobs)?;
+        let reader = |key: &BlobKey| loaded.get(key).cloned();
+        let facts = Rc::new(ManifestFacts {
+            manifest,
+            blobs: &reader,
+        });
+        Self::from_facts(manifest, &loaded, Path::new("/"), facts, None)
+    }
+
+    fn from_facts<'a>(
+        manifest: &'a Manifest,
+        loaded: &BTreeMap<String, Arc<[u8]>>,
+        root: &Path,
+        facts: Rc<dyn ProjectFacts + 'a>,
+        selected: Option<&BTreeSet<CallerRefKey>>,
+    ) -> Result<Self, ManifestJoinError> {
+        let paths = FactPaths {
+            root,
+            facts: facts.as_ref(),
+        };
+        let mut extracts = HashMap::new();
+        let mut work = Vec::new();
+        let mut unbound_non_utf8_paths = Vec::new();
+        for (path, entry) in manifest.entries() {
+            let ManifestEntry::Regular { planes, .. } = entry else {
+                continue;
+            };
+            let Some(key) = &planes.callgraph else {
+                continue;
+            };
+            let bytes = loaded
+                .get(key)
+                .ok_or_else(|| ManifestJoinError::MissingBlob(key.clone()))?;
+            let CallgraphBlob::Parse(blob) = CallgraphBlob::from_bytes(bytes)? else {
+                continue;
+            };
+            let Ok(rel) = std::str::from_utf8(path.as_bytes()) else {
+                unbound_non_utf8_paths.push(path.as_bytes().to_vec());
+                continue;
+            };
+            let extract = blob.bind(rel, &paths)?;
+            for (raw, bound) in blob.refs.iter().zip(&extract.raw_refs) {
+                let ref_key = CallerRefKey {
+                    caller_blob_key: key.clone(),
+                    ref_ordinal: raw.ordinal,
+                    caller_path: path.as_bytes().to_vec(),
+                };
+                if selected.is_none_or(|set| set.contains(&ref_key)) {
+                    work.push((ref_key, (raw.kind, bound.clone())));
+                }
+            }
+            extracts.insert(rel.to_string(), extract);
+        }
+        let files = extracts
+            .iter()
+            .map(|(path, extract)| {
+                (
+                    path.clone(),
+                    super::DbFileIndex::from_extract(root, extract, &paths),
+                )
+            })
+            .collect();
+        let caller_data = extracts
+            .iter()
+            .map(|(path, extract)| (path.clone(), &extract.data))
+            .collect();
+        let mut index = ManifestProjectIndex::from_parts(
+            root,
+            files,
+            caller_data,
+            super::WorkspaceCratePrefixCache::default(),
+            facts,
+        );
+        index.unbound_non_utf8_paths = unbound_non_utf8_paths;
+        if !index.unbound_non_utf8_paths.is_empty() {
+            log::warn!(
+                "callgraph index left {} non-UTF-8 source paths unbound",
+                index.unbound_non_utf8_paths.len()
+            );
+        }
+        let mut result = Self {
+            rows: BTreeSet::new(),
+            resolution_order: Vec::new(),
+            unbound_non_utf8_paths: index.unbound_non_utf8_paths.clone(),
+        };
+        work.sort_by(|a, b| (&a.0, a.1 .0).cmp(&(&b.0, b.1 .0)));
+        for (key, (kind, raw)) in work {
+            let resolved = super::resolve_ref(raw, &index)
+                .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
+            result.rows.insert(DerivedRow {
+                caller_blob_key: key.caller_blob_key.clone(),
+                ref_ordinal: key.ref_ordinal,
+                caller_path: key.caller_path.clone(),
+                kind,
+                status: if resolved.target_file.is_some() {
+                    ResolutionStatus::Resolved
+                } else {
+                    ResolutionStatus::Unresolved
+                },
+                target_path: resolved.target_file.map(String::into_bytes),
+                target_symbol: resolved.target_symbol,
+            });
+            result.resolution_order.push(key);
+        }
+        Ok(result)
+    }
+
+    pub fn update(
+        &self,
+        previous_manifest: &Manifest,
+        manifest: &Manifest,
+        blobs: &impl ManifestBlobReader,
+    ) -> Result<IncrementalJoinResult, ManifestJoinError> {
+        let changed = changed_manifest_paths(previous_manifest, manifest);
+        let full_re_resolve = changed.iter().any(|path| {
+            manifest_resolution_input(previous_manifest, path)
+                || manifest_resolution_input(manifest, path)
+        });
+        let loaded = manifest_payloads(manifest, blobs)?;
+        let reader = |key: &BlobKey| loaded.get(key).cloned();
+        let mut current_keys = BTreeSet::new();
+        for (path, entry) in manifest.entries() {
+            if std::str::from_utf8(path.as_bytes()).is_err() {
+                continue;
+            }
+            let ManifestEntry::Regular { planes, .. } = entry else {
+                continue;
+            };
+            let Some(key) = &planes.callgraph else {
+                continue;
+            };
+            if let CallgraphBlob::Parse(blob) = CallgraphBlob::from_bytes(&loaded[key])? {
+                current_keys.extend(blob.refs.iter().map(|raw| CallerRefKey {
+                    caller_blob_key: key.clone(),
+                    ref_ordinal: raw.ordinal,
+                    caller_path: path.as_bytes().to_vec(),
+                }));
+            }
+        }
+        let previous_rows = self
+            .rows
+            .iter()
+            .map(|row| (row.ref_key(), row))
+            .collect::<BTreeMap<_, _>>();
+        let selected = current_keys
+            .iter()
+            .filter(|key| {
+                full_re_resolve
+                    || changed.contains(&key.caller_path)
+                    || previous_rows.get(*key).is_none_or(|row| {
+                        row.target_path
+                            .as_ref()
+                            .is_some_and(|path| changed.contains(path))
+                    })
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let facts = Rc::new(ManifestFacts {
+            manifest,
+            blobs: &reader,
+        });
+        let mut result =
+            Self::from_facts(manifest, &loaded, Path::new("/"), facts, Some(&selected))?;
+        result.rows.extend(
+            self.rows
+                .iter()
+                .filter(|row| {
+                    current_keys.contains(&row.ref_key()) && !selected.contains(&row.ref_key())
+                })
+                .cloned(),
+        );
+        result.resolution_order = result.rows.iter().map(DerivedRow::ref_key).collect();
+        result.resolution_order.sort();
+        Ok(IncrementalJoinResult {
+            result,
+            re_resolved: selected,
+            full_re_resolve,
+        })
+    }
+}
+
+fn manifest_payloads(
+    manifest: &Manifest,
+    blobs: &impl ManifestBlobReader,
+) -> Result<BTreeMap<String, Arc<[u8]>>, ManifestJoinError> {
+    let mut loaded = BTreeMap::new();
+    for (_, entry) in manifest.entries() {
+        let ManifestEntry::Regular { planes, .. } = entry else {
+            continue;
+        };
+        let Some(key) = &planes.callgraph else {
+            continue;
+        };
+        if !loaded.contains_key(key) {
+            let bytes = blobs
+                .read_callgraph_blob(key)?
+                .ok_or_else(|| ManifestJoinError::MissingBlob(key.clone()))?;
+            loaded.insert(key.clone(), Arc::from(bytes));
+        }
+    }
+    Ok(loaded)
+}
+
+#[cfg(test)]
+#[path = "../../tests/integration/join_manifest_test.rs"]
+mod manifest_integration_tests;
