@@ -56,6 +56,7 @@ const GH_SHIMS_DIR_ENV: &str = "AFT_GH_SHIMS_DIR";
 const GH_SHIM_BINARY_ENV: &str = "AFT_GH_SHIM_BINARY";
 const GIT_CO_AUTHOR_ENV: &str = "AFT_GIT_CO_AUTHOR";
 const STORAGE_DIR_ENV: &str = "AFT_STORAGE_DIR";
+const GH_SHIM_STATE_DIR_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
 const SUBC_CREDENTIAL_ENV_PREFIX: &str = "SUBC_";
 const SUBC_IDENTITY_ENV_KEYS: [&str; 2] = [
     subc_protocol::SUBC_MODULE_ID_ENV,
@@ -341,6 +342,14 @@ pub fn inject(
     if let Some(explicit) = std::env::var_os(STORAGE_DIR_ENV) {
         environment.insert(
             STORAGE_DIR_ENV.to_string(),
+            explicit.to_string_lossy().into_owned(),
+        );
+    }
+    // Preserve an explicitly selected gh-shim state directory for hooks and
+    // nested AFT children, but never mint one from the operator's default.
+    if let Some(explicit) = std::env::var_os(GH_SHIM_STATE_DIR_ENV) {
+        environment.insert(
+            GH_SHIM_STATE_DIR_ENV.to_string(),
             explicit.to_string_lossy().into_owned(),
         );
     }

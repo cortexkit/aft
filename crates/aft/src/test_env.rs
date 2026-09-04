@@ -79,7 +79,7 @@ struct ScopedEnvVar {
 }
 
 impl ScopedEnvVar {
-    fn set(key: &'static str, value: &'static OsStr) -> Self {
+    fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
         let previous = std::env::var_os(key);
         unsafe { std::env::set_var(key, value) };
         Self { key, previous }
@@ -144,6 +144,26 @@ pub(crate) fn hermetic_git_env_guard() -> HermeticGitEnvGuard {
     }
 }
 
+/// Keep in-process gh-shim tests away from the operator's state directory.
+/// The shared lock is held for the complete lifetime of the override because
+/// libtest runs these tests concurrently with other env-sensitive modules.
+pub(crate) struct GhShimStateGuard {
+    _lock: ProcessEnvLockGuard,
+    _state: ScopedEnvVar,
+    _temp: tempfile::TempDir,
+}
+
+pub(crate) fn gh_shim_state_guard() -> GhShimStateGuard {
+    let lock = process_env_lock();
+    let temp = tempfile::tempdir().expect("create gh-shim test state directory");
+    let state = ScopedEnvVar::set("AFT_GH_SHIM_STATE_DIR", temp.path());
+    GhShimStateGuard {
+        _lock: lock,
+        _state: state,
+        _temp: temp,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +179,18 @@ mod tests {
         assert!(mutex.is_poisoned());
 
         drop(lock_test_mutex(&mutex));
+    }
+
+    #[test]
+    fn gh_shim_state_guard_scopes_a_temp_override() {
+        let previous = std::env::var_os("AFT_GH_SHIM_STATE_DIR");
+        {
+            let _guard = gh_shim_state_guard();
+            let selected = std::env::var_os("AFT_GH_SHIM_STATE_DIR")
+                .expect("gh-shim guard installs a state override");
+            assert!(std::path::Path::new(&selected).is_absolute());
+        }
+        assert_eq!(std::env::var_os("AFT_GH_SHIM_STATE_DIR"), previous);
     }
 
     #[test]

@@ -81,6 +81,7 @@ const CO_AUTHOR_LINE_REPORT: &str = "--co-author-line";
 const GOVERNANCE_UNAVAILABLE_TEXT: &str = "the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns";
 const UNTRUSTED_MANIFEST_KEY_STEERING: &str = "the manifest may be newer than this aft build's trust set - update aft, or install a manifest signed by a trusted key";
 const PRE_PROVENANCE_RECORD: &str = "unrecorded (pre-provenance record)";
+const GH_SHIM_STATE_DIR_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
 
 /// The only shim-originated refusal identifiers. Keep this enumeration closed:
 /// callers must parse these identifiers rather than human prose.
@@ -446,19 +447,13 @@ struct StatePaths {
 
 impl StatePaths {
     fn from_process() -> Self {
-        let root = std::env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .or_else(|| std::env::var_os("USERPROFILE"))
-                    .map(|home| PathBuf::from(home).join(".local/state"))
-            })
-            .unwrap_or_else(|| std::env::temp_dir())
-            .join("cortexkit")
-            .join("aft")
-            .join("gh-shim");
-        Self::from_root(root)
+        Self::from_root(gh_shim_state_dir_from(
+            std::env::var_os(GH_SHIM_STATE_DIR_ENV).as_deref(),
+            std::env::var_os("XDG_STATE_HOME").as_deref(),
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .as_deref(),
+        ))
     }
 
     fn from_root(root: PathBuf) -> Self {
@@ -475,6 +470,30 @@ impl StatePaths {
             root,
         }
     }
+}
+
+/// Resolve the one process-state directory used by every gh-shim reader and
+/// writer. The dedicated override is useful for embedding callers and tests;
+/// otherwise the shim follows the repository's existing XDG state convention.
+fn gh_shim_state_dir_from(
+    dedicated_override: Option<&OsStr>,
+    xdg_state_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> PathBuf {
+    if let Some(path) = dedicated_override
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        return path;
+    }
+    xdg_state_home
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| home.map(|home| PathBuf::from(home).join(".local/state")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("cortexkit")
+        .join("aft")
+        .join("gh-shim")
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -3990,6 +4009,42 @@ mod tests {
         assert_eq!(
             resolve_real_gh_in_path(&image, &path, Some(&shims)),
             Some(real)
+        );
+    }
+
+    #[test]
+    fn state_paths_from_process_obey_the_test_state_guard() {
+        let _guard = crate::test_env::gh_shim_state_guard();
+        let selected = std::env::var_os(GH_SHIM_STATE_DIR_ENV).expect("test state override");
+        assert_eq!(StatePaths::from_process().root, PathBuf::from(selected));
+    }
+
+    #[test]
+    fn state_dir_override_wins_without_touching_the_xdg_operator_root() {
+        let operator_state = tempfile::tempdir().unwrap();
+        let canary = tempfile::tempdir().unwrap();
+        let before = fs::metadata(canary.path()).unwrap().modified().unwrap();
+
+        let resolved = gh_shim_state_dir_from(
+            Some(canary.path().as_os_str()),
+            Some(operator_state.path().as_os_str()),
+            Some(operator_state.path().as_os_str()),
+        );
+        assert_eq!(resolved, canary.path());
+        assert_eq!(
+            fs::metadata(canary.path()).unwrap().modified().unwrap(),
+            before,
+            "resolving the test override must not create or rewrite operator state"
+        );
+
+        let xdg_resolved = gh_shim_state_dir_from(
+            None,
+            Some(operator_state.path().as_os_str()),
+            Some(canary.path().as_os_str()),
+        );
+        assert_eq!(
+            xdg_resolved,
+            operator_state.path().join("cortexkit/aft/gh-shim")
         );
     }
 
