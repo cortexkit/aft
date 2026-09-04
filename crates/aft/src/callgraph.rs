@@ -1322,7 +1322,7 @@ fn attribute_sites_to_symbols(
     calls_by_symbol
 }
 
-fn build_file_data_from_source_with_lang(
+pub(crate) fn build_file_data_from_source_with_lang(
     path: &Path,
     source: &str,
     lang: LangId,

@@ -5,6 +5,8 @@
 //! trace) as well as dead-code reachability. It is self-contained: it can be
 //! built and queried directly without going through the in-memory call graph.
 
+pub mod join;
+
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph::{self, EdgeResolution, FileCallData, TraceToSymbolCandidate};
 use crate::context::SubcLifecycleAdmission;
