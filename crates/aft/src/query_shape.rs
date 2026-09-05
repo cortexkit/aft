@@ -134,9 +134,9 @@ pub fn extract_tokens(query: &str, shape: &QueryShape) -> Vec<String> {
     }
 }
 
-/// Tokens for the lexical side of hybrid retrieval and zero-result escalation.
-/// Natural-language queries contribute normalized content words rather than
-/// grammatical glue. Regex escalation remains conservative and prefers explicit
+/// Tokens supplied to the trigram search during hybrid retrieval and a lexical
+/// retry after zero results. Natural-language queries contribute normalized
+/// content words with stopwords removed. Regex retries prefer explicit
 /// code-shaped tokens before falling back to identifier-shaped text.
 pub fn extract_lexical_tokens(query: &str, shape: &QueryShape) -> Vec<String> {
     match shape.kind {
@@ -153,14 +153,13 @@ pub fn extract_lexical_tokens(query: &str, shape: &QueryShape) -> Vec<String> {
     }
 }
 
-/// Back-compatible entry point for natural-language lexical tokens.
+/// Legacy wrapper that delegates natural-language token extraction.
 pub fn extract_short_nl_lexical_tokens(query: &str) -> Vec<String> {
     extract_content_tokens(query)
 }
 
-/// Lowercase natural-language tokens that carry enough meaning for trigram
-/// retrieval. This uses the same identifier-aware tokenizer as the other query
-/// extractors, then removes grammatical glue and tokens below the trigram floor.
+/// Unique lowercase natural-language tokens with stopwords and words shorter
+/// than the three-character trigram minimum removed.
 pub fn extract_content_tokens(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     for mat in IDENTIFIER_TOKEN_RE.find_iter(text) {
@@ -173,9 +172,9 @@ pub fn extract_content_tokens(text: &str) -> Vec<String> {
     tokens
 }
 
-/// Check a file body for every normalized query content token without retaining
-/// a token set for the whole file. Lexical fusion calls this only for the bounded
-/// candidate list and exits as soon as every requested token has been observed.
+/// Return whether every normalized query content token occurs in the supplied
+/// text slice. Exact-tier fusion supplies at most three consecutive source lines
+/// and exits as soon as every requested token has been observed.
 pub fn contains_all_content_tokens(text: &str, tokens: &[String]) -> bool {
     if tokens.is_empty() {
         return false;

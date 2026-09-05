@@ -3330,11 +3330,11 @@ fn fuse_hybrid_results_with_zoom(
         return results;
     }
 
-    // Every bounded lexical candidate participates in reciprocal-rank fusion.
-    // Files returned by both lanes receive both rank contributions; candidates
-    // from only one lane remain eligible instead of being appended after a full
-    // semantic budget. Exact-tier ordering is applied by sort_hybrid_results
-    // before the final top-k truncation.
+    // Merge semantic symbol hits and trigram-ranked files with reciprocal-rank
+    // fusion. A file found by both searches receives both rank contributions;
+    // files found by only one search remain eligible. Phrase matches and files
+    // containing every query token within three source lines sort first, before
+    // the final top-k truncation.
     let lexical_top_files: HashMap<PathBuf, (LexicalCandidate, usize)> = lexical_candidates
         .iter()
         .cloned()
@@ -3370,7 +3370,14 @@ fn fuse_hybrid_results_with_zoom(
     }
 
     sort_hybrid_results(&mut results);
-    let mut results = cap_per_file(results, 2);
+    // Natural-language searches previously used the uncapped semantic lane. Keep
+    // those candidates available after adding lexical RRF so enabling both
+    // searches does not discard distinct relevant symbols from the same file.
+    let mut results = if shape.kind == QueryKind::NaturalLanguage {
+        results
+    } else {
+        cap_per_file(results, 2)
+    };
     sort_hybrid_results(&mut results);
     results.truncate(top_k);
     results
@@ -3468,9 +3475,10 @@ fn reciprocal_rank(zero_based_rank: usize) -> f32 {
 
 fn hybrid_rrf_weights(shape: &QueryShape) -> (f32, f32) {
     match shape.kind {
-        // Exact local co-occurrence has its own tier. Below it, lexical rank is
-        // deliberately a light corroborating signal so a broad file that shares
-        // scattered concept words cannot displace the best semantic answer.
+        // Phrase matches and files containing every normalized query token in
+        // at most three source lines sort before this score. For all remaining
+        // results, lexical rank is a light corroborating signal so scattered
+        // concept words cannot displace the best semantic answer.
         QueryKind::NaturalLanguage | QueryKind::Mixed => (0.999, 0.001),
         _ => (shape.weights.semantic, shape.weights.lexical),
     }
