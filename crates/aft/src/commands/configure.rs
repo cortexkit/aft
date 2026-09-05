@@ -4471,8 +4471,8 @@ enum ConfigureMaintenanceStage {
     SessionReplay,
     BashRuntime,
     ProjectRuntime,
-    StorageSweeps,
     Watcher,
+    StorageSweeps,
     ProcessFlags,
     Callgraph,
     SemanticRelease,
@@ -4482,13 +4482,23 @@ enum ConfigureMaintenanceStage {
 impl ConfigureMaintenanceStage {
     /// Stages a request's correctness depends on. They run to completion before
     /// the first request after a configure is served: bash replay (a queued
-    /// `bash_drain_completions` must see the previous process's tasks) and the
+    /// `bash_drain_completions` must see the previous process's tasks), the
     /// project runtime (a queued `outline`/`glob` must see the rebuilt gitignore
-    /// matcher). Everything after them is housekeeping and yields to requests.
+    /// matcher), and the watcher start. The watcher only observes changes made
+    /// after it subscribes, so a file written between the configure ack and the
+    /// first request is lost for good if the start waits for a later yield: on a
+    /// small tree the index is ready after one request, an ignore-rule change
+    /// written right after it was never seen, and the ignored file stayed in
+    /// grep results. Everything after these is housekeeping and yields to
+    /// requests.
     fn is_non_yielding_prefix(self) -> bool {
         matches!(
             self,
-            Self::Admission | Self::SessionReplay | Self::BashRuntime | Self::ProjectRuntime
+            Self::Admission
+                | Self::SessionReplay
+                | Self::BashRuntime
+                | Self::ProjectRuntime
+                | Self::Watcher
         )
     }
 }
@@ -4768,14 +4778,6 @@ fn run_configure_maintenance_unit(
                     ctx.clear_gitignore();
                 }
             }
-            continuation.stage = ConfigureMaintenanceStage::StorageSweeps;
-        }
-        ConfigureMaintenanceStage::StorageSweeps => {
-            if detach_storage_sweeps {
-                spawn_configure_storage_sweeps(&job.storage_root, job.harness.clone());
-            } else {
-                run_configure_storage_sweeps(&job.storage_root, job.harness.clone());
-            }
             continuation.stage = ConfigureMaintenanceStage::Watcher;
         }
         ConfigureMaintenanceStage::Watcher => {
@@ -4810,6 +4812,14 @@ fn run_configure_maintenance_unit(
                     forget_configure_job_binding(ctx, job);
                     return ConfigureMaintenanceUnitResult::Complete;
                 }
+            }
+            continuation.stage = ConfigureMaintenanceStage::StorageSweeps;
+        }
+        ConfigureMaintenanceStage::StorageSweeps => {
+            if detach_storage_sweeps {
+                spawn_configure_storage_sweeps(&job.storage_root, job.harness.clone());
+            } else {
+                run_configure_storage_sweeps(&job.storage_root, job.harness.clone());
             }
             continuation.stage = ConfigureMaintenanceStage::ProcessFlags;
         }
@@ -4995,6 +5005,28 @@ fn callgraph_configure_warm_allowed(ctx: &AppContext) -> bool {
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
+
+    /// The watcher only sees changes made after it subscribes, so its start
+    /// must complete before the first request after configure is served and
+    /// must not sit behind the (possibly detached, possibly slow) storage
+    /// sweeps. The Linux watcher-integration ignore-purge test is the runtime
+    /// oracle for this; this pins the stage table so a reorder reds here first.
+    #[test]
+    fn watcher_start_is_a_non_yielding_prefix_stage_before_storage_sweeps() {
+        assert!(ConfigureMaintenanceStage::Watcher.is_non_yielding_prefix());
+        assert!(ConfigureMaintenanceStage::ProjectRuntime.is_non_yielding_prefix());
+        assert!(!ConfigureMaintenanceStage::StorageSweeps.is_non_yielding_prefix());
+        // Discriminant order is the drain order: the gitignore matcher rebuild
+        // (ProjectRuntime) precedes the watcher, and the sweeps follow it.
+        assert!(
+            (ConfigureMaintenanceStage::ProjectRuntime as u8)
+                < (ConfigureMaintenanceStage::Watcher as u8)
+        );
+        assert!(
+            (ConfigureMaintenanceStage::Watcher as u8)
+                < (ConfigureMaintenanceStage::StorageSweeps as u8)
+        );
+    }
     use std::ffi::OsString;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
@@ -5014,7 +5046,8 @@ mod tests {
         reset_configure_deferred_delay_reached_for_test, semantic_build_retry_backoff,
         set_configure_artifact_post_gate_delay_for_test, should_clear_failed_spawns,
         should_wait_for_callgraph_start, validate_storage_dir, wait_for_semantic_artifact_start,
-        INDEX_ORDER_GRACE_MS, INDEX_ORDER_TEST_LOCK, INDEX_ORDER_TIMEOUT_LOGS,
+        ConfigureMaintenanceStage, INDEX_ORDER_GRACE_MS, INDEX_ORDER_TEST_LOCK,
+        INDEX_ORDER_TIMEOUT_LOGS,
     };
     use crate::cache_freshness::{self, VerifyArtifact, WarmVerifyPlan};
     use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
