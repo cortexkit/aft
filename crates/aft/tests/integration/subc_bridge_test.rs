@@ -1119,6 +1119,7 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "bash_abort_inflight" => aft::commands::bash_abort_inflight::handle(&req, ctx),
         "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
         "bash_regex_match" => aft::commands::bash_regex_match::handle(&req),
+        "bash_notify" => aft::commands::bash_notify::handle(&req, ctx),
         "bash_ack_completions" => aft::commands::bash_drain_completions::handle_ack(&req, ctx),
         "read" => aft::commands::read::handle_read(&req, ctx),
         "write" => aft::commands::write::handle_write(&req, ctx),
@@ -2345,6 +2346,26 @@ fn subc_bridge_bg_events_idle_completion_wake_lane() {
         "subc_bridge_bg_events_idle_completion_wake_lane",
         Duration::from_secs(90),
         drive_bg_events_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_dropped_completion_nudge_is_rearmed_until_ack() {
+    run_subc_bridge_test(
+        "subc_bridge_dropped_completion_nudge_is_rearmed_until_ack",
+        Duration::from_secs(60),
+        drive_dropped_completion_nudge_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_dropped_pattern_nudge_is_rearmed_and_drains_match() {
+    run_subc_bridge_test(
+        "subc_bridge_dropped_pattern_nudge_is_rearmed_and_drains_match",
+        Duration::from_secs(60),
+        drive_dropped_pattern_nudge_daemon,
         |_, _, _| {},
     );
 }
@@ -6355,6 +6376,200 @@ async fn drive_session_scoped_bg_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+async fn drive_dropped_completion_nudge_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    const BG_CHANNEL: u16 = 245;
+    const BG_CORR: u64 = 780;
+    send_route_bind_with_session(&mut stream, BG_CHANNEL, 779, &root1, "session-1").await;
+    expect_route_bind_ack(&mut stream, 779).await;
+    send_bg_events_subscribe(&mut stream, BG_CHANNEL, BG_CORR).await;
+    drain_bg_events_for(
+        &mut stream,
+        BG_CHANNEL,
+        BG_CORR,
+        Duration::from_millis(800),
+        "completion dropped-nudge subscription seed",
+    )
+    .await;
+
+    send_bash_background(&mut stream, 781, "sleep 1; printf 'completion-rearm\n'").await;
+    let launch = read_tool_response_allowing_bg_events(
+        &mut stream,
+        781,
+        BG_CHANNEL,
+        BG_CORR,
+        "completion dropped-nudge launch",
+    )
+    .await;
+    let task_id = launch["task_id"]
+        .as_str()
+        .expect("background task id")
+        .to_string();
+
+    let _dropped = wait_for_bg_event(
+        &mut stream,
+        BG_CHANNEL,
+        BG_CORR,
+        Duration::from_secs(30),
+        "first completion nudge to drop",
+    )
+    .await;
+    let _rearmed = wait_for_bg_event(
+        &mut stream,
+        BG_CHANNEL,
+        BG_CORR,
+        Duration::from_secs(3),
+        "rearmed completion nudge",
+    )
+    .await;
+
+    let drained =
+        drain_bg_completions_until(&mut stream, 1, 782, &[task_id.clone()], BG_CHANNEL, BG_CORR)
+            .await;
+    assert!(drained["bg_completions"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item["task_id"] == task_id)));
+    send_tool_call(
+        &mut stream,
+        1,
+        1082,
+        "bash_ack_completions",
+        json!({ "task_ids": [task_id] }),
+    )
+    .await;
+    let ack = read_tool_response_allowing_bg_events(
+        &mut stream,
+        1082,
+        BG_CHANNEL,
+        BG_CORR,
+        "completion dropped-nudge ack",
+    )
+    .await;
+    assert_eq!(ack["success"], true);
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_dropped_pattern_nudge_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        executor,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    let root_id = ProjectRootId::from_path(&root1).expect("bound root id");
+    let ctx = executor
+        .actor_context(&root_id)
+        .expect("bound root actor context");
+    ctx.bash_background().set_harness(Harness::Opencode);
+    let watch_db = Arc::new(Mutex::new(
+        aft::db::open(&root1.join("dropped-pattern-watch.db")).expect("open watch DB"),
+    ));
+    ctx.bash_background().set_db_pool(watch_db);
+    const BG_CHANNEL: u16 = 245;
+    const BG_CORR: u64 = 790;
+    send_route_bind_with_session(&mut stream, BG_CHANNEL, 789, &root1, "session-1").await;
+    expect_route_bind_ack(&mut stream, 789).await;
+    send_bg_events_subscribe(&mut stream, BG_CHANNEL, BG_CORR).await;
+    drain_bg_events_for(
+        &mut stream,
+        BG_CHANNEL,
+        BG_CORR,
+        Duration::from_millis(800),
+        "pattern dropped-nudge subscription seed",
+    )
+    .await;
+
+    send_bash_background(
+        &mut stream,
+        791,
+        "sleep 1; printf 'PATTERN-READY\n'; sleep 5",
+    )
+    .await;
+    let launch = read_tool_response_allowing_bg_events(
+        &mut stream,
+        791,
+        BG_CHANNEL,
+        BG_CORR,
+        "pattern dropped-nudge launch",
+    )
+    .await;
+    let task_id = launch["task_id"]
+        .as_str()
+        .expect("background task id")
+        .to_string();
+    send_tool_call(
+        &mut stream,
+        1,
+        792,
+        "bash_notify",
+        json!({ "task_id": task_id, "pattern": "PATTERN-READY", "once": true }),
+    )
+    .await;
+    let notify = read_tool_response_allowing_bg_events(
+        &mut stream,
+        792,
+        BG_CHANNEL,
+        BG_CORR,
+        "register pattern dropped-nudge watch",
+    )
+    .await;
+    assert_eq!(notify["success"], true, "bash_notify failed: {notify:?}");
+
+    let _dropped = wait_for_bg_event(
+        &mut stream,
+        BG_CHANNEL,
+        BG_CORR,
+        Duration::from_secs(30),
+        "first pattern nudge to drop",
+    )
+    .await;
+    let _rearmed = wait_for_bg_event(
+        &mut stream,
+        BG_CHANNEL,
+        BG_CORR,
+        Duration::from_secs(3),
+        "rearmed pattern nudge",
+    )
+    .await;
+
+    send_tool_call(&mut stream, 1, 793, "bash_drain_completions", json!({})).await;
+    let drained = read_tool_response_allowing_bg_events(
+        &mut stream,
+        793,
+        BG_CHANNEL,
+        BG_CORR,
+        "drain rearmed pattern match",
+    )
+    .await;
+    assert!(drained["pending_matches"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item["task_id"] == task_id && item["match_text"] == "PATTERN-READY")
+    }));
+    send_tool_call(
+        &mut stream,
+        1,
+        794,
+        "bash_ack_completions",
+        json!({ "task_ids": [task_id] }),
+    )
+    .await;
+    let ack = read_tool_response_allowing_bg_events(
+        &mut stream,
+        794,
+        BG_CHANNEL,
+        BG_CORR,
+        "pattern dropped-nudge ack",
+    )
+    .await;
+    assert_eq!(ack["success"], true);
+    send_connection_goodbye(&mut stream).await;
+}
+
 async fn drive_bg_events_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream, root1, ..
@@ -6463,8 +6678,8 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
     );
     assert_bg_events_are_coalesced(&early_bg_events);
     if early_bg_events.len() == 1 {
-        // This samples the coalescer's 150 ms product tick after an observed
-        // completion event; it is not a process-readiness deadline.
+        // This checks only the first 150 ms of the coalescer's 250 ms product
+        // tick after an observed completion; it is not a readiness deadline.
         let elapsed = early_bg_events[0].0.elapsed();
         if elapsed < Duration::from_millis(150) {
             assert_no_bg_event_for(

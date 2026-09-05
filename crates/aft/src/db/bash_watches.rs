@@ -177,6 +177,33 @@ pub fn list_bash_pattern_watches_by_task_id(
     rows
 }
 
+pub fn count_pending_bash_pattern_watches_for_session(
+    conn: &Connection,
+    harness: &str,
+    session_id: &str,
+) -> rusqlite::Result<usize> {
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM bash_pattern_watches
+         WHERE harness = ?1 AND session_id = ?2 AND pending_match = 1",
+        params![harness, session_id],
+        |row| row.get(0),
+    )
+}
+
+pub fn count_pending_bash_pattern_watches(
+    conn: &Connection,
+    harness: &str,
+) -> rusqlite::Result<usize> {
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM bash_pattern_watches
+         WHERE harness = ?1 AND pending_match = 1",
+        params![harness],
+        |row| row.get(0),
+    )
+}
+
 pub fn get_bash_pattern_watch(
     conn: &Connection,
     harness: &str,

@@ -823,6 +823,23 @@ struct BgSub {
     session: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BgWakeState {
+    next_nudge_at: Instant,
+    nudges_sent: u32,
+}
+
+impl BgWakeState {
+    fn armed(now: Instant) -> Self {
+        Self {
+            next_nudge_at: now,
+            nudges_sent: 0,
+        }
+    }
+}
+
+type BgWakePending = HashMap<RouteChannel, BgWakeState>;
+
 // A session can be observed by multiple long-lived consumer records. Retain
 // every route so each wake uses the correlation captured by that route's BgSub.
 type BgSubsBySession = HashMap<(ProjectRootId, String), HashSet<RouteChannel>>;
@@ -916,7 +933,7 @@ fn due_maintenance_jobs(
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     executor: Option<&Executor>,
     bg_sub_by_session: &BgSubsBySession,
-    bg_wake_pending: &HashSet<RouteChannel>,
+    bg_wake_pending: &BgWakePending,
     budget: usize,
     pending_bind_roots: &HashSet<ProjectRootId>,
 ) -> (Vec<(ProjectRootId, MaintenanceDrainKind)>, bool) {
@@ -965,7 +982,7 @@ fn due_maintenance_jobs(
                     sub_root == &root_id
                         && channels
                             .iter()
-                            .any(|channel| bg_wake_pending.contains(channel))
+                            .any(|channel| bg_wake_pending.contains_key(channel))
                 });
             let kinds_with_work: Vec<MaintenanceDrainKind> = match executor_actor_context {
                 Some(ctx) => INITIAL_MAINTENANCE_DRAIN_KINDS
@@ -1465,7 +1482,7 @@ fn purge_deleted_root_residents(
     push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
-    bg_wake_pending: &mut HashSet<RouteChannel>,
+    bg_wake_pending: &mut BgWakePending,
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     metrics: &DispatchPathMetrics,
@@ -1527,7 +1544,7 @@ fn submit_due_maintenance_jobs(
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &HashMap<RouteChannel, PendingBind>,
     bg_sub_by_session: &BgSubsBySession,
-    bg_wake_pending: &HashSet<RouteChannel>,
+    bg_wake_pending: &BgWakePending,
     bg_wake_epoch: &HashMap<(ProjectRootId, String), u64>,
     maintenance_tx: &mpsc::Sender<MaintenanceCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
@@ -2133,7 +2150,7 @@ async fn end_bg_subscription(
     metrics: &DispatchPathMetrics,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
-    bg_wake_pending: &mut HashSet<RouteChannel>,
+    bg_wake_pending: &mut BgWakePending,
     channel: RouteChannel,
     identity: Option<&RouteIdentity>,
     cause: &str,
@@ -2161,7 +2178,7 @@ async fn teardown_installed_route(
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
-    bg_wake_pending: &mut HashSet<RouteChannel>,
+    bg_wake_pending: &mut BgWakePending,
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
@@ -2954,7 +2971,7 @@ where
     let mut management_routes: HashSet<RouteChannel> = HashSet::new();
     let mut bg_subs: HashMap<RouteChannel, BgSub> = HashMap::new();
     let mut bg_sub_by_session: BgSubsBySession = HashMap::new();
-    let mut bg_wake_pending: HashSet<RouteChannel> = HashSet::new();
+    let mut bg_wake_pending = BgWakePending::new();
     let mut bg_wake_epoch: HashMap<(ProjectRootId, String), u64> = HashMap::new();
     let mut root_channels: HashMap<ProjectRootId, HashSet<RouteChannel>> = HashMap::new();
     let mut session_identity: HashMap<(ProjectRootId, String), RetainedSessionIdentity> =
@@ -3051,6 +3068,7 @@ where
                 &bg_subs,
                 &mut bg_wake_pending,
             );
+            dispatch_path_metrics.warn_stuck_pending_watches(&executor, &bg_sub_by_session);
             warn_slow_pending_binds(&mut pending_binds, &executor);
             warn_slow_running_interactive_jobs(&executor);
             if let Err(error) = expire_overdue_route_binds(
@@ -4261,7 +4279,7 @@ async fn handle_control_request(
     root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
-    bg_wake_pending: &mut HashSet<RouteChannel>,
+    bg_wake_pending: &mut BgWakePending,
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
     active_tool_calls: &ActiveToolCalls,
@@ -4651,7 +4669,17 @@ async fn handle_control_request(
             Ok(())
         }
         ModuleControlRequest::HealthCheck {} => {
-            metrics.record_bg_runtime(bg_subs.len(), bg_wake_pending.len());
+            let bg_wake_unacked_total = executor
+                .try_actor_entries()
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .flat_map(|(_, ctx)| ctx.bash_background().unacked_wake_keys())
+                        .collect::<HashSet<_>>()
+                        .len()
+                })
+                .unwrap_or_else(|| metrics.bg_wake_unacked_total.load(Ordering::Relaxed));
+            metrics.record_bg_runtime(bg_subs.len(), bg_wake_pending.len(), bg_wake_unacked_total);
             let report = build_health_report(
                 health_rollup_cache,
                 executor,
@@ -5022,7 +5050,7 @@ async fn handle_tool_call(
     next_bash_ask_corr: &mut u64,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
-    bg_wake_pending: &mut HashSet<RouteChannel>,
+    bg_wake_pending: &mut BgWakePending,
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     dispatch: DispatchFn,
     deferred_response_tx: &mpsc::UnboundedSender<PendingSubcResponse>,
@@ -5872,8 +5900,7 @@ fn submit_maintenance_job(
                 let empty_bg_sessions = bg_sessions_to_check
                     .into_iter()
                     .filter(|(session, _)| {
-                        !ctx.bash_background()
-                            .has_completions_for_session(Some(session.as_str()))
+                        !ctx.bash_background().has_unacked_wakes_for_session(session)
                     })
                     .collect();
                 MaintenanceJobOutcome {
@@ -7206,7 +7233,7 @@ mod tests {
             live_roots,
             None,
             &HashMap::new(),
-            &HashSet::new(),
+            &BgWakePending::new(),
             budget,
             pending_bind_roots,
         )
@@ -7649,7 +7676,8 @@ mod tests {
             (root.clone(), "deleted-route".to_string()),
             HashSet::from([route]),
         )]);
-        let mut bg_wake_pending = HashSet::from([route]);
+        let mut bg_wake_pending =
+            BgWakePending::from([(route, BgWakeState::armed(Instant::now()))]);
         let mut bg_wake_epoch = HashMap::new();
         let mut pending_bash_asks = HashMap::new();
         let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
@@ -8162,7 +8190,7 @@ mod tests {
         let mut push_buffer = HashMap::new();
         let mut bg_subs = HashMap::new();
         let mut bg_sub_by_session = HashMap::new();
-        let mut bg_wake_pending = HashSet::new();
+        let mut bg_wake_pending = BgWakePending::new();
         let mut bg_wake_epoch = HashMap::new();
         let mut pending_bash_asks = HashMap::new();
         let mut retry_buffer = HashMap::new();
@@ -8495,7 +8523,7 @@ mod tests {
         let metrics = DispatchPathMetrics::new();
         let bg_sub_by_session =
             HashMap::from([((root.clone(), session.clone()), HashSet::from([channel]))]);
-        let mut bg_wake_pending = HashSet::new();
+        let mut bg_wake_pending = BgWakePending::new();
 
         let (idle_tick_jobs, deferred) = due_maintenance_jobs(
             &mut live_roots,

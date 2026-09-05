@@ -114,8 +114,8 @@ type SessionBgState = {
    * confirmed (so the Rust registry still holds them and, over subc, re-nudges).
    * Ingest skips these for fresh delivery AND a forced drain RE-ACKs them (the
    * self-terminating close of the re-nudge loop, C-#3). Entries are removed by
-   * DAEMON RECONCILIATION, not a timer: a forced drain that no longer returns a
-   * task proves the daemon dropped it, so it is safe to forget (R2-T3 — a
+    * DAEMON RECONCILIATION, not a timer: when a forced drain no longer returns a
+    * task as unacknowledged, it is safe to forget (R2-T3 — a
    * time-based TTL could evict a task the daemon still holds, reopening the
    * double-deliver). Self-drains: the module re-nudges (→ drain → re-ack) until
    * ack confirms. Insertion-ordered for the FIFO OOM backstop cap.
@@ -359,7 +359,7 @@ export async function handlePushedPatternMatch(
   frame: PatternMatchEntry,
 ): Promise<void> {
   const state = stateFor(drainContext.sessionID);
-  queuePendingPatternMatch(state, frame);
+  queuePendingPatternMatch(state, { ...frame, ackCompletionOnDelivery: true });
   await triggerWakeIfPending(drainContext, true);
 }
 
@@ -511,8 +511,9 @@ export async function handleIdleBgCompletions(
 
 /**
  * Subc bg_events wake entrypoint. Over subc, an idle-completion WAKE is a thin
- * payload-less nudge: the module only nudges while it holds pending completions
- * (re-armed each tick until acked), so a nudge ALWAYS means "drain me now". This
+ * payload-less nudge. The module sends one optimistic nudge when the subscription
+ * opens, then re-nudges while completions or pattern matches remain unacknowledged;
+ * either case means "drain me now". This
  * differs from {@link handleIdleBgCompletions}, whose drain is GATED — once
  * `forcedDrainCompleted` is set and nothing is locally outstanding, it skips the
  * drain. A subc completion can be for a task this process never tracked (a prior
@@ -520,9 +521,9 @@ export async function handleIdleBgCompletions(
  * drain would skip it and the module would re-arm and nudge forever. The
  * module-side loop is
  * `crates/aft/src/subc/push.rs::{emit_bg_event_wakes,clear_stale_bg_wakes_for_empty_sessions}`:
- * it re-emits pending wakes until ack empties the queue, so coalescing a duplicate
+ * it re-emits pending wakes until ack clears durable items, so coalescing a duplicate
  * while this handler is in flight is safe. This path forces an UNCONDITIONAL drain
- * so the completion is fetched, delivered, and acked.
+ * so each durable notification is fetched, delivered, and acked.
  */
 export function handleSubcBgEventsNudge(
   drainContext: DrainContext & { client: unknown },
@@ -1001,9 +1002,18 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
       return;
     }
     state.forcedDrainCompleted = true;
-    const drainedTaskIds = Array.isArray(response.bg_completions)
-      ? response.bg_completions.filter(isBgCompletion).map((completion) => completion.task_id)
+    const drainedCompletions = Array.isArray(response.bg_completions)
+      ? response.bg_completions.filter(isBgCompletion)
       : [];
+    const drainedMatches = Array.isArray(response.pending_matches)
+      ? response.pending_matches.filter(isPatternMatchEntry)
+      : [];
+    const drainedTaskIds = [
+      ...new Set([
+        ...drainedCompletions.map((completion) => completion.task_id),
+        ...drainedMatches.map((match) => match.task_id),
+      ]),
+    ];
     logDeliveryHop(drainContext, "drain-ok", "drain ok", {
       event: "bash_completion_drain_ok",
       count: drainedTaskIds.length,
@@ -1015,8 +1025,9 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
     // drain no longer returns was already dropped daemon-side → reconcile forgets
     // it. ingestDrainedBgCompletions skips awaiting-ack tasks for fresh delivery,
     // so a re-ack never double-delivers.
-    const reackTaskIds = reconcileAwaitingAck(state, response.bg_completions);
-    ingestDrainedBgCompletions(drainContext.sessionID, response.bg_completions);
+    const reackTaskIds = reconcileAwaitingAck(state, drainedTaskIds);
+    ingestDrainedBgCompletions(drainContext.sessionID, drainedCompletions);
+    ingestDrainedPatternMatches(drainContext.sessionID, drainedMatches);
     if (reackTaskIds.length > 0) {
       const reacked = await ackCompletions(
         drainContext,
@@ -1317,6 +1328,18 @@ function stateFor(sessionID: string | undefined): SessionBgState {
   return state;
 }
 
+function ingestDrainedPatternMatches(
+  sessionID: string | undefined,
+  matches: readonly PatternMatchEntry[],
+): void {
+  const state = stateFor(sessionID);
+  for (const match of matches) {
+    state.outstandingTaskIds.delete(match.task_id);
+    if (isDeliveringOrAwaitingAck(state, match.task_id)) continue;
+    queuePendingPatternMatch(state, { ...match, ackCompletionOnDelivery: true });
+  }
+}
+
 function ingestDrainedBgCompletions(
   sessionID: string | undefined,
   completions: unknown,
@@ -1466,14 +1489,9 @@ function clearAwaitingAck(state: SessionBgState, taskIds: readonly string[]): vo
  * acks then confirms. This replaces a timer-based eviction that could drop a
  * still-held task and reopen the double-deliver window.
  */
-function reconcileAwaitingAck(state: SessionBgState, completions: unknown): string[] {
+function reconcileAwaitingAck(state: SessionBgState, drainedTaskIds: readonly string[]): string[] {
   if (state.deliveredAwaitingAckTaskIds.size === 0) return [];
-  const drainedIds = new Set<string>();
-  if (Array.isArray(completions)) {
-    for (const completion of completions) {
-      if (isBgCompletion(completion)) drainedIds.add(completion.task_id);
-    }
-  }
+  const drainedIds = new Set(drainedTaskIds);
   const reack: string[] = [];
   for (const id of [...state.deliveredAwaitingAckTaskIds]) {
     if (drainedIds.has(id)) reack.push(id);
@@ -1498,6 +1516,20 @@ function capDeliveredAwaitingAck(state: SessionBgState, sessionID?: string): voi
       `${LOG_PREFIX} deliveredAwaitingAckTaskIds exceeded ${DELIVERED_AWAITING_ACK_CAP}; evicting ${oldest}`,
     );
   }
+}
+
+function isPatternMatchEntry(value: unknown): value is PatternMatchEntry {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const match = value as Record<string, unknown>;
+  return (
+    typeof match.task_id === "string" &&
+    typeof match.session_id === "string" &&
+    typeof match.watch_id === "string" &&
+    typeof match.match_text === "string" &&
+    typeof match.match_offset === "number" &&
+    typeof match.context === "string" &&
+    typeof match.once === "boolean"
+  );
 }
 
 function isBgCompletion(value: unknown): value is BgCompletion {

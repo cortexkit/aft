@@ -96,9 +96,9 @@ type SessionBgState = {
    * Task IDs DELIVERED to the agent but whose `bash_ack_completions` has not yet
    * confirmed (Rust still holds them and, over subc, re-nudges). Ingest skips them
    * for fresh delivery AND a forced drain RE-ACKs them (the self-terminating close
-   * of the re-nudge loop, C-#3). Removed by DAEMON RECONCILIATION, not a timer: a
-   * forced drain that no longer returns a task proves the daemon dropped it
-   * (R2-T3 — a time TTL could evict a still-held task and reopen the
+   * of the re-nudge loop, C-#3). Removed by DAEMON RECONCILIATION, not a timer:
+   * when a forced drain no longer returns a task as unacknowledged, it is safe to
+   * forget (R2-T3 — a time TTL could evict a still-held task and reopen the
    * double-deliver). Insertion-ordered for the FIFO OOM backstop cap.
    */
   deliveredAwaitingAckTaskIds: Set<string>;
@@ -316,7 +316,7 @@ export async function handlePushedPatternMatch(
   frame: PatternMatchEntry,
 ): Promise<void> {
   const state = stateFor(drainContext.sessionID);
-  queuePendingPatternMatch(state, frame);
+  queuePendingPatternMatch(state, { ...frame, ackCompletionOnDelivery: true });
   await triggerWakeIfPending(drainContext, true);
 }
 
@@ -452,13 +452,14 @@ export async function handleTurnEndBgCompletions(
 
 /**
  * Subc bg_events wake entrypoint (forced unconditional drain). The subc nudge is
- * payload-less and only fires while the module holds pending completions
- * (re-armed until acked), so it always means "drain me now" — even for a task
+ * payload-less. The module sends one optimistic nudge when the subscription opens,
+ * then re-nudges while completions or pattern matches remain unacknowledged, so it
+ * always means "drain me now" — even for a task
  * this process never tracked (prior session / already-cleared outstanding entry),
  * which the gated drain in {@link triggerWakeIfPending} would skip, leaving the
  * module to re-arm and nudge forever. The module-side loop lives at
  * `crates/aft/src/subc/push.rs::{emit_bg_event_wakes,clear_stale_bg_wakes_for_empty_sessions}`:
- * it re-emits pending wakes until ack empties the queue, so coalescing a duplicate
+ * it re-emits pending wakes until ack clears durable items, so coalescing a duplicate
  * while this handler is in flight is safe. See the OpenCode twin for the full rationale.
  */
 export function handleSubcBgEventsNudge(
@@ -799,9 +800,18 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
       return;
     }
     state.forcedDrainCompleted = true;
-    const drainedTaskIds = Array.isArray(response.bg_completions)
-      ? response.bg_completions.filter(isBgCompletion).map((completion) => completion.task_id)
+    const drainedCompletions = Array.isArray(response.bg_completions)
+      ? response.bg_completions.filter(isBgCompletion)
       : [];
+    const drainedMatches = Array.isArray(response.pending_matches)
+      ? response.pending_matches.filter(isPatternMatchEntry)
+      : [];
+    const drainedTaskIds = [
+      ...new Set([
+        ...drainedCompletions.map((completion) => completion.task_id),
+        ...drainedMatches.map((match) => match.task_id),
+      ]),
+    ];
     logDeliveryHop(drainContext, "drain-ok", "drain ok", {
       event: "bash_completion_drain_ok",
       count: drainedTaskIds.length,
@@ -812,8 +822,9 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
     // nudges, self-terminating); one it no longer returns was dropped daemon-side
     // → reconcile forgets it. Ingest skips awaiting-ack tasks, so re-ack never
     // double-delivers.
-    const reackTaskIds = reconcileAwaitingAck(state, response.bg_completions);
-    ingestDrainedBgCompletions(drainContext.sessionID, response.bg_completions);
+    const reackTaskIds = reconcileAwaitingAck(state, drainedTaskIds);
+    ingestDrainedBgCompletions(drainContext.sessionID, drainedCompletions);
+    ingestDrainedPatternMatches(drainContext.sessionID, drainedMatches);
     if (reackTaskIds.length > 0) {
       const reacked = await ackCompletions(
         drainContext,
@@ -1074,6 +1085,18 @@ function stateFor(sessionID: string | undefined): SessionBgState {
   return state;
 }
 
+function ingestDrainedPatternMatches(
+  sessionID: string | undefined,
+  matches: readonly PatternMatchEntry[],
+): void {
+  const state = stateFor(sessionID);
+  for (const match of matches) {
+    state.outstandingTaskIds.delete(match.task_id);
+    if (isDeliveringOrAwaitingAck(state, match.task_id)) continue;
+    queuePendingPatternMatch(state, { ...match, ackCompletionOnDelivery: true });
+  }
+}
+
 function ingestDrainedBgCompletions(
   sessionID: string | undefined,
   completions: unknown,
@@ -1220,14 +1243,9 @@ function clearAwaitingAck(state: SessionBgState, taskIds: readonly string[]): vo
  * → forget. Returns ids to re-ack; the caller acks then confirms. Replaces a
  * timer eviction that could drop a still-held task and reopen the double-deliver.
  */
-function reconcileAwaitingAck(state: SessionBgState, completions: unknown): string[] {
+function reconcileAwaitingAck(state: SessionBgState, drainedTaskIds: readonly string[]): string[] {
   if (state.deliveredAwaitingAckTaskIds.size === 0) return [];
-  const drainedIds = new Set<string>();
-  if (Array.isArray(completions)) {
-    for (const completion of completions) {
-      if (isBgCompletion(completion)) drainedIds.add(completion.task_id);
-    }
-  }
+  const drainedIds = new Set(drainedTaskIds);
   const reack: string[] = [];
   for (const id of [...state.deliveredAwaitingAckTaskIds]) {
     if (drainedIds.has(id)) reack.push(id);
@@ -1247,6 +1265,20 @@ function capDeliveredAwaitingAck(state: SessionBgState, sessionID?: string): voi
       `${LOG_PREFIX} deliveredAwaitingAckTaskIds exceeded ${DELIVERED_AWAITING_ACK_CAP}; evicting ${oldest}`,
     );
   }
+}
+
+function isPatternMatchEntry(value: unknown): value is PatternMatchEntry {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const match = value as Record<string, unknown>;
+  return (
+    typeof match.task_id === "string" &&
+    typeof match.session_id === "string" &&
+    typeof match.watch_id === "string" &&
+    typeof match.match_text === "string" &&
+    typeof match.match_offset === "number" &&
+    typeof match.context === "string" &&
+    typeof match.once === "boolean"
+  );
 }
 
 function isBgCompletion(value: unknown): value is BgCompletion {

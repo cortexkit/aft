@@ -662,6 +662,48 @@ describe("Pi background notifications", () => {
 });
 
 describe("Pi subc forced-drain dedup (C-#1 / C-#3)", () => {
+  test("a forced drain delivers and acknowledges a durable pattern match", async () => {
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? {
+            success: true,
+            bg_completions: [],
+            pending_matches: [
+              {
+                task_id: "task-pattern",
+                session_id: "s1",
+                watch_id: "watch-1",
+                match_text: "READY",
+                match_offset: 42,
+                context: "server READY",
+                once: true,
+                reason: "pattern_match",
+              },
+            ],
+          }
+        : { success: true, acked_task_ids: ["task-pattern"] },
+    );
+    const { ctx } = harness(send);
+    const sendUserMessage = mock(() => {});
+
+    await handleSubcBgEventsNudge({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      runtime: { sendUserMessage },
+    });
+    await waitForMockCallCount(sendUserMessage, 1);
+    await waitUntil(
+      () => send.mock.calls.filter((call) => call[0] === "bash_ack_completions").length === 1,
+    );
+
+    expect(sendUserMessage.mock.calls[0][0]).toContain('task task-pattern matched "READY"');
+    expect(send.mock.calls.find((call) => call[0] === "bash_ack_completions")?.[1]).toEqual({
+      session_id: "s1",
+      task_ids: ["task-pattern"],
+    });
+  });
+
   test("coalesces concurrent multi-record nudge fan-in at handler entry", async () => {
     let releaseDrain!: () => void;
     const drainGate = new Promise<void>((resolve) => {

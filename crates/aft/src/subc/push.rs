@@ -434,34 +434,56 @@ pub(super) async fn send_reliable_bg_stream_end(
     send_reliable_writer_frame(writer_tx, metrics, frame, "bg_events StreamEnd").await
 }
 
+const BG_WAKE_REARM_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const BG_WAKE_REARM_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+fn bg_wake_backoff(nudges_sent: u32) -> Duration {
+    let exponent = nudges_sent.saturating_sub(1).min(5);
+    BG_WAKE_REARM_INITIAL_BACKOFF
+        .saturating_mul(1_u32 << exponent)
+        .min(BG_WAKE_REARM_MAX_BACKOFF)
+}
+
 pub(super) fn emit_bg_event_wakes(
     writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     bg_subs: &HashMap<RouteChannel, BgSub>,
-    bg_wake_pending: &mut HashSet<RouteChannel>,
+    bg_wake_pending: &mut BgWakePending,
 ) {
-    // Cross-component liveness contract: keep every armed channel pending and
-    // re-emit its nudge on each tick until the completion drain is acknowledged
-    // and maintenance clears it. `handleSubcBgEventsNudge` coalesces a nudge when
-    // a handler is already in flight, so a completion arriving during that drain
-    // needs a later Rust-side nudge; stopping re-arm-until-ack would silently lose
-    // that wake. The plugin-side in-flight dedupe lives in
-    // `packages/opencode-plugin/src/bg-notifications.ts` and
-    // `packages/pi-plugin/src/bg-notifications.ts`, in their respective
-    // `handleSubcBgEventsNudge` implementations.
-    let pending_channels: Vec<RouteChannel> = bg_wake_pending.iter().copied().collect();
-    let mut stale_channels = Vec::new();
+    emit_bg_event_wakes_at(writer_tx, metrics, bg_subs, bg_wake_pending, Instant::now());
+}
+
+fn emit_bg_event_wakes_at(
+    writer_tx: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    bg_subs: &HashMap<RouteChannel, BgSub>,
+    bg_wake_pending: &mut BgWakePending,
+    now: Instant,
+) {
+    // A stream nudge is only a prompt to drain durable state. Keep retry state
+    // until maintenance observes that ack removed every item; plugin-side task-id
+    // dedupe makes a duplicate nudge harmless while closing the lost-frame gap.
+    let pending_channels: Vec<RouteChannel> = bg_wake_pending.keys().copied().collect();
     for channel in pending_channels {
-        if let Some(sub) = bg_subs.get(&channel) {
-            if try_send_bg_stream_data(writer_tx, metrics, channel, sub) == PushSendOutcome::Sent {
-                metrics.record_bg_nudge_enqueued(&sub.root, &sub.session, channel);
-            }
-        } else {
-            stale_channels.push(channel);
+        let Some(sub) = bg_subs.get(&channel) else {
+            bg_wake_pending.remove(&channel);
+            continue;
+        };
+        let Some(state) = bg_wake_pending.get_mut(&channel) else {
+            continue;
+        };
+        if now < state.next_nudge_at {
+            continue;
         }
-    }
-    for channel in stale_channels {
-        bg_wake_pending.remove(&channel);
+        if try_send_bg_stream_data(writer_tx, metrics, channel, sub) != PushSendOutcome::Sent {
+            continue;
+        }
+        metrics.record_bg_nudge_enqueued(&sub.root, &sub.session, channel);
+        if state.nudges_sent > 0 {
+            metrics.record_bg_wake_rearm();
+        }
+        state.nudges_sent = state.nudges_sent.saturating_add(1);
+        state.next_nudge_at = now + bg_wake_backoff(state.nudges_sent);
     }
 }
 
@@ -473,20 +495,20 @@ pub(super) fn arm_bg_wake(
     root: ProjectRootId,
     session: String,
     channel: RouteChannel,
-    bg_wake_pending: &mut HashSet<RouteChannel>,
+    bg_wake_pending: &mut BgWakePending,
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     metrics: &DispatchPathMetrics,
 ) {
     metrics.record_bg_arm_hit(&root, &session, channel);
     *bg_wake_epoch.entry((root, session)).or_default() += 1;
-    bg_wake_pending.insert(channel);
+    bg_wake_pending.insert(channel, BgWakeState::armed(Instant::now()));
 }
 
 pub(super) fn clear_stale_bg_wakes_for_empty_sessions(
     root_id: &ProjectRootId,
     empty_bg_sessions: &[(String, u64)],
     bg_sub_by_session: &BgSubsBySession,
-    bg_wake_pending: &mut HashSet<RouteChannel>,
+    bg_wake_pending: &mut BgWakePending,
     bg_wake_epoch: &HashMap<(ProjectRootId, String), u64>,
 ) {
     for (session, epoch_at_submit) in empty_bg_sessions {
@@ -857,7 +879,7 @@ fn process_reliable_push_frame(
 fn arm_durable_bg_wake(
     metrics: &DispatchPathMetrics,
     bg_sub_by_session: &BgSubsBySession,
-    bg_wake_pending: &mut HashSet<RouteChannel>,
+    bg_wake_pending: &mut BgWakePending,
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     root: ProjectRootId,
     session: String,
@@ -868,7 +890,7 @@ fn arm_durable_bg_wake(
             .or_default() += 1;
         for channel in channels {
             metrics.record_bg_arm_hit(&root, &session, *channel);
-            bg_wake_pending.insert(*channel);
+            bg_wake_pending.insert(*channel, BgWakeState::armed(Instant::now()));
         }
     } else {
         let live_root_subscriptions = bg_sub_by_session
@@ -890,7 +912,7 @@ fn process_reliable_push_and_arm_bg_wake(
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     completed_tasks: &mut CompletedTaskIds,
     bg_sub_by_session: &BgSubsBySession,
-    bg_wake_pending: &mut HashSet<RouteChannel>,
+    bg_wake_pending: &mut BgWakePending,
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     root: ProjectRootId,
     frame: PushFrame,
@@ -931,7 +953,7 @@ pub(super) fn drain_reliable_push_turn(
     push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
     completed_tasks: &mut CompletedTaskIds,
     bg_sub_by_session: &BgSubsBySession,
-    bg_wake_pending: &mut HashSet<RouteChannel>,
+    bg_wake_pending: &mut BgWakePending,
     bg_wake_epoch: &mut HashMap<(ProjectRootId, String), u64>,
     reliable_rx: &mut mpsc::UnboundedReceiver<PushEnvelope>,
     first: Option<PushEnvelope>,
@@ -1128,7 +1150,7 @@ mod tests {
         let mut push_buffer = HashMap::new();
         let mut completed_tasks = CompletedTaskIds::default();
         let bg_sub_by_session = HashMap::new();
-        let mut bg_wake_pending = HashSet::new();
+        let mut bg_wake_pending = BgWakePending::new();
         let mut bg_wake_epoch = HashMap::new();
         let metrics = DispatchPathMetrics::new();
         let (writer_tx, mut writer_rx) =
@@ -2038,7 +2060,8 @@ mod tests {
         let key = (root.clone(), session.clone());
         let channel = route_key(7, 1);
         let metrics = DispatchPathMetrics::new();
-        let mut bg_wake_pending = HashSet::from([channel]);
+        let mut bg_wake_pending =
+            BgWakePending::from([(channel, BgWakeState::armed(Instant::now()))]);
         let mut bg_wake_epoch = HashMap::from([(key.clone(), 41_u64)]);
 
         arm_bg_wake(
@@ -2050,8 +2073,74 @@ mod tests {
             &metrics,
         );
 
-        assert_eq!(bg_wake_pending, HashSet::from([channel]));
+        assert_eq!(bg_wake_pending.len(), 1);
+        assert!(bg_wake_pending.contains_key(&channel));
         assert_eq!(bg_wake_epoch.get(&key).copied(), Some(42));
+    }
+
+    #[test]
+    fn dropped_nudge_is_rearmed_with_backoff_until_pending_is_cleared() {
+        let (_root_dir, root) = test_root("subc-bg-dropped-nudge-root");
+        let session = "session-1".to_string();
+        let channel = route_key(7, 1);
+        let metrics = DispatchPathMetrics::new();
+        let bg_subs = HashMap::from([(
+            channel,
+            BgSub {
+                corr: 701,
+                ver: PROTOCOL_VERSION,
+                flags: control_flags(),
+                root,
+                session,
+            },
+        )]);
+        let now = Instant::now();
+        let mut bg_wake_pending = BgWakePending::from([(channel, BgWakeState::armed(now))]);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
+
+        emit_bg_event_wakes_at(&writer_tx, &metrics, &bg_subs, &mut bg_wake_pending, now);
+        let _dropped = writer_rx.try_recv().expect("first nudge to discard");
+
+        emit_bg_event_wakes_at(
+            &writer_tx,
+            &metrics,
+            &bg_subs,
+            &mut bg_wake_pending,
+            now + Duration::from_millis(999),
+        );
+        assert!(writer_rx.try_recv().is_err(), "retry ran before backoff");
+
+        emit_bg_event_wakes_at(
+            &writer_tx,
+            &metrics,
+            &bg_subs,
+            &mut bg_wake_pending,
+            now + Duration::from_secs(1),
+        );
+        let rearmed = writer_rx.try_recv().expect("rearmed nudge");
+        assert_eq!(rearmed.header.corr, 701);
+        assert_eq!(metrics.bg_wake_rearm_total(), 1);
+
+        emit_bg_event_wakes_at(
+            &writer_tx,
+            &metrics,
+            &bg_subs,
+            &mut bg_wake_pending,
+            now + Duration::from_millis(2_999),
+        );
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "second retry ignored backoff"
+        );
+        emit_bg_event_wakes_at(
+            &writer_tx,
+            &metrics,
+            &bg_subs,
+            &mut bg_wake_pending,
+            now + Duration::from_secs(3),
+        );
+        writer_rx.try_recv().expect("second rearmed nudge");
+        assert_eq!(metrics.bg_wake_rearm_total(), 2);
     }
 
     #[test]
@@ -2064,7 +2153,7 @@ mod tests {
         let metrics = DispatchPathMetrics::new();
         let mut bg_sub_by_session =
             HashMap::from([(key.clone(), HashSet::from([route_a, route_b]))]);
-        let mut bg_wake_pending = HashSet::new();
+        let mut bg_wake_pending = BgWakePending::new();
         let mut bg_wake_epoch = HashMap::new();
 
         arm_durable_bg_wake(
@@ -2075,7 +2164,9 @@ mod tests {
             root.clone(),
             session.clone(),
         );
-        assert_eq!(bg_wake_pending, HashSet::from([route_a, route_b]));
+        assert_eq!(bg_wake_pending.len(), 2);
+        assert!(bg_wake_pending.contains_key(&route_a));
+        assert!(bg_wake_pending.contains_key(&route_b));
         assert_eq!(bg_wake_epoch.get(&key).copied(), Some(1));
 
         let bg_subs = HashMap::from([
@@ -2129,7 +2220,7 @@ mod tests {
         let metrics = DispatchPathMetrics::new();
         let mut bg_sub_by_session = HashMap::new();
         bg_sub_by_session.insert(key.clone(), HashSet::from([channel]));
-        let mut bg_wake_pending = HashSet::new();
+        let mut bg_wake_pending = BgWakePending::new();
         let mut bg_wake_epoch = HashMap::new();
 
         arm_bg_wake(
@@ -2158,7 +2249,7 @@ mod tests {
             &bg_wake_epoch,
         );
 
-        assert!(bg_wake_pending.contains(&channel));
+        assert!(bg_wake_pending.contains_key(&channel));
         assert_eq!(bg_wake_epoch.get(&key).copied(), Some(epoch_at_submit + 1));
     }
 
@@ -2171,7 +2262,7 @@ mod tests {
         let metrics = DispatchPathMetrics::new();
         let mut bg_sub_by_session = HashMap::new();
         bg_sub_by_session.insert(key.clone(), HashSet::from([channel]));
-        let mut bg_wake_pending = HashSet::new();
+        let mut bg_wake_pending = BgWakePending::new();
         let mut bg_wake_epoch = HashMap::new();
 
         arm_bg_wake(
@@ -2192,14 +2283,14 @@ mod tests {
             &bg_wake_epoch,
         );
 
-        assert!(!bg_wake_pending.contains(&channel));
+        assert!(!bg_wake_pending.contains_key(&channel));
     }
 
     #[test]
     fn completed_bg_wake_without_subscription_records_rate_and_miss_log() {
         let (_root_dir, root) = test_root("subc-bg-wake-miss-root");
         let metrics = DispatchPathMetrics::new();
-        let mut bg_wake_pending = HashSet::new();
+        let mut bg_wake_pending = BgWakePending::new();
         let mut bg_wake_epoch = HashMap::new();
         super::super::health::take_bg_observability_logs_for_test();
 

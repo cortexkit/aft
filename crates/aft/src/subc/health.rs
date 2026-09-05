@@ -4,9 +4,9 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    json, Arc, AtomicBool, AtomicU64, AtomicUsize, Duration, Executor, HashMap, HealthReport,
-    HealthStatus, Instant, Ordering, PendingBind, ProjectRootId, RootHealthSnapshot, RouteChannel,
-    StdMutex, Value, DISPATCH_PATH_BIND_WARN_AFTER, WRITER_QUEUE_CAPACITY,
+    json, Arc, AtomicBool, AtomicU64, AtomicUsize, BgSubsBySession, Duration, Executor, HashMap,
+    HealthReport, HealthStatus, Instant, Ordering, PendingBind, ProjectRootId, RootHealthSnapshot,
+    RouteChannel, StdMutex, Value, DISPATCH_PATH_BIND_WARN_AFTER, WRITER_QUEUE_CAPACITY,
 };
 use crate::context::{App, AppContext};
 use crate::executor::BindBlockerSnapshot;
@@ -129,6 +129,9 @@ impl ReapMetrics {
 }
 
 const BG_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(60);
+const STUCK_PENDING_WATCH_AGE: Duration = Duration::from_secs(10 * 60);
+const STUCK_PENDING_WATCH_SCAN_INTERVAL: Duration = Duration::from_secs(60);
+const STUCK_PENDING_WATCH_LOG_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const INTERACTIVE_OCCUPANCY_WARN_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -251,6 +254,10 @@ pub(super) struct DispatchPathMetrics {
     pub(super) response_tasks_live: AtomicUsize,
     bg_subscriptions: AtomicUsize,
     bg_wake_pending: AtomicUsize,
+    pub(super) bg_wake_unacked_total: AtomicUsize,
+    bg_wake_rearm_total: AtomicU64,
+    stuck_pending_watch_next_scan_ms: AtomicU64,
+    stuck_pending_watch_logs: StdMutex<HashMap<String, Instant>>,
     bg_events: StdMutex<HashMap<BgEventKey, BgEventRecord>>,
     bg_event_rates: BgEventRates,
     reap: ReapMetrics,
@@ -273,6 +280,10 @@ impl DispatchPathMetrics {
             response_tasks_live: AtomicUsize::new(0),
             bg_subscriptions: AtomicUsize::new(0),
             bg_wake_pending: AtomicUsize::new(0),
+            bg_wake_unacked_total: AtomicUsize::new(0),
+            bg_wake_rearm_total: AtomicU64::new(0),
+            stuck_pending_watch_next_scan_ms: AtomicU64::new(0),
+            stuck_pending_watch_logs: StdMutex::new(HashMap::new()),
             bg_events: StdMutex::new(HashMap::new()),
             bg_event_rates: BgEventRates::new(),
             reap: ReapMetrics::new(),
@@ -296,10 +307,87 @@ impl DispatchPathMetrics {
         self.reap.record(last_sweep_ms, census);
     }
 
-    pub(super) fn record_bg_runtime(&self, subscriptions: usize, wake_pending: usize) {
+    pub(super) fn record_bg_runtime(
+        &self,
+        subscriptions: usize,
+        wake_pending: usize,
+        unacked_total: usize,
+    ) {
         self.bg_subscriptions
             .store(subscriptions, Ordering::Relaxed);
         self.bg_wake_pending.store(wake_pending, Ordering::Relaxed);
+        self.bg_wake_unacked_total
+            .store(unacked_total, Ordering::Relaxed);
+    }
+
+    pub(super) fn record_bg_wake_rearm(&self) {
+        self.bg_wake_rearm_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn bg_wake_rearm_total(&self) -> u64 {
+        self.bg_wake_rearm_total.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn warn_stuck_pending_watches(
+        &self,
+        executor: &Executor,
+        subscriptions: &BgSubsBySession,
+    ) {
+        let now_ms = self.now_ms();
+        let next_scan_ms = self
+            .stuck_pending_watch_next_scan_ms
+            .load(Ordering::Relaxed);
+        if now_ms < next_scan_ms {
+            return;
+        }
+        let next = now_ms.saturating_add(duration_millis_u64(STUCK_PENDING_WATCH_SCAN_INTERVAL));
+        if self
+            .stuck_pending_watch_next_scan_ms
+            .compare_exchange(next_scan_ms, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let now = Instant::now();
+        let Ok(mut logged) = self.stuck_pending_watch_logs.lock() else {
+            return;
+        };
+        for ((root, session), channels) in subscriptions {
+            if channels.is_empty() {
+                continue;
+            }
+            let Some(ctx) = executor.actor_context(root) else {
+                continue;
+            };
+            for (task_id, watch_id, age_ms) in ctx
+                .bash_background()
+                .stuck_pending_watches_for_session(session, STUCK_PENDING_WATCH_AGE)
+            {
+                let key = format!(
+                    "{}\0{session}\0{task_id}\0{watch_id}",
+                    root.as_path().display()
+                );
+                if logged.get(&key).is_some_and(|last| {
+                    now.saturating_duration_since(*last) < STUCK_PENDING_WATCH_LOG_INTERVAL
+                }) {
+                    continue;
+                }
+                logged.insert(key, now);
+                crate::slog_warn!(
+                    "subc bg wake: pending watch remains unacked root={} session={} task={} watch={} age_ms={}",
+                    root.as_path().display(),
+                    session,
+                    task_id,
+                    watch_id,
+                    age_ms
+                );
+            }
+        }
+        logged.retain(|_, last| {
+            now.saturating_duration_since(*last) < STUCK_PENDING_WATCH_LOG_INTERVAL
+        });
     }
 
     fn record_bg_event_at(
@@ -1165,6 +1253,8 @@ pub(super) fn build_health_report(
             "open_routes": shared_app.open_route_count(),
             "bg_subscriptions": dispatch_path_metrics.bg_subscriptions.load(Ordering::Relaxed),
             "bg_wake_pending": dispatch_path_metrics.bg_wake_pending.load(Ordering::Relaxed),
+            "bg_wake_unacked_total": dispatch_path_metrics.bg_wake_unacked_total.load(Ordering::Relaxed),
+            "bg_wake_rearm_total": dispatch_path_metrics.bg_wake_rearm_total.load(Ordering::Relaxed),
             "bg_nudges_enqueued_60s_total": dispatch_path_metrics.bg_nudges_enqueued_60s_total(),
             "bg_arm_misses_60s_total": dispatch_path_metrics.bg_arm_misses_60s_total(),
             "spawned_lsp_children": lsp_children.get("spawned").cloned().unwrap_or(Value::Null),
@@ -1490,13 +1580,16 @@ mod tests {
         }
         assert_eq!(cold_runtime["bg_subscriptions"].as_u64(), Some(0));
         assert_eq!(cold_runtime["bg_wake_pending"].as_u64(), Some(0));
+        assert_eq!(cold_runtime["bg_wake_unacked_total"].as_u64(), Some(0));
+        assert_eq!(cold_runtime["bg_wake_rearm_total"].as_u64(), Some(0));
         assert_eq!(
             cold_runtime["bg_nudges_enqueued_60s_total"].as_u64(),
             Some(0)
         );
         assert_eq!(cold_runtime["bg_arm_misses_60s_total"].as_u64(), Some(0));
 
-        metrics.record_bg_runtime(2, 1);
+        metrics.record_bg_runtime(2, 1, 3);
+        metrics.record_bg_wake_rearm();
         metrics.record_bg_arm_miss(&root, "missing-session", 2);
         metrics.record_bg_nudge_enqueued(&root, "live-session", channel);
 
@@ -1506,6 +1599,8 @@ mod tests {
         let hot_runtime = &hot_metrics["runtime"];
         assert_eq!(hot_runtime["bg_subscriptions"].as_u64(), Some(2));
         assert_eq!(hot_runtime["bg_wake_pending"].as_u64(), Some(1));
+        assert_eq!(hot_runtime["bg_wake_unacked_total"].as_u64(), Some(3));
+        assert_eq!(hot_runtime["bg_wake_rearm_total"].as_u64(), Some(1));
         assert_eq!(
             hot_runtime["bg_nudges_enqueued_60s_total"].as_u64(),
             Some(1)
