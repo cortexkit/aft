@@ -837,7 +837,7 @@ fn checkpoint_and_sync_database(
     // Open directly and treat NotFound as "nothing left to sync" instead of
     // probing first.
     let wal_path = PathBuf::from(format!("{}-wal", path.display()));
-    match File::open(&wal_path) {
+    match open_file_for_sync(&wal_path) {
         Ok(file) => file.sync_all()?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(ViewError::Io(error)),
@@ -903,8 +903,21 @@ fn sync_file_and_parent(path: &Path) -> Result<()> {
 }
 
 fn sync_file(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
+    open_file_for_sync(path)?.sync_all()?;
     Ok(())
+}
+
+fn open_file_for_sync(path: &Path) -> std::io::Result<File> {
+    #[cfg(windows)]
+    {
+        // FlushFileBuffers rejects read-only handles, so Windows must open
+        // durability inputs for writing even though no bytes are changed.
+        OpenOptions::new().write(true).open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+    }
 }
 
 fn sync_parent(path: &Path) -> Result<()> {
@@ -971,6 +984,15 @@ mod tests {
             failures.is_empty(),
             "concurrent artifact checkpoints must wait out the WAL switch: {failures:?}"
         );
+    }
+
+    #[test]
+    fn sync_file_flushes_an_existing_artifact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let artifact = dir.path().join("artifact.bin");
+        fs::write(&artifact, b"durable").expect("artifact");
+
+        sync_file(&artifact).expect("flush pre-existing artifact");
     }
 
     #[test]
