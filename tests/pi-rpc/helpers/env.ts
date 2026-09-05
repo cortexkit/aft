@@ -1,6 +1,20 @@
 import { mkdirSync, realpathSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join } from "node:path";
+
+/**
+ * Root for the isolated Pi environments. Not the OS temp dir: the product
+ * records no undo snapshot for mutations under a system temp path (release
+ * binaries enforce that unconditionally), so a workspace under /tmp would make
+ * every undo assertion in these suites fail for a reason unrelated to Pi. The
+ * user cache directory is the same out-of-repo, out-of-temp location the Pi
+ * plugin e2e helpers use.
+ */
+function isolatedEnvRoot(): string {
+  const override = process.env.AFT_PI_RPC_TEST_ROOT;
+  if (override) return override;
+  return join(homedir(), ".cache", "aft-pi-rpc-e2e");
+}
 
 export interface PiIsolatedEnv {
   baseDir: string;
@@ -14,7 +28,7 @@ export interface PiIsolatedEnv {
 
 export function createPiIsolatedEnv(sharedDataDir?: string): PiIsolatedEnv {
   const unique = `aft-pi-rpc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const baseDirRaw = join(tmpdir(), unique);
+  const baseDirRaw = join(isolatedEnvRoot(), unique);
   mkdirSync(baseDirRaw, { recursive: true });
   const baseDir = realpathSync(baseDirRaw);
   const configDir = join(baseDir, "config");

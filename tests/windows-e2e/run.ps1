@@ -270,7 +270,10 @@ Write-Host ""
 # Test project setup
 # ---------------------------------------------------------------------------
 
-$ProjectDir = Join-Path $env:TEMP "aft-e2e-project"
+# Not under %TEMP%: the product skips undo snapshots for mutations under a system
+# temp directory, so the scripted "edit then undo" turn would run without undo
+# there. LOCALAPPDATA is a per-user, non-temp location that always exists.
+$ProjectDir = Join-Path $env:LOCALAPPDATA "aft-e2e-project"
 if (Test-Path $ProjectDir) { Remove-Item -Recurse -Force $ProjectDir }
 New-Item -ItemType Directory -Path $ProjectDir | Out-Null
 
