@@ -134,8 +134,8 @@
     },
     {
       "path": "crates/aft/src/commands/undo.rs",
-      "location": "line 60, column 21",
-      "line": 60,
+      "location": "line 84, column 21",
+      "line": 84,
       "column": 21,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -143,8 +143,8 @@
     },
     {
       "path": "crates/aft/src/commands/undo.rs",
-      "location": "line 69, column 37",
-      "line": 69,
+      "location": "line 93, column 37",
+      "line": 93,
       "column": 37,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -422,8 +422,8 @@
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "location": "line 361, column 47",
-      "line": 361,
+      "location": "line 373, column 47",
+      "line": 373,
       "column": 47,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -431,8 +431,8 @@
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "location": "line 567, column 29",
-      "line": 567,
+      "location": "line 579, column 29",
+      "line": 579,
       "column": 29,
       "token": "filePath",
       "class": "rust-compatibility",
@@ -440,8 +440,8 @@
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "location": "line 2075, column 23",
-      "line": 2075,
+      "location": "line 2087, column 23",
+      "line": 2087,
       "column": 23,
       "token": "toFile",
       "class": "rust-compatibility",
@@ -449,8 +449,8 @@
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "location": "line 2077, column 45",
-      "line": 2077,
+      "location": "line 2089, column 45",
+      "line": 2089,
       "column": 45,
       "token": "toFile",
       "class": "rust-compatibility",
@@ -1329,6 +1329,15 @@
       "token": "filePath",
       "class": "compatibility-fixture",
       "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
+    },
+    {
+      "path": "crates/aft/tests/integration/safety_test.rs",
+      "location": "line 2085, column 29",
+      "line": 2085,
+      "column": 29,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
       "path": "crates/aft/tests/integration/standalone_search_deferred_test.rs",
