@@ -34,10 +34,21 @@ describe("CortexKit config paths", () => {
   const originalUserProfile = process.env.USERPROFILE;
   const originalXdg = process.env.XDG_CONFIG_HOME;
 
+  // `process.env.KEY = undefined` stores the string "undefined"; a variable that
+  // was unset before the test must be deleted so later-spawned processes do not
+  // inherit USERPROFILE=undefined (or XDG_CONFIG_HOME=undefined on macOS).
+  const restoreEnv = (key: string, value: string | undefined) => {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  };
+
   afterEach(() => {
-    process.env.HOME = originalHome;
-    process.env.USERPROFILE = originalUserProfile;
-    process.env.XDG_CONFIG_HOME = originalXdg;
+    restoreEnv("HOME", originalHome);
+    restoreEnv("USERPROFILE", originalUserProfile);
+    restoreEnv("XDG_CONFIG_HOME", originalXdg);
   });
 
   test("user config honors absolute XDG_CONFIG_HOME", () => {

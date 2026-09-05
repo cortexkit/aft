@@ -92,14 +92,29 @@ function representativeProcessState(root: string): Record<string, unknown> {
   };
 }
 
+/**
+ * Assigning `undefined` to a `process.env` key stores the string "undefined"
+ * (Node and Bun both stringify), so a variable that was unset before the test
+ * comes back as `XDG_CONFIG_HOME=undefined` for every process this test file's
+ * successors spawn - the login-shell PATH probe then ran fish with that value
+ * and fish created `./undefined/fish/` inside the repository. Unset means delete.
+ */
+function restoreEnv(key: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[key];
+  } else {
+    process.env[key] = value;
+  }
+}
+
 afterEach(() => {
   for (const root of tempRoots) {
     rmSync(root, { recursive: true, force: true });
   }
   tempRoots.clear();
-  process.env.HOME = originalEnv.HOME;
-  process.env.XDG_CONFIG_HOME = originalEnv.XDG_CONFIG_HOME;
-  process.env.OPENCODE_CONFIG_DIR = originalEnv.OPENCODE_CONFIG_DIR;
+  restoreEnv("HOME", originalEnv.HOME);
+  restoreEnv("XDG_CONFIG_HOME", originalEnv.XDG_CONFIG_HOME);
+  restoreEnv("OPENCODE_CONFIG_DIR", originalEnv.OPENCODE_CONFIG_DIR);
   __resetConfigureWarningQueuesForTests();
 });
 

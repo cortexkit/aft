@@ -92,9 +92,23 @@ afterEach(() => {
     rmSync(root, { recursive: true, force: true });
   }
   tempRoots.clear();
-  process.env.HOME = originalHome;
-  process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
+  restoreEnv("HOME", originalHome);
+  restoreEnv("XDG_CONFIG_HOME", originalXdgConfigHome);
 });
+
+/**
+ * `process.env.KEY = undefined` stores the string "undefined" (Node and Bun both
+ * stringify), which then reaches every process spawned by later test files in
+ * the run. A variable that was unset before the test must be deleted, not
+ * assigned back.
+ */
+function restoreEnv(key: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[key];
+  } else {
+    process.env[key] = value;
+  }
+}
 
 describe("Pi configure config tiers cutover", () => {
   test("sends raw config tiers plus process-state keys and no resolved core-domain flat params", () => {
