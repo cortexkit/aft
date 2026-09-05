@@ -704,6 +704,49 @@ describe("Pi subc forced-drain dedup (C-#1 / C-#3)", () => {
     });
   });
 
+  test("a forced drain renders and acknowledges a durable task-exit match once", async () => {
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? {
+            success: true,
+            bg_completions: [],
+            pending_matches: [
+              {
+                task_id: "task-exit",
+                session_id: "s1",
+                watch_id: "exit",
+                match_text: "watch task exited",
+                match_offset: 0,
+                context: "task task-exit exited (exit 0)\nserver stopped",
+                once: true,
+                reason: "task_exit",
+              },
+            ],
+          }
+        : { success: true, acked_task_ids: ["task-exit"] },
+    );
+    const { ctx } = harness(send);
+    const sendUserMessage = mock(() => {});
+
+    await handleSubcBgEventsNudge({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      runtime: { sendUserMessage },
+    });
+    await waitForMockCallCount(sendUserMessage, 1);
+    await waitUntil(
+      () => send.mock.calls.filter((call) => call[0] === "bash_ack_completions").length === 1,
+    );
+
+    expect(sendUserMessage.mock.calls[0][0]).toContain("- task task-exit exited:");
+    expect(sendUserMessage.mock.calls[0][0]).toContain("task task-exit exited (exit 0)");
+    expect(sendUserMessage.mock.calls[0][0]).not.toContain("matched");
+    const ackCalls = send.mock.calls.filter((call) => call[0] === "bash_ack_completions");
+    expect(ackCalls).toHaveLength(1);
+    expect(ackCalls[0]?.[1]).toEqual({ session_id: "s1", task_ids: ["task-exit"] });
+  });
+
   test("coalesces concurrent multi-record nudge fan-in at handler entry", async () => {
     let releaseDrain!: () => void;
     const drainGate = new Promise<void>((resolve) => {
