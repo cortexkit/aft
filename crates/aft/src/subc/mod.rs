@@ -849,6 +849,7 @@ struct MaintenanceCompletion {
     kind: MaintenanceDrainKind,
     response: Response,
     empty_bg_sessions: Vec<(String, u64)>,
+    unacked_bg_keys: Option<HashSet<String>>,
     requeue_kind: Option<MaintenanceDrainKind>,
 }
 
@@ -874,6 +875,7 @@ impl MaintenanceDrainKind {
 #[derive(Debug, Default)]
 struct MaintenanceJobOutcome {
     empty_bg_sessions: Vec<(String, u64)>,
+    unacked_bg_keys: Option<HashSet<String>>,
     requeue_kind: Option<MaintenanceDrainKind>,
 }
 
@@ -2973,6 +2975,7 @@ where
     let mut bg_sub_by_session: BgSubsBySession = HashMap::new();
     let mut bg_wake_pending = BgWakePending::new();
     let mut bg_wake_epoch: HashMap<(ProjectRootId, String), u64> = HashMap::new();
+    let mut bg_unacked_keys_by_root: HashMap<ProjectRootId, HashSet<String>> = HashMap::new();
     let mut root_channels: HashMap<ProjectRootId, HashSet<RouteChannel>> = HashMap::new();
     let mut session_identity: HashMap<(ProjectRootId, String), RetainedSessionIdentity> =
         HashMap::new();
@@ -3539,6 +3542,15 @@ where
                     &mut bg_wake_pending,
                     &bg_wake_epoch,
                 );
+                if let Some(keys) = completion.unacked_bg_keys {
+                    bg_unacked_keys_by_root.insert(root_id.clone(), keys);
+                }
+                record_bg_runtime_from_snapshots(
+                    &dispatch_path_metrics,
+                    bg_subs.len(),
+                    bg_wake_pending.len(),
+                    &bg_unacked_keys_by_root,
+                );
                 if response_is_fatal {
                     if let Some(meta) = live_roots.get_mut(&root_id) {
                         meta.maintenance_poisoned = true;
@@ -3581,6 +3593,7 @@ where
                     &dispatch_path_metrics,
                 );
                 for root_id in &reap.forgotten_deleted_roots {
+                    bg_unacked_keys_by_root.remove(root_id);
                     purge_deleted_root_residents(
                         root_id,
                         &mut routes,
@@ -3604,6 +3617,12 @@ where
                 if reap.evicted > 0 {
                     log::debug!("subc attach: reaped {} idle root(s)", reap.evicted);
                 }
+                record_bg_runtime_from_snapshots(
+                    &dispatch_path_metrics,
+                    bg_subs.len(),
+                    bg_wake_pending.len(),
+                    &bg_unacked_keys_by_root,
+                );
                 submit_due_maintenance_jobs(
                     &executor,
                     &mut live_roots,
@@ -4262,6 +4281,50 @@ async fn expire_overdue_route_binds(
     Ok(())
 }
 
+fn record_bg_runtime_from_snapshots(
+    metrics: &DispatchPathMetrics,
+    subscriptions: usize,
+    wake_pending: usize,
+    unacked_keys_by_root: &HashMap<ProjectRootId, HashSet<String>>,
+) {
+    let unacked_total = unacked_keys_by_root
+        .values()
+        .flatten()
+        .collect::<HashSet<_>>()
+        .len();
+    metrics.record_bg_runtime(subscriptions, wake_pending, unacked_total);
+}
+
+async fn send_cached_health_response(
+    tx: &WriterSender,
+    frame: &Frame,
+    shared_app: &App,
+    executor: &Executor,
+    pending_binds: &HashMap<RouteChannel, PendingBind>,
+    metrics: &DispatchPathMetrics,
+    health_rollup_cache: &HealthRollupCache,
+) -> Result<(), SubcError> {
+    let report = build_health_report(
+        health_rollup_cache,
+        executor,
+        pending_binds,
+        metrics,
+        shared_app,
+    );
+    let body = serde_json::to_vec(&ModuleControlResponse::from(report)).map_err(SubcError::Json)?;
+    let response = Frame::build_with_version(
+        frame.header.ver,
+        FrameType::Response,
+        frame.header.flags,
+        0,
+        0,
+        frame.header.corr,
+        body,
+    )
+    .map_err(SubcError::FrameBuild)?;
+    send_frame(tx, metrics, response).await
+}
+
 /// Channel-0 control requests: RouteBind plus the cached health probe.
 /// Tool-provider binds reconcile RootConfig through the executor's Mutating lane;
 /// management binds install immediately without creating project state.
@@ -4669,37 +4732,16 @@ async fn handle_control_request(
             Ok(())
         }
         ModuleControlRequest::HealthCheck {} => {
-            let bg_wake_unacked_total = executor
-                .try_actor_entries()
-                .map(|entries| {
-                    entries
-                        .into_iter()
-                        .flat_map(|(_, ctx)| ctx.bash_background().unacked_wake_keys())
-                        .collect::<HashSet<_>>()
-                        .len()
-                })
-                .unwrap_or_else(|| metrics.bg_wake_unacked_total.load(Ordering::Relaxed));
-            metrics.record_bg_runtime(bg_subs.len(), bg_wake_pending.len(), bg_wake_unacked_total);
-            let report = build_health_report(
-                health_rollup_cache,
+            send_cached_health_response(
+                tx,
+                frame,
+                shared_app,
                 executor,
                 pending_binds,
                 metrics,
-                shared_app,
-            );
-            let body = serde_json::to_vec(&ModuleControlResponse::from(report))
-                .map_err(SubcError::Json)?;
-            let response = Frame::build_with_version(
-                frame.header.ver,
-                FrameType::Response,
-                frame.header.flags,
-                0,
-                0,
-                frame.header.corr,
-                body,
+                health_rollup_cache,
             )
-            .map_err(SubcError::FrameBuild)?;
-            send_frame(tx, metrics, response).await
+            .await
         }
     }
 }
@@ -5873,6 +5915,7 @@ fn submit_maintenance_job(
                 );
                 MaintenanceJobOutcome {
                     empty_bg_sessions: Vec::new(),
+                    unacked_bg_keys: None,
                     requeue_kind: drained.has_more.then_some(kind),
                 }
             }
@@ -5883,6 +5926,7 @@ fn submit_maintenance_job(
                 );
                 MaintenanceJobOutcome {
                     empty_bg_sessions: Vec::new(),
+                    unacked_bg_keys: None,
                     requeue_kind: drained.has_more.then_some(kind),
                 }
             }
@@ -5905,6 +5949,7 @@ fn submit_maintenance_job(
                     .collect();
                 MaintenanceJobOutcome {
                     empty_bg_sessions,
+                    unacked_bg_keys: Some(ctx.bash_background().unacked_wake_keys()),
                     requeue_kind: None,
                 }
             }
@@ -5949,6 +5994,7 @@ fn submit_maintenance_job(
                 kind,
                 response,
                 empty_bg_sessions: outcome.empty_bg_sessions,
+                unacked_bg_keys: outcome.unacked_bg_keys,
                 requeue_kind: outcome.requeue_kind,
             },
         )
@@ -7048,6 +7094,75 @@ mod tests {
                 source: io::Error::new(kind, "constructed auth failure"),
             },
         }
+    }
+
+    #[test]
+    fn channel_zero_health_response_does_not_wait_for_bash_background_db() {
+        let (dir, root) = test_root("health-does-not-lock-bash-db");
+        let executor = Arc::new(Executor::new());
+        let ctx = test_ctx();
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        let db = Arc::new(StdMutex::new(
+            crate::db::open(&dir.path().join("health.db")).expect("open health test DB"),
+        ));
+        ctx.bash_background().set_db_pool(Arc::clone(&db));
+        executor.register_actor(root, ctx);
+
+        let guard = db.lock().expect("hold bash-background DB mutex");
+        let app = App::default_shared();
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let health_rollup_cache = Arc::new(HealthRollupCache::new());
+        let frame = Frame::build_with_version(
+            PROTOCOL_VERSION,
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            77,
+            Vec::new(),
+        )
+        .expect("health request frame");
+        let (writer_tx, _writer_rx) = mpsc::channel::<WriterFrame>(1);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let join = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("health test runtime");
+            let result = runtime.block_on(send_cached_health_response(
+                &writer_tx,
+                &frame,
+                &app,
+                &executor,
+                &HashMap::new(),
+                &metrics,
+                &health_rollup_cache,
+            ));
+            done_tx.send(result).expect("report health result");
+        });
+
+        let result = done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("channel-0 health blocked on bash-background DB mutex");
+        result.expect("send cached health response");
+        drop(guard);
+        join.join().expect("health thread");
+    }
+
+    #[test]
+    fn maintenance_bg_runtime_refresh_deduplicates_shared_db_items() {
+        let (_dir_a, root_a) = test_root("health-metric-root-a");
+        let (_dir_b, root_b) = test_root("health-metric-root-b");
+        let duplicate_key = "match\0session-1\0bash-0000000000000001\0watch-00000001";
+        let snapshots = HashMap::from([
+            (root_a, HashSet::from([duplicate_key.to_string()])),
+            (root_b, HashSet::from([duplicate_key.to_string()])),
+        ]);
+        let metrics = DispatchPathMetrics::new();
+
+        record_bg_runtime_from_snapshots(&metrics, 2, 1, &snapshots);
+
+        assert_eq!(metrics.bg_runtime_for_test(), (2, 1, 1));
     }
 
     #[test]

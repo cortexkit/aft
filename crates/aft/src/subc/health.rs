@@ -320,6 +320,15 @@ impl DispatchPathMetrics {
             .store(unacked_total, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
+    pub(super) fn bg_runtime_for_test(&self) -> (usize, usize, usize) {
+        (
+            self.bg_subscriptions.load(Ordering::Relaxed),
+            self.bg_wake_pending.load(Ordering::Relaxed),
+            self.bg_wake_unacked_total.load(Ordering::Relaxed),
+        )
+    }
+
     pub(super) fn record_bg_wake_rearm(&self) {
         self.bg_wake_rearm_total.fetch_add(1, Ordering::Relaxed);
     }
