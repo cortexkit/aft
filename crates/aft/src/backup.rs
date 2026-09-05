@@ -16,6 +16,17 @@ pub const DEFAULT_MAX_UNDO_DEPTH: usize = 20;
 /// Default upper bound for one automatic undo snapshot (64 MiB).
 pub const DEFAULT_MAX_BACKUP_FILE_SIZE: u64 = 64 * 1024 * 1024;
 
+static BACKUP_SKIPPED_TOO_LARGE_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BACKUP_SKIPPED_TEMP_PATH_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide automatic-backup skip counters for status and health surfaces.
+pub fn backup_skipped_totals() -> (u64, u64) {
+    (
+        BACKUP_SKIPPED_TOO_LARGE_TOTAL.load(Ordering::Relaxed),
+        BACKUP_SKIPPED_TEMP_PATH_TOTAL.load(Ordering::Relaxed),
+    )
+}
+
 #[cfg(test)]
 const MAX_UNDO_DEPTH: usize = DEFAULT_MAX_UNDO_DEPTH;
 const V2_FORMAT_VERSION: &str = "v2";
@@ -339,6 +350,38 @@ pub struct RestoredFile {
     pub backup_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupSkippedReason {
+    TooLarge,
+    TempPath,
+    Disabled,
+}
+
+impl BackupSkippedReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TooLarge => "too_large",
+            Self::TempPath => "temp_path",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SkippedBackup {
+    path: PathBuf,
+    op_id: Option<String>,
+    reason: BackupSkippedReason,
+    order: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotDecision {
+    Capture,
+    Skip(BackupSkippedReason),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackupPolicy {
     pub enabled: bool,
@@ -393,6 +436,10 @@ pub struct BackupStore {
     /// Unknown stacks take the full repair path once before append deltas begin.
     db_mirrored_stacks: RwLock<HashMap<String, HashSet<PathBuf>>>,
     policy: BackupPolicy,
+    /// In-process mutation records whose undo snapshot was intentionally skipped.
+    skipped_backups: HashMap<String, Vec<SkippedBackup>>,
+    #[cfg(test)]
+    enforce_temp_path_policy: bool,
     #[cfg(test)]
     disk_io_count: AtomicU64,
     #[cfg(test)]
@@ -443,6 +490,9 @@ impl BackupStore {
             db_project_key: RwLock::new(None),
             db_mirrored_stacks: RwLock::new(HashMap::new()),
             policy: BackupPolicy::default(),
+            skipped_backups: HashMap::new(),
+            #[cfg(test)]
+            enforce_temp_path_policy: false,
             #[cfg(test)]
             disk_io_count: AtomicU64::new(0),
             #[cfg(test)]
@@ -481,6 +531,11 @@ impl BackupStore {
     #[cfg(test)]
     fn fail_next_disk_write_for_tests(&mut self) {
         self.fail_next_disk_write = true;
+    }
+
+    #[cfg(test)]
+    fn enforce_temp_path_policy_for_tests(&mut self) {
+        self.enforce_temp_path_policy = true;
     }
 
     pub fn set_db_pool(&self, conn: Arc<Mutex<TrackedConnection>>) {
@@ -539,6 +594,7 @@ impl BackupStore {
         self.entries.clear();
         self.disk_index.clear();
         self.session_meta.clear();
+        self.skipped_backups.clear();
         self.clear_db_mirror_sync();
     }
 
@@ -596,7 +652,7 @@ impl BackupStore {
         description: &str,
         op_id: Option<&str>,
     ) -> Result<Option<String>, AftError> {
-        if !self.should_snapshot_path(path)? {
+        if !self.prepare_snapshot(session, path, op_id, false)? {
             return Ok(None);
         }
         self.run_process_maintenance_once();
@@ -626,7 +682,7 @@ impl BackupStore {
         op_id: Option<&str>,
         capture: &CapturedRegularFile,
     ) -> Result<Option<String>, AftError> {
-        if !self.should_snapshot_path(path)? {
+        if !self.prepare_snapshot(session, path, op_id, false)? {
             return Ok(None);
         }
         self.run_process_maintenance_once();
@@ -651,7 +707,7 @@ impl BackupStore {
         path: &Path,
         description: &str,
     ) -> Result<Option<String>, AftError> {
-        if !self.policy.enabled {
+        if !self.prepare_snapshot(session, path, Some(op_id), true)? {
             return Ok(None);
         }
         self.run_process_maintenance_once();
@@ -838,7 +894,20 @@ impl BackupStore {
             remove_created_dirs_best_effort(&tombstone_created_dirs);
 
             let mut restored = Vec::new();
-            let mut warnings = Vec::new();
+            let mut warnings = self
+                .skipped_backups
+                .get(session)
+                .into_iter()
+                .flatten()
+                .filter(|skip| skip.op_id.as_deref() == Some(op_id.as_str()))
+                .map(|skip| {
+                    format!(
+                        "{}: undo unavailable because backup was skipped ({})",
+                        skip.path.display(),
+                        skip.reason.as_str()
+                    )
+                })
+                .collect::<Vec<_>>();
             for (key, entry, warning, _) in content_targets {
                 self.commit_restored_backup_locked(session, &key)?;
                 if let Some(warning) = warning {
@@ -855,6 +924,12 @@ impl BackupStore {
                     path: key,
                     backup_id: entry.backup_id,
                 });
+            }
+            if let Some(skips) = self.skipped_backups.get_mut(session) {
+                skips.retain(|skip| skip.op_id.as_deref() != Some(op_id.as_str()));
+                if skips.is_empty() {
+                    self.skipped_backups.remove(session);
+                }
             }
             self.touch_session(session);
             drop(disk_locks);
@@ -1613,6 +1688,12 @@ impl BackupStore {
     }
 
     pub fn discard_operation_entries(&mut self, session: &str, op_id: &str) {
+        if let Some(skips) = self.skipped_backups.get_mut(session) {
+            skips.retain(|skip| skip.op_id.as_deref() != Some(op_id));
+            if skips.is_empty() {
+                self.skipped_backups.remove(session);
+            }
+        }
         let keys: Vec<PathBuf> = self
             .entries
             .get(session)
@@ -1676,6 +1757,12 @@ impl BackupStore {
         path: &Path,
     ) {
         let key = canonicalize_key(path);
+        if let Some(skips) = self.skipped_backups.get_mut(session) {
+            skips.retain(|skip| skip.op_id.as_deref() != Some(op_id) || skip.path != key);
+            if skips.is_empty() {
+                self.skipped_backups.remove(session);
+            }
+        }
         let mut remove_key = false;
         let mut remaining_stack = None;
 
@@ -2127,16 +2214,44 @@ impl BackupStore {
         parsed.get("last_accessed").and_then(|v| v.as_u64())
     }
 
-    fn should_snapshot_path(&self, path: &Path) -> Result<bool, AftError> {
-        if !self.policy.enabled {
-            return Ok(false);
+    fn prepare_snapshot(
+        &mut self,
+        session: &str,
+        path: &Path,
+        op_id: Option<&str>,
+        allow_missing: bool,
+    ) -> Result<bool, AftError> {
+        match self.should_snapshot_path(path, allow_missing)? {
+            SnapshotDecision::Capture => Ok(true),
+            SnapshotDecision::Skip(reason) => {
+                self.record_skipped_backup(session, path, op_id, reason);
+                Ok(false)
+            }
+        }
+    }
+
+    fn should_snapshot_path(
+        &self,
+        path: &Path,
+        allow_missing: bool,
+    ) -> Result<SnapshotDecision, AftError> {
+        if !self.policy.enabled || self.policy.max_file_size == Some(0) {
+            return Ok(SnapshotDecision::Skip(BackupSkippedReason::Disabled));
+        }
+        if self.temp_path_policy_applies() && crate::bash_permissions::is_system_temp_path(path) {
+            return Ok(SnapshotDecision::Skip(BackupSkippedReason::TempPath));
         }
         let Some(max_file_size) = self.policy.max_file_size else {
-            return Ok(true);
+            return Ok(SnapshotDecision::Capture);
         };
         match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_file() && metadata.len() > max_file_size => Ok(false),
-            Ok(_) => Ok(true),
+            Ok(metadata) if metadata.is_file() && metadata.len() > max_file_size => {
+                Ok(SnapshotDecision::Skip(BackupSkippedReason::TooLarge))
+            }
+            Ok(_) => Ok(SnapshotDecision::Capture),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && allow_missing => {
+                Ok(SnapshotDecision::Capture)
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Err(AftError::FileNotFound {
                     path: path.display().to_string(),
@@ -2147,6 +2262,155 @@ impl BackupStore {
                 message: error.to_string(),
             }),
         }
+    }
+
+    fn temp_path_policy_applies(&self) -> bool {
+        #[cfg(test)]
+        if !self.enforce_temp_path_policy {
+            return false;
+        }
+        #[cfg(debug_assertions)]
+        {
+            // Integration fixtures live under the OS temp directory, so debug test
+            // processes may opt back into legacy snapshots while production-path
+            // tests explicitly leave the temp-path policy enabled.
+            return std::env::var_os("AFT_TEST_ALLOW_TEMP_BACKUPS").as_deref()
+                != Some(std::ffi::OsStr::new("1"));
+        }
+        #[cfg(not(debug_assertions))]
+        true
+    }
+
+    fn record_skipped_backup(
+        &mut self,
+        session: &str,
+        path: &Path,
+        op_id: Option<&str>,
+        reason: BackupSkippedReason,
+    ) {
+        match reason {
+            BackupSkippedReason::TooLarge => {
+                BACKUP_SKIPPED_TOO_LARGE_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
+            BackupSkippedReason::TempPath => {
+                BACKUP_SKIPPED_TEMP_PATH_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
+            BackupSkippedReason::Disabled => {}
+        }
+        let (_, order) = self.next_id_and_order();
+        self.skipped_backups
+            .entry(session.to_string())
+            .or_default()
+            .push(SkippedBackup {
+                path: canonicalize_key(path),
+                op_id: op_id.map(str::to_string),
+                reason,
+                order,
+            });
+    }
+
+    pub fn skipped_reason_for_operation(
+        &self,
+        session: &str,
+        op_id: &str,
+        path: Option<&Path>,
+    ) -> Option<BackupSkippedReason> {
+        let key = path.map(canonicalize_key);
+        self.skipped_backups
+            .get(session)?
+            .iter()
+            .rev()
+            .find(|skip| {
+                skip.op_id.as_deref() == Some(op_id)
+                    && key.as_ref().is_none_or(|key| &skip.path == key)
+            })
+            .map(|skip| skip.reason)
+    }
+
+    pub fn latest_skipped_order(&self, session: &str) -> Option<u128> {
+        self.skipped_backups
+            .get(session)?
+            .iter()
+            .map(|skip| skip.order)
+            .max()
+    }
+
+    pub fn skipped_reason_after(
+        &self,
+        session: &str,
+        order: Option<u128>,
+    ) -> Option<BackupSkippedReason> {
+        self.skipped_backups
+            .get(session)?
+            .iter()
+            .filter(|skip| order.is_none_or(|order| skip.order > order))
+            .max_by_key(|skip| skip.order)
+            .map(|skip| skip.reason)
+    }
+
+    pub fn latest_skipped_reason_for_undo(
+        &self,
+        session: &str,
+        path: Option<&Path>,
+    ) -> Option<BackupSkippedReason> {
+        self.latest_skipped_candidate_for_undo(session, path)
+            .map(|(_, reason, _)| reason)
+    }
+
+    fn latest_skipped_candidate_for_undo(
+        &self,
+        session: &str,
+        path: Option<&Path>,
+    ) -> Option<(usize, BackupSkippedReason, Option<String>)> {
+        let key = path.map(canonicalize_key);
+        let skips = self.skipped_backups.get(session)?;
+        let (index, skip) = skips
+            .iter()
+            .enumerate()
+            .filter(|(_, skip)| key.as_ref().is_none_or(|key| &skip.path == key))
+            .max_by_key(|(_, skip)| skip.order)?;
+
+        let latest_backup = if let Some(key) = key.as_ref() {
+            self.entries
+                .get(session)
+                .and_then(|files| files.get(key))
+                .and_then(|stack| stack.last())
+                .map(|entry| (entry.order, entry.op_id.as_deref()))
+        } else {
+            self.entries.get(session).and_then(|files| {
+                files
+                    .values()
+                    .filter_map(|stack| stack.last())
+                    .max_by_key(|entry| entry.order)
+                    .map(|entry| (entry.order, entry.op_id.as_deref()))
+            })
+        };
+        if latest_backup.is_some_and(|(order, op_id)| {
+            order > skip.order || (op_id.is_some() && op_id == skip.op_id.as_deref())
+        }) {
+            return None;
+        }
+        Some((index, skip.reason, skip.op_id.clone()))
+    }
+
+    pub fn take_latest_skipped_reason_for_undo(
+        &mut self,
+        session: &str,
+        path: Option<&Path>,
+    ) -> Option<BackupSkippedReason> {
+        let (index, reason, op_id) = self.latest_skipped_candidate_for_undo(session, path)?;
+        let skips = self.skipped_backups.get_mut(session)?;
+        if path.is_some() {
+            skips.remove(index);
+        } else if let Some(op_id) = op_id {
+            skips.retain(|skip| skip.op_id.as_deref() != Some(op_id.as_str()));
+        } else {
+            skips.remove(index);
+        }
+        if skips.is_empty() {
+            self.skipped_backups.remove(session);
+        }
+        Some(reason)
     }
 
     fn ensure_session_marker(&self, session_dir: &Path, session: &str) -> Result<(), AftError> {
