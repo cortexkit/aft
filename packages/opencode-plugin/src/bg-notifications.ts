@@ -113,12 +113,12 @@ type SessionBgState = {
    * Task IDs DELIVERED to the agent but whose `bash_ack_completions` has not yet
    * confirmed (so the Rust registry still holds them and, over subc, re-nudges).
    * Ingest skips these for fresh delivery AND a forced drain RE-ACKs them (the
-   * self-terminating close of the re-nudge loop, C-#3). Entries are removed by
-    * DAEMON RECONCILIATION, not a timer: when a forced drain no longer returns a
-    * task as unacknowledged, it is safe to forget (R2-T3 — a
-   * time-based TTL could evict a task the daemon still holds, reopening the
-   * double-deliver). Self-drains: the module re-nudges (→ drain → re-ack) until
-   * ack confirms. Insertion-ordered for the FIFO OOM backstop cap.
+   * self-terminating close of the re-nudge loop). Entries are removed by
+   * DAEMON RECONCILIATION, not a timer: when a forced drain no longer returns a
+   * task as unacknowledged, it is safe to forget. A time-based TTL could evict a
+   * task the daemon still holds, reopening the double-deliver. Self-drains: the
+   * module re-nudges (→ drain → re-ack) until ack confirms. Insertion-ordered
+   * for the FIFO OOM backstop cap.
    */
   deliveredAwaitingAckTaskIds: Set<string>;
   lastSeenAt: number;
