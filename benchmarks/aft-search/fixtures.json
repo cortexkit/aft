@@ -171,7 +171,7 @@
     "shape": "natural-language",
     "expected_top_files": [
       "crates/aft/src/commands/organize_imports.rs",
-      "crates/aft/src/imports.rs"
+      "crates/aft/src/imports/mod.rs"
     ],
     "notes": "Conceptual query for import management."
   },
