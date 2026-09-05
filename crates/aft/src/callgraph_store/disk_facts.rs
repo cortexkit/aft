@@ -67,6 +67,10 @@ impl ProjectFacts for DiskFacts {
             path.strip_prefix(&self.project_root).unwrap_or(&path),
         ))
     }
+    fn canonical_path(&self, root: &Path, rel: &[u8]) -> Option<PathBuf> {
+        let path = root.join(byte_path(rel));
+        Some(super::canonicalize_path(&path))
+    }
     fn list_dir(&self, rel: &[u8]) -> Vec<DirEntry> {
         let dir = self.project_root.join(byte_path(rel));
         let Ok(boundary) = crate::walk_boundary::DeviceBoundary::for_root(&self.project_root)
