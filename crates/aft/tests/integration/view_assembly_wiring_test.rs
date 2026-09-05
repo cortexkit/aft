@@ -48,6 +48,8 @@ fn request(
         scope: scope.to_string(),
         desired_head: head_tree_fingerprint(&head),
         changed_paths,
+        semantic_keys: Default::default(),
+        require_semantic: false,
         allow_blob_put,
     }
 }

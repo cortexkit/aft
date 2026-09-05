@@ -8,9 +8,7 @@ use crate::alias::{head_tree_entries, AliasStore, GitMode};
 use crate::blob_store::{
     BlobPlane, BlobStore, CallgraphKey, FullKey, PutOutcome, CALLGRAPH_PRODUCER_VERSION,
 };
-use crate::callgraph_store::join::{
-    CallgraphBlob, JoinResult, ManifestBlobReader, ManifestJoinError,
-};
+use crate::callgraph_store::join::CallgraphBlob;
 use crate::parser::detect_language;
 use crate::path_status::PathStatusStore;
 use crate::pins::AssemblyPin;
@@ -29,6 +27,8 @@ pub struct AssemblyRequest {
     pub scope: String,
     pub desired_head: String,
     pub changed_paths: BTreeSet<Vec<u8>>,
+    pub semantic_keys: BTreeMap<Vec<u8>, String>,
+    pub require_semantic: bool,
     pub allow_blob_put: bool,
 }
 
@@ -184,13 +184,19 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
                     entry: ManifestEntry::Regular {
                         mode: if executable { 0o100755 } else { 0o100644 },
                         planes: RegularPlanes {
-                            semantic: previous_entries.get(&tracked.rel_path).and_then(|entry| {
-                                if let ManifestEntry::Regular { planes, .. } = entry {
-                                    planes.semantic.clone()
-                                } else {
-                                    None
-                                }
-                            }),
+                            semantic: request
+                                .semantic_keys
+                                .get(&tracked.rel_path)
+                                .cloned()
+                                .or_else(|| {
+                                    previous_entries.get(&tracked.rel_path).and_then(|entry| {
+                                        if let ManifestEntry::Regular { planes, .. } = entry {
+                                            planes.semantic.clone()
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                }),
                             callgraph: callgraph_key,
                         },
                         resolution_input,
@@ -203,6 +209,24 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
             }
             GitMode::Other(_) => {
                 pending_paths.insert(tracked.rel_path);
+            }
+        }
+    }
+
+    if request.require_semantic {
+        for candidate in &candidates {
+            let missing = matches!(
+                &candidate.entry,
+                ManifestEntry::Regular { planes, .. }
+                    if planes.semantic.is_none()
+                        && crate::semantic_index::is_semantic_indexed_extension(
+                            &request
+                                .project_root
+                                .join(path_from_bytes(candidate.path.as_bytes()))
+                        )
+            );
+            if missing {
+                pending_paths.insert(candidate.path.as_bytes().to_vec());
             }
         }
     }
@@ -277,10 +301,12 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
             .into_iter()
             .map(|candidate| (candidate.path, candidate.entry)),
     )?;
-    let reader = SqliteCallgraphReader(callgraph.path().to_path_buf());
-    let joined = JoinResult::from_manifest(&manifest, &reader)
-        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-    write_derived(status.path(), &joined.canonical_serialization())?;
+    crate::callgraph_store::materialize_manifest_view_database(
+        status.path(),
+        callgraph.path(),
+        &manifest,
+    )
+    .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
     let trigram = view.view_dir().join("trigram.bin");
     fs::write(&trigram, [])?;
     let artifacts = PublicationArtifacts {
@@ -343,41 +369,6 @@ fn generation_number(generation: &str) -> u64 {
         .split_once('-')
         .and_then(|(number, _)| number.parse().ok())
         .unwrap_or(0)
-}
-
-fn write_derived(path: &Path, rows: &[u8]) -> Result<()> {
-    let connection = Connection::open(path)?;
-    connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS callgraph_join (singleton INTEGER PRIMARY KEY, rows BLOB NOT NULL);",
-    )?;
-    connection.execute(
-        "INSERT INTO callgraph_join(singleton, rows) VALUES (1, ?1)
-         ON CONFLICT(singleton) DO UPDATE SET rows = excluded.rows",
-        [rows],
-    )?;
-    Ok(())
-}
-
-struct SqliteCallgraphReader(PathBuf);
-
-impl ManifestBlobReader for SqliteCallgraphReader {
-    fn read_callgraph_blob(
-        &self,
-        full_key: &str,
-    ) -> std::result::Result<Option<Vec<u8>>, ManifestJoinError> {
-        let Some(key) = decode_hex(full_key) else {
-            return Ok(None);
-        };
-        Connection::open(&self.0)
-            .map_err(|error| ManifestJoinError::InvalidBlob(error.to_string()))?
-            .query_row(
-                "SELECT payload FROM blob_payloads WHERE full_key = ?1",
-                [key],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| ManifestJoinError::InvalidBlob(error.to_string()))
-    }
 }
 
 struct SqliteClosure {

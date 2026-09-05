@@ -5647,7 +5647,7 @@ mod tests {
                     "views": { "enabled": true },
                     "search_index": false,
                     "semantic_search": false,
-                    "callgraph_store": false
+                    "callgraph_store": true
                 }))]
             })),
             &ctx,
@@ -5679,6 +5679,18 @@ mod tests {
             .join("callgraph.sqlite")
             .is_file());
         assert!(storage.path().join("views").join(scope).is_dir());
+        match ctx.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Ready(store) => {
+                assert_eq!(store.reader_kind(), "view");
+                assert!(crate::callgraph_store::CallGraphRead::node_for(
+                    &store,
+                    Path::new("tracked.rs"),
+                    "tracked",
+                )
+                .is_ok());
+            }
+            _ => panic!("expected view callgraph reader"),
+        }
     }
 
     #[test]

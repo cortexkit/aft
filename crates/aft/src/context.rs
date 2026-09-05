@@ -4079,7 +4079,7 @@ impl AppContext {
         }
     }
 
-    /// Access the persisted call graph store.
+    /// Install the checkout's manifest snapshot and its durable query pin.
     pub(crate) fn install_view_runtime(
         &self,
         snapshot: ViewRuntimeSnapshot,
@@ -4128,6 +4128,32 @@ impl AppContext {
             .ok_or_else(|| "view root is not configured".to_string())?;
         let head = crate::alias::head_tree_entries(&root).map_err(|error| error.to_string())?;
         let desired_head = crate::views::assembly::head_tree_fingerprint(&head);
+        let semantic_search = self.config().semantic_search;
+        let semantic_keys = if semantic_search && allow_blob_put {
+            let index = self
+                .semantic_index
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+                .ok_or_else(|| {
+                    "semantic view publication is waiting for the semantic index".to_string()
+                })?;
+            let fingerprint = index
+                .fingerprint()
+                .map(crate::semantic_index::SemanticIndexFingerprint::as_string)
+                .ok_or_else(|| "semantic index fingerprint is unavailable".to_string())?;
+            let mut request = crate::migration::SemanticMigrationRequest::for_root(
+                snapshot.storage.clone(),
+                root.clone(),
+                fingerprint,
+            );
+            request.family.clone_from(&snapshot.family);
+            request.view.clone_from(&snapshot.scope);
+            crate::migration::store_live_semantic_blobs(&request, &index)
+                .map_err(|error| error.to_string())?
+        } else {
+            BTreeMap::new()
+        };
         let report =
             crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
                 storage: snapshot.storage.clone(),
@@ -4136,6 +4162,8 @@ impl AppContext {
                 scope: snapshot.scope.clone(),
                 desired_head: desired_head.clone(),
                 changed_paths,
+                semantic_keys,
+                require_semantic: semantic_search,
                 allow_blob_put,
             })
             .map_err(|error| error.to_string())?;
@@ -4165,6 +4193,7 @@ impl AppContext {
         Ok(report)
     }
 
+    /// Access the persisted call graph store.
     pub fn callgraph_store(&self) -> &RwLock<Option<Arc<ReadonlyCallGraphStore>>> {
         self.callgraph_store.as_ref()
     }
@@ -4433,6 +4462,23 @@ impl AppContext {
     fn callgraph_store_for_ops_with_wait(&self, wait: Duration) -> CallgraphStoreAccess {
         if !self.heavy_root_work_allowed() {
             return CallgraphStoreAccess::Unavailable;
+        }
+        if self.config().views.enabled && self.config().callgraph_store {
+            if let Some(view) = self.pinned_view_runtime() {
+                if view.manifest.is_some() {
+                    let Some(project_root) = self.callgraph_project_root() else {
+                        return CallgraphStoreAccess::Unavailable;
+                    };
+                    return match ReadonlyCallGraphStore::open_manifest_view(
+                        project_root,
+                        view.family,
+                        view.view_dir,
+                    ) {
+                        Ok(store) => CallgraphStoreAccess::Ready(Arc::new(store)),
+                        Err(error) => CallgraphStoreAccess::Error(error),
+                    };
+                }
+            }
         }
         let operation_generation = self.configure_generation();
 

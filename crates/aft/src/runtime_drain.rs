@@ -921,6 +921,23 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
         }
     }
 
+    if terminal
+        && ctx.config().views.enabled
+        && matches!(
+            &*ctx
+                .semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SemanticIndexStatus::Ready { .. }
+        )
+    {
+        if let Some(_permit) = ctx.cold_build_limiter().try_acquire() {
+            if let Err(error) = ctx.publish_view_paths(BTreeSet::new(), true) {
+                aft::slog_warn!("semantic-ready view publication failed: {}", error);
+            }
+        }
+    }
+
     if disconnected && !terminal {
         let committed =
             ctx.with_current_semantic_index_rx(receiver_generation, receiver_epoch, |receiver| {

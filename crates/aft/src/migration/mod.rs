@@ -29,7 +29,7 @@ use crate::blob_store::{
     BlobStore, BlobStoreError, FullKey, PutOutcome, SemanticKey, SEMANTIC_PRODUCER_VERSION,
 };
 use crate::callgraph_store::CallGraphStoreError;
-use crate::pins::PinError;
+use crate::pins::{AssemblyPin, PinError};
 use crate::views::{
     ArtifactPlane, ClosureRequirements, Manifest, ManifestEntry, PublicationArtifacts,
     PublicationClosure, PublicationRequest, PublishOutcome, RegularPlanes, RelPath, ViewError,
@@ -241,6 +241,81 @@ impl From<CallGraphStoreError> for MigrationError {
     fn from(error: CallGraphStoreError) -> Self {
         Self::Callgraph(error)
     }
+}
+
+/// Imports an eligible root's old `semantic.bin` without making embedding requests.
+///
+/// Compatibility is intentionally strict: V6/V7 snapshots must carry the exact
+/// configured model fingerprint and the current legacy chunking version. Earlier
+/// or unstamped snapshots are recorded as a rebuild request rather than treated as
+/// an import failure. The source snapshot is never deleted or rewritten here.
+pub(crate) fn store_live_semantic_blobs(
+    request: &SemanticMigrationRequest,
+    index: &crate::semantic_index::SemanticIndex,
+) -> Result<BTreeMap<Vec<u8>, String>, MigrationError> {
+    let raw = index.to_bytes();
+    let parsed = parse_legacy_snapshot(&raw, &request.configured_model_fingerprint)
+        .map_err(MigrationError::InvalidLegacySnapshot)?;
+    let root = fs::canonicalize(&request.project_root)?;
+    let view = ViewStore::open(&request.storage, &request.view)?;
+    let mut candidates = Vec::new();
+    for file in parsed.files {
+        let Some(rel_path) = legacy_path_to_rel_path(&file.path, &root) else {
+            continue;
+        };
+        let source_path = root.join(os_path_from_bytes(rel_path.as_bytes()));
+        let Ok(source) = fs::read(&source_path) else {
+            continue;
+        };
+        if blake3::hash(&source).as_bytes() != &file.content_hash {
+            continue;
+        }
+        let key = SemanticKey::from_bytes(
+            &source,
+            rel_path.as_bytes(),
+            &request.chunker_version,
+            &request.embed_template_version,
+            &request.configured_model_fingerprint,
+        )
+        .full_key();
+        candidates.push(ImportCandidate {
+            rel_path,
+            mode: regular_mode(&source_path)?,
+            key,
+            payload: encode_imported_payload(request, &file.entries),
+        });
+    }
+    let keys = candidates
+        .iter()
+        .map(|candidate| candidate.key.clone())
+        .collect::<Vec<_>>();
+    let generation = format!("semantic-live-{}", &blake3::hash(&raw).to_hex()[..16]);
+    let mut pin = AssemblyPin::create(
+        view.view_dir(),
+        request.family.clone(),
+        request.view.clone(),
+        generation,
+        &keys,
+    )?;
+    let mut store = BlobStore::open(
+        &request.storage,
+        request.family.clone(),
+        crate::blob_store::BlobPlane::Semantic,
+    )?;
+    let mut semantic_keys = BTreeMap::new();
+    for candidate in candidates {
+        pin.renew_if_due()?;
+        let put = store.put(&candidate.key, &candidate.payload)?;
+        if !put.durable {
+            return Err(MigrationError::UndurablePut(put.outcome));
+        }
+        semantic_keys.insert(
+            candidate.rel_path.as_bytes().to_vec(),
+            candidate.key.to_hex(),
+        );
+    }
+    pin.release();
+    Ok(semantic_keys)
 }
 
 /// Imports an eligible root's old `semantic.bin` without making embedding requests.
