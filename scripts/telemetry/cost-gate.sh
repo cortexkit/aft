@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Run the fixed, twice-sampled nightly OSS cost gate. The Python helper owns
-# cloning, NDJSON-matrix invocation, structured metric comparison, and reports.
+# Dispatch nightly OSS cost gates. The default runner compares two index-cost
+# samples across the fixed repository matrix; --exact-recall checks deterministic
+# sentence and token-pair retrieval against its checked-in baseline.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -1,19 +1,19 @@
 # Exact-tier retrieval measurements
 
-Measured against base `5001d938ffc190ee029156bc4f3e0c6c418a178e` and the exact-tier implementation in `715e4994`. The concept family uses the seven ripgrep tasks from `external-fixtures.json`, `top_k=10`, and file-only relevance.
+Measured against base `5001d938ffc190ee029156bc4f3e0c6c418a178e` and the final exact-tier implementation on this branch. The concept family uses the seven ripgrep tasks from `external-fixtures.json`, `top_k=10`, and the runner's standard line-overlap relevance.
 
 ## Concept family (three independent runs)
 
 | Binary | Run | MRR@10 | R@10 |
 | --- | ---: | ---: | ---: |
-| Before | 1 | 0.743 | 0.738 |
-| Before | 2 | 0.743 | 0.738 |
-| Before | 3 | 0.743 | 0.738 |
-| After | 1 | 0.857 | 0.738 |
-| After | 2 | 0.857 | 0.738 |
-| After | 3 | 0.857 | 0.738 |
+| Before | 1 | 0.571 | 0.690 |
+| Before | 2 | 0.571 | 0.690 |
+| Before | 3 | 0.571 | 0.690 |
+| After | 1 | 0.619 | 0.690 |
+| After | 2 | 0.619 | 0.690 |
+| After | 3 | 0.619 | 0.690 |
 
-The observed noise band (maximum minus minimum over the three repetitions) was 0.000 for both metrics on each binary. R@10 did not regress; MRR@10 increased by 0.114.
+The observed noise band (maximum minus minimum over the three repetitions) was 0.000 for both metrics on each binary. R@10 did not regress; MRR@10 increased by 0.048.
 
 ## Exact recall before
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gate exact lexical recall on deterministic samples from the pinned corpus."""
+"""Measure sentence rank-1 and token-pair recall@10 on commit-pinned repositories."""
 
 from __future__ import annotations
 
