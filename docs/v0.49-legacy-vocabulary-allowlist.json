@@ -3159,6 +3159,42 @@
       "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
     },
     {
+      "path": "packages/opencode-plugin/src/tools/definitions/v2.ts",
+      "location": "line 104, column 36",
+      "line": 104,
+      "column": 36,
+      "token": "filePath",
+      "class": "host-display-contract",
+      "reason": "The V2 projection consumes the V1 trio's filePath header and re-emits it as path."
+    },
+    {
+      "path": "packages/opencode-plugin/src/tools/definitions/v2.ts",
+      "location": "line 109, column 59",
+      "line": 109,
+      "column": 59,
+      "token": "filePath",
+      "class": "host-display-contract",
+      "reason": "The V2 projection consumes the V1 trio's filePath header and re-emits it as path."
+    },
+    {
+      "path": "packages/opencode-plugin/src/tools/definitions/v2.ts",
+      "location": "line 113, column 11",
+      "line": 113,
+      "column": 11,
+      "token": "filePath",
+      "class": "host-display-contract",
+      "reason": "The V2 projection consumes the V1 trio's filePath header and re-emits it as path."
+    },
+    {
+      "path": "packages/opencode-plugin/src/tools/definitions/v2.ts",
+      "location": "line 114, column 18",
+      "line": 114,
+      "column": 18,
+      "token": "filePath",
+      "class": "host-display-contract",
+      "reason": "The V2 projection consumes the V1 trio's filePath header and re-emits it as path."
+    },
+    {
       "path": "packages/opencode-plugin/src/tools/hoisted.ts",
       "location": "line 135, column 62",
       "line": 135,
@@ -3816,6 +3852,13 @@
       "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
     },
     {
+      "path": "packages/opencode-plugin/test/tool-surface/v2-tool-surface.test.ts",
+      "location": "file-level",
+      "token": "filePath",
+      "class": "compatibility-fixture",
+      "reason": "The fixture submits or asserts a retired input spelling at a compatibility boundary."
+    },
+    {
       "path": "packages/pi-plugin/src/__tests__/_shared.test.ts",
       "location": "file-level",
       "token": "filePath",
@@ -4467,35 +4510,8 @@
     },
     {
       "path": "scripts/audit-v049-agent-surface.ts",
-      "location": "line 248, column 81",
-      "line": 248,
-      "column": 81,
-      "token": "filePath",
-      "class": "audit-implementation",
-      "reason": "The audit or capture implementation names the vocabulary it checks."
-    },
-    {
-      "path": "scripts/audit-v049-agent-surface.ts",
-      "location": "line 248, column 90",
-      "line": 248,
-      "column": 90,
-      "token": "toFile",
-      "class": "audit-implementation",
-      "reason": "The audit or capture implementation names the vocabulary it checks."
-    },
-    {
-      "path": "scripts/audit-v049-agent-surface.ts",
-      "location": "line 432, column 30",
-      "line": 432,
-      "column": 30,
-      "token": "filePath",
-      "class": "audit-implementation",
-      "reason": "The audit or capture implementation names the vocabulary it checks."
-    },
-    {
-      "path": "scripts/audit-v049-agent-surface.ts",
-      "location": "line 444, column 27",
-      "line": 444,
+      "location": "line 247, column 27",
+      "line": 247,
       "column": 27,
       "token": "filePath",
       "class": "audit-implementation",
@@ -4503,8 +4519,62 @@
     },
     {
       "path": "scripts/audit-v049-agent-surface.ts",
-      "location": "line 444, column 64",
-      "line": 444,
+      "location": "line 248, column 17",
+      "line": 248,
+      "column": 17,
+      "token": "filePath",
+      "class": "audit-implementation",
+      "reason": "The audit or capture implementation names the vocabulary it checks."
+    },
+    {
+      "path": "scripts/audit-v049-agent-surface.ts",
+      "location": "line 253, column 57",
+      "line": 253,
+      "column": 57,
+      "token": "filePath",
+      "class": "audit-implementation",
+      "reason": "The audit or capture implementation names the vocabulary it checks."
+    },
+    {
+      "path": "scripts/audit-v049-agent-surface.ts",
+      "location": "line 264, column 81",
+      "line": 264,
+      "column": 81,
+      "token": "filePath",
+      "class": "audit-implementation",
+      "reason": "The audit or capture implementation names the vocabulary it checks."
+    },
+    {
+      "path": "scripts/audit-v049-agent-surface.ts",
+      "location": "line 264, column 90",
+      "line": 264,
+      "column": 90,
+      "token": "toFile",
+      "class": "audit-implementation",
+      "reason": "The audit or capture implementation names the vocabulary it checks."
+    },
+    {
+      "path": "scripts/audit-v049-agent-surface.ts",
+      "location": "line 448, column 30",
+      "line": 448,
+      "column": 30,
+      "token": "filePath",
+      "class": "audit-implementation",
+      "reason": "The audit or capture implementation names the vocabulary it checks."
+    },
+    {
+      "path": "scripts/audit-v049-agent-surface.ts",
+      "location": "line 460, column 27",
+      "line": 460,
+      "column": 27,
+      "token": "filePath",
+      "class": "audit-implementation",
+      "reason": "The audit or capture implementation names the vocabulary it checks."
+    },
+    {
+      "path": "scripts/audit-v049-agent-surface.ts",
+      "location": "line 460, column 64",
+      "line": 460,
       "column": 64,
       "token": "toFile",
       "class": "audit-implementation",
@@ -4512,8 +4582,8 @@
     },
     {
       "path": "scripts/audit-v049-agent-surface.ts",
-      "location": "line 450, column 30",
-      "line": 450,
+      "location": "line 466, column 30",
+      "line": 466,
       "column": 30,
       "token": "toFile",
       "class": "audit-implementation",
@@ -4521,8 +4591,8 @@
     },
     {
       "path": "scripts/audit-v049-agent-surface.ts",
-      "location": "line 450, column 94",
-      "line": 450,
+      "location": "line 466, column 94",
+      "line": 466,
       "column": 94,
       "token": "toFile",
       "class": "audit-implementation",
@@ -4530,8 +4600,8 @@
     },
     {
       "path": "scripts/audit-v049-agent-surface.ts",
-      "location": "line 451, column 30",
-      "line": 451,
+      "location": "line 467, column 30",
+      "line": 467,
       "column": 30,
       "token": "filePath",
       "class": "audit-implementation",
@@ -4539,8 +4609,8 @@
     },
     {
       "path": "scripts/audit-v049-agent-surface.ts",
-      "location": "line 452, column 61",
-      "line": 452,
+      "location": "line 468, column 61",
+      "line": 468,
       "column": 61,
       "token": "filePath",
       "class": "audit-implementation",
@@ -4548,8 +4618,8 @@
     },
     {
       "path": "scripts/audit-v049-agent-surface.ts",
-      "location": "line 482, column 24",
-      "line": 482,
+      "location": "line 498, column 24",
+      "line": 498,
       "column": 24,
       "token": "filePath",
       "class": "audit-implementation",
@@ -4557,8 +4627,8 @@
     },
     {
       "path": "scripts/audit-v049-agent-surface.ts",
-      "location": "line 483, column 63",
-      "line": 483,
+      "location": "line 499, column 63",
+      "line": 499,
       "column": 63,
       "token": "filePath",
       "class": "audit-implementation",
@@ -4566,8 +4636,8 @@
     },
     {
       "path": "scripts/audit-v049-agent-surface.ts",
-      "location": "line 595, column 56",
-      "line": 595,
+      "location": "line 611, column 56",
+      "line": 611,
       "column": 56,
       "token": "filePath",
       "class": "audit-implementation",
@@ -4575,8 +4645,8 @@
     },
     {
       "path": "scripts/audit-v049-agent-surface.ts",
-      "location": "line 596, column 55",
-      "line": 596,
+      "location": "line 612, column 55",
+      "line": 612,
       "column": 55,
       "token": "toFile",
       "class": "audit-implementation",
@@ -4584,8 +4654,8 @@
     },
     {
       "path": "scripts/audit-v049-agent-surface.ts",
-      "location": "line 597, column 9",
-      "line": 597,
+      "location": "line 613, column 9",
+      "line": 613,
       "column": 9,
       "token": "filePath",
       "class": "audit-implementation",
