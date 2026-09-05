@@ -33,6 +33,7 @@ use crate::parser::{SharedSymbolCache, SymbolCache, TreeSitterProvider};
 use crate::protocol::{
     ConfigureWarningsFrame, ProgressFrame, PushFrame, StatusChangedFrame, StatusPayload,
 };
+use crate::views::Manifest;
 use crate::watcher_filter::WatcherJoinOutcome;
 use crate::watcher_filter::{SharedGitignore, WatcherDispatchEvent, WatcherThreadHandle};
 
@@ -750,6 +751,24 @@ impl Drop for CallGraphStoreBuildSettlement {
             let _ = self.tx.send(CallGraphStoreBuildEvent::Settled);
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ViewRuntimeSnapshot {
+    pub(crate) storage: PathBuf,
+    pub(crate) family: String,
+    pub(crate) scope: String,
+    pub(crate) view_dir: PathBuf,
+    pub(crate) generation: Option<String>,
+    pub(crate) manifest: Option<Manifest>,
+    pub(crate) desired_head: String,
+    pub(crate) pending_paths: BTreeSet<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct ViewRuntimeState {
+    snapshot: ViewRuntimeSnapshot,
+    pin: Option<crate::pins::QueryPin>,
 }
 
 #[derive(Clone, Debug)]
@@ -1743,6 +1762,7 @@ pub struct AppContext {
     /// remain subject to every verification and publication fence.
     standing_artifact_exempt: AtomicBool,
     cold_build_limiter: RwLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>>,
+    view_runtime: RwLock<Option<ViewRuntimeState>>,
     callgraph_store: Arc<RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
     callgraph_store_force_requested: AtomicU64,
     callgraph_store_force_fulfilled: AtomicU64,
@@ -2221,6 +2241,7 @@ impl AppContext {
             heavy_root_work_allowed: Arc::clone(&heavy_root_work_allowed),
             standing_artifact_exempt: AtomicBool::new(false),
             cold_build_limiter: RwLock::new(crate::cold_build_limiter::global_limiter()),
+            view_runtime: RwLock::new(None),
             callgraph_store: Arc::new(RwLock::new(None)),
             callgraph_store_force_requested: AtomicU64::new(0),
             callgraph_store_force_fulfilled: AtomicU64::new(0),
@@ -4055,6 +4076,41 @@ impl AppContext {
     }
 
     /// Access the persisted call graph store.
+    pub(crate) fn install_view_runtime(
+        &self,
+        snapshot: ViewRuntimeSnapshot,
+        pin: Option<crate::pins::QueryPin>,
+    ) {
+        *self
+            .view_runtime
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(ViewRuntimeState { snapshot, pin });
+    }
+
+    pub(crate) fn clear_view_runtime(&self) {
+        *self
+            .view_runtime
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+
+    pub(crate) fn view_runtime_snapshot(&self) -> Option<ViewRuntimeSnapshot> {
+        self.view_runtime
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|state| state.snapshot.clone())
+    }
+
+    pub(crate) fn pinned_view_runtime(&self) -> Option<ViewRuntimeSnapshot> {
+        self.view_runtime
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .filter(|state| state.pin.is_some() && state.snapshot.generation.is_some())
+            .map(|state| state.snapshot.clone())
+    }
+
     pub fn callgraph_store(&self) -> &RwLock<Option<Arc<ReadonlyCallGraphStore>>> {
         self.callgraph_store.as_ref()
     }

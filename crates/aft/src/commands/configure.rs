@@ -11,14 +11,14 @@ use std::time::{Duration, Instant, SystemTime};
 use crossbeam_channel::unbounded;
 use notify::{RecursiveMode, Watcher};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::cache_freshness::{self, VerifyArtifact, VerifyStrategy, WarmVerifyPlan};
 use crate::config::{Config, SemanticBackendConfig};
 use crate::context::{
     AppContext, CallgraphStoreAccess, ConfigureMaintenanceJob, SemanticBuildProgress,
     SemanticIndexEvent, SemanticIndexStatus, SemanticRefreshEvent, SemanticRefreshRequest,
-    SemanticRefreshWorkerSlot, SubcLifecycleAdmission,
+    SemanticRefreshWorkerSlot, SubcLifecycleAdmission, ViewRuntimeSnapshot,
 };
 use crate::harness::Harness;
 use crate::log_ctx;
@@ -4479,6 +4479,7 @@ enum ConfigureMaintenanceStage {
     ProjectRuntime,
     Watcher,
     StorageSweeps,
+    ViewLoad,
     ProcessFlags,
     Callgraph,
     SemanticRelease,
@@ -4827,6 +4828,17 @@ fn run_configure_maintenance_unit(
             } else {
                 run_configure_storage_sweeps(&job.storage_root, job.harness.clone());
             }
+            continuation.stage = ConfigureMaintenanceStage::ViewLoad;
+        }
+        ConfigureMaintenanceStage::ViewLoad => {
+            if ctx.config().views.enabled && ctx.callgraph_writer() {
+                if let Err(error) = open_view_runtime_for_configure(ctx, job) {
+                    ctx.clear_view_runtime();
+                    slog_warn!("content-addressed view load failed: {}", error);
+                }
+            } else {
+                ctx.clear_view_runtime();
+            }
             continuation.stage = ConfigureMaintenanceStage::ProcessFlags;
         }
         ConfigureMaintenanceStage::ProcessFlags => {
@@ -4936,6 +4948,126 @@ fn run_configure_maintenance_unit(
     }
 
     ConfigureMaintenanceUnitResult::Continue
+}
+
+fn head_tree_fingerprint(entries: &[crate::alias::TrackedPath]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for entry in entries {
+        hasher.update(&(entry.rel_path.len() as u64).to_le_bytes());
+        hasher.update(&entry.rel_path);
+        hasher.update(entry.mode.as_bytes());
+        hasher.update(entry.git_oid.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn manifest_checkout_paths(manifest: &crate::views::Manifest) -> BTreeSet<Vec<u8>> {
+    manifest
+        .entries()
+        .filter_map(|(path, entry)| {
+            (!matches!(entry, crate::views::ManifestEntry::Synthetic { .. }))
+                .then(|| path.as_bytes().to_vec())
+        })
+        .collect()
+}
+
+fn open_view_runtime_for_configure(
+    ctx: &AppContext,
+    job: &ConfigureMaintenanceJob,
+) -> Result<(), String> {
+    let family = ctx.memoized_artifact_cache_key(&job.canonical_cache_root);
+    let scope = crate::path_identity::project_scope_key(&job.canonical_cache_root);
+    let view = crate::views::ViewStore::open(&job.storage_root, &scope)
+        .map_err(|error| error.to_string())?;
+    let _semantic = crate::blob_store::BlobStore::open(
+        &job.storage_root,
+        family.clone(),
+        crate::blob_store::BlobPlane::Semantic,
+    )
+    .map_err(|error| error.to_string())?;
+    let _callgraph = crate::blob_store::BlobStore::open(
+        &job.storage_root,
+        family.clone(),
+        crate::blob_store::BlobPlane::Callgraph,
+    )
+    .map_err(|error| error.to_string())?;
+    let alias_store = crate::alias::AliasStore::open(&job.storage_root, &family)
+        .map_err(|error| error.to_string())?;
+
+    let head_entries = crate::alias::head_tree_entries(&job.canonical_cache_root)
+        .map_err(|error| error.to_string())?;
+    let desired_head = head_tree_fingerprint(&head_entries);
+    let generation = view
+        .current_generation()
+        .map_err(|error| error.to_string())?;
+    let manifest = generation
+        .as_deref()
+        .map(|generation| view.load_manifest(generation))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let previous_paths = manifest
+        .as_ref()
+        .map(manifest_checkout_paths)
+        .unwrap_or_default();
+    let report = alias_store
+        .report_head_checkout(&job.canonical_cache_root, &previous_paths)
+        .map_err(|error| error.to_string())?;
+    slog_debug!(
+        "content-addressed view HEAD reuse {}/{} for {}",
+        report.numerator,
+        report.denominator,
+        job.canonical_cache_root.display()
+    );
+
+    let head_paths = head_entries
+        .iter()
+        .map(|entry| entry.rel_path.clone())
+        .collect::<BTreeSet<_>>();
+    let generation_matches_head = generation
+        .as_deref()
+        .is_some_and(|value| value.ends_with(&desired_head))
+        && previous_paths == head_paths;
+    let pending_paths = if generation_matches_head {
+        BTreeSet::new()
+    } else {
+        head_entries
+            .iter()
+            .filter(|entry| {
+                !previous_paths.contains(&entry.rel_path)
+                    || !entry.is_alias_eligible()
+                    || alias_store.resolve(entry.git_oid).ok().flatten().is_none()
+            })
+            .map(|entry| entry.rel_path.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    if !pending_paths.is_empty() {
+        let mut status = crate::path_status::PathStatusStore::open(view.view_dir())
+            .map_err(|error| error.to_string())?;
+        for path in &pending_paths {
+            status
+                .mark_pending(path, "view publication scheduled", 1)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    let pin = generation
+        .as_deref()
+        .map(|generation| crate::pins::QueryPin::acquire(view.view_dir(), generation))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    ctx.install_view_runtime(
+        ViewRuntimeSnapshot {
+            storage: job.storage_root.clone(),
+            family,
+            scope,
+            view_dir: view.view_dir().to_path_buf(),
+            generation,
+            manifest,
+            desired_head,
+            pending_paths,
+        },
+        pin,
+    );
+    Ok(())
 }
 
 fn spawn_configure_storage_sweeps(storage_root: &Path, harness: Harness) {
@@ -5454,6 +5586,95 @@ mod tests {
             .status()
             .unwrap()
             .success());
+    }
+
+    #[test]
+    fn views_gate_off_does_not_create_view_storage() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let response = handle_configure_for_test(
+            &configure_request_with_params(json!({
+                "project_root": project.path(),
+                "storage_dir": storage.path(),
+                "harness": "opencode",
+                "config": [user_tier(json!({
+                    "search_index": false,
+                    "semantic_search": false,
+                    "callgraph_store": false
+                }))]
+            })),
+            &ctx,
+        );
+        assert!(response.success, "{}", response.data);
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(!storage.path().join("views").exists());
+        assert!(ctx.view_runtime_snapshot().is_none());
+    }
+
+    #[test]
+    fn views_gate_on_opens_family_stores_after_ack_and_schedules_fresh_head() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let canonical_root = std::fs::canonicalize(project.path()).unwrap();
+        let family = crate::search_index::artifact_cache_key(&canonical_root);
+        let scope = crate::path_identity::project_scope_key(&canonical_root);
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let response = handle_configure_for_test(
+            &configure_request_with_params(json!({
+                "project_root": canonical_root,
+                "storage_dir": storage.path(),
+                "harness": "opencode",
+                "config": [user_tier(json!({
+                    "views": { "enabled": true },
+                    "search_index": false,
+                    "semantic_search": false,
+                    "callgraph_store": false
+                }))]
+            })),
+            &ctx,
+        );
+        assert!(response.success, "{}", response.data);
+        assert!(!storage.path().join("views").exists());
+
+        super::drain_deferred_configure_maintenance(&ctx);
+
+        let view = ctx.view_runtime_snapshot().expect("view runtime");
+        assert_eq!(view.family, family);
+        assert_eq!(view.scope, scope);
+        assert!(view.generation.is_none());
+        assert!(view.pending_paths.contains(b"tracked.rs".as_slice()));
+        assert!(storage
+            .path()
+            .join("blobs")
+            .join(&family)
+            .join("semantic.sqlite")
+            .is_file());
+        assert!(storage
+            .path()
+            .join("blobs")
+            .join(&family)
+            .join("callgraph.sqlite")
+            .is_file());
+        assert!(storage.path().join("views").join(scope).is_dir());
     }
 
     #[test]
