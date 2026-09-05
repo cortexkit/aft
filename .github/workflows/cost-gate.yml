@@ -62,6 +62,14 @@ jobs:
           fi
           scripts/telemetry/cost-gate.sh "${args[@]}"
 
+      - name: Gate exact lexical recall
+        run: |
+          python3 benchmarks/aft-search/setup_corpus.py
+          scripts/telemetry/cost-gate.sh --exact-recall \
+            --binary "${{ github.workspace }}/target/release/aft" \
+            --out "$AFT_COST_GATE_RESULTS_DIR/exact-recall.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
       - name: Upload cost-gate CSV and logs
         if: always()
         uses: actions/upload-artifact@v4

@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "sample_per_family_per_repo": 2,
+  "sentence_rank1": 1.0,
+  "pair_recall_at_10": 1.0
+}
