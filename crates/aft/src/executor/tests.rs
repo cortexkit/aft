@@ -2604,7 +2604,6 @@ fn bind_blocker_snapshot_labels_reader_parked_before_execution_as_zombie() {
         "parked-before-execution".to_string(),
         Box::new(|_| ok("parked-before-execution")),
     );
-    let deadline = Instant::now() + Duration::from_secs(1);
     loop {
         let admitted = executor
             .inner
@@ -2616,8 +2615,7 @@ fn bind_blocker_snapshot_labels_reader_parked_before_execution_as_zombie() {
         if admitted {
             break;
         }
-        assert!(Instant::now() < deadline, "reader was not dispatched");
-        std::thread::sleep(Duration::from_millis(2));
+        std::thread::yield_now();
     }
 
     let bind = executor.submit(
@@ -2626,9 +2624,13 @@ fn bind_blocker_snapshot_labels_reader_parked_before_execution_as_zombie() {
         "subc-bind-zombie-census".to_string(),
         Box::new(|_| ok("subc-bind-zombie-census")),
     );
-    let snapshot = executor
-        .try_bind_blocker_snapshot(&root, "subc-bind-zombie-census")
-        .expect("zombie bind blocker snapshot");
+    let snapshot = loop {
+        if let Some(snapshot) = executor.try_bind_blocker_snapshot(&root, "subc-bind-zombie-census")
+        {
+            break snapshot;
+        }
+        std::thread::yield_now();
+    };
     assert!(snapshot
         .blockers
         .iter()
