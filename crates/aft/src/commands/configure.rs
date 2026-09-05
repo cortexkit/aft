@@ -264,7 +264,7 @@ const SEMANTIC_REFRESH_QUIET_WINDOW_MS: u64 = 15_000;
 /// clamped to the production window so a stray environment value cannot
 /// silently stretch the refresh cadence (values above the default would delay
 /// re-embeds indefinitely; values below it are exactly what tests need).
-fn semantic_refresh_quiet_window() -> Duration {
+pub(crate) fn semantic_refresh_quiet_window() -> Duration {
     let from_env = std::env::var("AFT_SEMANTIC_QUIET_WINDOW_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -4831,10 +4831,21 @@ fn run_configure_maintenance_unit(
             continuation.stage = ConfigureMaintenanceStage::ViewLoad;
         }
         ConfigureMaintenanceStage::ViewLoad => {
-            if ctx.config().views.enabled && ctx.callgraph_writer() {
+            if ctx.config().views.enabled && !job.home_match {
                 if let Err(error) = open_view_runtime_for_configure(ctx, job) {
                     ctx.clear_view_runtime();
                     slog_warn!("content-addressed view load failed: {}", error);
+                } else if ctx
+                    .view_runtime_snapshot()
+                    .is_some_and(|view| !view.pending_paths.is_empty())
+                {
+                    if let Some(_permit) = ctx.cold_build_limiter().try_acquire() {
+                        if let Err(error) = ctx
+                            .publish_view_paths(BTreeSet::new(), !ctx.shared_artifacts_read_only())
+                        {
+                            slog_warn!("content-addressed initial publication failed: {}", error);
+                        }
+                    }
                 }
             } else {
                 ctx.clear_view_runtime();
@@ -4950,17 +4961,6 @@ fn run_configure_maintenance_unit(
     ConfigureMaintenanceUnitResult::Continue
 }
 
-fn head_tree_fingerprint(entries: &[crate::alias::TrackedPath]) -> String {
-    let mut hasher = blake3::Hasher::new();
-    for entry in entries {
-        hasher.update(&(entry.rel_path.len() as u64).to_le_bytes());
-        hasher.update(&entry.rel_path);
-        hasher.update(entry.mode.as_bytes());
-        hasher.update(entry.git_oid.as_bytes());
-    }
-    hasher.finalize().to_hex().to_string()
-}
-
 fn manifest_checkout_paths(manifest: &crate::views::Manifest) -> BTreeSet<Vec<u8>> {
     manifest
         .entries()
@@ -4996,7 +4996,7 @@ fn open_view_runtime_for_configure(
 
     let head_entries = crate::alias::head_tree_entries(&job.canonical_cache_root)
         .map_err(|error| error.to_string())?;
-    let desired_head = head_tree_fingerprint(&head_entries);
+    let desired_head = crate::views::assembly::head_tree_fingerprint(&head_entries);
     let generation = view
         .current_generation()
         .map_err(|error| error.to_string())?;
@@ -5660,8 +5660,12 @@ mod tests {
         let view = ctx.view_runtime_snapshot().expect("view runtime");
         assert_eq!(view.family, family);
         assert_eq!(view.scope, scope);
-        assert!(view.generation.is_none());
-        assert!(view.pending_paths.contains(b"tracked.rs".as_slice()));
+        assert!(view
+            .generation
+            .as_deref()
+            .is_some_and(|generation| generation.starts_with("1-")));
+        assert!(view.pending_paths.is_empty());
+        assert!(view.manifest.is_some());
         assert!(storage
             .path()
             .join("blobs")

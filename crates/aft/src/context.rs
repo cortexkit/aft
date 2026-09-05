@@ -648,6 +648,8 @@ pub(crate) struct WatcherDrainSliceState {
     pub(crate) status_changed: bool,
     pub(crate) scheduler_changed_path_count: usize,
     pub(crate) semantic_refresh_paths: Vec<PathBuf>,
+    pub(crate) view_publication_paths: BTreeSet<PathBuf>,
+    pub(crate) view_publication_due: Option<Instant>,
     pub(crate) path_slice_count: usize,
 }
 
@@ -674,6 +676,8 @@ impl WatcherDrainSliceState {
             status_changed: false,
             scheduler_changed_path_count: 0,
             semantic_refresh_paths: Vec::new(),
+            view_publication_paths: BTreeSet::new(),
+            view_publication_due: None,
             path_slice_count: 0,
         }
     }
@@ -4109,6 +4113,56 @@ impl AppContext {
             .as_ref()
             .filter(|state| state.pin.is_some() && state.snapshot.generation.is_some())
             .map(|state| state.snapshot.clone())
+    }
+
+    pub(crate) fn publish_view_paths(
+        &self,
+        changed_paths: BTreeSet<Vec<u8>>,
+        allow_blob_put: bool,
+    ) -> Result<crate::views::assembly::AssemblyReport, String> {
+        let snapshot = self
+            .view_runtime_snapshot()
+            .ok_or_else(|| "view runtime is not configured".to_string())?;
+        let root = self
+            .canonical_cache_root_opt()
+            .ok_or_else(|| "view root is not configured".to_string())?;
+        let head = crate::alias::head_tree_entries(&root).map_err(|error| error.to_string())?;
+        let desired_head = crate::views::assembly::head_tree_fingerprint(&head);
+        let report =
+            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
+                storage: snapshot.storage.clone(),
+                project_root: root,
+                family: snapshot.family.clone(),
+                scope: snapshot.scope.clone(),
+                desired_head: desired_head.clone(),
+                changed_paths,
+                allow_blob_put,
+            })
+            .map_err(|error| error.to_string())?;
+        let view = crate::views::ViewStore::open(&snapshot.storage, &snapshot.scope)
+            .map_err(|error| error.to_string())?;
+        let generation = report.generation.clone();
+        let manifest = match (&report.manifest, generation.as_deref()) {
+            (Some(manifest), _) => Some(manifest.clone()),
+            (None, Some(generation)) => view.load_manifest(generation).ok(),
+            (None, None) => None,
+        };
+        let pin = generation
+            .as_deref()
+            .map(|generation| crate::pins::QueryPin::acquire(view.view_dir(), generation))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        self.install_view_runtime(
+            ViewRuntimeSnapshot {
+                generation,
+                manifest,
+                desired_head,
+                pending_paths: report.pending_paths.clone(),
+                ..snapshot
+            },
+            pin,
+        );
+        Ok(report)
     }
 
     pub fn callgraph_store(&self) -> &RwLock<Option<Arc<ReadonlyCallGraphStore>>> {

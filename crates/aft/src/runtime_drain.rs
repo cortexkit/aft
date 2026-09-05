@@ -9,7 +9,7 @@ use crate::log_ctx;
 use crate::lsp::client::LspEvent;
 use crate::protocol::PushFrame;
 use crate::watcher_filter::{watcher_path_is_infra_skip, WatcherDispatchEvent};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
@@ -2463,6 +2463,47 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
     state.semantic_refresh_paths.clear();
 }
 
+fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSliceState) {
+    if !ctx.config().views.enabled
+        || !matches!(state.phase, WatcherDrainPhase::Collect)
+        || state
+            .view_publication_due
+            .is_none_or(|due| Instant::now() < due)
+    {
+        return;
+    }
+    let Some(root) = ctx.canonical_cache_root_opt() else {
+        return;
+    };
+    let changed = state
+        .view_publication_paths
+        .iter()
+        .filter_map(|path| path.strip_prefix(&root).ok())
+        .filter_map(|path| aft::views::RelPath::from_os_path(path).ok())
+        .map(|path| path.as_bytes().to_vec())
+        .collect::<BTreeSet<_>>();
+    let Some(_permit) = ctx.cold_build_limiter().try_acquire() else {
+        state.view_publication_due = Some(Instant::now() + Duration::from_millis(100));
+        return;
+    };
+    match ctx.publish_view_paths(changed, !ctx.shared_artifacts_read_only()) {
+        Ok(report) => {
+            aft::slog_info!(
+                "content-addressed view publication published={} blob_puts={} pending_paths={}",
+                report.published,
+                report.blob_puts,
+                report.pending_paths.len()
+            );
+            state.view_publication_paths.clear();
+            state.view_publication_due = None;
+        }
+        Err(error) => {
+            aft::slog_warn!("content-addressed view publication failed: {}", error);
+            state.view_publication_due = Some(Instant::now() + Duration::from_secs(1));
+        }
+    }
+}
+
 pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> DrainBatchOutcome {
     let started = Instant::now();
     let configure_generation = ctx.configure_generation();
@@ -2616,6 +2657,12 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         {
             state.rescan_required = false;
             state.ignore_changed = false;
+            if ctx.config().views.enabled {
+                state.view_publication_paths.clear();
+                state.view_publication_due = Some(
+                    Instant::now() + crate::commands::configure::semantic_refresh_quiet_window(),
+                );
+            }
         }
         state.status_changed = false;
         state.scheduler_changed_path_count = 0;
@@ -2630,6 +2677,13 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 .is_some()
             {
                 state.ignore_changed = false;
+                if ctx.config().views.enabled {
+                    state.view_publication_paths.clear();
+                    state.view_publication_due = Some(
+                        Instant::now()
+                            + crate::commands::configure::semantic_refresh_quiet_window(),
+                    );
+                }
             }
         }
 
@@ -2654,6 +2708,13 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 ctx.tick_tier2_refresh_scheduler(usize::from(ignore_changed));
                 state.status_changed = false;
             } else {
+                if ctx.config().views.enabled {
+                    state.view_publication_paths.extend(paths.iter().cloned());
+                    state.view_publication_due = Some(
+                        Instant::now()
+                            + crate::commands::configure::semantic_refresh_quiet_window(),
+                    );
+                }
                 state.path_slice_count += 1;
                 state.scheduler_changed_path_count = if ignore_changed {
                     paths.len().max(1)
@@ -2708,6 +2769,8 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
     {
         apply_watcher_slice(ctx, &mut state, started);
     }
+
+    publish_view_if_quiet(ctx, &mut state);
 
     let receiver_has_more = ctx
         .watcher_rx()
