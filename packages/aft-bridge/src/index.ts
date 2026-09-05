@@ -113,6 +113,19 @@ export {
 export { compressionSavingsPercent, formatTokenCount } from "./format.js";
 // --- jsonc helpers ---
 export { stripJsoncSymbols } from "./jsonc.js";
+// --- per-Location process-global transport ownership ---
+export type {
+  AcquireBridgeDependencies,
+  BridgeLifecycleCensus,
+  BridgeLifecycleCensusOptions,
+  BridgeLifecycleTopology,
+} from "./location-lifecycle.js";
+export {
+  acquireBridge,
+  getBridgeLifecycleTopology,
+  releaseBridge,
+  sampleBridgeLifecycleCensus,
+} from "./location-lifecycle.js";
 export type { Logger, LogMeta } from "./logger.js";
 export type {
   AftConfigFileMigrationOptions,

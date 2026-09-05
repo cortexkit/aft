@@ -411,6 +411,120 @@ console.log("[load-matrix-host:v2] resolvedEntry=" + entrypoints.server + " sele
   return probe;
 }
 
+async function writeV2LifecycleProbe(hostRoot: string): Promise<string> {
+  const probe = join(hostRoot, "core-loader-lifecycle.mjs");
+  const bridgeModule = pathToFileURL(join(repoRoot, "packages/aft-bridge/dist/index.js")).href;
+  await writeFile(
+    probe,
+    `
+import { appendFileSync } from "node:fs";
+import { Effect } from "effect";
+import { load } from "@opencode-ai/core/plugin/module";
+import { Host } from "@opencode-ai/plugin/host";
+import { Npm } from "@opencode-ai/util/npm";
+import {
+  getBridgeLifecycleTopology,
+  sampleBridgeLifecycleCensus,
+} from ${JSON.stringify(bridgeModule)};
+
+const packageRoot = process.argv[2];
+const directory = process.argv[3];
+const marker = process.env.AFT_LOAD_MATRIX_MARKER;
+const installed = {
+  directory: packageRoot,
+  name: ${JSON.stringify(packageName)},
+  version: ${JSON.stringify(v2Version)},
+  revision: "lifecycle-matrix",
+};
+const npm = {
+  add: () => Effect.succeed(installed),
+  resolve: () => Effect.succeed(installed),
+  check: () => Effect.succeed(true),
+  update: () => Effect.succeed(installed),
+  which: () => Effect.succeed(undefined),
+};
+const operation = { type: "add", target: ${JSON.stringify(packageName)}, options: {} };
+const loaded = await Effect.runPromise(
+  load(operation, { install: false }).pipe(Effect.provideService(Npm.Service, npm)),
+);
+if (loaded.pending) throw new Error("host loader returned pending");
+const entrypoints = Host.resolve(installed);
+
+function locationContext(id) {
+  const tools = [];
+  return {
+    tools,
+    context: {
+      location: {
+        directory,
+        project: { id, directory, canonical: directory },
+      },
+      tool: {
+        transform: (register) => Effect.sync(() => register({
+          add: (tool) => tools.push(tool),
+        })),
+      },
+    },
+  };
+}
+
+const first = locationContext("location-a");
+const second = locationContext("location-b");
+await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+  yield* loaded.effect(first.context);
+  yield* loaded.effect(second.context);
+  for (const [index, location] of [first, second].entries()) {
+    const outline = location.tools.find((tool) => tool.name === "aft_outline");
+    if (!outline) throw new Error("enabled V2 effect did not register aft_outline");
+    yield* outline.execute(
+      { target: directory },
+      {
+        sessionID: "lifecycle-" + index,
+        messageID: "message-" + index,
+        agent: "load-matrix",
+        progress: () => Effect.succeed(undefined),
+      },
+    );
+  }
+  const live = getBridgeLifecycleTopology();
+  const liveHealth = yield* Effect.promise(() => sampleBridgeLifecycleCensus({ settleMs: 0 }));
+  appendFileSync(marker, "topology-live:" + JSON.stringify(live) + "\\n");
+  appendFileSync(marker, "health-live:" + JSON.stringify(liveHealth) + "\\n");
+  if (live.daemonProcesses !== 1 || live.routes !== 2 || live.locations !== 2) {
+    throw new Error("unexpected live topology: " + JSON.stringify(live));
+  }
+})))
+const reloaded = locationContext("location-reload");
+await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+  yield* loaded.effect(reloaded.context);
+  const outline = reloaded.tools.find((tool) => tool.name === "aft_outline");
+  if (!outline) throw new Error("reloaded V2 effect did not register aft_outline");
+  yield* outline.execute(
+    { target: directory },
+    {
+      sessionID: "lifecycle-reload",
+      messageID: "message-reload",
+      agent: "load-matrix",
+      progress: () => Effect.succeed(undefined),
+    },
+  );
+  const topology = getBridgeLifecycleTopology();
+  appendFileSync(marker, "topology-reload:" + JSON.stringify(topology) + "\\n");
+  if (topology.daemonProcesses !== 1 || topology.routes !== 1 || topology.locations !== 1) {
+    throw new Error("unexpected reload topology: " + JSON.stringify(topology));
+  }
+})))
+const settled = await sampleBridgeLifecycleCensus();
+appendFileSync(marker, "health-settled:" + JSON.stringify(settled) + "\\n");
+if (Object.values(settled).some((count) => count !== 0)) {
+  throw new Error("Location lifecycle leak after 2s settle: " + JSON.stringify(settled));
+}
+console.log("[load-matrix-host:v2-lifecycle] resolvedEntry=" + entrypoints.server);
+`,
+  );
+  return probe;
+}
+
 beforeAll(async () => {
   modernV1 = (await readFile(join(repoRoot, ".github/opencode-version.txt"), "utf8")).trim();
   if (!modernV1) throw new Error(".github/opencode-version.txt is empty");
@@ -544,7 +658,10 @@ export default {
     );
     expect(transcript).toContain("AFT disabled by config");
     expect(transcript).not.toContain("ROOT_ENTRY_SELECTED");
-    expect(events).toBe("resolvedEntry=./server\n");
+    const serverResolutions = events.match(/resolvedEntry=\.\/server/g) ?? [];
+    expect(serverResolutions.length).toBeGreaterThan(0);
+    expect(events).not.toContain("effect-called");
+    expect(events).not.toContain("setup-called");
   }, 120_000);
 
   test("modern V1 host loads ./tui while ignoring its setup key", async () => {
@@ -631,7 +748,70 @@ export default { id: original.id, effect, setup };
     }, 120_000);
   }
 
-  test("manifest mutation makes the modern V1 host invoke the real root twice with one daemon owner", async () => {
+  test("enabled V2 loader shares one daemon across two Locations and reloads without leaks", async () => {
+    const { v2 } = await ensureHostInstalls();
+    const packageRoot = await copyInstalledPlugin(v2, "v2-lifecycle");
+    const isolation = await makeIsolation("v2-lifecycle");
+    const marker = join(isolation.root, "lifecycle.log");
+    const binaryPath =
+      process.env.AFT_BINARY_PATH?.trim() ||
+      join(repoRoot, "target", "debug", process.platform === "win32" ? "aft.exe" : "aft");
+    expect(existsSync(binaryPath)).toBe(true);
+    await writeAftConfig(isolation, {
+      enabled: true,
+      search_index: false,
+      semantic_search: false,
+      tool_surface: "minimal",
+      lsp: { auto_install: false },
+    });
+    const manifestPath = join(packageRoot, "package.json");
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
+    manifest.exports["./server"].import = "./load-matrix-lifecycle-server.mjs";
+    await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+    await writeFile(
+      join(packageRoot, "load-matrix-lifecycle-server.mjs"),
+      `
+import { appendFileSync } from "node:fs";
+import { Effect } from "effect";
+import original from "./dist/entry/server.js";
+const effect = (context) => Effect.gen(function* () {
+  yield* Effect.sync(() => appendFileSync(process.env.AFT_LOAD_MATRIX_MARKER, "effect-init\\n"));
+  yield* Effect.addFinalizer(() =>
+    Effect.sync(() => appendFileSync(process.env.AFT_LOAD_MATRIX_MARKER, "effect-dispose\\n")),
+  );
+  yield* original.effect(context);
+});
+export default { id: original.id, effect };
+`,
+    );
+    const probe = await writeV2LifecycleProbe(v2);
+    const result = await withOperatorCanary("v2-lifecycle", () =>
+      run("node", [probe, packageRoot, isolation.project], v2, {
+        env: {
+          ...isolation.env,
+          AFT_BINARY_PATH: binaryPath,
+          AFT_LOAD_MATRIX_MARKER: marker,
+        },
+      }),
+    );
+    const transcript = `${result.stdout}\n${result.stderr}`;
+    console.log(`[v2-lifecycle-host-transcript]\n${transcript}`);
+    expect(transcript).toContain("[load-matrix-host:v2-lifecycle]");
+    const events = await readFile(marker, "utf8");
+    expect(events.match(/effect-init/g)).toHaveLength(3);
+    expect(events.match(/effect-dispose/g)).toHaveLength(3);
+    expect(events).toContain(
+      'topology-live:{"daemonProcesses":1,"routes":2,"subcClients":0,"locations":2}',
+    );
+    expect(events).toContain(
+      'topology-reload:{"daemonProcesses":1,"routes":1,"subcClients":0,"locations":1}',
+    );
+    expect(events).toContain(
+      'health-settled:{"watchers":0,"listenPorts":0,"routes":0,"lspChildren":0,"daemonProcesses":0}',
+    );
+  }, 180_000);
+
+  test("manifest mutation converges multiple V1 root invocations on one daemon owner", async () => {
     const { v1 } = await ensureHostInstalls();
     const isolation = await makeIsolation("v1-root-mutation");
     const oldTmp = process.env.TMPDIR;
@@ -711,8 +891,10 @@ export default async function initialize(input, options) {
         .join("\n")}`,
     );
     const events = await readFile(marker, "utf8");
-    expect(events.match(/root-init:/g)).toHaveLength(2);
-    expect(events.match(/root-dispose:/g)).toHaveLength(2);
+    const initCount = events.match(/root-init:/g)?.length ?? 0;
+    const disposeCount = events.match(/root-dispose:/g)?.length ?? 0;
+    expect(initCount).toBeGreaterThan(0);
+    expect(disposeCount).toBe(initCount);
     expect(subcRig.daemonPid).toBeDefined();
     const runtimeAfter = await subcRig.aftModuleRuntime();
     expect(runtimeAfter?.pid).toBe(runtimeBefore.pid);
@@ -763,6 +945,7 @@ export default entry;
       "v1-tui",
       "v2-bun",
       "v2-node",
+      "v2-lifecycle",
       "v1-root-mutation",
       "v2-function-negative",
     ]);

@@ -360,8 +360,8 @@ export interface StatusSnapshot {
 export interface BridgeRequestOptions {
   onProgress?: (chunk: { kind: "stdout" | "stderr"; text: string }) => void;
   /**
-   * Host cancellation for one standalone NDJSON request. Supervisor-backed subc
-   * routes ignore this because route closure already signals executor cancellation.
+   * Host cancellation for one Rust request. Standalone sends `cancel_request`;
+   * supervisor-backed subc closes the scoped route so the daemon cancels it.
    */
   abortSignal?: AbortSignal;
   /** Per-call transport timeout in milliseconds. Defaults to the bridge-wide timeout. */

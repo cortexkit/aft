@@ -91,6 +91,7 @@ describe("findBinarySync versioned cache validation", () => {
     // Bun runs test files concurrently in one process. Keep resolver env
     // overrides guarded for the full test so other files cannot clobber them.
     releaseEnv = await acquireEnv({
+      AFT_BINARY_PATH: undefined,
       // CI exports an ambient AFT_CACHE_DIR (highest precedence in the shared
       // cache resolver); clear it so the XDG sandbox below actually applies.
       AFT_CACHE_DIR: undefined,
@@ -184,6 +185,7 @@ describe.skipIf(skipPosixPathLookup)("findBinarySync PATH/cargo validation", () 
     const pathDir = join(tmpDir, "path-bin");
     mkdirSync(pathDir, { recursive: true });
     releaseEnv = await acquireEnv({
+      AFT_BINARY_PATH: undefined,
       AFT_CACHE_DIR: undefined,
       XDG_CACHE_HOME: join(tmpDir, "cache"),
       PATH: `${pathDir}:${process.env.PATH ?? ""}`,
@@ -210,5 +212,46 @@ describe.skipIf(skipPosixPathLookup)("findBinarySync PATH/cargo validation", () 
     expect(readBinaryVersion(pathBinary)).toBe("9.9.9");
     expect(readBinaryVersion(cargoBinary)).toBe("1.2.3");
     expect(findBinarySync("1.2.3")).toBe(cargoBinary);
+  });
+});
+
+describe("findBinarySync AFT_BINARY_PATH override", () => {
+  let tmpDir: string;
+  let releaseEnv: (() => void) | undefined;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "aft-explicit-binary-test-"));
+  });
+
+  afterEach(() => {
+    releaseEnv?.();
+    releaseEnv = undefined;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("uses the explicit hermetic binary before caches and PATH", async () => {
+    const binaryPath = writeAftVersionFixture(join(tmpDir, "aft-explicit"), "1.2.3");
+    releaseEnv = await acquireEnv({
+      AFT_BINARY_PATH: binaryPath,
+      AFT_CACHE_DIR: undefined,
+      XDG_CACHE_HOME: tmpDir,
+      HOME: tmpDir,
+      PATH: "",
+    });
+
+    expect(findBinarySync("1.2.3")).toBe(binaryPath);
+  });
+
+  test("fails closed instead of touching operator resolution sources", async () => {
+    const missing = join(tmpDir, "missing-aft");
+    releaseEnv = await acquireEnv({
+      AFT_BINARY_PATH: missing,
+      AFT_CACHE_DIR: undefined,
+      XDG_CACHE_HOME: tmpDir,
+      HOME: tmpDir,
+      PATH: "",
+    });
+
+    expect(() => findBinarySync("1.2.3")).toThrow(/AFT_BINARY_PATH.*native executable/);
   });
 });

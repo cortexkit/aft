@@ -24,13 +24,12 @@ function testDependencies(events: string[]) {
       return "/isolated/bin/aft";
     },
     resolvePoolOptions: () => ({ timeoutMs: 30_000, hangThreshold: 2 }),
-    createTransportPool: async ({ binaryPath }: { binaryPath: string }) => {
-      events.push(`pool:${binaryPath}`);
-      return {
-        shutdown: async () => {
-          events.push("shutdown");
-        },
-      };
+    acquireBridge: async (directory: string, { binaryPath }: { binaryPath: string }) => {
+      events.push(`acquire:${directory}:${binaryPath}`);
+      return { directory };
+    },
+    releaseBridge: async ({ directory }: { directory: string }) => {
+      events.push(`release:${directory}`);
     },
     buildToolMap: (context: { storageDir: string }, _config: unknown) => {
       events.push(`tools:${context.storageDir}`);
@@ -45,7 +44,12 @@ function testDependencies(events: string[]) {
   };
 }
 
-function hostContext(directory: string, events: string[], added: string[]) {
+function hostContext(
+  directory: string,
+  events: string[],
+  added: string[],
+  canonicalDirectory = directory,
+) {
   let locationReads = 0;
   const context = {
     get location() {
@@ -53,7 +57,7 @@ function hostContext(directory: string, events: string[], added: string[]) {
       events.push(`location:${directory}`);
       return {
         directory,
-        project: { directory, canonical: directory },
+        project: { directory, canonical: canonicalDirectory },
       };
     },
     tool: {
@@ -94,13 +98,25 @@ describe("V2 server effect", () => {
         "storage",
         `configure:${directory}`,
         "binary:0.55.1",
-        "pool:/isolated/bin/aft",
+        `acquire:${directory}:/isolated/bin/aft`,
         "tools:/isolated/storage",
         `transform:${directory}`,
         `add:${directory}:aft_probe`,
-        "shutdown",
+        `release:${directory}`,
       ]);
     }
+  });
+
+  test("acquires the bridge with the Location's canonical project directory", async () => {
+    const events: string[] = [];
+    const host = hostContext("/work/alias", events, [], "/work/canonical");
+
+    await Effect.runPromise(
+      Effect.scoped(makeServerEffect(testDependencies(events))(host.context)),
+    );
+
+    expect(events).toContain("acquire:/work/canonical:/isolated/bin/aft");
+    expect(events).toContain("release:/work/canonical");
   });
 
   test("adapts V1 tools to Effect execution with the host AbortSignal", async () => {

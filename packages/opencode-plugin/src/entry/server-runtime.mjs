@@ -1,6 +1,7 @@
 import {
-  createAftTransportPool,
+  acquireBridge,
   findBinary,
+  releaseBridge,
   resolveCortexKitStorageRoot,
 } from "@cortexkit/aft-bridge";
 import { Effect } from "effect";
@@ -17,8 +18,9 @@ import { buildOpenCodeToolMap, openCodeHashlineEffective } from "../tool-registr
 const defaults = {
   buildConfigureParams: buildConfigTierConfigureParams,
   buildToolMap: buildOpenCodeToolMap,
-  createTransportPool: createAftTransportPool,
+  acquireBridge,
   loadConfig: loadAftConfig,
+  releaseBridge,
   resolveBinary: findBinary,
   resolvePoolOptions: resolveBridgePoolTransportOptions,
   resolveStorageRoot: resolveCortexKitStorageRoot,
@@ -100,7 +102,8 @@ async function bootLocation(context, location, dependencies) {
     storage_dir: storageDir,
   });
   const binaryPath = await dependencies.resolveBinary(dependencies.resolveVersion());
-  const pool = await dependencies.createTransportPool({
+  const canonicalDirectory = location.project?.canonical ?? directory;
+  const pool = await dependencies.acquireBridge(canonicalDirectory, {
     harness: "opencode",
     binaryPath,
     poolOptions: dependencies.resolvePoolOptions(config),
@@ -132,7 +135,9 @@ export function makeServerEffect(overrides = {}) {
       const runtime = yield* Effect.promise(() => bootLocation(context, location, dependencies));
       if (!runtime) return;
 
-      yield* Effect.addFinalizer(() => Effect.promise(() => runtime.pool.shutdown()));
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(() => dependencies.releaseBridge(runtime.pool)),
+      );
       yield* context.tool.transform((editor) => {
         for (const [name, definition] of Object.entries(runtime.tools)) {
           editor.add(adaptV1Tool(name, definition, location));

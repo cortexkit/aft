@@ -648,6 +648,12 @@ function safeCloseRoute(client: SubcClientLike, route: RouteHandle): void {
   }
 }
 
+function abortedRequestError(): Error {
+  const error = new Error("AFT request aborted by host cancellation");
+  error.name = "AbortError";
+  return error;
+}
+
 /** Per-identity session lifecycle state, independent from transient route churn. */
 interface SessionRecord {
   /** Complete identity is retained; the opaque map key is never parsed. */
@@ -803,7 +809,7 @@ class SubcTransport implements AftProjectTransport {
     options?: ToolCallOptions,
   ): Promise<ToolCallResult> {
     this.assertCurrent();
-    const { preview, timeoutMs, onProgress } = this.splitOptions(options);
+    const { preview, timeoutMs, onProgress, abortSignal } = this.splitOptions(options);
     const body: Record<string, unknown> = { name, arguments: rawArgs };
     const editSlotSurvives = this.pool.getEditSlotSurvives();
     if (editSlotSurvives !== undefined) body.edit_slot_survives = editSlotSurvives;
@@ -814,6 +820,7 @@ class SubcTransport implements AftProjectTransport {
       timeoutMs,
       onProgress,
       this.generation,
+      abortSignal,
     );
     return reliftReply(reply) as ToolCallResult;
   }
@@ -837,7 +844,7 @@ class SubcTransport implements AftProjectTransport {
     if (LOCALLY_SATISFIED_COMMANDS.has(command)) {
       return { success: true, command, subc_local: true };
     }
-    const { timeoutMs, onProgress } = this.splitOptions(options);
+    const { timeoutMs, onProgress, abortSignal } = this.splitOptions(options);
     const session = typeof params.session_id === "string" ? params.session_id : undefined;
     const body: Record<string, unknown> = { name: command, arguments: params };
     const editSlotSurvives = this.pool.getEditSlotSurvives();
@@ -848,6 +855,7 @@ class SubcTransport implements AftProjectTransport {
       timeoutMs,
       onProgress,
       this.generation,
+      abortSignal,
     );
     return reliftReply(reply);
   }
@@ -856,6 +864,7 @@ class SubcTransport implements AftProjectTransport {
     preview?: boolean;
     timeoutMs?: number;
     onProgress?: RequestOptions["onProgress"];
+    abortSignal?: AbortSignal;
   } {
     if (!options) return {};
     const preview = (options as ToolCallOptions).preview;
@@ -865,7 +874,7 @@ class SubcTransport implements AftProjectTransport {
     // default unary deadline while the command keeps running module-side.
     const timeoutMs = options.transportTimeoutMs ?? options.timeoutMs;
     const onProgress = (options as { onProgress?: RequestOptions["onProgress"] }).onProgress;
-    return { preview, timeoutMs, onProgress };
+    return { preview, timeoutMs, onProgress, abortSignal: options.abortSignal };
   }
 }
 
@@ -1489,6 +1498,7 @@ export class SubcTransportPool implements AftTransportPool {
     timeoutMs?: number,
     onProgress?: RequestOptions["onProgress"],
     expectedGeneration?: RootGeneration,
+    abortSignal?: AbortSignal,
   ): Promise<unknown> {
     const root = asCanonicalRootPath(identity.project_root);
     let generation = expectedGeneration;
@@ -1560,6 +1570,7 @@ export class SubcTransportPool implements AftTransportPool {
 
       const handleRequestFailure = (error: unknown, entry: RouteEntry): void => {
         clearRouteEntry(entry);
+        if (error instanceof Error && error.name === "AbortError") return;
         if (
           !this.isCurrentSession(key, record) ||
           this.client !== client ||
@@ -1580,24 +1591,43 @@ export class SubcTransportPool implements AftTransportPool {
         }
       };
 
-      const requestOnRoute = async (route: RouteHandle): Promise<unknown> => {
+      const requestOnRoute = async (route: RouteHandle, entry: RouteEntry): Promise<unknown> => {
         this.assertRecordLive(record);
-        const reply = await client.request(route, body, { timeoutMs, onProgress });
-        // A legacy closeSession may intentionally let an already-delivered reply
-        // settle. It must not mutate shared state or recreate a subscription.
-        if (!this.isCurrentSession(key, record)) {
-          if (this.isReapInduced(record)) throw this.rootReapedError(record);
-          return reply;
+        if (abortSignal?.aborted) {
+          clearRouteEntry(entry);
+          throw abortedRequestError();
         }
-        this.assertGeneration(record.canonicalRoot, record.generation, "request_completion");
-        if (this.client === client) this.transportFailures = 0;
-        this.ensureBgSubscription(identity, record);
-        return reply;
+
+        let rejectAbort: ((error: Error) => void) | undefined;
+        const aborted = new Promise<never>((_resolve, reject) => {
+          rejectAbort = reject;
+        });
+        const onAbort = (): void => {
+          clearRouteEntry(entry);
+          rejectAbort?.(abortedRequestError());
+        };
+        abortSignal?.addEventListener("abort", onAbort, { once: true });
+        try {
+          const request = client.request(route, body, { timeoutMs, onProgress });
+          const reply = abortSignal ? await Promise.race([request, aborted]) : await request;
+          // A legacy closeSession may intentionally let an already-delivered reply
+          // settle. It must not mutate shared state or recreate a subscription.
+          if (!this.isCurrentSession(key, record)) {
+            if (this.isReapInduced(record)) throw this.rootReapedError(record);
+            return reply;
+          }
+          this.assertGeneration(record.canonicalRoot, record.generation, "request_completion");
+          if (this.client === client) this.transportFailures = 0;
+          this.ensureBgSubscription(identity, record);
+          return reply;
+        } finally {
+          abortSignal?.removeEventListener("abort", onAbort);
+        }
       };
 
       let routeAndEntry = await openRouteAfterReloadWindow();
       try {
-        return await requestOnRoute(routeAndEntry.route);
+        return await requestOnRoute(routeAndEntry.route, routeAndEntry.entry);
       } catch (error) {
         if (this.isReapInduced(record)) throw this.annotateReapError(error, record);
         if (
@@ -1609,7 +1639,7 @@ export class SubcTransportPool implements AftTransportPool {
           await this.waitForRouteReopenBackoff().wait;
           routeAndEntry = await openRouteAfterReloadWindow();
           try {
-            const reply = await requestOnRoute(routeAndEntry.route);
+            const reply = await requestOnRoute(routeAndEntry.route, routeAndEntry.entry);
             this.resetRouteReopenBackoff();
             return reply;
           } catch (retryError) {
