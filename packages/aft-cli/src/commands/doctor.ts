@@ -20,7 +20,9 @@ import {
   terminateNpmProcessTree,
 } from "@cortexkit/aft-bridge";
 
+import { OpenCodeAdapter } from "../adapters/opencode.js";
 import type { HarnessAdapter } from "../adapters/types.js";
+import { diagnoseOpenCodeLoad } from "../doctor/opencode.js";
 import { type AftResponse, sendAftRequest } from "../lib/aft-bridge.js";
 import { getBinaryCacheInfo } from "../lib/binary-cache.js";
 import { findAftBinary, probeAftBinary } from "../lib/binary-probe.js";
@@ -60,6 +62,7 @@ import { confirm, intro, log, note, outro, selectMany, selectOne, text } from ".
 import { sanitizeContent } from "../lib/sanitize.js";
 import { getSelfVersion } from "../lib/self-version.js";
 import { listRecentSessions, type RecentSession, truncateTitle } from "../lib/sessions.js";
+import { formatHostGenerations, type OpenCodeHostDetection } from "../setup/host-generation.js";
 
 export type DoctorClearTarget = "plugin-cache" | "lsp-cache" | "binary-cache";
 
@@ -86,10 +89,39 @@ export interface DoctorOptions {
   force: boolean;
   issue: boolean;
   argv: string[];
-  /** Test seams keep command rendering covered without spawning a binary. */
+  /** Optional adapter override lets tests render doctor output without launching a host. */
   resolveAdapters?: typeof resolveAdaptersForCommand;
   collectDiagnostics?: typeof collectDiagnostics;
   collectRemovalHealth?: typeof collectRemovalHealth;
+  detectOpenCodeHost?: () => OpenCodeHostDetection;
+}
+
+function openCodeAdapter(adapters: HarnessAdapter[]): HarnessAdapter | undefined {
+  return adapters.find((adapter) => adapter.kind === "opencode");
+}
+
+function detectOpenCodeForCommand(
+  adapters: HarnessAdapter[],
+  override?: () => OpenCodeHostDetection,
+): OpenCodeHostDetection | null {
+  const adapter = openCodeAdapter(adapters);
+  if (!adapter) return null;
+  if (override) return override();
+  return adapter instanceof OpenCodeAdapter ? adapter.detectHostGeneration() : null;
+}
+
+function refuseAmbiguousOpenCodeWrites(detection: OpenCodeHostDetection | null): boolean {
+  if (detection?.status !== "ambiguous") return false;
+  log.error(
+    "OpenCode: host generation ambiguous (V1, V2); refusing configuration writes until only one generation is selected on PATH.",
+  );
+  return true;
+}
+
+function adapterConfigNeedsUpdate(adapter: HarnessAdapter, tui = false): boolean {
+  const method = tui ? "needsTuiPluginEntryUpdate" : "needsPluginEntryUpdate";
+  const candidate = adapter as HarnessAdapter & Partial<Record<typeof method, () => boolean>>;
+  return candidate[method]?.() ?? false;
 }
 
 export interface RemovalHealth {
@@ -165,7 +197,12 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
   intro(`${CLI} doctor`);
 
   if (options.fix) {
-    return runFixFlow(options.argv);
+    return runFixFlow(
+      options.argv,
+      options.detectOpenCodeHost,
+      options.resolveAdapters,
+      options.collectDiagnostics,
+    );
   }
 
   if (options.clear) {
@@ -178,8 +215,22 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
     verb: "diagnose",
   });
 
+  const hostDetection = detectOpenCodeForCommand(adapters, options.detectOpenCodeHost);
   const report = await (options.collectDiagnostics ?? collectDiagnostics)(adapters);
   const removalHealth = await (options.collectRemovalHealth ?? collectRemovalHealth)(adapters);
+  const opencodeAdapter = openCodeAdapter(adapters);
+  const opencodeHarness = report.harnesses.find((harness) => harness.kind === "opencode");
+  const opencodeDoctor =
+    hostDetection && opencodeAdapter && opencodeHarness
+      ? diagnoseOpenCodeLoad({
+          detection: hostDetection,
+          configPath: opencodeHarness.configPaths.harnessConfig,
+          logPath: opencodeHarness.logFile.path,
+          pluginCachePath: opencodeHarness.pluginCache.path,
+          cachedPluginVersion: opencodeHarness.pluginCache.cached,
+          expectedPluginEntry: opencodeAdapter.pluginEntryWithVersion,
+        })
+      : null;
 
   log.info(`AFT CLI v${report.cliVersion}, AFT binary ${report.binaryVersion ?? "unknown"}`);
   if (!report.binaryVersion) {
@@ -225,7 +276,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
     );
   }
 
-  const hadProblems = hasDoctorProblems(report);
+  const hadProblems = hasDoctorProblems(report) || Boolean(opencodeDoctor?.problems.length);
   for (const h of report.harnesses) {
     log.step(`${h.displayName}`);
     if (!h.hostInstalled) {
@@ -233,8 +284,23 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
       continue;
     }
     log.info(`  host: ${h.hostVersion ?? "unknown version"}`);
+    if (h.kind === "opencode" && hostDetection) {
+      log.info(`  host generation: ${formatHostGenerations(hostDetection)}`);
+      if (opencodeDoctor?.takenLoadPath) {
+        log.info(`  load path: ${opencodeDoctor.takenLoadPath}`);
+      }
+      if (
+        opencodeDoctor?.expectedLoadPath &&
+        opencodeDoctor.takenLoadPath !== opencodeDoctor.expectedLoadPath
+      ) {
+        log.error(`  expected load path: ${opencodeDoctor.expectedLoadPath}`);
+      }
+      for (const problem of opencodeDoctor?.problems ?? []) log.error(`  ${problem}`);
+    }
     log.info(`  plugin registered: ${h.pluginRegistered ? "yes" : "no"}`);
-    log.info(`  plugin version: ${h.pluginCache.cached ?? "not installed"}`);
+    log.info(
+      `  plugin version: ${h.kind === "opencode" ? (opencodeDoctor?.pluginVersion ?? h.pluginCache.cached ?? "not installed") : (h.pluginCache.cached ?? "not installed")}`,
+    );
     if (!h.aftConfig.enabled) {
       log.info(
         `  AFT disabled by config${h.aftConfig.enabledSource ? ` (${h.aftConfig.enabledSource})` : ""}; plugin will stay inert`,
@@ -296,6 +362,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
   // Plain `doctor` must remain strictly read-only: plugin registration is only
   // mutated by `aft setup` or the explicit `aft doctor --fix` flow.
   if (options.force) {
+    if (refuseAmbiguousOpenCodeWrites(hostDetection)) return 1;
     await clearDoctorCaches(adapters, DOCTOR_FORCE_CLEAR_TARGETS, { includePluginBytes: false });
   }
 
@@ -822,7 +889,9 @@ export function buildDoctorFixPlan(
 
   for (const harness of report.harnesses) {
     const adapter = adaptersByKind.get(harness.kind);
-    if (!adapter || harness.pluginRegistered || !harness.hostInstalled) continue;
+    if (!adapter || !harness.hostInstalled) continue;
+    const needsPluginConfig = !harness.pluginRegistered || adapterConfigNeedsUpdate(adapter);
+    if (!needsPluginConfig) continue;
     if (adapter.kind === "pi") {
       items.push({
         kind: "plugin",
@@ -831,7 +900,7 @@ export function buildDoctorFixPlan(
     } else {
       items.push({
         kind: "plugin",
-        message: `Will add ${adapter.pluginEntryWithVersion} to ${harness.configPaths.harnessConfig}`,
+        message: `Will ${harness.pluginRegistered ? "update" : "add"} ${adapter.pluginEntryWithVersion} ${harness.pluginRegistered ? "in" : "to"} ${harness.configPaths.harnessConfig}`,
       });
     }
   }
@@ -840,10 +909,11 @@ export function buildDoctorFixPlan(
     const adapter = adaptersByKind.get(harness.kind);
     if (!adapter || !harness.hostInstalled) continue;
     if (!adapter.ensureTuiPluginEntry || !adapter.hasTuiPluginEntry) continue;
-    if (adapter.hasTuiPluginEntry()) continue;
+    const hasTuiEntry = adapter.hasTuiPluginEntry();
+    if (hasTuiEntry && !adapterConfigNeedsUpdate(adapter, true)) continue;
     items.push({
       kind: "plugin",
-      message: `Will add ${adapter.pluginEntryWithVersion} to ${harness.configPaths.tuiConfig} (TUI sidebar)`,
+      message: `Will ${hasTuiEntry ? "update" : "add"} ${adapter.pluginEntryWithVersion} ${hasTuiEntry ? "in" : "to"} ${harness.configPaths.tuiConfig} (TUI sidebar)`,
     });
   }
 
@@ -938,18 +1008,34 @@ function logUnmatchedBinaryCandidates(expectedVersion: string): void {
 }
 
 /**
- * `aft doctor --fix` flow — detect and apply auto-fixable issues with
- * user consent. Currently covers plugin registration, missing aft binary
- * (GitHub #46 follow-up), and ONNX Runtime version mismatches.
+ * Detect repairable plugin registration and version config, package cache,
+ * storage, schema, native binary, and ONNX issues, then apply them with consent.
  */
-async function runFixFlow(argv: string[]): Promise<number> {
-  const adapters = await resolveAdaptersForCommand(argv, {
+async function runFixFlow(
+  argv: string[],
+  detectOpenCodeHost?: () => OpenCodeHostDetection,
+  resolveAdapters: typeof resolveAdaptersForCommand = resolveAdaptersForCommand,
+  collect: typeof collectDiagnostics = collectDiagnostics,
+): Promise<number> {
+  const adapters = await resolveAdapters(argv, {
     allowMulti: false,
     verb: "auto-fix issues for",
   });
+  const hostDetection = detectOpenCodeForCommand(adapters, detectOpenCodeHost);
+  if (refuseAmbiguousOpenCodeWrites(hostDetection)) {
+    outro("Done — no changes made.");
+    return 1;
+  }
+  if (hostDetection?.status === "unknown") {
+    log.warn(
+      "OpenCode: host generation is unavailable; applying only generation-independent exact-pin config fixes.",
+    );
+  } else if (hostDetection) {
+    log.info(`OpenCode: host generation ${formatHostGenerations(hostDetection)}`);
+  }
 
   log.info("Running diagnostics to identify auto-fixable issues…");
-  const report = await collectDiagnostics(adapters);
+  const report = await collect(adapters);
   if (!report.binaryVersion) {
     logUnmatchedBinaryCandidates(report.cliVersion);
   }
@@ -1016,7 +1102,7 @@ async function runFixFlow(argv: string[]): Promise<number> {
     }
   }
 
-  // ONNX Runtime fix is the other supported auto-fix today.
+  // Apply the ONNX Runtime repair when diagnostics found a managed-runtime issue.
   const onnxResult = await runOnnxFix(adapters, report, { yes: true });
 
   // Decide outro state based on combined results. We can have any
@@ -1040,7 +1126,7 @@ async function runFixFlow(argv: string[]): Promise<number> {
       `If you're still seeing 'Semantic Index: failed' in the TUI sidebar, run \`${CLI} doctor\` (without --fix) for a full diagnostic dump.`,
       "Tip",
     );
-    const afterReport = await collectDiagnostics(adapters);
+    const afterReport = await collect(adapters);
     const stillHasProblems = hasDoctorProblems(afterReport);
     outro(stillHasProblems ? "Done — some issues remain." : "Done.");
     return stillHasProblems ? 1 : 0;
@@ -1205,23 +1291,26 @@ export async function fixPluginEntries(adapters: HarnessAdapter[]): Promise<void
 
 async function maybeFixPlugin(adapter: HarnessAdapter): Promise<void> {
   if (!adapter.isInstalled()) return;
-  if (!adapter.hasPluginEntry()) {
-    log.info(`${adapter.displayName}: attempting to register plugin…`);
-    const r = await adapter.ensurePluginEntry();
-    if (r.ok) {
-      log.success(`${adapter.displayName}: ${r.message}`);
+  if (!adapter.hasPluginEntry() || adapterConfigNeedsUpdate(adapter)) {
+    log.info(`${adapter.displayName}: attempting to register or update plugin config…`);
+    const result = await adapter.ensurePluginEntry();
+    if (result.ok) {
+      log.success(`${adapter.displayName}: ${result.message}`);
     } else {
-      log.error(`${adapter.displayName}: ${r.message}`);
+      log.error(`${adapter.displayName}: ${result.message}`);
     }
   }
-  // TUI sidebar entry (tui.json(c)) is registered only via setup/doctor — the
-  // runtime plugin never injects it, so a deliberate removal stays removed.
-  if (adapter.ensureTuiPluginEntry && adapter.hasTuiPluginEntry && !adapter.hasTuiPluginEntry()) {
-    const r = await adapter.ensureTuiPluginEntry();
-    if (r.ok && (r.action === "added" || r.action === "updated")) {
-      log.success(`${adapter.displayName}: ${r.message}`);
-    } else if (!r.ok) {
-      log.error(`${adapter.displayName}: ${r.message}`);
+  // TUI sidebar entry is setup/doctor-owned, so runtime startup never reverses
+  // a user's deliberate removal. Explicit --fix may register or update it.
+  if (adapter.ensureTuiPluginEntry && adapter.hasTuiPluginEntry) {
+    const hasTuiEntry = adapter.hasTuiPluginEntry();
+    if (!hasTuiEntry || adapterConfigNeedsUpdate(adapter, true)) {
+      const result = await adapter.ensureTuiPluginEntry();
+      if (result.ok && (result.action === "added" || result.action === "updated")) {
+        log.success(`${adapter.displayName}: ${result.message}`);
+      } else if (!result.ok) {
+        log.error(`${adapter.displayName}: ${result.message}`);
+      }
     }
   }
 }

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { fixPluginEntries } from "../../commands/doctor.js";
+import { getSelfVersion } from "../../lib/self-version.js";
 import { OpenCodeAdapter } from "../opencode.js";
 
 class InstalledOpenCodeAdapter extends OpenCodeAdapter {
@@ -13,6 +14,8 @@ class InstalledOpenCodeAdapter extends OpenCodeAdapter {
     return true;
   }
 }
+
+const PINNED_PLUGIN_ENTRY = `@cortexkit/aft-opencode@${getSelfVersion()}`;
 
 const JSONC_WITH_COMMENTS = `{
   // keep top-level comment
@@ -44,14 +47,19 @@ describe("OpenCodeAdapter JSONC preservation", () => {
     const configPath = join(configDir, "opencode.jsonc");
     writeFileSync(configPath, JSONC_WITH_COMMENTS);
 
-    const result = await new OpenCodeAdapter().ensurePluginEntry();
+    const adapter = new OpenCodeAdapter();
+    const result = await adapter.ensurePluginEntry();
 
     expect(result.ok).toBe(true);
     const written = readFileSync(configPath, "utf-8");
     expect(written).toContain("// keep top-level comment");
     expect(written).toContain("// keep plugin comment");
     expect(written).toContain("// keep existing plugin comment");
-    expect(written).toContain("@cortexkit/aft-opencode@latest");
+    expect(written).toContain(PINNED_PLUGIN_ENTRY);
+
+    const second = await adapter.ensurePluginEntry();
+    expect(second.action).toBe("already_present");
+    expect(readFileSync(configPath, "utf-8")).toBe(written);
   });
 
   test("doctor fix path preserves opencode.jsonc comments when registering plugin", async () => {
@@ -64,7 +72,7 @@ describe("OpenCodeAdapter JSONC preservation", () => {
     expect(written).toContain("// keep top-level comment");
     expect(written).toContain("// keep plugin comment");
     expect(written).toContain("// keep existing plugin comment");
-    expect(written).toContain("@cortexkit/aft-opencode@latest");
+    expect(written).toContain(PINNED_PLUGIN_ENTRY);
   });
 });
 
@@ -92,7 +100,7 @@ describe("OpenCodeAdapter TUI plugin entry (setup/doctor-owned registration)", (
     expect(result.ok).toBe(true);
     expect(result.action).toBe("added");
     const written = readFileSync(join(configDir, "tui.json"), "utf-8");
-    expect(written).toContain("@cortexkit/aft-opencode@latest");
+    expect(written).toContain(PINNED_PLUGIN_ENTRY);
     expect(adapter.hasTuiPluginEntry()).toBe(true);
   });
 
@@ -119,7 +127,7 @@ describe("OpenCodeAdapter TUI plugin entry (setup/doctor-owned registration)", (
     expect(written).toContain("// user's tui comment");
     expect(written).toContain("// other plugin");
     expect(written).toContain("some-other-tui-plugin");
-    expect(written).toContain("@cortexkit/aft-opencode@latest");
+    expect(written).toContain(PINNED_PLUGIN_ENTRY);
 
     const second = await adapter.ensureTuiPluginEntry();
     expect(second.action).toBe("already_present");
@@ -139,6 +147,7 @@ describe("OpenCodeAdapter TUI plugin entry (setup/doctor-owned registration)", (
         : join(configDir, "tui.json"),
       "utf-8",
     );
-    expect(written).toContain("@cortexkit/aft-opencode@latest");
+    expect(written).toContain(PINNED_PLUGIN_ENTRY);
+    expect(written).not.toContain("@cortexkit/aft-opencode@latest");
   });
 });

@@ -8,6 +8,7 @@ import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-gua
 import { getAdapter, getAllAdapters } from "../adapters/index.js";
 import { OpenCodeAdapter } from "../adapters/opencode.js";
 import { PiAdapter } from "../adapters/pi.js";
+import { getSelfVersion } from "../lib/self-version.js";
 
 function withPlatform<T>(platform: NodeJS.Platform, fn: () => T): T {
   const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
@@ -67,7 +68,7 @@ describe("OpenCodeAdapter configuration", () => {
 
     withPlatform("win32", () => {
       expect(new OpenCodeAdapter().getPluginCacheInfo().path).toBe(
-        join(xdgCache, "opencode", "packages", "@cortexkit", "aft-opencode@latest"),
+        join(xdgCache, "opencode", "packages", "@cortexkit", `aft-opencode@${getSelfVersion()}`),
       );
     });
   });
@@ -206,7 +207,7 @@ describe("OpenCodeAdapter configuration", () => {
     expect(result.ok).toBe(true);
     expect(result.action).toBe("added");
     const written = readFileSync(result.configPath, "utf-8");
-    expect(written).toContain("@cortexkit/aft-opencode@latest");
+    expect(written).toContain(`@cortexkit/aft-opencode@${getSelfVersion()}`);
   });
 
   test("ensurePluginEntry is idempotent", async () => {
@@ -225,7 +226,7 @@ describe("OpenCodeAdapter configuration", () => {
     expect(result.action).toBe("added");
     const parsed = JSON.parse(readFileSync(result.configPath, "utf-8").replace(/\/\/.*$/gm, ""));
     expect(parsed.plugin).toContain("some-other-plugin");
-    expect(parsed.plugin).toContain("@cortexkit/aft-opencode@latest");
+    expect(parsed.plugin).toContain(`@cortexkit/aft-opencode@${getSelfVersion()}`);
   });
 });
 

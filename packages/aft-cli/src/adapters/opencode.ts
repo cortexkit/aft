@@ -1,4 +1,3 @@
-import { execSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, parse, resolve } from "node:path";
@@ -14,6 +13,18 @@ import { dirSize } from "../lib/fs-util.js";
 import { detectJsoncFile, readJsoncFile, writeJsoncFile } from "../lib/jsonc.js";
 import { getCortexKitStorageRoot } from "../lib/paths.js";
 import { getSelfVersion } from "../lib/self-version.js";
+import {
+  detectOpenCodeHostGeneration,
+  findExecutableOnPath,
+  type OpenCodeHostDetection,
+} from "../setup/host-generation.js";
+import {
+  AFT_OPENCODE_PACKAGE,
+  ensurePinnedPluginConfig,
+  isAftNpmEntry,
+  pinnedPluginEntry,
+  pluginConfigNeedsUpdate,
+} from "../setup/opencode-config.js";
 import type {
   HarnessAdapter,
   HarnessConfigPaths,
@@ -21,8 +32,9 @@ import type {
   PluginEntryResult,
 } from "./types.js";
 
-const PLUGIN_NAME = "@cortexkit/aft-opencode";
-const PLUGIN_ENTRY = `${PLUGIN_NAME}@latest`;
+const PLUGIN_NAME = AFT_OPENCODE_PACKAGE;
+const PLUGIN_ENTRY = pinnedPluginEntry(getSelfVersion());
+const LEGACY_PLUGIN_ENTRY = `${PLUGIN_NAME}@latest`;
 
 function getOpenCodeConfigDir(): string {
   const envDir = process.env.OPENCODE_CONFIG_DIR?.trim();
@@ -33,7 +45,7 @@ function getOpenCodeConfigDir(): string {
 function getLegacyOpenCodePluginCachePath(primaryPath: string): string | null {
   if (process.platform !== "win32") return null;
   const localAppData = process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local");
-  const legacyPath = join(localAppData, "opencode", "packages", PLUGIN_ENTRY);
+  const legacyPath = join(localAppData, "opencode", "packages", LEGACY_PLUGIN_ENTRY);
   return resolve(legacyPath) === resolve(primaryPath) ? null : legacyPath;
 }
 
@@ -55,22 +67,15 @@ function getOpenCodeCacheDir(): string {
   return getOpenCodeCacheRoot();
 }
 
-/** True when the `opencode` CLI is runnable on PATH. */
+/** True when either generation's CLI is present on PATH. */
 function hasOpenCodeCli(): boolean {
-  try {
-    // timeout: a misbehaving/booting host must never hang the probe (and a hung
-    // probe under PATH self-resolution is what enabled a fork bomb).
-    execSync("opencode --version", { stdio: "ignore", timeout: 5000 });
-    return true;
-  } catch {
-    return false;
-  }
+  return Boolean(findExecutableOnPath("opencode") ?? findExecutableOnPath("opencode2"));
 }
 
 /**
- * True when an OpenCode Desktop app bundle exists in a known install location.
- * Used only as a last-resort signal when the config dir hasn't been created yet
- * (e.g. a freshly installed Desktop app that hasn't been launched).
+ * True when a known OpenCode Desktop or package-install marker exists.
+ * Used when the config directory has not been created yet, such as after a fresh
+ * install that has not been launched.
  */
 function openCodeDesktopAppExists(): boolean {
   const candidates: string[] = [];
@@ -168,20 +173,13 @@ export class OpenCodeAdapter implements HarnessAdapter {
   readonly displayName = "OpenCode";
   readonly pluginPackageName = PLUGIN_NAME;
   readonly pluginEntryWithVersion = PLUGIN_ENTRY;
+  private hostDetection: OpenCodeHostDetection | undefined;
 
   isInstalled(): boolean {
-    // OpenCode ships two ways: the `opencode` CLI (on PATH) and OpenCode
-    // Desktop (an Electron app that does NOT put `opencode` on PATH). Both read
-    // the same `~/.config/opencode` config and load the same plugin entry, so
-    // "installed" must mean "OpenCode is present", not just "CLI is runnable" —
-    // otherwise `aft setup` bails for Desktop-only users (issue: setup finds no
-    // harness). getHostVersion() stays CLI-only and reports null for Desktop.
-    //
-    // Check cheap filesystem signals BEFORE shelling out: the config dir is
-    // created by Desktop and the CLI alike and is exactly where we write the
-    // plugin entry, so its presence both proves OpenCode is present and makes
-    // setup meaningful — without booting `opencode --version` (slow, and the
-    // probe that, under PATH self-resolution, enabled a fork bomb).
+    // Treat the configured root, known installation markers, or either CLI as
+    // evidence that OpenCode is installed. Check filesystem signals before PATH
+    // discovery so Desktop-only users can run setup without booting the host; a
+    // prior self-resolution probe was slow and could recurse into this CLI.
     if (existsSync(getOpenCodeConfigDir())) return true;
     // App bundle exists but config dir not yet created (freshly installed,
     // never launched).
@@ -190,16 +188,16 @@ export class OpenCodeAdapter implements HarnessAdapter {
     return hasOpenCodeCli();
   }
 
+  detectHostGeneration(): OpenCodeHostDetection {
+    this.hostDetection ??= detectOpenCodeHostGeneration();
+    return this.hostDetection;
+  }
+
   getHostVersion(): string | null {
-    try {
-      return execSync("opencode --version", {
-        encoding: "utf-8",
-        stdio: "pipe",
-        timeout: 5000,
-      }).trim();
-    } catch {
-      return null;
-    }
+    const versions = this.detectHostGeneration()
+      .evidence.map((item) => item.version)
+      .filter((version): version is string => Boolean(version));
+    return versions.length > 0 ? versions.join(" + ") : null;
   }
 
   detectConfigPaths(): HarnessConfigPaths {
@@ -232,52 +230,12 @@ export class OpenCodeAdapter implements HarnessAdapter {
 
   async ensurePluginEntry(): Promise<PluginEntryResult> {
     const paths = this.detectConfigPaths();
-    const configPath = paths.harnessConfig;
+    return this.ensureConfigEntry(paths.harnessConfig, paths.harnessConfigFormat, "server config");
+  }
 
-    if (paths.harnessConfigFormat === "none") {
-      // No existing file — create one with the plugin entry.
-      const initial = { plugin: [PLUGIN_ENTRY] };
-      writeJsoncFile(configPath, initial, "json");
-      return {
-        ok: true,
-        action: "added",
-        message: `Created ${configPath} and added ${PLUGIN_ENTRY}`,
-        configPath,
-      };
-    }
-
-    const { value, error } = readJsoncFile(configPath);
-    if (error || !value) {
-      return {
-        ok: false,
-        action: "error",
-        message: `Could not parse ${configPath}: ${error ?? "unknown error"}`,
-        configPath,
-      };
-    }
-
-    const plugins = Array.isArray(value.plugin) ? value.plugin : [];
-    const already = plugins.some((entry) => typeof entry === "string" && matchesPluginEntry(entry));
-    if (already) {
-      return {
-        ok: true,
-        action: "already_present",
-        message: `${PLUGIN_NAME} is already registered in ${configPath}`,
-        configPath,
-      };
-    }
-
-    plugins.push(PLUGIN_ENTRY);
-    // Mutate in place so comment-json keeps symbol-keyed comment metadata on
-    // the parsed object. Spreading into a fresh literal drops JSONC comments.
-    value.plugin = plugins;
-    writeJsoncFile(configPath, value, paths.harnessConfigFormat);
-    return {
-      ok: true,
-      action: "added",
-      message: `Added ${PLUGIN_ENTRY} to ${configPath}`,
-      configPath,
-    };
+  needsPluginEntryUpdate(): boolean {
+    const paths = this.detectConfigPaths();
+    return this.configEntryNeedsUpdate(paths.harnessConfig, paths.harnessConfigFormat);
   }
 
   hasTuiPluginEntry(): boolean {
@@ -295,8 +253,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
    */
   async ensureTuiPluginEntry(): Promise<PluginEntryResult> {
     const paths = this.detectConfigPaths();
-    const configPath = paths.tuiConfig;
-    if (!configPath) {
+    if (!paths.tuiConfig) {
       return {
         ok: false,
         action: "error",
@@ -304,13 +261,27 @@ export class OpenCodeAdapter implements HarnessAdapter {
         configPath: paths.configDir,
       };
     }
+    return this.ensureConfigEntry(paths.tuiConfig, paths.tuiConfigFormat ?? "none", "TUI config");
+  }
 
-    if (paths.tuiConfigFormat === "none") {
+  needsTuiPluginEntryUpdate(): boolean {
+    const paths = this.detectConfigPaths();
+    return paths.tuiConfig
+      ? this.configEntryNeedsUpdate(paths.tuiConfig, paths.tuiConfigFormat ?? "none")
+      : true;
+  }
+
+  private ensureConfigEntry(
+    configPath: string,
+    format: HarnessConfigPaths["harnessConfigFormat"],
+    label: string,
+  ): PluginEntryResult {
+    if (format === "none") {
       writeJsoncFile(configPath, { plugin: [PLUGIN_ENTRY] }, "json");
       return {
         ok: true,
         action: "added",
-        message: `Created ${configPath} and added ${PLUGIN_ENTRY} (TUI sidebar)`,
+        message: `Created ${configPath} and added ${PLUGIN_ENTRY} (${label})`,
         configPath,
       };
     }
@@ -325,32 +296,42 @@ export class OpenCodeAdapter implements HarnessAdapter {
       };
     }
 
-    const plugins = Array.isArray(value.plugin) ? value.plugin : [];
-    const already = plugins.some((entry) => typeof entry === "string" && matchesPluginEntry(entry));
-    if (already) {
+    const update = ensurePinnedPluginConfig(value, getSelfVersion(), pathPointsToOurPlugin);
+    if (!update.changed) {
       return {
         ok: true,
         action: "already_present",
-        message: `${PLUGIN_NAME} is already registered in ${configPath}`,
+        message: `${PLUGIN_ENTRY} is already registered in ${configPath}`,
         configPath,
       };
     }
 
-    plugins.push(PLUGIN_ENTRY);
-    // Mutate in place so comment-json keeps symbol-keyed comment metadata on
-    // the parsed object. Spreading into a fresh literal drops JSONC comments.
-    value.plugin = plugins;
-    writeJsoncFile(configPath, value, paths.tuiConfigFormat);
+    writeJsoncFile(configPath, value, format);
     return {
       ok: true,
-      action: "added",
-      message: `Added ${PLUGIN_ENTRY} to ${configPath} (TUI sidebar)`,
+      action: update.action,
+      message: `${update.action === "added" ? "Added" : "Updated"} ${PLUGIN_ENTRY} in ${configPath} (${label})`,
       configPath,
     };
   }
 
+  private configEntryNeedsUpdate(
+    configPath: string,
+    format: HarnessConfigPaths["harnessConfigFormat"],
+  ): boolean {
+    if (format === "none") return true;
+    const { value, error } = readJsoncFile(configPath);
+    if (error || !value) return false;
+    return pluginConfigNeedsUpdate(value, getSelfVersion(), pathPointsToOurPlugin);
+  }
+
   getPluginCacheInfo(): PluginCacheInfo {
-    const path = join(getOpenCodeCacheDir(), "packages", PLUGIN_ENTRY);
+    const configPath = this.detectConfigPaths().harnessConfig;
+    const { value } = readJsoncFile(configPath);
+    const configuredEntry = Array.isArray(value?.plugin)
+      ? value.plugin.find(isAftNpmEntry)
+      : undefined;
+    const path = join(getOpenCodeCacheDir(), "packages", configuredEntry ?? PLUGIN_ENTRY);
     let cached: string | undefined;
     try {
       const installedPkgPath = join(
