@@ -1,4 +1,5 @@
 use regex::Regex;
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 static CAMEL_CASE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[a-z][A-Z]").unwrap());
@@ -39,6 +40,12 @@ static CHAR_RANGE_RE: LazyLock<Regex> =
 
 const QUESTION_WORDS: &[&str] = &[
     "how", "what", "where", "why", "when", "which", "who", "does",
+];
+
+const CONTENT_STOP_WORDS: &[&str] = &[
+    "and", "are", "been", "but", "does", "for", "from", "had", "has", "have", "how", "into", "its",
+    "not", "of", "on", "that", "the", "their", "then", "there", "these", "this", "those", "was",
+    "were", "what", "when", "where", "which", "who", "why", "with", "would",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,39 +134,61 @@ pub fn extract_tokens(query: &str, shape: &QueryShape) -> Vec<String> {
     }
 }
 
-/// Tokens for a lexical second chance after an exact or semantic lane misses.
-/// Natural-language and regex shapes normally have no `extract_tokens` output,
-/// but quoted code phrases still carry useful identifiers. Reuse the same quote
-/// parser used for semantic name priors so a query such as `"outside <touser>"
-/// reminder text` can rank files containing either quoted token.
+/// Tokens for the lexical side of hybrid retrieval and zero-result escalation.
+/// Natural-language queries contribute normalized content words rather than
+/// grammatical glue. Regex escalation remains conservative and prefers explicit
+/// code-shaped tokens before falling back to identifier-shaped text.
 pub fn extract_lexical_tokens(query: &str, shape: &QueryShape) -> Vec<String> {
     match shape.kind {
-        QueryKind::NaturalLanguage | QueryKind::Regex => {
+        QueryKind::NaturalLanguage => extract_content_tokens(query),
+        QueryKind::Regex => {
             let explicit = extract_explicit_code_tokens(query);
-            if !explicit.is_empty() {
-                return explicit;
-            }
-            if shape.kind == QueryKind::NaturalLanguage {
-                extract_short_nl_lexical_tokens(query)
-            } else {
+            if explicit.is_empty() {
                 extract_identifier_tokens(query, false)
+            } else {
+                explicit
             }
         }
         _ => extract_tokens(query, shape),
     }
 }
 
-/// Lexical tokens for a short natural-language concept routed to Hybrid (e.g.
-/// "parse imports"). `extract_tokens` returns nothing for NL (its words are not
-/// code identifiers), but a short two-word concept is frequently a literal code
-/// phrase the trigram lane can match. Split on whitespace and keep words of at
-/// least 3 chars (the trigram floor).
+/// Back-compatible entry point for natural-language lexical tokens.
 pub fn extract_short_nl_lexical_tokens(query: &str) -> Vec<String> {
-    query
-        .split_whitespace()
-        .filter(|word| word.chars().count() >= 3)
-        .map(str::to_string)
-        .collect()
+    extract_content_tokens(query)
+}
+
+/// Lowercase natural-language tokens that carry enough meaning for trigram
+/// retrieval. This uses the same identifier-aware tokenizer as the other query
+/// extractors, then removes grammatical glue and tokens below the trigram floor.
+pub fn extract_content_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for mat in IDENTIFIER_TOKEN_RE.find_iter(text) {
+        let token = mat.as_str().to_ascii_lowercase();
+        if token.chars().count() < 3 || CONTENT_STOP_WORDS.contains(&token.as_str()) {
+            continue;
+        }
+        push_unique(&mut tokens, &token);
+    }
+    tokens
+}
+
+/// Check a file body for every normalized query content token without retaining
+/// a token set for the whole file. Lexical fusion calls this only for the bounded
+/// candidate list and exits as soon as every requested token has been observed.
+pub fn contains_all_content_tokens(text: &str, tokens: &[String]) -> bool {
+    if tokens.is_empty() {
+        return false;
+    }
+    let mut remaining = tokens.iter().map(String::as_str).collect::<HashSet<_>>();
+    for mat in IDENTIFIER_TOKEN_RE.find_iter(text) {
+        let token = mat.as_str().to_ascii_lowercase();
+        remaining.remove(token.as_str());
+        if remaining.is_empty() {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn is_type_concept_identifier_query(query: &str, shape: &QueryShape) -> bool {
@@ -1086,6 +1115,24 @@ mod tests {
         for query in ["colou?r", "https?"] {
             assert_eq!(kind(query), QueryKind::Regex, "{query}");
         }
+    }
+
+    #[test]
+    fn content_tokens_share_identifier_boundaries_and_drop_stopwords() {
+        let tokens =
+            extract_content_tokens("How is RequestAdapter wired into the built-in browser yet?");
+        assert_eq!(
+            tokens,
+            ["requestadapter", "wired", "built", "browser", "yet"]
+        );
+        assert!(contains_all_content_tokens(
+            "The browser keeps RequestAdapter; it will be WIRED once built.",
+            &tokens[..4],
+        ));
+        assert!(!contains_all_content_tokens(
+            "The browser is wired.",
+            &tokens[..4],
+        ));
     }
 
     #[test]

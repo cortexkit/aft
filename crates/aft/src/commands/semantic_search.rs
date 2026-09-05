@@ -37,6 +37,7 @@ const DEFAULT_TOP_K: usize = 10;
 const MAX_TOP_K: usize = 100;
 const HYBRID_LEXICAL_BOOST: f32 = 1.1;
 const LEXICAL_ONLY_SCORE_CEILING: f32 = 0.25;
+const RRF_K: f32 = 60.0;
 const LEXICAL_ENUMERATION_LIMIT: usize = 50;
 const GENERATED_DIRECTORY_DENSITY_NUMERATOR: usize = 3;
 const GENERATED_DIRECTORY_DENSITY_DENOMINATOR: usize = 5;
@@ -116,6 +117,10 @@ pub struct HybridResult {
     pub semantic_score: Option<f32>,
     pub lexical_score: Option<f32>,
     pub hybrid_boosted: bool,
+    pub exact: bool,
+    pub(crate) exact_phrase_count: usize,
+    pub(crate) exact_window_lines: Option<usize>,
+    pub(crate) fusion_score: f32,
     pub(crate) cap_protected: bool,
     pub(crate) lexical_generated_artifact: bool,
     pub snippet: String,
@@ -159,6 +164,9 @@ struct LexicalCandidate {
     file: PathBuf,
     score: f32,
     generated_artifact: bool,
+    exact: bool,
+    exact_phrase_count: usize,
+    exact_window_lines: Option<usize>,
     ordinal: usize,
 }
 
@@ -978,6 +986,7 @@ fn handle_external_semantic_or_hybrid_search(
         params.include_tests,
         &external_root,
         ctx.tool_enabled("aft_zoom"),
+        Some(&params.query),
     );
     results.retain(|result| result.file.is_file());
     let fused_more_available = results.len() > top_k;
@@ -1081,6 +1090,7 @@ fn external_lexical_only_response(
         params.include_tests,
         external_root,
         ctx.tool_enabled("aft_zoom"),
+        Some(&params.query),
     );
     results.retain(|result| result.file.is_file());
     let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
@@ -1307,17 +1317,27 @@ impl<'a> GeneratedArtifactCache<'a> {
 fn lexical_candidates_with_generated_artifact_rank(
     lexical_files: Vec<(PathBuf, f32)>,
     project_root: &Path,
+    query: Option<&str>,
 ) -> Vec<LexicalCandidate> {
     let mut generated_cache = GeneratedArtifactCache::new(project_root);
+    let content_tokens = query
+        .map(query_shape::extract_content_tokens)
+        .unwrap_or_default();
     let mut candidates = lexical_files
         .into_iter()
         .enumerate()
         .map(|(ordinal, (file, score))| {
             let generated_artifact = generated_cache.is_generated_artifact(&file);
+            let (exact, exact_phrase_count, exact_window_lines) = query
+                .map(|query| lexical_candidate_exactness(&file, query, &content_tokens))
+                .unwrap_or((false, 0, None));
             LexicalCandidate {
                 file,
                 score,
                 generated_artifact,
+                exact,
+                exact_phrase_count,
+                exact_window_lines,
                 ordinal,
             }
         })
@@ -1336,6 +1356,61 @@ fn lexical_candidates_with_generated_artifact_rank(
     candidates
 }
 
+fn lexical_candidate_exactness(
+    file: &Path,
+    query: &str,
+    content_tokens: &[String],
+) -> (bool, usize, Option<usize>) {
+    let Ok(bytes) = fs::read(file) else {
+        return (false, 0, None);
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let normalized_text = normalize_exact_phrase(&text);
+    let normalized_phrase = normalize_exact_phrase(exact_phrase(query));
+    let phrase_count = if normalized_phrase.is_empty() {
+        0
+    } else {
+        normalized_text.matches(&normalized_phrase).count()
+    };
+    if phrase_count > 0 {
+        return (true, phrase_count, Some(1));
+    }
+
+    let lines = text.lines().collect::<Vec<_>>();
+    for width in 1..=3 {
+        if lines.len() < width {
+            continue;
+        }
+        if lines.windows(width).any(|window| {
+            query_shape::contains_all_content_tokens(&window.join("\n"), content_tokens)
+        }) {
+            return (true, 0, Some(width));
+        }
+    }
+    (false, 0, None)
+}
+
+fn exact_phrase(query: &str) -> &str {
+    let trimmed = query.trim();
+    if trimmed.len() < 2 {
+        return trimmed;
+    }
+    let first = trimmed.as_bytes()[0];
+    let last = trimmed.as_bytes()[trimmed.len() - 1];
+    if matches!(first, b'\'' | b'"') && first == last {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    }
+}
+
+fn normalize_exact_phrase(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
 fn choose_mode(
     query: &str,
     shape: &QueryShape,
@@ -1350,17 +1425,6 @@ fn choose_mode(
             "Auto mode is using literal full-file scan for all-short exact tokens because the trigram index cannot rank tokens shorter than 3 chars.".to_string(),
         );
         return SearchMode::Literal;
-    }
-    if shape.kind == QueryKind::NaturalLanguage {
-        // Short NL concepts (e.g. "parse imports", "retry backoff") are
-        // frequently literal code tokens the trigram lane nails exactly.
-        // Run them as Hybrid so lexical still contributes; only longer
-        // NL phrases go pure semantic. One extra trigram lookup.
-        let word_count = query.split_whitespace().count();
-        if lexical_ready && word_count <= 2 {
-            return SearchMode::Hybrid;
-        }
-        return SearchMode::Semantic;
     }
     if lexical_ready {
         SearchMode::Hybrid
@@ -1698,6 +1762,7 @@ fn handle_semantic_or_hybrid_search(
                 params.include_tests,
                 project_root,
                 ctx.tool_enabled("aft_zoom"),
+                Some(&params.query),
             );
             let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
             let note = building_lexical_note(borrowed_loading && !results.is_empty());
@@ -1922,6 +1987,7 @@ fn handle_semantic_or_hybrid_search(
         params.include_tests,
         project_root,
         ctx.tool_enabled("aft_zoom"),
+        Some(&params.query),
     );
     if ctx.shared_artifacts_read_only() {
         results.retain(|result| result.file.is_file());
@@ -2062,6 +2128,7 @@ fn zero_result_escalation_response(
         include_tests,
         project_root,
         ctx.map_or(true, |ctx| ctx.tool_enabled("aft_zoom")),
+        Some(query),
     );
     if let Some(ctx) = ctx {
         if ctx.shared_artifacts_read_only() {
@@ -2213,13 +2280,15 @@ fn semantic_unavailable_or_fallback_response(
     if lexical_ready {
         let lexical_count = lexical.files.len();
         let lexical_engine_capped = lexical.engine_capped;
-        let results = fuse_hybrid_results(
+        let results = fuse_hybrid_results_with_zoom(
             Vec::new(),
             lexical.files,
             shape,
             top_k,
             params.include_tests,
             project_root,
+            ctx.tool_enabled("aft_zoom"),
+            Some(&params.query),
         );
         let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
         warnings.push(
@@ -3141,8 +3210,42 @@ fn apply_natural_language_diversity_cap(results: &mut Vec<SemanticResult>) {
 
 fn sort_hybrid_results(results: &mut [HybridResult]) {
     results.sort_by(|a, b| {
-        a.lexical_generated_artifact
-            .cmp(&b.lexical_generated_artifact)
+        b.exact_phrase_count
+            .gt(&0)
+            .cmp(&a.exact_phrase_count.gt(&0))
+            .then_with(|| {
+                if a.exact_phrase_count > 0 && b.exact_phrase_count > 0 {
+                    b.exact_phrase_count
+                        .cmp(&a.exact_phrase_count)
+                        .then_with(|| a.file.cmp(&b.file))
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| b.exact.cmp(&a.exact))
+            .then_with(|| {
+                if a.exact && b.exact {
+                    a.exact_window_lines
+                        .unwrap_or(usize::MAX)
+                        .cmp(&b.exact_window_lines.unwrap_or(usize::MAX))
+                        .then_with(|| a.file.cmp(&b.file))
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| {
+                if a.exact || b.exact {
+                    std::cmp::Ordering::Equal
+                } else {
+                    a.lexical_generated_artifact
+                        .cmp(&b.lexical_generated_artifact)
+                }
+            })
+            .then_with(|| {
+                b.fusion_score
+                    .partial_cmp(&a.fusion_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then_with(|| {
                 b.score
                     .partial_cmp(&a.score)
@@ -3169,6 +3272,7 @@ pub fn fuse_hybrid_results(
         include_tests,
         project_root,
         true,
+        None,
     )
 }
 
@@ -3180,26 +3284,35 @@ fn fuse_hybrid_results_with_zoom(
     include_tests: bool,
     project_root: &Path,
     zoom_enabled: bool,
+    query: Option<&str>,
 ) -> Vec<HybridResult> {
     if top_k == 0 {
         return Vec::new();
     }
 
-    let semantic = semantic
+    let mut semantic = semantic
         .into_iter()
         .filter(|result| path_allowed_by_include_tests(&result.file, project_root, include_tests))
         .collect::<Vec<_>>();
+    semantic.sort_by(|a, b| {
+        b.rank_score
+            .partial_cmp(&a.rank_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.name.cmp(&b.name))
+    });
     let lexical_files = lexical_files
         .into_iter()
         .filter(|(file, _)| path_allowed_by_include_tests(file, project_root, include_tests))
         .collect::<Vec<_>>();
     let lexical_candidates =
-        lexical_candidates_with_generated_artifact_rank(lexical_files, project_root);
+        lexical_candidates_with_generated_artifact_rank(lexical_files, project_root, query);
 
     if lexical_candidates.is_empty() {
         let mut results = semantic
             .into_iter()
-            .map(|result| hybrid_from_semantic(result, None))
+            .enumerate()
+            .map(|(rank, result)| hybrid_from_semantic(result, None, rank, None, shape))
             .collect::<Vec<_>>();
         sort_hybrid_results(&mut results);
         results.truncate(top_k);
@@ -3207,40 +3320,52 @@ fn fuse_hybrid_results_with_zoom(
     }
 
     if semantic.is_empty() {
-        return lexical_candidates
+        let mut results = lexical_candidates
             .into_iter()
-            .take(top_k)
-            .map(|candidate| lexical_only_result(candidate, shape, zoom_enabled))
-            .collect();
+            .enumerate()
+            .map(|(rank, candidate)| lexical_only_result(candidate, shape, zoom_enabled, rank))
+            .collect::<Vec<_>>();
+        sort_hybrid_results(&mut results);
+        results.truncate(top_k);
+        return results;
     }
 
-    // Use every collected lexical candidate, not a hidden sub-cap. The lexical
-    // lane already bounds enumeration at LEXICAL_ENUMERATION_LIMIT upstream and
-    // returns candidates pre-ranked by score; an additional `.take(20)` here
-    // silently dropped candidates 21..=50 from both the semantic-boost map and
-    // the standalone-lexical results without that loss being reflected in
-    // `more_available`/`engine_capped`. The final output is already bounded by
-    // cap_per_file + truncate(top_k), so honoring all collected candidates is
-    // both more correct and honest about what was considered. Generated documentation
-    // artifacts stay in that candidate set but are marked so their lexical lane
-    // contribution cannot outrank non-generated files.
-    let lexical_top_files: HashMap<PathBuf, LexicalCandidate> = lexical_candidates
+    // Every bounded lexical candidate participates in reciprocal-rank fusion.
+    // Files returned by both lanes receive both rank contributions; candidates
+    // from only one lane remain eligible instead of being appended after a full
+    // semantic budget. Exact-tier ordering is applied by sort_hybrid_results
+    // before the final top-k truncation.
+    let lexical_top_files: HashMap<PathBuf, (LexicalCandidate, usize)> = lexical_candidates
         .iter()
-        .map(|candidate| (candidate.file.clone(), candidate.clone()))
+        .cloned()
+        .enumerate()
+        .map(|(rank, candidate)| (candidate.file.clone(), (candidate, rank)))
         .collect();
     let mut results: Vec<HybridResult> = semantic
         .into_iter()
-        .map(|result| {
-            let lexical_candidate = lexical_top_files.get(&result.file);
-            hybrid_from_semantic(result, lexical_candidate)
+        .enumerate()
+        .map(|(semantic_rank, result)| {
+            let lexical = lexical_top_files.get(&result.file);
+            hybrid_from_semantic(
+                result,
+                lexical.map(|(candidate, _)| candidate),
+                semantic_rank,
+                lexical.map(|(_, rank)| *rank),
+                shape,
+            )
         })
         .collect();
 
     let semantic_files: HashSet<PathBuf> =
         results.iter().map(|result| result.file.clone()).collect();
-    for candidate in lexical_candidates {
+    for (lexical_rank, candidate) in lexical_candidates.into_iter().enumerate() {
         if !semantic_files.contains(&candidate.file) {
-            results.push(lexical_only_result(candidate, shape, zoom_enabled));
+            results.push(lexical_only_result(
+                candidate,
+                shape,
+                zoom_enabled,
+                lexical_rank,
+            ));
         }
     }
 
@@ -3254,6 +3379,9 @@ fn fuse_hybrid_results_with_zoom(
 fn hybrid_from_semantic(
     result: SemanticResult,
     lexical_candidate: Option<&LexicalCandidate>,
+    semantic_rank: usize,
+    lexical_rank: Option<usize>,
+    shape: &QueryShape,
 ) -> HybridResult {
     let semantic_score = result.score;
     let ranking_score = result.rank_score;
@@ -3265,6 +3393,9 @@ fn hybrid_from_semantic(
     } else {
         ranking_score
     };
+    let (semantic_weight, lexical_weight) = hybrid_rrf_weights(shape);
+    let fusion_score = semantic_weight * reciprocal_rank(semantic_rank)
+        + lexical_weight * lexical_rank.map(reciprocal_rank).unwrap_or_default();
 
     HybridResult {
         file: result.file,
@@ -3279,8 +3410,13 @@ fn hybrid_from_semantic(
         semantic_score: Some(semantic_score),
         lexical_score,
         hybrid_boosted,
+        exact: lexical_candidate.is_some_and(|candidate| candidate.exact),
+        exact_phrase_count: lexical_candidate.map_or(0, |candidate| candidate.exact_phrase_count),
+        exact_window_lines: lexical_candidate.and_then(|candidate| candidate.exact_window_lines),
+        fusion_score,
         cap_protected,
-        lexical_generated_artifact: false,
+        lexical_generated_artifact: lexical_candidate
+            .is_some_and(|candidate| candidate.generated_artifact),
     }
 }
 
@@ -3288,6 +3424,7 @@ fn lexical_only_result(
     candidate: LexicalCandidate,
     shape: &QueryShape,
     zoom_enabled: bool,
+    lexical_rank: usize,
 ) -> HybridResult {
     let score = if candidate.generated_artifact {
         0.0
@@ -3311,6 +3448,10 @@ fn lexical_only_result(
         semantic_score: None,
         lexical_score: Some(candidate.score),
         hybrid_boosted: false,
+        exact: candidate.exact,
+        exact_phrase_count: candidate.exact_phrase_count,
+        exact_window_lines: candidate.exact_window_lines,
+        fusion_score: hybrid_rrf_weights(shape).1 * reciprocal_rank(lexical_rank),
         cap_protected: false,
         lexical_generated_artifact: candidate.generated_artifact,
         snippet: if zoom_enabled {
@@ -3318,6 +3459,20 @@ fn lexical_only_result(
         } else {
             "[lexical match — use read for context]".to_string()
         },
+    }
+}
+
+fn reciprocal_rank(zero_based_rank: usize) -> f32 {
+    1.0 / (RRF_K + zero_based_rank as f32 + 1.0)
+}
+
+fn hybrid_rrf_weights(shape: &QueryShape) -> (f32, f32) {
+    match shape.kind {
+        // Exact local co-occurrence has its own tier. Below it, lexical rank is
+        // deliberately a light corroborating signal so a broad file that shares
+        // scattered concept words cannot displace the best semantic answer.
+        QueryKind::NaturalLanguage | QueryKind::Mixed => (0.999, 0.001),
+        _ => (shape.weights.semantic, shape.weights.lexical),
     }
 }
 
@@ -3945,6 +4100,9 @@ fn format_result_sections_with_context(
         .iter()
         .map(|file| {
             let mut section = file.clone();
+            if groups[file].iter().any(|(_, result)| result.exact) {
+                section.push_str(" [exact]");
+            }
 
             // Three distinct indent levels disambiguate the three roles for a
             // weak model at a glance: file path at col 0 (with its `/` and
@@ -4088,6 +4246,7 @@ fn result_to_json(result: &HybridResult) -> serde_json::Value {
         "semantic_score": result.semantic_score,
         "lexical_score": result.lexical_score,
         "hybrid_boosted": result.hybrid_boosted,
+        "exact": result.exact,
         "snippet": result.snippet,
     })
 }
@@ -4456,15 +4615,27 @@ mod tests {
     }
 
     #[test]
-    fn long_nl_phrase_stays_semantic() {
-        // A longer NL phrase (>2 words) is a genuine concept query → pure
-        // Semantic; the lexical lane would only add noise.
+    fn long_nl_phrase_runs_both_ready_lanes() {
         let q = "how does the bridge resolve the binary";
         let shape = query_shape::classify(q);
         assert_eq!(shape.kind, QueryKind::NaturalLanguage);
         let mut warnings = Vec::new();
         let mode = choose_mode(q, &shape, true, &mut warnings);
+        assert_eq!(mode, SearchMode::Hybrid);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn long_nl_phrase_discloses_semantic_only_when_lexical_is_unavailable() {
+        let q = "how does the bridge resolve the binary";
+        let shape = query_shape::classify(q);
+        let mut warnings = Vec::new();
+        let mode = choose_mode(q, &shape, false, &mut warnings);
         assert_eq!(mode, SearchMode::Semantic);
+        assert_eq!(
+            warnings,
+            ["Lexical trigram index is unavailable; using semantic search only."]
+        );
     }
 
     #[test]
@@ -4476,6 +4647,152 @@ mod tests {
         // Sub-3-char words are dropped (trigram floor).
         let tokens2 = query_shape::extract_short_nl_lexical_tokens("go to");
         assert!(tokens2.is_empty());
+    }
+
+    #[test]
+    fn long_nl_lexical_tokens_drop_stopwords_and_normalize_punctuation() {
+        let shape = query_shape::classify("not wired into the built-in browser tool yet");
+        assert_eq!(
+            query_shape::extract_lexical_tokens(
+                "not wired into the built-in browser tool yet",
+                &shape,
+            ),
+            ["wired", "built", "browser", "tool", "yet"]
+        );
+    }
+
+    #[test]
+    fn exact_tier_precedes_semantic_budget_and_survives_truncation() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let target = project.path().join("src/tool/browser.rs");
+        let cooccurrence = project.path().join("src/tool/other.rs");
+        fs::create_dir_all(target.parent().expect("target parent")).expect("create source dir");
+        fs::write(
+            &target,
+            "// The feature is not wired into the built-in browser tool yet.\n",
+        )
+        .expect("write exact fixture");
+        fs::write(
+            &cooccurrence,
+            "// A browser can be wired later after the tool is built.\n",
+        )
+        .expect("write co-occurrence fixture");
+        let semantic = (0..100)
+            .map(|index| {
+                semantic_candidate(
+                    &project
+                        .path()
+                        .join(format!("src/semantic-{index:03}.rs"))
+                        .display()
+                        .to_string(),
+                    &format!("semanticGuess{index}"),
+                    None,
+                    SymbolKind::Function,
+                    1.0 - index as f32 / 1_000.0,
+                )
+            })
+            .collect::<Vec<_>>();
+        let lexical = vec![(cooccurrence, 2.0), (target.clone(), 1.0)];
+
+        for (query, top_k, must_rank_first) in [
+            ("not wired into the built-in browser tool yet", 5, true),
+            ("wired yet", 10, false),
+            ("wired browser", 100, false),
+        ] {
+            let shape = query_shape::classify(query);
+            let results = fuse_hybrid_results_with_zoom(
+                semantic.clone(),
+                lexical.clone(),
+                &shape,
+                top_k,
+                true,
+                project.path(),
+                true,
+                Some(query),
+            );
+            let rank = results
+                .iter()
+                .position(|result| result.file == target)
+                .unwrap_or_else(|| panic!("exact target missing for {query:?}: {results:?}"));
+            if must_rank_first {
+                assert_eq!(rank, 0, "verbatim sentence must rank first");
+            }
+            assert!(results[rank].exact);
+            assert!(format_result_sections(&results, project.path()).contains("[exact]"));
+        }
+    }
+
+    #[test]
+    fn exact_tiers_normalize_phrases_and_bound_token_windows() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let phrase = project.path().join("phrase.rs");
+        let window = project.path().join("window.rs");
+        let scattered = project.path().join("scattered.rs");
+        fs::write(&phrase, "// ALPHA   beta gamma\n").expect("write phrase fixture");
+        fs::write(&window, "// gamma\n// alpha\n// beta\n").expect("write window fixture");
+        fs::write(
+            &scattered,
+            "// gamma\n// filler\n// filler\n// alpha\n// beta\n",
+        )
+        .expect("write scattered fixture");
+        let tokens = query_shape::extract_content_tokens("alpha beta gamma");
+
+        assert_eq!(
+            lexical_candidate_exactness(&phrase, "alpha beta gamma", &tokens),
+            (true, 1, Some(1))
+        );
+        assert_eq!(
+            lexical_candidate_exactness(&window, "alpha beta gamma", &tokens),
+            (true, 0, Some(3))
+        );
+        assert_eq!(
+            lexical_candidate_exactness(&scattered, "alpha beta gamma", &tokens),
+            (false, 0, None)
+        );
+    }
+
+    #[test]
+    fn semantic_first_concept_guard_rejects_scattered_whole_file_cooccurrence() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let lexical_guess = project.path().join("src/authorization.rs");
+        fs::create_dir_all(lexical_guess.parent().expect("fixture parent"))
+            .expect("create source dir");
+        fs::write(
+            &lexical_guess,
+            "// authorization policy\n// unrelated helper\n// unrelated helper\n// decide access\n",
+        )
+        .expect("write scattered lexical fixture");
+        let semantic_answer = project.path().join("src/policy.rs");
+        let query = "how does authorization policy decide access";
+        let shape = query_shape::classify(query);
+        let results = fuse_hybrid_results_with_zoom(
+            vec![
+                semantic_candidate(
+                    &semantic_answer.display().to_string(),
+                    "evaluatePolicy",
+                    None,
+                    SymbolKind::Function,
+                    0.95,
+                ),
+                semantic_candidate(
+                    &lexical_guess.display().to_string(),
+                    "authorizationHelper",
+                    None,
+                    SymbolKind::Function,
+                    0.90,
+                ),
+            ],
+            vec![(lexical_guess, 4.0)],
+            &shape,
+            5,
+            true,
+            project.path(),
+            true,
+            Some(query),
+        );
+
+        assert_eq!(results[0].file, semantic_answer);
+        assert!(!results[0].exact);
     }
 
     #[test]
@@ -5133,7 +5450,7 @@ mod tests {
     }
 
     #[test]
-    fn quoted_natural_language_zero_results_find_terms_in_one_escalation() {
+    fn quoted_natural_language_runs_lexical_lane_without_zero_escalation() {
         let project = tempfile::tempdir().expect("create project dir");
         let source_file = project.path().join("src/reminder.rs");
         std::fs::create_dir_all(source_file.parent().expect("source parent"))
@@ -5169,7 +5486,8 @@ mod tests {
             &ctx,
         ));
         assert_eq!(response["success"], true);
-        assert_eq!(response["zero_result_escalation"], true);
+        assert_eq!(response["interpreted_as"], "hybrid");
+        assert!(response.get("zero_result_escalation").is_none());
         assert!(response["results"]
             .as_array()
             .expect("results")
@@ -5177,9 +5495,6 @@ mod tests {
             .any(|result| result["file"]
                 .as_str()
                 .is_some_and(|file| file.ends_with("src/reminder.rs"))));
-        assert!(response["text"].as_str().expect("text").contains(
-            "[interpreted_as: semantic; no result above cutoff — ranked by terms instead]"
-        ));
         handle.join().expect("embedding server thread");
     }
 
@@ -6064,6 +6379,10 @@ mod tests {
             semantic_score: Some(0.75),
             lexical_score: None,
             hybrid_boosted: false,
+            exact: false,
+            exact_phrase_count: 0,
+            exact_window_lines: None,
+            fusion_score: 0.0,
             cap_protected: false,
             lexical_generated_artifact: false,
         }];
@@ -6127,6 +6446,10 @@ mod tests {
             semantic_score: Some(score),
             lexical_score: None,
             hybrid_boosted: false,
+            exact: false,
+            exact_phrase_count: 0,
+            exact_window_lines: None,
+            fusion_score: 0.0,
             cap_protected: false,
             lexical_generated_artifact: false,
         }
@@ -6368,6 +6691,10 @@ mod tests {
             semantic_score: Some(0.99),
             lexical_score: None,
             hybrid_boosted: false,
+            exact: false,
+            exact_phrase_count: 0,
+            exact_window_lines: None,
+            fusion_score: 0.0,
             cap_protected: false,
             lexical_generated_artifact: false,
         }];
@@ -6467,6 +6794,10 @@ mod tests {
             semantic_score: Some(0.99),
             lexical_score: None,
             hybrid_boosted: false,
+            exact: false,
+            exact_phrase_count: 0,
+            exact_window_lines: None,
+            fusion_score: 0.0,
             cap_protected: false,
             lexical_generated_artifact: false,
         }];
@@ -6519,6 +6850,10 @@ mod tests {
             semantic_score: Some(HIGH_CONFIDENCE_COSINE_FLOOR),
             lexical_score: None,
             hybrid_boosted: false,
+            exact: false,
+            exact_phrase_count: 0,
+            exact_window_lines: None,
+            fusion_score: 0.0,
             cap_protected: false,
             lexical_generated_artifact: false,
         }];
@@ -6596,10 +6931,13 @@ mod tests {
             file: dir.path().join("a.rs"),
             score: 1.0,
             generated_artifact: false,
+            exact: false,
+            exact_phrase_count: 0,
+            exact_window_lines: None,
             ordinal: 0,
         };
-        let enabled_lexical = lexical_only_result(candidate.clone(), &shape, true);
-        let disabled_lexical = lexical_only_result(candidate, &shape, false);
+        let enabled_lexical = lexical_only_result(candidate.clone(), &shape, true, 0);
+        let disabled_lexical = lexical_only_result(candidate, &shape, false, 0);
         assert!(enabled_lexical.snippet.contains("aft_zoom"));
         assert!(disabled_lexical.snippet.contains("use read for context"));
         assert!(!disabled_lexical.snippet.contains("aft_zoom"));
@@ -6636,6 +6974,10 @@ mod tests {
             semantic_score: Some(0.5),
             lexical_score: None,
             hybrid_boosted: false,
+            exact: false,
+            exact_phrase_count: 0,
+            exact_window_lines: None,
+            fusion_score: 0.0,
             cap_protected: false,
             lexical_generated_artifact: false,
         }];
@@ -6701,6 +7043,10 @@ mod tests {
                 semantic_score: Some(0.8),
                 lexical_score: None,
                 hybrid_boosted: false,
+                exact: false,
+                exact_phrase_count: 0,
+                exact_window_lines: None,
+                fusion_score: 0.0,
                 cap_protected: false,
                 lexical_generated_artifact: false,
             },
@@ -6717,6 +7063,10 @@ mod tests {
                 semantic_score: Some(0.7),
                 lexical_score: None,
                 hybrid_boosted: false,
+                exact: false,
+                exact_phrase_count: 0,
+                exact_window_lines: None,
+                fusion_score: 0.0,
                 cap_protected: false,
                 lexical_generated_artifact: false,
             },
@@ -6799,6 +7149,10 @@ mod tests {
             semantic_score: Some(0.75),
             lexical_score: None,
             hybrid_boosted: false,
+            exact: false,
+            exact_phrase_count: 0,
+            exact_window_lines: None,
+            fusion_score: 0.0,
             cap_protected: false,
             lexical_generated_artifact: false,
         };

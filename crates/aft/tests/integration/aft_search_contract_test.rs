@@ -1113,6 +1113,41 @@ fn hybrid_disabled_semantic_uses_lexical_only_fallback() {
 }
 
 #[test]
+fn natural_language_exact_phrase_marks_rank_one_lexical_fallback() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let target = project.path().join("src/tool/browser.rs");
+    let partial = project.path().join("src/tool/other.rs");
+    std::fs::create_dir_all(target.parent().expect("source parent")).expect("create source dir");
+    let sentence = "The feature is not wired into the built-in browser tool yet.";
+    std::fs::write(&target, format!("// {sentence}\n")).expect("write target");
+    std::fs::write(&partial, "// browser tool wiring\n").expect("write partial match");
+    let entries = vec![
+        (target.clone(), format!("// {sentence}\n")),
+        (partial, "// browser tool wiring\n".to_string()),
+    ];
+    let ctx = test_context(project.path());
+    install_lexical_index_entries(&ctx, &entries);
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+
+    let response = response_value(handle_semantic_search(
+        &request_with_top_k(sentence, None, 5),
+        &ctx,
+    ));
+    let first = &response["results"][0];
+    assert!(path_ends_with(
+        first["file"].as_str().expect("result file"),
+        "src/tool/browser.rs"
+    ));
+    assert_eq!(first["exact"], true);
+    assert!(response["text"]
+        .as_str()
+        .expect("rendered response")
+        .contains("src/tool/browser.rs [exact]"));
+}
+
+#[test]
 fn hybrid_failed_semantic_uses_lexical_only_fallback() {
     let (project, source_file, source) = project_with_needle();
     let ctx = test_context(project.path());
