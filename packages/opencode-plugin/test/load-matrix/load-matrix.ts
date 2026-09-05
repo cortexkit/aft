@@ -476,6 +476,9 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   for (const [index, location] of [first, second].entries()) {
     const outline = location.tools.find((tool) => tool.name === "aft_outline");
     if (!outline) throw new Error("enabled V2 effect did not register aft_outline");
+    if (outline.options?.codemode !== false) {
+      throw new Error("enabled V2 effect did not disable CodeMode for aft_outline");
+    }
     yield* outline.execute(
       { target: directory },
       {
@@ -499,6 +502,9 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   yield* loaded.effect(reloaded.context);
   const outline = reloaded.tools.find((tool) => tool.name === "aft_outline");
   if (!outline) throw new Error("reloaded V2 effect did not register aft_outline");
+  if (outline.options?.codemode !== false) {
+    throw new Error("reloaded V2 effect did not disable CodeMode for aft_outline");
+  }
   yield* outline.execute(
     { target: directory },
     {

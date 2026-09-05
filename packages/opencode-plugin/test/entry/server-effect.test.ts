@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { Effect } from "effect";
 import { z } from "zod";
 
-import { adaptV1Tool, makeServerEffect } from "../../src/entry/server-runtime.mjs";
+import { makeServerEffect } from "../../src/entry/server-runtime.mjs";
 
 function testDependencies(events: string[]) {
   return {
@@ -47,7 +47,7 @@ function testDependencies(events: string[]) {
 function hostContext(
   directory: string,
   events: string[],
-  added: string[],
+  added: Array<Record<string, unknown>>,
   canonicalDirectory = directory,
 ) {
   let locationReads = 0;
@@ -61,14 +61,20 @@ function hostContext(
       };
     },
     tool: {
-      transform: (register: (editor: { add(tool: { name: string }): void }) => void) =>
+      transform: (
+        register: (editor: {
+          add(tool: Record<string, unknown> & { name: string }): void;
+          remove(name: string): void;
+        }) => void,
+      ) =>
         Effect.sync(() => {
           events.push(`transform:${directory}`);
           register({
             add: (tool) => {
-              added.push(tool.name);
+              added.push(tool);
               events.push(`add:${directory}:${tool.name}`);
             },
+            remove: (name) => events.push(`remove:${directory}:${name}`),
           });
         }),
     },
@@ -80,7 +86,7 @@ describe("V2 server effect", () => {
   test("captures and boots each Location exactly once, then releases its pool", async () => {
     for (const directory of ["/work/a", "/work/b"]) {
       const events: string[] = [];
-      const added: string[] = [];
+      const added: Array<Record<string, unknown>> = [];
       const effect = makeServerEffect(testDependencies(events));
       const host = hostContext(directory, events, added);
 
@@ -91,7 +97,8 @@ describe("V2 server effect", () => {
       await Effect.runPromise(Effect.scoped(program));
 
       expect(host.locationReads()).toBe(1);
-      expect(added).toEqual(["aft_probe"]);
+      expect(added.map((tool) => tool.name)).toEqual(["aft_probe"]);
+      expect(added[0]?.options).toEqual({ codemode: false });
       expect(events).toEqual([
         `location:${directory}`,
         `config:${directory}`,
@@ -119,35 +126,42 @@ describe("V2 server effect", () => {
     expect(events).toContain("release:/work/canonical");
   });
 
-  test("adapts V1 tools to Effect execution with the host AbortSignal", async () => {
+  test("registers shared definitions with Effect execution and the host AbortSignal", async () => {
+    const events: string[] = [];
+    const registered: Array<Record<string, unknown>> = [];
     const progress: Array<Record<string, unknown>> = [];
     let receivedContext: Record<string, unknown> | undefined;
-    const tool = adaptV1Tool(
-      "aft_probe",
-      {
-        description: "Probe execution",
-        args: { value: z.string() },
-        execute: async (input: { value: string }, context: Record<string, unknown>) => {
-          receivedContext = context;
-          (context.metadata as (update: Record<string, unknown>) => void)({
-            title: "Probe",
-            metadata: { value: input.value },
-          });
-          return {
-            title: "Probe",
-            output: `value=${input.value}`,
-            metadata: { ok: true },
-          };
+    const dependencies = {
+      ...testDependencies(events),
+      buildToolMap: () => ({
+        aft_probe: {
+          description: "Probe execution",
+          args: { value: z.string() },
+          execute: async (input: { value: string }, context: Record<string, unknown>) => {
+            receivedContext = context;
+            (context.metadata as (update: Record<string, unknown>) => void)({
+              title: "Probe",
+              metadata: { value: input.value },
+            });
+            return {
+              title: "Probe",
+              output: `value=${input.value}`,
+              metadata: { ok: true },
+            };
+          },
         },
-      },
-      {
-        directory: "/work/a",
-        project: { directory: "/work/a", canonical: "/canonical/a" },
-      },
-    );
+      }),
+    };
+    const host = hostContext("/work/a", events, registered, "/canonical/a");
 
+    await Effect.runPromise(Effect.scoped(makeServerEffect(dependencies)(host.context)));
+    const registeredTool = registered[0] as {
+      input: { safeParse(input: unknown): { success: boolean } };
+      options: unknown;
+      execute(input: unknown, context: unknown): Effect.Effect<Record<string, unknown>>;
+    };
     const result = await Effect.runPromise(
-      tool.execute(
+      registeredTool.execute(
         { value: "ready" },
         {
           sessionID: "session-1",
@@ -162,7 +176,8 @@ describe("V2 server effect", () => {
     );
     await Promise.resolve();
 
-    expect(tool.input.safeParse({ value: "ready" }).success).toBe(true);
+    expect(registeredTool.input.safeParse({ value: "ready" }).success).toBe(true);
+    expect(registeredTool.options).toEqual({ codemode: false });
     expect(receivedContext).toMatchObject({
       sessionID: "session-1",
       messageID: "message-1",
