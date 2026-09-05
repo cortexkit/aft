@@ -1121,6 +1121,17 @@ fn replay_runs_maybe_gc_persisted_once() {
     let storage = tempfile::tempdir().unwrap();
     let registry = registry();
     registry.replay_session(storage.path(), SESSION).unwrap();
+    // The first replay's GC runs detached; the fixture below is aged past the
+    // GC threshold on purpose, so it must be planted only after that sweep has
+    // finished or the first run (not a second) deletes it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while registry.persisted_gc_thread().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "first persisted GC never finished after replay"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     let paths = fake_task(
         storage.path(),

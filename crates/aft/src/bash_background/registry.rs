@@ -1898,6 +1898,7 @@ impl BgTaskRegistry {
     }
 
     /// Thread name recorded by the last `maybe_gc_persisted` run, if any.
+    /// Recorded as the run exits, so `Some` also means that run has finished.
     #[doc(hidden)]
     pub fn persisted_gc_thread(&self) -> Option<String> {
         self.inner
@@ -2837,16 +2838,26 @@ impl BgTaskRegistry {
     pub fn maybe_gc_persisted(&self, storage_dir: &Path) -> Result<usize, String> {
         #[cfg(test)]
         self.inner.persisted_gc_runs.fetch_add(1, Ordering::SeqCst);
-        *self
-            .inner
-            .persisted_gc_thread
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
-            std::thread::current()
-                .name()
-                .unwrap_or("<unnamed>")
-                .to_string(),
-        );
+        // Recorded when the run ENDS (on every exit path, via the guard), so an
+        // observer that sees the thread name knows the sweep is over. Replay
+        // spawns this detached; a test that plants storage after replay returns
+        // must wait for this before its fixture is safe from the sweep.
+        struct RecordThreadOnExit<'a>(&'a RegistryInner);
+        impl Drop for RecordThreadOnExit<'_> {
+            fn drop(&mut self) {
+                *self
+                    .0
+                    .persisted_gc_thread
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+                    std::thread::current()
+                        .name()
+                        .unwrap_or("<unnamed>")
+                        .to_string(),
+                );
+            }
+        }
+        let _record_thread = RecordThreadOnExit(&self.inner);
 
         let mut deleted = 0usize;
 
