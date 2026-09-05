@@ -241,7 +241,13 @@ fn rewrites_cat_append_and_echo_append() {
 
 #[test]
 fn rewrite_append_uses_original_session_for_backups() {
-    let dir = tempfile::tempdir().unwrap();
+    let parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/aft-bash-rewrite-tests");
+    fs::create_dir_all(&parent).unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("case-")
+        .tempdir_in(parent)
+        .unwrap();
     let storage = tempfile::tempdir().unwrap();
     let file = dir.path().join("notes.txt");
     fs::write(&file, "before\n").unwrap();

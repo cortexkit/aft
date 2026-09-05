@@ -15,6 +15,12 @@ use super::helpers::{warm_executable, AftProcess};
 const SESSION: &str = "backup-dual-write-session";
 const PROJECT_KEY: &str = "backup-project-key";
 
+fn non_temp_dir() -> std::io::Result<tempfile::TempDir> {
+    let parent = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/aft-backup-tests");
+    fs::create_dir_all(&parent)?;
+    tempfile::Builder::new().prefix("case-").tempdir_in(parent)
+}
+
 #[derive(Debug)]
 struct DbBackupRow {
     backup_id: String,
@@ -88,8 +94,8 @@ fn backup_count(conn: &Connection) -> i64 {
 
 #[test]
 fn backups_dual_write_backup_save_writes_both_disk_and_db_row() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let (mut store, conn) = store_with_db(storage.path(), Harness::Opencode);
     let file = temp_file(project.path(), "file.txt", "original");
 
@@ -141,8 +147,8 @@ fn backups_dual_write_backup_save_writes_both_disk_and_db_row() {
 
 #[test]
 fn backups_dual_write_backup_order_preserves_sort_in_db() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let (mut store, conn) = store_with_db(storage.path(), Harness::Opencode);
     let file = temp_file(project.path(), "ordered.txt", "v1");
 
@@ -161,8 +167,8 @@ fn backups_dual_write_backup_order_preserves_sort_in_db() {
 
 #[test]
 fn backups_dual_write_backup_op_id_isolates_operations() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let (mut store, conn) = store_with_db(storage.path(), Harness::Opencode);
     let file = temp_file(project.path(), "op-id.txt", "v1");
 
@@ -190,7 +196,7 @@ fn backups_dual_write_backup_op_id_isolates_operations() {
 
 #[test]
 fn backups_dual_write_backup_harness_isolation_in_db() {
-    let storage = tempfile::tempdir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let conn = aft::db::open(&storage.path().join("aft.db")).unwrap();
 
     upsert_backup(&conn, &direct_row("opencode", SESSION, "shared", 1)).unwrap();
@@ -208,8 +214,8 @@ fn backups_dual_write_backup_harness_isolation_in_db() {
 
 #[test]
 fn backups_dual_write_backup_db_failure_does_not_break_disk_write() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let (mut store, conn) = store_with_db(storage.path(), Harness::Opencode);
     let file = temp_file(project.path(), "db-failure.txt", "original");
     conn.lock()
@@ -224,8 +230,8 @@ fn backups_dual_write_backup_db_failure_does_not_break_disk_write() {
 
 #[test]
 fn backups_dual_write_backup_disabled_db_path_skips_dual_write() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let mut store = BackupStore::new();
     store.set_storage_dir(storage.path().to_path_buf(), 72);
     store.set_db_harness(Harness::Opencode);
@@ -268,7 +274,7 @@ fn backup_tombstone_file_undo_uses_same_key_for_relative_created_path() {
 
 #[test]
 fn backup_restore_round_trips_binary_bytes() {
-    let project = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
     let mut store = BackupStore::new();
     let file = project.path().join("binary.bin");
     let original = vec![0, 159, 146, 150, 255, b'\n'];
@@ -284,7 +290,7 @@ fn backup_restore_round_trips_binary_bytes() {
 #[cfg(unix)]
 #[test]
 fn backup_restore_preserves_unix_permissions() {
-    let project = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
     let mut store = BackupStore::new();
     let file = temp_file(project.path(), "executable.sh", "#!/bin/sh\nexit 0\n");
     fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
@@ -302,8 +308,8 @@ fn backup_restore_preserves_unix_permissions() {
 #[cfg(unix)]
 #[test]
 fn legacy_db_row_without_restore_meta_reads_mode_from_sidecar() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let (mut store, conn) = store_with_db(storage.path(), Harness::Opencode);
     let file = temp_file(
         project.path(),
@@ -351,8 +357,8 @@ fn legacy_db_row_without_restore_meta_reads_mode_from_sidecar() {
 fn binary_db_fallback_restores_mode_without_sidecar() {
     const BINARY_SESSION: &str = "binary-db-restore-metadata-session";
 
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let file = temp_file(project.path(), "tool.sh", "#!/bin/sh\necho ORIGINAL\n");
     fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
     warm_executable(&file, &["--version"]);
@@ -434,7 +440,7 @@ fn binary_db_fallback_restores_mode_without_sidecar() {
 
 #[test]
 fn backup_process_maintenance_repairs_legacy_root_backups() {
-    let storage = tempfile::tempdir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let legacy = storage.path().join("backups").join("legacy-session");
     fs::create_dir_all(&legacy).unwrap();
     fs::write(legacy.join("sentinel"), "legacy").unwrap();
@@ -461,7 +467,7 @@ fn backup_process_maintenance_repairs_legacy_root_backups() {
 
 #[test]
 fn backups_dual_write_backup_order_blob_is_16_bytes() {
-    let storage = tempfile::tempdir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let conn = aft::db::open(&storage.path().join("aft.db")).unwrap();
 
     upsert_backup(&conn, &direct_row("opencode", SESSION, "len", 42)).unwrap();
@@ -476,7 +482,7 @@ fn backups_dual_write_backup_order_blob_is_16_bytes() {
 
 #[test]
 fn backups_dual_write_backup_order_blob_sorts_lexicographically() {
-    let storage = tempfile::tempdir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let conn = aft::db::open(&storage.path().join("aft.db")).unwrap();
 
     upsert_backup(&conn, &direct_row("opencode", SESSION, "one", 1)).unwrap();
@@ -489,7 +495,7 @@ fn backups_dual_write_backup_order_blob_sorts_lexicographically() {
 
 #[test]
 fn backups_dual_write_backup_op_id_index_is_partial() {
-    let storage = tempfile::tempdir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let conn = aft::db::open(&storage.path().join("aft.db")).unwrap();
 
     let sql: String = conn

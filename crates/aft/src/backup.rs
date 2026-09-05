@@ -5939,6 +5939,99 @@ mod tests {
         assert!(!stack_dir.join("bak_999_orphan.bak").exists());
     }
 
+    #[test]
+    fn default_policy_skips_sparse_1_7_gib_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("engram-large.db");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(1_700_000_000).unwrap();
+
+        let store = BackupStore::new();
+        assert_eq!(
+            store.should_snapshot_path(&path, false).unwrap(),
+            SnapshotDecision::Skip(BackupSkippedReason::TooLarge)
+        );
+        assert_eq!(
+            store.policy().max_file_size,
+            Some(DEFAULT_MAX_BACKUP_FILE_SIZE)
+        );
+    }
+
+    #[test]
+    fn explicit_larger_cap_allows_a_file_above_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large-but-allowed.db");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(DEFAULT_MAX_BACKUP_FILE_SIZE + 1).unwrap();
+
+        let mut store = BackupStore::new();
+        store.set_policy(BackupPolicy {
+            max_file_size: Some(DEFAULT_MAX_BACKUP_FILE_SIZE + 2),
+            ..BackupPolicy::default()
+        });
+        assert_eq!(
+            store.should_snapshot_path(&path, false).unwrap(),
+            SnapshotDecision::Capture
+        );
+    }
+
+    #[test]
+    fn too_large_snapshots_increment_the_process_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("over-cap.txt");
+        fs::write(&path, "oversized").unwrap();
+
+        let before = backup_skipped_totals().0;
+        let mut store = BackupStore::new();
+        store.set_policy(BackupPolicy {
+            max_file_size: Some(1),
+            ..BackupPolicy::default()
+        });
+        assert!(store
+            .snapshot_with_op(DEFAULT_SESSION_ID, &path, "large", Some("large-op"))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.skipped_reason_for_operation(DEFAULT_SESSION_ID, "large-op", Some(&path)),
+            Some(BackupSkippedReason::TooLarge)
+        );
+        assert!(backup_skipped_totals().0 >= before + 1);
+    }
+
+    #[test]
+    fn temp_paths_and_zero_cap_report_their_skip_reasons() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scratch.txt");
+        fs::write(&path, "scratch").unwrap();
+
+        let before_temp = backup_skipped_totals().1;
+        let mut store = BackupStore::new();
+        store.enforce_temp_path_policy_for_tests();
+        assert!(store
+            .snapshot_with_op(DEFAULT_SESSION_ID, &path, "temp", Some("temp-op"))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.skipped_reason_for_operation(DEFAULT_SESSION_ID, "temp-op", Some(&path)),
+            Some(BackupSkippedReason::TempPath)
+        );
+        assert!(backup_skipped_totals().1 >= before_temp + 1);
+
+        let mut disabled = BackupStore::new();
+        disabled.set_policy(BackupPolicy {
+            max_file_size: Some(0),
+            ..BackupPolicy::default()
+        });
+        assert!(disabled
+            .snapshot_with_op(DEFAULT_SESSION_ID, &path, "disabled", Some("disabled-op"))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            disabled.skipped_reason_for_operation(DEFAULT_SESSION_ID, "disabled-op", Some(&path)),
+            Some(BackupSkippedReason::Disabled)
+        );
+    }
+
     fn backup_content_names(dir: &Path) -> HashSet<String> {
         fs::read_dir(dir)
             .unwrap()

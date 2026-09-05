@@ -13,7 +13,7 @@
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { access, cp, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { join, relative, resolve } from "node:path";
 import type { BinaryBridge } from "@cortexkit/aft-bridge";
 import { BridgePool, inlineUserConfigTier, setActiveLogger } from "@cortexkit/aft-bridge";
@@ -240,7 +240,9 @@ export async function createHarness(
     throw new Error(preparedBinary.skipReason ?? "aft binary unavailable");
   }
 
-  const tempDir = await mkdtemp(join(tmpdir(), "aft-pi-e2e-"));
+  const testRoot = join(homedir(), ".cache");
+  await mkdir(testRoot, { recursive: true });
+  const tempDir = await mkdtemp(join(testRoot, "aft-pi-e2e-"));
 
   try {
     if (!options.noFixtures) {

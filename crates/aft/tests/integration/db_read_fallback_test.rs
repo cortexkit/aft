@@ -17,6 +17,13 @@ use aft::harness::Harness;
 const SESSION: &str = "db-read-fallback-session";
 const PROJECT_KEY: &str = "db-read-fallback-project";
 
+fn non_temp_dir() -> std::io::Result<tempfile::TempDir> {
+    let parent =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/aft-db-fallback-tests");
+    fs::create_dir_all(&parent)?;
+    tempfile::Builder::new().prefix("case-").tempdir_in(parent)
+}
+
 fn registry_with_db(storage: &Path) -> (BgTaskRegistry, Arc<Mutex<Connection>>) {
     let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
     registry.set_harness(Harness::Opencode);
@@ -153,8 +160,8 @@ fn latest_backup_path(storage: &Path, conn: &Arc<Mutex<Connection>>) -> PathBuf 
 
 #[test]
 fn db_read_fallback_bash_lookup_refuses_corrupt_disk_despite_db_row() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let (registry, conn) = registry_with_db(storage.path());
     let task_id = spawn_task(&registry, storage.path(), project.path(), "echo db-wins");
     wait_for_task_status(
@@ -182,8 +189,8 @@ fn db_read_fallback_bash_lookup_refuses_corrupt_disk_despite_db_row() {
 
 #[test]
 fn db_read_fallback_bash_lookup_falls_back_to_disk_when_db_row_absent() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let (_registry, conn) = registry_with_db(storage.path());
     write_disk_task(
         storage.path(),
@@ -210,8 +217,8 @@ fn db_read_fallback_bash_lookup_falls_back_to_disk_when_db_row_absent() {
 
 #[test]
 fn db_read_fallback_bash_lookup_returns_not_found_when_both_missing() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let (_registry, conn) = registry_with_db(storage.path());
     let fresh = fresh_registry(conn);
 
@@ -229,8 +236,8 @@ fn db_read_fallback_bash_lookup_returns_not_found_when_both_missing() {
 
 #[test]
 fn db_read_fallback_bash_replay_refuses_db_rows_missing_strict_metadata() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let (registry, conn) = registry_with_db(storage.path());
     let task_ids: Vec<_> = (0..3)
         .map(|idx| {
@@ -263,8 +270,8 @@ fn db_read_fallback_bash_replay_refuses_db_rows_missing_strict_metadata() {
 
 #[test]
 fn db_read_fallback_bash_replay_session_falls_back_to_disk_when_db_empty() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let (_registry, conn) = registry_with_db(storage.path());
     for idx in 0..3 {
         write_disk_task(
@@ -283,8 +290,8 @@ fn db_read_fallback_bash_replay_session_falls_back_to_disk_when_db_empty() {
 
 #[test]
 fn db_read_fallback_bash_replay_session_no_double_count_when_both_present() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let (registry, conn) = registry_with_db(storage.path());
     let task_ids: Vec<_> = (0..3)
         .map(|idx| {
@@ -324,8 +331,8 @@ fn db_read_fallback_bash_replay_session_no_double_count_when_both_present() {
 
 #[test]
 fn db_read_fallback_backup_iter_prefers_db_order_by_order_blob() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let (mut store, conn) = backup_store_with_db(storage.path());
     let file = temp_file(project.path(), "ordered.txt", "v1");
     store.snapshot(SESSION, &file, "first").unwrap();
@@ -347,8 +354,8 @@ fn db_read_fallback_backup_iter_prefers_db_order_by_order_blob() {
 
 #[test]
 fn db_read_fallback_backup_iter_falls_back_to_disk_when_db_empty() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let mut store = BackupStore::new();
     store.set_storage_dir(storage.path().to_path_buf(), 72);
     let file = temp_file(project.path(), "disk-history.txt", "v1");
@@ -366,8 +373,8 @@ fn db_read_fallback_backup_iter_falls_back_to_disk_when_db_empty() {
 
 #[test]
 fn db_read_fallback_backup_pop_prefers_db_when_present() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let (mut store, conn) = backup_store_with_db(storage.path());
     let file = temp_file(project.path(), "pop.txt", "v1");
     store.snapshot(SESSION, &file, "first").unwrap();
@@ -388,8 +395,8 @@ fn db_read_fallback_backup_pop_prefers_db_when_present() {
 
 #[test]
 fn db_read_fallback_backup_pop_falls_back_to_disk_when_db_empty() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let mut store = BackupStore::new();
     store.set_storage_dir(storage.path().to_path_buf(), 72);
     let file = temp_file(project.path(), "disk-pop.txt", "before");
@@ -407,8 +414,8 @@ fn db_read_fallback_backup_pop_falls_back_to_disk_when_db_empty() {
 
 #[test]
 fn db_read_fallback_backup_op_id_query_via_db() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     let (mut store, conn) = backup_store_with_db(storage.path());
     let file = temp_file(project.path(), "op.txt", "v1");
     store
@@ -432,8 +439,8 @@ fn db_read_fallback_backup_op_id_query_via_db() {
 
 #[test]
 fn db_read_fallback_db_unavailable_falls_back_to_disk_for_all_ops() {
-    let project = tempfile::tempdir().unwrap();
-    let storage = tempfile::tempdir().unwrap();
+    let project = non_temp_dir().unwrap();
+    let storage = non_temp_dir().unwrap();
     write_disk_task(
         storage.path(),
         project.path(),
