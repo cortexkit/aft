@@ -338,9 +338,10 @@ function buildSchema(): Record<string, unknown> {
           },
           max_file_size: {
             type: "integer",
-            minimum: 1,
+            minimum: 0,
+            default: 64 * 1024 * 1024,
             description:
-              "Skip backup capture for files larger than this many bytes; edits still proceed. User-only; project config is ignored.",
+              "Maximum existing-file size captured for undo, in bytes. Defaults to 64 MiB. User and project tiers may set it; explicit larger values are honored. Zero disables automatic snapshots. Mutations still proceed when capture is skipped.",
           },
         },
         additionalProperties: false,

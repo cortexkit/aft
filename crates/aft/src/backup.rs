@@ -13,6 +13,9 @@ use crate::error::AftError;
 use sha2::{Digest, Sha256};
 
 pub const DEFAULT_MAX_UNDO_DEPTH: usize = 20;
+/// Default upper bound for one automatic undo snapshot (64 MiB).
+pub const DEFAULT_MAX_BACKUP_FILE_SIZE: u64 = 64 * 1024 * 1024;
+
 #[cfg(test)]
 const MAX_UNDO_DEPTH: usize = DEFAULT_MAX_UNDO_DEPTH;
 const V2_FORMAT_VERSION: &str = "v2";
@@ -348,7 +351,7 @@ impl Default for BackupPolicy {
         Self {
             enabled: true,
             max_depth: DEFAULT_MAX_UNDO_DEPTH,
-            max_file_size: None,
+            max_file_size: Some(DEFAULT_MAX_BACKUP_FILE_SIZE),
         }
     }
 }

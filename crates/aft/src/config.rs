@@ -275,7 +275,7 @@ impl Default for BackupConfig {
         Self {
             enabled: Some(true),
             max_depth: Some(crate::backup::DEFAULT_MAX_UNDO_DEPTH),
-            max_file_size: None,
+            max_file_size: Some(crate::backup::DEFAULT_MAX_BACKUP_FILE_SIZE),
         }
     }
 }

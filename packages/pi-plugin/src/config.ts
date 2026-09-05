@@ -778,7 +778,8 @@ const WorktreeConfigSchema = z.object({
 const BackupConfigSchema = z.object({
   enabled: z.boolean().optional(),
   max_depth: z.number().int().positive().optional(),
-  max_file_size: z.number().int().positive().optional(),
+  /** Skip backup capture above 64 MiB by default. Zero disables snapshots. */
+  max_file_size: z.number().int().nonnegative().optional(),
 });
 
 const AftConfigFieldsSchema = z.object({
@@ -1593,12 +1594,21 @@ function pickProjectSafeFields(override: AftConfig): Partial<AftConfig> {
   return safe;
 }
 
+function mergeProjectBackupConfig(
+  base: AftConfig["backup"],
+  project: AftConfig["backup"],
+): AftConfig["backup"] {
+  if (project?.max_file_size === undefined) return base;
+  return { ...base, max_file_size: project.max_file_size };
+}
+
 function getStrippedTopLevelKeys(override: AftConfig): string[] {
   const stripped: string[] = [];
   if (override.restrict_to_project_root !== undefined) stripped.push("restrict_to_project_root");
   if (override.url_fetch_allow_private !== undefined) stripped.push("url_fetch_allow_private");
   if (override.bridge !== undefined) stripped.push("bridge");
-  if (override.backup !== undefined) stripped.push("backup");
+  if (override.backup?.enabled !== undefined || override.backup?.max_depth !== undefined)
+    stripped.push("backup");
   if (override.index?.roots !== undefined) stripped.push("index.roots");
   // enabled:true is an accepted project-tier hardening opt-in; only the
   // weakening direction (enabled:false) is stripped as user-only.
@@ -1625,6 +1635,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const inspect = mergeInspectConfig(base.inspect, override.inspect);
   const worktree = mergeWorktreeConfig(base.worktree, override.worktree);
   const sandbox = mergeSandboxConfig(base.sandbox, override.sandbox);
+  const backup = mergeProjectBackupConfig(base.backup, override.backup);
   const bridge = base.bridge;
 
   // STRICT ALLOWLIST: only project-safe top-level fields are inherited.
@@ -1647,6 +1658,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...(inspect !== undefined ? { inspect } : {}),
     ...(worktree !== undefined ? { worktree } : {}),
     ...(sandbox !== undefined ? { sandbox } : {}),
+    ...(backup !== undefined ? { backup } : {}),
     experimental,
     semantic,
     ...(bridge !== undefined ? { bridge } : {}),

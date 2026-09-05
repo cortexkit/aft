@@ -529,7 +529,6 @@ pub struct RawBackup {
     pub enabled: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
     pub max_depth: Option<usize>,
-    #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
     pub max_file_size: Option<u64>,
 }
 
@@ -939,10 +938,23 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     base.inspect = merge_inspect_config(base.inspect.clone(), project.inspect);
     base.idle = merge_idle_config(base.idle.clone(), project.idle);
     base.worktree = merge_worktree_config(base.worktree.clone(), project.worktree);
+    base.backup = merge_project_backup_config(base.backup.clone(), project.backup);
     if project.git.is_some() {
         base.git = project.git;
     }
     base.sandbox = merge_project_sandbox(base.sandbox.clone(), project.sandbox);
+}
+
+fn merge_project_backup_config(
+    base: Option<RawBackup>,
+    project: Option<RawBackup>,
+) -> Option<RawBackup> {
+    let Some(project_max_file_size) = project.and_then(|backup| backup.max_file_size) else {
+        return base;
+    };
+    let mut backup = base.unwrap_or_default();
+    backup.max_file_size = Some(project_max_file_size);
+    Some(backup)
 }
 
 fn merge_project_sandbox(
@@ -1272,7 +1284,11 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     if raw.subc.is_some() {
         push_drop(dropped, "subc", tier, USER_ONLY_REASON);
     }
-    if raw.backup.is_some() {
+    if raw
+        .backup
+        .as_ref()
+        .is_some_and(|backup| backup.enabled.is_some() || backup.max_depth.is_some())
+    {
         push_drop(dropped, "backup", tier, USER_ONLY_REASON);
     }
     if raw.gh_shim.is_some() {

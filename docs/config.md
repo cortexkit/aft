@@ -335,6 +335,19 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     "lsp_ttl_minutes": 10
   },
 
+  // Automatic undo snapshots. Existing-file mutations larger than 64 MiB and
+  // every mutation under an OS temporary directory proceed without an undo
+  // snapshot and report why undo is unavailable.
+  "backup": {
+    // User-only master switch and per-file history depth.
+    "enabled": true,
+    "max_depth": 20,
+    // Maximum existing-file size captured for undo, in bytes. Default 64 MiB.
+    // User and project tiers may set this value; project config wins. Explicit
+    // larger values are honored. Set 0 to disable automatic snapshots.
+    "max_file_size": 67108864
+  },
+
   // Native sandbox for first-party bash and PTY commands. Default: false.
   "sandbox": {
     "enabled": false,
@@ -385,7 +398,7 @@ Set `edit_mode` to `"hashline"` to make `edit` accept exactly `{ "patch": "..." 
 
 See the [Hashline patch grammar](hashline.md) for section headers, addresses, operations, and tag freshness rules.
 
-A hashline mutation starts only after every affected path has a backup record. If backup registration cannot complete, the edit fails before any file is changed.
+A hashline mutation attempts to register every affected path before changing files. An actual backup error still fails the edit before mutation. Policy skips for an oversized file or an OS temporary path allow the edit to proceed, and the response states that undo is unavailable for that change.
 
 Hashline mode needs the host's unprefixed `edit` slot. If final surface selection, hoisting, or `disabled_tools` removes that slot, AFT keeps the default edit/read behavior for the session and emits a `hashline_downgraded` warning with reason `edit_not_registered` on the configure-warnings channel.
 

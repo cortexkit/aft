@@ -2648,7 +2648,12 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 .backup
                 .max_depth
                 .unwrap_or(crate::backup::DEFAULT_MAX_UNDO_DEPTH),
-            max_file_size: next_config.backup.max_file_size,
+            max_file_size: Some(
+                next_config
+                    .backup
+                    .max_file_size
+                    .unwrap_or(crate::backup::DEFAULT_MAX_BACKUP_FILE_SIZE),
+            ),
         });
         backup.set_db_harness(harness.clone());
     }
