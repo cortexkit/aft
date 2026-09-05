@@ -82,7 +82,13 @@ fn branch_switch_reuses_unchanged_blobs_and_puts_only_changed_files() {
         initial.generation.as_deref().unwrap().split('-').next(),
         Some("1")
     );
+    assert_eq!(
+        initial.blob_puts, 320,
+        "every file is new content on the first publish"
+    );
 
+    // A real branch: 300 of the 320 files change content on it.
+    git(project.path(), &["checkout", "--quiet", "-b", "feature"]);
     let mut changed = BTreeSet::new();
     for index in 0..300 {
         let name = format!("file_{index}.rs");
@@ -99,15 +105,43 @@ fn branch_switch_reuses_unchanged_blobs_and_puts_only_changed_files() {
         project.path(),
         family,
         "main-view",
-        changed,
+        changed.clone(),
         true,
     ))
     .unwrap();
     assert!(switched.published);
-    assert!(
-        switched.blob_puts <= 300,
-        "blob puts: {}",
-        switched.blob_puts
+    assert_eq!(
+        switched.blob_puts, 300,
+        "exactly the changed files are new content; the 20 untouched ones are reused"
+    );
+
+    // Switching back is the content-addressed claim: every blob for the base
+    // tree already exists, so the publication must put nothing, whether the
+    // watcher reports the 300 paths or (as an oversized batch) nothing at all.
+    git(project.path(), &["checkout", "--quiet", "-"]);
+    let back = publish_checkout(&request(
+        storage.path(),
+        project.path(),
+        family,
+        "main-view",
+        changed,
+        true,
+    ))
+    .unwrap();
+    assert!(back.published);
+    assert_eq!(back.blob_puts, 0, "switching back re-derives nothing");
+    let back_full = publish_checkout(&request(
+        storage.path(),
+        project.path(),
+        family,
+        "main-view",
+        BTreeSet::new(),
+        true,
+    ))
+    .unwrap();
+    assert_eq!(
+        back_full.blob_puts, 0,
+        "a full rebuild over unchanged content puts nothing either"
     );
 }
 
