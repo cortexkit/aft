@@ -2604,6 +2604,9 @@ fn bind_blocker_snapshot_labels_reader_parked_before_execution_as_zombie() {
         "parked-before-execution".to_string(),
         Box::new(|_| ok("parked-before-execution")),
     );
+    // Bounded: a reader that never dispatches must fail the test, not hang it.
+    // The bound is generous because it measures CI scheduling, not our code.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let admitted = executor
             .inner
@@ -2615,6 +2618,10 @@ fn bind_blocker_snapshot_labels_reader_parked_before_execution_as_zombie() {
         if admitted {
             break;
         }
+        assert!(
+            Instant::now() < deadline,
+            "reader was not dispatched within 30s"
+        );
         std::thread::yield_now();
     }
 
@@ -2624,11 +2631,17 @@ fn bind_blocker_snapshot_labels_reader_parked_before_execution_as_zombie() {
         "subc-bind-zombie-census".to_string(),
         Box::new(|_| ok("subc-bind-zombie-census")),
     );
+    // The snapshot is a try-lock read; under contention it returns None until
+    // the scheduler releases the state lock, so retry - but bounded.
     let snapshot = loop {
         if let Some(snapshot) = executor.try_bind_blocker_snapshot(&root, "subc-bind-zombie-census")
         {
             break snapshot;
         }
+        assert!(
+            Instant::now() < deadline,
+            "zombie bind blocker snapshot not readable within 30s"
+        );
         std::thread::yield_now();
     };
     assert!(snapshot
