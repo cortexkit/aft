@@ -414,6 +414,14 @@ pub struct SemanticHealthComponentSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ViewHealthSnapshot {
+    pub generation: u64,
+    pub pinned: bool,
+    pub pending_paths: usize,
+    pub failed_paths: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Tier2HealthSnapshot {
     pub status: &'static str,
 }
@@ -444,6 +452,8 @@ pub struct RootHealthSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callgraph_pages_or_bytes_written_60s: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub views: Option<ViewHealthSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tier2: Option<Tier2HealthSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bash: Option<BgTaskHealthCounts>,
@@ -457,6 +467,7 @@ pub(crate) struct RootHealthSummary {
     search_index_status: Option<&'static str>,
     semantic_index: Option<SemanticHealthComponentSnapshot>,
     callgraph_store_status: Option<&'static str>,
+    views: Option<ViewHealthSnapshot>,
     tier2_status: Option<&'static str>,
     bash: Option<BgTaskHealthCounts>,
     suspended_domains: Vec<SuspendedDomainHealthSnapshot>,
@@ -469,6 +480,7 @@ impl RootHealthSummary {
             search_index_status: None,
             semantic_index: None,
             callgraph_store_status: None,
+            views: None,
             tier2_status: None,
             bash: None,
             suspended_domains: Vec::new(),
@@ -490,6 +502,10 @@ impl RootHealthSummary {
             && self
                 .callgraph_store_status
                 .is_some_and(component_is_satisfied)
+            && self
+                .views
+                .as_ref()
+                .is_none_or(|view| view.pinned && view.pending_paths == 0 && view.failed_paths == 0)
             && self.tier2_status.is_some_and(component_is_satisfied)
     }
 
@@ -529,6 +545,7 @@ impl RootHealthSummary {
             callgraph_repair_entries_60s: None,
             callgraph_commits_60s,
             callgraph_pages_or_bytes_written_60s,
+            views: self.views,
             tier2: self
                 .tier2_status
                 .map(|status| Tier2HealthSnapshot { status }),
@@ -550,6 +567,7 @@ impl RootHealthSnapshot {
             callgraph_repair_entries_60s: None,
             callgraph_commits_60s: None,
             callgraph_pages_or_bytes_written_60s: None,
+            views: None,
             tier2: None,
             bash: None,
             suspended_domains: Vec::new(),
@@ -575,6 +593,10 @@ impl RootHealthSnapshot {
                 .callgraph_store
                 .as_ref()
                 .is_some_and(component_is_satisfied)
+            && self
+                .views
+                .as_ref()
+                .is_none_or(|view| view.pinned && view.pending_paths == 0 && view.failed_paths == 0)
             && self.tier2.as_ref().is_some_and(tier2_is_satisfied)
     }
 }
@@ -765,7 +787,6 @@ pub(crate) struct ViewRuntimeSnapshot {
     pub(crate) view_dir: PathBuf,
     pub(crate) generation: Option<String>,
     pub(crate) manifest: Option<Manifest>,
-    pub(crate) desired_head: String,
     pub(crate) pending_paths: BTreeSet<Vec<u8>>,
 }
 
@@ -2616,6 +2637,11 @@ impl AppContext {
             search_index_status: Some(search_index_status),
             semantic_index: Some(semantic_index),
             callgraph_store_status: Some(callgraph_store_status),
+            views: if config.views.enabled {
+                self.view_health_snapshot()
+            } else {
+                None
+            },
             tier2_status: Some(tier2_status),
             bash: Some(bash),
             suspended_domains,
@@ -4098,6 +4124,36 @@ impl AppContext {
             .unwrap_or_else(|error| error.into_inner()) = None;
     }
 
+    pub(crate) fn view_health_snapshot(&self) -> Option<ViewHealthSnapshot> {
+        if !self.config().views.enabled {
+            return None;
+        }
+        let state = self
+            .view_runtime
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let state = state.as_ref()?;
+        let status = crate::path_status::PathStatusStore::open(&state.snapshot.view_dir)
+            .ok()
+            .and_then(|store| store.summary().ok());
+        Some(ViewHealthSnapshot {
+            generation: state
+                .snapshot
+                .generation
+                .as_deref()
+                .and_then(|generation| generation.split('-').next())
+                .and_then(|generation| generation.parse().ok())
+                .unwrap_or(0),
+            pinned: state.pin.is_some(),
+            pending_paths: status
+                .as_ref()
+                .map_or(state.snapshot.pending_paths.len(), |status| {
+                    status.pending_count
+                }),
+            failed_paths: status.as_ref().map_or(0, |status| status.failed_count),
+        })
+    }
+
     pub(crate) fn view_runtime_snapshot(&self) -> Option<ViewRuntimeSnapshot> {
         self.view_runtime
             .read()
@@ -4184,7 +4240,6 @@ impl AppContext {
             ViewRuntimeSnapshot {
                 generation,
                 manifest,
-                desired_head,
                 pending_paths: report.pending_paths.clone(),
                 ..snapshot
             },

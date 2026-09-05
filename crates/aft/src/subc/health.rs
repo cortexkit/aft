@@ -2575,6 +2575,7 @@ fn unhosted_standing_health_snapshot(entry: &StandingHealthEntry) -> RootHealthS
         callgraph_repair_entries_60s: None,
         callgraph_commits_60s: None,
         callgraph_pages_or_bytes_written_60s: None,
+        views: None,
         tier2: None,
         bash: None,
         suspended_domains: Vec::new(),

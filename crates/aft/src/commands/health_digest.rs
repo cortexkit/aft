@@ -51,6 +51,7 @@ pub struct DigestCurrentValues {
     pub complexity_over_threshold: Option<TicketedCurrent<u64>>,
     pub todos: Option<TicketedCurrent<u64>>,
     pub watcher_events: Option<TicketedCurrent<u64>>,
+    pub views: Option<TicketedCurrent<crate::context::ViewHealthSnapshot>>,
 }
 
 /// Render only independently verified current values. The caller owns source
@@ -76,6 +77,7 @@ pub fn render_current_values(values: &DigestCurrentValues) -> Value {
         "watcher_events",
         values.watcher_events.as_ref(),
     );
+    insert_ticketed(&mut fields, "views", values.views.as_ref());
     Value::Object(fields)
 }
 
@@ -99,7 +101,7 @@ fn insert_ticketed<T: Serialize>(
 /// Handle the management operation without starting analyzers, waiting for
 /// quiescence, or constructing inspection work. Existing caches do not expose
 /// the required freshness tickets yet, so every category is omitted here.
-pub fn handle_health_digest(req: &RawRequest, _ctx: &AppContext) -> Response {
+pub fn handle_health_digest(req: &RawRequest, ctx: &AppContext) -> Response {
     // `project_root` is the management-wire spelling; `root` remains accepted
     // for the standalone handler's original contract.
     let _conceptual_inputs = (
@@ -109,9 +111,28 @@ pub fn handle_health_digest(req: &RawRequest, _ctx: &AppContext) -> Response {
         req.params.get("since"),
     );
 
+    let views = ctx.view_health_snapshot().and_then(|value| {
+        (value.generation > 0).then(|| {
+            let identity = ctx
+                .view_runtime_snapshot()
+                .map(|view| view.scope)
+                .unwrap_or_default();
+            let generation = value.generation;
+            TicketedCurrent::new(
+                value,
+                FreshnessTicket::ArtifactGeneration {
+                    identity,
+                    generation,
+                },
+            )
+        })
+    });
     Response::success(
         &req.id,
-        render_current_values(&DigestCurrentValues::default()),
+        render_current_values(&DigestCurrentValues {
+            views,
+            ..DigestCurrentValues::default()
+        }),
     )
 }
 

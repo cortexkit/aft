@@ -7515,7 +7515,6 @@ mod tests {
             view_dir: storage.path().join("views/semantic-reader-view"),
             generation: Some("1-head".to_string()),
             manifest: Some(manifest),
-            desired_head: "head".to_string(),
             pending_paths: Default::default(),
         };
 

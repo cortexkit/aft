@@ -352,7 +352,7 @@ impl AppContext {
                 serde_json::json!(callgraph_write_metrics.pages_or_bytes_written_60s);
         }
 
-        serde_json::json!({
+        let mut payload = serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "project_root": config.project_root.as_ref().map(|p| p.display().to_string()),
             "canonical_root": self.canonical_cache_root_opt().map(|p| p.display().to_string()),
@@ -396,7 +396,12 @@ impl AppContext {
                 "tracked_files": session_tracked_files,
                 "checkpoints": session_checkpoints,
             },
-        })
+        });
+        if config.views.enabled {
+            payload["views"] = serde_json::to_value(self.view_health_snapshot())
+                .unwrap_or(serde_json::Value::Null);
+        }
+        payload
     }
 
     fn compression_stats_for_session(&self, session_id: &str) -> CompressionStats {

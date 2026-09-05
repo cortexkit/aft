@@ -6,12 +6,12 @@ use std::sync::{mpsc, Arc, Mutex};
 #[cfg(test)]
 use std::sync::{Condvar, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::unbounded;
 use notify::{RecursiveMode, Watcher};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::cache_freshness::{self, VerifyArtifact, VerifyStrategy, WarmVerifyPlan};
 use crate::config::{Config, SemanticBackendConfig};
@@ -4478,8 +4478,8 @@ enum ConfigureMaintenanceStage {
     BashRuntime,
     ProjectRuntime,
     Watcher,
-    StorageSweeps,
     ViewLoad,
+    StorageSweeps,
     ProcessFlags,
     Callgraph,
     SemanticRelease,
@@ -4673,6 +4673,64 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
     while drain_deferred_configure_maintenance_unit(ctx, &mut state) {}
 }
 
+fn run_configure_view_sweep(ctx: &AppContext) {
+    let Some(view) = ctx.view_runtime_snapshot() else {
+        return;
+    };
+    let Some(manifest) = view.manifest.as_ref() else {
+        return;
+    };
+    let mut retained_keys = BTreeSet::new();
+    for (_, entry) in manifest.entries() {
+        let mut retain = |value: &str| {
+            if value.len() != 64 {
+                return;
+            }
+            let bytes = (0..value.len())
+                .step_by(2)
+                .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+                .collect::<Option<Vec<_>>>();
+            if let Some(bytes) = bytes.and_then(|bytes| bytes.try_into().ok()) {
+                retained_keys.insert(bytes);
+            }
+        };
+        match entry {
+            crate::views::ManifestEntry::Regular { planes, .. } => {
+                if let Some(key) = planes.semantic.as_deref() {
+                    retain(key);
+                }
+                if let Some(key) = planes.callgraph.as_deref() {
+                    retain(key);
+                }
+            }
+            crate::views::ManifestEntry::Synthetic { planes, .. } => retain(&planes.callgraph),
+            crate::views::ManifestEntry::Symlink { .. }
+            | crate::views::ManifestEntry::Gitlink { .. } => {}
+        }
+    }
+    let mut generation_keys = BTreeMap::new();
+    if let Some(generation) = view.generation.clone() {
+        generation_keys.insert(generation, retained_keys.clone());
+    }
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    if let Err(error) = crate::gc::sweep(crate::gc::SweepRequest {
+        storage: &view.storage,
+        family: &view.family,
+        view_dir: &view.view_dir,
+        byte_budget: 2 * 1024 * 1024 * 1024,
+        now_ms,
+        references: crate::gc::SweepReferences {
+            retained_keys,
+            generation_keys,
+        },
+    }) {
+        slog_warn!("content-addressed view sweep failed: {}", error);
+    }
+}
+
 fn run_configure_maintenance_unit(
     ctx: &AppContext,
     continuation: &mut ConfigureMaintenanceContinuation,
@@ -4820,14 +4878,6 @@ fn run_configure_maintenance_unit(
                     return ConfigureMaintenanceUnitResult::Complete;
                 }
             }
-            continuation.stage = ConfigureMaintenanceStage::StorageSweeps;
-        }
-        ConfigureMaintenanceStage::StorageSweeps => {
-            if detach_storage_sweeps {
-                spawn_configure_storage_sweeps(&job.storage_root, job.harness.clone());
-            } else {
-                run_configure_storage_sweeps(&job.storage_root, job.harness.clone());
-            }
             continuation.stage = ConfigureMaintenanceStage::ViewLoad;
         }
         ConfigureMaintenanceStage::ViewLoad => {
@@ -4850,6 +4900,15 @@ fn run_configure_maintenance_unit(
             } else {
                 ctx.clear_view_runtime();
             }
+            continuation.stage = ConfigureMaintenanceStage::StorageSweeps;
+        }
+        ConfigureMaintenanceStage::StorageSweeps => {
+            if detach_storage_sweeps {
+                spawn_configure_storage_sweeps(&job.storage_root, job.harness.clone());
+            } else {
+                run_configure_storage_sweeps(&job.storage_root, job.harness.clone());
+            }
+            run_configure_view_sweep(ctx);
             continuation.stage = ConfigureMaintenanceStage::ProcessFlags;
         }
         ConfigureMaintenanceStage::ProcessFlags => {
@@ -5062,7 +5121,6 @@ fn open_view_runtime_for_configure(
             view_dir: view.view_dir().to_path_buf(),
             generation,
             manifest,
-            desired_head,
             pending_paths,
         },
         pin,
@@ -5165,7 +5223,9 @@ mod tests {
                 < (ConfigureMaintenanceStage::StorageSweeps as u8)
         );
     }
+    use std::collections::BTreeSet;
     use std::ffi::OsString;
+    use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
@@ -5619,6 +5679,13 @@ mod tests {
         super::drain_deferred_configure_maintenance(&ctx);
         assert!(!storage.path().join("views").exists());
         assert!(ctx.view_runtime_snapshot().is_none());
+        assert!(ctx.build_status_snapshot().get("views").is_none());
+        assert!(
+            serde_json::to_value(ctx.try_health_snapshot(project.path()))
+                .unwrap()
+                .get("views")
+                .is_none()
+        );
     }
 
     #[test]
@@ -5679,6 +5746,18 @@ mod tests {
             .join("callgraph.sqlite")
             .is_file());
         assert!(storage.path().join("views").join(scope).is_dir());
+        let health = ctx.view_health_snapshot().expect("view health");
+        assert_eq!(health.generation, 1);
+        assert!(health.pinned);
+        let digest_request: RawRequest = serde_json::from_value(json!({
+            "id": "digest-1",
+            "command": "health.digest"
+        }))
+        .unwrap();
+        let digest = crate::commands::health_digest::handle_health_digest(&digest_request, &ctx);
+        let digest = serde_json::to_value(digest).unwrap();
+        assert_eq!(digest["views"]["ticket"]["generation"], json!(1));
+
         match ctx.callgraph_store_for_ops() {
             CallgraphStoreAccess::Ready(store) => {
                 assert_eq!(store.reader_kind(), "view");
@@ -5691,6 +5770,30 @@ mod tests {
             }
             _ => panic!("expected view callgraph reader"),
         }
+
+        fs::write(project.path().join("next.rs"), "pub fn next() {}\n").unwrap();
+        assert!(Command::new("git")
+            .args(["add", "next.rs"])
+            .current_dir(project.path())
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-m", "next"])
+            .current_dir(project.path())
+            .status()
+            .unwrap()
+            .success());
+        ctx.publish_view_paths(BTreeSet::from([b"next.rs".to_vec()]), true)
+            .unwrap();
+        let digest_request: RawRequest = serde_json::from_value(json!({
+            "id": "digest-2",
+            "command": "health.digest"
+        }))
+        .unwrap();
+        let digest = crate::commands::health_digest::handle_health_digest(&digest_request, &ctx);
+        let digest = serde_json::to_value(digest).unwrap();
+        assert_eq!(digest["views"]["ticket"]["generation"], json!(2));
     }
 
     #[test]
