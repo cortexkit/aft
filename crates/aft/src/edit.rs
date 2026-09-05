@@ -316,6 +316,26 @@ pub fn auto_backup(
 
 /// Persist a regular-file capture that was already freshness-checked while
 /// creating the operation's rollback checkpoint.
+/// Attach the stable reason when an automatic snapshot for this mutation was skipped.
+pub fn attach_backup_skipped_reason(
+    result: &mut serde_json::Value,
+    ctx: &AppContext,
+    session: &str,
+    op_id: &str,
+    path: Option<&Path>,
+) {
+    let reason = ctx
+        .backup()
+        .lock()
+        .skipped_reason_for_operation(session, op_id, path);
+    if let (Some(object), Some(reason)) = (result.as_object_mut(), reason) {
+        object.insert(
+            "backup_skipped_reason".to_string(),
+            serde_json::Value::String(reason.as_str().to_string()),
+        );
+    }
+}
+
 pub(crate) fn auto_backup_from_capture(
     ctx: &AppContext,
     session: &str,

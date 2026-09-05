@@ -908,8 +908,22 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "outline" => aft::commands::outline::handle_outline(&req, ctx),
         "zoom" => aft::commands::zoom::handle_zoom(&req, ctx),
         "read" => aft::commands::read::handle_read(&req, ctx),
-        "undo" | "undo_preview" | "edit_history" | "checkpoint" | "checkpoint_paths"
-        | "restore_checkpoint" | "list_checkpoints"
+        "undo" | "undo_preview"
+            if ctx.config().backup.enabled == Some(false)
+                && ctx
+                    .backup()
+                    .lock()
+                    .latest_skipped_reason_for_undo(req.session(), None)
+                    .is_none() =>
+        {
+            Response::error(
+                &req.id,
+                "backups_disabled",
+                "Backup tools are disabled by configuration.",
+            )
+        }
+        "edit_history" | "checkpoint" | "checkpoint_paths" | "restore_checkpoint"
+        | "list_checkpoints"
             if ctx.config().backup.enabled == Some(false) =>
         {
             Response::error(

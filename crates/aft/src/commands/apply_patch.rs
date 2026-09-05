@@ -1015,18 +1015,17 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
         format!("Applied {} of {} hunks", applied.len(), resolved.len())
     };
 
-    Response::success(
-        &req.id,
-        json!({
-            "output": output,
-            "title": title,
-            "complete": complete,
-            "partial": !complete,
-            "all_failed": false,
-            "failures": failures,
-            "metadata": { "diff": diff, "files": files },
-        }),
-    )
+    let mut result = json!({
+        "output": output,
+        "title": title,
+        "complete": complete,
+        "partial": !complete,
+        "all_failed": false,
+        "failures": failures,
+        "metadata": { "diff": diff, "files": files },
+    });
+    edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), &op_id, None);
+    Response::success(&req.id, result)
 }
 
 #[cfg(test)]

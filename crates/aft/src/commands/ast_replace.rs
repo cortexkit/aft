@@ -429,6 +429,13 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
                             serde_json::Value::String(backup_id),
                         );
                     }
+                    crate::edit::attach_backup_skipped_reason(
+                        &mut entry,
+                        ctx,
+                        req.session(),
+                        &op_id,
+                        Some(validated_path.as_path()),
+                    );
                     file_results.push(entry);
                 }
                 Err(e) => {
@@ -482,6 +489,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
             payload["hint"] = serde_json::Value::String(hint);
         }
     }
+    crate::edit::attach_backup_skipped_reason(&mut payload, ctx, req.session(), &op_id, None);
 
     Response::success(&req.id, payload)
 }

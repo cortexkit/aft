@@ -276,7 +276,7 @@ pub fn format_response_with_context(
         return format_error(bare_name, data, ctx);
     }
 
-    match bare_name {
+    let mut text = match bare_name {
         "edit" => format_edit_response(data),
         "write" => format_write_response(data),
         "apply_patch" => format_apply_patch(data),
@@ -302,7 +302,19 @@ pub fn format_response_with_context(
         "import" => format_import(data, ctx),
         "safety" => format_safety(data, ctx),
         _ => unreachable!("core agent tools are exhaustive"),
+    };
+    if let Some(reason) = data.get("backup_skipped_reason").and_then(Value::as_str) {
+        let notice = format!(
+            "Undo is unavailable for this change because the backup snapshot was skipped ({reason})."
+        );
+        if text.is_empty() {
+            text = notice;
+        } else {
+            text.push_str("\n\n");
+            text.push_str(&notice);
+        }
     }
+    text
 }
 
 fn import_string_field(response: &serde_json::Map<String, Value>, key: &str) -> Option<String> {

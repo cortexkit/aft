@@ -172,6 +172,7 @@ pub fn handle_move_file(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(ref id) = backup_id {
         result["backup_id"] = serde_json::json!(id);
     }
+    edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), &op_id, None);
 
     Response::success(&req.id, result)
 }
