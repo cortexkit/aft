@@ -1,15 +1,16 @@
-// Every host process in this suite gets an isolated HOME and the XDG directories it uses.
-// Without that boundary, the OpenCode v2 client can discover and connect to the user's
-// running OpenCode service, migrate its live database, and write credentials to its logs.
-// The opt-in live-operator mode relaxes only the database modification-time check because
-// OpenCode launches this test and may update the same database while it runs. In CI, the
-// mode is unset, so the database's modification time and size must remain unchanged.
+// Every spawned host receives HOME and XDG directories under this suite's temp root.
+// Otherwise the V2 client can discover the operator's OpenCode service and modify its
+// database or logs. Normal runs hash those operator files before and after the matrix and
+// compare metadata around each invocation. AFT_LOAD_MATRIX_ALLOW_LIVE_OPERATOR is only for
+// local runs beside an active operator process; it permits database content and mtime
+// changes from that process while still requiring stable database size and unchanged logs.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { createReadStream, existsSync } from "node:fs";
 import { cp, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
 
@@ -46,6 +47,7 @@ type PathSnapshot = {
   exists: boolean;
   size?: number;
   mtimeMs?: number;
+  sha256?: string;
 };
 
 type HostIsolation = {
@@ -124,14 +126,35 @@ function moduleExportNames(source: string, fileName: string): string[] {
   return names.sort();
 }
 
-async function snapshotPath(path: string): Promise<PathSnapshot> {
+async function hashFile(hash: ReturnType<typeof createHash>, path: string): Promise<void> {
+  for await (const chunk of createReadStream(path)) hash.update(chunk);
+}
+
+async function snapshotPath(path: string, includeBytes = true): Promise<PathSnapshot> {
   try {
     const info = await stat(path);
+    let sha256: string | undefined;
+    if (includeBytes) {
+      const hash = createHash("sha256");
+      if (info.isDirectory()) {
+        const files = (await fixtureFiles(path)).sort();
+        for (const file of files) {
+          hash.update(relative(path, file));
+          hash.update("\0");
+          await hashFile(hash, file);
+          hash.update("\0");
+        }
+      } else {
+        await hashFile(hash, path);
+      }
+      sha256 = hash.digest("hex");
+    }
     return {
       path,
       exists: true,
       size: info.size,
       mtimeMs: info.mtimeMs,
+      ...(sha256 ? { sha256 } : {}),
     };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { path, exists: false };
@@ -139,17 +162,19 @@ async function snapshotPath(path: string): Promise<PathSnapshot> {
   }
 }
 
-async function snapshotOperatorState(): Promise<{ db: PathSnapshot; logs: PathSnapshot }> {
+async function snapshotOperatorState(
+  includeBytes = true,
+): Promise<{ db: PathSnapshot; logs: PathSnapshot }> {
   return {
-    db: await snapshotPath(operatorDb),
-    logs: await snapshotPath(operatorLogDir),
+    db: await snapshotPath(operatorDb, includeBytes),
+    logs: await snapshotPath(operatorLogDir, includeBytes),
   };
 }
 
 async function withOperatorCanary<T>(label: string, operation: () => T | Promise<T>): Promise<T> {
-  const before = await snapshotOperatorState();
+  const before = await snapshotOperatorState(false);
   const result = await operation();
-  const after = await snapshotOperatorState();
+  const after = await snapshotOperatorState(false);
   hostCanaries.push({ label, before, after });
   if (allowLiveOperatorWrites) {
     expect(after.db.size).toBe(before.db.size);
@@ -252,6 +277,15 @@ async function copyInstalledPlugin(hostRoot: string, label: string): Promise<str
   return destination;
 }
 
+async function writeAftConfig(
+  isolation: HostIsolation,
+  aftConfig: Record<string, unknown>,
+): Promise<void> {
+  const projectConfigDir = join(isolation.project, ".cortexkit");
+  await mkdir(projectConfigDir, { recursive: true });
+  await writeFile(join(projectConfigDir, "aft.jsonc"), `${JSON.stringify(aftConfig, null, 2)}\n`);
+}
+
 async function writeV1Configs(
   isolation: HostIsolation,
   pluginRoots: string[],
@@ -264,9 +298,7 @@ async function writeV1Configs(
     join(configDir, tui ? "tui.json" : "opencode.json"),
     `${JSON.stringify({ plugin: pluginRoots.map((root) => pathToFileURL(root).href) }, null, 2)}\n`,
   );
-  const projectConfigDir = join(isolation.project, ".cortexkit");
-  await mkdir(projectConfigDir, { recursive: true });
-  await writeFile(join(projectConfigDir, "aft.jsonc"), `${JSON.stringify(aftConfig, null, 2)}\n`);
+  await writeAftConfig(isolation, aftConfig);
 }
 
 function v1Binary(hostRoot: string): string {
@@ -357,7 +389,14 @@ ${
     ? `const loaded = await Effect.runPromise(program);
 if (loaded.pending) throw new Error("host loader returned pending");
 const entrypoints = Host.resolve(installed);
-await Effect.runPromise(Effect.scoped(loaded.effect({})));
+const directory = process.argv[3];
+const context = {
+  location: {
+    directory,
+    project: { id: "load-matrix", directory, canonical: directory },
+  },
+};
+await Effect.runPromise(Effect.scoped(loaded.effect(context)));
 console.log("[load-matrix-host:v2] resolvedEntry=" + entrypoints.server + " selected=effect");`
     : `try {
   await Effect.runPromise(program);
@@ -386,7 +425,7 @@ beforeAll(async () => {
   await mkdir(dirname(packedRoot), { recursive: true });
   run("tar", ["-xzf", tarball, "-C", dirname(packedRoot)], tempRoot);
   await ensureHostInstalls();
-  operatorBefore = await snapshotOperatorState();
+  operatorBefore = await snapshotOperatorState(!allowLiveOperatorWrites);
 }, 300_000);
 
 afterAll(async () => {
@@ -423,6 +462,17 @@ describe("packed module shapes", () => {
     expect(Object.keys(manifest.exports).sort()).toEqual([".", "./server", "./tui"]);
     expect(manifest.dependencies.effect).toBe("4.0.0-rc.112");
     expect(manifest.peerDependencies["@opencode-ai/plugin"]).toBe(">=0.0.0-beta-0");
+  });
+
+  test("operator canary detects same-size byte changes", async () => {
+    const canary = join(tempRoot, "canary-proof.txt");
+    await writeFile(canary, "before");
+    const before = await snapshotPath(canary);
+    await writeFile(canary, "after!");
+    const after = await snapshotPath(canary);
+
+    expect(before.size).toBe(after.size);
+    expect(before.sha256).not.toBe(after.sha256);
   });
 
   test("modern V1 version is sourced only from the repository pin", async () => {
@@ -541,6 +591,7 @@ export default {
       const packageRoot = await copyInstalledPlugin(v2, `v2-${runtime}`);
       const isolation = await makeIsolation(`v2-${runtime}`);
       const marker = join(isolation.root, "entry.log");
+      await writeAftConfig(isolation, { enabled: false });
       const manifestPath = join(packageRoot, "package.json");
       const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
       manifest.exports["./server"].import = "./load-matrix-server.mjs";
@@ -561,7 +612,7 @@ export default { id: original.id, effect, setup };
       );
       const probe = await writeV2CoreProbe(v2, "load");
       const result = await withOperatorCanary(`v2-${runtime}`, () =>
-        run(runtime, [probe, packageRoot], v2, {
+        run(runtime, [probe, packageRoot, isolation.project], v2, {
           env: { ...isolation.env, AFT_LOAD_MATRIX_MARKER: marker },
         }),
       );
@@ -700,7 +751,7 @@ export default entry;
   }, 120_000);
 
   test("operator OpenCode database and logs are unchanged during every host invocation", async () => {
-    const operatorAfter = await snapshotOperatorState();
+    const operatorAfter = await snapshotOperatorState(!allowLiveOperatorWrites);
     if (allowLiveOperatorWrites) {
       expect(operatorAfter.db.size).toBe(operatorBefore.db.size);
       expect(operatorAfter.logs).toEqual(operatorBefore.logs);
@@ -725,5 +776,5 @@ export default entry;
         expect(canary.after).toEqual(canary.before);
       }
     }
-  });
+  }, 300_000);
 });
