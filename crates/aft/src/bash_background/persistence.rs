@@ -951,7 +951,26 @@ pub fn uninitialized_layout_is_recent(
     task_id: &str,
     grace: std::time::Duration,
 ) -> io::Result<bool> {
-    let task = resolve_uninitialized_task_layout(session_dir, task_id)?;
+    // A spawn creates the task directory a few syscalls before `control/` and
+    // the metadata exist, and the persisted-task GC runs concurrently with
+    // spawns (in this process since it left the replay thread, and always from
+    // sibling processes sharing the storage root). Mid-creation, the layout
+    // resolver finds nothing to resolve; the directory's own mtime still says
+    // how young it is, and a young directory must be skipped, not quarantined.
+    let task = match resolve_uninitialized_task_layout(session_dir, task_id) {
+        Ok(task) => task,
+        Err(_) => {
+            // The directory's age is an answer either way: young means a spawn
+            // in progress, old means an abandoned layout that may be reclaimed.
+            // Only a failing metadata probe (the directory is already gone)
+            // propagates as an error.
+            let modified = session_dir.join(task_id).metadata()?.modified()?;
+            let age = SystemTime::now()
+                .duration_since(modified)
+                .unwrap_or_default();
+            return Ok(age < grace);
+        }
+    };
     let modified = match task.paths.layout {
         TaskLayout::Directory => task.dirs.control.modified()?,
         TaskLayout::Flat => task

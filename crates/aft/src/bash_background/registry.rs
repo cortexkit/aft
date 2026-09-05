@@ -2875,6 +2875,10 @@ impl BgTaskRegistry {
                 for task_id in task_ids {
                     let resolved = match resolve_task_layout(&session_dir, &task_id) {
                         Ok(task) => task,
+                        // Uncertainty never quarantines: if the age probe itself
+                        // fails (the directory vanished or is mid-creation), skip
+                        // this pass; a genuinely abandoned layout is still there
+                        // for the next one.
                         Err(error)
                             if error.kind() == std::io::ErrorKind::NotFound
                                 && uninitialized_layout_is_recent(
@@ -2882,7 +2886,7 @@ impl BgTaskRegistry {
                                     &task_id,
                                     Duration::from_secs(5 * 60),
                                 )
-                                .unwrap_or(false) =>
+                                .unwrap_or(true) =>
                         {
                             continue;
                         }
@@ -8344,6 +8348,42 @@ mod tests {
             .insert_rehydrated_task(metadata, paths.clone(), true, None)
             .unwrap();
         paths
+    }
+
+    /// The window a concurrent spawn leaves open: the task directory exists but
+    /// neither `control/` nor the metadata do yet. GC must leave it alone; an
+    /// identical directory older than the grace is still quarantined, so the
+    /// skip is age-bound rather than a blanket exemption.
+    #[test]
+    fn gc_skips_a_task_directory_still_being_created_but_quarantines_an_abandoned_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let registry = BgTaskRegistry::default();
+        let session_dir = session_tasks_dir(storage, "session");
+        let young = session_dir.join("bash-0000000000000301");
+        let abandoned = session_dir.join("bash-0000000000000302");
+        fs::create_dir_all(&young).unwrap();
+        fs::create_dir_all(&abandoned).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(6 * 60);
+        filetime::set_file_mtime(&abandoned, filetime::FileTime::from_system_time(old)).unwrap();
+
+        registry.maybe_gc_persisted(storage).unwrap();
+
+        assert!(
+            young.is_dir(),
+            "a task directory younger than the grace was quarantined mid-creation"
+        );
+        assert!(
+            !abandoned.is_dir(),
+            "an empty task directory older than the grace must still be quarantined"
+        );
+        let quarantined = fs::read_dir(storage.join("bash-tasks-quarantine"))
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(
+            quarantined, 1,
+            "exactly the abandoned layout is quarantined"
+        );
     }
 
     #[cfg(unix)]
