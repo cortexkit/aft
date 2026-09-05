@@ -1,4 +1,3 @@
-import { createRequire } from "node:module";
 import {
   createAftTransportPool,
   ensureBinary,
@@ -66,6 +65,7 @@ import {
   sendFeatureAnnouncement,
   sendWarning,
 } from "./notifications.js";
+import { resolvePluginVersion } from "./plugin-version.js";
 import { maybeAppendConflictsHint } from "./shared/bash-hints.js";
 import { sendIgnoredMessage } from "./shared/ignored-message.js";
 import {
@@ -180,15 +180,8 @@ function throwSentinel(command: string): never {
 // sendIgnoredMessage moved to ./shared/ignored-message.ts so tools/permissions.ts
 // can call it too (index.ts must export only the plugin default).
 
-/** Read the plugin's own version from package.json at build time. */
-const PLUGIN_VERSION: string = (() => {
-  try {
-    const req = createRequire(import.meta.url);
-    return (req("../package.json") as { version: string }).version;
-  } catch {
-    return "0.0.0";
-  }
-})();
+/** The plugin's own version, resolved from whichever entry bundle this runs in. */
+const PLUGIN_VERSION: string = resolvePluginVersion(import.meta.url);
 
 /**
  * Release-notes identifier for the startup announcement dialog.
