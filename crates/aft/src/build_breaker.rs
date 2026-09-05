@@ -24,8 +24,13 @@ pub const BREAKER_CONFIGURATION_VERSION: &str = "v1";
 
 static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 
+// Thread-local, not process-global: libtest runs sibling tests in parallel and
+// they open breakers of their own, so a shared counter cannot support the exact
+// open-count assertions the health rollup test makes about its own thread.
 #[cfg(test)]
-static OPEN_CALLS_FOR_TEST: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static OPEN_CALLS_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 #[cfg(test)]
 static FAIL_NEXT_ACTIVE_SUSPENSIONS_FOR_TEST: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -158,7 +163,7 @@ pub struct BuildDeathBreaker {
 impl BuildDeathBreaker {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         #[cfg(test)]
-        OPEN_CALLS_FOR_TEST.fetch_add(1, Ordering::Relaxed);
+        OPEN_CALLS_FOR_TEST.with(|calls| calls.set(calls.get() + 1));
         let path = path.into();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
@@ -447,12 +452,12 @@ impl BuildDeathBreaker {
 
     #[cfg(test)]
     pub(crate) fn reset_open_calls_for_test() {
-        OPEN_CALLS_FOR_TEST.store(0, Ordering::SeqCst);
+        OPEN_CALLS_FOR_TEST.with(|calls| calls.set(0));
     }
 
     #[cfg(test)]
     pub(crate) fn open_calls_for_test() -> u64 {
-        OPEN_CALLS_FOR_TEST.load(Ordering::SeqCst)
+        OPEN_CALLS_FOR_TEST.with(|calls| calls.get())
     }
 
     #[cfg(test)]

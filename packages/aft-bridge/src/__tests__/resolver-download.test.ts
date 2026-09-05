@@ -33,6 +33,9 @@ describe("findBinary async download", () => {
     // Empty the cache + PATH + HOME so every sync resolution path misses
     // naturally, forcing the async download fallback to run.
     releaseEnv = await acquireEnv({
+      // CI exports the freshly built binary here for the e2e suites; it is the
+      // first resolution step and would satisfy findBinary before any fallback.
+      AFT_BINARY_PATH: undefined,
       AFT_CACHE_DIR: cacheDir,
       PATH: "",
       HOME: cacheDir,

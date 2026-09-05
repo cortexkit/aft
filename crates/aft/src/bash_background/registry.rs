@@ -6196,6 +6196,12 @@ mod tests {
     #[cfg(windows)]
     const QUICK_SUCCESS_COMMAND: &str = "cmd /c exit 0";
 
+    /// Upper bound for "a trivial child terminates". This asserts liveness, not
+    /// speed: under a parallel libtest run on a contended Windows CI runner a
+    /// `cmd /c exit 0` spawn has taken longer than the 5s these tests once
+    /// allowed, and the scheduler's delay is not the product's.
+    const CHILD_EXIT_LIVENESS_BOUND: Duration = Duration::from_secs(30);
+
     #[cfg(unix)]
     const LONG_RUNNING_COMMAND: &str = "sleep 5";
 
@@ -7235,8 +7241,8 @@ mod tests {
             match child.try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) => {
-                    if started.elapsed() > Duration::from_secs(5) {
-                        panic!("dead-child stand-in did not exit within 5s");
+                    if started.elapsed() > CHILD_EXIT_LIVENESS_BOUND {
+                        panic!("dead-child stand-in did not exit within the liveness bound");
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -7335,7 +7341,7 @@ mod tests {
         assert!(is_process_alive(pid));
 
         assert_eq!(registry.kill_running_tasks_for_root(root.path()), 1);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + CHILD_EXIT_LIVENESS_BOUND;
         while is_process_alive(pid) {
             assert!(
                 Instant::now() < deadline,
@@ -7663,7 +7669,7 @@ mod tests {
                 break;
             }
             assert!(
-                started.elapsed() < Duration::from_secs(5),
+                started.elapsed() < CHILD_EXIT_LIVENESS_BOUND,
                 "child should exit quickly"
             );
             std::thread::sleep(Duration::from_millis(20));
@@ -7837,7 +7843,7 @@ mod tests {
                 break;
             }
             assert!(
-                started.elapsed() < Duration::from_secs(5),
+                started.elapsed() < CHILD_EXIT_LIVENESS_BOUND,
                 "child should exit and write marker quickly"
             );
             std::thread::sleep(Duration::from_millis(20));
@@ -7942,8 +7948,8 @@ mod tests {
         let started = Instant::now();
         while !is_zombie(pid) {
             assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "stand-in child should become a zombie within 5s"
+                started.elapsed() < CHILD_EXIT_LIVENESS_BOUND,
+                "stand-in child should become a zombie within the liveness bound"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -7997,7 +8003,7 @@ mod tests {
         let started = Instant::now();
         while !task.paths.exit.exists() {
             assert!(
-                started.elapsed() < Duration::from_secs(5),
+                started.elapsed() < CHILD_EXIT_LIVENESS_BOUND,
                 "exit marker should land quickly for `true`"
             );
             std::thread::sleep(Duration::from_millis(20));
@@ -8090,7 +8096,7 @@ mod tests {
         let started = Instant::now();
         while !task.paths.exit.exists() {
             assert!(
-                started.elapsed() < Duration::from_secs(5),
+                started.elapsed() < CHILD_EXIT_LIVENESS_BOUND,
                 "exit marker should land quickly for `true`"
             );
             std::thread::sleep(Duration::from_millis(20));
