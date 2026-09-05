@@ -272,6 +272,11 @@ export function toolEnabled(config: AftConfig, toolName: string): boolean {
   return !(config.disabled_tools ?? []).includes(toolName);
 }
 
+export interface ViewsConfig {
+  /** Enable content-addressed index views. Default: false. */
+  enabled?: boolean;
+}
+
 export interface AftConfig {
   /**
    * Optional JSON Schema URL for editor tooling. Runtime no-op — only present
@@ -300,6 +305,8 @@ export interface AftConfig {
   /** User-tier standing roots; project config cannot configure this machine state. */
   index?: IndexConfig;
   semantic_search?: boolean;
+  /** Content-addressed index views. Disabled by default. */
+  views?: ViewsConfig;
   callgraph_store?: boolean;
   /** Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build. Default: 100. */
   callgraph_chunk_size?: number;
@@ -765,6 +772,11 @@ const IdleConfigSchema = z.object({
     .transform((value) => (value === undefined ? undefined : clampIdleLspTtlMinutes(value))),
 });
 
+const ViewsConfigSchema = z.object({
+  /** Enable content-addressed index views. Default: false. */
+  enabled: z.boolean().optional(),
+});
+
 const WorktreeConfigSchema = z.object({
   /**
    * When true, a linked worktree applies local file-watcher events to the
@@ -817,6 +829,7 @@ const AftConfigFieldsSchema = z.object({
   /** User-configured filesystem roots for indexed search; project config cannot change them. */
   index: IndexConfigSchema.optional(),
   semantic_search: z.boolean().optional(),
+  views: ViewsConfigSchema.optional(),
   callgraph_store: z.boolean().optional(),
   callgraph_chunk_size: z.number().optional(),
   inspect: InspectConfigSchema.optional(),
@@ -951,6 +964,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.search_index !== undefined) overrides.search_index = config.search_index;
   if (config.index !== undefined) overrides.index = config.index;
   if (config.semantic_search !== undefined) overrides.semantic_search = config.semantic_search;
+  if (config.views !== undefined) overrides.views = config.views;
   if (config.callgraph_store !== undefined) overrides.callgraph_store = config.callgraph_store;
   if (config.callgraph_chunk_size !== undefined)
     overrides.callgraph_chunk_size = config.callgraph_chunk_size;
@@ -1555,6 +1569,7 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // and toggle per-project (or vice versa). Project value overrides user value.
   "search_index",
   "semantic_search",
+  "views",
   "callgraph_store",
   "callgraph_chunk_size",
   "inspect",

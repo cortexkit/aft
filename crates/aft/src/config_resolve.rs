@@ -115,6 +115,7 @@ pub struct RawAftConfig {
     pub search_index: Option<bool>,
     pub index: Option<RawIndex>,
     pub semantic_search: Option<bool>,
+    pub views: Option<RawViews>,
     pub callgraph_store: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_usize")]
     pub callgraph_chunk_size: Option<usize>,
@@ -492,6 +493,12 @@ pub struct RawSubc {
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct RawViews {
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct RawWorktree {
     pub ram_overlay: Option<bool>,
 }
@@ -836,6 +843,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.semantic_search.is_some() {
         base.semantic_search = override_config.semantic_search;
     }
+    if override_config.views.is_some() {
+        base.views = override_config.views;
+    }
     if override_config.callgraph_store.is_some() {
         base.callgraph_store = override_config.callgraph_store;
     }
@@ -920,6 +930,9 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     }
     if project.semantic_search.is_some() {
         base.semantic_search = project.semantic_search;
+    }
+    if project.views.is_some() {
+        base.views = project.views;
     }
     if project.callgraph_store.is_some() {
         base.callgraph_store = project.callgraph_store;
@@ -1421,6 +1434,9 @@ fn apply_resolved_config(
     }
     if let Some(value) = raw.semantic_search {
         config.semantic_search = value;
+    }
+    if let Some(value) = raw.views.as_ref().and_then(|views| views.enabled) {
+        config.views.enabled = value;
     }
     if let Some(value) = raw.callgraph_store {
         config.callgraph_store = value;

@@ -126,6 +126,18 @@
       "default": false,
       "description": "Enable semantic search via aft_search. Backend defaults to local fastembed; configurable via the `semantic` field."
     },
+    "views": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable content-addressed index views. Default: false."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Content-addressed index view assembly. Disabled by default."
+    },
     "callgraph_store": {
       "type": "boolean",
       "default": true,

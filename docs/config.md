@@ -180,6 +180,13 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
   // Default: false
   "semantic_search": false,
 
+  // Content-addressed index views. When enabled, semantic and callgraph artifacts
+  // are assembled from reusable per-file blobs behind an atomic manifest.
+  // User and project tiers may both set this. Default: false.
+  "views": {
+    "enabled": false
+  },
+
   // When project_root is exactly $HOME, search_index, semantic_search, and callgraph_store
   // are force-disabled because the home directory is not treated as a project root.
 

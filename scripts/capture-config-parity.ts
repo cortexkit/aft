@@ -176,6 +176,11 @@ const CASES: ParityCase[] = [
     project: { search_index: true, format_on_edit: false },
   },
   {
+    name: "views_enabled_project_override",
+    user: { views: { enabled: false } },
+    project: { views: { enabled: true } },
+  },
+  {
     name: "backup_project_larger_cap",
     user: { backup: {} },
     project: { backup: { max_file_size: 128 * 1024 * 1024 } },

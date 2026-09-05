@@ -1911,7 +1911,7 @@ fn configure_warm_key(
     workspace_manifests: Option<&str>,
 ) -> String {
     format!(
-        "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};callgraph={}:{};inspect={};manifests={}",
+        "root={:?};storage={:?};home={};worktree={};readonly={};search={}:{};semantic={}:{:?};views={};callgraph={}:{};inspect={};manifests={}",
         canonical_root,
         config.storage_dir,
         home_match,
@@ -1921,6 +1921,7 @@ fn configure_warm_key(
         config.search_index_max_file_size,
         config.semantic_search,
         config.semantic,
+        config.views.enabled,
         config.callgraph_store,
         config.callgraph_chunk_size,
         config.inspect.enabled,

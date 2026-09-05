@@ -367,6 +367,14 @@ pub fn normalize_git_co_author(value: &str) -> Option<String> {
     Some(value.to_string())
 }
 
+/// Content-addressed index view assembly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ViewsConfig {
+    /// Enable manifest-backed index views. Default false.
+    pub enabled: bool,
+}
+
 /// Linked-worktree behavior that never writes shared on-disk artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -474,6 +482,8 @@ pub struct Config {
     pub index: IndexConfig,
     /// Enable semantic search (default: false).
     pub semantic_search: bool,
+    /// Content-addressed index view assembly. Disabled by default.
+    pub views: ViewsConfig,
     /// Whether the plugin registered the `aft_search` tool for this surface
     /// (default: false). Forwarded by the plugin's resolved registration
     /// predicate (semantic on + not minimal + not disabled). Used only to pick
@@ -603,6 +613,7 @@ impl Default for Config {
             search_index: false,
             index: IndexConfig::default(),
             semantic_search: false,
+            views: ViewsConfig::default(),
             aft_search_registered: false,
             callgraph_store: true,
             callgraph_chunk_size: 100,
