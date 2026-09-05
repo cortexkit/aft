@@ -5877,15 +5877,24 @@ mod tests {
         }
 
         fs::write(project.path().join("next.rs"), "pub fn next() {}\n").unwrap();
-        assert!(Command::new("git")
+        assert!(git_command(project.path())
             .args(["add", "next.rs"])
-            .current_dir(project.path())
             .status()
             .unwrap()
             .success());
-        assert!(Command::new("git")
-            .args(["commit", "-m", "next"])
-            .current_dir(project.path())
+        // The hermetic git env has no identity of its own; a CI runner has none
+        // either, so the commit must carry it the way the fixture's first one does.
+        assert!(git_command(project.path())
+            .args([
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "next",
+            ])
             .status()
             .unwrap()
             .success());
