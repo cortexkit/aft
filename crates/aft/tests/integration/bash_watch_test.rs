@@ -375,6 +375,100 @@ fn watch_controlled_exit_emits_exit_safety_net_not_completion() {
 }
 
 #[test]
+fn watch_controlled_exit_drain_redelivers_dropped_safety_net_until_ack() {
+    let mut aft = AftProcess::spawn();
+    let dir = configure_background(&mut aft);
+    let release = dir.path().join("durable-exit-safety-release");
+    // Declare after the TempDir: Rust drops locals in reverse declaration order,
+    // so this guard writes the sentinel before the TempDir removes its directory.
+    let _release_guard = ReleaseOnDrop::new(release.clone());
+    let command = release_gate_command(&release, "durable-never-matches-output");
+    let task_id = spawn(&mut aft, &command);
+    let response = notify(&mut aft, &task_id, json!({ "pattern": "not-present" }));
+    assert_eq!(response["success"], true, "notify failed: {response:?}");
+    drop(_release_guard);
+
+    // Consume and intentionally discard the live push to model a disconnected plugin.
+    let live_frame = wait_for_pattern_frame(&mut aft, &task_id);
+    assert_eq!(live_frame["reason"], "task_exit");
+
+    let drained = aft.send(
+        &json!({
+            "id": "drain-durable-watch-exit",
+            "command": "bash_drain_completions"
+        })
+        .to_string(),
+    );
+    assert_eq!(drained["success"], true, "drain failed: {drained:?}");
+    assert!(
+        drained["bg_completions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|completion| completion["task_id"] != task_id),
+        "watch-controlled task also queued a normal completion: {drained:?}"
+    );
+    let pending_match = drained["pending_matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pending| pending["task_id"] == task_id)
+        .unwrap_or_else(|| panic!("drain lost durable task-exit safety net: {drained:?}"));
+    assert_eq!(pending_match["reason"], "task_exit");
+    assert_eq!(pending_match["context"], live_frame["context"]);
+
+    let ack = aft.send(
+        &json!({
+            "id": "ack-durable-watch-exit",
+            "command": "bash_ack_completions",
+            "params": { "task_ids": [&task_id] }
+        })
+        .to_string(),
+    );
+    assert_eq!(ack["success"], true, "task-exit ack failed: {ack:?}");
+    assert_eq!(ack["acked_task_ids"], json!([task_id]));
+
+    let drained_after_ack = aft.send(
+        &json!({
+            "id": "drain-after-task-exit-ack",
+            "command": "bash_drain_completions"
+        })
+        .to_string(),
+    );
+    assert!(drained_after_ack["pending_matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|pending| pending["task_id"] != task_id));
+    assert!(drained_after_ack["bg_completions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|completion| completion["task_id"] != task_id));
+
+    let conn = aft::db::open(&aft.cache_dir().join("aft").join("aft.db"))
+        .expect("open isolated test database");
+    let completion_delivered: i64 = conn
+        .query_row(
+            "SELECT completion_delivered FROM bash_tasks WHERE harness = 'opencode' AND task_id = ?1",
+            [&task_id],
+            |row| row.get(0),
+        )
+        .expect("acked task row remains available");
+    assert_eq!(completion_delivered, 1);
+    let remaining_watches: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM bash_pattern_watches WHERE harness = 'opencode' AND task_id = ?1",
+            [&task_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_watches, 0, "ack must remove durable exit row");
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn erased_watch_target_emits_tombstone_and_terminalizes_watch() {
     let mut aft = AftProcess::spawn();
     let dir = configure_background(&mut aft);

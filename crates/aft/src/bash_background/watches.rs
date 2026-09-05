@@ -14,6 +14,7 @@ const SCAN_OVERLAP_BYTES: usize = 8 * 1024;
 pub const WATCH_TARGET_ERASED_TEXT: &str = "watch target erased";
 pub const WATCH_TARGET_ERASED_CONTEXT: &str =
     "watch target erased: the background task row was erased before the watch reached a normal terminal result";
+pub const WATCH_TASK_EXIT_TEXT: &str = "watch task exited";
 
 #[derive(Debug, Clone)]
 pub struct WatchSpec {

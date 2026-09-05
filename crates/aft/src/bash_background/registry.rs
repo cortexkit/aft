@@ -55,7 +55,7 @@ use super::pty_process::spawn_pty_for_command;
 use super::pty_runtime::PtyRuntime;
 use super::watches::{
     PatternMatch, WatchPattern, WatchRegistry, WATCH_TARGET_ERASED_CONTEXT,
-    WATCH_TARGET_ERASED_TEXT,
+    WATCH_TARGET_ERASED_TEXT, WATCH_TASK_EXIT_TEXT,
 };
 use super::{BgTaskInfo, BgTaskStatus};
 use crate::db::bash_tasks::BashTaskRow;
@@ -954,6 +954,8 @@ impl BgTaskRegistry {
                         match_text,
                         context,
                     )
+                } else if match_text == WATCH_TASK_EXIT_TEXT {
+                    BashPatternMatchFrame::task_exit(row.task_id, session_id, match_text, context)
                 } else {
                     BashPatternMatchFrame::new(
                         row.task_id,
@@ -2425,15 +2427,12 @@ impl BgTaskRegistry {
                 return Ok(watch_id);
             }
 
-            let completion = if terminal_matches.is_empty() {
-                self.completion_snapshot_for_task(&task)
-            } else {
-                self.remove_pending_completion(&task_id)
-                    .or_else(|| self.completion_snapshot_for_task(&task))
-            };
+            let completion = self
+                .remove_pending_completion(&task_id)
+                .or_else(|| self.completion_snapshot_for_task(&task));
             if terminal_matches.is_empty() {
                 if let Some(completion) = completion.as_ref() {
-                    self.emit_bash_watch_exit(completion);
+                    self.record_bash_watch_exit(completion, true);
                 }
             } else {
                 for pattern_match in &terminal_matches {
@@ -3870,8 +3869,11 @@ impl BgTaskRegistry {
             self.delete_persisted_watches_for_task(&task.session_id, &task.task_id);
             return;
         }
-        if let Some(completion) = self.completion_snapshot_for_task(task) {
-            self.emit_bash_watch_exit(&completion);
+        if let Some(completion) = self
+            .remove_pending_completion(&task.task_id)
+            .or_else(|| self.completion_snapshot_for_task(task))
+        {
+            self.record_bash_watch_exit(&completion, true);
         }
         // Keep durable watches until bash_ack_completions confirms delivery.
         self.clear_task_watch_state(&task.task_id);
@@ -4236,19 +4238,10 @@ impl BgTaskRegistry {
         let (watch_controlled, watch_matched) = self.task_watch_state(&metadata.task_id);
         if watch_controlled {
             if !watch_matched && !metadata.completion_delivered {
-                if let Ok(mut completions) = self.inner.completions.lock() {
-                    if !completions
-                        .iter()
-                        .any(|existing| existing.task_id == metadata.task_id)
-                    {
-                        completions.push_back(completion.clone());
-                    }
-                }
-                if emit_frame {
-                    self.emit_bash_watch_exit(&completion);
-                }
+                self.record_bash_watch_exit(&completion, emit_frame);
             }
-            // Memory only — SQLite watch rows survive until ack, GC, or rearm settle.
+            // Clear only in-memory control state; the pending SQLite watch row
+            // survives until ack, GC, or re-arm settlement.
             self.clear_task_watch_state(&metadata.task_id);
             return;
         }
@@ -4426,15 +4419,25 @@ impl BgTaskRegistry {
             return;
         };
         if let Some(sender) = progress_sender.as_ref() {
-            sender(PushFrame::BashPatternMatch(BashPatternMatchFrame::new(
-                pattern_match.task_id,
-                session_id.to_string(),
-                pattern_match.watch_id,
-                pattern_match.match_text,
-                pattern_match.match_offset,
-                pattern_match.context,
-                pattern_match.once,
-            )));
+            let frame = if pattern_match.match_text == WATCH_TASK_EXIT_TEXT {
+                BashPatternMatchFrame::task_exit(
+                    pattern_match.task_id,
+                    session_id.to_string(),
+                    pattern_match.match_text,
+                    pattern_match.context,
+                )
+            } else {
+                BashPatternMatchFrame::new(
+                    pattern_match.task_id,
+                    session_id.to_string(),
+                    pattern_match.watch_id,
+                    pattern_match.match_text,
+                    pattern_match.match_offset,
+                    pattern_match.context,
+                    pattern_match.once,
+                )
+            };
+            sender(PushFrame::BashPatternMatch(frame));
         }
     }
 
@@ -4461,18 +4464,7 @@ impl BgTaskRegistry {
         ));
     }
 
-    fn emit_bash_watch_exit(&self, completion: &BgCompletion) {
-        let Ok(progress_sender) = self
-            .inner
-            .progress_sender
-            .lock()
-            .map(|sender| sender.clone())
-        else {
-            return;
-        };
-        let Some(sender) = progress_sender.as_ref() else {
-            return;
-        };
+    fn record_bash_watch_exit(&self, completion: &BgCompletion, emit_frame: bool) {
         let status = completion_status_text(&completion.status, completion.exit_code);
         let preview = completion.output_preview.trim_end();
         let context = if preview.is_empty() {
@@ -4484,14 +4476,68 @@ impl BgTaskRegistry {
                 completion.task_id
             )
         };
-        sender(PushFrame::BashPatternMatch(
-            BashPatternMatchFrame::task_exit(
-                completion.task_id.clone(),
-                completion.session_id.clone(),
-                format!("exited ({status})"),
-                context,
-            ),
-        ));
+        let frame = BashPatternMatchFrame::task_exit(
+            completion.task_id.clone(),
+            completion.session_id.clone(),
+            format!("exited ({status})"),
+            context,
+        );
+        self.persist_bash_watch_exit(&frame);
+        if emit_frame {
+            self.emit_bash_watch_exit(frame);
+        }
+    }
+
+    fn persist_bash_watch_exit(&self, frame: &BashPatternMatchFrame) {
+        let Some((harness, pool)) = self.db_harness_and_pool() else {
+            return;
+        };
+        let Ok(conn) = pool.lock() else {
+            return;
+        };
+        let Ok(mut rows) = crate::db::bash_watches::list_bash_pattern_watches_for_task(
+            &conn,
+            &harness,
+            &frame.session_id,
+            &frame.task_id,
+        ) else {
+            return;
+        };
+        let Some(mut row) = rows
+            .iter()
+            .position(|row| row.match_text.as_deref() == Some(WATCH_TASK_EXIT_TEXT))
+            .map(|index| rows.swap_remove(index))
+            .or_else(|| rows.into_iter().next())
+        else {
+            return;
+        };
+        row.scanning = false;
+        row.pending_match = true;
+        row.match_text = Some(WATCH_TASK_EXIT_TEXT.to_string());
+        row.match_offset = Some(0);
+        row.match_context = Some(frame.context.clone());
+        if let Err(error) = crate::db::bash_watches::upsert_bash_pattern_watch(&conn, &row) {
+            crate::slog_warn!(
+                "persist bash watch task-exit failed for {}/{}: {error}",
+                frame.task_id,
+                row.watch_id
+            );
+        }
+    }
+
+    fn emit_bash_watch_exit(&self, frame: BashPatternMatchFrame) {
+        let Ok(progress_sender) = self
+            .inner
+            .progress_sender
+            .lock()
+            .map(|sender| sender.clone())
+        else {
+            return;
+        };
+        let Some(sender) = progress_sender.as_ref() else {
+            return;
+        };
+        sender(PushFrame::BashPatternMatch(frame));
     }
 
     fn emit_bash_completed(&self, completion: BgCompletion) {
