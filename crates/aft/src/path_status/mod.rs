@@ -1,8 +1,8 @@
 //! Per-view status annotations for paths that could not join a complete generation.
 //!
-//! The table intentionally contains only non-complete paths. A missing row means
-//! the current complete generation supplies the path normally; callers keep that
-//! generation current while a row is pending or failed.
+//! The path table contains only pending or failed annotations. Removing an
+//! annotation means assembly no longer reports a problem for that path; manifest
+//! membership remains the authority for whether the path is in a generation.
 
 use std::error::Error;
 use std::fmt;
@@ -21,9 +21,14 @@ CREATE TABLE IF NOT EXISTS path_status (
     reason TEXT NOT NULL,
     since_generation INTEGER NOT NULL CHECK(since_generation >= 0)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS maintenance_outcomes (
+    operation TEXT NOT NULL PRIMARY KEY,
+    outcome TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation >= 0)
+) WITHOUT ROWID;
 "#;
 
-/// The only two ways a path can be absent from a newly assembled generation.
+/// The two path problem states exposed by view status.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PathState {
     Pending,
@@ -204,6 +209,35 @@ impl PathStatusStore {
     }
 
     /// Returns counts for both states and at most twenty bytewise-ordered paths.
+    pub fn record_maintenance_outcome(
+        &mut self,
+        operation: &str,
+        outcome: &str,
+        generation: u64,
+    ) -> Result<(), PathStatusError> {
+        self.connection.execute(
+            "INSERT INTO maintenance_outcomes(operation, outcome, generation)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(operation) DO NOTHING",
+            params![operation, outcome, generation],
+        )?;
+        Ok(())
+    }
+
+    pub fn maintenance_outcome(
+        &self,
+        operation: &str,
+    ) -> Result<Option<(String, u64)>, PathStatusError> {
+        self.connection
+            .query_row(
+                "SELECT outcome, generation FROM maintenance_outcomes WHERE operation = ?1",
+                [operation],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(PathStatusError::from)
+    }
+
     pub fn summary(&self) -> Result<PathStatusSummary, PathStatusError> {
         let (pending_count, failed_count) = self.connection.query_row(
             "SELECT

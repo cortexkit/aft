@@ -4,16 +4,14 @@
 //! manifest is visible.  A caller can therefore roll back by removing the view
 //! directory and continue to use the legacy snapshot.
 //!
-//! Nothing calls [`import_legacy_semantic`] on a live root yet. The call-site
-//! contract for the integrator: run it under a `ColdBuildLimiter` slot, only
-//! for a root with writer capability on the family (a borrow-only worktree
-//! must not open the shared blob store), off the bind/artifact-load path, and
-//! after the view has been checked for a current generation (done inside).
-//! It reads the whole snapshot, re-reads and hashes every source row, and
-//! writes every row into the blob store, so its cost scales with the corpus.
-//! A `RebuildRequired` outcome only records `migration-state.json` in the view
-//! directory; the semantic builder does not consume that marker yet, and the
-//! hand-off from the marker to a scheduled rebuild belongs to the integrator.
+//! Configure maintenance calls [`import_legacy_semantic`] once when views are
+//! enabled, the checkout owns shared artifact writes, and no manifest exists.
+//! Admission uses the shared cold-build limiter and runs after the configure
+//! acknowledgement. The importer reads the whole snapshot, then re-reads and
+//! hashes every eligible source row before writing compatible rows, so its cost
+//! scales with the corpus. A `RebuildRequired` outcome records
+//! `migration-state.json`; later attempts observe that marker rather than
+//! repeatedly scheduling the same rebuild.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -114,9 +112,9 @@ pub struct SemanticMigrationReport {
     pub imported_rows: usize,
     /// Total rows omitted from the imported manifest.
     pub skipped_rows: usize,
-    /// Rows omitted specifically because their absolute path is outside the root.
+    /// Rows omitted because their path is invalid for, or outside, the current root.
     pub outside_root_rows: usize,
-    /// Rows omitted because their current source bytes no longer match the snapshot.
+    /// Rows omitted because source bytes were unreadable or no longer match the snapshot.
     pub stale_rows: usize,
     /// Semantic embedding work performed by this importer. Compatible imports are zero.
     pub reembedded_rows: usize,
@@ -249,6 +247,29 @@ impl From<CallGraphStoreError> for MigrationError {
 /// configured model fingerprint and the current legacy chunking version. Earlier
 /// or unstamped snapshots are recorded as a rebuild request rather than treated as
 /// an import failure. The source snapshot is never deleted or rewritten here.
+pub(crate) fn configured_fingerprint_for_legacy(
+    path: &Path,
+    config: &crate::config::SemanticBackendConfig,
+) -> Result<String, MigrationError> {
+    let bytes = fs::read(path)?;
+    let mut reader = LegacyReader::new(&bytes);
+    let version = reader
+        .read_u8()
+        .map_err(MigrationError::InvalidLegacySnapshot)?;
+    if version != LEGACY_SEMANTIC_V6 && version != LEGACY_SEMANTIC_V7 {
+        return Err(MigrationError::InvalidLegacySnapshot(format!(
+            "semantic.bin version {version} has no established producer stamps"
+        )));
+    }
+    let dimension = reader
+        .read_u32()
+        .map_err(MigrationError::InvalidLegacySnapshot)? as usize;
+    Ok(
+        crate::semantic_index::SemanticIndexFingerprint::for_config_dimension(config, dimension)
+            .as_string(),
+    )
+}
+
 pub(crate) fn store_live_semantic_blobs(
     request: &SemanticMigrationRequest,
     index: &crate::semantic_index::SemanticIndex,

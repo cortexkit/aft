@@ -4673,6 +4673,67 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
     while drain_deferred_configure_maintenance_unit(ctx, &mut state) {}
 }
 
+fn import_legacy_view_once(
+    ctx: &AppContext,
+    job: &ConfigureMaintenanceJob,
+) -> Result<bool, String> {
+    if ctx.shared_artifacts_read_only() {
+        return Ok(true);
+    }
+    let Some(view) = ctx.view_runtime_snapshot() else {
+        return Ok(true);
+    };
+    if view.generation.is_some() {
+        return Ok(true);
+    }
+    let mut path_status = crate::path_status::PathStatusStore::open(&view.view_dir)
+        .map_err(|error| error.to_string())?;
+    if path_status
+        .maintenance_outcome("legacy_semantic_import")
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    let Some(_permit) = ctx.cold_build_limiter().try_acquire() else {
+        return Ok(false);
+    };
+    let semantic_config = ctx.config().semantic.clone();
+    let mut request = crate::migration::SemanticMigrationRequest::for_root(
+        view.storage.clone(),
+        job.canonical_cache_root.clone(),
+        crate::semantic_index::SemanticIndexFingerprint::for_config_dimension(&semantic_config, 1)
+            .as_string(),
+    );
+    request.family.clone_from(&view.family);
+    request.view.clone_from(&view.scope);
+    if request.legacy_semantic_path().is_file() {
+        request.configured_model_fingerprint = crate::migration::configured_fingerprint_for_legacy(
+            &request.legacy_semantic_path(),
+            &semantic_config,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    let report =
+        crate::migration::import_legacy_semantic(&request).map_err(|error| error.to_string())?;
+    path_status
+        .record_maintenance_outcome(
+            "legacy_semantic_import",
+            &format!("{:?}", report.outcome),
+            0,
+        )
+        .map_err(|error| error.to_string())?;
+    if matches!(
+        report.outcome,
+        crate::migration::SemanticMigrationOutcome::Imported
+            | crate::migration::SemanticMigrationOutcome::PublishConflict { .. }
+            | crate::migration::SemanticMigrationOutcome::AlreadyPublished { .. }
+    ) {
+        open_view_runtime_for_configure(ctx, job)?;
+    }
+    Ok(true)
+}
+
 fn run_configure_view_sweep(ctx: &AppContext) {
     let Some(view) = ctx.view_runtime_snapshot() else {
         return;
@@ -4885,15 +4946,29 @@ fn run_configure_maintenance_unit(
                 if let Err(error) = open_view_runtime_for_configure(ctx, job) {
                     ctx.clear_view_runtime();
                     slog_warn!("content-addressed view load failed: {}", error);
-                } else if ctx
-                    .view_runtime_snapshot()
-                    .is_some_and(|view| !view.pending_paths.is_empty())
-                {
-                    if let Some(_permit) = ctx.cold_build_limiter().try_acquire() {
-                        if let Err(error) = ctx
-                            .publish_view_paths(BTreeSet::new(), !ctx.shared_artifacts_read_only())
-                        {
-                            slog_warn!("content-addressed initial publication failed: {}", error);
+                } else {
+                    let import_ready = match import_legacy_view_once(ctx, job) {
+                        Ok(ready) => ready,
+                        Err(error) => {
+                            slog_warn!("legacy semantic view import failed: {}", error);
+                            false
+                        }
+                    };
+                    if import_ready
+                        && ctx
+                            .view_runtime_snapshot()
+                            .is_some_and(|view| !view.pending_paths.is_empty())
+                    {
+                        if let Some(_permit) = ctx.cold_build_limiter().try_acquire() {
+                            if let Err(error) = ctx.publish_view_paths(
+                                BTreeSet::new(),
+                                !ctx.shared_artifacts_read_only(),
+                            ) {
+                                slog_warn!(
+                                    "content-addressed initial publication failed: {}",
+                                    error
+                                );
+                            }
                         }
                     }
                 }
@@ -5648,6 +5723,36 @@ mod tests {
             .success());
     }
 
+    fn write_legacy_semantic_fixture(path: &Path, fingerprint: &str, source: &[u8]) {
+        fn put_field(bytes: &mut Vec<u8>, value: &[u8]) {
+            bytes.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(value);
+        }
+        let mut bytes = vec![7];
+        bytes.extend_from_slice(&2_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        put_field(&mut bytes, fingerprint.as_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        put_field(&mut bytes, b"tracked.rs");
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&(source.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(blake3::hash(source).as_bytes());
+        put_field(&mut bytes, b"tracked.rs");
+        put_field(&mut bytes, b"tracked");
+        put_field(&mut bytes, b"");
+        bytes.push(0);
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.push(0);
+        put_field(&mut bytes, b"fn tracked() {}");
+        put_field(&mut bytes, b"tracked function");
+        bytes.extend_from_slice(&1.0_f32.to_le_bytes());
+        bytes.extend_from_slice(&0.0_f32.to_le_bytes());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn views_gate_off_does_not_create_view_storage() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
@@ -5794,6 +5899,74 @@ mod tests {
         let digest = crate::commands::health_digest::handle_health_digest(&digest_request, &ctx);
         let digest = serde_json::to_value(digest).unwrap();
         assert_eq!(digest["views"]["ticket"]["generation"], json!(2));
+    }
+
+    #[test]
+    fn legacy_semantic_import_runs_once_and_records_its_outcome() {
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let canonical_root = std::fs::canonicalize(project.path()).unwrap();
+        let family = crate::search_index::artifact_cache_key(&canonical_root);
+        let scope = crate::path_identity::project_scope_key(&canonical_root);
+        let fingerprint =
+            SemanticIndexFingerprint::for_config_dimension(&Config::default().semantic, 2)
+                .as_string();
+        let semantic_path = storage
+            .path()
+            .join("semantic")
+            .join(&family)
+            .join("semantic.bin");
+        let source = fs::read(canonical_root.join("tracked.rs")).unwrap();
+        write_legacy_semantic_fixture(&semantic_path, &fingerprint, &source);
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let params = json!({
+            "project_root": canonical_root,
+            "storage_dir": storage.path(),
+            "harness": "opencode",
+            "config": [user_tier(json!({
+                "views": { "enabled": true },
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false
+            }))]
+        });
+
+        let response =
+            handle_configure_for_test(&configure_request_with_params(params.clone()), &ctx);
+        assert!(response.success, "{}", response.data);
+        super::drain_deferred_configure_maintenance(&ctx);
+        let status =
+            crate::path_status::PathStatusStore::open(&storage.path().join("views").join(&scope))
+                .unwrap();
+        let first = status
+            .maintenance_outcome("legacy_semantic_import")
+            .unwrap()
+            .expect("import outcome");
+        assert!(first.0.contains("Imported"));
+        fs::write(&semantic_path, [99]).unwrap();
+
+        let response = handle_configure_for_test(&configure_request_with_params(params), &ctx);
+        assert!(response.success, "{}", response.data);
+        super::drain_deferred_configure_maintenance(&ctx);
+        let status =
+            crate::path_status::PathStatusStore::open(&storage.path().join("views").join(&scope))
+                .unwrap();
+        assert_eq!(
+            status
+                .maintenance_outcome("legacy_semantic_import")
+                .unwrap()
+                .expect("persisted import outcome"),
+            first
+        );
     }
 
     #[test]
