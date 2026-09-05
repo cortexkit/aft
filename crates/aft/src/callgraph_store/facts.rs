@@ -29,6 +29,9 @@ pub(crate) trait ProjectFacts {
     fn config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>>;
     fn symlink_target(&self, rel: &[u8]) -> Option<&[u8]>;
     fn canonical(&self, rel: &[u8]) -> Option<Vec<u8>>;
+    fn canonical_path(&self, root: &Path, rel: &[u8]) -> Option<PathBuf> {
+        Some(root.join(byte_path(&self.canonical(rel)?)))
+    }
     fn list_dir(&self, rel: &[u8]) -> Vec<DirEntry>;
 }
 
@@ -197,10 +200,7 @@ impl FactPaths<'_> {
         self.facts.config_bytes(&self.rel(path)?)
     }
     pub fn canonical(&self, path: &Path) -> Option<PathBuf> {
-        Some(
-            self.root
-                .join(byte_path(&self.facts.canonical(&self.rel(path)?)?)),
-        )
+        self.facts.canonical_path(self.root, &self.rel(path)?)
     }
     pub fn list_dir(&self, path: &Path) -> Vec<DirEntry> {
         self.rel(path)
