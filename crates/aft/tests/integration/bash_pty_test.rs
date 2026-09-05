@@ -10,6 +10,7 @@ use aft::bash_background::pty_runtime::CompletionCoordinator;
 use aft::bash_background::{BgCompletion, BgTaskRegistry, BgTaskStatus};
 use serde_json::json;
 
+#[cfg(unix)]
 use super::helpers::ReleaseOnDrop;
 
 const SESSION: &str = "pty-phase-1a";

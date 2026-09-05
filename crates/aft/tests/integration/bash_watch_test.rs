@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
