@@ -285,6 +285,8 @@ impl AppContext {
             0
         };
         let compression = self.compression_stats_for_session(session_id);
+        let (backup_skipped_too_large_total, backup_skipped_temp_path_total) =
+            crate::backup::backup_skipped_totals();
 
         // Degraded-mode reasons recorded by `handle_configure` when the
         // project root doesn't look like a real project (`home_root`). Heavy
@@ -386,6 +388,8 @@ impl AppContext {
             "storage_dir": storage_dir,
             // Project-wide (all sessions): total in-memory checkpoint count.
             "checkpoints_total": checkpoint_total,
+            "backup_skipped_too_large_total": backup_skipped_too_large_total,
+            "backup_skipped_temp_path_total": backup_skipped_temp_path_total,
             // Current session slice: only when the caller passed `session_id`.
             "session": {
                 "id": session_id,
@@ -496,6 +500,8 @@ mod tests {
         assert!(response.data["canonical_root"].is_null());
         assert!(response.data["runtime"]["callgraph_commits_60s_total"].is_u64());
         assert!(response.data["runtime"]["callgraph_pages_or_bytes_written_60s_total"].is_u64());
+        assert!(response.data["backup_skipped_too_large_total"].is_u64());
+        assert!(response.data["backup_skipped_temp_path_total"].is_u64());
 
         let temp = tempfile::tempdir().unwrap();
         ctx.update_config(|config| {

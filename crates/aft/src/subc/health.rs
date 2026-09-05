@@ -1171,6 +1171,16 @@ pub(super) fn build_health_report(
             "lsp_children_with_deleted_cwd": lsp_children.get("cwd_gone").cloned().unwrap_or(Value::Null),
         }),
     );
+    let (backup_skipped_too_large_total, backup_skipped_temp_path_total) =
+        crate::backup::backup_skipped_totals();
+    metrics.insert(
+        "backup_skipped_too_large_total".to_string(),
+        json!(backup_skipped_too_large_total),
+    );
+    metrics.insert(
+        "backup_skipped_temp_path_total".to_string(),
+        json!(backup_skipped_temp_path_total),
+    );
     metrics.insert("reap".to_string(), dispatch_path_metrics.reap_snapshot());
     metrics.insert(
         "dispatch_liveness".to_string(),
@@ -1291,8 +1301,11 @@ mod tests {
             &DispatchPathMetrics::new(),
             &app,
         );
+        let report_metrics = report.metrics.expect("health metrics");
+        assert!(report_metrics["backup_skipped_too_large_total"].is_u64());
+        assert!(report_metrics["backup_skipped_temp_path_total"].is_u64());
         assert!(
-            report.metrics.expect("health metrics")["snapshot_age_ms"]
+            report_metrics["snapshot_age_ms"]
                 .as_u64()
                 .is_some_and(|age| age < 1_000),
             "the background publication must reset snapshot age"
