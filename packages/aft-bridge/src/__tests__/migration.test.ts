@@ -27,6 +27,9 @@ describe("storage migration bootstrap", () => {
       XDG_DATA_HOME: tempDir,
       HOME: tempDir,
       AFT_STORAGE_DIR: undefined,
+      // CI exports AFT_CACHE_DIR for the e2e suites; it outranks the XDG data
+      // root in the storage ladder these tests pin.
+      AFT_CACHE_DIR: undefined,
     });
   });
 
