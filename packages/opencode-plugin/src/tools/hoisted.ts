@@ -30,8 +30,10 @@ import { createBashWriteTool } from "./bash_write.js";
 import {
   askEditPermission,
   assertExternalDirectoryPermission,
+  classifyPermissionError,
   permissionDeniedResponse,
   permissionPath,
+  permissionRuleDenial,
   runAsk,
 } from "./permissions.js";
 
@@ -445,9 +447,10 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
             }),
           );
         } catch (error) {
-          if (error instanceof Error && error.message)
-            return permissionDeniedResponse(error.message);
-          return permissionDeniedResponse("Permission denied.");
+          const failure = classifyPermissionError(error);
+          return permissionDeniedResponse(
+            failure.kind === "rule_denied" ? permissionRuleDenial("read") : failure.message,
+          );
         }
 
         const rawStartLine = coerceOptionalInt(
