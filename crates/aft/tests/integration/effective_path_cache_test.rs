@@ -274,8 +274,14 @@ fn inline_probe_total_budget_caps_two_hanging_candidates() {
         &fixture.path().join("probe-ran"),
     );
 
+    // The claim is that the 4 s total budget caps the probe, not the sum of
+    // the two 3 s per-candidate timeouts (6 s) or the shells' own 10 s sleeps.
+    // `elapsed` also includes spawning the binary and its configure, so the
+    // bound sits between the capped and uncapped outcomes rather than at the
+    // budget plus a fixed slack: a contended CI runner measured 4.53 s against
+    // a 4.5 s bound with the cap working exactly as designed.
     assert!(
-        elapsed < Duration::from_millis(4500),
+        elapsed < Duration::from_millis(5500),
         "two hanging candidates exceeded total budget: {elapsed:?}"
     );
     assert_eq!(response["id"], "1");
