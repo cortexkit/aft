@@ -726,6 +726,64 @@ else
   fail "could not find $real_workflows to check the shipped workflows against"
 fi
 
+# --- lifted into a repository with no preflight scripts --------------------
+# Other repositories carry this script as a file. A fixture has none of this
+# repository's governed-docs scripts, so a train there must land with the header
+# naming that nothing ran, rather than refusing at step zero over a file that
+# does not exist (the first lift failed exactly that way).
+dir="$(new_fixture lifted)"
+add_train_commit "$dir/work" "lifted"
+run_train "$dir" lifted
+expect_rc 0 "a repository with no preflight scripts lands"
+expect_out "preflights: none" "the header says no preflight ran"
+expect_no_out "governed-surface" "no governed-docs gate ran where its script is absent"
+
+# --- repo-local preflight hook: named when it runs, able to refuse ---------
+dir="$(new_fixture localhook)"
+mkdir -p "$dir/work/scripts"
+printf '#!/usr/bin/env bash\n: > "%s/hook-ran"\n' "$dir" > "$dir/work/scripts/train-push.local.sh"
+git -C "$dir/work" add scripts/train-push.local.sh
+git -C "$dir/work" commit -qm "local preflight"
+add_train_commit "$dir/work" "hooked"
+run_train "$dir" hooked
+expect_rc 0 "a passing local preflight lets the train land"
+expect_out "preflights: train-push.local.sh" "the header names the local hook"
+if [ -f "$dir/hook-ran" ]; then ok "the local hook actually ran"; else fail "the local hook was named but never ran"; fi
+
+dir="$(new_fixture localrefuse)"
+mkdir -p "$dir/work/scripts"
+printf '#!/usr/bin/env bash\nrefuse "local preflight says no"\n' > "$dir/work/scripts/train-push.local.sh"
+git -C "$dir/work" add scripts/train-push.local.sh
+git -C "$dir/work" commit -qm "refusing local preflight"
+add_train_commit "$dir/work" "refused"
+run_train "$dir" refused
+expect_rc 2 "a refusing local preflight stops the train before any push"
+expect_out "local preflight says no" "the refusal reason is the hook's own"
+if git -C "$dir/origin.git" show-ref --quiet "refs/heads/train/refused"; then
+  fail "a refused preflight still pushed the train branch"
+else
+  ok "nothing was pushed after the preflight refused"
+fi
+
+# --- the governed-docs gate still runs where its script exists ------------
+# The existence check must not turn into a skip: with the audit script present
+# and failing, the train refuses. `bun` is the harness's exit-0 stub on PATH, so
+# this fixture shadows it with a failing one for the run.
+dir="$(new_fixture auditfails)"
+mkdir -p "$dir/work/scripts" "$dir/failbin"
+: > "$dir/work/scripts/audit-v049-agent-surface.ts"
+git -C "$dir/work" add scripts/audit-v049-agent-surface.ts
+git -C "$dir/work" commit -qm "carry the audit script"
+add_train_commit "$dir/work" "audited"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$dir/failbin/bun"
+chmod +x "$dir/failbin/bun"
+saved_bin="$BIN_DIR"
+BIN_DIR="$dir/failbin:$saved_bin"
+run_train "$dir" audited
+BIN_DIR="$saved_bin"
+expect_rc 2 "a present, failing governed-surface audit refuses the train"
+expect_out "governed-surface audit failed" "the refusal names the gate"
+
 if [ "$failures" -ne 0 ]; then
   printf 'train-push.test.sh: %s check(s) failed\n' "$failures" >&2
   exit 1

@@ -3,6 +3,14 @@
 # green. Operator tooling runs through the real GitHub CLI (gh) via watch-ci.sh;
 # the shim is only for AI agent commands.
 #
+# Lifting this into another repository: carry four files together —
+# scripts/train-push.sh, scripts/watch-ci.sh, scripts/lib/operator-gh.sh,
+# scripts/lib/workflow-gates.py — plus `python3`, `git`, and the real `gh` on
+# PATH. Nothing else here assumes this repository's layout: the default branch
+# is read from origin/HEAD, and repo-local preflights run only when their
+# scripts exist (see "Repo-local preflights" below), with the header line
+# naming which ones ran.
+#
 # Why this is the default push path instead of scripts/gated-push.sh:
 # the local full Rust gate takes ~12 minutes on this box and only sees macOS.
 # Measured over the last week, about half the red trains failed on Linux or
@@ -378,14 +386,35 @@ if [ ! -f "$probe_marker" ]; then
   run_trigger_probe
 fi
 
-# Governed-docs alignment, using the same two commands gated-push.sh runs as
-# its preflight. Both are read-only here; scripts/align-governed-docs.sh is the
-# writing half and stays the remedy, not something this script performs.
-if ! bun scripts/audit-v049-agent-surface.ts; then
-  refuse "governed-surface audit failed — run scripts/align-governed-docs.sh"
+# Repo-local preflights. The script is lifted into other repositories as a
+# file, so nothing here may assume this repository's layout: each preflight
+# runs only when its script exists, and the header line names which ones ran
+# so a repository with none is distinguishable from one whose block was
+# deleted. This repository's two are the governed-docs gates gated-push.sh
+# runs; both are read-only here (scripts/align-governed-docs.sh is the
+# writing half and stays the remedy, not something this script performs).
+preflights_ran=()
+if [ -f scripts/audit-v049-agent-surface.ts ]; then
+  bun scripts/audit-v049-agent-surface.ts \
+    || refuse "governed-surface audit failed — run scripts/align-governed-docs.sh"
+  preflights_ran+=(governed-surface-audit)
 fi
-if ! node scripts/release-gate-v049.mjs; then
-  refuse "release gate failed — run scripts/align-governed-docs.sh"
+if [ -f scripts/release-gate-v049.mjs ]; then
+  node scripts/release-gate-v049.mjs \
+    || refuse "release gate failed — run scripts/align-governed-docs.sh"
+  preflights_ran+=(release-gate)
+fi
+# A repository may add its own preflights beside this script without editing
+# it; the hook is sourced so it can call `refuse` and `say`.
+if [ -f scripts/train-push.local.sh ]; then
+  # shellcheck disable=SC1091
+  . scripts/train-push.local.sh
+  preflights_ran+=(train-push.local.sh)
+fi
+if [ "${#preflights_ran[@]}" -eq 0 ]; then
+  say "preflights: none (no repo-local preflight scripts present)"
+else
+  say "preflights: ${preflights_ran[*]}"
 fi
 
 # ---------------------------------------------------------------------------
