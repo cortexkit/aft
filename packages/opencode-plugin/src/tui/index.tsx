@@ -29,6 +29,7 @@ import {
   resolveTuiStorageDir,
   shouldSuppressUninitializedDowngrade,
 } from "./sidebar";
+import { setupV2Tui } from "./v2";
 
 // The TUI talks to the server plugin via AftRpcClient. The client reads the
 // JSON port file written by AftRpcServer ({ port, token }) and includes that
@@ -803,4 +804,5 @@ const id = "aft-opencode";
 export default {
   id,
   tui,
+  setup: setupV2Tui,
 };

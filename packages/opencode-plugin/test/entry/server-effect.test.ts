@@ -31,6 +31,14 @@ function testDependencies(events: string[]) {
     releaseBridge: async ({ directory }: { directory: string }) => {
       events.push(`release:${directory}`);
     },
+    registerRpc: async (_context: unknown, location: { directory: string }) => {
+      events.push(`rpc:${location.directory}`);
+      return {
+        dispose: async () => {
+          events.push(`rpc-dispose:${location.directory}`);
+        },
+      };
+    },
     buildToolMap: (context: { storageDir: string }, _config: unknown) => {
       events.push(`tools:${context.storageDir}`);
       return {
@@ -107,8 +115,10 @@ describe("V2 server effect", () => {
         "binary:0.55.1",
         `acquire:${directory}:/isolated/bin/aft`,
         "tools:/isolated/storage",
+        `rpc:${directory}`,
         `transform:${directory}`,
         `add:${directory}:aft_probe`,
+        `rpc-dispose:${directory}`,
         `release:${directory}`,
       ]);
     }

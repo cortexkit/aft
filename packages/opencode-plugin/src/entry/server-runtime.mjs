@@ -12,6 +12,7 @@ import {
   resolveBridgePoolTransportOptions,
 } from "../config.js";
 import { resolvePluginVersion } from "../plugin-version.js";
+import { registerAftRpc } from "../rpc/register.js";
 import {
   buildAftToolDefinitions,
   openCodeHashlineEffective,
@@ -22,6 +23,7 @@ const defaults = {
   buildConfigureParams: buildConfigTierConfigureParams,
   buildToolMap: buildAftToolDefinitions,
   registerTools: registerAftTools,
+  registerRpc: registerAftRpc,
   toolConsumers: {},
   acquireBridge,
   loadConfig: loadAftConfig,
@@ -80,6 +82,10 @@ export function makeServerEffect(overrides = {}) {
       yield* Effect.addFinalizer(() =>
         Effect.promise(() => dependencies.releaseBridge(runtime.pool)),
       );
+      const rpc = yield* Effect.promise(() =>
+        dependencies.registerRpc(context, location, runtime.pool),
+      );
+      yield* Effect.addFinalizer(() => Effect.promise(() => rpc.dispose()));
       yield* dependencies.registerTools(
         context,
         location,

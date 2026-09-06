@@ -452,12 +452,32 @@ const entrypoints = Host.resolve(installed);
 
 function locationContext(id) {
   const tools = [];
+  const rpcRegistrations = [];
+  const rpcEvents = [];
+  let rpcDisposals = 0;
   return {
     tools,
+    rpcRegistrations,
+    rpcEvents,
+    rpcDisposals: () => rpcDisposals,
     context: {
       location: {
         directory,
         project: { id, directory, canonical: directory },
+      },
+      rpc: {
+        register: async (definition, handlers) => {
+          const registration = {
+            events: {
+              emit: async (name, payload) => rpcEvents.push({ name, payload }),
+            },
+            dispose: async () => {
+              rpcDisposals += 1;
+            },
+          };
+          rpcRegistrations.push({ definition, handlers, registration });
+          return registration;
+        },
       },
       tool: {
         transform: (register) => Effect.sync(() => register({
@@ -488,15 +508,45 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
         progress: () => Effect.succeed(undefined),
       },
     );
+    const rpc = location.rpcRegistrations.find(({ definition }) => definition.id === "aft");
+    if (!rpc) throw new Error("enabled V2 effect did not register AftRpc");
+    if (Object.keys(rpc.definition.methods).join(",") !== "getStatus") {
+      throw new Error("enabled V2 effect registered unexpected AftRpc methods");
+    }
+    const status = yield* Effect.promise(() => rpc.handlers.getStatus(
+      { sessionID: "lifecycle-" + index },
+      { signal: new AbortController().signal },
+    ));
+    if (status.success === false || !status.session) {
+      throw new Error("AftRpc.getStatus did not round-trip through the warm bridge: " + JSON.stringify(status));
+    }
+    appendFileSync(marker, "rpc-call:" + index + ":" + status.session.id + "\\n");
   }
   const live = getBridgeLifecycleTopology();
   const liveHealth = yield* Effect.promise(() => sampleBridgeLifecycleCensus({ settleMs: 0 }));
+  const listeningPorts = process._getActiveHandles().flatMap((handle) => {
+    if (!handle?.listening || typeof handle.address !== "function") return [];
+    const address = handle.address();
+    return address && typeof address === "object" && Number.isInteger(address.port)
+      ? [address.port]
+      : [];
+  });
   appendFileSync(marker, "topology-live:" + JSON.stringify(live) + "\\n");
   appendFileSync(marker, "health-live:" + JSON.stringify(liveHealth) + "\\n");
+  appendFileSync(marker, "port-census:" + JSON.stringify(listeningPorts) + "\\n");
   if (live.daemonProcesses !== 1 || live.routes !== 2 || live.locations !== 2) {
     throw new Error("unexpected live topology: " + JSON.stringify(live));
   }
+  if (liveHealth.listenPorts !== 0 || listeningPorts.length !== 0) {
+    throw new Error(
+      "V2 started a private listening socket: " +
+      JSON.stringify({ health: liveHealth, ports: listeningPorts }),
+    );
+  }
 })))
+if (first.rpcDisposals() !== 1 || second.rpcDisposals() !== 1) {
+  throw new Error("Location RPC registrations were not supervisor-scoped");
+}
 const reloaded = locationContext("location-reload");
 await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   yield* loaded.effect(reloaded.context);
@@ -514,12 +564,32 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       progress: () => Effect.succeed(undefined),
     },
   );
+  const rpc = reloaded.rpcRegistrations.find(({ definition }) => definition.id === "aft");
+  if (!rpc) throw new Error("reloaded Location did not re-register AftRpc");
+  const status = yield* Effect.promise(() => rpc.handlers.getStatus(
+    { sessionID: "lifecycle-reload" },
+    { signal: new AbortController().signal },
+  ));
+  if (status.success === false || status.session?.id !== "lifecycle-reload") {
+    throw new Error("reloaded AftRpc.getStatus did not round-trip: " + JSON.stringify(status));
+  }
+  yield* Effect.promise(() => rpc.registration.events.emit(
+    "indexProgress",
+    { index: "search", status: "ready", sessionID: "lifecycle-reload" },
+  ));
+  if (!reloaded.rpcEvents.some(({ name }) => name === "indexProgress")) {
+    throw new Error("reloaded Location did not deliver the index-progress event");
+  }
+  appendFileSync(marker, "rpc-reload-event:indexProgress\\n");
   const topology = getBridgeLifecycleTopology();
   appendFileSync(marker, "topology-reload:" + JSON.stringify(topology) + "\\n");
   if (topology.daemonProcesses !== 1 || topology.routes !== 1 || topology.locations !== 1) {
     throw new Error("unexpected reload topology: " + JSON.stringify(topology));
   }
 })))
+if (reloaded.rpcDisposals() !== 1) {
+  throw new Error("reloaded RPC registration was not disposed");
+}
 const settled = await sampleBridgeLifecycleCensus();
 appendFileSync(marker, "health-settled:" + JSON.stringify(settled) + "\\n");
 if (Object.values(settled).some((count) => count !== 0)) {
@@ -812,6 +882,15 @@ export default { id: original.id, effect };
     expect(events).toContain(
       'topology-reload:{"daemonProcesses":1,"routes":1,"subcClients":0,"locations":1}',
     );
+    const liveHealthLine = events.split(/\r?\n/).find((line) => line.startsWith("health-live:"));
+    expect(liveHealthLine).toBeDefined();
+    if (!liveHealthLine) throw new Error("load matrix did not record live health");
+    const liveHealth = JSON.parse(liveHealthLine.slice("health-live:".length));
+    expect(liveHealth.listenPorts).toBe(0);
+    expect(events).toContain("port-census:[]");
+    expect(events).toContain("rpc-call:0:lifecycle-0");
+    expect(events).toContain("rpc-call:1:lifecycle-1");
+    expect(events).toContain("rpc-reload-event:indexProgress");
     expect(events).toContain(
       'health-settled:{"watchers":0,"listenPorts":0,"routes":0,"lspChildren":0,"daemonProcesses":0}',
     );

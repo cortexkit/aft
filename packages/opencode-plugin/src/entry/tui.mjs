@@ -1,6 +1,6 @@
 import legacy from "../tui/entry.mjs";
 
-const setup = async () => {};
+const setup = (...args) => legacy.setup(...args);
 
 export default {
   id: legacy.id,
