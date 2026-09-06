@@ -1918,27 +1918,31 @@ fn is_exported(node: &Node, export_ranges: &[std::ops::Range<usize>]) -> bool {
         .any(|er| er.start <= r.start && r.end <= er.end)
 }
 
+/// Pre-order walk of the whole tree collecting exported names.
+///
+/// Iterative with one cursor on purpose: the recursive form spent a stack
+/// frame per tree depth, and a large non-TypeScript document parsed by the
+/// TypeScript grammar (an HTML page whose URL ended in `.d.ts`) produced an
+/// error-recovery tree deep enough to overflow the 2 MiB executor worker
+/// stack and abort the daemon - twice, 55 s apart, on the same request.
 fn collect_exported_symbol_names(source: &str, root: &Node) -> HashSet<String> {
     let mut exported = HashSet::new();
-    collect_exported_symbol_names_inner(source, root, &mut exported);
-    exported
-}
-
-fn collect_exported_symbol_names_inner(source: &str, node: &Node, exported: &mut HashSet<String>) {
-    if node.kind() == "export_statement" {
-        collect_names_from_export_statement(source, node, exported);
-    }
-
-    let mut cursor = node.walk();
-    if !cursor.goto_first_child() {
-        return;
-    }
-
+    let mut cursor = root.walk();
     loop {
-        let child = cursor.node();
-        collect_exported_symbol_names_inner(source, &child, exported);
-        if !cursor.goto_next_sibling() {
-            break;
+        let node = cursor.node();
+        if node.kind() == "export_statement" {
+            collect_names_from_export_statement(source, &node, &mut exported);
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return exported;
+            }
         }
     }
 }
@@ -7984,6 +7988,40 @@ mod tests {
             .join("tests")
             .join("fixtures")
             .join(name)
+    }
+
+    /// The export walk must not spend stack per tree depth. This runs it on a
+    /// deliberately small thread over a tree nested far deeper than the old
+    /// recursive walk survived at that size; a return to recursion overflows
+    /// here (the abort is deterministic, not a timing flake) instead of in the
+    /// daemon, where a URL that parsed as TypeScript did exactly that.
+    #[test]
+    fn export_walk_survives_deep_trees_on_a_small_stack() {
+        const DEPTH: usize = 3000;
+        // The export clause sits after the deep expression: the walk is
+        // pre-order over the whole tree, so it must come through the nesting
+        // to find it, and finding it proves the traversal completed.
+        let mut source = String::from("const deep = ");
+        source.push_str(&"(".repeat(DEPTH));
+        source.push('1');
+        source.push_str(&")".repeat(DEPTH));
+        source.push_str(";\nfunction shallow() {}\nexport { deep, shallow };\n");
+
+        let exported = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let grammar = grammar_for(LangId::TypeScript);
+                let mut parser = Parser::new();
+                parser.set_language(&grammar).unwrap();
+                let tree = parser.parse(&source, None).unwrap();
+                collect_exported_symbol_names(&source, &tree.root_node())
+            })
+            .unwrap()
+            .join()
+            .expect("export walk must not overflow a 256 KiB stack");
+
+        assert!(exported.contains("deep"), "exports: {exported:?}");
+        assert!(exported.contains("shallow"), "exports: {exported:?}");
     }
 
     #[test]
