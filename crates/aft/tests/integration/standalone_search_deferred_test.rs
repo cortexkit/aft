@@ -322,12 +322,22 @@ fn write_embedding_response(stream: &mut TcpStream) {
     let _ = stream.write_all(response.as_bytes());
 }
 
-fn start_embedding_server() -> (String, mpsc::Receiver<()>, thread::JoinHandle<()>) {
+/// A mock embedding backend that holds the query embedding open until the
+/// test releases it. The hold is a gate rather than a sleep so the test proves
+/// an ordering (sibling requests answered while the search is provably still
+/// pending) instead of racing a fixed delay against runner load.
+fn start_embedding_server() -> (
+    String,
+    mpsc::Receiver<()>,
+    mpsc::SyncSender<()>,
+    thread::JoinHandle<()>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind embedding server");
     let address = listener.local_addr().expect("embedding server address");
     let (query_started_tx, query_started_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
     let handle = thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
             let (mut stream, _) = listener.accept().expect("accept embedding request");
             let request = read_http_request(&mut stream);
@@ -335,7 +345,9 @@ fn start_embedding_server() -> (String, mpsc::Receiver<()>, thread::JoinHandle<(
                 query_started_tx
                     .send(())
                     .expect("signal query embedding start");
-                thread::sleep(Duration::from_secs(2));
+                // Held until released, or until the test is gone; a dropped
+                // sender releases too, so a panicking test cannot wedge this.
+                let _ = release_rx.recv_timeout(Duration::from_secs(60));
                 write_embedding_response(&mut stream);
                 return;
             }
@@ -343,14 +355,19 @@ fn start_embedding_server() -> (String, mpsc::Receiver<()>, thread::JoinHandle<(
         }
         panic!("semantic query embedding did not reach the mock server");
     });
-    (format!("http://{address}"), query_started_rx, handle)
+    (
+        format!("http://{address}"),
+        query_started_rx,
+        release_tx,
+        handle,
+    )
 }
 
 #[test]
 fn standalone_ndjson_status_and_cancel_proceed_while_search_is_pending() {
     let project = tempfile::tempdir().expect("create standalone project");
     let storage = tempfile::tempdir().expect("create standalone storage");
-    let (base_url, query_started, embedding_server) = start_embedding_server();
+    let (base_url, query_started, release_query, embedding_server) = start_embedding_server();
     let mut aft = AftProcess::spawn();
 
     let configure = aft.send(
@@ -410,22 +427,22 @@ fn standalone_ndjson_status_and_cancel_proceed_while_search_is_pending() {
         .recv_timeout(Duration::from_secs(10))
         .expect("standalone query embedding starts");
 
-    let status_started_at = Instant::now();
+    // The remote is gated (not released yet), so the search is provably
+    // pending while the sibling requests below are answered: an answer that
+    // arrives at all is an answer that did not wait behind the embedding.
+    // The bounds are liveness bounds for a contended runner, not latency
+    // claims; `send_with_timeout` fails the test if either is exceeded.
+    let liveness = Duration::from_secs(30);
     let status = aft.send_with_timeout(
         &serde_json::to_string(&json!({"id": "sibling-status", "command": "status"}))
             .expect("serialize status request"),
-        Duration::from_millis(500),
+        liveness,
     );
-    let status_latency = status_started_at.elapsed();
     assert_eq!(
         status["id"], "sibling-status",
         "search blocked status: {status:?}"
     );
     assert_eq!(status["success"], true);
-    assert!(
-        status_latency < Duration::from_millis(500),
-        "sibling status waited behind query embedding for {status_latency:?}"
-    );
 
     let cancel = aft.send_with_timeout(
         &serde_json::to_string(&json!({
@@ -434,33 +451,34 @@ fn standalone_ndjson_status_and_cancel_proceed_while_search_is_pending() {
             "params": {"id": "slow-search"}
         }))
         .expect("serialize cancel request"),
-        Duration::from_millis(500),
+        liveness,
     );
     assert_eq!(cancel["success"], true, "cancel command failed: {cancel:?}");
     assert_eq!(cancel["cancelled"], true);
 
-    let deadline = Instant::now() + Duration::from_millis(500);
+    // The cancelled search must resolve while the remote is still held: the
+    // `request_cancelled` code is only reachable that way, because a released
+    // remote would produce a real result instead.
+    let deadline = Instant::now() + liveness;
     let cancelled = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            remaining > Duration::ZERO,
+            "cancelled search response did not arrive within the liveness bound"
+        );
         let Some(frame) = aft.try_read_next_timeout(remaining.min(Duration::from_millis(100)))
         else {
-            assert!(
-                Instant::now() < deadline,
-                "cancelled search should resolve before the remote response"
-            );
             continue;
         };
         if frame["id"] == "slow-search" {
             break frame;
         }
-        assert!(
-            Instant::now() < deadline,
-            "cancelled search response timed out"
-        );
     };
     assert_eq!(cancelled["success"], false);
     assert_eq!(cancelled["code"], "request_cancelled");
 
+    // Only now let the remote answer, so the mock thread can finish.
+    let _ = release_query.send(());
     let status = aft.shutdown();
     assert!(status.success());
     embedding_server.join().expect("embedding server joins");

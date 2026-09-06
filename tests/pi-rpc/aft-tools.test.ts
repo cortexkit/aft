@@ -249,8 +249,9 @@ describe("AFT Pi tools (real Pi RPC)", () => {
 
     expect(toolEnd.isError).toBe(false);
     const text = resultText(toolEnd);
-    expect(text).toMatch(/one\.ts\s+typescript\s+1 syms\s+\d+ bytes/);
-    expect(text).toMatch(/two\.py\s+python\s+1 syms\s+\d+ bytes/);
+    // Files mode reports line counts (the size signal agents act on), not bytes.
+    expect(text).toMatch(/one\.ts\s+typescript\s+1 syms\s+1 lines/);
+    expect(text).toMatch(/two\.py\s+python\s+1 syms\s+2 lines/);
   }, 120_000);
 
   test("aft_outline file mode returns server-rendered symbol text", async () => {
