@@ -61,13 +61,19 @@ WATCH_SHA=""
 # Run ids are decimal and around 11 digits; a sha is 7-40 hex characters. The
 # two only overlap for an all-decimal sha, so length decides that case: a
 # 32-or-longer all-decimal string is a sha, never a run id.
+#
+# Anything that is not a run id is resolved through git rather than pattern
+# matched: the run lookup below compares against the FULL head sha, so a short
+# sha stored verbatim never matches and the watch reports "no run appeared"
+# after the whole poll budget. Resolving also admits tags, branch names and
+# HEAD~n, and dereferences an annotated tag to the commit that carries runs.
 if [ -n "$ARG" ]; then
   if [[ "$ARG" =~ ^[0-9]+$ ]] && [ "${#ARG}" -lt 32 ]; then
     RID="$ARG"
-  elif [[ "$ARG" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
-    WATCH_SHA="$ARG"
+  elif WATCH_SHA=$(git rev-parse --verify --quiet "${ARG}^{commit}"); then
+    :
   else
-    echo "watch-ci: argument must be a numeric run id or a commit sha (got '$ARG'); pass nothing to watch HEAD's run" >&2
+    echo "watch-ci: argument must be a numeric run id or a commit ref this checkout can resolve (got '$ARG'); pass nothing to watch HEAD's run" >&2
     exit 2
   fi
 fi
