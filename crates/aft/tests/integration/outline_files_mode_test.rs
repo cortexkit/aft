@@ -54,17 +54,17 @@ fn response_paths(resp: &Value) -> Vec<String> {
 #[test]
 fn outline_files_mode_returns_file_metadata_with_language_and_symbol_counts() {
     let dir = TempDir::new().unwrap();
-    let ts = write_file(
+    let _ts = write_file(
         dir.path(),
         "src/service.ts",
         "export function greet() { return 1; }\nexport const answer = 42;\n",
     );
-    let rs = write_file(
+    let _rs = write_file(
         dir.path(),
         "crates/model.rs",
         "pub struct Config {}\npub fn compute() -> i32 { 1 }\n",
     );
-    let md = write_file(dir.path(), "docs/readme.md", "# Title\n\n## Details\n");
+    let _md = write_file(dir.path(), "docs/readme.md", "# Title\n\n## Details\n");
 
     let mut aft = AftProcess::spawn();
     assert_eq!(aft.configure(dir.path())["success"], true);
@@ -79,17 +79,20 @@ fn outline_files_mode_returns_file_metadata_with_language_and_symbol_counts() {
     let rs_entry = file_entry(&resp, "crates/model.rs");
     assert_eq!(rs_entry["language"], "rust");
     assert_eq!(rs_entry["symbols"], 2);
-    assert_eq!(rs_entry["bytes"], fs::metadata(rs).unwrap().len());
+    assert_eq!(rs_entry["lines"], 2);
+    assert!(rs_entry.get("bytes").is_none());
 
     let ts_entry = file_entry(&resp, "src/service.ts");
     assert_eq!(ts_entry["language"], "typescript");
     assert_eq!(ts_entry["symbols"], 2);
-    assert_eq!(ts_entry["bytes"], fs::metadata(ts).unwrap().len());
+    assert_eq!(ts_entry["lines"], 2);
+    assert!(ts_entry.get("bytes").is_none());
 
     let md_entry = file_entry(&resp, "docs/readme.md");
     assert_eq!(md_entry["language"], "markdown");
     assert_eq!(md_entry["symbols"], 2);
-    assert_eq!(md_entry["bytes"], fs::metadata(md).unwrap().len());
+    assert_eq!(md_entry["lines"], 3);
+    assert!(md_entry.get("bytes").is_none());
 
     let text = resp["text"].as_str().unwrap().replace('\\', "/");
     assert!(text.contains("src/service.ts"), "missing TS row: {text}");
@@ -167,7 +170,7 @@ fn outline_files_mode_rejects_file_targets() {
 #[test]
 fn outline_files_mode_lists_binary_unknown_extension_files() {
     let dir = TempDir::new().unwrap();
-    write_bytes(dir.path(), "assets/blob.dat", &[0, 159, 146, 150, 0, 1]);
+    write_bytes(dir.path(), "blob.dat", &[0, 159, 146, 150, 0, 1]);
 
     let mut aft = AftProcess::spawn();
     assert_eq!(aft.configure(dir.path())["success"], true);
@@ -178,10 +181,14 @@ fn outline_files_mode_lists_binary_unknown_extension_files() {
         "outline files should succeed: {resp:?}"
     );
 
-    let entry = file_entry(&resp, "assets/blob.dat");
+    let entry = file_entry(&resp, "blob.dat");
     assert_eq!(entry["language"], "binary");
     assert_eq!(entry["symbols"], 0);
-    assert_eq!(entry["bytes"], 6);
+    assert_eq!(entry["lines"], Value::Null);
+    assert!(entry.get("bytes").is_none());
+    let text = resp["text"].as_str().unwrap();
+    assert!(text.contains("blob.dat"));
+    assert!(text.contains("      - lines"), "binary row: {text}");
 
     assert!(aft.shutdown().success());
 }
@@ -236,7 +243,7 @@ fn outline_files_mode_excludes_gitignored_paths_when_matcher_is_active() {
 // without the racy protocol-level setup.
 
 #[test]
-fn outline_files_mode_truncates_text_and_reports_unchecked_files() {
+fn outline_files_mode_collapses_data_heavy_directory_without_marking_it_incomplete() {
     let dir = TempDir::new().unwrap();
     let long_dir = format!("src/{}", "very-long-segment-".repeat(8));
     for index in 0..200 {
@@ -255,21 +262,19 @@ fn outline_files_mode_truncates_text_and_reports_unchecked_files() {
         resp["success"], true,
         "outline files should succeed: {resp:?}"
     );
-    assert_eq!(resp["complete"], false);
+    assert_eq!(resp["complete"], true);
     assert_eq!(resp["walk_truncated"], false);
     assert_eq!(files(&resp).len(), 200);
     assert!(
-        !resp["unchecked_files"].as_array().unwrap().is_empty(),
-        "unchecked_files should list rows omitted by the text cap: {resp:?}"
+        resp["unchecked_files"].as_array().unwrap().is_empty(),
+        "rollups are counted content, not unchecked files: {resp:?}"
     );
     let text = resp["text"].as_str().unwrap();
+    assert!(text.contains("src/"), "missing top-level rollup: {text}");
+    assert!(!text.contains("file-000-with-extra-name.txt"));
     assert!(
-        text.contains("... truncated ("),
-        "missing truncation marker: {text}"
-    );
-    assert!(
-        text.contains("30KB limit"),
-        "missing cap in truncation marker: {text}"
+        text.contains("1 directory shown as a rollup (budget: 30KB)"),
+        "missing rollup trailer: {text}"
     );
 
     assert!(aft.shutdown().success());
@@ -299,6 +304,7 @@ fn files_mode_multi_target_uses_project_root_relative_paths() {
             "command": "outline",
             "target": [dir.path().join("src"), dir.path().join("tests")],
             "files": true,
+            "includeTests": true,
         }),
     );
     assert_eq!(
@@ -360,12 +366,12 @@ fn files_mode_single_target_keeps_target_relative_behavior() {
 }
 
 #[test]
-fn files_mode_walk_cap_is_subset_stable_under_lexical_sort() {
+fn files_mode_retires_the_200_file_render_cap() {
     let dir = TempDir::new().unwrap();
     for index in (0..260).rev() {
         write_file(dir.path(), &format!("files/file-{index:03}.txt"), "x\n");
     }
-    let expected = (0..200)
+    let expected = (0..260)
         .map(|index| format!("files/file-{index:03}.txt"))
         .collect::<Vec<_>>();
 
@@ -378,10 +384,16 @@ fn files_mode_walk_cap_is_subset_stable_under_lexical_sort() {
             resp["success"], true,
             "outline files should succeed: {resp:?}"
         );
-        assert_eq!(resp["complete"], false);
-        assert_eq!(resp["walk_truncated"], true);
+        assert_eq!(resp["complete"], true);
+        assert_eq!(resp["walk_truncated"], false);
         assert_eq!(resp["collection_truncated"], false);
         assert_eq!(response_paths(&resp), expected);
+        let text = resp["text"].as_str().unwrap();
+        assert!(text.contains("files/"), "missing files rollup: {text}");
+        assert!(
+            !text.contains("file-000.txt"),
+            "data files should stay collapsed: {text}"
+        );
     }
 
     assert!(aft.shutdown().success());
@@ -452,6 +464,102 @@ fn outline_multi_file_array_marks_incomplete_when_a_file_is_skipped() {
     assert_eq!(
         resp_ok["complete"], true,
         "all-present must be complete: {resp_ok:?}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn files_mode_breadth_first_rollups_keep_code_visible_past_large_json_tree() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "Cargo.toml", "[workspace]\n");
+    for (crate_name, count) in [("a", 120), ("b", 120), ("c", 20)] {
+        for index in 0..count {
+            write_file(
+                dir.path(),
+                &format!("crates/{crate_name}/src/module-{index:03}.rs"),
+                "pub fn visible() {}\n",
+            );
+        }
+    }
+    for index in 0..300 {
+        write_file(
+            dir.path(),
+            &format!("schema/json/schema-{index:03}.json"),
+            "{}\n",
+        );
+    }
+    write_file(dir.path(), "docs/guide.md", "# Guide\n");
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let resp = outline_files(&mut aft, dir.path());
+    assert_eq!(
+        resp["success"], true,
+        "outline files should succeed: {resp:?}"
+    );
+    assert_eq!(resp["complete"], true);
+    assert_eq!(resp["walk_truncated"], false);
+    let text = resp["text"].as_str().unwrap();
+    assert!(
+        text.contains("Cargo.toml"),
+        "top-level file missing: {text}"
+    );
+    assert!(text.contains("crates/c/"), "later crate missing: {text}");
+    assert!(
+        text.contains("schema/json/"),
+        "schema rollup missing: {text}"
+    );
+    assert!(
+        text.contains("300 json files"),
+        "schema count missing: {text}"
+    );
+    assert!(
+        !text.contains("schema-000.json"),
+        "JSON leaf leaked into rows: {text}"
+    );
+    assert!(
+        text.contains("shown as rollups (budget: 30KB)"),
+        "rollup trailer missing: {text}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn files_mode_excludes_tests_from_rows_and_rollup_counts_by_default() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "src/lib.rs", "pub fn product() {}\n");
+    write_file(
+        dir.path(),
+        "tests/product_test.rs",
+        "fn product_test() {}\n",
+    );
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let default_resp = outline_files(&mut aft, dir.path());
+    assert_eq!(response_paths(&default_resp), vec!["src/lib.rs"]);
+    assert!(!default_resp["text"]
+        .as_str()
+        .unwrap()
+        .contains("product_test"));
+
+    let included_resp = send(
+        &mut aft,
+        json!({
+            "id": "outline-files-with-tests",
+            "command": "outline",
+            "directory": dir.path(),
+            "files": true,
+            "includeTests": true,
+        }),
+    );
+    assert_eq!(
+        response_paths(&included_resp),
+        vec!["src/lib.rs", "tests/product_test.rs"]
     );
 
     assert!(aft.shutdown().success());
