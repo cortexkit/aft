@@ -2102,6 +2102,15 @@ fn missing_callgraph_collection(
         _ => "hops",
     };
     let Some(top_level) = record.get(required).and_then(Value::as_array) else {
+        // trace_to_symbol answers "no path" with `path: null` and a `reason`
+        // (no_path_found, max_depth_exhausted); that is the contract, not an
+        // omitted collection. Only a response with neither is malformed.
+        if op == "trace_to_symbol"
+            && record.get("path").is_none_or(Value::is_null)
+            && record.get("reason").and_then(Value::as_str).is_some()
+        {
+            return None;
+        }
         return Some(required);
     };
     if op == "call_tree" && call_tree_descendant_missing_children(top_level) {
@@ -3181,6 +3190,32 @@ mod callgraph_format_tests {
                 false
             ),
             "Unable to format trace_to: response omitted required `hops` collection."
+        );
+    }
+
+    /// `path: null` plus a reason is trace_to_symbol's no-path answer, not an
+    /// omitted collection; a response with neither is still malformed.
+    #[test]
+    fn trace_to_symbol_no_path_with_reason_renders_not_refuses() {
+        assert_eq!(
+            format_callgraph(
+                "trace_to_symbol",
+                &json!({ "path": null, "complete": true, "reason": "no_path_found" }),
+                false
+            ),
+            "No path (no_path_found)"
+        );
+        assert_eq!(
+            format_callgraph(
+                "trace_to_symbol",
+                &json!({ "complete": false, "reason": "max_depth_exhausted" }),
+                false
+            ),
+            "No complete path (max_depth_exhausted)"
+        );
+        assert_eq!(
+            format_callgraph("trace_to_symbol", &json!({ "complete": true }), false),
+            "Unable to format trace_to_symbol: response omitted required `path` collection."
         );
     }
 

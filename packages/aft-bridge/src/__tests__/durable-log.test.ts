@@ -33,12 +33,26 @@ describe("durable plugin logging", () => {
     });
   });
 
-  test("computed XDG root wins over legacy AFT_CACHE_DIR", async () => {
+  // The log root follows the one storage ladder every AFT entry point uses
+  // (AFT_STORAGE_DIR, then AFT_CACHE_DIR/aft, then the XDG data root), so a
+  // bridge and the Rust binary it spawns never log under different roots.
+  test("legacy AFT_CACHE_DIR outranks the computed XDG root, as in the Rust ladder", async () => {
     const xdg = join(tmpdir(), "aft-xdg-resolution");
+    const legacyCache = join(tmpdir(), "aft-cache-resolution");
     await withEnv(
       {
         AFT_STORAGE_DIR: undefined,
-        AFT_CACHE_DIR: join(tmpdir(), "aft-cache-resolution"),
+        AFT_CACHE_DIR: legacyCache,
+        XDG_DATA_HOME: xdg,
+      },
+      () => {
+        expect(resolveAftStorageRoot()).toBe(join(legacyCache, "aft"));
+      },
+    );
+    await withEnv(
+      {
+        AFT_STORAGE_DIR: undefined,
+        AFT_CACHE_DIR: undefined,
         XDG_DATA_HOME: xdg,
       },
       () => {
