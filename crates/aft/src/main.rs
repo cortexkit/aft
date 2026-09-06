@@ -3973,6 +3973,22 @@ mod watcher_filter_tests {
 
         let ctx = make_ctx_with_root(&root);
         ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        // The bar renders only once every producer has reported; an empty
+        // diagnostics publish is a proven zero, not a fabricated one. It is
+        // published for a different file than the one the watcher touches:
+        // a change to a diagnosed file masks that file's report as stale,
+        // which would drop the only diagnostics producer and blank the bar
+        // for a reason unrelated to what this test pins.
+        {
+            let key = ServerKey {
+                kind: ServerKind::TypeScript,
+                root: root.clone(),
+            };
+            let mut lsp = ctx.lsp();
+            lsp.diagnostics_store_mut_for_test()
+                .publish(key, root.join("other.ts"), vec![]);
+        }
+        assert_eq!(ctx.status_bar_count_values().errors, Some(0));
         let rx = status_frame_rx(&ctx);
         let watcher_tx = install_watcher_rx(&ctx);
         watcher_tx.send(watcher_paths_event(file)).unwrap();
