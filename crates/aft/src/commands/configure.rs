@@ -2734,9 +2734,13 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let semantic_search = ctx.config().semantic_search;
     let mut search_index_cache_reused = false;
 
-    // Reconfigure is still the signal that workspace package metadata may have
-    // changed, even when the warm-maintenance key is otherwise equivalent.
-    crate::callgraph::clear_workspace_package_cache();
+    // Reconfigure is still the signal that this root's workspace package
+    // metadata may have changed, even when the warm-maintenance key is
+    // otherwise equivalent. Scoped to the root: the caches are process-wide
+    // and other roots' binds must not empty them.
+    if let Some(root) = ctx.config().project_root.as_deref() {
+        crate::callgraph::clear_workspace_package_cache_under(root);
+    }
 
     let search_build_in_progress = ctx
         .search_index_rx()
@@ -2872,9 +2876,11 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         (search_artifact_load_start, semantic_artifact_load_start) =
             schedule_missing_artifact_loads(ctx, search_index, semantic_search);
 
-        // Clear the workspace package caches here because reconfigure can point AFT at a
-        // different root; reset them before warming the callgraph store for the new project.
-        crate::callgraph::clear_workspace_package_cache();
+        // Reconfigure can point AFT at a different root; reset that root's
+        // entries before warming the callgraph store for it.
+        if let Some(root) = ctx.config().project_root.as_deref() {
+            crate::callgraph::clear_workspace_package_cache_under(root);
+        }
     }
 
     let refresh_project_runtime =

@@ -2520,6 +2520,28 @@ fn is_workspace_root(
         || !pnpm_workspace_patterns(dir, facts).is_empty()
 }
 
+/// Drop the workspace and crate caches for one project root only. The caches
+/// are process-wide and the daemon serves dozens of roots that bind about ten
+/// times a minute; clearing everything on each configure gave the caches a
+/// lifetime of seconds, so every Tier-2 rescan re-walked every workspace under
+/// every root. A configure is a signal about its own root's manifests, and
+/// the keys are canonical paths, so containment is the right scope.
+pub(crate) fn clear_workspace_package_cache_under(root: &Path) {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
+        cache.retain(|(workspace, _), _| !workspace.starts_with(&root));
+    }
+    if let Ok(mut cache) = WORKSPACE_MEMBER_DIRS_CACHE.write() {
+        cache.retain(|workspace, _| !workspace.starts_with(&root));
+    }
+    if let Ok(mut cache) = RUST_CRATE_INFO_CACHE.write() {
+        cache.retain(|dir, _| !dir.starts_with(&root));
+    }
+    if let Ok(mut cache) = RUST_WORKSPACE_CRATE_CACHE.write() {
+        cache.retain(|workspace, _| !workspace.starts_with(&root));
+    }
+}
+
 pub(crate) fn clear_workspace_package_cache() {
     if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
         cache.clear();
@@ -4234,7 +4256,33 @@ function hidden() {}
         assert!(member.ends_with("packages/b"), "{member:?}");
         assert_eq!(counting.list_dir_calls.get(), walked);
 
-        // A workspace manifest change is the one thing that may re-walk.
+        // A configure of some OTHER root must leave this workspace's entries
+        // alone: the daemon binds other roots many times a minute.
+        let other = TempDir::new().unwrap();
+        clear_workspace_package_cache_under(other.path());
+        resolve_workspace_package(
+            &root,
+            "react",
+            Some(&ModuleResolutionMemo::default()),
+            &facts,
+        );
+        assert_eq!(
+            counting.list_dir_calls.get(),
+            walked,
+            "clearing under another root must not drop this workspace's entries"
+        );
+        // A configure of THIS root drops them.
+        clear_workspace_package_cache_under(&root);
+        resolve_workspace_package(
+            &root,
+            "react",
+            Some(&ModuleResolutionMemo::default()),
+            &facts,
+        );
+        let rewalked = counting.list_dir_calls.get();
+        assert!(rewalked > walked, "clearing under this root re-walks");
+
+        // A workspace manifest change is the other thing that may re-walk.
         clear_workspace_package_cache();
         resolve_workspace_package(
             &root,
@@ -4243,7 +4291,7 @@ function hidden() {}
             &facts,
         );
         assert!(
-            counting.list_dir_calls.get() > walked,
+            counting.list_dir_calls.get() > rewalked,
             "after the cache is dropped the next miss walks again"
         );
     }
