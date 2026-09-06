@@ -90,7 +90,10 @@ fn outline_files_mode_returns_file_metadata_with_language_and_symbol_counts() {
 
     let md_entry = file_entry(&resp, "docs/readme.md");
     assert_eq!(md_entry["language"], "markdown");
-    assert_eq!(md_entry["symbols"], 2);
+    assert!(
+        md_entry.get("symbols").is_none(),
+        "files hidden by a rollup must not be parsed"
+    );
     assert_eq!(md_entry["lines"], 3);
     assert!(md_entry.get("bytes").is_none());
 
@@ -512,14 +515,16 @@ fn files_mode_breadth_first_rollups_keep_code_visible_past_large_json_tree() {
         text.contains("schema/json/"),
         "schema rollup missing: {text}"
     );
-    assert!(
-        text.contains("300 json files"),
-        "schema count missing: {text}"
-    );
+    assert!(text.contains("300 files"), "schema count missing: {text}");
     assert!(
         !text.contains("schema-000.json"),
         "JSON leaf leaked into rows: {text}"
     );
+    let schema_row = text
+        .lines()
+        .find(|line| line.starts_with("schema/json/"))
+        .expect("schema rollup row");
+    assert!(!schema_row.contains("syms"), "rollup row: {schema_row}");
     assert!(
         text.contains("shown as rollups (budget: 30KB)"),
         "rollup trailer missing: {text}"

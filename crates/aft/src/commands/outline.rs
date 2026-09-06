@@ -382,8 +382,11 @@ impl SkippedFile {
 struct OutlineFileEntry {
     path: String,
     language: String,
-    symbols: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbols: Option<usize>,
     lines: Option<usize>,
+    #[serde(skip)]
+    absolute_path: PathBuf,
     #[serde(skip)]
     data_doc: bool,
 }
@@ -393,10 +396,8 @@ struct OutlineDirectoryStats {
     dirs: usize,
     files: usize,
     lines: usize,
-    symbols: usize,
     code_files: usize,
     code_lines: usize,
-    languages: HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -508,6 +509,7 @@ fn handle_outline_files_mode(
         &file_entries,
         max_output_bytes,
     );
+    populate_rendered_file_symbols(&rows, &mut file_entries, ctx);
     let text = format_files_table(&rows, &directory_nodes, &file_entries, max_output_bytes);
     let rollup_count = rows
         .iter()
@@ -687,7 +689,7 @@ fn append_outline_directory_tree(
         if !include_tests && is_test_file(&test_path) {
             continue;
         }
-        let Some(entry) = outline_file_entry(&path, display_root, ctx) else {
+        let Some(entry) = outline_file_entry(&path, display_root) else {
             continue;
         };
         let Some(parent_id) = path
@@ -717,9 +719,7 @@ fn aggregate_outline_directory(
         let entry = &file_entries[file_id];
         stats.files += 1;
         stats.lines += entry.lines.unwrap_or(0);
-        *stats.languages.entry(entry.language.clone()).or_default() += 1;
         if !entry.data_doc {
-            stats.symbols += entry.symbols;
             stats.code_files += 1;
             stats.code_lines += entry.lines.unwrap_or(0);
         }
@@ -729,12 +729,8 @@ fn aggregate_outline_directory(
         stats.dirs += child_stats.dirs + 1;
         stats.files += child_stats.files;
         stats.lines += child_stats.lines;
-        stats.symbols += child_stats.symbols;
         stats.code_files += child_stats.code_files;
         stats.code_lines += child_stats.code_lines;
-        for (language, count) in child_stats.languages {
-            *stats.languages.entry(language).or_default() += count;
-        }
     }
 
     directory_nodes[node_id].stats = stats.clone();
@@ -886,12 +882,7 @@ fn plan_outline_file_rows(
     rows
 }
 
-fn outline_file_entry(
-    path: &Path,
-    display_root: &Path,
-    ctx: &AppContext,
-) -> Option<OutlineFileEntry> {
-    let metadata = std::fs::metadata(path).ok()?;
+fn outline_file_entry(path: &Path, display_root: &Path) -> Option<OutlineFileEntry> {
     let rel_path =
         relative_path_from_root(path, display_root).unwrap_or_else(|| path_to_slash(path));
     let detected_language = detect_language(path);
@@ -904,28 +895,55 @@ fn outline_file_entry(
     } else {
         outline_file_language(path, detected_language)
     };
-    let data_doc = is_data_doc_outline_file(path, detected_language);
-
-    let symbols = if content.binary {
-        0
-    } else if let Some(symbols) = cached_symbol_count(ctx, path, &metadata) {
-        symbols
-    } else if detected_language.is_none() || metadata.len() > MAX_OUTLINE_FILE_BYTES {
-        0
-    } else {
-        ctx.provider()
-            .list_symbols(path)
-            .map(|symbols| symbols.len())
-            .unwrap_or(0)
-    };
 
     Some(OutlineFileEntry {
         path: rel_path,
         language: language.to_string(),
-        symbols,
+        symbols: None,
         lines: content.lines,
-        data_doc,
+        absolute_path: path.to_path_buf(),
+        data_doc: is_data_doc_outline_file(path, detected_language),
     })
+}
+
+fn populate_rendered_file_symbols(
+    rows: &[OutlineTableRow],
+    file_entries: &mut [OutlineFileEntry],
+    ctx: &AppContext,
+) {
+    for file_id in rows.iter().filter_map(|row| match row {
+        OutlineTableRow::File(file_id) => Some(*file_id),
+        OutlineTableRow::Rollup(_) => None,
+    }) {
+        let entry = &mut file_entries[file_id];
+        if entry.symbols.is_some() {
+            continue;
+        }
+        if entry.language == "binary" {
+            entry.symbols = Some(0);
+            continue;
+        }
+        let path = entry.absolute_path.clone();
+        if detect_language(&path).is_none() {
+            entry.symbols = Some(0);
+            continue;
+        }
+        let Ok(metadata) = std::fs::metadata(&path) else {
+            entry.symbols = Some(0);
+            continue;
+        };
+        let symbols = cached_symbol_count(ctx, &path, &metadata).unwrap_or_else(|| {
+            if metadata.len() > MAX_OUTLINE_FILE_BYTES {
+                0
+            } else {
+                ctx.provider()
+                    .list_symbols(&path)
+                    .map(|symbols| symbols.len())
+                    .unwrap_or(0)
+            }
+        });
+        entry.symbols = Some(symbols);
+    }
 }
 
 fn relative_path_from_root(path: &Path, root: &Path) -> Option<String> {
@@ -1075,15 +1093,48 @@ fn format_files_table(
     file_entries: &[OutlineFileEntry],
     max_bytes: usize,
 ) -> String {
-    let rendered_rows = rows
+    let path_width = rows
         .iter()
         .map(|row| match row {
+            OutlineTableRow::File(file_id) => file_entries[*file_id].path.len(),
+            OutlineTableRow::Rollup(node_id) => directory_nodes[*node_id].path.len() + 1,
+        })
+        .max()
+        .unwrap_or(0);
+    let language_width = rows
+        .iter()
+        .filter_map(|row| match row {
+            OutlineTableRow::File(file_id) => Some(file_entries[*file_id].language.len()),
+            OutlineTableRow::Rollup(_) => None,
+        })
+        .max()
+        .unwrap_or("language".len())
+        .max(8);
+    let file_middle_width = language_width + 11;
+    let middle_width = rows
+        .iter()
+        .filter_map(|row| match row {
+            OutlineTableRow::File(_) => None,
+            OutlineTableRow::Rollup(node_id) => {
+                Some(directory_rollup_summary(&directory_nodes[*node_id].stats).len())
+            }
+        })
+        .max()
+        .unwrap_or(0)
+        .max(file_middle_width);
+
+    let mut output = String::new();
+    for row in rows {
+        let (path, middle, lines) = match row {
             OutlineTableRow::File(file_id) => {
                 let entry = &file_entries[*file_id];
                 (
                     entry.path.clone(),
-                    entry.language.clone(),
-                    entry.symbols,
+                    format!(
+                        "{:<language_width$} {:>5} syms",
+                        entry.language,
+                        entry.symbols.unwrap_or(0)
+                    ),
                     entry.lines.map(|lines| lines.to_string()),
                 )
             }
@@ -1091,29 +1142,13 @@ fn format_files_table(
                 let node = &directory_nodes[*node_id];
                 (
                     format!("{}/", node.path.trim_end_matches('/')),
-                    directory_rollup_language(&node.stats),
-                    node.stats.symbols,
+                    directory_rollup_summary(&node.stats),
                     Some(node.stats.lines.to_string()),
                 )
             }
-        })
-        .collect::<Vec<_>>();
-    let path_width = rendered_rows
-        .iter()
-        .map(|(path, _, _, _)| path.len())
-        .max()
-        .unwrap_or(0);
-    let language_width = rendered_rows
-        .iter()
-        .map(|(_, language, _, _)| language.len())
-        .max()
-        .unwrap_or("language".len())
-        .max(8);
-
-    let mut output = String::new();
-    for (path, language, symbols, lines) in rendered_rows {
+        };
         output.push_str(&format!(
-            "{path:<path_width$}  {language:<language_width$} {symbols:>5} syms {lines:>7} lines\n",
+            "{path:<path_width$}  {middle:<middle_width$} {lines:>7} lines\n",
             lines = lines.as_deref().unwrap_or("-"),
         ));
     }
@@ -1137,23 +1172,13 @@ fn format_files_table(
     output
 }
 
-fn directory_rollup_language(stats: &OutlineDirectoryStats) -> String {
+fn directory_rollup_summary(stats: &OutlineDirectoryStats) -> String {
     let file_word = if stats.files == 1 { "file" } else { "files" };
     let dir_word = if stats.dirs == 1 { "dir" } else { "dirs" };
-    let mut languages = stats.languages.iter().collect::<Vec<_>>();
-    languages.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-    let files = if let [(language, _)] = languages.as_slice() {
-        format!("{} {} {file_word}", stats.files, language)
-    } else {
-        format!("{} {file_word}", stats.files)
-    };
     if stats.dirs == 0 {
-        files
-    } else if stats.files == 0 {
-        format!("{} {dir_word}", stats.dirs)
+        format!("{} {file_word}", stats.files)
     } else {
-        format!("{files}, {} {dir_word}", stats.dirs)
+        format!("{} {file_word}, {} {dir_word}", stats.files, stats.dirs)
     }
 }
 
@@ -2452,8 +2477,9 @@ mod tests {
         OutlineFileEntry {
             path: path.to_string(),
             language: language.to_string(),
-            symbols,
+            symbols: Some(symbols),
             lines,
+            absolute_path: PathBuf::from(path),
             data_doc,
         }
     }
@@ -2556,8 +2582,9 @@ mod tests {
         assert_eq!(rows, vec![OutlineTableRow::Rollup(2)]);
         let text = format_files_table(&rows, &directories, &files, 30 * 1024);
         assert!(text.contains("schema/json/"));
-        assert!(text.contains("3 json files"));
+        assert!(text.contains("3 files"));
         assert!(text.contains("6 lines"));
+        assert!(!text.contains("syms"), "rollup row: {text}");
         assert!(text.contains("1 directory shown as a rollup (budget: 30KB)"));
         assert!(!text.contains(".json  "));
     }
