@@ -2,6 +2,11 @@
 # Run a verification command and its preflight checks with their original exit
 # statuses preserved, then push only on success.
 #
+# NOT the default push path any more: use scripts/train-push.sh, which pushes a
+# train branch and lets CI gate it on all three platforms. This script is for
+# the work whose failures only reproduce on this box (watcher/fseventsd, macOS
+# exec assessment), where the local full gate is the only gate that can see them.
+#
 # Usage: scripts/gated-push.sh [--remote origin] [--branch main] -- <gate command...>
 # Example: scripts/gated-push.sh -- cargo test -p agent-file-tools --lib
 set -euo pipefail

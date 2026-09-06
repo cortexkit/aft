@@ -34,28 +34,19 @@ on:
       - ".github/workflows/_e2e-suite.yml"
       - ".github/workflows/bump-opencode.yml"
       - ".github/workflows/discord-release.yml"
+  # No paths filter on push, deliberately. `train/**` branches are the push
+  # gate: scripts/train-push.sh pushes a train here, waits for THIS run, and
+  # fast-forwards main only when it concludes success. A paths filter would
+  # skip the run for a train that happens to touch only unlisted files (a
+  # docs-only or workflow-only train is still a train), and a skipped run is
+  # not a green run - the watcher would wait for a run that never appears and
+  # the train could never land. GitHub applies one paths filter to the whole
+  # push event, so main gives up its filter to keep trains unconditional; the
+  # pull_request filter above is unchanged.
   push:
     branches:
       - main
-    paths:
-      - "crates/**"
-      - "packages/**"
-      - "tests/**"
-      - "scripts/**"
-      - "docs/**"
-      - "ARCHITECTURE.md"
-      - "STRUCTURE.md"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "package.json"
-      - "bun.lock"
-      - ".github/opencode-version.txt"
-      - ".github/workflows/tests.yml"
-      - ".github/workflows/release.yml"
-      - ".github/workflows/_unit-suite.yml"
-      - ".github/workflows/_e2e-suite.yml"
-      - ".github/workflows/bump-opencode.yml"
-      - ".github/workflows/discord-release.yml"
+      - "train/**"
   workflow_dispatch:
     inputs:
       ref:
