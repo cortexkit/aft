@@ -282,7 +282,7 @@ opencode-aft/
 
 ## Contributing
 
-Pull requests for bugs are welcome. For features or broader fixes that need architectural changes, please open an issue first to discuss the approach.
+Open an issue first and let a maintainer agree the design; a pull request is reviewable once its linked issue carries the `design-approved` label. See [Design first](CONTRIBUTING.md#design-first) — typo-class fixes are exempt.
 
 Adding a command means implementing it in Rust (`crates/aft/src/commands/`) and adding a tool definition in each harness adapter (`packages/opencode-plugin/src/tools/`, `packages/pi-plugin/src/tools/`). Run `bun run format` and `cargo fmt` before submitting; CI rejects unformatted code.
 

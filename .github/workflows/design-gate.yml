@@ -1,0 +1,82 @@
+name: Design gate
+
+# Contributor work reaches us as a pull request, and until now the design
+# conversation only started once the code already existed — on an issue opened
+# after the fact, or on a competing PR. This workflow moves that conversation
+# in front of the code: a PR is reviewable and mergeable only once the issue it
+# closes carries a maintainer's `design-approved` label.
+#
+# GitHub has no "issue first" setting, so the rule is built from two
+# primitives: the `design-gate` check below (made a required status check on
+# main through branch protection — an operator setting, not part of this file)
+# and the pull request's draft state.
+#
+# All parsing and decision logic lives in scripts/design-gate.mjs so it can be
+# unit tested offline; see scripts/design-gate.test.mjs.
+#
+# Note the trigger list: label changes on a PR do not re-run it. When a
+# maintainer applies `trivial` to an already-failing PR, re-run this workflow
+# from the checks tab (or push) to turn the check green.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+  issues:
+    types: [labeled]
+
+concurrency:
+  group: design-gate-${{ github.event.pull_request.number || github.event.issue.number }}
+  # Pull request runs are pure re-evaluations, so superseding one is free. The
+  # issue arm marks PRs ready and must not be interrupted half way.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # The job id is the check name. Branch protection on main requires
+  # `design-gate`; renaming this job renames the required check.
+  design-gate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # check out the gate script
+      issues: read # read the linked issue's labels
+      pull-requests: write # post the gate comment, convert back to draft
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      # Fork pull requests run with a read-only token: the comment and the
+      # draft conversion are then refused, and the script logs that and still
+      # fails. A side step that cannot run must never turn the gate green.
+      - name: Evaluate the design gate
+        run: node scripts/design-gate.mjs pull-request
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Marking a pull request ready with GITHUB_TOKEN does not start another
+  # workflow run, so this job re-runs the gate logic itself and publishes the
+  # `design-gate` check run on the PR head. Without that the required check
+  # would stay red until the author pushed a commit.
+  design-approved-sync:
+    if: github.event_name == 'issues' && github.event.label.name == 'design-approved'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # check out the gate script
+      issues: read # read the labelled issue
+      pull-requests: write # mark waiting drafts ready for review
+      checks: write # publish the design-gate check run on the PR head
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Release pull requests waiting on this issue
+        run: node scripts/design-gate.mjs issue-labeled
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
