@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1268,72 +1268,65 @@ fn collect_outline_files_with_device_lookup<F>(
 ) where
     F: FnMut(&Path) -> std::io::Result<Option<u64>>,
 {
-    if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
-        *walk_truncated = true;
-        return;
-    }
+    let mut pending = VecDeque::from([directory.to_path_buf()]);
 
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
-    };
-    let mut entries = entries.flatten().collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.path());
-
-    for entry in entries {
+    while let Some(current) = pending.pop_front() {
         if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
             *walk_truncated = true;
             return;
         }
-        // Query the directory entry once. Calling Path::is_dir, Path::is_file,
-        // and symlink_metadata separately issues up to three metadata lookups per
-        // file, which dominates `files: true` outlines on large repositories.
-        let Ok(file_type) = entry.file_type() else {
+        let Ok(entries) = std::fs::read_dir(&current) else {
             continue;
         };
-        if file_type.is_symlink() {
-            continue;
+        let mut entries = entries.flatten().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.path());
+        let mut child_directories = Vec::new();
+        let mut child_files = Vec::new();
+        for entry in entries {
+            // DirEntry::file_type is one metadata lookup; avoid separate is_dir,
+            // is_file, and symlink_metadata calls for every repository entry.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                child_directories.push(entry.path());
+            } else if file_type.is_file() {
+                child_files.push(entry.path());
+            }
         }
 
-        let path = entry.path();
-        if file_type.is_dir() {
+        // Discover child directories before counting files. A repository with
+        // one huge schema directory must still expose every sibling at this
+        // breadth level even when the 10k-file safety fence is reached.
+        for path in child_directories {
             if should_skip_directory(&path) || is_ignored_outline_path(&path, true, options) {
                 continue;
             }
             match boundary.should_descend_with(&path, |child| device_lookup(child)) {
-                Ok(true) => {}
-                Ok(false) => {
-                    *skipped_foreign_mounts += 1;
-                    continue;
+                Ok(true) => {
+                    directories.push(path.to_string_lossy().to_string());
+                    pending.push_back(path);
                 }
+                Ok(false) => *skipped_foreign_mounts += 1,
                 Err(_) => {
                     *collection_truncated = true;
                     return;
                 }
             }
-            directories.push(path.to_string_lossy().to_string());
-            collect_outline_files_with_device_lookup(
-                &path,
-                files,
-                directories,
-                walk_truncated,
-                collection_truncated,
-                skipped_foreign_mounts,
-                options,
-                boundary,
-                device_lookup,
-            );
-            if *walk_truncated || *collection_truncated {
-                return;
-            }
-        } else if file_type.is_file() {
-            if is_ignored_outline_path(&path, false, options) {
-                continue;
-            }
-            files.push(path.to_string_lossy().to_string());
+        }
+
+        for path in child_files {
             if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
                 *walk_truncated = true;
                 return;
             }
+            if is_ignored_outline_path(&path, false, options) {
+                continue;
+            }
+            files.push(path.to_string_lossy().to_string());
         }
     }
 }
