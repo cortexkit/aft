@@ -472,10 +472,10 @@ struct StatePaths {
 
 impl StatePaths {
     fn from_process() -> Self {
-        let storage_root = crate::bash_background::storage_dir(None);
         Self::from_root(gh_shim_state_dir_from(
-            std::env::var_os(GH_SHIM_STATE_DIR_ENV).as_deref(),
-            &storage_root,
+            crate::environment::non_empty_os_var(GH_SHIM_STATE_DIR_ENV).as_deref(),
+            crate::environment::non_empty_os_var("XDG_STATE_HOME").as_deref(),
+            crate::environment::non_empty_os_var("HOME").as_deref(),
         ))
     }
 
@@ -496,11 +496,24 @@ impl StatePaths {
 }
 
 /// Resolve the one process-state directory used by every gh-shim reader and
-/// writer. The dedicated absolute override is useful for embedding callers and
-/// tests; otherwise shim state is a subtree of AFT's shared storage root. Keeping
-/// that fallback as a call prevents the shim from drifting onto an independent
-/// XDG state-home ladder that the supervised module never consults.
-fn gh_shim_state_dir_from(dedicated_override: Option<&OsStr>, storage_root: &Path) -> PathBuf {
+/// writer. The dedicated absolute override is for embedding callers and tests;
+/// otherwise the ladder is XDG state-home, then `$HOME/.local/state`.
+///
+/// This is a deliberate divergence from the daemon's storage ladder, and it
+/// must stay one: the shim is not the supervised module. It runs inside the
+/// agent's child process with the operator's environment, and every placed
+/// artifact of the governance protocol - the signed routing manifest, the
+/// version high-water that refuses rollbacks, the rung cache, the bypass
+/// audit - lives at this path on every governed seat, written there by the
+/// activation ceremony. Moving the rung silently would start every seat with
+/// an empty state directory: no manifest reads as "unmanifested", which is
+/// transparent passthrough under the operator's own credentials, so bot
+/// speech would post as the operator fleet-wide with nothing refusing.
+fn gh_shim_state_dir_from(
+    dedicated_override: Option<&OsStr>,
+    xdg_state_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> PathBuf {
     if let Some(path) = dedicated_override
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -508,7 +521,18 @@ fn gh_shim_state_dir_from(dedicated_override: Option<&OsStr>, storage_root: &Pat
     {
         return path;
     }
-    storage_root.join("gh-shim")
+    xdg_state_home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            home.filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".local/state"))
+        })
+        .unwrap_or_else(std::env::temp_dir)
+        .join("cortexkit")
+        .join("aft")
+        .join("gh-shim")
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -4116,14 +4140,23 @@ mod tests {
         assert_eq!(StatePaths::from_process().root, PathBuf::from(selected));
     }
 
+    /// The shim's state ladder is the operator's XDG state home, deliberately
+    /// not the daemon's storage root: every governed seat's placed manifest,
+    /// high-water and rung cache live there. See `gh_shim_state_dir_from`.
     #[test]
-    fn state_dir_uses_dedicated_override_then_shared_storage_and_ignores_empty_override() {
-        let storage_root = tempfile::tempdir().unwrap();
+    fn state_dir_uses_dedicated_override_then_xdg_state_home_then_home_and_ignores_empty_values() {
+        let xdg_state = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
         let dedicated = tempfile::tempdir().unwrap();
         let before = fs::metadata(dedicated.path()).unwrap().modified().unwrap();
+        let tail = Path::new("cortexkit").join("aft").join("gh-shim");
 
         assert_eq!(
-            gh_shim_state_dir_from(Some(dedicated.path().as_os_str()), storage_root.path()),
+            gh_shim_state_dir_from(
+                Some(dedicated.path().as_os_str()),
+                Some(xdg_state.path().as_os_str()),
+                Some(home.path().as_os_str()),
+            ),
             dedicated.path()
         );
         assert_eq!(
@@ -4132,12 +4165,27 @@ mod tests {
             "resolving the dedicated override must not create or rewrite state"
         );
         assert_eq!(
-            gh_shim_state_dir_from(None, storage_root.path()),
-            storage_root.path().join("gh-shim")
+            gh_shim_state_dir_from(
+                None,
+                Some(xdg_state.path().as_os_str()),
+                Some(home.path().as_os_str())
+            ),
+            xdg_state.path().join(&tail),
+            "the operator's XDG state home is the rung the ceremony writes to"
         );
         assert_eq!(
-            gh_shim_state_dir_from(Some(OsStr::new("")), storage_root.path()),
-            storage_root.path().join("gh-shim")
+            gh_shim_state_dir_from(
+                Some(OsStr::new("")),
+                Some(OsStr::new("")),
+                Some(home.path().as_os_str())
+            ),
+            home.path().join(".local/state").join(&tail),
+            "empty override and empty XDG_STATE_HOME fall through to HOME"
+        );
+        assert_eq!(
+            gh_shim_state_dir_from(None, Some(OsStr::new("relative/state")), None),
+            std::env::temp_dir().join(&tail),
+            "a relative XDG_STATE_HOME is not a rung"
         );
     }
 
