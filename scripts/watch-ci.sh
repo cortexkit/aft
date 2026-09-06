@@ -18,7 +18,28 @@
 #   WATCH_CI_SETTLE=1 scripts/watch-ci.sh <run-id>
 set -uo pipefail
 
-REPO="${REPO:-cortexkit/aft}"
+# The repository the runs live in: from the checkout's origin unless REPO is
+# given. A fixed default was the first thing a lift of this script kept by
+# accident, so a lifted copy watched THIS repository's runs for another repo's
+# trains. Both github.com URL forms are accepted; anything else refuses so the
+# watch never quietly targets the wrong repository.
+repo_from_origin() {
+  local url
+  url="$(git config --get remote.origin.url 2>/dev/null)" || return 1
+  case "$url" in
+    git@github.com:*) url="${url#git@github.com:}" ;;
+    https://github.com/*) url="${url#https://github.com/}" ;;
+    ssh://git@github.com/*) url="${url#ssh://git@github.com/}" ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' "${url%.git}"
+}
+if [ -z "${REPO:-}" ]; then
+  REPO="$(repo_from_origin)" || {
+    echo "watch-ci: cannot derive the repository from origin; set REPO=owner/name" >&2
+    exit 2
+  }
+fi
 # Which workflow gates a landing. A sha can carry runs from several workflows
 # (cost-gate, testbox), so resolving a run BY SHA has to name the gating one or
 # it can latch a run that says nothing about the tests.

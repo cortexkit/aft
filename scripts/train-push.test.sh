@@ -90,16 +90,25 @@ fi
 
 case "$json" in
   defaultBranchRef) cat "$STATE/default_branch" ;;
-  databaseId,headSha)
+  databaseId,headSha|databaseId,headSha,workflowName)
     # A green_shas file makes the stub sha-aware: shas listed there have a run,
     # any other sha has none yet (what a just-pushed commit looks like).
     if [ -f "$STATE/green_shas" ]; then
       sha="$(printf '%s' "$jq_arg" | sed -n 's/.*headSha=="\([0-9a-fA-F]*\)".*/\1/p')"
       grep -qx "$sha" "$STATE/green_shas" || exit 0
     fi
+    # The probe matches its run by the workflow's display name. The stub's run
+    # belongs to the workflow named in $STATE/workflow_name (default: the name
+    # write_tests_workflow gives); a query for any other name finds no run,
+    # which is what the forge answers when the names disagree.
+    if [ "$json" = "databaseId,headSha,workflowName" ]; then
+      want="$(printf '%s' "$jq_arg" | sed -n 's/.*workflowName=="\([^"]*\)".*/\1/p')"
+      have="$(cat "$STATE/workflow_name" 2>/dev/null || echo Tests)"
+      [ "$want" = "$have" ] || exit 0
+    fi
     cat "$STATE/run_id"
     ;;
-  url) echo "https://github.com/cortexkit/aft/actions/runs/$(cat "$STATE/run_id")" ;;
+  url) echo "https://github.com/example/repo/actions/runs/$(cat "$STATE/run_id")" ;;
   status) echo "completed" ;;
   jobs) cat "$STATE/failed_job" ;;
   conclusion) cat "$STATE/conclusion" ;;
@@ -218,6 +227,7 @@ run_train() {
   LAST_OUT="$(
     cd "$dir/work" &&
       PATH="$BIN_DIR:$PATH" \
+      REPO="${TRAIN_PUSH_TEST_REPO-example/repo}" \
       OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" \
       TRAIN_PUSH_TEST_STATE="$dir/ci-state" \
       WATCH_CI_RESOLVE_ATTEMPTS=1 \
@@ -783,6 +793,53 @@ run_train "$dir" audited
 BIN_DIR="$saved_bin"
 expect_rc 2 "a present, failing governed-surface audit refuses the train"
 expect_out "governed-surface audit failed" "the refusal names the gate"
+
+# --- the gating workflow is a parameter, not this repository's filename ----
+# Lifts whose gate is ci.yml refused at "no .github/workflows/tests.yml" while
+# WATCH_CI_WORKFLOW=ci.yml was set: the scan read a hardcoded path and the
+# probe read the variable. One variable now feeds both.
+dir="$(new_fixture ciyml)"
+git -C "$dir/work" mv .github/workflows/tests.yml .github/workflows/ci.yml
+sed -i.bak 's/^name: Tests$/name: CI/' "$dir/work/.github/workflows/ci.yml" && rm -f "$dir/work/.github/workflows/ci.yml.bak"
+git -C "$dir/work" add -A .github/workflows
+git -C "$dir/work" commit -qm "gate is ci.yml"
+echo "CI" > "$dir/ci-state/workflow_name"
+add_train_commit "$dir/work" "ciyml"
+run_train "$dir" ciyml
+expect_rc 2 "without WATCH_CI_WORKFLOW a ci.yml repository refuses"
+expect_out "set WATCH_CI_WORKFLOW=" "the refusal names the override"
+expect_out "ci.yml" "the refusal lists the workflow files present"
+WATCH_CI_WORKFLOW=ci.yml run_train "$dir" ciyml
+expect_rc 0 "with WATCH_CI_WORKFLOW=ci.yml the same repository lands"
+
+# --- first-run probe finds its run by sha + display name, not by file ------
+# A train that RENAMES the gating workflow file: the forge cannot list the new
+# file until it lands, so a file-filtered run query finds nothing for a probe
+# whose run started. The display name survives the rename.
+dir="$(new_fixture renamed)"
+rm -f "$dir/work/.git/train-push-proven"
+git -C "$dir/work" mv .github/workflows/tests.yml .github/workflows/gate.yml
+git -C "$dir/work" add -A .github/workflows
+git -C "$dir/work" commit -qm "rename the gate file"
+add_train_commit "$dir/work" "renamed"
+WATCH_CI_WORKFLOW=gate.yml run_train "$dir" renamed
+expect_rc 0 "a train that renames the gating workflow still proves its trigger"
+expect_out "trigger proven" "the probe found the run under the workflow's display name"
+
+# --- repository slug: derived from origin, refused when underivable ---------
+dir="$(new_fixture slug)"
+add_train_commit "$dir/work" "slug"
+TRAIN_PUSH_TEST_REPO="" run_train "$dir" slug
+expect_rc 2 "a local-path origin cannot yield a repository slug and refuses"
+expect_out "set REPO=owner/name" "the refusal names the override"
+# A github-shaped configured URL, rewritten to the local bare repo for the
+# actual fetch/push: the slug is read from the configured value, which is what
+# an operator's clone carries; insteadOf keeps the fixture offline.
+git -C "$dir/work" remote set-url origin "git@github.com:example/derived.git"
+git -C "$dir/work" config url."$dir/origin.git".insteadOf "git@github.com:example/derived.git"
+TRAIN_PUSH_TEST_REPO="" run_train "$dir" slug
+expect_rc 0 "a github-shaped origin lands without REPO"
+expect_out "example/derived" "the slug is derived from origin's configured URL"
 
 if [ "$failures" -ne 0 ]; then
   printf 'train-push.test.sh: %s check(s) failed\n' "$failures" >&2
