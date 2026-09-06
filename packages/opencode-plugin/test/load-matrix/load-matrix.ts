@@ -417,7 +417,8 @@ async function writeV2LifecycleProbe(hostRoot: string): Promise<string> {
   await writeFile(
     probe,
     `
-import { appendFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { Effect } from "effect";
 import { load } from "@opencode-ai/core/plugin/module";
 import { Host } from "@opencode-ai/plugin/host";
@@ -450,17 +451,74 @@ const loaded = await Effect.runPromise(
 if (loaded.pending) throw new Error("host loader returned pending");
 const entrypoints = Host.resolve(installed);
 
+function permissionStream() {
+  const queued = [];
+  const waiters = [];
+  let closed = false;
+  return {
+    emit: (event) => {
+      const waiter = waiters.shift();
+      if (waiter) waiter({ done: false, value: event });
+      else queued.push(event);
+    },
+    stream: {
+      [Symbol.asyncIterator]() {
+        return {
+          next: () => {
+            const value = queued.shift();
+            if (value) return Promise.resolve({ done: false, value });
+            if (closed) return Promise.resolve({ done: true, value: undefined });
+            return new Promise((resolveNext) => waiters.push(resolveNext));
+          },
+          return: () => {
+            closed = true;
+            return Promise.resolve({ done: true, value: undefined });
+          },
+        };
+      },
+    },
+  };
+}
+
 function locationContext(id) {
   const tools = [];
   const rpcRegistrations = [];
   const rpcEvents = [];
   let rpcDisposals = 0;
+  const permissionCreates = [];
+  const subscriptions = [];
+  const replyPlan = ["once", "once", "reject", "reject"];
+  const client = {
+    event: {
+      subscribe: async () => {
+        const subscription = permissionStream();
+        subscriptions.push(subscription);
+        return { stream: subscription.stream };
+      },
+    },
+    permission: {
+      create: async (input) => {
+        permissionCreates.push(input);
+        const subscription = subscriptions.shift();
+        if (!subscription) throw new Error("permission.create ran before event.subscribe");
+        const requestID = "permission-" + permissionCreates.length;
+        const reply = replyPlan.shift();
+        queueMicrotask(() => subscription.emit({
+          type: "permission.replied",
+          properties: { sessionID: input.sessionID, requestID, reply },
+        }));
+        return { data: { id: requestID, effect: "ask" } };
+      },
+    },
+  };
   return {
     tools,
     rpcRegistrations,
     rpcEvents,
     rpcDisposals: () => rpcDisposals,
+    permissionCreates,
     context: {
+      client,
       location: {
         directory,
         project: { id, directory, canonical: directory },
@@ -482,6 +540,7 @@ function locationContext(id) {
       tool: {
         transform: (register) => Effect.sync(() => register({
           add: (tool) => tools.push(tool),
+          remove: () => {},
         })),
       },
     },
@@ -522,6 +581,56 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     }
     appendFileSync(marker, "rpc-call:" + index + ":" + status.session.id + "\\n");
   }
+  const edit = first.tools.find((tool) => tool.name === "edit");
+  const aftDelete = first.tools.find((tool) => tool.name === "aft_delete");
+  if (!edit || !aftDelete) throw new Error("enabled V2 effect did not register hoisted mutation tools");
+  const editPath = resolve(directory, "permission-edit.ts");
+  const deletePath = resolve(directory, "permission-delete.ts");
+  const deniedDeletePath = resolve(directory, "permission-delete-denied.ts");
+  writeFileSync(editPath, "old\\n");
+  writeFileSync(deletePath, "delete me\\n");
+  writeFileSync(deniedDeletePath, "keep me\\n");
+  const permissionContext = (id) => ({
+    sessionID: "permission-session",
+    messageID: "permission-message",
+    agent: "load-matrix",
+    id,
+    progress: () => Effect.succeed(undefined),
+  });
+  yield* edit.execute(
+    { path: editPath, edits: [{ oldString: "old", newString: "new" }] },
+    permissionContext("edit-allowed"),
+  );
+  yield* aftDelete.execute(
+    { files: [deletePath] },
+    permissionContext("delete-allowed"),
+  );
+  const deniedEdit = yield* edit.execute(
+    { path: editPath, edits: [{ oldString: "new", newString: "denied" }] },
+    permissionContext("edit-denied"),
+  );
+  const deniedEditPayload = JSON.parse(deniedEdit.content);
+  if (deniedEditPayload.code !== "permission_denied") {
+    throw new Error("denied edit did not return permission_denied: " + deniedEdit.content);
+  }
+  const deniedDelete = yield* Effect.flip(aftDelete.execute(
+    { files: [deniedDeletePath] },
+    permissionContext("delete-denied"),
+  ));
+  if (deniedDelete?._tag !== "Tool.Error" || deniedDelete.message !== "Permission denied.") {
+    throw new Error("denied aft_delete did not throw: " + JSON.stringify(deniedDelete));
+  }
+  const [editAsk, deleteAsk, deniedEditAsk, deniedDeleteAsk] = first.permissionCreates;
+  if (editAsk.action !== "edit" || editAsk.metadata.filepath !== editPath || !editAsk.metadata.diff?.includes("@@")) {
+    throw new Error("hoisted edit permission shape mismatch: " + JSON.stringify(editAsk));
+  }
+  if (deleteAsk.action !== "edit" || deleteAsk.metadata.action !== "delete") {
+    throw new Error("aft_delete permission shape mismatch: " + JSON.stringify(deleteAsk));
+  }
+  if (deniedEditAsk.action !== "edit" || deniedDeleteAsk.action !== "edit") {
+    throw new Error("denied permission vocabulary mismatch: " + JSON.stringify(first.permissionCreates));
+  }
+  appendFileSync(marker, "permissions:" + JSON.stringify(first.permissionCreates) + "\\n");
   const live = getBridgeLifecycleTopology();
   const liveHealth = yield* Effect.promise(() => sampleBridgeLifecycleCensus({ settleMs: 0 }));
   const listeningPorts = process._getActiveHandles().flatMap((handle) => {
@@ -837,7 +946,9 @@ export default { id: original.id, effect, setup };
       enabled: true,
       search_index: false,
       semantic_search: false,
-      tool_surface: "minimal",
+      tool_surface: "all",
+      hoist_builtin_tools: true,
+      bash: false,
       lsp: { auto_install: false },
     });
     const manifestPath = join(packageRoot, "package.json");
@@ -894,6 +1005,8 @@ export default { id: original.id, effect };
     expect(events).toContain(
       'health-settled:{"watchers":0,"listenPorts":0,"routes":0,"lspChildren":0,"daemonProcesses":0}',
     );
+    expect(events).toContain('permissions:[{"sessionID":"permission-session","action":"edit"');
+    expect(events).toContain('"metadata":{"action":"delete"');
   }, 180_000);
 
   test("manifest mutation converges multiple V1 root invocations on one daemon owner", async () => {

@@ -13,6 +13,7 @@ import {
 } from "../config.js";
 import { resolvePluginVersion } from "../plugin-version.js";
 import { registerAftRpc } from "../rpc/register.js";
+import { hoistedV2ToolConsumers } from "../tools/hoisted/v2.js";
 import {
   buildAftToolDefinitions,
   openCodeHashlineEffective,
@@ -24,7 +25,9 @@ const defaults = {
   buildToolMap: buildAftToolDefinitions,
   registerTools: registerAftTools,
   registerRpc: registerAftRpc,
-  toolConsumers: {},
+  toolConsumers: (context) => ({
+    ...hoistedV2ToolConsumers(context),
+  }),
   acquireBridge,
   loadConfig: loadAftConfig,
   releaseBridge,
@@ -90,7 +93,7 @@ export function makeServerEffect(overrides = {}) {
         context,
         location,
         runtime.tools,
-        dependencies.toolConsumers,
+        dependencies.toolConsumers(context),
       );
     });
   };
