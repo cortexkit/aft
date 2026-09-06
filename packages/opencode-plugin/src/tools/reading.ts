@@ -76,13 +76,13 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
       description:
         "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with " +
         (zoomEnabled ? "aft_zoom" : "read") +
-        ". Set `files: true` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\n" +
+        ". With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\n" +
         (zoomEnabled
           ? "For understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\n"
           : "For understanding a specific feature, prefer aft_search + read on named symbols; use aft_outline on a whole directory only for high-level structure mapping.\n\n") +
         "Pass a single `target`:\n" +
         "  • file path → outline that file (with signatures)\n" +
-        "  • directory path → outline all source files under it (recursively, up to 200 files)\n" +
+        "  • directory path → outline source files under it\n" +
         "  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n" +
         "  • array of paths → outline multiple files in one call; with files:true, every path must be a directory" +
         (githubOutlineDescription ? `\n\n${githubOutlineDescription}` : ""),
@@ -96,7 +96,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           .boolean()
           .optional()
           .describe(
-            "Directory-only mode: when true, target must be a directory or array of directories and the result is a flat file tree with path, language, symbol count, and byte size instead of a symbol outline.",
+            "Directory-only mode: when true, target must be a directory or array of directories and the result is a breadth-first file tree with directory rollups plus language, symbol, and line counts.",
           ),
         includeTests: z
           .boolean()

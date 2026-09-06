@@ -121,6 +121,10 @@ describe("reading tool adapters", () => {
       createPluginContext(pool, { config: { disabled_tools: ["aft_zoom"] } as never }),
     ).aft_outline.description;
     expect(enabled).toContain("aft_zoom with `callgraph:true`");
+    expect(enabled).toContain("breadth-first with directory rollups");
+    expect(enabled).toContain("line count");
+    expect(enabled).not.toContain("up to 200 files");
+    expect(enabled).not.toContain("byte metadata");
     expect(disabled).toContain("prefer aft_search + read on named symbols");
     expect(disabled).not.toContain("aft_zoom");
     expect(disabled).not.toContain("read with `callgraph:true`");
