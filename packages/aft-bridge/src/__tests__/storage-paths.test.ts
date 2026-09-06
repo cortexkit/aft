@@ -9,19 +9,17 @@ import {
 } from "../storage-paths.js";
 
 describe("storage path ladder", () => {
-  test("matches daemon data-home rungs on both platforms and ignores empty values", () => {
+  test("matches daemon except for stable Windows cache-class storage and ignores empty values", () => {
     const currentDirectory = resolve("audit-storage-cwd");
     const fallbackHome = join(currentDirectory, "system-home");
     const values: Record<string, string | undefined> = {
       AFT_STORAGE_DIR: "",
       AFT_CACHE_DIR: "",
       XDG_DATA_HOME: "",
-      APPDATA: "",
+      APPDATA: join(currentDirectory, "wrong-roaming-data"),
       USERPROFILE: "",
       HOME: "",
-      // LOCALAPPDATA must not affect this result: the shared Windows data-home
-      // ladder uses roaming APPDATA or USERPROFILE.
-      LOCALAPPDATA: join(currentDirectory, "wrong-local-data"),
+      LOCALAPPDATA: "",
     };
     const context = (platform: StoragePlatform): StoragePathContext => ({
       platform,
@@ -42,13 +40,13 @@ describe("storage path ladder", () => {
       join(values.HOME, ".local", "share", "cortexkit", "aft"),
     );
 
-    values.APPDATA = join(currentDirectory, "roaming");
+    values.LOCALAPPDATA = join(currentDirectory, "local-data");
     expect(resolveCortexKitStorageRoot(context("windows"))).toBe(
-      join(values.APPDATA, "cortexkit", "aft"),
+      join(values.LOCALAPPDATA, "cortexkit", "aft"),
     );
-    values.APPDATA = "";
+    values.LOCALAPPDATA = "";
     expect(resolveCortexKitStorageRoot(context("windows"))).toBe(
-      join(values.USERPROFILE, "AppData", "Roaming", "cortexkit", "aft"),
+      join(values.USERPROFILE, "AppData", "Local", "cortexkit", "aft"),
     );
 
     values.XDG_DATA_HOME = "relative-data";

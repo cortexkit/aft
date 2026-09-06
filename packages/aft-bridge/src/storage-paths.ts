@@ -33,17 +33,20 @@ function homeDir(context: StoragePathContext): string {
  *
  * Last re-derived 2026-09-06 against subconscious d5e09914b0791a66f2a5a00a9bb3422860ade95e:
  * compare ordered variables, platform gates, and empty-value guards with
- * `subc-core/src/daemon_config.rs::default_data_home`, resolving named constants
- * before changing a rung.
+ * `subc-core/src/daemon_config.rs::default_data_home`, resolve named constants,
+ * then preserve the documented Windows cache-class divergence.
  */
 export function resolveDataHome(context: StoragePathContext = {}): string {
   const xdg = environmentValue(context, "XDG_DATA_HOME");
   if (xdg) return xdg;
   if (storagePlatform(context) === "windows") {
-    const appData = environmentValue(context, "APPDATA");
-    if (appData) return appData;
+    // AFT stores indexes, backups, and checkpoints here.
+    // cache-class storage; stable for existing installs.
+    // Do not move this shipped ladder to Roaming.
+    const localAppData = environmentValue(context, "LOCALAPPDATA");
+    if (localAppData) return localAppData;
     const userProfile = environmentValue(context, "USERPROFILE");
-    if (userProfile) return join(userProfile, "AppData", "Roaming");
+    if (userProfile) return join(userProfile, "AppData", "Local");
   }
   const home = environmentValue(context, "HOME");
   if (home) return join(home, ".local", "share");

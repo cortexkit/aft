@@ -401,8 +401,8 @@ impl StoragePlatform {
 ///
 /// Last re-derived 2026-09-06 against subconscious d5e09914b0791a66f2a5a00a9bb3422860ade95e:
 /// compare the ordered variables, platform gates, and empty-value guards below with
-/// `subc-core/src/daemon_config.rs::default_data_home`, then resolve its named path
-/// constants before changing a rung.
+/// `subc-core/src/daemon_config.rs::default_data_home`, resolve its named constants,
+/// then preserve the documented Windows cache-class divergence.
 pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {
     let lookup = |name: &str| std::env::var_os(name);
     let fallback_home = std::env::home_dir();
@@ -479,11 +479,14 @@ fn cortexkit_data_root_from(
         return dir;
     }
     if platform == StoragePlatform::Windows {
-        if let Some(dir) = non_empty_env_path_from(lookup, "APPDATA") {
+        // AFT stores indexes, backups, and checkpoints here.
+        // cache-class storage; stable for existing installs.
+        // Do not move this shipped ladder to Roaming.
+        if let Some(dir) = non_empty_env_path_from(lookup, "LOCALAPPDATA") {
             return dir;
         }
         if let Some(home) = non_empty_env_path_from(lookup, "USERPROFILE") {
-            return home.join("AppData").join("Roaming");
+            return home.join("AppData").join("Local");
         }
     }
     if let Some(home) = non_empty_env_path_from(lookup, "HOME") {
@@ -648,7 +651,7 @@ mod storage_root_tests {
     }
 
     #[test]
-    fn storage_ladder_matches_daemon_on_both_platforms_and_ignores_empty_rungs() {
+    fn storage_ladder_matches_daemon_except_for_stable_windows_cache_class_storage() {
         let current_dir = Path::new("/work");
         let fallback_home = Path::new("/system-home");
         let module_suffix = Path::new("cortexkit").join("aft");
@@ -656,12 +659,10 @@ mod storage_root_tests {
             ("AFT_STORAGE_DIR", OsString::new()),
             ("AFT_CACHE_DIR", OsString::new()),
             ("XDG_DATA_HOME", OsString::new()),
-            ("APPDATA", OsString::new()),
+            ("APPDATA", OsString::from("/wrong-roaming-data")),
             ("USERPROFILE", OsString::new()),
             ("HOME", OsString::new()),
-            // LOCALAPPDATA must not affect this result: the shared Windows
-            // data-home ladder uses roaming APPDATA or USERPROFILE.
-            ("LOCALAPPDATA", OsString::from("/wrong-local-data")),
+            ("LOCALAPPDATA", OsString::new()),
         ]);
 
         for platform in [
@@ -699,7 +700,7 @@ mod storage_root_tests {
             Path::new("/home/operator/.local/share").join(&module_suffix)
         );
 
-        env.insert("APPDATA", OsString::from("/roaming"));
+        env.insert("LOCALAPPDATA", OsString::from("/local-data"));
         assert_eq!(
             resolve_storage_fixture(
                 &env,
@@ -708,9 +709,9 @@ mod storage_root_tests {
                 Some(fallback_home),
                 Some(current_dir),
             ),
-            Path::new("/roaming").join(&module_suffix)
+            Path::new("/local-data").join(&module_suffix)
         );
-        env.insert("APPDATA", OsString::new());
+        env.insert("LOCALAPPDATA", OsString::new());
         assert_eq!(
             resolve_storage_fixture(
                 &env,
@@ -719,7 +720,7 @@ mod storage_root_tests {
                 Some(fallback_home),
                 Some(current_dir),
             ),
-            Path::new("/wrong-profile/AppData/Roaming").join(&module_suffix)
+            Path::new("/wrong-profile/AppData/Local").join(&module_suffix)
         );
 
         env.insert("XDG_DATA_HOME", OsString::from("relative-data"));
