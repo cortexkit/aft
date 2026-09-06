@@ -821,7 +821,8 @@ fn plan_outline_file_rows(
     // A depth-first alphabetical list lets a large crate consume the whole
     // response before later siblings appear. Start with every direct entry,
     // then prefer cheap same-level expansions so the budget reveals breadth
-    // before flattening a directory with hundreds of direct files.
+    // before flattening a directory with hundreds of direct files. If a level
+    // cannot finish, stop before deeper `src/` trees outrun sibling crates.
     let mut rows = roots
         .iter()
         .flat_map(|root| outline_rows_for_directory(*root, directory_nodes, file_entries))
@@ -867,6 +868,7 @@ fn plan_outline_file_rows(
                 .then_with(|| a_node.path.cmp(&b_node.path))
         });
 
+        let mut level_fully_expanded = true;
         for node_id in candidates {
             considered.insert(node_id);
             let replacement = outline_rows_for_directory(node_id, directory_nodes, file_entries);
@@ -885,7 +887,12 @@ fn plan_outline_file_rows(
                 <= max_bytes
             {
                 rows = candidate_rows;
+            } else {
+                level_fully_expanded = false;
             }
+        }
+        if !level_fully_expanded {
+            break;
         }
     }
 
@@ -2602,7 +2609,13 @@ mod tests {
     #[test]
     fn cheapest_same_level_expansion_buys_breadth_before_large_directory() {
         let files = vec![
-            outline_file_entry_for_test("z-small/lib.rs", "rust", 1, Some(1), false),
+            outline_file_entry_for_test(
+                "z-small/src/long-breadth-marker/lib.rs",
+                "rust",
+                1,
+                Some(1),
+                false,
+            ),
             outline_file_entry_for_test("a-large/a.rs", "rust", 1, Some(1), false),
             outline_file_entry_for_test("a-large/b.rs", "rust", 1, Some(1), false),
             outline_file_entry_for_test("docs/readme.md", "markdown", 0, Some(1), true),
@@ -2618,8 +2631,8 @@ mod tests {
             OutlineDirectoryNode {
                 path: "z-small".to_string(),
                 depth: 1,
-                direct_files: vec![0],
-                children: Vec::new(),
+                direct_files: Vec::new(),
+                children: vec![4],
                 stats: OutlineDirectoryStats::default(),
             },
             OutlineDirectoryNode {
@@ -2636,12 +2649,19 @@ mod tests {
                 children: Vec::new(),
                 stats: OutlineDirectoryStats::default(),
             },
+            OutlineDirectoryNode {
+                path: "z-small/src/long-breadth-marker".to_string(),
+                depth: 2,
+                direct_files: vec![0],
+                children: Vec::new(),
+                stats: OutlineDirectoryStats::default(),
+            },
         ];
         aggregate_outline_directory(0, &mut directories, &files);
         let small_only = vec![
             OutlineTableRow::Rollup(2),
             OutlineTableRow::Rollup(3),
-            OutlineTableRow::File(0),
+            OutlineTableRow::Rollup(4),
         ];
         let large_only = vec![
             OutlineTableRow::File(1),
@@ -2653,7 +2673,7 @@ mod tests {
             OutlineTableRow::File(1),
             OutlineTableRow::File(2),
             OutlineTableRow::Rollup(3),
-            OutlineTableRow::File(0),
+            OutlineTableRow::Rollup(4),
         ];
         let mut budget = 0;
         for _ in 0..8 {
