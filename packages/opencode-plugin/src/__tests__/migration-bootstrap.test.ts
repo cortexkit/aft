@@ -52,6 +52,9 @@ describe.serial("OpenCode migration bootstrap", () => {
       // shared cache resolver, so clear it for the sandbox to apply.
       AFT_CACHE_DIR: undefined,
       AFT_STORAGE_DIR: undefined,
+      // CI also exports the built binary here, and since it became resolution
+      // step 0 it would win over the fake `aft` this test plants on PATH.
+      AFT_BINARY_PATH: undefined,
       PATH: `${binDir}:${process.env.PATH ?? ""}`,
       HOME: join(tempDir, "home"),
       XDG_DATA_HOME: join(tempDir, "data"),
