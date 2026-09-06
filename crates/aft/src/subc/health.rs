@@ -48,6 +48,11 @@ impl ReapBlockerCensus {
 
 struct ReapMetrics {
     last_sweep_ms: AtomicU64,
+    /// Rendered `<retained>;<blockers>` of the last sweep, so the retained-roots
+    /// log line is emitted on change only. Sweeps run several times a second
+    /// during route churn and an unchanged census wrote ~2,000 identical lines
+    /// per hour before this.
+    last_retained_summary: StdMutex<String>,
     deleted_retained: AtomicUsize,
     absence_unconfirmed: AtomicUsize,
     bound_routes: AtomicUsize,
@@ -66,6 +71,7 @@ impl ReapMetrics {
     fn new() -> Self {
         Self {
             last_sweep_ms: AtomicU64::new(0),
+            last_retained_summary: StdMutex::new(String::new()),
             deleted_retained: AtomicUsize::new(0),
             absence_unconfirmed: AtomicUsize::new(0),
             bound_routes: AtomicUsize::new(0),
@@ -81,8 +87,20 @@ impl ReapMetrics {
         }
     }
 
-    fn record(&self, now_ms: u64, census: ReapBlockerCensus) {
+    /// Stores the census; returns whether its retained-roots summary differs
+    /// from the previous sweep's.
+    fn record(&self, now_ms: u64, census: ReapBlockerCensus) -> bool {
         self.last_sweep_ms.store(now_ms, Ordering::Relaxed);
+        let summary = format!("{};{}", census.deleted_retained, census.blocker_histogram());
+        let changed = {
+            let mut last = self
+                .last_retained_summary
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let changed = *last != summary;
+            *last = summary;
+            changed
+        };
         self.deleted_retained
             .store(census.deleted_retained, Ordering::Relaxed);
         self.absence_unconfirmed
@@ -105,6 +123,7 @@ impl ReapMetrics {
             .store(census.artifact_eviction_blocked, Ordering::Relaxed);
         self.artifact_eviction_failed
             .store(census.artifact_eviction_failed, Ordering::Relaxed);
+        changed
     }
 
     fn snapshot(&self) -> Value {
@@ -299,12 +318,13 @@ impl DispatchPathMetrics {
             .store(self.now_ms(), Ordering::Relaxed);
     }
 
-    pub(super) fn record_reap(&self, census: ReapBlockerCensus) {
+    /// Returns whether the retained-roots summary changed since the last sweep.
+    pub(super) fn record_reap(&self, census: ReapBlockerCensus) -> bool {
         let last_sweep_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(duration_millis_u64)
             .unwrap_or(0);
-        self.reap.record(last_sweep_ms, census);
+        self.reap.record(last_sweep_ms, census)
     }
 
     pub(super) fn record_bg_runtime(
