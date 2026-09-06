@@ -319,6 +319,39 @@ describe("OpenCode background notifications", () => {
     expect(payload.body.parts[0].ignored).toBeUndefined();
   });
 
+  test("turn-end wake invokes promptAsync on its receiver, as the generated SDK requires (#297)", async () => {
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({
+      success: true,
+      bg_completions: [completion("task-1", "npm test")],
+    }));
+    // Mirrors packages/sdk/js/src/gen/sdk.gen.ts: the method reads
+    // `this._client`, so a detached call throws before any request is made.
+    // An arrow-function stub cannot catch that; this class can.
+    const posted: unknown[] = [];
+    class SessionApi {
+      _client = { post: async (input: unknown) => posted.push(input) };
+      promptAsync(input: unknown) {
+        return this._client.post(input);
+      }
+    }
+    const client = { session: new SessionApi() };
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client,
+    });
+    const deadline = Date.now() + 5_000;
+    while (posted.length < 1 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    expect(posted).toHaveLength(1);
+    expect(findTraceEvent("bash_completion_wake_prompt_async_error")).toBeUndefined();
+  });
+
   test("turn-end wake forwards resolved agent + model + variant to preserve prefix cache", async () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({

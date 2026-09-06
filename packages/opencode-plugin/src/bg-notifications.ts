@@ -711,10 +711,20 @@ async function triggerWakeIfPending(
       };
 
       const sendPrompt = async (client: OpenCodeClient): Promise<string> => {
-        const promptAsync = client.session?.promptAsync;
-        if (typeof promptAsync !== "function") {
+        // The SDK's generated methods read `this._client`, so the method is
+        // invoked on its receiver rather than extracted: a detached call
+        // throws "Cannot read properties of undefined (reading '_client')"
+        // on every attempt and the fallback path fails the same way (#297).
+        const session = client.session;
+        if (!session || typeof session.promptAsync !== "function") {
           throw new Error("wake client.session.promptAsync is unavailable");
         }
+        // Keep the receiver: `session.promptAsync(...)` below, never a
+        // detached reference. The narrowed type is captured here so the
+        // async closure sees a definitely-present method.
+        const sessionApi = session as typeof session & {
+          promptAsync: NonNullable<typeof session.promptAsync>;
+        };
         // Pass the previous turn's prompt context (agent + model + variant)
         // explicitly. OpenCode's `createUserMessage` resolves variant
         // relative to the chosen agent's model — passing model alone makes
@@ -789,7 +799,7 @@ async function triggerWakeIfPending(
           try {
             const response = await withBgHopTimeout(
               Promise.resolve(
-                promptAsync({
+                sessionApi.promptAsync({
                   path: { id: drainContext.sessionID },
                   body: attemptBody,
                 }),
