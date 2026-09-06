@@ -86,6 +86,10 @@ const INTERACTIVE_WRITER_PROMOTION_AGE: Duration = Duration::from_secs(6);
 /// Readers older than this still block queued writer jobs; report their job
 /// metadata instead of only the generic `waiting_on_readers` diagnosis.
 const READER_STUCK_CENSUS_AGE: Duration = Duration::from_secs(60);
+/// Stack for executor worker threads: the standalone main thread's size, so a
+/// request that fits there cannot overflow only under the daemon. Stack pages
+/// are committed on touch, so idle workers cost nothing extra.
+const EXECUTOR_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
@@ -637,8 +641,14 @@ impl Executor {
         for worker_id in 0..effective.pool_size {
             let worker_rx = run_rx.clone();
             let worker_events = event_tx.clone();
+            // Workers run every tool call, including tree-sitter walks over
+            // whatever a URL or file turns out to contain. The standalone loop
+            // runs those on the 8 MiB main thread; the 2 MiB default for spawned
+            // threads let a deep parse tree abort the whole daemon while the same
+            // request succeeded standalone. Match the main thread.
             let handle = thread::Builder::new()
                 .name(format!("aft-executor-worker-{worker_id}"))
+                .stack_size(EXECUTOR_WORKER_STACK_BYTES)
                 .spawn(move || worker_loop(worker_rx, worker_events))
                 .expect("spawn AFT executor worker");
             worker_handles.push(handle);
