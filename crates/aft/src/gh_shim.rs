@@ -6045,10 +6045,34 @@ mod tests {
 
     #[test]
     fn v13_release_maintenance_rows_allow_reviewed_flags_and_refuse_destructive_forms() {
-        let manifest: Manifest = serde_json::from_str(include_str!(
-            "../../../.alfonso/ceremonies/gh-routing-manifest-v13.json"
-        ))
-        .expect("v13 ceremony payload");
+        // The v13 shape is built here rather than read from a ceremony file:
+        // the signed payload lives in the operator's state directory and the
+        // assembled draft under the gitignored `.alfonso/`, so neither exists
+        // on a clean checkout. This is the classifier's view of v13 - the
+        // admin release rows plus the branch-protection API rules.
+        let mut manifest = branch_protection_manifest("PUT", Tier::Admin);
+        manifest.api_rules.push(ApiRule {
+            method: "DELETE".to_string(),
+            path_glob: BRANCH_PROTECTION_PATH_GLOB.to_string(),
+            tier: Tier::Admin,
+            platform: vec!["macos".to_string(), "linux".to_string()],
+            rationale: Some(
+                "branch protection is a repository setting; operator identity, audited bypass"
+                    .to_string(),
+            ),
+        });
+        let admin = manifest
+            .tiers
+            .get_mut(&Tier::Admin)
+            .expect("v13 admin tier");
+        for tuple in ["release edit", "release upload"] {
+            admin.push(TupleDecl::Details {
+                tuple: tuple.to_string(),
+                platform: vec!["macos".to_string(), "linux".to_string()],
+                api_match: None,
+                rationale: None,
+            });
+        }
         manifest.validate().expect("valid v13 admin extensions");
         for method in ["PUT", "DELETE"] {
             let rule = manifest
