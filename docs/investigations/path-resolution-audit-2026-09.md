@@ -28,7 +28,7 @@ Positive controls: searching the sibling source for `XDG_RUNTIME_DIR`, `DAEMON_C
 
 | Role / value | Ordered `(rung, guard)` pairs after fixes | Result |
 |---|---|---|
-| all Rust AFT storage (`bash_background::storage_dir`) | `(AFT_STORAGE_DIR, non-empty)`; `(configured root, present and non-empty)`; `(AFT_CACHE_DIR/aft, non-empty compatibility rung)`; shared data home: `(XDG_DATA_HOME, non-empty)`, Windows `(APPDATA, non-empty)`, Windows `(USERPROFILE/AppData/Roaming, non-empty)`, `(HOME/.local/share, non-empty)`, `(.local/share, always)`; append `cortexkit/aft` | Daemon data-home rung/guard pairs now match exactly. AFT-only override rungs intentionally precede the shared ladder. Relative values use the real cwd when available; failure preserves the original relative spelling instead of inventing a temp path. |
+| all Rust AFT storage (`bash_background::storage_dir`) | `(AFT_STORAGE_DIR, non-empty)`; `(configured root, present and non-empty)`; `(AFT_CACHE_DIR/aft, non-empty compatibility rung)`; data home: `(XDG_DATA_HOME, non-empty)`, Windows `(LOCALAPPDATA, non-empty)`, Windows `(USERPROFILE/AppData/Local, non-empty)`, `(HOME/.local/share, non-empty)`, `(.local/share, always)`; append `cortexkit/aft` | Matches daemon guards except for the documented Windows rung. AFT retains LOCALAPPDATA/AppData/Local because its indexes, backups, and checkpoints are cache-class storage and existing standalone installs already live there. Relative values use the real cwd when available; failure preserves the original relative spelling instead of inventing a temp path. |
 | tilde/relative normalization | `~` uses Windows `USERPROFILE → HOME`, non-Windows `HOME → USERPROFILE`, then OS home if available; `~/x` same; absolute unchanged; relative joins a successfully read cwd | Empty home values are unset. Missing home/cwd preserves the supplied path rather than substituting temp. This syntax expansion is not the daemon data-home ladder. |
 | supervised `aft --subc` config home | `(XDG_CONFIG_HOME/cortexkit/aft.jsonc, non-empty absolute XDG)`; `(HOME/.config/cortexkit/aft.jsonc, non-empty HOME)` | **Remaining copy: becomes a call on the config-home wave.** Exact replacement: non-empty XDG; Windows non-empty APPDATA; Windows non-empty USERPROFILE + `AppData/Roaming`; non-empty HOME + `.config`; relative `.config`. Site is dated in `subc_config.rs`/the shared TS copy; no speculative duplicate implementation was added. |
 | `--subc` connection | daemon supplies the connection as launch/bootstrap state; AFT authenticates that supplied transport rather than discovering another file | No local discovery ladder in the supervised role. Positive control: `SUBC_CONNECTION_FILE` occurs in bridge config docs and daemon bootstrap, while `run_subc_mode` receives an established channel. |
@@ -48,7 +48,7 @@ Every remaining Rust copy carries, at the site, `last re-derived 2026-09-06 agai
 
 | Site / value | Ordered `(rung, guard)` pairs after fixes |
 |---|---|
-| `storage-paths.ts::resolveDataHome` | non-empty XDG; Windows non-empty APPDATA; Windows non-empty USERPROFILE + `AppData/Roaming`; non-empty HOME + `.local/share`; relative `.local/share` |
+| `storage-paths.ts::resolveDataHome` | non-empty XDG; Windows non-empty LOCALAPPDATA; Windows non-empty USERPROFILE + `AppData/Local`; non-empty HOME + `.local/share`; relative `.local/share` |
 | `resolveCortexKitStorageRoot` | non-empty `AFT_STORAGE_DIR`; non-empty `AFT_CACHE_DIR/aft`; otherwise data home + `cortexkit/aft` |
 | `resolveAftStorageRoot(configured)` | non-empty `AFT_STORAGE_DIR`; non-empty configured; non-empty `AFT_CACHE_DIR/aft`; otherwise data home + `cortexkit/aft` |
 | `cache-paths.ts` | call `resolveAftStorageRoot(configured)`, then append the cache-specific subtree |
@@ -62,7 +62,7 @@ Rust and TypeScript now agree rung-for-rung on the AFT storage question. Tests p
 
 | Finding | Tier | Difference over `(rung, guard)` pairs | Fix and defending test |
 |---|---|---|---|
-| P1 Rust/TS Windows data home used LOCALAPPDATA and `AppData/Local`; daemon uses APPDATA and `AppData/Roaming` | quiet | wrong named rung and wrong suffix | shared Rust and TS pure ladders; `storage_ladder_matches_daemon_on_both_platforms_and_ignores_empty_rungs`, `data_home_ladder_matches_daemon_on_both_platforms` |
+| P1 AFT Windows data home differs from daemon APPDATA/`AppData/Roaming` | deliberate divergence, recorded | AFT uses LOCALAPPDATA and `USERPROFILE/AppData/Local` with the same non-empty/platform guards | Retained with no migration: indexes, backups, and checkpoints are cache-class storage, Roaming profiles must not sync them, and changing the shipped rung would orphan existing standalone state. Defended by `storage_ladder_matches_daemon_except_for_stable_windows_cache_class_storage` and `matches daemon except for stable Windows cache-class storage and ignores empty values`. |
 | P2 TS configured storage ignored legacy `AFT_CACHE_DIR` while Rust honored it | quiet | missing AFT rung | added cache compatibility rung below configured root; plugin tests clear it when asserting configured behavior |
 | P3 `gh` state independently used XDG state home | quiet | two AFT resolvers answered the same state-root question differently | derive from shared storage; `state_dir_uses_dedicated_override_then_shared_storage_and_ignores_empty_override` |
 | P4 profile dSYM cache hard-coded HOME | red-misattributed | missing all storage override and Windows rungs | call shared storage root; injected-root test |
@@ -99,15 +99,16 @@ The production-prefix sweep (each file cut at its first `#[cfg(test)]`) checked 
 
 Positive controls were `subc_format.rs`'s former `{}` serialization fallbacks and `health_digest.rs`'s former empty view identity. A search for the same patterns in the production prefix found those known examples, so the null classifications are not bare absence. `health.rs`, `fleet_status.rs`, and the monolithic `memory.rs` census return unavailable/null or prior snapshots for failed reads; no healthy-looking memory count substitution was found in the current checkout.
 
+`commands/status.rs` is a null result: its legacy numeric projection is guarded by `StatusBarCountValues::legacy_projection`, which returns `None` unless every independent producer supplied a value; the status payload emits JSON null rather than clean-looking zeros. Positive control: response finalization tests that supplied only Tier-2 counts previously expected `E0 W0` and now assert absence.
+
 | Finding/site | What crossed the boundary | Tier | Fix / test |
 |---|---|---|---|
-| S1 `commands/status.rs` used the legacy all-numeric projection | unavailable independent health categories appeared as zero in status JSON | quiet | status now serializes `StatusBarCountValues`, omits each absent category, and emits null when none exist; `status_bar_omits_unreported_counts_instead_of_substituting_zero` |
-| S2 response finalization legacy tests assumed missing diagnostics were `E0 W0` | an incomplete fleet/status segment asserted a clean diagnostic count | quiet | production already suppresses the legacy segment until every count is present; tests now assert absence/empty publication rather than canonizing zero |
-| S3 `commands/health_digest.rs` defaulted a missing view scope to `""` | an artifact-generation ticket with a false identity | quiet | omit the entire ticket unless both generation and non-empty identity exist; `missing_view_identity_omits_the_ticket_instead_of_substituting_an_empty_name` |
-| S4 callgraph handlers used `serde_json::to_value(...).unwrap_or_default()` | serialization failure became successful `null` result or empty candidate data | red-misattributed | shared serialization helper returns a named `serialization_error`; `serialization_failure_returns_an_error_instead_of_a_successful_null` |
-| S5 `subc_format.rs` used `{}`/empty collections/default paths for malformed successful responses | rendered output asserted no records, an update operation, source/destination paths, or empty JSON | red-misattributed | explicit formatting-failure text and required-collection preflight; `serialization_failure_is_explicit_instead_of_substituting_an_empty_object`, `missing_patch_and_move_facts_are_reported_instead_of_substituted`, `missing_callgraph_collection_is_reported_instead_of_rendered_as_empty` |
-| S6 profile raw-sample timestamp defaulted clock failure to zero | a filename asserted Unix second zero | red-misattributed | clock failure is absence/error before writing; `pre_epoch_timestamp_is_rejected_instead_of_becoming_zero` |
-| S7 storage/profile/embed paths used cwd/temp/HOME stand-ins | emitted paths asserted a location that was never resolved | quiet / red-misattributed | shared true-source ladders; missing cwd preserves relative spelling, missing embed home returns error, profile derives shared root; injected path tests listed under P1–P5 |
+| S1 response finalization legacy tests assumed missing diagnostics were `E0 W0` | an incomplete fleet/status segment asserted a clean diagnostic count | quiet | production already suppresses the legacy segment until every count is present; tests now assert absence/empty publication rather than canonizing zero |
+| S2 `commands/health_digest.rs` defaulted a missing view scope to `""` | an artifact-generation ticket with a false identity | quiet | omit the entire ticket unless both generation and non-empty identity exist; `missing_view_identity_omits_the_ticket_instead_of_substituting_an_empty_name` |
+| S3 callgraph handlers used `serde_json::to_value(...).unwrap_or_default()` | serialization failure became successful `null` result or empty candidate data | red-misattributed | shared serialization helper returns a named `serialization_error`; `serialization_failure_returns_an_error_instead_of_a_successful_null` |
+| S4 `subc_format.rs` used `{}`/empty collections/default paths for malformed successful responses | rendered output asserted no records, an update operation, source/destination paths, or empty JSON | red-misattributed | explicit formatting-failure text and required-collection preflight; `serialization_failure_is_explicit_instead_of_substituting_an_empty_object`, `missing_patch_and_move_facts_are_reported_instead_of_substituted`, `missing_callgraph_collection_is_reported_instead_of_rendered_as_empty` |
+| S5 profile raw-sample timestamp defaulted clock failure to zero | a filename asserted Unix second zero | red-misattributed | clock failure is absence/error before writing; `pre_epoch_timestamp_is_rejected_instead_of_becoming_zero` |
+| S6 storage/profile/embed paths used cwd/temp/HOME stand-ins | emitted paths asserted a location that was never resolved | quiet / red-misattributed | shared true-source ladders; missing cwd preserves relative spelling, missing embed home returns error, profile derives shared root; injected path tests listed under P1–P5 |
 
 No outbound factual substituted-value finding remains. Values that remain visibly labeled `unknown`, `unavailable`, or `serialization failed` are absence/refusal text, not plausible facts.
 
@@ -115,8 +116,8 @@ No outbound factual substituted-value finding remains. Values that remain visibl
 
 The tests above were mutation-checked with the required stage → mutate → non-empty diff-stat → named test red → checkout restore → touch → empty diff-stat sequence. Exact captured reds are recorded here after verification and mirrored in the delivery result:
 
-- TS storage, mutation `APPDATA → LOCALAPPDATA`: `storage path ladder > matches daemon data-home rungs on both platforms and ignores empty values` failed, received `wrong-local-data/cortexkit/aft`; no other test failed.
-- Rust storage, mutation `APPDATA → LOCALAPPDATA`: `storage_ladder_matches_daemon_on_both_platforms_and_ignores_empty_rungs` failed, left `/wrong-local-data/cortexkit/aft`, right `/work/.local/share/cortexkit/aft`; no other test failed.
+- Rust Windows storage divergence, mutation `LOCALAPPDATA → APPDATA`: `storage_ladder_matches_daemon_except_for_stable_windows_cache_class_storage` failed with `/wrong-roaming-data/cortexkit/aft` instead of the relative fallback; no other test failed.
+- TS Windows storage divergence, mutation `LOCALAPPDATA → APPDATA`: `storage path ladder > matches daemon except for stable Windows cache-class storage and ignores empty values` failed with `wrong-roaming-data/cortexkit/aft` instead of the relative fallback; no other test failed.
 - gh state, mutation inserted `wrong-root`: `state_dir_uses_dedicated_override_then_shared_storage_and_ignores_empty_override` failed with the wrong subtree; no other test failed.
 - shared empty guard, predicate inverted: `injected_lookup_treats_empty_environment_values_as_unset` failed with `Some("")` versus `None`; no other test failed.
 - LSP empty guard, predicate inverted: `empty_lsp_binary_override_is_unset_without_mutating_the_process_environment` failed with `Some("")` versus `None`; no other test failed.
@@ -126,7 +127,6 @@ The tests above were mutation-checked with the required stage → mutate → non
 - Synapse capture guard, predicate inverted: `empty_synapse_capture_directory_is_unset_with_an_injected_lookup` failed with `Some("")` versus `None`; no other test failed.
 - profile cache, subtree changed to `wrong-cache`: `debug_cache_is_derived_from_the_injected_shared_storage_root` failed with `wrong-cache/ABCD` versus `dsym/ABCD`; no other test failed.
 - profile timestamp, absent time changed back to zero: `unavailable_profile_timestamp_is_not_substituted_into_an_outbound_path` failed after receiving `aft-profile-42-0.unsymbolicated.txt`; no other test failed.
-- status counts, absent errors changed back to zero: `status_bar_omits_unreported_counts_instead_of_substituting_zero` failed because `errors: 0` appeared; no other test failed.
 - health identity, missing identity changed back to `""`: `missing_view_identity_omits_the_ticket_instead_of_substituting_an_empty_name` failed with an `ArtifactGeneration { identity: "" }` ticket; no other test failed.
 - command serialization, errors changed back to successful null: `serialization_failure_returns_an_error_instead_of_a_successful_null` failed at `assertion failed: !response.success`; no other test failed.
 - formatter serialization, error text changed back to `{}`: `serialization_failure_is_explicit_instead_of_substituting_an_empty_object` failed with `{}` versus the named serialization error; no other test failed.
@@ -134,3 +134,24 @@ The tests above were mutation-checked with the required stage → mutate → non
 - patch path absence changed back to `Updated (file)`: `missing_patch_and_move_facts_are_reported_instead_of_substituted` failed against the explicit omission message; no other test failed.
 
 The placeholders are replaced with captured test names and output before commit.
+
+## Integration gate
+
+The required bare command was run after the audit changes:
+
+```text
+cargo test -p agent-file-tools --test integration
+test result: FAILED. 1682 passed; 20 failed; 12 ignored; 0 measured; 0 filtered out; finished in 195.69s
+```
+
+Status-related failures exposed assertions that still treated unavailable diagnostics as `E0 W0`, exposed the temporary attempt to publish partial worktree Tier-2 state, or waited for a stale bit inside an unavailable status bar. The status command retains its existing all-producers-ready gate; SUBC assertions now expect status absence when only Tier-2 data is available, and the watcher assertion accepts an absent bar until all producers report. All five affected tests pass individually:
+
+- `linked_worktree_skips_automatic_tier2_and_leaves_parent_gate_open`
+- `linked_worktree_explicit_inspect_keeps_parent_aggregates_byte_identical`
+- `subc_bridge_discovered_status_line_publishes_over_consumer_connection`
+- `subc_bridge_response_finalizer_status_bar_and_bg_completion_once_per_epoch`
+- `subc_bridge_watcher_stale_maintenance_push`
+
+The only remaining failures are 19 callgraph tests that target fixtures inside this linked task worktree and receive the worktree read-only `callgraph_unavailable` response. Positive control: `callgraph_unknown_symbol_error` reproduces that environmental limitation in isolation.
+
+No parity fixture moved. `cargo test -p agent-file-tools --test integration tool_call_parity_test` passed all 12 tests exercising the 69 pinned fixtures: `12 passed; 0 failed; 1702 filtered out`.

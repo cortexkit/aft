@@ -5919,7 +5919,10 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
             && frame.header.channel == 1
             && frame.header.corr == 80;
         if completed {
-            assert_eq!(tool_response_json(&frame)["status_bar"]["dead_code"], 21);
+            assert!(
+                tool_response_json(&frame).get("status_bar").is_none(),
+                "Tier-2 counts without an authoritative diagnostics report stay absent"
+            );
         }
         module_inventory.push(frame);
         if completed {
@@ -6017,8 +6020,8 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
     assert_eq!(publish_body["method"], "status.publish");
     assert_eq!(publish_body["params"]["module"], "aft");
     assert_eq!(
-        publish_body["params"]["text"], "AFT E0 W0 | D21 U12 C13 | T14",
-        "the discovered holder must receive the real Tier-2 segment seeded by the tool call"
+        publish_body["params"]["text"], "",
+        "the discovered holder must not receive E0 W0 when diagnostics are unavailable"
     );
     assert_eq!(publish_body["params"]["revision"], 1);
     assert_eq!(publish_body["params"]["ttl_ms"], 7_500);
@@ -6119,10 +6122,9 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
             && frame.header.channel == 1
             && frame.header.corr == 82;
         if completed {
-            assert_eq!(
-                tool_response_json(&frame)["status_bar"]["dead_code"],
-                22,
-                "catalog drop after route Goodbye must restore the solo bar"
+            assert!(
+                tool_response_json(&frame).get("status_bar").is_none(),
+                "catalog drop cannot make unavailable diagnostics authoritative"
             );
         }
         module_inventory.push(frame);
@@ -6154,8 +6156,8 @@ async fn drive_response_finalizer_daemon(input: FakeDaemonInput) {
     } = open_fake_daemon_session(input).await;
     bind_route1(&mut stream, &root1).await;
 
-    // L2 response finalizer: a normal route-channel read gets status_bar once
-    // the actor has real Tier-2 counts, matching standalone response shape.
+    // When finalizing the response, Tier-2 counts alone must not create a
+    // status bar; keep it absent until diagnostics are reported separately.
     send_tool_call(
         &mut stream,
         1,
@@ -6167,13 +6169,9 @@ async fn drive_response_finalizer_daemon(input: FakeDaemonInput) {
     let status_bar_read = read_frame_timeout(&mut stream, "status-bar read response").await;
     assert_eq!(status_bar_read.header.corr, 80);
     let status_bar_response = tool_response_json(&status_bar_read);
-    assert_eq!(status_bar_response["status_bar"]["dead_code"], 21);
-    assert_eq!(status_bar_response["status_bar"]["unused_exports"], 12);
-    assert_eq!(status_bar_response["status_bar"]["duplicates"], 13);
-    assert_eq!(status_bar_response["status_bar"]["todos"], 14);
     assert!(
-        status_bar_response["status_bar"]["line"].is_null(),
-        "a daemon with no discovered status holder must keep the solo status bar"
+        status_bar_response.get("status_bar").is_none(),
+        "missing diagnostics must omit the status bar rather than invent E0 W0"
     );
 
     // A completed bg-bash task for the bound route's BindIdentity.session is
@@ -6225,8 +6223,8 @@ async fn drive_response_finalizer_daemon(input: FakeDaemonInput) {
     assert_bg_completion(&second_after_completion_response, &task_id);
 
     // Two same-actor PureRead jobs finish/finalize concurrently. Both should
-    // clone the pending bg completion safely; the status_bar dedup lock is also
-    // exercised because counts were populated above.
+    // clone the pending bg completion safely while the unavailable status bar
+    // remains omitted.
     let finalizer_epoch_base = state.begin_epoch_wave();
     for corr in 122..124 {
         send_tool_call(&mut stream, 1, corr, "echo", json!({ "case": "epoch" })).await;
@@ -10552,14 +10550,15 @@ async fn expect_watcher_stale_status_pushes_for_tool(
                 assert_eq!(frame.header.corr, 0, "Push frames are server-initiated");
                 let body: Value = serde_json::from_slice(&frame.body).expect("push body");
                 let snapshot = body.get("snapshot").unwrap_or(&Value::Null);
-                let stale = snapshot
-                    .get("status_bar")
-                    .and_then(|status_bar| status_bar.get("tier2_stale"))
-                    .and_then(Value::as_bool)
-                    == Some(true);
+                let status_bar = snapshot.get("status_bar").unwrap_or(&Value::Null);
+                let stale = status_bar.get("tier2_stale").and_then(Value::as_bool) == Some(true);
                 let root_matches = snapshot.get("project_root").and_then(Value::as_str)
                     == Some(expected_root.as_str());
-                if push_type(&body) == Some("status_changed") && stale && root_matches {
+                if push_type(&body) == Some("status_changed") && root_matches {
+                    assert!(
+                        stale || status_bar.is_null(),
+                        "watcher status must be marked stale or remain absent until all producers report"
+                    );
                     assert!(
                         expected_channels.contains(&frame.header.channel),
                         "watcher stale push leaked to unexpected channel {}",
