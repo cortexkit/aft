@@ -396,6 +396,7 @@ struct OutlineDirectoryStats {
     dirs: usize,
     files: usize,
     lines: usize,
+    data_doc_files: usize,
     code_files: usize,
     code_lines: usize,
 }
@@ -719,7 +720,9 @@ fn aggregate_outline_directory(
         let entry = &file_entries[file_id];
         stats.files += 1;
         stats.lines += entry.lines.unwrap_or(0);
-        if !entry.data_doc {
+        if entry.data_doc {
+            stats.data_doc_files += 1;
+        } else {
             stats.code_files += 1;
             stats.code_lines += entry.lines.unwrap_or(0);
         }
@@ -729,6 +732,7 @@ fn aggregate_outline_directory(
         stats.dirs += child_stats.dirs + 1;
         stats.files += child_stats.files;
         stats.lines += child_stats.lines;
+        stats.data_doc_files += child_stats.data_doc_files;
         stats.code_files += child_stats.code_files;
         stats.code_lines += child_stats.code_lines;
     }
@@ -768,15 +772,10 @@ fn outline_rows_for_directory(
         .collect()
 }
 
-fn directory_is_data_heavy(node: &OutlineDirectoryNode, file_entries: &[OutlineFileEntry]) -> bool {
+fn directory_is_data_heavy(node: &OutlineDirectoryNode) -> bool {
     !node.direct_files.is_empty()
-        && node
-            .direct_files
-            .iter()
-            .filter(|file_id| file_entries[**file_id].data_doc)
-            .count()
-            * 10
-            >= node.direct_files.len() * 9
+        && node.stats.files > 0
+        && node.stats.data_doc_files * 10 >= node.stats.files * 9
 }
 
 fn outline_expansion_added_rows(node: &OutlineDirectoryNode) -> usize {
@@ -835,7 +834,7 @@ fn plan_outline_file_rows(
             .filter_map(|row| match row {
                 OutlineTableRow::Rollup(node_id)
                     if !considered.contains(node_id)
-                        && !directory_is_data_heavy(&directory_nodes[*node_id], file_entries) =>
+                        && !directory_is_data_heavy(&directory_nodes[*node_id]) =>
                 {
                     Some(directory_nodes[*node_id].depth)
                 }
@@ -852,7 +851,7 @@ fn plan_outline_file_rows(
                 OutlineTableRow::Rollup(node_id)
                     if directory_nodes[*node_id].depth == level
                         && !considered.contains(node_id)
-                        && !directory_is_data_heavy(&directory_nodes[*node_id], file_entries) =>
+                        && !directory_is_data_heavy(&directory_nodes[*node_id]) =>
                 {
                     Some(*node_id)
                 }
