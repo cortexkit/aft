@@ -761,8 +761,8 @@ fn unsupported_tool(message: impl Into<String>) -> TranslateError {
 }
 
 fn resolve_home_dir() -> Option<PathBuf> {
-    let raw = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    let raw = crate::environment::non_empty_os_var("HOME")
+        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
         .map(PathBuf::from)?;
     Some(raw)
 }

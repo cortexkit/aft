@@ -20,6 +20,13 @@ function homeDir(): string {
   return process.env.HOME || homedir();
 }
 
+// This copy becomes the daemon's config-home callable when exported. The call
+// replaces it with: non-empty XDG_CONFIG_HOME; Windows-only non-empty APPDATA;
+// Windows-only non-empty USERPROFILE plus `AppData/Roaming`; non-empty HOME plus
+// `.config`; relative `.config`. Last re-derived 2026-09-06 against subconscious
+// d5e09914b0791a66f2a5a00a9bb3422860ade95e: compare ordered guards with
+// `subc-core/src/daemon_config.rs::default_config_path` and resolve
+// `DAEMON_CONFIG_RELATIVE_PATH` before editing this temporary copy.
 function configHome(): string {
   const xdg = process.env.XDG_CONFIG_HOME;
   if (xdg && isAbsolute(xdg)) return xdg;

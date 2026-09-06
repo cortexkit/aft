@@ -492,16 +492,16 @@ fn try_well_known_path_lookup(command: &str) -> Option<PathBuf> {
         return None;
     }
     if cfg!(windows) {
-        for dir in crate::tool_path::well_known_windows_bin_dirs(
-            std::env::var_os("USERPROFILE").as_deref(),
-        ) {
+        let user_profile = crate::environment::non_empty_os_var("USERPROFILE");
+        for dir in crate::tool_path::well_known_windows_bin_dirs(user_profile.as_deref()) {
             if let Some(found) = crate::tool_path::probe_tool_in_dir(&dir, command) {
                 return Some(found);
             }
         }
         return None;
     }
-    let candidates = well_known_search_paths(command, std::env::var_os("HOME").as_deref());
+    let home = crate::environment::non_empty_os_var("HOME");
+    let candidates = well_known_search_paths(command, home.as_deref());
     try_well_known_path_lookup_in(&candidates)
 }
 

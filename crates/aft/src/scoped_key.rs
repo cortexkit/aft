@@ -235,8 +235,8 @@ pub fn classify_resolved_standing_root(
 /// Resolve a configured spelling into the durable identity it records. The
 /// literal spelling remains untouched; only the recorded target is canonical.
 pub fn resolve_standing_root(literal_path: &str) -> Result<ResolvedStandingRoot, ScopedKeyError> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    let home = crate::environment::non_empty_os_var("HOME")
+        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
         .map(PathBuf::from);
     let expanded = expand_index_root_path(literal_path, home.as_deref()).map_err(|detail| {
         ScopedKeyError::ResolvePath {

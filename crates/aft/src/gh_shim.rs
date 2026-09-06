@@ -472,12 +472,10 @@ struct StatePaths {
 
 impl StatePaths {
     fn from_process() -> Self {
+        let storage_root = crate::bash_background::storage_dir(None);
         Self::from_root(gh_shim_state_dir_from(
             std::env::var_os(GH_SHIM_STATE_DIR_ENV).as_deref(),
-            std::env::var_os("XDG_STATE_HOME").as_deref(),
-            std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .as_deref(),
+            &storage_root,
         ))
     }
 
@@ -498,27 +496,19 @@ impl StatePaths {
 }
 
 /// Resolve the one process-state directory used by every gh-shim reader and
-/// writer. The dedicated override is useful for embedding callers and tests;
-/// otherwise the shim follows the repository's existing XDG state convention.
-fn gh_shim_state_dir_from(
-    dedicated_override: Option<&OsStr>,
-    xdg_state_home: Option<&OsStr>,
-    home: Option<&OsStr>,
-) -> PathBuf {
+/// writer. The dedicated absolute override is useful for embedding callers and
+/// tests; otherwise shim state is a subtree of AFT's shared storage root. Keeping
+/// that fallback as a call prevents the shim from drifting onto an independent
+/// XDG state-home ladder that the supervised module never consults.
+fn gh_shim_state_dir_from(dedicated_override: Option<&OsStr>, storage_root: &Path) -> PathBuf {
     if let Some(path) = dedicated_override
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
     {
         return path;
     }
-    xdg_state_home
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .or_else(|| home.map(|home| PathBuf::from(home).join(".local/state")))
-        .unwrap_or_else(std::env::temp_dir)
-        .join("cortexkit")
-        .join("aft")
-        .join("gh-shim")
+    storage_root.join("gh-shim")
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -918,11 +908,17 @@ fn configured_connection_file_from(
     xdg_config_home: Option<&OsStr>,
     home: Option<&OsStr>,
 ) -> Option<PathBuf> {
-    // The shim uses the same user-tier resolver as subc: `$XDG_CONFIG_HOME/cortexkit/aft.jsonc`,
-    // then `~/.config/cortexkit/aft.jsonc`. XDG selects only the trusted user's
-    // config location; it cannot select a project file or alter the configured
-    // connection. An invalid path resolves to `None`; the caller decides whether
-    // that means structural passthrough or an unavailable governed route.
+    // This reader becomes `subc_transport::connection_file::discover(explicit)`
+    // when the transport API reaches AFT. That call replaces these ordered rungs:
+    // explicit (exclusive); non-empty SUBC_CONNECTION_FILE (exclusive); non-empty
+    // XDG_RUNTIME_DIR/subc-connection.json; non-empty
+    // HOME/.local/share/cortexkit/run/subc-connection.json; user-scoped temp file.
+    // Last re-derived 2026-09-06 against subconscious
+    // d5e09914b0791a66f2a5a00a9bb3422860ade95e: compare `(rung, guard)` pairs with
+    // `subc-transport/src/connection_file.rs::discovery_candidates_with_environment`
+    // and resolve `CONNECTION_FILE_NAME` and `PROD_CONNECTION_RELATIVE_PATH`.
+    // Until the call lands here, only trusted user config can provide the explicit
+    // path; invalid or unreadable paths resolve to `None` for the rung classifier.
     let config_path = crate::subc_config::user_config_path_from(xdg_config_home, home)?;
     let doc = fs::read_to_string(config_path).ok()?;
     connection_file_from_config_doc(&doc).filter(|path| path.is_file())
@@ -1272,8 +1268,8 @@ fn find_ambient_agent_credential(detectors: &Detectors) -> Option<String> {
         }
     }
 
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    let home = crate::environment::non_empty_os_var("HOME")
+        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
         .map(PathBuf::from);
     for raw_pattern in &detectors.wrapper_config_dirs {
         let pattern = expand_home_pattern(raw_pattern, home.as_deref());
@@ -1294,7 +1290,7 @@ fn find_ambient_agent_credential(detectors: &Detectors) -> Option<String> {
     // `GH_CONFIG_DIR` is only inspected as a metadata path. The basename is
     // compared to the manifest's declared wrapper-dir glob, so the operator's
     // normal gh configuration remains outside this detector inventory.
-    let configured = std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from)?;
+    let configured = crate::environment::non_empty_os_var("GH_CONFIG_DIR").map(PathBuf::from)?;
     if !configured.is_dir() {
         return None;
     }
@@ -3777,7 +3773,7 @@ fn delegate(args: &[OsString]) -> i32 {
 
 fn resolve_real_gh(executing_image: &Path) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    let shims_dir = std::env::var_os("AFT_GH_SHIMS_DIR").map(PathBuf::from);
+    let shims_dir = crate::environment::non_empty_os_var("AFT_GH_SHIMS_DIR").map(PathBuf::from);
     resolve_real_gh_in_path(executing_image, &path, shims_dir.as_deref())
 }
 
@@ -4121,31 +4117,27 @@ mod tests {
     }
 
     #[test]
-    fn state_dir_override_wins_without_touching_the_xdg_operator_root() {
-        let operator_state = tempfile::tempdir().unwrap();
-        let canary = tempfile::tempdir().unwrap();
-        let before = fs::metadata(canary.path()).unwrap().modified().unwrap();
+    fn state_dir_uses_dedicated_override_then_shared_storage_and_ignores_empty_override() {
+        let storage_root = tempfile::tempdir().unwrap();
+        let dedicated = tempfile::tempdir().unwrap();
+        let before = fs::metadata(dedicated.path()).unwrap().modified().unwrap();
 
-        let resolved = gh_shim_state_dir_from(
-            Some(canary.path().as_os_str()),
-            Some(operator_state.path().as_os_str()),
-            Some(operator_state.path().as_os_str()),
-        );
-        assert_eq!(resolved, canary.path());
         assert_eq!(
-            fs::metadata(canary.path()).unwrap().modified().unwrap(),
+            gh_shim_state_dir_from(Some(dedicated.path().as_os_str()), storage_root.path()),
+            dedicated.path()
+        );
+        assert_eq!(
+            fs::metadata(dedicated.path()).unwrap().modified().unwrap(),
             before,
-            "resolving the test override must not create or rewrite operator state"
-        );
-
-        let xdg_resolved = gh_shim_state_dir_from(
-            None,
-            Some(operator_state.path().as_os_str()),
-            Some(canary.path().as_os_str()),
+            "resolving the dedicated override must not create or rewrite state"
         );
         assert_eq!(
-            xdg_resolved,
-            operator_state.path().join("cortexkit/aft/gh-shim")
+            gh_shim_state_dir_from(None, storage_root.path()),
+            storage_root.path().join("gh-shim")
+        );
+        assert_eq!(
+            gh_shim_state_dir_from(Some(OsStr::new("")), storage_root.path()),
+            storage_root.path().join("gh-shim")
         );
     }
 

@@ -505,13 +505,23 @@ fn normalize_debug_id(value: impl AsRef<str>) -> String {
 fn preserve_raw_sample(pid: u32, raw: &str) -> Result<PathBuf, ProfileError> {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("aft-profile-{pid}-{stamp}.unsymbolicated.txt"));
+        .ok()
+        .map(|duration| duration.as_secs());
+    let path = raw_sample_path(&std::env::temp_dir(), pid, stamp)?;
     fs::write(&path, raw).map_err(|error| {
         ProfileError::runtime(format!("could not write {}: {error}", path.display()))
     })?;
     Ok(path)
+}
+
+fn raw_sample_path(
+    temp_dir: &Path,
+    pid: u32,
+    unix_seconds: Option<u64>,
+) -> Result<PathBuf, ProfileError> {
+    let stamp = unix_seconds
+        .ok_or_else(|| ProfileError::runtime("system clock predates the Unix epoch"))?;
+    Ok(temp_dir.join(format!("aft-profile-{pid}-{stamp}.unsymbolicated.txt")))
 }
 
 fn command_text(command: &mut Command) -> Result<String, ProfileError> {
@@ -1045,12 +1055,17 @@ fn is_debug_file(path: &Path) -> bool {
 }
 
 fn debug_cache_dir(debug_id: &str) -> Result<PathBuf, ProfileError> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| ProfileError::runtime("could not determine HOME for dSYM cache"))?;
-    Ok(home
-        .join(".local/share/cortexkit/aft/dsym")
-        .join(normalize_debug_id(debug_id)))
+    Ok(debug_cache_dir_from(
+        &aft::bash_background::storage_dir(None),
+        debug_id,
+    ))
+}
+
+fn debug_cache_dir_from(storage_root: &Path, debug_id: &str) -> PathBuf {
+    // Profiling artifacts belong to the same storage universe as the binary
+    // being profiled. Reusing the module root keeps explicit, compatibility,
+    // and platform data-home rungs from being copied into this CLI.
+    storage_root.join("dsym").join(normalize_debug_id(debug_id))
 }
 
 fn download_release_debug(
@@ -1708,6 +1723,24 @@ fn print_human(report: &ProfileReport) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_cache_is_derived_from_the_injected_shared_storage_root() {
+        assert_eq!(
+            debug_cache_dir_from(Path::new("/storage/cortexkit/aft"), "ab-cd"),
+            PathBuf::from("/storage/cortexkit/aft/dsym/ABCD")
+        );
+    }
+
+    #[test]
+    fn unavailable_profile_timestamp_is_not_substituted_into_an_outbound_path() {
+        let error = raw_sample_path(Path::new("/tmp"), 42, None).expect_err("timestamp absent");
+        assert!(error.to_string().contains("system clock predates"));
+        assert_eq!(
+            raw_sample_path(Path::new("/tmp"), 42, Some(17)).unwrap(),
+            PathBuf::from("/tmp/aft-profile-42-17.unsymbolicated.txt")
+        );
+    }
 
     #[test]
     fn unsymbolicated_sample_is_kept_on_disk_and_named() {

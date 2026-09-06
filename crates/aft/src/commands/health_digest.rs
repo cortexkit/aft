@@ -111,22 +111,10 @@ pub fn handle_health_digest(req: &RawRequest, ctx: &AppContext) -> Response {
         req.params.get("since"),
     );
 
-    let views = ctx.view_health_snapshot().and_then(|value| {
-        (value.generation > 0).then(|| {
-            let identity = ctx
-                .view_runtime_snapshot()
-                .map(|view| view.scope)
-                .unwrap_or_default();
-            let generation = value.generation;
-            TicketedCurrent::new(
-                value,
-                FreshnessTicket::ArtifactGeneration {
-                    identity,
-                    generation,
-                },
-            )
-        })
-    });
+    let views = ticket_current_view(
+        ctx.view_health_snapshot(),
+        ctx.view_runtime_snapshot().map(|view| view.scope),
+    );
     Response::success(
         &req.id,
         render_current_values(&DigestCurrentValues {
@@ -134,6 +122,22 @@ pub fn handle_health_digest(req: &RawRequest, ctx: &AppContext) -> Response {
             ..DigestCurrentValues::default()
         }),
     )
+}
+
+fn ticket_current_view(
+    value: Option<crate::context::ViewHealthSnapshot>,
+    identity: Option<String>,
+) -> Option<TicketedCurrent<crate::context::ViewHealthSnapshot>> {
+    let value = value.filter(|value| value.generation > 0)?;
+    let identity = identity.filter(|identity| !identity.is_empty())?;
+    let generation = value.generation;
+    Some(TicketedCurrent::new(
+        value,
+        FreshnessTicket::ArtifactGeneration {
+            identity,
+            generation,
+        },
+    ))
 }
 
 /// Preserve the operation's structured failure when its requested root has no
@@ -154,8 +158,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        handle_health_digest, render_current_values, DigestCurrentValues, FreshnessTicket,
-        TicketedCurrent, HEALTH_DIGEST_OPERATION,
+        handle_health_digest, render_current_values, ticket_current_view, DigestCurrentValues,
+        FreshnessTicket, TicketedCurrent, HEALTH_DIGEST_OPERATION,
     };
     use crate::config::Config;
     use crate::context::{callgraph_cold_build_spawn_count_for_test, AppContext};
@@ -168,6 +172,22 @@ mod tests {
             "command": HEALTH_DIGEST_OPERATION,
         }))
         .expect("digest request is valid")
+    }
+
+    #[test]
+    fn missing_view_identity_omits_the_ticket_instead_of_substituting_an_empty_name() {
+        let snapshot = crate::context::ViewHealthSnapshot {
+            generation: 7,
+            pinned: true,
+            pending_paths: 0,
+            failed_paths: 0,
+        };
+        assert_eq!(ticket_current_view(Some(snapshot.clone()), None), None);
+        assert_eq!(
+            ticket_current_view(Some(snapshot.clone()), Some(String::new())),
+            None
+        );
+        assert!(ticket_current_view(Some(snapshot), Some("view-scope".to_string())).is_some());
     }
 
     #[test]

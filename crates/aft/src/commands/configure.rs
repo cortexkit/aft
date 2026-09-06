@@ -412,8 +412,8 @@ fn configure_replay_session_calls_for_test() -> u64 {
 }
 
 fn resolve_home_dir() -> Option<PathBuf> {
-    let raw = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    let raw = crate::environment::non_empty_os_var("HOME")
+        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
         .map(PathBuf::from)?;
     Some(std::fs::canonicalize(&raw).unwrap_or(raw))
 }

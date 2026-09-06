@@ -163,7 +163,7 @@ pub fn effective_path() -> &'static OsStr {
 
     let started = Instant::now();
     let current = std::env::var_os("PATH").unwrap_or_default();
-    let home = std::env::var_os("HOME");
+    let home = crate::environment::non_empty_os_var("HOME");
     // Use the normal process-state resolver. It is available before the app is
     // constructed, so no early XDG-only fallback can split this cache from AFT's
     // configured storage root.
@@ -327,7 +327,7 @@ fn login_shell_candidates() -> Vec<PathBuf> {
     // This runtime seam lets integration tests exercise the production binary
     // with a deterministic shell. Normal launches still use SHELL and fall back
     // to the common interactive shells below.
-    if let Some(value) = std::env::var_os("AFT_TEST_LOGIN_SHELL_CANDIDATES") {
+    if let Some(value) = crate::environment::non_empty_os_var("AFT_TEST_LOGIN_SHELL_CANDIDATES") {
         let candidates = std::env::split_paths(&value).collect::<Vec<_>>();
         if !candidates.is_empty() {
             return candidates;

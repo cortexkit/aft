@@ -1,7 +1,7 @@
 //! AFT status command — returns the current state of indexes, features, and configuration.
 
-use crate::context::AppContext;
 use crate::context::SemanticIndexStatus;
+use crate::context::{AppContext, StatusBarCountValues};
 use crate::db::compression_events::CompressionAggregate;
 use crate::protocol::{RawRequest, Response, StatusPayload, DEFAULT_SESSION_ID};
 
@@ -17,6 +17,36 @@ pub struct CompressionAggregateSerde {
     pub original_tokens: u64,
     pub compressed_tokens: u64,
     pub savings_tokens: u64,
+}
+
+fn status_bar_value(counts: StatusBarCountValues) -> serde_json::Value {
+    if [
+        counts.errors,
+        counts.warnings,
+        counts.dead_code,
+        counts.unused_exports,
+        counts.duplicates,
+        counts.todos,
+    ]
+    .iter()
+    .all(Option::is_none)
+    {
+        return serde_json::Value::Null;
+    }
+    let mut value = serde_json::json!({ "tier2_stale": counts.tier2_stale });
+    for (key, count) in [
+        ("errors", counts.errors),
+        ("warnings", counts.warnings),
+        ("dead_code", counts.dead_code),
+        ("unused_exports", counts.unused_exports),
+        ("duplicates", counts.duplicates),
+        ("todos", counts.todos),
+    ] {
+        if let Some(count) = count {
+            value[key] = serde_json::json!(count);
+        }
+    }
+    value
 }
 
 impl From<CompressionAggregate> for CompressionAggregateSerde {
@@ -305,18 +335,10 @@ impl AppContext {
         // agents get. `None` until the Tier-2 cache is populated at least once
         // (so we never render fabricated zeros) — emitted as JSON null then,
         // and the sidebar hides the section.
-        let status_bar = match self.status_bar_counts() {
-            Some(counts) => serde_json::json!({
-                "errors": counts.errors,
-                "warnings": counts.warnings,
-                "dead_code": counts.dead_code,
-                "unused_exports": counts.unused_exports,
-                "duplicates": counts.duplicates,
-                "todos": counts.todos,
-                "tier2_stale": counts.tier2_stale,
-            }),
-            None => serde_json::Value::Null,
-        };
+        // These counters come from independent producers. Omit any producer
+        // that has not reported instead of making an unavailable count look
+        // like an authoritative zero.
+        let status_bar = status_bar_value(self.status_bar_count_values());
         let memory_root = self
             .canonical_cache_root_opt()
             .or_else(|| config.project_root.clone());
@@ -462,12 +484,33 @@ fn dir_size_recursive(path: &std::path::Path) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::handle_status;
+    use super::{handle_status, status_bar_value};
     use crate::config::Config;
     use crate::context::AppContext;
     use crate::parser::TreeSitterProvider;
     use crate::protocol::RawRequest;
     use serde_json::json;
+
+    #[test]
+    fn status_bar_omits_unreported_counts_instead_of_substituting_zero() {
+        let value = status_bar_value(crate::context::StatusBarCountValues {
+            errors: None,
+            warnings: Some(0),
+            dead_code: None,
+            unused_exports: Some(4),
+            duplicates: None,
+            todos: None,
+            tier2_stale: false,
+        });
+        assert_eq!(
+            value,
+            json!({ "warnings": 0, "unused_exports": 4, "tier2_stale": false })
+        );
+        assert_eq!(
+            status_bar_value(crate::context::StatusBarCountValues::default()),
+            serde_json::Value::Null
+        );
+    }
 
     fn request() -> RawRequest {
         RawRequest {

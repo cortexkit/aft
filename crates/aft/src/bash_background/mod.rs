@@ -379,78 +379,134 @@ pub(crate) fn task_storage_dir(ctx: &AppContext) -> PathBuf {
         .unwrap_or(root)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoragePlatform {
+    Windows,
+    Other,
+}
+
+impl StoragePlatform {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Other
+        }
+    }
+}
+
 /// Resolve the process-state storage root exactly once for every Rust entry point.
 /// The environment override is checked here so it wins over a stale plugin wire
 /// value, while both plugin-less fallback and plugin-injected paths share one root.
+///
+/// Last re-derived 2026-09-06 against subconscious d5e09914b0791a66f2a5a00a9bb3422860ade95e:
+/// compare the ordered variables, platform gates, and empty-value guards below with
+/// `subc-core/src/daemon_config.rs::default_data_home`, then resolve its named path
+/// constants before changing a rung.
 pub fn storage_dir(configured: Option<&std::path::Path>) -> PathBuf {
-    if let Some(dir) = non_empty_env_path("AFT_STORAGE_DIR") {
-        return resolve_storage_path(&dir);
+    let lookup = |name: &str| std::env::var_os(name);
+    let fallback_home = std::env::home_dir();
+    let current_dir = std::env::current_dir().ok();
+    storage_dir_from(
+        configured,
+        &lookup,
+        StoragePlatform::current(),
+        fallback_home.as_deref(),
+        current_dir.as_deref(),
+    )
+}
+
+fn storage_dir_from(
+    configured: Option<&std::path::Path>,
+    lookup: &impl Fn(&str) -> Option<std::ffi::OsString>,
+    platform: StoragePlatform,
+    fallback_home: Option<&std::path::Path>,
+    current_dir: Option<&std::path::Path>,
+) -> PathBuf {
+    let resolve = |path: &std::path::Path| {
+        resolve_storage_path_from(path, lookup, platform, fallback_home, current_dir)
+    };
+
+    if let Some(dir) = non_empty_env_path_from(lookup, "AFT_STORAGE_DIR") {
+        return resolve(&dir);
     }
-    if let Some(dir) = configured {
+    if let Some(dir) = configured.filter(|path| !path.as_os_str().is_empty()) {
         // Explicit process-state paths are already caller-owned. Preserve their
         // spelling so every downstream read/write uses the exact configured root.
         return dir.to_path_buf();
     }
-    // AFT_CACHE_DIR outranks the computed data root: it predates
-    // AFT_STORAGE_DIR as the storage sandbox lever, and the data root is
-    // effectively always derivable (any HOME yields one), so ranking it
-    // higher would leave the cache-dir arm permanently dead and leak
-    // sandboxed fixtures onto the real machine root.
-    if let Some(dir) = non_empty_env_path("AFT_CACHE_DIR") {
-        return resolve_storage_path(&dir).join("aft");
+    // AFT_CACHE_DIR predates AFT_STORAGE_DIR as the storage sandbox lever. It
+    // remains above the shared data-home ladder so old isolated invocations do
+    // not escape into the operator's data root.
+    if let Some(dir) = non_empty_env_path_from(lookup, "AFT_CACHE_DIR") {
+        return resolve(&dir).join("aft");
     }
-    if let Some(root) = cortexkit_data_root() {
-        return root.join("cortexkit").join("aft");
-    }
-    std::env::temp_dir().join("cortexkit").join("aft")
+
+    resolve(&cortexkit_data_root_from(lookup, platform))
+        .join("cortexkit")
+        .join("aft")
 }
 
-fn non_empty_env_path(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
+fn non_empty_env_path_from(
+    lookup: &impl Fn(&str) -> Option<std::ffi::OsString>,
+    name: &str,
+) -> Option<PathBuf> {
+    lookup(name)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
 
-fn storage_home_dir() -> Option<PathBuf> {
-    let configured = if cfg!(windows) {
-        non_empty_env_path("USERPROFILE").or_else(|| non_empty_env_path("HOME"))
+fn storage_home_dir_from(
+    lookup: &impl Fn(&str) -> Option<std::ffi::OsString>,
+    platform: StoragePlatform,
+    fallback_home: Option<&std::path::Path>,
+) -> Option<PathBuf> {
+    let configured = if platform == StoragePlatform::Windows {
+        non_empty_env_path_from(lookup, "USERPROFILE")
+            .or_else(|| non_empty_env_path_from(lookup, "HOME"))
     } else {
-        non_empty_env_path("HOME").or_else(|| non_empty_env_path("USERPROFILE"))
+        non_empty_env_path_from(lookup, "HOME")
+            .or_else(|| non_empty_env_path_from(lookup, "USERPROFILE"))
     };
-    configured.or_else(std::env::home_dir)
+    configured.or_else(|| fallback_home.map(PathBuf::from))
 }
 
-fn cortexkit_data_root() -> Option<PathBuf> {
-    if let Some(dir) = non_empty_env_path("XDG_DATA_HOME") {
-        return Some(resolve_storage_path(&dir));
+fn cortexkit_data_root_from(
+    lookup: &impl Fn(&str) -> Option<std::ffi::OsString>,
+    platform: StoragePlatform,
+) -> PathBuf {
+    if let Some(dir) = non_empty_env_path_from(lookup, "XDG_DATA_HOME") {
+        return dir;
     }
-    if cfg!(windows) {
-        if let Some(dir) = std::env::var_os("LOCALAPPDATA")
-            .filter(|value| !value.is_empty())
-            .or_else(|| std::env::var_os("APPDATA").filter(|value| !value.is_empty()))
-            .map(PathBuf::from)
-        {
-            return Some(resolve_storage_path(&dir));
+    if platform == StoragePlatform::Windows {
+        if let Some(dir) = non_empty_env_path_from(lookup, "APPDATA") {
+            return dir;
+        }
+        if let Some(home) = non_empty_env_path_from(lookup, "USERPROFILE") {
+            return home.join("AppData").join("Roaming");
         }
     }
-    storage_home_dir().map(|home| {
-        let root = if cfg!(windows) {
-            home.join("AppData").join("Local")
-        } else {
-            home.join(".local").join("share")
-        };
-        resolve_storage_path(&root)
-    })
+    if let Some(home) = non_empty_env_path_from(lookup, "HOME") {
+        return home.join(".local").join("share");
+    }
+    PathBuf::from(".local").join("share")
 }
 
-fn resolve_storage_path(path: &std::path::Path) -> PathBuf {
+fn resolve_storage_path_from(
+    path: &std::path::Path,
+    lookup: &impl Fn(&str) -> Option<std::ffi::OsString>,
+    platform: StoragePlatform,
+    fallback_home: Option<&std::path::Path>,
+    current_dir: Option<&std::path::Path>,
+) -> PathBuf {
+    let storage_home = || storage_home_dir_from(lookup, platform, fallback_home);
     let expanded = if path == std::path::Path::new("~") {
-        storage_home_dir().unwrap_or_else(std::env::temp_dir)
+        storage_home().unwrap_or_else(|| path.to_path_buf())
     } else if let Some(raw) = path.to_str() {
         if raw.starts_with("~/") || raw.starts_with("~\\") {
-            storage_home_dir()
-                .unwrap_or_else(std::env::temp_dir)
-                .join(&raw[2..])
+            storage_home()
+                .map(|home| home.join(&raw[2..]))
+                .unwrap_or_else(|| path.to_path_buf())
         } else {
             path.to_path_buf()
         }
@@ -459,10 +515,10 @@ fn resolve_storage_path(path: &std::path::Path) -> PathBuf {
     };
     let absolute = if expanded.is_absolute() {
         expanded
+    } else if let Some(current_dir) = current_dir {
+        current_dir.join(expanded)
     } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| std::env::temp_dir())
-            .join(expanded)
+        expanded
     };
     normalize_absolute_path(&absolute)
 }
@@ -547,9 +603,10 @@ fn dir_has_entries(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod storage_root_tests {
-    use std::ffi::{OsStr, OsString};
+    use std::collections::HashMap;
+    use std::ffi::OsString;
     use std::panic::{catch_unwind, AssertUnwindSafe};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     struct NonPanickingCleanup<F: FnOnce()> {
         cleanup: Option<F>,
@@ -574,140 +631,143 @@ mod storage_root_tests {
         }
     }
 
-    struct StorageEnvGuard {
-        previous: Vec<(&'static str, Option<OsString>)>,
+    fn resolve_storage_fixture(
+        env: &HashMap<&str, OsString>,
+        configured: Option<&Path>,
+        platform: super::StoragePlatform,
+        fallback_home: Option<&Path>,
+        current_dir: Option<&Path>,
+    ) -> PathBuf {
+        super::storage_dir_from(
+            configured,
+            &|name| env.get(name).cloned(),
+            platform,
+            fallback_home,
+            current_dir,
+        )
     }
 
-    impl StorageEnvGuard {
-        fn capture() -> Self {
-            Self {
-                previous: [
-                    "AFT_STORAGE_DIR",
-                    "AFT_CACHE_DIR",
-                    "XDG_DATA_HOME",
-                    "HOME",
-                    "USERPROFILE",
-                    "LOCALAPPDATA",
-                    "APPDATA",
-                ]
-                .into_iter()
-                .map(|key| (key, std::env::var_os(key)))
-                .collect(),
-            }
-        }
-
-        fn set(&self, key: &'static str, value: Option<&OsStr>) {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
-
-    impl Drop for StorageEnvGuard {
-        fn drop(&mut self) {
-            let previous: Vec<_> = self.previous.drain(..).collect();
-            // Env restoration runs while a failing test may already be
-            // unwinding; a cleanup panic at that point aborts the whole
-            // libtest process (observed on Windows CI), so the restore loop
-            // stays contained like NonPanickingCleanup above.
-            let _ = catch_unwind(AssertUnwindSafe(move || {
-                for (key, value) in previous {
-                    match value {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
-                    }
-                }
-            }));
-        }
-    }
-
-    // The plugin-injected and plugin-less paths must use one resolver so every
-    // artifact lane sees the same absolute root under every environment arm.
     #[test]
-    fn fallback_and_injected_roots_agree_with_storage_override_arms() {
-        let _env_lock = crate::test_env::process_env_lock();
-        let env = StorageEnvGuard::capture();
-        let base = tempfile::tempdir().expect("storage root test directory");
-        let data_home = base.path().join("data");
-        let home = base.path().join("home");
-        let expected_plugin_root = data_home.join("cortexkit").join("aft");
-        let cache_root = base.path().join("legacy-cache");
-        env.set("XDG_DATA_HOME", Some(data_home.as_os_str()));
-        env.set("HOME", Some(home.as_os_str()));
-        env.set("USERPROFILE", Some(home.as_os_str()));
-        // The fallback==injected agreement is proven with the cache lever
-        // unset: plugin flows always pass `configured`, so AFT_CACHE_DIR
-        // only ever steers plugin-less (sandbox/test) invocations and ranks
-        // above the computed data root for exactly that purpose.
-        env.set("AFT_CACHE_DIR", None);
-        env.set("AFT_STORAGE_DIR", None);
+    fn storage_ladder_matches_daemon_on_both_platforms_and_ignores_empty_rungs() {
+        let current_dir = Path::new("/work");
+        let fallback_home = Path::new("/system-home");
+        let module_suffix = Path::new("cortexkit").join("aft");
+        let mut env = HashMap::from([
+            ("AFT_STORAGE_DIR", OsString::new()),
+            ("AFT_CACHE_DIR", OsString::new()),
+            ("XDG_DATA_HOME", OsString::new()),
+            ("APPDATA", OsString::new()),
+            ("USERPROFILE", OsString::new()),
+            ("HOME", OsString::new()),
+            // LOCALAPPDATA must not affect this result: the shared Windows
+            // data-home ladder uses roaming APPDATA or USERPROFILE.
+            ("LOCALAPPDATA", OsString::from("/wrong-local-data")),
+        ]);
 
-        assert_eq!(super::storage_dir(None), expected_plugin_root);
+        for platform in [
+            super::StoragePlatform::Other,
+            super::StoragePlatform::Windows,
+        ] {
+            assert_eq!(
+                resolve_storage_fixture(
+                    &env,
+                    Some(Path::new("")),
+                    platform,
+                    Some(fallback_home),
+                    Some(current_dir),
+                ),
+                current_dir.join(".local/share").join(&module_suffix),
+                "empty values and an empty configured root are unset"
+            );
+        }
+        assert_eq!(
+            resolve_storage_fixture(&env, None, super::StoragePlatform::Other, None, None,),
+            PathBuf::from(".local/share/cortexkit/aft"),
+            "an unavailable cwd preserves the honest relative path"
+        );
 
-        env.set("AFT_CACHE_DIR", Some(cache_root.as_os_str()));
-        assert_eq!(super::storage_dir(None), cache_root.join("aft"));
+        env.insert("HOME", OsString::from("/home/operator"));
+        env.insert("USERPROFILE", OsString::from("/wrong-profile"));
         assert_eq!(
-            super::storage_dir(Some(&expected_plugin_root)),
-            expected_plugin_root,
-            "configured root must outrank the cache lever"
-        );
-        env.set("AFT_CACHE_DIR", None);
-        assert_eq!(
-            super::storage_dir(Some(&expected_plugin_root)),
-            expected_plugin_root
-        );
-        assert_eq!(
-            crate::search_index::resolve_cache_dir(Path::new("/tmp/project"), None)
-                .parent()
-                .and_then(Path::parent),
-            Some(expected_plugin_root.as_path())
-        );
-
-        let spelled_dir = base.path().join("spelled");
-        std::fs::create_dir(&spelled_dir).expect("spelled path component");
-        let explicit_spelling = spelled_dir.join("..");
-        assert_eq!(
-            super::storage_dir(Some(&explicit_spelling)),
-            explicit_spelling
-        );
-        assert_eq!(
-            crate::search_index::resolve_cache_dir(
-                Path::new("/tmp/project"),
-                Some(&explicit_spelling)
+            resolve_storage_fixture(
+                &env,
+                None,
+                super::StoragePlatform::Other,
+                Some(fallback_home),
+                Some(current_dir),
             ),
-            explicit_spelling
-                .join("index")
-                .join(crate::search_index::artifact_cache_key(Path::new(
-                    "/tmp/project"
-                )))
+            Path::new("/home/operator/.local/share").join(&module_suffix)
         );
 
-        env.set(
-            "AFT_STORAGE_DIR",
-            Some(OsStr::new("./relative/../local-aft-storage")),
-        );
-        let expected_relative = super::resolve_storage_path(Path::new("./local-aft-storage"));
-        assert!(expected_relative.is_absolute());
-        assert_eq!(super::storage_dir(None), expected_relative);
+        env.insert("APPDATA", OsString::from("/roaming"));
         assert_eq!(
-            super::storage_dir(Some(&expected_plugin_root)),
-            expected_relative
+            resolve_storage_fixture(
+                &env,
+                None,
+                super::StoragePlatform::Windows,
+                Some(fallback_home),
+                Some(current_dir),
+            ),
+            Path::new("/roaming").join(&module_suffix)
+        );
+        env.insert("APPDATA", OsString::new());
+        assert_eq!(
+            resolve_storage_fixture(
+                &env,
+                None,
+                super::StoragePlatform::Windows,
+                Some(fallback_home),
+                Some(current_dir),
+            ),
+            Path::new("/wrong-profile/AppData/Roaming").join(&module_suffix)
         );
 
-        env.set("AFT_STORAGE_DIR", Some(OsStr::new("")));
-        assert_eq!(super::storage_dir(None), expected_plugin_root);
+        env.insert("XDG_DATA_HOME", OsString::from("relative-data"));
         assert_eq!(
-            super::storage_dir(Some(&expected_plugin_root)),
-            expected_plugin_root
+            resolve_storage_fixture(
+                &env,
+                None,
+                super::StoragePlatform::Other,
+                Some(fallback_home),
+                Some(current_dir),
+            ),
+            current_dir.join("relative-data").join(&module_suffix)
         );
 
-        env.set("AFT_STORAGE_DIR", Some(OsStr::new("~/tilde-aft-storage")));
-        let expected_tilde = home.join("tilde-aft-storage");
-        assert_eq!(super::storage_dir(None), expected_tilde);
+        env.insert("AFT_CACHE_DIR", OsString::from("/legacy-cache"));
         assert_eq!(
-            super::storage_dir(Some(&expected_plugin_root)),
-            expected_tilde
+            resolve_storage_fixture(
+                &env,
+                None,
+                super::StoragePlatform::Other,
+                Some(fallback_home),
+                Some(current_dir),
+            ),
+            PathBuf::from("/legacy-cache/aft")
+        );
+        let configured = Path::new("configured/../configured-aft");
+        assert_eq!(
+            resolve_storage_fixture(
+                &env,
+                Some(configured),
+                super::StoragePlatform::Other,
+                Some(fallback_home),
+                Some(current_dir),
+            ),
+            configured,
+            "the caller-owned configured spelling outranks the legacy cache lever"
+        );
+
+        env.insert("AFT_STORAGE_DIR", OsString::from("~/operator-aft"));
+        assert_eq!(
+            resolve_storage_fixture(
+                &env,
+                Some(configured),
+                super::StoragePlatform::Other,
+                Some(fallback_home),
+                Some(current_dir),
+            ),
+            PathBuf::from("/home/operator/operator-aft")
         );
     }
 

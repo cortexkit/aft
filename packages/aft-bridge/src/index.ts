@@ -204,7 +204,15 @@ export type {
 } from "./protocol.js";
 export { findBinary, findBinarySync, isNativeExecutable, platformKey } from "./resolver.js";
 export { RevivableTransportPool } from "./revivable-transport.js";
-export { resolveAftLogPath, resolveAftStorageRoot } from "./storage-paths.js";
+export {
+  resolveAftLogPath,
+  resolveAftStorageRoot,
+  resolveDataHome,
+  resolveStoragePath,
+  type StorageEnvironmentLookup,
+  type StoragePathContext,
+  type StoragePlatform,
+} from "./storage-paths.js";
 export {
   type BgNudgeRef,
   resolveBridgeForNudge,

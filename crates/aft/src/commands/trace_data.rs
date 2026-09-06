@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::commands::callgraph_store_adapter::serialized_response;
 use crate::commands::callgraph_store_adapter::suspended_response;
 use crate::commands::callgraph_store_adapter::{
     building_response, note_callgraph_building, note_callgraph_served, store_error_response,
@@ -122,8 +123,7 @@ pub fn handle_trace_data(req: &RawRequest, ctx: &AppContext) -> Response {
     ) {
         Ok(result) => {
             note_callgraph_served(ctx, "trace_data", 0, "ok");
-            let result_json = serde_json::to_value(&result).unwrap_or_default();
-            Response::success(&req.id, result_json)
+            serialized_response(&req.id, "trace_data", &result)
         }
         Err(error) => store_error_response(&req.id, "trace_data", error),
     }

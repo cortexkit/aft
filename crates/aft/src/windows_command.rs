@@ -98,8 +98,8 @@ where
     command_line.push('"');
 
     let mut command = Command::new(
-        std::env::var_os("ComSpec")
-            .or_else(|| std::env::var_os("COMSPEC"))
+        crate::environment::non_empty_os_var("ComSpec")
+            .or_else(|| crate::environment::non_empty_os_var("COMSPEC"))
             .unwrap_or_else(|| "cmd.exe".into()),
     );
     command

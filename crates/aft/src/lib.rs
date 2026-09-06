@@ -73,6 +73,8 @@ pub mod context;
 pub mod db;
 pub mod edit;
 pub mod effective_path;
+#[doc(hidden)]
+pub mod environment;
 pub mod error;
 pub mod executor;
 pub mod extract;

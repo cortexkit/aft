@@ -2816,10 +2816,12 @@ mod status_bar_refresh_tests {
                 ),
             ]),
         );
-        let counts = ctx.status_bar_counts().expect("populated");
-        assert_eq!(counts.dead_code, 7);
-        assert_eq!(counts.unused_exports, 3);
-        assert_eq!(counts.duplicates, 1);
+        let counts = ctx.status_bar_count_values();
+        assert_eq!(counts.errors, None);
+        assert_eq!(counts.warnings, None);
+        assert_eq!(counts.dead_code, Some(7));
+        assert_eq!(counts.unused_exports, Some(3));
+        assert_eq!(counts.duplicates, Some(1));
         assert!(!counts.tier2_stale);
     }
 
@@ -2841,10 +2843,12 @@ mod status_bar_refresh_tests {
                 (InspectCategory::Duplicates, stale_cache(2)),
             ]),
         );
-        let counts = ctx.status_bar_counts().expect("populated");
-        assert_eq!(counts.dead_code, 12);
-        assert_eq!(counts.unused_exports, 4);
-        assert_eq!(counts.duplicates, 2);
+        let counts = ctx.status_bar_count_values();
+        assert_eq!(counts.errors, None);
+        assert_eq!(counts.warnings, None);
+        assert_eq!(counts.dead_code, Some(12));
+        assert_eq!(counts.unused_exports, Some(4));
+        assert_eq!(counts.duplicates, Some(2));
         assert!(counts.tier2_stale);
     }
 

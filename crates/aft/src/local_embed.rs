@@ -18,7 +18,7 @@
 //!   - mean pool: sum(mask · tok, over seq) / max(sum(mask), 1)
 //!   - L2 normalize: v / (||v|| + 1e-12)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
@@ -295,7 +295,7 @@ fn mask_at(mask: &ndarray::Array2<i64>, row: usize, col: usize) -> i64 {
 /// Resolve the MiniLM model.onnx + tokenizer.json, reusing an existing local
 /// download when present (offline-safe) and falling back to an hf-hub fetch.
 fn resolve_model_files() -> Result<(PathBuf, PathBuf), String> {
-    let cache_dir = embedding_cache_dir();
+    let cache_dir = embedding_cache_dir()?;
 
     if let Some(found) = scan_local_snapshot(&cache_dir) {
         return Ok(found);
@@ -309,15 +309,27 @@ fn resolve_model_files() -> Result<(PathBuf, PathBuf), String> {
 /// fastembed read `FASTEMBED_CACHE_DIR`; the bridge/warmup set it to
 /// `<storage>/semantic/models`. Keep the same env + default so existing
 /// downloads are reused.
-fn embedding_cache_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("FASTEMBED_CACHE_DIR") {
-        return PathBuf::from(dir);
+fn embedding_cache_dir() -> Result<PathBuf, String> {
+    embedding_cache_dir_from(
+        |name| crate::environment::non_empty_os_var(name),
+        std::env::home_dir().as_deref(),
+    )
+    .ok_or_else(|| "could not determine a home directory for the fastembed cache".to_string())
+}
+
+fn embedding_cache_dir_from(
+    lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+    fallback_home: Option<&Path>,
+) -> Option<PathBuf> {
+    let non_empty = |name| lookup(name).filter(|value| !value.is_empty());
+    if let Some(dir) = non_empty("FASTEMBED_CACHE_DIR") {
+        return Some(PathBuf::from(dir));
     }
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    non_empty("HOME")
+        .or_else(|| non_empty("USERPROFILE"))
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    home.join(".cache").join("fastembed")
+        .or_else(|| fallback_home.map(PathBuf::from))
+        .map(|home| home.join(".cache").join("fastembed"))
 }
 
 /// hf-hub stores repos at `<cache>/models--<org>--<repo>/snapshots/<rev>/`.
@@ -372,9 +384,27 @@ fn download_via_hf_hub(cache_dir: &std::path::Path) -> Result<(PathBuf, PathBuf)
 
 #[cfg(test)]
 mod tests {
-    use super::MINILM_MAX_LENGTH;
+    use super::{embedding_cache_dir_from, MINILM_MAX_LENGTH};
     use std::io::Write;
     use tokenizers::Tokenizer;
+
+    #[test]
+    fn empty_fastembed_and_home_rungs_are_unset_with_an_injected_lookup() {
+        let empty = std::ffi::OsString::new();
+        let cache = embedding_cache_dir_from(
+            |name| match name {
+                "FASTEMBED_CACHE_DIR" | "HOME" => Some(empty.clone()),
+                "USERPROFILE" => Some(std::ffi::OsString::from("/profile")),
+                _ => None,
+            },
+            None,
+        );
+        assert_eq!(
+            cache,
+            Some(std::path::PathBuf::from("/profile/.cache/fastembed"))
+        );
+        assert_eq!(embedding_cache_dir_from(|_| None, None), None);
+    }
 
     fn minilm_like_tokenizer_json() -> Vec<u8> {
         serde_json::json!({

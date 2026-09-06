@@ -1430,7 +1430,7 @@ const MANAGED_ORT_MIN_MINOR: u32 = 20;
 /// up the runtime the plugin already downloaded.
 ///
 /// Resolution order:
-///   1. If `ORT_DYLIB_PATH` is already set (an explicit user override, or the
+///   1. If `ORT_DYLIB_PATH` is non-empty (an explicit user override, or the
 ///      plugin already exported it), do nothing — the caller's choice wins and
 ///      the resolver must not run at all.
 ///   2. Enumerate `<storage_dir>/onnxruntime/` version directories, keep only
@@ -1446,7 +1446,7 @@ const MANAGED_ORT_MIN_MINOR: u32 = 20;
 /// dlopen and other threads reading the env. The function is idempotent: once
 /// `ORT_DYLIB_PATH` is set, subsequent calls short-circuit.
 pub fn resolve_managed_onnx_runtime(storage_dir: &Path) {
-    if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+    if onnx_runtime_override_configured_with(|name| std::env::var_os(name)) {
         return;
     }
     let Some(lib_path) = find_managed_onnx_runtime(storage_dir) else {
@@ -1457,6 +1457,12 @@ pub fn resolve_managed_onnx_runtime(storage_dir: &Path) {
         "using plugin-managed ONNX Runtime at {}",
         lib_path.display()
     );
+}
+
+fn onnx_runtime_override_configured_with(
+    lookup: impl FnOnce(&str) -> Option<std::ffi::OsString>,
+) -> bool {
+    lookup("ORT_DYLIB_PATH").is_some_and(|value| !value.is_empty())
 }
 
 /// Find the highest compatible managed ONNX Runtime library under
@@ -8321,6 +8327,17 @@ public class Greeter {
             None,
             "no compatible version with a library file should resolve"
         );
+    }
+
+    #[test]
+    fn empty_onnx_runtime_override_is_unset_with_an_injected_lookup() {
+        assert!(!onnx_runtime_override_configured_with(|key| {
+            assert_eq!(key, "ORT_DYLIB_PATH");
+            Some(std::ffi::OsString::new())
+        }));
+        assert!(onnx_runtime_override_configured_with(|_| Some(
+            std::ffi::OsString::from("/runtime/libonnxruntime.so")
+        )));
     }
 
     #[test]

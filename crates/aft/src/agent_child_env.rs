@@ -195,7 +195,7 @@ pub fn maintain(config: &Config, storage_root: &Path) -> Result<(), String> {
 /// the gh-shim invocation path (which legitimately reads the shims marker)
 /// dispatches before this runs.
 pub fn scrub_inherited_process_markers() {
-    if let Some(stale) = std::env::var_os(GH_SHIMS_DIR_ENV).map(PathBuf::from) {
+    if let Some(stale) = crate::environment::non_empty_os_var(GH_SHIMS_DIR_ENV).map(PathBuf::from) {
         if let Some(inherited) = std::env::var_os("PATH") {
             let cleaned: Vec<_> = std::env::split_paths(&inherited)
                 .filter(|entry| entry != &stale)
@@ -339,7 +339,7 @@ pub fn inject(
     // test-suite fixtures that isolate via HOME/XDG resolved the production
     // store). Children that resolve storage by default reach the same root
     // anyway; explicitness is only preserved, never minted.
-    if let Some(explicit) = std::env::var_os(STORAGE_DIR_ENV) {
+    if let Some(explicit) = crate::environment::non_empty_os_var(STORAGE_DIR_ENV) {
         environment.insert(
             STORAGE_DIR_ENV.to_string(),
             explicit.to_string_lossy().into_owned(),
@@ -347,7 +347,7 @@ pub fn inject(
     }
     // Preserve an explicitly selected gh-shim state directory for hooks and
     // nested AFT children, but never mint one from the operator's default.
-    if let Some(explicit) = std::env::var_os(GH_SHIM_STATE_DIR_ENV) {
+    if let Some(explicit) = crate::environment::non_empty_os_var(GH_SHIM_STATE_DIR_ENV) {
         environment.insert(
             GH_SHIM_STATE_DIR_ENV.to_string(),
             explicit.to_string_lossy().into_owned(),

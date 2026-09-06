@@ -1426,7 +1426,7 @@ mod pending_response_tests {
             helper.data["bg_completions"][0]["task_id"],
             "bash-0000000000000501"
         );
-        assert_eq!(helper.data["status_bar"]["dead_code"], 3);
+        assert!(helper.data.get("status_bar").is_none());
     }
 
     #[test]
@@ -1478,7 +1478,7 @@ mod pending_response_tests {
             values[0]["bg_completions"][0]["task_id"],
             "bash-0000000000000502"
         );
-        assert_eq!(values[0]["status_bar"]["dead_code"], 3);
+        assert!(values[0].get("status_bar").is_none());
 
         assert_eq!(
             write_ready_pending_to_writer(&fixture.ctx, &mut pending, &mut writer).unwrap(),
@@ -3050,8 +3050,18 @@ mod watcher_filter_tests {
     #[test]
     fn status_bar_attach_skips_unchanged_fingerprint() {
         let tmp = TempDir::new().unwrap();
-        let ctx = make_ctx_with_root(tmp.path());
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let ctx = make_ctx_with_root(&root);
         ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        {
+            let key = ServerKey {
+                kind: ServerKind::TypeScript,
+                root: root.clone(),
+            };
+            ctx.lsp()
+                .diagnostics_store_mut_for_test()
+                .publish(key, root.join("known.ts"), vec![]);
+        }
 
         let mut first = Response::success("one", serde_json::json!({}));
         attach_status_bar(&mut first, &ctx, "session-status", "read");
@@ -4004,7 +4014,8 @@ mod watcher_filter_tests {
         drain_watcher_events(&ctx);
 
         let snapshot = recv_status_changed(&rx);
-        assert_eq!(snapshot["status_bar"]["errors"], serde_json::Value::from(0));
-        assert_eq!(ctx.status_bar_counts().unwrap().errors, 0);
+        assert!(snapshot["status_bar"].get("errors").is_none());
+        assert_eq!(ctx.status_bar_count_values().errors, None);
+        assert_eq!(ctx.status_bar_counts(), None);
     }
 }

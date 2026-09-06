@@ -413,9 +413,13 @@ mod tests {
 
         finalize_response_with_bg_completions(&mut response, &ctx, "session-1", "echo", false);
 
-        assert_eq!(response.data["status_bar"]["dead_code"], 21);
+        assert!(response.data.get("status_bar").is_none());
         let publish = wire_rx.try_recv().expect("single discovery publish");
-        assert_eq!(publish.body()["text"], "AFT E0 W0 | D21 U12 C13 | T14");
+        assert_eq!(
+            publish.body()["text"],
+            "",
+            "missing diagnostics stay absent instead of being published as E0 W0"
+        );
         assert!(
             wire_rx.try_recv().is_err(),
             "response published more than once"

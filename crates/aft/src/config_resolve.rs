@@ -1467,8 +1467,8 @@ fn resolve_index_config(raw: Option<&RawIndex>, warnings: &mut Vec<ConfigWarning
         return IndexConfig::default();
     };
 
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    let home = crate::environment::non_empty_os_var("HOME")
+        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
         .map(PathBuf::from);
     let mut normalized_roots = Vec::with_capacity(roots.len());
 

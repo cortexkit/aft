@@ -73,6 +73,16 @@ export interface AftTransportFactoryOptions {
   onBgEventsNudgeRef?: (ref: BgNudgeRef) => void;
 }
 
+// This expansion becomes `subc_transport::connection_file::discover(explicit)`
+// when the shared transport callable reaches TypeScript. It will replace this
+// configured-only path with: explicit (exclusive); non-empty
+// SUBC_CONNECTION_FILE (exclusive); non-empty XDG_RUNTIME_DIR plus
+// `subc-connection.json`; non-empty HOME plus
+// `.local/share/cortexkit/run/subc-connection.json`; user-scoped temp file.
+// Last re-derived 2026-09-06 against subconscious
+// d5e09914b0791a66f2a5a00a9bb3422860ade95e: compare ordered guards with
+// `subc-transport/src/connection_file.rs::discovery_candidates_with_environment`
+// and resolve `CONNECTION_FILE_NAME` and `PROD_CONNECTION_RELATIVE_PATH`.
 function resolveConnectionFilePath(raw: string): string {
   const trimmed = raw.trim();
   if (trimmed.startsWith("~")) {

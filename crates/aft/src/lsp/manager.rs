@@ -3154,6 +3154,13 @@ fn classify_spawn_error(binary: &str, err: &LspError) -> ServerAttemptResult {
 }
 
 fn env_binary_override(kind: &ServerKind) -> Option<PathBuf> {
+    env_binary_override_from(kind, |key| std::env::var_os(key))
+}
+
+fn env_binary_override_from(
+    kind: &ServerKind,
+    lookup: impl FnOnce(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
     let id = kind.id_str();
     let suffix: String = id
         .chars()
@@ -3166,7 +3173,30 @@ fn env_binary_override(kind: &ServerKind) -> Option<PathBuf> {
         })
         .collect();
     let key = format!("AFT_LSP_{suffix}_BINARY");
-    std::env::var_os(key).map(PathBuf::from)
+    lookup(&key)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod env_binary_override_tests {
+    use super::*;
+
+    #[test]
+    fn empty_lsp_binary_override_is_unset_without_mutating_the_process_environment() {
+        let kind = ServerKind::TypeScript;
+        assert_eq!(
+            env_binary_override_from(&kind, |key| {
+                assert_eq!(key, "AFT_LSP_TYPESCRIPT_BINARY");
+                Some(std::ffi::OsString::new())
+            }),
+            None
+        );
+        assert_eq!(
+            env_binary_override_from(&kind, |_| Some(std::ffi::OsString::from("/bin/lsp"))),
+            Some(PathBuf::from("/bin/lsp"))
+        );
+    }
 }
 
 #[cfg(all(test, windows))]

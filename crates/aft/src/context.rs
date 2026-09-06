@@ -264,19 +264,24 @@ pub struct StatusBarCountValues {
 
 impl StatusBarCountValues {
     fn legacy_projection(&self) -> Option<StatusBarCounts> {
-        let [Some(dead_code), Some(unused_exports), Some(duplicates)] =
-            [self.dead_code, self.unused_exports, self.duplicates]
-        else {
+        let [Some(errors), Some(warnings), Some(dead_code), Some(unused_exports), Some(duplicates), Some(todos)] = [
+            self.errors,
+            self.warnings,
+            self.dead_code,
+            self.unused_exports,
+            self.duplicates,
+            self.todos,
+        ] else {
             return None;
         };
 
         Some(StatusBarCounts {
-            errors: self.errors.unwrap_or_default(),
-            warnings: self.warnings.unwrap_or_default(),
+            errors,
+            warnings,
             dead_code,
             unused_exports,
             duplicates,
-            todos: self.todos.unwrap_or_default(),
+            todos,
             tier2_stale: self.tier2_stale,
         })
     }
@@ -9548,7 +9553,7 @@ mod status_bar_tests {
     }
 
     #[test]
-    fn truthful_values_omit_unproven_categories_while_legacy_projection_stays_hidden() {
+    fn truthful_values_omit_unproven_categories_and_legacy_projection_requires_all_counts() {
         let ctx = ctx();
         let values = ctx.status_bar_count_values();
         assert_eq!(values.errors, None);
@@ -9572,10 +9577,11 @@ mod status_bar_tests {
         );
         assert!(!values.tier2_stale);
 
-        let legacy = ctx
-            .status_bar_counts()
-            .expect("legacy projection is populated");
-        assert_eq!((legacy.errors, legacy.warnings), (0, 0));
+        assert_eq!(
+            ctx.status_bar_counts(),
+            None,
+            "the legacy numeric shape must not fabricate missing diagnostics"
+        );
     }
 
     #[test]
@@ -9588,7 +9594,7 @@ mod status_bar_tests {
         let ctx = ctx();
         ctx.set_canonical_cache_root(first_root);
         ctx.update_status_bar_tier2(Some(5), Some(3), Some(7), Some(2), false);
-        assert!(ctx.status_bar_counts().is_some());
+        assert_eq!(ctx.status_bar_count_values().dead_code, Some(5));
 
         ctx.set_canonical_cache_root(second_root);
 
@@ -9714,12 +9720,12 @@ mod status_bar_tests {
         }
 
         // Bar reflects the live warm-set error.
-        assert_eq!(ctx.status_bar_counts().expect("populated").errors, 1);
+        assert_eq!(ctx.status_bar_count_values().errors, Some(1));
 
         // Clearing the (now-deleted) file's diagnostics drops the count.
         let removed = ctx.lsp_clear_diagnostics_for_file(&file);
         assert!(removed);
-        assert_eq!(ctx.status_bar_counts().expect("populated").errors, 0);
+        assert_eq!(ctx.status_bar_count_values().errors, None);
     }
 
     #[test]
@@ -9827,7 +9833,7 @@ mod status_bar_tests {
             source: Some("json".into()),
         };
 
-        assert_eq!(ctx.status_bar_counts().expect("populated").errors, 0);
+        assert_eq!(ctx.status_bar_count_values().errors, None);
 
         {
             let mut lsp = ctx.lsp();
@@ -9835,9 +9841,9 @@ mod status_bar_tests {
                 .publish(key.clone(), file.clone(), vec![env]);
         }
         assert_eq!(
-            ctx.status_bar_counts().expect("populated").errors,
-            0,
-            "environmental publish must not change status-bar E"
+            ctx.status_bar_count_values().errors,
+            Some(0),
+            "an environmental-only report proves there are zero included errors"
         );
 
         {
@@ -9846,9 +9852,9 @@ mod status_bar_tests {
                 .publish(key, file, vec![]);
         }
         assert_eq!(
-            ctx.status_bar_counts().expect("populated").errors,
-            0,
-            "environmental clear must not change status-bar E"
+            ctx.status_bar_count_values().errors,
+            Some(0),
+            "clearing the excluded diagnostic keeps the proven included count at zero"
         );
     }
 }
