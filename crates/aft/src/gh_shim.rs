@@ -336,19 +336,45 @@ fn run(args: &[OsString]) -> i32 {
         return delegate(args);
     };
 
-    match classify(args, &manifest, current_platform()) {
-        Classification::Mechanical => delegate(args),
+    let classification = classify(args, &manifest, current_platform());
+    dispatch_r3(
+        args,
+        classification,
+        &manifest,
+        &paths,
+        &determination.record,
+        &agent_binding,
+        now,
+        delegate,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_r3<F>(
+    args: &[OsString],
+    classification: Classification,
+    manifest: &Manifest,
+    paths: &StatePaths,
+    rung: &RungRecord,
+    agent_binding: &AgentBinding,
+    now: u64,
+    delegate_to_upstream: F,
+) -> i32
+where
+    F: FnOnce(&[OsString]) -> i32,
+{
+    match classification {
+        Classification::Mechanical => delegate_to_upstream(args),
         Classification::Admin { tuple } => {
             if std::env::var_os("GH_SHIM_BYPASS").as_deref() == Some(OsStr::new("operator")) {
                 let repository = explicit_repo(args).or_else(infer_repository_from_git);
-                if let Err(error) = append_bypass_audit(&paths, &tuple, repository.as_deref(), now)
-                {
+                if let Err(error) = append_bypass_audit(paths, &tuple, repository.as_deref(), now) {
                     return refuse(
                         RefusalCode::BypassAuditUnavailable,
                         &format!("operator bypass audit could not be appended: {error}"),
                     );
                 }
-                delegate(args)
+                delegate_to_upstream(args)
             } else {
                 refuse(
                     RefusalCode::AdminTier,
@@ -363,10 +389,9 @@ fn run(args: &[OsString]) -> i32 {
                     Err(error) => return refuse_governed_canonicalization(&error),
                 };
             let mutation = GithubReadMutation::from_governed_request(&request);
-            let outcome =
-                route_governed(&paths, &determination.record, &agent_binding, request, now);
+            let outcome = route_governed(paths, rung, agent_binding, request, now);
             invalidate_successful_github_read_mutation(mutation.as_ref(), &outcome);
-            governed_outcome_status(&paths, &agent_binding, now, outcome)
+            governed_outcome_status(paths, agent_binding, now, outcome)
         }
         Classification::Unclassified => refuse(
             RefusalCode::Unclassified,
@@ -1442,6 +1467,16 @@ impl Manifest {
                     rule.method, rule.path_glob
                 ));
             }
+            if let Some(platform) = rule
+                .platform
+                .iter()
+                .find(|platform| !matches!(platform.as_str(), "macos" | "linux"))
+            {
+                return Err(format!(
+                    "api rule {} {} names unknown host platform {platform}",
+                    rule.method, rule.path_glob
+                ));
+            }
             let key = format!("{} {}", rule.method.to_ascii_uppercase(), rule.path_glob);
             if !api_declared.insert(key.clone()) {
                 return Err(format!("api rule {key} is declared more than once"));
@@ -2316,7 +2351,7 @@ fn command_head(args: &[OsString]) -> Option<(String, Option<String>, usize)> {
 }
 
 fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Classification {
-    let Some((method, path)) = api_method_and_path(args) else {
+    let Some((method, path, has_fields)) = api_method_and_path(args) else {
         return Classification::Unclassified;
     };
     let matches = manifest
@@ -2328,7 +2363,7 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
                 && glob::Pattern::new(&rule.path_glob).is_ok_and(|pattern| pattern.matches(&path))
         })
         .collect::<Vec<_>>();
-    if matches.is_empty() && method.eq_ignore_ascii_case("GET") {
+    if matches.is_empty() && method.eq_ignore_ascii_case("GET") && !has_fields {
         // A field-free GET cannot write or assert an identity, so it remains a
         // mechanical read even when the manifest has no endpoint-specific rule.
         return Classification::Mechanical;
@@ -2336,19 +2371,38 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
     if matches.len() != 1 {
         return Classification::Unclassified;
     }
-    // API writes are not normalized into governed or ADMIN equivalents until a
-    // parser accepts and validates their exact argv forms. An id-addressed
-    // comment PATCH can target any contributor's comment, unlike native
-    // `--edit-last`, which is scoped to the caller.
-    match matches[0].tier {
+    let rule = matches[0];
+    if rule.tier == Tier::Admin {
+        return Classification::Admin {
+            tuple: format!(
+                "api:{}:{}",
+                rule.method.to_ascii_uppercase(),
+                rule.path_glob
+            ),
+        };
+    }
+    // Field payloads change request semantics independently of the endpoint.
+    // Only ADMIN may cross this protection wall because it delegates under the
+    // operator's own identity after writing the bypass audit; holder-bound
+    // classifications must never sign a payload the shim has not parsed.
+    if has_fields {
+        return Classification::Unclassified;
+    }
+    match rule.tier {
         Tier::Mechanical => Classification::Mechanical,
-        Tier::Governed | Tier::Admin => Classification::Unclassified,
+        // API writes are not normalized into governed equivalents until a
+        // parser accepts and validates their exact argv forms. An id-addressed
+        // comment PATCH can target any contributor's comment, unlike native
+        // `--edit-last`, which is scoped to the caller.
+        Tier::Governed => Classification::Unclassified,
+        Tier::Admin => unreachable!("admin API rules return before field protection"),
     }
 }
 
-fn api_method_and_path(args: &[OsString]) -> Option<(String, String)> {
+fn api_method_and_path(args: &[OsString]) -> Option<(String, String, bool)> {
     let mut method = "GET".to_string();
     let mut path = None;
+    let mut has_fields = false;
     let mut index = 1;
     while index < args.len() {
         let value = args[index].to_str()?;
@@ -2363,10 +2417,14 @@ fn api_method_and_path(args: &[OsString]) -> Option<(String, String)> {
             continue;
         }
         if is_api_field_argument(value) {
-            // Field-bearing API forms can change request semantics independently
-            // of the endpoint. Until an audited form has a reviewed parser, they
-            // remain unclassified rather than inheriting a read-like API rule.
-            return None;
+            has_fields = true;
+            if matches!(value, "--input" | "--raw-field" | "--field" | "-F" | "-f") {
+                args.get(index + 1)?.to_str()?;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
         }
         if value.starts_with('-') {
             index += 1;
@@ -2378,7 +2436,7 @@ fn api_method_and_path(args: &[OsString]) -> Option<(String, String)> {
         index += 1;
     }
     let path = path?;
-    (path != "-").then_some((method, path))
+    (path != "-").then_some((method, path, has_fields))
 }
 
 fn is_api_field_argument(value: &str) -> bool {
@@ -3863,6 +3921,33 @@ mod tests {
         "schema_unsupported",
         "rate_limited",
     ];
+    const BRANCH_PROTECTION_PATH_GLOB: &str = "/repos/*/*/branches/*/protection";
+    const BRANCH_PROTECTION_API_TUPLE: &str = "api:PUT:/repos/*/*/branches/*/protection";
+
+    struct ScopedTestEnvVar {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl ScopedTestEnvVar {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let previous = std::env::var_os(key);
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedTestEnvVar {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(previous) => unsafe { std::env::set_var(self.key, previous) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
 
     fn fixture_manifest() -> Manifest {
         serde_json::from_str(include_str!(
@@ -3889,6 +3974,22 @@ mod tests {
     fn v12_fixture_manifest() -> Manifest {
         serde_json::from_str(include_str!("../tests/fixtures/gh_shim/v12-manifest.json"))
             .expect("v12 manifest fixture")
+    }
+
+    fn branch_protection_manifest(method: &str, tier: Tier) -> Manifest {
+        let mut manifest = v12_fixture_manifest();
+        manifest.manifest_version = 13;
+        manifest.api_rules.push(ApiRule {
+            method: method.to_string(),
+            path_glob: BRANCH_PROTECTION_PATH_GLOB.to_string(),
+            tier,
+            platform: vec!["macos".to_string(), "linux".to_string()],
+            rationale: Some(
+                "branch protection is a repository setting; operator identity, audited bypass"
+                    .to_string(),
+            ),
+        });
+        manifest
     }
 
     fn os_args(args: &[&str]) -> Vec<OsString> {
@@ -5048,6 +5149,20 @@ mod tests {
     }
 
     #[test]
+    fn manifest_rejects_api_rules_for_unknown_host_platforms() {
+        let mut manifest = branch_protection_manifest("PUT", Tier::Admin);
+        manifest
+            .api_rules
+            .last_mut()
+            .expect("branch protection API rule")
+            .platform = vec!["github".to_string()];
+        assert_eq!(
+            manifest.validate().unwrap_err(),
+            "api rule PUT /repos/*/*/branches/*/protection names unknown host platform github"
+        );
+    }
+
+    #[test]
     fn binding_keys_and_governed_session_identity_are_stable() {
         assert_eq!(
             canonical_repository_key("https://github.com/CortexKit/aft.git"),
@@ -5930,21 +6045,26 @@ mod tests {
 
     #[test]
     fn v13_release_maintenance_rows_allow_reviewed_flags_and_refuse_destructive_forms() {
-        let mut manifest = v12_fixture_manifest();
-        manifest.manifest_version = 13;
-        let admin = manifest
-            .tiers
-            .get_mut(&Tier::Admin)
-            .expect("v13 admin tier");
-        for tuple in ["release edit", "release upload"] {
-            admin.push(TupleDecl::Details {
-                tuple: tuple.to_string(),
-                platform: vec!["macos".to_string(), "linux".to_string()],
-                api_match: None,
-                rationale: None,
-            });
-        }
+        let manifest: Manifest = serde_json::from_str(include_str!(
+            "../../../.alfonso/ceremonies/gh-routing-manifest-v13.json"
+        ))
+        .expect("v13 ceremony payload");
         manifest.validate().expect("valid v13 admin extensions");
+        for method in ["PUT", "DELETE"] {
+            let rule = manifest
+                .api_rules
+                .iter()
+                .find(|rule| rule.method == method && rule.path_glob == BRANCH_PROTECTION_PATH_GLOB)
+                .expect("v13 branch protection API rule");
+            assert_eq!(rule.tier, Tier::Admin);
+            assert_eq!(rule.platform, ["macos", "linux"]);
+            assert_eq!(
+                rule.rationale.as_deref(),
+                Some(
+                    "branch protection is a repository setting; operator identity, audited bypass"
+                )
+            );
+        }
 
         for args in [
             vec![
@@ -6000,6 +6120,136 @@ mod tests {
     }
 
     #[test]
+    fn admin_api_rule_classifies_field_bearing_branch_protection_puts() {
+        let input_args = os_args(&[
+            "api",
+            "-X",
+            "PUT",
+            "/repos/o/r/branches/main/protection",
+            "--input",
+            "body.json",
+        ]);
+        let admin_manifest = branch_protection_manifest("PUT", Tier::Admin);
+        assert!(matches!(
+            classify(&input_args, &admin_manifest, "macos"),
+            Classification::Admin { ref tuple } if tuple == BRANCH_PROTECTION_API_TUPLE
+        ));
+        assert!(matches!(
+            classify(&input_args, &v12_fixture_manifest(), "macos"),
+            Classification::Unclassified
+        ));
+        assert!(matches!(
+            classify(
+                &input_args,
+                &branch_protection_manifest("PUT", Tier::Governed),
+                "macos"
+            ),
+            Classification::Unclassified
+        ));
+
+        let field_args = os_args(&[
+            "api",
+            "-X",
+            "PUT",
+            "/repos/o/r/branches/main/protection",
+            "-f",
+            "enforce_admins=true",
+        ]);
+        assert!(matches!(
+            classify(&field_args, &admin_manifest, "macos"),
+            Classification::Admin { ref tuple } if tuple == BRANCH_PROTECTION_API_TUPLE
+        ));
+    }
+
+    #[test]
+    fn delete_branch_protection_is_admin_only_when_declared_and_not_destructive() {
+        let args = os_args(&["api", "-X", "DELETE", "/repos/o/r/branches/main/protection"]);
+        assert!(matches!(
+            classify(
+                &args,
+                &branch_protection_manifest("DELETE", Tier::Admin),
+                "macos"
+            ),
+            Classification::Admin { ref tuple }
+                if tuple == "api:DELETE:/repos/*/*/branches/*/protection"
+        ));
+        assert!(matches!(
+            classify(&args, &v12_fixture_manifest(), "macos"),
+            Classification::Unclassified
+        ));
+    }
+
+    #[test]
+    fn dev_signed_admin_api_dispatch_requires_bypass_and_audits_delegation() {
+        use std::cell::Cell;
+
+        let _env_lock = crate::test_env::process_env_lock();
+        let directory = tempfile::tempdir().expect("create admin dispatch state directory");
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let manifest = branch_protection_manifest("PUT", Tier::Admin);
+        manifest.validate().expect("valid admin API manifest");
+        write_signed_manifest(&paths, manifest, TEST_NOW);
+        let manifest = load_manifest(&paths, TEST_NOW).expect("dev-signed manifest verifies");
+        let args = os_args(&[
+            "api",
+            "-X",
+            "PUT",
+            "/repos/o/r/branches/main/protection",
+            "--input",
+            "body.json",
+        ]);
+        let rung =
+            RungDetermination::r3(TEST_NOW, manifest.manifest_version, &test_rung_provenance())
+                .record;
+        let binding = AgentBinding {
+            repo: "cortexkit/aft".to_string(),
+            agent_id: "alfonso-aft".to_string(),
+        };
+
+        {
+            let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", None);
+            let status = dispatch_r3(
+                &args,
+                classify(&args, &manifest, current_platform()),
+                &manifest,
+                &paths,
+                &rung,
+                &binding,
+                TEST_NOW,
+                |_| panic!("ADMIN request delegated without operator bypass"),
+            );
+            assert_eq!(status, REFUSAL_EXIT_STATUS);
+            assert_eq!(RefusalCode::AdminTier.as_str(), "gh_shim_admin_tier");
+        }
+
+        let delegated = Cell::new(0);
+        {
+            let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", Some("operator"));
+            let status = dispatch_r3(
+                &args,
+                classify(&args, &manifest, current_platform()),
+                &manifest,
+                &paths,
+                &rung,
+                &binding,
+                TEST_NOW,
+                |delegated_args| {
+                    assert_eq!(delegated_args, args);
+                    delegated.set(delegated.get() + 1);
+                    73
+                },
+            );
+            assert_eq!(status, 73);
+        }
+        assert_eq!(delegated.get(), 1);
+        let (records, error) = read_bypass_audit(&paths);
+        assert!(error.is_none());
+        let records = records.expect("operator bypass audit records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["tuple"], BRANCH_PROTECTION_API_TUPLE);
+    }
+
+    #[test]
     fn release_api_mutations_remain_unclassified_because_api_rules_are_get_only() {
         let manifest = v12_fixture_manifest();
         // The v1 audit keeps api_rules GET-only; do not widen them for REST writes.
@@ -6015,7 +6265,7 @@ mod tests {
     }
 
     #[test]
-    fn field_bearing_api_forms_remain_unclassified_without_an_audited_parser() {
+    fn field_bearing_get_remains_unclassified_without_widening_the_mechanical_fallback() {
         let manifest = fixture_manifest();
         for field_flag in [
             "--field=name=value",
@@ -6034,6 +6284,27 @@ mod tests {
                 Classification::Unclassified
             ));
         }
+        assert!(matches!(
+            classify(
+                &os_args(&[
+                    "api",
+                    "/repos/o/r/branches/main/protection",
+                    "--input",
+                    "body.json"
+                ]),
+                &manifest,
+                "macos"
+            ),
+            Classification::Unclassified
+        ));
+        assert!(matches!(
+            classify(
+                &os_args(&["api", "/repos/o/r/branches/main/protection"]),
+                &manifest,
+                "macos"
+            ),
+            Classification::Mechanical
+        ));
     }
 
     #[test]
