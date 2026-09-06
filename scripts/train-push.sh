@@ -305,11 +305,27 @@ warn_repo_local_pre_push
 # Refuse a tree that is mid-merge/cherry-pick/rebase for the same reason
 # gated-push.sh does: a conflicted tree can carry stale HEAD state, and here it
 # would also push a sha that is not the change under test.
-for marker in CHERRY_PICK_HEAD MERGE_HEAD REBASE_HEAD; do
+#
+# A rebase in progress is the DIRECTORY (rebase-merge/ or rebase-apply/), which
+# git creates on start and removes on finish or abort. REBASE_HEAD is a
+# convenience ref that git does not always remove when a rebase completes, so
+# on its own it is a fossil, not an operation: a checkout that finished a
+# rebase weeks ago would otherwise refuse every train until someone deleted
+# the file by hand. MERGE_HEAD and CHERRY_PICK_HEAD are cleaned up by git and
+# stay authoritative.
+for marker in CHERRY_PICK_HEAD MERGE_HEAD; do
   if [ -e "$git_dir/$marker" ]; then
     refuse "$marker present (unresolved git operation)"
   fi
 done
+for rebase_dir in rebase-merge rebase-apply; do
+  if [ -d "$git_dir/$rebase_dir" ]; then
+    refuse "$rebase_dir/ present (rebase in progress)"
+  fi
+done
+if [ -e "$git_dir/REBASE_HEAD" ]; then
+  say "note: REBASE_HEAD present with no rebase in progress (a finished rebase's leftover ref; ignored)"
+fi
 
 # CI tests the pushed commit, not the working tree. Uncommitted work would be
 # invisible to the gate and then silently absent from what lands on main.

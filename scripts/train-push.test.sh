@@ -529,6 +529,23 @@ run_train "$dir" midop
 expect_rc 2 "MERGE_HEAD refuses"
 expect_out "MERGE_HEAD present" "MERGE_HEAD names the reason"
 
+# A rebase in progress is the directory; refuse on it.
+dir="$(new_fixture midrebase)"
+add_train_commit "$dir/work" "rebasing"
+mkdir -p "$dir/work/.git/rebase-merge"
+run_train "$dir" midrebase
+expect_rc 2 "rebase-merge/ refuses"
+expect_out "rebase-merge/ present" "an in-progress rebase names the directory"
+
+# A bare REBASE_HEAD with no rebase directory is a finished rebase's leftover
+# ref (git does not always remove it); it must be noted, not refused.
+dir="$(new_fixture fossil)"
+add_train_commit "$dir/work" "fossil"
+git -C "$dir/work" rev-parse HEAD > "$dir/work/.git/REBASE_HEAD"
+run_train "$dir" fossil
+expect_rc 0 "a REBASE_HEAD fossil with no rebase directory does not refuse"
+expect_out "REBASE_HEAD present with no rebase in progress" "the fossil is named on the header"
+
 # --- refusal: local main behind origin/main --------------------------------
 dir="$(new_fixture behind)"
 advance_origin_main "$dir" "landed-elsewhere"
