@@ -72,6 +72,12 @@ where
             "batch path cannot be represented safely for cmd.exe",
         ));
     }
+    // `fs::canonicalize` produces extended-length (`\\?\`) paths on Windows.
+    // CreateProcess accepts those paths, but cmd.exe does not reliably execute a
+    // batch file through that namespace, and npm shims additionally derive
+    // `%~dp0` paths that fail with "The system cannot find the path specified."
+    // Convert only the namespace spelling; the path remains canonical.
+    let command_path = cmd_compatible_path(command_path);
 
     let mut command_line = format!("\"\"%{BATCH_COMMAND_ENV}%\"");
     let mut argument_env = Vec::new();
@@ -108,14 +114,73 @@ where
         // argument escaping would add another quoting layer and break paths
         // containing spaces.
         .raw_arg(command_line)
-        .env(BATCH_COMMAND_ENV, binary)
+        .env(BATCH_COMMAND_ENV, command_path)
         .envs(argument_env);
     Ok(command)
+}
+
+#[cfg(windows)]
+fn cmd_compatible_path(path: &str) -> String {
+    for prefix in [r"\\?\UNC\", r"\\??\UNC\", r"\??\UNC\"] {
+        if let Some(tail) = strip_ascii_prefix(path, prefix) {
+            let mut components = tail
+                .split(['\\', '/'])
+                .filter(|component| !component.is_empty());
+            if components.next().is_some() && components.next().is_some() {
+                return format!(r"\\{tail}");
+            }
+            return path.to_string();
+        }
+    }
+
+    for prefix in [r"\\?\", r"\\??\", r"\??\"] {
+        if let Some(tail) = strip_ascii_prefix(path, prefix) {
+            let bytes = tail.as_bytes();
+            if bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && matches!(bytes[2], b'\\' | b'/')
+            {
+                return tail.to_string();
+            }
+            // Namespaces such as `\\?\Volume{GUID}\` cannot be safely
+            // converted into a DOS path by dropping their prefix.
+            return path.to_string();
+        }
+    }
+
+    path.to_string()
+}
+
+#[cfg(windows)]
+fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = value.get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix) {
+        value.get(prefix.len()..)
+    } else {
+        None
+    }
 }
 
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cmd_compatible_path_only_converts_dos_and_unc_namespaces() {
+        assert_eq!(
+            cmd_compatible_path(r"\\?\C:\cache\server.cmd"),
+            r"C:\cache\server.cmd"
+        );
+        assert_eq!(
+            cmd_compatible_path(r"\\?\unc\host\share\server.cmd"),
+            r"\\host\share\server.cmd"
+        );
+        assert_eq!(
+            cmd_compatible_path(r"\\?\Volume{1234}\server.cmd"),
+            r"\\?\Volume{1234}\server.cmd"
+        );
+    }
 
     #[test]
     fn batch_command_invokes_a_spaced_shim_with_args() {
@@ -126,6 +191,38 @@ mod tests {
         let output = batch_command(&shim, ["--stdio"]).unwrap().output().unwrap();
 
         assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "--stdio");
+    }
+
+    #[test]
+    fn batch_command_invokes_canonicalized_npm_style_shim() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("npm cache 100%");
+        let bin = root.join("node_modules").join(".bin");
+        let package = root.join("node_modules").join("language-server");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&package).unwrap();
+        let shim = bin.join("language-server.cmd");
+        let target = package.join("server.cmd");
+        std::fs::write(
+            &shim,
+            "@echo off\r\nset dp0=%~dp0\r\n\"%dp0%\\..\\language-server\\server.cmd\" %*\r\n",
+        )
+        .unwrap();
+        std::fs::write(&target, "@echo off\r\necho %~1\r\n").unwrap();
+        let canonical_shim = std::fs::canonicalize(&shim).unwrap();
+        assert!(canonical_shim.to_string_lossy().starts_with(r"\\?\"));
+
+        let output = batch_command(&canonical_shim, ["--stdio"])
+            .unwrap()
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "--stdio");
     }
 
