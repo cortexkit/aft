@@ -43,6 +43,13 @@ function permissionErrorMessage(error: unknown, fallbackMessage: string): string
  * class without the Effect tag; message prefixes are only a compatibility
  * fallback for older wrappers that erased both forms of type information.
  */
+function permissionKindForTypeName(name: string | undefined): PermissionAskFailureKind | undefined {
+  if (name === "PermissionDeniedError" || name === "DeniedError") return "rule_denied";
+  if (name === "PermissionRejectedError" || name === "RejectedError") return "user_rejected";
+  if (name === "PermissionCorrectedError" || name === "CorrectedError") return "feedback";
+  return undefined;
+}
+
 export function classifyPermissionError(
   error: unknown,
   fallbackMessage = "Permission denied.",
@@ -56,16 +63,10 @@ export function classifyPermissionError(
     typeof errorConstructor === "function" && typeof errorConstructor.name === "string"
       ? errorConstructor.name
       : undefined;
-  const typeNames = new Set([tag, constructorName]);
+  const classKind = permissionKindForTypeName(tag) ?? permissionKindForTypeName(constructorName);
 
-  if (typeNames.has("PermissionDeniedError") || typeNames.has("DeniedError")) {
-    return { kind: "rule_denied", message: permissionErrorMessage(error, fallbackMessage) };
-  }
-  if (typeNames.has("PermissionRejectedError") || typeNames.has("RejectedError")) {
-    return { kind: "user_rejected", message: permissionErrorMessage(error, fallbackMessage) };
-  }
-  if (typeNames.has("PermissionCorrectedError") || typeNames.has("CorrectedError")) {
-    return { kind: "feedback", message: permissionErrorMessage(error, fallbackMessage) };
+  if (classKind) {
+    return { kind: classKind, message: permissionErrorMessage(error, fallbackMessage) };
   }
 
   const message = permissionErrorMessage(error, fallbackMessage);

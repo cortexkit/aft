@@ -255,6 +255,12 @@ describe("permission audit regressions", () => {
         ),
       ).kind,
     ).toBe("rule_denied");
+    const taggedRejectionWithDeniedConstructor = Object.assign(new constructorNamedDeniedError(), {
+      _tag: "PermissionRejectedError",
+    });
+    expect(classifyPermissionError(taggedRejectionWithDeniedConstructor).kind).toBe(
+      "user_rejected",
+    );
 
     // Older wrappers can erase `_tag` and the constructor name, so the exact
     // OpenCode rule prefix remains a deliberate compatibility fallback.
