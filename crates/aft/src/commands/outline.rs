@@ -383,7 +383,41 @@ struct OutlineFileEntry {
     path: String,
     language: String,
     symbols: usize,
-    bytes: u64,
+    lines: Option<usize>,
+    #[serde(skip)]
+    data_doc: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OutlineDirectoryStats {
+    dirs: usize,
+    files: usize,
+    lines: usize,
+    symbols: usize,
+    code_files: usize,
+    code_lines: usize,
+    languages: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone)]
+struct OutlineDirectoryNode {
+    path: String,
+    depth: usize,
+    direct_files: Vec<usize>,
+    children: Vec<usize>,
+    stats: OutlineDirectoryStats,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutlineTableRow {
+    File(usize),
+    Rollup(usize),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutlineFileContentStats {
+    binary: bool,
+    lines: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -395,6 +429,7 @@ struct OutlineWalkOptions {
 #[derive(Debug, Clone)]
 struct OutlineFileDiscovery {
     files: Vec<String>,
+    directories: Vec<String>,
     walk_truncated: bool,
     collection_truncated: bool,
     skipped_foreign_mounts: usize,
@@ -412,8 +447,11 @@ fn handle_outline_files_mode(
 
     let multiple_targets = targets.len() >= 2;
     let project_root = ctx.config().project_root.clone();
+    let include_tests = include_tests_param(req);
 
     let mut file_entries = Vec::new();
+    let mut directory_nodes = Vec::new();
+    let mut tree_roots = Vec::new();
     let mut walk_truncated = false;
     let mut collection_truncated = false;
     let mut skipped_foreign_mounts = 0usize;
@@ -449,24 +487,40 @@ fn handle_outline_files_mode(
         collection_truncated |= discovery.collection_truncated;
         skipped_foreign_mounts += discovery.skipped_foreign_mounts;
 
-        for file in discovery.files {
-            let file_path = PathBuf::from(file);
-            if let Some(entry) = outline_file_entry(&file_path, display_root, ctx) {
-                file_entries.push(entry);
-            }
-        }
+        let root = append_outline_directory_tree(
+            &dir_path,
+            display_root,
+            discovery,
+            ctx,
+            include_tests,
+            &mut file_entries,
+            &mut directory_nodes,
+        );
+        tree_roots.push(root);
     }
 
-    file_entries.sort_by(|a, b| a.path.cmp(&b.path));
-    let (text, mut unchecked_files, text_truncated) =
-        format_files_table(&file_entries, max_output_bytes);
-    if walk_truncated && unchecked_files.is_empty() {
-        unchecked_files
-            .push("<additional files not discovered: directory walk limit reached>".to_string());
+    for root in &tree_roots {
+        aggregate_outline_directory(*root, &mut directory_nodes, &file_entries);
     }
-    if collection_truncated && unchecked_files.is_empty() {
+    let rows = plan_outline_file_rows(
+        &tree_roots,
+        &directory_nodes,
+        &file_entries,
+        max_output_bytes,
+    );
+    let text = format_files_table(&rows, &directory_nodes, &file_entries, max_output_bytes);
+    let rollup_count = rows
+        .iter()
+        .filter(|row| matches!(row, OutlineTableRow::Rollup(_)))
+        .count();
+
+    let mut unchecked_files = Vec::new();
+    if walk_truncated {
         unchecked_files
-            .push("<additional files not discovered: collection safety limit reached>".to_string());
+            .push("<additional files not counted: 10000-file walk limit reached>".to_string());
+    }
+    if collection_truncated {
+        unchecked_files.push("<additional files not counted: directory walk failed>".to_string());
     }
     if skipped_foreign_mounts > 0 {
         unchecked_files.push(format!(
@@ -474,6 +528,7 @@ fn handle_outline_files_mode(
         ));
     }
 
+    file_entries.sort_by(|a, b| a.path.cmp(&b.path));
     Response::success(
         &req.id,
         serde_json::json!({
@@ -481,12 +536,12 @@ fn handle_outline_files_mode(
             "files": file_entries,
             "complete": !walk_truncated
                 && !collection_truncated
-                && skipped_foreign_mounts == 0
-                && !text_truncated,
+                && skipped_foreign_mounts == 0,
             "walk_truncated": walk_truncated,
             "collection_truncated": collection_truncated,
             "skipped_foreign_mounts": skipped_foreign_mounts,
             "unchecked_files": unchecked_files,
+            "rollup_count": rollup_count,
         }),
     )
 }
@@ -568,6 +623,268 @@ fn discover_outline_files_for_files_mode(
     discover_outline_files_with_options(directory, Some(&options))
 }
 
+fn append_outline_directory_tree(
+    target_root: &Path,
+    display_root: &Path,
+    mut discovery: OutlineFileDiscovery,
+    ctx: &AppContext,
+    include_tests: bool,
+    file_entries: &mut Vec<OutlineFileEntry>,
+    directory_nodes: &mut Vec<OutlineDirectoryNode>,
+) -> usize {
+    let root_path = relative_path_from_root(target_root, display_root).unwrap_or_default();
+    let root_id = directory_nodes.len();
+    directory_nodes.push(OutlineDirectoryNode {
+        path: root_path,
+        depth: 0,
+        direct_files: Vec::new(),
+        children: Vec::new(),
+        stats: OutlineDirectoryStats::default(),
+    });
+
+    discovery.directories.sort_by(|a, b| {
+        Path::new(a)
+            .components()
+            .count()
+            .cmp(&Path::new(b).components().count())
+            .then_with(|| a.cmp(b))
+    });
+    let mut directory_ids = HashMap::new();
+    directory_ids.insert(target_root.to_path_buf(), root_id);
+
+    for directory in discovery.directories {
+        let path = PathBuf::from(directory);
+        let Some(parent_id) = path
+            .parent()
+            .and_then(|parent| directory_ids.get(parent).copied())
+        else {
+            continue;
+        };
+        let node_id = directory_nodes.len();
+        let node_path =
+            relative_path_from_root(&path, display_root).unwrap_or_else(|| path_to_slash(&path));
+        let depth = directory_nodes[parent_id].depth + 1;
+        directory_nodes.push(OutlineDirectoryNode {
+            path: node_path,
+            depth,
+            direct_files: Vec::new(),
+            children: Vec::new(),
+            stats: OutlineDirectoryStats::default(),
+        });
+        directory_nodes[parent_id].children.push(node_id);
+        directory_ids.insert(path, node_id);
+    }
+
+    for file in discovery.files {
+        let path = PathBuf::from(file);
+        let test_path = ctx
+            .config()
+            .project_root
+            .as_deref()
+            .and_then(|root| relative_path_from_root(&path, root))
+            .unwrap_or_else(|| path_to_slash(&path));
+        if !include_tests && is_test_file(&test_path) {
+            continue;
+        }
+        let Some(entry) = outline_file_entry(&path, display_root, ctx) else {
+            continue;
+        };
+        let Some(parent_id) = path
+            .parent()
+            .and_then(|parent| directory_ids.get(parent).copied())
+        else {
+            continue;
+        };
+        let file_id = file_entries.len();
+        file_entries.push(entry);
+        directory_nodes[parent_id].direct_files.push(file_id);
+    }
+
+    root_id
+}
+
+fn aggregate_outline_directory(
+    node_id: usize,
+    directory_nodes: &mut [OutlineDirectoryNode],
+    file_entries: &[OutlineFileEntry],
+) -> OutlineDirectoryStats {
+    let direct_files = directory_nodes[node_id].direct_files.clone();
+    let children = directory_nodes[node_id].children.clone();
+    let mut stats = OutlineDirectoryStats::default();
+
+    for file_id in direct_files {
+        let entry = &file_entries[file_id];
+        stats.files += 1;
+        stats.lines += entry.lines.unwrap_or(0);
+        *stats.languages.entry(entry.language.clone()).or_default() += 1;
+        if !entry.data_doc {
+            stats.symbols += entry.symbols;
+            stats.code_files += 1;
+            stats.code_lines += entry.lines.unwrap_or(0);
+        }
+    }
+    for child in children {
+        let child_stats = aggregate_outline_directory(child, directory_nodes, file_entries);
+        stats.dirs += child_stats.dirs + 1;
+        stats.files += child_stats.files;
+        stats.lines += child_stats.lines;
+        stats.symbols += child_stats.symbols;
+        stats.code_files += child_stats.code_files;
+        stats.code_lines += child_stats.code_lines;
+        for (language, count) in child_stats.languages {
+            *stats.languages.entry(language).or_default() += count;
+        }
+    }
+
+    directory_nodes[node_id].stats = stats.clone();
+    stats
+}
+
+fn outline_rows_for_directory(
+    node_id: usize,
+    directory_nodes: &[OutlineDirectoryNode],
+    file_entries: &[OutlineFileEntry],
+) -> Vec<OutlineTableRow> {
+    let node = &directory_nodes[node_id];
+    let mut code_files = node
+        .direct_files
+        .iter()
+        .copied()
+        .filter(|file_id| !file_entries[*file_id].data_doc)
+        .collect::<Vec<_>>();
+    let mut data_files = node
+        .direct_files
+        .iter()
+        .copied()
+        .filter(|file_id| file_entries[*file_id].data_doc)
+        .collect::<Vec<_>>();
+    let mut directories = node.children.clone();
+    code_files.sort_by(|a, b| file_entries[*a].path.cmp(&file_entries[*b].path));
+    data_files.sort_by(|a, b| file_entries[*a].path.cmp(&file_entries[*b].path));
+    directories.sort_by(|a, b| directory_nodes[*a].path.cmp(&directory_nodes[*b].path));
+
+    code_files
+        .into_iter()
+        .map(OutlineTableRow::File)
+        .chain(directories.into_iter().map(OutlineTableRow::Rollup))
+        .chain(data_files.into_iter().map(OutlineTableRow::File))
+        .collect()
+}
+
+fn directory_is_data_heavy(node: &OutlineDirectoryNode, file_entries: &[OutlineFileEntry]) -> bool {
+    !node.direct_files.is_empty()
+        && node
+            .direct_files
+            .iter()
+            .filter(|file_id| file_entries[**file_id].data_doc)
+            .count()
+            * 10
+            >= node.direct_files.len() * 9
+}
+
+fn compare_directory_code_share(
+    a: &OutlineDirectoryNode,
+    b: &OutlineDirectoryNode,
+) -> std::cmp::Ordering {
+    let a_total = if a.stats.lines == 0 {
+        a.stats.files.max(1)
+    } else {
+        a.stats.lines
+    };
+    let b_total = if b.stats.lines == 0 {
+        b.stats.files.max(1)
+    } else {
+        b.stats.lines
+    };
+    let a_code = if a.stats.lines == 0 {
+        a.stats.code_files
+    } else {
+        a.stats.code_lines
+    };
+    let b_code = if b.stats.lines == 0 {
+        b.stats.code_files
+    } else {
+        b.stats.code_lines
+    };
+    (a_code as u128 * b_total as u128).cmp(&(b_code as u128 * a_total as u128))
+}
+
+fn plan_outline_file_rows(
+    roots: &[usize],
+    directory_nodes: &[OutlineDirectoryNode],
+    file_entries: &[OutlineFileEntry],
+    max_bytes: usize,
+) -> Vec<OutlineTableRow> {
+    // A depth-first alphabetical list lets a schema subtree consume the whole
+    // response before later crates appear. Start with every direct entry and
+    // replace rollups breadth-first only when the complete rendered view fits.
+    let mut rows = roots
+        .iter()
+        .flat_map(|root| outline_rows_for_directory(*root, directory_nodes, file_entries))
+        .collect::<Vec<_>>();
+    let mut considered = std::collections::HashSet::new();
+
+    loop {
+        let Some(level) = rows
+            .iter()
+            .filter_map(|row| match row {
+                OutlineTableRow::Rollup(node_id)
+                    if !considered.contains(node_id)
+                        && !directory_is_data_heavy(&directory_nodes[*node_id], file_entries) =>
+                {
+                    Some(directory_nodes[*node_id].depth)
+                }
+                _ => None,
+            })
+            .min()
+        else {
+            break;
+        };
+
+        let mut candidates = rows
+            .iter()
+            .filter_map(|row| match row {
+                OutlineTableRow::Rollup(node_id)
+                    if directory_nodes[*node_id].depth == level
+                        && !considered.contains(node_id)
+                        && !directory_is_data_heavy(&directory_nodes[*node_id], file_entries) =>
+                {
+                    Some(*node_id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|a, b| {
+            compare_directory_code_share(&directory_nodes[*a], &directory_nodes[*b])
+                .reverse()
+                .then_with(|| directory_nodes[*a].path.cmp(&directory_nodes[*b].path))
+        });
+
+        for node_id in candidates {
+            considered.insert(node_id);
+            let replacement = outline_rows_for_directory(node_id, directory_nodes, file_entries);
+            if replacement.is_empty() {
+                continue;
+            }
+            let Some(position) = rows
+                .iter()
+                .position(|row| *row == OutlineTableRow::Rollup(node_id))
+            else {
+                continue;
+            };
+            let mut candidate_rows = rows.clone();
+            candidate_rows.splice(position..=position, replacement);
+            if format_files_table(&candidate_rows, directory_nodes, file_entries, max_bytes).len()
+                <= max_bytes
+            {
+                rows = candidate_rows;
+            }
+        }
+    }
+
+    rows
+}
+
 fn outline_file_entry(
     path: &Path,
     display_root: &Path,
@@ -576,61 +893,37 @@ fn outline_file_entry(
     let metadata = std::fs::metadata(path).ok()?;
     let rel_path =
         relative_path_from_root(path, display_root).unwrap_or_else(|| path_to_slash(path));
-    let bytes = metadata.len();
-    let detected_language = detect_language(path).map(language_id);
-
-    if let Some(symbols) = cached_symbol_count(ctx, path, &metadata) {
-        return Some(OutlineFileEntry {
-            path: rel_path,
-            language: detected_language.unwrap_or("unknown").to_string(),
-            symbols,
-            bytes,
-        });
-    }
-
-    let Some(language) = detected_language else {
-        return Some(OutlineFileEntry {
-            path: rel_path,
-            language: if file_looks_binary(path) {
-                "binary"
-            } else {
-                "unknown"
-            }
-            .to_string(),
-            symbols: 0,
-            bytes,
-        });
+    let detected_language = detect_language(path);
+    let content = inspect_outline_file_content(path).unwrap_or(OutlineFileContentStats {
+        binary: false,
+        lines: None,
+    });
+    let language = if content.binary {
+        "binary"
+    } else {
+        outline_file_language(path, detected_language)
     };
+    let data_doc = is_data_doc_outline_file(path, detected_language);
 
-    if file_looks_binary(path) {
-        return Some(OutlineFileEntry {
-            path: rel_path,
-            language: "binary".to_string(),
-            symbols: 0,
-            bytes,
-        });
-    }
-
-    if bytes > MAX_OUTLINE_FILE_BYTES {
-        return Some(OutlineFileEntry {
-            path: rel_path,
-            language: language.to_string(),
-            symbols: 0,
-            bytes,
-        });
-    }
-
-    let symbols = ctx
-        .provider()
-        .list_symbols(path)
-        .map(|symbols| symbols.len())
-        .unwrap_or(0);
+    let symbols = if content.binary {
+        0
+    } else if let Some(symbols) = cached_symbol_count(ctx, path, &metadata) {
+        symbols
+    } else if detected_language.is_none() || metadata.len() > MAX_OUTLINE_FILE_BYTES {
+        0
+    } else {
+        ctx.provider()
+            .list_symbols(path)
+            .map(|symbols| symbols.len())
+            .unwrap_or(0)
+    };
 
     Some(OutlineFileEntry {
         path: rel_path,
         language: language.to_string(),
         symbols,
-        bytes,
+        lines: content.lines,
+        data_doc,
     })
 }
 
@@ -665,15 +958,79 @@ fn cached_symbol_count(
         .or_else(|| cache.get(path, mtime).map(|symbols| symbols.len()))
 }
 
-fn file_looks_binary(path: &Path) -> bool {
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
+fn inspect_outline_file_content(path: &Path) -> std::io::Result<OutlineFileContentStats> {
+    let mut file = std::fs::File::open(path)?;
     let mut sample = [0u8; BINARY_SAMPLE_BYTES];
-    let Ok(bytes_read) = file.read(&mut sample) else {
-        return false;
-    };
-    bytes_read > 0 && content_inspector::inspect(&sample[..bytes_read]).is_binary()
+    let sample_len = file.read(&mut sample)?;
+    if sample_len > 0 && content_inspector::inspect(&sample[..sample_len]).is_binary() {
+        return Ok(OutlineFileContentStats {
+            binary: true,
+            lines: None,
+        });
+    }
+
+    let mut newline_count = sample[..sample_len]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    let mut total_bytes = sample_len;
+    let mut last_byte = sample_len.checked_sub(1).map(|index| sample[index]);
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        newline_count += buffer[..read].iter().filter(|byte| **byte == b'\n').count();
+        total_bytes += read;
+        last_byte = Some(buffer[read - 1]);
+    }
+
+    let lines = newline_count + usize::from(total_bytes > 0 && last_byte != Some(b'\n'));
+    Ok(OutlineFileContentStats {
+        binary: false,
+        lines: Some(lines),
+    })
+}
+
+fn outline_file_language(path: &Path, detected_language: Option<LangId>) -> &'static str {
+    if let Some(language) = detected_language {
+        return language_id(language);
+    }
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if extension == "toml" {
+        "toml"
+    } else if extension == "lock" || filename.ends_with(".lock") {
+        "lock"
+    } else if extension == "txt" {
+        "text"
+    } else if extension == "bazel" || matches!(filename, "BUILD" | "WORKSPACE" | "MODULE.bazel") {
+        "bazel"
+    } else {
+        "unknown"
+    }
+}
+
+fn is_data_doc_outline_file(path: &Path, detected_language: Option<LangId>) -> bool {
+    if matches!(
+        detected_language,
+        Some(LangId::Json | LangId::Yaml | LangId::Markdown)
+    ) {
+        return true;
+    }
+    detected_language.is_none()
+        || matches!(
+            outline_file_language(path, detected_language),
+            "toml" | "lock" | "text" | "bazel" | "unknown"
+        )
 }
 
 fn language_id(lang: LangId) -> &'static str {
@@ -712,63 +1069,99 @@ fn language_id(lang: LangId) -> &'static str {
 }
 
 fn format_files_table(
-    entries: &[OutlineFileEntry],
+    rows: &[OutlineTableRow],
+    directory_nodes: &[OutlineDirectoryNode],
+    file_entries: &[OutlineFileEntry],
     max_bytes: usize,
-) -> (String, Vec<String>, bool) {
-    let path_width = entries
+) -> String {
+    let rendered_rows = rows
         .iter()
-        .map(|entry| entry.path.len())
+        .map(|row| match row {
+            OutlineTableRow::File(file_id) => {
+                let entry = &file_entries[*file_id];
+                (
+                    entry.path.clone(),
+                    entry.language.clone(),
+                    entry.symbols,
+                    entry.lines.map(|lines| lines.to_string()),
+                )
+            }
+            OutlineTableRow::Rollup(node_id) => {
+                let node = &directory_nodes[*node_id];
+                (
+                    format!("{}/", node.path.trim_end_matches('/')),
+                    directory_rollup_language(&node.stats),
+                    node.stats.symbols,
+                    Some(node.stats.lines.to_string()),
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+    let path_width = rendered_rows
+        .iter()
+        .map(|(path, _, _, _)| path.len())
         .max()
         .unwrap_or(0);
-    let language_width = entries
+    let language_width = rendered_rows
         .iter()
-        .map(|entry| entry.language.len())
+        .map(|(_, language, _, _)| language.len())
         .max()
         .unwrap_or("language".len())
         .max(8);
 
     let mut output = String::new();
-    let mut shown = 0usize;
-    let mut truncated = false;
-
-    for entry in entries {
-        let line = format!(
-            "{:<path_width$}  {:<language_width$} {:>5} syms {:>9} bytes\n",
-            entry.path,
-            entry.language,
-            entry.symbols,
-            entry.bytes,
-            path_width = path_width,
-            language_width = language_width,
-        );
-        if output.len() + line.len() > max_bytes {
-            truncated = true;
-            break;
-        }
-        output.push_str(&line);
-        shown += 1;
-    }
-
-    let unchecked_files = if truncated {
-        entries[shown..]
-            .iter()
-            .map(|entry| entry.path.clone())
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-
-    if truncated {
+    for (path, language, symbols, lines) in rendered_rows {
         output.push_str(&format!(
-            "\n... truncated ({}/{} files shown, {}KB limit)\n\
-             Narrow scope with a more specific directory path.\n",
-            shown,
-            entries.len(),
-            max_bytes / 1024,
+            "{path:<path_width$}  {language:<language_width$} {symbols:>5} syms {lines:>7} lines\n",
+            lines = lines.as_deref().unwrap_or("-"),
         ));
     }
 
-    (output, unchecked_files, truncated)
+    let rollup_count = rows
+        .iter()
+        .filter(|row| matches!(row, OutlineTableRow::Rollup(_)))
+        .count();
+    if rollup_count > 0 {
+        let (directory_word, rollup_phrase, expand_phrase) = if rollup_count == 1 {
+            ("directory", "a rollup", "it")
+        } else {
+            ("directories", "rollups", "one")
+        };
+        output.push_str(&format!(
+            "\n{rollup_count} {directory_word} shown as {rollup_phrase} (budget: {}); \
+             expand {expand_phrase} with aft_outline <dir> files:true\n",
+            format_outline_budget(max_bytes),
+        ));
+    }
+    output
+}
+
+fn directory_rollup_language(stats: &OutlineDirectoryStats) -> String {
+    let file_word = if stats.files == 1 { "file" } else { "files" };
+    let dir_word = if stats.dirs == 1 { "dir" } else { "dirs" };
+    let mut languages = stats.languages.iter().collect::<Vec<_>>();
+    languages.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let files = if let [(language, _)] = languages.as_slice() {
+        format!("{} {} {file_word}", stats.files, language)
+    } else {
+        format!("{} {file_word}", stats.files)
+    };
+    if stats.dirs == 0 {
+        files
+    } else if stats.files == 0 {
+        format!("{} {dir_word}", stats.dirs)
+    } else {
+        format!("{files}, {} {dir_word}", stats.dirs)
+    }
+}
+
+fn format_outline_budget(max_bytes: usize) -> String {
+    if max_bytes >= 1024 && max_bytes % 1024 == 0 {
+        format!("{}KB", max_bytes / 1024)
+    } else {
+        format!("{max_bytes} bytes")
+    }
 }
 
 fn outline_many_files(
@@ -812,7 +1205,12 @@ fn outline_many_files(
 }
 
 fn discover_outline_files(directory: &Path) -> OutlineFileDiscovery {
-    discover_outline_files_with_options(directory, None)
+    let mut discovery = discover_outline_files_with_options(directory, None);
+    if discovery.files.len() > OUTLINE_FILE_WALK_CAP {
+        discovery.files.truncate(OUTLINE_FILE_WALK_CAP);
+        discovery.walk_truncated = true;
+    }
+    discovery
 }
 
 fn discover_outline_files_with_options(
@@ -820,6 +1218,8 @@ fn discover_outline_files_with_options(
     options: Option<&OutlineWalkOptions>,
 ) -> OutlineFileDiscovery {
     let mut files = Vec::new();
+    let mut directories = Vec::new();
+    let mut walk_truncated = false;
     let mut collection_truncated = false;
     let mut skipped_foreign_mounts = 0usize;
     // A vanished mounted child can make std::fs::ReadDir::drop panic after
@@ -831,6 +1231,8 @@ fn discover_outline_files_with_options(
         collect_outline_files_with_device_lookup(
             directory,
             &mut files,
+            &mut directories,
+            &mut walk_truncated,
             &mut collection_truncated,
             &mut skipped_foreign_mounts,
             options,
@@ -841,14 +1243,11 @@ fn discover_outline_files_with_options(
         collection_truncated = true;
     }
     files.sort();
-
-    let walk_truncated = files.len() > OUTLINE_FILE_WALK_CAP;
-    if walk_truncated {
-        files.truncate(OUTLINE_FILE_WALK_CAP);
-    }
+    directories.sort();
 
     OutlineFileDiscovery {
         files,
+        directories,
         walk_truncated,
         collection_truncated,
         skipped_foreign_mounts,
@@ -858,6 +1257,8 @@ fn discover_outline_files_with_options(
 fn collect_outline_files_with_device_lookup<F>(
     directory: &Path,
     files: &mut Vec<String>,
+    directories: &mut Vec<String>,
+    walk_truncated: &mut bool,
     collection_truncated: &mut bool,
     skipped_foreign_mounts: &mut usize,
     options: Option<&OutlineWalkOptions>,
@@ -867,7 +1268,7 @@ fn collect_outline_files_with_device_lookup<F>(
     F: FnMut(&Path) -> std::io::Result<Option<u64>>,
 {
     if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
-        *collection_truncated = true;
+        *walk_truncated = true;
         return;
     }
 
@@ -879,7 +1280,7 @@ fn collect_outline_files_with_device_lookup<F>(
 
     for entry in entries {
         if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
-            *collection_truncated = true;
+            *walk_truncated = true;
             return;
         }
         // Query the directory entry once. Calling Path::is_dir, Path::is_file,
@@ -908,16 +1309,19 @@ fn collect_outline_files_with_device_lookup<F>(
                     return;
                 }
             }
+            directories.push(path.to_string_lossy().to_string());
             collect_outline_files_with_device_lookup(
                 &path,
                 files,
+                directories,
+                walk_truncated,
                 collection_truncated,
                 skipped_foreign_mounts,
                 options,
                 boundary,
                 device_lookup,
             );
-            if *collection_truncated {
+            if *walk_truncated || *collection_truncated {
                 return;
             }
         } else if file_type.is_file() {
@@ -925,6 +1329,10 @@ fn collect_outline_files_with_device_lookup<F>(
                 continue;
             }
             files.push(path.to_string_lossy().to_string());
+            if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
+                *walk_truncated = true;
+                return;
+            }
         }
     }
 }
@@ -1275,6 +1683,8 @@ mod tests {
 
         let boundary = crate::walk_boundary::DeviceBoundary::from_device_for_test(41);
         let mut files = Vec::new();
+        let mut directories = Vec::new();
+        let mut walk_truncated = false;
         let mut collection_truncated = false;
         let mut skipped_foreign_mounts = 0usize;
         let mut lookup = |path: &Path| {
@@ -1290,6 +1700,8 @@ mod tests {
         collect_outline_files_with_device_lookup(
             &root,
             &mut files,
+            &mut directories,
+            &mut walk_truncated,
             &mut collection_truncated,
             &mut skipped_foreign_mounts,
             None,
@@ -1298,6 +1710,10 @@ mod tests {
         );
 
         assert_eq!(skipped_foreign_mounts, 1, "foreign mount is disclosed");
+        assert!(
+            !walk_truncated,
+            "a foreign mount is not the file-count fence"
+        );
         assert!(
             !collection_truncated,
             "a known foreign mount is not an I/O failure"
@@ -1941,6 +2357,184 @@ mod tests {
         ));
         assert!(!signature_has_visibility("def compute(value):"));
         assert!(!signature_has_visibility("func Parse(input string)"));
+    }
+
+    fn outline_file_entry_for_test(
+        path: &str,
+        language: &str,
+        symbols: usize,
+        lines: Option<usize>,
+        data_doc: bool,
+    ) -> OutlineFileEntry {
+        OutlineFileEntry {
+            path: path.to_string(),
+            language: language.to_string(),
+            symbols,
+            lines,
+            data_doc,
+        }
+    }
+
+    #[test]
+    fn outline_file_line_count_matches_text_and_binary_contract() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let terminated = temp.path().join("terminated.txt");
+        let unterminated = temp.path().join("unterminated.txt");
+        let empty = temp.path().join("empty.txt");
+        let binary = temp.path().join("binary.dat");
+        std::fs::write(&terminated, b"a\nb\nc\n").expect("write terminated");
+        std::fs::write(&unterminated, b"a\nb\nc").expect("write unterminated");
+        std::fs::write(&empty, b"").expect("write empty");
+        std::fs::write(&binary, [0, 159, 146, 150, 0, 1]).expect("write binary");
+
+        assert_eq!(
+            inspect_outline_file_content(&terminated)
+                .expect("inspect terminated")
+                .lines,
+            Some(3)
+        );
+        assert_eq!(
+            inspect_outline_file_content(&unterminated)
+                .expect("inspect unterminated")
+                .lines,
+            Some(3)
+        );
+        assert_eq!(
+            inspect_outline_file_content(&empty)
+                .expect("inspect empty")
+                .lines,
+            Some(0)
+        );
+        let binary_stats = inspect_outline_file_content(&binary).expect("inspect binary");
+        assert!(binary_stats.binary);
+        assert_eq!(binary_stats.lines, None);
+    }
+
+    #[test]
+    fn outline_rows_put_code_before_data_files() {
+        let files = vec![
+            outline_file_entry_for_test("docs/readme.md", "markdown", 1, Some(4), true),
+            outline_file_entry_for_test("docs/lib.rs", "rust", 2, Some(8), false),
+        ];
+        let mut directories = vec![OutlineDirectoryNode {
+            path: String::new(),
+            depth: 0,
+            direct_files: vec![0, 1],
+            children: Vec::new(),
+            stats: OutlineDirectoryStats::default(),
+        }];
+        aggregate_outline_directory(0, &mut directories, &files);
+
+        assert_eq!(
+            plan_outline_file_rows(&[0], &directories, &files, 30 * 1024),
+            vec![OutlineTableRow::File(1), OutlineTableRow::File(0)]
+        );
+    }
+
+    #[test]
+    fn data_only_leaf_stays_one_rollup_with_summed_lines() {
+        let files = (0..3)
+            .map(|index| {
+                outline_file_entry_for_test(
+                    &format!("schema/json/{index}.json"),
+                    "json",
+                    0,
+                    Some(2),
+                    true,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut directories = vec![
+            OutlineDirectoryNode {
+                path: String::new(),
+                depth: 0,
+                direct_files: Vec::new(),
+                children: vec![1],
+                stats: OutlineDirectoryStats::default(),
+            },
+            OutlineDirectoryNode {
+                path: "schema".to_string(),
+                depth: 1,
+                direct_files: Vec::new(),
+                children: vec![2],
+                stats: OutlineDirectoryStats::default(),
+            },
+            OutlineDirectoryNode {
+                path: "schema/json".to_string(),
+                depth: 2,
+                direct_files: vec![0, 1, 2],
+                children: Vec::new(),
+                stats: OutlineDirectoryStats::default(),
+            },
+        ];
+        aggregate_outline_directory(0, &mut directories, &files);
+
+        let rows = plan_outline_file_rows(&[0], &directories, &files, 30 * 1024);
+        assert_eq!(rows, vec![OutlineTableRow::Rollup(2)]);
+        let text = format_files_table(&rows, &directories, &files, 30 * 1024);
+        assert!(text.contains("schema/json/"));
+        assert!(text.contains("3 json files"));
+        assert!(text.contains("6 lines"));
+        assert!(text.contains("1 directory shown as a rollup (budget: 30KB)"));
+        assert!(!text.contains(".json  "));
+    }
+
+    #[test]
+    fn top_level_rows_are_never_cut_by_the_budget() {
+        let files = vec![
+            outline_file_entry_for_test("a/lib.rs", "rust", 1, Some(1), false),
+            outline_file_entry_for_test("b/lib.rs", "rust", 1, Some(1), false),
+        ];
+        let mut directories = vec![
+            OutlineDirectoryNode {
+                path: String::new(),
+                depth: 0,
+                direct_files: Vec::new(),
+                children: vec![1, 2],
+                stats: OutlineDirectoryStats::default(),
+            },
+            OutlineDirectoryNode {
+                path: "a".to_string(),
+                depth: 1,
+                direct_files: vec![0],
+                children: Vec::new(),
+                stats: OutlineDirectoryStats::default(),
+            },
+            OutlineDirectoryNode {
+                path: "b".to_string(),
+                depth: 1,
+                direct_files: vec![1],
+                children: Vec::new(),
+                stats: OutlineDirectoryStats::default(),
+            },
+        ];
+        aggregate_outline_directory(0, &mut directories, &files);
+
+        let rows = plan_outline_file_rows(&[0], &directories, &files, 1);
+        assert_eq!(
+            rows,
+            vec![OutlineTableRow::Rollup(1), OutlineTableRow::Rollup(2)]
+        );
+        let text = format_files_table(&rows, &directories, &files, 1);
+        assert!(text.contains("a/"));
+        assert!(text.contains("b/"));
+        assert!(
+            text.len() > 1,
+            "level zero deliberately exceeds a tiny budget"
+        );
+    }
+
+    #[test]
+    fn binary_file_row_uses_a_dash_for_lines() {
+        let files = vec![outline_file_entry_for_test(
+            "assets/blob.dat",
+            "binary",
+            0,
+            None,
+            true,
+        )];
+        let text = format_files_table(&[OutlineTableRow::File(0)], &[], &files, 30 * 1024);
+        assert!(text.contains("      - lines"), "binary row: {text}");
     }
 
     /// Manual release-mode probe for the directory walk paid by one outline
