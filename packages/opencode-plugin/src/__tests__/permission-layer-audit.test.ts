@@ -15,6 +15,7 @@ import { importTools } from "../tools/imports.js";
 import {
   _permissionsInternalsForTest,
   assertExternalDirectoryPermission,
+  classifyPermissionError,
 } from "../tools/permissions.js";
 import { safetyTools } from "../tools/safety.js";
 import { searchTools } from "../tools/search.js";
@@ -29,6 +30,46 @@ type AskCall = {
   always?: string[];
   metadata?: Record<string, unknown>;
 };
+
+// These fixtures mirror OpenCode's TaggedErrorClass definitions:
+// RejectedError/_tag=PermissionRejectedError is at
+// https://github.com/anomalyco/opencode/blob/dev/packages/core/src/v1/permission.ts#L7-L11;
+// CorrectedError/_tag=PermissionCorrectedError and its feedback message are at
+// https://github.com/anomalyco/opencode/blob/dev/packages/core/src/v1/permission.ts#L13-L19;
+// DeniedError/_tag=PermissionDeniedError and its ruleset message are at
+// https://github.com/anomalyco/opencode/blob/dev/packages/core/src/v1/permission.ts#L21-L27.
+// The constructor names are the names OpenCode's classes expose.
+class RejectedError extends Error {
+  readonly _tag = "PermissionRejectedError";
+
+  constructor() {
+    super("The user rejected permission to use this specific tool call.");
+  }
+}
+
+class CorrectedError extends Error {
+  readonly _tag = "PermissionCorrectedError";
+  readonly feedback: string;
+
+  constructor(input: { feedback: string }) {
+    super(
+      `The user rejected permission to use this specific tool call with the following feedback: ${input.feedback}`,
+    );
+    this.feedback = input.feedback;
+  }
+}
+
+class DeniedError extends Error {
+  readonly _tag = "PermissionDeniedError";
+  readonly ruleset: unknown;
+
+  constructor(input: { ruleset: unknown }) {
+    super(
+      `The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules ${JSON.stringify(input.ruleset)}`,
+    );
+    this.ruleset = input.ruleset;
+  }
+}
 
 type PermissionAskFrame = {
   kind: "external_directory" | "bash";
@@ -122,12 +163,12 @@ function createSdkContext(
 
 function recordingAsk(
   calls: AskCall[],
-  deny?: { permission: string; message: string },
+  deny?: { permission: string; message?: string; error?: unknown },
 ): ToolContext["ask"] {
   return (async (input: AskCall) => {
     calls.push(input);
     if (deny && input.permission === deny.permission) {
-      throw new Error(deny.message);
+      throw deny.error ?? new Error(deny.message ?? "Permission denied.");
     }
   }) as unknown as ToolContext["ask"];
 }
@@ -138,6 +179,18 @@ async function makeRepoLocalTempRoot(prefix: string): Promise<string> {
 
 async function makeProjectAndExternalDirs(): Promise<{ project: string; external: string }> {
   tmpRoot = await makeRepoLocalTempRoot(".aft-permission-audit-");
+  const project = path.join(tmpRoot, "project");
+  const external = path.join(tmpRoot, "external");
+  await mkdir(project, { recursive: true });
+  await mkdir(external, { recursive: true });
+  return { project, external };
+}
+
+async function makeIndependentProjectAndExternalDirs(): Promise<{
+  project: string;
+  external: string;
+}> {
+  tmpRoot = await realpath(await mkdtemp(path.join(tmpdir(), "aft-permission-external-")));
   const project = path.join(tmpRoot, "project");
   const external = path.join(tmpRoot, "external");
   await mkdir(project, { recursive: true });
@@ -187,6 +240,35 @@ function parsePermissionDenied(raw: string): Record<string, unknown> {
 }
 
 describe("permission audit regressions", () => {
+  test("classifies tagged, constructor-named, and message-only host permission errors", () => {
+    expect(classifyPermissionError(new DeniedError({ ruleset: [] })).kind).toBe("rule_denied");
+    expect(classifyPermissionError(new RejectedError()).kind).toBe("user_rejected");
+    expect(
+      classifyPermissionError(new CorrectedError({ feedback: "Use a narrower path" })).kind,
+    ).toBe("feedback");
+
+    const constructorNamedDeniedError = class DeniedError extends Error {};
+    expect(
+      classifyPermissionError(
+        new constructorNamedDeniedError(
+          "constructor-only rule error; the class name must be checked before message text",
+        ),
+      ).kind,
+    ).toBe("rule_denied");
+
+    // Older wrappers can erase `_tag` and the constructor name, so the exact
+    // OpenCode rule prefix remains a deliberate compatibility fallback.
+    expect(
+      classifyPermissionError(
+        new Error(
+          "The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules []",
+        ),
+      ).kind,
+    ).toBe("rule_denied");
+    // A changed host prefix must not silently be treated as a rule denial.
+    expect(classifyPermissionError(new Error("A changed host rule wording")).kind).toBe("feedback");
+  });
+
   test("bash permission loop groups multi-bash pipeline asks into one prompt", async () => {
     const { project } = await makeProjectAndExternalDirs();
     const askCalls: AskCall[] = [];
@@ -374,6 +456,147 @@ describe("permission audit regressions", () => {
       1,
     );
     expect(deniedCalls).toEqual([]);
+  });
+
+  test("aft_search rule denial explains the rule and falls back to the project index", async () => {
+    const { project, external } = await makeIndependentProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const ruleError = new DeniedError({
+      ruleset: [
+        { permission: "*", action: "deny", pattern: "*" },
+        { permission: "aft_search_external", action: "allow", pattern: "*" },
+      ],
+    });
+    const { calls, tools } = createHarness(semanticTools, () => ({
+      success: true,
+      text: "project index hit",
+    }));
+    const sdkCtx = createSdkContext(
+      project,
+      recordingAsk(askCalls, { permission: "aft_search_external", error: ruleError }),
+      "permission-audit-rule-fallback-session",
+    );
+
+    const first = await tools.aft_search.execute({ query: "needle", path: external }, sdkCtx);
+    const second = await tools.aft_search.execute({ query: "needle", path: external }, sdkCtx);
+    const notice =
+      `permission_denied: aft_search_external for ${external} is denied by this session's ` +
+      "permission rules (not a user choice); searching the project index only";
+
+    expect(first).toContain(notice);
+    expect(first).toContain("project index hit");
+    expect(second).toContain(notice);
+    expect(calls).toEqual([
+      { command: "search", params: { query: "needle" } },
+      { command: "search", params: { query: "needle" } },
+    ]);
+    expect(askCalls.filter((call) => call.permission === "aft_search_external")).toHaveLength(1);
+    expect(first).not.toContain('"action":"deny"');
+  });
+
+  test("aft_search rule denial has no fallback when the query is only the external path", async () => {
+    const { project, external } = await makeIndependentProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const { calls, tools } = createHarness(semanticTools, () => ({
+      success: true,
+      text: "must not search",
+    }));
+    const raw = await tools.aft_search.execute(
+      { query: external, path: external },
+      createSdkContext(
+        project,
+        recordingAsk(askCalls, {
+          permission: "aft_search_external",
+          error: new DeniedError({
+            ruleset: [{ permission: "*", action: "deny", pattern: "*" }],
+          }),
+        }),
+        "permission-audit-rule-no-fallback-session",
+      ),
+    );
+    const denied = parsePermissionDenied(raw);
+
+    expect(denied.message).toBe(
+      `permission_denied: aft_search_external for ${external} is denied by this session's ` +
+        "permission rules (not a user choice)",
+    );
+    expect(raw).not.toContain('"action":"deny"');
+    expect(calls).toHaveLength(0);
+  });
+
+  test("aft_search user rejection keeps the host message and does not fall back", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const askCalls: AskCall[] = [];
+    const { calls, tools } = createHarness(semanticTools, () => ({
+      success: true,
+      text: "must not search",
+    }));
+    const raw = await tools.aft_search.execute(
+      { query: "needle", path: external },
+      createSdkContext(
+        project,
+        recordingAsk(askCalls, {
+          permission: "aft_search_external",
+          error: new RejectedError(),
+        }),
+        "permission-audit-user-rejection-session",
+      ),
+    );
+
+    expect(parsePermissionDenied(raw).message).toBe(
+      "The user rejected permission to use this specific tool call.",
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  test("aft_search corrected rejection keeps the host feedback", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const { calls, tools } = createHarness(semanticTools, () => ({
+      success: true,
+      text: "must not search",
+    }));
+    const raw = await tools.aft_search.execute(
+      { query: "needle", path: external },
+      createSdkContext(
+        project,
+        recordingAsk([], {
+          permission: "aft_search_external",
+          error: new CorrectedError({ feedback: "Use a narrower path" }),
+        }),
+        "permission-audit-feedback-session",
+      ),
+    );
+
+    expect(parsePermissionDenied(raw).message).toBe(
+      "The user rejected permission to use this specific tool call with the following feedback: Use a narrower path",
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  test("external_directory rule denial names the root without leaking the ruleset", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const { calls, tools } = createHarness(hoistedTools);
+    const raw = await tools.read.execute(
+      { filePath: path.join(external, "read.ts") },
+      createSdkContext(
+        project,
+        recordingAsk([], {
+          permission: "external_directory",
+          error: new DeniedError({
+            ruleset: [{ permission: "*", action: "deny", pattern: "*" }],
+          }),
+        }),
+        "permission-audit-external-directory-rule-session",
+      ),
+    );
+    const denied = parsePermissionDenied(String(raw));
+
+    expect(denied.message).toBe(
+      `permission_denied: external_directory for ${external} is denied by this session's ` +
+        "permission rules (not a user choice)",
+    );
+    expect(String(raw)).not.toContain('"action":"deny"');
+    expect(calls).toHaveLength(0);
   });
 
   test("aft_search external path hard-blocks under restrict_to_project_root", async () => {
