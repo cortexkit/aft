@@ -6250,6 +6250,10 @@ mod tests {
         let _env_lock = crate::test_env::process_env_lock();
         let directory = tempfile::tempdir().expect("create admin dispatch state directory");
         let paths = StatePaths::from_root(directory.path().to_path_buf());
+        // The rule is declared for the platforms the fleet runs on; this test
+        // exercises dispatch given an Admin classification, so it classifies
+        // against a declared platform rather than the host (Windows would
+        // classify nothing and assert the refusal arm twice).
         let manifest = branch_protection_manifest("PUT", Tier::Admin);
         manifest.validate().expect("valid admin API manifest");
         write_signed_manifest(&paths, manifest, TEST_NOW);
@@ -6274,7 +6278,7 @@ mod tests {
             let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", None);
             let status = dispatch_r3(
                 &args,
-                classify(&args, &manifest, current_platform()),
+                classify(&args, &manifest, "macos"),
                 &manifest,
                 &paths,
                 &rung,
@@ -6291,7 +6295,7 @@ mod tests {
             let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", Some("operator"));
             let status = dispatch_r3(
                 &args,
-                classify(&args, &manifest, current_platform()),
+                classify(&args, &manifest, "macos"),
                 &manifest,
                 &paths,
                 &rung,
