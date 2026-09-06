@@ -2536,12 +2536,23 @@ fn resolve_workspace_package(
         .unwrap_or_else(|| workspace_root.to_path_buf());
     let cache_key = (workspace_root.clone(), package_name.to_string());
 
+    // The memo is a bounded per-pass layer; the process-wide cache is the
+    // durable one. Both are consulted whenever present: several call sites
+    // resolve with a memo that lives for a single import, and a memo alone
+    // turned every bare package import in a workspace monorepo into a full
+    // member-directory walk (realpath per directory) because the miss never
+    // reached the cache that already held the answer. Two daemon threads sat
+    // at 70% each in that walk during one-file Tier-2 rescans across roots.
     if let Some(memo) = memo {
         if let Some(cached) = memo.workspace_package(&cache_key) {
             return cached;
         }
-    } else if let Ok(cache) = WORKSPACE_PACKAGE_CACHE.read() {
+    }
+    if let Ok(cache) = WORKSPACE_PACKAGE_CACHE.read() {
         if let Some(cached) = cache.get(&cache_key) {
+            if let Some(memo) = memo {
+                memo.remember_workspace_package(cache_key, cached.clone());
+            }
             return cached.clone();
         }
     }
@@ -2552,8 +2563,9 @@ fn resolve_workspace_package(
         .map(|dir| facts.canonical(&dir).unwrap_or(dir));
 
     if let Some(memo) = memo {
-        memo.remember_workspace_package(cache_key, resolved.clone());
-    } else if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
+        memo.remember_workspace_package(cache_key.clone(), resolved.clone());
+    }
+    if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
         cache.insert(cache_key, resolved.clone());
     }
 
@@ -4074,6 +4086,110 @@ function hidden() {}
         assert!(
             resolved.ends_with("src/index.mts"),
             "dist/index.mjs should map to src/index.mts, got {resolved:?}"
+        );
+    }
+
+    /// A bare package import that is not a workspace member costs one
+    /// member-directory walk per (workspace, package), not one per resolution:
+    /// the walk's answer must reach the process-wide cache even when the caller
+    /// resolves with a throwaway memo, which is what the refresh and extract
+    /// paths do per import.
+    #[test]
+    fn workspace_package_miss_is_walked_once_across_throwaway_memos() {
+        use crate::callgraph_store::facts::{DirEntry, ProjectFacts};
+        use std::cell::Cell;
+        use std::sync::Arc;
+
+        struct CountingFacts<'a> {
+            inner: &'a DiskFacts,
+            list_dir_calls: Cell<usize>,
+        }
+        impl ProjectFacts for CountingFacts<'_> {
+            fn is_file(&self, rel: &[u8]) -> bool {
+                self.inner.is_file(rel)
+            }
+            fn is_dir(&self, rel: &[u8]) -> bool {
+                self.inner.is_dir(rel)
+            }
+            fn config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
+                self.inner.config_bytes(rel)
+            }
+            fn symlink_target(&self, rel: &[u8]) -> Option<&[u8]> {
+                self.inner.symlink_target(rel)
+            }
+            fn canonical(&self, rel: &[u8]) -> Option<Vec<u8>> {
+                self.inner.canonical(rel)
+            }
+            fn list_dir(&self, rel: &[u8]) -> Vec<DirEntry> {
+                self.list_dir_calls.set(self.list_dir_calls.get() + 1);
+                self.inner.list_dir(rel)
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        for member in ["a", "b", "c"] {
+            let member_dir = root.join("packages").join(member);
+            fs::create_dir_all(member_dir.join("src")).unwrap();
+            fs::write(
+                member_dir.join("package.json"),
+                format!(r#"{{"name":"@ws/{member}"}}"#),
+            )
+            .unwrap();
+        }
+        let disk = DiskFacts::new(&root);
+        let counting = CountingFacts {
+            inner: &disk,
+            list_dir_calls: Cell::new(0),
+        };
+        let facts = FactPaths {
+            root: &root,
+            facts: &counting,
+        };
+        clear_workspace_package_cache();
+
+        let first = resolve_workspace_package(
+            &root,
+            "react",
+            Some(&ModuleResolutionMemo::default()),
+            &facts,
+        );
+        assert_eq!(first, None, "react is not a member");
+        let walked = counting.list_dir_calls.get();
+        assert!(
+            walked > 0,
+            "the first miss must walk the member directories"
+        );
+
+        let second = resolve_workspace_package(
+            &root,
+            "react",
+            Some(&ModuleResolutionMemo::default()),
+            &facts,
+        );
+        assert_eq!(second, None);
+        assert_eq!(
+            counting.list_dir_calls.get(),
+            walked,
+            "a second resolution with a fresh memo must not walk again"
+        );
+
+        // A workspace manifest change is the one thing that may re-walk.
+        clear_workspace_package_cache();
+        resolve_workspace_package(
+            &root,
+            "react",
+            Some(&ModuleResolutionMemo::default()),
+            &facts,
+        );
+        assert!(
+            counting.list_dir_calls.get() > walked,
+            "after the cache is dropped the next miss walks again"
         );
     }
 

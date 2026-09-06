@@ -990,6 +990,17 @@ pub(crate) fn invalidates_workspace_crate_prefix_cache(path: &Path) -> bool {
     path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml")
 }
 
+/// A JS workspace manifest change can add or remove members, so the
+/// process-wide workspace package cache must be dropped before the refresh
+/// resolves imports against it. The cache is otherwise cleared only on
+/// configure, which is what makes it worth having across refreshes.
+pub(crate) fn invalidates_workspace_package_cache(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("package.json") | Some("pnpm-workspace.yaml")
+    )
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct RefreshRoot {
     callgraph_dir: PathBuf,
@@ -1481,6 +1492,13 @@ fn process_callgraph_refresh_batch(
         .any(|path| invalidates_workspace_crate_prefix_cache(path))
     {
         workspace_crate_prefixes.remove(&batch.root);
+    }
+    if batch
+        .paths
+        .iter()
+        .any(|path| invalidates_workspace_package_cache(path))
+    {
+        callgraph::clear_workspace_package_cache();
     }
 
     let paths = batch
