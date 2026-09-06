@@ -3129,7 +3129,9 @@ async fn drive_s1_rejection_daemon(
         "rejection must carry unknown_tool: {inner:?}"
     );
 
-    // Close the stream so the production run_subc_mode reader hits EOF and exits.
+    // Ask the module to stop the way a real daemon does: a channel-0 Goodbye.
+    // A bare socket drop is a connection loss and exits non-zero on purpose.
+    send_connection_goodbye(&mut stream).await;
     drop(stream);
 }
 

@@ -30,6 +30,11 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Exit status for a daemon connection that ended without a Goodbye. Non-zero so
+/// the supervisor respawns the module (it reads exit 0 as a stop request and
+/// never respawns), distinct from 1 (attach/auth failure) and 2 (usage).
+const SUBC_CONNECTION_LOST_EXIT_CODE: i32 = 3;
+
 /// Parse `--subc <connection-file>` / `--subc=<path>` from argv. Returns `None`
 /// when absent (standalone mode). The presence of the flag is the subc-mode
 /// gate; the value is the daemon's published connection-file path.
@@ -199,6 +204,15 @@ fn main() {
         match aft::subc::run_subc_mode(&connection_file, ctx, executor, dispatch, user_config_path)
         {
             Ok(()) => return,
+            // A lost connection is a restart request, not a failure to attach:
+            // the supervisor respawns any non-zero exit, and a distinct code keeps
+            // it separate from attach/auth failures in the supervisor's ledger.
+            Err(aft::subc::SubcError::ConnectionLost) => {
+                aft::slog_error!(
+                    "subc connection lost after attach; exiting for supervisor restart"
+                );
+                std::process::exit(SUBC_CONNECTION_LOST_EXIT_CODE);
+            }
             Err(error) => {
                 aft::slog_error!("subc attach failed: {error}");
                 std::process::exit(1);

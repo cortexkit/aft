@@ -119,6 +119,58 @@ fn subc_background_bash_survives_module_process_group_restart() {
     });
 }
 
+/// The supervisor respawns a module only on a non-zero exit; exit 0 means
+/// "stopped on request" and leaves the module down with no respawn. So the
+/// two ways a daemon connection can end must map to different exit codes:
+/// a channel-0 Goodbye is a stop request (0), a bare EOF is a connection loss
+/// (3). Both arms run the real binary; the second is the control that keeps
+/// the codes provably distinct.
+#[test]
+fn subc_bare_eof_exits_nonzero_and_goodbye_exits_zero() {
+    const CONNECTION_LOST_EXIT_CODE: i32 = 3;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+
+    runtime.block_on(async {
+        let project = tempfile::tempdir().expect("project tempdir");
+        let storage = tempfile::tempdir().expect("storage tempdir");
+        let conn_dir = tempfile::tempdir().expect("connection tempdir");
+        let config_home = tempfile::tempdir().expect("config home tempdir");
+        let data_home = tempfile::tempdir().expect("data home tempdir");
+        write_user_config(config_home.path(), storage.path());
+        let listener = write_connection_file(conn_dir.path()).await;
+        let conn_path = conn_dir.path().join("subc-connection.json");
+
+        // Arm 1: the daemon's socket goes away with no Goodbye (the 2026-09-06
+        // outage shape: the daemon dropped the module connection on a client
+        // error and the module exited 0, so nothing respawned it for 4.5 h).
+        let mut module = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        bind_route(&mut stream, project.path()).await;
+        drop(stream);
+        let exit = module.wait_for_exit("module after bare EOF");
+        assert_eq!(
+            exit.code(),
+            Some(CONNECTION_LOST_EXIT_CODE),
+            "bare EOF must exit with the connection-lost code so the supervisor respawns; status={exit}"
+        );
+
+        // Arm 2 (control): an explicit channel-0 Goodbye is a stop request.
+        let mut module = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        bind_route(&mut stream, project.path()).await;
+        send_connection_goodbye(&mut stream).await;
+        let exit = module.wait_for_exit("module after channel-0 Goodbye");
+        assert_eq!(
+            exit.code(),
+            Some(0),
+            "channel-0 Goodbye is a stop request and must exit 0; status={exit}"
+        );
+    });
+}
+
 fn write_user_config(config_home: &Path, storage: &Path) {
     let config_dir = config_home.join("cortexkit");
     std::fs::create_dir_all(&config_dir).expect("create user config dir");

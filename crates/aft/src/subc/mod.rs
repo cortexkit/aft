@@ -1425,8 +1425,10 @@ fn reap_idle_roots(
         reaped.push((root_id, memory_before));
     }
 
-    metrics.record_reap(census);
-    if census.deleted_retained > 0 {
+    // Emit-on-change: the census is on the health surface every sweep; the log
+    // line is for transitions, including the one back to zero retained.
+    let census_changed = metrics.record_reap(census);
+    if census_changed {
         log::info!(
             "subc attach: retained {} deleted root(s) during idle reap; blockers={}",
             census.deleted_retained,
@@ -2407,7 +2409,12 @@ pub type DispatchFn = fn(RawRequest, &AppContext) -> Response;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModuleLoopExit {
+    /// The daemon asked us to stop (channel-0 Goodbye). Exit 0 is correct:
+    /// the supervisor treats a clean exit as "stopped on request".
     Graceful,
+    /// The connection ended without a Goodbye. Indexes still flush, but the
+    /// process must exit non-zero so the supervisor restarts it.
+    ConnectionLost,
     SkipSearchFlush,
 }
 
@@ -2479,7 +2486,10 @@ fn run_subc_mode_inner(
     });
 
     let actor_contexts = executor.actor_contexts();
-    if matches!(loop_result, Ok(ModuleLoopExit::Graceful)) {
+    if matches!(
+        loop_result,
+        Ok(ModuleLoopExit::Graceful | ModuleLoopExit::ConnectionLost)
+    ) {
         // EOF/Goodbye teardown flushes each root's index deltas and queued
         // callgraph refreshes. Fatal/panic teardown skips this best-effort work.
         flush_actor_indexes_on_graceful_shutdown(&actor_contexts);
@@ -2489,7 +2499,11 @@ fn run_subc_mode_inner(
         actor_ctx.bash_background().detach();
     }
 
-    loop_result.map(|_| ())
+    match loop_result {
+        Ok(ModuleLoopExit::ConnectionLost) => Err(SubcError::ConnectionLost),
+        Ok(_) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn flush_actor_indexes_on_graceful_shutdown(actor_contexts: &[Arc<AppContext>]) {
@@ -3176,8 +3190,10 @@ where
             maybe_frame = reader_rx.recv() => {
                 let frame = match maybe_frame {
                     None => {
-                        log::info!("subc attach: daemon closed connection");
-                        break Ok(ModuleLoopExit::Graceful);
+                        log::warn!(
+                            "subc attach: daemon connection ended without Goodbye; exiting for restart"
+                        );
+                        break Ok(ModuleLoopExit::ConnectionLost);
                     }
                     Some(Err(error)) => break Err(error),
                     Some(Ok(frame)) => frame,
