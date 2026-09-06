@@ -12,6 +12,82 @@ import { expandTilde, projectRootFor } from "./_shared.js";
 const UNSUPPORTED_ASK_HOST =
   "AFT requires OpenCode 1.15.5 or newer for permission asks; please upgrade OpenCode";
 
+const RULE_DENIAL_MESSAGE_PREFIX =
+  "The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules ";
+const USER_REJECTION_MESSAGE_PREFIX =
+  "The user rejected permission to use this specific tool call.";
+const USER_FEEDBACK_MESSAGE_PREFIX = `${USER_REJECTION_MESSAGE_PREFIX} with the following feedback:`;
+
+export type PermissionAskFailureKind = "rule_denied" | "user_rejected" | "feedback";
+
+export type PermissionAskFailure = {
+  kind: PermissionAskFailureKind;
+  message: string;
+};
+
+function stringProperty(value: unknown, key: string): string | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const property = (value as Record<string, unknown>)[key];
+  return typeof property === "string" ? property : undefined;
+}
+
+function permissionErrorMessage(error: unknown, fallbackMessage: string): string {
+  if (error instanceof Error && error.message) return error.message;
+  const message = stringProperty(error, "message");
+  return message || fallbackMessage;
+}
+
+/**
+ * OpenCode's tagged permission errors have stable `_tag` values even when their
+ * display wording changes. The constructor names cover hosts that expose the
+ * class without the Effect tag; message prefixes are only a compatibility
+ * fallback for older wrappers that erased both forms of type information.
+ */
+export function classifyPermissionError(
+  error: unknown,
+  fallbackMessage = "Permission denied.",
+): PermissionAskFailure {
+  const tag = stringProperty(error, "_tag");
+  const errorConstructor =
+    typeof error === "object" && error !== null
+      ? (error as { constructor?: unknown }).constructor
+      : undefined;
+  const constructorName =
+    typeof errorConstructor === "function" && typeof errorConstructor.name === "string"
+      ? errorConstructor.name
+      : undefined;
+  const typeNames = new Set([tag, constructorName]);
+
+  if (typeNames.has("PermissionDeniedError") || typeNames.has("DeniedError")) {
+    return { kind: "rule_denied", message: permissionErrorMessage(error, fallbackMessage) };
+  }
+  if (typeNames.has("PermissionRejectedError") || typeNames.has("RejectedError")) {
+    return { kind: "user_rejected", message: permissionErrorMessage(error, fallbackMessage) };
+  }
+  if (typeNames.has("PermissionCorrectedError") || typeNames.has("CorrectedError")) {
+    return { kind: "feedback", message: permissionErrorMessage(error, fallbackMessage) };
+  }
+
+  const message = permissionErrorMessage(error, fallbackMessage);
+  if (message.startsWith(RULE_DENIAL_MESSAGE_PREFIX)) {
+    return { kind: "rule_denied", message };
+  }
+  if (message.startsWith(USER_FEEDBACK_MESSAGE_PREFIX)) {
+    return { kind: "feedback", message };
+  }
+  if (message.startsWith(USER_REJECTION_MESSAGE_PREFIX)) {
+    return { kind: "user_rejected", message };
+  }
+  return { kind: "feedback", message };
+}
+
+export function permissionRuleDenial(permission: string, root?: string): string {
+  return (
+    `permission_denied: ${permission}${root ? ` for ${root}` : ""} is denied by this session's ` +
+    "permission rules (not a user choice)"
+  );
+}
+
 /**
  * Throttle for the user-facing "restrict_to_project_root blocked this" panel.
  * An agent that probes several external paths shouldn't spawn a panel per path;
@@ -23,10 +99,21 @@ const UNSUPPORTED_ASK_HOST =
  */
 const RESTRICT_NOTICE_THROTTLE_MS = 5 * 60 * 1000;
 const restrictNoticeLastSentAt = new Map<string, number>();
-const aftSearchExternalDecisionCache = new Map<string, string | undefined>();
-const aftSearchExternalPendingAsks = new Map<string, Promise<string | undefined>>();
+const aftSearchExternalDecisionCache = new Map<
+  string,
+  AftSearchExternalPermissionDenial | undefined
+>();
+const aftSearchExternalPendingAsks = new Map<
+  string,
+  Promise<AftSearchExternalPermissionDenial | undefined>
+>();
 const POSIX_SYSTEM_TEMP_ROOTS = ["/tmp", "/var/tmp", "/private/tmp", "/private/var/tmp"];
 const MACOS_SYSTEM_TEMP_ROOTS = ["/var/folders", "/private/var/folders"];
+
+export type AftSearchExternalPermissionDenial = PermissionAskFailure & {
+  permission: "aft_search_external";
+  root: string;
+};
 
 function restrictNoticeWording(target: string): string {
   return (
@@ -69,8 +156,9 @@ function restrictDenialMessage(target: string): string {
  * (it briefly returned `Effect.Effect<void>` in 1.14.x–1.15.4; the Promise
  * shape is what the SDK originally used and what AFT supports today).
  *
- * On deny, the Promise rejects with `DeniedError` / `RejectedError`, so
- * callers can rely on a normal `try/catch` to detect denial. This helper
+ * On deny, the Promise rejects with `DeniedError`, `RejectedError`, or
+ * `CorrectedError`, so callers can rely on a normal `try/catch` to detect the
+ * host's rule, user, or feedback outcome. This helper
  * stays as a single chokepoint so that if the SDK ever changes its return
  * shape again, only this function needs to be touched.
  */
@@ -148,10 +236,8 @@ export async function askEditPermission(
     );
     return undefined;
   } catch (error) {
-    if (error instanceof Error && error.message) {
-      return error.message;
-    }
-    return "Permission denied.";
+    const failure = classifyPermissionError(error, "Permission denied.");
+    return failure.kind === "rule_denied" ? permissionRuleDenial("edit") : failure.message;
   }
 }
 
@@ -282,6 +368,7 @@ function normalizePathPattern(p: string): string {
 }
 
 export const _permissionsInternalsForTest = {
+  classifyPermissionError,
   containsPath,
   isSystemTempPath,
   normalizePathPattern,
@@ -386,10 +473,10 @@ export async function assertExternalDirectoryPermission(
     );
     return undefined;
   } catch (error) {
-    if (error instanceof Error && error.message) {
-      return error.message;
-    }
-    return "Permission denied (external directory).";
+    const failure = classifyPermissionError(error, "Permission denied (external directory).");
+    return failure.kind === "rule_denied"
+      ? permissionRuleDenial("external_directory", parentDir)
+      : failure.message;
   }
 }
 
@@ -420,12 +507,17 @@ function gitRootForNearestExistingParent(resolved: string): string | undefined {
  * This deliberately uses a tool-specific permission id rather than
  * `external_directory`: a user may allow ordinary path reads while still wanting
  * a separate audit point for search results produced from borrowed indexes.
+ *
+ * A denial keeps its classification and root so aft_search can safely fall back
+ * to the current project's index only for session-rule denials. The result is
+ * cached with the same session/root key as the old denial string, so a rule
+ * decision cannot change halfway through a session.
  */
 export async function assertAftSearchExternalPermission(
   ctx: PluginContext,
   context: ToolContext,
   target: string,
-): Promise<string | undefined> {
+): Promise<AftSearchExternalPermissionDenial | undefined> {
   if (!target) return undefined;
 
   const resolved = resolveAbsolutePath(context, target);
@@ -450,10 +542,22 @@ export async function assertAftSearchExternalPermission(
 
   if (ctx.config.restrict_to_project_root === true) {
     notifyRestrictBlocked(ctx, context, externalRoot);
-    return restrictDenialMessage(externalRoot);
+    return {
+      kind: "feedback",
+      message: restrictDenialMessage(externalRoot),
+      permission: "aft_search_external",
+      root: externalRoot,
+    };
   }
 
-  if (typeof context.ask !== "function") return UNSUPPORTED_ASK_HOST;
+  if (typeof context.ask !== "function") {
+    return {
+      kind: "feedback",
+      message: UNSUPPORTED_ASK_HOST,
+      permission: "aft_search_external",
+      root: externalRoot,
+    };
+  }
 
   const sessionKey = (context as { sessionID?: string }).sessionID ?? "unknown-session";
   const cacheKey = `${sessionKey}\0${externalRoot}`;
@@ -483,12 +587,18 @@ export async function assertAftSearchExternalPermission(
       aftSearchExternalDecisionCache.set(cacheKey, undefined);
       return undefined;
     } catch (error) {
-      const message =
-        error instanceof Error && error.message
-          ? error.message
-          : "Permission denied (aft_search_external).";
-      aftSearchExternalDecisionCache.set(cacheKey, message);
-      return message;
+      const failure = classifyPermissionError(error, "Permission denied (aft_search_external).");
+      const denial: AftSearchExternalPermissionDenial = {
+        kind: failure.kind,
+        message:
+          failure.kind === "rule_denied"
+            ? permissionRuleDenial("aft_search_external", externalRoot)
+            : failure.message,
+        permission: "aft_search_external",
+        root: externalRoot,
+      };
+      aftSearchExternalDecisionCache.set(cacheKey, denial);
+      return denial;
     } finally {
       aftSearchExternalPendingAsks.delete(cacheKey);
     }
@@ -522,10 +632,8 @@ async function askSearchPatternPermission(
     );
     return undefined;
   } catch (error) {
-    if (error instanceof Error && error.message) {
-      return error.message;
-    }
-    return `Permission denied (${permission}).`;
+    const failure = classifyPermissionError(error, `Permission denied (${permission}).`);
+    return failure.kind === "rule_denied" ? permissionRuleDenial(permission) : failure.message;
   }
 }
 
@@ -583,10 +691,8 @@ export async function askGlobPermission(
     );
     return undefined;
   } catch (error) {
-    if (error instanceof Error && error.message) {
-      return error.message;
-    }
-    return "Permission denied (glob).";
+    const failure = classifyPermissionError(error, "Permission denied (glob).");
+    return failure.kind === "rule_denied" ? permissionRuleDenial("glob") : failure.message;
   }
 }
 
