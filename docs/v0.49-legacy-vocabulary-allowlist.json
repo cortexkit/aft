@@ -440,8 +440,8 @@
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "location": "line 2174, column 23",
-      "line": 2174,
+      "location": "line 2178, column 23",
+      "line": 2178,
       "column": 23,
       "token": "toFile",
       "class": "rust-compatibility",
@@ -449,8 +449,8 @@
     },
     {
       "path": "crates/aft/src/subc_format.rs",
-      "location": "line 2176, column 45",
-      "line": 2176,
+      "location": "line 2180, column 45",
+      "line": 2180,
       "column": 45,
       "token": "toFile",
       "class": "rust-compatibility",
