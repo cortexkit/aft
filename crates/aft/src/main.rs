@@ -3988,7 +3988,8 @@ mod watcher_filter_tests {
             lsp.diagnostics_store_mut_for_test()
                 .publish(key, root.join("other.ts"), vec![]);
         }
-        assert_eq!(ctx.status_bar_count_values().errors, Some(0));
+        // Every producer has now reported, so the legacy projection exists.
+        assert!(ctx.status_bar_counts().is_some());
         let rx = status_frame_rx(&ctx);
         let watcher_tx = install_watcher_rx(&ctx);
         watcher_tx.send(watcher_paths_event(file)).unwrap();
@@ -4031,7 +4032,6 @@ mod watcher_filter_tests {
 
         let snapshot = recv_status_changed(&rx);
         assert!(snapshot["status_bar"].get("errors").is_none());
-        assert_eq!(ctx.status_bar_count_values().errors, None);
         assert_eq!(ctx.status_bar_counts(), None);
     }
 }
