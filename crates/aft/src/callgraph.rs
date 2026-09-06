@@ -31,10 +31,17 @@ use crate::symbols::{Range, Symbol, SymbolKind};
 // ---------------------------------------------------------------------------
 
 type WorkspacePackageCache = HashMap<(PathBuf, String), Option<PathBuf>>;
+// Member directories per canonical workspace root. The walk that produces them
+// visits every directory under the workspace with a realpath each, so it is
+// keyed by the workspace and not by the package being looked up: the first
+// resolution of each distinct bare import must not pay the walk again.
+type WorkspaceMemberDirsCache = HashMap<PathBuf, Arc<Vec<PathBuf>>>;
 type RustCrateInfoCache = HashMap<PathBuf, Option<RustCrateInfo>>;
 type RustWorkspaceCrateCache = HashMap<PathBuf, HashMap<String, RustCrateInfo>>;
 
 static WORKSPACE_PACKAGE_CACHE: LazyLock<RwLock<WorkspacePackageCache>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static WORKSPACE_MEMBER_DIRS_CACHE: LazyLock<RwLock<WorkspaceMemberDirsCache>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 static RUST_CRATE_INFO_CACHE: LazyLock<RwLock<RustCrateInfoCache>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
@@ -2517,6 +2524,9 @@ pub(crate) fn clear_workspace_package_cache() {
     if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
         cache.clear();
     }
+    if let Ok(mut cache) = WORKSPACE_MEMBER_DIRS_CACHE.write() {
+        cache.clear();
+    }
     if let Ok(mut cache) = RUST_CRATE_INFO_CACHE.write() {
         cache.clear();
     }
@@ -2557,10 +2567,10 @@ fn resolve_workspace_package(
         }
     }
 
-    let resolved = workspace_member_dirs(&workspace_root, memo, facts)
-        .into_iter()
+    let resolved = cached_workspace_member_dirs(&workspace_root, memo, facts)
+        .iter()
         .find(|dir| package_json_name(dir, memo, facts).as_deref() == Some(package_name))
-        .map(|dir| facts.canonical(&dir).unwrap_or(dir));
+        .map(|dir| facts.canonical(dir).unwrap_or_else(|| dir.clone()));
 
     if let Some(memo) = memo {
         memo.remember_workspace_package(cache_key.clone(), resolved.clone());
@@ -2570,6 +2580,26 @@ fn resolve_workspace_package(
     }
 
     resolved
+}
+
+/// The member list for a workspace root, walked at most once per cache
+/// lifetime. `workspace_root` is already canonical here (the caller keys on
+/// it), so alias spellings cannot split the entry.
+fn cached_workspace_member_dirs(
+    workspace_root: &Path,
+    memo: Option<&ModuleResolutionMemo>,
+    facts: &FactPaths<'_>,
+) -> Arc<Vec<PathBuf>> {
+    if let Ok(cache) = WORKSPACE_MEMBER_DIRS_CACHE.read() {
+        if let Some(members) = cache.get(workspace_root) {
+            return Arc::clone(members);
+        }
+    }
+    let members = Arc::new(workspace_member_dirs(workspace_root, memo, facts));
+    if let Ok(mut cache) = WORKSPACE_MEMBER_DIRS_CACHE.write() {
+        cache.insert(workspace_root.to_path_buf(), Arc::clone(&members));
+    }
+    members
 }
 
 fn workspace_member_dirs(
@@ -4178,6 +4208,31 @@ function hidden() {}
             walked,
             "a second resolution with a fresh memo must not walk again"
         );
+
+        // The walk is per workspace, not per package: a different non-member
+        // import is answered from the same member list.
+        let third = resolve_workspace_package(
+            &root,
+            "effect",
+            Some(&ModuleResolutionMemo::default()),
+            &facts,
+        );
+        assert_eq!(third, None, "effect is not a member either");
+        assert_eq!(
+            counting.list_dir_calls.get(),
+            walked,
+            "a second package on the same workspace must reuse the member walk"
+        );
+        // And a member resolves from the same list too.
+        let member = resolve_workspace_package(
+            &root,
+            "@ws/b",
+            Some(&ModuleResolutionMemo::default()),
+            &facts,
+        )
+        .expect("@ws/b is a member");
+        assert!(member.ends_with("packages/b"), "{member:?}");
+        assert_eq!(counting.list_dir_calls.get(), walked);
 
         // A workspace manifest change is the one thing that may re-walk.
         clear_workspace_package_cache();
