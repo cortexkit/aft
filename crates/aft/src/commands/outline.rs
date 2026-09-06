@@ -621,7 +621,7 @@ fn discover_outline_files_for_files_mode(
         gitignore,
         gitignore_root,
     };
-    discover_outline_files_with_options(directory, Some(&options))
+    discover_outline_files_with_options(directory, Some(&options), true)
 }
 
 fn append_outline_directory_tree(
@@ -1206,7 +1206,7 @@ fn outline_many_files(
 }
 
 fn discover_outline_files(directory: &Path) -> OutlineFileDiscovery {
-    let mut discovery = discover_outline_files_with_options(directory, None);
+    let mut discovery = discover_outline_files_with_options(directory, None, false);
     if discovery.files.len() > OUTLINE_FILE_WALK_CAP {
         discovery.files.truncate(OUTLINE_FILE_WALK_CAP);
         discovery.walk_truncated = true;
@@ -1217,6 +1217,7 @@ fn discover_outline_files(directory: &Path) -> OutlineFileDiscovery {
 fn discover_outline_files_with_options(
     directory: &Path,
     options: Option<&OutlineWalkOptions>,
+    breadth_first: bool,
 ) -> OutlineFileDiscovery {
     let mut files = Vec::new();
     let mut directories = Vec::new();
@@ -1229,17 +1230,31 @@ fn discover_outline_files_with_options(
     let boundary = crate::walk_boundary::DeviceBoundary::for_root(directory);
     if let Ok(boundary) = boundary {
         let mut device_lookup = crate::walk_boundary::filesystem_device_id;
-        collect_outline_files_with_device_lookup(
-            directory,
-            &mut files,
-            &mut directories,
-            &mut walk_truncated,
-            &mut collection_truncated,
-            &mut skipped_foreign_mounts,
-            options,
-            &boundary,
-            &mut device_lookup,
-        );
+        if breadth_first {
+            collect_outline_files_breadth_first_with_device_lookup(
+                directory,
+                &mut files,
+                &mut directories,
+                &mut walk_truncated,
+                &mut collection_truncated,
+                &mut skipped_foreign_mounts,
+                options,
+                &boundary,
+                &mut device_lookup,
+            );
+        } else {
+            collect_outline_files_with_device_lookup(
+                directory,
+                &mut files,
+                &mut directories,
+                &mut walk_truncated,
+                &mut collection_truncated,
+                &mut skipped_foreign_mounts,
+                options,
+                &boundary,
+                &mut device_lookup,
+            );
+        }
     } else {
         collection_truncated = true;
     }
@@ -1256,6 +1271,80 @@ fn discover_outline_files_with_options(
 }
 
 fn collect_outline_files_with_device_lookup<F>(
+    directory: &Path,
+    files: &mut Vec<String>,
+    directories: &mut Vec<String>,
+    walk_truncated: &mut bool,
+    collection_truncated: &mut bool,
+    skipped_foreign_mounts: &mut usize,
+    options: Option<&OutlineWalkOptions>,
+    boundary: &crate::walk_boundary::DeviceBoundary,
+    device_lookup: &mut F,
+) where
+    F: FnMut(&Path) -> std::io::Result<Option<u64>>,
+{
+    if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
+        *walk_truncated = true;
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    let mut entries = entries.flatten().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        if files.len() >= OUTLINE_FILE_COLLECTION_CAP {
+            *walk_truncated = true;
+            return;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            if should_skip_directory(&path) || is_ignored_outline_path(&path, true, options) {
+                continue;
+            }
+            match boundary.should_descend_with(&path, |child| device_lookup(child)) {
+                Ok(true) => {}
+                Ok(false) => {
+                    *skipped_foreign_mounts += 1;
+                    continue;
+                }
+                Err(_) => {
+                    *collection_truncated = true;
+                    return;
+                }
+            }
+            directories.push(path.to_string_lossy().to_string());
+            collect_outline_files_with_device_lookup(
+                &path,
+                files,
+                directories,
+                walk_truncated,
+                collection_truncated,
+                skipped_foreign_mounts,
+                options,
+                boundary,
+                device_lookup,
+            );
+            if *walk_truncated || *collection_truncated {
+                return;
+            }
+        } else if file_type.is_file() {
+            if is_ignored_outline_path(&path, false, options) {
+                continue;
+            }
+            files.push(path.to_string_lossy().to_string());
+        }
+    }
+}
+
+fn collect_outline_files_breadth_first_with_device_lookup<F>(
     directory: &Path,
     files: &mut Vec<String>,
     directories: &mut Vec<String>,
