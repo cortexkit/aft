@@ -1598,8 +1598,12 @@ fn format_outline_files_text(data: &Value) -> String {
         } else {
             " Some files in this directory were not indexed.".to_string()
         };
+        let walk_limit = data
+            .get("walk_limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(200);
         footer.push(format!(
-            "⚠ Partial result: walk truncated at 200 files.{suffix}"
+            "⚠ Partial result: walk truncated at {walk_limit} files.{suffix}"
         ));
     } else {
         let suffix = if !unchecked.is_empty() {
@@ -3275,5 +3279,22 @@ mod outline_format_tests {
         let formatted = format_outline(&response, OutlineMode::DirectoryJson);
         assert!(formatted.contains("src/\n  a.rs (rs)"));
         assert!(formatted.contains("⚠ Partial result: walk truncated at 200 files. Some files in this directory were not indexed."));
+    }
+
+    #[test]
+    fn files_outline_uses_the_counting_walk_limit_in_partial_footer() {
+        let response = Response::success(
+            "1",
+            json!({
+                "text": "src/  10000 files",
+                "complete": false,
+                "walk_truncated": true,
+                "walk_limit": 10_000
+            }),
+        );
+
+        let formatted = format_outline(&response, OutlineMode::Files);
+        assert!(formatted.contains("walk truncated at 10000 files"));
+        assert!(!formatted.contains("walk truncated at 200 files"));
     }
 }

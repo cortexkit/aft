@@ -386,6 +386,7 @@ fn files_mode_retires_the_200_file_render_cap() {
         );
         assert_eq!(resp["complete"], true);
         assert_eq!(resp["walk_truncated"], false);
+        assert_eq!(resp["walk_limit"], 10_000);
         assert_eq!(resp["collection_truncated"], false);
         assert_eq!(response_paths(&resp), expected);
         let text = resp["text"].as_str().unwrap();

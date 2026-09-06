@@ -538,6 +538,7 @@ fn handle_outline_files_mode(
                 && !collection_truncated
                 && skipped_foreign_mounts == 0,
             "walk_truncated": walk_truncated,
+            "walk_limit": OUTLINE_FILE_COLLECTION_CAP,
             "collection_truncated": collection_truncated,
             "skipped_foreign_mounts": skipped_foreign_mounts,
             "unchecked_files": unchecked_files,
