@@ -98,8 +98,10 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   # Post-sign digest sidecar: ad-hoc signing shifts the bytes, so any later
   # placement verification must compare against the digest AFTER signing.
   # Emitting it next to the binary moves that rule from operator memory into
-  # artifact shape - the file carries the correct comparison value.
-  shasum -a 256 "$BINARY_PATH" | awk '{print $1}' > "${BINARY_PATH}.sha256.postsign"
+  # artifact shape - the file carries the correct comparison value. Written in
+  # `shasum -c` form (`<hash>  <basename>`) because that is the command the
+  # placer runs from the staging directory; a bare hash is refused by it.
+  (cd "$(dirname "$BINARY_PATH")" && shasum -a 256 "$(basename "$BINARY_PATH")" > "$(basename "$BINARY_PATH").sha256.postsign")
 
   # Preserve the dSYM for the staged binary. `ditto` dereferences the `aft.dSYM`
   # symlink cargo emits (it points at a hash-named bundle under deps/) and

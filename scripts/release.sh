@@ -419,8 +419,9 @@ if mkdir -p "$CACHE_DIR/$TAG" && cp target/release/aft "$CACHE_DIR/$TAG/aft" 2>/
     # Post-sign digest sidecar: ad-hoc signing shifts the bytes, so placement
     # verification must compare against the digest AFTER signing, never the
     # published-asset checksum. The sidecar carries the correct value so the
-    # rule lives in the artifact, not in operator memory.
-    shasum -a 256 "$CACHE_DIR/$TAG/aft" | awk '{print $1}' > "$CACHE_DIR/$TAG/aft.sha256.postsign"
+    # rule lives in the artifact, not in operator memory, in `shasum -c` form
+    # (`<hash>  <basename>`) because that is the command the placer runs.
+    (cd "$CACHE_DIR/$TAG" && shasum -a 256 aft > aft.sha256.postsign)
 
     # Preserve the split debug info (dSYM) for the staged release binary, keyed
     # by the binary's content sha, next to the preswap evidence. The staged
