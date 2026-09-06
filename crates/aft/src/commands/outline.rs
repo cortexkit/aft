@@ -779,6 +779,13 @@ fn directory_is_data_heavy(node: &OutlineDirectoryNode, file_entries: &[OutlineF
             >= node.direct_files.len() * 9
 }
 
+fn outline_expansion_added_rows(node: &OutlineDirectoryNode) -> usize {
+    node.direct_files
+        .len()
+        .saturating_add(node.children.len())
+        .saturating_sub(1)
+}
+
 fn compare_directory_code_share(
     a: &OutlineDirectoryNode,
     b: &OutlineDirectoryNode,
@@ -812,9 +819,10 @@ fn plan_outline_file_rows(
     file_entries: &[OutlineFileEntry],
     max_bytes: usize,
 ) -> Vec<OutlineTableRow> {
-    // A depth-first alphabetical list lets a schema subtree consume the whole
-    // response before later crates appear. Start with every direct entry and
-    // replace rollups breadth-first only when the complete rendered view fits.
+    // A depth-first alphabetical list lets a large crate consume the whole
+    // response before later siblings appear. Start with every direct entry,
+    // then prefer cheap same-level expansions so the budget reveals breadth
+    // before flattening a directory with hundreds of direct files.
     let mut rows = roots
         .iter()
         .flat_map(|root| outline_rows_for_directory(*root, directory_nodes, file_entries))
@@ -852,9 +860,12 @@ fn plan_outline_file_rows(
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|a, b| {
-            compare_directory_code_share(&directory_nodes[*a], &directory_nodes[*b])
-                .reverse()
-                .then_with(|| directory_nodes[*a].path.cmp(&directory_nodes[*b].path))
+            let a_node = &directory_nodes[*a];
+            let b_node = &directory_nodes[*b];
+            outline_expansion_added_rows(a_node)
+                .cmp(&outline_expansion_added_rows(b_node))
+                .then_with(|| compare_directory_code_share(a_node, b_node).reverse())
+                .then_with(|| a_node.path.cmp(&b_node.path))
         });
 
         for node_id in candidates {
@@ -2587,6 +2598,82 @@ mod tests {
         assert!(!text.contains("syms"), "rollup row: {text}");
         assert!(text.contains("1 directory shown as a rollup (budget: 30KB)"));
         assert!(!text.contains(".json  "));
+    }
+
+    #[test]
+    fn cheapest_same_level_expansion_buys_breadth_before_large_directory() {
+        let files = vec![
+            outline_file_entry_for_test("z-small/lib.rs", "rust", 1, Some(1), false),
+            outline_file_entry_for_test("a-large/a.rs", "rust", 1, Some(1), false),
+            outline_file_entry_for_test("a-large/b.rs", "rust", 1, Some(1), false),
+            outline_file_entry_for_test("docs/readme.md", "markdown", 0, Some(1), true),
+        ];
+        let mut directories = vec![
+            OutlineDirectoryNode {
+                path: String::new(),
+                depth: 0,
+                direct_files: Vec::new(),
+                children: vec![1, 2, 3],
+                stats: OutlineDirectoryStats::default(),
+            },
+            OutlineDirectoryNode {
+                path: "z-small".to_string(),
+                depth: 1,
+                direct_files: vec![0],
+                children: Vec::new(),
+                stats: OutlineDirectoryStats::default(),
+            },
+            OutlineDirectoryNode {
+                path: "a-large".to_string(),
+                depth: 1,
+                direct_files: vec![1, 2],
+                children: Vec::new(),
+                stats: OutlineDirectoryStats::default(),
+            },
+            OutlineDirectoryNode {
+                path: "docs".to_string(),
+                depth: 1,
+                direct_files: vec![3],
+                children: Vec::new(),
+                stats: OutlineDirectoryStats::default(),
+            },
+        ];
+        aggregate_outline_directory(0, &mut directories, &files);
+        let small_only = vec![
+            OutlineTableRow::Rollup(2),
+            OutlineTableRow::Rollup(3),
+            OutlineTableRow::File(0),
+        ];
+        let large_only = vec![
+            OutlineTableRow::File(1),
+            OutlineTableRow::File(2),
+            OutlineTableRow::Rollup(3),
+            OutlineTableRow::Rollup(1),
+        ];
+        let both = vec![
+            OutlineTableRow::File(1),
+            OutlineTableRow::File(2),
+            OutlineTableRow::Rollup(3),
+            OutlineTableRow::File(0),
+        ];
+        let mut budget = 0;
+        for _ in 0..8 {
+            let required = format_files_table(&small_only, &directories, &files, budget)
+                .len()
+                .max(format_files_table(&large_only, &directories, &files, budget).len());
+            if required == budget {
+                break;
+            }
+            budget = required;
+        }
+        assert!(format_files_table(&small_only, &directories, &files, budget).len() <= budget);
+        assert!(format_files_table(&large_only, &directories, &files, budget).len() <= budget);
+        assert!(format_files_table(&both, &directories, &files, budget).len() > budget);
+
+        assert_eq!(
+            plan_outline_file_rows(&[0], &directories, &files, budget),
+            small_only
+        );
     }
 
     #[test]
