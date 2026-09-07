@@ -1732,6 +1732,20 @@ fn session_isolation_on_replay() {
 #[test]
 fn restart_sweep_marks_dead_pid_fate_unknown_once() {
     let storage = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
+    // The first replay's persisted GC runs detached. Let that storage-wide
+    // sweep finish before planting a fixture, or it can observe and remove the
+    // fixture concurrently with this test's replay.
+    registry.replay_session(storage.path(), SESSION).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while registry.persisted_gc_thread().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "first persisted GC never finished after replay"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
     let task_id = "bash-0000000000000120";
     let mut metadata = PersistedTask::starting(
         task_id.to_string(),
@@ -1753,7 +1767,6 @@ fn restart_sweep_marks_dead_pid_fate_unknown_once() {
     )
     .unwrap();
 
-    let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
     registry.replay_session(storage.path(), SESSION).unwrap();
     let replayed = read_json(storage.path(), SESSION, task_id);
     assert_eq!(replayed["status"], "fate_unknown");
