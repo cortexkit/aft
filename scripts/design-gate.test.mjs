@@ -193,6 +193,14 @@ describe("pullRequestSkipReason", () => {
     ["maintainer train branch", { headRepoFullName: REPO, headRef: "train/v0.56" }, true],
     ["maintainer alfonso branch", { headRepoFullName: REPO, headRef: "alfonso/task/abc" }, true],
     ["nested train branch", { headRepoFullName: REPO, headRef: "train/a/b/c" }, true],
+    // The pin-bump automation opens `ci/bump-opencode-<version>` from an app
+    // token; a mechanical version bump has no design to approve (PR #299).
+    ["automation ci branch", { headRepoFullName: REPO, headRef: "ci/bump-opencode-1.18.29" }, true],
+    [
+      "fork ci branch",
+      { headRepoFullName: "contributor/aft", headRef: "ci/bump-opencode-9.9.9" },
+      false,
+    ],
     // `train/**` is a path prefix, not a substring: a branch simply named
     // `train` or `trainer` is an ordinary branch.
     ["bare train branch name", { headRepoFullName: REPO, headRef: "train" }, false],

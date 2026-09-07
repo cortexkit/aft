@@ -30,12 +30,15 @@ export const COMMENT_MARKER = "<!-- design-gate -->";
 export const CHECK_NAME = "design-gate";
 
 /**
- * Branches maintainers push directly. These carry no contributor design
- * conversation, so the gate does not apply to them — but only when the head
- * is this repository, so a fork cannot bypass the gate by naming its branch
- * `train/whatever`.
+ * Branches maintainers (or this repository's own automation) push directly.
+ * These carry no contributor design conversation, so the gate does not apply
+ * to them — but only when the head is this repository, so a fork cannot bypass
+ * the gate by naming its branch `train/whatever`. `ci/` is the automation
+ * prefix: the OpenCode pin bump (`.github/workflows/bump-opencode.yml`) opens
+ * `ci/bump-opencode-<version>` from an app token, and a mechanical version
+ * bump has no design to approve.
  */
-export const MAINTAINER_BRANCH_PREFIXES = ["train", "alfonso"];
+export const MAINTAINER_BRANCH_PREFIXES = ["train", "alfonso", "ci"];
 
 /**
  * The only text a blocked contributor reads. Keep it exact: it has to explain

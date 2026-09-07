@@ -1799,6 +1799,24 @@
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
+      "path": "docs/investigations/scripts/row-facts-spike.py",
+      "location": "line 499, column 36",
+      "line": 499,
+      "column": 36,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "docs/investigations/scripts/row-facts-spike.py",
+      "location": "line 504, column 36",
+      "line": 504,
+      "column": 36,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
       "path": "docs/v0.49-unified-tool-surface-inventory.json",
       "location": "line 49, column 61",
       "line": 49,
