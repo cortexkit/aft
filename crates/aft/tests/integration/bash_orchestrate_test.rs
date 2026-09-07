@@ -391,15 +391,22 @@ fn bash_gate_off_still_returns_spawn_response() {
 fn pending_orchestrated_bash_does_not_starve_push_frames() {
     let mut aft = spawn_with_wait("5000");
     let dir = tempfile::tempdir().unwrap();
+    let child_started = dir.path().join("pending-bash-started");
+    let child_release = dir.path().join("pending-bash-release");
+    // Declare after the TempDir so a panic releases the gated child before
+    // the directory is removed.
+    let _release_guard = ReleaseOnDrop::new(child_release.clone());
+    let command = hold_until_release_command(&child_started, &child_release, "true");
 
     aft.send_silent(&bash_request(
         "bash-drain-orchestrated",
         json!({
-            "command": "sleep 2",
+            "command": command,
             "foreground_orchestrate": true,
             "block_to_completion": true,
         }),
     ));
+    wait_for_file(&child_started, "pending foreground child start");
 
     let configure = aft.send(
         &json!({
@@ -416,32 +423,31 @@ fn pending_orchestrated_bash_does_not_starve_push_frames() {
         "configure failed: {configure:?}"
     );
 
-    // The invariant: the pending deferred bash response must not starve push
-    // frames — configure_warnings has to arrive BEFORE that deferred response.
-    // Under host load the 2s sleep can finish while configure is still running,
-    // so the task's own completion push may legitimately land first; pushes
-    // overtaking pushes is not starvation. Tolerate the task's push frames and
-    // fail only if the deferred RESPONSE (an "id" frame) beats the warnings.
+    // Keep the child pending until configure_warnings has arrived. The former
+    // fixed `sleep 2` completion raced the warning worker's OS scheduling under
+    // loaded CI, so it could report a false starvation failure before the
+    // warning work had even run.
     let push = loop {
         let frame = aft
-            .try_read_next_timeout(Duration::from_secs(12))
-            .expect("configure warning push before deferred bash response");
+            .try_read_next_timeout(HANG_CATCH)
+            .expect("configure warning push while deferred bash remains pending");
         if frame.get("type").is_some() {
             if frame["type"] == "configure_warnings" {
                 break frame;
             }
             continue;
         }
-        panic!("deferred response overtook the configure push (starvation): {frame:?}");
+        panic!("deferred response settled before its gated child was released: {frame:?}");
     };
     assert_eq!(
         push["type"], "configure_warnings",
         "unexpected frame: {push:?}"
     );
 
+    std::fs::write(&child_release, b"release").expect("release pending foreground child");
     let bash_response = loop {
         let value = aft
-            .try_read_next_timeout(Duration::from_secs(12))
+            .try_read_next_timeout(HANG_CATCH)
             .expect("deferred bash response after command completion");
         if value["id"] == "bash-drain-orchestrated" {
             break value;
