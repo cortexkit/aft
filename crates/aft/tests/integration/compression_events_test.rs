@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aft::bash_background::{BgCompletion, BgTaskRegistry, BgTaskStatus};
+use aft::db::TrackedConnection as Connection;
 use aft::harness::Harness;
-use rusqlite::{params, Connection};
+use rusqlite::params;
 
 const SESSION: &str = "compression-events-session";
 

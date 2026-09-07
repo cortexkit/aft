@@ -347,6 +347,27 @@ fn shim_status(
     serde_json::from_slice(&output.stdout).expect("parse gh shim status JSON")
 }
 
+fn snapshot_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn collect(root: &Path, current: &Path, entries: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let Ok(directory) = fs::read_dir(current) else {
+            return;
+        };
+        for entry in directory.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(root, &path, entries);
+            } else if let Ok(bytes) = fs::read(&path) {
+                entries.push((path.strip_prefix(root).unwrap().to_path_buf(), bytes));
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    collect(root, root, &mut entries);
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    entries
+}
+
 fn assert_status_provenance(report: &Value) {
     assert!(report["executing_image"]
         .as_str()
@@ -379,6 +400,7 @@ fn shim_command(
         .current_dir(project)
         .env("XDG_CONFIG_HOME", config_home)
         .env("XDG_STATE_HOME", state_home)
+        .env("AFT_GH_SHIM_STATE_DIR", state_home.join("cortexkit/aft/gh-shim"))
         .env("HOME", home)
         // Direct shim invocations bypass the shared AftProcess helper. Give each
         // fixture its own root so an unexpected future configure path cannot
@@ -391,6 +413,44 @@ fn shim_command(
         .env_remove("GH_ENTERPRISE_TOKEN")
         .env_remove("GH_SHIM_BYPASS");
     shim
+}
+
+#[test]
+fn gh_shim_child_override_leaves_operator_state_canary_untouched() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let isolated_state = temp.path().join("isolated-state");
+    let operator_xdg = temp.path().join("operator-xdg");
+    let operator_home = temp.path().join("operator-home");
+    let project = write_project_repo(temp.path());
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    write_fresh_manifest(&isolated_state, unix_seconds());
+    write_user_config(&config_home, &connection_file, None);
+    let before = snapshot_tree(&operator_xdg);
+
+    let output = shim_command(
+        &["issue", "list"],
+        &project,
+        &config_home,
+        &isolated_state,
+        &operator_home,
+        &upstream_bin,
+        &recorder,
+    )
+    // Point HOME and XDG_STATE_HOME at canary directories. The child's
+    // dedicated state-location override must take precedence so that records
+    // written by the child leave both operator directories unchanged.
+    .env("XDG_STATE_HOME", &operator_xdg)
+    .env("HOME", &operator_home)
+    .output()
+    .expect("spawn canary gh shim child");
+
+    assert_eq!(output.status.code(), Some(73));
+    assert_eq!(snapshot_tree(&operator_xdg), before);
+    assert!(snapshot_tree(&operator_home).is_empty());
 }
 
 #[test]
@@ -1857,6 +1917,10 @@ fn shim_invoked_as_gh_skips_its_managed_path_entry_and_execs_upstream_once() {
         .current_dir(project)
         .env("PATH", path)
         .env("AFT_GH_SHIMS_DIR", &shims)
+        .env(
+            "AFT_GH_SHIM_STATE_DIR",
+            temp.path().join("state/cortexkit/aft/gh-shim"),
+        )
         .env("GH_SHIM_TEST_RECORD", &recorder)
         .env("XDG_CONFIG_HOME", temp.path().join("config"))
         .env("XDG_STATE_HOME", temp.path().join("state"))

@@ -1189,7 +1189,7 @@ fn current_hostname() -> String {
 
 #[cfg(windows)]
 fn current_hostname() -> String {
-    std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown-host".to_string())
+    crate::environment::non_empty_var("COMPUTERNAME").unwrap_or_else(|| "unknown-host".to_string())
 }
 
 #[cfg(all(not(unix), not(windows)))]

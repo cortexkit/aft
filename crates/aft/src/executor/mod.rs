@@ -6,7 +6,7 @@ mod tests;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
-        atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc,
     },
     thread::{self, JoinHandle},
@@ -38,8 +38,9 @@ pub enum Lane {
     /// using the shared epoch read gate.
     SerialLspStatus,
     /// Heavy lazy initialization. The scheduler acquires a process-wide heavy
-    /// permit before dispatch; the worker runs the build outside the epoch and
-    /// then takes a short write gate for the install point.
+    /// permit before dispatch; cache and index builders reject stale generations
+    /// and serialize publication internally, so no actor epoch guard wraps the
+    /// command or the delivery of its response.
     HeavyInit,
     /// Mutating work. Becomes a writer barrier at the actor queue head, drains
     /// in-flight reads, and runs under the actor epoch write gate. Reserved for
@@ -85,6 +86,10 @@ const INTERACTIVE_WRITER_PROMOTION_AGE: Duration = Duration::from_secs(6);
 /// Readers older than this still block queued writer jobs; report their job
 /// metadata instead of only the generic `waiting_on_readers` diagnosis.
 const READER_STUCK_CENSUS_AGE: Duration = Duration::from_secs(60);
+/// Stack for executor worker threads: the standalone main thread's size, so a
+/// request that fits there cannot overflow only under the daemon. Stack pages
+/// are committed on touch, so idle workers cost nothing extra.
+const EXECUTOR_WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
@@ -314,6 +319,7 @@ pub struct BindBlockerReaderSnapshot {
     pub command: String,
     pub lane: Lane,
     pub started_age_ms: u64,
+    pub execution_started: bool,
     pub started_before_oldest_writer: bool,
 }
 
@@ -365,13 +371,34 @@ impl JobCancellation {
         }
     }
 
-    fn mark_running(&self) {
-        let _ = self.inner.state.compare_exchange(
+    fn mark_running(&self) -> bool {
+        match self.inner.state.compare_exchange(
             JOB_CANCEL_STATE_PENDING,
             JOB_CANCEL_STATE_RUNNING,
             Ordering::SeqCst,
             Ordering::SeqCst,
-        );
+        ) {
+            Ok(_) => true,
+            Err(state) => state != JOB_CANCEL_STATE_CANCELLED,
+        }
+    }
+
+    fn try_cancel_before_running(&self) -> bool {
+        let cancelled = self
+            .inner
+            .state
+            .compare_exchange(
+                JOB_CANCEL_STATE_PENDING,
+                JOB_CANCEL_STATE_CANCELLED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok();
+        if cancelled {
+            let _wait_guard = self.inner.wait_lock.lock();
+            self.inner.wake.notify_all();
+        }
+        cancelled
     }
 
     /// Seal the job as committed. Returns `false` when a cancel already won
@@ -487,6 +514,14 @@ pub enum JobCancelOutcome {
     NotFound,
 }
 
+/// Result of cancelling only work whose command closure has not started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreExecutionCancelOutcome {
+    QueuedRemoved,
+    DispatchedCancelled,
+    AlreadyStarted,
+}
+
 thread_local! {
     static CURRENT_JOB_CANCELLATION: std::cell::RefCell<Option<JobCancellation>> =
         const { std::cell::RefCell::new(None) };
@@ -538,6 +573,7 @@ struct RunningJob {
     job_class: JobClass,
     lane: Lane,
     started_at: Instant,
+    execution_started: Arc<AtomicBool>,
     occupancy_reported: bool,
 }
 
@@ -548,6 +584,7 @@ pub(crate) struct LongRunningInteractiveJobSnapshot {
     pub(crate) command: String,
     pub(crate) lane: Lane,
     pub(crate) age: Duration,
+    pub(crate) execution_started: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -604,8 +641,14 @@ impl Executor {
         for worker_id in 0..effective.pool_size {
             let worker_rx = run_rx.clone();
             let worker_events = event_tx.clone();
+            // Workers run every tool call, including tree-sitter walks over
+            // whatever a URL or file turns out to contain. The standalone loop
+            // runs those on the 8 MiB main thread; the 2 MiB default for spawned
+            // threads let a deep parse tree abort the whole daemon while the same
+            // request succeeded standalone. Match the main thread.
             let handle = thread::Builder::new()
                 .name(format!("aft-executor-worker-{worker_id}"))
+                .stack_size(EXECUTOR_WORKER_STACK_BYTES)
                 .spawn(move || worker_loop(worker_rx, worker_events))
                 .expect("spawn AFT executor worker");
             worker_handles.push(handle);
@@ -793,6 +836,13 @@ impl Executor {
         )
     }
 
+    /// Registered actor count under the scheduler lock. Tests that assert a
+    /// bind had no actor side effect use this rather than the try-lock form,
+    /// which reports contention (`None`) instead of a count.
+    pub fn actor_count(&self) -> usize {
+        self.inner.state.lock().actors.len()
+    }
+
     /// Constant-time scheduler contention signal for the health reply path.
     pub fn try_actor_count(&self) -> Option<usize> {
         self.inner.state.try_lock().map(|state| state.actors.len())
@@ -902,6 +952,45 @@ impl Executor {
                     _ => (JobCancelOutcome::NotFound, None),
                 },
             }
+        };
+        if let Some(queued) = settled {
+            queued.completion.send(Response::error(
+                queued.request_id,
+                "request_cancelled",
+                "request cancelled before execution",
+            ));
+            self.wake_scheduler();
+        }
+        outcome
+    }
+
+    /// Cancel a route job only while its command closure has not started.
+    ///
+    /// Detaching a route must discard work that cannot produce a live reply,
+    /// while a command already executing remains eligible for session replay.
+    /// A dispatched job may already reserve scheduler capacity; its worker sees
+    /// the cancelled token before invoking the closure and releases that
+    /// reservation through the normal completion event.
+    pub(crate) fn cancel_job_before_execution(
+        &self,
+        root_id: &ProjectRootId,
+        token: &JobCancellation,
+    ) -> PreExecutionCancelOutcome {
+        let (outcome, settled) = {
+            let mut state = self.inner.state.lock();
+            if !token.try_cancel_before_running() {
+                return PreExecutionCancelOutcome::AlreadyStarted;
+            }
+            let settled = state
+                .actors
+                .get_mut(root_id)
+                .and_then(|actor| actor.remove_queued_cancellable(token));
+            let outcome = if settled.is_some() {
+                PreExecutionCancelOutcome::QueuedRemoved
+            } else {
+                PreExecutionCancelOutcome::DispatchedCancelled
+            };
+            (outcome, settled)
         };
         if let Some(queued) = settled {
             queued.completion.send(Response::error(
@@ -1145,6 +1234,7 @@ impl Executor {
                     command: job.command.clone(),
                     lane: job.lane,
                     age,
+                    execution_started: job.execution_started.load(Ordering::Acquire),
                 })
             })
             .collect::<Vec<_>>();
@@ -1328,6 +1418,7 @@ impl SchedulerState {
                 command: job.command.clone(),
                 lane: job.lane,
                 started_age_ms: duration_millis_u64(now.saturating_duration_since(job.started_at)),
+                execution_started: job.execution_started.load(Ordering::Acquire),
                 started_before_oldest_writer: oldest_queued_writer_at
                     .is_some_and(|queued_at| job.started_at <= queued_at),
             })
@@ -1342,20 +1433,29 @@ impl SchedulerState {
                     blockers.push(format!("queued_behind_configure({configure_count})"));
                 }
                 if actor.read_inflight > 0 || actor.lsp_inflight {
+                    let zombie_readers = in_flight_readers
+                        .iter()
+                        .filter(|reader| !reader.execution_started)
+                        .map(format_bind_blocker_reader)
+                        .collect::<Vec<_>>();
                     let stuck_readers = in_flight_readers
                         .iter()
                         .filter(|reader| {
-                            reader.started_age_ms >= duration_millis_u64(READER_STUCK_CENSUS_AGE)
+                            reader.execution_started
+                                && reader.started_age_ms
+                                    >= duration_millis_u64(READER_STUCK_CENSUS_AGE)
                         })
                         .map(format_bind_blocker_reader)
                         .collect::<Vec<_>>();
-                    if stuck_readers.is_empty() {
-                        blockers.push("waiting_on_readers".to_string());
-                    } else {
+                    if !zombie_readers.is_empty() {
+                        blockers.push(format!("zombie_reader({})", zombie_readers.join("; ")));
+                    } else if !stuck_readers.is_empty() {
                         blockers.push(format!(
                             "waiting_on_readers_stuck({})",
                             stuck_readers.join("; ")
                         ));
+                    } else {
+                        blockers.push("waiting_on_readers".to_string());
                     }
                 }
             }
@@ -1402,11 +1502,12 @@ fn is_configure_request(request_id: &str) -> bool {
 
 fn format_bind_blocker_reader(reader: &BindBlockerReaderSnapshot) -> String {
     format!(
-        "job={} command={} lane={:?} age_ms={} started_before_oldest_writer={}",
+        "job={} command={} lane={:?} age_ms={} execution_started={} started_before_oldest_writer={}",
         reader.request_id,
         reader.command,
         reader.lane,
         reader.started_age_ms,
+        reader.execution_started,
         reader.started_before_oldest_writer
     )
 }
@@ -1918,6 +2019,7 @@ struct RunJob {
     command: String,
     heavy_permit: Option<HeavyPermit>,
     cancellation: Option<JobCancellation>,
+    execution_started: Arc<AtomicBool>,
 }
 
 struct CompletionEvent {
@@ -2174,6 +2276,7 @@ fn dispatch_runnable_class(
                     job_class: run_job.job_class,
                     lane: run_job.lane,
                     started_at: Instant::now(),
+                    execution_started: Arc::clone(&run_job.execution_started),
                     occupancy_reported: false,
                 },
             );
@@ -2272,9 +2375,6 @@ fn try_admit_actor(
 
     let queued = actor.pop_front_job(job_class, lane)?;
     actor.deficit -= JOB_COST;
-    if let Some(cancellation) = queued.cancellation.as_ref() {
-        cancellation.mark_running();
-    }
     if lane == Lane::Mutating {
         actor.mutating_inflight = Some(RunningMutatingJob {
             request_id: queued.request_id.clone(),
@@ -2316,6 +2416,7 @@ fn try_admit_actor(
         command: queued.command,
         heavy_permit,
         cancellation: queued.cancellation,
+        execution_started: Arc::new(AtomicBool::new(false)),
     })
 }
 
@@ -2362,28 +2463,56 @@ fn run_lane_job(run_job: &mut RunJob) -> Response {
         }),
     );
 
+    let run = |job: ExecutorJob| {
+        let can_start = run_job
+            .cancellation
+            .as_ref()
+            .is_none_or(JobCancellation::mark_running);
+        if !can_start {
+            return Response::error(
+                run_job.request_id.clone(),
+                "request_cancelled",
+                "request cancelled before execution",
+            );
+        }
+        run_job.execution_started.store(true, Ordering::Release);
+        job(&run_job.ctx)
+    };
+
     match run_job.lane {
         Lane::PureRead | Lane::SerialLspStatus => {
-            let _epoch = run_job.epoch.read();
-            job(&run_job.ctx)
-        }
-        Lane::HeavyInit => {
-            let response = job(&run_job.ctx);
-            {
-                let _install = run_job.epoch.write();
+            if let Some(cancellation) = run_job.cancellation.as_ref() {
+                loop {
+                    if let Some(_epoch) = run_job.epoch.try_read_for(Duration::from_millis(25)) {
+                        return run(job);
+                    }
+                    if cancellation.cancel_requested_before_commit() {
+                        return Response::error(
+                            run_job.request_id.clone(),
+                            "request_cancelled",
+                            "request cancelled before execution",
+                        );
+                    }
+                }
             }
-            response
+            let _epoch = run_job.epoch.read();
+            run(job)
         }
+        // Cache and index builders reject stale generations and serialize
+        // publication internally. Taking the actor write gate after the command
+        // constructs its response would delay completion behind maintenance and
+        // park later readers behind an otherwise unnecessary writer.
+        Lane::HeavyInit => run(job),
         Lane::Mutating => {
             let _epoch = run_job.epoch.write();
-            job(&run_job.ctx)
+            run(job)
         }
         Lane::MaintenanceCommit => {
             // Same gate as reads: the job's mutations are protected by the
             // touched subsystems' own locks, and holding only the read gate
             // lets interactive PureReads overlap freely.
             let _epoch = run_job.epoch.read();
-            job(&run_job.ctx)
+            run(job)
         }
     }
 }

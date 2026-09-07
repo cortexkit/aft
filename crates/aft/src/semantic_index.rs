@@ -1430,7 +1430,7 @@ const MANAGED_ORT_MIN_MINOR: u32 = 20;
 /// up the runtime the plugin already downloaded.
 ///
 /// Resolution order:
-///   1. If `ORT_DYLIB_PATH` is already set (an explicit user override, or the
+///   1. If `ORT_DYLIB_PATH` is non-empty (an explicit user override, or the
 ///      plugin already exported it), do nothing — the caller's choice wins and
 ///      the resolver must not run at all.
 ///   2. Enumerate `<storage_dir>/onnxruntime/` version directories, keep only
@@ -1446,7 +1446,7 @@ const MANAGED_ORT_MIN_MINOR: u32 = 20;
 /// dlopen and other threads reading the env. The function is idempotent: once
 /// `ORT_DYLIB_PATH` is set, subsequent calls short-circuit.
 pub fn resolve_managed_onnx_runtime(storage_dir: &Path) {
-    if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+    if onnx_runtime_override_configured_with(|name| std::env::var_os(name)) {
         return;
     }
     let Some(lib_path) = find_managed_onnx_runtime(storage_dir) else {
@@ -1457,6 +1457,12 @@ pub fn resolve_managed_onnx_runtime(storage_dir: &Path) {
         "using plugin-managed ONNX Runtime at {}",
         lib_path.display()
     );
+}
+
+fn onnx_runtime_override_configured_with(
+    lookup: impl FnOnce(&str) -> Option<std::ffi::OsString>,
+) -> bool {
+    lookup("ORT_DYLIB_PATH").is_some_and(|value| !value.is_empty())
 }
 
 /// Find the highest compatible managed ONNX Runtime library under
@@ -4590,6 +4596,7 @@ fn build_embed_text_with_lines(
 
     let kind_label = match &symbol.kind {
         SymbolKind::Function => "function",
+        SymbolKind::Kernel => "kernel",
         SymbolKind::Class => "class",
         SymbolKind::Method => "method",
         SymbolKind::Struct => "struct",
@@ -4793,6 +4800,9 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "cxx"
                 | "hpp"
                 | "hh"
+                | "cu"
+                | "cuh"
+                | "metal"
                 | "zig"
                 | "cs"
                 | "sh"
@@ -4829,7 +4839,8 @@ pub fn is_semantic_indexed_extension(path: &Path) -> bool {
                 | "gsh"
                 | "gradle"
                 | "m"
-                | "mm",
+                | "mm"
+                | "toml",
         )
     )
 }
@@ -5145,6 +5156,7 @@ fn symbol_kind_to_u8(kind: &SymbolKind) -> u8 {
         SymbolKind::Variable => 7,
         SymbolKind::Heading => 8,
         SymbolKind::FileSummary => 9,
+        SymbolKind::Kernel => 10,
     }
 }
 
@@ -5160,6 +5172,7 @@ fn u8_to_symbol_kind(v: u8) -> SymbolKind {
         7 => SymbolKind::Variable,
         8 => SymbolKind::Heading,
         9 => SymbolKind::FileSummary,
+        10 => SymbolKind::Kernel,
         _ => SymbolKind::Heading,
     }
 }
@@ -7033,6 +7046,101 @@ Connection: close
     }
 
     #[test]
+    fn metal_chunk_collection_uses_shader_function_boundaries() {
+        let project_root = Path::new("/project");
+        let file = project_root.join("sample.metal");
+        let source = include_str!("../tests/fixtures/sample.metal");
+        let chunks = collect_file_chunks_from_source(
+            project_root,
+            &file,
+            crate::parser::LangId::Metal,
+            source,
+        )
+        .expect("collect Metal chunks");
+
+        let helper = chunks
+            .iter()
+            .find(|chunk| chunk.name == "brighten")
+            .expect("helper chunk");
+        assert_eq!((helper.start_line, helper.end_line), (3, 5));
+        assert!(!helper.snippet.contains("brighten_buffer"));
+
+        let shader = chunks
+            .iter()
+            .find(|chunk| chunk.name == "brighten_buffer")
+            .expect("shader chunk");
+        assert_eq!(shader.kind, SymbolKind::Function);
+        assert_eq!((shader.start_line, shader.end_line), (7, 9));
+        assert!(shader.snippet.starts_with("kernel void brighten_buffer"));
+        assert!(shader.snippet.contains("brighten(values[id])"));
+    }
+
+    #[test]
+    fn cuda_chunk_collection_uses_function_boundaries() {
+        let project_root = Path::new("/project");
+        let file = project_root.join("sample.cu");
+        let source = include_str!("../tests/fixtures/sample.cu");
+        let chunks = collect_file_chunks_from_source(
+            project_root,
+            &file,
+            crate::parser::LangId::Cuda,
+            source,
+        )
+        .expect("collect CUDA chunks");
+
+        let kernel = chunks
+            .iter()
+            .find(|chunk| chunk.name == "transform")
+            .expect("kernel chunk");
+        assert_eq!(kernel.kind, SymbolKind::Kernel);
+        assert_eq!((kernel.start_line, kernel.end_line), (4, 7));
+        assert!(kernel.snippet.contains("scale(data[index])"));
+        assert!(!kernel.snippet.contains("launch_transform"));
+
+        let host = chunks
+            .iter()
+            .find(|chunk| chunk.name == "launch_transform")
+            .expect("host function chunk");
+        assert_eq!((host.start_line, host.end_line), (9, 11));
+        assert!(host.snippet.contains("transform<<<grid, block>>>(data)"));
+    }
+
+    #[test]
+    fn toml_chunk_collection_uses_table_and_key_boundaries() {
+        let project_root = Path::new("/project");
+        let file = project_root.join("Cargo.toml");
+        let source = "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies.foo]\nversion = \"1\"\n";
+        let chunks = collect_file_chunks_from_source(
+            project_root,
+            &file,
+            crate::parser::LangId::Toml,
+            source,
+        )
+        .expect("collect TOML chunks");
+
+        let package = chunks
+            .iter()
+            .find(|chunk| chunk.name == "package")
+            .expect("package table chunk");
+        assert_eq!((package.start_line, package.end_line), (0, 2));
+        assert!(package.snippet.contains("name = \"demo\""));
+        assert!(!package.snippet.contains("dependencies.foo"));
+
+        let name = chunks
+            .iter()
+            .find(|chunk| chunk.qualified_name.as_deref() == Some("package.name"))
+            .expect("nested package.name key chunk");
+        assert_eq!((name.start_line, name.end_line), (1, 1));
+        assert_eq!(name.snippet, "name = \"demo\"");
+
+        let dependency = chunks
+            .iter()
+            .find(|chunk| chunk.name == "dependencies.foo")
+            .expect("dependency table chunk");
+        assert_eq!((dependency.start_line, dependency.end_line), (4, 5));
+    }
+
+    #[test]
     fn optimized_file_chunk_collection_matches_file_parser_path() {
         let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let file = project_root.join("src/semantic_index.rs");
@@ -8321,6 +8429,17 @@ public class Greeter {
             None,
             "no compatible version with a library file should resolve"
         );
+    }
+
+    #[test]
+    fn empty_onnx_runtime_override_is_unset_with_an_injected_lookup() {
+        assert!(!onnx_runtime_override_configured_with(|key| {
+            assert_eq!(key, "ORT_DYLIB_PATH");
+            Some(std::ffi::OsString::new())
+        }));
+        assert!(onnx_runtime_override_configured_with(|_| Some(
+            std::ffi::OsString::from("/runtime/libonnxruntime.so")
+        )));
     }
 
     #[test]

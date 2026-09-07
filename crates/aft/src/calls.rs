@@ -43,7 +43,9 @@ pub fn call_node_kinds(lang: LangId) -> Vec<&'static str> {
         ],
         LangId::Perl => vec!["function_call_expression", "method_call_expression"],
         LangId::Lua => vec!["function_call"],
-        LangId::C | LangId::Cpp | LangId::Zig => vec!["call_expression"],
+        LangId::C | LangId::Cpp | LangId::Cuda | LangId::Metal | LangId::Zig => {
+            vec!["call_expression"]
+        }
         LangId::CSharp => vec!["invocation_expression"],
         LangId::Bash
         | LangId::Scss
@@ -55,7 +57,8 @@ pub fn call_node_kinds(lang: LangId) -> Vec<&'static str> {
         | LangId::Pascal
         | LangId::R
         | LangId::Groovy
-        | LangId::ObjC => vec![],
+        | LangId::ObjC
+        | LangId::Toml => vec![],
     }
 }
 

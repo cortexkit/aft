@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, unbounded, Receiver, RecvTimeoutError, Sender, TrySendError};
 use lsp_types::notification::{
@@ -14,7 +15,7 @@ use lsp_types::{
 use crate::alert_state::AcceptedDiagnosticSnapshot;
 use crate::config::Config;
 use crate::lsp::child_registry::LspChildRegistry;
-use crate::lsp::client::{LspClient, LspEvent, ServerState};
+use crate::lsp::client::{LspClient, LspEvent, ReaderExitReap, ServerState};
 use crate::lsp::diagnostics::{
     from_lsp_diagnostics, DiagnosticEntry, DiagnosticsStore, StoredDiagnostic,
 };
@@ -28,8 +29,11 @@ use crate::lsp::registry::{resolve_server_binary, servers_for_file, ServerDef, S
 use crate::lsp::roots::ServerKey;
 use crate::lsp::LspError;
 use crate::slog_error;
+use crate::slog_info;
 
 const STDERR_REASON_BYTES: usize = 2 * 1024;
+/// The total grace period for draining every LSP client during process shutdown.
+const LSP_SHUTDOWN_ALL_BUDGET: Duration = Duration::from_secs(5);
 
 fn server_key_for_definition(
     def: &ServerDef,
@@ -358,6 +362,15 @@ impl IntoIterator for DrainedLspEvents {
     fn into_iter(self) -> Self::IntoIter {
         self.events.into_iter()
     }
+}
+
+/// Result of one bounded all-client shutdown. The same counts are emitted in
+/// the `lsp shutdown_all` summary log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LspShutdownAllOutcome {
+    pub graceful: usize,
+    pub forced: usize,
+    pub elapsed: Duration,
 }
 
 pub struct LspManager {
@@ -837,6 +850,12 @@ impl LspManager {
                     });
                     continue;
                 }
+
+                // A spurious ServerExited can drop the client without killing
+                // the child. Reap any still-tracked processes for this pair
+                // before spawning a replacement, otherwise leaked servers
+                // accumulate on a live worktree.
+                self.reap_unreferenced_children_for(&key);
 
                 match self.spawn_server(&def, &key.root, file_path, config) {
                     Ok(client) => {
@@ -1458,6 +1477,22 @@ impl LspManager {
         self.event_tx
             .send(event)
             .expect("LSP event receiver should remain connected");
+    }
+
+    // Used only by the Unix-gated child-spawning test modules.
+    #[cfg(all(test, unix))]
+    pub(crate) fn event_sender_for_test(&self) -> Sender<LspEvent> {
+        self.event_tx.clone()
+    }
+
+    // Used only by the Unix-gated child-spawning test modules.
+    #[cfg(all(test, unix))]
+    pub(crate) fn insert_client_for_test(&mut self, client: LspClient) {
+        let key = ServerKey {
+            kind: client.kind(),
+            root: client.root().to_path_buf(),
+        };
+        self.clients.insert(key, client);
     }
 
     #[doc(hidden)]
@@ -2166,16 +2201,112 @@ impl LspManager {
         }
     }
 
-    /// Shutdown all servers gracefully.
-    pub fn shutdown_all(&mut self) {
-        for (key, mut client) in self.clients.drain() {
-            if let Err(err) = client.shutdown() {
-                slog_error!("error shutting down {:?}: {}", key, err);
-            }
-        }
+    /// Drain every client and clear spawn/document/diagnostic state without
+    /// waiting on child processes. The caller owns graceful shutdown so the
+    /// manager lock is not held across a Shutdown handshake.
+    pub fn take_all_clients(&mut self) -> Vec<(ServerKey, LspClient)> {
+        let clients: Vec<_> = self.clients.drain().collect();
         self.server_binaries.clear();
         self.documents.clear();
         self.diagnostics = DiagnosticsStore::new();
+        clients
+    }
+
+    /// Shut down every server concurrently within one shared grace period.
+    pub fn shutdown_all(&mut self) -> LspShutdownAllOutcome {
+        let clients = self.take_all_clients();
+        Self::shutdown_all_clients(
+            clients,
+            self.child_registry.clone(),
+            LSP_SHUTDOWN_ALL_BUDGET,
+        )
+    }
+
+    fn shutdown_all_clients(
+        clients: Vec<(ServerKey, LspClient)>,
+        child_registry: LspChildRegistry,
+        budget: Duration,
+    ) -> LspShutdownAllOutcome {
+        let started = Instant::now();
+        let mut pending_pids = clients
+            .iter()
+            .map(|(_, client)| client.child_pid())
+            .collect::<HashSet<_>>();
+        let (result_tx, result_rx) = unbounded();
+
+        for (key, mut client) in clients {
+            let pid = client.child_pid();
+            let result_tx = result_tx.clone();
+            std::thread::spawn(move || {
+                let result = client.shutdown();
+                // Do the drop before reporting completion so the registry cannot
+                // briefly report a reaped client as still live after this method
+                // has returned its shutdown summary.
+                drop(client);
+                let _ = result_tx.send((key, pid, result));
+            });
+        }
+        drop(result_tx);
+
+        let deadline = started + budget;
+        let mut outcome = LspShutdownAllOutcome::default();
+        while !pending_pids.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match result_rx.recv_timeout(remaining) {
+                Ok((key, pid, result)) => {
+                    if !pending_pids.remove(&pid) {
+                        continue;
+                    }
+                    match result {
+                        Ok(()) => outcome.graceful += 1,
+                        Err(err) => {
+                            outcome.forced += 1;
+                            slog_error!("error shutting down {:?}: {}", key, err);
+                        }
+                    }
+                }
+                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        if !pending_pids.is_empty() {
+            let pids = pending_pids.into_iter().collect::<Vec<_>>();
+            outcome.forced += pids.len();
+            // The shared registry owns process-group termination, so timed-out
+            // clients are reaped even though their graceful worker is still
+            // blocked in its per-client Shutdown request.
+            child_registry.reap_pids(&pids);
+        }
+
+        outcome.elapsed = started.elapsed();
+        slog_info!(
+            "lsp shutdown_all: graceful={} forced={} elapsed_ms={}",
+            outcome.graceful,
+            outcome.forced,
+            outcome.elapsed.as_millis()
+        );
+        outcome
+    }
+
+    /// Shut down taken clients on a detached thread named `aft-lsp-idle-reap`.
+    /// Idle reapers use this so a hung Shutdown handshake cannot stall the
+    /// daemon loop or hold the manager mutex.
+    pub(crate) fn spawn_idle_lsp_reap(clients: Vec<(ServerKey, LspClient)>) {
+        if clients.is_empty() {
+            return;
+        }
+        let spawn_result = std::thread::Builder::new()
+            .name("aft-lsp-idle-reap".into())
+            .spawn(move || {
+                for (key, mut client) in clients {
+                    if let Err(err) = client.shutdown_for_idle_reap() {
+                        slog_error!("error shutting down {:?}: {}", key, err);
+                    }
+                }
+            });
+        if let Err(err) = spawn_result {
+            slog_error!("failed to spawn idle LSP reap thread: {err}");
+        }
     }
 
     /// Check if any server is active.
@@ -2443,12 +2574,33 @@ impl LspManager {
                 self.handle_server_status(server_kind.clone(), root.clone(), params);
                 None
             }
-            LspEvent::ServerExited { server_kind, root } => {
+            LspEvent::ServerExited {
+                server_kind,
+                root,
+                reason,
+            } => {
                 let key = ServerKey {
                     kind: server_kind.clone(),
                     root: root.clone(),
                 };
-                self.clients.remove(&key);
+                if let Some(mut client) = self.clients.remove(&key) {
+                    match client.reap_after_reader_exit(reason) {
+                        ReaderExitReap::AlreadyExited(status) => {
+                            slog_info!(
+                                "exited {:?} {}: exit status {status} ({reason})",
+                                server_kind,
+                                root.display()
+                            );
+                        }
+                        ReaderExitReap::KilledWhileAlive => {
+                            slog_info!(
+                                "exited {:?} {}: reader ended while child alive: {reason}",
+                                server_kind,
+                                root.display()
+                            );
+                        }
+                    }
+                }
                 self.server_binaries.remove(&key);
                 self.documents.remove(&key);
                 self.diagnostics.clear_for_server(&key);
@@ -2523,6 +2675,23 @@ impl LspManager {
             .is_some_and(|client| client.set_rust_analyzer_quiescent(true));
         if became_quiescent {
             self.diagnostics.promote_provisional_for_server(&key);
+        }
+    }
+
+    fn reap_unreferenced_children_for(&self, key: &ServerKey) {
+        let live_pids = self
+            .clients
+            .values()
+            .map(LspClient::child_pid)
+            .collect::<HashSet<_>>();
+        let orphans = self
+            .child_registry
+            .pids_for_server(&key.root, &key.kind)
+            .into_iter()
+            .filter(|pid| !live_pids.contains(pid))
+            .collect::<Vec<_>>();
+        if !orphans.is_empty() {
+            self.child_registry.reap_pids(&orphans);
         }
     }
 
@@ -2985,6 +3154,13 @@ fn classify_spawn_error(binary: &str, err: &LspError) -> ServerAttemptResult {
 }
 
 fn env_binary_override(kind: &ServerKind) -> Option<PathBuf> {
+    env_binary_override_from(kind, |key| std::env::var_os(key))
+}
+
+fn env_binary_override_from(
+    kind: &ServerKind,
+    lookup: impl FnOnce(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
     let id = kind.id_str();
     let suffix: String = id
         .chars()
@@ -2997,7 +3173,30 @@ fn env_binary_override(kind: &ServerKind) -> Option<PathBuf> {
         })
         .collect();
     let key = format!("AFT_LSP_{suffix}_BINARY");
-    std::env::var_os(key).map(PathBuf::from)
+    lookup(&key)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod env_binary_override_tests {
+    use super::*;
+
+    #[test]
+    fn empty_lsp_binary_override_is_unset_without_mutating_the_process_environment() {
+        let kind = ServerKind::TypeScript;
+        assert_eq!(
+            env_binary_override_from(&kind, |key| {
+                assert_eq!(key, "AFT_LSP_TYPESCRIPT_BINARY");
+                Some(std::ffi::OsString::new())
+            }),
+            None
+        );
+        assert_eq!(
+            env_binary_override_from(&kind, |_| Some(std::ffi::OsString::from("/bin/lsp"))),
+            Some(PathBuf::from("/bin/lsp"))
+        );
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -3407,5 +3606,194 @@ mod inspect_path_tests {
 
         assert!(snapshot.server_keys.is_empty());
         assert!(snapshot.candidates.is_empty());
+    }
+}
+
+// Every test in this module spawns a real child process, so the module is Unix-only.
+#[cfg(all(test, unix))]
+mod server_exit_reap_tests {
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::process::{Child, Command};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use super::LspManager;
+    use crate::config::Config;
+    use crate::lsp::child_registry::LspChildRegistry;
+    use crate::lsp::client::{LspClient, LspEvent, ServerExitReason};
+    use crate::lsp::registry::ServerKind;
+
+    #[cfg(unix)]
+    fn spawn_session_sleep() -> Child {
+        use std::os::unix::process::CommandExt;
+
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec sleep 60"]);
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn().expect("spawn session-leader sleep")
+    }
+
+    #[cfg(unix)]
+    fn wait_until_dead(pid: u32, timeout: Duration) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if !crate::bash_background::process::is_process_alive(pid) {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    fn spawn_malformed_then_sleep_client(
+        event_tx: crossbeam_channel::Sender<LspEvent>,
+        registry: LspChildRegistry,
+        root: std::path::PathBuf,
+    ) -> LspClient {
+        LspClient::spawn(
+            ServerKind::TypeScript,
+            root,
+            Path::new("sh"),
+            &[
+                "-c".to_string(),
+                "printf 'Content-Length: 3\r\n\r\n{{{'; exec sleep 60".to_string(),
+            ],
+            &HashMap::new(),
+            event_tx,
+            registry,
+        )
+        .expect("spawn malformed-then-sleep stand-in")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_exited_handler_kills_live_child_and_untracks() {
+        let registry = LspChildRegistry::new();
+        let mut manager = LspManager::new();
+        manager.set_child_registry(registry.clone());
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let mut client = spawn_malformed_then_sleep_client(
+            manager.event_sender_for_test(),
+            registry.clone(),
+            root.clone(),
+        );
+        let pid = client.child_pid();
+        client.suppress_kill_on_drop_for_test();
+        manager.insert_client_for_test(client);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_exit = false;
+        while Instant::now() < deadline {
+            let drained = manager.drain_events();
+            if drained.events.iter().any(|event| {
+                matches!(
+                    event,
+                    LspEvent::ServerExited {
+                        reason: ServerExitReason::ReadError(_),
+                        ..
+                    }
+                )
+            }) {
+                saw_exit = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(saw_exit, "reader must emit ServerExited with ReadError");
+        assert!(
+            wait_until_dead(pid, Duration::from_secs(5)),
+            "ServerExited handler must kill the still-running child"
+        );
+        assert!(
+            !registry.pids().contains(&pid),
+            "ServerExited handler must untrack the child"
+        );
+        assert_eq!(manager.active_client_count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_census_reports_dropped_client_until_reaper_cleans_child() {
+        let registry = LspChildRegistry::new();
+        let (events, _event_rx) = crossbeam_channel::unbounded();
+        let root = tempfile::tempdir().expect("tempdir");
+        let mut client =
+            spawn_malformed_then_sleep_client(events, registry.clone(), root.path().to_path_buf());
+        client.suppress_kill_on_drop_for_test();
+        drop(client);
+
+        let leaked = registry.health_snapshot();
+        assert_eq!(leaked.children_without_client, 1);
+        assert_eq!(leaked.children_total, 1);
+        assert_eq!(registry.reap_children_without_client(), 1);
+        assert_eq!(registry.health_snapshot().children_without_client, 0);
+        assert_eq!(registry.health_snapshot().children_total, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_server_reaps_unreferenced_children_before_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        let src = root.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
+        let main_rs = src.join("main.rs");
+        std::fs::write(&main_rs, "fn main() {}\n").unwrap();
+        let config = Config::default();
+        let rust_def = crate::lsp::registry::servers_for_file(&main_rs, &config)
+            .into_iter()
+            .find(|def| matches!(def.kind, ServerKind::Rust))
+            .expect("rust server applies to main.rs");
+        let key = super::server_key_for_definition(&rust_def, &main_rs, &config)
+            .expect("rust workspace root");
+
+        let registry = LspChildRegistry::new();
+        let mut first = spawn_session_sleep();
+        let mut second = spawn_session_sleep();
+        let pid1 = first.id();
+        let pid2 = second.id();
+        registry.track_child(pid1, Some(&key.root), Some(&key.root), Some(&key.kind));
+        registry.track_child(pid2, Some(&key.root), Some(&key.root), Some(&key.kind));
+
+        let mut manager = LspManager::new();
+        manager.set_child_registry(registry.clone());
+        manager.override_binary(ServerKind::Rust, Path::new("false").to_path_buf());
+        assert_eq!(
+            registry.pids_for_server(&key.root, &key.kind).len(),
+            2,
+            "both orphans must be registered under the spawn key"
+        );
+        let _ = manager.ensure_server_for_file(&main_rs, &config);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let first_exited = first.try_wait().ok().flatten().is_some();
+            let second_exited = second.try_wait().ok().flatten().is_some();
+            if first_exited && second_exited {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "orphans must exit after rebind reap (first alive={}, second alive={})",
+                crate::bash_background::process::is_process_alive(pid1),
+                crate::bash_background::process::is_process_alive(pid2)
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !registry.pids().contains(&pid1) && !registry.pids().contains(&pid2),
+            "reaped orphans must be untracked before the new spawn is tracked"
+        );
     }
 }

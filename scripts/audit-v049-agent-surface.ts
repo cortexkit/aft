@@ -243,6 +243,22 @@ function classifyOccurrence(path: string, line: string): { class: string; reason
       reason: "OpenCode renders file headers from input.filePath; the hoisted trio must advertise it.",
     };
   }
+  // The OpenCode 2 projection is the other end of that exception: V2 headers
+  // read `path` with no `filePath` fallback, so the projection consumes the
+  // V1 trio's `filePath` argument and re-emits it as `path`. It names the
+  // retired spelling only to remove it.
+  if (path === "packages/opencode-plugin/src/tools/definitions/v2.ts") {
+    return {
+      class: "host-display-contract",
+      reason: "The V2 projection consumes the V1 trio's filePath header and re-emits it as path.",
+    };
+  }
+  if (path.startsWith("packages/opencode-plugin/test/")) {
+    return {
+      class: "compatibility-fixture",
+      reason: "The fixture submits or asserts a retired input spelling at a compatibility boundary.",
+    };
+  }
   if (surface?.prohibited) {
     const agentText =
       /description|prompt|guideline|Example|example|README|documentation|`[^`]*(filePath|toFile)/i.test(

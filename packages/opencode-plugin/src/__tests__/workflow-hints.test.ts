@@ -55,6 +55,19 @@ describe("buildWorkflowHints", () => {
     expect(out).toContain("Never loop `bash_status`");
   });
 
+  test("replaces zoom steering with read when zoom is disabled", () => {
+    const out = buildWorkflowHints({
+      toolSurface: "recommended",
+      hoistBuiltins: true,
+      semanticEnabled: true,
+      bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
+      disabledTools: new Set(["aft_zoom"]),
+    });
+    expect(out).toContain("→ `read` for symbol(s)");
+    expect(out).not.toContain("aft_zoom");
+  });
+
   test("omits long-running bash hint when background bash is off (foreground auto-promotes)", () => {
     const out = buildWorkflowHints({
       toolSurface: "recommended",

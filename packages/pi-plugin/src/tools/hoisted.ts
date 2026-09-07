@@ -94,11 +94,17 @@ function formatReadAttachmentText(attachment: ReadAttachment): string {
 const ISSUE_AND_PR_READ_DESCRIPTION =
   "GitHub issues and pull requests can be read with `issue://NUMBER` and `pr://NUMBER` (or `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`).";
 
+/** Reuse the user-tier gh_read description gate across every GitHub-capable tool. */
+export function whenGhReadEnabled(enabled: boolean, description: string): string {
+  return enabled ? description : "";
+}
+
 const READ_DESCRIPTION =
   "Read file contents with line numbers. Backed by AFT's indexed Rust reader — faster than the built-in `read` on large repos. Images are returned as attachments on vision-capable models; PDFs and non-vision models are not yet supported.";
 
 function readDescription(ghReadEnabled: boolean): string {
-  return ghReadEnabled ? `${READ_DESCRIPTION} ${ISSUE_AND_PR_READ_DESCRIPTION}` : READ_DESCRIPTION;
+  const githubDescription = whenGhReadEnabled(ghReadEnabled, ISSUE_AND_PR_READ_DESCRIPTION);
+  return githubDescription ? `${READ_DESCRIPTION} ${githubDescription}` : READ_DESCRIPTION;
 }
 
 function visionCapabilityForPiModel(extCtx: { model?: { input?: unknown } }): boolean | undefined {

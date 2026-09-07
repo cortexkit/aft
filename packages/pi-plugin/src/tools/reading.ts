@@ -11,6 +11,7 @@ import type {
   Theme,
 } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
+import { toolEnabled } from "../config.js";
 import type { PluginContext } from "../types.js";
 import {
   bridgeFor,
@@ -21,7 +22,7 @@ import {
   textResult,
   withPathAliasPreparation,
 } from "./_shared.js";
-import { assertExternalDirectoryPermission, resolvePathArg } from "./hoisted.js";
+import { assertExternalDirectoryPermission, resolvePathArg, whenGhReadEnabled } from "./hoisted.js";
 import {
   accentPath,
   asRecord,
@@ -41,12 +42,12 @@ import {
 const OutlineParams = Type.Object({
   target: Type.Union([Type.String(), Type.Array(Type.String())], {
     description:
-      "What to outline: a file path, directory path, URL (http:// or https://), or array of file paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file. Directory walks cap at 200 files.",
+      "What to outline: a file path, directory path, URL (http:// or https://), or array of file paths. The mode is auto-detected: URLs by `http://`/`https://` prefix, directories by stat, arrays as multi-file.",
   }),
   files: Type.Optional(
     Type.Boolean({
       description:
-        "Directory-only mode: when true, target must be a directory or array of directories and the result is a flat file tree with path, language, symbol count, and byte size instead of a symbol outline.",
+        "Directory-only mode: when true, target must be a directory or array of directories and the result is a breadth-first file tree with directory rollups plus language, symbol, and line counts.",
     }),
   ),
   includeTests: Type.Optional(
@@ -95,7 +96,12 @@ const ZoomParams = Type.Object({
 });
 
 function isUrl(s: string): boolean {
-  return s.startsWith("http://") || s.startsWith("https://");
+  return (
+    s.startsWith("http://") ||
+    s.startsWith("https://") ||
+    s.startsWith("issue://") ||
+    s.startsWith("pr://")
+  );
 }
 
 async function assertReadPathPermissions(
@@ -344,80 +350,88 @@ export function registerReadingTools(
   ctx: PluginContext,
   surface: ReadingSurface,
 ): void {
+  const zoomEnabled = toolEnabled(ctx.config, "aft_zoom");
+  const ghReadEnabled = ctx.config.gh_read?.enabled === true;
+  const githubOutlineDescription = whenGhReadEnabled(
+    ghReadEnabled,
+    "GitHub issues and pull requests can be outlined with `issue://NUMBER` or `pr://NUMBER` (including `OWNER/REPO` forms).",
+  );
+  const githubZoomDescription = whenGhReadEnabled(
+    ghReadEnabled,
+    "GitHub issue and pull-request discussion ordinals can be zoomed with `path: issue://…` or `path: pr://…` and `symbols`.",
+  );
   if (surface.outline) {
-    pi.registerTool(
-      withPathAliasPreparation({
-        name: "aft_outline",
-        label: "outline",
-        description:
-          "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. Set `files: true` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\nFor understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\nPass a single `target`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it (recursively, up to 200 files)\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory",
-        parameters: OutlineParams,
-        async execute(
-          _toolCallId: string,
-          params: Static<typeof OutlineParams>,
-          _signal,
-          _onUpdate,
-          extCtx,
-        ) {
-          const bridge = bridgeFor(ctx, extCtx.cwd);
-          // Coerce at the boundary: a host may deliver the string|array `target` as
-          // a JSON-stringified array, which would otherwise be treated as one
-          // literal path (coerceTargetParam). And a stringified "true" must enable
-          // files mode (coerceBoolean).
-          const target = coerceTargetParam(params.target);
-          const filesMode = coerceBoolean(params.files);
-          const hasIncludeTests = !isEmptyParam(params.includeTests);
-          const includeTests = coerceBoolean(params.includeTests);
-          const rawArgs: Record<string, unknown> = {
-            target,
-            ...(filesMode ? { files: true } : {}),
-            ...(hasIncludeTests ? { includeTests } : {}),
-          };
+    const outlineTool = withPathAliasPreparation({
+      name: "aft_outline",
+      label: "outline",
+      description: `Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with ${zoomEnabled ? "aft_zoom" : "read"}. With \`files: true\`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\n${zoomEnabled ? "For understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces." : "For understanding a specific feature, prefer aft_search + read on named symbols; use aft_outline on a whole directory only for high-level structure mapping."}\n\nPass a single \`target\`:\n  • file path → outline that file (with signatures)\n  • directory path → outline source files under it\n  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n  • array of paths → outline multiple files in one call; with files:true, every path must be a directory${githubOutlineDescription ? `\n\n${githubOutlineDescription}` : ""}`,
+      parameters: OutlineParams,
+      async execute(
+        _toolCallId: string,
+        params: Static<typeof OutlineParams>,
+        _signal,
+        _onUpdate,
+        extCtx,
+      ) {
+        const bridge = bridgeFor(ctx, extCtx.cwd);
+        // Coerce at the boundary: a host may deliver the string|array `target` as
+        // a JSON-stringified array, which would otherwise be treated as one
+        // literal path (coerceTargetParam). And a stringified "true" must enable
+        // files mode (coerceBoolean).
+        const target = coerceTargetParam(params.target);
+        const filesMode = coerceBoolean(params.files);
+        const hasIncludeTests = !isEmptyParam(params.includeTests);
+        const includeTests = coerceBoolean(params.includeTests);
+        const rawArgs: Record<string, unknown> = {
+          target,
+          ...(filesMode ? { files: true } : {}),
+          ...(hasIncludeTests ? { includeTests } : {}),
+        };
 
-          if (Array.isArray(target)) {
-            if (target.length === 0) {
-              throw new Error("'target' must be a non-empty string or array of strings");
-            }
-            const resolvedTargets = await Promise.all(
-              (target as string[]).map((entry) => resolvePathArg(extCtx.cwd, entry)),
-            );
-            await assertReadPathPermissions(extCtx, ctx, resolvedTargets);
-          } else {
-            if (typeof target !== "string" || target.length === 0) {
-              throw new Error("'target' must be a non-empty string or array of strings");
-            }
-            if (!(!filesMode && isUrl(target))) {
-              const resolvedTarget = await resolvePathArg(extCtx.cwd, target);
-              await assertReadPathPermissions(extCtx, ctx, resolvedTarget);
-            }
+        if (Array.isArray(target)) {
+          if (target.length === 0) {
+            throw new Error("'target' must be a non-empty string or array of strings");
           }
+          const resolvedTargets = await Promise.all(
+            (target as string[]).map((entry) => resolvePathArg(extCtx.cwd, entry)),
+          );
+          await assertReadPathPermissions(extCtx, ctx, resolvedTargets);
+        } else {
+          if (typeof target !== "string" || target.length === 0) {
+            throw new Error("'target' must be a non-empty string or array of strings");
+          }
+          if (!(!filesMode && isUrl(target))) {
+            const resolvedTarget = await resolvePathArg(extCtx.cwd, target);
+            await assertReadPathPermissions(extCtx, ctx, resolvedTarget);
+          }
+        }
 
-          const response = await callToolCall(bridge, "outline", rawArgs, extCtx);
-          if (response.success === false) {
-            throw new Error(response.text || response.message || "outline failed");
-          }
-          let text = typeof response.text === "string" ? response.text : "";
-          const trimmed = text.trim();
-          if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-            try {
-              const parsed = JSON.parse(text);
-              if (typeof parsed.text === "string") {
-                text = parsed.text;
-              }
-            } catch {
-              // keep original text
+        const response = await callToolCall(bridge, "outline", rawArgs, extCtx);
+        if (response.success === false) {
+          throw new Error(response.text || response.message || "outline failed");
+        }
+        let text = typeof response.text === "string" ? response.text : "";
+        const trimmed = text.trim();
+        if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+          try {
+            const parsed = JSON.parse(text);
+            if (typeof parsed.text === "string") {
+              text = parsed.text;
             }
+          } catch {
+            // keep original text
           }
-          return textResult(text, response);
-        },
-        renderCall(args, theme, context) {
-          return renderOutlineCall(args, theme, context);
-        },
-        renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
-          return renderOutlineResult(result, theme, context, options);
-        },
-      }),
-    );
+        }
+        return textResult(text, response);
+      },
+      renderCall(args, theme, context) {
+        return renderOutlineCall(args, theme, context);
+      },
+      renderResult(result, options = { expanded: false, isPartial: false }, theme, context) {
+        return renderOutlineResult(result, theme, context, options);
+      },
+    });
+    pi.registerTool(outlineTool);
   }
 
   if (surface.zoom) {
@@ -426,7 +440,8 @@ export function registerReadingTools(
         name: "aft_zoom",
         label: "zoom",
         description:
-          "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ path, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them.",
+          "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ path, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them." +
+          (githubZoomDescription ? `\n\n${githubZoomDescription}` : ""),
         parameters: ZoomParams,
         async execute(
           _toolCallId: string,
@@ -523,7 +538,14 @@ export function registerReadingTools(
           // URL mode passes through to Rust; Rust fetches, validates, and caches.
           // File mode still resolves locally before dispatch so external-directory
           // permission checks approve the same path the server will read.
-          if (!hasUrl) {
+          const githubPath =
+            (hasPath &&
+              (String(params.path).startsWith("issue://") ||
+                String(params.path).startsWith("pr://"))) ||
+            (hasUrl &&
+              (String(params.url).startsWith("issue://") ||
+                String(params.url).startsWith("pr://")));
+          if (!hasUrl && !githubPath) {
             const file = await resolvePathArg(extCtx.cwd, params.path as string);
             await assertReadPathPermissions(extCtx, ctx, file);
           }

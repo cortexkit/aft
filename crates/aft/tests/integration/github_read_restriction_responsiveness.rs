@@ -11,7 +11,9 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use aft::commands::outline::handle_outline;
 use aft::commands::read::handle_read;
+use aft::commands::zoom::handle_zoom;
 use aft::config::{Config, GhReadConfig};
 use aft::context::{default_language_provider_factory, AppContext};
 use aft::github_read::{
@@ -24,7 +26,7 @@ use aft::protocol::RawRequest;
 use serde_json::json;
 use url::Url;
 
-use super::helpers::AftProcess;
+use super::helpers::{AftProcess, ReleaseOnDrop};
 
 const RESOURCE: &str = "issue://owner/repo/7";
 const AMBIENT_OPERATOR_CREDENTIAL: &str = "ghp_operator_ambient_credential";
@@ -188,8 +190,8 @@ fn first_party_opencode_pi_and_runner_binds_remain_permitted() {
             .expect("read first-party gh call log")
             .lines()
             .count(),
-        3,
-        "each first-party bind must reach the GitHub CLI under its normal trust posture"
+        6,
+        "each first-party bind must fetch the resource and its timeline through the GitHub CLI"
     );
 }
 
@@ -242,6 +244,29 @@ fn isolated_restriction_probe() {
     let rendered = serde_json::to_string(&response).expect("serialize restricted response");
     assert!(rendered.contains("Network-backed GitHub reads are unavailable on restricted binds"));
     assert_no_sensitive_material(&rendered);
+
+    for (command, params) in [
+        ("outline", json!({ "target": "issue://7" })),
+        ("zoom", json!({ "file": "issue://7", "symbols": ["1"] })),
+    ] {
+        let request = RawRequest {
+            id: format!("{case}-github-{command}"),
+            command: command.to_string(),
+            lsp_hints: None,
+            session_id: Some(format!("{case}-session")),
+            params,
+        };
+        let response = ctx.with_force_restrict(&request.id, || match command {
+            "outline" => handle_outline(&request, &ctx),
+            "zoom" => handle_zoom(&request, &ctx),
+            _ => unreachable!(),
+        });
+        assert!(
+            !response.success,
+            "restricted {command} unexpectedly succeeded"
+        );
+        assert_eq!(response.data["code"], "external_fetch_restricted");
+    }
     fs::write(completion_marker, case).expect("mark isolated restriction probe complete");
 }
 
@@ -613,6 +638,9 @@ fn slow_github_fetch_does_not_block_sibling_status_or_ordinary_read_on_standalon
     let bin_dir = fixture.path().join("bin");
     let slow_started = fixture.path().join("slow-gh-started");
     let slow_release = fixture.path().join("slow-gh-release");
+    // Declare after the fixture TempDir: Rust drops locals in reverse declaration
+    // order, so this guard writes the sentinel before the TempDir removes its directory.
+    let _release_guard = ReleaseOnDrop::new(slow_release.clone());
     fs::create_dir_all(&bin_dir).expect("create slow-gh bin directory");
     // The fetch blocks on a release file rather than a sleep so the pending
     // window is gated, not timed: siblings answering while the release file is
@@ -700,6 +728,6 @@ printf '%s\n' '{"number":7,"title":"slow fixture","state":"OPEN","body":"slow bo
         !slow_release.exists(),
         "release file must not exist before the test creates it"
     );
-    fs::write(&slow_release, "").expect("release the slow gh fixture");
+    drop(_release_guard);
     assert!(aft.shutdown().success());
 }

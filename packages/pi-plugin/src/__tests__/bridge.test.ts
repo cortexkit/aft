@@ -6,36 +6,99 @@
  * keep coverage mirrored to catch regressions in either package.
  */
 
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative } from "node:path";
 import { BinaryBridge, compareSemver } from "@cortexkit/aft-bridge";
 
-const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
+let bridge: BinaryBridge | null = null;
+let projectRoot: string;
+let canaryDataHome: string;
+let canarySnapshot: string;
+
+beforeAll(() => {
+  canaryDataHome = mkdtempSync(join(tmpdir(), "aft-pi-shared-storage-canary-"));
+  const sharedStorage = join(canaryDataHome, "cortexkit", "aft");
+  mkdirSync(sharedStorage, { recursive: true });
+  writeFileSync(join(sharedStorage, "sentinel"), "must remain unchanged\n");
+  canarySnapshot = snapshotFiles(sharedStorage);
+});
+
+beforeEach(() => {
+  projectRoot = mkdtempSync(join(tmpdir(), "aft-pi-bridge-project-"));
+});
+
+afterEach(async () => {
+  if (bridge) {
+    await bridge.shutdown();
+    bridge = null;
+  }
+  rmSync(projectRoot, { recursive: true, force: true });
+});
+
+afterAll(() => {
+  expect(snapshotFiles(join(canaryDataHome, "cortexkit", "aft"))).toBe(canarySnapshot);
+  rmSync(canaryDataHome, { recursive: true, force: true });
+});
+
+function isolatedBridgeOptions<T extends object>(options: T) {
+  const childEnv = (options as { childEnv?: Record<string, string | undefined> }).childEnv;
+  return {
+    ...options,
+    childEnv: {
+      ...childEnv,
+      AFT_STORAGE_DIR: join(projectRoot, ".aft-storage"),
+      AFT_CACHE_DIR: join(projectRoot, ".aft-cache"),
+      XDG_DATA_HOME: canaryDataHome,
+    },
+  };
+}
+
+function snapshotFiles(root: string): string {
+  const files: Array<[string, string, number]> = [];
+  const walk = (directory: string) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) =>
+      a.name.localeCompare(b.name),
+    )) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        walk(path);
+      } else {
+        files.push([
+          relative(root, path),
+          readFileSync(path).toString("base64"),
+          statSync(path).mtimeMs,
+        ]);
+      }
+    }
+  };
+  walk(root);
+  return JSON.stringify(files);
+}
 
 describe("Pi BinaryBridge", () => {
-  let bridge: BinaryBridge | null = null;
-
-  afterEach(async () => {
-    if (bridge) {
-      await bridge.shutdown();
-      bridge = null;
-    }
-  });
-
   test("parses pushed bash_completed frames without request correlation", async () => {
     const completions: unknown[] = [];
     bridge = new BinaryBridge(
       "/tmp/aft-does-not-need-to-exist",
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: 5_000,
         onBashCompletion: (completion) => {
           completions.push(completion);
         },
-      },
+      }),
       { harness: "pi" },
     );
 
@@ -66,13 +129,13 @@ describe("Pi BinaryBridge", () => {
     const completions: unknown[] = [];
     bridge = new BinaryBridge(
       "/tmp/aft-does-not-need-to-exist",
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: 5_000,
         onBashCompletion: (completion) => {
           completions.push(completion);
         },
-      },
+      }),
       { harness: "pi" },
     );
 
@@ -96,13 +159,13 @@ describe("Pi BinaryBridge", () => {
     const deliveries: unknown[] = [];
     bridge = new BinaryBridge(
       "/tmp/aft-does-not-need-to-exist",
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: 5_000,
         onConfigureWarnings: (context) => {
           deliveries.push(context);
         },
-      },
+      }),
       { harness: "pi" },
     );
 
@@ -142,13 +205,13 @@ describe("Pi BinaryBridge", () => {
     const deliveries: unknown[] = [];
     bridge = new BinaryBridge(
       "/tmp/aft-does-not-need-to-exist",
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: 5_000,
         onConfigureWarnings: (context) => {
           deliveries.push(context);
         },
-      },
+      }),
       { harness: "pi" },
     );
 
@@ -191,13 +254,13 @@ describe("Pi BinaryBridge", () => {
     const clientB = { name: "client-b" };
     bridge = new BinaryBridge(
       "/tmp/aft-does-not-need-to-exist",
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: 5_000,
         onConfigureWarnings: (context) => {
           deliveries.push(context);
         },
-      },
+      }),
       { harness: "pi" },
     );
     (bridge as any).configureWarningClients.set("session-a", clientA);
@@ -234,11 +297,11 @@ describe("Pi BinaryBridge", () => {
     try {
       bridge = new BinaryBridge(
         fakeBin,
-        PROJECT_CWD,
-        {
+        projectRoot,
+        isolatedBridgeOptions({
           timeoutMs: 5_000, // bridge-wide default
           maxRestarts: 0,
-        },
+        }),
         { harness: "pi" },
       );
 
@@ -263,11 +326,11 @@ describe("Pi BinaryBridge", () => {
   test("restart counter decays even after max restarts is reached", async () => {
     bridge = new BinaryBridge(
       "/tmp/aft-does-not-need-to-exist",
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: 5_000,
         maxRestarts: 1,
-      },
+      }),
       { harness: "pi" },
     );
     const originalResetMs = (BinaryBridge as any).RESTART_RESET_MS;
@@ -294,11 +357,11 @@ describe("Pi BinaryBridge", () => {
     try {
       bridge = new BinaryBridge(
         fakeBin,
-        PROJECT_CWD,
-        {
+        projectRoot,
+        isolatedBridgeOptions({
           timeoutMs: 5_000,
           maxRestarts: 0,
-        },
+        }),
         { harness: "pi" },
       );
 
@@ -325,11 +388,11 @@ describe("Pi BinaryBridge", () => {
     try {
       bridge = new BinaryBridge(
         fakeBin,
-        PROJECT_CWD,
-        {
+        projectRoot,
+        isolatedBridgeOptions({
           timeoutMs: 5_000,
           maxRestarts: 0,
-        },
+        }),
         { harness: "pi" },
       );
 

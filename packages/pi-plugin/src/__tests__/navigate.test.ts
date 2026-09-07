@@ -23,6 +23,23 @@ function toolArgs(call: { params: Record<string, unknown> }): Record<string, unk
 }
 
 describe("aft_callgraph adapter", () => {
+  test("describes callgraph guidance without invalid read callgraph syntax", () => {
+    const enabledApi = makeMockApi();
+    const { bridge } = makeMockBridge();
+    registerNavigateTool(enabledApi.api, makePluginContext(bridge));
+    const enabled = enabledApi.tools.get("aft_callgraph")!.description;
+
+    const disabledApi = makeMockApi();
+    registerNavigateTool(
+      disabledApi.api,
+      makePluginContext(bridge, { config: { disabled_tools: ["aft_zoom"] } as never }),
+    );
+    const disabled = disabledApi.tools.get("aft_callgraph")!.description;
+    expect(enabled).toContain("aft_zoom with `callgraph:true`");
+    expect(disabled).toContain("Use aft_callgraph call_tree (depth 1)");
+    expect(disabled).not.toContain("aft_zoom");
+    expect(disabled).not.toContain("read with `callgraph:true`");
+  });
   test("dispatches to the selected op and maps filePath to file", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, total_affected: 0 }));

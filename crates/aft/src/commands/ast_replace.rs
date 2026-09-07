@@ -55,7 +55,7 @@ fn dry_run_diff(original: &str, proposed: &str, path: &Path) -> DryRunResult {
 /// Params:
 ///   - `pattern` (string, required) — ast-grep pattern, e.g. `console.log($MSG)`
 ///   - `rewrite` (string, required) — replacement template, e.g. `logger.info($MSG)`
-///   - `lang` (string, required) — selects the source language that ast-grep should parse; accepted values are typescript, tsx, javascript, python, rust, go, c, cpp, zig, csharp, solidity, vue, pascal, r, groovy, objc
+///   - `lang` (string, required) — selects the source language that ast-grep should parse; accepted values are typescript, tsx, javascript, python, rust, go, c, cpp, cuda, metal, zig, csharp, solidity, vue, pascal, r, groovy, objc
 ///   - `paths` (array of strings, optional) — restrict to these paths
 ///   - `globs` (array of strings, optional) — include/exclude glob patterns
 ///   - `dry_run` (bool, optional, default true) — preview without writing
@@ -165,7 +165,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
                 &req.id,
                 "invalid_request",
                 format!(
-                    "ast_replace: unsupported language '{}'. Supported: typescript, tsx, javascript, python, rust, go, c, cpp, zig, csharp, solidity, vue, pascal, r, groovy, objc",
+                    "ast_replace: unsupported language '{}'. Supported: typescript, tsx, javascript, python, rust, go, c, cpp, cuda, metal, zig, csharp, solidity, vue, pascal, r, groovy, objc",
                     lang_str
                 ),
             );
@@ -429,6 +429,13 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
                             serde_json::Value::String(backup_id),
                         );
                     }
+                    crate::edit::attach_backup_skipped_reason(
+                        &mut entry,
+                        ctx,
+                        req.session(),
+                        &op_id,
+                        Some(validated_path.as_path()),
+                    );
                     file_results.push(entry);
                 }
                 Err(e) => {
@@ -482,6 +489,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
             payload["hint"] = serde_json::Value::String(hint);
         }
     }
+    crate::edit::attach_backup_skipped_reason(&mut payload, ctx, req.session(), &op_id, None);
 
     Response::success(&req.id, payload)
 }

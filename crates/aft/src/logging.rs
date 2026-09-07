@@ -191,6 +191,14 @@ struct IndexLifecycle {
     unclaimed: Mutex<HashMap<(String, IndexPlane), UnclaimedReady>>,
 }
 
+#[derive(Default)]
+struct IndexBuildStartSignals {
+    sequence: u64,
+    last_by_root_plane: HashMap<(String, IndexPlane), u64>,
+    in_flight_by_root_plane: HashMap<(String, IndexPlane), u64>,
+    waiters: HashMap<(String, IndexPlane), Vec<(u64, crossbeam_channel::Sender<()>)>>,
+}
+
 struct ToolCallWaitState {
     waiting_on: WaitingOn,
     waiting_on_build_id: Option<String>,
@@ -211,6 +219,8 @@ impl Default for ToolCallWaitState {
 
 static INDEX_BUILD_COUNTER: AtomicU64 = AtomicU64::new(1);
 static INDEX_LIFECYCLE: LazyLock<IndexLifecycle> = LazyLock::new(IndexLifecycle::default);
+static INDEX_BUILD_START_SIGNALS: LazyLock<Mutex<IndexBuildStartSignals>> =
+    LazyLock::new(|| Mutex::new(IndexBuildStartSignals::default()));
 
 thread_local! {
     static CURRENT_INDEX_BUILD: RefCell<Option<IndexBuildScope>> = const { RefCell::new(None) };
@@ -374,6 +384,21 @@ fn root_plane_key(root: &Path, plane: IndexPlane) -> (String, IndexPlane) {
 fn remember_in_flight(event: &IndexEvent) {
     let key = root_plane_key(&event.root, event.plane);
     if event.kind == IndexEventKind::BuildStarted {
+        if let Ok(mut signals) = INDEX_BUILD_START_SIGNALS.lock() {
+            signals.sequence = signals.sequence.wrapping_add(1);
+            let sequence = signals.sequence;
+            signals.last_by_root_plane.insert(key.clone(), sequence);
+            signals
+                .in_flight_by_root_plane
+                .insert(key.clone(), sequence);
+            if let Some(waiters) = signals.waiters.remove(&key) {
+                for (baseline, sender) in waiters {
+                    if sequence > baseline {
+                        let _ = sender.send(());
+                    }
+                }
+            }
+        }
         if let Ok(mut in_flight) = INDEX_LIFECYCLE.in_flight.lock() {
             in_flight.insert(
                 key,
@@ -388,6 +413,10 @@ fn remember_in_flight(event: &IndexEvent) {
         if let Ok(mut in_flight) = INDEX_LIFECYCLE.in_flight.lock() {
             in_flight.remove(&key);
         }
+        if let Ok(mut signals) = INDEX_BUILD_START_SIGNALS.lock() {
+            signals.in_flight_by_root_plane.remove(&key);
+        }
+        release_index_build_start_waiters(event.plane, &event.root);
     }
     if event.kind == IndexEventKind::BuildReady {
         if let Ok(mut unclaimed) = INDEX_LIFECYCLE.unclaimed.lock() {
@@ -426,6 +455,60 @@ pub(crate) fn log_current_index_event(kind: IndexEventKind, extra: &[(&'static s
         event.extra.push((key, value.clone()));
     }
     log_index_event(event);
+}
+
+/// Most recent build-start sequence observed for one root and index plane.
+pub(crate) fn index_build_start_sequence(plane: IndexPlane, root: &Path) -> u64 {
+    INDEX_BUILD_START_SIGNALS
+        .lock()
+        .ok()
+        .and_then(|signals| {
+            signals
+                .last_by_root_plane
+                .get(&root_plane_key(root, plane))
+                .copied()
+        })
+        .unwrap_or(0)
+}
+
+/// Send a one-shot signal once the current or next build starts for this root and plane.
+pub(crate) fn signal_after_index_build_start(
+    plane: IndexPlane,
+    root: &Path,
+    baseline: u64,
+    sender: crossbeam_channel::Sender<()>,
+) {
+    let Ok(mut signals) = INDEX_BUILD_START_SIGNALS.lock() else {
+        let _ = sender.send(());
+        return;
+    };
+    let key = root_plane_key(root, plane);
+    if signals.in_flight_by_root_plane.contains_key(&key)
+        || signals
+            .last_by_root_plane
+            .get(&key)
+            .is_some_and(|sequence| *sequence > baseline)
+    {
+        let _ = sender.send(());
+    } else {
+        signals
+            .waiters
+            .entry(key)
+            .or_default()
+            .push((baseline, sender));
+    }
+}
+
+/// Release start waiters when a build attempt ends before emitting `build_started`.
+pub(crate) fn release_index_build_start_waiters(plane: IndexPlane, root: &Path) {
+    let waiters = INDEX_BUILD_START_SIGNALS
+        .lock()
+        .ok()
+        .and_then(|mut signals| signals.waiters.remove(&root_plane_key(root, plane)))
+        .unwrap_or_default();
+    for (_, sender) in waiters {
+        let _ = sender.send(());
+    }
 }
 
 /// In-flight `build_id` for a root/plane, if a cold build has started and not yet terminated.
@@ -1722,7 +1805,16 @@ mod tests {
         });
         let _ = result;
         assert_index_event_grammar(&lines);
-        assert_eq!(lines.len(), 1);
+        // The capture slot is process-wide: a parallel lib test that builds an
+        // index can emit into the same window. Only this test's own event
+        // (unique build_id) is the subject here.
+        let own: Vec<&String> = lines
+            .iter()
+            .filter(|line| {
+                index_event_fields(line).get("build_id").map(String::as_str) == Some("b-1-1")
+            })
+            .collect();
+        assert_eq!(own.len(), 1, "{lines:?}");
     }
 
     #[test]

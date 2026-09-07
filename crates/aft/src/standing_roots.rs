@@ -606,7 +606,7 @@ impl StandingRoots {
             })
     }
 
-    fn open_database(&self) -> Result<rusqlite::Connection, StandingRootsError> {
+    fn open_database(&self) -> Result<crate::db::TrackedConnection, StandingRootsError> {
         let path = self
             .inner
             .database_path

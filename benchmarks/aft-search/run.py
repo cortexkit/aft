@@ -39,11 +39,13 @@ class AftClient:
         project_root: Path,
         ready_timeout_secs: float,
         storage_dir: Optional[Path] = None,
+        semantic_search: bool = True,
     ) -> None:
         self.binary = binary
         self.project_root = project_root
         self.ready_timeout_secs = ready_timeout_secs
         self.storage_dir = storage_dir or Path(tempfile.mkdtemp(prefix="aft-search-"))
+        self.semantic_search_enabled = semantic_search
         self.proc = subprocess.Popen(
             [str(binary)],
             stdin=subprocess.PIPE,
@@ -70,11 +72,19 @@ class AftClient:
             {
                 "project_root": str(self.project_root),
                 "harness": "opencode",
-                "search_index": True,
-                "semantic_search": True,
-                "experimental_search_index": True,
-                "experimental_semantic_search": True,
                 "storage_dir": str(self.storage_dir),
+                "config": [
+                    {
+                        "tier": "user",
+                        "source": "<aft-search-benchmark>",
+                        "doc": json.dumps(
+                            {
+                                "search_index": True,
+                                "semantic_search": self.semantic_search_enabled,
+                            }
+                        ),
+                    }
+                ],
             },
             timeout_secs=60.0,
         )
@@ -96,9 +106,10 @@ class AftClient:
             search = response.get("search_index")
             semantic_status = semantic.get("status") if isinstance(semantic, dict) else None
             search_status = search.get("status") if isinstance(search, dict) else None
-            if semantic_status == "failed":
+            if self.semantic_search_enabled and semantic_status == "failed":
                 raise AftProtocolError(f"semantic index failed: {semantic}")
-            if semantic_status == "ready" and (not require_search or search_status == "ready"):
+            semantic_ready = semantic_status == "ready" if self.semantic_search_enabled else semantic_status == "disabled"
+            if semantic_ready and (not require_search or search_status == "ready"):
                 return response
             time.sleep(0.5)
         raise TimeoutError(f"indexes did not become ready: {last_status}")

@@ -11,16 +11,50 @@
 //! poll). Signal handlers must finish quickly. Graceful shutdown still
 //! happens on the natural stdin-closed exit path via `LspManager::shutdown_all`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+use crate::lsp::registry::ServerKind;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LspChildRootHealth {
+    pub root: String,
+    pub kind: String,
+    pub count: usize,
+    pub rss_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LspChildHealth {
+    /// Compatibility fields retain the older `spawned` and `cwd_gone` names.
     pub spawned: usize,
     pub cwd_gone: usize,
+    pub children_total: usize,
+    pub children_by_root: Vec<LspChildRootHealth>,
+    pub children_roots_total: usize,
+    pub children_roots_omitted: usize,
+    pub children_omitted_total: usize,
+    pub children_omitted_rss_bytes: u64,
+    pub children_without_client: usize,
+    pub children_with_deleted_cwd: usize,
+}
+
+/// Identity recorded for a spawned language-server child.
+///
+/// `root` is the reclaim-marker path (often the session project). `server_root`
+/// and `kind` identify the `(ServerKind, workspace root)` pair so a later spawn
+/// can reap children that no live client still references.
+#[derive(Clone, Debug, Default)]
+struct TrackedChild {
+    root: Option<PathBuf>,
+    server_root: Option<PathBuf>,
+    kind: Option<ServerKind>,
+    /// Set once an `LspClient` owns this child. A tracked child with no live
+    /// client is the orphan signature the lifecycle census needs to expose.
+    client_live: bool,
 }
 
 #[derive(Clone, Default)]
@@ -28,7 +62,7 @@ pub struct LspChildRegistry {
     // A child is registered with the project root that owns it. Maintenance
     // checks only these known roots for reclaim markers, avoiding directory
     // scans while still covering servers rooted below a task worktree.
-    inner: Arc<Mutex<HashMap<u32, Option<PathBuf>>>>,
+    inner: Arc<Mutex<HashMap<u32, TrackedChild>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,8 +85,30 @@ impl LspChildRegistry {
     /// The root is retained solely for reclaim-marker checks; it is not used
     /// for process cwd inspection or normal shutdown.
     pub fn track_in_root(&self, pid: u32, root: Option<&Path>) {
+        self.track_child(pid, root, None, None);
+    }
+
+    /// Track a child with the workspace root and server kind used to spawn it.
+    ///
+    /// `root` remains the reclaim-marker path. `server_root` and `kind` are the
+    /// `(ServerKind, workspace root)` pair a later spawn uses to find orphans.
+    pub fn track_child(
+        &self,
+        pid: u32,
+        root: Option<&Path>,
+        server_root: Option<&Path>,
+        kind: Option<&ServerKind>,
+    ) {
         if let Ok(mut children) = self.inner.lock() {
-            children.insert(pid, root.map(Path::to_path_buf));
+            children.insert(
+                pid,
+                TrackedChild {
+                    root: root.map(Path::to_path_buf),
+                    server_root: server_root.map(Path::to_path_buf),
+                    kind: kind.cloned(),
+                    client_live: false,
+                },
+            );
         }
     }
 
@@ -71,13 +127,52 @@ impl LspChildRegistry {
         command: &mut Command,
         root: Option<&Path>,
     ) -> io::Result<Child> {
+        self.spawn_tracked_child(command, root, None, None)
+    }
+
+    /// Spawn and register a child with reclaim-marker root plus server identity.
+    pub fn spawn_tracked_child(
+        &self,
+        command: &mut Command,
+        root: Option<&Path>,
+        server_root: Option<&Path>,
+        kind: Option<&ServerKind>,
+    ) -> io::Result<Child> {
         let mut children = self
             .inner
             .lock()
             .map_err(|_| io::Error::other("LSP child registry mutex poisoned"))?;
         let child = command.spawn()?;
-        children.insert(child.id(), root.map(Path::to_path_buf));
+        children.insert(
+            child.id(),
+            TrackedChild {
+                root: root.map(Path::to_path_buf),
+                server_root: server_root.map(Path::to_path_buf),
+                kind: kind.cloned(),
+                client_live: false,
+            },
+        );
         Ok(child)
+    }
+
+    /// Mark that a returned `LspClient` owns a tracked child.
+    pub(crate) fn mark_client_live(&self, pid: u32) {
+        if let Ok(mut children) = self.inner.lock() {
+            if let Some(child) = children.get_mut(&pid) {
+                child.client_live = true;
+            }
+        }
+    }
+
+    /// Leave a tracked PID visible to the reaper after its client disappears.
+    /// This is primarily a crash/leak backstop: normal client teardown kills and
+    /// untracks its child immediately, while a failed teardown remains observable.
+    pub(crate) fn mark_client_gone(&self, pid: u32) {
+        if let Ok(mut children) = self.inner.lock() {
+            if let Some(child) = children.get_mut(&pid) {
+                child.client_live = false;
+            }
+        }
     }
 
     /// Forget a PID (called when the client is dropped or shut down gracefully).
@@ -95,42 +190,80 @@ impl LspChildRegistry {
             .collect()
     }
 
-    fn tracked_children(&self) -> Vec<(u32, Option<PathBuf>)> {
+    fn tracked_children(&self) -> Vec<(u32, TrackedChild)> {
         self.inner
             .lock()
             .map(|children| {
                 children
                     .iter()
-                    .map(|(pid, root)| (*pid, root.clone()))
+                    .map(|(pid, tracked)| (*pid, tracked.clone()))
                     .collect()
             })
             .unwrap_or_default()
     }
 
-    /// Snapshot the current child count and the children whose working directory
-    /// no longer resolves. CWD lookup uses the kernel process API rather than a
-    /// subprocess so this remains cheap enough for health and maintenance paths.
-    pub fn health_snapshot(&self) -> LspChildHealth {
-        health_for_pids(self.pids())
+    /// PIDs registered for this workspace root and server kind.
+    pub fn pids_for_server(&self, server_root: &Path, kind: &ServerKind) -> Vec<u32> {
+        self.tracked_children()
+            .into_iter()
+            .filter(|(_, tracked)| {
+                tracked.server_root.as_deref() == Some(server_root)
+                    && tracked.kind.as_ref() == Some(kind)
+            })
+            .map(|(pid, _)| pid)
+            .collect()
     }
 
-    /// Non-blocking health snapshot for latency-sensitive probes.
+    /// Kill and untrack the given PIDs. Used to reap children that are still
+    /// registered after their `LspClient` was dropped without a kill.
+    pub fn reap_pids(&self, pids: &[u32]) -> usize {
+        let mut reaped = 0;
+        for pid in pids {
+            if kill_child_process_group(*pid) {
+                self.untrack(*pid);
+                reaped += 1;
+            }
+        }
+        reaped
+    }
+
+    /// Snapshot tracked children without holding the registry lock across CWD
+    /// and RSS probes. The health rollup worker calls this off the reply path.
+    pub fn health_snapshot(&self) -> LspChildHealth {
+        health_for_children(self.tracked_children())
+    }
+
+    /// Non-blocking health snapshot for latency-sensitive probes. The lock only
+    /// protects cloning registry metadata; kernel process probes run afterwards.
     pub fn try_health_snapshot(&self) -> Option<LspChildHealth> {
-        let pids = self
+        let children = self
             .inner
             .try_lock()
             .ok()?
-            .keys()
-            .copied()
+            .iter()
+            .map(|(pid, tracked)| (*pid, tracked.clone()))
             .collect::<Vec<_>>();
-        Some(health_for_pids(pids))
+        Some(health_for_children(children))
+    }
+
+    /// Kill children that are still tracked but no longer have a live client.
+    /// The registry snapshot is copied before signal delivery so a slow process
+    /// group does not block an LSP spawn or health observation.
+    pub fn reap_children_without_client(&self) -> usize {
+        let pids = self
+            .tracked_children()
+            .into_iter()
+            .filter_map(|(pid, tracked)| (!tracked.client_live).then_some(pid))
+            .collect::<Vec<_>>();
+        self.reap_pids(&pids)
     }
 
     /// Kill and untrack every child whose working directory no longer exists.
     /// This is a crash/leak backstop; ordinary root teardown still drops the
     /// owning `LspClient` and performs its normal process-group cleanup.
     pub fn reap_children_with_gone_cwd(&self) -> usize {
-        self.reap_children_using(false, |pid, _| kill_child_process_group(pid))
+        self.reap_children_without_client()
+            + self.reap_children_using(false, |pid, _| kill_child_process_group(pid))
     }
 
     /// Kill and untrack children with a deleted cwd or a reclaimed project root.
@@ -140,7 +273,8 @@ impl LspChildRegistry {
     /// this periodic sweep release the analyzer immediately instead of waiting
     /// for the idle-root TTL or for the directory itself to disappear.
     pub fn reap_children_with_gone_cwd_or_reclaimed_root(&self) -> usize {
-        self.reap_children_using(true, |pid, _| kill_child_process_group(pid))
+        self.reap_children_without_client()
+            + self.reap_children_using(true, |pid, _| kill_child_process_group(pid))
     }
 
     fn reap_children_using<Terminate>(
@@ -152,10 +286,10 @@ impl LspChildRegistry {
         Terminate: FnMut(u32, ReapSignal) -> bool,
     {
         let mut reaped = 0;
-        for (pid, root) in self.tracked_children() {
+        for (pid, tracked) in self.tracked_children() {
             let has_gone_cwd = matches!(child_cwd_state(pid), ChildCwdState::Gone);
-            let has_reclaimed_root =
-                include_reclaimed_roots && root.as_deref().is_some_and(root_has_reclaim_marker);
+            let has_reclaimed_root = include_reclaimed_roots
+                && tracked.root.as_deref().is_some_and(root_has_reclaim_marker);
             if !has_gone_cwd && !has_reclaimed_root {
                 continue;
             }
@@ -232,15 +366,179 @@ fn root_has_reclaim_marker(root: &Path) -> bool {
     reclaim_marker_path(root).is_file()
 }
 
-fn health_for_pids(pids: Vec<u32>) -> LspChildHealth {
-    let cwd_gone = pids
-        .iter()
-        .filter(|pid| matches!(child_cwd_state(**pid), ChildCwdState::Gone))
-        .count();
-    LspChildHealth {
-        spawned: pids.len(),
-        cwd_gone,
+const LSP_CHILD_ROOT_DETAIL_CAP: usize = 8;
+
+fn health_for_children(children: Vec<(u32, TrackedChild)>) -> LspChildHealth {
+    #[derive(Default)]
+    struct RootAggregate {
+        count: usize,
+        rss_bytes: u64,
+        by_kind: BTreeMap<String, (usize, u64)>,
     }
+
+    let mut roots = BTreeMap::<String, RootAggregate>::new();
+    let mut cwd_gone = 0;
+    let mut without_client = 0;
+    for (pid, tracked) in &children {
+        if matches!(child_cwd_state(*pid), ChildCwdState::Gone) {
+            cwd_gone += 1;
+        }
+        if !tracked.client_live {
+            without_client += 1;
+        }
+        let root = tracked
+            .server_root
+            .as_ref()
+            .or(tracked.root.as_ref())
+            .map(|root| root.display().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let kind = tracked
+            .kind
+            .as_ref()
+            .map(|kind| kind.id_str().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let rss_bytes = child_rss_bytes(*pid);
+        let aggregate = roots.entry(root).or_default();
+        aggregate.count += 1;
+        aggregate.rss_bytes = aggregate.rss_bytes.saturating_add(rss_bytes);
+        let kind_aggregate = aggregate.by_kind.entry(kind).or_default();
+        kind_aggregate.0 += 1;
+        kind_aggregate.1 = kind_aggregate.1.saturating_add(rss_bytes);
+    }
+
+    let roots_total = roots.len();
+    let mut roots = roots.into_iter().collect::<Vec<_>>();
+    roots.sort_by(|(left_root, left), (right_root, right)| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left_root.cmp(right_root))
+    });
+    let omitted = if roots.len() > LSP_CHILD_ROOT_DETAIL_CAP {
+        roots.split_off(LSP_CHILD_ROOT_DETAIL_CAP)
+    } else {
+        Vec::new()
+    };
+    let children_omitted_total = omitted.iter().map(|(_, root)| root.count).sum();
+    let children_omitted_rss_bytes = omitted
+        .iter()
+        .map(|(_, root)| root.rss_bytes)
+        .fold(0u64, u64::saturating_add);
+    let mut children_by_root = roots
+        .into_iter()
+        .flat_map(|(root, aggregate)| {
+            aggregate
+                .by_kind
+                .into_iter()
+                .map(move |(kind, (count, rss_bytes))| LspChildRootHealth {
+                    root: root.clone(),
+                    kind,
+                    count,
+                    rss_bytes,
+                })
+        })
+        .collect::<Vec<_>>();
+    children_by_root.sort_by(|left, right| {
+        left.root
+            .cmp(&right.root)
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+
+    LspChildHealth {
+        spawned: children.len(),
+        cwd_gone,
+        children_total: children.len(),
+        children_by_root,
+        children_roots_total: roots_total,
+        children_roots_omitted: omitted.len(),
+        children_omitted_total,
+        children_omitted_rss_bytes,
+        children_without_client: without_client,
+        children_with_deleted_cwd: cwd_gone,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn child_rss_bytes(pid: u32) -> u64 {
+    let Ok(statm) = std::fs::read_to_string(format!("/proc/{pid}/statm")) else {
+        return 0;
+    };
+    let Some(resident_pages) = statm
+        .split_whitespace()
+        .nth(1)
+        .and_then(|pages| pages.parse::<u64>().ok())
+    else {
+        return 0;
+    };
+    // SAFETY: sysconf has no pointer arguments and `_SC_PAGESIZE` is valid.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(page_size)
+        .ok()
+        .and_then(|page_size| resident_pages.checked_mul(page_size))
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "macos")]
+fn child_rss_bytes(pid: u32) -> u64 {
+    const PROC_PIDTASKINFO: libc::c_int = 4;
+
+    #[repr(C)]
+    struct ProcTaskInfo {
+        _virtual_size: u64,
+        resident_size: u64,
+        _total_user: u64,
+        _total_system: u64,
+        _threads_user: u64,
+        _threads_system: u64,
+        _policy: i32,
+        _faults: i32,
+        _pageins: i32,
+        _cow_faults: i32,
+        _messages_sent: i32,
+        _messages_received: i32,
+        _syscalls_mach: i32,
+        _syscalls_unix: i32,
+        _context_switches: i32,
+        _thread_count: i32,
+        _running_thread_count: i32,
+        _priority: i32,
+    }
+
+    #[link(name = "proc")]
+    extern "C" {
+        fn proc_pidinfo(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffer_size: libc::c_int,
+        ) -> libc::c_int;
+    }
+
+    let Ok(pid) = libc::c_int::try_from(pid) else {
+        return 0;
+    };
+    // SAFETY: proc_pidinfo fills this C structure before it is read.
+    let mut info: ProcTaskInfo = unsafe { std::mem::zeroed() };
+    let Ok(buffer_size) = libc::c_int::try_from(std::mem::size_of::<ProcTaskInfo>()) else {
+        return 0;
+    };
+    // SAFETY: `info` is valid writable storage for the exact byte count passed.
+    let bytes = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDTASKINFO,
+            0,
+            (&mut info as *mut ProcTaskInfo).cast(),
+            buffer_size,
+        )
+    };
+    (bytes > 0).then_some(info.resident_size).unwrap_or(0)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn child_rss_bytes(_pid: u32) -> u64 {
+    0
 }
 
 #[derive(Debug)]
@@ -421,6 +719,27 @@ mod tests {
     }
 
     #[test]
+    fn pids_for_server_filters_by_root_and_kind() {
+        let reg = LspChildRegistry::new();
+        let root_a = PathBuf::from("/tmp/a");
+        let root_b = PathBuf::from("/tmp/b");
+        reg.track_child(1, Some(&root_a), Some(&root_a), Some(&ServerKind::Rust));
+        reg.track_child(
+            2,
+            Some(&root_a),
+            Some(&root_a),
+            Some(&ServerKind::TypeScript),
+        );
+        reg.track_child(3, Some(&root_b), Some(&root_b), Some(&ServerKind::Rust));
+        let mut rust_a = reg.pids_for_server(&root_a, &ServerKind::Rust);
+        rust_a.sort();
+        assert_eq!(rust_a, vec![1]);
+        reg.untrack(1);
+        reg.untrack(2);
+        reg.untrack(3);
+    }
+
+    #[test]
     fn untracking_unknown_pid_is_safe() {
         let reg = LspChildRegistry::new();
         reg.untrack(999); // no-op, no panic
@@ -431,13 +750,12 @@ mod tests {
     fn health_snapshot_counts_spawned_child_with_live_cwd() {
         let reg = LspChildRegistry::new();
         reg.track(std::process::id());
-        assert_eq!(
-            reg.health_snapshot(),
-            LspChildHealth {
-                spawned: 1,
-                cwd_gone: 0,
-            }
-        );
+        let health = reg.health_snapshot();
+        assert_eq!(health.spawned, 1);
+        assert_eq!(health.children_total, 1);
+        assert_eq!(health.cwd_gone, 0);
+        assert_eq!(health.children_with_deleted_cwd, 0);
+        assert_eq!(health.children_without_client, 1);
         reg.untrack(std::process::id());
     }
 
@@ -489,15 +807,15 @@ mod tests {
             });
         }
         let mut child = reg.spawn_tracked(&mut command).expect("spawn child");
+        reg.mark_client_live(child.id());
         root.close().expect("delete child cwd");
 
-        assert_eq!(
-            reg.health_snapshot(),
-            LspChildHealth {
-                spawned: 1,
-                cwd_gone: 1,
-            }
-        );
+        let health = reg.health_snapshot();
+        assert_eq!(health.spawned, 1);
+        assert_eq!(health.children_total, 1);
+        assert_eq!(health.cwd_gone, 1);
+        assert_eq!(health.children_with_deleted_cwd, 1);
+        assert_eq!(health.children_without_client, 0);
         assert_eq!(reg.reap_children_with_gone_cwd(), 1);
         child.wait().expect("reap child");
         assert_eq!(reg.health_snapshot(), LspChildHealth::default());
@@ -622,6 +940,7 @@ mod tests {
 
         let registry = LspChildRegistry::new();
         registry.track_in_root(42, Some(&worktree));
+        registry.mark_client_live(42);
         let mut signals = Vec::new();
         let reaped = registry.reap_children_using(true, |pid, signal| {
             signals.push((pid, signal));
@@ -645,6 +964,7 @@ mod tests {
 
         let registry = LspChildRegistry::new();
         registry.track_in_root(42, Some(&worktree));
+        registry.mark_client_live(42);
         let mut signals = Vec::new();
         let reaped = registry.reap_children_using(true, |pid, signal| {
             signals.push((pid, signal));

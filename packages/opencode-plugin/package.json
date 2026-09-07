@@ -12,6 +12,7 @@
   },
   "files": [
     "dist",
+    "src/entry",
     "src/tui",
     "src/tui-compiled",
     "src/shared",
@@ -19,11 +20,12 @@
     "README.md"
   ],
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node --format esm --external @opencode-ai/plugin --external @opencode-ai/sdk && tsc --emitDeclarationOnly && bun run build:tui",
+    "build": "bun build src/index.ts src/entry/server.mjs --outdir dist --target node --format esm --external effect && tsc --emitDeclarationOnly && bun run build:tui",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.scripts.json",
     "pretest": "node -e \"if (process.env.CI !== 'true') { const { spawnSync } = require('node:child_process'); const result = spawnSync('cargo', ['build'], { cwd: '../..', stdio: 'inherit', shell: process.platform === 'win32' }); process.exit(result.status ?? 1); } else { console.log('Skipping cargo build in CI; workflow builds agent-file-tools before tests.'); }\"",
     "test": "bun test",
     "test:e2e": "bun test src/__tests__/e2e/",
+    "test:load-matrix": "bun test ./test/load-matrix/load-matrix.ts",
     "lint": "biome check src",
     "schema": "bun scripts/build-schema.ts",
     "build:tool-schemas": "bun run scripts/build-tool-schemas.ts",
@@ -38,6 +40,7 @@
     "@opentui/core": "0.4.3",
     "@opentui/solid": "0.4.3",
     "comment-json": "^4.6.2",
+    "effect": "4.0.0-rc.112",
     "solid-js": "1.9.12",
     "undici": "^7.25.0",
     "zod": "^4.4.3"
@@ -61,9 +64,13 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./server": {
+      "types": "./src/entry/server.d.ts",
+      "import": "./dist/entry/server.js"
+    },
     "./tui": {
-      "types": "./src/tui/index.tsx",
-      "import": "./src/tui/entry.mjs"
+      "types": "./src/entry/tui.d.ts",
+      "import": "./src/entry/tui.mjs"
     }
   },
   "oc-plugin": [
@@ -71,6 +78,6 @@
     "tui"
   ],
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.17.0"
+    "@opencode-ai/plugin": ">=0.0.0-beta-0"
   }
 }

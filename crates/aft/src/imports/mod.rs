@@ -575,7 +575,7 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         LangId::Solidity => Some(&SOLIDITY_SYNTAX),
         LangId::Vue => Some(&VUE_SYNTAX),
         LangId::C => Some(&c::C_SYNTAX),
-        LangId::Cpp => Some(&c::C_SYNTAX),
+        LangId::Cpp | LangId::Cuda | LangId::Metal => Some(&c::C_SYNTAX),
         LangId::Java => Some(&java::JAVA_SYNTAX),
         LangId::Kotlin => Some(&kotlin::KOTLIN_SYNTAX),
         LangId::Lua => Some(&lua::LUA_SYNTAX),
@@ -595,7 +595,8 @@ pub fn syntax_for(lang: LangId) -> Option<&'static dyn ImportSyntax> {
         | LangId::Pascal
         | LangId::R
         | LangId::Groovy
-        | LangId::ObjC => None,
+        | LangId::ObjC
+        | LangId::Toml => None,
     }
 }
 

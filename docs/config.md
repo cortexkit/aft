@@ -10,6 +10,8 @@ Both files are JSONC (comments allowed). One location serves every harness:
 
 For the removal order and harness-specific registration steps, see [Uninstall](../README.md#uninstall).
 
+`bash.watch_sync_max_ms` bounds synchronous `bash_watch` calls, which should only cover a short remaining wait on a task; it defaults to 120 seconds because longer synchronous waits keep the agent turn occupied. For longer commands, use `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. Values are clamped to 1000..=1800000 with a warning; set it to `1800000` in user or project config to restore the old 30-minute cap.
+
 Older installs used per-harness paths (`~/.config/opencode/aft.jsonc`, `~/.pi/agent/aft.jsonc`,
 and their project-level equivalents). On first load, the plugin migrates them to the CortexKit
 location automatically and leaves a `.MOVED_READPLEASE` marker behind.
@@ -55,6 +57,8 @@ Set `AFT_STORAGE_DIR` to place AFT's SQLite databases, WALs, writer leases, and 
 Storage resolution is identical for plugins, standalone binaries, and warmup:
 `AFT_STORAGE_DIR` (explicit override) > `XDG_DATA_HOME/cortexkit/aft` when set > the platform data directory (`~/.local/share/cortexkit/aft` on POSIX, or `%LOCALAPPDATA%/cortexkit/aft` on Windows with its documented fallbacks). The statfs-based root key refuses to combine storage roots from different filesystems, preventing a local override from silently sharing indexes with the old NFS root.
 
+AFT caches the login-shell PATH probe in `<storage_dir>/effective-path.json`. The cache records the shell startup files and is invalidated when one is created, removed, or changes size or modification time. A cached timeout stores a null PATH, so a blocked shell profile delays only the first launch after its startup files change; AFT refreshes the cache in a detached helper for a later launch.
+
 ## Uninstall paths
 
 Delete the user and project config files listed above, then delete the data roots below. A non-empty environment override takes precedence over the corresponding default.
@@ -64,6 +68,30 @@ Delete the user and project config files listed above, then delete the data root
 **Downloaded-binary and LSP cache** (`AFT_CACHE_DIR`): if unset, POSIX uses `${XDG_CACHE_HOME}/aft/` when `XDG_CACHE_HOME` is set, otherwise `~/.cache/aft/`. Windows uses `%LOCALAPPDATA%/aft/`, then `%APPDATA%/aft/`, then `%USERPROFILE%/AppData/Local/aft/`. The `bin/`, `lsp-packages/`, and `lsp-binaries/` subdirectories are under this root.
 
 The backup store treats its on-disk tree as authoritative across processes; deleting the storage root permanently deletes undo history for past edits, but does not delete project files.
+
+## CPU profile
+
+On macOS, profile a running AFT subc daemon with its matching release dSYM in one command:
+
+```sh
+npx @cortexkit/aft doctor --profile 4
+```
+
+`--profile` accepts an optional sampling duration in seconds. The command finds a single
+`aft --subc` or `ck-aft --subc` process (or use native `aft profile --pid <pid>`), verifies the
+running image UUID against a local or downloaded dSYM, and reports a running-versus-waiting
+thread census. Pass `--json` through to the native command for tooling.
+
+```text
+AFT CPU profile (macos-sample)
+pid: 48123
+Thread census (running / total):
+  48124 search-worker: 392 / 400 running (8 waiting) — search_index
+Top inclusive running symbols:
+    392 aft::search_index::build ...
+```
+
+Raw sampler output is withheld unless native `aft profile --raw` is explicitly requested.
 
 ## Config Options
 
@@ -151,6 +179,13 @@ The backup store treats its on-disk tree as authoritative across processes; dele
   // below and the aft_search "Embedding backends" section above.
   // Default: false
   "semantic_search": false,
+
+  // Content-addressed index views. When enabled, semantic and callgraph artifacts
+  // are assembled from reusable per-file blobs behind an atomic manifest.
+  // User and project tiers may both set this. Default: false.
+  "views": {
+    "enabled": false
+  },
 
   // When project_root is exactly $HOME, search_index, semantic_search, and callgraph_store
   // are force-disabled because the home directory is not treated as a project root.
@@ -268,7 +303,13 @@ The backup store treats its on-disk tree as authoritative across processes; dele
     // the background. Default true. Set false to keep the call blocking through
     // steering messages; even then, a message containing `&detach` forces the
     // detach (the token is stripped before the model sees the message).
-    "detach_on_user_message": true
+    "detach_on_user_message": true,
+
+    // Maximum time a synchronous bash_watch call may wait. Defaults to 120000ms;
+    // values outside 1000..=1800000 are clamped with a warning. Sync waits are
+    // intended for a short remaining wait; to restore the old 30-minute cap,
+    // set this to 1800000 in the user or project config.
+    "watch_sync_max_ms": 120000
   },
 
   // aft_inspect codebase-health scanner (recommended/all tiers).
@@ -286,6 +327,32 @@ The backup store treats its on-disk tree as authoritative across processes; dele
       // still counted in the duplicates summary.
       "expected_mirrors": [["plugin/**", "pi-plugin/**"]]
     }
+  },
+
+  // Idle reclamation. User and project tiers. Values outside the documented
+  // ranges are clamped with a warning; non-integers are dropped with a warning.
+  // Reclaimed indexes rebuild and language servers respawn on the next request.
+  "idle": {
+    // Minutes without tool traffic before an unbound root's artifacts are
+    // evicted. Default 30; clamped to 5..=30.
+    "root_ttl_minutes": 30,
+    // Minutes without a request before language servers for a root shut down,
+    // even while the root is still bound. Default 10; clamped to 1..=10.
+    // Independent of root_ttl_minutes.
+    "lsp_ttl_minutes": 10
+  },
+
+  // Automatic undo snapshots. Existing-file mutations larger than 64 MiB and
+  // every mutation under an OS temporary directory proceed without an undo
+  // snapshot and report why undo is unavailable.
+  "backup": {
+    // User-only master switch and per-file history depth.
+    "enabled": true,
+    "max_depth": 20,
+    // Maximum existing-file size captured for undo, in bytes. Default 64 MiB.
+    // User and project tiers may set this value; project config wins. Explicit
+    // larger values are honored. Set 0 to disable automatic snapshots.
+    "max_file_size": 67108864
   },
 
   // Native sandbox for first-party bash and PTY commands. Default: false.
@@ -338,7 +405,7 @@ Set `edit_mode` to `"hashline"` to make `edit` accept exactly `{ "patch": "..." 
 
 See the [Hashline patch grammar](hashline.md) for section headers, addresses, operations, and tag freshness rules.
 
-A hashline mutation starts only after every affected path has a backup record. If backup registration cannot complete, the edit fails before any file is changed.
+A hashline mutation attempts to register every affected path before changing files. An actual backup error still fails the edit before mutation. Policy skips for an oversized file or an OS temporary path allow the edit to proceed, and the response states that undo is unavailable for that change.
 
 Hashline mode needs the host's unprefixed `edit` slot. If final surface selection, hoisting, or `disabled_tools` removes that slot, AFT keeps the default edit/read behavior for the session and emits a `hashline_downgraded` warning with reason `edit_not_registered` on the configure-warnings channel.
 
@@ -348,7 +415,7 @@ AFT maintains `<storage_root>/shims/gh` (or `gh.cmd` on Windows) and prepends th
 
 ## GitHub resource reads
 
-Structured `issue://` and `pr://` reads are disabled by default. Set `gh_read.enabled` to `true` in `aft.jsonc` to allow the GitHub read integration to fetch a resource through the user's own `gh` authentication:
+Structured `issue://` and `pr://` reads, concise `aft_outline` indexes, and ordinal `aft_zoom` drill-downs are disabled by default. Set `gh_read.enabled` to `true` in `aft.jsonc` to allow the GitHub read integration to fetch a resource through the user's own `gh` authentication:
 
 ```jsonc
 {

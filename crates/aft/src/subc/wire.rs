@@ -862,6 +862,11 @@ pub enum SubcError {
     WriterJoin(tokio::task::JoinError),
     Json(serde_json::Error),
     ClosedBeforeHelloAck,
+    /// The daemon connection ended (EOF) after attach without a channel-0
+    /// Goodbye. Not a stop request: the process must exit non-zero so the
+    /// supervisor restarts it, because the supervisor reads exit 0 as "asked
+    /// to stop" and never respawns (fleet-wide outage 2026-09-06, 4.5 h).
+    ConnectionLost,
     HelloRejected {
         body: Option<ErrorBody>,
     },
@@ -907,6 +912,10 @@ impl fmt::Display for SubcError {
             Self::ClosedBeforeHelloAck => {
                 write!(f, "subc daemon closed the connection before HelloAck")
             }
+            Self::ConnectionLost => write!(
+                f,
+                "subc daemon connection ended without a channel-0 Goodbye; exiting for supervisor restart"
+            ),
             Self::HelloRejected { body } => match body {
                 Some(b) => write!(f, "subc rejected ModuleHello: {} ({})", b.code, b.message),
                 None => write!(f, "subc rejected ModuleHello (unparseable error body)"),

@@ -4,13 +4,11 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{
-    json, Arc, AtomicBool, AtomicU64, AtomicUsize, Duration, Executor, HashMap, HealthReport,
-    HealthStatus, Instant, Ordering, PendingBind, ProjectRootId, RootHealthSnapshot, RouteChannel,
-    StdMutex, Value, DISPATCH_PATH_BIND_WARN_AFTER, WRITER_QUEUE_CAPACITY,
+    json, Arc, AtomicBool, AtomicU64, AtomicUsize, BgSubsBySession, Duration, Executor, HashMap,
+    HealthReport, HealthStatus, Instant, Ordering, PendingBind, ProjectRootId, RootHealthSnapshot,
+    RouteChannel, StdMutex, Value, DISPATCH_PATH_BIND_WARN_AFTER, WRITER_QUEUE_CAPACITY,
 };
-use crate::context::App;
-#[cfg(test)]
-use crate::context::AppContext;
+use crate::context::{App, AppContext};
 use crate::executor::BindBlockerSnapshot;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -50,6 +48,11 @@ impl ReapBlockerCensus {
 
 struct ReapMetrics {
     last_sweep_ms: AtomicU64,
+    /// Rendered `<retained>;<blockers>` of the last sweep, so the retained-roots
+    /// log line is emitted on change only. Sweeps run several times a second
+    /// during route churn and an unchanged census wrote ~2,000 identical lines
+    /// per hour before this.
+    last_retained_summary: StdMutex<String>,
     deleted_retained: AtomicUsize,
     absence_unconfirmed: AtomicUsize,
     bound_routes: AtomicUsize,
@@ -68,6 +71,7 @@ impl ReapMetrics {
     fn new() -> Self {
         Self {
             last_sweep_ms: AtomicU64::new(0),
+            last_retained_summary: StdMutex::new(String::new()),
             deleted_retained: AtomicUsize::new(0),
             absence_unconfirmed: AtomicUsize::new(0),
             bound_routes: AtomicUsize::new(0),
@@ -83,8 +87,20 @@ impl ReapMetrics {
         }
     }
 
-    fn record(&self, now_ms: u64, census: ReapBlockerCensus) {
+    /// Stores the census; returns whether its retained-roots summary differs
+    /// from the previous sweep's.
+    fn record(&self, now_ms: u64, census: ReapBlockerCensus) -> bool {
         self.last_sweep_ms.store(now_ms, Ordering::Relaxed);
+        let summary = format!("{};{}", census.deleted_retained, census.blocker_histogram());
+        let changed = {
+            let mut last = self
+                .last_retained_summary
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let changed = *last != summary;
+            *last = summary;
+            changed
+        };
         self.deleted_retained
             .store(census.deleted_retained, Ordering::Relaxed);
         self.absence_unconfirmed
@@ -107,6 +123,7 @@ impl ReapMetrics {
             .store(census.artifact_eviction_blocked, Ordering::Relaxed);
         self.artifact_eviction_failed
             .store(census.artifact_eviction_failed, Ordering::Relaxed);
+        changed
     }
 
     fn snapshot(&self) -> Value {
@@ -131,6 +148,9 @@ impl ReapMetrics {
 }
 
 const BG_OBSERVABILITY_INTERVAL: Duration = Duration::from_secs(60);
+const STUCK_PENDING_WATCH_AGE: Duration = Duration::from_secs(10 * 60);
+const STUCK_PENDING_WATCH_SCAN_INTERVAL: Duration = Duration::from_secs(60);
+const STUCK_PENDING_WATCH_LOG_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const INTERACTIVE_OCCUPANCY_WARN_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -253,6 +273,10 @@ pub(super) struct DispatchPathMetrics {
     pub(super) response_tasks_live: AtomicUsize,
     bg_subscriptions: AtomicUsize,
     bg_wake_pending: AtomicUsize,
+    pub(super) bg_wake_unacked_total: AtomicUsize,
+    bg_wake_rearm_total: AtomicU64,
+    stuck_pending_watch_next_scan_ms: AtomicU64,
+    stuck_pending_watch_logs: StdMutex<HashMap<String, Instant>>,
     bg_events: StdMutex<HashMap<BgEventKey, BgEventRecord>>,
     bg_event_rates: BgEventRates,
     reap: ReapMetrics,
@@ -275,6 +299,10 @@ impl DispatchPathMetrics {
             response_tasks_live: AtomicUsize::new(0),
             bg_subscriptions: AtomicUsize::new(0),
             bg_wake_pending: AtomicUsize::new(0),
+            bg_wake_unacked_total: AtomicUsize::new(0),
+            bg_wake_rearm_total: AtomicU64::new(0),
+            stuck_pending_watch_next_scan_ms: AtomicU64::new(0),
+            stuck_pending_watch_logs: StdMutex::new(HashMap::new()),
             bg_events: StdMutex::new(HashMap::new()),
             bg_event_rates: BgEventRates::new(),
             reap: ReapMetrics::new(),
@@ -290,18 +318,105 @@ impl DispatchPathMetrics {
             .store(self.now_ms(), Ordering::Relaxed);
     }
 
-    pub(super) fn record_reap(&self, census: ReapBlockerCensus) {
+    /// Returns whether the retained-roots summary changed since the last sweep.
+    pub(super) fn record_reap(&self, census: ReapBlockerCensus) -> bool {
         let last_sweep_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(duration_millis_u64)
             .unwrap_or(0);
-        self.reap.record(last_sweep_ms, census);
+        self.reap.record(last_sweep_ms, census)
     }
 
-    pub(super) fn record_bg_runtime(&self, subscriptions: usize, wake_pending: usize) {
+    pub(super) fn record_bg_runtime(
+        &self,
+        subscriptions: usize,
+        wake_pending: usize,
+        unacked_total: usize,
+    ) {
         self.bg_subscriptions
             .store(subscriptions, Ordering::Relaxed);
         self.bg_wake_pending.store(wake_pending, Ordering::Relaxed);
+        self.bg_wake_unacked_total
+            .store(unacked_total, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn bg_runtime_for_test(&self) -> (usize, usize, usize) {
+        (
+            self.bg_subscriptions.load(Ordering::Relaxed),
+            self.bg_wake_pending.load(Ordering::Relaxed),
+            self.bg_wake_unacked_total.load(Ordering::Relaxed),
+        )
+    }
+
+    pub(super) fn record_bg_wake_rearm(&self) {
+        self.bg_wake_rearm_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(super) fn bg_wake_rearm_total(&self) -> u64 {
+        self.bg_wake_rearm_total.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn warn_stuck_pending_watches(
+        &self,
+        executor: &Executor,
+        subscriptions: &BgSubsBySession,
+    ) {
+        let now_ms = self.now_ms();
+        let next_scan_ms = self
+            .stuck_pending_watch_next_scan_ms
+            .load(Ordering::Relaxed);
+        if now_ms < next_scan_ms {
+            return;
+        }
+        let next = now_ms.saturating_add(duration_millis_u64(STUCK_PENDING_WATCH_SCAN_INTERVAL));
+        if self
+            .stuck_pending_watch_next_scan_ms
+            .compare_exchange(next_scan_ms, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let now = Instant::now();
+        let Ok(mut logged) = self.stuck_pending_watch_logs.lock() else {
+            return;
+        };
+        for ((root, session), channels) in subscriptions {
+            if channels.is_empty() {
+                continue;
+            }
+            let Some(ctx) = executor.actor_context(root) else {
+                continue;
+            };
+            for (task_id, watch_id, age_ms) in ctx
+                .bash_background()
+                .stuck_pending_watches_for_session(session, STUCK_PENDING_WATCH_AGE)
+            {
+                let key = format!(
+                    "{}\0{session}\0{task_id}\0{watch_id}",
+                    root.as_path().display()
+                );
+                if logged.get(&key).is_some_and(|last| {
+                    now.saturating_duration_since(*last) < STUCK_PENDING_WATCH_LOG_INTERVAL
+                }) {
+                    continue;
+                }
+                logged.insert(key, now);
+                crate::slog_warn!(
+                    "subc bg wake: pending watch remains unacked root={} session={} task={} watch={} age_ms={}",
+                    root.as_path().display(),
+                    session,
+                    task_id,
+                    watch_id,
+                    age_ms
+                );
+            }
+        }
+        logged.retain(|_, last| {
+            now.saturating_duration_since(*last) < STUCK_PENDING_WATCH_LOG_INTERVAL
+        });
     }
 
     fn record_bg_event_at(
@@ -530,11 +645,17 @@ fn warn_slow_running_interactive_jobs_after(executor: &Executor, minimum_age: Du
         return;
     };
     for job in jobs {
+        let state = if job.execution_started {
+            "executing"
+        } else {
+            "zombie_reader"
+        };
         let line = format!(
-            "executor occupancy census: class=Interactive job={} command={} lane={:?} age_ms={} root={}",
+            "executor occupancy census: class=Interactive job={} command={} lane={:?} state={} age_ms={} root={}",
             job.request_id,
             job.command,
             job.lane,
+            state,
             job.age.as_millis(),
             job.root_id,
         );
@@ -612,11 +733,12 @@ fn pending_bind_breadcrumb(
         .iter()
         .map(|reader| {
             format!(
-                "job={} command={} lane={:?} age_ms={} started_before_oldest_writer={}",
+                "job={} command={} lane={:?} age_ms={} execution_started={} started_before_oldest_writer={}",
                 reader.request_id,
                 reader.command,
                 reader.lane,
                 reader.started_age_ms,
+                reader.execution_started,
                 reader.started_before_oldest_writer
             )
         })
@@ -644,26 +766,34 @@ struct HealthDiagnosticRollup {
     status: HealthStatus,
     detail: Option<String>,
     metrics: Value,
+    memory_census: Value,
 }
 
 impl HealthDiagnosticRollup {
     fn unavailable() -> Self {
+        let mut metrics = json!({
+            "actor_count": 0,
+            "root_count": 0,
+            "root_details_omitted": 0,
+            "callgraph_repair_entries_60s_total": 0,
+            "callgraph_repair_roots_annotated": 0,
+            "callgraph_repair_roots_total": 0,
+            "callgraph_commits_60s_total": 0,
+            "callgraph_pages_or_bytes_written_60s_total": 0,
+            "lsp_children": { "spawned": 0, "cwd_gone": 0 },
+            "memory": memory_rollup_metrics(None),
+            "mutating_lanes": { "scheduler_busy": true },
+            "roots": [],
+        });
+        insert_lifecycle_metrics(
+            &mut metrics,
+            crate::lifecycle_census::LifecycleCensusSnapshot::default(),
+        );
         Self {
             status: HealthStatus::Degraded,
             detail: Some("health diagnostic snapshot is being refreshed".to_string()),
-            metrics: json!({
-                "actor_count": 0,
-                "root_count": 0,
-                "root_details_omitted": 0,
-                "callgraph_repair_entries_60s_total": 0,
-                "callgraph_repair_roots_annotated": 0,
-                "callgraph_repair_roots_total": 0,
-                "callgraph_commits_60s_total": 0,
-                "callgraph_pages_or_bytes_written_60s_total": 0,
-                "memory": memory_rollup_metrics(None),
-                "mutating_lanes": { "scheduler_busy": true },
-                "roots": [],
-            }),
+            metrics,
+            memory_census: json!({ "roots": {}, "process": {} }),
         }
     }
 }
@@ -671,7 +801,13 @@ impl HealthDiagnosticRollup {
 pub(super) struct HealthRollupCache {
     origin: Instant,
     generated_at_ms: AtomicU64,
+    /// Count of completed refreshes. `generated_at_ms` cannot signal "published"
+    /// on its own: a refresh that finishes within the cache's first millisecond
+    /// stores 0, the same value as never-published.
+    refreshes: AtomicU64,
     snapshot: std::sync::RwLock<Arc<HealthDiagnosticRollup>>,
+    breakers:
+        std::sync::Mutex<HashMap<std::path::PathBuf, Arc<crate::build_breaker::BuildDeathBreaker>>>,
 }
 
 impl HealthRollupCache {
@@ -679,14 +815,16 @@ impl HealthRollupCache {
         Self {
             origin: Instant::now(),
             generated_at_ms: AtomicU64::new(0),
+            refreshes: AtomicU64::new(0),
             snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable())),
+            breakers: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
     /// Assemble outside the cache lock, then hold the write lock only long
     /// enough to replace one `Arc`. Probe readers never wait for a refresh.
     pub(super) fn refresh(&self, executor: &Executor, shared_app: &App) {
-        let rollup = Arc::new(build_health_diagnostic_rollup(executor, shared_app));
+        let rollup = Arc::new(build_health_diagnostic_rollup(self, executor, shared_app));
         let generated_at_ms = duration_millis_u64(self.origin.elapsed());
         match self.snapshot.write() {
             Ok(mut snapshot) => *snapshot = rollup,
@@ -694,6 +832,57 @@ impl HealthRollupCache {
         }
         self.generated_at_ms
             .store(generated_at_ms, Ordering::Release);
+        self.refreshes.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn refresh_build_suspensions(
+        &self,
+        ctx: &AppContext,
+        project_root: &std::path::Path,
+        project_key: Option<&str>,
+    ) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let Some(path) = ctx.build_breaker_path_for_health(project_key) else {
+            ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
+            return;
+        };
+        let breaker = {
+            let mut breakers = self
+                .breakers
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(breaker) = breakers.get(&path) {
+                Arc::clone(breaker)
+            } else {
+                match crate::build_breaker::BuildDeathBreaker::open(&path) {
+                    Ok(breaker) => {
+                        let breaker = Arc::new(breaker);
+                        breakers.insert(path, Arc::clone(&breaker));
+                        breaker
+                    }
+                    Err(error) => {
+                        log::debug!("health breaker open failed; retrying next rollup: {error}");
+                        ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
+                        return;
+                    }
+                }
+            }
+        };
+        match breaker.active_suspensions_for_root_at(&project_root.display().to_string(), now_ms) {
+            Ok(suspensions) => ctx.publish_build_suspensions_for_health(suspensions, now_ms),
+            Err(error) => {
+                log::debug!("health breaker read failed; reopening next rollup: {error}");
+                self.breakers
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .retain(|_, cached| !Arc::ptr_eq(cached, &breaker));
+                ctx.publish_build_suspensions_for_health(Vec::new(), now_ms);
+            }
+        }
     }
 
     fn snapshot(&self) -> (Arc<HealthDiagnosticRollup>, u64) {
@@ -708,6 +897,50 @@ impl HealthRollupCache {
         };
         (snapshot, age_ms)
     }
+
+    pub(super) fn memory_census(&self) -> Value {
+        self.snapshot().0.memory_census.clone()
+    }
+}
+
+pub(super) struct HealthRollupWorker {
+    wake_tx: std::sync::mpsc::SyncSender<bool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HealthRollupWorker {
+    pub(super) fn start(
+        cache: Arc<HealthRollupCache>,
+        executor: Arc<Executor>,
+        shared_app: Arc<App>,
+    ) -> Self {
+        let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
+        let join = std::thread::Builder::new()
+            .name("aft-health-rollup".to_string())
+            .spawn(move || loop {
+                cache.refresh(&executor, &shared_app);
+                match wake_rx.recv_timeout(HEALTH_ROLLUP_TTL) {
+                    Ok(true) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Ok(false) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            })
+            .expect("spawn health rollup worker");
+        Self {
+            wake_tx,
+            join: Some(join),
+        }
+    }
+
+    pub(super) fn request_refresh(&self) {
+        let _ = self.wake_tx.try_send(true);
+    }
+
+    pub(super) fn shutdown(mut self) {
+        let _ = self.wake_tx.send(false);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
 }
 
 /// Build the compact memory rollup from pre-aggregated root counters. Rich
@@ -720,6 +953,7 @@ fn memory_rollup_metrics(
             "status": "busy",
             "allocator_slack_bytes": 0,
             "allocator_slack_measured": false,
+            "allocator_observation_age_ms": Value::Null,
         });
     };
     let snapshot = crate::memory::MemoryRollupSnapshot::new("ready", roots);
@@ -748,7 +982,8 @@ fn memory_rollup_metrics(
         // Zero means either measured zero slack or unavailable allocator counters;
         // the sibling boolean disambiguates "no slack" from "unmeasurable".
         "allocator_slack_bytes": snapshot.process.allocator.retained_slack_bytes.unwrap_or(0),
-        "allocator_slack_measured": snapshot.process.allocator.retained_slack_bytes.is_some(),
+        "allocator_slack_measured": snapshot.process.allocator_slack_measured,
+        "allocator_observation_age_ms": snapshot.process.allocator_observation_age_ms,
         // Headline number: excludes reclaimable pages RSS still counts.
         "phys_footprint_bytes": snapshot.process.phys_footprint_bytes,
         "total_attributed_bytes": snapshot.process.total_attributed_bytes,
@@ -775,6 +1010,22 @@ fn mutating_lanes_metrics(executor: &Executor) -> Value {
     }
 }
 
+fn insert_lifecycle_metrics(
+    metrics: &mut Value,
+    snapshot: crate::lifecycle_census::LifecycleCensusSnapshot,
+) {
+    let census = serde_json::to_value(snapshot).expect("lifecycle census serializes");
+    let Some(target) = metrics.as_object_mut() else {
+        return;
+    };
+    let Some(census) = census.as_object() else {
+        return;
+    };
+    for (key, value) in census {
+        target.insert(key.clone(), value.clone());
+    }
+}
+
 fn dispatch_liveness_metrics(executor: &Executor) -> Value {
     match executor.try_dispatch_liveness_snapshot() {
         Some(snapshot) => json!({
@@ -797,7 +1048,11 @@ fn dispatch_liveness_metrics(executor: &Executor) -> Value {
     }
 }
 
-fn build_health_diagnostic_rollup(executor: &Executor, shared_app: &App) -> HealthDiagnosticRollup {
+fn build_health_diagnostic_rollup(
+    cache: &HealthRollupCache,
+    executor: &Executor,
+    shared_app: &App,
+) -> HealthDiagnosticRollup {
     struct RootCandidate {
         root_label: String,
         health: RootHealthSnapshot,
@@ -815,13 +1070,19 @@ fn build_health_diagnostic_rollup(executor: &Executor, shared_app: &App) -> Heal
                 "executor scheduler state could not be snapshotted without contention".to_string(),
             ),
             metrics: HealthDiagnosticRollup::unavailable().metrics,
+            memory_census: json!({ "roots": {}, "process": {} }),
         };
     };
 
+    let lifecycle_contexts = actor_entries
+        .iter()
+        .map(|(_, context)| Arc::clone(context))
+        .collect::<Vec<_>>();
     let standing_entries = standing_health_entries(&actor_entries);
     let mut standing_matched = vec![false; standing_entries.len()];
     let actor_count = actor_entries.len();
     let mut memory_roots = std::collections::BTreeMap::new();
+    let mut census_roots = std::collections::BTreeMap::new();
     let mut candidates = Vec::with_capacity(actor_count.saturating_add(standing_entries.len()));
     let mut repair_roots_annotated = 0usize;
     for (root_id, ctx) in actor_entries {
@@ -840,6 +1101,8 @@ fn build_health_diagnostic_rollup(executor: &Executor, shared_app: &App) -> Heal
             .as_ref()
             .and_then(|entry| entry.artifact_key.clone())
             .unwrap_or_else(|| root_label.clone());
+        let census_memory = ctx.memory_root_snapshot();
+        census_roots.insert(root_label.clone(), census_memory);
         let memory = if standing.is_some() {
             ctx.memory_root_rollup().with_standing()
         } else {
@@ -856,7 +1119,7 @@ fn build_health_diagnostic_rollup(executor: &Executor, shared_app: &App) -> Heal
         // Durable breaker state is loaded during the off-path rollup, then the
         // cached health reply reads only the context snapshot. Standing keys can
         // be scoped or path-based, so they must not depend on the session-key memo.
-        ctx.refresh_build_suspensions_for_health(root_id.as_path(), artifact_key);
+        cache.refresh_build_suspensions(ctx.as_ref(), root_id.as_path(), artifact_key);
         let repair_entries_60s = artifact_key.and_then(|key| {
             repair_roots_annotated = repair_roots_annotated.saturating_add(1);
             crate::callgraph_store::repair_entry_rate(key)
@@ -940,7 +1203,11 @@ fn build_health_diagnostic_rollup(executor: &Executor, shared_app: &App) -> Heal
     let callgraph_repair_entries_60s_total = crate::callgraph_store::repair_entry_rate_total();
     let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
     let memory = memory_rollup_metrics(Some(memory_roots));
-    let lsp_children = shared_app.lsp_child_registry().try_health_snapshot();
+    let census_snapshot = crate::memory::MemorySnapshot::new_uncapped("ready", census_roots);
+    let memory_census =
+        crate::commands::memory_census::render_memory_census(&census_snapshot, None);
+    let lifecycle = crate::lifecycle_census::collect(shared_app, &lifecycle_contexts);
+    shared_app.publish_lifecycle_census(lifecycle.clone());
     let detail = if busy_roots > 0 {
         Some(format!(
             "{busy_roots} root actor(s) could not be snapshotted without contention"
@@ -957,6 +1224,24 @@ fn build_health_diagnostic_rollup(executor: &Executor, shared_app: &App) -> Heal
         None
     };
 
+    let mut metrics = json!({
+        "actor_count": actor_count,
+        "root_count": root_count,
+        "root_details_omitted": root_details_omitted,
+        "callgraph_repair_entries_60s_total": callgraph_repair_entries_60s_total,
+        "callgraph_repair_roots_annotated": repair_roots_annotated,
+        "callgraph_repair_roots_total": actor_count,
+        "callgraph_commits_60s_total": callgraph_write_metrics_total.commits_60s,
+        "callgraph_pages_or_bytes_written_60s_total": callgraph_write_metrics_total.pages_or_bytes_written_60s,
+        "lsp_children": {
+            "spawned": lifecycle.lsp.children_total,
+            "cwd_gone": lifecycle.lsp.children_with_deleted_cwd,
+        },
+        "memory": memory,
+        "mutating_lanes": mutating_lanes_metrics(executor),
+        "roots": roots,
+    });
+    insert_lifecycle_metrics(&mut metrics, lifecycle);
     HealthDiagnosticRollup {
         status: if busy_roots > 0 || standing_refusals > 0 {
             HealthStatus::Degraded
@@ -964,23 +1249,8 @@ fn build_health_diagnostic_rollup(executor: &Executor, shared_app: &App) -> Heal
             HealthStatus::Ok
         },
         detail,
-        metrics: json!({
-            "actor_count": actor_count,
-            "root_count": root_count,
-            "root_details_omitted": root_details_omitted,
-            "callgraph_repair_entries_60s_total": callgraph_repair_entries_60s_total,
-            "callgraph_repair_roots_annotated": repair_roots_annotated,
-            "callgraph_repair_roots_total": actor_count,
-            "callgraph_commits_60s_total": callgraph_write_metrics_total.commits_60s,
-            "callgraph_pages_or_bytes_written_60s_total": callgraph_write_metrics_total.pages_or_bytes_written_60s,
-            "lsp_children": {
-                "spawned": lsp_children.map(|health| health.spawned),
-                "cwd_gone": lsp_children.map(|health| health.cwd_gone),
-            },
-            "memory": memory,
-            "mutating_lanes": mutating_lanes_metrics(executor),
-            "roots": roots,
-        }),
+        metrics,
+        memory_census,
     }
 }
 
@@ -1012,11 +1282,23 @@ pub(super) fn build_health_report(
             "open_routes": shared_app.open_route_count(),
             "bg_subscriptions": dispatch_path_metrics.bg_subscriptions.load(Ordering::Relaxed),
             "bg_wake_pending": dispatch_path_metrics.bg_wake_pending.load(Ordering::Relaxed),
+            "bg_wake_unacked_total": dispatch_path_metrics.bg_wake_unacked_total.load(Ordering::Relaxed),
+            "bg_wake_rearm_total": dispatch_path_metrics.bg_wake_rearm_total.load(Ordering::Relaxed),
             "bg_nudges_enqueued_60s_total": dispatch_path_metrics.bg_nudges_enqueued_60s_total(),
             "bg_arm_misses_60s_total": dispatch_path_metrics.bg_arm_misses_60s_total(),
             "spawned_lsp_children": lsp_children.get("spawned").cloned().unwrap_or(Value::Null),
             "lsp_children_with_deleted_cwd": lsp_children.get("cwd_gone").cloned().unwrap_or(Value::Null),
         }),
+    );
+    let (backup_skipped_too_large_total, backup_skipped_temp_path_total) =
+        crate::backup::backup_skipped_totals();
+    metrics.insert(
+        "backup_skipped_too_large_total".to_string(),
+        json!(backup_skipped_too_large_total),
+    );
+    metrics.insert(
+        "backup_skipped_temp_path_total".to_string(),
+        json!(backup_skipped_temp_path_total),
     );
     metrics.insert("reap".to_string(), dispatch_path_metrics.reap_snapshot());
     metrics.insert(
@@ -1113,6 +1395,81 @@ mod tests {
         }
         samples.sort_unstable();
         samples[samples.len() / 2]
+    }
+
+    #[test]
+    fn health_worker_publishes_a_fresh_snapshot_without_loop_refresh() {
+        let cache = Arc::new(HealthRollupCache::new());
+        let executor = Arc::new(Executor::new());
+        let app = crate::context::App::default_shared();
+        let worker = HealthRollupWorker::start(Arc::clone(&cache), executor, Arc::clone(&app));
+        // Generous under a loaded parallel suite: the property is "publishes
+        // without the loop", not how fast a starved thread gets scheduled.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cache.refreshes.load(Ordering::Acquire) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "background health rollup did not publish"
+            );
+            std::thread::yield_now();
+        }
+        let report = build_health_report(
+            &cache,
+            &Executor::new(),
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &app,
+        );
+        let report_metrics = report.metrics.expect("health metrics");
+        assert!(report_metrics["backup_skipped_too_large_total"].is_u64());
+        assert!(report_metrics["backup_skipped_temp_path_total"].is_u64());
+        assert!(
+            report_metrics["snapshot_age_ms"]
+                .as_u64()
+                .is_some_and(|age| age < 1_000),
+            "the background publication must reset snapshot age"
+        );
+        worker.shutdown();
+    }
+
+    #[test]
+    fn rollup_reuses_breaker_connection_and_reopens_after_read_error() {
+        let (storage, root) = test_root("health-breaker-cache");
+        let mut config = crate::config::Config::default();
+        config.storage_dir = Some(storage.path().join("state"));
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        ));
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let key = crate::search_index::artifact_cache_key(root.as_path());
+        let path = ctx
+            .storage_dir()
+            .join("callgraph")
+            .join(&key)
+            .join("build-breaker.sqlite");
+        crate::build_breaker::BuildDeathBreaker::open(path).expect("create fixture breaker");
+        crate::build_breaker::BuildDeathBreaker::reset_open_calls_for_test();
+
+        let cache = HealthRollupCache::new();
+        let app = crate::context::App::default_shared();
+        cache.refresh(&executor, &app);
+        cache.refresh(&executor, &app);
+        assert_eq!(
+            crate::build_breaker::BuildDeathBreaker::open_calls_for_test(),
+            1,
+            "consecutive rollups over the same root reuse one cached breaker"
+        );
+
+        crate::build_breaker::BuildDeathBreaker::fail_next_active_suspensions_for_test();
+        cache.refresh(&executor, &app);
+        cache.refresh(&executor, &app);
+        assert_eq!(
+            crate::build_breaker::BuildDeathBreaker::open_calls_for_test(),
+            2,
+            "a read error evicts the cached breaker and the next rollup reopens it"
+        );
     }
 
     #[test]
@@ -1213,6 +1570,7 @@ mod tests {
         assert!(line.contains("job=long-search"));
         assert!(line.contains("command="));
         assert!(line.contains("lane=PureRead"));
+        assert!(line.contains("state=executing"));
         assert!(line.contains("age_ms="));
         assert!(line.contains(&format!("root={root}")));
     }
@@ -1230,15 +1588,37 @@ mod tests {
         let cold = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app);
         let cold_metrics = cold.metrics.expect("cold health metrics");
         let cold_runtime = &cold_metrics["runtime"];
+        for (section, field) in [
+            ("lsp", "children_total"),
+            ("lsp", "children_by_root"),
+            ("lsp", "children_without_client"),
+            ("lsp", "children_with_deleted_cwd"),
+            ("threads", "total"),
+            ("threads", "classified"),
+            ("threads", "by_class"),
+            ("sqlite", "open_connections"),
+            ("sqlite", "open_by_store"),
+            ("children", "detached_total"),
+            ("fds", "open"),
+            ("fds", "soft_limit"),
+        ] {
+            assert!(
+                cold_metrics[section].get(field).is_some(),
+                "health omitted {section}.{field}: {cold_metrics:#}"
+            );
+        }
         assert_eq!(cold_runtime["bg_subscriptions"].as_u64(), Some(0));
         assert_eq!(cold_runtime["bg_wake_pending"].as_u64(), Some(0));
+        assert_eq!(cold_runtime["bg_wake_unacked_total"].as_u64(), Some(0));
+        assert_eq!(cold_runtime["bg_wake_rearm_total"].as_u64(), Some(0));
         assert_eq!(
             cold_runtime["bg_nudges_enqueued_60s_total"].as_u64(),
             Some(0)
         );
         assert_eq!(cold_runtime["bg_arm_misses_60s_total"].as_u64(), Some(0));
 
-        metrics.record_bg_runtime(2, 1);
+        metrics.record_bg_runtime(2, 1, 3);
+        metrics.record_bg_wake_rearm();
         metrics.record_bg_arm_miss(&root, "missing-session", 2);
         metrics.record_bg_nudge_enqueued(&root, "live-session", channel);
 
@@ -1248,6 +1628,8 @@ mod tests {
         let hot_runtime = &hot_metrics["runtime"];
         assert_eq!(hot_runtime["bg_subscriptions"].as_u64(), Some(2));
         assert_eq!(hot_runtime["bg_wake_pending"].as_u64(), Some(1));
+        assert_eq!(hot_runtime["bg_wake_unacked_total"].as_u64(), Some(3));
+        assert_eq!(hot_runtime["bg_wake_rearm_total"].as_u64(), Some(1));
         assert_eq!(
             hot_runtime["bg_nudges_enqueued_60s_total"].as_u64(),
             Some(1)
@@ -1279,12 +1661,30 @@ mod tests {
             .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, true);
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
 
-        let report = test_health_report(
-            &executor,
-            &HashMap::new(),
-            &DispatchPathMetrics::new(),
-            &crate::context::App::default_shared(),
-        );
+        // Health reads try-locks by design and reports "could not be snapshotted
+        // without contention" when a parallel test holds one; that is the busy
+        // signal, not the verdict under test, so retry until a real snapshot.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let report = loop {
+            let report = test_health_report(
+                &executor,
+                &HashMap::new(),
+                &DispatchPathMetrics::new(),
+                &crate::context::App::default_shared(),
+            );
+            let busy = report
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("without contention"));
+            if !busy {
+                break report;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "health snapshot stayed contended: {report:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
         assert_eq!(
             report.detail.as_deref(),
             Some("1 root(s) warming background indexes (serving normally)")
@@ -1297,6 +1697,44 @@ mod tests {
 
         ctx.inspect_manager()
             .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, false);
+    }
+
+    #[test]
+    fn disabled_callgraph_store_reports_disabled_despite_lingering_build_receiver() {
+        let executor = Executor::new();
+        let (_dir, root) = test_root("health-callgraph-disabled-lingering-rx");
+        let mut config = crate::config::Config::default();
+        config.callgraph_store = false;
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        ));
+        // Reproduce the configure window in which the disabling config is
+        // already published while the previous generation's build receiver
+        // has not been retired yet.
+        let (_tx, rx) = crossbeam_channel::unbounded::<crate::context::CallGraphStoreBuildEvent>();
+        *ctx.callgraph_store_rx().lock() = Some(rx);
+        assert!(executor.register_actor(root.clone(), ctx));
+
+        let report = test_health_report(
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &crate::context::App::default_shared(),
+        );
+        assert_ne!(
+            report.status,
+            HealthStatus::Degraded,
+            "a disabled store is not a degradation: {report:?}"
+        );
+        // build_health_report reads one rollup Arc for both the verdict and
+        // the roots detail, so they describe the same moment: the component
+        // must not claim "building" for a store this config disables.
+        let metrics = report.metrics.expect("health metrics");
+        assert_eq!(
+            metrics["roots"][0]["callgraph_store"]["status"], "disabled",
+            "a disabled store must never report building: {metrics:#}"
+        );
     }
 
     #[test]
@@ -2015,11 +2453,7 @@ fn standing_health_entries(
 
     let database_path =
         crate::bash_background::storage_dir(config.storage_dir.as_deref()).join("aft.db");
-    let database = rusqlite::Connection::open_with_flags(
-        database_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .ok();
+    let database = crate::db::open_readonly(&database_path).ok();
     let mut entries = std::collections::BTreeMap::new();
     for root in &config.index.roots {
         entries
@@ -2031,7 +2465,7 @@ fn standing_health_entries(
 
 fn standing_health_entry(
     root: &crate::config::IndexRootConfig,
-    database: Option<&rusqlite::Connection>,
+    database: Option<&crate::db::TrackedConnection>,
 ) -> StandingHealthEntry {
     let recorded = database
         .and_then(|database| {
@@ -2161,6 +2595,7 @@ fn unhosted_standing_health_snapshot(entry: &StandingHealthEntry) -> RootHealthS
         callgraph_repair_entries_60s: None,
         callgraph_commits_60s: None,
         callgraph_pages_or_bytes_written_60s: None,
+        views: None,
         tier2: None,
         bash: None,
         suspended_domains: Vec::new(),

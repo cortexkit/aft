@@ -61,6 +61,10 @@ const ISSUE_CLOSE_REASONS: &[&str] = &["completed", "not_planned"];
 // surface. `run cancel` remains deliberately absent because it is destructive
 // and rarely needed, so the operator bypass cannot enable it by accident.
 const V10_ADMIN_TUPLES: &[&str] = &["workflow run", "run rerun"];
+// v13 adds operator-only release maintenance while keeping release deletion
+// and release delete-prefixed flags outside the bypass allowlist.
+const V13_ADMIN_TUPLES: &[&str] = &["release edit", "release upload"];
+const DESTRUCTIVE_TUPLES: &[&str] = &["release delete", "release delete-asset"];
 // The v10 manifest version is the first version whose code-side allowlist
 // permits these native comment mutations. The allowlist covers only the exact
 // flag variants below and does not broaden raw API writes.
@@ -77,6 +81,7 @@ const CO_AUTHOR_LINE_REPORT: &str = "--co-author-line";
 const GOVERNANCE_UNAVAILABLE_TEXT: &str = "the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns";
 const UNTRUSTED_MANIFEST_KEY_STEERING: &str = "the manifest may be newer than this aft build's trust set - update aft, or install a manifest signed by a trusted key";
 const PRE_PROVENANCE_RECORD: &str = "unrecorded (pre-provenance record)";
+const GH_SHIM_STATE_DIR_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
 
 /// The only shim-originated refusal identifiers. Keep this enumeration closed:
 /// callers must parse these identifiers rather than human prose.
@@ -295,6 +300,10 @@ fn run(args: &[OsString]) -> i32 {
                 RefusalCode::Unclassified,
                 &unclassified_refusal_text(manifest_version),
             ),
+            GovernanceDisposition::Destructive => refuse(
+                RefusalCode::DestructiveFlag,
+                "destructive GitHub operations are not available through the shim",
+            ),
             GovernanceDisposition::Delegate | GovernanceDisposition::Ready => {
                 match invalid_manifest_problem.as_ref() {
                     Some(problem) => delegate_after_invalid_manifest_notice(args, problem),
@@ -327,19 +336,45 @@ fn run(args: &[OsString]) -> i32 {
         return delegate(args);
     };
 
-    match classify(args, &manifest, current_platform()) {
-        Classification::Mechanical => delegate(args),
+    let classification = classify(args, &manifest, current_platform());
+    dispatch_r3(
+        args,
+        classification,
+        &manifest,
+        &paths,
+        &determination.record,
+        &agent_binding,
+        now,
+        delegate,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_r3<F>(
+    args: &[OsString],
+    classification: Classification,
+    manifest: &Manifest,
+    paths: &StatePaths,
+    rung: &RungRecord,
+    agent_binding: &AgentBinding,
+    now: u64,
+    delegate_to_upstream: F,
+) -> i32
+where
+    F: FnOnce(&[OsString]) -> i32,
+{
+    match classification {
+        Classification::Mechanical => delegate_to_upstream(args),
         Classification::Admin { tuple } => {
             if std::env::var_os("GH_SHIM_BYPASS").as_deref() == Some(OsStr::new("operator")) {
                 let repository = explicit_repo(args).or_else(infer_repository_from_git);
-                if let Err(error) = append_bypass_audit(&paths, &tuple, repository.as_deref(), now)
-                {
+                if let Err(error) = append_bypass_audit(paths, &tuple, repository.as_deref(), now) {
                     return refuse(
                         RefusalCode::BypassAuditUnavailable,
                         &format!("operator bypass audit could not be appended: {error}"),
                     );
                 }
-                delegate(args)
+                delegate_to_upstream(args)
             } else {
                 refuse(
                     RefusalCode::AdminTier,
@@ -354,14 +389,17 @@ fn run(args: &[OsString]) -> i32 {
                     Err(error) => return refuse_governed_canonicalization(&error),
                 };
             let mutation = GithubReadMutation::from_governed_request(&request);
-            let outcome =
-                route_governed(&paths, &determination.record, &agent_binding, request, now);
+            let outcome = route_governed(paths, rung, agent_binding, request, now);
             invalidate_successful_github_read_mutation(mutation.as_ref(), &outcome);
-            governed_outcome_status(&paths, &agent_binding, now, outcome)
+            governed_outcome_status(paths, agent_binding, now, outcome)
         }
         Classification::Unclassified => refuse(
             RefusalCode::Unclassified,
             &unclassified_refusal_text(manifest.manifest_version),
+        ),
+        Classification::Destructive => refuse(
+            RefusalCode::DestructiveFlag,
+            "destructive GitHub operations are not available through the shim",
         ),
     }
 }
@@ -434,19 +472,11 @@ struct StatePaths {
 
 impl StatePaths {
     fn from_process() -> Self {
-        let root = std::env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .or_else(|| std::env::var_os("USERPROFILE"))
-                    .map(|home| PathBuf::from(home).join(".local/state"))
-            })
-            .unwrap_or_else(|| std::env::temp_dir())
-            .join("cortexkit")
-            .join("aft")
-            .join("gh-shim");
-        Self::from_root(root)
+        Self::from_root(gh_shim_state_dir_from(
+            crate::environment::non_empty_os_var(GH_SHIM_STATE_DIR_ENV).as_deref(),
+            crate::environment::non_empty_os_var("XDG_STATE_HOME").as_deref(),
+            crate::environment::non_empty_os_var("HOME").as_deref(),
+        ))
     }
 
     fn from_root(root: PathBuf) -> Self {
@@ -463,6 +493,46 @@ impl StatePaths {
             root,
         }
     }
+}
+
+/// Resolve the one process-state directory used by every gh-shim reader and
+/// writer. The dedicated absolute override is for embedding callers and tests;
+/// otherwise the ladder is XDG state-home, then `$HOME/.local/state`.
+///
+/// This is a deliberate divergence from the daemon's storage ladder, and it
+/// must stay one: the shim is not the supervised module. It runs inside the
+/// agent's child process with the operator's environment, and every placed
+/// artifact of the governance protocol - the signed routing manifest, the
+/// version high-water that refuses rollbacks, the rung cache, the bypass
+/// audit - lives at this path on every governed seat, written there by the
+/// activation ceremony. Moving the rung silently would start every seat with
+/// an empty state directory: no manifest reads as "unmanifested", which is
+/// transparent passthrough under the operator's own credentials, so bot
+/// speech would post as the operator fleet-wide with nothing refusing.
+fn gh_shim_state_dir_from(
+    dedicated_override: Option<&OsStr>,
+    xdg_state_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> PathBuf {
+    if let Some(path) = dedicated_override
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        return path;
+    }
+    xdg_state_home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .or_else(|| {
+            home.filter(|value| !value.is_empty())
+                .map(|home| PathBuf::from(home).join(".local/state"))
+        })
+        .unwrap_or_else(std::env::temp_dir)
+        .join("cortexkit")
+        .join("aft")
+        .join("gh-shim")
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -662,6 +732,7 @@ enum GovernanceDisposition {
     Ready,
     Unavailable(AgentBinding),
     Unclassified { manifest_version: u64 },
+    Destructive,
 }
 
 fn structural_governance_disposition(
@@ -685,6 +756,7 @@ fn structural_governance_disposition(
             GovernanceDisposition::Unavailable(agent_binding)
         }
         Classification::Unclassified => GovernanceDisposition::Unclassified { manifest_version },
+        Classification::Destructive => GovernanceDisposition::Destructive,
         Classification::Mechanical => GovernanceDisposition::Delegate,
     }
 }
@@ -703,6 +775,9 @@ fn non_r3_governance_disposition(
     let classification = classify(args, manifest, platform);
     if matches!(classification, Classification::Mechanical) {
         return GovernanceDisposition::Delegate;
+    }
+    if matches!(classification, Classification::Destructive) {
+        return GovernanceDisposition::Destructive;
     }
 
     // Binding resolution runs `git` to inspect the origin. Classify first so
@@ -847,7 +922,7 @@ fn determine_rung_from_doc(
     determination
 }
 
-fn configured_connection_file() -> Option<PathBuf> {
+pub fn configured_connection_file() -> Option<PathBuf> {
     let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     configured_connection_file_from(xdg_config_home.as_deref(), home.as_deref())
@@ -857,11 +932,17 @@ fn configured_connection_file_from(
     xdg_config_home: Option<&OsStr>,
     home: Option<&OsStr>,
 ) -> Option<PathBuf> {
-    // The shim uses the same user-tier resolver as subc: `$XDG_CONFIG_HOME/cortexkit/aft.jsonc`,
-    // then `~/.config/cortexkit/aft.jsonc`. XDG selects only the trusted user's
-    // config location; it cannot select a project file or alter the configured
-    // connection. An invalid path resolves to `None`; the caller decides whether
-    // that means structural passthrough or an unavailable governed route.
+    // This reader becomes `subc_transport::connection_file::discover(explicit)`
+    // when the transport API reaches AFT. That call replaces these ordered rungs:
+    // explicit (exclusive); non-empty SUBC_CONNECTION_FILE (exclusive); non-empty
+    // XDG_RUNTIME_DIR/subc-connection.json; non-empty
+    // HOME/.local/share/cortexkit/run/subc-connection.json; user-scoped temp file.
+    // Last re-derived 2026-09-06 against subconscious
+    // d5e09914b0791a66f2a5a00a9bb3422860ade95e: compare `(rung, guard)` pairs with
+    // `subc-transport/src/connection_file.rs::discovery_candidates_with_environment`
+    // and resolve `CONNECTION_FILE_NAME` and `PROD_CONNECTION_RELATIVE_PATH`.
+    // Until the call lands here, only trusted user config can provide the explicit
+    // path; invalid or unreadable paths resolve to `None` for the rung classifier.
     let config_path = crate::subc_config::user_config_path_from(xdg_config_home, home)?;
     let doc = fs::read_to_string(config_path).ok()?;
     connection_file_from_config_doc(&doc).filter(|path| path.is_file())
@@ -1211,8 +1292,8 @@ fn find_ambient_agent_credential(detectors: &Detectors) -> Option<String> {
         }
     }
 
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    let home = crate::environment::non_empty_os_var("HOME")
+        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
         .map(PathBuf::from);
     for raw_pattern in &detectors.wrapper_config_dirs {
         let pattern = expand_home_pattern(raw_pattern, home.as_deref());
@@ -1233,7 +1314,7 @@ fn find_ambient_agent_credential(detectors: &Detectors) -> Option<String> {
     // `GH_CONFIG_DIR` is only inspected as a metadata path. The basename is
     // compared to the manifest's declared wrapper-dir glob, so the operator's
     // normal gh configuration remains outside this detector inventory.
-    let configured = std::env::var_os("GH_CONFIG_DIR").map(PathBuf::from)?;
+    let configured = crate::environment::non_empty_os_var("GH_CONFIG_DIR").map(PathBuf::from)?;
     if !configured.is_dir() {
         return None;
     }
@@ -1403,6 +1484,16 @@ impl Manifest {
             if rule.platform.is_empty() {
                 return Err(format!(
                     "api rule {} {} is missing its platform declaration",
+                    rule.method, rule.path_glob
+                ));
+            }
+            if let Some(platform) = rule
+                .platform
+                .iter()
+                .find(|platform| !matches!(platform.as_str(), "macos" | "linux"))
+            {
+                return Err(format!(
+                    "api rule {} {} names unknown host platform {platform}",
                     rule.method, rule.path_glob
                 ));
             }
@@ -1959,6 +2050,10 @@ fn regressed_disposition(
                 text,
             }
         }
+        Classification::Destructive => RegressedDisposition::Refuse {
+            code: RefusalCode::DestructiveFlag,
+            text: "destructive GitHub operations are not available through the shim".to_string(),
+        },
         Classification::Unclassified => RegressedDisposition::Refuse {
             code: RefusalCode::Unclassified,
             text:
@@ -2146,6 +2241,7 @@ enum Classification {
         tuple: String,
     },
     Unclassified,
+    Destructive,
 }
 
 fn is_reviewed_admin_tuple(manifest_version: u64, tuple: &str) -> bool {
@@ -2153,6 +2249,7 @@ fn is_reviewed_admin_tuple(manifest_version: u64, tuple: &str) -> bool {
         || (manifest_version >= 9 && V9_ADMIN_TUPLES.contains(&tuple))
         || (manifest_version >= 10 && V10_ADMIN_TUPLES.contains(&tuple))
         || (manifest_version >= 11 && V11_ADMIN_TUPLES.contains(&tuple))
+        || (manifest_version >= 13 && V13_ADMIN_TUPLES.contains(&tuple))
 }
 
 fn is_reviewed_governed_tuple(manifest_version: u64, tuple: &str) -> bool {
@@ -2198,6 +2295,15 @@ fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classific
         Some(subcommand) => format!("{verb} {subcommand}"),
         None => verb,
     };
+    if DESTRUCTIVE_TUPLES.contains(&tuple.as_str())
+        || (tuple.starts_with("release ")
+            && args.iter().any(|arg| {
+                arg.to_str()
+                    .is_some_and(|value| value.starts_with("--delete-"))
+            }))
+    {
+        return Classification::Destructive;
+    }
     // `--edit-last` is the native gh operation that edits the authenticated
     // user's own last comment. Keep this exact author-scoped form limited to
     // the explicitly allowed comment tuples. An id-addressed API PATCH remains
@@ -2265,7 +2371,7 @@ fn command_head(args: &[OsString]) -> Option<(String, Option<String>, usize)> {
 }
 
 fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Classification {
-    let Some((method, path)) = api_method_and_path(args) else {
+    let Some((method, path, has_fields)) = api_method_and_path(args) else {
         return Classification::Unclassified;
     };
     let matches = manifest
@@ -2277,7 +2383,7 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
                 && glob::Pattern::new(&rule.path_glob).is_ok_and(|pattern| pattern.matches(&path))
         })
         .collect::<Vec<_>>();
-    if matches.is_empty() && method.eq_ignore_ascii_case("GET") {
+    if matches.is_empty() && method.eq_ignore_ascii_case("GET") && !has_fields {
         // A field-free GET cannot write or assert an identity, so it remains a
         // mechanical read even when the manifest has no endpoint-specific rule.
         return Classification::Mechanical;
@@ -2285,19 +2391,38 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
     if matches.len() != 1 {
         return Classification::Unclassified;
     }
-    // API writes are not normalized into governed or ADMIN equivalents until a
-    // parser accepts and validates their exact argv forms. An id-addressed
-    // comment PATCH can target any contributor's comment, unlike native
-    // `--edit-last`, which is scoped to the caller.
-    match matches[0].tier {
+    let rule = matches[0];
+    if rule.tier == Tier::Admin {
+        return Classification::Admin {
+            tuple: format!(
+                "api:{}:{}",
+                rule.method.to_ascii_uppercase(),
+                rule.path_glob
+            ),
+        };
+    }
+    // Field payloads change request semantics independently of the endpoint.
+    // Only ADMIN may cross this protection wall because it delegates under the
+    // operator's own identity after writing the bypass audit; holder-bound
+    // classifications must never sign a payload the shim has not parsed.
+    if has_fields {
+        return Classification::Unclassified;
+    }
+    match rule.tier {
         Tier::Mechanical => Classification::Mechanical,
-        Tier::Governed | Tier::Admin => Classification::Unclassified,
+        // API writes are not normalized into governed equivalents until a
+        // parser accepts and validates their exact argv forms. An id-addressed
+        // comment PATCH can target any contributor's comment, unlike native
+        // `--edit-last`, which is scoped to the caller.
+        Tier::Governed => Classification::Unclassified,
+        Tier::Admin => unreachable!("admin API rules return before field protection"),
     }
 }
 
-fn api_method_and_path(args: &[OsString]) -> Option<(String, String)> {
+fn api_method_and_path(args: &[OsString]) -> Option<(String, String, bool)> {
     let mut method = "GET".to_string();
     let mut path = None;
+    let mut has_fields = false;
     let mut index = 1;
     while index < args.len() {
         let value = args[index].to_str()?;
@@ -2312,10 +2437,14 @@ fn api_method_and_path(args: &[OsString]) -> Option<(String, String)> {
             continue;
         }
         if is_api_field_argument(value) {
-            // Field-bearing API forms can change request semantics independently
-            // of the endpoint. Until an audited form has a reviewed parser, they
-            // remain unclassified rather than inheriting a read-like API rule.
-            return None;
+            has_fields = true;
+            if matches!(value, "--input" | "--raw-field" | "--field" | "-F" | "-f") {
+                args.get(index + 1)?.to_str()?;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
         }
         if value.starts_with('-') {
             index += 1;
@@ -2327,7 +2456,21 @@ fn api_method_and_path(args: &[OsString]) -> Option<(String, String)> {
         index += 1;
     }
     let path = path?;
-    (path != "-").then_some((method, path))
+    if path == "-" {
+        return None;
+    }
+    // `gh api` accepts the endpoint with or without a leading slash
+    // (`repos/o/r/...` and `/repos/o/r/...` are the same request), and the
+    // slash-less spelling is the common one. Manifest globs are written with
+    // the leading slash, so normalize here; otherwise the everyday form of a
+    // declared admin endpoint reads as undeclared and refuses with the wrong
+    // reason (v13 round trip, 2026-09-07).
+    let path = if path.starts_with('/') || path.starts_with("http") {
+        path
+    } else {
+        format!("/{path}")
+    };
+    Some((method, path, has_fields))
 }
 
 fn is_api_field_argument(value: &str) -> bool {
@@ -3668,7 +3811,7 @@ fn delegate(args: &[OsString]) -> i32 {
 
 fn resolve_real_gh(executing_image: &Path) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    let shims_dir = std::env::var_os("AFT_GH_SHIMS_DIR").map(PathBuf::from);
+    let shims_dir = crate::environment::non_empty_os_var("AFT_GH_SHIMS_DIR").map(PathBuf::from);
     resolve_real_gh_in_path(executing_image, &path, shims_dir.as_deref())
 }
 
@@ -3812,6 +3955,33 @@ mod tests {
         "schema_unsupported",
         "rate_limited",
     ];
+    const BRANCH_PROTECTION_PATH_GLOB: &str = "/repos/*/*/branches/*/protection";
+    const BRANCH_PROTECTION_API_TUPLE: &str = "api:PUT:/repos/*/*/branches/*/protection";
+
+    struct ScopedTestEnvVar {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl ScopedTestEnvVar {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let previous = std::env::var_os(key);
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedTestEnvVar {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(previous) => unsafe { std::env::set_var(self.key, previous) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
 
     fn fixture_manifest() -> Manifest {
         serde_json::from_str(include_str!(
@@ -3838,6 +4008,22 @@ mod tests {
     fn v12_fixture_manifest() -> Manifest {
         serde_json::from_str(include_str!("../tests/fixtures/gh_shim/v12-manifest.json"))
             .expect("v12 manifest fixture")
+    }
+
+    fn branch_protection_manifest(method: &str, tier: Tier) -> Manifest {
+        let mut manifest = v12_fixture_manifest();
+        manifest.manifest_version = 13;
+        manifest.api_rules.push(ApiRule {
+            method: method.to_string(),
+            path_glob: BRANCH_PROTECTION_PATH_GLOB.to_string(),
+            tier,
+            platform: vec!["macos".to_string(), "linux".to_string()],
+            rationale: Some(
+                "branch protection is a repository setting; operator identity, audited bypass"
+                    .to_string(),
+            ),
+        });
+        manifest
     }
 
     fn os_args(args: &[&str]) -> Vec<OsString> {
@@ -3958,6 +4144,62 @@ mod tests {
         assert_eq!(
             resolve_real_gh_in_path(&image, &path, Some(&shims)),
             Some(real)
+        );
+    }
+
+    #[test]
+    fn state_paths_from_process_obey_the_test_state_guard() {
+        let _guard = crate::test_env::gh_shim_state_guard();
+        let selected = std::env::var_os(GH_SHIM_STATE_DIR_ENV).expect("test state override");
+        assert_eq!(StatePaths::from_process().root, PathBuf::from(selected));
+    }
+
+    /// The shim's state ladder is the operator's XDG state home, deliberately
+    /// not the daemon's storage root: every governed seat's placed manifest,
+    /// high-water and rung cache live there. See `gh_shim_state_dir_from`.
+    #[test]
+    fn state_dir_uses_dedicated_override_then_xdg_state_home_then_home_and_ignores_empty_values() {
+        let xdg_state = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let dedicated = tempfile::tempdir().unwrap();
+        let before = fs::metadata(dedicated.path()).unwrap().modified().unwrap();
+        let tail = Path::new("cortexkit").join("aft").join("gh-shim");
+
+        assert_eq!(
+            gh_shim_state_dir_from(
+                Some(dedicated.path().as_os_str()),
+                Some(xdg_state.path().as_os_str()),
+                Some(home.path().as_os_str()),
+            ),
+            dedicated.path()
+        );
+        assert_eq!(
+            fs::metadata(dedicated.path()).unwrap().modified().unwrap(),
+            before,
+            "resolving the dedicated override must not create or rewrite state"
+        );
+        assert_eq!(
+            gh_shim_state_dir_from(
+                None,
+                Some(xdg_state.path().as_os_str()),
+                Some(home.path().as_os_str())
+            ),
+            xdg_state.path().join(&tail),
+            "the operator's XDG state home is the rung the ceremony writes to"
+        );
+        assert_eq!(
+            gh_shim_state_dir_from(
+                Some(OsStr::new("")),
+                Some(OsStr::new("")),
+                Some(home.path().as_os_str())
+            ),
+            home.path().join(".local/state").join(&tail),
+            "empty override and empty XDG_STATE_HOME fall through to HOME"
+        );
+        assert_eq!(
+            gh_shim_state_dir_from(None, Some(OsStr::new("relative/state")), None),
+            std::env::temp_dir().join(&tail),
+            "a relative XDG_STATE_HOME is not a rung"
         );
     }
 
@@ -4961,6 +5203,20 @@ mod tests {
     }
 
     #[test]
+    fn manifest_rejects_api_rules_for_unknown_host_platforms() {
+        let mut manifest = branch_protection_manifest("PUT", Tier::Admin);
+        manifest
+            .api_rules
+            .last_mut()
+            .expect("branch protection API rule")
+            .platform = vec!["github".to_string()];
+        assert_eq!(
+            manifest.validate().unwrap_err(),
+            "api rule PUT /repos/*/*/branches/*/protection names unknown host platform github"
+        );
+    }
+
+    #[test]
     fn binding_keys_and_governed_session_identity_are_stable() {
         assert_eq!(
             canonical_repository_key("https://github.com/CortexKit/aft.git"),
@@ -5842,7 +6098,283 @@ mod tests {
     }
 
     #[test]
-    fn field_bearing_api_forms_remain_unclassified_without_an_audited_parser() {
+    fn v13_release_maintenance_rows_allow_reviewed_flags_and_refuse_destructive_forms() {
+        // The v13 shape is built here rather than read from a ceremony file:
+        // the signed payload lives in the operator's state directory and the
+        // assembled draft under the gitignored `.alfonso/`, so neither exists
+        // on a clean checkout. This is the classifier's view of v13 - the
+        // admin release rows plus the branch-protection API rules.
+        let mut manifest = branch_protection_manifest("PUT", Tier::Admin);
+        manifest.api_rules.push(ApiRule {
+            method: "DELETE".to_string(),
+            path_glob: BRANCH_PROTECTION_PATH_GLOB.to_string(),
+            tier: Tier::Admin,
+            platform: vec!["macos".to_string(), "linux".to_string()],
+            rationale: Some(
+                "branch protection is a repository setting; operator identity, audited bypass"
+                    .to_string(),
+            ),
+        });
+        let admin = manifest
+            .tiers
+            .get_mut(&Tier::Admin)
+            .expect("v13 admin tier");
+        for tuple in ["release edit", "release upload"] {
+            admin.push(TupleDecl::Details {
+                tuple: tuple.to_string(),
+                platform: vec!["macos".to_string(), "linux".to_string()],
+                api_match: None,
+                rationale: None,
+            });
+        }
+        manifest.validate().expect("valid v13 admin extensions");
+        for method in ["PUT", "DELETE"] {
+            let rule = manifest
+                .api_rules
+                .iter()
+                .find(|rule| rule.method == method && rule.path_glob == BRANCH_PROTECTION_PATH_GLOB)
+                .expect("v13 branch protection API rule");
+            assert_eq!(rule.tier, Tier::Admin);
+            assert_eq!(rule.platform, ["macos", "linux"]);
+            assert_eq!(
+                rule.rationale.as_deref(),
+                Some(
+                    "branch protection is a repository setting; operator identity, audited bypass"
+                )
+            );
+        }
+
+        for args in [
+            vec![
+                "release",
+                "edit",
+                "v1.2.3",
+                "--notes",
+                "notes",
+                "--notes-file",
+                "notes.md",
+                "--title",
+                "Dashboard",
+                "--draft=false",
+                "--latest",
+                "--prerelease",
+            ],
+            vec!["release", "upload", "v1.2.3", "dashboard.json", "--clobber"],
+        ] {
+            let args = os_args(&args);
+            assert!(matches!(
+                classify(&args, &manifest, "macos"),
+                Classification::Admin { ref tuple }
+                    if tuple == if args[1] == "edit" { "release edit" } else { "release upload" }
+            ));
+        }
+        assert!(is_reviewed_admin_tuple(13, "release edit"));
+        assert!(is_reviewed_admin_tuple(13, "release upload"));
+        assert!(!is_reviewed_admin_tuple(12, "release edit"));
+        assert!(!is_reviewed_admin_tuple(12, "release upload"));
+
+        for args in [
+            os_args(&["release", "delete", "v1.2.3"]),
+            os_args(&["release", "delete-asset", "v1.2.3", "dashboard.json"]),
+            os_args(&["release", "edit", "v1.2.3", "--delete-tag"]),
+            os_args(&["release", "upload", "v1.2.3", "--delete-asset"]),
+        ] {
+            assert!(matches!(
+                classify(&args, &manifest, "macos"),
+                Classification::Destructive
+            ));
+            assert_eq!(
+                RefusalCode::DestructiveFlag.as_str(),
+                "gh_shim_destructive_flag"
+            );
+            assert_eq!(
+                refuse(
+                    RefusalCode::DestructiveFlag,
+                    "destructive GitHub operations are not available through the shim"
+                ),
+                REFUSAL_EXIT_STATUS
+            );
+        }
+    }
+
+    #[test]
+    fn admin_api_rule_classifies_field_bearing_branch_protection_puts() {
+        let input_args = os_args(&[
+            "api",
+            "-X",
+            "PUT",
+            "/repos/o/r/branches/main/protection",
+            "--input",
+            "body.json",
+        ]);
+        let admin_manifest = branch_protection_manifest("PUT", Tier::Admin);
+        assert!(matches!(
+            classify(&input_args, &admin_manifest, "macos"),
+            Classification::Admin { ref tuple } if tuple == BRANCH_PROTECTION_API_TUPLE
+        ));
+        assert!(matches!(
+            classify(&input_args, &v12_fixture_manifest(), "macos"),
+            Classification::Unclassified
+        ));
+        assert!(matches!(
+            classify(
+                &input_args,
+                &branch_protection_manifest("PUT", Tier::Governed),
+                "macos"
+            ),
+            Classification::Unclassified
+        ));
+
+        let field_args = os_args(&[
+            "api",
+            "-X",
+            "PUT",
+            "/repos/o/r/branches/main/protection",
+            "-f",
+            "enforce_admins=true",
+        ]);
+        assert!(matches!(
+            classify(&field_args, &admin_manifest, "macos"),
+            Classification::Admin { ref tuple } if tuple == BRANCH_PROTECTION_API_TUPLE
+        ));
+    }
+
+    #[test]
+    fn delete_branch_protection_is_admin_only_when_declared_and_not_destructive() {
+        let args = os_args(&["api", "-X", "DELETE", "/repos/o/r/branches/main/protection"]);
+        assert!(matches!(
+            classify(
+                &args,
+                &branch_protection_manifest("DELETE", Tier::Admin),
+                "macos"
+            ),
+            Classification::Admin { ref tuple }
+                if tuple == "api:DELETE:/repos/*/*/branches/*/protection"
+        ));
+        assert!(matches!(
+            classify(&args, &v12_fixture_manifest(), "macos"),
+            Classification::Unclassified
+        ));
+    }
+
+    /// `gh api repos/o/r/...` (no leading slash) is the everyday spelling and
+    /// the same request as `/repos/o/r/...`; a declared endpoint must classify
+    /// identically under both, or the common form refuses as undeclared.
+    #[test]
+    fn slashless_api_endpoint_classifies_like_the_declared_glob() {
+        let manifest = branch_protection_manifest("PUT", Tier::Admin);
+        for spelling in [
+            "/repos/o/r/branches/main/protection",
+            "repos/o/r/branches/main/protection",
+        ] {
+            let args = os_args(&["api", "-X", "PUT", spelling, "--input", "-"]);
+            assert!(
+                matches!(
+                    classify(&args, &manifest, "macos"),
+                    Classification::Admin { ref tuple } if tuple == BRANCH_PROTECTION_API_TUPLE
+                ),
+                "{spelling} must classify as the declared admin endpoint"
+            );
+        }
+        // An undeclared endpoint stays undeclared under either spelling.
+        let args = os_args(&["api", "-X", "PUT", "repos/o/r/topics", "--input", "-"]);
+        assert!(matches!(
+            classify(&args, &manifest, "macos"),
+            Classification::Unclassified
+        ));
+    }
+
+    #[test]
+    fn dev_signed_admin_api_dispatch_requires_bypass_and_audits_delegation() {
+        use std::cell::Cell;
+
+        let _env_lock = crate::test_env::process_env_lock();
+        let directory = tempfile::tempdir().expect("create admin dispatch state directory");
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        // The rule is declared for the platforms the fleet runs on; this test
+        // exercises dispatch given an Admin classification, so it classifies
+        // against a declared platform rather than the host (Windows would
+        // classify nothing and assert the refusal arm twice).
+        let manifest = branch_protection_manifest("PUT", Tier::Admin);
+        manifest.validate().expect("valid admin API manifest");
+        write_signed_manifest(&paths, manifest, TEST_NOW);
+        let manifest = load_manifest(&paths, TEST_NOW).expect("dev-signed manifest verifies");
+        let args = os_args(&[
+            "api",
+            "-X",
+            "PUT",
+            "/repos/o/r/branches/main/protection",
+            "--input",
+            "body.json",
+        ]);
+        let rung =
+            RungDetermination::r3(TEST_NOW, manifest.manifest_version, &test_rung_provenance())
+                .record;
+        let binding = AgentBinding {
+            repo: "cortexkit/aft".to_string(),
+            agent_id: "alfonso-aft".to_string(),
+        };
+
+        {
+            let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", None);
+            let status = dispatch_r3(
+                &args,
+                classify(&args, &manifest, "macos"),
+                &manifest,
+                &paths,
+                &rung,
+                &binding,
+                TEST_NOW,
+                |_| panic!("ADMIN request delegated without operator bypass"),
+            );
+            assert_eq!(status, REFUSAL_EXIT_STATUS);
+            assert_eq!(RefusalCode::AdminTier.as_str(), "gh_shim_admin_tier");
+        }
+
+        let delegated = Cell::new(0);
+        {
+            let _bypass = ScopedTestEnvVar::set("GH_SHIM_BYPASS", Some("operator"));
+            let status = dispatch_r3(
+                &args,
+                classify(&args, &manifest, "macos"),
+                &manifest,
+                &paths,
+                &rung,
+                &binding,
+                TEST_NOW,
+                |delegated_args| {
+                    assert_eq!(delegated_args, args);
+                    delegated.set(delegated.get() + 1);
+                    73
+                },
+            );
+            assert_eq!(status, 73);
+        }
+        assert_eq!(delegated.get(), 1);
+        let (records, error) = read_bypass_audit(&paths);
+        assert!(error.is_none());
+        let records = records.expect("operator bypass audit records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["tuple"], BRANCH_PROTECTION_API_TUPLE);
+    }
+
+    #[test]
+    fn release_api_mutations_remain_unclassified_because_api_rules_are_get_only() {
+        let manifest = v12_fixture_manifest();
+        // The v1 audit keeps api_rules GET-only; do not widen them for REST writes.
+        for args in [
+            os_args(&["api", "-X", "PATCH", "repos/owner/repo/releases/42"]),
+            os_args(&["api", "-X", "POST", "repos/owner/repo/releases/42/assets"]),
+        ] {
+            assert!(matches!(
+                classify(&args, &manifest, "macos"),
+                Classification::Unclassified
+            ));
+        }
+    }
+
+    #[test]
+    fn field_bearing_get_remains_unclassified_without_widening_the_mechanical_fallback() {
         let manifest = fixture_manifest();
         for field_flag in [
             "--field=name=value",
@@ -5861,6 +6393,27 @@ mod tests {
                 Classification::Unclassified
             ));
         }
+        assert!(matches!(
+            classify(
+                &os_args(&[
+                    "api",
+                    "/repos/o/r/branches/main/protection",
+                    "--input",
+                    "body.json"
+                ]),
+                &manifest,
+                "macos"
+            ),
+            Classification::Unclassified
+        ));
+        assert!(matches!(
+            classify(
+                &os_args(&["api", "/repos/o/r/branches/main/protection"]),
+                &manifest,
+                "macos"
+            ),
+            Classification::Mechanical
+        ));
     }
 
     #[test]

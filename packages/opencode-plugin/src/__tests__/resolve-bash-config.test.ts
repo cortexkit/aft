@@ -188,6 +188,16 @@ describe("resolveBashConfig", () => {
     ).toBe(false);
   });
 
+  test("watch_sync_max_ms defaults to 120 seconds, clamps, and accepts the old cap", () => {
+    expect(resolveBashConfig(cfg({})).watch_sync_max_ms).toBe(120_000);
+    expect(resolveBashConfig(cfg({ bash: { watch_sync_max_ms: 5 } })).watch_sync_max_ms).toBe(
+      1_000,
+    );
+    expect(
+      resolveBashConfig(cfg({ bash: { watch_sync_max_ms: 1_800_000 } })).watch_sync_max_ms,
+    ).toBe(1_800_000);
+  });
+
   // ---- Reminder tuning carries through ---------------------------------
 
   test("long_running_reminder_* on top-level carries through", () => {

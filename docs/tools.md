@@ -331,8 +331,11 @@ and return a `taskId`.
 Never waits. For PTY tasks, `outputMode` selects `screen` (vt100-rendered), `raw` (byte stream),
 or `both`.
 
-**`bash_watch`** — block on or register for a background task's output. Sync mode waits until a
-`pattern` matches, the task exits, or `timeoutMs` elapses. Async mode (`background: true`)
+**`bash_watch`** — block on or register for a background task's output. Sync waits are for a
+short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s by default);
+for anything longer end the turn on `bash({background:true})` and let the completion reminder
+wake you, or use `bash({wait:true})` when the result is needed before anything else. Sync mode
+waits until a `pattern` matches, the task exits, or `timeoutMs` elapses. Async mode (`background: true`)
 registers a pattern watcher that fires a notification when matched and suppresses the default
 completion reminder. (Wait/watch semantics moved here from `bash_status` — `bash_status` is
 snapshot-only.)

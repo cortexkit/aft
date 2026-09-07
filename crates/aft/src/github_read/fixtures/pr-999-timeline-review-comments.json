@@ -1,0 +1,39 @@
+{
+  "data": {
+    "repository": {
+      "nameWithOwner": "cortexkit/aft",
+      "pullRequest": {
+        "number": 999,
+        "reviews": {
+          "nodes": [
+            {
+              "author": { "login": "reviewer-one" },
+              "body": "Looks good",
+              "state": "APPROVED",
+              "submittedAt": "2026-09-03T05:20:00Z",
+              "comments": {
+                "totalCount": 2,
+                "nodes": [
+                  {
+                    "author": { "login": "inline-one" },
+                    "body": "Inline comment one",
+                    "createdAt": "2026-09-03T05:40:00Z",
+                    "path": "src/timeline.rs",
+                    "line": 12
+                  },
+                  {
+                    "author": { "login": "inline-two" },
+                    "body": "Inline comment two",
+                    "createdAt": "2026-09-03T05:45:00Z",
+                    "path": "src/timeline.rs",
+                    "line": 24
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

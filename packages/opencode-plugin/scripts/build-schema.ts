@@ -286,6 +286,26 @@ function buildSchema(): Record<string, unknown> {
           "Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect.",
       },
 
+      idle: {
+        type: "object",
+        properties: {
+          root_ttl_minutes: {
+            type: "integer",
+            default: 30,
+            description:
+              "Minutes without tool traffic before an unbound root's indexes are evicted. Default 30; values outside 5..=30 are clamped. Reclaimed state rebuilds on the next request. User and project tiers.",
+          },
+          lsp_ttl_minutes: {
+            type: "integer",
+            default: 10,
+            description:
+              "Minutes without a request before language servers for a root are shut down, even while the root is still bound. Default 10; values outside 1..=10 are clamped. Servers respawn on the next diagnostics request. Independent of root_ttl_minutes. User and project tiers.",
+          },
+        },
+        additionalProperties: false,
+        description: "Idle reclamation windows for unbound-root artifacts and language servers.",
+      },
+
       worktree: {
         type: "object",
         properties: {
@@ -318,9 +338,10 @@ function buildSchema(): Record<string, unknown> {
           },
           max_file_size: {
             type: "integer",
-            minimum: 1,
+            minimum: 0,
+            default: 64 * 1024 * 1024,
             description:
-              "Skip backup capture for files larger than this many bytes; edits still proceed. User-only; project config is ignored.",
+              "Maximum existing-file size captured for undo, in bytes. Defaults to 64 MiB. User and project tiers may set it; explicit larger values are honored. Zero disables automatic snapshots. Mutations still proceed when capture is skipped.",
           },
         },
         additionalProperties: false,
@@ -400,6 +421,14 @@ function buildSchema(): Record<string, unknown> {
                 default: true,
                 description:
                   "Detach a `wait: true` bash call when a new user message arrives. Default true. Set false to keep the wait blocking; a message containing the literal `&detach` still forces detachment, the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Project-safe.",
+              },
+              watch_sync_max_ms: {
+                type: "integer",
+                minimum: 1000,
+                maximum: 1800000,
+                default: 120000,
+                description:
+                  "Maximum synchronous bash_watch wait in milliseconds. Defaults to 120 seconds for short remaining waits; set to 1800000 to restore the old 30-minute cap.",
               },
               long_running_reminder_enabled: {
                 type: "boolean",
@@ -691,6 +720,21 @@ function buildSchema(): Record<string, unknown> {
         additionalProperties: false,
         description:
           "Agent-child Git attribution injected through environment-scoped core.hooksPath configuration.",
+      },
+
+      pi: {
+        type: "object",
+        properties: {
+          tool_presentation: {
+            type: "string",
+            enum: ["top_level", "host_default"],
+            default: "top_level",
+            description:
+              "Pi and OMP tool presentation mode. 'top_level' registers tools with loadMode: essential on OMP so they appear at top level (default). 'host_default' uses host default loadMode (mounting tools under xd:// on OMP). User and project tiers are accepted with project precedence.",
+          },
+        },
+        additionalProperties: false,
+        description: "Pi and OMP harness-specific configuration.",
       },
 
       auto_update: {

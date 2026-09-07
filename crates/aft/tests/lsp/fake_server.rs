@@ -242,6 +242,10 @@ fn main() -> io::Result<()> {
     let mut reader = BufReader::new(stdin.lock());
     let mut writer = stdout.lock();
     let mut should_register_watched_files = false;
+    let ignore_shutdown = std::env::var("AFT_FAKE_LSP_IGNORE_SHUTDOWN")
+        .ok()
+        .as_deref()
+        == Some("1");
 
     while let Some(message) = read_message(&mut reader)? {
         match message {
@@ -299,6 +303,7 @@ fn main() -> io::Result<()> {
                     //   AFT_FAKE_LSP_WORKSPACE=1           → also support workspace/diagnostic
                     //   AFT_FAKE_LSP_NO_WATCHED_FILES=1    → OMIT workspace.didChangeWatchedFiles
                     //                                        (exercises the F5 capability-gate skip path)
+                    //   AFT_FAKE_LSP_IGNORE_SHUTDOWN=1      → never reply to shutdown
                     //   (no env)                           → push-only with watched-files support
                     let pull_enabled =
                         std::env::var("AFT_FAKE_LSP_PULL").ok().as_deref() == Some("1");
@@ -373,7 +378,9 @@ fn main() -> io::Result<()> {
                     )?;
                 }
                 "shutdown" => {
-                    write_response(&mut writer, id, Value::Null)?;
+                    if !ignore_shutdown {
+                        write_response(&mut writer, id, Value::Null)?;
+                    }
                 }
                 "textDocument/hover" => {
                     let (line, character) = request_position(&params);

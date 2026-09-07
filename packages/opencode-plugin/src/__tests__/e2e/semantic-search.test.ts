@@ -60,6 +60,34 @@ function findLocalOrtDir(): string | undefined {
 
 const localOrtDir = findLocalOrtDir();
 
+// The bridge points FASTEMBED_CACHE_DIR at `<storage_dir>/semantic/models`, and
+// this suite gives every run a throwaway storage dir - so without this, each
+// run re-downloads the 90 MB MiniLM model from Hugging Face and the ready-path
+// assertion silently depends on the network. Reuse the developer's warm
+// fastembed cache when it already holds the model: the blob is immutable and
+// content-addressed, so sharing it costs no isolation. A cold machine (CI)
+// takes the download path exactly as before.
+function findWarmFastembedCache(): string | undefined {
+  const cacheDir = process.env.FASTEMBED_CACHE_DIR ?? join(homedir(), ".cache", "fastembed");
+  const snapshots = join(cacheDir, "models--Qdrant--all-MiniLM-L6-v2-onnx", "snapshots");
+  try {
+    for (const revision of readdirSync(snapshots)) {
+      const snapshot = join(snapshots, revision);
+      if (
+        existsSync(join(snapshot, "model.onnx")) &&
+        existsSync(join(snapshot, "tokenizer.json"))
+      ) {
+        return cacheDir;
+      }
+    }
+  } catch {
+    // No warm cache - the bridge's per-storage download path applies.
+  }
+  return undefined;
+}
+
+const warmFastembedCache = findWarmFastembedCache();
+
 function createMockClient(): any {
   return {
     lsp: {
@@ -119,7 +147,10 @@ maybeDescribe("e2e semantic search tool", () => {
 
     const pool = new BridgePool(
       harness.binaryPath,
-      { timeoutMs: 20_000 },
+      {
+        timeoutMs: 20_000,
+        ...(warmFastembedCache ? { childEnv: { FASTEMBED_CACHE_DIR: warmFastembedCache } } : {}),
+      },
       configureParamsFromLegacyOverrides({
         semantic_search: options?.experimentalSemanticSearch ?? false,
         storage_dir: join(harness.tempDir, ".storage"),

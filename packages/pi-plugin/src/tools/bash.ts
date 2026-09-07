@@ -30,7 +30,7 @@ import {
   unmarkExplicitControl,
   unmarkTaskWaiting,
 } from "../bg-notifications.js";
-import { resolveBashConfig } from "../config.js";
+import { resolveBashConfig, toolEnabled } from "../config.js";
 import { clearSyncWatchAbort, isSyncWatchAborted } from "../sync-watch-abort.js";
 import type { PluginContext } from "../types.js";
 import {
@@ -46,8 +46,16 @@ import { collapsibleResult, type RenderResultOptionsLike } from "./render-helper
 
 const BASH_WAIT_POLL_INTERVAL_MS = 100;
 const DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS = 30_000;
-const MAX_BASH_STATUS_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
+
+function coerceConfiguredWatchTimeout(value: unknown, cap: number): number | undefined {
+  try {
+    return coerceOptionalInt(value, "timeoutMs", 1, cap);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${message} (bash.watch_sync_max_ms)`);
+  }
+}
 
 // Test-only override for the foreground wait window. Production resolves the
 // window from config (floored at 5000ms), but bun caps each test at 5000ms, so
@@ -198,11 +206,7 @@ const BashWatchParams = Type.Object({
   }),
   pattern: Type.Optional(Type.Union([Type.String(), Type.Object({ regex: Type.String() })])),
   background: Type.Optional(Type.Boolean()),
-  timeout_ms: optionalInt(
-    1,
-    MAX_BASH_STATUS_WAIT_TIMEOUT_MS,
-    "Maximum time to wait in milliseconds",
-  ),
+  timeout_ms: optionalInt(1, 1800000, "Maximum time to wait in milliseconds"),
   once: Type.Optional(Type.Boolean()),
 });
 
@@ -460,9 +464,10 @@ export function registerBashTool(
   // advertising `compressed: false` when compression is disabled would
   // describe a no-op. Background/PTY/watch wording appears only when
   // `bash.background` is enabled.
+  const zoomSteer = toolEnabled(ctx.config, "aft_zoom") ? ", or `aft_zoom`" : "";
   const searchSteer = aftSearchRegistered
-    ? `use \`aft_search\` (concepts, identifiers, regex, literals), \`${readToolName}\`, \`aft_outline\`, or \`aft_zoom\` instead`
-    : `use the \`${grepToolName}\` tool, \`${readToolName}\`, \`aft_outline\`, or \`aft_zoom\` instead`;
+    ? `use \`aft_search\` (concepts, identifiers, regex, literals), \`${readToolName}\`, \`aft_outline\`${zoomSteer} instead`
+    : `use the \`${grepToolName}\` tool, \`${readToolName}\`, \`aft_outline\`${zoomSteer} instead`;
   const bashCfg = resolveBashConfig(ctx.config);
   // Every command probes the module before fallback. Retain only enough state to
   // clear fallback mode after the first successful module response.
@@ -474,7 +479,7 @@ export function registerBashTool(
     ? "A new user message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`."
     : "Because `bash.detach_on_user_message` is false, a new user message leaves this wait blocking; include the literal `&detach` anywhere to force detachment, and the token is stripped before delivery; the rest of the message is preserved, while a token-only message becomes `(requested background detach)`.";
   const tasksSentence = bashCfg.background
-    ? ` Commands run in the foreground and return inline; \`wait: true\` blocks until a long command finishes instead of auto-promoting; ${detachSentence} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use \`background: true\` yourself ONLY when you have other useful work to do while it runs; then \`bash_watch\` waits on the task (sync blocks until exit/pattern, async notifies) and \`bash_status\` peeks at it — never background a command and immediately \`bash_watch\` it (that wastes a turn for what foreground returns in one), and never loop \`bash_status\` to wait. \`pty: true\` runs interactive programs (REPLs, TUIs), implies background, and is driven with \`bash_status({ output_mode: "screen" })\` plus \`bash_write\`.`
+    ? ` Commands run in the foreground and return inline; \`wait: true\` blocks until a long command finishes instead of auto-promoting; ${detachSentence} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use \`background: true\` yourself ONLY when you have other useful work to do while it runs; then \`bash_watch\` handles only a short remaining wait (default 30s, max bash.watch_sync_max_ms, 120s by default); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately \`bash_watch\` it (that wastes a turn for what foreground returns in one), and never loop \`bash_status\` to wait. \`pty: true\` runs interactive programs (REPLs, TUIs), implies background, and is driven with \`bash_status({ output_mode: "screen" })\` plus \`bash_write\`.`
     : " Commands run in the foreground to completion; `timeout` is the hard kill cap (default 30 minutes).";
   pi.registerTool<typeof BashParams, BashDetails>({
     name: registeredName,
@@ -759,7 +764,7 @@ export function createBashWatchTool(ctx: PluginContext) {
     name: "bash_watch",
     label: "bash_watch",
     description:
-      "Watch a background bash task. Sync (default) blocks until a pattern matches, the task exits, or timeout — use it when the result is the next thing you need, even for long builds/tests/installs (pass timeout_ms up to 30 min for those). The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
+      "Watch a background bash task. Sync waits are for a short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s by default); for anything longer end the turn on `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
     promptSnippet: "Wait for or watch a background bash task",
     parameters: BashWatchParams,
     async execute(
@@ -804,6 +809,7 @@ export function createBashWatchTool(ctx: PluginContext) {
           watchDetails,
         );
       }
+      const syncWaitCap = resolveBashConfig(ctx.config).watch_sync_max_ms;
       const data = await waitForBashStatus(
         ctx,
         bridge,
@@ -813,9 +819,9 @@ export function createBashWatchTool(ctx: PluginContext) {
         waitFor,
         true,
         Math.min(
-          coerceOptionalInt(params.timeout_ms, "timeout_ms", 1, MAX_BASH_STATUS_WAIT_TIMEOUT_MS) ??
+          coerceConfiguredWatchTimeout(params.timeout_ms, syncWaitCap) ??
             DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS,
-          MAX_BASH_STATUS_WAIT_TIMEOUT_MS,
+          syncWaitCap,
         ),
       );
       // User-message abort: the sync wait was interrupted because the user

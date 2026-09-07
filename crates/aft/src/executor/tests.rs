@@ -898,6 +898,7 @@ fn bind_blocker_snapshot_names_a_stuck_reader_occupant() {
         "abandoned-inspect"
     );
     assert!(snapshot.in_flight_readers[0].started_age_ms >= 60_000);
+    assert!(snapshot.in_flight_readers[0].execution_started);
     assert!(snapshot.in_flight_readers[0].started_before_oldest_writer);
     assert!(snapshot.oldest_queued_writer_age_ms.is_some());
     assert_eq!(
@@ -2484,4 +2485,253 @@ fn cancel_and_seal_race_has_exactly_one_winner() {
             assert!(token.cancel_requested_before_commit());
         }
     }
+}
+
+#[test]
+fn heavy_init_completion_and_following_read_do_not_wait_on_maintenance_epoch() {
+    let executor = test_executor(4, 2, 3, 2);
+    let (_dir, root) = test_root("heavy-response-epoch");
+    executor.register_actor(root.clone(), test_ctx());
+
+    let (maintenance_started_tx, maintenance_started_rx) = crossbeam_channel::bounded(1);
+    let (release_maintenance_tx, release_maintenance_rx) = crossbeam_channel::bounded(1);
+    let maintenance = executor.submit_maintenance_async(
+        root.clone(),
+        Lane::MaintenanceCommit,
+        "gated-configure-tail".to_string(),
+        Box::new(move |_| {
+            maintenance_started_tx
+                .send(())
+                .expect("signal maintenance start");
+            release_maintenance_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release maintenance epoch");
+            ok("gated-configure-tail")
+        }),
+    );
+    maintenance_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("maintenance holds the epoch read gate");
+
+    let (heavy_done_tx, heavy_done_rx) = crossbeam_channel::bounded(1);
+    let heavy = executor.submit(
+        root.clone(),
+        Lane::HeavyInit,
+        "finalized-search".to_string(),
+        Box::new(move |_| {
+            heavy_done_tx.send(()).expect("signal heavy closure done");
+            ok("finalized-search")
+        }),
+    );
+    heavy_done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("heavy command closure finishes");
+
+    let read = executor.submit(
+        root.clone(),
+        Lane::PureRead,
+        "read-after-finalized-search".to_string(),
+        Box::new(|_| ok("read-after-finalized-search")),
+    );
+    let bind = executor.submit(
+        root.clone(),
+        Lane::Mutating,
+        "subc-bind-after-finalized-search".to_string(),
+        Box::new(|_| ok("subc-bind-after-finalized-search")),
+    );
+
+    let heavy_result = heavy.recv_timeout(Duration::from_secs(1));
+    let read_result = read.recv_timeout(Duration::from_secs(1));
+    let snapshot_deadline = Instant::now() + Duration::from_secs(1);
+    let snapshot = loop {
+        if let Some(snapshot) = executor
+            .try_bind_blocker_snapshot(&root, "subc-bind-after-finalized-search")
+            .filter(|snapshot| {
+                snapshot.configure_state == "queued" && snapshot.in_flight_readers.is_empty()
+            })
+        {
+            break Some(snapshot);
+        }
+        if Instant::now() >= snapshot_deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+
+    release_maintenance_tx
+        .send(())
+        .expect("release maintenance epoch");
+    let snapshot = snapshot.expect("completed read remained in the bind census");
+    assert!(
+        heavy_result
+            .expect("heavy completion must not reacquire the actor epoch")
+            .success
+    );
+    assert!(
+        read_result
+            .expect("a finalized HeavyInit must not park a later reader")
+            .success
+    );
+    assert!(snapshot.in_flight_readers.is_empty());
+    assert!(
+        snapshot
+            .blockers
+            .iter()
+            .all(|blocker| !blocker.starts_with("waiting_on_readers")
+                && !blocker.starts_with("zombie_reader")),
+        "completed reads must not remain in the bind census: {:?}",
+        snapshot.blockers
+    );
+    assert!(recv_async(maintenance, "maintenance completion").success);
+    bind.recv_timeout(Duration::from_secs(1))
+        .expect("bind runs after the real maintenance reader exits");
+}
+
+#[test]
+fn bind_blocker_snapshot_labels_reader_parked_before_execution_as_zombie() {
+    let executor = test_executor(2, 1, 2, 1);
+    let (_dir, root) = test_root("zombie-reader-blocker");
+    executor.register_actor(root.clone(), test_ctx());
+    let epoch = {
+        let state = executor.inner.state.lock();
+        Arc::clone(&state.actors.get(&root).expect("actor").epoch)
+    };
+    let epoch_writer = epoch.write();
+
+    let read = executor.submit(
+        root.clone(),
+        Lane::PureRead,
+        "parked-before-execution".to_string(),
+        Box::new(|_| ok("parked-before-execution")),
+    );
+    // Bounded: a reader that never dispatches must fail the test, not hang it.
+    // The bound is generous because it measures CI scheduling, not our code.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let admitted = executor
+            .inner
+            .state
+            .lock()
+            .running_jobs
+            .get(&(root.clone(), "parked-before-execution".to_string()))
+            .is_some_and(|job| !job.execution_started.load(Ordering::Acquire));
+        if admitted {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "reader was not dispatched within 30s"
+        );
+        std::thread::yield_now();
+    }
+
+    let bind = executor.submit(
+        root.clone(),
+        Lane::Mutating,
+        "subc-bind-zombie-census".to_string(),
+        Box::new(|_| ok("subc-bind-zombie-census")),
+    );
+    // The snapshot is a try-lock read; under contention it returns None until
+    // the scheduler releases the state lock, so retry - but bounded.
+    let snapshot = loop {
+        if let Some(snapshot) = executor.try_bind_blocker_snapshot(&root, "subc-bind-zombie-census")
+        {
+            break snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "zombie bind blocker snapshot not readable within 30s"
+        );
+        std::thread::yield_now();
+    };
+    assert!(snapshot
+        .blockers
+        .iter()
+        .any(|blocker| blocker.starts_with("zombie_reader(")));
+    assert!(snapshot
+        .blockers
+        .iter()
+        .all(|blocker| !blocker.starts_with("waiting_on_readers_stuck(")));
+    assert_eq!(snapshot.in_flight_readers.len(), 1);
+    assert!(!snapshot.in_flight_readers[0].execution_started);
+
+    drop(epoch_writer);
+    read.recv_timeout(Duration::from_secs(1))
+        .expect("parked reader executes after epoch release");
+    bind.recv_timeout(Duration::from_secs(1))
+        .expect("bind executes after parked reader");
+}
+
+#[test]
+fn cancelling_dispatched_reader_releases_barrier_before_epoch_writer_exits() {
+    let executor = test_executor(2, 1, 2, 1);
+    let (_dir, root) = test_root("cancel-dispatched-reader");
+    executor.register_actor(root.clone(), test_ctx());
+    let epoch = {
+        let state = executor.inner.state.lock();
+        Arc::clone(&state.actors.get(&root).expect("actor").epoch)
+    };
+    let epoch_writer = epoch.write();
+
+    let executed = Arc::new(AtomicUsize::new(0));
+    let executed_probe = Arc::clone(&executed);
+    let (read, cancellation) = executor.submit_cancellable_async(
+        root.clone(),
+        Lane::PureRead,
+        "dead-route-reader".to_string(),
+        Box::new(move |_| {
+            executed_probe.fetch_add(1, Ordering::AcqRel);
+            ok("dead-route-reader")
+        }),
+    );
+    let admission_deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let parked = executor
+            .inner
+            .state
+            .lock()
+            .running_jobs
+            .get(&(root.clone(), "dead-route-reader".to_string()))
+            .is_some_and(|job| !job.execution_started.load(Ordering::Acquire));
+        if parked {
+            break;
+        }
+        assert!(
+            Instant::now() < admission_deadline,
+            "reader did not reach the pre-execution epoch wait"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let bind = executor.submit(
+        root.clone(),
+        Lane::Mutating,
+        "subc-bind-after-dead-route".to_string(),
+        Box::new(|_| ok("subc-bind-after-dead-route")),
+    );
+    assert_eq!(
+        executor.cancel_job_before_execution(&root, &cancellation),
+        PreExecutionCancelOutcome::DispatchedCancelled
+    );
+
+    let release_deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let state = executor.try_mutating_job_state_label(&root, "subc-bind-after-dead-route");
+        if state == Some("running") {
+            break;
+        }
+        assert!(
+            Instant::now() < release_deadline,
+            "cancelled reader kept the scheduler writer barrier: {state:?}"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    drop(epoch_writer);
+    let read_response = read.blocking_recv().expect("cancelled read completion");
+    assert!(!read_response.success);
+    assert_eq!(read_response.data["code"], "request_cancelled");
+    assert_eq!(executed.load(Ordering::Acquire), 0);
+    bind.recv_timeout(Duration::from_secs(1))
+        .expect("bind completes after the external epoch writer exits");
 }

@@ -33,7 +33,7 @@ PLANES = ("search", "callgraph")
 CSV_FIELDS = (
     "repo", "path", "git", "files", "top_languages", "semantic", "search_status",
     "callgraph_status", "search_wall_ms", "search_first_query_ms", "callgraph_wall_ms",
-    "callgraph_first_query_ms", "search_superseded", "search_failed", "search_suspended",
+    "callgraph_first_query_ms", "callgraph_resolution_share_pct", "search_superseded", "search_failed", "search_suspended",
     "callgraph_superseded", "callgraph_failed", "callgraph_suspended", "waiting_on",
     "peak_rss_mb", "cpu_s", "disk_write_bytes", "outcome", "log_path", "gaps",
 )
@@ -64,9 +64,13 @@ class NdjsonError(RuntimeError):
 class NdjsonClient:
     """Minimal request/response client that ignores asynchronous standalone frames."""
 
-    def __init__(self, binary: Path, root: Path, storage: Path):
+    def __init__(self, binary: Path, root: Path, storage: Path, *, allow_non_git_callgraph: bool = False):
         env = os.environ.copy()
         env["AFT_STORAGE_DIR"] = str(storage)
+        if allow_non_git_callgraph:
+            # Disable file watching for the synthetic non-git corpus so both
+            # planes use a cold path instead of reusing a warm callgraph.
+            env["AFT_TEST_DISABLE_FILE_WATCHER"] = "1"
         env.setdefault("RUST_LOG", "info")
         self.proc = subprocess.Popen(
             [str(binary)],
@@ -264,7 +268,10 @@ def outlined_symbol(client: NdjsonClient, root: Path, paths: Iterable[Path], tim
             continue
         text = str(response.get("text") or "")
         match = SYMBOL_RE.search(text)
-        if response.get("success") and match:
+        if response.get("success") and match and match.group(1) not in {"init"}:
+            # Go permits package init functions that are not addressable by the
+            # callgraph query resolver. Prefer a named callable so the probe
+            # measures the query path rather than a resolver false negative.
             return relative, match.group(1)
     return None
 
@@ -385,7 +392,7 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
     sampler: ProcessSampler | None = None
     outcome = "failed"
     try:
-        client = NdjsonClient(binary, root, storage)
+        client = NdjsonClient(binary, root, storage, allow_non_git_callgraph=not git)
         sampler = ProcessSampler(client.proc)
         sampler.start()
         config_doc = json.dumps({"search_index": True, "callgraph_store": True, "semantic_search": False})
@@ -484,6 +491,7 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
         "search_first_query_ms": metrics.get("index_search_ready_to_first_query_ms_n_p50_max", "n/a"),
         "callgraph_wall_ms": metrics.get("index_callgraph_start_to_ready_ms_n_p50_max", "n/a"),
         "callgraph_first_query_ms": metrics.get("index_callgraph_ready_to_first_query_ms_n_p50_max", "n/a"),
+        "callgraph_resolution_share_pct": metrics.get("index_callgraph_resolution_share_pct_n_p50_max", "n/a"),
         "search_superseded": metrics.get("index_search_superseded", "n/a"),
         "search_failed": metrics.get("index_search_failed", "n/a"),
         "search_suspended": metrics.get("index_search_suspended", "n/a"),
@@ -531,11 +539,11 @@ def write_markdown(path: Path, rows: list[dict[str, str]], scratch: Path) -> Non
     with path.open("w", encoding="utf-8") as handle:
         handle.write("# OSS repository-shape cold-build matrix\n\n")
         handle.write("Every row uses a fresh `AFT_STORAGE_DIR`; semantic indexing is disabled for the entire matrix. Timing values are `n/p50/max` milliseconds as emitted by `index-census.py`.\n\n")
-        handle.write("| Repo | Git? | Files | Top languages | Semantic | Search wall / first query | Callgraph wall / first query | Peak RSS MB | CPU s | Outcome | Log |\n")
+        handle.write("| Repo | Git? | Files | Top languages | Semantic | Search wall / first query | Callgraph wall / first query / resolution share | Peak RSS MB | CPU s | Outcome | Log |\n")
         handle.write("| --- | --- | ---: | --- | --- | --- | --- | ---: | ---: | --- | --- |\n")
         for row in rows:
             handle.write(
-                f"| {row['repo']} | {row['git']} | {row['files']} | {row['top_languages']} | {row['semantic']} | {row['search_wall_ms']} / {row['search_first_query_ms']} | {row['callgraph_wall_ms']} / {row['callgraph_first_query_ms']} | {row['peak_rss_mb']} | {row['cpu_s']} | {row['outcome']} | `{row['log_path']}` |\n"
+                f"| {row['repo']} | {row['git']} | {row['files']} | {row['top_languages']} | {row['semantic']} | {row['search_wall_ms']} / {row['search_first_query_ms']} | {row['callgraph_wall_ms']} / {row['callgraph_first_query_ms']} / {row['callgraph_resolution_share_pct']} | {row['peak_rss_mb']} | {row['cpu_s']} | {row['outcome']} | `{row['log_path']}` |\n"
             )
         handle.write("\n## Plane terminal events\n\n")
         handle.write("| Repo | Search superseded / failed / suspended | Callgraph superseded / failed / suspended | Waiting on |\n| --- | --- | --- | --- |\n")

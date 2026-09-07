@@ -5,7 +5,7 @@ use url::Url;
 
 use super::model::{
     GithubComment, GithubDocument, GithubDocumentKind, GithubPullRequestFile, GithubReaction,
-    GithubReview, GithubReviewCommentSection,
+    GithubReview, GithubReviewCommentSection, GithubTimelineEvent,
 };
 use super::resource::{GithubResource, GithubResourceKind};
 
@@ -80,11 +80,21 @@ pub fn normalize_structured_document(
         files: Vec::new(),
         reviews: Vec::new(),
         review_comment_sections: Vec::new(),
+        base_ref_name: None,
+        head_ref_name: None,
+        review_decision: None,
+        timeline: Vec::new(),
     };
 
     if resource.kind == GithubResourceKind::PullRequest {
         document.files = files_from(root.get("files"));
         document.reviews = reviews_from(root.get("reviews"));
+        document.base_ref_name =
+            value_string(root, "baseRefName").or_else(|| value_string(root, "base_ref_name"));
+        document.head_ref_name =
+            value_string(root, "headRefName").or_else(|| value_string(root, "head_ref_name"));
+        document.review_decision =
+            value_string(root, "reviewDecision").or_else(|| value_string(root, "review_decision"));
         document.review_comment_sections = review_comment_sections_from(
             root.get("reviewCommentSections")
                 .or_else(|| root.get("review_comment_sections")),
@@ -218,6 +228,8 @@ fn comment_from(value: &Value) -> GithubComment {
             .or_else(|| value.get("minimized"))
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        path: value_string(value, "path"),
+        line: value_u64(value, "line").or_else(|| value_u64(value, "originalLine")),
     }
 }
 
@@ -304,6 +316,70 @@ fn review_comment_sections_from(value: Option<&Value>) -> Vec<GithubReviewCommen
         .collect()
 }
 
+/// Normalize the selected state-changing event records from one or more pages
+/// returned by `gh api --paginate --slurp`.
+pub fn normalize_timeline_events(json: &Value) -> Vec<GithubTimelineEvent> {
+    let mut values = Vec::new();
+    collect_timeline_values(json, &mut values);
+    values.into_iter().filter_map(timeline_event_from).collect()
+}
+
+fn collect_timeline_values<'a>(value: &'a Value, values: &mut Vec<&'a Value>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_timeline_values(item, values);
+            }
+        }
+        Value::Object(object) if object.contains_key("event") => values.push(value),
+        Value::Object(object) => {
+            if let Some(events) = object.get("events") {
+                collect_timeline_values(events, values);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn timeline_event_from(value: &Value) -> Option<GithubTimelineEvent> {
+    let event = value_string(value, "event")?;
+    if !matches!(
+        event.as_str(),
+        "closed"
+            | "reopened"
+            | "merged"
+            | "labeled"
+            | "unlabeled"
+            | "assigned"
+            | "unassigned"
+            | "milestoned"
+            | "demilestoned"
+            | "renamed"
+            | "review_requested"
+            | "ready_for_review"
+            | "converted_to_draft"
+    ) {
+        return None;
+    }
+    let rename = value.get("rename");
+    Some(GithubTimelineEvent {
+        actor: actor_login(value.get("actor")),
+        event,
+        created_at: value_string(value, "created_at").or_else(|| value_string(value, "createdAt")),
+        label: value
+            .get("label")
+            .and_then(|label| value_string(label, "name")),
+        assignee: actor_login(value.get("assignee")),
+        milestone: value
+            .get("milestone")
+            .and_then(|milestone| value_string(milestone, "title")),
+        rename_from: rename.and_then(|rename| value_string(rename, "from")),
+        rename_to: rename.and_then(|rename| value_string(rename, "to")),
+        requested_reviewer: actor_login(value.get("requested_reviewer")),
+        commit_id: value_string(value, "commit_id").or_else(|| value_string(value, "commitId")),
+    })
+}
+
 fn actor_login(value: Option<&Value>) -> Option<String> {
     let value = value?;
     value_string(value, "login")
@@ -357,5 +433,50 @@ mod tests {
         assert_eq!(document.repository, "CortexKit/aft");
         assert_eq!(document.comments_total_count, Some(2));
         assert_eq!(document.reactions[0].count, 2);
+    }
+
+    #[test]
+    fn timeline_fixture_keeps_selected_events_and_inline_review_locations() {
+        let resource = GithubResource {
+            kind: GithubResourceKind::PullRequest,
+            number: 999,
+            repository: Some("cortexkit/aft".to_string()),
+            comment_selector: None,
+        };
+        let primary = serde_json::from_str(include_str!("fixtures/pr-999-timeline.json"))
+            .expect("parse timeline PR fixture");
+        let review_comments = serde_json::from_str(include_str!(
+            "fixtures/pr-999-timeline-review-comments.json"
+        ))
+        .expect("parse timeline review comment fixture");
+        let timeline = serde_json::from_str(include_str!("fixtures/pr-999-timeline-events.json"))
+            .expect("parse timeline event fixture");
+
+        let document = normalize_structured_document(&resource, &primary)
+            .expect("normalize timeline PR fixture");
+        let review_document = normalize_structured_document(&resource, &review_comments)
+            .expect("normalize inline review fixture");
+        let events = normalize_timeline_events(&timeline);
+
+        assert_eq!(document.comments.len(), 2);
+        assert_eq!(document.reviews.len(), 2);
+        assert_eq!(
+            review_document.review_comment_sections[0].comments[1]
+                .path
+                .as_deref(),
+            Some("src/timeline.rs")
+        );
+        assert_eq!(
+            review_document.review_comment_sections[0].comments[1].line,
+            Some(24)
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event.as_str())
+                .collect::<Vec<_>>(),
+            ["labeled", "closed", "reopened"]
+        );
+        assert_eq!(events[1].actor.as_deref(), Some("aft-alfonso[bot]"));
     }
 }

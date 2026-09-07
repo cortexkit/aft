@@ -1,6 +1,7 @@
 import { coerceBoolean, coerceTargetParam, formatZoomText } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
+import { toolEnabled } from "../config.js";
 import { prepareToolMap } from "../normalize-schemas.js";
 import type { PluginContext } from "../types.js";
 import {
@@ -10,6 +11,7 @@ import {
   optionalInt,
   resolvePathArg,
 } from "./_shared.js";
+import { whenGhReadEnabled } from "./hoisted.js";
 import { assertExternalDirectoryPermission, permissionDeniedResponse } from "./permissions.js";
 
 const z = tool.schema;
@@ -59,16 +61,31 @@ interface ZoomBatchResult {
  * Tool definitions for code reading commands: outline + zoom.
  */
 export function readingTools(ctx: PluginContext): Record<string, ToolDefinition> {
-  return prepareToolMap({
+  const zoomEnabled = toolEnabled(ctx.config, "aft_zoom");
+  const ghReadEnabled = ctx.config.gh_read?.enabled === true;
+  const githubOutlineDescription = whenGhReadEnabled(
+    ghReadEnabled,
+    "GitHub issues and pull requests can be outlined with `issue://NUMBER` or `pr://NUMBER` (including `OWNER/REPO` forms).",
+  );
+  const githubZoomDescription = whenGhReadEnabled(
+    ghReadEnabled,
+    "GitHub issue and pull-request discussion ordinals can be zoomed with `path: issue://…` or `path: pr://…` and `symbols`.",
+  );
+  const tools = prepareToolMap({
     aft_outline: {
       description:
-        "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with aft_zoom. Set `files: true` with a directory target for a flat indexed file tree with language, symbol count, and byte metadata.\n\n" +
-        "For understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\n" +
+        "Structural outline of source code, documentation files, or remote URLs. For code, returns symbols (functions, classes, types) with line ranges. For Markdown and HTML, returns heading hierarchy. Use this to explore structure before reading specific sections with " +
+        (zoomEnabled ? "aft_zoom" : "read") +
+        ". With `files: true`, the outline is breadth-first with directory rollups; drill in by outlining a subdirectory. Rows show language, symbol count, and line count.\n\n" +
+        (zoomEnabled
+          ? "For understanding a specific feature, prefer aft_search + aft_zoom on named symbols; use aft_outline on a whole directory only for high-level structure mapping. aft_zoom with `callgraph:true` gives one-level forward calls-out; use aft_callgraph only for reverse callers or multi-level traces.\n\n"
+          : "For understanding a specific feature, prefer aft_search + read on named symbols; use aft_outline on a whole directory only for high-level structure mapping.\n\n") +
         "Pass a single `target`:\n" +
         "  • file path → outline that file (with signatures)\n" +
-        "  • directory path → outline all source files under it (recursively, up to 200 files)\n" +
+        "  • directory path → outline source files under it\n" +
         "  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n" +
-        "  • array of paths → outline multiple files in one call; with files:true, every path must be a directory",
+        "  • array of paths → outline multiple files in one call; with files:true, every path must be a directory" +
+        (githubOutlineDescription ? `\n\n${githubOutlineDescription}` : ""),
       args: {
         target: z
           .union([z.string(), z.array(z.string())])
@@ -79,7 +96,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           .boolean()
           .optional()
           .describe(
-            "Directory-only mode: when true, target must be a directory or array of directories and the result is a flat file tree with path, language, symbol count, and byte size instead of a symbol outline.",
+            "Directory-only mode: when true, target must be a directory or array of directories and the result is a breadth-first file tree with directory rollups plus language, symbol, and line counts.",
           ),
         includeTests: z
           .boolean()
@@ -123,7 +140,11 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
           }
 
           const hasUrl =
-            !filesMode && (target.startsWith("http://") || target.startsWith("https://"));
+            !filesMode &&
+            (target.startsWith("http://") ||
+              target.startsWith("https://") ||
+              target.startsWith("issue://") ||
+              target.startsWith("pr://"));
           if (!hasUrl) {
             const resolvedTarget = await resolvePathArg(ctx, context, target);
             const permissionDenied = await assertPathExternalPermissions(
@@ -146,7 +167,8 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
 
     aft_zoom: {
       description:
-        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ path, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them.",
+        "Inspect code symbols or documentation sections. For code, returns the full source of a symbol. Pass `callgraph: true` to also include call-graph annotations (calls-out / called-by within the same file). For Markdown and HTML, returns the section content under the given heading.\n\nUse exactly ONE mode: `{ path, symbols }`, `{ url, symbols }`, or `{ targets }`. `symbols` can be a string or array (one or many lookups in the same file/URL). Use `targets` for cross-file batches: `{ path, symbol }` or an array of them." +
+        (githubZoomDescription ? `\n\n${githubZoomDescription}` : ""),
       args: {
         path: z.string().optional().describe("Path to file (absolute or relative to project root)"),
         url: z
@@ -306,7 +328,12 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         // URL mode passes through to Rust; Rust fetches, validates, and caches.
         // File mode still resolves locally before dispatch so external-directory
         // permission checks approve the same path the server will read.
-        if (!hasUrl) {
+        const githubPath =
+          (hasFilePath &&
+            (String(args.path).startsWith("issue://") || String(args.path).startsWith("pr://"))) ||
+          (hasUrl &&
+            (String(args.url).startsWith("issue://") || String(args.url).startsWith("pr://")));
+        if (!hasUrl && !githubPath) {
           const file = await resolvePathArg(ctx, context, args.path as string);
           const permissionDenied = await assertPathExternalPermissions(ctx, context, file);
           if (permissionDenied) return permissionDeniedResponse(permissionDenied);
@@ -327,6 +354,7 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
       },
     },
   });
+  return tools;
 }
 
 /**

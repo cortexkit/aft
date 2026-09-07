@@ -9,12 +9,34 @@ import type { DiagnosticReport, HarnessDiagnostic } from "../lib/diagnostics.js"
 import { AFT_SCHEMA_URL } from "../lib/jsonc.js";
 import {
   buildDoctorFixPlan,
+  buildDoctorProfileArgs,
   type DoctorFixPlanItem,
   doctorSkewBinaryDownloadDecision,
   formatDoctorStorageStatus,
   renderRemovalSection,
   shouldSkipDoctorFixConfirmation,
 } from "./doctor.js";
+
+describe("doctor --profile passthrough", () => {
+  test("converts the optional seconds argument to the native profile flag", () => {
+    expect(buildDoctorProfileArgs(["--profile", "6", "--json"])).toEqual([
+      "profile",
+      "--seconds",
+      "6",
+      "--json",
+    ]);
+  });
+
+  test("forwards native profile flags unchanged", () => {
+    expect(buildDoctorProfileArgs(["--profile", "--pid", "123", "--seconds", "2"])).toEqual([
+      "profile",
+      "--pid",
+      "123",
+      "--seconds",
+      "2",
+    ]);
+  });
+});
 
 function configPaths(kind: "opencode" | "pi" = "opencode"): HarnessConfigPaths {
   return {

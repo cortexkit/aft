@@ -3,11 +3,11 @@ use std::io::{self, BufWriter};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock, TryLockError, Weak};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
+use crate::db::TrackedConnection;
 use lsp_types::FileChangeType;
 use notify::RecommendedWatcher;
-use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::alert_state::{
@@ -33,6 +33,7 @@ use crate::parser::{SharedSymbolCache, SymbolCache, TreeSitterProvider};
 use crate::protocol::{
     ConfigureWarningsFrame, ProgressFrame, PushFrame, StatusChangedFrame, StatusPayload,
 };
+use crate::views::Manifest;
 use crate::watcher_filter::WatcherJoinOutcome;
 use crate::watcher_filter::{SharedGitignore, WatcherDispatchEvent, WatcherThreadHandle};
 
@@ -263,19 +264,24 @@ pub struct StatusBarCountValues {
 
 impl StatusBarCountValues {
     fn legacy_projection(&self) -> Option<StatusBarCounts> {
-        let [Some(dead_code), Some(unused_exports), Some(duplicates)] =
-            [self.dead_code, self.unused_exports, self.duplicates]
-        else {
+        let [Some(errors), Some(warnings), Some(dead_code), Some(unused_exports), Some(duplicates), Some(todos)] = [
+            self.errors,
+            self.warnings,
+            self.dead_code,
+            self.unused_exports,
+            self.duplicates,
+            self.todos,
+        ] else {
             return None;
         };
 
         Some(StatusBarCounts {
-            errors: self.errors.unwrap_or_default(),
-            warnings: self.warnings.unwrap_or_default(),
+            errors,
+            warnings,
             dead_code,
             unused_exports,
             duplicates,
-            todos: self.todos.unwrap_or_default(),
+            todos,
             tier2_stale: self.tier2_stale,
         })
     }
@@ -413,6 +419,14 @@ pub struct SemanticHealthComponentSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ViewHealthSnapshot {
+    pub generation: u64,
+    pub pinned: bool,
+    pub pending_paths: usize,
+    pub failed_paths: usize,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Tier2HealthSnapshot {
     pub status: &'static str,
 }
@@ -443,6 +457,8 @@ pub struct RootHealthSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub callgraph_pages_or_bytes_written_60s: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub views: Option<ViewHealthSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tier2: Option<Tier2HealthSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bash: Option<BgTaskHealthCounts>,
@@ -456,6 +472,7 @@ pub(crate) struct RootHealthSummary {
     search_index_status: Option<&'static str>,
     semantic_index: Option<SemanticHealthComponentSnapshot>,
     callgraph_store_status: Option<&'static str>,
+    views: Option<ViewHealthSnapshot>,
     tier2_status: Option<&'static str>,
     bash: Option<BgTaskHealthCounts>,
     suspended_domains: Vec<SuspendedDomainHealthSnapshot>,
@@ -468,6 +485,7 @@ impl RootHealthSummary {
             search_index_status: None,
             semantic_index: None,
             callgraph_store_status: None,
+            views: None,
             tier2_status: None,
             bash: None,
             suspended_domains: Vec::new(),
@@ -489,6 +507,10 @@ impl RootHealthSummary {
             && self
                 .callgraph_store_status
                 .is_some_and(component_is_satisfied)
+            && self
+                .views
+                .as_ref()
+                .is_none_or(|view| view.pinned && view.pending_paths == 0 && view.failed_paths == 0)
             && self.tier2_status.is_some_and(component_is_satisfied)
     }
 
@@ -528,6 +550,7 @@ impl RootHealthSummary {
             callgraph_repair_entries_60s: None,
             callgraph_commits_60s,
             callgraph_pages_or_bytes_written_60s,
+            views: self.views,
             tier2: self
                 .tier2_status
                 .map(|status| Tier2HealthSnapshot { status }),
@@ -549,6 +572,7 @@ impl RootHealthSnapshot {
             callgraph_repair_entries_60s: None,
             callgraph_commits_60s: None,
             callgraph_pages_or_bytes_written_60s: None,
+            views: None,
             tier2: None,
             bash: None,
             suspended_domains: Vec::new(),
@@ -574,6 +598,10 @@ impl RootHealthSnapshot {
                 .callgraph_store
                 .as_ref()
                 .is_some_and(component_is_satisfied)
+            && self
+                .views
+                .as_ref()
+                .is_none_or(|view| view.pinned && view.pending_paths == 0 && view.failed_paths == 0)
             && self.tier2.as_ref().is_some_and(tier2_is_satisfied)
     }
 }
@@ -647,6 +675,8 @@ pub(crate) struct WatcherDrainSliceState {
     pub(crate) status_changed: bool,
     pub(crate) scheduler_changed_path_count: usize,
     pub(crate) semantic_refresh_paths: Vec<PathBuf>,
+    pub(crate) view_publication_paths: BTreeSet<PathBuf>,
+    pub(crate) view_publication_due: Option<Instant>,
     pub(crate) path_slice_count: usize,
 }
 
@@ -673,6 +703,8 @@ impl WatcherDrainSliceState {
             status_changed: false,
             scheduler_changed_path_count: 0,
             semantic_refresh_paths: Vec::new(),
+            view_publication_paths: BTreeSet::new(),
+            view_publication_due: None,
             path_slice_count: 0,
         }
     }
@@ -753,6 +785,23 @@ impl Drop for CallGraphStoreBuildSettlement {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct ViewRuntimeSnapshot {
+    pub(crate) storage: PathBuf,
+    pub(crate) family: String,
+    pub(crate) scope: String,
+    pub(crate) view_dir: PathBuf,
+    pub(crate) generation: Option<String>,
+    pub(crate) manifest: Option<Manifest>,
+    pub(crate) pending_paths: BTreeSet<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct ViewRuntimeState {
+    snapshot: ViewRuntimeSnapshot,
+    pin: Option<crate::pins::QueryPin>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct ConfigureMaintenanceJob {
     pub(crate) generation: u64,
     pub(crate) root_path: PathBuf,
@@ -780,9 +829,12 @@ pub(crate) struct ConfigureMaintenanceJob {
     /// can still publish its result while unrelated configure work replaces the
     /// other artifact lanes.
     pub(crate) supersede_semantic_artifact_persistence: bool,
-    /// One-shot gates for artifact workers created during configure. The
-    /// configure tail opens them only after the bind response has been produced.
-    pub(crate) artifact_load_starts: Vec<crossbeam_channel::Sender<()>>,
+    /// Allows the search worker to start once. Final configuration maintenance
+    /// sends this signal before starting the callgraph warm-up operation.
+    pub(crate) search_artifact_load_start: Option<crossbeam_channel::Sender<()>>,
+    /// Allows the semantic worker to start once. Final configuration maintenance
+    /// waits until callgraph warm-up starts or determines that no build is needed.
+    pub(crate) semantic_artifact_load_start: Option<crossbeam_channel::Sender<()>>,
 }
 
 impl StatusEmitter {
@@ -860,7 +912,6 @@ struct SemanticRefreshCircuit {
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SemanticColdSeedResume {
     request_tier2: bool,
-    warm_callgraph: bool,
 }
 
 fn ensure_refreshing_path(refreshing: &mut Vec<PathBuf>, path: PathBuf) {
@@ -1291,7 +1342,8 @@ pub struct App {
     /// One process-wide handle for the current AFT database. Every project
     /// actor points at this handle so roots do not open duplicate SQLite/WAL
     /// descriptors for the same database.
-    db: parking_lot::Mutex<Option<(PathBuf, Arc<Mutex<Connection>>)>>,
+    db: parking_lot::Mutex<Option<(PathBuf, Arc<Mutex<TrackedConnection>>)>>,
+    lifecycle_census: crate::lifecycle_census::LifecycleCensusCache,
     active_watchers: AtomicUsize,
     active_actor_roots: AtomicUsize,
     open_routes: AtomicUsize,
@@ -1307,6 +1359,7 @@ impl App {
     pub fn new(provider_factory: LanguageProviderFactory) -> Self {
         Self {
             db: parking_lot::Mutex::new(None),
+            lifecycle_census: crate::lifecycle_census::LifecycleCensusCache::default(),
             active_watchers: AtomicUsize::new(0),
             active_actor_roots: AtomicUsize::new(0),
             open_routes: AtomicUsize::new(0),
@@ -1332,6 +1385,19 @@ impl App {
 
     pub fn lsp_child_registry(&self) -> crate::lsp::child_registry::LspChildRegistry {
         self.lsp_child_registry.clone()
+    }
+
+    pub(crate) fn publish_lifecycle_census(
+        &self,
+        snapshot: crate::lifecycle_census::LifecycleCensusSnapshot,
+    ) {
+        self.lifecycle_census.publish(snapshot);
+    }
+
+    pub(crate) fn lifecycle_census_snapshot(
+        &self,
+    ) -> crate::lifecycle_census::LifecycleCensusSnapshot {
+        self.lifecycle_census.snapshot()
     }
 
     pub fn stdout_writer(&self) -> SharedStdoutWriter {
@@ -1432,7 +1498,10 @@ impl App {
     /// requested path is not already resident. The connection mutex serializes
     /// transactions from all roots; callers never hold the App lock while using
     /// the returned connection.
-    pub fn open_db(&self, path: &Path) -> Result<Arc<Mutex<Connection>>, crate::db::OpenError> {
+    pub fn open_db(
+        &self,
+        path: &Path,
+    ) -> Result<Arc<Mutex<TrackedConnection>>, crate::db::OpenError> {
         let key = database_path_key(path);
         let mut slot = self.db.lock();
         if let Some((existing_path, conn)) = slot.as_ref() {
@@ -1446,7 +1515,7 @@ impl App {
         Ok(conn)
     }
 
-    pub fn set_db(&self, conn: Arc<Mutex<Connection>>) {
+    pub fn set_db(&self, conn: Arc<Mutex<TrackedConnection>>) {
         *self.db.lock() = Some((PathBuf::new(), conn));
     }
 
@@ -1467,7 +1536,7 @@ impl App {
         }
     }
 
-    pub fn db(&self) -> Option<Arc<Mutex<Connection>>> {
+    pub fn db(&self) -> Option<Arc<Mutex<TrackedConnection>>> {
         self.db.lock().as_ref().map(|(_, conn)| Arc::clone(conn))
     }
 
@@ -1685,6 +1754,9 @@ pub struct AppContext {
     backup: parking_lot::Mutex<BackupStore>,
     checkpoint: parking_lot::Mutex<CheckpointStore>,
     config: RwLock<Arc<Config>>,
+    /// Last tool/request activity for this root. Standalone idle LSP reclaim
+    /// keys off this stamp; the subc reaper uses its own per-root `last_touched`.
+    last_request_at: parking_lot::Mutex<Instant>,
     /// Per-root-actor memo for containment checks. The key is the configured
     /// root's exact `PathBuf` spelling, so reconfiguration never reuses a
     /// canonical root selected for another configured value.
@@ -1720,6 +1792,7 @@ pub struct AppContext {
     /// remain subject to every verification and publication fence.
     standing_artifact_exempt: AtomicBool,
     cold_build_limiter: RwLock<Arc<crate::cold_build_limiter::ColdBuildLimiter>>,
+    view_runtime: RwLock<Option<ViewRuntimeState>>,
     callgraph_store: Arc<RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
     callgraph_store_force_requested: AtomicU64,
     callgraph_store_force_fulfilled: AtomicU64,
@@ -1747,7 +1820,9 @@ pub struct AppContext {
     /// without delivering an index, so a persistently failing worker cannot be
     /// relaunched in a loop on the drain thread. Resets when the configure
     /// generation advances.
-    search_index_disconnect_reschedule: parking_lot::Mutex<(u64, u32)>,
+    // Generation, automatic replacement count, and the earliest time a query may
+    // probe again after repeated load disconnects.
+    search_index_disconnect_reschedule: parking_lot::Mutex<(u64, u32, Option<Instant>)>,
     search_persist_epoch: crate::root_cache::ArtifactPublishEpoch,
     pending_search_index_paths: parking_lot::Mutex<BTreeSet<PathBuf>>,
     symbol_cache: SharedSymbolCache,
@@ -1779,7 +1854,6 @@ pub struct AppContext {
     /// reopening the cold-seed gate after a later configure has reset it.
     semantic_cold_seed_generation: Arc<AtomicU64>,
     semantic_fingerprint_generation: Arc<AtomicU64>,
-    semantic_callgraph_warm_deferred: AtomicBool,
     pending_semantic_index_paths: Arc<parking_lot::Mutex<BTreeSet<PathBuf>>>,
     pending_semantic_corpus_refresh: parking_lot::Mutex<bool>,
     semantic_refresh_tx:
@@ -2178,6 +2252,7 @@ impl AppContext {
             backup: parking_lot::Mutex::new(BackupStore::new()),
             checkpoint: parking_lot::Mutex::new(CheckpointStore::new()),
             config: RwLock::new(Arc::new(config)),
+            last_request_at: parking_lot::Mutex::new(Instant::now()),
             path_restriction_root_memo: parking_lot::Mutex::new(None),
             #[cfg(test)]
             path_restriction_root_canonicalizations: AtomicUsize::new(0),
@@ -2196,6 +2271,7 @@ impl AppContext {
             heavy_root_work_allowed: Arc::clone(&heavy_root_work_allowed),
             standing_artifact_exempt: AtomicBool::new(false),
             cold_build_limiter: RwLock::new(crate::cold_build_limiter::global_limiter()),
+            view_runtime: RwLock::new(None),
             callgraph_store: Arc::new(RwLock::new(None)),
             callgraph_store_force_requested: AtomicU64::new(0),
             callgraph_store_force_fulfilled: AtomicU64::new(0),
@@ -2213,7 +2289,7 @@ impl AppContext {
             search_index_rx_generation: AtomicU64::new(0),
             search_index_rx_epoch: AtomicU64::new(0),
             search_index_rx_terminal_epoch: Arc::new(AtomicU64::new(0)),
-            search_index_disconnect_reschedule: parking_lot::Mutex::new((0, 0)),
+            search_index_disconnect_reschedule: parking_lot::Mutex::new((0, 0, None)),
             search_persist_epoch: crate::root_cache::ArtifactPublishEpoch::default(),
             pending_search_index_paths: parking_lot::Mutex::new(BTreeSet::new()),
             symbol_cache,
@@ -2237,7 +2313,6 @@ impl AppContext {
             semantic_cold_seed_active,
             semantic_cold_seed_generation: Arc::new(AtomicU64::new(0)),
             semantic_fingerprint_generation: Arc::new(AtomicU64::new(0)),
-            semantic_callgraph_warm_deferred: AtomicBool::new(false),
             pending_semantic_index_paths: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),
             pending_semantic_corpus_refresh: parking_lot::Mutex::new(false),
             semantic_refresh_tx: Arc::new(parking_lot::Mutex::new(None)),
@@ -2425,7 +2500,11 @@ impl AppContext {
             Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
         };
-        let callgraph_store_rx = match self.callgraph_store_rx.try_lock() {
+        // The receiver contents no longer feed the status below (a disabled
+        // store must not report "building" from a lingering receiver), but a
+        // contended lock still means the snapshot would race a build state
+        // transition, so keep the probe for its busy signal.
+        let _callgraph_store_rx = match self.callgraph_store_rx.try_lock() {
             Some(guard) => guard,
             None => return RootHealthSummary::busy(),
         };
@@ -2517,9 +2596,15 @@ impl AppContext {
             // Read-only roots never cold-build; they query the shared store
             // via ReadonlyCallGraphStore on demand.
             "ready"
-        } else if callgraph_store_rx.is_some() || config.callgraph_store {
+        } else if config.callgraph_store {
+            // Either a build receiver is installed or the build has not been
+            // admitted yet; both resolve to ready under this configuration.
             "building"
         } else {
+            // A configure that disables the store publishes the new config
+            // before it retires the previous generation's build receiver.
+            // That lingering receiver must not report "building": no build it
+            // describes can ever publish into a disabled configuration.
             "disabled"
         };
         // dead_code is suppressed while the callgraph store is unavailable.
@@ -2557,6 +2642,11 @@ impl AppContext {
             search_index_status: Some(search_index_status),
             semantic_index: Some(semantic_index),
             callgraph_store_status: Some(callgraph_store_status),
+            views: if config.views.enabled {
+                self.view_health_snapshot()
+            } else {
+                None
+            },
             tier2_status: Some(tier2_status),
             bash: Some(bash),
             suspended_domains,
@@ -3613,7 +3703,7 @@ impl AppContext {
         &self.checkpoint
     }
 
-    pub fn set_db(&self, conn: Arc<Mutex<Connection>>) {
+    pub fn set_db(&self, conn: Arc<Mutex<TrackedConnection>>) {
         self.app.set_db(conn);
         self.compression_aggregates.clear();
     }
@@ -3623,7 +3713,7 @@ impl AppContext {
         self.compression_aggregates.clear();
     }
 
-    pub fn db(&self) -> Option<Arc<Mutex<Connection>>> {
+    pub fn db(&self) -> Option<Arc<Mutex<TrackedConnection>>> {
         self.app.db()
     }
 
@@ -3631,6 +3721,24 @@ impl AppContext {
         &self,
     ) -> &crate::db::compression_events::CompressionAggregateCache {
         self.compression_aggregates.as_ref()
+    }
+
+    pub fn note_request(&self) {
+        *self.last_request_at.lock() = Instant::now();
+    }
+
+    pub fn last_request_at(&self) -> Instant {
+        *self.last_request_at.lock()
+    }
+
+    #[cfg(test)]
+    pub fn set_last_request_at_for_test(&self, at: Instant) {
+        *self.last_request_at.lock() = at;
+    }
+
+    /// Return whether a tool is available to the active agent session.
+    pub fn tool_enabled(&self, tool: &str) -> bool {
+        !self.config().disabled_tools.iter().any(|name| name == tool)
     }
 
     /// Access an owned configuration snapshot.
@@ -3731,44 +3839,45 @@ impl AppContext {
         self.storage_dir().join(self.harness().storage_segment())
     }
 
-    /// Refresh the in-memory list of durable build suspensions during health
-    /// maintenance so reply handling can return the cached snapshot instead of
-    /// querying storage.
-    pub(crate) fn refresh_build_suspensions_for_health(
-        &self,
-        project_root: &Path,
-        project_key: Option<&str>,
-    ) {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64;
-        self.refresh_build_suspensions_for_health_at(project_root, project_key, now_ms);
-    }
-
+    #[cfg(test)]
     pub(crate) fn refresh_build_suspensions_for_health_at(
         &self,
         project_root: &Path,
         project_key: Option<&str>,
         now_ms: u64,
     ) {
-        let suspended_domains = project_key
-            .and_then(|key| {
-                let path = self
-                    .storage_dir()
-                    .join("callgraph")
-                    .join(key)
-                    .join("build-breaker.sqlite");
-                path.is_file().then_some(path)
-            })
+        let suspensions = self
+            .build_breaker_path_for_health(project_key)
             .and_then(|path| crate::build_breaker::BuildDeathBreaker::open(path).ok())
             .and_then(|breaker| {
                 breaker
                     .active_suspensions_for_root_at(&project_root.display().to_string(), now_ms)
                     .ok()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        self.publish_build_suspensions_for_health(suspensions, now_ms);
+    }
+
+    pub(crate) fn build_breaker_path_for_health(
+        &self,
+        project_key: Option<&str>,
+    ) -> Option<PathBuf> {
+        project_key.and_then(|key| {
+            let path = self
+                .storage_dir()
+                .join("callgraph")
+                .join(key)
+                .join("build-breaker.sqlite");
+            path.is_file().then_some(path)
+        })
+    }
+
+    pub(crate) fn publish_build_suspensions_for_health(
+        &self,
+        suspensions: Vec<crate::build_breaker::BuildSuspension>,
+        now_ms: u64,
+    ) {
+        let suspended_domains = suspensions
             .into_iter()
             .map(|suspension| {
                 let age_s = suspension.age_seconds_at(now_ms);
@@ -4001,6 +4110,149 @@ impl AppContext {
         }
     }
 
+    /// Install the checkout's manifest snapshot and its durable query pin.
+    pub(crate) fn install_view_runtime(
+        &self,
+        snapshot: ViewRuntimeSnapshot,
+        pin: Option<crate::pins::QueryPin>,
+    ) {
+        *self
+            .view_runtime
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(ViewRuntimeState { snapshot, pin });
+    }
+
+    pub(crate) fn clear_view_runtime(&self) {
+        *self
+            .view_runtime
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+
+    pub(crate) fn view_health_snapshot(&self) -> Option<ViewHealthSnapshot> {
+        if !self.config().views.enabled {
+            return None;
+        }
+        let state = self
+            .view_runtime
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let state = state.as_ref()?;
+        let status = crate::path_status::PathStatusStore::open(&state.snapshot.view_dir)
+            .ok()
+            .and_then(|store| store.summary().ok());
+        Some(ViewHealthSnapshot {
+            generation: state
+                .snapshot
+                .generation
+                .as_deref()
+                .and_then(|generation| generation.split('-').next())
+                .and_then(|generation| generation.parse().ok())
+                .unwrap_or(0),
+            pinned: state.pin.is_some(),
+            pending_paths: status
+                .as_ref()
+                .map_or(state.snapshot.pending_paths.len(), |status| {
+                    status.pending_count
+                }),
+            failed_paths: status.as_ref().map_or(0, |status| status.failed_count),
+        })
+    }
+
+    pub(crate) fn view_runtime_snapshot(&self) -> Option<ViewRuntimeSnapshot> {
+        self.view_runtime
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|state| state.snapshot.clone())
+    }
+
+    pub(crate) fn pinned_view_runtime(&self) -> Option<ViewRuntimeSnapshot> {
+        self.view_runtime
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .filter(|state| state.pin.is_some() && state.snapshot.generation.is_some())
+            .map(|state| state.snapshot.clone())
+    }
+
+    pub(crate) fn publish_view_paths(
+        &self,
+        changed_paths: BTreeSet<Vec<u8>>,
+        allow_blob_put: bool,
+    ) -> Result<crate::views::assembly::AssemblyReport, String> {
+        let snapshot = self
+            .view_runtime_snapshot()
+            .ok_or_else(|| "view runtime is not configured".to_string())?;
+        let root = self
+            .canonical_cache_root_opt()
+            .ok_or_else(|| "view root is not configured".to_string())?;
+        let head = crate::alias::head_tree_entries(&root).map_err(|error| error.to_string())?;
+        let desired_head = crate::views::assembly::head_tree_fingerprint(&head);
+        let semantic_search = self.config().semantic_search;
+        let semantic_keys = if semantic_search && allow_blob_put {
+            let index = self
+                .semantic_index
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+                .ok_or_else(|| {
+                    "semantic view publication is waiting for the semantic index".to_string()
+                })?;
+            let fingerprint = index
+                .fingerprint()
+                .map(crate::semantic_index::SemanticIndexFingerprint::as_string)
+                .ok_or_else(|| "semantic index fingerprint is unavailable".to_string())?;
+            let mut request = crate::migration::SemanticMigrationRequest::for_root(
+                snapshot.storage.clone(),
+                root.clone(),
+                fingerprint,
+            );
+            request.family.clone_from(&snapshot.family);
+            request.view.clone_from(&snapshot.scope);
+            crate::migration::store_live_semantic_blobs(&request, &index)
+                .map_err(|error| error.to_string())?
+        } else {
+            BTreeMap::new()
+        };
+        let report =
+            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
+                storage: snapshot.storage.clone(),
+                project_root: root,
+                family: snapshot.family.clone(),
+                scope: snapshot.scope.clone(),
+                desired_head: desired_head.clone(),
+                changed_paths,
+                semantic_keys,
+                require_semantic: semantic_search,
+                allow_blob_put,
+            })
+            .map_err(|error| error.to_string())?;
+        let view = crate::views::ViewStore::open(&snapshot.storage, &snapshot.scope)
+            .map_err(|error| error.to_string())?;
+        let generation = report.generation.clone();
+        let manifest = match (&report.manifest, generation.as_deref()) {
+            (Some(manifest), _) => Some(manifest.clone()),
+            (None, Some(generation)) => view.load_manifest(generation).ok(),
+            (None, None) => None,
+        };
+        let pin = generation
+            .as_deref()
+            .map(|generation| crate::pins::QueryPin::acquire(view.view_dir(), generation))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        self.install_view_runtime(
+            ViewRuntimeSnapshot {
+                generation,
+                manifest,
+                pending_paths: report.pending_paths.clone(),
+                ..snapshot
+            },
+            pin,
+        );
+        Ok(report)
+    }
+
     /// Access the persisted call graph store.
     pub fn callgraph_store(&self) -> &RwLock<Option<Arc<ReadonlyCallGraphStore>>> {
         self.callgraph_store.as_ref()
@@ -4016,6 +4268,11 @@ impl AppContext {
         let requested = self.callgraph_store_force_requested.load(Ordering::SeqCst);
         let fulfilled = self.callgraph_store_force_fulfilled.load(Ordering::SeqCst);
         (requested > fulfilled).then_some(requested)
+    }
+
+    #[doc(hidden)]
+    pub fn pending_callgraph_store_force_token_for_test(&self) -> Option<u64> {
+        self.pending_callgraph_store_force_token()
     }
 
     pub fn fulfill_callgraph_store_force_token(&self, token: u64) {
@@ -4266,6 +4523,23 @@ impl AppContext {
         if !self.heavy_root_work_allowed() {
             return CallgraphStoreAccess::Unavailable;
         }
+        if self.config().views.enabled && self.config().callgraph_store {
+            if let Some(view) = self.pinned_view_runtime() {
+                if view.manifest.is_some() {
+                    let Some(project_root) = self.callgraph_project_root() else {
+                        return CallgraphStoreAccess::Unavailable;
+                    };
+                    return match ReadonlyCallGraphStore::open_manifest_view(
+                        project_root,
+                        view.family,
+                        view.view_dir,
+                    ) {
+                        Ok(store) => CallgraphStoreAccess::Ready(Arc::new(store)),
+                        Err(error) => CallgraphStoreAccess::Error(error),
+                    };
+                }
+            }
+        }
         let operation_generation = self.configure_generation();
 
         // Converge to a newer generation another process (or a local cold
@@ -4358,11 +4632,6 @@ impl AppContext {
                 }
             } else if !self.callgraph_writer() {
                 return CallgraphStoreAccess::Unavailable;
-            }
-
-            if self.semantic_cold_seed_active() {
-                self.defer_callgraph_store_warm_for_semantic_cold_seed();
-                return CallgraphStoreAccess::Building;
             }
 
             // Cold build required: run it off the request thread and return
@@ -4539,10 +4808,6 @@ impl AppContext {
             || !self.callgraph_writer()
             || !self.heavy_root_work_allowed()
         {
-            return;
-        }
-        if self.semantic_cold_seed_active() {
-            self.defer_callgraph_store_warm_for_semantic_cold_seed();
             return;
         }
         let _ = self.spawn_callgraph_store_cold_build(
@@ -4746,6 +5011,10 @@ impl AppContext {
                     }
                 }
             });
+            crate::logging::release_index_build_start_waiters(
+                crate::logging::IndexPlane::Callgraph,
+                &project_root,
+            );
         });
         true
     }
@@ -5010,23 +5279,51 @@ impl AppContext {
     }
 
     /// Allow one automatic search-index replacement load per configure
-    /// generation. The drain disconnect path calls this before rescheduling a
-    /// load whose worker exited without delivering an index; capping it at one
-    /// prevents a persistently failing worker from being relaunched in a loop on
-    /// the drain thread. After the cap is hit, the query-triggered reload
-    /// (`trigger_search_index_reload_if_evicted`) remains the recovery path.
+    /// generation. A second disconnect opens a retry cooldown so queued fallback
+    /// queries cannot each launch the same load again after the worker exits.
     pub(crate) fn allow_search_index_disconnect_reschedule(&self) -> bool {
         const MAX_REPLACEMENTS_PER_GENERATION: u32 = 1;
+        const QUERY_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
         let generation = self.configure_generation();
         let mut state = self.search_index_disconnect_reschedule.lock();
         if state.0 != generation {
-            *state = (generation, 0);
+            *state = (generation, 0, None);
         }
         if state.1 >= MAX_REPLACEMENTS_PER_GENERATION {
+            state.2 = Some(Instant::now() + QUERY_RETRY_COOLDOWN);
             return false;
         }
         state.1 += 1;
         true
+    }
+
+    pub(crate) fn search_index_query_reload_allowed(&self) -> bool {
+        let generation = self.configure_generation();
+        let now = Instant::now();
+        let mut state = self.search_index_disconnect_reschedule.lock();
+        if state.0 != generation {
+            *state = (generation, 0, None);
+            return true;
+        }
+        let Some(retry_at) = state.2 else {
+            return true;
+        };
+        if now < retry_at {
+            return false;
+        }
+        // Record the next retry while holding this mutex so another query cannot
+        // consume the same retry opportunity. Receiver installation is separately
+        // serialized by `artifact_reload_lock`.
+        state.2 = Some(now + Duration::from_secs(60));
+        true
+    }
+
+    pub(crate) fn note_search_index_load_succeeded(&self) {
+        let generation = self.configure_generation();
+        let mut state = self.search_index_disconnect_reschedule.lock();
+        if state.0 == generation {
+            state.2 = None;
+        }
     }
 
     pub(crate) fn next_search_persist_epoch(&self) -> u64 {
@@ -5764,8 +6061,6 @@ impl AppContext {
     pub fn reset_semantic_cold_seed_gate_for_configure(&self) -> u64 {
         self.semantic_cold_seed_active
             .store(false, Ordering::SeqCst);
-        self.semantic_callgraph_warm_deferred
-            .store(false, Ordering::SeqCst);
         self.semantic_cold_seed_generation
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1)
@@ -5791,15 +6086,6 @@ impl AppContext {
         self.semantic_cold_seed_active.store(true, Ordering::SeqCst);
     }
 
-    pub fn defer_callgraph_store_warm_for_semantic_cold_seed(&self) {
-        self.semantic_callgraph_warm_deferred
-            .store(true, Ordering::SeqCst);
-    }
-
-    fn semantic_callgraph_warm_deferred(&self) -> bool {
-        self.semantic_callgraph_warm_deferred.load(Ordering::SeqCst)
-    }
-
     /// Clear the cold-seed gate and resume work that was intentionally held back
     /// while the full semantic corpus was accumulating. This entry point is used
     /// by the code that drains events from the semantic worker.
@@ -5815,56 +6101,14 @@ impl AppContext {
 
     pub(crate) fn take_semantic_cold_seed_resume(&self, force: bool) -> SemanticColdSeedResume {
         let was_active = self.semantic_cold_seed_active.swap(false, Ordering::SeqCst);
-        let warm_callgraph = self
-            .semantic_callgraph_warm_deferred
-            .swap(false, Ordering::SeqCst);
         SemanticColdSeedResume {
-            request_tier2: force || was_active || warm_callgraph,
-            warm_callgraph,
+            request_tier2: force || was_active,
         }
     }
 
     pub(crate) fn apply_semantic_cold_seed_resume(&self, resume: SemanticColdSeedResume) {
         if resume.request_tier2 {
             let _ = self.request_tier2_refresh_pull();
-        }
-
-        if !resume.warm_callgraph
-            || !self.config().callgraph_store
-            || !self.heavy_root_work_allowed()
-        {
-            return;
-        }
-
-        match self.schedule_callgraph_store_warm() {
-            CallgraphStoreAccess::Ready(_) => {
-                crate::slog_debug!(
-                    "deferred callgraph store warm completed after semantic cold seed gate cleared"
-                );
-            }
-            CallgraphStoreAccess::Building => {
-                crate::slog_info!(
-                    "deferred callgraph store warm scheduled after semantic cold seed gate cleared"
-                );
-            }
-            CallgraphStoreAccess::Suspended(suspension) => {
-                crate::slog_warn!(
-                    "deferred callgraph store warm suspended for {} after {} deaths",
-                    suspension.domain.as_str(),
-                    suspension.death_count
-                );
-            }
-            CallgraphStoreAccess::Unavailable => {
-                crate::slog_info!(
-                    "deferred callgraph store warm unavailable after semantic cold seed gate cleared"
-                );
-            }
-            CallgraphStoreAccess::Error(error) => {
-                crate::slog_warn!(
-                    "deferred callgraph store warm failed after semantic cold seed gate cleared: {}",
-                    error
-                );
-            }
         }
     }
 
@@ -5877,11 +6121,6 @@ impl AppContext {
     pub fn set_semantic_cold_seed_active_for_test(&self, active: bool) {
         self.semantic_cold_seed_active
             .store(active, Ordering::SeqCst);
-    }
-
-    #[doc(hidden)]
-    pub fn semantic_callgraph_warm_deferred_for_test(&self) -> bool {
-        self.semantic_callgraph_warm_deferred()
     }
 
     pub fn install_semantic_refresh_worker(
@@ -6392,6 +6631,9 @@ impl AppContext {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        // Intentional idle eviction starts a new reload lifecycle; a cooldown
+        // from an earlier failed load must not suppress the first reopen.
+        self.note_search_index_load_succeeded();
         self.semantic_index
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -7170,6 +7412,18 @@ impl AppContext {
     /// Attribute all actor roots registered in this process. Standalone mode
     /// has no actor registry, so the current context is inserted directly.
     pub fn memory_snapshot(&self, current_root: Option<&Path>) -> crate::memory::MemorySnapshot {
+        self.memory_snapshot_with_cap(current_root, true)
+    }
+
+    pub fn memory_snapshot_uncapped(&self) -> crate::memory::MemorySnapshot {
+        self.memory_snapshot_with_cap(None, false)
+    }
+
+    fn memory_snapshot_with_cap(
+        &self,
+        current_root: Option<&Path>,
+        cap_detail: bool,
+    ) -> crate::memory::MemorySnapshot {
         let mut roots = BTreeMap::new();
         let (roots_status, contexts) = match self.app.try_memory_contexts() {
             Some(contexts) => ("ready", contexts),
@@ -7191,7 +7445,11 @@ impl AppContext {
         roots
             .entry(current_label)
             .or_insert_with(|| self.memory_root_snapshot());
-        crate::memory::MemorySnapshot::new(roots_status, roots)
+        if cap_detail {
+            crate::memory::MemorySnapshot::new(roots_status, roots)
+        } else {
+            crate::memory::MemorySnapshot::new_uncapped(roots_status, roots)
+        }
     }
 }
 
@@ -8035,7 +8293,7 @@ mod callgraph_store_for_ops_tests {
     }
 
     #[test]
-    fn semantic_ready_event_resumes_deferred_callgraph_and_tier2() {
+    fn semantic_ready_event_resumes_tier2_without_rescheduling_callgraph() {
         let _env_guard = force_async_callgraph_builds();
         CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
         let ctx = cold_build_context();
@@ -8047,7 +8305,11 @@ mod callgraph_store_for_ops_tests {
             ctx.callgraph_store_for_ops(),
             CallgraphStoreAccess::Building
         ));
-        assert_eq!(CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            1,
+            "the semantic cold seed must not block callgraph admission"
+        );
         tx.send(SemanticIndexEvent::Ready(empty_semantic_index_for_ctx(
             &ctx,
         )))
@@ -8066,21 +8328,21 @@ mod callgraph_store_for_ops_tests {
         assert_eq!(
             CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
             1,
-            "semantic Ready must resume the deferred callgraph warm"
+            "semantic Ready must not schedule a duplicate callgraph warm"
         );
         let rx = ctx
             .callgraph_store_rx
             .lock()
             .as_ref()
             .cloned()
-            .expect("ready resume should install an in-flight callgraph receiver");
+            .expect("callgraph warm should install an in-flight receiver");
         rx.recv_timeout(Duration::from_secs(30))
             .expect("background cold build should complete");
         *ctx.callgraph_store_rx.lock() = None;
     }
 
     #[test]
-    fn semantic_gate_cleared_event_resumes_deferred_callgraph_and_tier2() {
+    fn semantic_gate_cleared_event_resumes_tier2_without_rescheduling_callgraph() {
         let _env_guard = force_async_callgraph_builds();
         CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
         let ctx = cold_build_context();
@@ -8090,7 +8352,11 @@ mod callgraph_store_for_ops_tests {
             ctx.callgraph_store_for_ops(),
             CallgraphStoreAccess::Building
         ));
-        assert_eq!(CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
+            1,
+            "the semantic cold seed must not block callgraph admission"
+        );
         ctx.resume_deferred_work_after_semantic_cold_seed_gate_cleared();
 
         assert!(
@@ -8104,45 +8370,41 @@ mod callgraph_store_for_ops_tests {
         assert_eq!(
             CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
             1,
-            "cached-load or retry-wait clear must resume deferred callgraph warm"
+            "clearing the semantic gate must not schedule a duplicate callgraph warm"
         );
         let rx = ctx
             .callgraph_store_rx
             .lock()
             .as_ref()
             .cloned()
-            .expect("gate-clear resume should install an in-flight callgraph receiver");
+            .expect("callgraph warm should install an in-flight receiver");
         rx.recv_timeout(Duration::from_secs(30))
             .expect("background cold build should complete");
         *ctx.callgraph_store_rx.lock() = None;
     }
 
     #[test]
-    fn semantic_cold_seed_gate_defers_callgraph_cold_spawn_until_resume() {
+    fn semantic_cold_seed_gate_allows_callgraph_cold_spawn_immediately() {
         let _env_guard = force_async_callgraph_builds();
         CALLGRAPH_COLD_BUILD_SPAWN_COUNT.store(0, Ordering::SeqCst);
         let ctx = cold_build_context();
 
         ctx.set_semantic_cold_seed_active_for_test(true);
-        assert!(
-            matches!(
-                ctx.callgraph_store_for_ops(),
-                CallgraphStoreAccess::Building
-            ),
-            "callgraph ops should degrade as building while the semantic cold gate is active"
-        );
+        assert!(matches!(
+            ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Building
+        ));
         assert_eq!(
             CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
-            0,
-            "semantic cold gate must not spawn a competing callgraph cold build"
+            1,
+            "callgraph navigation must start while the semantic cold seed is active"
         );
-        assert!(ctx.semantic_callgraph_warm_deferred_for_test());
 
         ctx.clear_semantic_cold_seed_gate_and_resume_deferred_work();
         assert_eq!(
             CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst),
             1,
-            "clearing the semantic cold gate should resume the deferred callgraph warm"
+            "clearing the semantic cold gate must not schedule a second callgraph warm"
         );
 
         let rx = ctx
@@ -8150,7 +8412,7 @@ mod callgraph_store_for_ops_tests {
             .lock()
             .as_ref()
             .cloned()
-            .expect("deferred warm should install an in-flight receiver");
+            .expect("callgraph warm should install an in-flight receiver");
         rx.recv_timeout(Duration::from_secs(30))
             .expect("background cold build should complete");
         *ctx.callgraph_store_rx.lock() = None;
@@ -9291,7 +9553,7 @@ mod status_bar_tests {
     }
 
     #[test]
-    fn truthful_values_omit_unproven_categories_while_legacy_projection_stays_hidden() {
+    fn truthful_values_omit_unproven_categories_and_legacy_projection_requires_all_counts() {
         let ctx = ctx();
         let values = ctx.status_bar_count_values();
         assert_eq!(values.errors, None);
@@ -9315,10 +9577,11 @@ mod status_bar_tests {
         );
         assert!(!values.tier2_stale);
 
-        let legacy = ctx
-            .status_bar_counts()
-            .expect("legacy projection is populated");
-        assert_eq!((legacy.errors, legacy.warnings), (0, 0));
+        assert_eq!(
+            ctx.status_bar_counts(),
+            None,
+            "the legacy numeric shape must not fabricate missing diagnostics"
+        );
     }
 
     #[test]
@@ -9331,7 +9594,7 @@ mod status_bar_tests {
         let ctx = ctx();
         ctx.set_canonical_cache_root(first_root);
         ctx.update_status_bar_tier2(Some(5), Some(3), Some(7), Some(2), false);
-        assert!(ctx.status_bar_counts().is_some());
+        assert_eq!(ctx.status_bar_count_values().dead_code, Some(5));
 
         ctx.set_canonical_cache_root(second_root);
 
@@ -9457,12 +9720,12 @@ mod status_bar_tests {
         }
 
         // Bar reflects the live warm-set error.
-        assert_eq!(ctx.status_bar_counts().expect("populated").errors, 1);
+        assert_eq!(ctx.status_bar_count_values().errors, Some(1));
 
         // Clearing the (now-deleted) file's diagnostics drops the count.
         let removed = ctx.lsp_clear_diagnostics_for_file(&file);
         assert!(removed);
-        assert_eq!(ctx.status_bar_counts().expect("populated").errors, 0);
+        assert_eq!(ctx.status_bar_count_values().errors, None);
     }
 
     #[test]
@@ -9570,7 +9833,7 @@ mod status_bar_tests {
             source: Some("json".into()),
         };
 
-        assert_eq!(ctx.status_bar_counts().expect("populated").errors, 0);
+        assert_eq!(ctx.status_bar_count_values().errors, None);
 
         {
             let mut lsp = ctx.lsp();
@@ -9578,9 +9841,9 @@ mod status_bar_tests {
                 .publish(key.clone(), file.clone(), vec![env]);
         }
         assert_eq!(
-            ctx.status_bar_counts().expect("populated").errors,
-            0,
-            "environmental publish must not change status-bar E"
+            ctx.status_bar_count_values().errors,
+            Some(0),
+            "an environmental-only report proves there are zero included errors"
         );
 
         {
@@ -9589,9 +9852,9 @@ mod status_bar_tests {
                 .publish(key, file, vec![]);
         }
         assert_eq!(
-            ctx.status_bar_counts().expect("populated").errors,
-            0,
-            "environmental clear must not change status-bar E"
+            ctx.status_bar_count_values().errors,
+            Some(0),
+            "clearing the excluded diagnostic keeps the proven included count at zero"
         );
     }
 }

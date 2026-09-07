@@ -59,7 +59,7 @@ fn run_with_storage(
     // already downloaded (issue #128). Must run here, not lazily from a worker
     // thread, because env mutation races ort's own dlopen.
     aft::semantic_index::resolve_managed_onnx_runtime(&storage_dir);
-    if std::env::var_os("FASTEMBED_CACHE_DIR").is_none() {
+    if !fastembed_cache_configured_with(|name| std::env::var_os(name)) {
         std::env::set_var(
             "FASTEMBED_CACHE_DIR",
             storage_dir.join("semantic").join("models"),
@@ -262,6 +262,10 @@ fn print_usage() {
     println!(
         "  --force  bypass file-count caps (callgraph + semantic) to fully index a large repo"
     );
+}
+
+fn fastembed_cache_configured_with(lookup: impl FnOnce(&str) -> Option<OsString>) -> bool {
+    lookup("FASTEMBED_CACHE_DIR").is_some_and(|value| !value.is_empty())
 }
 
 fn warmup_storage_dir() -> PathBuf {
@@ -905,6 +909,17 @@ mod tests {
                 std::env::remove_var(self.key);
             }
         }
+    }
+
+    #[test]
+    fn empty_fastembed_cache_assignment_is_unset_with_an_injected_lookup() {
+        assert!(!fastembed_cache_configured_with(|key| {
+            assert_eq!(key, "FASTEMBED_CACHE_DIR");
+            Some(OsString::new())
+        }));
+        assert!(fastembed_cache_configured_with(|_| Some(OsString::from(
+            "/cache"
+        ))));
     }
 
     #[test]

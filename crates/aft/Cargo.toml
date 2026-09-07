@@ -41,6 +41,7 @@ tree-sitter-rust = "0.24"
 tree-sitter-go = "0.25"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
+tree-sitter-cuda = "0.21.1"
 tree-sitter-zig = "1.1"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-bash = "0.25"
@@ -49,6 +50,7 @@ tree-sitter-md = "0.5"
 tree-sitter-solidity = "1.2"
 tree-sitter-vue = { package = "tree-sitter-vue-next", version = "0.1" }
 tree-sitter-json = "0.24"
+tree-sitter-toml = { package = "tree-sitter-toml-ng", version = "0.7.0" }
 tree-sitter-scala = "0.26"
 tree-sitter-java = "0.23"
 tree-sitter-ruby = "0.23"
@@ -74,6 +76,7 @@ regex = "1"
 regex-syntax = "0.8"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 globset = "0.4"
+sha1 = "0.10"
 sha2 = "0.10"
 crc32fast = "1"
 blake3 = "1"
@@ -86,6 +89,7 @@ oxc_semantic = "0.126"
 oxc_span = "0.126"
 oxc_str = "0.126"
 rustc-hash = "2"
+rustc-demangle = "0.1"
 rusqlite = { version = "0.32", features = ["bundled", "backup", "trace"] }
 aft-tokenizer = { path = "../aft-tokenizer", version = "0.55.1" }
 # Shared CortexKit-neutral path-canonicalization primitive (ProjectRootId).

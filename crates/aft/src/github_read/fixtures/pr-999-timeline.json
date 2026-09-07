@@ -1,0 +1,47 @@
+{
+  "number": 999,
+  "title": "Timeline fixture pull request",
+  "state": "OPEN",
+  "author": { "login": "author" },
+  "createdAt": "2026-09-03T05:00:00Z",
+  "updatedAt": "2026-09-03T07:10:00Z",
+  "labels": { "nodes": [{ "name": "bug" }] },
+  "body": "Fixture body",
+  "url": "https://github.com/cortexkit/aft/pull/999",
+  "baseRefName": "main",
+  "headRefName": "timeline-fixture",
+  "reviewDecision": "APPROVED",
+  "comments": {
+    "nodes": [
+      {
+        "author": { "login": "commenter" },
+        "body": "First discussion comment",
+        "createdAt": "2026-09-03T05:10:00Z"
+      },
+      {
+        "author": { "login": "commenter" },
+        "body": "Last discussion comment",
+        "createdAt": "2026-09-03T06:50:00Z"
+      }
+    ]
+  },
+  "files": {
+    "nodes": [{ "path": "src/timeline.rs", "additions": 3, "deletions": 1 }]
+  },
+  "reviews": {
+    "nodes": [
+      {
+        "author": { "login": "reviewer-one" },
+        "body": "Looks good",
+        "state": "APPROVED",
+        "submittedAt": "2026-09-03T05:20:00Z"
+      },
+      {
+        "author": { "login": "reviewer-two" },
+        "body": "Please address this",
+        "state": "CHANGES_REQUESTED",
+        "submittedAt": "2026-09-03T05:30:00Z"
+      }
+    ]
+  }
+}

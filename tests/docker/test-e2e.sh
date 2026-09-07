@@ -212,8 +212,17 @@ run_opencode_session() {
     set +e
     # OPENAI_API_KEY required for OpenCode's openai adapter to make requests.
     # `timeout` is only a safety bound; a healthy scripted session must exit 0.
+    #
+    # OPENCODE_DISABLE_DEFAULT_PLUGINS: on a cold cache, OpenCode's config load
+    # forks an `npm install` of its own default plugin (@opencode-ai/plugin) into
+    # .opencode/node_modules and plugin init joins that fiber under a 5-minute
+    # lock before any external plugin loads (bootstrap.ts:34-38, config.ts:452-471,
+    # plugin/index.ts:199, npm.ts:80-113). A slow registry turned that join into a
+    # silent multi-minute stall with no log line and no provider request. AFT
+    # does not need the host's default plugins, so skip the install.
     TMPDIR="$AIMOCK_RUN_DIR" \
     OPENAI_API_KEY=sk-mock-e2e-test \
+    OPENCODE_DISABLE_DEFAULT_PLUGINS=true \
     timeout --signal=KILL "$timeout_secs" opencode run \
         --model "mock/mock-model" \
         "$prompt" \
@@ -223,6 +232,25 @@ run_opencode_session() {
 
     if [ $exit_code -eq 124 ] || [ $exit_code -eq 137 ]; then
         echo "OpenCode timed out after ${timeout_secs}s (exit ${exit_code})" >&2
+        # A stall before the first model request leaves the plugin log empty,
+        # so OpenCode's own output is the only trace of where startup blocked.
+        echo "  OpenCode output (last 40 lines of ${result_file}):" >&2
+        if [ -s "$result_file" ]; then
+            tail -n 40 "$result_file" | sed 's/^/    /' >&2
+        else
+            echo "    (empty)" >&2
+        fi
+        # With stdout/stderr empty, OpenCode's own log file is the only record
+        # of what a stalled launch was doing (plugin install, provider fetches).
+        local oc_log_dir="${XDG_DATA_HOME:-$HOME/.local/share}/opencode/log"
+        local oc_log
+        oc_log=$(ls -t "$oc_log_dir"/*.log 2>/dev/null | head -n 1 || true)
+        if [ -n "$oc_log" ]; then
+            echo "  OpenCode log (last 60 lines of ${oc_log}):" >&2
+            tail -n 60 "$oc_log" | sed 's/^/    /' >&2
+        else
+            echo "  OpenCode log: none under ${oc_log_dir}" >&2
+        fi
     fi
     return "$exit_code"
 }
@@ -247,6 +275,38 @@ echo ""
 # Exercises: outline, read, grep, glob, aft_search, edit, undo
 # Verifies: trigram index builds, semantic search degrades gracefully
 # ══════════════════════════════════════════════════════════════════
+
+echo "── Warm-up: first OpenCode launch (cold caches) ──"
+echo ""
+
+# The very first `opencode run` on a fresh image pays every cold-cache cost at
+# once (plugin install from the file:// tarball, LSP server npm installs, the
+# ONNX Runtime download) before it makes a single model request, and on a slow
+# runner that alone can exceed a scenario budget while emitting nothing. Pay it
+# here under its own generous budget so Scenario 1 measures the session, not
+# the install. Success means only "OpenCode came back"; scenario assertions
+# stay unchanged and the plugin log is reset before Scenario 1.
+start_aimock
+WARMUP_RESULT="$AIMOCK_RUN_DIR/result-warmup.txt"
+if run_opencode_session "Say hello." "$WARMUP_RESULT" 240; then
+    WARMUP_RC=0
+else
+    WARMUP_RC=$?
+fi
+echo "  warm-up exit code: $WARMUP_RC"
+# 124/137 are the timeout wrapper's codes; any other non-zero exit still means
+# OpenCode came back on its own, which is all the warm-up needs.
+check "warm-up launch returned within 240s" "[ $WARMUP_RC -ne 124 ] && [ $WARMUP_RC -ne 137 ]"
+# The warm-up is the only launch that sees a fresh cache, so its plugin log is
+# the evidence for where a silent first start spends its time. Print it before
+# Scenario 1 resets the log.
+echo "  Plugin log after warm-up (last 40 lines):"
+if [ -s "$PLUGIN_LOG" ]; then
+    tail -n 40 "$PLUGIN_LOG" | sed 's/^/    /'
+else
+    echo "    (empty)"
+fi
+stop_aimock
 
 echo "── Scenario 1: Full session (no ONNX Runtime) ──"
 echo ""

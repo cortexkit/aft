@@ -270,7 +270,10 @@ Write-Host ""
 # Test project setup
 # ---------------------------------------------------------------------------
 
-$ProjectDir = Join-Path $env:TEMP "aft-e2e-project"
+# Not under %TEMP%: the product skips undo snapshots for mutations under a system
+# temp directory, so the scripted "edit then undo" turn would run without undo
+# there. LOCALAPPDATA is a per-user, non-temp location that always exists.
+$ProjectDir = Join-Path $env:LOCALAPPDATA "aft-e2e-project"
 if (Test-Path $ProjectDir) { Remove-Item -Recurse -Force $ProjectDir }
 New-Item -ItemType Directory -Path $ProjectDir | Out-Null
 
@@ -455,6 +458,11 @@ function Run-OpencodeSession {
     try {
         # OpenCode's openai adapter requires SOME api key; aimock ignores it.
         $env:OPENAI_API_KEY = "sk-mock-windows-e2e"
+        # Cold-cache OpenCode forks an npm install of its own default plugin and
+        # joins it under a 5-minute lock before external plugins load (see
+        # tests/docker/test-e2e.sh for the source lines); a slow registry made
+        # that a silent multi-minute stall. AFT needs no host default plugins.
+        $env:OPENCODE_DISABLE_DEFAULT_PLUGINS = "true"
 
         # On Windows, `npm install -g opencode-ai` deposits THREE shims at
         # %APPDATA%\npm\:
@@ -493,6 +501,11 @@ function Run-OpencodeSession {
             -RedirectStandardOutput $ResultFile `
             -RedirectStandardError  ($ResultFile + ".err") `
             -PassThru -NoNewWindow
+        # Windows PowerShell 5.1 leaves $proc.ExitCode null after WaitForExit
+        # unless the process handle was touched before the child exited; a
+        # null exit code then fails every "session completed" check on a run
+        # that actually finished. Touching the handle caches it.
+        $null = $proc.Handle
 
         if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
             Write-Host "  (opencode run timed out at ${TimeoutSec}s -- stopping process)" -ForegroundColor Yellow
@@ -824,6 +837,21 @@ if ($WarmupEndCount -le $WarmupStartCount) {
     Show-LogTail "opencode stderr" ($WarmupResult + ".err")
     Show-LogTail "aimock stdout" $AimockLog
     Show-LogTail "aimock stderr" $AimockErrLog
+    # A launch that stalls before the plugin loads leaves stdout/stderr empty;
+    # OpenCode's own log is the only record of what it was doing (plugin
+    # install, provider fetches). Dump the newest log file wherever this host
+    # keeps it.
+    $OpencodeLogDirs = @(
+        (Join-Path $env:USERPROFILE ".local\share\opencode\log"),
+        (Join-Path $env:LOCALAPPDATA "opencode\log"),
+        (Join-Path $env:APPDATA "opencode\log")
+    )
+    foreach ($dir in $OpencodeLogDirs) {
+        if (Test-Path $dir) {
+            $newest = Get-ChildItem -Path $dir -File | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($newest) { Show-LogTail "opencode log ($dir)" $newest.FullName }
+        }
+    }
     Write-Host ""
     Write-Host "warmup: plugin never loaded within 240s" -ForegroundColor Red
     exit 1
@@ -1139,6 +1167,7 @@ $ExitCode = Run-OpencodeSession `
 $S2bDuration = (Get-Date) - $S2bStart
 Write-Host "  (S2b wall-clock: $([Math]::Round($S2bDuration.TotalSeconds, 1))s)"
 
+Write-Host "  (S2b exit code: $ExitCode)"
 Check "interactive-prompt session completed" {
     $ExitCode -eq 0 -or $ExitCode -eq 124 -or $ExitCode -eq -1
 }

@@ -24,6 +24,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { type Static, type TSchema, Type } from "typebox";
 import { ingestBgCompletions } from "../bg-notifications.js";
+import type { PiToolPresentation } from "../config.js";
+import type { PiHarness } from "../harness.js";
 import type { PluginContext } from "../types.js";
 
 type TextContent = { type: "text"; text: string; textSignature?: string };
@@ -79,6 +81,85 @@ export function withPathAliasPreparation<
     execute(toolCallId, params, signal, onUpdate, context) {
       return tool.execute(toolCallId, prepare(params), signal, onUpdate, context);
     },
+  };
+}
+
+/**
+ * Fold `promptSnippet` and `promptGuidelines` into `description` with a fixed layout:
+ * description, blank line, snippet, guidelines as `- ` lines.
+ */
+export function foldToolGuidanceIntoDescription(
+  description: string | undefined,
+  snippet: string | undefined,
+  guidelines: readonly string[] | undefined,
+): string | undefined {
+  const trimmedSnippet = snippet?.trim();
+  const trimmedGuidelines = (guidelines ?? []).map((g) => g.trim()).filter((g) => g.length > 0);
+
+  if (!trimmedSnippet && trimmedGuidelines.length === 0) {
+    return description;
+  }
+
+  const sections: string[] = [];
+  const base = description?.trim() ?? "";
+  if (base.length > 0) {
+    sections.push(base);
+  }
+
+  const guidanceLines: string[] = [];
+  if (trimmedSnippet) {
+    guidanceLines.push(trimmedSnippet);
+  }
+  for (const g of trimmedGuidelines) {
+    guidanceLines.push(`- ${g}`);
+  }
+
+  if (guidanceLines.length > 0) {
+    sections.push(guidanceLines.join("\n"));
+  }
+
+  return sections.join("\n\n");
+}
+
+export type PreparedToolDefinition<
+  TParams extends TSchema = TSchema,
+  TDetails = unknown,
+  TState = unknown,
+> = ToolDefinition<TParams, TDetails, TState> & {
+  loadMode?: "essential" | "discoverable";
+};
+
+/**
+ * Funnel helper that applies harness-specific adjustments to a ToolDefinition:
+ * - On OMP: attaches `loadMode: "essential"` when presentation is "top_level",
+ *   and folds `promptSnippet` and `promptGuidelines` into `description`.
+ * - On Pi (or unknown): leaves definition fields untouched (Pi renders snippet
+ *   and guidelines itself; unknown behaves as pi).
+ */
+export function prepareToolDefinitionForRegistration<
+  TParams extends TSchema,
+  TDetails = unknown,
+  TState = unknown,
+>(
+  tool: ToolDefinition<TParams, TDetails, TState>,
+  harness: PiHarness = "pi",
+  presentation: PiToolPresentation = "top_level",
+): PreparedToolDefinition<TParams, TDetails, TState> {
+  const effectiveHarness = harness === "omp" ? "omp" : "pi";
+  if (effectiveHarness !== "omp") {
+    return tool;
+  }
+
+  const foldedDescription = foldToolGuidanceIntoDescription(
+    tool.description,
+    tool.promptSnippet,
+    tool.promptGuidelines,
+  );
+
+  return {
+    ...tool,
+    ...(foldedDescription !== undefined ? { description: foldedDescription } : {}),
+    ...(presentation === "top_level" ? { loadMode: "essential" } : {}),
   };
 }
 

@@ -1136,6 +1136,68 @@ describe("bash tool adapter", () => {
     ).rejects.toThrow("Permission ask reached Pi adapter");
   });
 
+  test("default sync cap rejects 120001 with the config knob in the error", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const { bridge } = makeTrackableMockBridge({ status: "completed", exit_code: 0 });
+    registerBashTool(api, makeMockContext(bridge));
+
+    await expect(
+      tools
+        .get("bash_watch")!
+        .execute(
+          "call",
+          { task_id: "bash-cap-default", timeout_ms: 120_001 },
+          undefined,
+          undefined,
+          { cwd: projectRoot },
+        ),
+    ).rejects.toThrow("timeoutMs must be between 1 and 120000 (bash.watch_sync_max_ms)");
+  });
+
+  test("configured 30-minute sync cap accepts 1800000", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const { bridge } = makeTrackableMockBridge({ status: "completed", exit_code: 0 });
+    registerBashTool(
+      api,
+      makeMockContext(bridge, {
+        bash: { watch_sync_max_ms: 1_800_000 },
+      } as PluginContext["config"]),
+    );
+
+    await expect(
+      tools
+        .get("bash_watch")!
+        .execute("call", { task_id: "bash-cap-old", timeout_ms: 1_800_000 }, undefined, undefined, {
+          cwd: projectRoot,
+        }),
+    ).resolves.toMatchObject({
+      content: expect.arrayContaining([
+        expect.objectContaining({ text: expect.stringContaining("task exited") }),
+      ]),
+    });
+  });
+
+  test("project-resolved sync cap is used at runtime", async () => {
+    const tools = new Map<string, MockToolDef>();
+    const api = makeMockApi(tools);
+    const { bridge, calls } = makeTrackableMockBridge({ status: "completed", exit_code: 0 });
+    registerBashTool(
+      api,
+      makeMockContext(bridge, { bash: { watch_sync_max_ms: 1_000 } } as PluginContext["config"]),
+    );
+
+    await expect(
+      tools
+        .get("bash_watch")!
+        .execute("call", { task_id: "bash-cap-project", timeout_ms: 1_001 }, undefined, undefined, {
+          cwd: projectRoot,
+        }),
+    ).rejects.toThrow("timeoutMs must be between 1 and 1000 (bash.watch_sync_max_ms)");
+    expect(calls).toHaveLength(0);
+  });
+
   test("bash-family control RPCs keep the bridge on transport timeout", async () => {
     const tools = new Map<string, MockToolDef>();
     const api = makeMockApi(tools);
@@ -1768,6 +1830,14 @@ describe("bash tool description (agent-facing wording)", () => {
     expect(promptGuidelines.join("\n")).toContain("DO NOT use bash for code search");
   });
 
+  test("replaces zoom steering with read when zoom is disabled", () => {
+    const { description } = registeredDescription(true, { disabled_tools: ["aft_zoom"] });
+    expect(description).toContain("aft_search");
+    expect(description).toContain("aft_outline");
+    expect(description).toContain("read");
+    expect(description).not.toContain("aft_zoom");
+  });
+
   test("steers to the grep tool when aft_search is not registered", () => {
     const { description } = registeredDescription(false);
     expect(description).toContain("DO NOT use bash for code search");
@@ -1801,8 +1871,9 @@ describe("bash tool description (agent-facing wording)", () => {
   test("bash_watch and bash_status agent-facing descriptions", () => {
     const ctx = makeMockContext({} as BinaryBridge);
     const watch = createBashWatchTool(ctx);
-    expect(watch.description).toContain("even for long builds/tests/installs");
-    expect(watch.description).toContain("interrupt");
+    expect(watch.description).toContain("short remaining wait on a task");
+    expect(watch.description).toContain("120s by default");
+    expect(watch.description).toContain("bash({background:true})");
     expect(watch.description).toContain("Never loop bash_status");
     const status = createBashStatusTool(ctx);
     expect(status.description).toContain("never loop");

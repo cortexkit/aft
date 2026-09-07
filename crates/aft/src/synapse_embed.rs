@@ -616,7 +616,7 @@ impl SynapseState {
 }
 
 fn capture_live_envelope(operation: &str, raw: &[u8]) {
-    let Some(directory) = std::env::var_os("AFT_SYNAPSE_CAPTURE_DIR").map(PathBuf::from) else {
+    let Some(directory) = capture_directory_with(|name| std::env::var_os(name)) else {
         return;
     };
     let sequence = LIVE_CAPTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -625,6 +625,14 @@ fn capture_live_envelope(operation: &str, raw: &[u8]) {
         directory.join(format!("{operation}-{sequence}-live.json")),
         raw,
     );
+}
+
+fn capture_directory_with(
+    lookup: impl FnOnce(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    lookup("AFT_SYNAPSE_CAPTURE_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn validate_connection_file(path: &Path) -> Result<(), SynapseEmbeddingError> {
@@ -978,6 +986,21 @@ fn hex_sha256(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_synapse_capture_directory_is_unset_with_an_injected_lookup() {
+        assert_eq!(
+            capture_directory_with(|key| {
+                assert_eq!(key, "AFT_SYNAPSE_CAPTURE_DIR");
+                Some(std::ffi::OsString::new())
+            }),
+            None
+        );
+        assert_eq!(
+            capture_directory_with(|_| Some(std::ffi::OsString::from("/captures"))),
+            Some(PathBuf::from("/captures"))
+        );
+    }
 
     fn item(id: &str, text: &str) -> BatchItem {
         BatchItem {

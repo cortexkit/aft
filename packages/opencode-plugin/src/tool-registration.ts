@@ -4,6 +4,12 @@ import type { AftConfig } from "./config.js";
 import { normalizeToolMap } from "./normalize-schemas.js";
 import { astTools } from "./tools/ast.js";
 import { conflictTools } from "./tools/conflicts.js";
+import {
+  projectV2Tool,
+  type V2Location,
+  type V2ProviderTool,
+  type V2ToolConsumers,
+} from "./tools/definitions/v2.js";
 import { aftPrefixedTools, hoistedTools } from "./tools/hoisted.js";
 import { importTools } from "./tools/imports.js";
 import { inspectToolSurfaceEnabled, inspectTools } from "./tools/inspect.js";
@@ -15,6 +21,18 @@ import { semanticTools } from "./tools/semantic.js";
 import type { PluginContext } from "./types.js";
 
 const ALL_ONLY_TOOLS = ["aft_callgraph", "aft_delete", "aft_move"] as const;
+const V2_BUILTIN_REPLACEMENTS = new Set(["read", "edit", "write", "apply_patch"]);
+
+export interface V2ToolEditor {
+  add(definition: V2ProviderTool): void;
+  remove(name: string): void;
+}
+
+export interface V2ToolRegistrationContext {
+  tool: {
+    transform(register: (editor: V2ToolEditor) => void): unknown;
+  };
+}
 
 /** Returns true when bare `edit` remains available after surface, hoisting, and disable filters. */
 export function openCodeEditSlotSurvives(config: AftConfig): boolean {
@@ -95,7 +113,7 @@ export function openCodeHashlineDowngrade(
  * the selection in one function makes the checked profile tests exercise the same
  * registration path rather than a second test-only inventory implementation.
  */
-export function buildOpenCodeToolMap(
+export function buildAftToolDefinitions(
   ctx: PluginContext,
   config: AftConfig,
   onUnknownDisabled?: (name: string, available: readonly string[]) => void,
@@ -131,4 +149,39 @@ export function buildOpenCodeToolMap(
   }
 
   return allTools;
+}
+
+/** Backward-compatible V1 name for the shared definition inventory. */
+export function buildOpenCodeToolMap(
+  ctx: PluginContext,
+  config: AftConfig,
+  onUnknownDisabled?: (name: string, available: readonly string[]) => void,
+): Record<string, ToolDefinition> {
+  return buildAftToolDefinitions(ctx, config, onUnknownDisabled);
+}
+
+/**
+ * Register the shared definition inventory on V2 as direct provider tools.
+ *
+ * The transform removes only the host tools AFT replaces, does not mutate the
+ * shared V1 definitions, and never calls `update`. Provider and model data are
+ * deliberately not inputs, so the same definitions produce the same registered
+ * projection on every turn.
+ */
+export function registerAftTools(
+  context: V2ToolRegistrationContext,
+  location: V2Location,
+  definitions: Readonly<Record<string, ToolDefinition>>,
+  consumers: V2ToolConsumers = {},
+): unknown {
+  const projected = Object.entries(definitions).map(([name, definition]) =>
+    projectV2Tool(name, definition, location, consumers),
+  );
+
+  return context.tool.transform((editor) => {
+    for (const definition of projected) {
+      if (V2_BUILTIN_REPLACEMENTS.has(definition.name)) editor.remove(definition.name);
+      editor.add(definition);
+    }
+  });
 }

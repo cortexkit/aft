@@ -40,6 +40,11 @@ pub struct GithubCommentSelector {
 }
 
 impl GithubCommentSelector {
+    /// Parse the selector grammar shared by `/comments/<sel>` and GitHub zoom.
+    pub fn parse(selector: &str) -> Result<Self, InvalidGithubResource> {
+        parse_comment_selector("/comments/<sel>", selector)
+    }
+
     pub fn contains(&self, ordinal: usize) -> bool {
         self.ranges.iter().any(|range| range.contains(&ordinal))
     }

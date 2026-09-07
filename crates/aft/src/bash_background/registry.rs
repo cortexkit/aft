@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::Connection;
+use crate::db::TrackedConnection;
 use serde::Serialize;
 
 use crate::bash_permissions::PermissionAsk;
@@ -55,7 +55,7 @@ use super::pty_process::spawn_pty_for_command;
 use super::pty_runtime::PtyRuntime;
 use super::watches::{
     PatternMatch, WatchPattern, WatchRegistry, WATCH_TARGET_ERASED_CONTEXT,
-    WATCH_TARGET_ERASED_TEXT,
+    WATCH_TARGET_ERASED_TEXT, WATCH_TASK_EXIT_TEXT,
 };
 use super::{BgTaskInfo, BgTaskStatus};
 use crate::db::bash_tasks::BashTaskRow;
@@ -245,6 +245,10 @@ pub(crate) struct RegistryInner {
     persisted_gc_started: AtomicBool,
     #[cfg(test)]
     persisted_gc_runs: AtomicU64,
+    /// Name of the thread the once-per-process persisted GC ran on. Lets the
+    /// integration suite pin that the GC stays off the configure/replay thread
+    /// (the replay caller is the standalone request loop).
+    persisted_gc_thread: Mutex<Option<String>>,
     /// Output compression callback. Set by `AppContext` after construction.
     /// Takes (command, raw_output, exit_code) and returns compressed text. Called from
     /// the watchdog thread when a task reaches a terminal state and from
@@ -252,7 +256,7 @@ pub(crate) struct RegistryInner {
     /// uncompressed.
     pub(crate) compressor:
         Mutex<Option<Box<dyn Fn(&str, String, Option<i32>) -> CompressionResult + Send + Sync>>>,
-    pub(crate) db_pool: RwLock<Option<Arc<Mutex<Connection>>>>,
+    pub(crate) db_pool: RwLock<Option<Arc<Mutex<TrackedConnection>>>>,
     pub(crate) db_harness: RwLock<Option<String>>,
     pub(crate) compression_aggregates: Arc<CompressionAggregateCache>,
     pub(crate) wake_tx: crossbeam_channel::Sender<()>,
@@ -325,6 +329,7 @@ impl BgTaskRegistry {
                 persisted_gc_started: AtomicBool::new(false),
                 #[cfg(test)]
                 persisted_gc_runs: AtomicU64::new(0),
+                persisted_gc_thread: Mutex::new(None),
                 compressor: Mutex::new(None),
                 db_pool: RwLock::new(None),
                 db_harness: RwLock::new(None),
@@ -438,7 +443,7 @@ impl BgTaskRegistry {
         }
     }
 
-    pub fn set_db_pool(&self, conn: Arc<Mutex<Connection>>) {
+    pub fn set_db_pool(&self, conn: Arc<Mutex<TrackedConnection>>) {
         if let Ok(mut slot) = self.inner.db_pool.write() {
             *slot = Some(conn);
         }
@@ -889,7 +894,7 @@ impl BgTaskRegistry {
             .unwrap_or(false)
     }
 
-    fn db_harness_and_pool(&self) -> Option<(String, Arc<Mutex<Connection>>)> {
+    fn db_harness_and_pool(&self) -> Option<(String, Arc<Mutex<TrackedConnection>>)> {
         let pool = self
             .inner
             .db_pool
@@ -905,13 +910,16 @@ impl BgTaskRegistry {
         Some((harness, pool))
     }
 
-    fn redeliver_pending_watches_for_session(&self, session_id: &str) -> usize {
+    pub fn pending_pattern_matches_for_session(
+        &self,
+        session_id: &str,
+    ) -> Vec<BashPatternMatchFrame> {
         let Some((harness, pool)) = self.db_harness_and_pool() else {
-            return 0;
+            return Vec::new();
         };
         let rows = {
             let Ok(conn) = pool.lock() else {
-                return 0;
+                return Vec::new();
             };
             match crate::db::bash_watches::list_bash_pattern_watches_for_session(
                 &conn, &harness, session_id,
@@ -921,39 +929,46 @@ impl BgTaskRegistry {
                     crate::slog_warn!(
                         "failed to load pending bash watches for session {session_id}: {error}"
                     );
-                    return 0;
+                    return Vec::new();
                 }
             }
         };
-        let mut delivered = 0;
-        for row in rows.into_iter().filter(|row| row.pending_match) {
-            let Some(match_text) = row.match_text else {
-                crate::slog_warn!(
-                    "pending bash watch {}/{} has no match text",
-                    row.task_id,
-                    row.watch_id
-                );
-                continue;
-            };
-            let context = row.match_context.unwrap_or_else(|| match_text.clone());
-            if match_text == WATCH_TARGET_ERASED_TEXT {
-                self.emit_bash_watch_erased(session_id, &row.task_id, &row.watch_id);
-            } else {
-                self.emit_bash_pattern_match(
-                    session_id,
-                    PatternMatch {
-                        watch_id: row.watch_id,
-                        task_id: row.task_id,
+
+        rows.into_iter()
+            .filter(|row| row.pending_match)
+            .filter_map(|row| {
+                let Some(match_text) = row.match_text else {
+                    crate::slog_warn!(
+                        "pending bash watch {}/{} has no match text",
+                        row.task_id,
+                        row.watch_id
+                    );
+                    return None;
+                };
+                let context = row.match_context.unwrap_or_else(|| match_text.clone());
+                Some(if match_text == WATCH_TARGET_ERASED_TEXT {
+                    BashPatternMatchFrame::watch_target_erased(
+                        row.task_id,
+                        session_id,
+                        row.watch_id,
                         match_text,
-                        match_offset: row.match_offset.unwrap_or_default().max(0) as u64,
                         context,
-                        once: row.once,
-                    },
-                );
-            }
-            delivered += 1;
-        }
-        delivered
+                    )
+                } else if match_text == WATCH_TASK_EXIT_TEXT {
+                    BashPatternMatchFrame::task_exit(row.task_id, session_id, match_text, context)
+                } else {
+                    BashPatternMatchFrame::new(
+                        row.task_id,
+                        session_id,
+                        row.watch_id,
+                        match_text,
+                        row.match_offset.unwrap_or_default().max(0) as u64,
+                        context,
+                        row.once,
+                    )
+                })
+            })
+            .collect()
     }
 
     fn terminal_db_status_for_session(
@@ -1882,6 +1897,17 @@ impl BgTaskRegistry {
         self.replay_session_inner(storage_dir, session_id, None)
     }
 
+    /// Thread name recorded by the last `maybe_gc_persisted` run, if any.
+    /// Recorded as the run exits, so `Some` also means that run has finished.
+    #[doc(hidden)]
+    pub fn persisted_gc_thread(&self) -> Option<String> {
+        self.inner
+            .persisted_gc_thread
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub fn replay_session_for_project(
         &self,
         storage_dir: &Path,
@@ -1899,8 +1925,26 @@ impl BgTaskRegistry {
     ) -> Result<(), String> {
         self.start_watchdog();
         if !self.inner.persisted_gc_started.swap(true, Ordering::SeqCst) {
-            if let Err(error) = self.maybe_gc_persisted(storage_dir) {
-                crate::slog_warn!("failed to GC persisted background bash tasks: {error}");
+            // The persisted GC walks every session under the shared storage root
+            // (liveness probes, row deletes, quarantines) and scales with the
+            // machine's task history, not this session's. Replay runs before the
+            // first request after configure, so keeping the GC inline made that
+            // request wait on storage-wide housekeeping: 2.4 s on a warm box,
+            // past the plugin's 5 s request timeout under load. Replay itself
+            // needs only this project's rows, so the GC runs detached; a row it
+            // would have deleted is at worst rehydrated as terminal and reaped
+            // by the watchdog.
+            let registry = self.clone();
+            let storage_dir = storage_dir.to_path_buf();
+            let spawned = std::thread::Builder::new()
+                .name("aft-bash-task-gc".to_string())
+                .spawn(move || {
+                    if let Err(error) = registry.maybe_gc_persisted(&storage_dir) {
+                        crate::slog_warn!("failed to GC persisted background bash tasks: {error}");
+                    }
+                });
+            if let Err(error) = spawned {
+                crate::slog_warn!("failed to spawn persisted background task GC: {error}");
             }
         }
 
@@ -2379,10 +2423,7 @@ impl BgTaskRegistry {
             let (watch_controlled, watch_matched) = self.task_watch_state(&task_id);
             if terminal_matches.is_empty() && (!watch_controlled || watch_matched) {
                 if watch_matched {
-                    let _ = task.set_completion_delivered(true, self);
                     self.clear_task_watch_state(&task_id);
-                    // Immediate terminal delivery is already confirmed locally.
-                    self.delete_persisted_watches_for_task(&task.session_id, &task_id);
                 }
                 return Ok(watch_id);
             }
@@ -2392,7 +2433,7 @@ impl BgTaskRegistry {
                 .or_else(|| self.completion_snapshot_for_task(&task));
             if terminal_matches.is_empty() {
                 if let Some(completion) = completion.as_ref() {
-                    self.emit_bash_watch_exit(completion);
+                    self.record_bash_watch_exit(completion, true);
                 }
             } else {
                 for pattern_match in &terminal_matches {
@@ -2407,10 +2448,7 @@ impl BgTaskRegistry {
                     self.emit_bash_pattern_match(&task.delivery_session_id, pattern_match.clone());
                 }
             }
-            let _ = task.set_completion_delivered(true, self);
             self.clear_task_watch_state(&task_id);
-            // Same as live path: terminal registration finishes delivery in-process.
-            self.delete_persisted_watches_for_task(&task.session_id, &task_id);
         }
 
         Ok(watch_id)
@@ -2800,6 +2838,26 @@ impl BgTaskRegistry {
     pub fn maybe_gc_persisted(&self, storage_dir: &Path) -> Result<usize, String> {
         #[cfg(test)]
         self.inner.persisted_gc_runs.fetch_add(1, Ordering::SeqCst);
+        // Recorded when the run ENDS (on every exit path, via the guard), so an
+        // observer that sees the thread name knows the sweep is over. Replay
+        // spawns this detached; a test that plants storage after replay returns
+        // must wait for this before its fixture is safe from the sweep.
+        struct RecordThreadOnExit<'a>(&'a RegistryInner);
+        impl Drop for RecordThreadOnExit<'_> {
+            fn drop(&mut self) {
+                *self
+                    .0
+                    .persisted_gc_thread
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+                    std::thread::current()
+                        .name()
+                        .unwrap_or("<unnamed>")
+                        .to_string(),
+                );
+            }
+        }
+        let _record_thread = RecordThreadOnExit(&self.inner);
 
         let mut deleted = 0usize;
 
@@ -2832,6 +2890,10 @@ impl BgTaskRegistry {
                 for task_id in task_ids {
                     let resolved = match resolve_task_layout(&session_dir, &task_id) {
                         Ok(task) => task,
+                        // Uncertainty never quarantines: if the age probe itself
+                        // fails (the directory vanished or is mid-creation), skip
+                        // this pass; a genuinely abandoned layout is still there
+                        // for the next one.
                         Err(error)
                             if error.kind() == std::io::ErrorKind::NotFound
                                 && uninitialized_layout_is_recent(
@@ -2839,7 +2901,7 @@ impl BgTaskRegistry {
                                     &task_id,
                                     Duration::from_secs(5 * 60),
                                 )
-                                .unwrap_or(false) =>
+                                .unwrap_or(true) =>
                         {
                             continue;
                         }
@@ -3091,7 +3153,19 @@ impl BgTaskRegistry {
 
     pub fn drain_completions_for_session(&self, session_id: Option<&str>) -> Vec<BgCompletion> {
         if let Some(session_id) = session_id {
-            self.redeliver_pending_watches_for_session(session_id);
+            let pending_matches = self.pending_pattern_matches_for_session(session_id);
+            if let Ok(sender) = self
+                .inner
+                .progress_sender
+                .lock()
+                .map(|sender| sender.clone())
+            {
+                if let Some(sender) = sender.as_ref() {
+                    for pattern_match in pending_matches {
+                        sender(PushFrame::BashPatternMatch(pattern_match));
+                    }
+                }
+            }
         }
         let completions = match self.inner.completions.lock() {
             Ok(completions) => completions,
@@ -3115,6 +3189,98 @@ impl BgTaskRegistry {
             // suppressing a pending completion.
             Err(_) => true,
         }
+    }
+
+    pub fn unacked_wake_keys(&self) -> HashSet<String> {
+        let mut keys = self
+            .inner
+            .completions
+            .lock()
+            .map(|completions| {
+                completions
+                    .iter()
+                    .map(|completion| {
+                        format!(
+                            "completion\0{}\0{}",
+                            completion.session_id, completion.task_id
+                        )
+                    })
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let Some((harness, pool)) = self.db_harness_and_pool() else {
+            return keys;
+        };
+        let Ok(conn) = pool.lock() else {
+            return keys;
+        };
+        if let Ok(rows) = crate::db::bash_watches::list_bash_pattern_watches(&conn, &harness) {
+            keys.extend(rows.into_iter().filter(|row| row.pending_match).map(|row| {
+                format!(
+                    "match\0{}\0{}\0{}",
+                    row.session_id, row.task_id, row.watch_id
+                )
+            }));
+        }
+        keys
+    }
+
+    pub fn unacked_wake_count_for_session(&self, session_id: Option<&str>) -> usize {
+        let completion_count = self
+            .inner
+            .completions
+            .lock()
+            .map(|completions| {
+                completions
+                    .iter()
+                    .filter(|completion| completion_matches_session(completion, session_id))
+                    .count()
+            })
+            .unwrap_or(1);
+        let Some((harness, pool)) = self.db_harness_and_pool() else {
+            return completion_count;
+        };
+        let Ok(conn) = pool.lock() else {
+            return completion_count.saturating_add(1);
+        };
+        let pending_matches = match session_id {
+            Some(session_id) => {
+                crate::db::bash_watches::count_pending_bash_pattern_watches_for_session(
+                    &conn, &harness, session_id,
+                )
+            }
+            None => crate::db::bash_watches::count_pending_bash_pattern_watches(&conn, &harness),
+        };
+        completion_count.saturating_add(pending_matches.unwrap_or(1))
+    }
+
+    pub fn has_unacked_wakes_for_session(&self, session_id: &str) -> bool {
+        self.unacked_wake_count_for_session(Some(session_id)) > 0
+    }
+
+    pub fn stuck_pending_watches_for_session(
+        &self,
+        session_id: &str,
+        older_than: Duration,
+    ) -> Vec<(String, String, u64)> {
+        let Some((harness, pool)) = self.db_harness_and_pool() else {
+            return Vec::new();
+        };
+        let Ok(conn) = pool.lock() else {
+            return Vec::new();
+        };
+        let now = unix_millis();
+        let minimum_age_ms = older_than.as_millis().min(u128::from(u64::MAX)) as u64;
+        crate::db::bash_watches::list_bash_pattern_watches_for_session(&conn, &harness, session_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|row| row.pending_match && self.task(&row.task_id).is_some())
+            .filter_map(|row| {
+                let created_at = u64::try_from(row.created_at).ok()?;
+                let age_ms = now.saturating_sub(created_at);
+                (age_ms >= minimum_age_ms).then_some((row.task_id, row.watch_id, age_ms))
+            })
+            .collect()
     }
 
     pub fn ack_completions_for_session(
@@ -3422,7 +3588,6 @@ impl BgTaskRegistry {
         if matches!(read_exit_marker(&task.paths), Ok(Some(_))) {
             return false;
         }
-        let watch_controlled = self.task_has_watch_control(&task.task_id);
         let child_exit_observed = state.child_exit_observed;
         let updated = self.update_task_metadata(&task.paths, |metadata| {
             let (status, reason) = if child_exit_observed {
@@ -3437,9 +3602,6 @@ impl BgTaskRegistry {
                 )
             };
             metadata.mark_terminal(status, None, Some(reason));
-            if watch_controlled {
-                metadata.completion_delivered = true;
-            }
         });
         if let Ok(metadata) = updated {
             state.pending_terminal_override = None;
@@ -3702,15 +3864,14 @@ impl BgTaskRegistry {
             return;
         }
 
-        // Terminal + watches: suppress the normal completion queue entry that
-        // replay may have enqueued before re-arm, and mirror the live exit path.
-        let _ = self.remove_pending_completion(&task.task_id);
         let (watch_controlled, watch_matched) = self.task_watch_state(&task.task_id);
         if !watch_controlled {
             return;
         }
         if watch_matched {
-            // Pattern already covered delivery; do not also emit task_exit.
+            // The pending pattern row is the durable item, so do not also drain a
+            // generic completion for the same terminal task.
+            let _ = self.remove_pending_completion(&task.task_id);
             return;
         }
         if completion_delivered {
@@ -3719,8 +3880,11 @@ impl BgTaskRegistry {
             self.delete_persisted_watches_for_task(&task.session_id, &task.task_id);
             return;
         }
-        if let Some(completion) = self.completion_snapshot_for_task(task) {
-            self.emit_bash_watch_exit(&completion);
+        if let Some(completion) = self
+            .remove_pending_completion(&task.task_id)
+            .or_else(|| self.completion_snapshot_for_task(task))
+        {
+            self.record_bash_watch_exit(&completion, true);
         }
         // Keep durable watches until bash_ack_completions confirms delivery.
         self.clear_task_watch_state(&task.task_id);
@@ -3757,9 +3921,7 @@ impl BgTaskRegistry {
             } else if let Ok(Some(marker)) = read_exit_marker(&task.paths) {
                 state.metadata =
                     terminal_metadata_from_marker(state.metadata.clone(), marker, reason.clone());
-                if self.task_has_watch_control(&task.task_id) {
-                    state.metadata.completion_delivered = true;
-                }
+
                 state.pending_terminal_override = None;
                 task.mark_terminal_now();
                 match &mut state.runtime {
@@ -3834,9 +3996,7 @@ impl BgTaskRegistry {
                         state
                             .metadata
                             .mark_terminal(terminal_status, exit_code, reason.clone());
-                        if self.task_has_watch_control(&task.task_id) {
-                            state.metadata.completion_delivered = true;
-                        }
+
                         state.pending_terminal_override = None;
                         task.mark_terminal_now();
                         self.persist_task(&task.paths, &state.metadata)
@@ -3887,9 +4047,7 @@ impl BgTaskRegistry {
                     state
                         .metadata
                         .mark_terminal(target_status, exit_code, reason.clone());
-                    if self.task_has_watch_control(&task.task_id) {
-                        state.metadata.completion_delivered = true;
-                    }
+
                     state.pending_terminal_override = None;
                     task.mark_terminal_now();
                     if let TaskRuntime::Pty(runtime) = &mut state.runtime {
@@ -3915,7 +4073,6 @@ impl BgTaskRegistry {
         marker: ExitMarker,
         reason: Option<String>,
     ) -> Result<(), String> {
-        let watch_controlled = self.task_has_watch_control(&task.task_id);
         let mut pty_reader_done = None;
         {
             let mut state = task
@@ -3932,7 +4089,7 @@ impl BgTaskRegistry {
             let reason = reason.or_else(|| state.metadata.status_reason.clone());
             let updated = self
                 .update_task_metadata(&task.paths, |metadata| {
-                    let mut new_metadata = if is_pty && marker == ExitMarker::Killed {
+                    let new_metadata = if is_pty && marker == ExitMarker::Killed {
                         let mut metadata = metadata.clone();
                         let target_status = pending_override.unwrap_or(BgTaskStatus::Killed);
                         let exit_code = terminal_exit_code_for_status(&target_status);
@@ -3941,9 +4098,6 @@ impl BgTaskRegistry {
                     } else {
                         terminal_metadata_from_marker(metadata.clone(), marker, reason.clone())
                     };
-                    if watch_controlled {
-                        new_metadata.completion_delivered = true;
-                    }
                     *metadata = new_metadata;
                 })
                 .map_err(|e| format!("failed to persist terminal state: {e}"))?;
@@ -4094,18 +4248,11 @@ impl BgTaskRegistry {
 
         let (watch_controlled, watch_matched) = self.task_watch_state(&metadata.task_id);
         if watch_controlled {
-            if emit_frame && !watch_matched {
-                self.emit_bash_watch_exit(&completion);
-            } else if watch_matched {
-                // Pattern match already notified the agent; mark completion
-                // delivered so replay does not enqueue a duplicate bash_completed.
-                // Durable once-watch rows with pending_match stay until ack/rearm
-                // recovery so a lost push can still be re-delivered once.
-                if let Some(task) = self.task(&metadata.task_id) {
-                    let _ = task.set_completion_delivered(true, self);
-                }
+            if !watch_matched && !metadata.completion_delivered {
+                self.record_bash_watch_exit(&completion, emit_frame);
             }
-            // Memory only — SQLite watch rows survive until ack, GC, or rearm settle.
+            // Clear only in-memory control state; the pending SQLite watch row
+            // survives until ack, GC, or re-arm settlement.
             self.clear_task_watch_state(&metadata.task_id);
             return;
         }
@@ -4283,15 +4430,25 @@ impl BgTaskRegistry {
             return;
         };
         if let Some(sender) = progress_sender.as_ref() {
-            sender(PushFrame::BashPatternMatch(BashPatternMatchFrame::new(
-                pattern_match.task_id,
-                session_id.to_string(),
-                pattern_match.watch_id,
-                pattern_match.match_text,
-                pattern_match.match_offset,
-                pattern_match.context,
-                pattern_match.once,
-            )));
+            let frame = if pattern_match.match_text == WATCH_TASK_EXIT_TEXT {
+                BashPatternMatchFrame::task_exit(
+                    pattern_match.task_id,
+                    session_id.to_string(),
+                    pattern_match.match_text,
+                    pattern_match.context,
+                )
+            } else {
+                BashPatternMatchFrame::new(
+                    pattern_match.task_id,
+                    session_id.to_string(),
+                    pattern_match.watch_id,
+                    pattern_match.match_text,
+                    pattern_match.match_offset,
+                    pattern_match.context,
+                    pattern_match.once,
+                )
+            };
+            sender(PushFrame::BashPatternMatch(frame));
         }
     }
 
@@ -4318,18 +4475,7 @@ impl BgTaskRegistry {
         ));
     }
 
-    fn emit_bash_watch_exit(&self, completion: &BgCompletion) {
-        let Ok(progress_sender) = self
-            .inner
-            .progress_sender
-            .lock()
-            .map(|sender| sender.clone())
-        else {
-            return;
-        };
-        let Some(sender) = progress_sender.as_ref() else {
-            return;
-        };
+    fn record_bash_watch_exit(&self, completion: &BgCompletion, emit_frame: bool) {
         let status = completion_status_text(&completion.status, completion.exit_code);
         let preview = completion.output_preview.trim_end();
         let context = if preview.is_empty() {
@@ -4341,14 +4487,68 @@ impl BgTaskRegistry {
                 completion.task_id
             )
         };
-        sender(PushFrame::BashPatternMatch(
-            BashPatternMatchFrame::task_exit(
-                completion.task_id.clone(),
-                completion.session_id.clone(),
-                format!("exited ({status})"),
-                context,
-            ),
-        ));
+        let frame = BashPatternMatchFrame::task_exit(
+            completion.task_id.clone(),
+            completion.session_id.clone(),
+            format!("exited ({status})"),
+            context,
+        );
+        self.persist_bash_watch_exit(&frame);
+        if emit_frame {
+            self.emit_bash_watch_exit(frame);
+        }
+    }
+
+    fn persist_bash_watch_exit(&self, frame: &BashPatternMatchFrame) {
+        let Some((harness, pool)) = self.db_harness_and_pool() else {
+            return;
+        };
+        let Ok(conn) = pool.lock() else {
+            return;
+        };
+        let Ok(mut rows) = crate::db::bash_watches::list_bash_pattern_watches_for_task(
+            &conn,
+            &harness,
+            &frame.session_id,
+            &frame.task_id,
+        ) else {
+            return;
+        };
+        let Some(mut row) = rows
+            .iter()
+            .position(|row| row.match_text.as_deref() == Some(WATCH_TASK_EXIT_TEXT))
+            .map(|index| rows.swap_remove(index))
+            .or_else(|| rows.into_iter().next())
+        else {
+            return;
+        };
+        row.scanning = false;
+        row.pending_match = true;
+        row.match_text = Some(WATCH_TASK_EXIT_TEXT.to_string());
+        row.match_offset = Some(0);
+        row.match_context = Some(frame.context.clone());
+        if let Err(error) = crate::db::bash_watches::upsert_bash_pattern_watch(&conn, &row) {
+            crate::slog_warn!(
+                "persist bash watch task-exit failed for {}/{}: {error}",
+                frame.task_id,
+                row.watch_id
+            );
+        }
+    }
+
+    fn emit_bash_watch_exit(&self, frame: BashPatternMatchFrame) {
+        let Ok(progress_sender) = self
+            .inner
+            .progress_sender
+            .lock()
+            .map(|sender| sender.clone())
+        else {
+            return;
+        };
+        let Some(sender) = progress_sender.as_ref() else {
+            return;
+        };
+        sender(PushFrame::BashPatternMatch(frame));
     }
 
     fn emit_bash_completed(&self, completion: BgCompletion) {
@@ -4502,6 +4702,27 @@ impl BgTaskRegistry {
             running,
             pending_completions,
         })
+    }
+
+    /// Count background task PIDs that are still alive without keeping registry
+    /// locks across the OS liveness probes used by the lifecycle health rollup.
+    pub(crate) fn detached_live_process_count(&self) -> usize {
+        let Some(pids) = self.inner.tasks.try_lock().ok().map(|tasks| {
+            tasks
+                .values()
+                .filter_map(|task| {
+                    task.state
+                        .try_lock()
+                        .ok()
+                        .and_then(|state| state.metadata.child_pid)
+                })
+                .collect::<Vec<_>>()
+        }) else {
+            return 0;
+        };
+        pids.into_iter()
+            .filter(|pid| is_process_alive(*pid))
+            .count()
     }
 
     /// Estimate resident bash output caches without reading disk-backed task
@@ -5986,6 +6207,12 @@ mod tests {
     #[cfg(windows)]
     const QUICK_SUCCESS_COMMAND: &str = "cmd /c exit 0";
 
+    /// Upper bound for "a trivial child terminates". This asserts liveness, not
+    /// speed: under a parallel libtest run on a contended Windows CI runner a
+    /// `cmd /c exit 0` spawn has taken longer than the 5s these tests once
+    /// allowed, and the scheduler's delay is not the product's.
+    const CHILD_EXIT_LIVENESS_BOUND: Duration = Duration::from_secs(30);
+
     #[cfg(unix)]
     const LONG_RUNNING_COMMAND: &str = "sleep 5";
 
@@ -6630,6 +6857,35 @@ mod tests {
     }
 
     #[test]
+    fn completion_drain_redelivers_until_ack_marks_it_delivered() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (task_id, task) =
+            insert_terminal_piped_task(&registry, &dir, QUICK_SUCCESS_COMMAND, "done\n", "", false);
+        registry.post_terminal_transition(&task, true).unwrap();
+
+        let first = registry.drain_completions_for_session(Some("session"));
+        let second = registry.drain_completions_for_session(Some("session"));
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(first[0].task_id, task_id);
+        assert_eq!(second[0].task_id, task_id);
+
+        let resolved =
+            resolve_task_layout(&session_tasks_dir(dir.path(), "session"), &task_id).unwrap();
+        assert!(!read_task_at(&resolved).unwrap().completion_delivered);
+
+        assert_eq!(
+            registry.ack_completions_for_session(Some("session"), std::slice::from_ref(&task_id)),
+            vec![task_id.clone()]
+        );
+        assert!(registry
+            .drain_completions_for_session(Some("session"))
+            .is_empty());
+        assert!(read_task_at(&resolved).unwrap().completion_delivered);
+    }
+
+    #[test]
     fn structured_gh_json_survives_intact_and_ignores_stderr() {
         let registry = BgTaskRegistry::default();
         let dir = tempfile::tempdir().unwrap();
@@ -6996,8 +7252,8 @@ mod tests {
             match child.try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) => {
-                    if started.elapsed() > Duration::from_secs(5) {
-                        panic!("dead-child stand-in did not exit within 5s");
+                    if started.elapsed() > CHILD_EXIT_LIVENESS_BOUND {
+                        panic!("dead-child stand-in did not exit within the liveness bound");
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -7096,7 +7352,7 @@ mod tests {
         assert!(is_process_alive(pid));
 
         assert_eq!(registry.kill_running_tasks_for_root(root.path()), 1);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + CHILD_EXIT_LIVENESS_BOUND;
         while is_process_alive(pid) {
             assert!(
                 Instant::now() < deadline,
@@ -7304,7 +7560,16 @@ mod tests {
         assert_eq!(frame.match_offset, 0);
         assert_eq!(registry.active_watch_count(&frame.task_id), 0);
         let metadata = read_task(&task.paths.json).unwrap();
-        assert!(metadata.completion_delivered);
+        assert!(
+            !metadata.completion_delivered,
+            "terminal pattern notification remains unacked until explicit ack"
+        );
+        drop(frames);
+        assert_eq!(
+            registry.ack_completions_for_session(Some("session"), std::slice::from_ref(&task_id),),
+            vec![task_id]
+        );
+        assert!(read_task(&task.paths.json).unwrap().completion_delivered);
     }
 
     #[test]
@@ -7415,7 +7680,7 @@ mod tests {
                 break;
             }
             assert!(
-                started.elapsed() < Duration::from_secs(5),
+                started.elapsed() < CHILD_EXIT_LIVENESS_BOUND,
                 "child should exit quickly"
             );
             std::thread::sleep(Duration::from_millis(20));
@@ -7589,7 +7854,7 @@ mod tests {
                 break;
             }
             assert!(
-                started.elapsed() < Duration::from_secs(5),
+                started.elapsed() < CHILD_EXIT_LIVENESS_BOUND,
                 "child should exit and write marker quickly"
             );
             std::thread::sleep(Duration::from_millis(20));
@@ -7694,8 +7959,8 @@ mod tests {
         let started = Instant::now();
         while !is_zombie(pid) {
             assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "stand-in child should become a zombie within 5s"
+                started.elapsed() < CHILD_EXIT_LIVENESS_BOUND,
+                "stand-in child should become a zombie within the liveness bound"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -7749,7 +8014,7 @@ mod tests {
         let started = Instant::now();
         while !task.paths.exit.exists() {
             assert!(
-                started.elapsed() < Duration::from_secs(5),
+                started.elapsed() < CHILD_EXIT_LIVENESS_BOUND,
                 "exit marker should land quickly for `true`"
             );
             std::thread::sleep(Duration::from_millis(20));
@@ -7842,7 +8107,7 @@ mod tests {
         let started = Instant::now();
         while !task.paths.exit.exists() {
             assert!(
-                started.elapsed() < Duration::from_secs(5),
+                started.elapsed() < CHILD_EXIT_LIVENESS_BOUND,
                 "exit marker should land quickly for `true`"
             );
             std::thread::sleep(Duration::from_millis(20));
@@ -8197,7 +8462,7 @@ mod tests {
         storage: &Path,
     ) -> (
         BgTaskRegistry,
-        Arc<Mutex<Connection>>,
+        Arc<Mutex<TrackedConnection>>,
         Arc<Mutex<Vec<PushFrame>>>,
     ) {
         let frames = Arc::new(Mutex::new(Vec::new()));
@@ -8228,7 +8493,7 @@ mod tests {
 
     fn install_delivered_terminal_with_pending_watch(
         registry: &BgTaskRegistry,
-        db: &Arc<Mutex<Connection>>,
+        db: &Arc<Mutex<TrackedConnection>>,
         storage: &Path,
         task_id: &str,
     ) -> TaskPaths {
@@ -8280,6 +8545,73 @@ mod tests {
             .insert_rehydrated_task(metadata, paths.clone(), true, None)
             .unwrap();
         paths
+    }
+
+    /// The window a concurrent spawn leaves open: the task directory exists but
+    /// neither `control/` nor the metadata do yet. GC must leave it alone; an
+    /// identical directory older than the grace is still quarantined, so the
+    /// skip is age-bound rather than a blanket exemption.
+    #[test]
+    fn gc_skips_a_task_directory_still_being_created_but_quarantines_an_abandoned_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let registry = BgTaskRegistry::default();
+        let session_dir = session_tasks_dir(storage, "session");
+        let young = session_dir.join("bash-0000000000000301");
+        let abandoned = session_dir.join("bash-0000000000000302");
+        fs::create_dir_all(&young).unwrap();
+        fs::create_dir_all(&abandoned).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(6 * 60);
+        filetime::set_file_mtime(&abandoned, filetime::FileTime::from_system_time(old)).unwrap();
+
+        registry.maybe_gc_persisted(storage).unwrap();
+
+        assert!(
+            young.is_dir(),
+            "a task directory younger than the grace was quarantined mid-creation"
+        );
+        assert!(
+            !abandoned.is_dir(),
+            "an empty task directory older than the grace must still be quarantined"
+        );
+        let quarantined = fs::read_dir(storage.join("bash-tasks-quarantine"))
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        assert_eq!(
+            quarantined, 1,
+            "exactly the abandoned layout is quarantined"
+        );
+    }
+
+    #[test]
+    fn pending_pattern_match_is_returned_by_drain_contract_until_ack() {
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        let task_id = "bash-0000000000000197";
+        install_delivered_terminal_with_pending_watch(&registry, &db, storage.path(), task_id);
+
+        let first = registry.pending_pattern_matches_for_session("session");
+        let second = registry.pending_pattern_matches_for_session("session");
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        assert_eq!(first[0].task_id, task_id);
+        assert_eq!(first[0].watch_id, "watch-00000001");
+        assert_eq!(registry.unacked_wake_count_for_session(Some("session")), 1);
+        let stuck =
+            registry.stuck_pending_watches_for_session("session", Duration::from_secs(10 * 60));
+        assert_eq!(stuck.len(), 1);
+        assert_eq!(stuck[0].0, task_id);
+        assert_eq!(stuck[0].1, "watch-00000001");
+        assert!(stuck[0].2 >= Duration::from_secs(10 * 60).as_millis() as u64);
+
+        assert_eq!(
+            registry.ack_completions_for_session(Some("session"), &[task_id.to_string()],),
+            vec![task_id.to_string()]
+        );
+        assert!(registry
+            .pending_pattern_matches_for_session("session")
+            .is_empty());
+        assert_eq!(registry.unacked_wake_count_for_session(Some("session")), 0);
     }
 
     #[cfg(unix)]

@@ -118,6 +118,17 @@ export interface GitConfig {
   co_author?: string;
 }
 
+export type PiToolPresentation = "top_level" | "host_default";
+
+export interface PiConfig {
+  /**
+   * Tool presentation on Pi and OMP harnesses.
+   * - "top_level": registers tools with `loadMode: "essential"` on OMP so they appear at top level. (default)
+   * - "host_default": leaves tool presentation to host defaults (on OMP, tools mount under xd://).
+   */
+  tool_presentation?: PiToolPresentation;
+}
+
 export interface IndexRootConfig {
   path: string;
   indexes: Array<"search" | "semantic" | "callgraph">;
@@ -161,6 +172,13 @@ export interface InspectConfig {
   duplicates?: {
     expected_mirrors?: [string, string][];
   };
+}
+
+export interface IdleConfig {
+  /** Unbound-root artifact eviction idle window in minutes. Default 30; clamped to 5..=30. */
+  root_ttl_minutes?: number;
+  /** Language-server idle window in minutes. Default 10; clamped to 1..=10. */
+  lsp_ttl_minutes?: number;
 }
 
 export const DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS = 120_000;
@@ -255,8 +273,19 @@ export interface BashConfig {
    * Default 15000ms; values below the 5000ms floor are clamped up.
    */
   foreground_wait_window_ms?: number;
+  /** Maximum synchronous bash_watch wait; values outside 1000..1800000 are clamped. Default 120000. */
+  watch_sync_max_ms?: number;
   /** Manual fallback for Pi versions that do not expose enabled default tools. */
   powershell_tool?: boolean;
+}
+
+export function toolEnabled(config: AftConfig, toolName: string): boolean {
+  return !(config.disabled_tools ?? []).includes(toolName);
+}
+
+export interface ViewsConfig {
+  /** Enable content-addressed index views. Default: false. */
+  enabled?: boolean;
 }
 
 export interface AftConfig {
@@ -287,11 +316,15 @@ export interface AftConfig {
   /** User-tier standing roots; project config cannot configure this machine state. */
   index?: IndexConfig;
   semantic_search?: boolean;
+  /** Content-addressed index views. Disabled by default. */
+  views?: ViewsConfig;
   callgraph_store?: boolean;
   /** Number of files to parse in a single batch during callgraph store cold build. Lower values reduce peak memory during cold build. Default: 100. */
   callgraph_chunk_size?: number;
   /** Codebase health inspection config. Enabled by default; set inspect.enabled=false to hide aft_inspect. */
   inspect?: InspectConfig;
+  /** Idle reclamation windows for unbound-root artifacts and language servers. */
+  idle?: IdleConfig;
   /** Undo backup config. User-only: project config cannot disable or shrink a user's safety net. */
   backup?: BackupConfig;
   /**
@@ -325,6 +358,8 @@ export interface AftConfig {
   gh_shim?: GhShimConfig;
   gh_read?: GhReadConfig;
   git?: GitConfig;
+  /** Pi and OMP harness-specific configuration. */
+  pi?: PiConfig;
   /** Per-harness config overrides; nested harnesses are ignored. */
   harnesses?: Record<string, Omit<AftConfig, "harnesses">>;
 }
@@ -348,6 +383,8 @@ export interface ResolvedBashConfig {
    * Always resolved: defaults to 15000, floored at 5000.
    */
   foreground_wait_window_ms: number;
+  /** Maximum synchronous bash_watch wait. Defaults to 120000 and is clamped to 1000..1800000. */
+  watch_sync_max_ms: number;
   /** Manual PowerShell registration fallback. Default false. */
   powershell_tool: boolean;
 }
@@ -356,6 +393,23 @@ export interface ResolvedBashConfig {
 export const FOREGROUND_WAIT_WINDOW_DEFAULT_MS = 15_000;
 /** Minimum allowed foreground wait-window (ms); smaller values clamp up. */
 export const FOREGROUND_WAIT_WINDOW_MIN_MS = 5_000;
+/** Default maximum synchronous bash_watch wait (ms). */
+export const DEFAULT_BASH_WATCH_SYNC_MAX_MS = 120_000;
+/** Minimum synchronous bash_watch wait cap (ms). */
+export const MIN_BASH_WATCH_SYNC_MAX_MS = 1_000;
+/** Static schema maximum and hard upper bound for synchronous bash_watch waits (ms). */
+export const MAX_BASH_WATCH_SYNC_MAX_MS = 1_800_000;
+
+export function clampBashWatchSyncMaxMs(value: number | undefined): number {
+  const raw = value ?? DEFAULT_BASH_WATCH_SYNC_MAX_MS;
+  const clamped = Math.min(MAX_BASH_WATCH_SYNC_MAX_MS, Math.max(MIN_BASH_WATCH_SYNC_MAX_MS, raw));
+  if (clamped !== raw) {
+    warn(
+      `bash.watch_sync_max_ms=${raw} is outside ${MIN_BASH_WATCH_SYNC_MAX_MS}..=${MAX_BASH_WATCH_SYNC_MAX_MS}; clamped to ${clamped}`,
+    );
+  }
+  return clamped;
+}
 
 /**
  * Single source of truth for bash config across the Pi plugin. Resolution
@@ -399,6 +453,9 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     FOREGROUND_WAIT_WINDOW_MIN_MS,
     rawForegroundWait ?? FOREGROUND_WAIT_WINDOW_DEFAULT_MS,
   );
+  const rawWatchSyncMax =
+    typeof top === "object" && top !== null ? top.watch_sync_max_ms : undefined;
+  const watchSyncMaxMs = clampBashWatchSyncMaxMs(rawWatchSyncMax);
 
   const base: ResolvedBashConfig = {
     enabled: false,
@@ -410,6 +467,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     long_running_reminder_enabled: reminderEnabled,
     long_running_reminder_interval_ms: reminderInterval,
     foreground_wait_window_ms: foregroundWaitWindowMs,
+    watch_sync_max_ms: watchSyncMaxMs,
     powershell_tool:
       typeof top === "object" && top !== null ? (top.powershell_tool ?? false) : false,
   };
@@ -620,6 +678,8 @@ const BashFeaturesSchema = z.object({
   long_running_reminder_enabled: z.boolean().optional(),
   long_running_reminder_interval_ms: z.number().int().positive().optional(),
   foreground_wait_window_ms: z.number().int().positive().optional(),
+  /** Maximum synchronous bash_watch wait in milliseconds; clamped to 1000..1800000. Default 120000. */
+  watch_sync_max_ms: z.number().int().positive().optional(),
   // Pi mirrors the host's optional PowerShell default tool when its API can
   // report that state. This project-safe fallback is used only on older hosts.
   powershell_tool: z.boolean().optional(),
@@ -704,6 +764,32 @@ const InspectConfigSchema = z.object({
     .optional(),
 });
 
+function clampIdleRootTtlMinutes(value: number): number {
+  return Math.min(30, Math.max(5, value));
+}
+
+function clampIdleLspTtlMinutes(value: number): number {
+  return Math.min(10, Math.max(1, value));
+}
+
+const IdleConfigSchema = z.object({
+  root_ttl_minutes: z
+    .number()
+    .int()
+    .optional()
+    .transform((value) => (value === undefined ? undefined : clampIdleRootTtlMinutes(value))),
+  lsp_ttl_minutes: z
+    .number()
+    .int()
+    .optional()
+    .transform((value) => (value === undefined ? undefined : clampIdleLspTtlMinutes(value))),
+});
+
+const ViewsConfigSchema = z.object({
+  /** Enable content-addressed index views. Default: false. */
+  enabled: z.boolean().optional(),
+});
+
 const WorktreeConfigSchema = z.object({
   /**
    * When true, a linked worktree applies local file-watcher events to the
@@ -717,7 +803,8 @@ const WorktreeConfigSchema = z.object({
 const BackupConfigSchema = z.object({
   enabled: z.boolean().optional(),
   max_depth: z.number().int().positive().optional(),
-  max_file_size: z.number().int().positive().optional(),
+  /** Skip backup capture above 64 MiB by default. Zero disables snapshots. */
+  max_file_size: z.number().int().nonnegative().optional(),
 });
 
 const AftConfigFieldsSchema = z.object({
@@ -755,9 +842,11 @@ const AftConfigFieldsSchema = z.object({
   /** User-configured filesystem roots for indexed search; project config cannot change them. */
   index: IndexConfigSchema.optional(),
   semantic_search: z.boolean().optional(),
+  views: ViewsConfigSchema.optional(),
   callgraph_store: z.boolean().optional(),
   callgraph_chunk_size: z.number().optional(),
   inspect: InspectConfigSchema.optional(),
+  idle: IdleConfigSchema.optional(),
   backup: BackupConfigSchema.optional(),
   worktree: WorktreeConfigSchema.optional(),
   sandbox: SandboxConfigSchema.optional(),
@@ -871,6 +960,10 @@ export function resolveLspConfigForConfigure(config: AftConfig): ConfigureLspOve
 export function resolveProjectOverridesForConfigure(config: AftConfig): Record<string, unknown> {
   const overrides: Record<string, unknown> = {};
 
+  // Forward disabled_tools because the Rust server uses it to omit disabled
+  // tools from the steering text it renders for the session.
+  if (config.disabled_tools !== undefined) overrides.disabled_tools = config.disabled_tools;
+
   if (config.edit_mode !== undefined) overrides.hashline_enabled = config.edit_mode === "hashline";
   if (config.format_on_edit !== undefined) overrides.format_on_edit = config.format_on_edit;
   if (config.formatter_timeout_secs !== undefined)
@@ -884,6 +977,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.search_index !== undefined) overrides.search_index = config.search_index;
   if (config.index !== undefined) overrides.index = config.index;
   if (config.semantic_search !== undefined) overrides.semantic_search = config.semantic_search;
+  if (config.views !== undefined) overrides.views = config.views;
   if (config.callgraph_store !== undefined) overrides.callgraph_store = config.callgraph_store;
   if (config.callgraph_chunk_size !== undefined)
     overrides.callgraph_chunk_size = config.callgraph_chunk_size;
@@ -893,6 +987,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
     typeof config.bash === "object" &&
     (config.bash.host_fallback !== undefined ||
       config.bash.detach_on_user_message !== undefined ||
+      config.bash.watch_sync_max_ms !== undefined ||
       config.bash.powershell_tool !== undefined)
   ) {
     overrides.bash = {
@@ -902,6 +997,9 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
       ...(config.bash.detach_on_user_message !== undefined
         ? { detach_on_user_message: config.bash.detach_on_user_message }
         : {}),
+      ...(config.bash.watch_sync_max_ms !== undefined
+        ? { watch_sync_max_ms: config.bash.watch_sync_max_ms }
+        : {}),
       ...(config.bash.powershell_tool !== undefined
         ? { powershell_tool: config.bash.powershell_tool }
         : {}),
@@ -910,6 +1008,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   Object.assign(overrides, resolveLspConfigForConfigure(config));
   if (config.semantic !== undefined) overrides.semantic = config.semantic;
   if (config.inspect !== undefined) overrides.inspect = config.inspect;
+  if (config.idle !== undefined) overrides.idle = config.idle;
   if (config.backup !== undefined) overrides.backup = config.backup;
   if (config.worktree !== undefined) overrides.worktree = config.worktree;
   if (config.sandbox !== undefined) overrides.sandbox = config.sandbox;
@@ -1483,13 +1582,16 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // and toggle per-project (or vice versa). Project value overrides user value.
   "search_index",
   "semantic_search",
+  "views",
   "callgraph_store",
   "callgraph_chunk_size",
   "inspect",
+  "idle",
   "worktree",
   // Git attribution only changes commit metadata; it grants no capabilities and
   // does not select an executable, so project configuration may override it.
   "git",
+  "pi",
   "experimental",
   // Graduated bash family (v0.27.2). Same reasoning as `experimental`:
   // project-settable so users can opt out per-repo (e.g. `bash: false` in a
@@ -1521,12 +1623,26 @@ function pickProjectSafeFields(override: AftConfig): Partial<AftConfig> {
   return safe;
 }
 
+function mergeProjectBackupConfig(
+  base: AftConfig["backup"],
+  project: AftConfig["backup"],
+): AftConfig["backup"] {
+  if (project?.max_file_size === undefined) return base;
+  return { ...base, max_file_size: project.max_file_size };
+}
+
+function mergePiConfig(base?: PiConfig, override?: PiConfig): PiConfig | undefined {
+  if (!base && !override) return undefined;
+  return { ...base, ...override };
+}
+
 function getStrippedTopLevelKeys(override: AftConfig): string[] {
   const stripped: string[] = [];
   if (override.restrict_to_project_root !== undefined) stripped.push("restrict_to_project_root");
   if (override.url_fetch_allow_private !== undefined) stripped.push("url_fetch_allow_private");
   if (override.bridge !== undefined) stripped.push("bridge");
-  if (override.backup !== undefined) stripped.push("backup");
+  if (override.backup?.enabled !== undefined || override.backup?.max_depth !== undefined)
+    stripped.push("backup");
   if (override.index?.roots !== undefined) stripped.push("index.roots");
   // enabled:true is an accepted project-tier hardening opt-in; only the
   // weakening direction (enabled:false) is stripped as user-only.
@@ -1553,6 +1669,8 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   const inspect = mergeInspectConfig(base.inspect, override.inspect);
   const worktree = mergeWorktreeConfig(base.worktree, override.worktree);
   const sandbox = mergeSandboxConfig(base.sandbox, override.sandbox);
+  const backup = mergeProjectBackupConfig(base.backup, override.backup);
+  const pi = mergePiConfig(base.pi, override.pi);
   const bridge = base.bridge;
 
   // STRICT ALLOWLIST: only project-safe top-level fields are inherited.
@@ -1564,6 +1682,7 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
   delete safeOverride.bash;
   delete safeOverride.inspect;
   delete safeOverride.worktree;
+  delete safeOverride.pi;
 
   return {
     ...base,
@@ -1575,10 +1694,12 @@ function mergeConfigs(base: AftConfig, override: AftConfig): AftConfig {
     ...(inspect !== undefined ? { inspect } : {}),
     ...(worktree !== undefined ? { worktree } : {}),
     ...(sandbox !== undefined ? { sandbox } : {}),
+    ...(backup !== undefined ? { backup } : {}),
+    ...(pi !== undefined ? { pi } : {}),
     experimental,
     semantic,
     ...(bridge !== undefined ? { bridge } : {}),
-    ...(disabledTools.length > 0 ? { disabled_tools: [...new Set(disabledTools)] } : {}),
+    ...(disabledTools.length > 0 ? { disabled_tools: [...new Set(disabledTools)].sort() } : {}),
   };
 }
 

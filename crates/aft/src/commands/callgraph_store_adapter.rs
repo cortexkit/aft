@@ -1728,6 +1728,61 @@ fn extract_callee_names(node: Node<'_>, source: &str) -> (Option<String>, Option
     (Some(full), Some(short))
 }
 
+pub fn serialized_value<T: Serialize>(
+    req_id: &str,
+    operation: &str,
+    value: &T,
+) -> Result<serde_json::Value, Response> {
+    serde_json::to_value(value)
+        .map_err(|error| serialization_error_response(req_id, operation, error))
+}
+
+pub fn serialized_response<T: Serialize>(req_id: &str, operation: &str, value: &T) -> Response {
+    match serialized_value(req_id, operation, value) {
+        Ok(value) => Response::success(req_id, value),
+        Err(response) => response,
+    }
+}
+
+pub fn serialization_error_response(
+    req_id: &str,
+    operation: &str,
+    error: serde_json::Error,
+) -> Response {
+    Response::error(
+        req_id,
+        "serialization_error",
+        format!("{operation}: failed to serialize response: {error}"),
+    )
+}
+
+#[cfg(test)]
+mod outbound_serialization_failure_tests {
+    use super::*;
+
+    struct AlwaysFails;
+
+    impl serde::Serialize for AlwaysFails {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("forced serialization failure"))
+        }
+    }
+
+    #[test]
+    fn serialization_failure_returns_an_error_instead_of_a_successful_null() {
+        let response = serialized_response("request", "callers", &AlwaysFails);
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "serialization_error");
+        assert!(response.data["message"]
+            .as_str()
+            .expect("message")
+            .contains("forced serialization failure"));
+    }
+}
+
 pub fn store_error_response(req_id: &str, operation: &str, error: CallGraphStoreError) -> Response {
     match error {
         CallGraphStoreError::Aft(error) => Response::error(req_id, error.code(), error.to_string()),
@@ -1749,6 +1804,34 @@ pub fn store_error_response(req_id: &str, operation: &str, error: CallGraphStore
             "callgraph_store_error",
             format!("{operation}: persisted callgraph store error: {other}"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod serialization_tests {
+    use super::*;
+
+    struct RefusesSerialization;
+
+    impl Serialize for RefusesSerialization {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom(
+                "deliberate serialization failure",
+            ))
+        }
+    }
+
+    #[test]
+    fn serialization_failure_is_an_error_instead_of_default_success_data() {
+        let response = serialized_response("request", "call_tree", &RefusesSerialization);
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "serialization_error");
+        assert!(response.data["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("deliberate serialization failure")));
     }
 }
 

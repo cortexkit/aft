@@ -1,0 +1,10 @@
+{
+  "disabled_tools": [
+    "aft_zoom"
+  ],
+  "experimental_bash_background": true,
+  "experimental_bash_compress": true,
+  "experimental_bash_rewrite": true,
+  "hoist_builtin_tools": true,
+  "restrict_to_project_root": false
+}

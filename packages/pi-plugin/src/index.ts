@@ -91,6 +91,7 @@ import {
   signalBashWaitDetachForProject,
   stripUserMessageDetachKeyword,
 } from "./bash-wait-detach.js";
+import { recordActiveExtensionApi } from "./harness.js";
 import { registerShutdownCleanup } from "./shutdown-hooks.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import {
@@ -341,6 +342,7 @@ async function handleConfigureWarningsForSession(context: {
  * Called once per session. Registers tools, commands, and session shutdown hooks.
  */
 export default async function (pi: ExtensionAPI): Promise<void> {
+  recordActiveExtensionApi(pi);
   const deliverConfigMigrationWarnings = (messages: readonly string[]) => {
     for (const message of messages) {
       const notify = (pi as { ui?: { notify?: (message: string, type?: "warning") => void } }).ui

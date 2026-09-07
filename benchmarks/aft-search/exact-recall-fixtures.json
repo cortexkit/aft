@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "sample_per_family_per_repo": 2,
+  "fixtures": [
+    {
+      "id": "ripgrep-sentence-sink-match",
+      "repo": "ripgrep",
+      "family": "sentence",
+      "query": "This method is called whenever a match is found.",
+      "expected_file": "crates/searcher/src/sink.rs"
+    },
+    {
+      "id": "ripgrep-sentence-file-types",
+      "repo": "ripgrep",
+      "family": "sentence",
+      "query": "All of the file type definitions, sorted lexicographically by name.",
+      "expected_file": "crates/ignore/src/types.rs"
+    },
+    {
+      "id": "ripgrep-pair-sink-match",
+      "repo": "ripgrep",
+      "family": "pair",
+      "query": "whenever match found",
+      "expected_file": "crates/searcher/src/sink.rs"
+    },
+    {
+      "id": "ripgrep-pair-file-types",
+      "repo": "ripgrep",
+      "family": "pair",
+      "query": "definitions lexicographically name",
+      "expected_file": "crates/ignore/src/types.rs"
+    },
+    {
+      "id": "flask-sentence-blueprint-order",
+      "repo": "flask",
+      "family": "sentence",
+      "query": "Iterates over all blueprints by the order they were registered.",
+      "expected_file": "src/flask/sansio/app.py"
+    },
+    {
+      "id": "flask-sentence-permanent-key",
+      "repo": "flask",
+      "family": "sentence",
+      "query": "This reflects the ``'_permanent'`` key in the dict.",
+      "expected_file": "src/flask/sessions.py"
+    },
+    {
+      "id": "flask-pair-blueprint-order",
+      "repo": "flask",
+      "family": "pair",
+      "query": "blueprints order registered",
+      "expected_file": "src/flask/sansio/app.py"
+    },
+    {
+      "id": "flask-pair-permanent-key",
+      "repo": "flask",
+      "family": "pair",
+      "query": "permanent key dict",
+      "expected_file": "src/flask/sessions.py"
+    },
+    {
+      "id": "fastify-sentence-shallow-copy",
+      "repo": "fastify",
+      "family": "sentence",
+      "query": "Since we are mutating/assigning only top level props, it is fine to have a shallow copy using the spread operator",
+      "expected_file": "lib/route.js"
+    },
+    {
+      "id": "fastify-sentence-reply-hijacked",
+      "repo": "fastify",
+      "family": "sentence",
+      "query": "We are checking whether reply was hijacked or the response has ended.",
+      "expected_file": "lib/reply.js"
+    },
+    {
+      "id": "fastify-pair-shallow-copy",
+      "repo": "fastify",
+      "family": "pair",
+      "query": "mutating shallow spread",
+      "expected_file": "lib/route.js"
+    },
+    {
+      "id": "fastify-pair-reply-hijacked",
+      "repo": "fastify",
+      "family": "pair",
+      "query": "reply hijacked ended",
+      "expected_file": "lib/reply.js"
+    },
+    {
+      "id": "turborepo-sentence-include-selector",
+      "repo": "turborepo",
+      "family": "sentence",
+      "query": "Each include selector contributes a set of tasks (unioned together).",
+      "expected_file": "crates/turborepo-lib/src/run/task_filter.rs"
+    },
+    {
+      "id": "turborepo-sentence-watch-entrypoint",
+      "repo": "turborepo",
+      "family": "sentence",
+      "query": "In watch mode, we can have a changed package that we want to serve as an entrypoint.",
+      "expected_file": "crates/turborepo-lib/src/run/builder.rs"
+    },
+    {
+      "id": "turborepo-pair-include-selector",
+      "repo": "turborepo",
+      "family": "pair",
+      "query": "contributes unioned",
+      "expected_file": "crates/turborepo-lib/src/run/task_filter.rs"
+    },
+    {
+      "id": "turborepo-pair-watch-entrypoint",
+      "repo": "turborepo",
+      "family": "pair",
+      "query": "changed package entrypoint",
+      "expected_file": "crates/turborepo-lib/src/run/builder.rs"
+    }
+  ]
+}

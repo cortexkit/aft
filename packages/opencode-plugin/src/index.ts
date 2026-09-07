@@ -1,4 +1,3 @@
-import { createRequire } from "node:module";
 import {
   createAftTransportPool,
   ensureBinary,
@@ -66,6 +65,7 @@ import {
   sendFeatureAnnouncement,
   sendWarning,
 } from "./notifications.js";
+import { resolvePluginVersion } from "./plugin-version.js";
 import { maybeAppendConflictsHint } from "./shared/bash-hints.js";
 import { sendIgnoredMessage } from "./shared/ignored-message.js";
 import {
@@ -86,7 +86,7 @@ import { registerShutdownCleanup, runCleanups } from "./shutdown-hooks.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { instrumentToolMap } from "./tool-perf.js";
 import {
-  buildOpenCodeToolMap,
+  buildAftToolDefinitions,
   openCodeHashlineDowngrade,
   openCodeHashlineEditRegistered,
   openCodeHashlineEffective,
@@ -158,7 +158,7 @@ function throwSentinel(command: string): never {
     `${SENTINEL_PREFIX}${command.toUpperCase().replace(/-/g, "_")}_HANDLED__`,
   ) as Error & Record<string, unknown>;
   sentinel[HTTP_SERVER_RESPONSE_TYPE_ID] = HTTP_SERVER_RESPONSE_TYPE_ID;
-  sentinel[ERROR_REPORTER_IGNORE] = true;
+  Object.defineProperty(sentinel, ERROR_REPORTER_IGNORE, { value: true, enumerable: true });
   sentinel.status = 204;
   sentinel.statusText = undefined;
   sentinel.headers = {};
@@ -180,15 +180,8 @@ function throwSentinel(command: string): never {
 // sendIgnoredMessage moved to ./shared/ignored-message.ts so tools/permissions.ts
 // can call it too (index.ts must export only the plugin default).
 
-/** Read the plugin's own version from package.json at build time. */
-const PLUGIN_VERSION: string = (() => {
-  try {
-    const req = createRequire(import.meta.url);
-    return (req("../package.json") as { version: string }).version;
-  } catch {
-    return "0.0.0";
-  }
-})();
+/** The plugin's own version, resolved from whichever entry bundle this runs in. */
+const PLUGIN_VERSION: string = resolvePluginVersion(import.meta.url);
 
 /**
  * Release-notes identifier for the startup announcement dialog.
@@ -1031,7 +1024,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
 
   // Build the exact tool map for the configured profile. The builder contains
   // only registration work; startup, transport, and lifecycle hooks stay here.
-  const allTools = buildOpenCodeToolMap(ctx, aftConfig, (name, available) => {
+  const allTools = buildAftToolDefinitions(ctx, aftConfig, (name, available) => {
     warn(`disabled_tools: "${name}" not found — available: ${available.join(", ")}`);
   });
   const disabled = aftConfig.disabled_tools ?? [];
@@ -1069,6 +1062,8 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     "aft_inspect",
     "grep",
     "aft_grep",
+    "read",
+    "aft_read",
     "bash",
     "aft_bash",
     "bash_status",

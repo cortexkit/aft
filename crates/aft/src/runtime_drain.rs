@@ -9,10 +9,11 @@ use crate::log_ctx;
 use crate::lsp::client::LspEvent;
 use crate::protocol::PushFrame;
 use crate::watcher_filter::{watcher_path_is_infra_skip, WatcherDispatchEvent};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -286,6 +287,106 @@ pub fn drain_deferred_configure_maintenance(ctx: &AppContext) {
     crate::commands::configure::drain_deferred_configure_maintenance(ctx);
 }
 
+/// Tracks deferred configure work for the standalone NDJSON loop. The attached-
+/// daemon (`subc`) path schedules this work through its executor instead.
+#[derive(Debug)]
+pub struct StandaloneConfigureMaintenance {
+    inner: crate::commands::configure::ConfigureMaintenanceState,
+}
+
+impl Default for StandaloneConfigureMaintenance {
+    fn default() -> Self {
+        Self {
+            inner: crate::commands::configure::ConfigureMaintenanceState::standalone(),
+        }
+    }
+}
+
+impl StandaloneConfigureMaintenance {
+    pub fn has_pending(&mut self, ctx: &AppContext) -> bool {
+        crate::commands::configure::standalone_configure_maintenance_pending(ctx, &mut self.inner)
+    }
+
+    pub fn drain_prefix(&mut self, ctx: &AppContext) -> bool {
+        crate::commands::configure::drain_standalone_configure_prefix(ctx, &mut self.inner)
+    }
+
+    pub fn drain_one(&mut self, ctx: &AppContext) -> bool {
+        crate::commands::configure::drain_deferred_configure_maintenance_unit(ctx, &mut self.inner)
+    }
+}
+
+const STANDALONE_LOG_SWEEP_ATTEMPT_INTERVAL: Duration = Duration::from_secs(60);
+const CONFIGURE_MAINTENANCE_YIELD_LOG_INTERVAL: Duration = Duration::from_secs(5);
+static STANDALONE_LOG_SWEEP_LAST_ATTEMPT: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+static STANDALONE_LOG_SWEEP_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static CONFIGURE_MAINTENANCE_YIELD_LAST_LOG: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+/// Keep shared log-retention I/O off the standalone request loop. The logging
+/// module retains its hourly sweep cadence; this coarser gate avoids spawning a
+/// no-op thread on every 250 ms idle tick.
+pub fn spawn_standalone_log_maintenance() {
+    let now = Instant::now();
+    let should_attempt = STANDALONE_LOG_SWEEP_LAST_ATTEMPT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map(|mut last_attempt| {
+            if last_attempt.is_some_and(|last| {
+                now.duration_since(last) < STANDALONE_LOG_SWEEP_ATTEMPT_INTERVAL
+            }) {
+                false
+            } else {
+                *last_attempt = Some(now);
+                true
+            }
+        })
+        .unwrap_or(false);
+    if !should_attempt || STANDALONE_LOG_SWEEP_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    if let Err(error) = thread::Builder::new()
+        .name("aft-log-retention-sweep".to_string())
+        .spawn(|| {
+            crate::logging::maybe_sweep_logs();
+            STANDALONE_LOG_SWEEP_IN_FLIGHT.store(false, Ordering::Release);
+        })
+    {
+        STANDALONE_LOG_SWEEP_IN_FLIGHT.store(false, Ordering::Release);
+        crate::slog_warn!("failed to spawn log retention maintenance thread: {error}");
+    }
+}
+
+/// Report cooperative configure work displaced by already-buffered requests.
+/// Bursty clients may trigger many unit boundaries, so emit at most once per
+/// five seconds while preserving the queued count from the observed boundary.
+pub fn note_configure_maintenance_yield(queued: usize) {
+    if queued == 0 {
+        return;
+    }
+    let now = Instant::now();
+    let should_log = CONFIGURE_MAINTENANCE_YIELD_LAST_LOG
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .map(|mut last_log| {
+            if last_log.is_some_and(|last| {
+                now.duration_since(last) < CONFIGURE_MAINTENANCE_YIELD_LOG_INTERVAL
+            }) {
+                false
+            } else {
+                *last_log = Some(now);
+                true
+            }
+        })
+        .unwrap_or(false);
+    if should_log {
+        crate::slog_info!(
+            "configure maintenance yielded to {} queued request(s)",
+            queued
+        );
+    }
+}
+
 pub fn drain_configure_warning_events(ctx: &AppContext) {
     for (generation, frame) in ctx.drain_configure_warnings() {
         if ctx.configure_generation() != generation {
@@ -479,6 +580,7 @@ pub fn drain_search_index_events(ctx: &AppContext) {
         if !installed_index {
             return;
         }
+        ctx.note_search_index_load_succeeded();
     } else if disconnected {
         let cleared = ctx
             .with_current_search_index_rx(receiver_generation, receiver_epoch, |receiver| {
@@ -586,6 +688,12 @@ pub fn drain_callgraph_store_events(ctx: &AppContext) {
         ready_received || denied.is_some() || suspended.is_some() || settled || disconnected;
     if !terminal {
         return;
+    }
+    if let Some(project_root) = ctx.callgraph_project_root() {
+        crate::logging::release_index_build_start_waiters(
+            crate::logging::IndexPlane::Callgraph,
+            &project_root,
+        );
     }
     wait_on_artifact_drain_commit_gate_for_test(ctx);
 
@@ -809,6 +917,23 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                 cold_seed_resumes.push(resume);
                 terminal = true;
                 status_changed = true;
+            }
+        }
+    }
+
+    if terminal
+        && ctx.config().views.enabled
+        && matches!(
+            &*ctx
+                .semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SemanticIndexStatus::Ready { .. }
+        )
+    {
+        if let Some(_permit) = ctx.cold_build_limiter().try_acquire() {
+            if let Err(error) = ctx.publish_view_paths(BTreeSet::new(), true) {
+                aft::slog_warn!("semantic-ready view publication failed: {}", error);
             }
         }
     }
@@ -2101,7 +2226,6 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                     |path| {
                         if heavy_root_work_allowed
                             && !shared_artifacts_read_only
-                            && !oversized_inline_batch
                             && search_build_in_progress
                         {
                             let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
@@ -2110,7 +2234,6 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                         }
                         if heavy_root_work_allowed
                             && !shared_artifacts_read_only
-                            && !oversized_inline_batch
                             && (semantic_build_in_progress || semantic_corpus_refresh_in_progress)
                             && watcher_path_is_semantic_source(path)
                         {
@@ -2143,7 +2266,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 &mut remaining,
                 started,
                 WATCHER_DRAIN_SLICE_BUDGET,
-                heavy_root_work_allowed && !oversized_inline_batch,
+                heavy_root_work_allowed,
                 |ctx, changed| {
                     let _ = ctx.enqueue_callgraph_store_refresh_for_generation(
                         changed.iter().cloned(),
@@ -2158,10 +2281,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 started,
                 WATCHER_DRAIN_SLICE_BUDGET,
                 |path| {
-                    if heavy_root_work_allowed
-                        && apply_ram_search_updates
-                        && !oversized_inline_batch
-                    {
+                    if heavy_root_work_allowed && apply_ram_search_updates {
                         let _ = ctx.run_if_subc_bound_generation(lifecycle_generation, || {
                             let mut index_ref = ctx
                                 .search_index()
@@ -2191,7 +2311,6 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                     |path| {
                         if heavy_root_work_allowed
                             && !shared_artifacts_read_only
-                            && !oversized_inline_batch
                             && watcher_path_is_semantic_source(path)
                         {
                             invalidated_paths.push(path.to_path_buf());
@@ -2361,6 +2480,47 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
     state.semantic_refresh_paths.clear();
 }
 
+fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSliceState) {
+    if !ctx.config().views.enabled
+        || !matches!(state.phase, WatcherDrainPhase::Collect)
+        || state
+            .view_publication_due
+            .is_none_or(|due| Instant::now() < due)
+    {
+        return;
+    }
+    let Some(root) = ctx.canonical_cache_root_opt() else {
+        return;
+    };
+    let changed = state
+        .view_publication_paths
+        .iter()
+        .filter_map(|path| path.strip_prefix(&root).ok())
+        .filter_map(|path| aft::views::RelPath::from_os_path(path).ok())
+        .map(|path| path.as_bytes().to_vec())
+        .collect::<BTreeSet<_>>();
+    let Some(_permit) = ctx.cold_build_limiter().try_acquire() else {
+        state.view_publication_due = Some(Instant::now() + Duration::from_millis(100));
+        return;
+    };
+    match ctx.publish_view_paths(changed, !ctx.shared_artifacts_read_only()) {
+        Ok(report) => {
+            aft::slog_info!(
+                "content-addressed view publication published={} blob_puts={} pending_paths={}",
+                report.published,
+                report.blob_puts,
+                report.pending_paths.len()
+            );
+            state.view_publication_paths.clear();
+            state.view_publication_due = None;
+        }
+        Err(error) => {
+            aft::slog_warn!("content-addressed view publication failed: {}", error);
+            state.view_publication_due = Some(Instant::now() + Duration::from_secs(1));
+        }
+    }
+}
+
 pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> DrainBatchOutcome {
     let started = Instant::now();
     let configure_generation = ctx.configure_generation();
@@ -2514,15 +2674,19 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         {
             state.rescan_required = false;
             state.ignore_changed = false;
+            if ctx.config().views.enabled {
+                state.view_publication_paths.clear();
+                state.view_publication_due = Some(
+                    Instant::now() + crate::commands::configure::semantic_refresh_quiet_window(),
+                );
+            }
         }
         state.status_changed = false;
         state.scheduler_changed_path_count = 0;
     } else if matches!(state.phase, WatcherDrainPhase::Collect) {
         let ignore_changed = state.ignore_changed;
-        let mut project_corpus_refresh_requested = false;
         if ignore_changed {
             state.status_changed |= refresh_corpus_after_ignore_change(ctx);
-            project_corpus_refresh_requested = true;
             // Same partial-sequence rule as the rescan path: acknowledge only
             // when the refresh ran fully under this lifecycle generation.
             if ctx
@@ -2530,6 +2694,13 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 .is_some()
             {
                 state.ignore_changed = false;
+                if ctx.config().views.enabled {
+                    state.view_publication_paths.clear();
+                    state.view_publication_due = Some(
+                        Instant::now()
+                            + crate::commands::configure::semantic_refresh_quiet_window(),
+                    );
+                }
             }
         }
 
@@ -2554,6 +2725,13 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 ctx.tick_tier2_refresh_scheduler(usize::from(ignore_changed));
                 state.status_changed = false;
             } else {
+                if ctx.config().views.enabled {
+                    state.view_publication_paths.extend(paths.iter().cloned());
+                    state.view_publication_due = Some(
+                        Instant::now()
+                            + crate::commands::configure::semantic_refresh_quiet_window(),
+                    );
+                }
                 state.path_slice_count += 1;
                 state.scheduler_changed_path_count = if ignore_changed {
                     paths.len().max(1)
@@ -2581,14 +2759,10 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 let oversized_inline_batch = paths.len() > WATCHER_BATCH_INLINE_CAP;
                 if oversized_inline_batch {
                     aft::slog_warn!(
-                        "watcher batch of {} paths exceeds inline cap {}; scheduling corpus refresh",
+                        "watcher batch of {} paths exceeds inline cap {}; applying bounded incremental refresh",
                         paths.len(),
                         WATCHER_BATCH_INLINE_CAP
                     );
-                    if !project_corpus_refresh_requested {
-                        state.status_changed |=
-                            refresh_project_corpus(ctx, "oversized watcher batch", false);
-                    }
                 }
                 let remaining = paths.len();
                 state.phase = WatcherDrainPhase::Apply {
@@ -2613,6 +2787,8 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         apply_watcher_slice(ctx, &mut state, started);
     }
 
+    publish_view_if_quiet(ctx, &mut state);
+
     let receiver_has_more = ctx
         .watcher_rx()
         .lock()
@@ -2630,6 +2806,44 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
 
 pub fn drain_lsp_events(ctx: &AppContext) {
     let _ = drain_lsp_events_bounded(ctx, usize::MAX);
+}
+
+/// Shut down language servers for a standalone runtime whose last request is
+/// older than `idle.lsp_ttl_minutes`. Subc uses the same helper with its own
+/// per-root activity stamp.
+pub fn shutdown_idle_lsp(ctx: &AppContext) {
+    shutdown_idle_lsp_at(ctx, Instant::now(), ctx.last_request_at());
+}
+
+pub fn shutdown_idle_lsp_at(ctx: &AppContext, now: Instant, last_activity: Instant) {
+    let ttl = ctx.config().idle.lsp_ttl();
+    let idle = now.saturating_duration_since(last_activity);
+    if idle < ttl {
+        return;
+    }
+    let clients = {
+        let mut lsp = ctx.lsp();
+        if lsp.server_count() == 0 {
+            return;
+        }
+        lsp.take_all_clients()
+    };
+    let n = clients.len();
+    if n == 0 {
+        return;
+    }
+    let root = ctx
+        .config()
+        .project_root
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "standalone".to_string());
+    aft::slog_info!(
+        "idle lsp reap {root}: shut down {n} server(s) after {}m (ttl {}m)",
+        idle.as_secs() / 60,
+        ctx.config().idle.lsp_ttl_minutes
+    );
+    crate::lsp::manager::LspManager::spawn_idle_lsp_reap(clients);
 }
 
 pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBatchOutcome {
@@ -2674,8 +2888,12 @@ pub fn drain_lsp_events_bounded(ctx: &AppContext, max_events: usize) -> DrainBat
                     params.unwrap_or(serde_json::Value::Null)
                 );
             }
-            LspEvent::ServerExited { server_kind, root } => {
-                aft::slog_info!("exited {:?} {}", server_kind, root.display());
+            LspEvent::ServerExited {
+                server_kind,
+                root,
+                reason,
+            } => {
+                aft::slog_info!("exited {:?} {} ({reason})", server_kind, root.display());
                 status_changed = true;
             }
         }
@@ -2725,7 +2943,8 @@ pub(crate) fn configure_search_order_context_for_test(
         supersede_search_artifact_persistence: false,
         supersede_callgraph_artifact_persistence: false,
         supersede_semantic_artifact_persistence: false,
-        artifact_load_starts: Vec::new(),
+        search_artifact_load_start: None,
+        semantic_artifact_load_start: None,
     })
     .expect("test configure maintenance queue has capacity");
 
@@ -3664,7 +3883,15 @@ mod tests {
             !ctx.allow_search_index_disconnect_reschedule(),
             "a second automatic replacement in the same generation must be denied"
         );
+        assert!(
+            !ctx.search_index_query_reload_allowed(),
+            "queued queries must use fallback during the retry cooldown"
+        );
         ctx.advance_configure_generation();
+        assert!(
+            ctx.search_index_query_reload_allowed(),
+            "a new configure generation must clear the retry cooldown"
+        );
         assert!(
             ctx.allow_search_index_disconnect_reschedule(),
             "advancing the configure generation must reset the replacement cap"
@@ -4922,6 +5149,98 @@ mod watcher_slice_tests {
                 .len(),
             1,
             "owner shutdown flush must persist the RAM delta"
+        );
+    }
+}
+
+// Every test here spawns a real child process, so the module is Unix-only.
+#[cfg(all(test, unix))]
+mod idle_lsp_tests {
+    use super::shutdown_idle_lsp_at;
+    use crate::config::Config;
+    use crate::context::AppContext;
+    use crate::lsp::child_registry::LspChildRegistry;
+    use crate::lsp::client::LspClient;
+    use crate::lsp::registry::ServerKind;
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    fn spawn_sleep_client(ctx: &AppContext, root: std::path::PathBuf) -> u32 {
+        let registry = LspChildRegistry::new();
+        ctx.lsp().set_child_registry(registry.clone());
+        let client = LspClient::spawn(
+            ServerKind::TypeScript,
+            root,
+            Path::new("sh"),
+            &["-c".to_string(), "exec sleep 60".to_string()],
+            &HashMap::new(),
+            ctx.lsp().event_sender_for_test(),
+            registry,
+        )
+        .expect("spawn idle-lsp stand-in");
+        let pid = client.child_pid();
+        ctx.lsp().insert_client_for_test(client);
+        pid
+    }
+
+    #[cfg(unix)]
+    fn wait_until_dead(pid: u32, timeout: Duration) -> bool {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if !crate::bash_background::process::is_process_alive(pid) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_lsp_ttl_shuts_down_stale_client_and_keeps_recent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut stale_config = Config::default();
+        stale_config.idle.lsp_ttl_minutes = 1;
+        let stale = AppContext::new(
+            crate::context::default_language_provider_factory(),
+            stale_config,
+        );
+        let pid = spawn_sleep_client(&stale, tmp.path().to_path_buf());
+        assert_eq!(stale.lsp().server_count(), 1);
+        let now = Instant::now();
+        stale.set_last_request_at_for_test(now - Duration::from_secs(61));
+        let started = Instant::now();
+        shutdown_idle_lsp_at(&stale, now, stale.last_request_at());
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "idle lsp reap must return without waiting on Shutdown, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            stale.lsp().server_count(),
+            0,
+            "a root idle longer than lsp_ttl_minutes must shut down its language servers"
+        );
+        assert!(
+            wait_until_dead(pid, Duration::from_secs(6)),
+            "idle-reaped child must die within SHUTDOWN_TIMEOUT + 1s"
+        );
+
+        let mut fresh_config = Config::default();
+        fresh_config.idle.lsp_ttl_minutes = 1;
+        let fresh = AppContext::new(
+            crate::context::default_language_provider_factory(),
+            fresh_config,
+        );
+        spawn_sleep_client(&fresh, tmp.path().to_path_buf());
+        assert_eq!(fresh.lsp().server_count(), 1);
+        shutdown_idle_lsp_at(&fresh, Instant::now(), fresh.last_request_at());
+        assert_eq!(
+            fresh.lsp().server_count(),
+            1,
+            "a root with recent activity must keep its language servers"
         );
     }
 }

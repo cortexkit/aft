@@ -1,0 +1,564 @@
+{
+  "schema": 1,
+  "generated_at": "2026-09-04T11:35:49Z",
+  "binary": {
+    "sha256": "95e1970cf0c3219debc74a2a1523e9ebf9e404eba4e713eee107c35899b3279c",
+    "source_commit": "84907c391b51e0bd826c71d2150cea785402a9b3",
+    "date": "2026-09-04"
+  },
+  "repos": {
+    "redox": {
+      "kind": "git",
+      "url": "https://github.com/redox-os/redox.git",
+      "sha": "af82439e08ebadd3f3540bc44b7b3f5bf68fb5d9",
+      "metrics": {
+        "callgraph_build_ready_ms": {
+          "value": 6987.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "callgraph_first_query_ms": {
+          "value": 436.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "callgraph_resolution_share_pct": {
+          "value": 93.159,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 5.0
+        },
+        "cpu_seconds": {
+          "value": 10.5,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "peak_rss_mb": {
+          "value": 79.7,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 128.0
+        },
+        "search_build_ready_ms": {
+          "value": 1143.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "search_first_query_ms": {
+          "value": 832.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "waiting_on.artifact_load": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.build": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.limiter": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.resolver": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.total": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        }
+      },
+      "index_events": {
+        "search.build_started.count": 1.0,
+        "search.build_progress.count": 2.0,
+        "search.build_progress.stage.streaming.count": 2.0,
+        "callgraph.build_started.count": 1.0,
+        "callgraph.breaker_admitted.count": 1.0,
+        "callgraph.build_progress.count": 15.0,
+        "callgraph.build_progress.stage.inventory.count": 2.0,
+        "callgraph.build_progress.stage.staging-admission.count": 1.0,
+        "callgraph.build_progress.stage.extraction.count": 4.0,
+        "callgraph.build_progress.stage.symbol-export-index.count": 2.0,
+        "callgraph.build_progress.stage.resolution.count": 3.0,
+        "search.build_ready.count": 1.0,
+        "search.first_query.count": 1.0,
+        "callgraph.build_progress.stage.method-dispatch.count": 3.0,
+        "callgraph.breaker_reset.count": 1.0,
+        "callgraph.build_ready.count": 1.0,
+        "callgraph.first_query.count": 1.0,
+        "search.build_progress.elapsed_ms.p50": 0.0,
+        "search.build_progress.elapsed_ms.max": 1143.0,
+        "search.build_progress.completed.p50": 0.0,
+        "search.build_progress.completed.max": 1.0,
+        "search.build_progress.total.p50": 1.0,
+        "search.build_progress.total.max": 1.0,
+        "callgraph.build_progress.elapsed_ms.p50": 291.0,
+        "callgraph.build_progress.elapsed_ms.max": 6861.0,
+        "callgraph.build_progress.completed.p50": 1.0,
+        "callgraph.build_progress.completed.max": 5542.0,
+        "callgraph.build_progress.total.p50": 38.0,
+        "callgraph.build_progress.total.max": 5542.0,
+        "search.build_ready.elapsed_ms.p50": 1143.0,
+        "search.build_ready.elapsed_ms.max": 1143.0,
+        "search.first_query.ready_to_first_query_ms.p50": 870.0,
+        "search.first_query.ready_to_first_query_ms.max": 870.0,
+        "callgraph.build_ready.elapsed_ms.p50": 6987.0,
+        "callgraph.build_ready.elapsed_ms.max": 6987.0,
+        "callgraph.first_query.ready_to_first_query_ms.p50": 436.0,
+        "callgraph.first_query.ready_to_first_query_ms.max": 436.0
+      },
+      "sample": {
+        "runs": 2,
+        "selection": "minimum observed value per metric"
+      }
+    },
+    "typescript-eslint": {
+      "kind": "git",
+      "url": "https://github.com/typescript-eslint/typescript-eslint.git",
+      "sha": "4586535ab24d7d5e9b3ba87e4adb8636f9314aca",
+      "metrics": {
+        "callgraph_build_ready_ms": {
+          "value": 138659.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "callgraph_first_query_ms": {
+          "value": 305.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "callgraph_resolution_share_pct": {
+          "value": 61.651,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 5.0
+        },
+        "cpu_seconds": {
+          "value": 167.65,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "peak_rss_mb": {
+          "value": 994.3,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 128.0
+        },
+        "search_build_ready_ms": {
+          "value": 1590.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "search_first_query_ms": {
+          "value": 433.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "waiting_on.artifact_load": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.build": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.limiter": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.resolver": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.total": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        }
+      },
+      "index_events": {
+        "search.build_started.count": 1.0,
+        "search.build_progress.count": 2.0,
+        "search.build_progress.stage.streaming.count": 2.0,
+        "callgraph.build_started.count": 1.0,
+        "callgraph.breaker_admitted.count": 1.0,
+        "callgraph.build_progress.count": 63.0,
+        "callgraph.build_progress.stage.inventory.count": 2.0,
+        "callgraph.build_progress.stage.staging-admission.count": 1.0,
+        "callgraph.build_progress.stage.extraction.count": 35.0,
+        "search.build_ready.count": 1.0,
+        "search.first_query.count": 1.0,
+        "callgraph.build_progress.stage.symbol-export-index.count": 2.0,
+        "callgraph.build_progress.stage.resolution.count": 4.0,
+        "callgraph.build_progress.stage.method-dispatch.count": 19.0,
+        "callgraph.breaker_reset.count": 1.0,
+        "callgraph.build_ready.count": 1.0,
+        "callgraph.first_query.count": 1.0,
+        "search.build_progress.elapsed_ms.p50": 0.0,
+        "search.build_progress.elapsed_ms.max": 1590.0,
+        "search.build_progress.completed.p50": 0.0,
+        "search.build_progress.completed.max": 1.0,
+        "search.build_progress.total.p50": 1.0,
+        "search.build_progress.total.max": 1.0,
+        "callgraph.build_progress.elapsed_ms.p50": 32090.0,
+        "callgraph.build_progress.elapsed_ms.max": 138520.0,
+        "callgraph.build_progress.completed.p50": 1200.0,
+        "callgraph.build_progress.completed.max": 38318.0,
+        "callgraph.build_progress.total.p50": 3151.0,
+        "callgraph.build_progress.total.max": 38318.0,
+        "search.build_ready.elapsed_ms.p50": 1590.0,
+        "search.build_ready.elapsed_ms.max": 1590.0,
+        "search.first_query.ready_to_first_query_ms.p50": 433.0,
+        "search.first_query.ready_to_first_query_ms.max": 433.0,
+        "callgraph.build_ready.elapsed_ms.p50": 138659.0,
+        "callgraph.build_ready.elapsed_ms.max": 138659.0,
+        "callgraph.first_query.ready_to_first_query_ms.p50": 641.0,
+        "callgraph.first_query.ready_to_first_query_ms.max": 641.0
+      },
+      "sample": {
+        "runs": 2,
+        "selection": "minimum observed value per metric"
+      }
+    },
+    "jupyterlab": {
+      "kind": "git",
+      "url": "https://github.com/jupyterlab/jupyterlab.git",
+      "sha": "7848d05af740c18b5950a8d1b90e2ed580af8260",
+      "metrics": {
+        "callgraph_build_ready_ms": {
+          "value": 228328.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "callgraph_first_query_ms": {
+          "value": 1868.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "callgraph_resolution_share_pct": {
+          "value": 86.512,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 5.0
+        },
+        "cpu_seconds": {
+          "value": 243.09,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "peak_rss_mb": {
+          "value": 523.9,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 128.0
+        },
+        "search_build_ready_ms": {
+          "value": 431.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "search_first_query_ms": {
+          "value": 1575.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "waiting_on.artifact_load": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.build": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.limiter": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.resolver": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.total": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        }
+      },
+      "index_events": {
+        "search.build_started.count": 1.0,
+        "search.build_progress.count": 2.0,
+        "search.build_progress.stage.streaming.count": 2.0,
+        "callgraph.build_started.count": 1.0,
+        "callgraph.breaker_admitted.count": 1.0,
+        "callgraph.build_progress.count": 53.0,
+        "callgraph.build_progress.stage.inventory.count": 2.0,
+        "callgraph.build_progress.stage.staging-admission.count": 1.0,
+        "callgraph.build_progress.stage.extraction.count": 24.0,
+        "search.build_ready.count": 1.0,
+        "search.first_query.count": 1.0,
+        "callgraph.build_progress.stage.symbol-export-index.count": 2.0,
+        "callgraph.build_progress.stage.resolution.count": 8.0,
+        "callgraph.build_progress.stage.method-dispatch.count": 16.0,
+        "callgraph.breaker_reset.count": 1.0,
+        "callgraph.build_ready.count": 1.0,
+        "callgraph.first_query.count": 1.0,
+        "search.build_progress.elapsed_ms.p50": 0.0,
+        "search.build_progress.elapsed_ms.max": 431.0,
+        "search.build_progress.completed.p50": 0.0,
+        "search.build_progress.completed.max": 1.0,
+        "search.build_progress.total.p50": 1.0,
+        "search.build_progress.total.max": 1.0,
+        "callgraph.build_progress.elapsed_ms.p50": 29811.0,
+        "callgraph.build_progress.elapsed_ms.max": 228248.0,
+        "callgraph.build_progress.completed.p50": 1000.0,
+        "callgraph.build_progress.completed.max": 113330.0,
+        "callgraph.build_progress.total.p50": 2071.0,
+        "callgraph.build_progress.total.max": 113330.0,
+        "search.build_ready.elapsed_ms.p50": 431.0,
+        "search.build_ready.elapsed_ms.max": 431.0,
+        "search.first_query.ready_to_first_query_ms.p50": 1618.0,
+        "search.first_query.ready_to_first_query_ms.max": 1618.0,
+        "callgraph.build_ready.elapsed_ms.p50": 228328.0,
+        "callgraph.build_ready.elapsed_ms.max": 228328.0,
+        "callgraph.first_query.ready_to_first_query_ms.p50": 1868.0,
+        "callgraph.first_query.ready_to_first_query_ms.max": 1868.0
+      },
+      "sample": {
+        "runs": 2,
+        "selection": "minimum observed value per metric"
+      }
+    },
+    "hugo": {
+      "kind": "git",
+      "url": "https://github.com/gohugoio/hugo.git",
+      "sha": "423e9cead1ce279dc1db3a4be4fff36cb49479ad",
+      "metrics": {
+        "callgraph_build_ready_ms": {
+          "value": 68433.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "callgraph_first_query_ms": {
+          "value": 391.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "callgraph_resolution_share_pct": {
+          "value": 50.493,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 5.0
+        },
+        "cpu_seconds": {
+          "value": 47.38,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "peak_rss_mb": {
+          "value": 341.3,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 128.0
+        },
+        "search_build_ready_ms": {
+          "value": 986.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "search_first_query_ms": {
+          "value": 996.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "waiting_on.artifact_load": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.build": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.limiter": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.resolver": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.total": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        }
+      },
+      "index_events": {
+        "search.build_started.count": 1.0,
+        "search.build_progress.count": 2.0,
+        "search.build_progress.stage.streaming.count": 2.0,
+        "callgraph.build_started.count": 1.0,
+        "callgraph.breaker_admitted.count": 1.0,
+        "callgraph.build_progress.count": 47.0,
+        "callgraph.build_progress.stage.inventory.count": 2.0,
+        "callgraph.build_progress.stage.staging-admission.count": 1.0,
+        "callgraph.build_progress.stage.extraction.count": 24.0,
+        "search.build_ready.count": 1.0,
+        "search.first_query.count": 1.0,
+        "callgraph.build_progress.stage.symbol-export-index.count": 2.0,
+        "callgraph.build_progress.stage.resolution.count": 6.0,
+        "callgraph.build_progress.stage.method-dispatch.count": 12.0,
+        "callgraph.breaker_reset.count": 1.0,
+        "callgraph.build_ready.count": 1.0,
+        "callgraph.first_query.count": 1.0,
+        "search.build_progress.elapsed_ms.p50": 0.0,
+        "search.build_progress.elapsed_ms.max": 986.0,
+        "search.build_progress.completed.p50": 0.0,
+        "search.build_progress.completed.max": 1.0,
+        "search.build_progress.total.p50": 1.0,
+        "search.build_progress.total.max": 1.0,
+        "callgraph.build_progress.elapsed_ms.p50": 22387.0,
+        "callgraph.build_progress.elapsed_ms.max": 66962.0,
+        "callgraph.build_progress.completed.p50": 800.0,
+        "callgraph.build_progress.completed.max": 65284.0,
+        "callgraph.build_progress.total.p50": 2096.0,
+        "callgraph.build_progress.total.max": 65284.0,
+        "search.build_ready.elapsed_ms.p50": 986.0,
+        "search.build_ready.elapsed_ms.max": 986.0,
+        "search.first_query.ready_to_first_query_ms.p50": 996.0,
+        "search.first_query.ready_to_first_query_ms.max": 996.0,
+        "callgraph.build_ready.elapsed_ms.p50": 68433.0,
+        "callgraph.build_ready.elapsed_ms.max": 68433.0,
+        "callgraph.first_query.ready_to_first_query_ms.p50": 391.0,
+        "callgraph.first_query.ready_to_first_query_ms.max": 391.0
+      },
+      "sample": {
+        "runs": 2,
+        "selection": "minimum observed value per metric"
+      }
+    },
+    "synthetic-24k": {
+      "kind": "synthetic",
+      "version": "synthetic-v2",
+      "metrics": {
+        "callgraph_build_ready_ms": {
+          "value": 58.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "callgraph_first_query_ms": {
+          "value": 1603.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "callgraph_resolution_share_pct": {
+          "value": 1.724,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 5.0
+        },
+        "cpu_seconds": {
+          "value": 6.97,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "peak_rss_mb": {
+          "value": 65.8,
+          "tolerance_pct": 20.0,
+          "absolute_floor": 128.0
+        },
+        "search_build_ready_ms": {
+          "value": 2567.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "search_first_query_ms": {
+          "value": 690.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 3000.0
+        },
+        "waiting_on.artifact_load": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.build": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.limiter": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.resolver": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        },
+        "waiting_on.total": {
+          "value": 0.0,
+          "tolerance_pct": 25.0,
+          "absolute_floor": 1.0
+        }
+      },
+      "index_events": {
+        "search.build_started.count": 1.0,
+        "search.build_progress.count": 2.0,
+        "search.build_progress.stage.streaming.count": 2.0,
+        "callgraph.build_started.count": 1.0,
+        "callgraph.breaker_admitted.count": 1.0,
+        "callgraph.build_progress.count": 15.0,
+        "callgraph.build_progress.stage.inventory.count": 2.0,
+        "callgraph.build_progress.stage.staging-admission.count": 1.0,
+        "callgraph.build_progress.stage.extraction.count": 4.0,
+        "callgraph.build_progress.stage.symbol-export-index.count": 2.0,
+        "callgraph.build_progress.stage.resolution.count": 3.0,
+        "callgraph.build_progress.stage.method-dispatch.count": 3.0,
+        "callgraph.breaker_reset.count": 1.0,
+        "callgraph.build_ready.count": 1.0,
+        "callgraph.first_query.count": 1.0,
+        "search.build_ready.count": 1.0,
+        "tier2.build_started.count": 1.0,
+        "tier2.build_ready.count": 1.0,
+        "search.first_query.count": 1.0,
+        "search.build_progress.elapsed_ms.p50": 0.0,
+        "search.build_progress.elapsed_ms.max": 2567.0,
+        "search.build_progress.completed.p50": 0.0,
+        "search.build_progress.completed.max": 1.0,
+        "search.build_progress.total.p50": 1.0,
+        "search.build_progress.total.max": 1.0,
+        "callgraph.build_progress.elapsed_ms.p50": 23.0,
+        "callgraph.build_progress.elapsed_ms.max": 28.0,
+        "callgraph.build_progress.completed.p50": 1.0,
+        "callgraph.build_progress.completed.max": 1.0,
+        "callgraph.build_progress.total.p50": 1.0,
+        "callgraph.build_progress.total.max": 1.0,
+        "callgraph.build_ready.elapsed_ms.p50": 79.0,
+        "callgraph.build_ready.elapsed_ms.max": 79.0,
+        "callgraph.first_query.ready_to_first_query_ms.p50": 1620.0,
+        "callgraph.first_query.ready_to_first_query_ms.max": 1620.0,
+        "search.build_ready.elapsed_ms.p50": 2567.0,
+        "search.build_ready.elapsed_ms.max": 2567.0,
+        "tier2.build_ready.elapsed_ms.p50": 2369.0,
+        "tier2.build_ready.elapsed_ms.max": 2369.0,
+        "search.first_query.ready_to_first_query_ms.p50": 1512.0,
+        "search.first_query.ready_to_first_query_ms.max": 1512.0
+      },
+      "sample": {
+        "runs": 2,
+        "selection": "minimum observed value per metric"
+      }
+    }
+  }
+}

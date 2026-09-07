@@ -44,7 +44,10 @@ function makeMockBridge(
   return { bridge, calls };
 }
 
-function makePluginContext(bridge: BinaryBridge): PluginContext {
+function makePluginContext(
+  bridge: BinaryBridge,
+  overrides: Partial<PluginContext> = {},
+): PluginContext {
   return {
     pool: { getBridge: () => bridge } as unknown as PluginContext["pool"],
     client: {
@@ -53,6 +56,7 @@ function makePluginContext(bridge: BinaryBridge): PluginContext {
     } as unknown as PluginContext["client"],
     config: {} as PluginContext["config"],
     storageDir: "/tmp/aft-opencode-tests",
+    ...overrides,
   };
 }
 
@@ -79,6 +83,17 @@ async function expectRejectMessage(action: () => Promise<unknown>): Promise<stri
 }
 
 describe("aft_callgraph OpenCode adapter", () => {
+  test("describes zoom-aware callgraph guidance without invalid read callgraph syntax", () => {
+    const bridge = makeMockBridge().bridge;
+    const enabled = navigationTools(makePluginContext(bridge)).aft_callgraph.description;
+    const disabled = navigationTools(
+      makePluginContext(bridge, { config: { disabled_tools: ["aft_zoom"] } as never }),
+    ).aft_callgraph.description;
+    expect(enabled).toContain("Use aft_zoom with `callgraph:true`");
+    expect(disabled).toContain("Use aft_callgraph call_tree (depth 1)");
+    expect(disabled).not.toContain("aft_zoom");
+    expect(disabled).not.toContain("read with `callgraph:true`");
+  });
   test("success path dispatches to the selected op and maps filePath to file", async () => {
     const { bridge, calls } = makeMockBridge((command, params) => ({
       success: true,

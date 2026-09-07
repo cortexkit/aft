@@ -19,6 +19,15 @@ use std::path::{Path, PathBuf};
 /// convention (`~/.config/cortexkit/<module>.jsonc`) alongside `subc.jsonc` and
 /// `mcp.jsonc`. Pure over its env inputs so it is testable without mutating
 /// process-global env vars (which race under the parallel test runner).
+///
+/// This copy becomes the daemon's config-home callable when that API is available.
+/// The call replaces these ordered daemon rungs: non-empty XDG_CONFIG_HOME;
+/// Windows-only non-empty APPDATA; Windows-only non-empty USERPROFILE joined with
+/// `AppData/Roaming`; non-empty HOME joined with `.config`; relative `.config`.
+/// Last re-derived 2026-09-06 against subconscious
+/// d5e09914b0791a66f2a5a00a9bb3422860ade95e: compare `(rung, guard)` pairs with
+/// `subc-core/src/daemon_config.rs::default_config_path` and resolve
+/// `DAEMON_CONFIG_RELATIVE_PATH` before editing this temporary copy.
 pub(crate) fn user_config_path_from(
     xdg_config_home: Option<&OsStr>,
     home: Option<&OsStr>,

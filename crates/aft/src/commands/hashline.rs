@@ -157,6 +157,7 @@ pub fn handle_edit(req: &RawRequest, ctx: &AppContext) -> Response {
         let (snapshots, registers) = binding.stores_mut();
         let mut backups = ctx.backup().lock();
         let backups_enabled = backups.policy().enabled;
+        let skipped_before = backups.latest_skipped_order(req.session());
         let mut execute = ExecuteContext {
             session: req.session(),
             backups: &mut backups,
@@ -166,18 +167,26 @@ pub fn handle_edit(req: &RawRequest, ctx: &AppContext) -> Response {
             fault: None,
         };
         let envelope = run_transaction(&inputs, &register_snapshot, &mut execute, preview)?;
+        drop(execute);
         let display_files = display_files_from_envelope(&envelope, &display_baselines);
-        Ok((envelope, display_files))
+        let backup_skipped_reason = backups.skipped_reason_after(req.session(), skipped_before);
+        Ok((envelope, display_files, backup_skipped_reason))
     });
 
     match result {
-        Ok((envelope, display_files)) => {
-            let payload = render_mutation_response(MutationRenderInput {
+        Ok((envelope, display_files, backup_skipped_reason)) => {
+            let mut payload = render_mutation_response(MutationRenderInput {
                 envelope: &envelope,
                 display_files: &display_files,
                 project_root: Some(&root),
                 transport: transport_kind(ctx),
             });
+            if let (Some(object), Some(reason)) = (payload.as_object_mut(), backup_skipped_reason) {
+                object.insert(
+                    "backup_skipped_reason".to_string(),
+                    Value::String(reason.as_str().to_string()),
+                );
+            }
             response_from_payload(&req.id, payload)
         }
         Err(rejection) => rejection_response(&req.id, &rejection, transport_kind(ctx)),

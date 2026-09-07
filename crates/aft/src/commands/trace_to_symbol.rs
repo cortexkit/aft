@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use crate::commands::callgraph_store_adapter::suspended_response;
 use crate::commands::callgraph_store_adapter::{
     building_response, ensure_symbol_resolves, note_callgraph_building, note_callgraph_served,
-    store_error_response, trace_to_symbol_candidates, trace_to_symbol_result, unavailable_for,
+    serialized_response, serialized_value, store_error_response, trace_to_symbol_candidates,
+    trace_to_symbol_result, unavailable_for,
 };
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::inspect::job::is_test_file;
@@ -117,7 +118,11 @@ pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
         if !target_candidates.iter().any(|candidate| {
             trace_candidate_matches_file(project_root.as_deref(), &candidate.file, to_file_path)
         }) {
-            let candidates_json = serde_json::to_value(&target_candidates).unwrap_or_default();
+            let candidates_json =
+                match serialized_value(&req.id, "trace_to_symbol candidates", &target_candidates) {
+                    Ok(value) => value,
+                    Err(response) => return response,
+                };
             return Response::error_with_data(
                 &req.id,
                 "target_symbol_not_in_file",
@@ -140,7 +145,14 @@ pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             }
             1 => {}
             _ => {
-                let candidates_json = serde_json::to_value(&target_candidates).unwrap_or_default();
+                let candidates_json = match serialized_value(
+                    &req.id,
+                    "trace_to_symbol candidates",
+                    &target_candidates,
+                ) {
+                    Ok(value) => value,
+                    Err(response) => return response,
+                };
                 return Response::error_with_data(
                     &req.id,
                     "ambiguous_target",
@@ -165,8 +177,7 @@ pub fn handle_trace_to_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     ) {
         Ok(result) => {
             note_callgraph_served(ctx, "trace_to_symbol", 0, "ok");
-            let result_json = serde_json::to_value(&result).unwrap_or_default();
-            Response::success(&req.id, result_json)
+            serialized_response(&req.id, "trace_to_symbol", &result)
         }
         Err(error) => store_error_response(&req.id, "trace_to_symbol", error),
     }

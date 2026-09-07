@@ -1192,36 +1192,41 @@ impl SearchIndex {
         path: &Path,
         canonical_parents: &mut ParentCanonicalizationMemo,
     ) {
-        self.remove_file_with_canonicalization_memo(path, canonical_parents);
+        // Watcher paths may use an alias of the configured root (for example,
+        // macOS /var versus /private/var). Keep the replacement under the same
+        // canonical key as the initial corpus build so scoped queries can see it.
+        let canonical_path =
+            canonicalize_existing_or_deleted_path_with_memo(path, canonical_parents);
+        self.remove_file_with_canonicalization_memo(&canonical_path, canonical_parents);
 
-        let metadata = match fs::metadata(path) {
+        let metadata = match fs::metadata(&canonical_path) {
             Ok(metadata) if metadata.is_file() => metadata,
             _ => return,
         };
 
         let metadata = search_file_metadata(&metadata);
 
-        if is_binary_path(path, metadata.size) {
-            self.track_unindexed_file_with_metadata(path, metadata);
+        if is_binary_path(&canonical_path, metadata.size) {
+            self.track_unindexed_file_with_metadata(&canonical_path, metadata);
             return;
         }
 
         if metadata.size > self.max_file_size {
-            self.track_unindexed_file_with_metadata(path, metadata);
+            self.track_unindexed_file_with_metadata(&canonical_path, metadata);
             return;
         }
 
-        let content = match fs::read(path) {
+        let content = match fs::read(&canonical_path) {
             Ok(content) => content,
             Err(_) => return,
         };
 
         if is_binary_bytes(&content) {
-            self.track_unindexed_file_with_metadata(path, metadata);
+            self.track_unindexed_file_with_metadata(&canonical_path, metadata);
             return;
         }
 
-        self.index_file_with_metadata(path, &content, metadata);
+        self.index_file_with_metadata(&canonical_path, &content, metadata);
     }
 
     pub fn grep(
@@ -7085,7 +7090,8 @@ mod tests {
         index.update_file(&file);
         let state = index.compaction_state.lock().expect("compaction state");
         assert!(state.requested_again || !index.delta.postings.is_empty());
-        assert!(state.buffered_paths.contains(&file));
+        let canonical_file = fs::canonicalize(&file).expect("canonical source path");
+        assert!(state.buffered_paths.contains(&canonical_file));
     }
 
     fn cache_has_file_trigram_count_extension(cache_path: &Path) -> bool {

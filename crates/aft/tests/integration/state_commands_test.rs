@@ -4,7 +4,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::{Arc, Barrier};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use aft::db::TrackedConnection as Connection;
+use rusqlite::{params, OptionalExtension};
 use serde_json::{json, Value};
 
 use super::helpers::AftProcess;

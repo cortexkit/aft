@@ -213,6 +213,7 @@ export function platformKey(
 }
 
 type BinaryResolutionSource =
+  | "AFT_BINARY_PATH"
   | "versioned cache"
   | "npm platform package"
   | "PATH"
@@ -252,6 +253,22 @@ export function findBinarySync(expectedVersion?: string): string | null {
 function findBinarySyncInner(expectedVersion?: string): BinaryResolution | null {
   const ext = process.platform === "win32" ? ".exe" : "";
   const env = { ...process.env };
+
+  // Hermetic host probes provide the just-built binary explicitly. Treat a bad
+  // override as an error instead of falling through to an operator cache or PATH.
+  const explicitBinary = env.AFT_BINARY_PATH?.trim();
+  if (explicitBinary) {
+    if (!existsSync(explicitBinary) || !isNativeExecutable(explicitBinary)) {
+      throw new Error(`AFT_BINARY_PATH does not name a native executable: ${explicitBinary}`);
+    }
+    const usable = probeBinaryCandidate(explicitBinary, "AFT_BINARY_PATH", expectedVersion);
+    if (!usable) {
+      throw new Error(
+        `AFT_BINARY_PATH is incompatible with the requested AFT version: ${explicitBinary}`,
+      );
+    }
+    return { path: usable, source: "AFT_BINARY_PATH" };
+  }
 
   // 1. Check versioned cache for the requested version (or this package's own
   // version as a fallback so direct callers without a host still benefit from
@@ -349,6 +366,7 @@ export const __test__ = {
  * Locate the `aft` binary, with auto-download as a last resort.
  *
  * Resolution order:
+ *   0. Explicit AFT_BINARY_PATH (hermetic host probes)
  *   1. Cached binary (~/.cache/aft/bin/)
  *   2. npm platform package (@cortexkit/aft-<platform>)
  *   3. PATH lookup (which aft)

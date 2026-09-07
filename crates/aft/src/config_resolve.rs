@@ -14,9 +14,12 @@ use serde_json::{Map, Value};
 
 use crate::config::{
     expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GhShimConfig, GitConfig,
-    IndexConfig, IndexKind, IndexRootConfig, InspectConfig, SandboxConfig, SemanticBackend,
-    SemanticBackendConfig, UserServerDef, WorktreeConfig, DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
-    MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS,
+    IdleConfig, IndexConfig, IndexKind, IndexRootConfig, InspectConfig, SandboxConfig,
+    SemanticBackend, SemanticBackendConfig, UserServerDef, WorktreeConfig,
+    DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_IDLE_LSP_TTL_MINUTES, DEFAULT_IDLE_ROOT_TTL_MINUTES,
+    DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_LSP_TTL_MINUTES,
+    MAX_IDLE_ROOT_TTL_MINUTES, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS,
+    MIN_BASH_WATCH_SYNC_MAX_MS, MIN_IDLE_LSP_TTL_MINUTES, MIN_IDLE_ROOT_TTL_MINUTES,
     MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
 use crate::harness::Harness;
@@ -112,15 +115,18 @@ pub struct RawAftConfig {
     pub search_index: Option<bool>,
     pub index: Option<RawIndex>,
     pub semantic_search: Option<bool>,
+    pub views: Option<RawViews>,
     pub callgraph_store: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_usize")]
     pub callgraph_chunk_size: Option<usize>,
     pub inspect: Option<RawInspect>,
+    pub idle: Option<RawIdle>,
     pub backup: Option<RawBackup>,
     pub worktree: Option<RawWorktree>,
     pub gh_shim: Option<RawGhShim>,
     pub gh_read: Option<RawGhRead>,
     pub git: Option<RawGit>,
+    pub pi: Option<RawPi>,
     pub sandbox: Option<RawSandbox>,
     pub bash: Option<RawBash>,
     pub experimental: Option<RawExperimental>,
@@ -370,6 +376,8 @@ pub struct RawBashFeatures {
     pub long_running_reminder_interval_ms: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
     pub foreground_wait_window_ms: Option<u64>,
+    #[serde(deserialize_with = "deserialize_opt_positive_u64")]
+    pub watch_sync_max_ms: Option<u64>,
     pub powershell_tool: Option<bool>,
 }
 
@@ -455,6 +463,19 @@ impl RawInspectDuplicates {
     }
 }
 
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RawIdle {
+    pub root_ttl_minutes: Option<Value>,
+    pub lsp_ttl_minutes: Option<Value>,
+}
+
+impl RawIdle {
+    fn is_empty(&self) -> bool {
+        self.root_ttl_minutes.is_none() && self.lsp_ttl_minutes.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RawBridge {
@@ -469,6 +490,12 @@ pub struct RawBridge {
 pub struct RawSubc {
     pub connection_file: Option<String>,
     pub client_reaper: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RawViews {
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
@@ -506,11 +533,43 @@ pub struct RawGit {
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct RawPi {
+    pub tool_presentation: Option<RawPiToolPresentation>,
+}
+
+impl RawPi {
+    fn is_empty(&self) -> bool {
+        self.tool_presentation.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawPiToolPresentation {
+    TopLevel,
+    HostDefault,
+    Unknown(String),
+}
+
+impl<'de> Deserialize<'de> for RawPiToolPresentation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "top_level" => Ok(Self::TopLevel),
+            "host_default" => Ok(Self::HostDefault),
+            other => Ok(Self::Unknown(other.to_string())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct RawBackup {
     pub enabled: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
     pub max_depth: Option<usize>,
-    #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
     pub max_file_size: Option<u64>,
 }
 
@@ -584,8 +643,9 @@ pub fn resolve_config_for_harness(
     }
 
     let mut config = Config::default();
-    apply_resolved_config(&merged, &mut config);
+    apply_resolved_config(&merged, &mut config, &mut warnings);
     config.index = resolve_index_config(merged.index.as_ref(), &mut warnings);
+    config.idle = resolve_idle_config(merged.idle.as_ref(), &mut warnings);
     ResolveResult {
         config,
         dropped,
@@ -817,6 +877,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     if override_config.semantic_search.is_some() {
         base.semantic_search = override_config.semantic_search;
     }
+    if override_config.views.is_some() {
+        base.views = override_config.views;
+    }
     if override_config.callgraph_store.is_some() {
         base.callgraph_store = override_config.callgraph_store;
     }
@@ -825,6 +888,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     }
     if override_config.inspect.is_some() {
         base.inspect = override_config.inspect;
+    }
+    if override_config.idle.is_some() {
+        base.idle = override_config.idle;
     }
     if override_config.backup.is_some() {
         base.backup = override_config.backup;
@@ -840,6 +906,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     }
     if override_config.git.is_some() {
         base.git = override_config.git;
+    }
+    if override_config.pi.is_some() {
+        base.pi = override_config.pi;
     }
     if override_config.sandbox.is_some() {
         base.sandbox = override_config.sandbox;
@@ -899,6 +968,9 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     if project.semantic_search.is_some() {
         base.semantic_search = project.semantic_search;
     }
+    if project.views.is_some() {
+        base.views = project.views;
+    }
     if project.callgraph_store.is_some() {
         base.callgraph_store = project.callgraph_store;
     }
@@ -914,11 +986,26 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     base.experimental = merge_experimental_config(base.experimental.clone(), project.experimental);
     base.bash = merge_bash_config(base.bash.clone(), project.bash);
     base.inspect = merge_inspect_config(base.inspect.clone(), project.inspect);
+    base.idle = merge_idle_config(base.idle.clone(), project.idle);
     base.worktree = merge_worktree_config(base.worktree.clone(), project.worktree);
+    base.backup = merge_project_backup_config(base.backup.clone(), project.backup);
     if project.git.is_some() {
         base.git = project.git;
     }
+    base.pi = merge_pi_config(base.pi.clone(), project.pi);
     base.sandbox = merge_project_sandbox(base.sandbox.clone(), project.sandbox);
+}
+
+fn merge_project_backup_config(
+    base: Option<RawBackup>,
+    project: Option<RawBackup>,
+) -> Option<RawBackup> {
+    let Some(project_max_file_size) = project.and_then(|backup| backup.max_file_size) else {
+        return base;
+    };
+    let mut backup = base.unwrap_or_default();
+    backup.max_file_size = Some(project_max_file_size);
+    Some(backup)
 }
 
 fn merge_project_sandbox(
@@ -1119,6 +1206,9 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                 foreground_wait_window_ms: override_features
                     .foreground_wait_window_ms
                     .or(base.foreground_wait_window_ms),
+                watch_sync_max_ms: override_features
+                    .watch_sync_max_ms
+                    .or(base.watch_sync_max_ms),
                 powershell_tool: override_features.powershell_tool.or(base.powershell_tool),
             }))
         }
@@ -1137,10 +1227,25 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
             long_running_reminder_enabled: None,
             long_running_reminder_interval_ms: None,
             foreground_wait_window_ms: None,
+            watch_sync_max_ms: None,
             powershell_tool: None,
         },
         RawBash::Features(features) => features.clone(),
     }
+}
+
+fn merge_idle_config(base: Option<RawIdle>, override_idle: Option<RawIdle>) -> Option<RawIdle> {
+    let Some(override_idle) = override_idle else {
+        return base;
+    };
+    let mut idle = base.unwrap_or_default();
+    if override_idle.root_ttl_minutes.is_some() {
+        idle.root_ttl_minutes = override_idle.root_ttl_minutes;
+    }
+    if override_idle.lsp_ttl_minutes.is_some() {
+        idle.lsp_ttl_minutes = override_idle.lsp_ttl_minutes;
+    }
+    (!idle.is_empty()).then_some(idle)
 }
 
 fn merge_inspect_config(
@@ -1192,6 +1297,19 @@ fn merge_worktree_config(
     (!worktree.is_empty()).then_some(worktree)
 }
 
+fn merge_pi_config(
+    base: Option<RawPi>,
+    override_pi: Option<RawPi>,
+) -> Option<RawPi> {
+    let Some(override_pi) = override_pi else {
+        return base;
+    };
+
+    let mut pi = base.unwrap_or_default();
+    pi.tool_presentation = override_pi.tool_presentation.or(pi.tool_presentation);
+    (!pi.is_empty()).then_some(pi)
+}
+
 fn merge_inspect_duplicates(
     base: Option<RawInspectDuplicates>,
     override_duplicates: Option<RawInspectDuplicates>,
@@ -1230,7 +1348,11 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     if raw.subc.is_some() {
         push_drop(dropped, "subc", tier, USER_ONLY_REASON);
     }
-    if raw.backup.is_some() {
+    if raw
+        .backup
+        .as_ref()
+        .is_some_and(|backup| backup.enabled.is_some() || backup.max_depth.is_some())
+    {
         push_drop(dropped, "backup", tier, USER_ONLY_REASON);
     }
     if raw.gh_shim.is_some() {
@@ -1316,7 +1438,11 @@ fn push_drop(dropped: &mut Vec<DroppedKey>, key: &str, tier: &str, reason: &str)
 /// scalar fields therefore retain defaults, while semantic, inspect, and LSP
 /// fields are fully resolved from the tiers. Process-state fields are not part
 /// of `RawAftConfig` and are preserved separately by `resolve_config_onto`.
-fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
+fn apply_resolved_config(
+    raw: &RawAftConfig,
+    config: &mut Config,
+    warnings: &mut Vec<ConfigWarning>,
+) {
     config.hashline_enabled = matches!(raw.edit_mode, Some(RawEditMode::Hashline));
     if let Some(value) = raw.hoist_builtin_tools {
         config.hoist_builtin_tools = value;
@@ -1360,6 +1486,9 @@ fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     if let Some(value) = raw.semantic_search {
         config.semantic_search = value;
     }
+    if let Some(value) = raw.views.as_ref().and_then(|views| views.enabled) {
+        config.views.enabled = value;
+    }
     if let Some(value) = raw.callgraph_store {
         config.callgraph_store = value;
     }
@@ -1378,7 +1507,7 @@ fn apply_resolved_config(raw: &RawAftConfig, config: &mut Config) {
     config.git = resolve_git_config(raw.git.as_ref());
     config.sandbox = resolve_sandbox_config(raw.sandbox.as_ref());
     resolve_lsp_config(raw, config);
-    resolve_bash_fields(raw, config);
+    resolve_bash_fields(raw, config, warnings);
 }
 
 fn resolve_index_config(raw: Option<&RawIndex>, warnings: &mut Vec<ConfigWarning>) -> IndexConfig {
@@ -1389,8 +1518,8 @@ fn resolve_index_config(raw: Option<&RawIndex>, warnings: &mut Vec<ConfigWarning
         return IndexConfig::default();
     };
 
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    let home = crate::environment::non_empty_os_var("HOME")
+        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
         .map(PathBuf::from);
     let mut normalized_roots = Vec::with_capacity(roots.len());
 
@@ -1520,6 +1649,96 @@ fn resolve_semantic_config(
     }
 
     semantic
+}
+
+fn resolve_idle_config(raw: Option<&RawIdle>, warnings: &mut Vec<ConfigWarning>) -> IdleConfig {
+    let mut idle = IdleConfig::default();
+    let Some(raw) = raw else {
+        return idle;
+    };
+    idle.root_ttl_minutes = resolve_clamped_minutes(
+        raw.root_ttl_minutes.as_ref(),
+        "idle.root_ttl_minutes",
+        DEFAULT_IDLE_ROOT_TTL_MINUTES,
+        MIN_IDLE_ROOT_TTL_MINUTES,
+        MAX_IDLE_ROOT_TTL_MINUTES,
+        warnings,
+    );
+    idle.lsp_ttl_minutes = resolve_clamped_minutes(
+        raw.lsp_ttl_minutes.as_ref(),
+        "idle.lsp_ttl_minutes",
+        DEFAULT_IDLE_LSP_TTL_MINUTES,
+        MIN_IDLE_LSP_TTL_MINUTES,
+        MAX_IDLE_LSP_TTL_MINUTES,
+        warnings,
+    );
+    idle
+}
+
+fn resolve_clamped_minutes(
+    raw: Option<&Value>,
+    key: &'static str,
+    default: u32,
+    min: u32,
+    max: u32,
+    warnings: &mut Vec<ConfigWarning>,
+) -> u32 {
+    let Some(value) = raw else {
+        return default;
+    };
+    let Some(parsed) = json_integer(value) else {
+        warnings.push(ConfigWarning {
+            code: "invalid_idle_ttl",
+            key,
+            tier: "config".to_string(),
+            value: value.to_string(),
+            message: format!("{key} must be an integer; using default {default}"),
+        });
+        return default;
+    };
+    let clamped = parsed.clamp(i64::from(min), i64::from(max)) as u32;
+    if i64::from(clamped) != parsed {
+        warnings.push(ConfigWarning {
+            code: "clamped_idle_ttl",
+            key,
+            tier: "config".to_string(),
+            value: parsed.to_string(),
+            message: format!("{key}={parsed} is outside {min}..={max}; clamped to {clamped}"),
+        });
+    }
+    clamped
+}
+
+fn resolve_clamped_bash_watch_sync_max_ms(
+    raw: Option<u64>,
+    warnings: &mut Vec<ConfigWarning>,
+) -> u64 {
+    let Some(raw) = raw else {
+        return DEFAULT_BASH_WATCH_SYNC_MAX_MS;
+    };
+    let clamped = raw.clamp(MIN_BASH_WATCH_SYNC_MAX_MS, MAX_BASH_WATCH_SYNC_MAX_MS);
+    if clamped != raw {
+        warnings.push(ConfigWarning {
+            code: "clamped_bash_watch_sync_max_ms",
+            key: "bash.watch_sync_max_ms",
+            tier: "config".to_string(),
+            value: raw.to_string(),
+            message: format!(
+                "bash.watch_sync_max_ms={raw} is outside {MIN_BASH_WATCH_SYNC_MAX_MS}..={MAX_BASH_WATCH_SYNC_MAX_MS}; clamped to {clamped}"
+            ),
+        });
+    }
+    clamped
+}
+
+fn json_integer(value: &Value) -> Option<i64> {
+    match value {
+        Value::Number(number) if number.is_i64() => number.as_i64(),
+        Value::Number(number) if number.is_u64() => {
+            number.as_u64().and_then(|value| i64::try_from(value).ok())
+        }
+        _ => None,
+    }
 }
 
 fn resolve_inspect_config(raw: Option<&RawInspect>) -> InspectConfig {
@@ -1683,17 +1902,19 @@ struct ResolvedBashConfig {
     long_running_reminder_enabled: Option<bool>,
     long_running_reminder_interval_ms: Option<u64>,
     foreground_wait_window_ms: u64,
+    watch_sync_max_ms: u64,
     powershell_tool: bool,
 }
 
-fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config) {
-    let bash = resolve_bash_config(raw);
+fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config, warnings: &mut Vec<ConfigWarning>) {
+    let bash = resolve_bash_config(raw, warnings);
     // The plugins use `enabled` and `subagent_background` when registering bash
     // capabilities. Rust resolves them only to accept and merge the same config;
     // they do not control engine behavior.
     let _registration_only = (bash.enabled, bash.subagent_background);
     config.bash.host_fallback = bash.host_fallback;
     config.bash.detach_on_user_message = bash.detach_on_user_message;
+    config.bash.watch_sync_max_ms = bash.watch_sync_max_ms;
     config.bash.powershell_tool = bash.powershell_tool;
     config.experimental_bash_rewrite = bash.rewrite;
     config.experimental_bash_compress = bash.compress;
@@ -1707,7 +1928,10 @@ fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config) {
     }
 }
 
-fn resolve_bash_config(raw: &RawAftConfig) -> ResolvedBashConfig {
+fn resolve_bash_config(
+    raw: &RawAftConfig,
+    warnings: &mut Vec<ConfigWarning>,
+) -> ResolvedBashConfig {
     let top = raw.bash.as_ref();
     let legacy = raw
         .experimental
@@ -1736,6 +1960,8 @@ fn resolve_bash_config(raw: &RawAftConfig) -> ResolvedBashConfig {
         .and_then(|features| features.detach_on_user_message)
         .unwrap_or(true);
     let raw_foreground_wait = top_features.and_then(|features| features.foreground_wait_window_ms);
+    let raw_watch_sync_max = top_features.and_then(|features| features.watch_sync_max_ms);
+    let watch_sync_max_ms = resolve_clamped_bash_watch_sync_max_ms(raw_watch_sync_max, warnings);
     let top_powershell_tool = top_features
         .and_then(|features| features.powershell_tool)
         .unwrap_or(false);
@@ -1754,6 +1980,7 @@ fn resolve_bash_config(raw: &RawAftConfig) -> ResolvedBashConfig {
         long_running_reminder_enabled: reminder_enabled,
         long_running_reminder_interval_ms: reminder_interval,
         foreground_wait_window_ms,
+        watch_sync_max_ms,
         powershell_tool: false,
     };
 
@@ -2121,6 +2348,39 @@ mod tests {
     }
 
     #[test]
+    fn bash_watch_sync_max_defaults_clamps_and_warns() {
+        let default_result = resolve_config(&[]);
+        assert_eq!(
+            default_result.config.bash.watch_sync_max_ms,
+            DEFAULT_BASH_WATCH_SYNC_MAX_MS
+        );
+        assert!(default_result
+            .warnings
+            .iter()
+            .all(|warning| warning.key != "bash.watch_sync_max_ms"));
+
+        let clamped = resolve_config(&[tier("user", r#"{ "bash": { "watch_sync_max_ms": 5 } }"#)]);
+        assert_eq!(
+            clamped.config.bash.watch_sync_max_ms,
+            MIN_BASH_WATCH_SYNC_MAX_MS
+        );
+        assert!(clamped.warnings.iter().any(|warning| {
+            warning.code == "clamped_bash_watch_sync_max_ms"
+                && warning.key == "bash.watch_sync_max_ms"
+                && warning.value == "5"
+        }));
+
+        let project_override = resolve_config(&[
+            tier("user", r#"{ "bash": { "watch_sync_max_ms": 120000 } }"#),
+            tier("project", r#"{ "bash": { "watch_sync_max_ms": 1800000 } }"#),
+        ]);
+        assert_eq!(
+            project_override.config.bash.watch_sync_max_ms,
+            MAX_BASH_WATCH_SYNC_MAX_MS
+        );
+    }
+
+    #[test]
     fn config_resolve_user_only_config_applies_fields() {
         let result = resolve_config(&[tier(
             "user",
@@ -2460,6 +2720,93 @@ mod tests {
     }
 
     #[test]
+    fn idle_root_ttl_clamps_to_five_through_thirty() {
+        let below = resolve_config(&[tier("user", r#"{ "idle": { "root_ttl_minutes": 1 } }"#)]);
+        assert_eq!(
+            below.config.idle.root_ttl_minutes,
+            MIN_IDLE_ROOT_TTL_MINUTES
+        );
+        assert!(below
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "clamped_idle_ttl"
+                && warning.key == "idle.root_ttl_minutes"));
+
+        let above = resolve_config(&[tier("user", r#"{ "idle": { "root_ttl_minutes": 60 } }"#)]);
+        assert_eq!(
+            above.config.idle.root_ttl_minutes,
+            MAX_IDLE_ROOT_TTL_MINUTES
+        );
+        assert!(above
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "clamped_idle_ttl"
+                && warning.key == "idle.root_ttl_minutes"));
+
+        let at_min = resolve_config(&[tier("user", r#"{ "idle": { "root_ttl_minutes": 5 } }"#)]);
+        assert_eq!(at_min.config.idle.root_ttl_minutes, 5);
+        assert!(at_min.warnings.is_empty());
+
+        let at_max = resolve_config(&[tier("user", r#"{ "idle": { "root_ttl_minutes": 30 } }"#)]);
+        assert_eq!(at_max.config.idle.root_ttl_minutes, 30);
+        assert!(at_max.warnings.is_empty());
+    }
+
+    #[test]
+    fn idle_lsp_ttl_clamps_to_one_through_ten() {
+        let below = resolve_config(&[tier("user", r#"{ "idle": { "lsp_ttl_minutes": 0 } }"#)]);
+        assert_eq!(below.config.idle.lsp_ttl_minutes, MIN_IDLE_LSP_TTL_MINUTES);
+        assert!(below
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "clamped_idle_ttl"
+                && warning.key == "idle.lsp_ttl_minutes"));
+
+        let above = resolve_config(&[tier("user", r#"{ "idle": { "lsp_ttl_minutes": 20 } }"#)]);
+        assert_eq!(above.config.idle.lsp_ttl_minutes, MAX_IDLE_LSP_TTL_MINUTES);
+        assert!(above
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "clamped_idle_ttl"
+                && warning.key == "idle.lsp_ttl_minutes"));
+
+        let at_min = resolve_config(&[tier("user", r#"{ "idle": { "lsp_ttl_minutes": 1 } }"#)]);
+        assert_eq!(at_min.config.idle.lsp_ttl_minutes, 1);
+        assert!(at_min.warnings.is_empty());
+
+        let at_max = resolve_config(&[tier("user", r#"{ "idle": { "lsp_ttl_minutes": 10 } }"#)]);
+        assert_eq!(at_max.config.idle.lsp_ttl_minutes, 10);
+        assert!(at_max.warnings.is_empty());
+    }
+
+    #[test]
+    fn idle_non_integer_ttl_is_dropped_with_warning() {
+        let result = resolve_config(&[tier("user", r#"{ "idle": { "root_ttl_minutes": 12.5 } }"#)]);
+        assert_eq!(
+            result.config.idle.root_ttl_minutes,
+            DEFAULT_IDLE_ROOT_TTL_MINUTES
+        );
+        assert!(result
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "invalid_idle_ttl"
+                && warning.key == "idle.root_ttl_minutes"));
+    }
+
+    #[test]
+    fn idle_project_tier_overrides_user_ttl() {
+        let result = resolve_config(&[
+            tier("user", r#"{ "idle": { "lsp_ttl_minutes": 8 } }"#),
+            tier("project", r#"{ "idle": { "lsp_ttl_minutes": 3 } }"#),
+        ]);
+        assert_eq!(result.config.idle.lsp_ttl_minutes, 3);
+        assert_eq!(
+            result.config.idle.root_ttl_minutes,
+            DEFAULT_IDLE_ROOT_TTL_MINUTES
+        );
+    }
+
+    #[test]
     fn project_inspect_diagnostics_timeout_can_raise_but_never_lower_user_value() {
         let lower = resolve_config(&[
             tier(
@@ -2697,6 +3044,24 @@ mod tests {
     }
 
     #[test]
+    fn disabled_tools_resolve_into_runtime_config() {
+        let result = resolve_config(&[tier(
+            "user",
+            r#"{ "disabled_tools": ["aft_zoom", "aft_search"] }"#,
+        )]);
+        assert!(result
+            .config
+            .disabled_tools
+            .iter()
+            .any(|tool| tool == "aft_zoom"));
+        assert!(result
+            .config
+            .disabled_tools
+            .iter()
+            .any(|tool| tool == "aft_search"));
+    }
+
+    #[test]
     fn config_resolve_bash_ladder_and_merge_parity() {
         let true_result = resolve_config(&[tier("user", r#"{ "bash": true }"#)]);
         assert!(true_result.config.experimental_bash_rewrite);
@@ -2763,7 +3128,8 @@ mod tests {
         )) else {
             panic!("test tier should parse");
         };
-        let bash = resolve_bash_config(&raw);
+        let mut warnings = Vec::new();
+        let bash = resolve_bash_config(&raw, &mut warnings);
 
         assert_eq!(
             bash.foreground_wait_window_ms,

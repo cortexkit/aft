@@ -22,20 +22,20 @@ pub use attachments::{
 pub use cache::{
     apply_selector, sqlite_cache_store, GithubReadCacheStore, GithubReadClock,
     GithubReadCompletion, GithubReadDeferred, GithubReadEngine, GithubReadFreshness,
-    GithubReadRequest, GithubReadSelector, GithubReadStart, SqliteGithubReadCacheStore,
-    SystemGithubReadClock,
+    GithubReadRequest, GithubReadSelector, GithubReadStart, GithubReadView,
+    SqliteGithubReadCacheStore, SystemGithubReadClock,
 };
 pub use fetch::{
-    gh_pr_review_comments_args, gh_view_args, redact_gh_error, GhCliFetcher, GhCommandError,
-    GhCommandOutput, GhCommandRunner, GithubFetchRequest, GithubFetcher, GithubReadError,
-    SystemGhCommandRunner,
+    gh_pr_review_comments_args, gh_timeline_args, gh_view_args, redact_gh_error, GhCliFetcher,
+    GhCommandError, GhCommandOutput, GhCommandRunner, GithubFetchRequest, GithubFetcher,
+    GithubReadError, SystemGhCommandRunner,
 };
 pub use model::{
     GithubComment, GithubDocument, GithubDocumentKind, GithubPullRequestFile, GithubReaction,
-    GithubReview, GithubReviewCommentSection,
+    GithubReview, GithubReviewCommentSection, GithubTimelineEvent,
 };
-pub use normalize::{normalize_structured_document, NormalizeError};
-pub use render::{render_document, MAX_RENDERED_COMMENTS_PER_SECTION};
+pub use normalize::{normalize_structured_document, normalize_timeline_events, NormalizeError};
+pub use render::{render_document, render_outline_for_resource, MAX_RENDERED_COMMENTS_PER_SECTION};
 pub use resource::{
     parse_resource, GithubCommentSelector, GithubResource, GithubResourceKind,
     InvalidGithubResource,

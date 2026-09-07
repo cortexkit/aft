@@ -1,43 +1,97 @@
-import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import type { ChildProcess, ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import { BinaryBridge, compareSemver } from "@cortexkit/aft-bridge";
 
 const BINARY_PATH = resolve(import.meta.dir, "../../../../target/debug/aft");
-const PROJECT_CWD = resolve(import.meta.dir, "../../../..");
 
 /** Short timeout for tests — we don't want to wait 30s on failure. */
 const TEST_TIMEOUT_MS = 5_000;
+let bridge: BinaryBridge | null = null;
 let projectRoot: string;
+let canaryDataHome: string;
+let canarySnapshot: string;
 
 beforeAll(() => {
-  projectRoot = mkdtempSync(join(tmpdir(), "aft-test-repo-"));
+  canaryDataHome = mkdtempSync(join(tmpdir(), "aft-opencode-shared-storage-canary-"));
+  const sharedStorage = join(canaryDataHome, "cortexkit", "aft");
+  mkdirSync(sharedStorage, { recursive: true });
+  writeFileSync(join(sharedStorage, "sentinel"), "must remain unchanged\n");
+  canarySnapshot = snapshotFiles(sharedStorage);
 });
 
-afterAll(() => {
+beforeEach(() => {
+  projectRoot = mkdtempSync(join(tmpdir(), "aft-opencode-bridge-project-"));
+});
+
+afterEach(async () => {
+  if (bridge) {
+    await bridge.shutdown();
+    bridge = null;
+  }
   rmSync(projectRoot, { recursive: true, force: true });
 });
 
-describe("BinaryBridge lifecycle", () => {
-  let bridge: BinaryBridge | null = null;
+afterAll(() => {
+  expect(snapshotFiles(join(canaryDataHome, "cortexkit", "aft"))).toBe(canarySnapshot);
+  rmSync(canaryDataHome, { recursive: true, force: true });
+});
 
-  afterEach(async () => {
-    if (bridge) {
-      await bridge.shutdown();
-      bridge = null;
+function isolatedBridgeOptions<T extends object>(options: T) {
+  const childEnv = (options as { childEnv?: Record<string, string | undefined> }).childEnv;
+  return {
+    ...options,
+    childEnv: {
+      ...childEnv,
+      AFT_STORAGE_DIR: join(projectRoot, ".aft-storage"),
+      AFT_CACHE_DIR: join(projectRoot, ".aft-cache"),
+      XDG_DATA_HOME: canaryDataHome,
+    },
+  };
+}
+
+function snapshotFiles(root: string): string {
+  const files: Array<[string, string, number]> = [];
+  const walk = (directory: string) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) =>
+      a.name.localeCompare(b.name),
+    )) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        walk(path);
+      } else {
+        files.push([
+          relative(root, path),
+          readFileSync(path).toString("base64"),
+          statSync(path).mtimeMs,
+        ]);
+      }
     }
-  });
+  };
+  walk(root);
+  return JSON.stringify(files);
+}
 
+describe("BinaryBridge lifecycle", () => {
   test("spawns binary and ping returns pong", async () => {
     bridge = new BinaryBridge(
       BINARY_PATH,
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: TEST_TIMEOUT_MS,
-      },
+      }),
       { harness: "opencode" },
     );
 
@@ -52,13 +106,13 @@ describe("BinaryBridge lifecycle", () => {
     const completions: unknown[] = [];
     bridge = new BinaryBridge(
       BINARY_PATH,
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: TEST_TIMEOUT_MS,
         onBashCompletion: (completion) => {
           completions.push(completion);
         },
-      },
+      }),
       { harness: "opencode" },
     );
 
@@ -89,13 +143,13 @@ describe("BinaryBridge lifecycle", () => {
     const completions: unknown[] = [];
     bridge = new BinaryBridge(
       "/tmp/aft-does-not-need-to-exist",
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: 5_000,
         onBashCompletion: (completion) => {
           completions.push(completion);
         },
-      },
+      }),
       { harness: "opencode" },
     );
 
@@ -119,13 +173,13 @@ describe("BinaryBridge lifecycle", () => {
     const deliveries: unknown[] = [];
     bridge = new BinaryBridge(
       BINARY_PATH,
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: TEST_TIMEOUT_MS,
         onConfigureWarnings: (context) => {
           deliveries.push(context);
         },
-      },
+      }),
       { harness: "opencode" },
     );
 
@@ -165,13 +219,13 @@ describe("BinaryBridge lifecycle", () => {
     const deliveries: unknown[] = [];
     bridge = new BinaryBridge(
       BINARY_PATH,
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: TEST_TIMEOUT_MS,
         onConfigureWarnings: (context) => {
           deliveries.push(context);
         },
-      },
+      }),
       { harness: "opencode" },
     );
 
@@ -214,13 +268,13 @@ describe("BinaryBridge lifecycle", () => {
     const clientB = { name: "client-b" };
     bridge = new BinaryBridge(
       BINARY_PATH,
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: TEST_TIMEOUT_MS,
         onConfigureWarnings: (context) => {
           deliveries.push(context);
         },
-      },
+      }),
       { harness: "opencode" },
     );
     (bridge as any).configureWarningClients.set("session-a", clientA);
@@ -249,10 +303,10 @@ describe("BinaryBridge lifecycle", () => {
   test("multiple sequential requests return correct responses (ID correlation)", async () => {
     bridge = new BinaryBridge(
       BINARY_PATH,
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: TEST_TIMEOUT_MS,
-      },
+      }),
       { harness: "opencode" },
     );
 
@@ -280,11 +334,11 @@ describe("BinaryBridge lifecycle", () => {
     // SIGTERM together. Recovery still works: the next send() lazy-spawns.
     bridge = new BinaryBridge(
       BINARY_PATH,
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: TEST_TIMEOUT_MS,
         maxRestarts: 3,
-      },
+      }),
       { harness: "opencode" },
     );
 
@@ -314,10 +368,10 @@ describe("BinaryBridge lifecycle", () => {
   test("shutdown cleans up child process (no orphans)", async () => {
     bridge = new BinaryBridge(
       BINARY_PATH,
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: TEST_TIMEOUT_MS,
-      },
+      }),
       { harness: "opencode" },
     );
 
@@ -340,11 +394,11 @@ describe("BinaryBridge lifecycle", () => {
   test("request to dead bridge after max retries rejects with error", async () => {
     bridge = new BinaryBridge(
       BINARY_PATH,
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: TEST_TIMEOUT_MS,
         maxRestarts: 0, // no restarts allowed
-      },
+      }),
       { harness: "opencode" },
     );
 
@@ -377,10 +431,10 @@ describe("BinaryBridge lifecycle", () => {
   test("multiple parallel first calls share one configure (no race)", async () => {
     bridge = new BinaryBridge(
       BINARY_PATH,
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: TEST_TIMEOUT_MS,
-      },
+      }),
       { harness: "opencode" },
     );
 
@@ -408,14 +462,14 @@ describe("BinaryBridge lifecycle", () => {
   test("bridge death during version check prevents configured=true", async () => {
     bridge = new BinaryBridge(
       BINARY_PATH,
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: TEST_TIMEOUT_MS,
         // Set a minVersion so checkVersion actually sends a "version" command
         minVersion: "0.0.1",
         // Disable auto-restart so the killed process stays dead
         maxRestarts: 0,
-      },
+      }),
       { harness: "opencode" },
     );
 
@@ -471,11 +525,11 @@ describe("BinaryBridge lifecycle", () => {
     try {
       bridge = new BinaryBridge(
         fakeBin,
-        PROJECT_CWD,
-        {
+        projectRoot,
+        isolatedBridgeOptions({
           timeoutMs: 5_000, // must exceed the fake binary's sleep
           maxRestarts: 0, // force straight to the "giving up" path
-        },
+        }),
         { harness: "opencode" },
       );
 
@@ -512,11 +566,11 @@ describe("BinaryBridge lifecycle", () => {
     try {
       bridge = new BinaryBridge(
         fakeBin,
-        PROJECT_CWD,
-        {
+        projectRoot,
+        isolatedBridgeOptions({
           timeoutMs: 5_000, // bridge-wide default
           maxRestarts: 0,
-        },
+        }),
         { harness: "opencode" },
       );
 
@@ -550,11 +604,11 @@ describe("BinaryBridge lifecycle", () => {
     try {
       bridge = new BinaryBridge(
         fakeBin,
-        PROJECT_CWD,
-        {
+        projectRoot,
+        isolatedBridgeOptions({
           timeoutMs: 5_000,
           maxRestarts: 0,
-        },
+        }),
         { harness: "opencode" },
       );
 
@@ -615,10 +669,10 @@ describe("BinaryBridge lifecycle", () => {
     try {
       bridge = new BinaryBridge(
         fakeBin,
-        PROJECT_CWD,
-        {
+        projectRoot,
+        isolatedBridgeOptions({
           timeoutMs: TEST_TIMEOUT_MS,
-        },
+        }),
         { harness: "opencode" },
       );
 
@@ -650,11 +704,11 @@ describe("BinaryBridge lifecycle", () => {
     try {
       bridge = new BinaryBridge(
         fakeBin,
-        PROJECT_CWD,
-        {
+        projectRoot,
+        isolatedBridgeOptions({
           timeoutMs: 30_000,
           maxRestarts: 0,
-        },
+        }),
         { harness: "opencode" },
       );
 
@@ -672,11 +726,11 @@ describe("BinaryBridge lifecycle", () => {
   test("restart counter decays even after max restarts is reached", async () => {
     bridge = new BinaryBridge(
       BINARY_PATH,
-      PROJECT_CWD,
-      {
+      projectRoot,
+      isolatedBridgeOptions({
         timeoutMs: TEST_TIMEOUT_MS,
         maxRestarts: 1,
-      },
+      }),
       { harness: "opencode" },
     );
     const originalResetMs = (BinaryBridge as any).RESTART_RESET_MS;
@@ -703,11 +757,11 @@ describe("BinaryBridge lifecycle", () => {
     try {
       bridge = new BinaryBridge(
         fakeBin,
-        PROJECT_CWD,
-        {
+        projectRoot,
+        isolatedBridgeOptions({
           timeoutMs: TEST_TIMEOUT_MS,
           maxRestarts: 0,
-        },
+        }),
         { harness: "opencode" },
       );
 
@@ -754,11 +808,11 @@ describe("BinaryBridge lifecycle", () => {
     try {
       bridge = new BinaryBridge(
         fakeBin,
-        PROJECT_CWD,
-        {
+        projectRoot,
+        isolatedBridgeOptions({
           timeoutMs: 5_000,
           maxRestarts: 0,
-        },
+        }),
         { harness: "opencode" },
       );
 

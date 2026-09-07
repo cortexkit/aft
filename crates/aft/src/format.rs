@@ -492,16 +492,16 @@ fn try_well_known_path_lookup(command: &str) -> Option<PathBuf> {
         return None;
     }
     if cfg!(windows) {
-        for dir in crate::tool_path::well_known_windows_bin_dirs(
-            std::env::var_os("USERPROFILE").as_deref(),
-        ) {
+        let user_profile = crate::environment::non_empty_os_var("USERPROFILE");
+        for dir in crate::tool_path::well_known_windows_bin_dirs(user_profile.as_deref()) {
             if let Some(found) = crate::tool_path::probe_tool_in_dir(&dir, command) {
                 return Some(found);
             }
         }
         return None;
     }
-    let candidates = well_known_search_paths(command, std::env::var_os("HOME").as_deref());
+    let home = crate::environment::non_empty_os_var("HOME");
+    let candidates = well_known_search_paths(command, home.as_deref());
     try_well_known_path_lookup_in(&candidates)
 }
 
@@ -661,6 +661,8 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Go => "go",
         LangId::C => "c",
         LangId::Cpp => "cpp",
+        LangId::Cuda => "cuda",
+        LangId::Metal => "metal",
         LangId::Zig => "zig",
         LangId::CSharp => "csharp",
         LangId::Bash => "bash",
@@ -683,6 +685,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::R => "r",
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
+        LangId::Toml => "toml",
     }
 }
 
@@ -900,6 +903,8 @@ fn formatter_candidates(lang: LangId, config: &Config, path: &Path) -> Vec<ToolC
         }
         LangId::C
         | LangId::Cpp
+        | LangId::Cuda
+        | LangId::Metal
         | LangId::Zig
         | LangId::CSharp
         | LangId::Bash
@@ -918,7 +923,8 @@ fn formatter_candidates(lang: LangId, config: &Config, path: &Path) -> Vec<ToolC
         | LangId::Pascal
         | LangId::R
         | LangId::Groovy
-        | LangId::ObjC => Vec::new(),
+        | LangId::ObjC
+        | LangId::Toml => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
         LangId::Yaml => Vec::new(),
@@ -1020,6 +1026,8 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
         }
         LangId::C
         | LangId::Cpp
+        | LangId::Cuda
+        | LangId::Metal
         | LangId::Zig
         | LangId::CSharp
         | LangId::Bash
@@ -1038,7 +1046,8 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
         | LangId::Pascal
         | LangId::R
         | LangId::Groovy
-        | LangId::ObjC => Vec::new(),
+        | LangId::ObjC
+        | LangId::Toml => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
         LangId::Yaml => Vec::new(),
@@ -1256,6 +1265,8 @@ fn placeholder_file_for_language(project_root: &Path, lang: LangId) -> PathBuf {
         LangId::Go => "aft_tool_detection.go",
         LangId::C => "aft_tool_detection.c",
         LangId::Cpp => "aft_tool_detection.cpp",
+        LangId::Cuda => "aft_tool_detection.cu",
+        LangId::Metal => "aft_tool_detection.metal",
         LangId::Zig => "aft_tool_detection.zig",
         LangId::CSharp => "aft_tool_detection.cs",
         LangId::Bash => "aft_tool_detection.sh",
@@ -1278,6 +1289,7 @@ fn placeholder_file_for_language(project_root: &Path, lang: LangId) -> PathBuf {
         LangId::R => "aft-tool-detection.R",
         LangId::Groovy => "aft-tool-detection.groovy",
         LangId::ObjC => "aft-tool-detection.m",
+        LangId::Toml => "aft-tool-detection.toml",
     };
     project_root.join(filename)
 }

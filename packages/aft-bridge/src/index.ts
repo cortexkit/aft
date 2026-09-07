@@ -113,6 +113,19 @@ export {
 export { compressionSavingsPercent, formatTokenCount } from "./format.js";
 // --- jsonc helpers ---
 export { stripJsoncSymbols } from "./jsonc.js";
+// --- per-Location process-global transport ownership ---
+export type {
+  AcquireBridgeDependencies,
+  BridgeLifecycleCensus,
+  BridgeLifecycleCensusOptions,
+  BridgeLifecycleTopology,
+} from "./location-lifecycle.js";
+export {
+  acquireBridge,
+  getBridgeLifecycleTopology,
+  releaseBridge,
+  sampleBridgeLifecycleCensus,
+} from "./location-lifecycle.js";
 export type { Logger, LogMeta } from "./logger.js";
 export type {
   AftConfigFileMigrationOptions,
@@ -154,6 +167,7 @@ export {
   prepareCanonicalEditArguments,
   prepareCanonicalPathArguments,
 } from "./path-aliases.js";
+export { withPathPrepended } from "./path-env.js";
 export type { LegacyAftConfigSource, ResolvedAftConfigPaths } from "./paths.js";
 export {
   decodeFileUrl,
@@ -191,7 +205,15 @@ export type {
 } from "./protocol.js";
 export { findBinary, findBinarySync, isNativeExecutable, platformKey } from "./resolver.js";
 export { RevivableTransportPool } from "./revivable-transport.js";
-export { resolveAftLogPath, resolveAftStorageRoot } from "./storage-paths.js";
+export {
+  resolveAftLogPath,
+  resolveAftStorageRoot,
+  resolveDataHome,
+  resolveStoragePath,
+  type StorageEnvironmentLookup,
+  type StoragePathContext,
+  type StoragePlatform,
+} from "./storage-paths.js";
 export {
   type BgNudgeRef,
   resolveBridgeForNudge,

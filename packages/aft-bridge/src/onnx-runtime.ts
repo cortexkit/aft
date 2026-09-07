@@ -55,6 +55,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, win32 } from "n
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { error, log, warn } from "./active-logger.js";
+import { withPathPrepended } from "./path-env.js";
 import { PLATFORM_ARCH_MAP } from "./platform.js";
 
 const ORT_VERSION = "1.24.4";
@@ -456,7 +457,10 @@ function isOnnxVersionCompatible(version: string): boolean {
 }
 
 function pathEnvValue(): string {
-  return process.env.PATH ?? process.env.Path ?? process.env.path ?? "";
+  const env = withPathPrepended(process.env);
+  if (process.platform !== "win32") return env.PATH ?? "";
+  const key = Object.keys(env).find((candidate) => candidate.toLowerCase() === "path");
+  return key === undefined ? "" : (env[key] ?? "");
 }
 
 function pathEntriesForPlatform(): string[] {

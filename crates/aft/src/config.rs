@@ -9,6 +9,18 @@ pub(crate) const MAX_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 15_000;
 pub(crate) const DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 120_000;
 pub(crate) const MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 10_000;
 pub(crate) const MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 600_000;
+pub const DEFAULT_BASH_WATCH_SYNC_MAX_MS: u64 = 120_000;
+pub const MIN_BASH_WATCH_SYNC_MAX_MS: u64 = 1_000;
+pub const MAX_BASH_WATCH_SYNC_MAX_MS: u64 = 1_800_000;
+
+/// Unbound-root artifact eviction idle window, in minutes.
+pub const DEFAULT_IDLE_ROOT_TTL_MINUTES: u32 = 30;
+pub const MIN_IDLE_ROOT_TTL_MINUTES: u32 = 5;
+pub const MAX_IDLE_ROOT_TTL_MINUTES: u32 = 30;
+/// Language-server idle window, in minutes. Independent of artifact eviction.
+pub const DEFAULT_IDLE_LSP_TTL_MINUTES: u32 = 10;
+pub const MIN_IDLE_LSP_TTL_MINUTES: u32 = 1;
+pub const MAX_IDLE_LSP_TTL_MINUTES: u32 = 10;
 
 const fn default_semantic_query_timeout_ms() -> u64 {
     DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS
@@ -22,7 +34,42 @@ const fn default_bash_detach_on_user_message() -> bool {
     true
 }
 
+pub(crate) const fn default_bash_watch_sync_max_ms() -> u64 {
+    DEFAULT_BASH_WATCH_SYNC_MAX_MS
+}
+
 use crate::harness::Harness;
+
+/// Idle reclamation windows for unbound-root artifacts and language servers.
+///
+/// `root_ttl_minutes` controls when an unbound root's indexes are evicted.
+/// `lsp_ttl_minutes` shuts down that root's language servers after no request,
+/// even while the root is still bound. Both rebuild/respawn on the next request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IdleConfig {
+    pub root_ttl_minutes: u32,
+    pub lsp_ttl_minutes: u32,
+}
+
+impl Default for IdleConfig {
+    fn default() -> Self {
+        Self {
+            root_ttl_minutes: DEFAULT_IDLE_ROOT_TTL_MINUTES,
+            lsp_ttl_minutes: DEFAULT_IDLE_LSP_TTL_MINUTES,
+        }
+    }
+}
+
+impl IdleConfig {
+    pub fn root_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.root_ttl_minutes) * 60)
+    }
+
+    pub fn lsp_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(self.lsp_ttl_minutes) * 60)
+    }
+}
 
 /// The durable index families that a standing root may maintain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -228,7 +275,7 @@ impl Default for BackupConfig {
         Self {
             enabled: Some(true),
             max_depth: Some(crate::backup::DEFAULT_MAX_UNDO_DEPTH),
-            max_file_size: None,
+            max_file_size: Some(crate::backup::DEFAULT_MAX_BACKUP_FILE_SIZE),
         }
     }
 }
@@ -320,6 +367,14 @@ pub fn normalize_git_co_author(value: &str) -> Option<String> {
     Some(value.to_string())
 }
 
+/// Content-addressed index view assembly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ViewsConfig {
+    /// Enable manifest-backed index views. Default false.
+    pub enabled: bool,
+}
+
 /// Linked-worktree behavior that never writes shared on-disk artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -367,6 +422,10 @@ pub struct BashConfig {
     /// Rust accepts this for cross-language config parity but never acts on it.
     #[serde(default = "default_bash_detach_on_user_message")]
     pub detach_on_user_message: bool,
+    /// Maximum synchronous `bash_watch` wait accepted by the hosting plugin.
+    /// Rust accepts this for cross-language config parity but never acts on it.
+    #[serde(default = "default_bash_watch_sync_max_ms")]
+    pub watch_sync_max_ms: u64,
     /// Pi-only fallback gate for its optional PowerShell default tool. The Rust
     /// executor accepts this solely to keep shared config parsing in parity.
     pub powershell_tool: bool,
@@ -377,6 +436,7 @@ impl Default for BashConfig {
         Self {
             host_fallback: false,
             detach_on_user_message: default_bash_detach_on_user_message(),
+            watch_sync_max_ms: default_bash_watch_sync_max_ms(),
             powershell_tool: false,
         }
     }
@@ -422,6 +482,8 @@ pub struct Config {
     pub index: IndexConfig,
     /// Enable semantic search (default: false).
     pub semantic_search: bool,
+    /// Content-addressed index view assembly. Disabled by default.
+    pub views: ViewsConfig,
     /// Whether the plugin registered the `aft_search` tool for this surface
     /// (default: false). Forwarded by the plugin's resolved registration
     /// predicate (semantic on + not minimal + not disabled). Used only to pick
@@ -523,6 +585,8 @@ pub struct Config {
     /// cap is exceeded. Set to 0 to disable the cap entirely.
     /// Default: 5000 (covers very large monorepos with bounded memory).
     pub diagnostic_cache_size: usize,
+    /// Idle reclamation windows for unbound-root artifacts and language servers.
+    pub idle: IdleConfig,
 }
 
 impl Default for Config {
@@ -549,6 +613,7 @@ impl Default for Config {
             search_index: false,
             index: IndexConfig::default(),
             semantic_search: false,
+            views: ViewsConfig::default(),
             aft_search_registered: false,
             callgraph_store: true,
             callgraph_chunk_size: 100,
@@ -584,6 +649,7 @@ impl Default for Config {
             disabled_tools: Vec::new(),
             harness: None,
             diagnostic_cache_size: 5000,
+            idle: IdleConfig::default(),
         }
     }
 }
@@ -641,6 +707,13 @@ mod tests {
             ..Config::default()
         };
         assert!(!unhoisted.read_slot_survives());
+    }
+
+    #[test]
+    fn bash_watch_sync_max_defaults_to_two_minutes_when_deserialized() {
+        let parsed: BashConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.watch_sync_max_ms, DEFAULT_BASH_WATCH_SYNC_MAX_MS);
+        assert_eq!(BashConfig::default().watch_sync_max_ms, 120_000);
     }
 
     #[test]

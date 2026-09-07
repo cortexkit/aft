@@ -8,6 +8,19 @@ import {
   permissionDeniedResponse,
 } from "./permissions.js";
 
+function hasMeaningfulProjectSearchFallback(
+  query: string,
+  pathArg: string,
+  externalRoot: string,
+): boolean {
+  const trimmedQuery = query.trim();
+  // A non-empty code query is useful in the current project unless the caller
+  // used the query solely as the external path itself. There is no separate
+  // "external-only" flag in the public tool schema, so this is the only
+  // unambiguous shape where dropping `path` would lose the request's purpose.
+  return trimmedQuery.length > 0 && trimmedQuery !== pathArg && trimmedQuery !== externalRoot;
+}
+
 const z = tool.schema;
 
 type ToolArg = ToolDefinition["args"][string];
@@ -69,16 +82,40 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
       const denied = await askSearchPermission(context, query);
       if (denied) return permissionDeniedResponse(denied);
 
-      if (pathArg) {
-        const denied = await assertAftSearchExternalPermission(ctx, context, pathArg);
-        if (denied) return permissionDeniedResponse(denied);
-      }
-
       const rawArgs: Record<string, unknown> = { query };
       const topK = coerceOptionalInt(args.topK, "topK", 1, 100);
       if (topK !== undefined) rawArgs.topK = topK;
       if (typeof args.includeTests === "boolean") rawArgs.includeTests = args.includeTests;
-      if (pathArg) rawArgs.path = pathArg;
+
+      if (pathArg) {
+        const externalDenied = await assertAftSearchExternalPermission(ctx, context, pathArg);
+        if (externalDenied) {
+          if (
+            externalDenied.kind === "rule_denied" &&
+            hasMeaningfulProjectSearchFallback(query, pathArg, externalDenied.root)
+          ) {
+            const fallbackResponse = await callToolCall(ctx, context, "search", rawArgs, {
+              abortSignal: context.abort,
+            });
+            if (fallbackResponse.success === false) {
+              const message =
+                typeof fallbackResponse.text === "string" && fallbackResponse.text.length > 0
+                  ? fallbackResponse.text
+                  : typeof fallbackResponse.message === "string" &&
+                      fallbackResponse.message.length > 0
+                    ? fallbackResponse.message
+                    : "semantic_search failed";
+              throw new Error(message);
+            }
+            const fallbackNotice = `${externalDenied.message}; searching the project index only`;
+            const fallbackText = fallbackResponse.text;
+            return fallbackText ? `${fallbackNotice}\n\n${fallbackText}` : fallbackNotice;
+          }
+          return permissionDeniedResponse(externalDenied.message);
+        }
+        rawArgs.path = pathArg;
+      }
+
       const response = await callToolCall(ctx, context, "search", rawArgs, {
         abortSignal: context.abort,
       });

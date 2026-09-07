@@ -24,7 +24,6 @@ import { callBashBridge, coerceOptionalInt, optionalInt, projectRootFor } from "
 const z = tool.schema;
 const BASH_WAIT_POLL_INTERVAL_MS = 100;
 const DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS = 30_000;
-const MAX_BASH_STATUS_WAIT_TIMEOUT_MS = 30 * 60 * 1000;
 const REGEX_WAIT_SCAN_WINDOW_BYTES = 64 * 1024;
 
 export type BashWaitPattern =
@@ -52,10 +51,19 @@ type OutputCursor = { output: number; stderr: number };
 type OutputScanChunk = { stream: OutputStream; text: string; baseOffset: number };
 type OutputScanState = Record<OutputStream, { text: string; baseOffset: number }>;
 
+function coerceConfiguredWatchTimeout(value: unknown, cap: number): number | undefined {
+  try {
+    return coerceOptionalInt(value, "timeoutMs", 1, cap);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`${message} (bash.watch_sync_max_ms)`);
+  }
+}
+
 export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
   return {
     description:
-      "Watch a background bash task. Sync (default) blocks until a pattern matches, the task exits, or timeout — use it when the result is the next thing you need, even for long builds/tests/installs (pass timeoutMs up to 30 min for those). The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
+      "Watch a background bash task. Sync waits are for a short remaining wait on a task (default 30s, max `bash.watch_sync_max_ms`, 120s by default); for anything longer end the turn on `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. The user can interrupt anytime; the wait auto-converts to an async notification. Async (background:true, requires pattern) registers a non-blocking notification and returns immediately — use when you have parallel work or want to end your turn. Never loop bash_status to wait.",
     args: {
       taskId: z.string().describe("Background task ID returned by bash({ background: true })."),
       pattern: z
@@ -70,8 +78,8 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         .describe(
           "When true, register an async watch and return immediately. Defaults to false (sync wait).",
         ),
-      timeoutMs: optionalInt(1, MAX_BASH_STATUS_WAIT_TIMEOUT_MS).describe(
-        "Sync-only timeout in milliseconds. Default 30000, max 1800000 (30 min).",
+      timeoutMs: optionalInt(1, 1800000).describe(
+        "Sync-only timeout in milliseconds. Default 30000; max `bash.watch_sync_max_ms` (120000 by default).",
       ),
       once: z
         .boolean()
@@ -121,12 +129,13 @@ export function createBashWatchTool(ctx: PluginContext): ToolDefinition {
         return `Watch registered: ${registered.watch_id} on task ${taskId}\nA notification will fire when the pattern matches or the task exits.`;
       }
 
+      const syncWaitCap = bashCfg.watch_sync_max_ms;
       const effectiveWaitMs = subagentForcedSync
-        ? MAX_BASH_STATUS_WAIT_TIMEOUT_MS
+        ? syncWaitCap
         : Math.min(
-            coerceOptionalInt(args.timeoutMs, "timeoutMs", 1, MAX_BASH_STATUS_WAIT_TIMEOUT_MS) ??
+            coerceConfiguredWatchTimeout(args.timeoutMs, syncWaitCap) ??
               DEFAULT_BASH_STATUS_WAIT_TIMEOUT_MS,
-            MAX_BASH_STATUS_WAIT_TIMEOUT_MS,
+            syncWaitCap,
           );
       const data = await waitForBashStatus(
         ctx,

@@ -610,23 +610,6 @@ fn execute_mutate(
         }
     };
 
-    // Content-destructive ops must hold a real restore record when backups are
-    // the precondition of hashline apply. A disabled store that yields no id is
-    // treated as backup failure rather than an unrecoverable write.
-    if backup_id.is_none() && path_exists(&file.canonical_path) {
-        return StepExec::Stopped {
-            outcomes: vec![failed_outcome(
-                &file.canonical_path,
-                &file.requested_path,
-                FileRole::Primary,
-                FileClassification::FailedBackup,
-                file.remove_file,
-                file.warnings.clone(),
-            )],
-            reason: "failed_backup",
-        };
-    }
-
     if fault_is(ctx, ExecuteFault::BaselineDrift { step: step_index })
         || !baseline_matches(&file.canonical_path, &file.baseline_bytes)
     {
@@ -816,16 +799,7 @@ fn execute_mv(
                 *journaled = true;
                 Some(id)
             }
-            Ok(None) => {
-                return StepExec::Stopped {
-                    outcomes: mv_failed_pair(
-                        &mv,
-                        FileClassification::FailedBackup,
-                        FileClassification::NotAttempted,
-                    ),
-                    reason: "failed_backup",
-                };
-            }
+            Ok(None) => None,
             Err(_) => {
                 return StepExec::Stopped {
                     outcomes: mv_failed_pair(
@@ -848,19 +822,7 @@ fn execute_mv(
                 *journaled = true;
                 Some(id)
             }
-            Ok(None) => {
-                // Tombstone unavailable (backups disabled). New-dest MV is still
-                // allowed in Phase 1; without a journal entry we refuse the write
-                // rather than advertise a missing undo identity.
-                return StepExec::Stopped {
-                    outcomes: mv_failed_pair(
-                        &mv,
-                        FileClassification::FailedBackup,
-                        FileClassification::NotAttempted,
-                    ),
-                    reason: "failed_backup",
-                };
-            }
+            Ok(None) => None,
             Err(_) => {
                 return StepExec::Stopped {
                     outcomes: mv_failed_pair(
@@ -885,7 +847,8 @@ fn execute_mv(
             *journaled = true;
             Some(id)
         }
-        Ok(None) | Err(_) => {
+        Ok(None) => None,
+        Err(_) => {
             return StepExec::Stopped {
                 outcomes: mv_failed_pair(
                     &mv,
@@ -2161,7 +2124,7 @@ mod tests {
 
     /// A17: backups disabled refuses PUT and MV-onto-existing; new-dest MV plans.
     #[test]
-    fn a17_backup_unavailable_refusals_and_new_dest_mv() {
+    fn a17_backup_failures_refuse_but_policy_skips_allow_new_dest_mv() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("t.txt");
         write_file(&path, b"t\n");
@@ -2265,7 +2228,8 @@ mod tests {
         assert_eq!(fs::read(&src2).unwrap(), b"s2\n");
         assert!(!dest2.exists());
 
-        // Disabled BackupStore must never advertise an op_id it did not journal.
+        // A policy skip is not a backup I/O failure: the move proceeds, reports
+        // why undo is unavailable, and never advertises an op_id it did not journal.
         let mut disabled = BackupStore::new();
         disabled.set_policy(BackupPolicy {
             enabled: false,
@@ -2285,11 +2249,13 @@ mod tests {
             None,
         );
         let envelope = execute_transaction(plan, &mut exec);
-        assert!(!envelope.success);
+        assert!(envelope.success);
         assert!(envelope.op_id.is_none());
+        assert_eq!(fs::read(&dest2).unwrap(), b"s2\n");
+        assert!(!src2.exists());
         assert_eq!(
-            envelope.files[0].classification,
-            FileClassification::FailedBackup
+            disabled.skipped_reason_after(SESSION, None),
+            Some(crate::backup::BackupSkippedReason::Disabled)
         );
     }
 

@@ -14,6 +14,8 @@ use serde::Serialize;
 use serde_json::Value;
 use tree_sitter::{Node, Parser};
 
+use crate::callgraph_store::disk_facts::DiskFacts;
+use crate::callgraph_store::facts::{byte_path, EntryKind, FactPaths};
 #[cfg(test)]
 use crate::calls::{call_node_kinds, extract_callee_name, extract_full_callee};
 use crate::calls::{extract_calls_full, extract_rust_value_references};
@@ -29,10 +31,17 @@ use crate::symbols::{Range, Symbol, SymbolKind};
 // ---------------------------------------------------------------------------
 
 type WorkspacePackageCache = HashMap<(PathBuf, String), Option<PathBuf>>;
+// Member directories per canonical workspace root. The walk that produces them
+// visits every directory under the workspace with a realpath each, so it is
+// keyed by the workspace and not by the package being looked up: the first
+// resolution of each distinct bare import must not pay the walk again.
+type WorkspaceMemberDirsCache = HashMap<PathBuf, Arc<Vec<PathBuf>>>;
 type RustCrateInfoCache = HashMap<PathBuf, Option<RustCrateInfo>>;
 type RustWorkspaceCrateCache = HashMap<PathBuf, HashMap<String, RustCrateInfo>>;
 
 static WORKSPACE_PACKAGE_CACHE: LazyLock<RwLock<WorkspacePackageCache>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static WORKSPACE_MEMBER_DIRS_CACHE: LazyLock<RwLock<WorkspaceMemberDirsCache>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 static RUST_CRATE_INFO_CACHE: LazyLock<RwLock<RustCrateInfoCache>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
@@ -146,7 +155,12 @@ impl Default for ModuleResolutionMemo {
 }
 
 impl ModuleResolutionMemo {
-    fn resolve_module_path(&self, from_dir: &Path, module_path: &str) -> Option<PathBuf> {
+    fn resolve_module_path(
+        &self,
+        from_dir: &Path,
+        module_path: &str,
+        facts: &FactPaths<'_>,
+    ) -> Option<PathBuf> {
         let key = (from_dir.to_path_buf(), module_path.to_string());
         if self.enabled {
             if let Some(cached) = self.module_paths.borrow().get(&key) {
@@ -155,7 +169,7 @@ impl ModuleResolutionMemo {
         }
 
         self.note_module_computation(&key);
-        let resolved = resolve_module_path_uncached(from_dir, module_path, Some(self));
+        let resolved = resolve_module_path_uncached(from_dir, module_path, Some(self), facts);
         if self.enabled {
             let retained_weight = module_resolution_entry_weight(&key, resolved.as_deref());
             self.module_paths
@@ -165,7 +179,7 @@ impl ModuleResolutionMemo {
         resolved
     }
 
-    fn json_value(&self, path: &Path) -> Option<Arc<Value>> {
+    fn json_value(&self, path: &Path, facts: &FactPaths<'_>) -> Option<Arc<Value>> {
         if self.enabled {
             if let Some(cached) = self.json_values.borrow().get(path) {
                 return cached.clone();
@@ -173,9 +187,9 @@ impl ModuleResolutionMemo {
         }
 
         self.note_json_probe(path);
-        let parsed = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|source| serde_json::from_str(&source).ok())
+        let parsed = facts
+            .bytes(path)
+            .and_then(|source| serde_json::from_slice(&source).ok())
             .map(Arc::new);
         if self.enabled {
             let retained_weight = MEMO_ENTRY_OVERHEAD_BYTES
@@ -611,6 +625,8 @@ pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangI
         }
         LangId::C
         | LangId::Cpp
+        | LangId::Cuda
+        | LangId::Metal
         | LangId::Zig
         | LangId::CSharp
         | LangId::Bash
@@ -632,7 +648,8 @@ pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangI
         | LangId::Pascal
         | LangId::R
         | LangId::Groovy
-        | LangId::ObjC => false,
+        | LangId::ObjC
+        | LangId::Toml => false,
     }
 }
 
@@ -935,6 +952,11 @@ impl CallGraph {
         D: FnMut(&Path) -> Option<String>,
     {
         let caller_dir = caller_file.parent().unwrap_or(Path::new("."));
+        let disk = DiskFacts::new(caller_dir.ancestors().last().unwrap_or(caller_dir));
+        let facts = &FactPaths {
+            root: &disk.project_root,
+            facts: &disk,
+        };
 
         // Rust uses `::` module paths rather than JS/TS specifiers. Keep this
         // branch gated to `.rs` callers so the existing JS/TS resolver below
@@ -1056,7 +1078,7 @@ impl CallGraph {
             if let Some(resolved_path) = resolve_module_path(caller_dir, &imp.module_path) {
                 // Check if the resolved path is a directory (barrel file)
                 if resolved_path.is_dir() {
-                    if let Some(index_path) = find_index_file(&resolved_path) {
+                    if let Some(index_path) = find_index_file(&resolved_path, facts) {
                         // Check if the index file exports this symbol
                         if file_exports_symbol(&index_path, short_name) {
                             return EdgeResolution::Resolved {
@@ -1322,7 +1344,7 @@ fn attribute_sites_to_symbols(
     calls_by_symbol
 }
 
-fn build_file_data_from_source_with_lang(
+pub(crate) fn build_file_data_from_source_with_lang(
     path: &Path,
     source: &str,
     lang: LangId,
@@ -1717,61 +1739,72 @@ fn collect_calls_full_with_ranges_inner(
 ///
 /// Tries common file extensions for TypeScript/JavaScript projects.
 pub(crate) fn resolve_module_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
-    resolve_module_path_uncached(from_dir, module_path, None)
+    let disk = DiskFacts::new(from_dir.ancestors().last().unwrap_or(from_dir));
+    let facts = &FactPaths {
+        root: &disk.project_root,
+        facts: &disk,
+    };
+    resolve_module_path_uncached(from_dir, module_path, None, facts)
 }
 
 pub(crate) fn resolve_module_path_with_memo(
     from_dir: &Path,
     module_path: &str,
     memo: &ModuleResolutionMemo,
+    facts: &FactPaths<'_>,
 ) -> Option<PathBuf> {
-    memo.resolve_module_path(from_dir, module_path)
+    memo.resolve_module_path(from_dir, module_path, facts)
 }
 
 fn resolve_module_path_uncached(
     from_dir: &Path,
     module_path: &str,
     memo: Option<&ModuleResolutionMemo>,
+    facts: &FactPaths<'_>,
 ) -> Option<PathBuf> {
     if module_path.starts_with('.') {
-        return resolve_relative_module_path(from_dir, module_path);
+        return resolve_relative_module_path(from_dir, module_path, facts);
     }
 
     if module_path.starts_with('/') {
         return None;
     }
 
-    if let Some(path) = resolve_tsconfig_path(from_dir, module_path, memo) {
+    if let Some(path) = resolve_tsconfig_path(from_dir, module_path, memo, facts) {
         return Some(path);
     }
 
-    resolve_workspace_module_path(from_dir, module_path, memo)
+    resolve_workspace_module_path(from_dir, module_path, memo, facts)
 }
 
-fn resolve_relative_module_path(from_dir: &Path, module_path: &str) -> Option<PathBuf> {
+fn resolve_relative_module_path(
+    from_dir: &Path,
+    module_path: &str,
+    facts: &FactPaths<'_>,
+) -> Option<PathBuf> {
     let base = from_dir.join(module_path);
-    resolve_file_like_path(&base)
+    resolve_file_like_path(&base, facts)
 }
 
-fn resolve_file_like_path(base: &Path) -> Option<PathBuf> {
+fn resolve_file_like_path(base: &Path, facts: &FactPaths<'_>) -> Option<PathBuf> {
     let base = base.to_path_buf();
 
     // Try exact path first
-    if base.is_file() {
-        return Some(std::fs::canonicalize(&base).unwrap_or(base));
+    if facts.is_file(&base) {
+        return Some(facts.canonical(&base).unwrap_or(base));
     }
 
     // Try common extensions, including ESM/CJS TypeScript pairs used by workspaces.
     for ext in JS_TS_EXTENSIONS {
         let with_ext = base.with_extension(ext);
-        if with_ext.is_file() {
-            return Some(std::fs::canonicalize(&with_ext).unwrap_or(with_ext));
+        if facts.is_file(&with_ext) {
+            return Some(facts.canonical(&with_ext).unwrap_or(with_ext));
         }
     }
 
     // Try as directory with index file
-    if base.is_dir() {
-        if let Some(index) = find_index_file(&base) {
+    if facts.is_dir(&base) {
+        if let Some(index) = find_index_file(&base, facts) {
             return Some(index);
         }
     }
@@ -1783,10 +1816,11 @@ fn resolve_workspace_module_path(
     from_dir: &Path,
     module_path: &str,
     memo: Option<&ModuleResolutionMemo>,
+    facts: &FactPaths<'_>,
 ) -> Option<PathBuf> {
     let (package_name, subpath) = split_package_import(module_path)?;
-    let package_root = find_package_root_for_import(from_dir, &package_name, memo)?;
-    resolve_package_entry(&package_root, &subpath, memo)
+    let package_root = find_package_root_for_import(from_dir, &package_name, memo, facts)?;
+    resolve_package_entry(&package_root, &subpath, memo, facts)
 }
 
 fn is_rust_source_file(path: &Path) -> bool {
@@ -2362,9 +2396,10 @@ fn resolve_tsconfig_path(
     from_dir: &Path,
     module_path: &str,
     memo: Option<&ModuleResolutionMemo>,
+    facts: &FactPaths<'_>,
 ) -> Option<PathBuf> {
-    let tsconfig_dir = find_tsconfig_dir(from_dir)?;
-    let tsconfig = package_json_like_value(&tsconfig_dir.join("tsconfig.json"), memo)?;
+    let tsconfig_dir = find_tsconfig_dir(from_dir, facts)?;
+    let tsconfig = package_json_like_value(&tsconfig_dir.join("tsconfig.json"), memo, facts)?;
     let compiler_options = tsconfig.get("compilerOptions")?;
     let paths = compiler_options.get("paths")?.as_object()?;
     let base_url = compiler_options
@@ -2386,7 +2421,7 @@ fn resolve_tsconfig_path(
             } else {
                 target.to_string()
             };
-            if let Some(path) = resolve_file_like_path(&base_dir.join(target)) {
+            if let Some(path) = resolve_file_like_path(&base_dir.join(target), facts) {
                 return Some(path);
             }
         }
@@ -2395,10 +2430,10 @@ fn resolve_tsconfig_path(
     None
 }
 
-fn find_tsconfig_dir(from_dir: &Path) -> Option<PathBuf> {
+fn find_tsconfig_dir(from_dir: &Path, facts: &FactPaths<'_>) -> Option<PathBuf> {
     let mut current = Some(from_dir);
     while let Some(dir) = current {
-        if dir.join("tsconfig.json").is_file() {
+        if facts.is_file(&dir.join("tsconfig.json")) {
             return Some(dir.to_path_buf());
         }
         current = dir.parent();
@@ -2447,39 +2482,74 @@ fn find_package_root_for_import(
     from_dir: &Path,
     package_name: &str,
     memo: Option<&ModuleResolutionMemo>,
+    facts: &FactPaths<'_>,
 ) -> Option<PathBuf> {
     let mut current = Some(from_dir);
     while let Some(dir) = current {
-        if package_json_name(dir, memo).as_deref() == Some(package_name) {
-            return Some(std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
+        if package_json_name(dir, memo, facts).as_deref() == Some(package_name) {
+            return Some(facts.canonical(dir).unwrap_or_else(|| dir.to_path_buf()));
         }
         current = dir.parent();
     }
 
-    find_workspace_root(from_dir, memo)
-        .and_then(|workspace_root| resolve_workspace_package(&workspace_root, package_name, memo))
+    find_workspace_root(from_dir, memo, facts).and_then(|workspace_root| {
+        resolve_workspace_package(&workspace_root, package_name, memo, facts)
+    })
 }
 
-fn find_workspace_root(from_dir: &Path, memo: Option<&ModuleResolutionMemo>) -> Option<PathBuf> {
+fn find_workspace_root(
+    from_dir: &Path,
+    memo: Option<&ModuleResolutionMemo>,
+    facts: &FactPaths<'_>,
+) -> Option<PathBuf> {
     let mut current = Some(from_dir);
     while let Some(dir) = current {
-        if is_workspace_root(dir, memo) {
-            return Some(std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf()));
+        if is_workspace_root(dir, memo, facts) {
+            return Some(facts.canonical(dir).unwrap_or_else(|| dir.to_path_buf()));
         }
         current = dir.parent();
     }
     None
 }
 
-fn is_workspace_root(dir: &Path, memo: Option<&ModuleResolutionMemo>) -> bool {
-    package_json_value(dir, memo)
+fn is_workspace_root(
+    dir: &Path,
+    memo: Option<&ModuleResolutionMemo>,
+    facts: &FactPaths<'_>,
+) -> bool {
+    package_json_value(dir, memo, facts)
         .map(|value| !workspace_patterns(&value).is_empty())
         .unwrap_or(false)
-        || !pnpm_workspace_patterns(dir).is_empty()
+        || !pnpm_workspace_patterns(dir, facts).is_empty()
+}
+
+/// Drop the workspace and crate caches for one project root only. The caches
+/// are process-wide and the daemon serves dozens of roots that bind about ten
+/// times a minute; clearing everything on each configure gave the caches a
+/// lifetime of seconds, so every Tier-2 rescan re-walked every workspace under
+/// every root. A configure is a signal about its own root's manifests, and
+/// the keys are canonical paths, so containment is the right scope.
+pub(crate) fn clear_workspace_package_cache_under(root: &Path) {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
+        cache.retain(|(workspace, _), _| !workspace.starts_with(&root));
+    }
+    if let Ok(mut cache) = WORKSPACE_MEMBER_DIRS_CACHE.write() {
+        cache.retain(|workspace, _| !workspace.starts_with(&root));
+    }
+    if let Ok(mut cache) = RUST_CRATE_INFO_CACHE.write() {
+        cache.retain(|dir, _| !dir.starts_with(&root));
+    }
+    if let Ok(mut cache) = RUST_WORKSPACE_CRATE_CACHE.write() {
+        cache.retain(|workspace, _| !workspace.starts_with(&root));
+    }
 }
 
 pub(crate) fn clear_workspace_package_cache() {
     if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
+        cache.clear();
+    }
+    if let Ok(mut cache) = WORKSPACE_MEMBER_DIRS_CACHE.write() {
         cache.clear();
     }
     if let Ok(mut cache) = RUST_CRATE_INFO_CACHE.write() {
@@ -2494,45 +2564,80 @@ fn resolve_workspace_package(
     workspace_root: &Path,
     package_name: &str,
     memo: Option<&ModuleResolutionMemo>,
+    facts: &FactPaths<'_>,
 ) -> Option<PathBuf> {
-    let workspace_root =
-        std::fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_path_buf());
+    let workspace_root = facts
+        .canonical(workspace_root)
+        .unwrap_or_else(|| workspace_root.to_path_buf());
     let cache_key = (workspace_root.clone(), package_name.to_string());
 
+    // The memo is a bounded per-pass layer; the process-wide cache is the
+    // durable one. Both are consulted whenever present: several call sites
+    // resolve with a memo that lives for a single import, and a memo alone
+    // turned every bare package import in a workspace monorepo into a full
+    // member-directory walk (realpath per directory) because the miss never
+    // reached the cache that already held the answer. Two daemon threads sat
+    // at 70% each in that walk during one-file Tier-2 rescans across roots.
     if let Some(memo) = memo {
         if let Some(cached) = memo.workspace_package(&cache_key) {
             return cached;
         }
-    } else if let Ok(cache) = WORKSPACE_PACKAGE_CACHE.read() {
+    }
+    if let Ok(cache) = WORKSPACE_PACKAGE_CACHE.read() {
         if let Some(cached) = cache.get(&cache_key) {
+            if let Some(memo) = memo {
+                memo.remember_workspace_package(cache_key, cached.clone());
+            }
             return cached.clone();
         }
     }
 
-    let resolved = workspace_member_dirs(&workspace_root, memo)
-        .into_iter()
-        .find(|dir| package_json_name(dir, memo).as_deref() == Some(package_name))
-        .map(|dir| std::fs::canonicalize(&dir).unwrap_or(dir));
+    let resolved = cached_workspace_member_dirs(&workspace_root, memo, facts)
+        .iter()
+        .find(|dir| package_json_name(dir, memo, facts).as_deref() == Some(package_name))
+        .map(|dir| facts.canonical(dir).unwrap_or_else(|| dir.clone()));
 
     if let Some(memo) = memo {
-        memo.remember_workspace_package(cache_key, resolved.clone());
-    } else if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
+        memo.remember_workspace_package(cache_key.clone(), resolved.clone());
+    }
+    if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
         cache.insert(cache_key, resolved.clone());
     }
 
     resolved
 }
 
+/// The member list for a workspace root, walked at most once per cache
+/// lifetime. `workspace_root` is already canonical here (the caller keys on
+/// it), so alias spellings cannot split the entry.
+fn cached_workspace_member_dirs(
+    workspace_root: &Path,
+    memo: Option<&ModuleResolutionMemo>,
+    facts: &FactPaths<'_>,
+) -> Arc<Vec<PathBuf>> {
+    if let Ok(cache) = WORKSPACE_MEMBER_DIRS_CACHE.read() {
+        if let Some(members) = cache.get(workspace_root) {
+            return Arc::clone(members);
+        }
+    }
+    let members = Arc::new(workspace_member_dirs(workspace_root, memo, facts));
+    if let Ok(mut cache) = WORKSPACE_MEMBER_DIRS_CACHE.write() {
+        cache.insert(workspace_root.to_path_buf(), Arc::clone(&members));
+    }
+    members
+}
+
 fn workspace_member_dirs(
     workspace_root: &Path,
     memo: Option<&ModuleResolutionMemo>,
+    facts: &FactPaths<'_>,
 ) -> Vec<PathBuf> {
-    let mut patterns = package_json_value(workspace_root, memo)
+    let mut patterns = package_json_value(workspace_root, memo, facts)
         .map(|package_json| workspace_patterns(&package_json))
         .unwrap_or_default();
-    patterns.extend(pnpm_workspace_patterns(workspace_root));
+    patterns.extend(pnpm_workspace_patterns(workspace_root, facts));
 
-    expand_workspace_patterns(workspace_root, &patterns)
+    expand_workspace_patterns(workspace_root, &patterns, facts)
 }
 
 fn workspace_patterns(package_json: &Value) -> Vec<String> {
@@ -2560,11 +2665,14 @@ fn non_empty_workspace_pattern(value: &Value) -> Option<String> {
     (!pattern.is_empty()).then(|| pattern.to_string())
 }
 
-fn pnpm_workspace_patterns(workspace_root: &Path) -> Vec<String> {
-    let Ok(source) = std::fs::read_to_string(workspace_root.join("pnpm-workspace.yaml")) else {
+fn pnpm_workspace_patterns(workspace_root: &Path, facts: &FactPaths<'_>) -> Vec<String> {
+    let Some(bytes) = facts.bytes(&workspace_root.join("pnpm-workspace.yaml")) else {
         return Vec::new();
     };
 
+    let Ok(source) = std::str::from_utf8(&bytes) else {
+        return Vec::new();
+    };
     let mut patterns = Vec::new();
     let mut in_packages = false;
     for line in source.lines() {
@@ -2592,7 +2700,11 @@ fn pnpm_workspace_patterns(workspace_root: &Path) -> Vec<String> {
     patterns
 }
 
-fn expand_workspace_patterns(workspace_root: &Path, patterns: &[String]) -> Vec<PathBuf> {
+fn expand_workspace_patterns(
+    workspace_root: &Path,
+    patterns: &[String],
+    facts: &FactPaths<'_>,
+) -> Vec<PathBuf> {
     let positive_patterns: Vec<&str> = patterns
         .iter()
         .map(|pattern| pattern.trim())
@@ -2612,17 +2724,14 @@ fn expand_workspace_patterns(workspace_root: &Path, patterns: &[String]) -> Vec<
         .collect();
     let negatives = build_glob_set(&negative_patterns);
 
-    let Ok(boundary) = crate::walk_boundary::DeviceBoundary::for_root(workspace_root) else {
-        return Vec::new();
-    };
     let mut members = Vec::new();
     collect_workspace_member_dirs(
         workspace_root,
         workspace_root,
-        &boundary,
         &positives,
         &negatives,
         &mut members,
+        facts,
     );
     members
 }
@@ -2642,34 +2751,17 @@ fn build_glob_set(patterns: &[&str]) -> GlobSet {
 fn collect_workspace_member_dirs(
     workspace_root: &Path,
     dir: &Path,
-    boundary: &crate::walk_boundary::DeviceBoundary,
     positives: &GlobSet,
     negatives: &GlobSet,
     members: &mut Vec<PathBuf>,
+    facts: &FactPaths<'_>,
 ) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-
-    for entry in entries.filter_map(Result::ok) {
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() {
+    for entry in facts.list_dir(dir) {
+        if entry.kind != EntryKind::Directory {
             continue;
         }
-        // Do not open a mounted child: its ReadDir destructor can abort on ENXIO
-        // when the mount disappears while callgraph discovery is running.
-        if !boundary.should_descend(&path).unwrap_or(false) {
-            crate::slog_warn!(
-                "callgraph workspace-member walk skipped foreign filesystem mount {}",
-                path.display()
-            );
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
+        let path = dir.join(byte_path(&entry.name));
+        let name = String::from_utf8_lossy(&entry.name);
         if matches!(
             name.as_ref(),
             "node_modules" | ".git" | "target" | "dist" | "build"
@@ -2677,7 +2769,7 @@ fn collect_workspace_member_dirs(
             continue;
         }
 
-        if path.join("package.json").is_file() {
+        if facts.is_file(&path.join("package.json")) {
             if let Ok(rel) = path.strip_prefix(workspace_root) {
                 let rel = rel.to_string_lossy().replace('\\', "/");
                 if positives.is_match(&rel) && !negatives.is_match(&rel) {
@@ -2686,31 +2778,36 @@ fn collect_workspace_member_dirs(
             }
         }
 
-        collect_workspace_member_dirs(
-            workspace_root,
-            &path,
-            boundary,
-            positives,
-            negatives,
-            members,
-        );
+        collect_workspace_member_dirs(workspace_root, &path, positives, negatives, members, facts);
     }
 }
 
-fn package_json_value(dir: &Path, memo: Option<&ModuleResolutionMemo>) -> Option<Arc<Value>> {
-    package_json_like_value(&dir.join("package.json"), memo)
+fn package_json_value(
+    dir: &Path,
+    memo: Option<&ModuleResolutionMemo>,
+    facts: &FactPaths<'_>,
+) -> Option<Arc<Value>> {
+    package_json_like_value(&dir.join("package.json"), memo, facts)
 }
 
-fn package_json_like_value(path: &Path, memo: Option<&ModuleResolutionMemo>) -> Option<Arc<Value>> {
+fn package_json_like_value(
+    path: &Path,
+    memo: Option<&ModuleResolutionMemo>,
+    facts: &FactPaths<'_>,
+) -> Option<Arc<Value>> {
     if let Some(memo) = memo {
-        return memo.json_value(path);
+        return memo.json_value(path, facts);
     }
-    let json = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&json).ok().map(Arc::new)
+    let json = facts.bytes(path)?;
+    serde_json::from_slice(&json).ok().map(Arc::new)
 }
 
-fn package_json_name(dir: &Path, memo: Option<&ModuleResolutionMemo>) -> Option<String> {
-    package_json_value(dir, memo)?
+fn package_json_name(
+    dir: &Path,
+    memo: Option<&ModuleResolutionMemo>,
+    facts: &FactPaths<'_>,
+) -> Option<String> {
+    package_json_value(dir, memo, facts)?
         .get("name")?
         .as_str()
         .map(ToOwned::to_owned)
@@ -2720,13 +2817,14 @@ fn resolve_package_entry(
     package_root: &Path,
     subpath: &Option<String>,
     memo: Option<&ModuleResolutionMemo>,
+    facts: &FactPaths<'_>,
 ) -> Option<PathBuf> {
     let package_json =
-        package_json_value(package_root, memo).unwrap_or_else(|| Arc::new(Value::Null));
+        package_json_value(package_root, memo, facts).unwrap_or_else(|| Arc::new(Value::Null));
 
     if let Some(exports) = package_json.get("exports") {
         if let Some(target) = export_target_for_subpath(exports, subpath.as_deref()) {
-            if let Some(path) = resolve_package_target(package_root, &target) {
+            if let Some(path) = resolve_package_target(package_root, &target, facts) {
                 return Some(path);
             }
         }
@@ -2735,14 +2833,14 @@ fn resolve_package_entry(
     if subpath.is_none() {
         for field in ["module", "main"] {
             if let Some(target) = package_json.get(field).and_then(Value::as_str) {
-                if let Some(path) = resolve_package_target(package_root, target) {
+                if let Some(path) = resolve_package_target(package_root, target, facts) {
                     return Some(path);
                 }
             }
         }
     }
 
-    resolve_package_fallback(package_root, subpath.as_deref())
+    resolve_package_fallback(package_root, subpath.as_deref(), facts)
 }
 
 fn export_target_for_subpath(exports: &Value, subpath: Option<&str>) -> Option<String> {
@@ -2799,25 +2897,35 @@ fn export_condition_target(value: &Value) -> Option<String> {
     }
 }
 
-fn resolve_package_target(package_root: &Path, target: &str) -> Option<PathBuf> {
+fn resolve_package_target(
+    package_root: &Path,
+    target: &str,
+    facts: &FactPaths<'_>,
+) -> Option<PathBuf> {
     let target = target.strip_prefix("./").unwrap_or(target);
     // Prefer source over compiled bundle when both exist: the callgraph
     // walks source files and cannot extract symbols from a built JS bundle.
     if let Some(src_relative) = target.strip_prefix("dist/") {
-        if let Some(path) = resolve_file_like_path(&package_root.join("src").join(src_relative)) {
+        if let Some(path) =
+            resolve_file_like_path(&package_root.join("src").join(src_relative), facts)
+        {
             return Some(path);
         }
     }
 
-    resolve_file_like_path(&package_root.join(target))
+    resolve_file_like_path(&package_root.join(target), facts)
 }
 
-fn resolve_package_fallback(package_root: &Path, subpath: Option<&str>) -> Option<PathBuf> {
+fn resolve_package_fallback(
+    package_root: &Path,
+    subpath: Option<&str>,
+    facts: &FactPaths<'_>,
+) -> Option<PathBuf> {
     match subpath {
-        Some(subpath) => resolve_file_like_path(&package_root.join(subpath))
-            .or_else(|| resolve_file_like_path(&package_root.join("src").join(subpath))),
-        None => resolve_file_like_path(&package_root.join("src").join("index"))
-            .or_else(|| resolve_file_like_path(&package_root.join("index"))),
+        Some(subpath) => resolve_file_like_path(&package_root.join(subpath), facts)
+            .or_else(|| resolve_file_like_path(&package_root.join("src").join(subpath), facts)),
+        None => resolve_file_like_path(&package_root.join("src").join("index"), facts)
+            .or_else(|| resolve_file_like_path(&package_root.join("index"), facts)),
     }
 }
 
@@ -3060,11 +3168,11 @@ fn string_literal_content(source: &str, node: tree_sitter::Node) -> Option<Strin
 }
 
 /// Find an index file in a directory.
-fn find_index_file(dir: &Path) -> Option<PathBuf> {
+fn find_index_file(dir: &Path, facts: &FactPaths<'_>) -> Option<PathBuf> {
     for name in JS_TS_INDEX_FILES {
         let p = dir.join(name);
-        if p.is_file() {
-            return Some(std::fs::canonicalize(&p).unwrap_or(p));
+        if facts.is_file(&p) {
+            return Some(facts.canonical(&p).unwrap_or(p));
         }
     }
     None
@@ -4033,6 +4141,161 @@ function hidden() {}
         assert!(
             resolved.ends_with("src/index.mts"),
             "dist/index.mjs should map to src/index.mts, got {resolved:?}"
+        );
+    }
+
+    /// A bare package import that is not a workspace member costs one
+    /// member-directory walk per (workspace, package), not one per resolution:
+    /// the walk's answer must reach the process-wide cache even when the caller
+    /// resolves with a throwaway memo, which is what the refresh and extract
+    /// paths do per import.
+    #[test]
+    fn workspace_package_miss_is_walked_once_across_throwaway_memos() {
+        use crate::callgraph_store::facts::{DirEntry, ProjectFacts};
+        use std::cell::Cell;
+        use std::sync::Arc;
+
+        struct CountingFacts<'a> {
+            inner: &'a DiskFacts,
+            list_dir_calls: Cell<usize>,
+        }
+        impl ProjectFacts for CountingFacts<'_> {
+            fn is_file(&self, rel: &[u8]) -> bool {
+                self.inner.is_file(rel)
+            }
+            fn is_dir(&self, rel: &[u8]) -> bool {
+                self.inner.is_dir(rel)
+            }
+            fn config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
+                self.inner.config_bytes(rel)
+            }
+            fn symlink_target(&self, rel: &[u8]) -> Option<&[u8]> {
+                self.inner.symlink_target(rel)
+            }
+            fn canonical(&self, rel: &[u8]) -> Option<Vec<u8>> {
+                self.inner.canonical(rel)
+            }
+            fn list_dir(&self, rel: &[u8]) -> Vec<DirEntry> {
+                self.list_dir_calls.set(self.list_dir_calls.get() + 1);
+                self.inner.list_dir(rel)
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        fs::write(
+            root.join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        for member in ["a", "b", "c"] {
+            let member_dir = root.join("packages").join(member);
+            fs::create_dir_all(member_dir.join("src")).unwrap();
+            fs::write(
+                member_dir.join("package.json"),
+                format!(r#"{{"name":"@ws/{member}"}}"#),
+            )
+            .unwrap();
+        }
+        let disk = DiskFacts::new(&root);
+        let counting = CountingFacts {
+            inner: &disk,
+            list_dir_calls: Cell::new(0),
+        };
+        let facts = FactPaths {
+            root: &root,
+            facts: &counting,
+        };
+        clear_workspace_package_cache();
+
+        let first = resolve_workspace_package(
+            &root,
+            "react",
+            Some(&ModuleResolutionMemo::default()),
+            &facts,
+        );
+        assert_eq!(first, None, "react is not a member");
+        let walked = counting.list_dir_calls.get();
+        assert!(
+            walked > 0,
+            "the first miss must walk the member directories"
+        );
+
+        let second = resolve_workspace_package(
+            &root,
+            "react",
+            Some(&ModuleResolutionMemo::default()),
+            &facts,
+        );
+        assert_eq!(second, None);
+        assert_eq!(
+            counting.list_dir_calls.get(),
+            walked,
+            "a second resolution with a fresh memo must not walk again"
+        );
+
+        // The walk is per workspace, not per package: a different non-member
+        // import is answered from the same member list.
+        let third = resolve_workspace_package(
+            &root,
+            "effect",
+            Some(&ModuleResolutionMemo::default()),
+            &facts,
+        );
+        assert_eq!(third, None, "effect is not a member either");
+        assert_eq!(
+            counting.list_dir_calls.get(),
+            walked,
+            "a second package on the same workspace must reuse the member walk"
+        );
+        // And a member resolves from the same list too.
+        let member = resolve_workspace_package(
+            &root,
+            "@ws/b",
+            Some(&ModuleResolutionMemo::default()),
+            &facts,
+        )
+        .expect("@ws/b is a member");
+        assert!(member.ends_with("packages/b"), "{member:?}");
+        assert_eq!(counting.list_dir_calls.get(), walked);
+
+        // A configure of some OTHER root must leave this workspace's entries
+        // alone: the daemon binds other roots many times a minute.
+        let other = TempDir::new().unwrap();
+        clear_workspace_package_cache_under(other.path());
+        resolve_workspace_package(
+            &root,
+            "react",
+            Some(&ModuleResolutionMemo::default()),
+            &facts,
+        );
+        assert_eq!(
+            counting.list_dir_calls.get(),
+            walked,
+            "clearing under another root must not drop this workspace's entries"
+        );
+        // A configure of THIS root drops them.
+        clear_workspace_package_cache_under(&root);
+        resolve_workspace_package(
+            &root,
+            "react",
+            Some(&ModuleResolutionMemo::default()),
+            &facts,
+        );
+        let rewalked = counting.list_dir_calls.get();
+        assert!(rewalked > walked, "clearing under this root re-walks");
+
+        // A workspace manifest change is the other thing that may re-walk.
+        clear_workspace_package_cache();
+        resolve_workspace_package(
+            &root,
+            "react",
+            Some(&ModuleResolutionMemo::default()),
+            &facts,
+        );
+        assert!(
+            counting.list_dir_calls.get() > rewalked,
+            "after the cache is dropped the next miss walks again"
         );
     }
 

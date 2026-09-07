@@ -1,0 +1,5 @@
+{
+  "bash": {
+    "watch_sync_max_ms": 1800000
+  }
+}

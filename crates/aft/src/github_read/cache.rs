@@ -16,7 +16,7 @@ use super::attachments::{
     download_github_image_attachments, GithubImageAttachment, GithubImageDownloader,
 };
 use super::fetch::{GithubFetchRequest, GithubFetcher, GithubReadError};
-use super::render::render_document_for_resource;
+use super::render::{render_document_for_resource, render_outline_for_resource};
 use super::resource::{parse_resource, GithubResource, GithubResourceKind, InvalidGithubResource};
 
 /// Clock seam used to make freshness boundaries deterministic in tests.
@@ -71,7 +71,7 @@ impl SqliteGithubReadCacheStore {
         }
     }
 
-    fn connection(&self) -> Result<rusqlite::Connection, String> {
+    fn connection(&self) -> Result<crate::db::TrackedConnection, String> {
         crate::db::open(&self.database_path)
             .map_err(|error| format!("failed to open GitHub read cache: {error}"))
     }
@@ -173,6 +173,13 @@ pub enum GithubReadFreshness {
     CachedFallback,
 }
 
+/// Presentation selected after the shared GitHub gate and live-fetch path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GithubReadView {
+    Document,
+    Outline,
+}
+
 impl GithubReadFreshness {
     /// Fallback status is part of the rendered text, where every agent can see it.
     pub const fn note(self) -> Option<&'static str> {
@@ -248,6 +255,7 @@ enum GithubReadFlightSlot {
 struct GithubReadFlightWaiter {
     request: GithubReadRequest,
     selector: GithubReadSelector,
+    view: GithubReadView,
     fallback: Option<GithubReadCacheEntry>,
     sender: mpsc::SyncSender<Result<GithubReadCompletion, GithubReadError>>,
 }
@@ -288,6 +296,29 @@ impl GithubReadEngine {
         vision_capability: Option<bool>,
         selector: GithubReadSelector,
     ) -> Result<GithubReadStart, GithubReadError> {
+        self.start_resource_with_view(
+            gh_read,
+            resource,
+            working_directory,
+            effective_authentication_identity,
+            vision_capability,
+            selector,
+            GithubReadView::Document,
+        )
+    }
+
+    /// Begin an alternate read-only view with the same typed gate, live fetch,
+    /// and durable fallback behavior as `read`.
+    pub fn start_resource_with_view(
+        &self,
+        gh_read: &GhReadConfig,
+        resource: &str,
+        working_directory: impl Into<PathBuf>,
+        effective_authentication_identity: impl Into<String>,
+        vision_capability: Option<bool>,
+        selector: GithubReadSelector,
+        view: GithubReadView,
+    ) -> Result<GithubReadStart, GithubReadError> {
         self.require_enabled(gh_read)?;
         let request = GithubReadRequest::parse(
             resource,
@@ -296,7 +327,7 @@ impl GithubReadEngine {
             vision_capability,
         )
         .map_err(|error| GithubReadError::invalid_resource(error.to_string()))?;
-        self.start(gh_read, request, selector)
+        self.start_with_view(gh_read, request, selector, view)
     }
 
     /// Start a read without blocking on GitHub or an image host.
@@ -306,9 +337,19 @@ impl GithubReadEngine {
         request: GithubReadRequest,
         selector: GithubReadSelector,
     ) -> Result<GithubReadStart, GithubReadError> {
+        self.start_with_view(gh_read, request, selector, GithubReadView::Document)
+    }
+
+    pub fn start_with_view(
+        &self,
+        gh_read: &GhReadConfig,
+        request: GithubReadRequest,
+        selector: GithubReadSelector,
+        view: GithubReadView,
+    ) -> Result<GithubReadStart, GithubReadError> {
         self.require_enabled(gh_read)?;
         let fallback = self.cache_fallback_for_request(&request);
-        Ok(self.defer_fetch(request, selector, fallback))
+        Ok(self.defer_fetch(request, selector, view, fallback))
     }
 
     /// Invalidate the exact resource after a successful structured `gh` mutation.
@@ -389,6 +430,7 @@ impl GithubReadEngine {
         &self,
         request: GithubReadRequest,
         selector: GithubReadSelector,
+        view: GithubReadView,
         fallback: Option<GithubReadCacheEntry>,
     ) -> GithubReadStart {
         let slot = self.flight_slot_for_request(&request);
@@ -401,6 +443,7 @@ impl GithubReadEngine {
             waiters.push(GithubReadFlightWaiter {
                 request,
                 selector,
+                view,
                 fallback,
                 sender,
             });
@@ -424,7 +467,7 @@ impl GithubReadEngine {
                 for waiter in waiters {
                     let result = match &fetched {
                         Ok(document) => {
-                            render_document_for_resource(document, &waiter.request.resource)
+                            render_for_view(document, &waiter.request.resource, waiter.view)
                                 .and_then(|canonical_text| {
                                     complete_with_optional_attachments(
                                         &waiter.request,
@@ -432,6 +475,7 @@ impl GithubReadEngine {
                                         canonical_text,
                                         GithubReadFreshness::Fetched,
                                         downloader.as_ref(),
+                                        waiter.view,
                                     )
                                 })
                         }
@@ -442,6 +486,7 @@ impl GithubReadEngine {
                                 cached_fallback_text(&entry, error),
                                 GithubReadFreshness::CachedFallback,
                                 downloader.as_ref(),
+                                waiter.view,
                             ),
                             None => Err(error.clone()),
                         },
@@ -495,14 +540,27 @@ fn fetch_store(
     Ok(document)
 }
 
+fn render_for_view(
+    document: &super::model::GithubDocument,
+    resource: &GithubResource,
+    view: GithubReadView,
+) -> Result<String, GithubReadError> {
+    match view {
+        GithubReadView::Document => render_document_for_resource(document, resource),
+        GithubReadView::Outline => Ok(render_outline_for_resource(document, resource)),
+    }
+}
+
 fn complete_with_optional_attachments(
     request: &GithubReadRequest,
     selector: GithubReadSelector,
     canonical_text: String,
     freshness: GithubReadFreshness,
     downloader: &dyn GithubImageDownloader,
+    view: GithubReadView,
 ) -> Result<GithubReadCompletion, GithubReadError> {
-    let attachments = if request.vision_capability == Some(true) {
+    let attachments = if view == GithubReadView::Document && request.vision_capability == Some(true)
+    {
         download_github_image_attachments(&canonical_text, downloader)
     } else {
         Vec::new()

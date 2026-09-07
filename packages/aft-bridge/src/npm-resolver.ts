@@ -18,7 +18,9 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
+
+import { withPathPrepended } from "./path-env.js";
 
 export interface ResolvedNpm {
   /** Absolute path to npm (or a bare name). Pass it through `npmInvocation()`. */
@@ -79,8 +81,14 @@ function isFile(p: string): boolean {
 /** Scan the PATH env for npm. Returns the first match's directory, or null. */
 function npmFromPath(deps: ResolveNpmDeps): string | null {
   const name = npmBinaryName(deps.platform);
-  const raw = deps.env.PATH ?? deps.env.Path ?? "";
-  for (const entry of raw.split(delimiter)) {
+  const env = withPathPrepended(deps.env, undefined, deps.platform);
+  const pathKey =
+    deps.platform === "win32"
+      ? Object.keys(env).find((key) => key.toLowerCase() === "path")
+      : "PATH";
+  const raw = pathKey === undefined ? "" : (env[pathKey] ?? "");
+  const separator = deps.platform === "win32" ? ";" : ":";
+  for (const entry of raw.split(separator)) {
     const dir = entry.trim().replace(/^"|"$/g, "");
     if (!dir || !isAbsolute(dir)) continue;
     if (isFile(join(dir, name))) return dir;
@@ -435,11 +443,9 @@ export function terminateNpmProcessTree(
 export function npmSpawnEnv(
   resolved: ResolvedNpm,
   baseEnv: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
 ): NodeJS.ProcessEnv {
-  if (!resolved.binDir) return { ...baseEnv };
-  const existing = baseEnv.PATH ?? baseEnv.Path ?? "";
-  const next = existing ? `${resolved.binDir}${delimiter}${existing}` : resolved.binDir;
-  return { ...baseEnv, PATH: next };
+  return withPathPrepended(baseEnv, resolved.binDir, platform);
 }
 
 /**

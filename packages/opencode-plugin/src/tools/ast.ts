@@ -55,6 +55,8 @@ const SUPPORTED_LANGS = [
   "python",
   "rust",
   "go",
+  "cuda",
+  "metal",
   "pascal",
   "r",
   "objc",
@@ -63,7 +65,7 @@ const SUPPORTED_LANGS = [
 export function astTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const searchTool: ToolDefinition = {
     description:
-      "Search code patterns across filesystem using AST-aware matching. Supports 9 languages.\n\n" +
+      "Search code patterns across filesystem using AST-aware matching. Supports 11 languages.\n\n" +
       "Use meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\n" +
       "IMPORTANT: Patterns must be complete AST nodes (valid code fragments).\n" +
       "For functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\n" +

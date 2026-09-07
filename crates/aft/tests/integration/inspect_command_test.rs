@@ -325,8 +325,28 @@ fn inspect(ctx: &AppContext, payload: Value) -> Value {
             ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
         }
     }
-    let response = handle_inspect(&request(payload), ctx);
-    serde_json::to_value(response).expect("inspect response serializes")
+    // The harness runs the nonblocking path, whose Tier-1 scans carry a 1 s
+    // soft deadline; under runner contention a two-line fixture can miss it
+    // and the product answers `inspect_not_fresh` with a Tier-1 "did not
+    // complete" message. That is the path's contract (the caller re-asks), not
+    // a scanner defect, so the harness re-asks under a liveness bound. Other
+    // not-fresh causes (diagnostics prerequisites) are returned unchanged:
+    // fixtures below assert on them.
+    let liveness_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = handle_inspect(&request(payload.clone()), ctx);
+        let value = serde_json::to_value(response).expect("inspect response serializes");
+        let tier1_deadline_miss = value["code"] == "inspect_not_fresh"
+            && value["message"].as_str().is_some_and(|message| {
+                (message.starts_with("metrics did not complete")
+                    || message.starts_with("todos did not complete"))
+                    && message.contains("deadline elapsed")
+            });
+        if !tier1_deadline_miss || Instant::now() >= liveness_deadline {
+            return value;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn inspect_warm_event_driven(ctx: &AppContext, payload: Value) -> Value {

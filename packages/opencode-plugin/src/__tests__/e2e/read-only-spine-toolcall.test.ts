@@ -205,7 +205,9 @@ export function runReadOnlySpineToolcallSuite(
       expect(output).toContain("typescript");
       expect(output).toContain("hit.ts");
       expect(output).toContain("other.ts");
-      expect(output).toContain("hit.test.ts");
+      // includeTests defaults to false in files mode as in every other mode;
+      // the includeTests test below covers the opt-in.
+      expect(output).not.toContain("hit.test.ts");
     });
 
     test("aft_outline returns multi-file Text output for array targets through tool_call", async () => {

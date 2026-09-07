@@ -85,14 +85,13 @@ pub fn handle_delete_file(req: &RawRequest, ctx: &AppContext) -> Response {
                 }),
             );
         }
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "complete": skipped.is_empty(),
-                "deleted": deleted,
-                "skipped_files": skipped,
-            }),
-        );
+        let mut result = serde_json::json!({
+            "complete": skipped.is_empty(),
+            "deleted": deleted,
+            "skipped_files": skipped,
+        });
+        edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), &op_id, None);
+        return Response::success(&req.id, result);
     }
 
     // Single-target mode: `file: "..."`
@@ -210,13 +209,9 @@ fn delete_one_or_dir(
     if let Err(e) = std::fs::remove_file(&path) {
         // A failed remove leaves this file unchanged. Discard its snapshot so
         // the failed request does not become a phantom undo operation.
-        if backup_id.is_some() {
-            ctx.backup().lock().discard_latest_operation_entry_for_path(
-                req.session(),
-                op_id,
-                &path,
-            );
-        }
+        ctx.backup()
+            .lock()
+            .discard_latest_operation_entry_for_path(req.session(), op_id, &path);
         return Err(Response::error(
             &req.id,
             "io_error",
@@ -235,6 +230,13 @@ fn delete_one_or_dir(
     if let Some(ref id) = backup_id {
         result["backup_id"] = serde_json::json!(id);
     }
+    edit::attach_backup_skipped_reason(
+        &mut result,
+        ctx,
+        req.session(),
+        op_id,
+        Some(path.as_path()),
+    );
     Ok(result)
 }
 
@@ -376,13 +378,15 @@ fn delete_directory(
         files_to_backup.len()
     );
 
-    Ok(serde_json::json!({
+    let mut result = serde_json::json!({
         "file": original,
         "deleted": true,
         "is_directory": true,
         "files_deleted": files_to_backup.len(),
         "backup_ids": backup_ids,
-    }))
+    });
+    edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), op_id, None);
+    Ok(result)
 }
 
 fn discard_delete_backups(ctx: &AppContext, session: &str, op_id: &str, paths: &[PathBuf]) {

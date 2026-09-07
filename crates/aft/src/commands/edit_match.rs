@@ -323,6 +323,13 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     if let Some(id) = backup_id {
         result["backup_id"] = serde_json::json!(id);
     }
+    edit::attach_backup_skipped_reason(
+        &mut result,
+        ctx,
+        req.session(),
+        op_id,
+        Some(path.as_path()),
+    );
 
     // Honest reporting: when file content is byte-identical to the pre-append
     // state (rare for append, but possible with empty appendContent or
@@ -782,17 +789,16 @@ fn handle_glob_edit_match(
     // skips (for example formatter_excluded_path) without scanning every file.
     let format_skip_reasons = format_skip_reasons.into_iter().collect::<Vec<_>>();
 
-    Response::success(
-        &req.id,
-        serde_json::json!({
-            "ok": true,
-            "files": file_results,
-            "total_replacements": total_replacements,
-            "total_files": total_files,
-            "format_skipped_count": format_skipped_count,
-            "format_skip_reasons": format_skip_reasons,
-        }),
-    )
+    let mut result = serde_json::json!({
+        "ok": true,
+        "files": file_results,
+        "total_replacements": total_replacements,
+        "total_files": total_files,
+        "format_skipped_count": format_skipped_count,
+        "format_skip_reasons": format_skip_reasons,
+    });
+    edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), op_id, None);
+    Response::success(&req.id, result)
 }
 
 #[cfg(windows)]
@@ -1330,6 +1336,13 @@ fn handle_single_file_edit_match(
     if let Some(ref id) = backup_id {
         result["backup_id"] = serde_json::json!(id);
     }
+    edit::attach_backup_skipped_reason(
+        &mut result,
+        ctx,
+        req.session(),
+        op_id,
+        Some(path.as_path()),
+    );
 
     write_result.append_lsp_diagnostics_to(&mut result);
     write_result.append_reformatted_excerpt_to(&mut result);

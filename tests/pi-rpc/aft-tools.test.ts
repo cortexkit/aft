@@ -53,7 +53,9 @@ function resultText(event: Record<string, unknown>): string {
 async function setupMergeConflict(env: PiIsolatedEnv): Promise<void> {
   const runGit = (args: string[]) =>
     execFileSync("git", args, { cwd: env.workdir, env: withHermeticGitEnv(), stdio: "ignore" });
-  runGit(["init"]);
+  // Pin the initial branch: `init.defaultBranch` differs between hosts (CI runners
+  // give master, developer machines often main) and the checkout below names it.
+  runGit(["init", "-b", "master"]);
   runGit(["config", "user.email", "pi@example.test"]);
   runGit(["config", "user.name", "Pi Test"]);
   await writeFile(join(env.workdir, "conflict.txt"), "base\n", "utf8");
@@ -247,8 +249,9 @@ describe("AFT Pi tools (real Pi RPC)", () => {
 
     expect(toolEnd.isError).toBe(false);
     const text = resultText(toolEnd);
-    expect(text).toMatch(/one\.ts\s+typescript\s+1 syms\s+\d+ bytes/);
-    expect(text).toMatch(/two\.py\s+python\s+1 syms\s+\d+ bytes/);
+    // Files mode reports line counts (the size signal agents act on), not bytes.
+    expect(text).toMatch(/one\.ts\s+typescript\s+1 syms\s+1 lines/);
+    expect(text).toMatch(/two\.py\s+python\s+1 syms\s+2 lines/);
   }, 120_000);
 
   test("aft_outline file mode returns server-rendered symbol text", async () => {

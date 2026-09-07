@@ -78,11 +78,15 @@ fn run_tool_call_parity(glob_mtimes: GlobMtimeProfile, cases: Vec<ParityCase>) {
 
         let direct_response = send_json(&mut direct_aft, direct_request);
         let tool_call_response = send_json(&mut tool_call_aft, tool_call_request);
+        if case.label == "status_snapshot" {
+            assert_lifecycle_census_presence(&direct_response);
+            assert_lifecycle_census_presence(&tool_call_response);
+        }
 
         assert_eq!(
             direct_response["success"], tool_call_response["success"],
             "success mismatch for {}: direct={direct_response:#} tool_call={tool_call_response:#}",
-            case.label
+            case.label,
         );
         assert_eq!(
             direct_response["success"].as_bool().map(|success| !success),
@@ -995,6 +999,41 @@ fn normalized_envelope(mut value: Value, project_root: &Path, cache_dir: &Path) 
     value
 }
 
+fn assert_lifecycle_census_presence(response: &Value) {
+    for (section, fields) in [
+        (
+            "lsp",
+            &[
+                "children_total",
+                "children_by_root",
+                "children_without_client",
+                "children_with_deleted_cwd",
+            ][..],
+        ),
+        ("threads", &["total", "classified", "by_class"][..]),
+        (
+            "sqlite",
+            &[
+                "open_connections",
+                "open_by_store",
+                "uninstrumented_openers",
+            ][..],
+        ),
+        ("children", &["detached_total"][..]),
+        ("fds", &["open", "soft_limit"][..]),
+    ] {
+        let value = response.get(section).unwrap_or_else(|| {
+            panic!("status response omitted lifecycle section {section}: {response:#}")
+        });
+        for field in fields {
+            assert!(
+                value.get(*field).is_some(),
+                "status response omitted {section}.{field}: {response:#}"
+            );
+        }
+    }
+}
+
 fn normalize_value(value: &mut Value, project_root: &Path, cache_dir: &Path) {
     match value {
         Value::String(text) => *text = normalize_text(text, project_root, cache_dir),
@@ -1010,6 +1049,10 @@ fn normalize_value(value: &mut Value, project_root: &Path, cache_dir: &Path) {
             if let Some(memory) = map.get_mut("memory") {
                 mask_memory_snapshot(memory);
             }
+            // Lifecycle counters are sampled by the health rollup independently
+            // in each process. Mask VALUES while retaining the full nested
+            // schema, so parity still fails if a required census field vanishes.
+            mask_lifecycle_census(map);
             // These fields are intentionally volatile: grep reports wall-clock timing,
             // backup ids are per-operation identifiers, cache keys derive from the
             // temporary root path, and `tier2_last_run` is a wall-clock unix-seconds
@@ -1058,6 +1101,23 @@ fn normalize_value(value: &mut Value, project_root: &Path, cache_dir: &Path) {
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn mask_lifecycle_census(map: &mut Map<String, Value>) {
+    for key in ["lsp", "threads", "sqlite", "children", "fds"] {
+        if let Some(value) = map.get_mut(key) {
+            mask_lifecycle_numbers(value);
+        }
+    }
+}
+
+fn mask_lifecycle_numbers(value: &mut Value) {
+    match value {
+        Value::Number(_) => *value = Value::String("<lifecycle_number>".to_string()),
+        Value::Array(values) => values.iter_mut().for_each(mask_lifecycle_numbers),
+        Value::Object(values) => values.values_mut().for_each(mask_lifecycle_numbers),
+        Value::Null | Value::Bool(_) | Value::String(_) => {}
     }
 }
 

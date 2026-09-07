@@ -142,12 +142,17 @@ fn container_rendered_line_count(
     line_count
 }
 
-pub fn render_container_member_menu(target: &Symbol, outline: &ContainerOutline) -> String {
+pub fn render_container_member_menu(
+    target: &Symbol,
+    outline: &ContainerOutline,
+    zoom_enabled: bool,
+) -> String {
     let kind = symbol_kind_string(&target.kind);
     let qualified_name = qualified_symbol_name(target);
     let member_count = outline.entry.members.len();
+    let action = if zoom_enabled { "zoom" } else { "read" };
     let mut lines = vec![format!(
-        "{kind} {qualified_name} ({member_count} members) — member-signature menu; zoom a member for its body"
+        "{kind} {qualified_name} ({member_count} members) — member-signature menu; {action} a member for its body"
     )];
 
     lines.push(format_qualified_entry(&outline.entry, Some(target)));
@@ -207,11 +212,12 @@ pub fn render_symbol_within_budget(
     lang: Option<LangId>,
     outline: Option<&ContainerOutline>,
     max_lines: usize,
+    zoom_enabled: bool,
 ) -> BudgetedSymbolRender {
     if should_return_member_menu(target, lang, outline) {
         let outline = outline.expect("member menu requires an outline");
         return BudgetedSymbolRender {
-            content: render_container_member_menu(target, outline),
+            content: render_container_member_menu(target, outline, zoom_enabled),
             status: BudgetedSymbolRenderStatus::Menu,
         };
     }
@@ -245,7 +251,8 @@ pub fn render_symbol_within_budget(
         content.push('\n');
     }
     content.push_str(&format!(
-        "… +{remaining} more lines — zoom {} for the full body",
+        "… +{remaining} more lines — {} {} for the full body",
+        if zoom_enabled { "zoom" } else { "read" },
         target.name
     ));
 

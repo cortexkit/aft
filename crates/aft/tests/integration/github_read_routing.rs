@@ -26,7 +26,7 @@ fn write_fake_gh(bin_dir: &Path) {
 if [ -n "${AFT_TEST_GH_STARTED:-}" ]; then
   : > "$AFT_TEST_GH_STARTED"
 fi
-if [ -n "${AFT_TEST_GH_DELAY_SECONDS:-}" ]; then
+if [ -n "${AFT_TEST_GH_DELAY_SECONDS:-}" ] && [ "$1" != "api" ]; then
   sleep "$AFT_TEST_GH_DELAY_SECONDS"
 fi
 case "$1" in
@@ -101,6 +101,53 @@ fn read_response(aft: &mut AftProcess, id: &str, file: &str, params: Value) -> V
     aft.send(&Value::Object(request).to_string())
 }
 
+fn write_timeline_fake_gh(bin_dir: &Path) {
+    fs::create_dir_all(bin_dir).expect("create timeline fixture gh directory");
+    let script = bin_dir.join("gh");
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+case "$1:$2" in
+  pr:view)
+    cat <<'JSON'
+{"number":999,"title":"Timeline fixture","state":"OPEN","author":{"login":"author"},"createdAt":"2026-09-03T05:00:00Z","updatedAt":"2026-09-03T07:00:00Z","labels":{"nodes":[{"name":"bug"}]},"body":"Fixture body","url":"https://github.com/cortexkit/aft/pull/999","baseRefName":"main","headRefName":"timeline-fixture","reviewDecision":"APPROVED","comments":{"nodes":[{"author":{"login":"commenter"},"body":"First discussion comment","createdAt":"2026-09-03T05:10:00Z"},{"author":{"login":"commenter"},"body":"Last discussion comment","createdAt":"2026-09-03T06:50:00Z"}]},"files":{"nodes":[{"path":"src/timeline.rs","additions":3,"deletions":1}]},"reviews":{"nodes":[{"author":{"login":"reviewer-one"},"body":"Looks good","state":"APPROVED","submittedAt":"2026-09-03T05:20:00Z"},{"author":{"login":"reviewer-two"},"body":"Please address this","state":"CHANGES_REQUESTED","submittedAt":"2026-09-03T05:30:00Z"}]}}
+JSON
+    ;;
+  api:graphql)
+    cat <<'JSON'
+{"data":{"repository":{"nameWithOwner":"cortexkit/aft","pullRequest":{"number":999,"reviews":{"nodes":[{"author":{"login":"reviewer-one"},"body":"Looks good","state":"APPROVED","submittedAt":"2026-09-03T05:20:00Z","comments":{"totalCount":2,"nodes":[{"author":{"login":"inline-one"},"body":"Inline comment one","createdAt":"2026-09-03T05:40:00Z","path":"src/timeline.rs","line":12},{"author":{"login":"inline-two"},"body":"Inline comment two","createdAt":"2026-09-03T05:45:00Z","path":"src/timeline.rs","line":24}]}}]}}}}}
+JSON
+    ;;
+  api:repos/*)
+    cat <<'JSON'
+[[{"event":"labeled","created_at":"2026-09-03T05:05:00Z","actor":{"login":"maintainer"},"label":{"name":"bug"}},{"event":"closed","created_at":"2026-09-03T06:57:00Z","actor":{"login":"aft-alfonso[bot]"},"commit_id":"0123456789abcdef"},{"event":"reopened","created_at":"2026-09-03T07:00:00Z","actor":{"login":"maintainer"}}]]
+JSON
+    ;;
+  *)
+    printf 'unexpected timeline fixture gh command: %s %s\n' "$1" "$2" >&2
+    exit 1
+    ;;
+esac
+"#,
+    )
+    .expect("write timeline fixture gh script");
+    let mut permissions = fs::metadata(&script)
+        .expect("stat timeline fixture gh script")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&script, permissions).expect("make timeline fixture gh script executable");
+}
+
+fn ordinals_with_prefix(text: &str, prefix: &str) -> std::collections::BTreeSet<usize> {
+    text.lines()
+        .filter_map(|line| {
+            let start = line.find(prefix)? + prefix.len();
+            let end = line[start..].find(']')? + start;
+            line[start..end].parse().ok()
+        })
+        .collect()
+}
+
 #[test]
 fn github_read_routes_short_and_explicit_forms_without_filesystem_rendering() {
     let temp = tempfile::tempdir().expect("create fake gh root");
@@ -134,6 +181,106 @@ fn github_read_routes_short_and_explicit_forms_without_filesystem_rendering() {
         Some("# Pull request #9: Fixture pull request\n\nRepository: owner/repo\nState: OPEN\n\n## Body\n\npull request body\n\nDiscussion drill-down: pr://owner/repo/9/comments/<sel> (for example 3, 3-5, or 3,7).\n\n")
     );
 
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn github_outline_zoom_and_read_share_timeline_ordinals() {
+    let temp = tempfile::tempdir().expect("create timeline fixture root");
+    write_timeline_fake_gh(&temp.path().join("bin"));
+    let mut aft = spawned_with_fake_gh(&temp.path().join("bin"));
+    configure_gh_read_enabled(&mut aft, temp.path());
+    let resource = "pr://cortexkit/aft/999";
+
+    let outline = aft.send(
+        &json!({
+            "id": "timeline-outline",
+            "command": "outline",
+            "target": resource,
+        })
+        .to_string(),
+    );
+    assert_eq!(outline["success"], true, "outline failed: {outline:#}");
+    let outline_text = outline["text"].as_str().expect("outline text");
+    assert!(outline_text.contains("#999 Timeline fixture"));
+    assert!(outline_text.contains("main<-timeline-fixture +3/-1 files=1 review=approved"));
+    assert!(outline_text.contains("[8] event(closed) @aft-alfonso[bot] 2026-09-03 06:57"));
+    assert!(outline_text.ends_with(&format!(
+        "Zoom items: aft_zoom {resource} <k>[,k..] · full: read {resource}\n"
+    )));
+
+    let read = read_response(&mut aft, "timeline-read", resource, json!({}));
+    assert_eq!(read["success"], true, "read failed: {read:#}");
+    let read_text = read["content"].as_str().expect("read content");
+    assert!(read_text.contains("## Timeline"));
+    assert!(read_text.contains("### [8] @aft-alfonso[bot]"));
+    assert!(read_text.contains("Event: closed"));
+    assert_eq!(
+        ordinals_with_prefix(outline_text, "["),
+        ordinals_with_prefix(read_text, "### ["),
+        "outline and read must address the same discussion items"
+    );
+
+    let zoom = aft.send(
+        &json!({
+            "id": "timeline-zoom",
+            "command": "zoom",
+            "file": resource,
+            "symbols": ["8"],
+        })
+        .to_string(),
+    );
+    assert_eq!(zoom["success"], true, "zoom failed: {zoom:#}");
+    assert!(zoom["content"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("Event: closed"));
+    assert!(zoom["content"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("aft-alfonso[bot]"));
+
+    let selected = read_response(
+        &mut aft,
+        "timeline-selector",
+        &format!("{resource}/comments/8"),
+        json!({}),
+    );
+    assert_eq!(selected["success"], true, "selector failed: {selected:#}");
+    assert_eq!(selected["content"], zoom["content"]);
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn github_outline_and_zoom_refuse_when_gh_read_is_disabled() {
+    let project = tempfile::tempdir().expect("create gate project");
+    let mut aft = AftProcess::spawn();
+    let configured = aft.send(
+        &json!({
+            "id": "configure-gate-off",
+            "command": "configure",
+            "harness": "runner",
+            "project_root": project.path(),
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configured["success"], true,
+        "configure failed: {configured:#}"
+    );
+
+    for request in [
+        json!({ "id": "outline-gate-off", "command": "outline", "target": "issue://7" }),
+        json!({ "id": "zoom-gate-off", "command": "zoom", "file": "issue://7", "symbols": ["1"] }),
+    ] {
+        let response = aft.send(&request.to_string());
+        assert_eq!(
+            response["success"], false,
+            "gate unexpectedly passed: {response:#}"
+        );
+        assert_eq!(response["code"], "gh_read_disabled");
+    }
     assert!(aft.shutdown().success());
 }
 

@@ -2052,6 +2052,100 @@ fn relative_path_escaping_root_still_fails_validation() {
 }
 
 #[test]
+fn temp_path_mutations_report_missing_undo_and_increment_status_counter() {
+    let dir = tempfile::tempdir().unwrap();
+    let deleted = dir.path().join("deleted.txt");
+    let written = dir.path().join("written.txt");
+    let edited = dir.path().join("edited.txt");
+    fs::write(&deleted, "delete me").unwrap();
+    fs::write(&written, "before write").unwrap();
+    fs::write(&edited, "before edit").unwrap();
+
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("AFT_TEST_DISABLE_FILE_WATCHER", std::ffi::OsStr::new("0")),
+        ("AFT_TEST_ALLOW_TEMP_BACKUPS", std::ffi::OsStr::new("0")),
+    ]);
+
+    let delete = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "temp-delete",
+            "command": "delete_file",
+            "file": deleted,
+        }))
+        .unwrap(),
+    );
+    assert_eq!(delete["success"], true, "delete: {delete:?}");
+    assert_eq!(delete["backup_skipped_reason"], "temp_path");
+
+    let write = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "temp-write",
+            "command": "tool_call",
+            "name": "write",
+            "arguments": { "filePath": written, "content": "after write" },
+        }))
+        .unwrap(),
+    );
+    assert_eq!(write["success"], true, "write: {write:?}");
+    assert_eq!(write["backup_skipped_reason"], "temp_path");
+    assert!(write["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("Undo is unavailable for this change")));
+
+    let edit = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "temp-edit",
+            "command": "tool_call",
+            "name": "edit",
+            "arguments": {
+                "path": edited.display().to_string(),
+                "edits": [{ "oldString": "before edit", "newString": "after edit" }],
+            },
+        }))
+        .unwrap(),
+    );
+    assert_eq!(edit["success"], true, "edit: {edit:?}");
+    assert_eq!(edit["backup_skipped_reason"], "temp_path");
+    assert!(edit["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("Undo is unavailable for this change")));
+
+    let preview = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "temp-undo-preview",
+            "command": "undo_preview",
+            "file": edited.display().to_string(),
+        }))
+        .unwrap(),
+    );
+    assert_eq!(preview["success"], true, "undo preview: {preview:?}");
+    assert_eq!(preview["backup_skipped_reason"], "temp_path");
+
+    let undo = aft.send(
+        &serde_json::to_string(&serde_json::json!({
+            "id": "temp-undo",
+            "command": "undo",
+            "file": edited.display().to_string(),
+        }))
+        .unwrap(),
+    );
+    assert_eq!(undo["success"], false, "undo: {undo:?}");
+    assert_eq!(undo["backup_skipped_reason"], "temp_path");
+    assert!(undo["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("undo is unavailable")));
+    assert_eq!(fs::read_to_string(&edited).unwrap(), "after edit");
+
+    let status = aft.send(r#"{"id":"temp-status","command":"status"}"#);
+    assert!(status["backup_skipped_temp_path_total"]
+        .as_u64()
+        .is_some_and(|count| count >= 3));
+    assert!(status["backup_skipped_too_large_total"].is_u64());
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn undo_miss_message_echoes_resolved_absolute_path() {
     // The miss message is a defect surface of its own: "no undo history for:
     // <input path>" is indistinguishable from a genuine no-backups state, and

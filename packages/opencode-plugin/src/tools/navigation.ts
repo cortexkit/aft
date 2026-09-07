@@ -1,6 +1,7 @@
 import { coerceBoolean } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
+import { toolEnabled } from "../config.js";
 import { prepareToolMap } from "../normalize-schemas.js";
 import type { PluginContext } from "../types.js";
 import {
@@ -27,11 +28,14 @@ const CALLGRAPH_SOFT_CODES = new Set(["symbol_not_found", "callgraph_building"])
  * Tool definitions for call-graph navigation: call_tree, callers, trace_to, trace_to_symbol, impact, and trace_data.
  */
 export function navigationTools(ctx: PluginContext): Record<string, ToolDefinition> {
-  return prepareToolMap({
+  const zoomEnabled = toolEnabled(ctx.config, "aft_zoom");
+  const tools = prepareToolMap({
     aft_callgraph: {
       description:
         "Answer code-relationship questions from a real call graph — instead of grep + read chains. Reach for this whenever the question is about how symbols connect: who calls X, what X calls, what breaks if X changes, how execution reaches X, or how a value flows.\n\n" +
-        "Use aft_zoom with `callgraph:true` for one-level forward calls-out while reading source. Use aft_callgraph only for reverse callers or multi-level traces so you do not double-fetch the same relationships.\n\n" +
+        (zoomEnabled
+          ? "Use aft_zoom with `callgraph:true` for one-level forward calls-out while reading source. Use aft_callgraph only for reverse callers or multi-level traces so you do not double-fetch the same relationships.\n\n"
+          : "Use aft_callgraph call_tree (depth 1) for one-level forward calls-out; use it for reverse callers or multi-level traces.\n\n") +
         "Ops:\n" +
         "- 'callers': Find all call sites of a symbol. Use before renaming or changing a function's signature.\n" +
         "- 'impact': What breaks if a symbol changes — affected callers with signatures and entry-point status (blast radius). Use before a risky edit.\n" +
@@ -141,4 +145,5 @@ export function navigationTools(ctx: PluginContext): Record<string, ToolDefiniti
       },
     },
   });
+  return tools;
 }

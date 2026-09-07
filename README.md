@@ -49,7 +49,15 @@ Sensory and motor make the **IDE**; the brainstem is the **OS**. Your agent gets
 
 **Increase productivity. Decrease token usage.**
 
-AFT ships as a Rust binary with thin adapters for [OpenCode](https://opencode.ai) and [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent). It **hoists the host's built-in tool slots** (the agent keeps calling `read`, `write`, `edit`, `bash`, `grep`, but now they're backed by tree-sitter parsing, indexed search, output compression, and symbol-aware operations) and adds an `aft_` family on top.
+AFT ships as a Rust binary with thin adapters for [OpenCode](https://opencode.ai), [Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent), and [OMP (oh-my-pi)](https://omp.sh). It **hoists the host's built-in tool slots** (the agent keeps calling `read`, `write`, `edit`, `bash`, `grep`, but now they're backed by tree-sitter parsing, indexed search, output compression, and symbol-aware operations) and adds an `aft_` family on top.
+
+### Supported harnesses
+
+| Harness | Support | Plugin | Configuration knobs |
+|---|---|---|---|
+| **[OpenCode](https://opencode.ai)** | Native adapter | `@cortexkit/aft-opencode` | `hoist_builtin_tools`, `tool_surface`, `edit_mode` |
+| **[Pi](https://github.com/badlogic/pi-mono)** | Native extension | `@cortexkit/aft-pi` | `hoist_builtin_tools`, `tool_surface`, `edit_mode` |
+| **[OMP (oh-my-pi)](https://omp.sh)** | Supported via the Pi plugin | `@cortexkit/aft-pi` | `pi.tool_presentation` (`"top_level"` default, `"host_default"`), `hoist_builtin_tools` |
 
 ---
 
@@ -65,6 +73,7 @@ Auto-detects which harnesses you have installed and configures each one. On the 
 
 - **OpenCode**: replaces built-in `read`, `write`, `edit`, and `apply_patch` with AFT-backed versions, and adds the `aft_` family on top.
 - **Pi**: replaces built-in `read`, `write`, `edit`, and `grep`, and adds the `aft_` family on top.
+- **OMP (oh-my-pi)**: supported via the Pi plugin (`@cortexkit/aft-pi`). Registers tools top-level by default via `pi.tool_presentation: "top_level"` (`loadMode: "essential"`), folding per-tool guidance into descriptions; set `pi.tool_presentation: "host_default"` to opt into OMP's `xd://` device mounting model. `hoist_builtin_tools` toggles replacing host built-ins vs. registering `aft_` prefixed alternatives.
 
 See the [CLI reference](docs/cli.md) for `doctor`, `doctor --fix`, `doctor lsp`, and cache-management commands.
 
@@ -100,8 +109,8 @@ AFT is **1 of the 3 plugins you'll ever need.** It perceives and acts; Magic Con
 
 *The IDE's eyes.* How the agent *sees* your codebase: structure, meaning, and relationships instead of a wall of text.
 
-- **`aft_outline`**: every symbol in a file, directory, or remote URL, with its kind, name, line range, visibility, and nested members. One call instead of reading the whole file.
-- **`aft_zoom`**: inspect a specific function, class, or type; pass `callgraph: true` to add annotations for what it calls and what calls it.
+- **`aft_outline`**: every symbol in a file, directory, or remote URL, with its kind, name, line range, visibility, and nested members; when `gh_read.enabled` is on, it also indexes GitHub issue and PR discussions. One call instead of reading the whole file.
+- **`aft_zoom`**: inspect a specific function, class, or type; pass `callgraph: true` to add annotations for what it calls and what calls it, or use a GitHub discussion ordinal when `gh_read.enabled` is on.
 - **`aft_search`**: find code by *meaning* when grep keywords fall short. Hybrid semantic + lexical retrieval over an indexed codebase, with local, OpenAI-compatible, or Ollama embedding backends.
 - **`aft_callgraph`**: follow callers, callees, data flow, impact analysis, and the shortest call path between two symbols across the workspace.
 - **`aft_inspect`**: a one-call codebase-health report covering LSP errors and warnings, TODOs, metrics, dead code, unused exports, and duplicates. The Problems and inspections panels an IDE keeps open, on demand.
@@ -151,6 +160,8 @@ _Coming soon._
 | Rust | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | Go | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | C / C++ / C# | ✓ | ✓ | ✓ | ✓ | ✓ | |
+| CUDA (`.cu`, `.cuh`) | ✓ | ✓ | ✓ | ✓ | ✓ | |
+| Metal (`.metal`) | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | Java / Kotlin | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | Scala | ✓ | ✓ | | ✓ | ✓ | |
 | Swift | ✓ | ✓ | ✓ | ✓ | ✓ | |
@@ -162,6 +173,7 @@ _Coming soon._
 | HTML / Markdown (incl. Quarto / R-Markdown) | ✓ | ✓ | | | | |
 | YAML (incl. Kubernetes) | ✓ | ✓ | | ✓ | | |
 | JSON | ✓ | ✓ | ✓ | | | |
+| TOML | ✓ | ✓ | | ✓ | | |
 | Solidity | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | Pascal | ✓ | ✓ | ✓ | ✓ | | |
 | R | ✓ | ✓ | ✓ | ✓ | | |
@@ -172,6 +184,8 @@ _Coming soon._
 Every listed language works with `aft_outline`, `aft_zoom`, and `read`/`edit`/`write`, and trigram-indexed `grep`/`glob` covers every text file regardless of language. **AST** is structural `ast_grep_search`/`ast_grep_replace`. **Semantic** is `aft_search` embedding coverage. **Refactor** is symbol move plus function extract and inline; *partial* means extract and inline only, without cross-file move.
 
 Objective-C `.h` headers continue to use the C grammar in v1, so Objective-C interfaces declared only in headers may outline imperfectly compared with `.m`/`.mm` implementation files.
+
+Metal uses the C++ grammar because there is no maintained tree-sitter-metal grammar; covered shader qualifiers still produce ordinary function symbols. CUDA uses the dedicated tree-sitter-cuda grammar so kernel launches remain call expressions, and `__global__` definitions render as `kernel` symbols. TOML is structural for outline, zoom, and semantic chunking, but is intentionally absent from AST pattern tools because its key grammar does not accept ast-grep's identifier metavariable sentinels.
 
 Indexes honor `.gitignore` and an optional `.aftignore` (same syntax) for paths git can't exclude, such as submodules. Naming a file explicitly in `grep` searches it even when ignored, matching ripgrep.
 
@@ -201,7 +215,7 @@ AFT is a Rust binary driven by thin adapter packages per harness. The binary spe
                    │     aft binary         │  ← shared core
                    │       (Rust)           │
                    ├────────────────────────┤
-                   │ • tree-sitter (27 lang)│
+                   │ • tree-sitter (30 lang)│
                    │ • symbols & call graph │
                    │ • diff/format/backup   │
                    │ • LSP client           │
@@ -282,7 +296,7 @@ opencode-aft/
 
 ## Contributing
 
-Pull requests for bugs are welcome. For features or broader fixes that need architectural changes, please open an issue first to discuss the approach.
+Open an issue first and let a maintainer agree the design; a pull request is reviewable once its linked issue carries the `design-approved` label. See [Design first](CONTRIBUTING.md#design-first) — typo-class fixes are exempt.
 
 Adding a command means implementing it in Rust (`crates/aft/src/commands/`) and adding a tool definition in each harness adapter (`packages/opencode-plugin/src/tools/`, `packages/pi-plugin/src/tools/`). Run `bun run format` and `cargo fmt` before submitting; CI rejects unformatted code.
 

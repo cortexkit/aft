@@ -1,7 +1,10 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { TSchema } from "typebox";
 
 import type { AftConfig } from "./config.js";
 import { resolveBashConfig } from "./config.js";
+import { detectPiHarness, type PiHarness } from "./harness.js";
+import { prepareToolDefinitionForRegistration } from "./tools/_shared.js";
 import { registerAstTools } from "./tools/ast.js";
 import { registerBashCompanionTools, registerBashTool } from "./tools/bash.js";
 import { registerConflictsTool } from "./tools/conflicts.js";
@@ -194,6 +197,45 @@ export function resolvePiToolSurface(config: AftConfig, pi?: ExtensionAPI): PiTo
   return base;
 }
 
+const FUNNEL_BOUND = Symbol.for("aft.pi.registration_funnel_bound");
+
+/**
+ * Wrap an ExtensionAPI instance so every `pi.registerTool` call flows through the
+ * shared registration funnel with harness-aware loadMode and guidance folding.
+ */
+export function bindToolRegistrationFunnel(
+  pi: ExtensionAPI,
+  ctx: PluginContext,
+  harness?: PiHarness,
+): ExtensionAPI {
+  if ((pi as unknown as Record<string | symbol, unknown>)[FUNNEL_BOUND]) {
+    return pi;
+  }
+
+  const effectiveHarness = harness ?? detectPiHarness(pi);
+  const presentation = ctx.config.pi?.tool_presentation ?? "top_level";
+  const originalRegisterTool = pi.registerTool.bind(pi);
+
+  const wrappedRegisterTool = <
+    TParams extends TSchema = TSchema,
+    TDetails = unknown,
+    TState = unknown,
+  >(
+    tool: ToolDefinition<TParams, TDetails, TState>,
+  ): void => {
+    const prepared = prepareToolDefinitionForRegistration(tool, effectiveHarness, presentation);
+    originalRegisterTool(prepared as ToolDefinition<TParams, TDetails, TState>);
+  };
+
+  return new Proxy(pi, {
+    get(target, prop, receiver) {
+      if (prop === FUNNEL_BOUND) return true;
+      if (prop === "registerTool") return wrappedRegisterTool;
+      return Reflect.get(target, prop, receiver);
+    },
+  });
+}
+
 /**
  * Invoke every Pi tool registration branch for the resolved production surface.
  * Commands, prompt hints, and lifecycle hooks intentionally remain outside this
@@ -203,13 +245,15 @@ export function registerPiToolSurface(
   pi: ExtensionAPI,
   ctx: PluginContext,
   surface: PiToolSurface,
+  harness?: PiHarness,
 ): void {
+  const boundPi = bindToolRegistrationFunnel(pi, ctx, harness);
   const bashCfg = resolveBashConfig(ctx.config);
   const bashRegistered = surface.hoistBash && bashCfg.enabled;
   const powershellRegistered = surface.hoistPowershell && bashCfg.enabled;
   if (bashRegistered) {
     registerBashTool(
-      pi,
+      boundPi,
       ctx,
       surface.semantic,
       surface.hoistBuiltinTools ? "bash" : "aft_bash",
@@ -218,7 +262,7 @@ export function registerPiToolSurface(
   }
   if (powershellRegistered) {
     registerBashTool(
-      pi,
+      boundPi,
       ctx,
       surface.semantic,
       surface.hoistBuiltinTools ? "powershell" : "aft_powershell",
@@ -228,16 +272,16 @@ export function registerPiToolSurface(
   }
   // These controls address AFT task IDs, so one shell-family registration makes
   // the shared controls available without colliding with a host-native tool.
-  if (bashRegistered || powershellRegistered) registerBashCompanionTools(pi, ctx);
-  registerHoistedTools(pi, ctx, surface);
+  if (bashRegistered || powershellRegistered) registerBashCompanionTools(boundPi, ctx);
+  registerHoistedTools(boundPi, ctx, surface);
 
-  if (surface.outline || surface.zoom) registerReadingTools(pi, ctx, surface);
-  if (surface.semantic) registerSemanticTool(pi, ctx);
-  if (surface.inspect) registerInspectTool(pi, ctx);
-  if (surface.navigate) registerNavigateTool(pi, ctx);
-  if (surface.conflicts) registerConflictsTool(pi, ctx);
-  if (surface.importTool) registerImportTools(pi, ctx);
-  if (surface.safety && ctx.config.backup?.enabled !== false) registerSafetyTool(pi, ctx);
-  if (surface.astSearch || surface.astReplace) registerAstTools(pi, ctx, surface);
-  if (surface.delete || surface.move) registerFsTools(pi, ctx, surface);
+  if (surface.outline || surface.zoom) registerReadingTools(boundPi, ctx, surface);
+  if (surface.semantic) registerSemanticTool(boundPi, ctx);
+  if (surface.inspect) registerInspectTool(boundPi, ctx);
+  if (surface.navigate) registerNavigateTool(boundPi, ctx);
+  if (surface.conflicts) registerConflictsTool(boundPi, ctx);
+  if (surface.importTool) registerImportTools(boundPi, ctx);
+  if (surface.safety && ctx.config.backup?.enabled !== false) registerSafetyTool(boundPi, ctx);
+  if (surface.astSearch || surface.astReplace) registerAstTools(boundPi, ctx, surface);
+  if (surface.delete || surface.move) registerFsTools(boundPi, ctx, surface);
 }

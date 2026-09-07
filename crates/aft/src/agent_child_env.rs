@@ -56,6 +56,7 @@ const GH_SHIMS_DIR_ENV: &str = "AFT_GH_SHIMS_DIR";
 const GH_SHIM_BINARY_ENV: &str = "AFT_GH_SHIM_BINARY";
 const GIT_CO_AUTHOR_ENV: &str = "AFT_GIT_CO_AUTHOR";
 const STORAGE_DIR_ENV: &str = "AFT_STORAGE_DIR";
+const GH_SHIM_STATE_DIR_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
 const SUBC_CREDENTIAL_ENV_PREFIX: &str = "SUBC_";
 const SUBC_IDENTITY_ENV_KEYS: [&str; 2] = [
     subc_protocol::SUBC_MODULE_ID_ENV,
@@ -194,7 +195,7 @@ pub fn maintain(config: &Config, storage_root: &Path) -> Result<(), String> {
 /// the gh-shim invocation path (which legitimately reads the shims marker)
 /// dispatches before this runs.
 pub fn scrub_inherited_process_markers() {
-    if let Some(stale) = std::env::var_os(GH_SHIMS_DIR_ENV).map(PathBuf::from) {
+    if let Some(stale) = crate::environment::non_empty_os_var(GH_SHIMS_DIR_ENV).map(PathBuf::from) {
         if let Some(inherited) = std::env::var_os("PATH") {
             let cleaned: Vec<_> = std::env::split_paths(&inherited)
                 .filter(|entry| entry != &stale)
@@ -338,9 +339,17 @@ pub fn inject(
     // test-suite fixtures that isolate via HOME/XDG resolved the production
     // store). Children that resolve storage by default reach the same root
     // anyway; explicitness is only preserved, never minted.
-    if let Some(explicit) = std::env::var_os(STORAGE_DIR_ENV) {
+    if let Some(explicit) = crate::environment::non_empty_os_var(STORAGE_DIR_ENV) {
         environment.insert(
             STORAGE_DIR_ENV.to_string(),
+            explicit.to_string_lossy().into_owned(),
+        );
+    }
+    // Preserve an explicitly selected gh-shim state directory for hooks and
+    // nested AFT children, but never mint one from the operator's default.
+    if let Some(explicit) = crate::environment::non_empty_os_var(GH_SHIM_STATE_DIR_ENV) {
+        environment.insert(
+            GH_SHIM_STATE_DIR_ENV.to_string(),
             explicit.to_string_lossy().into_owned(),
         );
     }
@@ -1119,6 +1128,13 @@ mod tests {
         assert!(status.success(), "git {args:?} failed: {status}");
     }
 
+    // The timeout turns a dispatcher that re-enters itself (an infinite hook
+    // loop) into a failure; it is not a bound on commit latency. A hook-chained
+    // commit spawns several git and shell processes, which under a parallel test
+    // gate on macOS can take multiple seconds each, so keep it far above that.
+    #[cfg(unix)]
+    const HOOK_REENTRY_GUARD: Duration = Duration::from_secs(60);
+
     #[cfg(unix)]
     fn run_git_with_timeout(
         repo: &Path,
@@ -1588,7 +1604,7 @@ mod tests {
             &repo,
             &["commit", "--quiet", "-m", "no repository hook"],
             &environment,
-            Duration::from_secs(5),
+            HOOK_REENTRY_GUARD,
         );
 
         assert!(
@@ -1617,7 +1633,7 @@ mod tests {
             &repo,
             &["commit", "--quiet", "-m", "self guard"],
             &environment,
-            Duration::from_secs(5),
+            HOOK_REENTRY_GUARD,
         );
 
         assert!(

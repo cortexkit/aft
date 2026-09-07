@@ -601,19 +601,19 @@ fn current_hostname() -> String {
             return String::from_utf8_lossy(&buffer[..len]).into_owned();
         }
     }
-    std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string())
+    crate::environment::non_empty_var("HOSTNAME").unwrap_or_else(|| "unknown-host".to_string())
 }
 
 #[cfg(windows)]
 fn current_hostname() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown-host".to_string())
+    crate::environment::non_empty_var("COMPUTERNAME")
+        .or_else(|| crate::environment::non_empty_var("HOSTNAME"))
+        .unwrap_or_else(|| "unknown-host".to_string())
 }
 
 #[cfg(not(any(unix, windows)))]
 fn current_hostname() -> String {
-    std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-host".to_string())
+    crate::environment::non_empty_var("HOSTNAME").unwrap_or_else(|| "unknown-host".to_string())
 }
 
 #[cfg(unix)]

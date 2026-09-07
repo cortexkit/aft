@@ -319,6 +319,39 @@ describe("OpenCode background notifications", () => {
     expect(payload.body.parts[0].ignored).toBeUndefined();
   });
 
+  test("turn-end wake invokes promptAsync on its receiver, as the generated SDK requires (#297)", async () => {
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({
+      success: true,
+      bg_completions: [completion("task-1", "npm test")],
+    }));
+    // Mirrors packages/sdk/js/src/gen/sdk.gen.ts: the method reads
+    // `this._client`, so a detached call throws before any request is made.
+    // An arrow-function stub cannot catch that; this class can.
+    const posted: unknown[] = [];
+    class SessionApi {
+      _client = { post: async (input: unknown) => posted.push(input) };
+      promptAsync(input: unknown) {
+        return this._client.post(input);
+      }
+    }
+    const client = { session: new SessionApi() };
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client,
+    });
+    const deadline = Date.now() + 5_000;
+    while (posted.length < 1 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    expect(posted).toHaveLength(1);
+    expect(findTraceEvent("bash_completion_wake_prompt_async_error")).toBeUndefined();
+  });
+
   test("turn-end wake forwards resolved agent + model + variant to preserve prefix cache", async () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({
@@ -955,6 +988,93 @@ describe("OpenCode background notifications", () => {
 });
 
 describe("subc forced-drain dedup (C-#1 / C-#3)", () => {
+  test("a forced drain delivers and acknowledges a durable pattern match", async () => {
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? {
+            success: true,
+            bg_completions: [],
+            pending_matches: [
+              {
+                task_id: "task-pattern",
+                session_id: "s1",
+                watch_id: "watch-1",
+                match_text: "READY",
+                match_offset: 42,
+                context: "server READY",
+                once: true,
+                reason: "pattern_match",
+              },
+            ],
+          }
+        : { success: true, acked_task_ids: ["task-pattern"] },
+    );
+    const { ctx } = harness(send);
+    const promptAsync = mock(async () => {});
+
+    await handleSubcBgEventsNudge({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: makeClient(promptAsync),
+    });
+    await waitForMockCallCount(promptAsync, 1);
+    await waitUntil(
+      () => send.mock.calls.filter((call) => call[0] === "bash_ack_completions").length === 1,
+    );
+
+    const prompt = promptAsync.mock.calls[0][0] as { body: { parts: Array<{ text: string }> } };
+    expect(prompt.body.parts[0].text).toContain('task task-pattern matched "READY"');
+    expect(send.mock.calls.find((call) => call[0] === "bash_ack_completions")?.[1]).toEqual({
+      session_id: "s1",
+      task_ids: ["task-pattern"],
+    });
+  });
+
+  test("a forced drain renders and acknowledges a durable task-exit match once", async () => {
+    const send = mock(async (command: string) =>
+      command === "bash_drain_completions"
+        ? {
+            success: true,
+            bg_completions: [],
+            pending_matches: [
+              {
+                task_id: "task-exit",
+                session_id: "s1",
+                watch_id: "exit",
+                match_text: "watch task exited",
+                match_offset: 0,
+                context: "task task-exit exited (exit 0)\nserver stopped",
+                once: true,
+                reason: "task_exit",
+              },
+            ],
+          }
+        : { success: true, acked_task_ids: ["task-exit"] },
+    );
+    const { ctx } = harness(send);
+    const promptAsync = mock(async () => {});
+
+    await handleSubcBgEventsNudge({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: makeClient(promptAsync),
+    });
+    await waitForMockCallCount(promptAsync, 1);
+    await waitUntil(
+      () => send.mock.calls.filter((call) => call[0] === "bash_ack_completions").length === 1,
+    );
+
+    const prompt = promptAsync.mock.calls[0][0] as { body: { parts: Array<{ text: string }> } };
+    expect(prompt.body.parts[0].text).toContain("- task task-exit exited:");
+    expect(prompt.body.parts[0].text).toContain("task task-exit exited (exit 0)");
+    expect(prompt.body.parts[0].text).not.toContain("matched");
+    const ackCalls = send.mock.calls.filter((call) => call[0] === "bash_ack_completions");
+    expect(ackCalls).toHaveLength(1);
+    expect(ackCalls[0]?.[1]).toEqual({ session_id: "s1", task_ids: ["task-exit"] });
+  });
+
   test("coalesces concurrent multi-record nudge fan-in at handler entry", async () => {
     let releaseDrain!: () => void;
     const drainGate = new Promise<void>((resolve) => {

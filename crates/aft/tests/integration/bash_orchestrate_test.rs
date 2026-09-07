@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use super::helpers::{user_config, AftProcess};
+use super::helpers::{user_config, AftProcess, ReleaseOnDrop};
 
 const SHORT_WAIT_MS: &str = "600";
 const HANG_CATCH: Duration = Duration::from_secs(12);
@@ -56,8 +56,9 @@ fn shell_quote_path(path: &Path) -> String {
 
 fn hold_until_release_command(started: &Path, release: &Path, on_release: &str) -> String {
     format!(
-        "printf ready > {}; while [ ! -e {} ]; do sleep 0.05; done; {on_release}",
+        "printf ready > {}; polls=0; while [ ! -e {} ] && [ \"$polls\" -lt 6000 ]; do sleep 0.05; polls=$((polls + 1)); done; if [ -e {} ]; then {on_release}; else printf 'gate-timeout\\n'; fi",
         shell_quote_path(started),
+        shell_quote_path(release),
         shell_quote_path(release),
     )
 }
@@ -145,6 +146,9 @@ fn orchestrated_foreground_promotes_after_wait_window() {
     configure_bash_background(&mut aft, &dir, PROMOTION_WAIT_MS);
     let child_started = dir.path().join("promotion-child-started");
     let child_release = dir.path().join("promotion-child-release");
+    // Declare after the TempDir: Rust drops locals in reverse declaration order,
+    // so this guard writes the sentinel before the TempDir removes its directory.
+    let _release_guard = ReleaseOnDrop::new(child_release.clone());
     let command = hold_until_release_command(
         &child_started,
         &child_release,
@@ -186,7 +190,7 @@ fn orchestrated_foreground_promotes_after_wait_window() {
     assert_eq!(status["task_id"], task_id);
     assert_eq!(status["status"], "running", "status: {status:?}");
 
-    std::fs::write(&child_release, b"release").expect("release promoted child");
+    drop(_release_guard);
     let completion = wait_for_bash_completed_frame(&mut aft, task_id);
     assert_eq!(completion["status"], "completed", "frame: {completion:?}");
     assert_eq!(completion["exit_code"], 0, "frame: {completion:?}");
@@ -463,9 +467,13 @@ fn abort_inflight_kills_wait_registered_foreground_and_settles_deferred_response
     configure_bash_background(&mut aft, &dir, 5_000);
     let pid_file = dir.path().join("foreground.pid");
     let release_file = dir.path().join("foreground.release");
+    // Declare after the TempDir: Rust drops locals in reverse declaration order,
+    // so this guard writes the sentinel before the TempDir removes its directory.
+    let _release_guard = ReleaseOnDrop::new(release_file.clone());
     let command = format!(
-        "echo $$ > {}; while [ ! -e {} ]; do sleep 0.05; done",
+        "echo $$ > {}; polls=0; while [ ! -e {} ] && [ \"$polls\" -lt 6000 ]; do sleep 0.05; polls=$((polls + 1)); done; if [ ! -e {} ]; then printf 'gate-timeout\\n'; fi",
         shell_quote_path(&pid_file),
+        shell_quote_path(&release_file),
         shell_quote_path(&release_file),
     );
     let session_id = "abort-session";
@@ -548,6 +556,7 @@ fn abort_inflight_kills_wait_registered_foreground_and_settles_deferred_response
         status["status_reason"], "call_aborted",
         "status: {status:?}"
     );
+    drop(_release_guard);
 
     let pid: i32 = std::fs::read_to_string(&pid_file)
         .unwrap()

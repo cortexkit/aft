@@ -20,6 +20,7 @@
     "test": "bun run --filter './packages/*' test",
     "pi-rpc-e2e": "cd tests/pi-rpc && bun test",
     "test:rust": "cargo test",
+    "test:design-gate": "node --test scripts/design-gate.test.mjs",
     "test:windows-e2e": "bun run scripts/windows-vm/test.ts",
     "windows-vm:setup": "bun run scripts/windows-vm/setup.ts",
     "version-sync": "node scripts/version-sync.mjs",

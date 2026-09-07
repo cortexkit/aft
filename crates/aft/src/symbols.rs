@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum SymbolKind {
     Function,
+    /// CUDA `__global__` entry point launched from host or device code.
+    Kernel,
     Class,
     Method,
     Struct,

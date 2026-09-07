@@ -141,11 +141,10 @@ describe("resolveProjectOverridesForConfigure", () => {
   });
 
   test("EXCLUDES tool-registration fields that lock at plugin init", () => {
-    // tool_surface, disabled_tools, and hoist_builtin_tools affect which
-    // tools OpenCode registers when the plugin function returns. They
-    // CANNOT change per-bridge. Smuggling them through the per-project
-    // override path would silently fail to take effect — worse than
-    // documenting the limitation.
+    // tool_surface and hoist_builtin_tools affect which tools OpenCode
+    // registers when the plugin function returns. They cannot change
+    // per-bridge. disabled_tools is also used by Rust to gate rendered
+    // steering text, so it is forwarded with the project-safe config.
     const overrides = resolveProjectOverridesForConfigure({
       tool_surface: "minimal",
       disabled_tools: ["aft_callgraph"],
@@ -155,7 +154,7 @@ describe("resolveProjectOverridesForConfigure", () => {
     });
 
     expect("tool_surface" in overrides).toBe(false);
-    expect("disabled_tools" in overrides).toBe(false);
+    expect(overrides.disabled_tools).toEqual(["aft_callgraph"]);
     expect("hoist_builtin_tools" in overrides).toBe(false);
     expect(overrides.format_on_edit).toBe(true);
   });

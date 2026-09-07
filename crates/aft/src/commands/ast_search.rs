@@ -15,7 +15,7 @@ use crate::protocol::{RawRequest, Response};
 ///
 /// Params:
 ///   - `pattern` (string, required) — ast-grep pattern (e.g. `console.log($MSG)`)
-///   - `lang` (string, required) — selects which language parser ast-grep should use for matching; accepted values are typescript, tsx, javascript, python, rust, go, c, cpp, zig, csharp, solidity, vue, pascal, r, groovy, objc
+///   - `lang` (string, required) — selects which language parser ast-grep should use for matching; accepted values are typescript, tsx, javascript, python, rust, go, c, cpp, cuda, metal, zig, csharp, solidity, vue, pascal, r, groovy, objc
 ///   - `paths` (string[], optional) — directories/files to search (default: project root)
 ///   - `globs` (string[], optional) — include/exclude glob filters; prefix `!` to exclude
 ///   - `context` (integer, optional) — lines of context around each match (default: 0)
@@ -51,7 +51,7 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
                 &req.id,
                 "invalid_request",
                 format!(
-                    "ast_search: unsupported language '{lang_str}'. Supported: typescript, tsx, javascript, python, rust, go, c, cpp, zig, csharp, solidity, vue, pascal, r, groovy, objc"
+                    "ast_search: unsupported language '{lang_str}'. Supported: typescript, tsx, javascript, python, rust, go, c, cpp, cuda, metal, zig, csharp, solidity, vue, pascal, r, groovy, objc"
                 ),
             );
         }

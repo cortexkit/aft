@@ -195,7 +195,7 @@ describe("Tool round-trips", () => {
     createBridge();
     const editTools = aftPrefixedTools(createPluginContext(pool));
     const undoTools = safetyTools(createPluginContext(pool));
-    tmpDir = await mkdtemp(resolve(tmpdir(), "aft-test-"));
+    tmpDir = await mkdtemp(resolve(PROJECT_CWD, "target", "aft-undo-test-"));
     sdkCtx = createMockSdkContext(tmpDir);
 
     const filePath = resolve(tmpDir, "undoable.ts");

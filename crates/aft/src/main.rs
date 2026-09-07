@@ -22,12 +22,18 @@ use aft::lsp::child_registry::LspChildRegistry;
 use aft::protocol::{EchoParams, PushFrame, RawRequest, Response};
 use aft::response_finalize::{DispatchOutcome, PendingResponse, PendingResponses};
 use aft::runtime_registry::RuntimeRegistry;
+use std::collections::VecDeque;
 use std::io::{self, BufRead, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Exit status for a daemon connection that ended without a Goodbye. Non-zero so
+/// the supervisor respawns the module (it reads exit 0 as a stop request and
+/// never respawns), distinct from 1 (attach/auth failure) and 2 (usage).
+const SUBC_CONNECTION_LOST_EXIT_CODE: i32 = 3;
 
 /// Parse `--subc <connection-file>` / `--subc=<path>` from argv. Returns `None`
 /// when absent (standalone mode). The presence of the flag is the subc-mode
@@ -67,6 +73,26 @@ fn main() {
             Err(error) => {
                 eprintln!("{error}");
                 std::process::exit(error.exit_code());
+            }
+        }
+    }
+
+    // The detached helper must not initialize PATH: it probes in its own
+    // process and writes a cache for a later serving process to apply.
+    if std::env::args().nth(1).as_deref() == Some("--probe-login-shell-path") {
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match cli::probe_login_shell_path::parse_cache_path(args) {
+            Ok(cache_path) => {
+                if let Err(error) = aft::effective_path::refresh_login_shell_path_cache(&cache_path)
+                {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+                return;
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
             }
         }
     }
@@ -121,6 +147,26 @@ fn main() {
     aft::agent_child_env::scrub_inherited_process_markers();
 
     aft::logging::init();
+    aft::effective_path::log_startup_probe_result();
+
+    if std::env::args().nth(1).as_deref() == Some("profile") {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+            match cli::profile::run(args) {
+                Ok(()) => return,
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(error.exit_code());
+                }
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            eprintln!("aft profile unavailable: CPU sampling is only supported on macOS and Linux");
+            std::process::exit(1);
+        }
+    }
 
     if std::env::args().nth(1).as_deref() == Some("warmup") {
         let args = std::env::args_os().skip(2).collect::<Vec<_>>();
@@ -158,6 +204,15 @@ fn main() {
         match aft::subc::run_subc_mode(&connection_file, ctx, executor, dispatch, user_config_path)
         {
             Ok(()) => return,
+            // A lost connection is a restart request, not a failure to attach:
+            // the supervisor respawns any non-zero exit, and a distinct code keeps
+            // it separate from attach/auth failures in the supervisor's ledger.
+            Err(aft::subc::SubcError::ConnectionLost) => {
+                aft::slog_error!(
+                    "subc connection lost after attach; exiting for supervisor restart"
+                );
+                std::process::exit(SUBC_CONNECTION_LOST_EXIT_CODE);
+            }
             Err(error) => {
                 aft::slog_error!("subc attach failed: {error}");
                 std::process::exit(1);
@@ -212,11 +267,8 @@ fn main() {
     const DRAIN_INTERVAL: Duration = Duration::from_millis(250);
     const PENDING_POLL_INTERVAL: Duration = Duration::from_millis(100);
     let mut pending = PendingResponses::default();
-    // Opportunistic allocator relief: rate-limit stamp for the slack check that
-    // runs on the periodic drain wake (threshold + spacing live in memory.rs so
-    // subc and standalone share one policy).
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let mut last_slack_relief: Option<std::time::Instant> = None;
+    let mut configure_maintenance = aft::runtime_drain::StandaloneConfigureMaintenance::default();
+    let mut queued_lines = VecDeque::new();
     let (line_tx, line_rx) = mpsc::channel::<io::Result<String>>();
     let mut graceful_stdin_shutdown = false;
     thread::spawn(move || {
@@ -234,39 +286,50 @@ fn main() {
             break;
         }
 
-        let recv_timeout = if pending.is_empty() {
+        let configure_pending = configure_maintenance.has_pending(registry.current());
+        let recv_timeout = if configure_pending {
+            Duration::from_millis(100)
+        } else if pending.is_empty() {
             DRAIN_INTERVAL
         } else {
             PENDING_POLL_INTERVAL
         };
-        let line_result = match line_rx.recv_timeout(recv_timeout) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Periodic drain so push frames flow even without requests.
-                // Cheap on the idle path: each drain just checks try_recv
-                // on a channel and bails if empty.
-                if let Err(e) = drain_runtime_events_and_write_pending(&registry, &mut pending) {
-                    aft::slog_error!("stdout write error: {}", e);
-                    break;
-                }
-                #[cfg(any(target_os = "macos", target_os = "linux"))]
-                {
-                    let now = std::time::Instant::now();
-                    if aft::memory::spawn_allocator_slack_relief_if_due(last_slack_relief, now) {
-                        last_slack_relief = Some(now);
+        let line_result = if let Some(result) = queued_lines.pop_front() {
+            result
+        } else {
+            match line_rx.recv_timeout(recv_timeout) {
+                Ok(result) => result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Periodic drain so push frames flow even without requests.
+                    // The request-critical configure prefix runs before a cooperative
+                    // suffix step; storage-wide sweeps run on separate threads.
+                    let mut collect_queued = || collect_queued_lines(&line_rx, &mut queued_lines);
+                    if let Err(e) = drain_runtime_events_and_write_pending_cooperatively(
+                        &registry,
+                        &mut pending,
+                        &mut configure_maintenance,
+                        &mut collect_queued,
+                    ) {
+                        aft::slog_error!("stdout write error: {}", e);
+                        break;
                     }
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    {
+                        let now = std::time::Instant::now();
+                        let _ = aft::memory::spawn_allocator_slack_relief_if_due(now);
+                    }
+                    if shutdown_requested.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    continue;
                 }
-                if shutdown_requested.load(Ordering::SeqCst) {
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // Human-readable reason line; the phase markers below cover the
+                    // shutdown sequence itself. protocol_test asserts this banner.
+                    aft::slog_info!("stdin closed, shutting down");
+                    graceful_stdin_shutdown = true;
                     break;
                 }
-                continue;
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // Human-readable reason line; the phase markers below cover the
-                // shutdown sequence itself. protocol_test asserts this banner.
-                aft::slog_info!("stdin closed, shutting down");
-                graceful_stdin_shutdown = true;
-                break;
             }
         };
 
@@ -286,14 +349,18 @@ fn main() {
         let mut shutdown_after_response = false;
         let response = match serde_json::from_str::<RawRequest>(trimmed) {
             Ok(req) => {
-                // Drain search index FIRST so watcher events apply to the latest index.
-                // If reversed, watcher updates applied to the old index would be lost
-                // when the background-built index replaces it.
-                aft::logging::note_drain_slice();
-                if let Err(e) = drain_runtime_events_and_write_pending(&registry, &mut pending) {
-                    aft::slog_error!("stdout write error: {}", e);
-                    break;
+                // The first request after each configure waits for the request-critical
+                // prefix. The remaining project-runtime and indexing work stays
+                // cooperative, so even ping runs before another suffix unit.
+                configure_maintenance.drain_prefix(registry.current());
+                if configure_maintenance.has_pending(registry.current()) {
+                    aft::runtime_drain::note_configure_maintenance_yield(queued_lines.len() + 1);
                 }
+                // Install any completed search index before applying watcher changes.
+                // These bounded, non-blocking drains let each request use the freshest
+                // available index without waiting for configure maintenance.
+                aft::logging::note_drain_slice();
+                drain_non_configure_runtime_events(&registry);
                 let request_id = req.id.clone();
                 let session_id = req.session().to_string();
                 let command = req.command.clone();
@@ -303,6 +370,7 @@ fn main() {
                 // standalone; the selected single runtime is the root today.
                 // P3-03 adds an explicit root selector here instead of path inference.
                 let runtime = registry.current();
+                runtime.note_request();
                 let dispatch_result = if req.command == "cancel_request" {
                     Ok(DispatchOutcome::Immediate(handle_cancel_request(
                         &req,
@@ -354,8 +422,31 @@ fn main() {
             }
         }
         drain_configure_warning_events_for_registry(&registry);
+        if let Err(e) = write_ready_pending(registry.current(), &mut pending) {
+            aft::slog_error!("stdout write error: {}", e);
+            break;
+        }
         if shutdown_after_response || shutdown_requested.load(Ordering::SeqCst) {
             break;
+        }
+
+        // One suffix unit per served request, whether or not more requests are
+        // queued. Yielding only on idle gaps starves the suffix under a steady
+        // request stream: an agent polling right after configure never left
+        // the 100 ms silence the idle branch waits for, so the project watcher
+        // (a suffix unit) never started and ignore-rule changes went unseen.
+        // Units are bounded by construction, and the cost lands after the
+        // response is written, so the served request's latency is unchanged.
+        if configure_maintenance.has_pending(registry.current()) {
+            configure_maintenance.drain_one(registry.current());
+        }
+        let queued = collect_queued_lines(&line_rx, &mut queued_lines);
+        if queued > 0 {
+            if configure_maintenance.has_pending(registry.current()) {
+                aft::runtime_drain::note_configure_maintenance_yield(queued);
+            }
+        } else {
+            drain_non_configure_runtime_events(&registry);
         }
     }
 
@@ -395,6 +486,7 @@ fn main() {
     );
 }
 
+#[cfg(test)]
 fn drain_runtime_events(registry: &RuntimeRegistry) {
     for runtime in registry.iter() {
         aft::runtime_drain::drain_deferred_configure_maintenance(runtime);
@@ -406,9 +498,59 @@ fn drain_runtime_events(registry: &RuntimeRegistry) {
         aft::runtime_drain::drain_inspect_events(runtime);
         aft::runtime_drain::drain_watcher_events(runtime);
         aft::runtime_drain::drain_lsp_events(runtime);
+        aft::runtime_drain::shutdown_idle_lsp(runtime);
     }
     aft::logging::perf_tick(None);
-    aft::logging::maybe_sweep_logs();
+}
+
+fn drain_runtime_events_cooperatively(
+    registry: &RuntimeRegistry,
+    configure: &mut aft::runtime_drain::StandaloneConfigureMaintenance,
+    queued_requests: &mut impl FnMut() -> usize,
+) {
+    // Standalone mode keeps this progress state with its runtime so deferred
+    // configure work resumes at the next step.
+    let runtime = registry.current();
+    if configure.has_pending(runtime) {
+        configure.drain_prefix(runtime);
+        let has_more = configure.has_pending(runtime) && configure.drain_one(runtime);
+        let queued = queued_requests();
+        if queued > 0 && has_more {
+            aft::runtime_drain::note_configure_maintenance_yield(queued);
+        }
+        if has_more || queued > 0 {
+            return;
+        }
+    }
+
+    drain_non_configure_runtime_events(registry);
+}
+
+fn drain_non_configure_runtime_events(registry: &RuntimeRegistry) {
+    let runtime = registry.current();
+    // Preserve the dependency order: install finished search artifacts before
+    // watcher deltas, then advance the other build channels and diagnostics.
+    aft::runtime_drain::drain_configure_warning_events(runtime);
+    aft::runtime_drain::drain_search_index_events(runtime);
+    aft::runtime_drain::drain_callgraph_store_events(runtime);
+    aft::runtime_drain::drain_semantic_index_events(runtime);
+    aft::runtime_drain::drain_semantic_refresh_events(runtime);
+    aft::runtime_drain::drain_inspect_events(runtime);
+    aft::runtime_drain::drain_watcher_events(runtime);
+    aft::runtime_drain::drain_lsp_events(runtime);
+    aft::runtime_drain::shutdown_idle_lsp(runtime);
+    aft::logging::perf_tick(None);
+    aft::runtime_drain::spawn_standalone_log_maintenance();
+}
+
+fn collect_queued_lines(
+    line_rx: &mpsc::Receiver<io::Result<String>>,
+    queued_lines: &mut VecDeque<io::Result<String>>,
+) -> usize {
+    while let Ok(line) = line_rx.try_recv() {
+        queued_lines.push_back(line);
+    }
+    queued_lines.len()
 }
 
 #[cfg(test)]
@@ -450,13 +592,15 @@ fn flush_indexes_on_graceful_shutdown(registry: &RuntimeRegistry) {
     );
 }
 
-fn drain_runtime_events_and_write_pending(
+fn drain_runtime_events_and_write_pending_cooperatively(
     registry: &RuntimeRegistry,
     pending: &mut PendingResponses,
+    configure: &mut aft::runtime_drain::StandaloneConfigureMaintenance,
+    queued_requests: &mut impl FnMut() -> usize,
 ) -> io::Result<usize> {
     let ctx = registry.current();
     let mut written = write_ready_pending(ctx, pending)?;
-    drain_runtime_events(registry);
+    drain_runtime_events_cooperatively(registry, configure, queued_requests);
     written += write_ready_pending(ctx, pending)?;
     Ok(written)
 }
@@ -510,7 +654,6 @@ fn finalize_ready_pending(
 
 fn drain_configure_warning_events_for_registry(registry: &RuntimeRegistry) {
     for runtime in registry.iter() {
-        aft::runtime_drain::drain_deferred_configure_maintenance(runtime);
         aft::runtime_drain::drain_configure_warning_events(runtime);
     }
 }
@@ -779,8 +922,22 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "outline" => aft::commands::outline::handle_outline(&req, ctx),
         "zoom" => aft::commands::zoom::handle_zoom(&req, ctx),
         "read" => aft::commands::read::handle_read(&req, ctx),
-        "undo" | "undo_preview" | "edit_history" | "checkpoint" | "checkpoint_paths"
-        | "restore_checkpoint" | "list_checkpoints"
+        "undo" | "undo_preview"
+            if ctx.config().backup.enabled == Some(false)
+                && ctx
+                    .backup()
+                    .lock()
+                    .latest_skipped_reason_for_undo(req.session(), None)
+                    .is_none() =>
+        {
+            Response::error(
+                &req.id,
+                "backups_disabled",
+                "Backup tools are disabled by configuration.",
+            )
+        }
+        "edit_history" | "checkpoint" | "checkpoint_paths" | "restore_checkpoint"
+        | "list_checkpoints"
             if ctx.config().backup.enabled == Some(false) =>
         {
             Response::error(
@@ -840,6 +997,9 @@ fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "inspect" => aft::commands::inspect::handle_inspect(&req, ctx),
         aft::commands::health_digest::HEALTH_DIGEST_OPERATION => {
             aft::commands::health_digest::handle_health_digest(&req, ctx)
+        }
+        aft::commands::memory_census::MEMORY_CENSUS_OPERATION => {
+            aft::commands::memory_census::handle_memory_census(&req, ctx)
         }
         "inspect_tier2_run" => aft::commands::inspect::handle_inspect_tier2_run(&req, ctx),
         "git_conflicts" => aft::commands::conflicts::handle_git_conflicts(ctx, &req),
@@ -1266,7 +1426,7 @@ mod pending_response_tests {
             helper.data["bg_completions"][0]["task_id"],
             "bash-0000000000000501"
         );
-        assert_eq!(helper.data["status_bar"]["dead_code"], 3);
+        assert!(helper.data.get("status_bar").is_none());
     }
 
     #[test]
@@ -1318,7 +1478,7 @@ mod pending_response_tests {
             values[0]["bg_completions"][0]["task_id"],
             "bash-0000000000000502"
         );
-        assert_eq!(values[0]["status_bar"]["dead_code"], 3);
+        assert!(values[0].get("status_bar").is_none());
 
         assert_eq!(
             write_ready_pending_to_writer(&fixture.ctx, &mut pending, &mut writer).unwrap(),
@@ -2373,7 +2533,7 @@ mod watcher_filter_tests {
         record_semantic_refresh_transient_failure, schedule_semantic_refresh_retry,
         semantic_refresh_circuit_is_open, semantic_refresh_probe_is_scheduled_for_test,
         semantic_refresh_transient_failure_count_for_test, watcher_path_is_callgraph_indexed,
-        BREAKER_TRIP_THRESHOLD, MAX_RETRY_ATTEMPTS, WATCHER_BATCH_INLINE_CAP,
+        BREAKER_TRIP_THRESHOLD, MAX_RETRY_ATTEMPTS,
     };
     use aft::semantic_index::SemanticIndex;
     use aft::watcher_filter::{
@@ -2440,8 +2600,22 @@ mod watcher_filter_tests {
     fn callgraph_watcher_gate_covers_all_indexed_languages() {
         use std::path::Path;
         for ok in [
-            "Foo.java", "x.cpp", "y.c", "Svc.cs", "m.kt", "a.rb", "z.php", "s.scala", "C.sol",
-            "app.ts", "main.rs", "h.go", "p.py",
+            "Foo.java",
+            "x.cpp",
+            "kernel.cu",
+            "shader.metal",
+            "y.c",
+            "Svc.cs",
+            "m.kt",
+            "a.rb",
+            "z.php",
+            "s.scala",
+            "C.sol",
+            "app.ts",
+            "main.rs",
+            "h.go",
+            "p.py",
+            "config.toml",
         ] {
             assert!(
                 watcher_path_is_callgraph_indexed(Path::new(ok)),
@@ -2449,15 +2623,9 @@ mod watcher_filter_tests {
             );
         }
         // Genuinely-undetected extensions (detect_language → None). Note md/json/
-        // yaml ARE detected (the store walks them at cold-build), so matching
+        // yaml/toml ARE detected (the store walks them at cold-build), so matching
         // cold-build means they refresh too — refresh coverage == index coverage.
-        for skip in [
-            "notes.txt",
-            "image.png",
-            "Cargo.lock",
-            "data.csv",
-            "config.toml",
-        ] {
+        for skip in ["notes.txt", "image.png", "Cargo.lock", "data.csv"] {
             assert!(
                 !watcher_path_is_callgraph_indexed(Path::new(skip)),
                 "{skip} should not be callgraph-indexed"
@@ -2890,8 +3058,18 @@ mod watcher_filter_tests {
     #[test]
     fn status_bar_attach_skips_unchanged_fingerprint() {
         let tmp = TempDir::new().unwrap();
-        let ctx = make_ctx_with_root(tmp.path());
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let ctx = make_ctx_with_root(&root);
         ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        {
+            let key = ServerKey {
+                kind: ServerKind::TypeScript,
+                root: root.clone(),
+            };
+            ctx.lsp()
+                .diagnostics_store_mut_for_test()
+                .publish(key, root.join("known.ts"), vec![]);
+        }
 
         let mut first = Response::success("one", serde_json::json!({}));
         attach_status_bar(&mut first, &ctx, "session-status", "read");
@@ -3154,18 +3332,39 @@ mod watcher_filter_tests {
             ctx.callgraph_store_rx().lock().is_none(),
             "drain must not start a synchronous/inline callgraph build"
         );
+        assert!(
+            ctx.pending_callgraph_store_force_token_for_test().is_some(),
+            "lost watcher events must retain a force-rebuild token"
+        );
         // The next callgraph op will see the force flag and background-build.
     }
 
     #[test]
-    fn watcher_large_batch_reschedules_indexes_instead_of_inline_refresh() {
+    fn watcher_large_batch_refreshes_every_index_incrementally() {
+        let _callgraph_refresh_worker_guard = super::callgraph_refresh_worker_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(Duration::from_secs(
+                30
+            ),),
+            "a prior callgraph refresh worker should fully stop before this test"
+        );
+
         let tmp = TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
-        std::fs::write(
-            root.join("main.ts"),
-            "export function entry() { oldLeaf(); }\nfunction oldLeaf() {}\n",
-        )
-        .unwrap();
+        let watcher_alias_dir = root.join("watcher-alias");
+        std::fs::create_dir(&watcher_alias_dir).unwrap();
+        let all_paths = (0..400)
+            .map(|index| root.join(format!("branch-{index:03}.ts")))
+            .collect::<Vec<_>>();
+        for (index, path) in all_paths.iter().enumerate() {
+            std::fs::write(
+                path,
+                format!("export function branchFile{index}() {{ return {index}; }}\n"),
+            )
+            .unwrap();
+        }
 
         let ctx = AppContext::new(
             Box::new(TreeSitterProvider::new()),
@@ -3190,82 +3389,157 @@ mod watcher_filter_tests {
             .ensure_callgraph_store()
             .expect("ensure callgraph store")
             .expect("callgraph store should build on demand");
-        drop(resident);
-        assert!(ctx
-            .callgraph_store()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some());
-
-        let mut search_index = aft::search_index::SearchIndex::new();
-        search_index.ready = true;
+        let callgraph_generation = resident.sqlite_path().to_path_buf();
+        let search_index = aft::search_index::SearchIndex::build(&root);
         *ctx.search_index()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(search_index);
 
+        let mut embed = |texts: Vec<String>| Ok(vec![vec![1.0, 0.0, 0.0]; texts.len()]);
+        let semantic_index = SemanticIndex::build(&root, &all_paths, &mut embed, 64)
+            .expect("build semantic fixture index");
         *ctx.semantic_index()
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(SemanticIndex::new(root.clone(), 3));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(semantic_index);
         *ctx.semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
         let (request_rx, _event_tx) = install_semantic_refresh_channels(&ctx);
 
-        let watcher_tx = install_watcher_rx(&ctx);
-        let paths = (0..=WATCHER_BATCH_INLINE_CAP)
-            .map(|i| root.join(format!("changed-{i}.ts")))
+        let changed_paths = all_paths[..300].to_vec();
+        for (index, path) in changed_paths.iter().enumerate() {
+            std::fs::write(
+                path,
+                format!(
+                    "export function switchedFile{index}() {{ return {}; }}\n",
+                    index + 1
+                ),
+            )
+            .unwrap();
+        }
+        let watcher_paths = changed_paths
+            .iter()
+            .map(|path| {
+                watcher_alias_dir
+                    .join("..")
+                    .join(path.file_name().expect("fixture file name"))
+            })
             .collect::<Vec<_>>();
-        watcher_tx.send(WatcherDispatchEvent::Paths(paths)).unwrap();
+        let expected_paths = watcher_paths
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        aft::callgraph_store::set_callgraph_refresh_worker_test_seam(
+            root.clone(),
+            Duration::from_millis(350),
+            false,
+        );
+        let watcher_tx = install_watcher_rx(&ctx);
+        watcher_tx
+            .send(WatcherDispatchEvent::Paths(watcher_paths))
+            .unwrap();
 
+        // "Off the worker loop" is proven structurally below (the resident
+        // store survives the drain and the refresh lands on the seamed worker),
+        // not by timing the drain: a wall-clock bound flakes under a parallel
+        // test run while proving nothing the store identity check does not.
         drain_watcher_events(&ctx);
 
+        let installed_after_drain = ctx
+            .callgraph_store()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(std::sync::Arc::clone)
+            .expect("oversized refresh must keep the resident callgraph store");
         assert!(
-            ctx.callgraph_store()
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_none(),
-            "oversized watcher batch must drop the resident store instead of refreshing inline"
+            std::sync::Arc::ptr_eq(&resident, &installed_after_drain),
+            "oversized refresh must not write None over the resident store"
         );
-        assert!(
-            ctx.callgraph_store_rx().lock().is_none(),
-            "drain must not start a callgraph cold build on the dispatch thread"
+        assert_eq!(
+            ctx.pending_callgraph_store_force_token_for_test(),
+            None,
+            "ordinary watcher paths must not mint a force-rebuild token"
         );
-        assert!(
-            matches!(
-                ctx.callgraph_store_for_ops(),
-                CallgraphStoreAccess::Building
-            ),
-            "next callgraph op should start the forced background rebuild and return Building"
-        );
+        match ctx.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Ready(store) => {
+                assert!(std::sync::Arc::ptr_eq(&resident, &store))
+            }
+            _ => panic!("resident store should remain ready without a cold-build decision"),
+        }
         assert!(
             ctx.search_index_rx()
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_some(),
-            "oversized watcher batch should spawn a background search corpus refresh"
+                .is_none(),
+            "oversized paths must not escalate search to a corpus rebuild"
         );
-        assert!(
-            !ctx.search_index()
+        let search_matches = {
+            let search_index = ctx
+                .search_index()
                 .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-                .expect("resident search index")
-                .ready,
-            "resident search index should be marked not-ready while the corpus refresh runs"
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let search_index = search_index.as_ref().expect("resident search index");
+            assert!(
+                search_index.ready,
+                "search should stay resident while paths update incrementally"
+            );
+            search_index
+                .grep("switchedFile0", true, &[], &[], &root, 10)
+                .matches
+                .len()
+        };
+        assert_eq!(
+            search_matches, 1,
+            "search must expose content refreshed through a non-canonical watcher path"
         );
         match request_rx
             .recv_timeout(RECV_DISPATCH_TIMEOUT)
-            .expect("semantic corpus refresh request")
+            .expect("semantic file refresh request")
         {
-            SemanticRefreshRequest::Corpus => {}
             SemanticRefreshRequest::Files { paths } => {
-                panic!("expected semantic corpus refresh for oversized batch, got {paths:?}")
+                assert_eq!(
+                    paths.into_iter().collect::<std::collections::BTreeSet<_>>(),
+                    expected_paths,
+                    "semantic incremental refresh must receive every changed path"
+                );
+            }
+            SemanticRefreshRequest::Corpus => {
+                panic!("oversized paths must not escalate semantic to a corpus refresh")
             }
         }
-        assert!(request_rx
-            .recv_timeout(std::time::Duration::from_millis(50))
-            .is_err());
+
+        assert!(
+            aft::callgraph_store::flush_callgraph_store_refreshes_with_budget(Duration::from_secs(
+                10
+            ),),
+            "oversized callgraph refresh should finish"
+        );
+        assert_eq!(
+            aft::callgraph_store::callgraph_refresh_worker_test_paths(&root),
+            expected_paths,
+            "the callgraph refresh worker must receive every changed path exactly once"
+        );
+        assert_eq!(
+            aft::callgraph_store::callgraph_refresh_worker_test_counts(&root).0,
+            1,
+            "one watcher event should produce one coalesced refresh_files call"
+        );
+        let installed_after_refresh = ctx
+            .callgraph_store()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(std::sync::Arc::clone)
+            .expect("incremental refresh must leave the store resident");
+        assert!(std::sync::Arc::ptr_eq(&resident, &installed_after_refresh));
+        assert_eq!(
+            installed_after_refresh.sqlite_path(),
+            callgraph_generation,
+            "incremental refresh must not replace the callgraph store generation"
+        );
+        assert_eq!(ctx.pending_callgraph_store_force_token_for_test(), None);
+        aft::callgraph_store::clear_callgraph_refresh_worker_test_seam(&root);
     }
 
     #[test]
@@ -3707,6 +3981,23 @@ mod watcher_filter_tests {
 
         let ctx = make_ctx_with_root(&root);
         ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        // The bar renders only once every producer has reported; an empty
+        // diagnostics publish is a proven zero, not a fabricated one. It is
+        // published for a different file than the one the watcher touches:
+        // a change to a diagnosed file masks that file's report as stale,
+        // which would drop the only diagnostics producer and blank the bar
+        // for a reason unrelated to what this test pins.
+        {
+            let key = ServerKey {
+                kind: ServerKind::TypeScript,
+                root: root.clone(),
+            };
+            let mut lsp = ctx.lsp();
+            lsp.diagnostics_store_mut_for_test()
+                .publish(key, root.join("other.ts"), vec![]);
+        }
+        // Every producer has now reported, so the legacy projection exists.
+        assert!(ctx.status_bar_counts().is_some());
         let rx = status_frame_rx(&ctx);
         let watcher_tx = install_watcher_rx(&ctx);
         watcher_tx.send(watcher_paths_event(file)).unwrap();
@@ -3748,7 +4039,7 @@ mod watcher_filter_tests {
         drain_watcher_events(&ctx);
 
         let snapshot = recv_status_changed(&rx);
-        assert_eq!(snapshot["status_bar"]["errors"], serde_json::Value::from(0));
-        assert_eq!(ctx.status_bar_counts().unwrap().errors, 0);
+        assert!(snapshot["status_bar"].get("errors").is_none());
+        assert_eq!(ctx.status_bar_counts(), None);
     }
 }

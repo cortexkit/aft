@@ -200,6 +200,13 @@ pub fn handle_batch(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(ref id) = backup_id {
         result["backup_id"] = serde_json::json!(id);
     }
+    edit::attach_backup_skipped_reason(
+        &mut result,
+        ctx,
+        req.session(),
+        &op_id,
+        Some(path.as_path()),
+    );
 
     write_result.append_lsp_diagnostics_to(&mut result);
     write_result.append_reformatted_excerpt_to(&mut result);

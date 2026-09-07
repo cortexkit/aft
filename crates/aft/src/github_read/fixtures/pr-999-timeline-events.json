@@ -1,0 +1,19 @@
+[
+  {
+    "event": "labeled",
+    "created_at": "2026-09-03T05:05:00Z",
+    "actor": { "login": "maintainer" },
+    "label": { "name": "bug" }
+  },
+  {
+    "event": "closed",
+    "created_at": "2026-09-03T06:57:00Z",
+    "actor": { "login": "aft-alfonso[bot]" },
+    "commit_id": "0123456789abcdef"
+  },
+  {
+    "event": "reopened",
+    "created_at": "2026-09-03T07:00:00Z",
+    "actor": { "login": "maintainer" }
+  }
+]

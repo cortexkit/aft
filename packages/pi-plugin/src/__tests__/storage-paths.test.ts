@@ -9,7 +9,7 @@ import { withEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.
 import { buildConfigTierConfigureParams } from "../config.js";
 
 describe("Pi storage root resolution", () => {
-  test("honors absent, empty, and explicit AFT_STORAGE_DIR values", async () => {
+  test("honors the legacy cache rung plus absent, empty, and explicit storage overrides", async () => {
     const root = mkdtempSync(join(tmpdir(), "aft-pi-storage-paths-"));
     try {
       const dataHome = join(root, "xdg-data");
@@ -24,6 +24,8 @@ describe("Pi storage root resolution", () => {
           AFT_STORAGE_DIR: undefined,
         },
         () => {
+          expect(resolveCortexKitStorageRoot()).toBe(join(root, "legacy-cache", "aft"));
+          process.env.AFT_CACHE_DIR = "";
           expect(resolveCortexKitStorageRoot()).toBe(join(dataHome, "cortexkit", "aft"));
           process.env.AFT_STORAGE_DIR = "";
           expect(resolveCortexKitStorageRoot()).toBe(join(dataHome, "cortexkit", "aft"));

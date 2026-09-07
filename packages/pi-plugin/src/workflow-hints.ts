@@ -45,6 +45,8 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
 
   const hasOutline = !opts.absentTools.has("aft_outline");
   const hasZoom = !opts.absentTools.has("aft_zoom");
+  const readName = opts.hoistBuiltins ? "read" : "aft_read";
+  const hasRead = !opts.absentTools.has(readName);
   const hasGrep = opts.toolSurface !== "minimal" && !opts.absentTools.has(grepName);
   const hasSearch =
     opts.toolSurface !== "minimal" && opts.semanticEnabled && !opts.absentTools.has("aft_search");
@@ -77,15 +79,21 @@ export function buildWorkflowHints(opts: WorkflowHintsOpts): string | null {
   // serializing independent lookups, and shelling out to grep for code search.
   // aft_search is named alone when available (it auto-routes literals too);
   // only when absent do we point at the grep TOOL.
-  if (hasOutline && hasZoom && (hasGrep || hasSearch)) {
+  if (hasOutline && (hasGrep || hasSearch) && (hasZoom || hasRead)) {
     const searchName = hasSearch ? "aft_search" : grepName;
     const locate = hasSearch
       ? "`aft_search` is the primary code-search tool: one call auto-routes concepts, identifiers, regex, error strings, and literals."
       : `\`${grepName}\` (the tool — indexed and ranked) locates code.`;
-    const readName = opts.hoistBuiltins ? "read" : "aft_read";
+    const zoomSteer = hasZoom ? ", or `aft_zoom`" : "";
+    const searchSteer = hasSearch
+      ? `use \`aft_search\` (concepts, identifiers, regex, literals), \`${readName}\`, \`aft_outline\`${zoomSteer} instead`
+      : `use the \`${grepName}\` tool, \`${readName}\`, \`aft_outline\`${zoomSteer} instead`;
+    const bashSteer = hasBash
+      ? ` If you are about to run grep, rg, sed, awk, find, or cat through ${bashName} to locate or read code: STOP — ${searchSteer}.`
+      : "";
     sections.push(
       [
-        `**Code exploration**: ${locate} Then \`aft_outline\` for structure → \`aft_zoom\` for symbol(s). DO NOT run \`grep\`/\`rg\`/\`find\`/\`sed\`/\`cat\` through \`bash\` to locate or read code — the bash path is unindexed, unranked, serial, and routinely surfaces the wrong hit. Keep \`bash\` for shell facts (git state, file metadata, processes). Reflex translations:`,
+        `**Code exploration**: ${locate} Then \`aft_outline\` for structure → \`${hasZoom ? "aft_zoom" : readName}\` for symbol(s). DO NOT run \`grep\`/\`rg\`/\`find\`/\`sed\`/\`cat\` through \`bash\` to locate or read code — the bash path is unindexed, unranked, serial, and routinely surfaces the wrong hit. Keep \`bash\` for shell facts (git state, file metadata, processes).${bashSteer} Reflex translations:`,
         `- \`grep -rn "handleAuth" src/\` in bash → \`${searchName}({ query: "handleAuth" })\``,
         `- \`find . -name "*.ts" | xargs grep watcher\` in bash → \`${searchName}({ query: "watcher invalidation" })\` (concepts work too)`,
         `- \`sed -n '100,160p' app.ts\` / \`cat app.ts\` in bash → \`${readName}({ path: "app.ts", startLine: 100, endLine: 160 })\``,
@@ -212,6 +220,7 @@ export function registerWorkflowHints(
   if (!surface.navigate) absent.add("aft_callgraph");
   if (!surface.inspect) absent.add("aft_inspect");
   if (!surface.hoistGrep) absent.add(grepName);
+  if (!surface.hoistRead) absent.add(hoistBuiltins ? "read" : "aft_read");
   if (!surface.hoistBash) {
     absent.add(bashName);
     absent.add("bash_status");

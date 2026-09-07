@@ -376,7 +376,14 @@ fn callgraph_store_dead_code_supports_language(language: LangId) -> bool {
     // gate tied to the extraction substrate instead of extension names alone.
     let supported_by_store_liveness = matches!(
         language,
-        LangId::Rust | LangId::Go | LangId::C | LangId::Cpp | LangId::Zig | LangId::CSharp
+        LangId::Rust
+            | LangId::Go
+            | LangId::C
+            | LangId::Cpp
+            | LangId::Cuda
+            | LangId::Metal
+            | LangId::Zig
+            | LangId::CSharp
     );
     supported_by_store_liveness && !crate::calls::call_node_kinds(language).is_empty()
 }
@@ -391,6 +398,8 @@ pub(crate) fn language_name(language: LangId) -> &'static str {
         LangId::Go => "go",
         LangId::C => "c",
         LangId::Cpp => "cpp",
+        LangId::Cuda => "cuda",
+        LangId::Metal => "metal",
         LangId::Zig => "zig",
         LangId::CSharp => "csharp",
         LangId::Bash => "bash",
@@ -413,6 +422,7 @@ pub(crate) fn language_name(language: LangId) -> &'static str {
         LangId::R => "r",
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
+        LangId::Toml => "toml",
     }
 }
 

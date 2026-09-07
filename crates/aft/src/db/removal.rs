@@ -122,7 +122,7 @@ mod tests {
     use crate::db::backups::{insert_backup, BackupRow};
     use crate::db::bash_tasks::{upsert_bash_task, BashTaskRow};
 
-    fn fixture_db() -> (tempfile::TempDir, rusqlite::Connection) {
+    fn fixture_db() -> (tempfile::TempDir, crate::db::TrackedConnection) {
         let dir = tempfile::tempdir().expect("create fixture directory");
         let connection = crate::db::open(&dir.path().join("aft.db")).expect("open fixture db");
         (dir, connection)

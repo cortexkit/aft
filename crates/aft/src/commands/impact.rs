@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use crate::commands::callgraph_store_adapter::serialized_response;
 use crate::commands::callgraph_store_adapter::suspended_response;
 use crate::commands::callgraph_store_adapter::{
     building_response, impact_result, note_callgraph_building, note_callgraph_served,
@@ -85,8 +86,7 @@ pub fn handle_impact(req: &RawRequest, ctx: &AppContext) -> Response {
     match impact_result(&store, &file_path, symbol, depth, include_tests_param(req)) {
         Ok(result) => {
             note_callgraph_served(ctx, "impact", 0, "ok");
-            let result_json = serde_json::to_value(&result).unwrap_or_default();
-            Response::success(&req.id, result_json)
+            serialized_response(&req.id, "impact", &result)
         }
         Err(error) => store_error_response(&req.id, "impact", error),
     }

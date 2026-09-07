@@ -43,6 +43,7 @@ pub mod lsp_inspect;
 pub mod lsp_navigation;
 pub mod lsp_prepare_rename;
 pub mod lsp_rename;
+pub mod memory_census;
 pub mod move_file;
 pub mod move_symbol;
 pub mod multi_path;

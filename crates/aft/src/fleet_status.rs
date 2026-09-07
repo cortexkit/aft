@@ -295,6 +295,16 @@ impl From<&StatusWireRequest> for FleetRouteIdentity {
     }
 }
 
+/// Connect a management client using the daemon's authenticated subc dial path.
+/// Profile and the status publisher share this helper so there is one client
+/// implementation and one connection-file/authentication behavior.
+pub async fn connect_subc_consumer(
+    connection_file: &Path,
+    options: ConsumerOptions,
+) -> Result<SubcConsumer, subc_client_rs::ConsumerError> {
+    SubcConsumer::connect(connection_file, options).await
+}
+
 pub(crate) fn spawn_fleet_status_dial(
     connection_file: &Path,
     capacity: usize,
@@ -327,7 +337,7 @@ async fn run_fleet_status_dial(
             call_timeout: STATUS_CADENCE,
             ..ConsumerOptions::default()
         };
-        match SubcConsumer::connect(&connection_file, options).await {
+        match connect_subc_consumer(&connection_file, options).await {
             Ok(consumer) => break consumer,
             Err(error) => {
                 client.set_route_live(false);

@@ -22,6 +22,7 @@ function printHelp(): void {
   console.log("    setup            Interactive setup wizard");
   console.log("    index            Build one configured index snapshot (no scheduler)");
   console.log("    doctor           Check and fix configuration issues");
+  console.log("    doctor --profile [seconds]  Profile a running AFT daemon");
   console.log("    doctor lsp <file> Inspect LSP setup for one file");
   console.log("    doctor --fix     Auto-fix common issues (e.g. ONNX Runtime mismatch)");
   console.log("    doctor --clear   Select caches to clear with an interactive prompt");
@@ -39,6 +40,7 @@ function printHelp(): void {
   console.log(`    ${CLI} setup`);
   console.log(`    ${CLI} index`);
   console.log(`    ${CLI} doctor`);
+  console.log(`    ${CLI} doctor --profile 4`);
   console.log(`    ${CLI} doctor lsp ./src/main.py`);
   console.log(`    ${CLI} doctor --clear`);
   console.log(`    ${CLI} doctor --issue`);
@@ -62,6 +64,10 @@ async function main(): Promise<number> {
     return runIndex(args);
   }
   if (command === "doctor") {
+    if (args.includes("--profile")) {
+      const { runDoctorProfile } = await import("./commands/doctor.js");
+      return runDoctorProfile(args);
+    }
     if (args[0] === "lsp") {
       const { runLspDoctor } = await import("./commands/lsp.js");
       return runLspDoctor({ argv: args.slice(1) });

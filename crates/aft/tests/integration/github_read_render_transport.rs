@@ -205,10 +205,13 @@ case "$1:$2" in
   pr:view)
     cat "$AFT_GH_READ_FIXTURE_DIR/pr.json"
     ;;
-  api:graphql)
-    cat "$AFT_GH_READ_FIXTURE_DIR/pr-review-comments.json"
-    ;;
-  *)
+   api:graphql)
+     cat "$AFT_GH_READ_FIXTURE_DIR/pr-review-comments.json"
+     ;;
+   api:repos/*)
+     printf '[]\n'
+     ;;
+   *)
     printf 'unexpected fixture gh command: %s %s\n' "$1" "$2" >&2
     exit 1
     ;;
@@ -404,7 +407,16 @@ fn fixture_selected_markdown_is_byte_identical_across_all_transport_harnesses() 
     );
     let expected_calls = TransportHarness::ALL
         .iter()
-        .flat_map(|_| ["pr view", "api graphql", "pr view", "api graphql"])
+        .flat_map(|_| {
+            [
+                "pr view",
+                "api graphql",
+                "api repos/cortexkit/aft/issues/42/timeline?per_page=100",
+                "pr view",
+                "api graphql",
+                "api repos/cortexkit/aft/issues/42/timeline?per_page=100",
+            ]
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         fs::read_to_string(&call_log)

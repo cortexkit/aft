@@ -58,6 +58,8 @@ SEARCH_BUILD_RE = re.compile(r"search index cold streaming build: (?P<files>\d+)
 # Exact sample: 2026-09-02T04:36:31Z [aft] [ses_13ae8f525ffeCnx9aTNmVDRBdR] slow tool_call name=bash_drain_completions channel=31 corr=14 total=5670ms queue=0 translate=0 exec=5670 format=0 finalize=0 egress=0 egress_enqueue=0 egress_queue=0 egress_prepare=0 egress_write=0 frame_bytes=285 writer_queue_depth=1 writer_active=false writer_queue_full=false reserve_timeouts=0 root=/Users/ufukaltinok/Work/OSS/pi-mono
 SLOW_TOOL_RE = re.compile(r"slow tool_call name=(?P<tool>\S+) channel=\d+ corr=\d+ total=(?P<total>\d+)ms queue=(?P<queue>\d+) .*?\broot=(?P<root>\S+)")
 SLOW_WAITING_ON_RE = re.compile(r"\bwaiting_on=(?P<waiting_on>\S+)")
+# Causal waiting is a gate metric only for calls long enough to affect users.
+SLOW_WAITING_THRESHOLD_MS = 2_000
 INDEX_EVENT_RE = re.compile(r"\bindex_event(?P<body>(?: [a-z_]+=[^ =]+)+)")
 # Exact sample: 2026-09-02T05:06:29Z [aft] inspect-triggered cold-build request queued behind concurrency cap (2): request=inspect:/Users/ufukaltinok/.local/share/cortexkit/alfonso/worktrees/8f93aad09f2535d0/bg_1d190f2f615098f5:1 kind=explicit inspect Tier-2 run
 LIMITER_QUEUED_RE = re.compile(r"inspect-triggered cold-build request queued behind concurrency cap \(2\): request=inspect:(?P<root>.+):(?P<request>\d+) kind=explicit inspect Tier-2 run")
@@ -163,13 +165,31 @@ class RootStats:
     index_failed: Counter[str] = field(default_factory=Counter)
     index_suspended: Counter[str] = field(default_factory=Counter)
     waiting_on: Counter[str] = field(default_factory=Counter)
+    index_progress: DefaultDict[str, list[tuple[str, int]]] = field(default_factory=lambda: defaultdict(list))
+    index_resolution_share_pct: list[float] = field(default_factory=list)
 
 
 def apply_index_event(stats: RootStats, fields: dict[str, str]) -> None:
     plane = fields["plane"]
     kind = fields["kind"]
-    if kind == "build_ready" and "elapsed_ms" in fields:
-        stats.index_start_to_ready_ms[plane].append(int(fields["elapsed_ms"]))
+    build_id = fields.get("build_id", "")
+    if kind == "build_progress" and build_id and "elapsed_ms" in fields:
+        stats.index_progress[build_id].append((fields.get("stage", "unknown"), int(fields["elapsed_ms"])))
+    elif kind == "build_ready" and "elapsed_ms" in fields:
+        elapsed_ms = int(fields["elapsed_ms"])
+        stats.index_start_to_ready_ms[plane].append(elapsed_ms)
+        if plane == "callgraph" and build_id:
+            progress = stats.index_progress.pop(build_id, [])
+            resolution = [(index, elapsed) for index, (stage, elapsed) in enumerate(progress) if stage == "resolution"]
+            if resolution and elapsed_ms > 0:
+                first_index, first_elapsed = resolution[0]
+                last_elapsed = resolution[-1][1]
+                # Progress elapsed_ms is cumulative from build_started. Use the
+                # preceding stage boundary when available so the first resolution
+                # progress record includes the transition into that stage.
+                start_elapsed = progress[first_index - 1][1] if first_index else first_elapsed
+                duration_ms = max(0, last_elapsed - start_elapsed)
+                stats.index_resolution_share_pct.append(100.0 * duration_ms / elapsed_ms)
     elif kind == "first_query" and "ready_to_first_query_ms" in fields:
         stats.index_ready_to_first_query_ms[plane].append(int(fields["ready_to_first_query_ms"]))
     elif kind == "build_superseded":
@@ -239,6 +259,14 @@ def fmt_compact_ms(values: Iterable[int]) -> str:
     if not values:
         return "0/n/a/n/a"
     return f"{len(values)}/{percentile(values, 0.50)}/{max(values)}"
+
+
+def fmt_compact_pct(values: Iterable[float]) -> str:
+    values = sorted(values)
+    if not values:
+        return "0/n/a/n/a"
+    middle = values[max(0, math.ceil(len(values) * 0.50) - 1)]
+    return f"{len(values)}/{middle:.3f}/{max(values):.3f}"
 
 
 def clean_root(value: str) -> str:
@@ -461,6 +489,7 @@ def write_csv(path: Path, infos: list[RootInfo], stats: dict[str, RootStats]) ->
         "tier2_deferred", "breaker_or_suspension_hits",
         "index_search_start_to_ready_ms_n_p50_max", "index_search_ready_to_first_query_ms_n_p50_max",
         "index_callgraph_start_to_ready_ms_n_p50_max", "index_callgraph_ready_to_first_query_ms_n_p50_max",
+        "index_callgraph_resolution_share_pct_n_p50_max",
         "index_semantic_start_to_ready_ms_n_p50_max", "index_semantic_ready_to_first_query_ms_n_p50_max",
         "index_search_superseded", "index_search_failed", "index_search_suspended",
         "index_callgraph_superseded", "index_callgraph_failed", "index_callgraph_suspended",
@@ -509,6 +538,7 @@ def write_csv(path: Path, infos: list[RootInfo], stats: dict[str, RootStats]) ->
                 "index_search_ready_to_first_query_ms_n_p50_max": fmt_compact_ms(root_stats.index_ready_to_first_query_ms["search"]),
                 "index_callgraph_start_to_ready_ms_n_p50_max": fmt_compact_ms(root_stats.index_start_to_ready_ms["callgraph"]),
                 "index_callgraph_ready_to_first_query_ms_n_p50_max": fmt_compact_ms(root_stats.index_ready_to_first_query_ms["callgraph"]),
+                "index_callgraph_resolution_share_pct_n_p50_max": fmt_compact_pct(root_stats.index_resolution_share_pct),
                 "index_semantic_start_to_ready_ms_n_p50_max": fmt_compact_ms(root_stats.index_start_to_ready_ms["semantic"]),
                 "index_semantic_ready_to_first_query_ms_n_p50_max": fmt_compact_ms(root_stats.index_ready_to_first_query_ms["semantic"]),
                 "index_search_superseded": root_stats.index_superseded["search"],
@@ -773,7 +803,7 @@ def main() -> int:
                     if slow:
                         waiting_root = clean_root(slow.group("root"))
                     target = assign(waiting_root, "slow_tool_call")
-                    if target:
+                    if target and slow and int(slow.group("total")) > SLOW_WAITING_THRESHOLD_MS:
                         target.waiting_on[match.group("waiting_on")] += 1
 
     for root_stats in stats.values():
@@ -800,11 +830,17 @@ def self_test() -> None:
         "2026-09-03T00:00:01Z [aft] index_event kind=build_progress plane=search build_id=b-1-1 root=/tmp/proj key=abc stage=streaming completed=1 total=1 elapsed_ms=12",
         "2026-09-03T00:00:02Z [aft] index_event kind=build_ready plane=search build_id=b-1-1 root=/tmp/proj key=abc elapsed_ms=25 files=3 trigrams=9",
         "2026-09-03T00:00:03Z [aft] index_event kind=first_query plane=search build_id=b-1-1 root=/tmp/proj key=abc tool=grep queue_ms=1 service_ms=4 status=ok ready_to_first_query_ms=40",
-        "2026-09-03T00:00:04Z [aft] index_event kind=build_started plane=callgraph build_id=b-1-2 root=/tmp/proj key=abc",
-        "2026-09-03T00:00:05Z [aft] index_event kind=build_superseded plane=callgraph build_id=b-1-2 root=/tmp/proj key=abc stage=inventory",
-        "2026-09-03T00:00:06Z [aft] index_event kind=build_failed plane=semantic build_id=b-1-3 root=/tmp/proj key=abc reason=denied",
-        "2026-09-03T00:00:07Z [aft] index_event kind=build_suspended plane=callgraph build_id=b-1-4 root=/tmp/other key=def reason=breaker",
-        "2026-09-03T00:00:08Z [aft] slow tool_call name=grep channel=1 corr=1 total=12000ms queue=0 translate=0 exec=12000 format=0 finalize=0 egress=0 egress_enqueue=0 egress_queue=0 egress_prepare=0 egress_write=0 frame_bytes=1 writer_queue_depth=1 writer_active=false writer_queue_full=false reserve_timeouts=0 waiting_on=build waiting_on_build_id=b-1-1 wait_ms=8000 root=/tmp/proj",
+        "2026-09-03T00:00:04Z [aft] index_event kind=build_started plane=callgraph build_id=b-1-5 root=/tmp/proj key=abc",
+        "2026-09-03T00:00:05Z [aft] index_event kind=build_progress plane=callgraph build_id=b-1-5 root=/tmp/proj key=abc stage=symbol-export-index completed=1 total=1 elapsed_ms=10",
+        "2026-09-03T00:00:06Z [aft] index_event kind=build_progress plane=callgraph build_id=b-1-5 root=/tmp/proj key=abc stage=resolution completed=0 total=2 elapsed_ms=20",
+        "2026-09-03T00:00:07Z [aft] index_event kind=build_progress plane=callgraph build_id=b-1-5 root=/tmp/proj key=abc stage=resolution completed=2 total=2 elapsed_ms=50",
+        "2026-09-03T00:00:08Z [aft] index_event kind=build_ready plane=callgraph build_id=b-1-5 root=/tmp/proj key=abc elapsed_ms=100",
+        "2026-09-03T00:00:09Z [aft] index_event kind=build_started plane=callgraph build_id=b-1-2 root=/tmp/proj key=abc",
+        "2026-09-03T00:00:12Z [aft] index_event kind=build_superseded plane=callgraph build_id=b-1-2 root=/tmp/proj key=abc stage=inventory",
+        "2026-09-03T00:00:13Z [aft] index_event kind=build_failed plane=semantic build_id=b-1-3 root=/tmp/proj key=abc reason=denied",
+        "2026-09-03T00:00:14Z [aft] index_event kind=build_suspended plane=callgraph build_id=b-1-4 root=/tmp/other key=def reason=breaker",
+        "2026-09-03T00:00:10Z [aft] slow tool_call name=grep channel=1 corr=1 total=12000ms queue=0 translate=0 exec=12000 format=0 finalize=0 egress=0 egress_enqueue=0 egress_queue=0 egress_prepare=0 egress_write=0 frame_bytes=1 writer_queue_depth=1 writer_active=false writer_queue_full=false reserve_timeouts=0 waiting_on=build waiting_on_build_id=b-1-1 wait_ms=8000 root=/tmp/proj",
+        "2026-09-03T00:00:11Z [aft] slow tool_call name=grep channel=1 corr=2 total=1500ms queue=0 translate=0 exec=1500 format=0 finalize=0 egress=0 egress_enqueue=0 egress_queue=0 egress_prepare=0 egress_write=0 frame_bytes=1 writer_queue_depth=1 writer_active=false writer_queue_full=false reserve_timeouts=0 waiting_on=build waiting_on_build_id=b-1-1 wait_ms=1000 root=/tmp/proj",
     ]
     by_root: dict[str, RootStats] = {}
     for line in lines:
@@ -814,7 +850,7 @@ def self_test() -> None:
             apply_index_event(stats, fields)
         waiting = SLOW_WAITING_ON_RE.search(line)
         slow = SLOW_TOOL_RE.search(line)
-        if waiting and slow:
+        if waiting and slow and int(slow.group("total")) > SLOW_WAITING_THRESHOLD_MS:
             stats = by_root.setdefault(clean_root(slow.group("root")), RootStats())
             stats.waiting_on[waiting.group("waiting_on")] += 1
     proj = by_root["/tmp/proj"]
@@ -822,6 +858,7 @@ def self_test() -> None:
     assert proj.index_ready_to_first_query_ms["search"] == [40], proj.index_ready_to_first_query_ms
     assert proj.index_superseded["callgraph"] == 1, proj.index_superseded
     assert proj.index_failed["semantic"] == 1, proj.index_failed
+    assert proj.index_resolution_share_pct == [40.0], proj.index_resolution_share_pct
     assert proj.waiting_on["build"] == 1, proj.waiting_on
     other = by_root["/tmp/other"]
     assert other.index_suspended["callgraph"] == 1, other.index_suspended

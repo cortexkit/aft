@@ -10,6 +10,9 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut backup = ctx.backup().lock();
 
     let Some(file) = req.params.get("file").and_then(|v| v.as_str()) else {
+        if let Some(reason) = backup.take_latest_skipped_reason_for_undo(req.session(), None) {
+            return backup_skipped_response(req, reason);
+        }
         return match backup.restore_last_operation(req.session()) {
             Ok(operation) => Response::success(
                 &req.id,
@@ -40,6 +43,12 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
         Err(resp) => return resp,
     };
 
+    if let Some(reason) =
+        backup.take_latest_skipped_reason_for_undo(req.session(), Some(resolved.as_path()))
+    {
+        return backup_skipped_response(req, reason);
+    }
+
     match backup.restore_latest(req.session(), &resolved) {
         Ok((entry, warning)) => {
             let mut result = serde_json::json!({
@@ -55,6 +64,21 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 }
 
+fn backup_skipped_response(
+    req: &RawRequest,
+    reason: crate::backup::BackupSkippedReason,
+) -> Response {
+    Response::error_with_data(
+        &req.id,
+        "no_undo_history",
+        format!(
+            "undo is unavailable for this change because its backup snapshot was skipped ({})",
+            reason.as_str()
+        ),
+        serde_json::json!({ "backup_skipped_reason": reason.as_str() }),
+    )
+}
+
 /// Handle the `undo_preview` command: return paths the next undo would touch without restoring.
 ///
 /// Params: `file`/`filePath` (string, optional) — when provided, previews that per-file stack;
@@ -63,20 +87,41 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
 pub fn handle_undo_preview(req: &RawRequest, ctx: &AppContext) -> Response {
     let backup = ctx.backup().lock();
 
-    let preview = req
+    let path = match req
         .params
         .get("file")
         .or_else(|| req.params.get("filePath"))
         .and_then(|v| v.as_str())
-        .map(|file| {
+    {
+        Some(file) => {
             let input = ctx.resolve_relative_path(Path::new(file));
-            ctx.validate_write_location(&req.id, &input)
-                .and_then(|path| {
-                    backup
-                        .preview_latest_path(req.session(), &path)
-                        .map(|path| vec![path])
-                        .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))
-                })
+            match ctx.validate_write_location(&req.id, &input) {
+                Ok(path) => Some(path),
+                Err(response) => return response,
+            }
+        }
+        None => None,
+    };
+
+    if let Some(reason) = backup.latest_skipped_reason_for_undo(req.session(), path.as_deref()) {
+        return Response::success(
+            &req.id,
+            serde_json::json!({
+                "paths": path.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                "count": path.iter().count(),
+                "backup_skipped_reason": reason.as_str(),
+                "undo_unavailable": true,
+            }),
+        );
+    }
+
+    let preview = path
+        .as_deref()
+        .map(|path| {
+            backup
+                .preview_latest_path(req.session(), path)
+                .map(|path| vec![path])
+                .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))
         })
         .unwrap_or_else(|| {
             backup

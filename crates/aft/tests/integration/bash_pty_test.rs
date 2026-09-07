@@ -10,6 +10,9 @@ use aft::bash_background::pty_runtime::CompletionCoordinator;
 use aft::bash_background::{BgCompletion, BgTaskRegistry, BgTaskStatus};
 use serde_json::json;
 
+#[cfg(unix)]
+use super::helpers::ReleaseOnDrop;
+
 const SESSION: &str = "pty-phase-1a";
 
 fn registry() -> BgTaskRegistry {
@@ -377,11 +380,15 @@ fn pty_completion_coordinator_fires_only_when_both_done() {
 fn pty_watchdog_wake_channel_triggers_immediate_completion() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
+    let wake_ready = project.path().join("wake-ready");
+    // Declare after both TempDirs: Rust drops locals in reverse declaration order,
+    // so this guard writes the sentinel before either TempDir removes its directory.
+    let _release_guard = ReleaseOnDrop::new(wake_ready.clone());
     let registry = registry();
     let task_id = registry
         .spawn_pty(
             aft::sandbox_spawn::SpawnPlan::Unsandboxed,
-            "/bin/sh -c 'while [ ! -f wake-ready ]; do sleep 0.01; done; printf wake'",
+            "/bin/sh -c 'polls=0; while [ ! -f wake-ready ] && [ \"$polls\" -lt 6000 ]; do sleep 0.01; polls=$((polls + 1)); done; if [ -f wake-ready ]; then printf wake; else printf gate-timeout; fi'",
             SESSION.to_string(),
             project.path().to_path_buf(),
             Default::default(),
@@ -401,7 +408,7 @@ fn pty_watchdog_wake_channel_triggers_immediate_completion() {
     // spawn folded PTY allocation + fork + `/bin/sh` startup into the budget —
     // the heavy, CI-variable cost that flaked this assertion under load.
     let started = Instant::now();
-    fs::write(project.path().join("wake-ready"), b"ready").unwrap();
+    drop(_release_guard);
 
     // Do not poll status here: status() calls poll_task directly and can
     // complete PTY tasks without the watchdog. Draining completions observes
@@ -772,7 +779,18 @@ fn pty_kill_terminates_sighup_ignoring_cat() {
     );
 
     let killed = registry.kill(&task_id, SESSION).unwrap();
-    assert_eq!(killed.info.status, BgTaskStatus::Killing);
+    // The reply reports Killing while the TERM grace runs, or Killed when the
+    // watchdog escalated and reaped the child before the reply was built (a
+    // slow CI runner); both mean the kill was accepted. The wait below is the
+    // real assertion.
+    assert!(
+        matches!(
+            killed.info.status,
+            BgTaskStatus::Killing | BgTaskStatus::Killed
+        ),
+        "unexpected kill status {:?}",
+        killed.info.status
+    );
     wait_for_status(&registry, &task_id, BgTaskStatus::Killed);
 }
 

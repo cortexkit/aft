@@ -4,7 +4,10 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use rusqlite::{Connection, OpenFlags};
+use crate::db::{SqliteStore, TrackedConnection};
+#[cfg(test)]
+use rusqlite::Connection;
+use rusqlite::OpenFlags;
 use serde_json::json;
 
 const ROOT_KEYED_COPY_DISK_FLOOR_NUMERATOR: u64 = 3;
@@ -394,7 +397,12 @@ fn inspect_tier2_last_full_run(inspect_dir: &Path, key: &str) -> Option<i64> {
     .into_iter()
     .find(|candidate| candidate.is_file())?;
 
-    let conn = Connection::open_with_flags(&sqlite_path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let conn = TrackedConnection::open_path_with_flags(
+        &sqlite_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+        SqliteStore::InspectScopeCache,
+    )
+    .ok()?;
     conn.busy_timeout(Duration::from_millis(500)).ok()?;
     conn.query_row("SELECT MAX(last_full_run) FROM tier2_meta", [], |row| {
         row.get::<_, Option<i64>>(0)

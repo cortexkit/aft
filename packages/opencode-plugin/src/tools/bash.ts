@@ -11,7 +11,7 @@ import {
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { trackBgTask } from "../bg-notifications.js";
-import { resolveBashConfig } from "../config.js";
+import { resolveBashConfig, toolEnabled } from "../config.js";
 import { sessionLog } from "../logger.js";
 import { resolveIsSubagent } from "../shared/subagent-detect.js";
 import type { PluginContext } from "../types.js";
@@ -92,15 +92,16 @@ export function bashToolDescription(
   compressionOn: boolean,
   backgroundOn: boolean,
   detachOnUserMessage = true,
+  zoomEnabled = true,
 ): string {
   const searchSteer = aftSearchRegistered
-    ? "use aft_search (concepts, identifiers, regex, literals), read, aft_outline, or aft_zoom instead"
-    : "use the grep tool, read, aft_outline, or aft_zoom instead";
+    ? `use aft_search (concepts, identifiers, regex, literals), read, aft_outline${zoomEnabled ? ", or aft_zoom" : ""} instead`
+    : `use the grep tool, read, aft_outline${zoomEnabled ? ", or aft_zoom" : ""} instead`;
   const compression = compressionOn
     ? " Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks."
     : "";
   const tasks = backgroundOn
-    ? ` Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting; ${userMessageDetachDescription(detachOnUserMessage)} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch waits on the task (sync blocks until exit/pattern, async notifies) and bash_status peeks at it — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: "screen" }) plus bash_write.`
+    ? ` Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting; ${userMessageDetachDescription(detachOnUserMessage)} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch handles only a short remaining wait (default 30s, max bash.watch_sync_max_ms, 120s by default); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: "screen" }) plus bash_write.`
     : " Commands run in the foreground to completion; timeout is the hard kill cap (default 30 minutes).";
   return `Execute shell commands.${compression}${tasks}
 
@@ -289,7 +290,13 @@ export function createBashTool(
   let hostFallbackActive = false;
 
   return {
-    description: bashToolDescription(false, initialBashCfg.compress, initialBashCfg.background),
+    description: bashToolDescription(
+      false,
+      initialBashCfg.compress,
+      initialBashCfg.background,
+      true,
+      toolEnabled(ctx.config, "aft_zoom"),
+    ),
     args: args as ToolDefinition["args"],
     execute: async (args, context) => {
       const bashCfg = resolveBashConfig(ctx.config);

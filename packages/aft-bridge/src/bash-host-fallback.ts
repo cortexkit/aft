@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { delimiter, join } from "node:path";
+import { join } from "node:path";
+import { withPathPrepended } from "./path-env.js";
 import { resolveCortexKitStorageRoot, resolveStoragePath } from "./storage-paths.js";
 
 export const BASH_HOST_FALLBACK_BANNER =
@@ -34,18 +35,61 @@ export interface BashHostFallbackResult extends Record<string, unknown> {
  * while the transport is down - exactly the fallback state. Without this, a
  * transport outage silently converts bot speech into ambient-credential posts.
  */
-export function hostFallbackPathWithShims(env: NodeJS.ProcessEnv): string | undefined {
+function pathKeyForPlatform(env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string | undefined {
+  return platform === "win32"
+    ? Object.keys(env).find((key) => key.toLowerCase() === "path")
+    : "PATH";
+}
+
+function mergeEnvForPlatform(
+  env: NodeJS.ProcessEnv,
+  overrides: NodeJS.ProcessEnv | undefined,
+  platform: NodeJS.Platform,
+): NodeJS.ProcessEnv {
+  const merged = { ...env };
+  if (platform === "win32" && overrides) {
+    const overridesPath = Object.keys(overrides).some((key) => key.toLowerCase() === "path");
+    if (overridesPath) {
+      for (const key of Object.keys(merged)) {
+        if (key.toLowerCase() === "path") delete merged[key];
+      }
+    }
+  }
+  return Object.assign(merged, overrides);
+}
+
+function hostFallbackEnvWithShims(
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+): NodeJS.ProcessEnv {
+  const normalized = withPathPrepended(env, undefined, platform);
+  const pathKey = pathKeyForPlatform(normalized, platform);
+  const inherited = pathKey === undefined ? undefined : normalized[pathKey];
+
   // Honor the caller-visible AFT_STORAGE_DIR override from the SAME env the
   // child will receive, falling back to the shared storage root.
-  const storageRoot = env.AFT_STORAGE_DIR
-    ? resolveStoragePath(env.AFT_STORAGE_DIR)
+  const storageRoot = normalized.AFT_STORAGE_DIR
+    ? resolveStoragePath(normalized.AFT_STORAGE_DIR)
     : resolveCortexKitStorageRoot();
   const shimsDir = join(storageRoot, "shims");
-  if (!existsSync(join(shimsDir, "gh"))) return env.PATH;
-  const inherited = env.PATH ?? "";
-  const entries = inherited.split(delimiter).filter((entry) => entry.length > 0);
-  if (entries[0] === shimsDir) return inherited;
-  return [shimsDir, ...entries.filter((entry) => entry !== shimsDir)].join(delimiter);
+  if (!existsSync(join(shimsDir, "gh"))) return normalized;
+
+  const separator = platform === "win32" ? ";" : ":";
+  const entries = (inherited ?? "").split(separator).filter((entry) => entry.length > 0);
+  if (entries[0] === shimsDir) return normalized;
+  normalized[pathKey ?? "PATH"] = [shimsDir, ...entries.filter((entry) => entry !== shimsDir)].join(
+    separator,
+  );
+  return normalized;
+}
+
+export function hostFallbackPathWithShims(
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  const normalized = hostFallbackEnvWithShims(env, platform);
+  const pathKey = pathKeyForPlatform(normalized, platform);
+  return pathKey === undefined ? undefined : normalized[pathKey];
 }
 
 export function bashHostFallbackAskPattern(command: string, cwd: string): string {
@@ -86,12 +130,10 @@ export async function runBashHostFallback(
     const child = spawn(options.command, {
       cwd: options.projectRoot,
       shell: true,
-      env: (() => {
-        const merged = { ...process.env, ...options.env };
-        const path = hostFallbackPathWithShims(merged);
-        if (path !== undefined) merged.PATH = path;
-        return merged;
-      })(),
+      env: hostFallbackEnvWithShims(
+        mergeEnvForPlatform(process.env, options.env, process.platform),
+        process.platform,
+      ),
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
       windowsHide: true,

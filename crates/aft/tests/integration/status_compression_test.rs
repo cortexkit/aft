@@ -4,10 +4,10 @@ use std::sync::{Arc, LazyLock, Mutex};
 use aft::config::Config;
 use aft::context::AppContext;
 use aft::db::compression_events::{insert_compression_event, CompressionEventRow};
+use aft::db::{SqliteStore, TrackedConnection as Connection};
 use aft::harness::Harness;
 use aft::parser::TreeSitterProvider;
 use aft::path_identity::project_scope_key;
-use rusqlite::Connection;
 use tempfile::tempdir;
 
 static STATUS_SQL_TRACE: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -20,7 +20,7 @@ fn capture_status_sql(sql: &str) {
 }
 
 fn context_with_db(project_root: &Path, harness: Harness) -> (AppContext, Arc<Mutex<Connection>>) {
-    let mut conn = Connection::open_in_memory().expect("open test DB");
+    let mut conn = Connection::open_in_memory(SqliteStore::AftDb).expect("open test DB");
     aft::db::run_migrations(&mut conn).expect("migrate test DB");
     let shared = Arc::new(Mutex::new(conn));
     let ctx = context_without_db(project_root, harness);

@@ -11,10 +11,12 @@ struct BashAckCompletionsParams {
 }
 
 pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
+    let background = ctx.bash_background();
     Response::success(
         &req.id,
         json!({
-            "bg_completions": ctx.bash_background().drain_completions_for_session(Some(req.session())),
+            "bg_completions": background.drain_completions_for_session(Some(req.session())),
+            "pending_matches": background.pending_pattern_matches_for_session(req.session()),
         }),
     )
 }

@@ -80,9 +80,9 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
     const result = await harness.callTool("aft_outline", { target: "directory", files: true });
     const text = harness.text(result);
 
-    expect(text).toMatch(/alpha\.ts\s+typescript\s+1 syms\s+\d+ bytes/);
-    expect(text).toMatch(/beta\.ts\s+typescript\s+1 syms\s+\d+ bytes/);
-    expect(text).toMatch(/gamma\.ts\s+typescript\s+1 syms\s+\d+ bytes/);
+    expect(text).toMatch(/alpha\.ts\s+typescript\s+1 syms\s+\d+ lines/);
+    expect(text).toMatch(/beta\.ts\s+typescript\s+1 syms\s+\d+ lines/);
+    expect(text).toMatch(/gamma\.ts\s+typescript\s+1 syms\s+\d+ lines/);
   });
 
   test("outline files mode accepts array target of directories", async () => {
@@ -105,8 +105,8 @@ maybeDescribe("aft_outline + aft_zoom (real bridge)", () => {
     });
     const text = harness.text(result);
 
-    expect(text).toMatch(/one\.ts\s+typescript\s+1 syms\s+\d+ bytes/);
-    expect(text).toMatch(/two\.py\s+python\s+1 syms\s+\d+ bytes/);
+    expect(text).toMatch(/one\.ts\s+typescript\s+1 syms\s+\d+ lines/);
+    expect(text).toMatch(/two\.py\s+python\s+1 syms\s+\d+ lines/);
   });
 
   test("outline rejects empty string target", async () => {

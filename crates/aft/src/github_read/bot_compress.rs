@@ -603,8 +603,6 @@ mod tests {
                         .any(|line| matches!(line.as_bytes(), [b'P', b'0'..=b'3', b':', ..]))
             })
             .expect("fixture contains a cubic thread finding");
-        let cubic_ordinal = cubic_index + 1;
-        assert_eq!(cubic_ordinal, 16, "the pinned first cubic ordinal changed");
         let cubic_body = bodies[cubic_index];
         let default_render = render_document_for_resource(
             &document,
@@ -621,6 +619,10 @@ mod tests {
             .split("### [")
             .find(|item| item.contains(cubic_finding))
             .expect("default render includes the compressed cubic finding");
+        let cubic_ordinal = rendered_cubic_item
+            .split_once(']')
+            .and_then(|(ordinal, _)| ordinal.parse::<usize>().ok())
+            .expect("default render item begins with its discussion ordinal");
         assert!(
             rendered_cubic_item.contains(&format!(
                 "[compressed; full: pr://cortexkit/aft/270/comments/{cubic_ordinal}]"

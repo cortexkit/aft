@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::commands::outline::symbol_to_entry;
+use crate::commands::read::{handle_github_zoom, is_github_read_target};
 use crate::commands::symbol_render::{
     build_container_outline, format_qualified_entry, might_have_container_members,
     qualified_symbol_name, render_container_member_menu, should_return_member_menu,
@@ -142,6 +143,9 @@ fn zoom_one_target_response(
     context_lines: usize,
     include_callgraph: bool,
 ) -> Response {
+    if is_github_read_target(file) {
+        return handle_github_zoom(req, ctx, file, symbol);
+    }
     let (path, source) = match resolve_zoom_file(req, ctx, file) {
         Ok(file) => file,
         Err(resp) => return resp,
@@ -294,6 +298,14 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
+
+    if is_github_read_target(file) {
+        let selector = match github_zoom_selector(req) {
+            Ok(selector) => selector,
+            Err(response) => return response,
+        };
+        return handle_github_zoom(req, ctx, file, &selector);
+    }
 
     let start_line = req
         .params
@@ -473,6 +485,35 @@ pub fn handle_zoom(req: &RawRequest, ctx: &AppContext) -> Response {
         context_lines,
         include_callgraph,
     )
+}
+
+fn github_zoom_selector(req: &RawRequest) -> Result<String, Response> {
+    let value = req
+        .params
+        .get("symbols")
+        .or_else(|| req.params.get("symbol"));
+    match value {
+        Some(serde_json::Value::String(selector)) if !selector.trim().is_empty() => {
+            Ok(selector.trim().to_string())
+        }
+        Some(serde_json::Value::Array(values)) if !values.is_empty() => values
+            .iter()
+            .map(|value| value.as_str().filter(|value| !value.trim().is_empty()))
+            .collect::<Option<Vec<_>>>()
+            .map(|values| values.join(","))
+            .ok_or_else(|| {
+                Response::error(
+                    &req.id,
+                    "invalid_request",
+                    "zoom: GitHub symbols must be non-empty ordinal strings",
+                )
+            }),
+        _ => Err(Response::error(
+            &req.id,
+            "invalid_request",
+            "zoom: GitHub targets require discussion ordinals in symbols",
+        )),
+    }
 }
 
 /// Raw `symbol` or `symbols` param before language-aware splitting.
@@ -890,10 +931,12 @@ fn zoom_one_symbol(
 
     if should_return_member_menu(target, resolved_lang, container_outline.as_ref()) {
         let kind_str = symbol_kind_string(&target.kind);
+        let zoom_enabled = ctx.tool_enabled("aft_zoom");
         let menu = format!(
-            "{}. {} Pick one of the listed member names and zoom it for its body.",
-            render_container_member_menu(target, container_outline.as_ref().unwrap()),
+            "{}. {} Pick one of the listed member names and {} it for its body.",
+            render_container_member_menu(target, container_outline.as_ref().unwrap(), zoom_enabled,),
             RETRY_UNCHANGED_ZOOM_MESSAGE,
+            if zoom_enabled { "zoom" } else { "read" },
         );
         let resp = ZoomResponse {
             name: target.name.clone(),
@@ -2805,6 +2848,16 @@ function helper(value: number): number {
             "expected member menu, got: {content}"
         );
         assert!(content.contains("Pick one of the listed member names"));
+
+        let disabled_ctx = make_ctx();
+        disabled_ctx.update_config(|config| {
+            config.disabled_tools.push("aft_zoom".to_string());
+        });
+        let disabled = serde_json::to_value(handle_zoom(&req, &disabled_ctx)).unwrap();
+        let disabled_content = disabled["content"].as_str().unwrap();
+        assert!(disabled_content.contains("member-signature menu; read a member for its body"));
+        assert!(disabled_content.contains("Pick one of the listed member names and read it"));
+        assert!(!disabled_content.contains("aft_zoom"));
     }
 
     fn assert_heading_miss_steering(fixture: &str) {

@@ -145,6 +145,12 @@ jobs:
       - name: Bun lint
         run: bun run lint
 
+      # The design gate decides whether a contributor PR is reviewable at all,
+      # so its parsing and decision logic is unit tested. The suite is offline
+      # and platform-independent, so Linux runs it once for everyone.
+      - name: Design gate unit tests
+        run: bun run test:design-gate
+
       - name: Build aft-bridge dist (workspace consumers depend on it)
         run: bun run --cwd packages/aft-bridge build
 

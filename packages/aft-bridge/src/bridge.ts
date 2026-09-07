@@ -8,6 +8,7 @@ import { StringDecoder } from "node:string_decoder";
 import { error, getActiveLogger, getLogFilePath, log, warn } from "./active-logger.js";
 import { isPassiveCommand, PASSIVE_COMMAND_TIMEOUT_MS } from "./command-timeouts.js";
 import type { Logger, LogMeta } from "./logger.js";
+import { withPathPrepended } from "./path-env.js";
 import type { BgCompletion, StatusCompression } from "./protocol.js";
 import type {
   AftProjectTransport,
@@ -360,8 +361,8 @@ export interface StatusSnapshot {
 export interface BridgeRequestOptions {
   onProgress?: (chunk: { kind: "stdout" | "stderr"; text: string }) => void;
   /**
-   * Host cancellation for one standalone NDJSON request. Supervisor-backed subc
-   * routes ignore this because route closure already signals executor cancellation.
+   * Host cancellation for one Rust request. Standalone sends `cancel_request`;
+   * supervisor-backed subc closes the scoped route so the daemon cancels it.
    */
   abortSignal?: AbortSignal;
   /** Per-call transport timeout in milliseconds. Defaults to the bridge-wide timeout. */
@@ -459,6 +460,7 @@ export class BinaryBridge implements AftProjectTransport {
   private errorPrefix: string;
   private readonly logger: Logger | undefined;
   private readonly childEnv: Record<string, string | undefined> | undefined;
+  private readonly platform: NodeJS.Platform;
 
   constructor(
     binaryPath: string,
@@ -466,6 +468,7 @@ export class BinaryBridge implements AftProjectTransport {
     options?: BridgeOptions,
     configOverrides?: Record<string, unknown>,
     editSlotSurvives?: boolean,
+    platform: NodeJS.Platform = process.platform,
   ) {
     this.binaryPath = binaryPath;
     this.cwd = cwd;
@@ -505,6 +508,7 @@ export class BinaryBridge implements AftProjectTransport {
     this.onBashPatternMatch = options?.onBashPatternMatch;
     this.logger = options?.logger;
     this.childEnv = options?.childEnv;
+    this.platform = platform;
   }
 
   private logVia(message: string, meta?: LogMeta): void {
@@ -1302,21 +1306,13 @@ export class BinaryBridge implements AftProjectTransport {
         ? null
         : join(
             ortDir,
-            process.platform === "win32"
+            this.platform === "win32"
               ? "onnxruntime.dll"
-              : process.platform === "darwin"
+              : this.platform === "darwin"
                 ? "libonnxruntime.dylib"
                 : "libonnxruntime.so",
           );
-    const envPath =
-      process.platform === "win32" && ortDir
-        ? `${ortDir};${process.env.PATH ?? ""}`
-        : process.env.PATH;
-
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      ...(envPath ? { PATH: envPath } : {}),
-    };
+    const env: NodeJS.ProcessEnv = { ...process.env };
 
     // Diagnostic: prove the spawnProcess code path executes and what
     // useFastembedBackend / parent ORT_DYLIB_PATH look like at spawn time.
@@ -1352,11 +1348,16 @@ export class BinaryBridge implements AftProjectTransport {
       }
     }
 
-    // Per-bridge child env overrides (e.g. AFT_CACHE_DIR in tests). Applied last
-    // so they win over inherited/derived values, and scoped to THIS child only —
-    // no shared process.env mutation, so concurrent bridges can't race.
+    // Per-bridge child env overrides (e.g. AFT_CACHE_DIR in tests) are scoped to
+    // THIS child only, so concurrent bridges never race through process.env. PATH
+    // overrides supply the inherited tail; managed ONNX still stays at the front.
     if (this.childEnv) {
       for (const [key, value] of Object.entries(this.childEnv)) {
+        if (this.platform === "win32" && key.toLowerCase() === "path") {
+          for (const envKey of Object.keys(env)) {
+            if (envKey.toLowerCase() === "path") delete env[envKey];
+          }
+        }
         if (value === undefined) {
           delete env[key];
         } else {
@@ -1365,10 +1366,15 @@ export class BinaryBridge implements AftProjectTransport {
       }
     }
 
+    const spawnEnv = withPathPrepended(
+      env,
+      this.platform === "win32" ? ortDir : undefined,
+      this.platform,
+    );
     const child = spawn(this.binaryPath, [], {
       cwd: this.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env,
+      env: spawnEnv,
     });
     const currentChild = child;
 

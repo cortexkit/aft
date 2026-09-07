@@ -78,10 +78,10 @@ pub(crate) fn well_known_windows_bin_dirs(userprofile: Option<&std::ffi::OsStr>)
     dirs.push(PathBuf::from(r"C:\Go\bin"));
     dirs.push(PathBuf::from(r"C:\Program Files\Go\bin"));
     dirs.push(PathBuf::from(r"C:\Program Files\nodejs"));
-    if let Some(appdata) = std::env::var_os("APPDATA") {
+    if let Some(appdata) = crate::environment::non_empty_os_var("APPDATA") {
         dirs.push(PathBuf::from(appdata).join("npm"));
     }
-    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+    if let Some(local) = crate::environment::non_empty_os_var("LOCALAPPDATA") {
         let local_path = PathBuf::from(local);
         dirs.push(local_path.join("pnpm"));
         dirs.push(local_path.join("Programs").join("Python"));

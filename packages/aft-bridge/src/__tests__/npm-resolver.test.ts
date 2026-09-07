@@ -107,11 +107,26 @@ describe("resolveNpm", () => {
     makeNpm(pathDir, "npm.cmd");
     const result = resolveNpm({
       platform: "win32",
-      env: { PATH: pathDir },
+      env: { Path: pathDir },
       home: root,
       execPath: "C:\\node\\node.exe",
     });
     expect(result?.command).toBe(join(pathDir, "npm.cmd"));
+  });
+
+  it("does not treat case-variant Path as executable PATH on non-Windows", () => {
+    const pathDir = join(root, "case-variant-bin");
+    makeNpm(pathDir);
+
+    expect(
+      resolveNpm({
+        platform: "linux",
+        env: { Path: pathDir },
+        home: root,
+        execPath: "/standalone/bun",
+        systemNpmDirs: [],
+      }),
+    ).toBeNull();
   });
 
   it("returns null when npm is nowhere to be found", () => {
@@ -371,12 +386,19 @@ describe("npmInvocation", () => {
           signalCode: { value: null },
         });
 
+        // The fake child never exits, so this call resolves only at the grace
+        // deadline, and only if taskkill's exit event has been delivered by
+        // then. Under Bun 1.4.0 on macOS a fast-exiting child's exit event is
+        // occasionally delivered about 1 s late (measured 2-5 per 200 spawns
+        // of this exact shape; 0 per 200 under Node 24), so a 1 s grace reads
+        // that runtime hiccup as "taskkill did not confirm". 3 s keeps the
+        // assertion about the code's late-exit handling, not the runtime's.
         await expect(
           terminateNpmProcessTree(
             child,
             { command: "cmd.exe", args: [], windowsCmdShim: true },
             { SystemRoot: systemRoot },
-            1_000,
+            3_000,
           ),
         ).resolves.toBeUndefined();
       } finally {
@@ -515,5 +537,16 @@ describe("npmSpawnEnv", () => {
   it("leaves env unchanged when binDir is null (PATH-resolved)", () => {
     const env = npmSpawnEnv({ command: "npm", binDir: null }, { PATH: "/usr/bin" });
     expect(env.PATH).toBe("/usr/bin");
+  });
+
+  it("normalizes inherited Windows Path spelling at the npm spawn seam", () => {
+    const env = npmSpawnEnv(
+      { command: "C:\\nodejs\\npm.cmd", binDir: "C:\\nodejs" },
+      { Path: "C:\\Windows\\System32", PATH: "C:\\stale" },
+      "win32",
+    );
+
+    expect(Object.keys(env).filter((key) => key.toLowerCase() === "path")).toEqual(["Path"]);
+    expect(env.Path).toBe("C:\\nodejs;C:\\Windows\\System32");
   });
 });

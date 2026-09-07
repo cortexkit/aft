@@ -2,7 +2,7 @@ use aft::db::github_read_cache::{
     invalidate_github_read_cache_resource, lookup_github_read_cache_entry,
     upsert_github_read_cache_entry, GithubReadCacheKey, GithubReadResourceKind,
 };
-use rusqlite::Connection;
+use aft::db::TrackedConnection as Connection;
 
 fn fixture_db() -> (tempfile::TempDir, Connection) {
     let dir = tempfile::tempdir().expect("create temporary storage");

@@ -94,4 +94,14 @@ describe("hostFallbackPathWithShims", () => {
     const env = { PATH: "/usr/bin:/bin", AFT_STORAGE_DIR: "/nonexistent-aft-storage-root" };
     expect(hostFallbackPathWithShims(env)).toBe("/usr/bin:/bin");
   });
+
+  test("uses the inherited Windows Path value when variants collide", () => {
+    const env = {
+      Path: "C:\\Windows\\System32;C:\\Git\\cmd",
+      PATH: "C:\\stale",
+      AFT_STORAGE_DIR: "C:\\nonexistent-aft-storage-root",
+    };
+
+    expect(hostFallbackPathWithShims(env, "win32")).toBe("C:\\Windows\\System32;C:\\Git\\cmd");
+  });
 });

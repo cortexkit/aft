@@ -28,6 +28,28 @@ afterEach(async () => {
 });
 
 describe("reading tool adapters", () => {
+  test("describes outline guidance without invalid read callgraph syntax", () => {
+    const { api, tools } = makeMockApi();
+    const { bridge } = makeMockBridge();
+    registerReadingTools(api, makePluginContext(bridge), { outline: true, zoom: true });
+    const enabled = tools.get("aft_outline")!.description;
+
+    const disabledApi = makeMockApi();
+    registerReadingTools(
+      disabledApi.api,
+      makePluginContext(bridge, { config: { disabled_tools: ["aft_zoom"] } as never }),
+      { outline: true, zoom: true },
+    );
+    const disabled = disabledApi.tools.get("aft_outline")!.description;
+    expect(enabled).toContain("aft_zoom with `callgraph:true`");
+    expect(enabled).toContain("breadth-first with directory rollups");
+    expect(enabled).toContain("line count");
+    expect(enabled).not.toContain("up to 200 files");
+    expect(enabled).not.toContain("byte metadata");
+    expect(disabled).toContain("prefer aft_search + read on named symbols");
+    expect(disabled).not.toContain("aft_zoom");
+    expect(disabled).not.toContain("read with `callgraph:true`");
+  });
   test("aft_outline maps a target array to the bridge files request", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "outline" }));

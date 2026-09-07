@@ -10,6 +10,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+
+use super::helpers::ReleaseOnDrop;
 use subc_protocol::session::{ModuleControlRequest, ModuleControlResponse};
 use subc_protocol::{
     BindIdentity, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody, Principal,
@@ -42,6 +44,9 @@ fn subc_background_bash_survives_module_process_group_restart() {
 
         let ready = project.path().join("bg.ready");
         let stop = project.path().join("bg.stop");
+        // Declare after all TempDirs: Rust drops locals in reverse declaration
+        // order, so this guard writes the sentinel before any TempDir removes its directory.
+        let _stop_guard = ReleaseOnDrop::new(stop.clone());
         let command = sentinel_command(&ready, &stop);
 
         let mut first_module = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
@@ -99,7 +104,7 @@ fn subc_background_bash_survives_module_process_group_restart() {
         );
         assert_process_alive(child_pid, "rehydrated background child");
 
-        std::fs::write(&stop, "stop\n").expect("write stop sentinel");
+        drop(_stop_guard);
         let completed = wait_for_status(&mut stream, 31, &task_id, "completed").await;
         assert_eq!(completed["exit_code"], 0, "task should exit cleanly: {completed}");
         let output = completed["output_preview"].as_str().unwrap_or_default();
@@ -111,6 +116,58 @@ fn subc_background_bash_survives_module_process_group_restart() {
         send_connection_goodbye(&mut stream).await;
         let second_exit = second_module.wait_for_exit("second module graceful shutdown");
         assert!(second_exit.success(), "second module exit status: {second_exit}");
+    });
+}
+
+/// The supervisor respawns a module only on a non-zero exit; exit 0 means
+/// "stopped on request" and leaves the module down with no respawn. So the
+/// two ways a daemon connection can end must map to different exit codes:
+/// a channel-0 Goodbye is a stop request (0), a bare EOF is a connection loss
+/// (3). Both arms run the real binary; the second is the control that keeps
+/// the codes provably distinct.
+#[test]
+fn subc_bare_eof_exits_nonzero_and_goodbye_exits_zero() {
+    const CONNECTION_LOST_EXIT_CODE: i32 = 3;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+
+    runtime.block_on(async {
+        let project = tempfile::tempdir().expect("project tempdir");
+        let storage = tempfile::tempdir().expect("storage tempdir");
+        let conn_dir = tempfile::tempdir().expect("connection tempdir");
+        let config_home = tempfile::tempdir().expect("config home tempdir");
+        let data_home = tempfile::tempdir().expect("data home tempdir");
+        write_user_config(config_home.path(), storage.path());
+        let listener = write_connection_file(conn_dir.path()).await;
+        let conn_path = conn_dir.path().join("subc-connection.json");
+
+        // Arm 1: the daemon's socket goes away with no Goodbye (the 2026-09-06
+        // outage shape: the daemon dropped the module connection on a client
+        // error and the module exited 0, so nothing respawned it for 4.5 h).
+        let mut module = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        bind_route(&mut stream, project.path()).await;
+        drop(stream);
+        let exit = module.wait_for_exit("module after bare EOF");
+        assert_eq!(
+            exit.code(),
+            Some(CONNECTION_LOST_EXIT_CODE),
+            "bare EOF must exit with the connection-lost code so the supervisor respawns; status={exit}"
+        );
+
+        // Arm 2 (control): an explicit channel-0 Goodbye is a stop request.
+        let mut module = ModuleProcess::spawn(&conn_path, config_home.path(), data_home.path());
+        let mut stream = accept_module(&listener).await;
+        bind_route(&mut stream, project.path()).await;
+        send_connection_goodbye(&mut stream).await;
+        let exit = module.wait_for_exit("module after channel-0 Goodbye");
+        assert_eq!(
+            exit.code(),
+            Some(0),
+            "channel-0 Goodbye is a stop request and must exit 0; status={exit}"
+        );
     });
 }
 
@@ -475,7 +532,7 @@ fn extract_task_id(frame: &Frame) -> String {
 
 fn sentinel_command(ready: &Path, stop: &Path) -> String {
     format!(
-        "printf 'sentinel-started\\n'; touch {ready}; while [ ! -f {stop} ]; do sleep 0.05; done; printf 'sentinel-stopped\\n'",
+        "printf 'sentinel-started\\n'; touch {ready}; polls=0; while [ ! -f {stop} ] && [ \"$polls\" -lt 6000 ]; do sleep 0.05; polls=$((polls + 1)); done; if [ -f {stop} ]; then printf 'sentinel-stopped\\n'; else printf 'gate-timeout\\n'; fi",
         ready = shell_quote(ready),
         stop = shell_quote(stop),
     )

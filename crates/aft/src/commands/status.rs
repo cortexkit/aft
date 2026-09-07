@@ -285,6 +285,8 @@ impl AppContext {
             0
         };
         let compression = self.compression_stats_for_session(session_id);
+        let (backup_skipped_too_large_total, backup_skipped_temp_path_total) =
+            crate::backup::backup_skipped_totals();
 
         // Degraded-mode reasons recorded by `handle_configure` when the
         // project root doesn't look like a real project (`home_root`). Heavy
@@ -326,8 +328,13 @@ impl AppContext {
             })
             .unwrap_or_default();
         let callgraph_write_metrics_total = crate::callgraph_store::callgraph_write_metrics_total();
+        // `MemorySnapshot::new` uses the process-wide allocator observation so
+        // status never walks allocator zones on a request worker.
         let memory = serde_json::to_value(self.memory_snapshot(memory_root.as_deref()))
             .unwrap_or(serde_json::Value::Null);
+        // The control-path status response reads the health worker's published
+        // lifecycle snapshot; it never probes processes or opens a database.
+        let lifecycle = self.app().lifecycle_census_snapshot();
         let mut runtime = serde_json::json!({
             "live_watchers": self.app().watcher_count(),
             "live_actor_roots": self.app().actor_root_count(),
@@ -345,7 +352,7 @@ impl AppContext {
                 serde_json::json!(callgraph_write_metrics.pages_or_bytes_written_60s);
         }
 
-        serde_json::json!({
+        let mut payload = serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "project_root": config.project_root.as_ref().map(|p| p.display().to_string()),
             "canonical_root": self.canonical_cache_root_opt().map(|p| p.display().to_string()),
@@ -371,18 +378,30 @@ impl AppContext {
             "lsp_servers": lsp_count,
             "symbol_cache": symbol_cache_stats,
             "memory": memory,
+            "lsp": lifecycle.lsp,
+            "threads": lifecycle.threads,
+            "sqlite": lifecycle.sqlite,
+            "children": lifecycle.children,
+            "fds": lifecycle.fds,
             "runtime": runtime,
             "compression": compression,
             "storage_dir": storage_dir,
             // Project-wide (all sessions): total in-memory checkpoint count.
             "checkpoints_total": checkpoint_total,
+            "backup_skipped_too_large_total": backup_skipped_too_large_total,
+            "backup_skipped_temp_path_total": backup_skipped_temp_path_total,
             // Current session slice: only when the caller passed `session_id`.
             "session": {
                 "id": session_id,
                 "tracked_files": session_tracked_files,
                 "checkpoints": session_checkpoints,
             },
-        })
+        });
+        if config.views.enabled {
+            payload["views"] = serde_json::to_value(self.view_health_snapshot())
+                .unwrap_or(serde_json::Value::Null);
+        }
+        payload
     }
 
     fn compression_stats_for_session(&self, session_id: &str) -> CompressionStats {
@@ -486,6 +505,8 @@ mod tests {
         assert!(response.data["canonical_root"].is_null());
         assert!(response.data["runtime"]["callgraph_commits_60s_total"].is_u64());
         assert!(response.data["runtime"]["callgraph_pages_or_bytes_written_60s_total"].is_u64());
+        assert!(response.data["backup_skipped_too_large_total"].is_u64());
+        assert!(response.data["backup_skipped_temp_path_total"].is_u64());
 
         let temp = tempfile::tempdir().unwrap();
         ctx.update_config(|config| {
@@ -500,6 +521,38 @@ mod tests {
         ctx.set_cache_role(true, None);
         let response = handle_status(&request(), &ctx);
         assert_eq!(response.data["cache_role"], "worktree");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn status_reuses_cached_allocator_observation_for_repeated_requests() {
+        let _allocator_test_lock = crate::memory::allocator_observation_test_lock();
+        crate::memory::reset_allocator_observation_for_test();
+        let _ =
+            crate::memory::MemorySnapshot::new_uncapped("ready", std::collections::BTreeMap::new());
+
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let before = crate::memory::allocator_snapshot_calls_for_test();
+        for _ in 0..50 {
+            let response = handle_status(&request(), &ctx);
+            assert!(response.data["memory"]["process"]["allocator_slack_measured"].is_boolean());
+        }
+        let memory = handle_status(&request(), &ctx).data["memory"]["process"].clone();
+        assert_eq!(crate::memory::allocator_snapshot_calls_for_test(), before);
+        assert!(memory["allocator_observation_age_ms"].is_u64());
+    }
+
+    #[test]
+    fn status_reports_cold_allocator_observation_without_measuring() {
+        let _allocator_test_lock = crate::memory::allocator_observation_test_lock();
+        crate::memory::reset_allocator_observation_for_test();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let before = crate::memory::allocator_snapshot_calls_for_test();
+        let memory = handle_status(&request(), &ctx).data["memory"]["process"].clone();
+
+        assert_eq!(memory["allocator_slack_measured"], false);
+        assert!(memory["allocator_observation_age_ms"].is_null());
+        assert_eq!(crate::memory::allocator_snapshot_calls_for_test(), before);
     }
 
     #[test]
@@ -550,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn status_status_bar_is_null_until_tier2_populated() {
+    fn status_status_bar_is_null_until_every_independent_producer_is_populated() {
         let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
         let response = handle_status(&request(), &ctx);
         // No Tier-2 scan has run yet, so the status-bar glance must be null
@@ -559,12 +612,10 @@ mod tests {
         assert!(response.data.get("status_bar").is_some());
         assert!(response.data["status_bar"].is_null());
 
-        // Once Tier-2 counts are populated, the snapshot carries the glance.
+        // Tier-2 counts are only one input to the status bar. Keep `status_bar`
+        // null until diagnostics and all other required inputs have reported.
         ctx.update_status_bar_tier2(Some(3), Some(2), Some(1), Some(5), false);
         let response = handle_status(&request(), &ctx);
-        assert_eq!(response.data["status_bar"]["dead_code"], 3);
-        assert_eq!(response.data["status_bar"]["unused_exports"], 2);
-        assert_eq!(response.data["status_bar"]["duplicates"], 1);
-        assert_eq!(response.data["status_bar"]["tier2_stale"], false);
+        assert!(response.data["status_bar"].is_null());
     }
 }

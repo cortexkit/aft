@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::time::Instant;
 
+use crate::commands::callgraph_store_adapter::serialized_response;
 use crate::commands::callgraph_store_adapter::suspended_response;
 use crate::commands::callgraph_store_adapter::{
     building_response, callers_result, note_callgraph_building, note_callgraph_served,
@@ -104,8 +105,7 @@ pub fn handle_callers(req: &RawRequest, ctx: &AppContext) -> Response {
                 elapsed_ms.min(u64::MAX as u128) as u64,
                 "ok",
             );
-            let result_json = serde_json::to_value(&result).unwrap_or_default();
-            Response::success(&req.id, result_json)
+            serialized_response(&req.id, "callers", &result)
         }
         Err(error) => {
             slog_warn!(

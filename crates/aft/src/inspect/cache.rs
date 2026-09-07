@@ -29,6 +29,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::cache_freshness::{FileFreshness, FreshnessVerdict};
 use crate::config::Config;
+use crate::db::{SqliteStore, TrackedConnection};
 use crate::jsonc::strip_jsonc;
 
 use super::job::{
@@ -438,7 +439,7 @@ pub struct InspectCache {
     sqlite_path: PathBuf,
     writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
     read_marker: Option<crate::root_cache::ReadMarker>,
-    conn: Mutex<Connection>,
+    conn: Mutex<TrackedConnection>,
     memory: RwLock<HashMap<JobKey, MemoryAggregate>>,
 }
 
@@ -535,7 +536,7 @@ impl InspectCache {
         std::fs::create_dir_all(&inspect_dir)?;
         let (sqlite_path, generation, needs_publish) =
             resolve_or_create_inspect_target(&inspect_dir, &project_key);
-        let conn = Connection::open(&sqlite_path)?;
+        let conn = TrackedConnection::open(&sqlite_path, SqliteStore::InspectScopeCache)?;
         configure_connection(&conn)?;
         if !writer_lease.verify().map_err(InspectCacheError::from)? {
             return Err(InspectCacheError::Io(std::io::Error::other(
@@ -595,7 +596,7 @@ impl InspectCache {
         project_root: PathBuf,
         project_key: String,
     ) -> Result<Self, InspectCacheError> {
-        let conn = Connection::open_in_memory()?;
+        let conn = TrackedConnection::open_in_memory(SqliteStore::InspectScopeCache)?;
         initialize_schema(&conn)?;
         conn.pragma_update(None, "query_only", true)?;
         Ok(Self::from_connection(
@@ -614,7 +615,7 @@ impl InspectCache {
         sqlite_path: PathBuf,
         writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
         read_marker: Option<crate::root_cache::ReadMarker>,
-        conn: Connection,
+        conn: TrackedConnection,
     ) -> Self {
         Self {
             project_root,
@@ -1888,11 +1889,12 @@ fn acquire_writer_lease(
     })
 }
 
-fn open_readonly_connection(path: &Path) -> Result<Connection, InspectCacheError> {
+fn open_readonly_connection(path: &Path) -> Result<TrackedConnection, InspectCacheError> {
     let uri = sqlite_readonly_uri(path);
-    let conn = Connection::open_with_flags(
+    let conn = TrackedConnection::open_with_flags(
         &uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        SqliteStore::InspectScopeCache,
     )?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.busy_timeout(reader_busy_timeout())?;

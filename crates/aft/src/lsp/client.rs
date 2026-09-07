@@ -66,7 +66,58 @@ pub enum LspEvent {
     ServerExited {
         server_kind: ServerKind,
         root: PathBuf,
+        reason: ServerExitReason,
     },
+}
+
+/// Why the background reader stopped.
+///
+/// A framing or I/O error on a still-running server used to be collapsed into
+/// the same `ServerExited` event as a real EOF, so the manager dropped the
+/// client without knowing whether the child was actually gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerExitReason {
+    /// `read_message` returned `Ok(None)`: the stdout stream closed cleanly.
+    Eof,
+    /// `read_message` returned an I/O or framing error. The child may still be
+    /// alive; the payload is the `Display` of that error so the next leak can
+    /// be diagnosed from the log line.
+    ReadError(String),
+    /// The pending-response mutex was poisoned. The reader cannot continue.
+    PendingLockPoisoned,
+}
+
+impl std::fmt::Display for ServerExitReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Eof => write!(f, "eof"),
+            Self::ReadError(err) => write!(f, "read error: {err}"),
+            Self::PendingLockPoisoned => write!(f, "pending lock poisoned"),
+        }
+    }
+}
+
+impl ServerExitReason {
+    /// Map a terminal `read_message` result onto the reason the reader stopped.
+    pub(crate) fn from_read_result(
+        result: io::Result<Option<crate::lsp::jsonrpc::ServerMessage>>,
+    ) -> Self {
+        match result {
+            Ok(None) => Self::Eof,
+            Err(err) => Self::ReadError(err.to_string()),
+            Ok(Some(_)) => {
+                debug_assert!(false, "from_read_result called on a live message");
+                Self::ReadError("unexpected live message".to_string())
+            }
+        }
+    }
+}
+
+/// Outcome of reaping a client after the reader thread stopped.
+#[derive(Debug)]
+pub(crate) enum ReaderExitReap {
+    AlreadyExited(std::process::ExitStatus),
+    KilledWhileAlive,
 }
 
 /// What this server told us it can do during the LSP `initialize` handshake.
@@ -130,6 +181,10 @@ pub struct LspClient {
     /// aft exits. Cloned via `Arc` — multiple clients share the same set.
     child_registry: LspChildRegistry,
     stderr_tail: Arc<Mutex<VecDeque<String>>>,
+    /// When true, `Drop` untracks but does not kill. Tests use this so a
+    /// `ServerExited` handler's kill is the only thing that can reap the child.
+    #[cfg(test)]
+    suppress_kill_on_drop: bool,
 }
 
 impl LspClient {
@@ -234,7 +289,12 @@ impl LspClient {
             });
         }
 
-        let mut child = child_registry.spawn_tracked_in_root(&mut command, reclaim_root)?;
+        let mut child = child_registry.spawn_tracked_child(
+            &mut command,
+            reclaim_root,
+            Some(&root),
+            Some(&kind),
+        )?;
         let child_pid = child.id();
 
         let stdout = child
@@ -276,6 +336,7 @@ impl LspClient {
                             let _ = event_tx.send(LspEvent::ServerExited {
                                 server_kind: reader_kind.clone(),
                                 root: reader_root.clone(),
+                                reason: ServerExitReason::PendingLockPoisoned,
                             });
                             break;
                         }
@@ -328,13 +389,14 @@ impl LspClient {
                             params,
                         });
                     }
-                    Ok(None) | Err(_) => {
+                    terminal @ (Ok(None) | Err(_)) => {
                         if let Ok(mut guard) = reader_pending.lock() {
                             guard.clear();
                         }
                         let _ = event_tx.send(LspEvent::ServerExited {
                             server_kind: reader_kind.clone(),
                             root: reader_root.clone(),
+                            reason: ServerExitReason::from_read_result(terminal),
                         });
                         break;
                     }
@@ -343,6 +405,7 @@ impl LspClient {
         });
 
         let rust_analyzer_quiescent = !matches!(&kind, ServerKind::Rust);
+        child_registry.mark_client_live(child_pid);
         Ok(Self {
             kind,
             root,
@@ -358,6 +421,8 @@ impl LspClient {
             watched_file_registrations,
             child_registry,
             stderr_tail,
+            #[cfg(test)]
+            suppress_kill_on_drop: false,
         })
     }
 
@@ -652,6 +717,17 @@ impl LspClient {
 
     /// Graceful shutdown: send shutdown request, then exit notification.
     pub fn shutdown(&mut self) -> Result<(), LspError> {
+        self.shutdown_with_request_timeout(HANDSHAKE_REQUEST_TIMEOUT)
+    }
+
+    /// Idle reclaim must not sit on the initialize-length Shutdown handshake.
+    /// A short request timeout falls through to the kill-if-still-running error
+    /// path so the detached reap thread finishes within `SHUTDOWN_TIMEOUT`.
+    pub(crate) fn shutdown_for_idle_reap(&mut self) -> Result<(), LspError> {
+        self.shutdown_with_request_timeout(EXIT_POLL_INTERVAL)
+    }
+
+    fn shutdown_with_request_timeout(&mut self, request_timeout: Duration) -> Result<(), LspError> {
         if self.state == ServerState::Exited {
             self.child_registry.untrack(self.child_pid);
             return Ok(());
@@ -663,27 +739,17 @@ impl LspClient {
             return Ok(());
         }
 
-        if let Err(err) = self.send_request_with_timeout::<lsp_types::request::Shutdown>(
-            (),
-            HANDSHAKE_REQUEST_TIMEOUT,
-        ) {
+        if let Err(err) =
+            self.send_request_with_timeout::<lsp_types::request::Shutdown>((), request_timeout)
+        {
             self.state = ServerState::ShuttingDown;
-            if self.child.try_wait()?.is_some() {
-                self.state = ServerState::Exited;
-                return Ok(());
-            }
-            return Err(err);
+            return self.abort_live_child_after_shutdown_error(err);
         }
-
-        self.state = ServerState::ShuttingDown;
 
         if let Err(err) = self.send_notification::<lsp_types::notification::Exit>(()) {
-            if self.child.try_wait()?.is_some() {
-                self.state = ServerState::Exited;
-                return Ok(());
-            }
-            return Err(err);
+            return self.abort_live_child_after_shutdown_error(err);
         }
+        self.state = ServerState::ShuttingDown;
 
         let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
         loop {
@@ -697,6 +763,7 @@ impl LspClient {
                 // a separate cli-darwin-arm64 child) don't leak orphans.
                 kill_lsp_child_group(&mut self.child);
                 self.state = ServerState::Exited;
+                self.child_registry.untrack(self.child_pid);
                 return Err(LspError::Timeout(format!(
                     "timed out waiting for {:?} to exit",
                     self.kind
@@ -719,6 +786,70 @@ impl LspClient {
 
     pub fn child_exit_status(&mut self) -> Option<std::process::ExitStatus> {
         self.child.try_wait().ok().flatten()
+    }
+
+    pub(crate) fn child_pid(&self) -> u32 {
+        self.child_pid
+    }
+
+    /// If the child is still running, kill its process group and wait bounded.
+    /// Always untrack. The caller logs whether this was a real exit or a reader
+    /// death that left the child alive.
+    pub(crate) fn reap_after_reader_exit(&mut self, _reason: &ServerExitReason) -> ReaderExitReap {
+        let outcome = match self.child.try_wait() {
+            Ok(Some(status)) => ReaderExitReap::AlreadyExited(status),
+            Ok(None) | Err(_) => {
+                kill_lsp_child_group(&mut self.child);
+                self.wait_for_child_exit_bounded();
+                ReaderExitReap::KilledWhileAlive
+            }
+        };
+        self.state = ServerState::Exited;
+        self.child_registry.untrack(self.child_pid);
+        outcome
+    }
+
+    fn abort_live_child_after_shutdown_error(&mut self, err: LspError) -> Result<(), LspError> {
+        if self.child.try_wait()?.is_some() {
+            self.state = ServerState::Exited;
+            self.child_registry.untrack(self.child_pid);
+            return Ok(());
+        }
+        kill_lsp_child_group(&mut self.child);
+        self.wait_for_child_exit_bounded();
+        self.state = ServerState::Exited;
+        self.child_registry.untrack(self.child_pid);
+        Err(err)
+    }
+
+    fn wait_for_child_exit_bounded(&mut self) {
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        loop {
+            if self.child.try_wait().ok().flatten().is_some() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                return;
+            }
+            thread::sleep(EXIT_POLL_INTERVAL);
+        }
+    }
+
+    // Used only by the Unix-gated child-spawning test modules.
+    #[cfg(all(test, unix))]
+    pub(crate) fn suppress_kill_on_drop_for_test(&mut self) {
+        self.suppress_kill_on_drop = true;
+    }
+
+    // Used only by the Unix-gated child-spawning test modules.
+    #[cfg(all(test, unix))]
+    pub(crate) fn poison_writer_for_test(&self) {
+        let writer = Arc::clone(&self.writer);
+        let _ = thread::spawn(move || {
+            let _guard = writer.lock().expect("writer lock");
+            panic!("poison lsp writer for test");
+        })
+        .join();
     }
 
     pub fn state(&self) -> ServerState {
@@ -768,8 +899,20 @@ impl LspClient {
 
 impl Drop for LspClient {
     fn drop(&mut self) {
-        // Untrack first so the signal handler can't race with this kill and
-        // try to SIGKILL a PID that's already been reaped.
+        #[cfg(test)]
+        if self.suppress_kill_on_drop {
+            // Test-only crash seam: retain the tracked child so the reaper and
+            // lifecycle census observe the same orphan signature as a failed
+            // client teardown instead of hiding it by untracking first.
+            self.child_registry.mark_client_gone(self.child_pid);
+            return;
+        }
+        // Record the transition before normal teardown untracks it. A control
+        // thread that snapshots in this narrow window sees an honest orphan
+        // rather than a child that is still reported as client-owned.
+        self.child_registry.mark_client_gone(self.child_pid);
+        // Untrack before the synchronous kill so signal cleanup cannot race this
+        // normal teardown.
         self.child_registry.untrack(self.child_pid);
         kill_lsp_child_group(&mut self.child);
     }
@@ -998,6 +1141,12 @@ fn parse_diagnostic_capabilities(value: &Value) -> ServerDiagnosticCapabilities 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the Unix-gated reap tests below spawn real children and name paths.
+    #[cfg(unix)]
+    use std::collections::HashMap;
+    use std::io::{BufReader, Cursor};
+    #[cfg(unix)]
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn parse_caps_no_diagnostic_provider() {
@@ -1112,5 +1261,128 @@ mod tests {
         let response = workspace_configuration_response(&ServerKind::Ty, root, Some(&params));
 
         assert!(response[0].is_null());
+    }
+
+    #[test]
+    fn eof_read_maps_to_eof_reason() {
+        let mut reader = BufReader::new(Cursor::new([]));
+        let result = transport::read_message(&mut reader);
+        assert!(matches!(result, Ok(None)));
+        assert_eq!(
+            ServerExitReason::from_read_result(result),
+            ServerExitReason::Eof
+        );
+    }
+
+    #[test]
+    fn malformed_frame_maps_to_read_error_reason() {
+        let mut reader = BufReader::new(Cursor::new(b"Content-Length: 3\r\n\r\n{{{"));
+        let result = transport::read_message(&mut reader);
+        assert!(result.is_err());
+        match ServerExitReason::from_read_result(result) {
+            ServerExitReason::ReadError(message) => assert!(
+                !message.is_empty(),
+                "ReadError must carry the concrete framing error"
+            ),
+            other => panic!("expected ReadError, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_long_lived_client(
+        script: &str,
+        event_tx: Sender<LspEvent>,
+        registry: LspChildRegistry,
+        root: PathBuf,
+    ) -> LspClient {
+        LspClient::spawn(
+            ServerKind::TypeScript,
+            root,
+            Path::new("sh"),
+            &["-c".to_string(), script.to_string()],
+            &HashMap::new(),
+            event_tx,
+            registry,
+        )
+        .expect("spawn long-lived LSP stand-in")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_emits_read_error_for_malformed_frame() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let registry = LspChildRegistry::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let client = spawn_long_lived_client(
+            "printf 'Content-Length: 3\r\n\r\n{{{'; exec sleep 60",
+            tx,
+            registry,
+            tmp.path().to_path_buf(),
+        );
+        let event = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader should emit ServerExited");
+        match event {
+            LspEvent::ServerExited {
+                reason: ServerExitReason::ReadError(message),
+                ..
+            } => assert!(!message.is_empty()),
+            other => panic!("expected ReadError ServerExited, got {other:?}"),
+        }
+        drop(client);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reader_emits_eof_when_child_closes_stdout() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let registry = LspChildRegistry::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let client = spawn_long_lived_client("exit 0", tx, registry, tmp.path().to_path_buf());
+        let event = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reader should emit ServerExited on EOF");
+        match event {
+            LspEvent::ServerExited {
+                reason: ServerExitReason::Eof,
+                ..
+            } => {}
+            other => panic!("expected Eof ServerExited, got {other:?}"),
+        }
+        drop(client);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_error_kills_and_untracks_live_child() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let registry = LspChildRegistry::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut client = spawn_long_lived_client(
+            "exec sleep 60",
+            tx,
+            registry.clone(),
+            tmp.path().to_path_buf(),
+        );
+        let pid = client.child_pid();
+        assert!(
+            registry.pids().contains(&pid),
+            "child must be tracked before shutdown"
+        );
+        assert!(
+            crate::bash_background::process::is_process_alive(pid),
+            "child must still be running"
+        );
+        client.poison_writer_for_test();
+        let result = client.shutdown();
+        assert!(result.is_err(), "shutdown must return Err, got {result:?}");
+        assert!(
+            !crate::bash_background::process::is_process_alive(pid),
+            "shutdown Err must not leave a live child"
+        );
+        assert!(
+            !registry.pids().contains(&pid),
+            "shutdown Err must untrack the child"
+        );
     }
 }

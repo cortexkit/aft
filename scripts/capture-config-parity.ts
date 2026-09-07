@@ -176,6 +176,25 @@ const CASES: ParityCase[] = [
     project: { search_index: true, format_on_edit: false },
   },
   {
+    name: "views_enabled_project_override",
+    user: { views: { enabled: false } },
+    project: { views: { enabled: true } },
+  },
+  {
+    name: "backup_project_larger_cap",
+    user: { backup: {} },
+    project: { backup: { max_file_size: 128 * 1024 * 1024 } },
+  },
+  {
+    name: "disabled_tools_project_safe",
+    project: { disabled_tools: ["aft_zoom"] },
+  },
+  {
+    name: "bash_watch_sync_project_override",
+    user: { bash: { watch_sync_max_ms: 120000 } },
+    project: { bash: { watch_sync_max_ms: 1800000 } },
+  },
+  {
     name: "index_roots_user_semantic_closure",
     user: { index: { roots: [{ path: "~/.aft-standing-root", indexes: ["semantic"] }] } },
   },
@@ -504,6 +523,23 @@ const CASES: ParityCase[] = [
     name: "bash_detach_on_user_message_project_safe",
     user: { bash: { detach_on_user_message: true } },
     project: { bash: { detach_on_user_message: false } },
+  },
+  {
+    name: "idle_user_tier",
+    user: { idle: { root_ttl_minutes: 20, lsp_ttl_minutes: 5 } },
+  },
+  {
+    name: "idle_project_tier",
+    user: { idle: { root_ttl_minutes: 20, lsp_ttl_minutes: 8 } },
+    project: { idle: { root_ttl_minutes: 15, lsp_ttl_minutes: 3 } },
+  },
+  {
+    name: "idle_out_of_range_clamped",
+    user: { idle: { root_ttl_minutes: 60, lsp_ttl_minutes: 0 } },
+  },
+  {
+    name: "idle_non_integer_dropped",
+    user: { idle: { root_ttl_minutes: 12.5 } },
   },
   {
     name: "jsonc_comments",

@@ -975,6 +975,7 @@ describe("bash_status tool", () => {
       params: Record<string, unknown>,
       options?: BridgeRequestOptions,
     ) => BridgeResponse | Promise<BridgeResponse>,
+    config: PluginContext["config"] = {} as PluginContext["config"],
   ) {
     const calls: Array<{
       cmd: string;
@@ -995,7 +996,7 @@ describe("bash_status tool", () => {
     const ctx: PluginContext = {
       pool,
       client: createMockClient(),
-      config: {} as PluginContext["config"],
+      config,
       storageDir: "/tmp/aft-test",
     };
     return {
@@ -1007,6 +1008,36 @@ describe("bash_status tool", () => {
       writeTool: createBashWriteTool(ctx),
     };
   }
+
+  test("default sync cap rejects 120001 with the config knob in the error", async () => {
+    const { watchTool } = makeCtx(() => ({ success: true, status: "completed", exit_code: 0 }));
+
+    await expect(
+      watchTool.execute({ taskId: "bash-cap-default", timeoutMs: 120_001 }, createMockSdkContext()),
+    ).rejects.toThrow("timeoutMs must be between 1 and 120000 (bash.watch_sync_max_ms)");
+  });
+
+  test("configured 30-minute sync cap accepts 1800000", async () => {
+    const { watchTool } = makeCtx(() => ({ success: true, status: "completed", exit_code: 0 }), {
+      bash: { watch_sync_max_ms: 1_800_000 },
+    } as PluginContext["config"]);
+
+    await expect(
+      watchTool.execute({ taskId: "bash-cap-old", timeoutMs: 1_800_000 }, createMockSdkContext()),
+    ).resolves.toContain("task exited");
+  });
+
+  test("project-resolved sync cap is used at runtime", async () => {
+    const { calls, watchTool } = makeCtx(
+      () => ({ success: true, status: "completed", exit_code: 0 }),
+      { bash: { watch_sync_max_ms: 1_000 } } as PluginContext["config"],
+    );
+
+    await expect(
+      watchTool.execute({ taskId: "bash-cap-project", timeoutMs: 1_001 }, createMockSdkContext()),
+    ).rejects.toThrow("timeoutMs must be between 1 and 1000 (bash.watch_sync_max_ms)");
+    expect(calls).toHaveLength(0);
+  });
 
   test("bash-family control RPCs keep the bridge on transport timeout", async () => {
     const { calls, statusTool, watchTool, writeTool, killTool } = makeCtx((cmd) => {
@@ -1863,6 +1894,13 @@ describe("bash tool description (agent-facing wording)", () => {
     expect(desc).toContain("aft_search");
   });
 
+  test("replaces zoom steering with read when zoom is disabled", () => {
+    const description = bashToolDescription(true, true, true, true, false);
+    expect(description).toContain("aft_search");
+    expect(description).toContain("aft_outline instead");
+    expect(description).not.toContain("aft_zoom");
+  });
+
   test("steers to the grep tool when aft_search is not registered", () => {
     const desc = bashToolDescription(false, true, true);
     expect(desc).toContain("DO NOT use bash for code search");
@@ -1900,7 +1938,7 @@ describe("bash tool description (agent-facing wording)", () => {
     expect(on).toContain("never loop bash_status to wait");
   });
 
-  test("bash_watch description endorses long sync waits and user interrupt", () => {
+  test("bash_watch description recommends short sync waits and the completion reminder", () => {
     const ctx: PluginContext = {
       pool: {
         getBridge: () => ({ send: async () => ({ success: true }) }),
@@ -1910,8 +1948,9 @@ describe("bash tool description (agent-facing wording)", () => {
       storageDir: "/tmp/aft-test",
     };
     const desc = createBashWatchTool(ctx).description;
-    expect(desc).toContain("even for long builds/tests/installs");
-    expect(desc).toContain("interrupt");
+    expect(desc).toContain("short remaining wait on a task");
+    expect(desc).toContain("120s by default");
+    expect(desc).toContain("bash({background:true})");
     expect(desc).toContain("Never loop bash_status");
   });
 
@@ -1929,7 +1968,7 @@ describe("bash tool description (agent-facing wording)", () => {
     expect(desc).toContain("To wait, use bash_watch");
   });
 
-  test("bash_watch timeoutMs arg documents 30 min max", () => {
+  test("bash_watch timeoutMs arg documents the configured cap", () => {
     const ctx: PluginContext = {
       pool: {
         getBridge: () => ({ send: async () => ({ success: true }) }),
@@ -1944,7 +1983,7 @@ describe("bash tool description (agent-facing wording)", () => {
       properties?: { timeoutMs?: { maximum?: number; description?: string } };
     };
     expect(jsonSchema.properties?.timeoutMs?.maximum).toBe(1_800_000);
-    expect(jsonSchema.properties?.timeoutMs?.description).toContain("1800000 (30 min)");
+    expect(jsonSchema.properties?.timeoutMs?.description).toContain("bash.watch_sync_max_ms");
   });
 
   test("background/PTY sentences track bash.background config", () => {

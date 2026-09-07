@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::commands::callgraph_store_adapter::suspended_response;
 use crate::commands::callgraph_store_adapter::{
     building_response, call_tree_result, note_callgraph_building, note_callgraph_served,
-    store_error_response, unavailable_for,
+    serialized_response, store_error_response, unavailable_for,
 };
 use crate::context::{AppContext, CallgraphStoreAccess};
 use crate::protocol::{RawRequest, Response};
@@ -85,8 +85,7 @@ pub fn handle_call_tree(req: &RawRequest, ctx: &AppContext) -> Response {
     match call_tree_result(&store, &file_path, symbol, depth, include_tests_param(req)) {
         Ok(tree) => {
             note_callgraph_served(ctx, "call_tree", 0, "ok");
-            let tree_json = serde_json::to_value(&tree).unwrap_or_default();
-            Response::success(&req.id, tree_json)
+            serialized_response(&req.id, "call_tree", &tree)
         }
         Err(error) => store_error_response(&req.id, "call_tree", error),
     }

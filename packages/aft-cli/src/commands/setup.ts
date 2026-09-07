@@ -1,13 +1,20 @@
+import { OpenCodeAdapter } from "../adapters/opencode.js";
 import type { HarnessAdapter } from "../adapters/types.js";
 import { CLI } from "../lib/cli.js";
 import { resolveAdaptersForCommand } from "../lib/harness-select.js";
 import { ensureAftSchemaUrl } from "../lib/jsonc.js";
 import { intro, log, note, outro } from "../lib/prompts.js";
+import { formatHostGenerations, type OpenCodeHostDetection } from "../setup/host-generation.js";
 
-export async function runSetup(argv: string[]): Promise<number> {
+export interface SetupOptions {
+  resolveAdapters?: typeof resolveAdaptersForCommand;
+  detectOpenCodeHost?: () => OpenCodeHostDetection;
+}
+
+export async function runSetup(argv: string[], options: SetupOptions = {}): Promise<number> {
   intro(`${CLI} setup`);
 
-  const adapters = await resolveAdaptersForCommand(argv, {
+  const adapters = await (options.resolveAdapters ?? resolveAdaptersForCommand)(argv, {
     allowMulti: true,
     verb: "setup",
   });
@@ -21,6 +28,25 @@ export async function runSetup(argv: string[]): Promise<number> {
       );
       anyFailure = true;
       continue;
+    }
+
+    if (adapter instanceof OpenCodeAdapter) {
+      const detection = options.detectOpenCodeHost
+        ? options.detectOpenCodeHost()
+        : adapter.detectHostGeneration();
+      log.info(`${adapter.displayName}: host generation ${formatHostGenerations(detection)}`);
+      if (detection.status === "ambiguous") {
+        log.error(
+          `${adapter.displayName}: both V1 and V2 hosts are installed; refusing to change either config until only one generation is selected on PATH.`,
+        );
+        anyFailure = true;
+        continue;
+      }
+      if (detection.status === "unknown") {
+        log.warn(
+          `${adapter.displayName}: host generation is unavailable (Desktop-only installs may not expose package metadata); applying the generation-independent exact plugin pin.`,
+        );
+      }
     }
 
     const result = await adapter.ensurePluginEntry();

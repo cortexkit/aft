@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use aft::bash_background::BgTaskStatus;
 use aft::config::Config;
 use aft::context::{
-    AppContext, SemanticIndexStatus, SemanticRefreshEvent, SemanticRefreshRequest,
+    App, AppContext, SemanticIndexStatus, SemanticRefreshEvent, SemanticRefreshRequest,
     SemanticRefreshWorkerSlot,
 };
 use aft::executor::{Executor, ExecutorConfig, Lane};
@@ -38,6 +38,8 @@ use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
+use super::helpers::ReleaseOnDrop;
+
 static BRIDGE_STATE: OnceLock<Mutex<Option<Arc<BridgeState>>>> = OnceLock::new();
 static BRIDGE_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -55,6 +57,7 @@ pub(super) struct FakeDaemonInput {
     pub(super) callgraph_root: std::path::PathBuf,
     pub(super) callgraph_file: std::path::PathBuf,
     pub(super) state: Arc<BridgeState>,
+    pub(super) app: Arc<App>,
     pub(super) executor: Arc<Executor>,
     pub(super) user_config_path: std::path::PathBuf,
     pub(super) lifecycle_events: Option<mpsc::UnboundedReceiver<SubcLifecycleEvent>>,
@@ -77,6 +80,7 @@ pub(super) struct FakeDaemonSession {
     pub(super) callgraph_root: std::path::PathBuf,
     pub(super) callgraph_file: std::path::PathBuf,
     pub(super) state: Arc<BridgeState>,
+    pub(super) app: Arc<App>,
     pub(super) executor: Arc<Executor>,
     pub(super) lifecycle_events: Option<mpsc::UnboundedReceiver<SubcLifecycleEvent>>,
 }
@@ -437,6 +441,10 @@ impl BridgeState {
         guard.epoch_started
     }
 
+    fn epoch_started_count(&self) -> usize {
+        self.inner.lock().expect("bridge state lock").epoch_started
+    }
+
     fn release_epoch_reads(&self) {
         let mut guard = self.inner.lock().expect("bridge state lock");
         guard.epoch_release = true;
@@ -527,6 +535,14 @@ impl BridgeState {
                 .any(|event| event.request_id == request_id),
             "{request_id} configure started while same-root reads were still in flight"
         );
+    }
+
+    fn configure_count(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("bridge state lock")
+            .configure_events
+            .len()
     }
 
     fn assert_configure_root(&self, request_id: &str, root: &std::path::Path) {
@@ -1103,6 +1119,7 @@ pub(super) fn bridge_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
         "bash_abort_inflight" => aft::commands::bash_abort_inflight::handle(&req, ctx),
         "bash_drain_completions" => aft::commands::bash_drain_completions::handle(&req, ctx),
         "bash_regex_match" => aft::commands::bash_regex_match::handle(&req),
+        "bash_notify" => aft::commands::bash_notify::handle(&req, ctx),
         "bash_ack_completions" => aft::commands::bash_drain_completions::handle_ack(&req, ctx),
         "read" => aft::commands::read::handle_read(&req, ctx),
         "write" => aft::commands::write::handle_write(&req, ctx),
@@ -1558,6 +1575,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
             ..Config::default()
         },
     ));
+    let app = ctx.app();
     let executor = Arc::new(Executor::with_config(executor_config));
     let executor_for_daemon = Arc::clone(&executor);
     let executor_for_check = Arc::clone(&executor);
@@ -1625,6 +1643,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
                     callgraph_root: callgraph_root_path,
                     callgraph_file: callgraph_file_path,
                     state: daemon_state,
+                    app,
                     executor: executor_for_daemon,
                     user_config_path: user_config_path_for_daemon,
                     lifecycle_events,
@@ -2119,6 +2138,16 @@ fn subc_bridge_routebind_nonblocking_slow_configure() {
 }
 
 #[test]
+fn subc_bridge_heavy_response_egress_is_root_epoch_independent() {
+    run_subc_bridge_test(
+        "heavy-response-egress-is-root-epoch-independent",
+        Duration::from_secs(20),
+        drive_heavy_response_egress_is_root_epoch_independent_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_routebind_ack_is_prioritized_over_reliable_flood() {
     run_subc_bridge_test(
         "subc_bridge_routebind_ack_is_prioritized_over_reliable_flood",
@@ -2155,6 +2184,24 @@ fn subc_bridge_goodbye_cancels_pending_bind() {
         Duration::from_secs(30),
         drive_goodbye_cancels_pending_bind_daemon,
         |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_goodbye_cancels_queued_read_before_same_root_rebind() {
+    run_subc_bridge_test_with_dispatch_and_executor_config(
+        "goodbye-cancels-queued-read-before-rebind",
+        Duration::from_secs(20),
+        drive_goodbye_cancels_queued_read_before_rebind_daemon,
+        |_, _, _| {},
+        bridge_dispatch,
+        ExecutorConfig {
+            pool_size: 2,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        },
     );
 }
 
@@ -2299,6 +2346,26 @@ fn subc_bridge_bg_events_idle_completion_wake_lane() {
         "subc_bridge_bg_events_idle_completion_wake_lane",
         Duration::from_secs(90),
         drive_bg_events_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_dropped_completion_nudge_is_rearmed_until_ack() {
+    run_subc_bridge_test(
+        "subc_bridge_dropped_completion_nudge_is_rearmed_until_ack",
+        Duration::from_secs(60),
+        drive_dropped_completion_nudge_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_dropped_pattern_nudge_is_rearmed_and_drains_match() {
+    run_subc_bridge_test(
+        "subc_bridge_dropped_pattern_nudge_is_rearmed_and_drains_match",
+        Duration::from_secs(60),
+        drive_dropped_pattern_nudge_daemon,
         |_, _, _| {},
     );
 }
@@ -2597,6 +2664,16 @@ fn subc_bridge_module_hello_advertises_health_and_tool_descriptions() {
         "subc_bridge_module_hello_advertises_health_and_tool_descriptions",
         Duration::from_secs(30),
         drive_module_hello_health_manifest_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
+fn subc_bridge_management_surface_is_passive_closed_and_first_party() {
+    run_subc_bridge_production_test(
+        "subc_bridge_management_surface_is_passive_closed_and_first_party",
+        Duration::from_secs(30),
+        drive_management_surface_daemon,
         |_, _, _| {},
     );
 }
@@ -3052,7 +3129,9 @@ async fn drive_s1_rejection_daemon(
         "rejection must carry unknown_tool: {inner:?}"
     );
 
-    // Close the stream so the production run_subc_mode reader hits EOF and exits.
+    // Ask the module to stop the way a real daemon does: a channel-0 Goodbye.
+    // A bare socket drop is a connection loss and exits non-zero on purpose.
+    send_connection_goodbye(&mut stream).await;
     drop(stream);
 }
 
@@ -3071,6 +3150,7 @@ pub(super) async fn open_fake_daemon_session_with_hello(
         callgraph_root,
         callgraph_file,
         state,
+        app,
         executor,
         user_config_path: _,
         lifecycle_events,
@@ -3121,6 +3201,7 @@ pub(super) async fn open_fake_daemon_session_with_hello(
             callgraph_root,
             callgraph_file,
             state,
+            app,
             executor,
             lifecycle_events,
         },
@@ -3795,6 +3876,10 @@ async fn drive_bash_lane_nonoccupancy_daemon(input: FakeDaemonInput) {
     bind_route1(&mut stream, &root1).await;
     let marker = root1.join("lane-bash-started");
     let release = root1.join("lane-bash-release");
+    // The root TempDir is owned by the enclosing bridge harness. Declare this
+    // guard after its path is bound so it releases the child before that owner
+    // removes the directory during unwinding.
+    let _release_guard = ReleaseOnDrop::new(release.clone());
     send_tool_call(
         &mut stream,
         1,
@@ -3842,7 +3927,7 @@ async fn drive_bash_lane_nonoccupancy_daemon(input: FakeDaemonInput) {
 
     // Release only after both sibling responses. If the bash wait occupied an
     // executor lane, neither response could satisfy this ordering proof.
-    std::fs::write(&release, b"release").expect("release lane bash task");
+    drop(_release_guard);
     let bash = read_frame_timeout(&mut stream, "lane bash final response").await;
     assert_eq!(bash.header.corr, 107);
     let text = tool_result_text(&bash);
@@ -4748,6 +4833,77 @@ async fn drive_routebind_nonblocking_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+async fn drive_heavy_response_egress_is_root_epoch_independent_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        root2,
+        state,
+        executor,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    send_route_bind(&mut stream, 2, 20, &root2).await;
+    expect_route_bind_ack(&mut stream, 20).await;
+
+    let root_id = ProjectRootId::from_path(&root1).expect("root1 id");
+    let (maintenance_started_tx, maintenance_started_rx) = crossbeam_channel::bounded(1);
+    let (release_maintenance_tx, release_maintenance_rx) = crossbeam_channel::bounded(1);
+    let maintenance = executor.submit_maintenance_async(
+        root_id,
+        aft::executor::Lane::MaintenanceCommit,
+        "test-held-root-epoch".to_string(),
+        Box::new(move |_| {
+            maintenance_started_tx
+                .send(())
+                .expect("signal root epoch holder");
+            release_maintenance_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("release root epoch holder");
+            Response::success("test-held-root-epoch", json!({}))
+        }),
+    );
+    maintenance_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("maintenance holds root1 epoch");
+
+    send_tool_call(
+        &mut stream,
+        1,
+        130,
+        "semantic_search",
+        json!({ "query": "finalize while root epoch is held" }),
+    )
+    .await;
+    state.wait_until("root1 heavy call started", |inner| inner.heavy_started);
+    send_tool_call(&mut stream, 2, 230, "echo", json!({ "case": "fast" })).await;
+    let other_root = read_frame_timeout(&mut stream, "other-root response").await;
+    assert_eq!(other_root.header.channel, 2);
+    assert_eq!(other_root.header.corr, 230);
+
+    state.release_heavy();
+    let heavy_response = read_frame_within(
+        &mut stream,
+        Duration::from_secs(1),
+        "HeavyInit response while root epoch remains held",
+    )
+    .await;
+    release_maintenance_tx
+        .send(())
+        .expect("release root epoch holder");
+    let maintenance_response = tokio::time::timeout(Duration::from_secs(1), maintenance)
+        .await
+        .expect("maintenance completion timed out")
+        .expect("maintenance completion channel closed");
+    assert!(maintenance_response.success);
+
+    let heavy_response = heavy_response
+        .expect("response finalization and egress must not reacquire the actor epoch");
+    assert_eq!(heavy_response.header.channel, 1);
+    assert_eq!(heavy_response.header.corr, 130);
+    send_connection_goodbye(&mut stream).await;
+}
+
 async fn drive_routebind_priority_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream,
@@ -5021,6 +5177,83 @@ async fn drive_goodbye_cancels_pending_bind_daemon(input: FakeDaemonInput) {
         "request on a closed route generation",
     )
     .await;
+
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_goodbye_cancels_queued_read_before_rebind_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        state,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+
+    let epoch_base = state.begin_epoch_wave();
+    send_tool_call(
+        &mut stream,
+        1,
+        120,
+        "semantic_search",
+        json!({ "query": "hold the only interactive actor slot" }),
+    )
+    .await;
+    state.wait_until("heavy route call started", |inner| inner.heavy_started);
+    send_tool_call(&mut stream, 1, 121, "echo", json!({ "case": "epoch" })).await;
+    send_frame(
+        &mut stream,
+        Frame::build(FrameType::Ping, control_flags(), 0, 0, 122, Vec::new())
+            .expect("queued-read barrier ping"),
+    )
+    .await;
+    let queued_barrier = read_frame_timeout(&mut stream, "queued-read barrier pong").await;
+    assert_eq!(queued_barrier.header.ty, FrameType::Pong);
+    assert_eq!(queued_barrier.header.corr, 122);
+    assert_eq!(
+        state.epoch_started_count(),
+        epoch_base,
+        "the actor-cap blocker must leave the read queued"
+    );
+
+    send_route_goodbye(&mut stream, 1, 123).await;
+    send_route_bind(&mut stream, 2, 220, &root1).await;
+    send_frame(
+        &mut stream,
+        Frame::build(FrameType::Ping, control_flags(), 0, 0, 124, Vec::new())
+            .expect("rebind submission barrier ping"),
+    )
+    .await;
+    let rebind_barrier = read_frame_timeout(&mut stream, "rebind submission barrier pong").await;
+    assert_eq!(rebind_barrier.header.ty, FrameType::Pong);
+    assert_eq!(rebind_barrier.header.corr, 124);
+
+    let released_at = Instant::now();
+    state.release_heavy();
+    let deadline = released_at + Duration::from_secs(6);
+    let mut bind_ack = None;
+    while let Some(frame) =
+        read_any_frame_until(&mut stream, deadline, "same-root rebind ack").await
+    {
+        if frame.header.channel == 0
+            && frame.header.corr == 220
+            && frame.header.ty == FrameType::Response
+        {
+            bind_ack = Some(frame);
+            break;
+        }
+    }
+    state.release_epoch_reads();
+    assert!(
+        bind_ack.is_some(),
+        "same-root RouteBind must ack within the 6s grace after the old route closes"
+    );
+    assert!(released_at.elapsed() < Duration::from_secs(6));
+    assert_eq!(
+        state.epoch_started_count(),
+        epoch_base,
+        "a queued call from the dead route must never execute after rebind"
+    );
 
     send_connection_goodbye(&mut stream).await;
 }
@@ -5686,7 +5919,10 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
             && frame.header.channel == 1
             && frame.header.corr == 80;
         if completed {
-            assert_eq!(tool_response_json(&frame)["status_bar"]["dead_code"], 21);
+            assert!(
+                tool_response_json(&frame).get("status_bar").is_none(),
+                "Tier-2 counts without an authoritative diagnostics report stay absent"
+            );
         }
         module_inventory.push(frame);
         if completed {
@@ -5784,8 +6020,8 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
     assert_eq!(publish_body["method"], "status.publish");
     assert_eq!(publish_body["params"]["module"], "aft");
     assert_eq!(
-        publish_body["params"]["text"], "AFT E0 W0 | D21 U12 C13 | T14",
-        "the discovered holder must receive the real Tier-2 segment seeded by the tool call"
+        publish_body["params"]["text"], "",
+        "the discovered holder must not receive E0 W0 when diagnostics are unavailable"
     );
     assert_eq!(publish_body["params"]["revision"], 1);
     assert_eq!(publish_body["params"]["ttl_ms"], 7_500);
@@ -5886,10 +6122,9 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
             && frame.header.channel == 1
             && frame.header.corr == 82;
         if completed {
-            assert_eq!(
-                tool_response_json(&frame)["status_bar"]["dead_code"],
-                22,
-                "catalog drop after route Goodbye must restore the solo bar"
+            assert!(
+                tool_response_json(&frame).get("status_bar").is_none(),
+                "catalog drop cannot make unavailable diagnostics authoritative"
             );
         }
         module_inventory.push(frame);
@@ -5921,8 +6156,8 @@ async fn drive_response_finalizer_daemon(input: FakeDaemonInput) {
     } = open_fake_daemon_session(input).await;
     bind_route1(&mut stream, &root1).await;
 
-    // L2 response finalizer: a normal route-channel read gets status_bar once
-    // the actor has real Tier-2 counts, matching standalone response shape.
+    // When finalizing the response, Tier-2 counts alone must not create a
+    // status bar; keep it absent until diagnostics are reported separately.
     send_tool_call(
         &mut stream,
         1,
@@ -5934,13 +6169,9 @@ async fn drive_response_finalizer_daemon(input: FakeDaemonInput) {
     let status_bar_read = read_frame_timeout(&mut stream, "status-bar read response").await;
     assert_eq!(status_bar_read.header.corr, 80);
     let status_bar_response = tool_response_json(&status_bar_read);
-    assert_eq!(status_bar_response["status_bar"]["dead_code"], 21);
-    assert_eq!(status_bar_response["status_bar"]["unused_exports"], 12);
-    assert_eq!(status_bar_response["status_bar"]["duplicates"], 13);
-    assert_eq!(status_bar_response["status_bar"]["todos"], 14);
     assert!(
-        status_bar_response["status_bar"]["line"].is_null(),
-        "a daemon with no discovered status holder must keep the solo status bar"
+        status_bar_response.get("status_bar").is_none(),
+        "missing diagnostics must omit the status bar rather than invent E0 W0"
     );
 
     // A completed bg-bash task for the bound route's BindIdentity.session is
@@ -5992,8 +6223,8 @@ async fn drive_response_finalizer_daemon(input: FakeDaemonInput) {
     assert_bg_completion(&second_after_completion_response, &task_id);
 
     // Two same-actor PureRead jobs finish/finalize concurrently. Both should
-    // clone the pending bg completion safely; the status_bar dedup lock is also
-    // exercised because counts were populated above.
+    // clone the pending bg completion safely while the unavailable status bar
+    // remains omitted.
     let finalizer_epoch_base = state.begin_epoch_wave();
     for corr in 122..124 {
         send_tool_call(&mut stream, 1, corr, "echo", json!({ "case": "epoch" })).await;
@@ -6145,6 +6376,200 @@ async fn drive_session_scoped_bg_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+async fn drive_dropped_completion_nudge_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    const BG_CHANNEL: u16 = 245;
+    const BG_CORR: u64 = 780;
+    send_route_bind_with_session(&mut stream, BG_CHANNEL, 779, &root1, "session-1").await;
+    expect_route_bind_ack(&mut stream, 779).await;
+    send_bg_events_subscribe(&mut stream, BG_CHANNEL, BG_CORR).await;
+    drain_bg_events_for(
+        &mut stream,
+        BG_CHANNEL,
+        BG_CORR,
+        Duration::from_millis(800),
+        "completion dropped-nudge subscription seed",
+    )
+    .await;
+
+    send_bash_background(&mut stream, 781, "sleep 1; printf 'completion-rearm\n'").await;
+    let launch = read_tool_response_allowing_bg_events(
+        &mut stream,
+        781,
+        BG_CHANNEL,
+        BG_CORR,
+        "completion dropped-nudge launch",
+    )
+    .await;
+    let task_id = launch["task_id"]
+        .as_str()
+        .expect("background task id")
+        .to_string();
+
+    let _dropped = wait_for_bg_event(
+        &mut stream,
+        BG_CHANNEL,
+        BG_CORR,
+        Duration::from_secs(30),
+        "first completion nudge to drop",
+    )
+    .await;
+    let _rearmed = wait_for_bg_event(
+        &mut stream,
+        BG_CHANNEL,
+        BG_CORR,
+        Duration::from_secs(3),
+        "rearmed completion nudge",
+    )
+    .await;
+
+    let drained =
+        drain_bg_completions_until(&mut stream, 1, 782, &[task_id.clone()], BG_CHANNEL, BG_CORR)
+            .await;
+    assert!(drained["bg_completions"]
+        .as_array()
+        .is_some_and(|items| items.iter().any(|item| item["task_id"] == task_id)));
+    send_tool_call(
+        &mut stream,
+        1,
+        1082,
+        "bash_ack_completions",
+        json!({ "task_ids": [task_id] }),
+    )
+    .await;
+    let ack = read_tool_response_allowing_bg_events(
+        &mut stream,
+        1082,
+        BG_CHANNEL,
+        BG_CORR,
+        "completion dropped-nudge ack",
+    )
+    .await;
+    assert_eq!(ack["success"], true);
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_dropped_pattern_nudge_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        executor,
+        ..
+    } = open_fake_daemon_session(input).await;
+    bind_route1(&mut stream, &root1).await;
+    let root_id = ProjectRootId::from_path(&root1).expect("bound root id");
+    let ctx = executor
+        .actor_context(&root_id)
+        .expect("bound root actor context");
+    ctx.bash_background().set_harness(Harness::Opencode);
+    let watch_db = Arc::new(Mutex::new(
+        aft::db::open(&root1.join("dropped-pattern-watch.db")).expect("open watch DB"),
+    ));
+    ctx.bash_background().set_db_pool(watch_db);
+    const BG_CHANNEL: u16 = 245;
+    const BG_CORR: u64 = 790;
+    send_route_bind_with_session(&mut stream, BG_CHANNEL, 789, &root1, "session-1").await;
+    expect_route_bind_ack(&mut stream, 789).await;
+    send_bg_events_subscribe(&mut stream, BG_CHANNEL, BG_CORR).await;
+    drain_bg_events_for(
+        &mut stream,
+        BG_CHANNEL,
+        BG_CORR,
+        Duration::from_millis(800),
+        "pattern dropped-nudge subscription seed",
+    )
+    .await;
+
+    send_bash_background(
+        &mut stream,
+        791,
+        "sleep 1; printf 'PATTERN-READY\n'; sleep 5",
+    )
+    .await;
+    let launch = read_tool_response_allowing_bg_events(
+        &mut stream,
+        791,
+        BG_CHANNEL,
+        BG_CORR,
+        "pattern dropped-nudge launch",
+    )
+    .await;
+    let task_id = launch["task_id"]
+        .as_str()
+        .expect("background task id")
+        .to_string();
+    send_tool_call(
+        &mut stream,
+        1,
+        792,
+        "bash_notify",
+        json!({ "task_id": task_id, "pattern": "PATTERN-READY", "once": true }),
+    )
+    .await;
+    let notify = read_tool_response_allowing_bg_events(
+        &mut stream,
+        792,
+        BG_CHANNEL,
+        BG_CORR,
+        "register pattern dropped-nudge watch",
+    )
+    .await;
+    assert_eq!(notify["success"], true, "bash_notify failed: {notify:?}");
+
+    let _dropped = wait_for_bg_event(
+        &mut stream,
+        BG_CHANNEL,
+        BG_CORR,
+        Duration::from_secs(30),
+        "first pattern nudge to drop",
+    )
+    .await;
+    let _rearmed = wait_for_bg_event(
+        &mut stream,
+        BG_CHANNEL,
+        BG_CORR,
+        Duration::from_secs(3),
+        "rearmed pattern nudge",
+    )
+    .await;
+
+    send_tool_call(&mut stream, 1, 793, "bash_drain_completions", json!({})).await;
+    let drained = read_tool_response_allowing_bg_events(
+        &mut stream,
+        793,
+        BG_CHANNEL,
+        BG_CORR,
+        "drain rearmed pattern match",
+    )
+    .await;
+    assert!(drained["pending_matches"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item["task_id"] == task_id && item["match_text"] == "PATTERN-READY")
+    }));
+    send_tool_call(
+        &mut stream,
+        1,
+        794,
+        "bash_ack_completions",
+        json!({ "task_ids": [task_id] }),
+    )
+    .await;
+    let ack = read_tool_response_allowing_bg_events(
+        &mut stream,
+        794,
+        BG_CHANNEL,
+        BG_CORR,
+        "pattern dropped-nudge ack",
+    )
+    .await;
+    assert_eq!(ack["success"], true);
+    send_connection_goodbye(&mut stream).await;
+}
+
 async fn drive_bg_events_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream, root1, ..
@@ -6253,8 +6678,8 @@ async fn drive_bg_events_daemon(input: FakeDaemonInput) {
     );
     assert_bg_events_are_coalesced(&early_bg_events);
     if early_bg_events.len() == 1 {
-        // This samples the coalescer's 150 ms product tick after an observed
-        // completion event; it is not a process-readiness deadline.
+        // This checks only the first 150 ms of the coalescer's 250 ms product
+        // tick after an observed completion; it is not a readiness deadline.
         let elapsed = early_bg_events[0].0.elapsed();
         if elapsed < Duration::from_millis(150) {
             assert_no_bg_event_for(
@@ -6674,15 +7099,17 @@ fn hold_bash_until_release_command(
         // timeout on Windows CI). Same pattern as bash_background_test.rs's
         // cross_platform_hold_until_release_command.
         format!(
-            "Set-Content -NoNewline -Path \"{}\" -Value started; while (-not (Test-Path \"{}\")) {{ Start-Sleep -Milliseconds 50 }}; Write-Output '{}'",
+            "Set-Content -NoNewline -Path \"{}\" -Value started; $polls = 0; while ((-not (Test-Path \"{}\")) -and ($polls -lt 6000)) {{ Start-Sleep -Milliseconds 50; $polls++ }}; if (Test-Path \"{}\") {{ Write-Output '{}' }} else {{ Write-Output 'gate-timeout' }}",
             shell_path(marker),
+            shell_path(release),
             shell_path(release),
             terminal_text,
         )
     } else {
         format!(
-            "printf started > \"{}\"; until [ -e \"{}\" ]; do sleep 0.05; done; printf '{}\\n'",
+            "printf started > \"{}\"; polls=0; until [ -e \"{}\" ] || [ \"$polls\" -ge 6000 ]; do sleep 0.05; polls=$((polls + 1)); done; if [ -e \"{}\" ]; then printf '{}\\n'; else printf 'gate-timeout\\n'; fi",
             shell_path(marker),
+            shell_path(release),
             shell_path(release),
             terminal_text,
         )
@@ -8042,11 +8469,38 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
         control_ops.iter().any(|op| op == "health.check"),
         "health.check missing from control_ops: {control_ops:?}"
     );
+    assert!(
+        !control_ops.iter().any(|op| op == "memory.census"),
+        "memory.census belongs to the management route, not channel 0: {control_ops:?}"
+    );
 
-    let tools = match hello_body.manifest.provides.first() {
-        Some(subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. }) => tools,
-        other => panic!("expected first provider role to be ToolProvider, got {other:?}"),
-    };
+    let tools = hello_body
+        .manifest
+        .provides
+        .iter()
+        .find_map(|role| match role {
+            subc_protocol::manifest::ProviderRole::ToolProvider { tools, .. } => Some(tools),
+            _ => None,
+        })
+        .expect("manifest should provide agent tools");
+    let management_operations = hello_body
+        .manifest
+        .provides
+        .iter()
+        .find_map(|role| match role {
+            subc_protocol::manifest::ProviderRole::ManagementSurface { operations, .. } => {
+                Some(operations)
+            }
+            _ => None,
+        })
+        .expect("manifest should provide a management surface");
+    assert_eq!(
+        management_operations
+            .iter()
+            .map(|operation| operation.name.as_str())
+            .collect::<HashSet<_>>(),
+        HashSet::from(["health.digest", "memory.census"])
+    );
     let schema_count = serde_json::from_str::<serde_json::Map<String, Value>>(include_str!(
         "../../src/subc_tool_schemas.json"
     ))
@@ -8065,6 +8519,8 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
             "tool {} should have a non-empty description",
             tool.name
         );
+        assert_ne!(tool.name, "health.digest");
+        assert_ne!(tool.name, "memory.census");
     }
 
     send_connection_goodbye(&mut stream).await;
@@ -8118,6 +8574,115 @@ async fn drive_pending_bind_health_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
+async fn drive_management_surface_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream,
+        root1,
+        root2,
+        state,
+        app,
+        executor,
+        ..
+    } = open_fake_daemon_session(input).await;
+
+    // Seed one live actor so both the digest's live-root path and the census's
+    // lifecycle join are exercised before opening the process-wide read plane.
+    bind_route1(&mut stream, &root1).await;
+    let actor_count = executor.actor_count();
+    let configure_count = state.configure_count();
+    let watcher_count = app.watcher_count();
+
+    send_management_route_bind(
+        &mut stream,
+        2,
+        20,
+        &root2,
+        Some(Principal::Reserved {
+            module_id: "prefrontal".to_string(),
+        }),
+    )
+    .await;
+    expect_route_bind_ack(&mut stream, 20).await;
+    assert_eq!(
+        executor.actor_count(),
+        actor_count,
+        "management bind must not register an actor"
+    );
+    assert_eq!(
+        state.configure_count(),
+        configure_count,
+        "management bind must not run configure"
+    );
+    assert_eq!(
+        app.watcher_count(),
+        watcher_count,
+        "management bind must not start a watcher"
+    );
+    let root2_id = ProjectRootId::from_path(&root2).expect("root2 id");
+    assert!(!executor.actor_registered(&root2_id));
+
+    send_management_request(&mut stream, 2, 30, json!({ "op": "memory.census" })).await;
+    let census = read_management_response(&mut stream, 2, 30, "memory.census").await;
+    assert!(
+        census.pointer("/data/roots").is_some(),
+        "census must carry uncapped roots: {census:?}"
+    );
+    assert!(
+        census.pointer("/data/process").is_some(),
+        "census must carry process header: {census:?}"
+    );
+
+    send_management_request(
+        &mut stream,
+        2,
+        31,
+        json!({
+            "op": "health.digest",
+            "params": { "project_root": root1, "since": "cursor-1" }
+        }),
+    )
+    .await;
+    let digest = read_management_response(&mut stream, 2, 31, "health.digest").await;
+    assert_eq!(digest.get("status").and_then(Value::as_str), Some("ok"));
+    assert!(
+        digest.get("data").is_some_and(Value::is_object),
+        "digest must carry its structured response: {digest:?}"
+    );
+
+    send_management_request(
+        &mut stream,
+        2,
+        34,
+        json!({ "op": "health.digest", "params": { "root": root2 } }),
+    )
+    .await;
+    let unbound = read_management_response(&mut stream, 2, 34, "health.digest").await;
+    assert_eq!(unbound.get("status").and_then(Value::as_str), Some("error"));
+    assert_eq!(
+        unbound.pointer("/data/code").and_then(Value::as_str),
+        Some("root_not_bound")
+    );
+
+    send_tool_call(&mut stream, 2, 32, "status", json!({})).await;
+    expect_error_frame(&mut stream, 2, 32, "unknown_management_op").await;
+
+    send_management_request(&mut stream, 1, 33, json!({ "op": "memory.census" })).await;
+    let tool_route_refusal = read_frame_timeout(&mut stream, "tool-route management refusal").await;
+    assert_tool_error_code(
+        &tool_response_json(&tool_route_refusal),
+        "unknown_tool",
+        "management operation on a tool route",
+    );
+
+    send_management_route_bind(&mut stream, 3, 40, &root2, Some(Principal::Unverified)).await;
+    expect_route_bind_error(&mut stream, 40, "route_refused").await;
+    assert_eq!(executor.actor_count(), actor_count);
+    assert_eq!(state.configure_count(), configure_count);
+    assert_eq!(app.watcher_count(), watcher_count);
+
+    send_connection_goodbye(&mut stream).await;
+}
+
 async fn drive_health_check_daemon(input: FakeDaemonInput) {
     let FakeDaemonSession {
         mut stream, root1, ..
@@ -8143,16 +8708,56 @@ async fn drive_health_check_daemon(input: FakeDaemonInput) {
         send_control_request(&mut stream, 20, ModuleControlRequest::HealthCheck {}).await;
         let report = expect_health_check_report(&mut stream, 20).await;
         let metrics = report.metrics.clone().expect("health check metrics");
-        if report.status == subc_protocol::session::HealthStatus::Ok {
+        // The verdict turns Ok while a root is still warming, so settle on
+        // the component field the assertions below read, not the verdict
+        // alone: a cached rollup can still carry the pre-configure callgraph
+        // state for a beat after the verdict has settled.
+        let callgraph_settled = metrics
+            .pointer("/roots/0/callgraph_store/status")
+            .and_then(Value::as_str)
+            == Some("disabled");
+        if report.status == subc_protocol::session::HealthStatus::Ok && callgraph_settled {
             break (report, metrics);
         }
         assert!(
             Instant::now() < deadline,
-            "health check should settle to ok for disabled components: {report:?}"
+            "health check should settle to ok with disabled components: {report:?}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
     assert_eq!(report.status, subc_protocol::session::HealthStatus::Ok);
+    for (section, fields) in [
+        (
+            "lsp",
+            &[
+                "children_total",
+                "children_by_root",
+                "children_without_client",
+                "children_with_deleted_cwd",
+            ][..],
+        ),
+        ("threads", &["total", "classified", "by_class"][..]),
+        (
+            "sqlite",
+            &[
+                "open_connections",
+                "open_by_store",
+                "uninstrumented_openers",
+            ][..],
+        ),
+        ("children", &["detached_total"][..]),
+        ("fds", &["open", "soft_limit"][..]),
+    ] {
+        let value = metrics
+            .get(section)
+            .unwrap_or_else(|| panic!("health.check omitted {section}: {metrics:#}"));
+        for field in fields {
+            assert!(
+                value.get(*field).is_some(),
+                "health.check omitted {section}.{field}: {metrics:#}"
+            );
+        }
+    }
     assert_eq!(metrics.get("root_count").and_then(Value::as_u64), Some(1));
     assert_eq!(metrics.get("actor_count").and_then(Value::as_u64), Some(1));
     let roots = metrics
@@ -8604,6 +9209,72 @@ async fn expect_health_check_report(stream: &mut tokio::net::TcpStream, corr: u6
     response
         .health_report()
         .expect("health.check response should carry a HealthReport")
+}
+
+async fn send_management_route_bind(
+    stream: &mut tokio::net::TcpStream,
+    route_channel: u16,
+    corr: u64,
+    identity_root: &std::path::Path,
+    principal: Option<Principal>,
+) {
+    send_control_request(
+        stream,
+        corr,
+        ModuleControlRequest::RouteBind {
+            route_channel,
+            epoch: 1,
+            target: RouteTarget::ManagementSurface {
+                module_id: "aft".to_string(),
+            },
+            identity: BindIdentity {
+                project_root: identity_root.to_path_buf(),
+                harness: "prefrontal".to_string(),
+                session: "management-route-must-not-register-session".to_string(),
+            },
+            principal,
+            consumer_capabilities: None,
+            admission_facts: Default::default(),
+        },
+    )
+    .await;
+}
+
+async fn send_management_request(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    body: Value,
+) {
+    send_frame(
+        stream,
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            channel,
+            1,
+            corr,
+            serde_json::to_vec(&body).expect("management request body"),
+        )
+        .expect("management request frame"),
+    )
+    .await;
+}
+
+async fn read_management_response(
+    stream: &mut tokio::net::TcpStream,
+    channel: u16,
+    corr: u64,
+    operation: &str,
+) -> Value {
+    let frame = read_frame_timeout(stream, "management response").await;
+    assert_eq!(frame.header.ty, FrameType::Response);
+    assert_eq!(frame.header.channel, channel);
+    assert_eq!(frame.header.epoch, 1);
+    assert_eq!(frame.header.corr, corr);
+    let response: Value = serde_json::from_slice(&frame.body).expect("management response body");
+    assert_eq!(response.get("op").and_then(Value::as_str), Some(operation));
+    response
 }
 
 async fn send_route_bind(
@@ -9879,14 +10550,15 @@ async fn expect_watcher_stale_status_pushes_for_tool(
                 assert_eq!(frame.header.corr, 0, "Push frames are server-initiated");
                 let body: Value = serde_json::from_slice(&frame.body).expect("push body");
                 let snapshot = body.get("snapshot").unwrap_or(&Value::Null);
-                let stale = snapshot
-                    .get("status_bar")
-                    .and_then(|status_bar| status_bar.get("tier2_stale"))
-                    .and_then(Value::as_bool)
-                    == Some(true);
+                let status_bar = snapshot.get("status_bar").unwrap_or(&Value::Null);
+                let stale = status_bar.get("tier2_stale").and_then(Value::as_bool) == Some(true);
                 let root_matches = snapshot.get("project_root").and_then(Value::as_str)
                     == Some(expected_root.as_str());
-                if push_type(&body) == Some("status_changed") && stale && root_matches {
+                if push_type(&body) == Some("status_changed") && root_matches {
+                    assert!(
+                        stale || status_bar.is_null(),
+                        "watcher status must be marked stale or remain absent until all producers report"
+                    );
                     assert!(
                         expected_channels.contains(&frame.header.channel),
                         "watcher stale push leaked to unexpected channel {}",

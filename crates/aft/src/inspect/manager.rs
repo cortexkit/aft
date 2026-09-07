@@ -4387,6 +4387,7 @@ fn duplicates_supports_language(language: crate::parser::LangId) -> bool {
             | crate::parser::LangId::R
             | crate::parser::LangId::Groovy
             | crate::parser::LangId::ObjC
+            | crate::parser::LangId::Toml
     )
 }
 
@@ -4409,6 +4410,8 @@ fn language_name(language: crate::parser::LangId) -> &'static str {
         crate::parser::LangId::Go => "go",
         crate::parser::LangId::C => "c",
         crate::parser::LangId::Cpp => "cpp",
+        crate::parser::LangId::Cuda => "cuda",
+        crate::parser::LangId::Metal => "metal",
         crate::parser::LangId::Zig => "zig",
         crate::parser::LangId::CSharp => "csharp",
         crate::parser::LangId::Bash => "bash",
@@ -4431,6 +4434,7 @@ fn language_name(language: crate::parser::LangId) -> &'static str {
         crate::parser::LangId::R => "r",
         crate::parser::LangId::Groovy => "groovy",
         crate::parser::LangId::ObjC => "objc",
+        crate::parser::LangId::Toml => "toml",
     }
 }
 
@@ -4788,9 +4792,12 @@ mod guard_tests {
         let dir = write_ts_project(2);
         let root = std::fs::canonicalize(dir.path()).expect("canonical fixture root");
         let snapshot = tier1_snapshot(&root);
+        // The property under test is that a worker panic reaches the waiter as
+        // `Failed`, not how fast the pool unwinds it; a loaded runner took 359ms
+        // to deliver the panic result, so the soft deadline is generous.
         let manager = InspectManager::with_worker(
             Arc::new(|_| panic!("forced Tier-1 worker panic")),
-            Duration::from_millis(250),
+            Duration::from_secs(10),
         );
 
         let outcome = manager.submit_category(

@@ -1819,3 +1819,72 @@ describe("SubcTransportPool lifecycle", () => {
     await expect(pool.replaceBinary("/new/path")).resolves.toBe("/new/path");
   });
 });
+
+describe("subc AbortSignal transport", () => {
+  test("closes the scoped route once and rejects promptly when the host aborts", async () => {
+    let markRequestStarted!: () => void;
+    const requestStarted = new Promise<void>((resolve) => {
+      markRequestStarted = resolve;
+    });
+    const client = new FakeClient(async () => {
+      markRequestStarted();
+      return new Promise(() => {});
+    });
+    const transport = poolWith(client);
+    const { pool } = transport;
+    const controller = new AbortController();
+    const request = pool.getBridge(TEST_PROJECT_ROOT).toolCall(
+      "session-abort",
+      "aft_search",
+      { query: "needle" },
+      {
+        abortSignal: controller.signal,
+      },
+    );
+
+    await requestStarted;
+    controller.abort();
+
+    await expect(request).rejects.toMatchObject({ name: "AbortError" });
+    expect(client.closedRoutes).toEqual([1]);
+    controller.abort();
+    await tick();
+    expect(client.closedRoutes).toEqual([1]);
+
+    for (const expectedRoute of [2, 3]) {
+      const nextController = new AbortController();
+      const nextRequest = pool.getBridge(TEST_PROJECT_ROOT).toolCall(
+        "session-abort",
+        "aft_search",
+        { query: "needle" },
+        {
+          abortSignal: nextController.signal,
+        },
+      );
+      await tick();
+      nextController.abort();
+      await expect(nextRequest).rejects.toMatchObject({ name: "AbortError" });
+      expect(client.closedRoutes.at(-1)).toBe(expectedRoute);
+    }
+    expect(transport.connects).toBe(1);
+
+    await pool.shutdown();
+  });
+
+  test("does not dispatch a Rust call when the signal is already aborted", async () => {
+    const client = new FakeClient(async () => envelope({ success: true, text: "unexpected" }));
+    const { pool } = poolWith(client);
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      pool
+        .getBridge(TEST_PROJECT_ROOT)
+        .send("aft_search", { query: "needle" }, { abortSignal: controller.signal }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(client.requests).toHaveLength(0);
+    expect(client.closedRoutes).toEqual([1]);
+
+    await pool.shutdown();
+  });
+});

@@ -1,4 +1,9 @@
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+
+pub mod lifecycle;
+pub use lifecycle::{
+    connection_snapshot, SqliteConnectionSnapshot, SqliteStore, SqliteStoreCount, TrackedConnection,
+};
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -259,14 +264,14 @@ impl From<rusqlite::Error> for OpenError {
 /// Applies per-connection PRAGMAs, runs schema migrations from the DB's
 /// current schema version up to [`CURRENT_SCHEMA_VERSION`], and returns the
 /// configured connection.
-pub fn open(path: &Path) -> Result<Connection, OpenError> {
+pub fn open(path: &Path) -> Result<TrackedConnection, OpenError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
         }
     }
 
-    let mut conn = Connection::open(path)?;
+    let mut conn = TrackedConnection::open(path, SqliteStore::AftDb)?;
     apply_pragmas(&conn)?;
     run_migrations(&mut conn)?;
     Ok(conn)
@@ -276,8 +281,12 @@ pub fn open(path: &Path) -> Result<Connection, OpenError> {
 ///
 /// Doctor uses this path for removal-time reporting, so checking state cannot
 /// itself create an AFT database or race a running bridge's write transaction.
-pub fn open_readonly(path: &Path) -> Result<Connection, OpenError> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+pub fn open_readonly(path: &Path) -> Result<TrackedConnection, OpenError> {
+    let conn = TrackedConnection::open_path_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+        SqliteStore::AftDb,
+    )?;
     conn.busy_timeout(Duration::from_secs(5))?;
     Ok(conn)
 }

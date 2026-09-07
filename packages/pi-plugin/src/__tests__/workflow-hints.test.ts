@@ -61,6 +61,10 @@ describe("Pi buildWorkflowHints", () => {
     // Imperative anti-bash-grep steer with concrete reflex translations (parity).
     expect(out).toContain("DO NOT run `grep`/`rg`/`find`/`sed`/`cat` through `bash`");
     expect(out).toContain("the bash path is unindexed, unranked, serial");
+    // Portable bash code-search STOP steer
+    expect(out).toContain(
+      "If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline`, or `aft_zoom` instead.",
+    );
     expect(out).toContain("Reflex translations:");
     expect(out).toContain('aft_search({ query: "handleAuth" })');
     expect(out).toContain("Use `aft_callgraph`");
@@ -79,6 +83,48 @@ describe("Pi buildWorkflowHints", () => {
     expect(out).toContain("the user can interrupt");
     expect(out).toContain("Never loop `bash_status`");
     expect(out).not.toContain("taskId");
+  });
+
+  test("replaces zoom steering with read when zoom is disabled", () => {
+    const out = buildWorkflowHints({
+      toolSurface: "recommended",
+      hoistBuiltins: true,
+      semanticEnabled: true,
+      bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
+      absentTools: new Set(["aft_zoom"]),
+    });
+    expect(out).toContain("→ `read` for symbol(s)");
+    expect(out).not.toContain("aft_zoom");
+    expect(out).toContain(
+      "If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use `aft_search` (concepts, identifiers, regex, literals), `read`, `aft_outline` instead.",
+    );
+  });
+
+  test("omits bash STOP steer when bash is absent", () => {
+    const out = buildWorkflowHints({
+      toolSurface: "recommended",
+      hoistBuiltins: true,
+      semanticEnabled: true,
+      bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
+      absentTools: new Set(["bash"]),
+    });
+    expect(out).not.toContain("STOP —");
+  });
+
+  test("steers to grep tool when aft_search is absent", () => {
+    const out = buildWorkflowHints({
+      toolSurface: "recommended",
+      hoistBuiltins: true,
+      semanticEnabled: false,
+      bashBackgroundEnabled: false,
+      bashCompressionEnabled: false,
+      absentTools: new Set(),
+    });
+    expect(out).toContain(
+      "If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — use the `grep` tool, `read`, `aft_outline`, or `aft_zoom` instead.",
+    );
   });
 
   test("omits bg-bash section when background is disabled", () => {

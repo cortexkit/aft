@@ -16,6 +16,25 @@ pub(crate) use shared_test_env::{
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+
+/// Releases a shell fixture when its owning test scope unwinds.
+///
+/// Several integration fixtures keep a child shell behind a sentinel file.
+/// Writing that file during unwinding lets the child exit before its temporary
+/// directory is removed.
+pub struct ReleaseOnDrop(pub PathBuf);
+
+impl ReleaseOnDrop {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self(path.into())
+    }
+}
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, b"release");
+    }
+}
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     mpsc::{self, Receiver, RecvTimeoutError},
@@ -225,6 +244,9 @@ impl AftProcess {
             // opt back in via spawn_with_real_watcher (which overrides this to
             // "0"). Explicit `envs` below can override it.
             .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
+            // Legacy integration fixtures live under the OS temp directory. Tests
+            // for the production temp-path policy override this dedicated test hook.
+            .env("AFT_TEST_ALLOW_TEMP_BACKUPS", "1")
             // Keep the child's PATH exactly what the test constructed. The
             // production login-shell probe + standard-dir enrichment would
             // re-add real tool dirs (e.g. /usr/local/bin on CI runners),

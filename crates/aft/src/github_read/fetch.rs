@@ -6,12 +6,12 @@ use std::sync::LazyLock;
 use serde_json::Value;
 
 use super::model::GithubDocument;
-use super::normalize::normalize_structured_document;
+use super::normalize::{normalize_structured_document, normalize_timeline_events};
 use super::resource::{GithubResource, GithubResourceKind};
 
 const ISSUE_JSON_FIELDS: &str = "number,title,state,author,createdAt,updatedAt,labels,assignees,milestone,body,reactionGroups,comments,url";
-const PR_JSON_FIELDS: &str = "number,title,state,author,createdAt,updatedAt,labels,assignees,milestone,body,reactionGroups,comments,files,reviews,url";
-const PR_REVIEW_COMMENTS_QUERY: &str = "query AftReadPullRequestReviewComments($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { number reviews(first: 100) { nodes { author { login } body state submittedAt comments(first: 100) { totalCount nodes { author { login } body createdAt updatedAt isMinimized } } } } } } }";
+const PR_JSON_FIELDS: &str = "number,title,state,author,createdAt,updatedAt,labels,assignees,milestone,body,reactionGroups,comments,files,reviews,baseRefName,headRefName,reviewDecision,url";
+const PR_REVIEW_COMMENTS_QUERY: &str = "query AftReadPullRequestReviewComments($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { number reviews(first: 100) { nodes { author { login } body state submittedAt comments(first: 100) { totalCount nodes { author { login } body createdAt updatedAt isMinimized path line originalLine } } } } } } }";
 
 /// Request context passed to a structured GitHub fetcher.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -159,6 +159,11 @@ impl<R: GhCommandRunner> GithubFetcher for GhCliFetcher<R> {
             let review_document = normalize_document(&request.resource, &review_json)?;
             document.review_comment_sections = review_document.review_comment_sections;
         }
+        let timeline_json = self.structured_json(
+            &request.working_directory,
+            &gh_timeline_args(&request.resource, &document.repository)?,
+        )?;
+        document.timeline = normalize_timeline_events(&timeline_json);
         Ok(document)
     }
 }
@@ -239,9 +244,33 @@ pub fn gh_view_args(resource: &GithubResource) -> Vec<String> {
     args
 }
 
-/// Build the structured GraphQL fetch for inline PR review comments. The first
-/// `pr view --json` call resolves the repository; this second JSON call fills
-/// comment sections that `gh pr view` does not expose as a display field.
+/// Build the paginated timeline request with the owner/repository resolved by
+/// the initial resource lookup, expanding shorthand resource names first.
+pub fn gh_timeline_args(
+    resource: &GithubResource,
+    resolved_repository: &str,
+) -> Result<Vec<String>, GithubReadError> {
+    let (owner, repository) = resolved_repository.split_once('/').ok_or_else(|| {
+        GithubReadError::InvalidStructuredResponse(
+            "GitHub structured response returned an invalid resolved repository".to_string(),
+        )
+    })?;
+    if owner.is_empty() || repository.is_empty() || repository.contains('/') {
+        return Err(GithubReadError::InvalidStructuredResponse(
+            "GitHub structured response returned an invalid resolved repository".to_string(),
+        ));
+    }
+    Ok(vec![
+        "api".to_string(),
+        format!(
+            "repos/{owner}/{repository}/issues/{}/timeline?per_page=100",
+            resource.number
+        ),
+        "--paginate".to_string(),
+        "--slurp".to_string(),
+    ])
+}
+
 pub fn gh_pr_review_comments_args(
     resource: &GithubResource,
     resolved_repository: &str,
@@ -266,7 +295,7 @@ pub fn gh_pr_review_comments_args(
             "GitHub resource number exceeds the GraphQL integer range".to_string(),
         )
     })?;
-    let mut args = vec![
+    let args = vec![
         "api".to_string(),
         "graphql".to_string(),
         "-f".to_string(),
@@ -278,10 +307,6 @@ pub fn gh_pr_review_comments_args(
         "-F".to_string(),
         format!("number={number}"),
     ];
-    if let Some(repository) = &resource.repository {
-        args.push("-R".to_string());
-        args.push(repository.clone());
-    }
     Ok(args)
 }
 
@@ -327,7 +352,7 @@ mod tests {
     #[derive(Default)]
     struct FixtureRunner {
         calls: Mutex<Vec<(PathBuf, Vec<String>)>>,
-        output: Mutex<Option<Result<GhCommandOutput, GhCommandError>>>,
+        output: Mutex<Vec<Result<GhCommandOutput, GhCommandError>>>,
     }
 
     impl GhCommandRunner for FixtureRunner {
@@ -340,7 +365,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((working_directory.to_path_buf(), args.to_vec()));
-            self.output.lock().unwrap().take().unwrap()
+            self.output.lock().unwrap().remove(0)
         }
     }
 
@@ -374,9 +399,10 @@ mod tests {
         let short_review_args = gh_pr_review_comments_args(&short_pr, "owner/repo").unwrap();
         assert!(!short_review_args.iter().any(|argument| argument == "-R"));
         let explicit_review_args = gh_pr_review_comments_args(&explicit_pr, "owner/repo").unwrap();
-        assert!(explicit_review_args
-            .windows(2)
-            .any(|pair| pair == ["-R", "owner/repo"]));
+        assert!(
+            !explicit_review_args.iter().any(|argument| argument == "-R"),
+            "the GraphQL request resolves owner and repository from its variables"
+        );
         assert!(short_review_args
             .iter()
             .any(|argument| argument.starts_with("query=query AftReadPullRequestReviewComments")));
@@ -385,16 +411,23 @@ mod tests {
     #[test]
     fn fetcher_uses_structured_json_and_redacts_failures() {
         let runner = FixtureRunner::default();
-        *runner.output.lock().unwrap() = Some(Ok(GhCommandOutput {
-            success: true,
-            stdout: serde_json::to_vec(&json!({
-                "number": 1,
-                "title": "fixture",
-                "url": "https://github.com/owner/repo/issues/1"
-            }))
-            .unwrap(),
-            stderr: Vec::new(),
-        }));
+        *runner.output.lock().unwrap() = vec![
+            Ok(GhCommandOutput {
+                success: true,
+                stdout: serde_json::to_vec(&json!({
+                    "number": 1,
+                    "title": "fixture",
+                    "url": "https://github.com/owner/repo/issues/1"
+                }))
+                .unwrap(),
+                stderr: Vec::new(),
+            }),
+            Ok(GhCommandOutput {
+                success: true,
+                stdout: b"[]".to_vec(),
+                stderr: Vec::new(),
+            }),
+        ];
         let fetcher = GhCliFetcher::new(runner);
         let request = GithubFetchRequest {
             resource: GithubResource {

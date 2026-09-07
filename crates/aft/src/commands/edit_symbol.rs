@@ -351,6 +351,13 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(ref id) = backup_id {
         result["backup_id"] = serde_json::json!(id);
     }
+    edit::attach_backup_skipped_reason(
+        &mut result,
+        ctx,
+        req.session(),
+        &op_id,
+        Some(path.as_path()),
+    );
 
     // Include surrounding context for replace/insert ops so the agent can
     // detect issues like duplicated attributes or misplaced decorators.

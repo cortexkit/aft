@@ -361,6 +361,78 @@ fn test_manager_shutdown_all() {
     assert!(!manager.has_active_servers());
 }
 
+#[cfg(unix)]
+#[test]
+fn shutdown_all_bounds_unresponsive_servers_and_reaps_them() {
+    let fixtures = (0..6).map(|_| rust_fixture_files()).collect::<Vec<_>>();
+    let registry = LspChildRegistry::new();
+    let mut manager = LspManager::new();
+    manager.set_child_registry(registry.clone());
+    manager.override_binary(ServerKind::Rust, fake_server_path());
+    manager.set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN", "1");
+
+    for (_, main_rs, _) in &fixtures {
+        manager.ensure_server_for_file_default(main_rs);
+    }
+    let pids = registry.pids();
+    assert_eq!(pids.len(), 6, "each fixture must have its own LSP child");
+
+    let started = Instant::now();
+    let outcome = manager.shutdown_all();
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "six unresponsive shutdowns must share one bounded wait"
+    );
+    assert_eq!(outcome.graceful, 0);
+    assert_eq!(outcome.forced, 6, "shutdown summary must report forced=6");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    for pid in pids {
+        while aft::bash_background::process::is_process_alive(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !aft::bash_background::process::is_process_alive(pid),
+            "timed-out LSP pid {pid} must be terminated"
+        );
+    }
+    assert!(
+        registry.pids().is_empty(),
+        "reaped LSP pids must be untracked"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shutdown_all_reports_graceful_servers_within_the_budget() {
+    let fixtures = (0..2).map(|_| rust_fixture_files()).collect::<Vec<_>>();
+    let registry = LspChildRegistry::new();
+    let mut manager = LspManager::new();
+    manager.set_child_registry(registry.clone());
+    manager.override_binary(ServerKind::Rust, fake_server_path());
+
+    for (_, main_rs, _) in &fixtures {
+        manager.ensure_server_for_file_default(main_rs);
+    }
+    assert_eq!(manager.active_client_count(), 2);
+
+    let started = Instant::now();
+    let outcome = manager.shutdown_all();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "responsive LSPs must finish well within the shutdown budget"
+    );
+    assert_eq!(
+        outcome.graceful, 2,
+        "shutdown summary must report graceful=2, got {outcome:?}"
+    );
+    assert_eq!(outcome.forced, 0);
+    assert!(
+        registry.pids().is_empty(),
+        "graceful LSP pids must be untracked"
+    );
+}
+
 #[test]
 fn test_server_lifecycle_states() {
     let (_temp_dir, main_rs, _lib_rs) = rust_fixture_files();

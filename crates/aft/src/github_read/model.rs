@@ -32,6 +32,11 @@ pub struct GithubDocument {
     pub files: Vec<GithubPullRequestFile>,
     pub reviews: Vec<GithubReview>,
     pub review_comment_sections: Vec<GithubReviewCommentSection>,
+    pub base_ref_name: Option<String>,
+    pub head_ref_name: Option<String>,
+    pub review_decision: Option<String>,
+    /// Timeline events selected from GitHub's issue timeline endpoint.
+    pub timeline: Vec<GithubTimelineEvent>,
 }
 
 impl GithubDocument {
@@ -67,6 +72,8 @@ pub struct GithubComment {
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub minimized: bool,
+    pub path: Option<String>,
+    pub line: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -99,4 +106,20 @@ pub struct GithubReviewCommentSection {
     pub comments: Vec<GithubComment>,
     pub comments_total_count: Option<usize>,
     pub minimized_comments_count: Option<usize>,
+}
+
+/// A timeline state-change event normalized from GitHub's issue timeline API.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GithubTimelineEvent {
+    pub actor: Option<String>,
+    pub event: String,
+    pub created_at: Option<String>,
+    pub label: Option<String>,
+    pub assignee: Option<String>,
+    pub milestone: Option<String>,
+    pub rename_from: Option<String>,
+    pub rename_to: Option<String>,
+    pub requested_reviewer: Option<String>,
+    pub commit_id: Option<String>,
 }

@@ -1,0 +1,10 @@
+{
+  "bash": {
+    "watch_sync_max_ms": 1800000
+  },
+  "experimental_bash_background": true,
+  "experimental_bash_compress": true,
+  "experimental_bash_rewrite": true,
+  "hoist_builtin_tools": true,
+  "restrict_to_project_root": false
+}

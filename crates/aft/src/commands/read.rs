@@ -20,8 +20,9 @@ use serde_json::Value;
 
 use crate::context::AppContext;
 use crate::github_read::{
-    sqlite_cache_store, GhCliFetcher, GithubReadCompletion, GithubReadEngine, GithubReadSelector,
-    GithubReadStart, ReqwestGithubImageDownloader, SystemGithubReadClock,
+    parse_resource, sqlite_cache_store, GhCliFetcher, GithubReadCompletion, GithubReadEngine,
+    GithubReadSelector, GithubReadStart, GithubReadView, ReqwestGithubImageDownloader,
+    SystemGithubReadClock,
 };
 use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse, PendingResponsePoll};
@@ -709,7 +710,7 @@ fn handle_registered_artifact_read(req: &RawRequest, bytes: Vec<u8>) -> Response
     )
 }
 
-fn is_github_read_target(file: &str) -> bool {
+pub(crate) fn is_github_read_target(file: &str) -> bool {
     file.starts_with("issue://") || file.starts_with("pr://")
 }
 
@@ -760,6 +761,15 @@ fn start_github_read(
     ctx: &AppContext,
     file: &str,
 ) -> Result<(GithubReadStart, usize), Response> {
+    start_github_read_with_view(req, ctx, file, GithubReadView::Document)
+}
+
+fn start_github_read_with_view(
+    req: &RawRequest,
+    ctx: &AppContext,
+    file: &str,
+    view: GithubReadView,
+) -> Result<(GithubReadStart, usize), Response> {
     if ctx.request_force_restrict(&req.id) {
         return Err(Response::error(
             &req.id,
@@ -777,19 +787,20 @@ fn start_github_read(
     let authentication_identity = format!("session:{}", req.session());
     let gh_read = ctx.config().gh_read.clone();
     github_read_engine(ctx)
-        .start_resource(
+        .start_resource_with_view(
             &gh_read,
             file,
             working_directory,
             authentication_identity,
             vision_capability,
             selector,
+            view,
         )
         .map(|start| (start, start_line))
         .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))
 }
 
-fn wait_for_github_read(
+pub(crate) fn wait_for_github_read(
     start: GithubReadStart,
 ) -> Result<GithubReadCompletion, crate::github_read::GithubReadError> {
     match start {
@@ -854,6 +865,71 @@ fn handle_github_read(req: &RawRequest, ctx: &AppContext, file: &str) -> Respons
     };
     match wait_for_github_read(start) {
         Ok(completion) => github_read_response(req, completion, start_line),
+        Err(error) => Response::error(&req.id, error.code(), error.to_string()),
+    }
+}
+
+/// Render a concise live GitHub index through the same gate and fetch engine as
+/// `read`. A failed refresh returns the cache's explicitly labelled read copy.
+pub(crate) fn handle_github_outline(req: &RawRequest, ctx: &AppContext, target: &str) -> Response {
+    let (start, _) = match start_github_read_with_view(req, ctx, target, GithubReadView::Outline) {
+        Ok(start) => start,
+        Err(response) => return response,
+    };
+    match wait_for_github_read(start) {
+        Ok(completion) => Response::success(
+            &req.id,
+            serde_json::json!({
+                "text": completion.content,
+                "complete": matches!(completion.freshness, crate::github_read::GithubReadFreshness::Fetched),
+            }),
+        ),
+        Err(error) => Response::error(&req.id, error.code(), error.to_string()),
+    }
+}
+
+/// Zoom GitHub discussion ordinals by reusing `read`'s selector renderer.
+pub(crate) fn handle_github_zoom(
+    req: &RawRequest,
+    ctx: &AppContext,
+    target: &str,
+    selector: &str,
+) -> Response {
+    let resource = match parse_resource(target) {
+        Ok(resource) if resource.comment_selector.is_none() => resource,
+        Ok(_) => return Response::error(
+            &req.id,
+            "invalid_resource",
+            "GitHub zoom target must not include /comments; pass discussion ordinals in symbols",
+        ),
+        Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
+    };
+    let selected = format!("{}/comments/{selector}", resource.base_spelling());
+    let (start, _) = match start_github_read(req, ctx, &selected) {
+        Ok(start) => start,
+        Err(response) => return response,
+    };
+    match wait_for_github_read(start) {
+        Ok(completion) => {
+            let end_line = completion.content.lines().count().max(1) as u32;
+            Response::success(
+                &req.id,
+                serde_json::json!({
+                    "name": format!("items {selector}"),
+                    "kind": "github-discussion",
+                    "range": {
+                        "start_line": 1,
+                        "start_col": 1,
+                        "end_line": end_line,
+                        "end_col": 1,
+                    },
+                    "content": completion.content,
+                    "context_before": [],
+                    "context_after": [],
+                    "annotations": { "calls_out": [], "called_by": [] },
+                }),
+            )
+        }
         Err(error) => Response::error(&req.id, error.code(), error.to_string()),
     }
 }

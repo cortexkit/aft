@@ -1,0 +1,80 @@
+name: Nightly OSS cost gate
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Run one fixed repository (all runs the complete matrix)"
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - redox
+          - typescript-eslint
+          - jupyterlab
+          - hugo
+          - synthetic-24k
+
+concurrency:
+  group: nightly-oss-cost-gate
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Two runs over five repositories can use the full budget without making a
+  # single slow repository consume an unbounded scheduled-run allocation.
+  AFT_COST_GATE_BUDGET_MIN: "15"
+  AFT_COST_GATE_RESULTS_DIR: ${{ github.workspace }}/cost-gate-results
+
+jobs:
+  cost-gate:
+    name: OSS index cost gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nightly-cost-gate
+          cache-on-failure: true
+
+      - name: Build release binary
+        run: cargo build --release -p agent-file-tools --quiet
+
+      - name: Compare fixed OSS matrix
+        env:
+          REPO_INPUT: ${{ inputs.repo }}
+          AFT_COST_GATE_CACHE_DIR: ${{ runner.temp }}/aft-cost-gate-cache
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ -n "${REPO_INPUT:-}" && "$REPO_INPUT" != "all" ]]; then
+            args+=(--repo "$REPO_INPUT")
+          fi
+          scripts/telemetry/cost-gate.sh "${args[@]}"
+
+      - name: Gate exact lexical recall
+        run: |
+          python3 benchmarks/aft-search/setup_corpus.py
+          scripts/telemetry/cost-gate.sh --exact-recall \
+            --binary "${{ github.workspace }}/target/release/aft" \
+            --out "$AFT_COST_GATE_RESULTS_DIR/exact-recall.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload cost-gate CSV and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oss-cost-gate-${{ github.run_id }}
+          path: cost-gate-results
+          if-no-files-found: error
+          retention-days: 30

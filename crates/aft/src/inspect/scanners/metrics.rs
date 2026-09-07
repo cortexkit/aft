@@ -204,6 +204,8 @@ fn language_key(path: &Path) -> &'static str {
         Some(LangId::Go) => "go",
         Some(LangId::C) => "c",
         Some(LangId::Cpp) => "cpp",
+        Some(LangId::Cuda) => "cuda",
+        Some(LangId::Metal) => "metal",
         Some(LangId::Zig) => "zig",
         Some(LangId::CSharp) => "csharp",
         Some(LangId::Bash) => "bash",
@@ -226,6 +228,7 @@ fn language_key(path: &Path) -> &'static str {
         Some(LangId::R) => "r",
         Some(LangId::Groovy) => "groovy",
         Some(LangId::ObjC) => "objc",
+        Some(LangId::Toml) => "toml",
         None => "unknown",
     }
 }

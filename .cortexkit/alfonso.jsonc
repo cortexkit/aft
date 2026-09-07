@@ -1,6 +1,5 @@
 {
   "agent_name": "AFT",
-  "agent_nodark": 30,
   "board": {
     "enabled": true
   },

@@ -666,6 +666,8 @@ pub enum LangId {
     Go,
     C,
     Cpp,
+    Cuda,
+    Metal,
     Zig,
     CSharp,
     Bash,
@@ -688,6 +690,7 @@ pub enum LangId {
     R,
     Groovy,
     ObjC,
+    Toml,
 }
 
 /// Maps file extension to language identifier.
@@ -706,6 +709,8 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "go" => Some(LangId::Go),
         "c" | "h" => Some(LangId::C),
         "cc" | "cpp" | "cxx" | "hpp" | "hh" => Some(LangId::Cpp),
+        "cu" | "cuh" => Some(LangId::Cuda),
+        "metal" => Some(LangId::Metal),
         "zig" => Some(LangId::Zig),
         "cs" => Some(LangId::CSharp),
         "sh" | "bash" | "zsh" => Some(LangId::Bash),
@@ -728,6 +733,7 @@ pub fn detect_language(path: &Path) -> Option<LangId> {
         "R" | "r" => Some(LangId::R),
         "groovy" | "gvy" | "gy" | "gsh" | "gradle" => Some(LangId::Groovy),
         "m" | "mm" => Some(LangId::ObjC),
+        "toml" => Some(LangId::Toml),
         _ => None,
     }
 }
@@ -743,6 +749,8 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::Go => tree_sitter_go::LANGUAGE.into(),
         LangId::C => tree_sitter_c::LANGUAGE.into(),
         LangId::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        LangId::Cuda => tree_sitter_cuda::LANGUAGE.into(),
+        LangId::Metal => tree_sitter_cpp::LANGUAGE.into(),
         LangId::Zig => tree_sitter_zig::LANGUAGE.into(),
         LangId::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
         LangId::Bash => tree_sitter_bash::LANGUAGE.into(),
@@ -765,6 +773,7 @@ pub fn grammar_for(lang: LangId) -> Language {
         LangId::R => tree_sitter_r::LANGUAGE.into(),
         LangId::Groovy => dekobon_tree_sitter_groovy::LANGUAGE.into(),
         LangId::ObjC => tree_sitter_objc::LANGUAGE.into(),
+        LangId::Toml => tree_sitter_toml::LANGUAGE.into(),
     }
 }
 
@@ -777,7 +786,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::Rust => None,
         LangId::Go => Some(GO_QUERY),
         LangId::C => Some(C_QUERY),
-        LangId::Cpp => Some(CPP_QUERY),
+        LangId::Cpp | LangId::Cuda | LangId::Metal => Some(CPP_QUERY),
         LangId::Zig => Some(ZIG_QUERY),
         LangId::CSharp => Some(CSHARP_QUERY),
         LangId::Bash => Some(BASH_QUERY),
@@ -800,6 +809,7 @@ fn query_for(lang: LangId) -> Option<&'static str> {
         LangId::R => Some(R_QUERY),
         LangId::Groovy => Some(GROOVY_QUERY),
         LangId::ObjC => Some(OBJC_QUERY),
+        LangId::Toml => None,
     }
 }
 
@@ -816,6 +826,8 @@ static GO_QUERY_CACHE: LazyLock<Result<Query, String>> =
 static C_QUERY_CACHE: LazyLock<Result<Query, String>> = LazyLock::new(|| compile_query(LangId::C));
 static CPP_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Cpp));
+static CUDA_QUERY_CACHE: LazyLock<Result<Query, String>> =
+    LazyLock::new(|| compile_query(LangId::Cuda));
 static ZIG_QUERY_CACHE: LazyLock<Result<Query, String>> =
     LazyLock::new(|| compile_query(LangId::Zig));
 static CSHARP_QUERY_CACHE: LazyLock<Result<Query, String>> =
@@ -866,6 +878,8 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         LangId::Go => Some(&*GO_QUERY_CACHE),
         LangId::C => Some(&*C_QUERY_CACHE),
         LangId::Cpp => Some(&*CPP_QUERY_CACHE),
+        LangId::Cuda => Some(&*CUDA_QUERY_CACHE),
+        LangId::Metal => Some(&*CPP_QUERY_CACHE),
         LangId::Zig => Some(&*ZIG_QUERY_CACHE),
         LangId::CSharp => Some(&*CSHARP_QUERY_CACHE),
         LangId::Bash => Some(&*BASH_QUERY_CACHE),
@@ -888,7 +902,8 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
         | LangId::Markdown
         | LangId::Vue
         | LangId::Json
-        | LangId::Yaml => None,
+        | LangId::Yaml
+        | LangId::Toml => None,
     };
 
     query
@@ -1659,6 +1674,9 @@ pub fn extract_symbols_from_tree(
     if lang == LangId::Yaml {
         return extract_yaml_symbols(source, &root);
     }
+    if lang == LangId::Toml {
+        return extract_toml_symbols(source, &root);
+    }
 
     let query = cached_query_for(lang)?.ok_or_else(|| AftError::InvalidRequest {
         message: format!("no query patterns implemented for {:?} yet", lang),
@@ -1670,7 +1688,9 @@ pub fn extract_symbols_from_tree(
         LangId::Python => extract_py_symbols(source, &root, query),
         LangId::Go => extract_go_symbols(source, &root, query),
         LangId::C => extract_c_symbols(source, &root, query),
-        LangId::Cpp => extract_cpp_symbols(source, &root, query),
+        LangId::Cpp | LangId::Cuda | LangId::Metal => {
+            extract_cpp_symbols(source, &root, query, lang)
+        }
         LangId::Zig => extract_zig_symbols(source, &root, query),
         LangId::CSharp => extract_csharp_symbols(source, &root, query),
         LangId::Bash => extract_bash_symbols(source, &root, query),
@@ -1693,7 +1713,8 @@ pub fn extract_symbols_from_tree(
         | LangId::Markdown
         | LangId::Vue
         | LangId::Json
-        | LangId::Yaml => unreachable!("handled before query lookup"),
+        | LangId::Yaml
+        | LangId::Toml => unreachable!("handled before query lookup"),
     }
 }
 
@@ -1773,6 +1794,8 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
             LangId::Go
             | LangId::C
             | LangId::Cpp
+            | LangId::Cuda
+            | LangId::Metal
             | LangId::ObjC
             | LangId::Zig
             | LangId::CSharp
@@ -1807,7 +1830,12 @@ fn node_range_with_decorators_inner(node: &Node, source: &str, lang: LangId) -> 
                 // Decorators are handled by decorated_definition capture
                 false
             }
-            LangId::Html | LangId::Markdown | LangId::Vue | LangId::Json | LangId::Yaml => false,
+            LangId::Html
+            | LangId::Markdown
+            | LangId::Vue
+            | LangId::Json
+            | LangId::Yaml
+            | LangId::Toml => false,
         };
 
         if should_include {
@@ -1918,27 +1946,31 @@ fn is_exported(node: &Node, export_ranges: &[std::ops::Range<usize>]) -> bool {
         .any(|er| er.start <= r.start && r.end <= er.end)
 }
 
+/// Pre-order walk of the whole tree collecting exported names.
+///
+/// Iterative with one cursor on purpose: the recursive form spent a stack
+/// frame per tree depth, and a large non-TypeScript document parsed by the
+/// TypeScript grammar (an HTML page whose URL ended in `.d.ts`) produced an
+/// error-recovery tree deep enough to overflow the 2 MiB executor worker
+/// stack and abort the daemon - twice, 55 s apart, on the same request.
 fn collect_exported_symbol_names(source: &str, root: &Node) -> HashSet<String> {
     let mut exported = HashSet::new();
-    collect_exported_symbol_names_inner(source, root, &mut exported);
-    exported
-}
-
-fn collect_exported_symbol_names_inner(source: &str, node: &Node, exported: &mut HashSet<String>) {
-    if node.kind() == "export_statement" {
-        collect_names_from_export_statement(source, node, exported);
-    }
-
-    let mut cursor = node.walk();
-    if !cursor.goto_first_child() {
-        return;
-    }
-
+    let mut cursor = root.walk();
     loop {
-        let child = cursor.node();
-        collect_exported_symbol_names_inner(source, &child, exported);
-        if !cursor.goto_next_sibling() {
-            break;
+        let node = cursor.node();
+        if node.kind() == "export_statement" {
+            collect_names_from_export_statement(source, &node, &mut exported);
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return exported;
+            }
         }
     }
 }
@@ -3406,9 +3438,25 @@ fn extract_c_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Sym
     Ok(symbols)
 }
 
+fn cpp_function_kind(source: &str, definition: &Node, lang: LangId) -> SymbolKind {
+    let is_cuda_kernel = lang == LangId::Cuda
+        && node_text(source, definition)
+            .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+            .any(|token| token == "__global__");
+    if is_cuda_kernel {
+        SymbolKind::Kernel
+    } else {
+        SymbolKind::Function
+    }
+}
+
 /// Extract symbols from C++ source.
-fn extract_cpp_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<Symbol>, AftError> {
-    let lang = LangId::Cpp;
+fn extract_cpp_symbols(
+    source: &str,
+    root: &Node,
+    query: &Query,
+    lang: LangId,
+) -> Result<Vec<Symbol>, AftError> {
     let capture_names = query.capture_names();
 
     let mut type_names = HashSet::new();
@@ -3519,7 +3567,7 @@ fn extract_cpp_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<S
                 let scope_chain = cpp_parent_scope_chain(&def_node, source);
                 symbols.push(Symbol {
                     name: node_text(source, &name_node).to_string(),
-                    kind: SymbolKind::Function,
+                    kind: cpp_function_kind(source, &def_node, lang),
                     range: node_range_with_decorators(&def_node, source, lang),
                     signature: Some(extract_signature(source, &def_node)),
                     scope_chain: scope_chain.clone(),
@@ -5159,6 +5207,110 @@ fn objc_declarator_name(source: &str, node: &Node) -> Option<String> {
             None
         }
     })
+}
+
+fn toml_key_text(source: &str, key: &Node) -> String {
+    let raw = node_text(source, key).trim();
+    if raw.len() >= 2
+        && ((raw.starts_with('"') && raw.ends_with('"'))
+            || (raw.starts_with('\'') && raw.ends_with('\'')))
+    {
+        raw[1..raw.len() - 1].to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+fn toml_pair_symbol(source: &str, pair: &Node, section: Option<&str>) -> Option<Symbol> {
+    let key = pair.child_by_field_name("key").or_else(|| {
+        let mut cursor = pair.walk();
+        let first = pair.named_children(&mut cursor).next();
+        first
+    })?;
+    let name = toml_key_text(source, &key);
+    if name.is_empty() {
+        return None;
+    }
+
+    let scope_chain = section
+        .map(|name| vec![name.to_string()])
+        .unwrap_or_default();
+    Some(Symbol {
+        name,
+        kind: SymbolKind::Variable,
+        range: node_range_with_decorators(pair, source, LangId::Toml),
+        signature: None,
+        scope_chain,
+        exported: false,
+        parent: section.map(str::to_string),
+    })
+}
+
+fn toml_table_name(source: &str, table: &Node) -> Option<String> {
+    let first_line = node_text(source, table).lines().next()?.trim();
+    let name = first_line
+        .strip_prefix("[[")
+        .and_then(|line| line.strip_suffix("]]"))
+        .or_else(|| {
+            first_line
+                .strip_prefix('[')
+                .and_then(|line| line.strip_suffix(']'))
+        })?
+        .trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn toml_table_range(source: &str, table: &Node) -> Range {
+    let start = table.start_position();
+    let text = node_text(source, table).trim_end();
+    let mut lines = text.lines();
+    let line_count = lines.clone().count().max(1);
+    let end_col = lines.next_back().map(str::len).unwrap_or_default();
+    Range {
+        start_line: start.row as u32,
+        start_col: start.column as u32,
+        end_line: start.row as u32 + line_count as u32 - 1,
+        end_col: end_col as u32,
+    }
+}
+
+fn extract_toml_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftError> {
+    let mut symbols = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        match child.kind() {
+            "pair" => {
+                if let Some(symbol) = toml_pair_symbol(source, &child, None) {
+                    symbols.push(symbol);
+                }
+            }
+            "table" | "table_array_element" => {
+                let Some(name) = toml_table_name(source, &child) else {
+                    continue;
+                };
+                symbols.push(Symbol {
+                    name: name.clone(),
+                    kind: SymbolKind::Variable,
+                    range: toml_table_range(source, &child),
+                    signature: None,
+                    scope_chain: Vec::new(),
+                    exported: false,
+                    parent: None,
+                });
+
+                let mut table_cursor = child.walk();
+                for item in child.named_children(&mut table_cursor) {
+                    if item.kind() == "pair" {
+                        if let Some(symbol) = toml_pair_symbol(source, &item, Some(&name)) {
+                            symbols.push(symbol);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(symbols)
 }
 
 /// Return the first non-comment value in a JSON document.
@@ -7984,6 +8136,40 @@ mod tests {
             .join("tests")
             .join("fixtures")
             .join(name)
+    }
+
+    /// The export walk must not spend stack per tree depth. This runs it on a
+    /// deliberately small thread over a tree nested far deeper than the old
+    /// recursive walk survived at that size; a return to recursion overflows
+    /// here (the abort is deterministic, not a timing flake) instead of in the
+    /// daemon, where a URL that parsed as TypeScript did exactly that.
+    #[test]
+    fn export_walk_survives_deep_trees_on_a_small_stack() {
+        const DEPTH: usize = 3000;
+        // The export clause sits after the deep expression: the walk is
+        // pre-order over the whole tree, so it must come through the nesting
+        // to find it, and finding it proves the traversal completed.
+        let mut source = String::from("const deep = ");
+        source.push_str(&"(".repeat(DEPTH));
+        source.push('1');
+        source.push_str(&")".repeat(DEPTH));
+        source.push_str(";\nfunction shallow() {}\nexport { deep, shallow };\n");
+
+        let exported = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let grammar = grammar_for(LangId::TypeScript);
+                let mut parser = Parser::new();
+                parser.set_language(&grammar).unwrap();
+                let tree = parser.parse(&source, None).unwrap();
+                collect_exported_symbol_names(&source, &tree.root_node())
+            })
+            .unwrap()
+            .join()
+            .expect("export walk must not overflow a 256 KiB stack");
+
+        assert!(exported.contains("deep"), "exports: {exported:?}");
+        assert!(exported.contains("shallow"), "exports: {exported:?}");
     }
 
     #[test]

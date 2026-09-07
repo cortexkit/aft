@@ -43,9 +43,35 @@ uv run python run.py \
   --out baseline.json
 ```
 
-The runner starts `aft`, sends `configure` with search and semantic search
-enabled, waits for the semantic index to be ready, runs `semantic_search(top_k=5)`
-for every fixture, and writes the baseline-shaped JSON report.
+The runner starts `aft`, sends a user-tier `configure` document with search and
+semantic search enabled, waits for the semantic index to be ready, runs
+`semantic_search(top_k=5)` for every fixture, and writes the baseline-shaped JSON
+report. A local embedding model and ONNX Runtime are required.
+
+## Exact-recall gate
+
+`exact-recall-fixtures.json` contains two deterministic sentence samples and two
+2-3 content-token co-occurrence samples from comments or strings in each pinned
+corpus repository. Sentence fixtures require the containing file at rank 1;
+co-occurrence fixtures require it within the top 10. The report records the
+result's `[exact]` classification separately; the marker does not affect recall.
+
+The exact-recall runner deliberately disables semantic search, so the nightly
+cost gate can exercise lexical retrieval and exact-tier fusion without an
+embedding backend. The existing concept benchmark remains separate because the
+nightly runner does not currently install its model/runtime prerequisites.
+
+```bash
+python3 setup_corpus.py
+python3 run_exact_recall.py \
+  --binary ../../target/release/aft \
+  --out results/exact-recall.json
+```
+
+The command compares against `exact-recall-baseline.json` and exits nonzero if
+sentence rank-1 or pair recall@10 drops below the checked-in baseline. The
+nightly workflow appends the same table to its job summary and uploads the JSON
+beside the index-cost artifacts.
 
 ## Search-fusion quality sub-benchmark
 

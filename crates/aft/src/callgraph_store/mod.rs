@@ -5,9 +5,16 @@
 //! trace) as well as dead-code reachability. It is self-contained: it can be
 //! built and queried directly without going through the in-memory call graph.
 
+pub(crate) mod disk_facts;
+pub(crate) mod facts;
+pub mod join;
+use disk_facts::DiskFacts;
+use facts::{byte_path, EntryKind, FactPaths, ProjectFacts};
+
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph::{self, EdgeResolution, FileCallData, TraceToSymbolCandidate};
 use crate::context::SubcLifecycleAdmission;
+use crate::db::{SqliteStore, TrackedConnection};
 use crate::error::AftError;
 use crate::imports::{ImportForm, ImportGroup, ImportKind, ImportStatement};
 use crate::parser::{grammar_for, parse_source_with_cached_parser, LangId};
@@ -16,10 +23,12 @@ use rayon::prelude::*;
 use rusqlite::{
     params, params_from_iter, Connection, OpenFlags, OptionalExtension, Statement, Transaction,
 };
+use std::cell::RefCell;
 use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -74,6 +83,7 @@ const COLD_BUILD_EXTRACT_BATCH_BYTES: u64 = 32 * 1024 * 1024;
 // A 20k-reference resolver window kept peak RSS working-set shaped in the
 // committed 20k/40k corpus harness; 100k rows did not.
 const COLD_BUILD_RESOLVE_WINDOW: usize = 20_000;
+const DISK_FILE_INDEX_MEMO_CAPACITY: usize = 4_096;
 const STAGED_COMMITTED_EXTRACTED_BYTES: &str = "committed_extracted_bytes";
 const STAGED_RESOLVE_CURSOR: &str = "resolve_cursor";
 const STAGED_BUILD_PHASE: &str = "staged_build_phase";
@@ -980,6 +990,17 @@ pub(crate) fn invalidates_workspace_crate_prefix_cache(path: &Path) -> bool {
     path.file_name().and_then(|name| name.to_str()) == Some("Cargo.toml")
 }
 
+/// A JS workspace manifest change can add or remove members, so the
+/// process-wide workspace package cache must be dropped before the refresh
+/// resolves imports against it. The cache is otherwise cleared only on
+/// configure, which is what makes it worth having across refreshes.
+pub(crate) fn invalidates_workspace_package_cache(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("package.json") | Some("pnpm-workspace.yaml")
+    )
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct RefreshRoot {
     callgraph_dir: PathBuf,
@@ -1472,6 +1493,13 @@ fn process_callgraph_refresh_batch(
     {
         workspace_crate_prefixes.remove(&batch.root);
     }
+    if batch
+        .paths
+        .iter()
+        .any(|path| invalidates_workspace_package_cache(path))
+    {
+        callgraph::clear_workspace_package_cache();
+    }
 
     let paths = batch
         .paths
@@ -1482,7 +1510,7 @@ fn process_callgraph_refresh_batch(
     if paths.is_empty() {
         return None;
     }
-    note_refresh_worker_batch_for_test(&batch.root.project_root);
+    note_refresh_worker_batch_for_test(&batch.root.project_root, &paths);
     if batch
         .ticket
         .as_ref()
@@ -1613,7 +1641,7 @@ fn workspace_crate_prefix_cache_for_root(
     caches.entry(root.clone()).or_default().clone()
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 struct RefreshWorkerTestSeam {
     delay: Duration,
     fail_refresh: bool,
@@ -1621,6 +1649,7 @@ struct RefreshWorkerTestSeam {
     refresh_calls: usize,
     worker_calls: usize,
     stale_marks: usize,
+    received_paths: BTreeSet<PathBuf>,
 }
 
 static REFRESH_WORKER_TEST_SEAMS: OnceLock<Mutex<HashMap<PathBuf, RefreshWorkerTestSeam>>> =
@@ -1673,11 +1702,11 @@ fn refresh_worker_test_seam(project_root: &Path) -> RefreshWorkerTestSeam {
         .lock()
         .expect("callgraph refresh test seam mutex poisoned")
         .get(project_root)
-        .copied()
+        .cloned()
         .unwrap_or_default()
 }
 
-fn note_refresh_worker_batch_for_test(project_root: &Path) {
+fn note_refresh_worker_batch_for_test(project_root: &Path, paths: &[PathBuf]) {
     if let Some(seams) = REFRESH_WORKER_TEST_SEAMS.get() {
         if let Some(seam) = seams
             .lock()
@@ -1685,6 +1714,7 @@ fn note_refresh_worker_batch_for_test(project_root: &Path) {
             .get_mut(project_root)
         {
             seam.worker_calls += 1;
+            seam.received_paths.extend(paths.iter().cloned());
         }
     }
 }
@@ -1758,6 +1788,11 @@ pub fn callgraph_refresh_worker_test_worker_calls(project_root: &Path) -> usize 
 }
 
 #[doc(hidden)]
+pub fn callgraph_refresh_worker_test_paths(project_root: &Path) -> BTreeSet<PathBuf> {
+    refresh_worker_test_seam(project_root).received_paths
+}
+
+#[doc(hidden)]
 pub fn clear_callgraph_refresh_worker_test_seam(project_root: &Path) {
     if let Some(seams) = REFRESH_WORKER_TEST_SEAMS.get() {
         seams
@@ -1783,6 +1818,7 @@ pub struct CallGraphStore {
     /// harness partition. Writer-capable callers use this to schedule migration
     /// without making read-only/worktree callers acquire a writer lease.
     legacy_fallback: bool,
+    manifest_view: bool,
     /// The generation file NAME this store opened (e.g. `<key>.g<nanos>.<pid>.sqlite`),
     /// or `None` when it opened the legacy single-file DB. Used to detect when
     /// another process has published a newer generation so this process can
@@ -1794,7 +1830,7 @@ pub struct CallGraphStore {
     // Failed validations are not cached, so a later successful build remains visible.
     database_ready: AtomicBool,
     write_metrics: Arc<CallgraphWriteMetrics>,
-    conn: Mutex<Connection>,
+    conn: Mutex<TrackedConnection>,
 }
 
 #[derive(Debug)]
@@ -2251,8 +2287,10 @@ struct ReexportIndex {
     wildcard: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ProjectIndex<'a> {
+    facts: Rc<dyn ProjectFacts + 'a>,
+    unbound_non_utf8_paths: Vec<Vec<u8>>,
     project_root: PathBuf,
     files: HashMap<String, DbFileIndex>,
     caller_data: HashMap<String, &'a FileCallData>,
@@ -2356,7 +2394,15 @@ impl ResolverIndex for ProjectIndex<'_> {
     fn crate_src_prefix(&self, crate_name: &str) -> Option<String> {
         self.workspace_crate_prefixes
             .0
-            .get_or_init(|| build_workspace_crate_prefixes(&self.project_root))
+            .get_or_init(|| {
+                build_workspace_crate_prefixes(
+                    &self.project_root,
+                    &FactPaths {
+                        root: &self.project_root,
+                        facts: self.facts.as_ref(),
+                    },
+                )
+            })
             .get(crate_name)
             .cloned()
     }
@@ -2397,9 +2443,16 @@ impl ResolverIndex for ProjectIndex<'_> {
     }
 }
 
-/// A cold-build resolver view that loads one file's index at a time. Keeping the
-/// complete staged corpus in SQLite makes the heap proportional to the active
-/// reference window rather than to the number of project files.
+/// A cold-build resolver view that loads file indexes on demand. The bounded
+/// memo keeps repeated lookups cheap without making the heap proportional to an
+/// unbounded project corpus.
+///
+/// Instances are created only after extraction commits every `files`, `nodes`,
+/// `file_dependencies`, and structural `refs` input and the indexing fence moves
+/// staging to `resolving`. Resolution replaces `refs` rows only to add status,
+/// target, and provenance outputs, and inserts `edges`; `DbFileIndex` reads none
+/// of those output columns. Its inputs therefore stay immutable for an instance,
+/// so the memo needs no generation key or slice-fence invalidation.
 struct DiskProjectIndex<'a> {
     project_root: &'a Path,
     conn: &'a Connection,
@@ -2407,10 +2460,37 @@ struct DiskProjectIndex<'a> {
     caller_data: &'a FileCallData,
     workspace_crate_prefixes: WorkspaceCratePrefixCache,
     module_resolution_memo: &'a callgraph::ModuleResolutionMemo,
+    file_index_memo: RefCell<HashMap<String, Option<Rc<DbFileIndex>>>>,
+    module_parent_memo: RefCell<HashMap<String, Option<(String, String)>>>,
+    memoize_resolver_indexes: bool,
 }
 
 impl DiskProjectIndex<'_> {
-    fn file_index(&self, rel_path: &str) -> Option<DbFileIndex> {
+    fn file_index(&self, rel_path: &str) -> Option<Rc<DbFileIndex>> {
+        if self.memoize_resolver_indexes {
+            if let Some(cached) = self.file_index_memo.borrow().get(rel_path).cloned() {
+                return cached;
+            }
+        }
+
+        let loaded = self.load_file_index(rel_path).map(Rc::new);
+        if self.memoize_resolver_indexes {
+            let mut memo = self.file_index_memo.borrow_mut();
+            if memo.len() >= DISK_FILE_INDEX_MEMO_CAPACITY {
+                // Keep the active caller's index hot even when an unusually broad
+                // resolution walk exhausts the bounded target-file memo.
+                let caller_index = memo.remove(self.caller_file);
+                memo.clear();
+                if let Some(caller_index) = caller_index {
+                    memo.insert(self.caller_file.to_string(), caller_index);
+                }
+            }
+            memo.insert(rel_path.to_string(), loaded.clone());
+        }
+        loaded
+    }
+
+    fn load_file_index(&self, rel_path: &str) -> Option<DbFileIndex> {
         let lang: String = self
             .conn
             .query_row(
@@ -2507,6 +2587,10 @@ impl DiskProjectIndex<'_> {
                     rel_path,
                     &module_path,
                     self.module_resolution_memo,
+                    &FactPaths {
+                        root: self.project_root,
+                        facts: &DiskFacts::new(self.project_root),
+                    },
                 )
             } else {
                 self.disk_module_target(rel_path, &module_path)
@@ -2571,27 +2655,16 @@ impl DiskProjectIndex<'_> {
             &caller_dir,
             module_path,
             self.module_resolution_memo,
+            &FactPaths {
+                root: self.project_root,
+                facts: &DiskFacts::new(self.project_root),
+            },
         )?;
         let rel_path = relative_path(self.project_root, &candidate);
         self.contains_file(&rel_path).then_some(rel_path)
     }
-}
 
-impl ResolverIndex for DiskProjectIndex<'_> {
-    fn caller_data(&self, file: &str) -> Option<&FileCallData> {
-        (file == self.caller_file).then_some(self.caller_data)
-    }
-
-    fn lang_for(&self, file: &str) -> Option<LangId> {
-        self.file_index(file).and_then(|index| index.lang)
-    }
-
-    fn module_target(&self, caller_file: &str, module_path: &str) -> Option<String> {
-        self.file_index(caller_file)
-            .and_then(|index| index.module_targets.get(module_path).cloned().flatten())
-    }
-
-    fn module_parent(&self, target_file: &str) -> Option<(String, String)> {
+    fn load_module_parent(&self, target_file: &str) -> Option<(String, String)> {
         let mut stmt = self
             .conn
             .prepare(
@@ -2612,10 +2685,43 @@ impl ResolverIndex for DiskProjectIndex<'_> {
         }
         None
     }
+}
+
+impl ResolverIndex for DiskProjectIndex<'_> {
+    fn caller_data(&self, file: &str) -> Option<&FileCallData> {
+        (file == self.caller_file).then_some(self.caller_data)
+    }
+
+    fn lang_for(&self, file: &str) -> Option<LangId> {
+        self.file_index(file).and_then(|index| index.lang)
+    }
+
+    fn module_target(&self, caller_file: &str, module_path: &str) -> Option<String> {
+        self.file_index(caller_file)
+            .and_then(|index| index.module_targets.get(module_path).cloned().flatten())
+    }
+
+    fn module_parent(&self, target_file: &str) -> Option<(String, String)> {
+        if self.memoize_resolver_indexes {
+            if let Some(cached) = self.module_parent_memo.borrow().get(target_file).cloned() {
+                return cached;
+            }
+        }
+
+        let parent = self.load_module_parent(target_file);
+        if self.memoize_resolver_indexes {
+            let mut memo = self.module_parent_memo.borrow_mut();
+            if memo.len() >= DISK_FILE_INDEX_MEMO_CAPACITY {
+                memo.clear();
+            }
+            memo.insert(target_file.to_string(), parent.clone());
+        }
+        parent
+    }
 
     fn reexports_for(&self, file: &str) -> Vec<ReexportIndex> {
         self.file_index(file)
-            .map(|index| index.reexports)
+            .map(|index| index.reexports.clone())
             .unwrap_or_default()
     }
 
@@ -2632,7 +2738,7 @@ impl ResolverIndex for DiskProjectIndex<'_> {
     fn node_is_callable(&self, file: &str, node_id: &str) -> bool {
         self.file_index(file)
             .and_then(|index| index.node_kind_by_id.get(node_id).cloned())
-            .is_some_and(|kind| matches!(kind.as_str(), "function" | "method"))
+            .is_some_and(|kind| matches!(kind.as_str(), "function" | "kernel" | "method"))
     }
 
     fn export_alias(&self, file: &str, symbol: &str) -> Option<String> {
@@ -2646,7 +2752,8 @@ impl ResolverIndex for DiskProjectIndex<'_> {
     }
 
     fn default_export(&self, file: &str) -> Option<String> {
-        self.file_index(file).and_then(|index| index.default_export)
+        self.file_index(file)
+            .and_then(|index| index.default_export.clone())
     }
 
     fn contains_file(&self, file: &str) -> bool {
@@ -2662,7 +2769,15 @@ impl ResolverIndex for DiskProjectIndex<'_> {
     fn crate_src_prefix(&self, crate_name: &str) -> Option<String> {
         self.workspace_crate_prefixes
             .0
-            .get_or_init(|| build_workspace_crate_prefixes(self.project_root))
+            .get_or_init(|| {
+                build_workspace_crate_prefixes(
+                    self.project_root,
+                    &FactPaths {
+                        root: self.project_root,
+                        facts: &DiskFacts::new(self.project_root),
+                    },
+                )
+            })
             .get(crate_name)
             .cloned()
     }
@@ -3387,7 +3502,7 @@ impl CallGraphStore {
         if let Some(parent) = sqlite_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut conn = Connection::open(&sqlite_path)?;
+        let mut conn = TrackedConnection::open(&sqlite_path, SqliteStore::CallgraphGeneration)?;
         if use_wal {
             configure_connection(&conn)?;
         } else {
@@ -3454,7 +3569,7 @@ impl CallGraphStore {
         generation: Option<String>,
         writer_lease: Option<Arc<crate::root_cache::WriterLease>>,
         read_marker: Option<crate::root_cache::ReadMarker>,
-        conn: Connection,
+        conn: TrackedConnection,
     ) -> Self {
         let write_metrics = callgraph_write_metrics_for_key(&project_key);
         Self {
@@ -3463,6 +3578,7 @@ impl CallGraphStore {
             sqlite_path,
             publication_dir,
             legacy_fallback,
+            manifest_view: false,
             generation,
             writer_lease,
             read_marker,
@@ -3663,6 +3779,7 @@ impl CallGraphStore {
             corpus_fingerprint,
             COLD_BUILD_RESOLVE_WINDOW,
             &module_resolution_memo,
+            true,
         )
     }
 
@@ -3674,12 +3791,31 @@ impl CallGraphStore {
         resolve_window: usize,
         module_resolution_memo: &callgraph::ModuleResolutionMemo,
     ) -> Result<ColdBuildStats> {
+        self.cold_build_chunked_with_disk_index_memo_for_test(
+            files,
+            chunk_size,
+            resolve_window,
+            module_resolution_memo,
+            true,
+        )
+    }
+
+    #[cfg(test)]
+    fn cold_build_chunked_with_disk_index_memo_for_test(
+        &self,
+        files: &[PathBuf],
+        chunk_size: usize,
+        resolve_window: usize,
+        module_resolution_memo: &callgraph::ModuleResolutionMemo,
+        memoize_resolver_indexes: bool,
+    ) -> Result<ColdBuildStats> {
         let corpus_fingerprint = self.stage_cold_build_file_inventory(files)?;
         self.cold_build_chunked_from_staged_inventory_with_resolution_memo(
             chunk_size,
             &corpus_fingerprint,
             resolve_window.max(1),
             module_resolution_memo,
+            memoize_resolver_indexes,
         )
     }
 
@@ -3689,6 +3825,7 @@ impl CallGraphStore {
         corpus_fingerprint: &str,
         resolve_window: usize,
         module_resolution_memo: &callgraph::ModuleResolutionMemo,
+        memoize_resolver_indexes: bool,
     ) -> Result<ColdBuildStats> {
         let started = Instant::now();
         let batch_files = chunk_size.max(1).min(COLD_BUILD_EXTRACT_BATCH_FILES);
@@ -3870,6 +4007,9 @@ impl CallGraphStore {
                             caller_data: &caller_extract.data,
                             workspace_crate_prefixes: workspace_crate_prefixes.clone(),
                             module_resolution_memo,
+                            file_index_memo: RefCell::new(HashMap::new()),
+                            module_parent_memo: RefCell::new(HashMap::new()),
+                            memoize_resolver_indexes,
                         };
                         for staged_ref in &staged[offset..end] {
                             let resolved = resolve_ref(staged_ref.raw.clone(), &index)?;
@@ -4742,6 +4882,38 @@ impl CallGraphStore {
 }
 
 impl ReadonlyCallGraphStore {
+    pub(crate) fn open_manifest_view(
+        project_root: PathBuf,
+        family: String,
+        view_dir: PathBuf,
+    ) -> Result<Self> {
+        let sqlite_path = view_dir.join("derived.sqlite");
+        let conn = open_readonly_connection(&sqlite_path)?;
+        ensure_database_ready(&conn)?;
+        let mut inner = CallGraphStore::from_connection(
+            project_root,
+            family,
+            sqlite_path,
+            view_dir,
+            false,
+            None,
+            None,
+            None,
+            conn,
+        );
+        inner.manifest_view = true;
+        inner.database_ready.store(true, AtomicOrdering::Release);
+        Ok(Self::from_inner(inner))
+    }
+
+    pub fn reader_kind(&self) -> &'static str {
+        if self.inner.manifest_view {
+            "view"
+        } else {
+            "legacy"
+        }
+    }
+
     fn from_inner(inner: CallGraphStore) -> Self {
         Self { inner }
     }
@@ -6534,7 +6706,7 @@ fn publish_backup_migration(
     remove_sqlite_file_set(&temp_path);
 
     let source_conn = open_readonly_connection(&source.sqlite_path)?;
-    let mut destination = Connection::open(&temp_path)?;
+    let mut destination = TrackedConnection::open(&temp_path, SqliteStore::CallgraphGeneration)?;
     destination.busy_timeout(Duration::from_secs(5))?;
     let backup = rusqlite::backup::Backup::new(&source_conn, &mut destination)?;
     let started = Instant::now();
@@ -6861,11 +7033,12 @@ fn legacy_read_marker_label(path: &Path, generation: Option<&str>) -> String {
     format!("legacy-{}", &digest[..16])
 }
 
-fn open_readonly_connection(path: &Path) -> Result<Connection> {
+fn open_readonly_connection(path: &Path) -> Result<TrackedConnection> {
     let uri = sqlite_readonly_uri(path);
-    let conn = Connection::open_with_flags(
+    let conn = TrackedConnection::open_with_flags(
         &uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        SqliteStore::CallgraphGeneration,
     )?;
     conn.pragma_update(
         None,
@@ -6960,7 +7133,10 @@ fn configure_build_connection(conn: &Connection) -> Result<()> {
 /// private temporary copy before publishing it; a busy reader is harmless because
 /// the next publication or cleanup pass can retry without affecting the source.
 fn checkpoint_sqlite_before_publication(path: &Path) {
-    let Ok(conn) = Connection::open(path) else {
+    let Ok(conn) = crate::db::lifecycle::TrackedConnection::open(
+        path,
+        crate::db::lifecycle::SqliteStore::CallgraphGeneration,
+    ) else {
         return;
     };
     let _ = conn.pragma_update(None, "synchronous", "NORMAL");
@@ -6986,6 +7162,236 @@ fn checkpoint_wal_truncate(conn: &Connection) -> bool {
             log::debug!("callgraph WAL truncate checkpoint skipped: {error}");
             false
         }
+    }
+}
+
+pub(crate) fn materialize_manifest_view_database(
+    database_path: &Path,
+    callgraph_blob_database: &Path,
+    manifest: &crate::views::Manifest,
+) -> Result<()> {
+    let mut connection = Connection::open(database_path)?;
+    initialize_schema(&connection)?;
+    let transaction = connection.transaction()?;
+    for table in ["edges", "refs", "nodes", "files"] {
+        transaction.execute(&format!("DELETE FROM {table}"), [])?;
+    }
+    let blob_connection = Connection::open(callgraph_blob_database)?;
+    let mut parsed = BTreeMap::new();
+    let mut nodes = HashMap::new();
+    for (path, entry) in manifest.entries() {
+        let crate::views::ManifestEntry::Regular {
+            planes,
+            resolution_input,
+            ..
+        } = entry
+        else {
+            continue;
+        };
+        let Some(key) = planes.callgraph.as_deref() else {
+            continue;
+        };
+        let key_bytes = decode_manifest_full_key(key).ok_or_else(|| {
+            CallGraphStoreError::Unavailable(format!("invalid manifest callgraph key {key}"))
+        })?;
+        let payload = blob_connection
+            .query_row(
+                "SELECT payload FROM blob_payloads WHERE full_key = ?1",
+                [key_bytes],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                CallGraphStoreError::Unavailable(format!("missing manifest callgraph blob {key}"))
+            })?;
+        let blob = join::CallgraphBlob::from_bytes(&payload)
+            .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+        let Some(parse) = blob.parse() else {
+            continue;
+        };
+        let path = String::from_utf8(path.as_bytes().to_vec()).map_err(|_| {
+            CallGraphStoreError::Unavailable("non-UTF-8 manifest callgraph path".to_string())
+        })?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO files
+             (path, content_hash, mtime_ns, size, lang, is_dead_code_root, is_public_api,
+              surface_fingerprint, indexed_at)
+             VALUES (?1, ?2, 0, 0, ?3, 0, 0, '', 0)",
+            params![path, key, parse.language],
+        )?;
+        for symbol in &parse.symbols {
+            let id = format!("view:{path}:{}:{}", symbol.scoped_name, symbol.ordinal);
+            transaction.execute(
+                "INSERT OR REPLACE INTO nodes
+                 (id, file_path, name, scoped_name, kind, start_line, start_col, end_line,
+                  end_col, range_ordinal, signature, exported, is_default_export,
+                  is_type_like, is_callgraph_entry_point, provenance)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?12, ?14)",
+                params![
+                    id,
+                    path,
+                    symbol.name,
+                    symbol.scoped_name,
+                    symbol.kind,
+                    i64::from(symbol.start_line),
+                    i64::from(symbol.start_col),
+                    i64::from(symbol.end_line),
+                    i64::from(symbol.end_col),
+                    i64::from(symbol.ordinal),
+                    symbol.signature,
+                    i64::from(symbol.exported),
+                    i64::from(symbol.is_default_export),
+                    PROVENANCE_TREESITTER,
+                ],
+            )?;
+            nodes.insert((path.clone(), symbol.scoped_name.clone()), id.clone());
+            nodes
+                .entry((path.clone(), symbol.name.clone()))
+                .or_insert(id);
+        }
+        if !resolution_input {
+            parsed.insert(path, parse.clone());
+        }
+    }
+
+    let reader = ManifestViewBlobReader {
+        connection: &blob_connection,
+    };
+    let joined = join::JoinResult::from_manifest(manifest, &reader)
+        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+    for row in joined.rows {
+        let caller_path = String::from_utf8(row.caller_path.clone()).map_err(|_| {
+            CallGraphStoreError::Unavailable("non-UTF-8 manifest caller path".to_string())
+        })?;
+        let Some(parse) = parsed.get(&caller_path) else {
+            continue;
+        };
+        let Some(reference) = parse
+            .refs
+            .iter()
+            .find(|reference| reference.ordinal == row.ref_ordinal)
+        else {
+            continue;
+        };
+        let caller_node = reference
+            .caller_symbol
+            .as_ref()
+            .and_then(|symbol| nodes.get(&(caller_path.clone(), symbol.clone())))
+            .cloned();
+        let target_path = row
+            .target_path
+            .as_ref()
+            .and_then(|path| String::from_utf8(path.clone()).ok());
+        let target_symbol = row.target_symbol.clone();
+        let target_node = target_path
+            .as_ref()
+            .zip(target_symbol.as_ref())
+            .and_then(|(path, symbol)| nodes.get(&(path.clone(), symbol.clone())))
+            .cloned();
+        let ref_id = format!("view:{caller_path}:{}", row.ref_ordinal);
+        transaction.execute(
+            "INSERT OR REPLACE INTO refs
+             (ref_id, caller_node, caller_file, kind, short_name, full_ref, module_path,
+              import_kind, local_name, requested_name, namespace_alias, wildcard, line,
+              byte_start, byte_end, status, target_node, target_file, target_symbol, provenance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                     ?15, ?16, ?17, ?18, ?19, ?20)",
+            params![
+                ref_id,
+                caller_node,
+                caller_path,
+                manifest_ref_kind(row.kind),
+                reference.short_name,
+                reference.full_ref,
+                reference.module_path,
+                reference.import_kind,
+                reference.local_name,
+                reference.requested_name,
+                reference.namespace_alias,
+                i64::from(reference.wildcard),
+                i64::from(reference.line),
+                reference.byte_start as i64,
+                reference.byte_end as i64,
+                if row.status == join::ResolutionStatus::Resolved {
+                    "resolved"
+                } else {
+                    "unresolved"
+                },
+                target_node,
+                target_path,
+                target_symbol,
+                PROVENANCE_TREESITTER,
+            ],
+        )?;
+        if row.kind == join::BlobRefKind::Call {
+            if let (Some(source_node), Some(target_file), Some(target_symbol)) =
+                (caller_node, target_path, target_symbol)
+            {
+                transaction.execute(
+                    "INSERT OR REPLACE INTO edges
+                     (edge_id, ref_id, source_node, target_node, target_file, target_symbol,
+                      kind, line, provenance)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'call', ?7, ?8)",
+                    params![
+                        format!("edge:{ref_id}"),
+                        ref_id,
+                        source_node,
+                        target_node,
+                        target_file,
+                        target_symbol,
+                        i64::from(reference.line),
+                        PROVENANCE_TREESITTER,
+                    ],
+                )?;
+            }
+        }
+    }
+    set_meta_ready(&transaction, true)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+struct ManifestViewBlobReader<'a> {
+    connection: &'a Connection,
+}
+
+impl join::ManifestBlobReader for ManifestViewBlobReader<'_> {
+    fn read_callgraph_blob(
+        &self,
+        full_key: &str,
+    ) -> std::result::Result<Option<Vec<u8>>, join::ManifestJoinError> {
+        let Some(key) = decode_manifest_full_key(full_key) else {
+            return Ok(None);
+        };
+        self.connection
+            .query_row(
+                "SELECT payload FROM blob_payloads WHERE full_key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| join::ManifestJoinError::InvalidBlob(error.to_string()))
+    }
+}
+
+fn decode_manifest_full_key(value: &str) -> Option<Vec<u8>> {
+    if value.len() != 64 {
+        return None;
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+        .collect()
+}
+
+const fn manifest_ref_kind(kind: join::BlobRefKind) -> &'static str {
+    match kind {
+        join::BlobRefKind::Call => "call",
+        join::BlobRefKind::ValueRef => "value_ref",
+        join::BlobRefKind::Import => "import",
+        join::BlobRefKind::Module => "module",
+        join::BlobRefKind::Reexport => "reexport",
+        join::BlobRefKind::ExportAlias => "export_alias",
     }
 }
 
@@ -8624,10 +9030,26 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
         .iter()
         .map(|node| (node.scoped_name.clone(), node.id.clone()))
         .collect();
-    let import_dependencies =
-        import_dependencies(project_root, &abs_path, &data.import_block.imports);
+    let import_dependencies = import_dependencies(
+        project_root,
+        &abs_path,
+        &data.import_block.imports,
+        &FactPaths {
+            root: project_root,
+            facts: &DiskFacts::new(project_root),
+        },
+    );
     let line_index = LineIndex::new(&source);
-    let reexports = collect_reexport_refs(project_root, &abs_path, &rel_path, &source);
+    let reexports = collect_reexport_refs(
+        project_root,
+        &abs_path,
+        &rel_path,
+        &source,
+        &FactPaths {
+            root: project_root,
+            facts: &DiskFacts::new(project_root),
+        },
+    );
     let rust_reexports = if lang == LangId::Rust {
         collect_rust_pub_use_reexport_refs(
             project_root,
@@ -8635,6 +9057,10 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
             &rel_path,
             &data.import_block.imports,
             &line_index,
+            &FactPaths {
+                root: project_root,
+                facts: &DiskFacts::new(project_root),
+            },
         )
     } else {
         ReexportRefs {
@@ -8662,6 +9088,10 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
         &rel_path,
         &data.import_block.imports,
         &line_index,
+        &FactPaths {
+            root: project_root,
+            facts: &DiskFacts::new(project_root),
+        },
     ));
     if lang == LangId::Rust {
         raw_refs.extend(build_rust_module_refs(
@@ -8669,6 +9099,10 @@ fn build_file_extract(project_root: &Path, path: &Path) -> Result<FileExtract> {
             &abs_path,
             &rel_path,
             &source,
+            &FactPaths {
+                root: project_root,
+                facts: &DiskFacts::new(project_root),
+            },
         ));
     }
     let mut surface_parts = reexports.surface_parts;
@@ -8876,6 +9310,7 @@ fn build_import_refs(
     rel_path: &str,
     imports: &[ImportStatement],
     line_index: &LineIndex,
+    facts: &FactPaths<'_>,
 ) -> Vec<RawRef> {
     let mut refs = Vec::new();
     for (index, import) in imports.iter().enumerate() {
@@ -8907,7 +9342,7 @@ fn build_import_refs(
             line: line_index.byte_to_line(import.byte_range.start),
             byte_start: import.byte_range.start,
             byte_end: import.byte_range.end,
-            dependencies: module_dependencies(project_root, abs_path, &import.module_path),
+            dependencies: module_dependencies(project_root, abs_path, &import.module_path, facts),
         });
     }
     refs
@@ -8918,6 +9353,7 @@ fn build_rust_module_refs(
     abs_path: &Path,
     rel_path: &str,
     source: &str,
+    facts: &FactPaths<'_>,
 ) -> Vec<RawRef> {
     let grammar = grammar_for(LangId::Rust);
     let mut parser = Parser::new();
@@ -8938,7 +9374,12 @@ fn build_rust_module_refs(
         {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let module_name = node_text(name_node, source).to_string();
-                let target = rust_external_module_target(abs_path, source, node, &module_name);
+                let target = rust_external_module_target(
+                    abs_path,
+                    rust_module_path_override(source, node),
+                    &module_name,
+                    facts,
+                );
                 let mut dependencies = BTreeSet::new();
                 if let Some(target) = target {
                     dependencies.insert(relative_path(project_root, &canonicalize_path(&target)));
@@ -8989,15 +9430,17 @@ fn rust_declared_module_target(
     caller_file: &str,
     module_name: &str,
     memo: &callgraph::ModuleResolutionMemo,
+    facts: &FactPaths<'_>,
 ) -> Option<String> {
     memo.rust_declared_module_target(caller_file, module_name, || {
-        rust_declared_module_targets(project_root, caller_file)
+        rust_declared_module_targets(project_root, caller_file, facts)
     })
 }
 
 fn rust_declared_module_targets(
     project_root: &Path,
     caller_file: &str,
+    facts: &FactPaths<'_>,
 ) -> HashMap<String, Option<String>> {
     let declaring_file = project_root.join(caller_file);
     let Ok(source) = std::fs::read_to_string(&declaring_file) else {
@@ -9016,9 +9459,18 @@ fn rust_declared_module_targets(
         {
             if let Some(name) = node.child_by_field_name("name") {
                 let module_name = node_text(name, &source);
-                let target =
-                    rust_external_module_target(&declaring_file, &source, node, module_name)
-                        .map(|target| relative_path(project_root, &canonicalize_path(&target)));
+                let target = rust_external_module_target(
+                    &declaring_file,
+                    rust_module_path_override(&source, node),
+                    module_name,
+                    facts,
+                )
+                .map(|target| {
+                    relative_path(
+                        project_root,
+                        &facts.canonical(&target).unwrap_or(target.clone()),
+                    )
+                });
                 targets.entry(module_name.to_string()).or_insert(target);
             }
         }
@@ -9037,22 +9489,14 @@ fn rust_declared_module_targets(
 
 fn rust_external_module_target(
     declaring_file: &Path,
-    source: &str,
-    module: Node<'_>,
+    path_override: Option<&str>,
     module_name: &str,
+    facts: &FactPaths<'_>,
 ) -> Option<PathBuf> {
     let parent = declaring_file.parent()?;
-    let mut previous = module.prev_sibling();
-    while let Some(attribute) = previous {
-        if attribute.kind() != "attribute_item" {
-            break;
-        }
-        let text = source.get(attribute.byte_range())?;
-        if let Some(path) = rust_path_attribute(text) {
-            let candidate = parent.join(path);
-            return candidate.is_file().then_some(candidate);
-        }
-        previous = attribute.prev_sibling();
+    if let Some(path) = path_override {
+        let candidate = parent.join(path);
+        return facts.is_file(&candidate).then_some(candidate);
     }
 
     let stem = declaring_file.file_stem().and_then(|stem| stem.to_str())?;
@@ -9066,7 +9510,21 @@ fn rust_external_module_target(
         module_dir.join(module_name).join("mod.rs"),
     ]
     .into_iter()
-    .find(|candidate| candidate.is_file())
+    .find(|candidate| facts.is_file(candidate))
+}
+
+fn rust_module_path_override<'a>(source: &'a str, module: Node<'_>) -> Option<&'a str> {
+    let mut previous = module.prev_sibling();
+    while let Some(attribute) = previous {
+        if attribute.kind() != "attribute_item" {
+            break;
+        }
+        if let Some(path) = rust_path_attribute(source.get(attribute.byte_range())?) {
+            return Some(path);
+        }
+        previous = attribute.prev_sibling();
+    }
+    None
 }
 
 fn rust_path_attribute(attribute: &str) -> Option<&str> {
@@ -9224,6 +9682,7 @@ fn collect_reexport_refs(
     abs_path: &Path,
     rel_path: &str,
     source: &str,
+    facts: &FactPaths<'_>,
 ) -> ReexportRefs {
     let mut raw_refs = Vec::new();
     let mut surface_parts = Vec::new();
@@ -9276,7 +9735,7 @@ fn collect_reexport_refs(
             line,
             byte_start: start,
             byte_end: end,
-            dependencies: module_dependencies(project_root, abs_path, &module_path),
+            dependencies: module_dependencies(project_root, abs_path, &module_path, facts),
         });
     }
     ReexportRefs {
@@ -9291,6 +9750,7 @@ fn collect_rust_pub_use_reexport_refs(
     rel_path: &str,
     imports: &[ImportStatement],
     line_index: &LineIndex,
+    facts: &FactPaths<'_>,
 ) -> ReexportRefs {
     let mut raw_refs = Vec::new();
     let mut surface_parts = Vec::new();
@@ -9333,7 +9793,7 @@ fn collect_rust_pub_use_reexport_refs(
             line: line_index.byte_to_line(import.byte_range.start),
             byte_start: import.byte_range.start,
             byte_end: import.byte_range.end,
-            dependencies: rust_module_dependencies(project_root, abs_path, &module_path),
+            dependencies: rust_module_dependencies(project_root, abs_path, &module_path, facts),
         });
     }
 
@@ -10084,7 +10544,10 @@ fn workspace_crate_prefix_build_count(project_root: &Path) -> usize {
 /// `-` normalized to `_`, plus any explicit `[lib] name`) to its `src` prefix.
 /// Replaces the previous per-ref tree walk: resolving 600k+ qualified refs no
 /// longer re-walks the filesystem once per ref.
-fn build_workspace_crate_prefixes(project_root: &Path) -> HashMap<String, String> {
+fn build_workspace_crate_prefixes(
+    project_root: &Path,
+    facts: &FactPaths<'_>,
+) -> HashMap<String, String> {
     note_workspace_crate_prefix_build(project_root);
     let mut prefixes = HashMap::new();
     let mut stack = vec![project_root.to_path_buf()];
@@ -10094,10 +10557,15 @@ fn build_workspace_crate_prefixes(project_root: &Path) -> HashMap<String, String
             continue;
         }
         let manifest = dir.join("Cargo.toml");
-        if manifest.is_file() {
-            let crate_names = rust_manifest_crate_names(&manifest);
+        if facts.is_file(&manifest) {
+            let crate_names = rust_manifest_crate_names(&manifest, facts);
             if !crate_names.is_empty() {
-                let src_prefix = relative_path(project_root, &canonicalize_path(&dir.join("src")));
+                let src_prefix = relative_path(
+                    project_root,
+                    &facts
+                        .canonical(&dir.join("src"))
+                        .unwrap_or_else(|| dir.join("src")),
+                );
                 for crate_name in crate_names {
                     prefixes
                         .entry(crate_name)
@@ -10105,13 +10573,9 @@ fn build_workspace_crate_prefixes(project_root: &Path) -> HashMap<String, String
                 }
             }
         }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
+        for entry in facts.list_dir(&dir) {
+            if entry.kind == EntryKind::Directory {
+                stack.push(dir.join(byte_path(&entry.name)));
             }
         }
     }
@@ -10121,8 +10585,11 @@ fn build_workspace_crate_prefixes(project_root: &Path) -> HashMap<String, String
 /// Extract the crate names a manifest defines: the normalized package name
 /// (`-` -> `_`) and any explicit `[lib] name`. Returns both so a crate is
 /// reachable by either spelling, matching the previous match semantics.
-fn rust_manifest_crate_names(manifest: &Path) -> Vec<String> {
-    let Ok(source) = std::fs::read_to_string(manifest) else {
+fn rust_manifest_crate_names(manifest: &Path, facts: &FactPaths<'_>) -> Vec<String> {
+    let Some(bytes) = facts.bytes(manifest) else {
+        return Vec::new();
+    };
+    let Ok(source) = std::str::from_utf8(&bytes) else {
         return Vec::new();
     };
     let mut in_lib = false;
@@ -10328,8 +10795,11 @@ impl<'a> ProjectIndex<'a> {
         files: HashMap<String, DbFileIndex>,
         caller_data: HashMap<String, &'a FileCallData>,
         workspace_crate_prefixes: WorkspaceCratePrefixCache,
+        facts: Rc<dyn ProjectFacts + 'a>,
     ) -> Self {
         Self {
+            facts,
+            unbound_non_utf8_paths: Vec::new(),
             project_root: project_root.to_path_buf(),
             files,
             caller_data,
@@ -10346,12 +10816,24 @@ impl<'a> ProjectIndex<'a> {
         // Incremental refreshes get a fresh snapshot memo so a watcher rewrite can
         // never observe declarations retained by an earlier refresh generation.
         let module_resolution_memo = callgraph::ModuleResolutionMemo::default();
-        let mut files = load_db_file_indexes(tx, project_root, &module_resolution_memo)?;
+        let disk = DiskFacts::new(project_root);
+        let facts = FactPaths {
+            root: project_root,
+            facts: &disk,
+        };
+        let mut files = load_db_file_indexes(tx, project_root, &module_resolution_memo, &facts)?;
         let mut caller_data = HashMap::new();
         for (rel_path, extract) in caller_extracts {
             files.insert(
                 rel_path.clone(),
-                DbFileIndex::from_extract(project_root, extract),
+                DbFileIndex::from_extract(
+                    project_root,
+                    extract,
+                    &FactPaths {
+                        root: project_root,
+                        facts: &DiskFacts::new(project_root),
+                    },
+                ),
             );
             caller_data.insert(rel_path.clone(), &extract.data);
         }
@@ -10360,6 +10842,7 @@ impl<'a> ProjectIndex<'a> {
             files,
             caller_data,
             workspace_crate_prefixes,
+            Rc::new(DiskFacts::new(project_root)),
         ))
     }
 
@@ -10393,12 +10876,12 @@ impl<'a> ProjectIndex<'a> {
         self.files
             .get(rel_path)
             .and_then(|file| file.node_kind_by_id.get(node_id))
-            .is_some_and(|kind| matches!(kind.as_str(), "function" | "method"))
+            .is_some_and(|kind| matches!(kind.as_str(), "function" | "kernel" | "method"))
     }
 }
 
 impl DbFileIndex {
-    fn from_extract(project_root: &Path, extract: &FileExtract) -> Self {
+    fn from_extract(project_root: &Path, extract: &FileExtract, facts: &FactPaths<'_>) -> Self {
         let mut node_by_scoped = HashMap::new();
         let mut node_by_bare = HashMap::new();
         for node in &extract.nodes {
@@ -10432,7 +10915,8 @@ impl DbFileIndex {
             let Some(module_path) = &raw_ref.module_path else {
                 continue;
             };
-            let target_file = module_target_from_dependencies(project_root, &raw_ref.dependencies);
+            let target_file =
+                module_target_from_dependencies(project_root, &raw_ref.dependencies, facts);
             module_targets
                 .entry(module_path.clone())
                 .or_insert_with(|| target_file.clone());
@@ -10464,6 +10948,7 @@ fn load_db_file_indexes(
     tx: &Transaction<'_>,
     project_root: &Path,
     module_resolution_memo: &callgraph::ModuleResolutionMemo,
+    facts: &FactPaths<'_>,
 ) -> Result<HashMap<String, DbFileIndex>> {
     let mut files = HashMap::new();
     let mut stmt = tx.prepare("SELECT path, lang FROM files")?;
@@ -10583,6 +11068,7 @@ fn load_db_file_indexes(
             &module_path,
             &file_deps,
             &file_keys,
+            facts,
         );
         let target_file = if kind == "module" {
             rust_declared_module_target(
@@ -10590,11 +11076,17 @@ fn load_db_file_indexes(
                 &caller_file,
                 &module_path,
                 module_resolution_memo,
+                facts,
             )
         } else {
-            deps.iter()
-                .find(|dep| file_keys.contains(*dep))
-                .map(|dep| relative_path(project_root, &canonicalize_path(&project_root.join(dep))))
+            deps.iter().find(|dep| file_keys.contains(*dep)).map(|dep| {
+                relative_path(
+                    project_root,
+                    &facts
+                        .canonical(&project_root.join(dep))
+                        .unwrap_or_else(|| project_root.join(dep)),
+                )
+            })
         };
         if let Some(file) = files.get_mut(&caller_file) {
             file.module_targets
@@ -10640,14 +11132,15 @@ fn stored_dependencies_for_module(
     module_path: &str,
     caller_dependencies: &BTreeSet<String>,
     indexed_files: &HashSet<String>,
+    facts: &FactPaths<'_>,
 ) -> BTreeSet<String> {
     let caller_path = project_root.join(caller_file);
-    let mut candidates = rust_module_dependencies(project_root, &caller_path, module_path);
+    let mut candidates = rust_module_dependencies(project_root, &caller_path, module_path, facts);
     if module_path.starts_with('.') {
         let caller_dir = caller_path.parent().unwrap_or(project_root);
         for candidate in relative_module_candidates(&caller_dir.join(module_path)) {
-            let normalized = if candidate.is_file() {
-                canonicalize_path(&candidate)
+            let normalized = if facts.is_file(&candidate) {
+                facts.canonical(&candidate).unwrap_or(candidate.clone())
             } else {
                 candidate
             };
@@ -11445,7 +11938,7 @@ fn load_name_match_candidates(
          FROM nodes n JOIN files f ON f.path = n.file_path
          WHERE n.name = ?1
            AND f.lang = ?2
-           AND n.kind IN ('method', 'function')
+           AND n.kind IN ('method', 'function', 'kernel')
          ORDER BY n.file_path, n.scoped_name, n.start_line, n.start_col, n.id",
     )?;
     let rows = stmt.query_map(params![method_name, lang], |row| {
@@ -13621,11 +14114,15 @@ fn edge_snapshot_with_conn(conn: &Connection) -> Result<BTreeSet<StoredEdge>> {
 fn module_target_from_dependencies(
     project_root: &Path,
     dependencies: &BTreeSet<String>,
+    facts: &FactPaths<'_>,
 ) -> Option<String> {
     dependencies.iter().find_map(|dep| {
         let path = project_root.join(dep);
-        if path.is_file() {
-            Some(relative_path(project_root, &canonicalize_path(&path)))
+        if facts.is_file(&path) {
+            Some(relative_path(
+                project_root,
+                &facts.canonical(&path).unwrap_or(path.clone()),
+            ))
         } else {
             None
         }
@@ -13707,13 +14204,22 @@ fn module_dependencies_for_ref(
     caller_file: &str,
     module_path: &str,
 ) -> BTreeSet<String> {
-    module_dependencies(project_root, &project_root.join(caller_file), module_path)
+    module_dependencies(
+        project_root,
+        &project_root.join(caller_file),
+        module_path,
+        &FactPaths {
+            root: project_root,
+            facts: &DiskFacts::new(project_root),
+        },
+    )
 }
 
 fn import_dependencies(
     project_root: &Path,
     abs_path: &Path,
     imports: &[ImportStatement],
+    facts: &FactPaths<'_>,
 ) -> BTreeSet<String> {
     let mut deps = BTreeSet::new();
     for import in imports {
@@ -13721,6 +14227,7 @@ fn import_dependencies(
             project_root,
             abs_path,
             &import.module_path,
+            facts,
         ));
     }
     deps
@@ -13730,10 +14237,16 @@ fn module_dependencies(
     project_root: &Path,
     abs_path: &Path,
     module_path: &str,
+    facts: &FactPaths<'_>,
 ) -> BTreeSet<String> {
-    let mut deps = rust_module_dependencies(project_root, abs_path, module_path);
+    let mut deps = rust_module_dependencies(project_root, abs_path, module_path, facts);
     let caller_dir = abs_path.parent().unwrap_or(project_root);
-    if let Some(resolved) = callgraph::resolve_module_path(caller_dir, module_path) {
+    if let Some(resolved) = callgraph::resolve_module_path_with_memo(
+        caller_dir,
+        module_path,
+        &callgraph::ModuleResolutionMemo::default(),
+        facts,
+    ) {
         deps.insert(relative_path(project_root, &resolved));
     }
     if module_path.starts_with('.') {
@@ -13749,20 +14262,33 @@ fn rust_module_dependencies(
     project_root: &Path,
     abs_path: &Path,
     module_path: &str,
+    facts: &FactPaths<'_>,
 ) -> BTreeSet<String> {
     let mut deps = BTreeSet::new();
-    let rel_path = relative_path(project_root, &canonicalize_path(abs_path));
+    let rel_path = relative_path(
+        project_root,
+        &facts
+            .canonical(abs_path)
+            .unwrap_or_else(|| abs_path.to_path_buf()),
+    );
     let Some(path_segments) = rust_module_dependency_segments(&rel_path, module_path) else {
         return deps;
     };
     let src_prefix = rust_src_prefix(&rel_path);
-    rust_push_module_dependency_candidate(project_root, &mut deps, &src_prefix, &path_segments);
+    rust_push_module_dependency_candidate(
+        project_root,
+        &mut deps,
+        &src_prefix,
+        &path_segments,
+        facts,
+    );
     if !path_segments.is_empty() {
         rust_push_module_dependency_candidate(
             project_root,
             &mut deps,
             &src_prefix,
             &path_segments[..path_segments.len() - 1],
+            facts,
         );
     }
     deps
@@ -13796,6 +14322,7 @@ fn rust_push_module_dependency_candidate(
     deps: &mut BTreeSet<String>,
     src_prefix: &str,
     segments: &[String],
+    facts: &FactPaths<'_>,
 ) {
     let candidates = if segments.is_empty() {
         vec![
@@ -13809,7 +14336,7 @@ fn rust_push_module_dependency_candidate(
         ]
     };
     for candidate in candidates {
-        if project_root.join(&candidate).is_file() {
+        if facts.is_file(&project_root.join(&candidate)) {
             deps.insert(candidate);
         }
     }
@@ -13873,6 +14400,7 @@ fn import_kind_label(kind: ImportKind) -> &'static str {
 fn symbol_kind_label(kind: &SymbolKind) -> &'static str {
     match kind {
         SymbolKind::Function => "function",
+        SymbolKind::Kernel => "kernel",
         SymbolKind::Class => "class",
         SymbolKind::Method => "method",
         SymbolKind::Struct => "struct",
@@ -13906,6 +14434,8 @@ fn lang_label(lang: LangId) -> &'static str {
         LangId::Go => "go",
         LangId::C => "c",
         LangId::Cpp => "cpp",
+        LangId::Cuda => "cuda",
+        LangId::Metal => "metal",
         LangId::Zig => "zig",
         LangId::CSharp => "csharp",
         LangId::Bash => "bash",
@@ -13928,6 +14458,7 @@ fn lang_label(lang: LangId) -> &'static str {
         LangId::R => "r",
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
+        LangId::Toml => "toml",
     }
 }
 
@@ -13941,6 +14472,8 @@ fn lang_from_label(label: &str) -> Option<LangId> {
         "go" => Some(LangId::Go),
         "c" => Some(LangId::C),
         "cpp" => Some(LangId::Cpp),
+        "cuda" => Some(LangId::Cuda),
+        "metal" => Some(LangId::Metal),
         "zig" => Some(LangId::Zig),
         "csharp" => Some(LangId::CSharp),
         "bash" => Some(LangId::Bash),
@@ -13963,6 +14496,7 @@ fn lang_from_label(label: &str) -> Option<LangId> {
         "r" => Some(LangId::R),
         "groovy" => Some(LangId::Groovy),
         "objc" => Some(LangId::ObjC),
+        "toml" => Some(LangId::Toml),
         _ => None,
     }
 }
@@ -15639,7 +16173,7 @@ mod cold_build_insert_tests {
         let generation = write_generation_with_age(dir.path(), &project_key, 100, Duration::ZERO);
         let sqlite_path = dir.path().join(&generation);
         fs::remove_file(&sqlite_path).unwrap();
-        let conn = Connection::open(&sqlite_path).unwrap();
+        let conn = TrackedConnection::open(&sqlite_path, SqliteStore::CallgraphGeneration).unwrap();
         let store = CallGraphStore::from_connection(
             dir.path().to_path_buf(),
             project_key,
@@ -16420,12 +16954,15 @@ export function leaf() {}
             project_root.to_path_buf(),
         )
         .expect("open uncached store");
+        // Bypass the outer disk-index memo so this comparison still isolates
+        // the filesystem-facing module-resolution memo.
         let uncached_stats = uncached
-            .cold_build_chunked_with_resolution_memo_for_test(
+            .cold_build_chunked_with_disk_index_memo_for_test(
                 &files,
                 7,
                 resolve_window,
                 &uncached_memo,
+                false,
             )
             .expect("uncached comparison build");
         assert!(
@@ -16527,6 +17064,56 @@ export function leaf() {}
     }
 
     #[test]
+    fn cold_build_disk_file_index_memo_preserves_resolved_rows() {
+        let dir = tempdir().expect("temp dir");
+        let project_root = dir.path().join("project");
+        fs::create_dir_all(&project_root).expect("create project root");
+        let project_root = fs::canonicalize(project_root).expect("canonical project root");
+        let files = write_rust_declared_module_memo_fixture(&project_root, 6);
+
+        let bypassed = CallGraphStore::open(
+            dir.path().join("store-disk-memo-bypassed"),
+            project_root.to_path_buf(),
+        )
+        .expect("open bypassed store");
+        let bypassed_module_memo = callgraph::ModuleResolutionMemo::new_for_test(true, true);
+        let bypassed_stats = bypassed
+            .cold_build_chunked_with_disk_index_memo_for_test(
+                &files,
+                3,
+                7,
+                &bypassed_module_memo,
+                false,
+            )
+            .expect("build with disk index memo bypassed");
+
+        let memoized = CallGraphStore::open(
+            dir.path().join("store-disk-memoized"),
+            project_root.to_path_buf(),
+        )
+        .expect("open memoized store");
+        let memoized_module_memo = callgraph::ModuleResolutionMemo::new_for_test(true, true);
+        let memoized_stats = memoized
+            .cold_build_chunked_with_disk_index_memo_for_test(
+                &files,
+                3,
+                7,
+                &memoized_module_memo,
+                true,
+            )
+            .expect("build with disk index memo enabled");
+
+        assert_cold_build_stats_match_except_elapsed(&bypassed_stats, &memoized_stats);
+        for table in ["refs", "edges"] {
+            assert_eq!(
+                graph_table_rows(&bypassed, table),
+                graph_table_rows(&memoized, table),
+                "memoized and bypassed disk indexes must produce byte-identical {table} rows"
+            );
+        }
+    }
+
+    #[test]
     fn rust_declared_module_memo_parses_each_declaring_file_once_and_preserves_edges() {
         let dir = tempdir().expect("temp dir");
         let project_root = dir.path().join("project");
@@ -16542,6 +17129,10 @@ export function leaf() {}
                     "src/lib.rs",
                     "undeclared",
                     &negative_memo,
+                    &FactPaths {
+                        root: &project_root,
+                        facts: &DiskFacts::new(&project_root)
+                    },
                 ),
                 None
             );
@@ -16560,8 +17151,10 @@ export function leaf() {}
             project_root.to_path_buf(),
         )
         .expect("open uncached Rust store");
+        // Bypass the outer disk-index memo so parse counts continue to measure
+        // the Rust declaration memo rather than the higher-level cache.
         let uncached_stats = uncached
-            .cold_build_chunked_with_resolution_memo_for_test(&files, 3, 11, &uncached_memo)
+            .cold_build_chunked_with_disk_index_memo_for_test(&files, 3, 11, &uncached_memo, false)
             .expect("uncached Rust build");
 
         let cached_memo = callgraph::ModuleResolutionMemo::new_for_test(true, true);
@@ -16892,6 +17485,10 @@ export function leaf() {}
                 "@cortexkit/aft-bridge",
                 &dependencies,
                 &indexed_files,
+                &FactPaths {
+                    root: root.path(),
+                    facts: &DiskFacts::new(root.path())
+                }
             ),
             BTreeSet::from(["packages/aft-bridge/src/index.ts".to_string()])
         );
@@ -17755,7 +18352,14 @@ edition = "2021"
             .map(|extract| {
                 (
                     extract.rel_path.clone(),
-                    DbFileIndex::from_extract(root, extract),
+                    DbFileIndex::from_extract(
+                        root,
+                        extract,
+                        &FactPaths {
+                            root,
+                            facts: &DiskFacts::new(root),
+                        },
+                    ),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -17768,6 +18372,7 @@ edition = "2021"
             files,
             caller_data,
             WorkspaceCratePrefixCache::default(),
+            Rc::new(DiskFacts::new(root)),
         );
         assert_eq!(
             index.module_parent("src/commands.rs"),
@@ -18169,6 +18774,8 @@ mod reexport_resolution_tests {
 
     fn barrel_index(files: Vec<(String, DbFileIndex)>) -> ProjectIndex<'static> {
         ProjectIndex {
+            facts: Rc::new(DiskFacts::new(Path::new("/fixture"))),
+            unbound_non_utf8_paths: Vec::new(),
             project_root: PathBuf::from("/fixture"),
             files: files.into_iter().collect(),
             caller_data: HashMap::new(),

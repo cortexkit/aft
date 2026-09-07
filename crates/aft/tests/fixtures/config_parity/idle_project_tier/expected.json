@@ -1,0 +1,11 @@
+{
+  "experimental_bash_background": true,
+  "experimental_bash_compress": true,
+  "experimental_bash_rewrite": true,
+  "hoist_builtin_tools": true,
+  "idle": {
+    "lsp_ttl_minutes": 3,
+    "root_ttl_minutes": 15
+  },
+  "restrict_to_project_root": false
+}

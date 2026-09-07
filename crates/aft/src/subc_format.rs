@@ -268,7 +268,10 @@ pub fn format_response_with_context(
     ctx: &FormatContext,
 ) -> String {
     if !is_core_agent_tool(bare_name) {
-        return serde_json::to_string(response).unwrap_or_else(|_| "{}".to_string());
+        return serialized_text_or_failure(
+            serde_json::to_string(response),
+            "non-core tool response",
+        );
     }
 
     let data = &response.data;
@@ -276,7 +279,7 @@ pub fn format_response_with_context(
         return format_error(bare_name, data, ctx);
     }
 
-    match bare_name {
+    let mut text = match bare_name {
         "edit" => format_edit_response(data),
         "write" => format_write_response(data),
         "apply_patch" => format_apply_patch(data),
@@ -302,7 +305,19 @@ pub fn format_response_with_context(
         "import" => format_import(data, ctx),
         "safety" => format_safety(data, ctx),
         _ => unreachable!("core agent tools are exhaustive"),
+    };
+    if let Some(reason) = data.get("backup_skipped_reason").and_then(Value::as_str) {
+        let notice = format!(
+            "Undo is unavailable for this change because the backup snapshot was skipped ({reason})."
+        );
+        if text.is_empty() {
+            text = notice;
+        } else {
+            text.push_str("\n\n");
+            text.push_str(&notice);
+        }
     }
+    text
 }
 
 fn import_string_field(response: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
@@ -348,35 +363,50 @@ fn format_apply_patch(data: &Value) -> String {
         return output.to_string();
     }
 
-    data.get("metadata")
+    let Some(files) = data
+        .get("metadata")
         .and_then(|metadata| metadata.get("files"))
         .and_then(Value::as_array)
-        .map(|files| {
-            files
-                .iter()
-                .filter_map(|file| {
-                    let kind = file.get("type").and_then(Value::as_str).unwrap_or("update");
-                    let rel = file
-                        .get("relativePath")
-                        .or_else(|| file.get("filePath"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("(file)");
-                    match kind {
-                        "add" => Some(format!("Created {rel}")),
-                        "delete" => Some(format!("Deleted {rel}")),
-                        "move" => {
-                            let move_path =
-                                file.get("movePath").and_then(Value::as_str).unwrap_or(rel);
-                            Some(format!("Moved {rel} → {move_path}"))
-                        }
-                        "update" => Some(format!("Updated {rel}")),
-                        _ => None,
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default()
+    else {
+        return "Unable to format apply_patch: response omitted metadata.files.".to_string();
+    };
+    let mut lines = Vec::with_capacity(files.len());
+    for file in files {
+        let Some(kind) = file.get("type").and_then(Value::as_str) else {
+            return "Unable to format apply_patch: a file omitted its change type.".to_string();
+        };
+        let Some(relative_path) = file
+            .get("relativePath")
+            .or_else(|| file.get("filePath"))
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+        else {
+            return "Unable to format apply_patch: a file omitted its path.".to_string();
+        };
+        let line = match kind {
+            "add" => format!("Created {relative_path}"),
+            "delete" => format!("Deleted {relative_path}"),
+            "update" => format!("Updated {relative_path}"),
+            "move" => {
+                let Some(move_path) = file
+                    .get("movePath")
+                    .and_then(Value::as_str)
+                    .filter(|path| !path.is_empty())
+                else {
+                    return "Unable to format apply_patch: a move omitted its destination."
+                        .to_string();
+                };
+                format!("Moved {relative_path} → {move_path}")
+            }
+            other => {
+                return format!(
+                    "Unable to format apply_patch: response used unknown change type `{other}`."
+                );
+            }
+        };
+        lines.push(line);
+    }
+    lines.join("\n")
 }
 
 fn format_delete(data: &Value) -> String {
@@ -408,41 +438,47 @@ fn format_delete(data: &Value) -> String {
 
 fn format_move(data: &Value, ctx: &FormatContext) -> String {
     let response = data.as_object();
-    let file = ctx
+    let Some(file) = ctx
         .move_file_arg
         .clone()
         .or_else(|| {
             response
-                .and_then(|r| import_string_field(r, "file"))
-                .map(|p| shorten_path(&p))
+                .and_then(|record| import_string_field(record, "file"))
+                .map(|path| shorten_path(&path))
         })
-        .unwrap_or_default();
-    let destination = ctx
+        .filter(|path| !path.is_empty())
+    else {
+        return "Unable to format move: response omitted the source path.".to_string();
+    };
+    let Some(destination) = ctx
         .move_dest_arg
         .clone()
         .or_else(|| {
             response
-                .and_then(|r| import_string_field(r, "destination"))
-                .map(|p| shorten_path(&p))
+                .and_then(|record| import_string_field(record, "destination"))
+                .map(|path| shorten_path(&path))
         })
-        .unwrap_or_default();
+        .filter(|path| !path.is_empty())
+    else {
+        return "Unable to format move: response omitted the destination path.".to_string();
+    };
 
     // Producer may mark a copy+delete-failed path as incomplete while both
     // paths still exist; never render that as a finished "Moved".
     let source_delete_failed = response
-        .and_then(|r| r.get("source_delete_failed"))
+        .and_then(|record| record.get("source_delete_failed"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let incomplete = response
-        .and_then(|r| r.get("complete"))
+        .and_then(|record| record.get("complete"))
         .and_then(Value::as_bool)
         == Some(false);
     if source_delete_failed || incomplete {
         let message = response
-            .and_then(|r| r.get("warning"))
+            .and_then(|record| record.get("warning"))
             .and_then(Value::as_str)
             .and_then(extract_move_source_delete_message)
-            .unwrap_or("unknown error");
+            .unwrap_or("response omitted the source-deletion error");
         return format!(
             "Partially moved {file} → {destination}; destination was written, but source deletion failed: {message}. Both paths exist. Verify the source and destination before retrying or accepting the duplicate."
         );
@@ -1562,8 +1598,12 @@ fn format_outline_files_text(data: &Value) -> String {
         } else {
             " Some files in this directory were not indexed.".to_string()
         };
+        let walk_limit = data
+            .get("walk_limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(200);
         footer.push(format!(
-            "⚠ Partial result: walk truncated at 200 files.{suffix}"
+            "⚠ Partial result: walk truncated at {walk_limit} files.{suffix}"
         ));
     } else {
         let suffix = if !unchecked.is_empty() {
@@ -1847,7 +1887,8 @@ fn format_inspect(response: &Response) -> String {
     if let Some(text) = response.data.get("text").and_then(Value::as_str) {
         return append_rendered_diagnostics(text, &response.data);
     }
-    let json = serde_json::to_string_pretty(response).unwrap_or_else(|_| "{}".to_string());
+    let json =
+        serialized_text_or_failure(serde_json::to_string_pretty(response), "inspect response");
     append_rendered_diagnostics(&json, &response.data)
 }
 
@@ -2037,6 +2078,9 @@ pub fn format_callgraph(op: &str, response_data: &Value, include_unresolved: boo
     let Some(record) = response_data.as_object() else {
         return "No navigation result.".to_string();
     };
+    if let Some(field) = missing_callgraph_collection(op, record) {
+        return format!("Unable to format {op}: response omitted required `{field}` collection.");
+    }
 
     let sections = match op {
         "call_tree" => format_call_tree_sections(record, include_unresolved),
@@ -2047,6 +2091,65 @@ pub fn format_callgraph(op: &str, response_data: &Value, include_unresolved: boo
         _ => format_trace_data_sections(record),
     };
     sections.join("\n")
+}
+
+fn missing_callgraph_collection(
+    op: &str,
+    record: &serde_json::Map<String, Value>,
+) -> Option<&'static str> {
+    let required = match op {
+        "call_tree" => "children",
+        "callers" => "callers",
+        "trace_to_symbol" => "path",
+        "trace_to" => "paths",
+        "impact" => "callers",
+        _ => "hops",
+    };
+    let Some(top_level) = record.get(required).and_then(Value::as_array) else {
+        // trace_to_symbol answers "no path" with `path: null` and a `reason`
+        // (no_path_found, max_depth_exhausted); that is the contract, not an
+        // omitted collection. Only a response with neither is malformed.
+        if op == "trace_to_symbol"
+            && record.get("path").is_none_or(Value::is_null)
+            && record.get("reason").and_then(Value::as_str).is_some()
+        {
+            return None;
+        }
+        return Some(required);
+    };
+    if op == "call_tree" && call_tree_descendant_missing_children(top_level) {
+        return Some("children");
+    }
+    let nested = match op {
+        "callers" => Some("callers"),
+        "trace_to" => Some("hops"),
+        _ => None,
+    };
+    if let Some(nested) = nested {
+        let missing_nested = top_level.iter().any(|value| {
+            value
+                .as_object()
+                .and_then(|record| record.get(nested))
+                .and_then(Value::as_array)
+                .is_none()
+        });
+        if missing_nested {
+            return Some(nested);
+        }
+    }
+    None
+}
+
+fn call_tree_descendant_missing_children(children: &[Value]) -> bool {
+    children.iter().any(|child| {
+        let Some(child) = child.as_object() else {
+            return true;
+        };
+        let Some(grandchildren) = child.get("children").and_then(Value::as_array) else {
+            return true;
+        };
+        call_tree_descendant_missing_children(grandchildren)
+    })
 }
 
 fn format_callgraph_error(command: &str, data: &Value) -> String {
@@ -2179,7 +2282,17 @@ fn collect_callgraph_error_extras(data: &Value) -> Option<String> {
 }
 
 fn stringify_json_pretty(value: &Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+    serialized_text_or_failure(serde_json::to_string_pretty(value), "JSON value")
+}
+
+fn serialized_text_or_failure<E: std::fmt::Display>(
+    serialized: Result<String, E>,
+    subject: &str,
+) -> String {
+    match serialized {
+        Ok(text) => text,
+        Err(error) => format!("Unable to format {subject}: serialization failed: {error}"),
+    }
 }
 
 fn format_call_tree_sections(
@@ -2585,8 +2698,8 @@ fn shorten_path(path: &str) -> String {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    crate::environment::non_empty_os_var("HOME")
+        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"))
         .map(PathBuf::from)
 }
 
@@ -3046,6 +3159,71 @@ mod callgraph_format_tests {
     use serde_json::json;
 
     #[test]
+    fn serialization_failure_is_explicit_instead_of_substituting_an_empty_object() {
+        assert_eq!(
+            serialized_text_or_failure::<&str>(Err("forced failure"), "test response"),
+            "Unable to format test response: serialization failed: forced failure"
+        );
+    }
+
+    #[test]
+    fn missing_patch_and_move_facts_are_reported_instead_of_substituted() {
+        assert_eq!(
+            format_apply_patch(&json!({ "metadata": { "files": [{ "type": "update" }] } })),
+            "Unable to format apply_patch: a file omitted its path."
+        );
+        assert_eq!(
+            format_move(
+                &json!({ "destination": "dest.txt" }),
+                &FormatContext::default()
+            ),
+            "Unable to format move: response omitted the source path."
+        );
+    }
+
+    #[test]
+    fn missing_callgraph_collection_is_reported_instead_of_rendered_as_empty() {
+        assert_eq!(
+            format_callgraph("trace_to", &json!({ "total_paths": 3 }), false),
+            "Unable to format trace_to: response omitted required `paths` collection."
+        );
+        assert_eq!(
+            format_callgraph(
+                "trace_to",
+                &json!({ "paths": [{ "name": "entry" }] }),
+                false
+            ),
+            "Unable to format trace_to: response omitted required `hops` collection."
+        );
+    }
+
+    /// `path: null` plus a reason is trace_to_symbol's no-path answer, not an
+    /// omitted collection; a response with neither is still malformed.
+    #[test]
+    fn trace_to_symbol_no_path_with_reason_renders_not_refuses() {
+        assert_eq!(
+            format_callgraph(
+                "trace_to_symbol",
+                &json!({ "path": null, "complete": true, "reason": "no_path_found" }),
+                false
+            ),
+            "No path (no_path_found)"
+        );
+        assert_eq!(
+            format_callgraph(
+                "trace_to_symbol",
+                &json!({ "complete": false, "reason": "max_depth_exhausted" }),
+                false
+            ),
+            "No complete path (max_depth_exhausted)"
+        );
+        assert_eq!(
+            format_callgraph("trace_to_symbol", &json!({ "complete": true }), false),
+            "Unable to format trace_to_symbol: response omitted required `path` collection."
+        );
+    }
+
+    #[test]
     fn trace_to_formats_budgeted_path_count_as_lower_bound() {
         let rendered = format_callgraph(
             "trace_to",
@@ -3101,5 +3279,22 @@ mod outline_format_tests {
         let formatted = format_outline(&response, OutlineMode::DirectoryJson);
         assert!(formatted.contains("src/\n  a.rs (rs)"));
         assert!(formatted.contains("⚠ Partial result: walk truncated at 200 files. Some files in this directory were not indexed."));
+    }
+
+    #[test]
+    fn files_outline_uses_the_counting_walk_limit_in_partial_footer() {
+        let response = Response::success(
+            "1",
+            json!({
+                "text": "src/  10000 files",
+                "complete": false,
+                "walk_truncated": true,
+                "walk_limit": 10_000
+            }),
+        );
+
+        let formatted = format_outline(&response, OutlineMode::Files);
+        assert!(formatted.contains("walk truncated at 10000 files"));
+        assert!(!formatted.contains("walk truncated at 200 files"));
     }
 }
