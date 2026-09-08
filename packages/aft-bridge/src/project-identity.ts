@@ -38,10 +38,10 @@ export function canonicalizeProjectRoot(dir: string): string {
  * Strip only safely convertible Windows extended-length DOS and UNC prefixes,
  * and uppercase a lowercase drive letter so `c:\x` and `C:\x` collapse to one
  * identity. Namespaces such as `\\?\Volume{GUID}\` must retain their prefix.
- * No-op off Windows.
+ * `platform` is injectable for cross-platform regression tests. No-op off Windows.
  */
-function normalizeWindowsRoot(p: string): string {
-  if (process.platform !== "win32") return p;
+export function normalizeWindowsRoot(p: string, platform = process.platform): string {
+  if (platform !== "win32") return p;
   let s = p;
   const lower = s.toLowerCase();
   const uncPrefix = ["\\\\?\\unc\\", "\\\\??\\unc\\", "\\??\\unc\\"].find((prefix) =>
@@ -49,12 +49,14 @@ function normalizeWindowsRoot(p: string): string {
   );
   if (uncPrefix) {
     const tail = s.slice(uncPrefix.length);
-    if (tail.split(/[\\/]+/).filter(Boolean).length >= 2) s = `\\\\${tail}`;
+    if (/^[^\\/]+[\\/][^\\/]+(?:[\\/]|$)/.test(tail) && !hasDotComponent(tail)) {
+      s = `\\\\${tail}`;
+    }
   } else {
     const dosPrefix = ["\\\\?\\", "\\\\??\\", "\\??\\"].find((prefix) => lower.startsWith(prefix));
     if (dosPrefix) {
       const tail = s.slice(dosPrefix.length);
-      if (/^[a-z]:[\\/]/i.test(tail)) s = tail;
+      if (/^[a-z]:[\\/]/i.test(tail) && !hasDotComponent(tail)) s = tail;
     }
   }
   if (s.length >= 2 && s[1] === ":") {
@@ -64,6 +66,10 @@ function normalizeWindowsRoot(p: string): string {
     }
   }
   return s;
+}
+
+function hasDotComponent(path: string): boolean {
+  return path.split(/[\\/]/).some((component) => component === "." || component === "..");
 }
 
 /**

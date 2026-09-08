@@ -28,10 +28,7 @@ pub fn normalize_windows_path(path: &Path) -> PathBuf {
 pub fn non_verbatim_path_text(path: &str) -> Option<String> {
     for prefix in [r"\\?\UNC\", r"\\??\UNC\", r"\??\UNC\"] {
         if let Some(tail) = strip_ascii_prefix(path, prefix) {
-            let mut components = tail
-                .split(['\\', '/'])
-                .filter(|component| !component.is_empty());
-            if components.next().is_some() && components.next().is_some() {
+            if is_safe_unc_tail(tail) {
                 return Some(format!(r"\\{tail}"));
             }
             return None;
@@ -45,6 +42,7 @@ pub fn non_verbatim_path_text(path: &str) -> Option<String> {
                 && bytes[0].is_ascii_alphabetic()
                 && bytes[1] == b':'
                 && matches!(bytes[2], b'\\' | b'/')
+                && !has_dot_component(tail)
             {
                 return Some(tail.to_string());
             }
@@ -53,6 +51,18 @@ pub fn non_verbatim_path_text(path: &str) -> Option<String> {
     }
 
     None
+}
+
+fn is_safe_unc_tail(tail: &str) -> bool {
+    let mut components = tail.split(['\\', '/']);
+    components.next().is_some_and(|server| !server.is_empty())
+        && components.next().is_some_and(|share| !share.is_empty())
+        && !has_dot_component(tail)
+}
+
+fn has_dot_component(path: &str) -> bool {
+    path.split(['\\', '/'])
+        .any(|component| matches!(component, "." | ".."))
 }
 
 fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
@@ -90,6 +100,10 @@ mod tests {
         for path in [
             r"\\?\Volume{1234}\server.cmd",
             r"\\?\UNC\host",
+            r"\\?\UNC\\host\share",
+            r"\\??\UNC\\host\share",
+            r"\\?\UNC\host\share\..\file",
+            r"\\?\C:\repo\..\other",
             r"\\?\C:relative",
             r"\\?\relative",
             r"C:\ordinary\path",

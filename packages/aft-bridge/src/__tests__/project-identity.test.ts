@@ -2,7 +2,11 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { canonicalizeProjectRoot, projectRootKeyHash } from "../project-identity.js";
+import {
+  canonicalizeProjectRoot,
+  normalizeWindowsRoot,
+  projectRootKeyHash,
+} from "../project-identity.js";
 
 describe("project-identity canonicalization", () => {
   test("trailing separators collapse to one identity", () => {
@@ -77,5 +81,22 @@ describe("project-identity canonicalization", () => {
     const missing = join(tmpdir(), "aft-pid-definitely-missing-xyz", "sub", "..");
     expect(() => canonicalizeProjectRoot(missing)).not.toThrow();
     expect(projectRootKeyHash(missing)).toMatch(/^[0-9a-f]{16}$/);
+  });
+
+  test("Windows verbatim normalization converts only safe DOS and UNC namespaces", () => {
+    const win32 = "win32";
+    expect(normalizeWindowsRoot("\\\\?\\c:\\repo", win32)).toBe("C:\\repo");
+    expect(normalizeWindowsRoot("\\\\?\\UNC\\server\\share\\repo", win32)).toBe(
+      "\\\\server\\share\\repo",
+    );
+    for (const path of [
+      "\\\\?\\Volume{1234}\\repo",
+      "\\\\?\\UNC\\\\server\\share",
+      "\\\\??\\UNC\\\\server\\share",
+      "\\\\?\\C:\\repo\\..\\other",
+      "\\\\?\\UNC\\server\\share\\.\\repo",
+    ]) {
+      expect(normalizeWindowsRoot(path, win32)).toBe(path);
+    }
   });
 });
