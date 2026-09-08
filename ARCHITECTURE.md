@@ -281,7 +281,7 @@
 **BgTaskRegistry:**
 - Purpose: Manage background bash tasks and PTY sessions.
 - Location: `crates/aft/src/bash_background/registry.rs`
-- Pattern: Thread-safe registry with a watchdog thread for output compression, completion notification, and task lifecycle cleanup. Generate unique task IDs using 64-bit entropy (represented as a 16-hex character slug `bash-{16hex}`) to prevent ID reuse collisions during subc delivery de-duplication. Preserves restart fate (`BgTaskStatus::FateUnknown`) across daemon restarts when child exit is unobserved, checks recorded process start-time liveness before GC or quarantine, redelivers durable pending pattern watches across session drains, records watch tombstones (`watch_target_erased`) for erased task bundles, and retargets completion delivery to active sessions.
+- Pattern: Thread-safe registry with a watchdog thread for output compression, completion notification, and task lifecycle cleanup. Generate unique task IDs using 64-bit entropy (represented as a 16-hex character slug `bash-{16hex}`) to prevent ID reuse collisions during subc delivery de-duplication. Preserves restart fate (`BgTaskStatus::FateUnknown`) across daemon restarts when child exit is unobserved, checks recorded process start-time liveness before GC or quarantine, redelivers durable pending pattern watches only to their originating sessions, records watch tombstones (`watch_target_erased`) for erased task bundles, and preserves cross-session task lookup for control without retargeting notice delivery.
 
 **Compressor:**
 - Purpose: Reduce hoisted-bash output to relevant tokens.
