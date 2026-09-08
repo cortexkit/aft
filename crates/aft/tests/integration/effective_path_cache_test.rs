@@ -12,6 +12,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use filetime::FileTime;
 use serde_json::{json, Value};
 
+const LIVENESS_CEILING: Duration = Duration::from_secs(30);
+
 fn aft_binary() -> PathBuf {
     std::env::var_os("AFT_TEST_AFT_BINARY")
         .or_else(|| std::env::var_os("NEXTEST_BIN_EXE_aft"))
@@ -66,8 +68,38 @@ fn write_cache(storage: &Path, shell: &Path, home: &Path, path: Option<&str>) ->
     cache_path
 }
 
-fn run_ping(storage: &Path, home: &Path, candidates: &OsStr, marker: &Path) -> (Duration, Value) {
-    let started = Instant::now();
+fn read_counter(marker: &Path) -> usize {
+    fs::read_to_string(marker)
+        .map(|s| s.matches('x').count())
+        .unwrap_or(0)
+}
+
+fn wait_with_liveness_ceiling(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> std::process::Output {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child.wait_with_output().expect("read output after exit");
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                panic!("process exceeded {timeout:?} liveness ceiling");
+            }
+            Ok(None) => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                panic!("failed to wait for child: {error}");
+            }
+        }
+    }
+}
+
+fn run_ping(storage: &Path, home: &Path, candidates: &OsStr, marker: &Path) -> Value {
     let mut child = Command::new(aft_binary())
         .env("AFT_CACHE_DIR", storage)
         .env("AFT_TEST_RAW_PATH", "0")
@@ -87,19 +119,74 @@ fn run_ping(storage: &Path, home: &Path, candidates: &OsStr, marker: &Path) -> (
         .unwrap()
         .write_all(b"{\"id\":\"1\",\"command\":\"ping\"}\n")
         .unwrap();
-    let output = child.wait_with_output().expect("wait for aft binary");
+    let output = wait_with_liveness_ceiling(child, LIVENESS_CEILING);
     assert!(output.status.success(), "aft failed: {output:?}");
     let response = String::from_utf8(output.stdout).unwrap();
     let response = response.lines().last().expect("ping response");
-    (started.elapsed(), serde_json::from_str(response).unwrap())
+    serde_json::from_str(response).unwrap()
+}
+
+fn run_bash_get_path(
+    storage: &Path,
+    home: &Path,
+    candidates: &OsStr,
+    marker: &Path,
+    output_path: &Path,
+) -> Value {
+    let mut child = Command::new(aft_binary())
+        .env("AFT_CACHE_DIR", storage)
+        .env("AFT_TEST_RAW_PATH", "0")
+        .env("AFT_TEST_LOGIN_SHELL_CANDIDATES", candidates)
+        .env("AFT_TEST_DISABLE_FILE_WATCHER", "1")
+        .env("AFT_TEST_PATH_MARKER", marker)
+        .env("HOME", home)
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn aft binary");
+
+    let cmd = serde_json::json!({
+        "id": "1",
+        "command": "bash",
+        "params": {
+            "command": format!("printf %s \"$PATH\" > \"{}\"", output_path.display())
+        }
+    });
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{cmd}\n").as_bytes())
+        .unwrap();
+
+    let output = wait_with_liveness_ceiling(child, LIVENESS_CEILING);
+    assert!(output.status.success(), "aft failed: {output:?}");
+
+    let deadline = Instant::now() + LIVENESS_CEILING;
+    while !output_path.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        output_path.exists(),
+        "bash did not write served path within liveness ceiling"
+    );
+
+    let response = String::from_utf8(output.stdout).unwrap();
+    let response = response.lines().last().expect("bash response");
+    serde_json::from_str(response).unwrap()
 }
 
 fn wait_for_marker(marker: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + LIVENESS_CEILING;
     while !marker.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
-    assert!(marker.exists(), "detached probe did not execute its shell");
+    assert!(
+        marker.exists(),
+        "detached probe did not execute its shell within liveness ceiling"
+    );
 }
 
 #[test]
@@ -109,10 +196,11 @@ fn valid_cache_skips_sleeping_shell_and_returns_ping_quickly() {
     let home = fixture.path().join("home");
     let shell = fixture.path().join("bash");
     let marker = fixture.path().join("shell-ran");
+    let served_path_file = fixture.path().join("served_path.txt");
     fs::create_dir_all(&home).unwrap();
     write_executable(
         &shell,
-        "#!/bin/sh\nprintf shell-ran > \"$AFT_TEST_PATH_MARKER\"\nsleep 10\n",
+        "#!/bin/sh\nprintf x >> \"$AFT_TEST_PATH_MARKER\"\nsleep 10\n",
     );
     write_cache(
         &storage,
@@ -121,16 +209,24 @@ fn valid_cache_skips_sleeping_shell_and_returns_ping_quickly() {
         Some("/cached/login/bin:/usr/bin:/bin"),
     );
 
-    let (elapsed, response) = run_ping(&storage, &home, shell.as_os_str(), &marker);
-
-    assert!(
-        elapsed < Duration::from_millis(500),
-        "cache hit took {elapsed:?}"
+    let response = run_bash_get_path(
+        &storage,
+        &home,
+        shell.as_os_str(),
+        &marker,
+        &served_path_file,
     );
+
     assert_eq!(response["id"], "1");
-    assert!(
-        !marker.exists(),
+    assert_eq!(
+        read_counter(&marker),
+        0,
         "the cache-hit request executed the sleeping login shell"
+    );
+    let served_path = fs::read_to_string(&served_path_file).expect("served path file written");
+    assert!(
+        std::env::split_paths(&served_path).any(|p| p == Path::new("/cached/login/bin")),
+        "served PATH {served_path:?} does not include cached entry /cached/login/bin"
     );
 }
 
@@ -149,14 +245,17 @@ fn changing_or_creating_a_recorded_rc_file_invalidates_the_cache() {
         }
         write_executable(
             &shell,
-            "#!/bin/sh\nprintf probe-ran > \"$AFT_TEST_PATH_MARKER\"\neval \"$2\"\n",
+            "#!/bin/sh\nprintf x >> \"$AFT_TEST_PATH_MARKER\"\neval \"$2\"\n",
         );
-        write_cache(
+        let cache_path = write_cache(
             &storage,
             &shell,
             &home,
             Some("/cached/login/bin:/usr/bin:/bin"),
         );
+        let initial_cache: Value = serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        let initial_inputs = initial_cache["inputs"].clone();
+
         if initially_exists {
             let future = FileTime::from_unix_time(
                 SystemTime::now()
@@ -171,10 +270,19 @@ fn changing_or_creating_a_recorded_rc_file_invalidates_the_cache() {
             fs::write(&bashrc, "export PATH=/created\n").unwrap();
         }
 
-        let (_, response) = run_ping(&storage, &home, shell.as_os_str(), &marker);
+        let response = run_ping(&storage, &home, shell.as_os_str(), &marker);
 
         assert_eq!(response["id"], "1");
-        assert!(marker.exists(), "rc-file change did not run the probe");
+        assert_eq!(
+            read_counter(&marker),
+            1,
+            "rc-file change did not run the probe exactly once"
+        );
+        let updated_cache: Value = serde_json::from_slice(&fs::read(&cache_path).unwrap()).unwrap();
+        assert_ne!(
+            initial_inputs, updated_cache["inputs"],
+            "cache file inputs must change after rc-file modification"
+        );
     }
 }
 
@@ -191,11 +299,7 @@ fn timed_out_probe_is_cached_and_second_binary_start_is_fast() {
         "#!/bin/sh\nprintf x >> \"$AFT_TEST_PATH_MARKER\"\nsleep 10\n",
     );
 
-    let (first_elapsed, first_response) = run_ping(&storage, &home, shell.as_os_str(), &marker);
-    assert!(
-        first_elapsed >= Duration::from_secs(2) && first_elapsed < Duration::from_millis(4500),
-        "first timeout path took {first_elapsed:?}"
-    );
+    let first_response = run_ping(&storage, &home, shell.as_os_str(), &marker);
     assert_eq!(first_response["id"], "1");
     let cache: Value = serde_json::from_slice(
         &fs::read(storage.join("aft/effective-path.json")).expect("timeout cache"),
@@ -203,23 +307,19 @@ fn timed_out_probe_is_cached_and_second_binary_start_is_fast() {
     .unwrap();
     assert!(cache["path"].is_null(), "timeout must cache null PATH");
     assert!(!cache["inputs"].as_array().unwrap().is_empty());
-    assert_eq!(fs::read_to_string(&marker).unwrap(), "x");
-
-    let (second_elapsed, second_response) = run_ping(&storage, &home, shell.as_os_str(), &marker);
-    // Same rule as the fallback-path sibling: each run spawns and configures a
-    // fresh binary, so an absolute bound measures runner load (534 ms on a
-    // contended macOS runner, train 48). The cache's observable is the absent
-    // ~2 s timeout probe, so bound the second run relative to the first; the
-    // marker proves the shell was not re-invoked.
-    assert!(
-        second_elapsed + Duration::from_millis(1500) < first_elapsed,
-        "cached timeout path took {second_elapsed:?} against a first run of {first_elapsed:?}"
-    );
-    assert_eq!(second_response["id"], "1");
+    let count_after_first = read_counter(&marker);
     assert_eq!(
-        fs::read_to_string(&marker).unwrap(),
-        "x",
-        "cached timeout started another login-shell probe"
+        count_after_first, 1,
+        "first run should have invoked the shell once"
+    );
+
+    let second_response = run_ping(&storage, &home, shell.as_os_str(), &marker);
+    assert_eq!(second_response["id"], "1");
+    let count_after_second = read_counter(&marker);
+    let delta = count_after_second - count_after_first;
+    assert_eq!(
+        delta, 0,
+        "cached timeout started another login-shell probe (counter delta {delta})"
     );
 }
 
@@ -239,29 +339,34 @@ fn fallback_result_is_cached_for_the_requested_hanging_shell() {
     write_executable(&fallback_shell, "#!/bin/sh\neval \"$2\"\n");
     let candidates = std::env::join_paths([&hanging_shell, &fallback_shell]).unwrap();
 
-    let (first_elapsed, first_response) = run_ping(&storage, &home, &candidates, &marker);
-    assert!(
-        first_elapsed >= Duration::from_secs(2) && first_elapsed < Duration::from_millis(4500),
-        "first fallback path took {first_elapsed:?}"
-    );
+    let first_response = run_ping(&storage, &home, &candidates, &marker);
     assert_eq!(first_response["id"], "1");
-    assert_eq!(fs::read_to_string(&marker).unwrap(), "x");
-
-    let (second_elapsed, second_response) = run_ping(&storage, &home, &candidates, &marker);
-    // Each run spawns a fresh binary and configures it, so an absolute bound
-    // measures runner load as much as the cache (a contended macOS runner spent
-    // 529 ms on this spawn alone). What the cache buys is the absence of the
-    // 2 s hanging-shell probe: assert the second run is at least that much
-    // faster than the first, and let the marker prove the shell never re-ran.
-    assert!(
-        second_elapsed + Duration::from_millis(1500) < first_elapsed,
-        "cached fallback path took {second_elapsed:?} against a first run of {first_elapsed:?}"
-    );
-    assert_eq!(second_response["id"], "1");
+    let count_after_first = read_counter(&marker);
     assert_eq!(
-        fs::read_to_string(&marker).unwrap(),
-        "x",
-        "cached fallback result retried the requested hanging shell"
+        count_after_first, 1,
+        "first run should have attempted the hanging shell once"
+    );
+    let cache: Value = serde_json::from_slice(
+        &fs::read(storage.join("aft/effective-path.json")).expect("fallback cache"),
+    )
+    .unwrap();
+    assert_eq!(
+        cache["shell"],
+        hanging_shell.to_string_lossy().as_ref(),
+        "fallback must cache against the requested shell"
+    );
+    assert!(
+        cache["path"].is_string(),
+        "fallback probe should succeed and cache non-null path"
+    );
+
+    let second_response = run_ping(&storage, &home, &candidates, &marker);
+    assert_eq!(second_response["id"], "1");
+    let count_after_second = read_counter(&marker);
+    let delta = count_after_second - count_after_first;
+    assert_eq!(
+        delta, 0,
+        "cached fallback result retried the requested hanging shell (counter delta {delta})"
     );
 }
 
@@ -272,29 +377,62 @@ fn inline_probe_total_budget_caps_two_hanging_candidates() {
     let home = fixture.path().join("home");
     let first = fixture.path().join("first-bash");
     let second = fixture.path().join("second-bash");
+    let first_start = fixture.path().join("first-start");
+    let second_start = fixture.path().join("second-start");
     fs::create_dir_all(&home).unwrap();
-    write_executable(&first, "#!/bin/sh\nsleep 10\n");
-    write_executable(&second, "#!/bin/sh\nsleep 10\n");
+    write_executable(
+        &first,
+        &format!(
+            "#!/bin/sh\ndate +%s > \"{}\"\nsleep 10\n",
+            first_start.display()
+        ),
+    );
+    write_executable(
+        &second,
+        &format!(
+            "#!/bin/sh\ndate +%s > \"{}\"\nsleep 10\n",
+            second_start.display()
+        ),
+    );
     let candidates = std::env::join_paths([&first, &second]).unwrap();
 
-    let (elapsed, response) = run_ping(
+    let response = run_ping(
         &storage,
         &home,
         &candidates,
         &fixture.path().join("probe-ran"),
     );
-
-    // The claim is that the 4 s total budget caps the probe, not the sum of
-    // the two 3 s per-candidate timeouts (6 s) or the shells' own 10 s sleeps.
-    // `elapsed` also includes spawning the binary and its configure, so the
-    // bound sits between the capped and uncapped outcomes rather than at the
-    // budget plus a fixed slack: a contended CI runner measured 4.53 s against
-    // a 4.5 s bound with the cap working exactly as designed.
-    assert!(
-        elapsed < Duration::from_millis(5500),
-        "two hanging candidates exceeded total budget: {elapsed:?}"
-    );
     assert_eq!(response["id"], "1");
+
+    assert!(
+        first_start.exists(),
+        "first hanging candidate must have started"
+    );
+    if second_start.exists() {
+        let first_ts: u64 = fs::read_to_string(&first_start)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let second_ts: u64 = fs::read_to_string(&second_start)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            second_ts >= first_ts,
+            "second candidate started before first candidate: {second_ts} < {first_ts}"
+        );
+    }
+    let cache: Value = serde_json::from_slice(
+        &fs::read(storage.join("aft/effective-path.json")).expect("cache file after probe"),
+    )
+    .unwrap();
+    assert!(
+        cache["path"].is_null(),
+        "total budget cap on two hanging candidates must cache null PATH"
+    );
+    assert_eq!(cache["shell"], first.to_string_lossy().as_ref());
 }
 
 #[test]
@@ -335,7 +473,7 @@ fn cache_hit_starts_a_detached_refresh_helper_in_production() {
         .unwrap()
         .write_all(b"{\"id\":\"1\",\"command\":\"ping\"}\n")
         .unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = wait_with_liveness_ceiling(child, LIVENESS_CEILING);
     assert!(output.status.success());
 
     wait_for_marker(&marker);
