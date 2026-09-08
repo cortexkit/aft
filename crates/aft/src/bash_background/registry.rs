@@ -1029,12 +1029,21 @@ impl BgTaskRegistry {
         let Ok(conn) = pool.lock() else {
             return false;
         };
-        let watched =
-            crate::db::bash_watches::list_bash_pattern_watches_by_task_id(&conn, &harness, task_id)
-                .map(|rows| !rows.is_empty())
-                .unwrap_or(false);
-        if !watched {
-            return false;
+        let rows = match crate::db::bash_watches::list_bash_pattern_watches_by_task_id(
+            &conn, &harness, task_id,
+        ) {
+            Ok(rows) if !rows.is_empty() => rows,
+            _ => return false,
+        };
+        // A persisted tombstone remains authoritative if a stale task row is
+        // restored later. Ack must delete that watch instead of treating it as
+        // an ordinary sticky match that can be terminalized again.
+        if rows.iter().any(|row| {
+            !row.scanning
+                && row.pending_match
+                && row.match_text.as_deref() == Some(WATCH_TARGET_ERASED_TEXT)
+        }) {
+            return true;
         }
         crate::db::bash_tasks::list_bash_tasks_by_id(&conn, &harness, task_id)
             .map(|rows| rows.is_empty())

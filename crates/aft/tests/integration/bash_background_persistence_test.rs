@@ -127,16 +127,20 @@ fn ack(aft: &mut AftProcess, session: &str, task_id: &str) -> Value {
     )
 }
 
-fn notify_once(aft: &mut AftProcess, session: &str, task_id: &str, pattern: &str) -> Value {
+fn notify(aft: &mut AftProcess, session: &str, task_id: &str, pattern: &str, once: bool) -> Value {
     aft.send(
         &json!({
             "id": "notify-persist-bg",
             "session_id": session,
             "command": "bash_notify",
-            "params": { "task_id": task_id, "pattern": pattern, "once": true }
+            "params": { "task_id": task_id, "pattern": pattern, "once": once }
         })
         .to_string(),
     )
+}
+
+fn notify_once(aft: &mut AftProcess, session: &str, task_id: &str, pattern: &str) -> Value {
+    notify(aft, session, task_id, pattern, true)
 }
 
 fn wait_for_pattern_frame(aft: &mut AftProcess, task_id: &str) -> Value {
@@ -176,14 +180,61 @@ fn process_is_alive(pid: u32) -> bool {
     output.status.success() && !String::from_utf8_lossy(&output.stdout).contains('Z')
 }
 
+fn persisted_watch_rows_for_harness(
+    storage: &Path,
+    harness: &str,
+    session: &str,
+    task_id: &str,
+) -> Vec<aft::db::bash_watches::BashPatternWatchRow> {
+    let conn = rusqlite::Connection::open(storage.join("aft.db")).expect("open watch database");
+    aft::db::bash_watches::list_bash_pattern_watches_for_task(&conn, harness, session, task_id)
+        .expect("read persisted watch rows")
+}
+
 fn persisted_watch_rows(
     storage: &Path,
     session: &str,
     task_id: &str,
 ) -> Vec<aft::db::bash_watches::BashPatternWatchRow> {
-    let conn = rusqlite::Connection::open(storage.join("aft.db")).expect("open watch database");
-    aft::db::bash_watches::list_bash_pattern_watches_for_task(&conn, "opencode", session, task_id)
-        .expect("read persisted watch rows")
+    persisted_watch_rows_for_harness(storage, "opencode", session, task_id)
+}
+
+fn erase_persisted_task_row(
+    storage: &Path,
+    harness: &str,
+    session: &str,
+    task_id: &str,
+) -> aft::db::bash_tasks::BashTaskRow {
+    let conn = rusqlite::Connection::open(storage.join("aft.db")).expect("open task database");
+    let row = aft::db::bash_tasks::get_bash_task(&conn, harness, session, task_id)
+        .expect("read persisted task row")
+        .expect("persisted task row");
+    let deleted = conn
+        .execute(
+            "DELETE FROM bash_tasks WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3",
+            rusqlite::params![harness, session, task_id],
+        )
+        .expect("erase persisted task row");
+    assert_eq!(deleted, 1, "expected exactly one erased task row");
+    row
+}
+
+fn persisted_task_row_exists(storage: &Path, harness: &str, session: &str, task_id: &str) -> bool {
+    let conn = rusqlite::Connection::open(storage.join("aft.db")).expect("open task database");
+    aft::db::bash_tasks::get_bash_task(&conn, harness, session, task_id)
+        .expect("read persisted task row")
+        .is_some()
+}
+
+fn wait_for_process_exit(pid: u32) {
+    let started = Instant::now();
+    while process_is_alive(pid) {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "background child {pid} did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1459,6 +1510,164 @@ fn pi_erased_bundle_notification_is_not_replayed_after_ack_and_second_restart() 
         "acked erased-bundle completion re-delivered after second restart: {second_drain:?}"
     );
     assert!(second_replay.shutdown().success());
+}
+
+fn assert_pi_watch_tombstone_is_not_replayed_after_second_restart(task_row_survives_ack: bool) {
+    const HARNESS: &str = "pi";
+    const ERASED_TEXT: &str = "watch target erased";
+
+    let project = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let release = project.path().join(if task_row_survives_ack {
+        "release-erased-watch-with-task-row"
+    } else {
+        "release-erased-watch"
+    });
+
+    let mut aft = AftProcess::spawn();
+    configure_background_for_harness(&mut aft, project.path(), storage.path(), SESSION, HARNESS);
+    let command = format!(
+        "while [ ! -e {} ]; do sleep 0.05; done",
+        shell_quote_path(&release)
+    );
+    let task_id = spawn_bg(&mut aft, SESSION, &command, Some(30_000));
+    let registered = notify(&mut aft, SESSION, &task_id, "never-matches", false);
+    assert_eq!(
+        registered["success"], true,
+        "watch registration failed: {registered:?}"
+    );
+    let child_pid = status(&mut aft, SESSION, &task_id)["child_pid"]
+        .as_u64()
+        .expect("running child PID") as u32;
+
+    let task_row = erase_persisted_task_row(storage.path(), HARNESS, SESSION, &task_id);
+    let first_frame = wait_for_pattern_frame(&mut aft, &task_id);
+    assert_eq!(first_frame["reason"], "task_exit");
+    assert_eq!(first_frame["match_text"], ERASED_TEXT);
+    let tombstones = persisted_watch_rows_for_harness(storage.path(), HARNESS, SESSION, &task_id);
+    assert_eq!(tombstones.len(), 1);
+    assert!(!tombstones[0].scanning);
+    assert!(tombstones[0].pending_match);
+    assert_eq!(tombstones[0].match_text.as_deref(), Some(ERASED_TEXT));
+    eprintln!(
+        "watch tombstone before restart: task_id={task_id} task_row=false scanning={} pending_match={} match_text={:?}",
+        tombstones[0].scanning, tombstones[0].pending_match, tombstones[0].match_text
+    );
+
+    if task_row_survives_ack {
+        let conn = rusqlite::Connection::open(storage.path().join("aft.db"))
+            .expect("open task database for row restoration");
+        aft::db::bash_tasks::upsert_bash_task(&conn, &task_row)
+            .expect("restore task row before restart");
+    }
+    sigkill_aft(aft);
+
+    if !task_row_survives_ack {
+        fs::write(&release, "release").unwrap();
+        wait_for_process_exit(child_pid);
+        let resolved = resolve_task_layout(&session_tasks_dir(storage.path(), SESSION), &task_id)
+            .expect("resolve task bundle before erasing it");
+        fs::remove_dir_all(&resolved.paths.dir).expect("erase task bundle");
+    }
+
+    let mut replay = AftProcess::spawn();
+    configure_background_for_harness(
+        &mut replay,
+        project.path(),
+        storage.path(),
+        SESSION,
+        HARNESS,
+    );
+    let first_drain = drain(&mut replay, SESSION);
+    let first_matches = first_drain["pending_matches"]
+        .as_array()
+        .expect("pending matches array");
+    let delivered = first_matches
+        .iter()
+        .filter(|entry| entry["task_id"] == task_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        delivered.len(),
+        1,
+        "watch tombstone must replay exactly once before ack: {first_drain:?}"
+    );
+    assert_eq!(delivered[0]["reason"], "task_exit");
+    assert_eq!(delivered[0]["match_text"], ERASED_TEXT);
+    assert_eq!(delivered[0]["session_id"], SESSION);
+    assert_eq!(
+        persisted_task_row_exists(storage.path(), HARNESS, SESSION, &task_id),
+        task_row_survives_ack,
+        "unexpected bash_tasks row state before ack"
+    );
+    eprintln!(
+        "first restart drain: task_id={task_id} session_id={} reason={} match_text={:?} bash_tasks_row={task_row_survives_ack}",
+        delivered[0]["session_id"], delivered[0]["reason"], delivered[0]["match_text"]
+    );
+
+    let acked = ack(&mut replay, SESSION, &task_id);
+    assert!(
+        acked["acked_task_ids"]
+            .as_array()
+            .expect("acked task IDs")
+            .iter()
+            .any(|entry| entry == &task_id),
+        "watch tombstone ack failed: {acked:?}"
+    );
+    let post_ack_watch_count =
+        persisted_watch_rows_for_harness(storage.path(), HARNESS, SESSION, &task_id).len();
+    eprintln!(
+        "post-ack database: task_id={task_id} bash_tasks_row={} bash_pattern_watches={post_ack_watch_count}",
+        persisted_task_row_exists(storage.path(), HARNESS, SESSION, &task_id)
+    );
+
+    if task_row_survives_ack {
+        sigkill_aft(replay);
+        fs::write(&release, "release").unwrap();
+        wait_for_process_exit(child_pid);
+        let resolved = resolve_task_layout(&session_tasks_dir(storage.path(), SESSION), &task_id)
+            .expect("resolve restored task bundle before erasing it");
+        fs::remove_dir_all(&resolved.paths.dir).expect("erase restored task bundle");
+        let _ = erase_persisted_task_row(storage.path(), HARNESS, SESSION, &task_id);
+    } else {
+        assert!(replay.shutdown().success());
+    }
+
+    let mut second_replay = AftProcess::spawn();
+    configure_background_for_harness(
+        &mut second_replay,
+        project.path(),
+        storage.path(),
+        SESSION,
+        HARNESS,
+    );
+    // The erased-target evaluator runs every 500 ms. Waiting across two passes
+    // distinguishes an absent acknowledged row from a surviving row that gets
+    // terminalized again after the task row disappears.
+    std::thread::sleep(Duration::from_millis(1_200));
+    let second_drain = drain(&mut second_replay, SESSION);
+    assert!(
+        second_drain["pending_matches"]
+            .as_array()
+            .expect("pending matches array")
+            .iter()
+            .all(|entry| entry["task_id"] != task_id),
+        "acked watch tombstone re-delivered after second restart: {second_drain:?}"
+    );
+    assert!(
+        persisted_watch_rows_for_harness(storage.path(), HARNESS, SESSION, &task_id).is_empty(),
+        "acked watch tombstone row survived the second restart"
+    );
+    assert!(second_replay.shutdown().success());
+}
+
+#[test]
+fn pi_erased_watch_tombstone_is_not_replayed_after_ack_and_second_restart() {
+    assert_pi_watch_tombstone_is_not_replayed_after_second_restart(false);
+}
+
+#[test]
+fn pi_erased_watch_tombstone_with_surviving_task_row_is_not_replayed_after_ack() {
+    assert_pi_watch_tombstone_is_not_replayed_after_second_restart(true);
 }
 
 #[test]
