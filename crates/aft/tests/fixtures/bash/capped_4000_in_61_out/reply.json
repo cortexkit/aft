@@ -1,0 +1,18 @@
+{
+  "id": "bash_capped_4000_fixture",
+  "success": true,
+  "output": "10\t./path/file_3941.txt\n10\t./path/file_3942.txt\n10\t./path/file_3943.txt\n10\t./path/file_3944.txt\n10\t./path/file_3945.txt\n10\t./path/file_3946.txt\n10\t./path/file_3947.txt\n10\t./path/file_3948.txt\n10\t./path/file_3949.txt\n10\t./path/file_3950.txt\n10\t./path/file_3951.txt\n10\t./path/file_3952.txt\n10\t./path/file_3953.txt\n10\t./path/file_3954.txt\n10\t./path/file_3955.txt\n10\t./path/file_3956.txt\n10\t./path/file_3957.txt\n10\t./path/file_3958.txt\n10\t./path/file_3959.txt\n10\t./path/file_3960.txt\n10\t./path/file_3961.txt\n10\t./path/file_3962.txt\n10\t./path/file_3963.txt\n10\t./path/file_3964.txt\n10\t./path/file_3965.txt\n10\t./path/file_3966.txt\n10\t./path/file_3967.txt\n10\t./path/file_3968.txt\n10\t./path/file_3969.txt\n10\t./path/file_3970.txt\n10\t./path/file_3971.txt\n10\t./path/file_3972.txt\n10\t./path/file_3973.txt\n10\t./path/file_3974.txt\n10\t./path/file_3975.txt\n10\t./path/file_3976.txt\n10\t./path/file_3977.txt\n10\t./path/file_3978.txt\n10\t./path/file_3979.txt\n10\t./path/file_3980.txt\n10\t./path/file_3981.txt\n10\t./path/file_3982.txt\n10\t./path/file_3983.txt\n10\t./path/file_3984.txt\n10\t./path/file_3985.txt\n10\t./path/file_3986.txt\n10\t./path/file_3987.txt\n10\t./path/file_3988.txt\n10\t./path/file_3989.txt\n10\t./path/file_3990.txt\n10\t./path/file_3991.txt\n10\t./path/file_3992.txt\n10\t./path/file_3993.txt\n10\t./path/file_3994.txt\n10\t./path/file_3995.txt\n10\t./path/file_3996.txt\n10\t./path/file_3997.txt\n10\t./path/file_3998.txt\n10\t./path/file_3999.txt\n10\t./path/file_4000.txt\nshown 61 of 4000 lines (cap)",
+  "bash_output_list_envelope": {
+    "shown": 61,
+    "total": {
+      "kind": "exact",
+      "value": 4000
+    },
+    "unit": "lines",
+    "reason": "cap",
+    "causes": [
+      "cap"
+    ],
+    "narrow": []
+  }
+}

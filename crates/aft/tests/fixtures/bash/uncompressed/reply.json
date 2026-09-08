@@ -1,0 +1,5 @@
+{
+  "id": "bash_uncompressed_fixture",
+  "success": true,
+  "output": "line 1\nline 2\nline 3\nline 4\nline 5\n"
+}

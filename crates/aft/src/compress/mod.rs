@@ -168,16 +168,20 @@ pub struct CompressionResult {
     pub had_inner_drop: bool,
     pub offset_hint_eligible: bool,
     pub offset_start_line: Option<usize>,
+    pub input_line_count: usize,
 }
 
 impl CompressionResult {
     pub fn new(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let input_line_count = text.lines().count();
         Self {
-            text: text.into(),
+            text,
             dropped_by_class: BTreeMap::new(),
             had_inner_drop: false,
             offset_hint_eligible: true,
             offset_start_line: None,
+            input_line_count,
         }
     }
 
@@ -185,34 +189,52 @@ impl CompressionResult {
         text: impl Into<String>,
         dropped_by_class: BTreeMap<DropClass, usize>,
     ) -> Self {
+        let text = text.into();
+        let input_line_count = text.lines().count();
         let had_inner_drop = !dropped_by_class.is_empty();
         Self {
-            text: text.into(),
+            text,
             dropped_by_class,
             had_inner_drop,
             offset_hint_eligible: !had_inner_drop,
             offset_start_line: None,
+            input_line_count,
         }
     }
 
     pub fn with_inner_drop(text: impl Into<String>, offset_hint_eligible: bool) -> Self {
+        let text = text.into();
+        let input_line_count = text.lines().count();
         Self {
-            text: text.into(),
+            text,
             dropped_by_class: BTreeMap::new(),
             had_inner_drop: true,
             offset_hint_eligible,
             offset_start_line: None,
+            input_line_count,
         }
     }
 
     pub fn with_prefix_drop(text: impl Into<String>, offset_start_line: usize) -> Self {
+        let text = text.into();
+        let input_line_count = text.lines().count();
         Self {
-            text: text.into(),
+            text,
             dropped_by_class: BTreeMap::new(),
             had_inner_drop: true,
             offset_hint_eligible: true,
             offset_start_line: Some(offset_start_line),
+            input_line_count,
         }
+    }
+
+    pub fn with_input_line_count(mut self, count: usize) -> Self {
+        self.input_line_count = count;
+        self
+    }
+
+    pub fn input_line_count(&self) -> usize {
+        self.input_line_count
     }
 
     pub fn has_semantic_drops(&self) -> bool {
@@ -339,7 +361,8 @@ pub fn compress_with_exit_code(
     ctx: &AppContext,
 ) -> CompressionResult {
     if !ctx.config().experimental_bash_compress {
-        return CompressionResult::new(output);
+        let count = output.lines().count();
+        return CompressionResult::new(output).with_input_line_count(count);
     }
     let registry_handle = ctx.shared_filter_registry();
     let guard = match registry_handle.read() {
@@ -363,6 +386,18 @@ pub fn compress_with_registry(
 }
 
 pub fn compress_with_registry_exit_code(
+    command: &str,
+    output: &str,
+    exit_code: Option<i32>,
+    registry: &FilterRegistry,
+) -> CompressionResult {
+    let input_line_count = output.lines().count();
+    let mut result = compress_with_registry_exit_code_inner(command, output, exit_code, registry);
+    result.input_line_count = input_line_count;
+    result
+}
+
+fn compress_with_registry_exit_code_inner(
     command: &str,
     output: &str,
     exit_code: Option<i32>,
