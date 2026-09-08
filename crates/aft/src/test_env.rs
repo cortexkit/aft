@@ -110,10 +110,13 @@ pub(crate) fn hermetic_git_env() -> [(&'static str, &'static OsStr); 2] {
     ]
 }
 
-/// Apply hermetic git-config env vars to one child process.
+/// Apply hermetic git-config env vars to one child process, including removal
+/// of command-scope config inherited through `GIT_CONFIG_COUNT`.
 #[allow(dead_code)]
 pub(crate) fn apply_hermetic_git_env(command: &mut Command) -> &mut Command {
-    command.envs(hermetic_git_env())
+    command
+        .envs(hermetic_git_env())
+        .env("GIT_CONFIG_COUNT", "0")
 }
 
 /// Hold hermetic git-config env vars for the current test thread.
@@ -179,6 +182,22 @@ mod tests {
         assert!(mutex.is_poisoned());
 
         drop(lock_test_mutex(&mutex));
+    }
+
+    #[test]
+    fn per_command_git_env_discards_inherited_command_scope_config() {
+        let mut command = Command::new("git");
+        command
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.fsyncMethod")
+            .env("GIT_CONFIG_VALUE_0", "batch");
+        let output = apply_hermetic_git_env(&mut command)
+            .args(["config", "--get", "core.fsyncMethod"])
+            .output()
+            .expect("query hermetic git config");
+
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
     }
 
     #[test]

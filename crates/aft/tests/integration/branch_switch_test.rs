@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -158,18 +158,7 @@ impl RepoFixture {
             &["config", "user.email", "branch-switch@example.test"],
         );
         git(&root, &["config", "user.name", "Branch Switch Test"]);
-        for index in 0..file_count {
-            write_branch_file(&root, index, 'A');
-        }
-        git(&root, &["add", "."]);
-        git(&root, &["commit", "-qm", "branch A"]);
-        git(&root, &["branch", "-M", "A"]);
-        git(&root, &["checkout", "-qb", "B"]);
-        for index in 0..changed_count {
-            write_branch_file(&root, index, 'B');
-        }
-        git(&root, &["add", "."]);
-        git(&root, &["commit", "-qm", "branch B"]);
+        fast_import_branches(&root, file_count, changed_count);
         git(&root, &["checkout", "-q", "A"]);
         let changed_paths = (0..changed_count)
             .map(|index| root.join(format!("src/file-{index:03}.ts")))
@@ -182,24 +171,125 @@ impl RepoFixture {
     }
 }
 
-fn write_branch_file(root: &Path, index: usize, branch: char) {
-    let path = root.join(format!("src/file-{index:03}.ts"));
-    std::fs::create_dir_all(path.parent().expect("source parent")).unwrap();
-    let source = match index {
+fn fast_import_branches(root: &Path, file_count: usize, changed_count: usize) {
+    // One pack-producing import avoids hundreds of loose-object temporary-file
+    // opens, which can fail with EINVAL on APFS while the watcher lane is busy.
+    let mut input = Vec::new();
+    writeln!(input, "feature done").unwrap();
+
+    for index in 0..file_count {
+        write_fast_import_blob(
+            &mut input,
+            index + 1,
+            branch_file_source(index, 'A').as_bytes(),
+        );
+    }
+    let branch_a_commit = file_count + 1;
+    write_fast_import_commit(
+        &mut input,
+        "A",
+        branch_a_commit,
+        None,
+        "branch A",
+        (0..file_count).map(|index| (index, index + 1)),
+    );
+
+    for index in 0..changed_count {
+        write_fast_import_blob(
+            &mut input,
+            branch_a_commit + index + 1,
+            branch_file_source(index, 'B').as_bytes(),
+        );
+    }
+    let branch_b_commit = branch_a_commit + changed_count + 1;
+    write_fast_import_commit(
+        &mut input,
+        "B",
+        branch_b_commit,
+        Some(branch_a_commit),
+        "branch B",
+        (0..changed_count).map(|index| (index, branch_a_commit + index + 1)),
+    );
+    writeln!(input, "done").unwrap();
+
+    git_with_stdin(root, &["fast-import", "--quiet"], &input);
+}
+
+fn write_fast_import_blob(input: &mut Vec<u8>, mark: usize, contents: &[u8]) {
+    writeln!(input, "blob\nmark :{mark}").unwrap();
+    write_fast_import_data(input, contents);
+}
+
+fn write_fast_import_commit(
+    input: &mut Vec<u8>,
+    branch: &str,
+    mark: usize,
+    parent: Option<usize>,
+    message: &str,
+    files: impl Iterator<Item = (usize, usize)>,
+) {
+    writeln!(input, "commit refs/heads/{branch}").unwrap();
+    writeln!(input, "mark :{mark}").unwrap();
+    writeln!(
+        input,
+        "committer Branch Switch Test <branch-switch@example.test> 1700000000 +0000"
+    )
+    .unwrap();
+    write_fast_import_data(input, message.as_bytes());
+    if let Some(parent) = parent {
+        writeln!(input, "from :{parent}").unwrap();
+    }
+    for (index, blob_mark) in files {
+        writeln!(input, "M 100644 :{blob_mark} src/file-{index:03}.ts").unwrap();
+    }
+    writeln!(input).unwrap();
+}
+
+fn write_fast_import_data(input: &mut Vec<u8>, data: &[u8]) {
+    writeln!(input, "data {}", data.len()).unwrap();
+    input.extend_from_slice(data);
+    input.push(b'\n');
+}
+
+fn branch_file_source(index: usize, branch: char) -> String {
+    match index {
         0 => format!("export function target{branch}() {{ return '{branch}'; }}\n"),
         1 => format!(
             "import {{ target{branch} }} from './file-000';\nexport function caller{branch}() {{ return target{branch}(); }}\n"
         ),
         2 => format!("export function dead{branch}() {{ return 'dead-{branch}'; }}\n"),
         _ => format!("export function branch{branch}File{index}() {{ return {index}; }}\n"),
-    };
-    std::fs::write(path, source).unwrap();
+    }
 }
 
 fn git(root: &Path, args: &[&str]) {
     let mut command = Command::new("git");
     crate::test_helpers::apply_hermetic_git_env(command.current_dir(root));
     let output = command.args(args).output().expect("run git");
+    assert_git_succeeded(args, &output);
+}
+
+fn git_with_stdin(root: &Path, args: &[&str], input: &[u8]) {
+    let mut command = Command::new("git");
+    crate::test_helpers::apply_hermetic_git_env(command.current_dir(root));
+    let mut child = command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run git");
+    child
+        .stdin
+        .take()
+        .expect("git stdin")
+        .write_all(input)
+        .expect("write git stdin");
+    let output = child.wait_with_output().expect("wait for git");
+    assert_git_succeeded(args, &output);
+}
+
+fn assert_git_succeeded(args: &[&str], output: &std::process::Output) {
     assert!(
         output.status.success(),
         "git {args:?} failed: {}",
