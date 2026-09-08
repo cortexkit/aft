@@ -39,6 +39,7 @@ pub const REFUSAL_EXIT_STATUS: i32 = 86;
 const UPSTREAM_FAILURE_EXIT_STATUS: i32 = 1;
 const DISCOVERY_BUDGET: Duration = Duration::from_millis(150);
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(15);
+const RECENTLY_REACHABLE_WINDOW: Duration = Duration::from_secs(300);
 /// Clock skew tolerated before a manifest's signed issue time counts as being
 /// in the future and therefore invalid.
 const ISSUED_AT_FUTURE_SKEW: Duration = Duration::from_secs(300);
@@ -608,6 +609,8 @@ struct RungRecord {
     recorded_by_version: Option<String>,
     #[serde(default)]
     recorded_by_repo_key: Option<String>,
+    #[serde(default)]
+    last_reachable_unix_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -632,6 +635,13 @@ impl RungRecordProvenance {
 impl RungRecord {
     fn fresh_at(&self, now: u64) -> bool {
         now.saturating_sub(self.as_of_unix_secs) < DISCOVERY_CACHE_TTL.as_secs()
+    }
+
+    fn recently_reachable(&self, now: u64) -> bool {
+        let reachable_at = self
+            .last_reachable_unix_secs
+            .unwrap_or(self.as_of_unix_secs);
+        now.saturating_sub(reachable_at) < RECENTLY_REACHABLE_WINDOW.as_secs()
     }
 }
 
@@ -726,6 +736,7 @@ impl RungDetermination {
                 recorded_by_image_path: None,
                 recorded_by_version: None,
                 recorded_by_repo_key: None,
+                last_reachable_unix_secs: None,
             },
             operator_disabled: reason == R1Reason::DisabledByConfig,
             refusal_detail: None,
@@ -750,6 +761,7 @@ impl RungDetermination {
                 recorded_by_image_path: Some(provenance.image_path.clone()),
                 recorded_by_version: Some(provenance.version.clone()),
                 recorded_by_repo_key: Some(provenance.repo_key.clone()),
+                last_reachable_unix_secs: None,
             },
             operator_disabled: false,
             refusal_detail: None,
@@ -775,6 +787,7 @@ impl RungDetermination {
                 recorded_by_image_path: Some(provenance.image_path.clone()),
                 recorded_by_version: Some(provenance.version.clone()),
                 recorded_by_repo_key: Some(provenance.repo_key.clone()),
+                last_reachable_unix_secs: Some(now),
             },
             operator_disabled: false,
             refusal_detail: None,
@@ -903,6 +916,11 @@ fn determine_rung_from_doc(
             outcome: "timed_out".to_string(),
         };
         write_last_probe_silently(paths, &probe);
+        if let Some(record) = cached.as_ref().filter(|record| {
+            record.rung == Rung::R3 && (record.fresh_at(now) || record.recently_reachable(now))
+        }) {
+            return RungDetermination::cached(record.clone());
+        }
         let mut determination = cached
             .filter(|record| record.fresh_at(now))
             .map(RungDetermination::cached)
@@ -964,6 +982,7 @@ fn determine_rung_from_doc(
                         Some(manifest.manifest_version),
                         &provenance,
                     );
+                    determination.record.last_reachable_unix_secs = Some(now);
                     determination
                         .record
                         .inputs
@@ -993,14 +1012,22 @@ fn determine_rung_from_doc(
             let refusal_text = format!(
                 "governance probe exceeded {budget_ms} ms at {stage} (daemon reachable; slow or busy)"
             );
-            let mut determination = cached
-                .filter(|record| record.fresh_at(now))
-                .map(RungDetermination::cached)
-                .unwrap_or_else(|| RungDetermination::r1(now, R1Reason::DiscoveryBudgetExhausted));
-            if determination.record.rung == Rung::R1 {
-                determination.refusal_detail = Some(refusal_text);
+            if let Some(record) = cached.as_ref().filter(|record| {
+                record.rung == Rung::R3 && (record.fresh_at(now) || record.recently_reachable(now))
+            }) {
+                RungDetermination::cached(record.clone())
+            } else {
+                let mut determination = cached
+                    .filter(|record| record.fresh_at(now))
+                    .map(RungDetermination::cached)
+                    .unwrap_or_else(|| {
+                        RungDetermination::r1(now, R1Reason::DiscoveryBudgetExhausted)
+                    });
+                if determination.record.rung == Rung::R1 {
+                    determination.refusal_detail = Some(refusal_text);
+                }
+                determination
             }
-            determination
         }
     };
 
@@ -3258,7 +3285,7 @@ fn route_governed(
     });
 
     let final_stage = *current_stage.lock().unwrap();
-    match result {
+    let outcome = match result {
         Ok(Ok(outcome)) => outcome,
         Ok(Err(RouteOutcome::GovernanceUnavailable)) => {
             if Instant::now() >= deadline {
@@ -3289,7 +3316,18 @@ fn route_governed(
                 elapsed_ms: call_timeout.as_millis() as u64,
             }
         }
+    };
+    if matches!(
+        &outcome,
+        RouteOutcome::Result(_) | RouteOutcome::StateAppliedCommentFailed(_)
+    ) && determination.rung == Rung::R3
+    {
+        let mut updated = determination.clone();
+        updated.as_of_unix_secs = now;
+        updated.last_reachable_unix_secs = Some(now);
+        write_rung_record_silently(paths, &updated);
     }
+    outcome
 }
 
 fn refuse_governance_unavailable(
@@ -7901,6 +7939,194 @@ mod tests {
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "connect");
         assert_eq!(status["last_probe"]["outcome"], "unreachable");
+    }
+
+    #[test]
+    fn slow_daemon_catalog_list_delay_fallback_active_determines_r3_and_records_last_probe() {
+        let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+            catalog_delay: Duration::from_millis(400),
+            open_route_delay: Duration::ZERO,
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(temp.path().join("state"));
+        let conn_file = temp.path().join("subc-connection.json");
+        daemon.write_connection_file(&conn_file);
+        let project = write_test_project_repo(temp.path(), "cortexkit/aft");
+
+        let manifest = v12_fixture_manifest();
+        let now = unix_seconds();
+        write_signed_manifest(&paths, manifest, now);
+
+        let mut cached_record = RungDetermination::r3(now - 30, 12, &test_rung_provenance()).record;
+        cached_record.last_reachable_unix_secs = Some(now - 30);
+        write_rung_record_silently(&paths, &cached_record);
+
+        let doc = json!({
+            "subc": { "connection_file": conn_file.to_str().unwrap() }
+        })
+        .to_string();
+
+        let determination = determine_rung_from_doc(
+            &paths,
+            &project,
+            now,
+            Instant::now() + DISCOVERY_BUDGET,
+            Some(&doc),
+        );
+        assert_eq!(determination.record.rung, Rung::R3);
+        assert!(determination.refusal_detail.is_none());
+
+        let last_probe = read_last_probe(&paths).expect("last probe record");
+        assert_eq!(last_probe.stage, "catalog_list");
+        assert_eq!(last_probe.outcome, "timed_out");
+        assert!(last_probe.elapsed_ms >= 150);
+
+        let report = render_self_report(&paths).expect("self report");
+        let status: Value = serde_json::from_str(&report).expect("status json");
+        assert_eq!(status["last_probe"]["stage"], "catalog_list");
+        assert_eq!(status["last_probe"]["outcome"], "timed_out");
+        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
+    }
+
+    #[test]
+    fn slow_daemon_catalog_list_delay_expired_fallback_refuses_naming_stage() {
+        let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+            catalog_delay: Duration::from_millis(400),
+            open_route_delay: Duration::ZERO,
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(temp.path().join("state"));
+        let conn_file = temp.path().join("subc-connection.json");
+        daemon.write_connection_file(&conn_file);
+        let project = write_test_project_repo(temp.path(), "cortexkit/aft");
+
+        let manifest = v12_fixture_manifest();
+        let now = unix_seconds();
+        write_signed_manifest(&paths, manifest, now);
+
+        let mut cached_record =
+            RungDetermination::r3(now - 301, 12, &test_rung_provenance()).record;
+        cached_record.last_reachable_unix_secs = Some(now - 301);
+        write_rung_record_silently(&paths, &cached_record);
+
+        let doc = json!({
+            "subc": { "connection_file": conn_file.to_str().unwrap() }
+        })
+        .to_string();
+
+        let determination = determine_rung_from_doc(
+            &paths,
+            &project,
+            now,
+            Instant::now() + DISCOVERY_BUDGET,
+            Some(&doc),
+        );
+        assert_eq!(determination.record.rung, Rung::R1);
+        assert_eq!(
+            determination.refusal_detail.as_deref(),
+            Some(
+                "governance probe exceeded 150 ms at catalog_list (daemon reachable; slow or busy)"
+            )
+        );
+
+        let report = render_self_report(&paths).expect("self report");
+        let status: Value = serde_json::from_str(&report).expect("status json");
+        assert_eq!(status["last_probe"]["stage"], "catalog_list");
+        assert_eq!(status["last_probe"]["outcome"], "timed_out");
+        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
+    }
+
+    #[test]
+    fn slow_daemon_open_route_delay_fallback_active_determines_r3_and_records_last_probe() {
+        let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+            catalog_delay: Duration::ZERO,
+            open_route_delay: Duration::from_millis(400),
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(temp.path().join("state"));
+        let conn_file = temp.path().join("subc-connection.json");
+        daemon.write_connection_file(&conn_file);
+        let project = write_test_project_repo(temp.path(), "cortexkit/aft");
+
+        let manifest = v12_fixture_manifest();
+        let now = unix_seconds();
+        write_signed_manifest(&paths, manifest, now);
+
+        let mut cached_record = RungDetermination::r3(now - 30, 12, &test_rung_provenance()).record;
+        cached_record.last_reachable_unix_secs = Some(now - 30);
+        write_rung_record_silently(&paths, &cached_record);
+
+        let doc = json!({
+            "subc": { "connection_file": conn_file.to_str().unwrap() }
+        })
+        .to_string();
+
+        let determination = determine_rung_from_doc(
+            &paths,
+            &project,
+            now,
+            Instant::now() + DISCOVERY_BUDGET,
+            Some(&doc),
+        );
+        assert_eq!(determination.record.rung, Rung::R3);
+        assert!(determination.refusal_detail.is_none());
+
+        let last_probe = read_last_probe(&paths).expect("last probe record");
+        assert_eq!(last_probe.stage, "open_route");
+        assert_eq!(last_probe.outcome, "timed_out");
+        assert!(last_probe.elapsed_ms >= 150);
+
+        let report = render_self_report(&paths).expect("self report");
+        let status: Value = serde_json::from_str(&report).expect("status json");
+        assert_eq!(status["last_probe"]["stage"], "open_route");
+        assert_eq!(status["last_probe"]["outcome"], "timed_out");
+        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
+    }
+
+    #[test]
+    fn slow_daemon_open_route_delay_expired_fallback_refuses_naming_stage() {
+        let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+            catalog_delay: Duration::ZERO,
+            open_route_delay: Duration::from_millis(400),
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(temp.path().join("state"));
+        let conn_file = temp.path().join("subc-connection.json");
+        daemon.write_connection_file(&conn_file);
+        let project = write_test_project_repo(temp.path(), "cortexkit/aft");
+
+        let manifest = v12_fixture_manifest();
+        let now = unix_seconds();
+        write_signed_manifest(&paths, manifest, now);
+
+        let mut cached_record =
+            RungDetermination::r3(now - 301, 12, &test_rung_provenance()).record;
+        cached_record.last_reachable_unix_secs = Some(now - 301);
+        write_rung_record_silently(&paths, &cached_record);
+
+        let doc = json!({
+            "subc": { "connection_file": conn_file.to_str().unwrap() }
+        })
+        .to_string();
+
+        let determination = determine_rung_from_doc(
+            &paths,
+            &project,
+            now,
+            Instant::now() + DISCOVERY_BUDGET,
+            Some(&doc),
+        );
+        assert_eq!(determination.record.rung, Rung::R1);
+        assert_eq!(
+            determination.refusal_detail.as_deref(),
+            Some("governance probe exceeded 150 ms at open_route (daemon reachable; slow or busy)")
+        );
+
+        let report = render_self_report(&paths).expect("self report");
+        let status: Value = serde_json::from_str(&report).expect("status json");
+        assert_eq!(status["last_probe"]["stage"], "open_route");
+        assert_eq!(status["last_probe"]["outcome"], "timed_out");
+        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
     }
 }
 

@@ -153,6 +153,7 @@ fn write_fresh_r3_cache_for_manifest(state_home: &Path, now: u64, manifest_versi
         serde_json::to_vec(&json!({
             "rung": "R3",
             "as_of_unix_secs": now,
+            "last_reachable_unix_secs": now,
             "inputs": {
                 "connection_file": "ready",
                 "catalog_gh_route": "ready",
@@ -161,6 +162,31 @@ fn write_fresh_r3_cache_for_manifest(state_home: &Path, now: u64, manifest_versi
                 "agent_credentials_present": "absent"
             },
             "manifest_version": manifest_version
+        }))
+        .expect("serialize R3 rung cache"),
+    )
+    .expect("write R3 rung cache");
+}
+
+fn write_recently_reachable_r3_cache(state_home: &Path, now: u64, age_secs: u64) {
+    let rung_path = state_home.join("cortexkit/aft/gh-shim/rung-cache.json");
+    fs::create_dir_all(rung_path.parent().expect("rung cache parent"))
+        .expect("create shim state directory");
+    let timestamp = now.saturating_sub(age_secs);
+    fs::write(
+        rung_path,
+        serde_json::to_vec(&json!({
+            "rung": "R3",
+            "as_of_unix_secs": timestamp,
+            "last_reachable_unix_secs": timestamp,
+            "inputs": {
+                "connection_file": "ready",
+                "catalog_gh_route": "ready",
+                "agent_binding": "ready",
+                "manifest": "ready",
+                "agent_credentials_present": "absent"
+            },
+            "manifest_version": 1
         }))
         .expect("serialize R3 rung cache"),
     )
@@ -1961,4 +1987,408 @@ fn co_author_line_is_silently_empty_without_a_cached_manifest_binding() {
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
     assert!(!recorder.exists());
+}
+
+use std::time::Duration;
+use subc_protocol::{Flags, Frame, FrameType, ModuleHelloAckBody, Priority, PROTOCOL_VERSION};
+
+fn control_flags() -> Flags {
+    Flags::new(false, Priority::Passive, false)
+}
+
+struct SlowDaemonConfig {
+    catalog_delay: Duration,
+    open_route_delay: Duration,
+}
+
+struct SlowTestDaemon {
+    port: u16,
+    key: Vec<u8>,
+    daemon_id: [u8; DAEMON_ID_LEN],
+    shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    server_task: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SlowTestDaemon {
+    fn spawn(config: SlowDaemonConfig) -> Self {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test daemon");
+        std_listener.set_nonblocking(true).expect("set nonblocking");
+        let port = std_listener.local_addr().expect("local addr").port();
+        let key = vec![0x42; KEY_LEN];
+        let daemon_id = [0x24; DAEMON_ID_LEN];
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let key_clone = key.clone();
+        let daemon_id_clone = daemon_id;
+
+        let server_task = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .expect("build daemon tokio runtime");
+            rt.block_on(async move {
+                let listener =
+                    tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
+                loop {
+                    tokio::select! {
+                        _ = &mut shutdown_rx => break,
+                        accepted = listener.accept() => {
+                            let Ok((mut stream, _)) = accepted else { break; };
+                            let k = key_clone.clone();
+                            let d = daemon_id_clone;
+                            let cat_delay = config.catalog_delay;
+                            let open_delay = config.open_route_delay;
+                            tokio::spawn(async move {
+                                if subc_transport::authenticate_server(
+                                    &mut stream,
+                                    &k,
+                                    &d,
+                                    "subc-test",
+                                    Duration::from_secs(5),
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    return;
+                                }
+
+                                loop {
+                                    let frame = match subc_transport::read_frame(&mut stream).await {
+                                        Ok(Some(frame)) => frame,
+                                        _ => break,
+                                    };
+
+                                    match frame.header.ty {
+                                        FrameType::Hello => {
+                                            let ack = Frame::build(
+                                                FrameType::HelloAck,
+                                                control_flags(),
+                                                0,
+                                                0,
+                                                frame.header.corr,
+                                                serde_json::to_vec(&ModuleHelloAckBody {
+                                                    negotiated_ver: PROTOCOL_VERSION,
+                                                    subc_ops: Vec::new(),
+                                                    subc_capabilities: Vec::new(),
+                                                    storage: None,
+                                                })
+                                                .expect("hello ack body"),
+                                            )
+                                            .expect("hello ack frame");
+                                            if subc_transport::write_frame(&mut stream, &ack).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        FrameType::Request => {
+                                            let op: Option<String> = serde_json::from_slice::<Value>(&frame.body)
+                                                .ok()
+                                                .and_then(|v| v.get("op").and_then(Value::as_str).map(String::from));
+
+                                            if op.as_deref() == Some("catalog.list") {
+                                                if !cat_delay.is_zero() {
+                                                    tokio::time::sleep(cat_delay).await;
+                                                }
+                                                let response_body = json!({
+                                                    "op": "catalog.list",
+                                                    "generation": 1,
+                                                    "modules": [{
+                                                        "module_id": "prefrontal-core",
+                                                        "module_version": "0.1.0",
+                                                        "roles": [{
+                                                            "role": "management_surface",
+                                                            "operations": [{ "name": "gh.route", "kind": "query" }],
+                                                            "config_schema": {},
+                                                            "observability": [],
+                                                            "identity_scope": ["project"]
+                                                        }],
+                                                        "control_ops": []
+                                                    }],
+                                                    "subc_ops": ["catalog.list", "route.open"]
+                                                });
+                                                let resp = Frame::build_with_version(
+                                                    frame.header.ver,
+                                                    FrameType::Response,
+                                                    frame.header.flags,
+                                                    frame.header.channel,
+                                                    frame.header.epoch,
+                                                    frame.header.corr,
+                                                    serde_json::to_vec(&response_body).expect("catalog json"),
+                                                )
+                                                .expect("catalog response frame");
+                                                if subc_transport::write_frame(&mut stream, &resp).await.is_err() {
+                                                    break;
+                                                }
+                                            } else if op.as_deref() == Some("route.open") {
+                                                if !open_delay.is_zero() {
+                                                    tokio::time::sleep(open_delay).await;
+                                                }
+                                                let response_body = json!({
+                                                    "op": "route.open",
+                                                    "route_channel": 42,
+                                                    "route_epoch": 1
+                                                });
+                                                let resp = Frame::build_with_version(
+                                                    frame.header.ver,
+                                                    FrameType::Response,
+                                                    frame.header.flags,
+                                                    frame.header.channel,
+                                                    frame.header.epoch,
+                                                    frame.header.corr,
+                                                    serde_json::to_vec(&response_body).expect("route open json"),
+                                                )
+                                                .expect("route open frame");
+                                                if subc_transport::write_frame(&mut stream, &resp).await.is_err() {
+                                                    break;
+                                                }
+                                            } else if op.as_deref() == Some("route.close") {
+                                                let response_body = json!({ "op": "route.close" });
+                                                let resp = Frame::build_with_version(
+                                                    frame.header.ver,
+                                                    FrameType::Response,
+                                                    frame.header.flags,
+                                                    frame.header.channel,
+                                                    frame.header.epoch,
+                                                    frame.header.corr,
+                                                    serde_json::to_vec(&response_body).expect("route close json"),
+                                                )
+                                                .expect("route close frame");
+                                                if subc_transport::write_frame(&mut stream, &resp).await.is_err() {
+                                                    break;
+                                                }
+                                            } else if frame.header.channel == 42 {
+                                                let response_body = json!({
+                                                    "outcome": "result",
+                                                    "gh_route_schema": 1,
+                                                    "result": { "url": "https://github.com/cortexkit/aft/issues/1#issuecomment-123" },
+                                                    "field_order": ["url"]
+                                                });
+                                                let resp = Frame::build_with_version(
+                                                    frame.header.ver,
+                                                    FrameType::Response,
+                                                    frame.header.flags,
+                                                    frame.header.channel,
+                                                    frame.header.epoch,
+                                                    frame.header.corr,
+                                                    serde_json::to_vec(&response_body).expect("result json"),
+                                                )
+                                                .expect("result frame");
+                                                if subc_transport::write_frame(&mut stream, &resp).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+        });
+
+        Self {
+            port,
+            key,
+            daemon_id,
+            shutdown_tx: Some(shutdown_tx),
+            server_task: Some(server_task),
+        }
+    }
+
+    fn write_connection_file(&self, path: &Path) {
+        let conn = ConnectionInfo {
+            schema: SCHEMA_VERSION,
+            wire_version: Some(PROTOCOL_VERSION),
+            endpoints: vec![Endpoint {
+                host: "127.0.0.1".to_string(),
+                port: self.port,
+            }],
+            key: self.key.clone(),
+            daemon_id: self.daemon_id,
+            pid: std::process::id(),
+            daemon_ver: "gh-shim-test-daemon".to_string(),
+        };
+        connection_file::write_atomic(path, &conn).expect("write test daemon connection file");
+    }
+}
+
+impl Drop for SlowTestDaemon {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(task) = self.server_task.take() {
+            let _ = task.join();
+        }
+    }
+}
+
+#[test]
+fn gh_shim_slow_daemon_catalog_list_delay_routes_under_fallback_and_records_last_probe() {
+    let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+        catalog_delay: Duration::from_millis(400),
+        open_route_delay: Duration::ZERO,
+    });
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = temp.path().join("subc-connection.json");
+    daemon.write_connection_file(&connection_file);
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    let now = unix_seconds();
+    write_fresh_manifest(&state_home, now);
+    write_user_config(&config_home, &connection_file, None);
+
+    // Write recently reachable R3 (30s ago, within 300s window)
+    write_recently_reachable_r3_cache(&state_home, now, 30);
+
+    // Run governed write: gh issue comment
+    let output = shim_command(
+        &["issue", "comment", "1", "--body", "test comment"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn gh shim");
+
+    assert!(
+        output.status.success(),
+        "slow daemon must route under fallback within 5s; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "url: \"https://github.com/cortexkit/aft/issues/1#issuecomment-123\"\n"
+    );
+    assert!(!recorder.exists(), "must not reach upstream gh");
+
+    // Status inspection: last_probe shows catalog_list and timed_out
+    let status = shim_status(
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    );
+    assert_eq!(status["last_probe"]["stage"], "catalog_list");
+    assert_eq!(status["last_probe"]["outcome"], "timed_out");
+    assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
+}
+
+#[test]
+fn gh_shim_slow_daemon_catalog_list_delay_expired_fallback_refuses_naming_stage() {
+    let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+        catalog_delay: Duration::from_millis(400),
+        open_route_delay: Duration::ZERO,
+    });
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = temp.path().join("subc-connection.json");
+    daemon.write_connection_file(&connection_file);
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    let now = unix_seconds();
+    write_fresh_manifest(&state_home, now);
+    write_user_config(&config_home, &connection_file, None);
+
+    // Write expired R3 (301s ago, > 300s window)
+    write_recently_reachable_r3_cache(&state_home, now, 301);
+
+    let output = shim_command(
+        &["issue", "comment", "1", "--body", "test comment"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn gh shim");
+
+    assert_eq!(output.status.code(), Some(86));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "gh-shim: gh_shim_governance_unavailable: governance probe exceeded 150 ms at catalog_list (daemon reachable; slow or busy)\n"
+    );
+
+    let status = shim_status(
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    );
+    assert_eq!(status["last_probe"]["stage"], "catalog_list");
+    assert_eq!(status["last_probe"]["outcome"], "timed_out");
+}
+
+#[test]
+fn gh_shim_slow_daemon_open_route_delay_expired_fallback_refuses_naming_stage() {
+    let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+        catalog_delay: Duration::ZERO,
+        open_route_delay: Duration::from_millis(400),
+    });
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = temp.path().join("subc-connection.json");
+    daemon.write_connection_file(&connection_file);
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    let now = unix_seconds();
+    write_fresh_manifest(&state_home, now);
+    write_user_config(&config_home, &connection_file, None);
+
+    // Write expired R3 (301s ago, > 300s window)
+    write_recently_reachable_r3_cache(&state_home, now, 301);
+
+    let output = shim_command(
+        &["issue", "comment", "1", "--body", "test comment"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn gh shim");
+
+    assert_eq!(output.status.code(), Some(86));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "gh-shim: gh_shim_governance_unavailable: governance probe exceeded 150 ms at open_route (daemon reachable; slow or busy)\n"
+    );
+
+    let status = shim_status(
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    );
+    assert_eq!(status["last_probe"]["stage"], "open_route");
+    assert_eq!(status["last_probe"]["outcome"], "timed_out");
 }
