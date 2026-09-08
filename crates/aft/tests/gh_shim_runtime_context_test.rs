@@ -1997,6 +1997,7 @@ fn control_flags() -> Flags {
 }
 
 struct SlowDaemonConfig {
+    handshake_delay: Duration,
     catalog_delay: Duration,
     open_route_delay: Duration,
 }
@@ -2037,9 +2038,13 @@ impl SlowTestDaemon {
                             let Ok((mut stream, _)) = accepted else { break; };
                             let k = key_clone.clone();
                             let d = daemon_id_clone;
+                            let hs_delay = config.handshake_delay;
                             let cat_delay = config.catalog_delay;
                             let open_delay = config.open_route_delay;
                             tokio::spawn(async move {
+                                if hs_delay > Duration::ZERO {
+                                    tokio::time::sleep(hs_delay).await;
+                                }
                                 if subc_transport::authenticate_server(
                                     &mut stream,
                                     &k,
@@ -2229,6 +2234,7 @@ impl Drop for SlowTestDaemon {
 #[test]
 fn gh_shim_slow_daemon_catalog_list_delay_routes_under_fallback_and_records_last_probe() {
     let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+        handshake_delay: Duration::ZERO,
         catalog_delay: Duration::from_millis(400),
         open_route_delay: Duration::ZERO,
     });
@@ -2290,6 +2296,7 @@ fn gh_shim_slow_daemon_catalog_list_delay_routes_under_fallback_and_records_last
 #[test]
 fn gh_shim_slow_daemon_catalog_list_delay_expired_fallback_refuses_naming_stage() {
     let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+        handshake_delay: Duration::ZERO,
         catalog_delay: Duration::from_millis(400),
         open_route_delay: Duration::ZERO,
     });
@@ -2343,6 +2350,7 @@ fn gh_shim_slow_daemon_catalog_list_delay_expired_fallback_refuses_naming_stage(
 #[test]
 fn gh_shim_slow_daemon_open_route_delay_expired_fallback_refuses_naming_stage() {
     let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+        handshake_delay: Duration::ZERO,
         catalog_delay: Duration::ZERO,
         open_route_delay: Duration::from_millis(400),
     });
@@ -2391,4 +2399,119 @@ fn gh_shim_slow_daemon_open_route_delay_expired_fallback_refuses_naming_stage() 
     );
     assert_eq!(status["last_probe"]["stage"], "open_route");
     assert_eq!(status["last_probe"]["outcome"], "timed_out");
+}
+
+#[test]
+fn gh_shim_slow_daemon_connect_delay_routes_under_fallback_and_records_last_probe() {
+    let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+        handshake_delay: Duration::from_millis(400),
+        catalog_delay: Duration::ZERO,
+        open_route_delay: Duration::ZERO,
+    });
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = temp.path().join("subc-connection.json");
+    daemon.write_connection_file(&connection_file);
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    let now = unix_seconds();
+    write_fresh_manifest(&state_home, now);
+    write_user_config(&config_home, &connection_file, None);
+
+    // Write recently reachable R3 (30s ago, within 300s window)
+    write_recently_reachable_r3_cache(&state_home, now, 30);
+
+    let output = shim_command(
+        &["issue", "comment", "1", "--body", "test comment"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn gh shim");
+
+    assert!(
+        output.status.success(),
+        "slow daemon at connect must route under fallback within 5s; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "url: \"https://github.com/cortexkit/aft/issues/1#issuecomment-123\"\n"
+    );
+    assert!(!recorder.exists(), "must not reach upstream gh");
+
+    let status = shim_status(
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    );
+    assert_eq!(status["last_probe"]["stage"], "connect");
+    assert_eq!(status["last_probe"]["outcome"], "timed_out");
+    assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
+}
+
+#[test]
+fn gh_shim_slow_daemon_connect_delay_expired_fallback_refuses_with_unreachable_outcome() {
+    let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+        handshake_delay: Duration::from_millis(400),
+        catalog_delay: Duration::ZERO,
+        open_route_delay: Duration::ZERO,
+    });
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = temp.path().join("subc-connection.json");
+    daemon.write_connection_file(&connection_file);
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    let now = unix_seconds();
+    write_fresh_manifest(&state_home, now);
+    write_user_config(&config_home, &connection_file, None);
+
+    // Write expired R3 (301s ago, > 300s window)
+    write_recently_reachable_r3_cache(&state_home, now, 301);
+
+    let output = shim_command(
+        &["issue", "comment", "1", "--body", "test comment"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn gh shim");
+
+    assert_eq!(output.status.code(), Some(86));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "gh-shim: gh_shim_governance_unavailable: the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns\n"
+    );
+
+    let status = shim_status(
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    );
+    assert_eq!(status["last_probe"]["stage"], "connect");
+    assert_eq!(status["last_probe"]["outcome"], "timed_out");
+    assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
 }

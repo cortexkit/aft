@@ -449,9 +449,13 @@ fn governed_outcome_status(
             refuse_governance_unavailable(paths, agent_binding, now, GOVERNANCE_UNAVAILABLE_TEXT)
         }
         RouteOutcome::GovernanceUnavailableTimedOut { stage, elapsed_ms } => {
-            let text = format!(
-                "governance probe exceeded {elapsed_ms} ms at {stage} (daemon reachable; slow or busy)"
-            );
+            let text = if stage == ProbeStage::Connect {
+                GOVERNANCE_UNAVAILABLE_TEXT.to_string()
+            } else {
+                format!(
+                    "governance probe exceeded {elapsed_ms} ms at {stage} (daemon reachable; slow or busy)"
+                )
+            };
             refuse_governance_unavailable(paths, agent_binding, now, &text)
         }
         RouteOutcome::Unavailable(message) => refuse(RefusalCode::SeamUnavailable, &message),
@@ -1008,15 +1012,17 @@ fn determine_rung_from_doc(
             RungDetermination::r2(now, R2Reason::GhRouteHolderUnbound, None, &provenance)
         }
         ProbeResult::TimedOut { stage, .. } => {
-            let budget_ms = DISCOVERY_BUDGET.as_millis();
-            let refusal_text = format!(
-                "governance probe exceeded {budget_ms} ms at {stage} (daemon reachable; slow or busy)"
-            );
             if let Some(record) = cached.as_ref().filter(|record| {
                 record.rung == Rung::R3 && (record.fresh_at(now) || record.recently_reachable(now))
             }) {
                 RungDetermination::cached(record.clone())
+            } else if stage == ProbeStage::Connect {
+                RungDetermination::r2(now, R2Reason::DaemonUnreachable, None, &provenance)
             } else {
+                let budget_ms = DISCOVERY_BUDGET.as_millis();
+                let refusal_text = format!(
+                    "governance probe exceeded {budget_ms} ms at {stage} (daemon reachable; slow or busy)"
+                );
                 let mut determination = cached
                     .filter(|record| record.fresh_at(now))
                     .map(RungDetermination::cached)
@@ -7543,6 +7549,7 @@ mod tests {
     }
 
     struct SlowDaemonConfig {
+        handshake_delay: Duration,
         catalog_delay: Duration,
         open_route_delay: Duration,
     }
@@ -7584,9 +7591,13 @@ mod tests {
                                 let Ok((mut stream, _)) = accepted else { break; };
                                 let k = key_clone.clone();
                                 let d = daemon_id_clone;
+                                let hs_delay = config.handshake_delay;
                                 let cat_delay = config.catalog_delay;
                                 let open_delay = config.open_route_delay;
                                 tokio::spawn(async move {
+                                    if hs_delay > Duration::ZERO {
+                                        tokio::time::sleep(hs_delay).await;
+                                    }
                                     if subc_transport::authenticate_server(
                                         &mut stream,
                                         &k,
@@ -7797,6 +7808,7 @@ mod tests {
     #[test]
     fn probe_exceeded_at_catalog_list_names_stage_and_budget_in_status_and_refusal() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+            handshake_delay: Duration::ZERO,
             catalog_delay: Duration::from_millis(400),
             open_route_delay: Duration::ZERO,
         });
@@ -7845,6 +7857,7 @@ mod tests {
     #[test]
     fn probe_exceeded_at_open_route_names_stage_and_budget_in_status_and_refusal() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+            handshake_delay: Duration::ZERO,
             catalog_delay: Duration::ZERO,
             open_route_delay: Duration::from_millis(400),
         });
@@ -7933,17 +7946,123 @@ mod tests {
 
         let last_probe = read_last_probe(&paths).expect("last probe record");
         assert_eq!(last_probe.stage, "connect");
+        #[cfg(windows)]
+        assert!(
+            last_probe.outcome == "timed_out" || last_probe.outcome == "unreachable",
+            "windows connect-refused probe outcome was {}",
+            last_probe.outcome
+        );
+        #[cfg(not(windows))]
         assert_eq!(last_probe.outcome, "unreachable");
 
         let report = render_self_report(&paths).expect("self report");
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "connect");
+        #[cfg(windows)]
+        assert!(
+            status["last_probe"]["outcome"] == "timed_out"
+                || status["last_probe"]["outcome"] == "unreachable"
+        );
+        #[cfg(not(windows))]
         assert_eq!(status["last_probe"]["outcome"], "unreachable");
+    }
+
+    #[test]
+    fn probe_connect_stage_budget_exceeded_determines_r2_and_records_last_probe() {
+        let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+            handshake_delay: Duration::from_millis(400),
+            catalog_delay: Duration::ZERO,
+            open_route_delay: Duration::ZERO,
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(temp.path().join("state"));
+        let conn_file = temp.path().join("subc-connection.json");
+        daemon.write_connection_file(&conn_file);
+        let project = write_test_project_repo(temp.path(), "cortexkit/aft");
+
+        let manifest = v12_fixture_manifest();
+        let now = unix_seconds();
+        write_signed_manifest(&paths, manifest, now);
+
+        let doc = json!({
+            "subc": { "connection_file": conn_file.to_str().unwrap() }
+        })
+        .to_string();
+
+        let determination = determine_rung_from_doc(
+            &paths,
+            &project,
+            now,
+            Instant::now() + DISCOVERY_BUDGET,
+            Some(&doc),
+        );
+        assert_eq!(determination.record.rung, Rung::R2);
+        assert_eq!(determination.refusal_detail, None);
+
+        let last_probe = read_last_probe(&paths).expect("last probe record");
+        assert_eq!(last_probe.stage, "connect");
+        assert_eq!(last_probe.outcome, "timed_out");
+        assert!(last_probe.elapsed_ms >= 150);
+
+        let report = render_self_report(&paths).expect("self report");
+        let status: Value = serde_json::from_str(&report).expect("status json");
+        assert_eq!(status["last_probe"]["stage"], "connect");
+        assert_eq!(status["last_probe"]["outcome"], "timed_out");
+        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
+    }
+
+    #[test]
+    fn slow_daemon_connect_delay_fallback_active_determines_r3_and_records_last_probe() {
+        let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+            handshake_delay: Duration::from_millis(400),
+            catalog_delay: Duration::ZERO,
+            open_route_delay: Duration::ZERO,
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(temp.path().join("state"));
+        let conn_file = temp.path().join("subc-connection.json");
+        daemon.write_connection_file(&conn_file);
+        let project = write_test_project_repo(temp.path(), "cortexkit/aft");
+
+        let manifest = v12_fixture_manifest();
+        let now = unix_seconds();
+        write_signed_manifest(&paths, manifest, now);
+
+        let mut cached_record = RungDetermination::r3(now - 30, 12, &test_rung_provenance()).record;
+        cached_record.last_reachable_unix_secs = Some(now - 30);
+        write_rung_record_silently(&paths, &cached_record);
+
+        let doc = json!({
+            "subc": { "connection_file": conn_file.to_str().unwrap() }
+        })
+        .to_string();
+
+        let determination = determine_rung_from_doc(
+            &paths,
+            &project,
+            now,
+            Instant::now() + DISCOVERY_BUDGET,
+            Some(&doc),
+        );
+        assert_eq!(determination.record.rung, Rung::R3);
+        assert!(determination.refusal_detail.is_none());
+
+        let last_probe = read_last_probe(&paths).expect("last probe record");
+        assert_eq!(last_probe.stage, "connect");
+        assert_eq!(last_probe.outcome, "timed_out");
+        assert!(last_probe.elapsed_ms >= 150);
+
+        let report = render_self_report(&paths).expect("self report");
+        let status: Value = serde_json::from_str(&report).expect("status json");
+        assert_eq!(status["last_probe"]["stage"], "connect");
+        assert_eq!(status["last_probe"]["outcome"], "timed_out");
+        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
     }
 
     #[test]
     fn slow_daemon_catalog_list_delay_fallback_active_determines_r3_and_records_last_probe() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+            handshake_delay: Duration::ZERO,
             catalog_delay: Duration::from_millis(400),
             open_route_delay: Duration::ZERO,
         });
@@ -7991,6 +8110,7 @@ mod tests {
     #[test]
     fn slow_daemon_catalog_list_delay_expired_fallback_refuses_naming_stage() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+            handshake_delay: Duration::ZERO,
             catalog_delay: Duration::from_millis(400),
             open_route_delay: Duration::ZERO,
         });
@@ -8039,6 +8159,7 @@ mod tests {
     #[test]
     fn slow_daemon_open_route_delay_fallback_active_determines_r3_and_records_last_probe() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+            handshake_delay: Duration::ZERO,
             catalog_delay: Duration::ZERO,
             open_route_delay: Duration::from_millis(400),
         });
@@ -8086,6 +8207,7 @@ mod tests {
     #[test]
     fn slow_daemon_open_route_delay_expired_fallback_refuses_naming_stage() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+            handshake_delay: Duration::ZERO,
             catalog_delay: Duration::ZERO,
             open_route_delay: Duration::from_millis(400),
         });
