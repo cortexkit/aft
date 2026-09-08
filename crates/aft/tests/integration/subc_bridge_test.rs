@@ -6290,6 +6290,30 @@ async fn drive_session_scoped_bg_daemon(input: FakeDaemonInput) {
     // asserting it on a specific response corr.
     settle_until_bg_completion(&mut stream, 4, 4250, &task_id_s4).await;
 
+    let session_1_drain = call_tool_response(
+        &mut stream,
+        1,
+        4251,
+        "bash_drain_completions",
+        json!({}),
+        "session-1 foreign completion drain",
+    )
+    .await;
+    assert!(
+        session_1_drain["bg_completions"]
+            .as_array()
+            .expect("session-1 completion array")
+            .is_empty(),
+        "session-1 drained session-4 completion: {session_1_drain:?}"
+    );
+    assert!(
+        session_1_drain["pending_matches"]
+            .as_array()
+            .expect("session-1 pending-match array")
+            .is_empty(),
+        "session-1 drained session-4 watch match: {session_1_drain:?}"
+    );
+
     send_tool_call(&mut stream, 4, 425, "echo", json!({ "case": "fast" })).await;
     let s4_after_completion = read_frame_timeout(&mut stream, "session-4 completion read").await;
     assert_eq!(s4_after_completion.header.corr, 425);

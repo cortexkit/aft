@@ -540,7 +540,7 @@ fn bash_status_cross_session_same_project_finds_task_by_id() {
 }
 
 #[test]
-fn cross_session_project_restart_sweep_delivers_and_acks_fate_unknown() {
+fn cross_session_project_restart_sweep_retires_fate_unknown_without_delivery() {
     let storage = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let task_id = "bash-0000000000000199";
@@ -580,14 +580,20 @@ fn cross_session_project_restart_sweep_delivers_and_acks_fate_unknown() {
     registry
         .replay_session_for_project(storage.path(), "session-b", project.path())
         .unwrap();
-    let completions = registry.drain_completions_for_session(Some("session-b"));
-    assert_eq!(completions.len(), 1);
-    assert_eq!(completions[0].status, BgTaskStatus::FateUnknown);
-    assert!(completions[0].output_preview.contains("last output at"));
-    assert_eq!(
-        registry.ack_completions_for_session(Some("session-b"), &[task_id.to_string()]),
-        vec![task_id.to_string()]
-    );
+    assert!(registry
+        .drain_completions_for_session(Some("session-b"))
+        .is_empty());
+    let snapshot = registry
+        .status(
+            task_id,
+            "session-b",
+            Some(project.path()),
+            Some(storage.path()),
+            1024,
+        )
+        .expect("cross-session status should preserve control access");
+    assert_eq!(snapshot.info.status, BgTaskStatus::FateUnknown);
+    assert!(snapshot.output_preview.contains("last release output"));
     assert_eq!(
         read_json(storage.path(), "session-a", task_id)["completion_delivered"],
         true
@@ -598,6 +604,56 @@ fn cross_session_project_restart_sweep_delivers_and_acks_fate_unknown() {
     assert!(registry
         .drain_completions_for_session(Some("session-b"))
         .is_empty());
+}
+
+#[test]
+fn foreign_session_replay_retires_completion_but_preserves_status_control() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let task_id = {
+        let mut session_a = AftProcess::spawn();
+        configure_background(&mut session_a, project.path(), storage.path(), "session-a");
+        let task_id = spawn_bg(&mut session_a, "session-a", "echo session-a-done", None);
+        let completed = wait_for_status(&mut session_a, "session-a", &task_id, "completed");
+        assert_eq!(completed["exit_code"], 0);
+        assert_eq!(
+            read_json(storage.path(), "session-a", &task_id)["completion_delivered"],
+            false
+        );
+        assert!(session_a.shutdown().success());
+        task_id
+    };
+
+    let mut session_b = AftProcess::spawn();
+    configure_background(&mut session_b, project.path(), storage.path(), "session-b");
+    let foreign_drain = drain(&mut session_b, "session-b");
+    assert!(
+        foreign_drain["bg_completions"]
+            .as_array()
+            .expect("background completions array")
+            .is_empty(),
+        "session B received session A's completion: {foreign_drain:?}"
+    );
+    assert!(
+        foreign_drain["pending_matches"]
+            .as_array()
+            .expect("pending matches array")
+            .is_empty(),
+        "session B received session A's watch match: {foreign_drain:?}"
+    );
+
+    let visible = status(&mut session_b, "session-b", &task_id);
+    assert_eq!(
+        visible["success"], true,
+        "session B lost cross-session status control: {visible:?}"
+    );
+    assert_eq!(visible["status"], "completed");
+    assert_eq!(
+        read_json(storage.path(), "session-a", &task_id)["completion_delivered"],
+        true,
+        "foreign replay did not retire the orphaned completion"
+    );
+    assert!(session_b.shutdown().success());
 }
 
 #[test]
@@ -1387,41 +1443,61 @@ fn terminal_state_monotonic_killed_wins_late_exit_file() {
 }
 
 #[test]
-fn completion_durability_replays_undelivered_terminal_task() {
+fn originating_session_restart_drains_completion_exactly_once_then_acks() {
     let project = tempfile::tempdir().unwrap();
     let storage = spawn_storage_dir("storage");
     let task_id = {
-        let mut aft = AftProcess::spawn();
-        configure_background(&mut aft, project.path(), storage.path(), SESSION);
-        let task_id = spawn_bg(&mut aft, SESSION, "echo durable", None);
-        let _ = wait_for_status(&mut aft, SESSION, &task_id, "completed");
+        let mut first_session = AftProcess::spawn();
+        configure_background(&mut first_session, project.path(), storage.path(), SESSION);
+        let task_id = spawn_bg(&mut first_session, SESSION, "echo durable", None);
+        let _ = wait_for_status(&mut first_session, SESSION, &task_id, "completed");
         assert_eq!(
             read_json(storage.path(), SESSION, &task_id)["completion_delivered"],
             false
         );
-        assert!(aft.shutdown().success());
+        assert!(first_session.shutdown().success());
         task_id
     };
 
-    let mut aft = AftProcess::spawn();
-    configure_background(&mut aft, project.path(), storage.path(), SESSION);
-    let drained = drain(&mut aft, SESSION);
-    assert!(drained["bg_completions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|completion| completion["task_id"] == task_id));
+    let mut restarted_session = AftProcess::spawn();
+    configure_background(
+        &mut restarted_session,
+        project.path(),
+        storage.path(),
+        SESSION,
+    );
+    let first_drain = drain(&mut restarted_session, SESSION);
+    assert_eq!(
+        first_drain["bg_completions"]
+            .as_array()
+            .expect("background completions array")
+            .iter()
+            .filter(|completion| completion["task_id"] == task_id)
+            .count(),
+        1,
+        "originating session did not receive exactly one completion: {first_drain:?}"
+    );
     assert_eq!(
         read_json(storage.path(), SESSION, &task_id)["completion_delivered"],
         false
     );
-    let acked = ack(&mut aft, SESSION, &task_id);
+
+    let acked = ack(&mut restarted_session, SESSION, &task_id);
     assert_eq!(acked["success"], true, "ack failed: {acked:?}");
     assert_eq!(
         read_json(storage.path(), SESSION, &task_id)["completion_delivered"],
         true
     );
-    assert!(aft.shutdown().success());
+    let after_ack = drain(&mut restarted_session, SESSION);
+    assert!(
+        after_ack["bg_completions"]
+            .as_array()
+            .expect("background completions array")
+            .iter()
+            .all(|completion| completion["task_id"] != task_id),
+        "acked completion remained drainable: {after_ack:?}"
+    );
+    assert!(restarted_session.shutdown().success());
 }
 
 #[test]
@@ -1508,6 +1584,119 @@ fn pi_erased_bundle_notification_is_not_replayed_after_ack_and_second_restart() 
             .iter()
             .all(|entry| entry["task_id"] != task_id),
         "acked erased-bundle completion re-delivered after second restart: {second_drain:?}"
+    );
+    assert!(second_replay.shutdown().success());
+}
+
+#[test]
+fn foreign_session_replay_retires_erased_watch_tombstone_before_second_replay() {
+    const HARNESS: &str = "pi";
+    const ORIGINATING_SESSION: &str = "session-a";
+    const FOREIGN_SESSION: &str = "session-b";
+    const ERASED_TEXT: &str = "watch target erased";
+
+    let project = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let release = project.path().join("release-foreign-erased-watch");
+
+    let mut session_a = AftProcess::spawn();
+    configure_background_for_harness(
+        &mut session_a,
+        project.path(),
+        storage.path(),
+        ORIGINATING_SESSION,
+        HARNESS,
+    );
+    let command = format!(
+        "while [ ! -e {} ]; do sleep 0.05; done",
+        shell_quote_path(&release)
+    );
+    let task_id = spawn_bg(&mut session_a, ORIGINATING_SESSION, &command, Some(30_000));
+    let registered = notify(
+        &mut session_a,
+        ORIGINATING_SESSION,
+        &task_id,
+        "never-matches",
+        false,
+    );
+    assert_eq!(
+        registered["success"], true,
+        "watch registration failed: {registered:?}"
+    );
+    let child_pid = status(&mut session_a, ORIGINATING_SESSION, &task_id)["child_pid"]
+        .as_u64()
+        .expect("running child PID") as u32;
+
+    let _ = erase_persisted_task_row(storage.path(), HARNESS, ORIGINATING_SESSION, &task_id);
+    let tombstone_frame = wait_for_pattern_frame(&mut session_a, &task_id);
+    assert_eq!(tombstone_frame["reason"], "task_exit");
+    assert_eq!(tombstone_frame["match_text"], ERASED_TEXT);
+    let tombstones =
+        persisted_watch_rows_for_harness(storage.path(), HARNESS, ORIGINATING_SESSION, &task_id);
+    assert_eq!(tombstones.len(), 1);
+    assert!(tombstones[0].pending_match);
+    assert_eq!(tombstones[0].match_text.as_deref(), Some(ERASED_TEXT));
+
+    sigkill_aft(session_a);
+    fs::write(&release, "release").unwrap();
+    wait_for_process_exit(child_pid);
+    let resolved = resolve_task_layout(
+        &session_tasks_dir(storage.path(), ORIGINATING_SESSION),
+        &task_id,
+    )
+    .expect("resolve task bundle before erasing it");
+    fs::remove_dir_all(&resolved.paths.dir).expect("erase task bundle");
+
+    let mut session_b = AftProcess::spawn();
+    configure_background_for_harness(
+        &mut session_b,
+        project.path(),
+        storage.path(),
+        FOREIGN_SESSION,
+        HARNESS,
+    );
+    let foreign_drain = drain(&mut session_b, FOREIGN_SESSION);
+    assert!(
+        foreign_drain["pending_matches"]
+            .as_array()
+            .expect("pending matches array")
+            .iter()
+            .all(|entry| entry["task_id"] != task_id),
+        "session B received session A's watch tombstone: {foreign_drain:?}"
+    );
+    assert!(
+        foreign_drain["bg_completions"]
+            .as_array()
+            .expect("background completions array")
+            .iter()
+            .all(|entry| entry["task_id"] != task_id),
+        "session B received session A's completion: {foreign_drain:?}"
+    );
+    let row_gone_after_b_replay =
+        persisted_watch_rows_for_harness(storage.path(), HARNESS, ORIGINATING_SESSION, &task_id)
+            .is_empty();
+    assert!(session_b.shutdown().success());
+
+    let mut second_replay = AftProcess::spawn();
+    configure_background_for_harness(
+        &mut second_replay,
+        project.path(),
+        storage.path(),
+        ORIGINATING_SESSION,
+        HARNESS,
+    );
+    let second_drain = drain(&mut second_replay, ORIGINATING_SESSION);
+    assert!(
+        second_drain["pending_matches"]
+            .as_array()
+            .expect("pending matches array")
+            .iter()
+            .all(|entry| entry["task_id"] != task_id),
+        "foreign tombstone re-armed on the second replay: {second_drain:?}"
+    );
+    assert!(
+        row_gone_after_b_replay,
+        "watch tombstone row survived session B's replay"
     );
     assert!(second_replay.shutdown().success());
 }
