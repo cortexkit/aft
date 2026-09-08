@@ -9,6 +9,7 @@
     "last_seam_refusal",
     "cached_manifest",
     "last_rung",
+    "last_probe",
     "bypass_audit",
     "bypass_audit_error",
     "executing_image",

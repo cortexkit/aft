@@ -16,7 +16,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use ring::signature::{UnparsedPublicKey, ED25519};
@@ -294,7 +295,11 @@ fn run(args: &[OsString]) -> i32 {
         };
         return match disposition {
             GovernanceDisposition::Unavailable(agent_binding) => {
-                refuse_governance_unavailable(&paths, &agent_binding, now)
+                let refusal_text = determination
+                    .refusal_detail
+                    .as_deref()
+                    .unwrap_or(GOVERNANCE_UNAVAILABLE_TEXT);
+                refuse_governance_unavailable(&paths, &agent_binding, now, refusal_text)
             }
             GovernanceDisposition::Unclassified { manifest_version } => refuse(
                 RefusalCode::Unclassified,
@@ -440,7 +445,13 @@ fn governed_outcome_status(
         ),
         RouteOutcome::SchemaMismatch(message) => refuse(RefusalCode::SeamSchemaMismatch, &message),
         RouteOutcome::GovernanceUnavailable => {
-            refuse_governance_unavailable(paths, agent_binding, now)
+            refuse_governance_unavailable(paths, agent_binding, now, GOVERNANCE_UNAVAILABLE_TEXT)
+        }
+        RouteOutcome::GovernanceUnavailableTimedOut { stage, elapsed_ms } => {
+            let text = format!(
+                "governance probe exceeded {elapsed_ms} ms at {stage} (daemon reachable; slow or busy)"
+            );
+            refuse_governance_unavailable(paths, agent_binding, now, &text)
         }
         RouteOutcome::Unavailable(message) => refuse(RefusalCode::SeamUnavailable, &message),
     }
@@ -456,6 +467,37 @@ fn is_reserved_self_report(args: &[OsString]) -> bool {
         .is_some_and(|arg| RESERVED_SELF_REPORT.contains(&arg))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProbeStage {
+    Connect,
+    CatalogList,
+    OpenRoute,
+}
+
+impl ProbeStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::CatalogList => "catalog_list",
+            Self::OpenRoute => "open_route",
+        }
+    }
+}
+
+impl std::fmt::Display for ProbeStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct LastProbeReport {
+    stage: String,
+    elapsed_ms: u64,
+    outcome: String,
+}
+
 #[derive(Clone, Debug)]
 struct StatePaths {
     root: PathBuf,
@@ -468,6 +510,7 @@ struct StatePaths {
     version_high_water: PathBuf,
     numeric_ids: PathBuf,
     manifests_dir: PathBuf,
+    last_probe: PathBuf,
 }
 
 impl StatePaths {
@@ -490,9 +533,25 @@ impl StatePaths {
             version_high_water: root.join("manifest-version-high-water.json"),
             numeric_ids: root.join("numeric-ids.json"),
             manifests_dir: root.join("manifests"),
+            last_probe: root.join("last-probe.json"),
             root,
         }
     }
+}
+
+fn write_last_probe_silently(paths: &StatePaths, probe: &LastProbeReport) {
+    let Ok(bytes) = serde_json::to_vec(probe) else {
+        return;
+    };
+    let _ = fs::create_dir_all(&paths.root);
+    let temporary = paths.last_probe.with_extension("tmp");
+    if fs::write(&temporary, bytes).is_ok() {
+        let _ = fs::rename(temporary, &paths.last_probe);
+    }
+}
+
+fn read_last_probe(paths: &StatePaths) -> Option<LastProbeReport> {
+    serde_json::from_slice(&fs::read(&paths.last_probe).ok()?).ok()
 }
 
 /// Resolve the one process-state directory used by every gh-shim reader and
@@ -650,6 +709,7 @@ impl R2Reason {
 struct RungDetermination {
     record: RungRecord,
     operator_disabled: bool,
+    refusal_detail: Option<String>,
 }
 
 impl RungDetermination {
@@ -668,6 +728,7 @@ impl RungDetermination {
                 recorded_by_repo_key: None,
             },
             operator_disabled: reason == R1Reason::DisabledByConfig,
+            refusal_detail: None,
         }
     }
 
@@ -691,6 +752,7 @@ impl RungDetermination {
                 recorded_by_repo_key: Some(provenance.repo_key.clone()),
             },
             operator_disabled: false,
+            refusal_detail: None,
         }
     }
 
@@ -715,6 +777,7 @@ impl RungDetermination {
                 recorded_by_repo_key: Some(provenance.repo_key.clone()),
             },
             operator_disabled: false,
+            refusal_detail: None,
         }
     }
 
@@ -722,6 +785,7 @@ impl RungDetermination {
         Self {
             record,
             operator_disabled: false,
+            refusal_detail: None,
         }
     }
 }
@@ -831,10 +895,24 @@ fn determine_rung_from_doc(
 
     let cached = load_rung_record(paths);
     if std::time::Instant::now() >= deadline {
-        return cached
+        let budget_ms = DISCOVERY_BUDGET.as_millis();
+        let stage = ProbeStage::Connect;
+        let probe = LastProbeReport {
+            stage: stage.as_str().to_string(),
+            elapsed_ms: budget_ms as u64,
+            outcome: "timed_out".to_string(),
+        };
+        write_last_probe_silently(paths, &probe);
+        let mut determination = cached
             .filter(|record| record.fresh_at(now))
             .map(RungDetermination::cached)
             .unwrap_or_else(|| RungDetermination::r1(now, R1Reason::DiscoveryBudgetExhausted));
+        if determination.record.rung == Rung::R1 {
+            determination.refusal_detail = Some(format!(
+                "governance probe exceeded {budget_ms} ms at {stage} (daemon reachable; slow or busy)"
+            ));
+        }
+        return determination;
     }
     if let Some(record) = cached.as_ref().filter(|record| record.fresh_at(now)) {
         if record.rung != Rung::R3
@@ -910,10 +988,20 @@ fn determine_rung_from_doc(
         ProbeResult::Unbound => {
             RungDetermination::r2(now, R2Reason::GhRouteHolderUnbound, None, &provenance)
         }
-        ProbeResult::TimedOut => cached
-            .filter(|record| record.fresh_at(now))
-            .map(RungDetermination::cached)
-            .unwrap_or_else(|| RungDetermination::r1(now, R1Reason::DiscoveryBudgetExhausted)),
+        ProbeResult::TimedOut { stage, .. } => {
+            let budget_ms = DISCOVERY_BUDGET.as_millis();
+            let refusal_text = format!(
+                "governance probe exceeded {budget_ms} ms at {stage} (daemon reachable; slow or busy)"
+            );
+            let mut determination = cached
+                .filter(|record| record.fresh_at(now))
+                .map(RungDetermination::cached)
+                .unwrap_or_else(|| RungDetermination::r1(now, R1Reason::DiscoveryBudgetExhausted));
+            if determination.record.rung == Rung::R1 {
+                determination.refusal_detail = Some(refusal_text);
+            }
+            determination
+        }
     };
 
     if determination.record.rung != Rung::R1 {
@@ -995,7 +1083,7 @@ enum ProbeResult {
     Unreachable,
     NoRoute,
     Unbound,
-    TimedOut,
+    TimedOut { stage: ProbeStage },
 }
 
 fn probe_governance(
@@ -1005,9 +1093,18 @@ fn probe_governance(
     deadline: std::time::Instant,
     agent_id: &str,
 ) -> ProbeResult {
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let start = std::time::Instant::now();
+    let remaining = deadline.saturating_duration_since(start);
     if remaining.is_zero() {
-        return ProbeResult::TimedOut;
+        let probe = LastProbeReport {
+            stage: ProbeStage::Connect.as_str().to_string(),
+            elapsed_ms: DISCOVERY_BUDGET.as_millis() as u64,
+            outcome: "timed_out".to_string(),
+        };
+        write_last_probe_silently(paths, &probe);
+        return ProbeResult::TimedOut {
+            stage: ProbeStage::Connect,
+        };
     }
     let connection_file = connection_file.to_path_buf();
     let project_root = project_root_for(cwd);
@@ -1018,14 +1115,23 @@ fn probe_governance(
         .enable_time()
         .build()
     else {
+        let probe = LastProbeReport {
+            stage: ProbeStage::Connect.as_str().to_string(),
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            outcome: "unreachable".to_string(),
+        };
+        write_last_probe_silently(paths, &probe);
         return ProbeResult::Unreachable;
     };
+
+    let current_stage = std::sync::Arc::new(std::sync::Mutex::new(ProbeStage::Connect));
+    let stage_handle = std::sync::Arc::clone(&current_stage);
 
     // `tokio::time::timeout` creates its timer immediately. Building that
     // future as a `block_on` argument happens before the runtime enters its
     // context, so the timer's reactor lookup panics in this synchronous CLI.
     // Construct it from inside the entered future instead.
-    match runtime.block_on(async move {
+    let result = runtime.block_on(async move {
         tokio::time::timeout(remaining, async move {
             let options = ConsumerOptions {
                 call_timeout: remaining,
@@ -1034,6 +1140,8 @@ fn probe_governance(
             let consumer = SubcConsumer::connect(&connection_file, options)
                 .await
                 .map_err(|_| ProbeResult::Unreachable)?;
+
+            *stage_handle.lock().unwrap() = ProbeStage::CatalogList;
             let catalog = consumer
                 .catalog_list()
                 .await
@@ -1043,6 +1151,8 @@ fn probe_governance(
             let Some(module_id) = holder.module_id else {
                 return Err(ProbeResult::NoRoute);
             };
+
+            *stage_handle.lock().unwrap() = ProbeStage::OpenRoute;
             let identity = BindIdentity {
                 project_root: project_root.to_string_lossy().into_owned().into(),
                 harness: "aft-gh-shim".to_string(),
@@ -1064,10 +1174,78 @@ fn probe_governance(
             Ok(module_id)
         })
         .await
-    }) {
-        Ok(Ok(module_id)) => ProbeResult::Ready { module_id },
-        Ok(Err(result)) => result,
-        Err(_) => ProbeResult::TimedOut,
+    });
+
+    let final_stage = *current_stage.lock().unwrap();
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(Ok(module_id)) => {
+            let probe = LastProbeReport {
+                stage: final_stage.as_str().to_string(),
+                elapsed_ms,
+                outcome: "ready".to_string(),
+            };
+            write_last_probe_silently(paths, &probe);
+            ProbeResult::Ready { module_id }
+        }
+        Ok(Err(ProbeResult::Unreachable)) => {
+            if std::time::Instant::now() >= deadline {
+                let probe = LastProbeReport {
+                    stage: final_stage.as_str().to_string(),
+                    elapsed_ms: elapsed_ms.max(DISCOVERY_BUDGET.as_millis() as u64),
+                    outcome: "timed_out".to_string(),
+                };
+                write_last_probe_silently(paths, &probe);
+                ProbeResult::TimedOut { stage: final_stage }
+            } else {
+                let probe = LastProbeReport {
+                    stage: final_stage.as_str().to_string(),
+                    elapsed_ms,
+                    outcome: "unreachable".to_string(),
+                };
+                write_last_probe_silently(paths, &probe);
+                ProbeResult::Unreachable
+            }
+        }
+        Ok(Err(ProbeResult::NoRoute)) => {
+            let probe = LastProbeReport {
+                stage: final_stage.as_str().to_string(),
+                elapsed_ms,
+                outcome: "no_route".to_string(),
+            };
+            write_last_probe_silently(paths, &probe);
+            ProbeResult::NoRoute
+        }
+        Ok(Err(ProbeResult::Unbound)) => {
+            if std::time::Instant::now() >= deadline {
+                let probe = LastProbeReport {
+                    stage: final_stage.as_str().to_string(),
+                    elapsed_ms: elapsed_ms.max(DISCOVERY_BUDGET.as_millis() as u64),
+                    outcome: "timed_out".to_string(),
+                };
+                write_last_probe_silently(paths, &probe);
+                ProbeResult::TimedOut { stage: final_stage }
+            } else {
+                let probe = LastProbeReport {
+                    stage: final_stage.as_str().to_string(),
+                    elapsed_ms,
+                    outcome: "unbound".to_string(),
+                };
+                write_last_probe_silently(paths, &probe);
+                ProbeResult::Unbound
+            }
+        }
+        Ok(Err(other)) => other,
+        Err(_) => {
+            let probe = LastProbeReport {
+                stage: final_stage.as_str().to_string(),
+                elapsed_ms: elapsed_ms.max(DISCOVERY_BUDGET.as_millis() as u64),
+                outcome: "timed_out".to_string(),
+            };
+            write_last_probe_silently(paths, &probe);
+            ProbeResult::TimedOut { stage: final_stage }
+        }
     }
 }
 
@@ -2951,6 +3129,7 @@ enum RouteOutcome {
     UnboundIdentity,
     SchemaMismatch(String),
     GovernanceUnavailable,
+    GovernanceUnavailableTimedOut { stage: ProbeStage, elapsed_ms: u64 },
     Unavailable(String),
 }
 
@@ -2993,15 +3172,20 @@ fn route_governed(
         Ok(runtime) => runtime,
         Err(error) => return RouteOutcome::Unavailable(error.to_string()),
     };
-    runtime
-        .block_on(async move {
+    let current_stage = Arc::new(Mutex::new(ProbeStage::Connect));
+    let stage_handle = Arc::clone(&current_stage);
+    let call_timeout = Duration::from_secs(5);
+    let deadline = Instant::now() + call_timeout;
+    let result = runtime.block_on(async move {
+        tokio::time::timeout(call_timeout, async move {
             let options = ConsumerOptions {
-                call_timeout: Duration::from_secs(5),
+                call_timeout,
                 ..ConsumerOptions::default()
             };
             let consumer = SubcConsumer::connect(&connection_file, options)
                 .await
                 .map_err(|_| RouteOutcome::GovernanceUnavailable)?;
+            *stage_handle.lock().unwrap() = ProbeStage::CatalogList;
             let catalog = consumer
                 .catalog_list()
                 .await
@@ -3011,6 +3195,7 @@ fn route_governed(
             let module_id = holder
                 .module_id
                 .ok_or(RouteOutcome::GovernanceUnavailable)?;
+            *stage_handle.lock().unwrap() = ProbeStage::OpenRoute;
             let route = consumer
                 .open_route(
                     RouteTarget::ManagementSurface {
@@ -3069,13 +3254,49 @@ fn route_governed(
             }
             Ok(outcome)
         })
-        .unwrap_or_else(|outcome| outcome)
+        .await
+    });
+
+    let final_stage = *current_stage.lock().unwrap();
+    match result {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(RouteOutcome::GovernanceUnavailable)) => {
+            if Instant::now() >= deadline {
+                let probe = LastProbeReport {
+                    stage: final_stage.as_str().to_string(),
+                    elapsed_ms: call_timeout.as_millis() as u64,
+                    outcome: "timed_out".to_string(),
+                };
+                write_last_probe_silently(paths, &probe);
+                RouteOutcome::GovernanceUnavailableTimedOut {
+                    stage: final_stage,
+                    elapsed_ms: call_timeout.as_millis() as u64,
+                }
+            } else {
+                RouteOutcome::GovernanceUnavailable
+            }
+        }
+        Ok(Err(outcome)) => outcome,
+        Err(_) => {
+            let probe = LastProbeReport {
+                stage: final_stage.as_str().to_string(),
+                elapsed_ms: call_timeout.as_millis() as u64,
+                outcome: "timed_out".to_string(),
+            };
+            write_last_probe_silently(paths, &probe);
+            RouteOutcome::GovernanceUnavailableTimedOut {
+                stage: final_stage,
+                elapsed_ms: call_timeout.as_millis() as u64,
+            }
+        }
+    }
 }
 
 fn refuse_governance_unavailable(
     paths: &StatePaths,
     agent_binding: &AgentBinding,
     now: u64,
+    text: &str,
 ) -> i32 {
     let state = SeamState {
         bound_holder: None,
@@ -3091,10 +3312,7 @@ fn refuse_governance_unavailable(
             &format!("governed self-report update failed: {error}"),
         );
     }
-    refuse(
-        RefusalCode::GovernanceUnavailable,
-        GOVERNANCE_UNAVAILABLE_TEXT,
-    )
+    refuse(RefusalCode::GovernanceUnavailable, text)
 }
 
 fn governed_seam_state(
@@ -3433,6 +3651,7 @@ struct SelfReport {
     last_seam_refusal: Option<LastSeamRefusal>,
     cached_manifest: CachedManifestReport,
     last_rung: LastRungReport,
+    last_probe: Option<LastProbeReport>,
     bypass_audit: Option<Vec<Value>>,
     bypass_audit_error: Option<String>,
     executing_image: Option<String>,
@@ -3528,6 +3747,11 @@ fn build_self_report(paths: &StatePaths) -> SelfReport {
     } else {
         (cached_manifest_report(paths), last_rung_report(paths))
     };
+    let last_probe = if disabled {
+        None
+    } else {
+        read_last_probe(paths)
+    };
     SelfReport {
         shim_version: env!("CARGO_PKG_VERSION"),
         gh_routing_schema_floor: SCHEMA_FLOOR,
@@ -3537,6 +3761,7 @@ fn build_self_report(paths: &StatePaths) -> SelfReport {
         last_seam_refusal: seam_state.last_seam_refusal,
         cached_manifest,
         last_rung,
+        last_probe,
         bypass_audit,
         bypass_audit_error,
         executing_image: image
@@ -4227,6 +4452,7 @@ mod tests {
                 "last_seam_refusal",
                 "cached_manifest",
                 "last_rung",
+                "last_probe",
                 "bypass_audit",
                 "bypass_audit_error",
                 "executing_image",
@@ -7269,6 +7495,412 @@ mod tests {
         assert_eq!(files.len(), 1);
         let mode = fs::metadata(&files[0]).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    use subc_protocol::{Flags, Frame, FrameType, ModuleHelloAckBody, Priority, PROTOCOL_VERSION};
+    use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VERSION};
+
+    fn control_flags() -> Flags {
+        Flags::new(false, Priority::Passive, false)
+    }
+
+    struct SlowDaemonConfig {
+        catalog_delay: Duration,
+        open_route_delay: Duration,
+    }
+
+    struct SlowTestDaemon {
+        port: u16,
+        key: Vec<u8>,
+        daemon_id: [u8; subc_transport::DAEMON_ID_LEN],
+        shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        server_task: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl SlowTestDaemon {
+        fn spawn(config: SlowDaemonConfig) -> Self {
+            let std_listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind test daemon");
+            std_listener.set_nonblocking(true).expect("set nonblocking");
+            let port = std_listener.local_addr().expect("local addr").port();
+            let key = vec![0x42; subc_transport::KEY_LEN];
+            let daemon_id = [0x24; subc_transport::DAEMON_ID_LEN];
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+            let key_clone = key.clone();
+            let daemon_id_clone = daemon_id;
+
+            let server_task = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .enable_time()
+                    .build()
+                    .expect("build daemon tokio runtime");
+                rt.block_on(async move {
+                    let listener =
+                        tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
+                    loop {
+                        tokio::select! {
+                            _ = &mut shutdown_rx => break,
+                            accepted = listener.accept() => {
+                                let Ok((mut stream, _)) = accepted else { break; };
+                                let k = key_clone.clone();
+                                let d = daemon_id_clone;
+                                let cat_delay = config.catalog_delay;
+                                let open_delay = config.open_route_delay;
+                                tokio::spawn(async move {
+                                    if subc_transport::authenticate_server(
+                                        &mut stream,
+                                        &k,
+                                        &d,
+                                        "subc-test",
+                                        Duration::from_secs(5),
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        return;
+                                    }
+
+                                    loop {
+                                        let frame = match subc_transport::read_frame(&mut stream).await {
+                                            Ok(Some(frame)) => frame,
+                                            _ => break,
+                                        };
+
+                                        match frame.header.ty {
+                                            FrameType::Hello => {
+                                                let ack = Frame::build(
+                                                    FrameType::HelloAck,
+                                                    control_flags(),
+                                                    0,
+                                                    0,
+                                                    frame.header.corr,
+                                                    serde_json::to_vec(&ModuleHelloAckBody {
+                                                        negotiated_ver: PROTOCOL_VERSION,
+                                                        subc_ops: Vec::new(),
+                                                        subc_capabilities: Vec::new(),
+                                                        storage: None,
+                                                    })
+                                                    .expect("hello ack body"),
+                                                )
+                                                .expect("hello ack frame");
+                                                if subc_transport::write_frame(&mut stream, &ack).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            FrameType::Request => {
+                                                let op: Option<String> = serde_json::from_slice::<Value>(&frame.body)
+                                                    .ok()
+                                                    .and_then(|v| v.get("op").and_then(Value::as_str).map(String::from));
+
+                                                if op.as_deref() == Some("catalog.list") {
+                                                    if !cat_delay.is_zero() {
+                                                        tokio::time::sleep(cat_delay).await;
+                                                    }
+                                                    let response_body = json!({
+                                                        "op": "catalog.list",
+                                                        "generation": 1,
+                                                        "modules": [{
+                                                            "module_id": "prefrontal-core",
+                                                            "module_version": "0.1.0",
+                                                            "roles": [{
+                                                                "role": "management_surface",
+                                                                "operations": [{ "name": "gh.route", "kind": "query" }],
+                                                                "config_schema": {},
+                                                                "observability": [],
+                                                                "identity_scope": ["project"]
+                                                            }],
+                                                            "control_ops": []
+                                                        }],
+                                                        "subc_ops": ["catalog.list", "route.open"]
+                                                    });
+                                                    let resp = Frame::build_with_version(
+                                                        frame.header.ver,
+                                                        FrameType::Response,
+                                                        frame.header.flags,
+                                                        frame.header.channel,
+                                                        frame.header.epoch,
+                                                        frame.header.corr,
+                                                        serde_json::to_vec(&response_body).expect("catalog json"),
+                                                    )
+                                                    .expect("catalog response frame");
+                                                    if subc_transport::write_frame(&mut stream, &resp).await.is_err() {
+                                                        break;
+                                                    }
+                                                } else if op.as_deref() == Some("route.open") {
+                                                    if !open_delay.is_zero() {
+                                                        tokio::time::sleep(open_delay).await;
+                                                    }
+                                                    let response_body = json!({
+                                                        "op": "route.open",
+                                                        "route_channel": 42,
+                                                        "route_epoch": 1
+                                                    });
+                                                    let resp = Frame::build_with_version(
+                                                        frame.header.ver,
+                                                        FrameType::Response,
+                                                        frame.header.flags,
+                                                        frame.header.channel,
+                                                        frame.header.epoch,
+                                                        frame.header.corr,
+                                                        serde_json::to_vec(&response_body).expect("route open json"),
+                                                    )
+                                                    .expect("route open frame");
+                                                    if subc_transport::write_frame(&mut stream, &resp).await.is_err() {
+                                                        break;
+                                                    }
+                                                } else if op.as_deref() == Some("route.close") {
+                                                    let response_body = json!({ "op": "route.close" });
+                                                    let resp = Frame::build_with_version(
+                                                        frame.header.ver,
+                                                        FrameType::Response,
+                                                        frame.header.flags,
+                                                        frame.header.channel,
+                                                        frame.header.epoch,
+                                                        frame.header.corr,
+                                                        serde_json::to_vec(&response_body).expect("route close json"),
+                                                    )
+                                                    .expect("route close frame");
+                                                    if subc_transport::write_frame(&mut stream, &resp).await.is_err() {
+                                                        break;
+                                                    }
+                                                } else if frame.header.channel == 42 {
+                                                    let response_body = json!({
+                                                        "outcome": "result",
+                                                        "gh_route_schema": 1,
+                                                        "result": { "url": "https://github.com/cortexkit/aft/issues/1#issuecomment-123" },
+                                                        "field_order": ["url"]
+                                                    });
+                                                    let resp = Frame::build_with_version(
+                                                        frame.header.ver,
+                                                        FrameType::Response,
+                                                        frame.header.flags,
+                                                        frame.header.channel,
+                                                        frame.header.epoch,
+                                                        frame.header.corr,
+                                                        serde_json::to_vec(&response_body).expect("result json"),
+                                                    )
+                                                    .expect("result frame");
+                                                    if subc_transport::write_frame(&mut stream, &resp).await.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                });
+            });
+
+            Self {
+                port,
+                key,
+                daemon_id,
+                shutdown_tx: Some(shutdown_tx),
+                server_task: Some(server_task),
+            }
+        }
+
+        fn write_connection_file(&self, path: &Path) {
+            let conn = ConnectionInfo {
+                schema: SCHEMA_VERSION,
+                wire_version: Some(PROTOCOL_VERSION),
+                endpoints: vec![Endpoint {
+                    host: "127.0.0.1".to_string(),
+                    port: self.port,
+                }],
+                key: self.key.clone(),
+                daemon_id: self.daemon_id,
+                pid: std::process::id(),
+                daemon_ver: "gh-shim-test-daemon".to_string(),
+            };
+            connection_file::write_atomic(path, &conn).expect("write test daemon connection file");
+        }
+    }
+
+    impl Drop for SlowTestDaemon {
+        fn drop(&mut self) {
+            if let Some(tx) = self.shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+            let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+            if let Some(task) = self.server_task.take() {
+                let _ = task.join();
+            }
+        }
+    }
+
+    fn write_test_project_repo(root: &Path, repository: &str) -> PathBuf {
+        let project = root.join("test-project");
+        fs::create_dir_all(&project).expect("create project directory");
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&project)
+            .status()
+            .expect("init git repo");
+        Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                &format!("https://github.com/{repository}.git"),
+            ])
+            .current_dir(&project)
+            .status()
+            .expect("add git origin");
+        project
+    }
+
+    #[test]
+    fn probe_exceeded_at_catalog_list_names_stage_and_budget_in_status_and_refusal() {
+        let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+            catalog_delay: Duration::from_millis(400),
+            open_route_delay: Duration::ZERO,
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(temp.path().join("state"));
+        let conn_file = temp.path().join("subc-connection.json");
+        daemon.write_connection_file(&conn_file);
+        let project = write_test_project_repo(temp.path(), "cortexkit/aft");
+
+        let manifest = v12_fixture_manifest();
+        let now = unix_seconds();
+        write_signed_manifest(&paths, manifest, now);
+
+        let doc = json!({
+            "subc": { "connection_file": conn_file.to_str().unwrap() }
+        })
+        .to_string();
+
+        let determination = determine_rung_from_doc(
+            &paths,
+            &project,
+            now,
+            Instant::now() + DISCOVERY_BUDGET,
+            Some(&doc),
+        );
+        assert_eq!(determination.record.rung, Rung::R1);
+        assert_eq!(
+            determination.refusal_detail.as_deref(),
+            Some(
+                "governance probe exceeded 150 ms at catalog_list (daemon reachable; slow or busy)"
+            )
+        );
+
+        let last_probe = read_last_probe(&paths).expect("last probe record");
+        assert_eq!(last_probe.stage, "catalog_list");
+        assert_eq!(last_probe.outcome, "timed_out");
+        assert!(last_probe.elapsed_ms >= 150);
+
+        let report = render_self_report(&paths).expect("self report");
+        let status: Value = serde_json::from_str(&report).expect("status json");
+        assert_eq!(status["last_probe"]["stage"], "catalog_list");
+        assert_eq!(status["last_probe"]["outcome"], "timed_out");
+        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
+    }
+
+    #[test]
+    fn probe_exceeded_at_open_route_names_stage_and_budget_in_status_and_refusal() {
+        let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+            catalog_delay: Duration::ZERO,
+            open_route_delay: Duration::from_millis(400),
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(temp.path().join("state"));
+        let conn_file = temp.path().join("subc-connection.json");
+        daemon.write_connection_file(&conn_file);
+        let project = write_test_project_repo(temp.path(), "cortexkit/aft");
+
+        let manifest = v12_fixture_manifest();
+        let now = unix_seconds();
+        write_signed_manifest(&paths, manifest, now);
+
+        let doc = json!({
+            "subc": { "connection_file": conn_file.to_str().unwrap() }
+        })
+        .to_string();
+
+        let determination = determine_rung_from_doc(
+            &paths,
+            &project,
+            now,
+            Instant::now() + DISCOVERY_BUDGET,
+            Some(&doc),
+        );
+        assert_eq!(determination.record.rung, Rung::R1);
+        assert_eq!(
+            determination.refusal_detail.as_deref(),
+            Some("governance probe exceeded 150 ms at open_route (daemon reachable; slow or busy)")
+        );
+
+        let last_probe = read_last_probe(&paths).expect("last probe record");
+        assert_eq!(last_probe.stage, "open_route");
+        assert_eq!(last_probe.outcome, "timed_out");
+        assert!(last_probe.elapsed_ms >= 150);
+
+        let report = render_self_report(&paths).expect("self report");
+        let status: Value = serde_json::from_str(&report).expect("status json");
+        assert_eq!(status["last_probe"]["stage"], "open_route");
+        assert_eq!(status["last_probe"]["outcome"], "timed_out");
+        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
+    }
+
+    #[test]
+    fn probe_connect_refused_keeps_unreachable_outcome() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let port = listener.local_addr().expect("port").port();
+        drop(listener);
+
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(temp.path().join("state"));
+        let conn_file = temp.path().join("subc-connection.json");
+        let conn = ConnectionInfo {
+            schema: SCHEMA_VERSION,
+            wire_version: Some(PROTOCOL_VERSION),
+            endpoints: vec![Endpoint {
+                host: "127.0.0.1".to_string(),
+                port,
+            }],
+            key: vec![0x42; subc_transport::KEY_LEN],
+            daemon_id: [0x24; subc_transport::DAEMON_ID_LEN],
+            pid: std::process::id(),
+            daemon_ver: "dead".to_string(),
+        };
+        connection_file::write_atomic(&conn_file, &conn).expect("write connection file");
+        let project = write_test_project_repo(temp.path(), "cortexkit/aft");
+
+        let manifest = v12_fixture_manifest();
+        let now = unix_seconds();
+        write_signed_manifest(&paths, manifest, now);
+
+        let doc = json!({
+            "subc": { "connection_file": conn_file.to_str().unwrap() }
+        })
+        .to_string();
+
+        let determination = determine_rung_from_doc(
+            &paths,
+            &project,
+            now,
+            Instant::now() + DISCOVERY_BUDGET,
+            Some(&doc),
+        );
+        assert_eq!(determination.record.rung, Rung::R2);
+        assert_eq!(determination.refusal_detail, None);
+
+        let last_probe = read_last_probe(&paths).expect("last probe record");
+        assert_eq!(last_probe.stage, "connect");
+        assert_eq!(last_probe.outcome, "unreachable");
+
+        let report = render_self_report(&paths).expect("self report");
+        let status: Value = serde_json::from_str(&report).expect("status json");
+        assert_eq!(status["last_probe"]["stage"], "connect");
+        assert_eq!(status["last_probe"]["outcome"], "unreachable");
     }
 }
 
