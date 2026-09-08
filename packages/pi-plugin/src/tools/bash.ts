@@ -486,7 +486,7 @@ export function registerBashTool(
     label: registeredName,
     description: isPowerShell
       ? `Execute PowerShell commands through AFT.${compressionSentence}${tasksSentence}\n\nPowerShell syntax is not analyzed as POSIX shell. Each command requires explicit approval so syntax AFT cannot safely interpret is never auto-allowed.`
-      : `Execute shell commands.${compressionSentence}${tasksSentence}\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}.`,
+      : `Execute shell commands.${compressionSentence}${tasksSentence}\n\nDO NOT use bash for code search or code exploration. If you are about to run grep, rg, sed, awk, find, or cat through bash to locate or read code: STOP — ${searchSteer}. When a list is cut, the reply ends with \`shown N of M <unit> (<reason>) · narrow: <knobs>\`; absence of that line means the list is complete.`,
     promptSnippet: isPowerShell
       ? "Run PowerShell commands (timeout in milliseconds; supports workdir, background tasks, compressed output, PTY mode)"
       : bashCfg.background

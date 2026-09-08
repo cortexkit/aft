@@ -85,7 +85,8 @@ export function readingTools(ctx: PluginContext): Record<string, ToolDefinition>
         "  • directory path → outline source files under it\n" +
         "  • URL (http:// or https://) → fetch and outline a remote HTML/Markdown document\n" +
         "  • array of paths → outline multiple files in one call; with files:true, every path must be a directory" +
-        (githubOutlineDescription ? `\n\n${githubOutlineDescription}` : ""),
+        (githubOutlineDescription ? `\n\n${githubOutlineDescription}` : "") +
+        "\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
       args: {
         target: z
           .union([z.string(), z.array(z.string())])

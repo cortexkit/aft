@@ -116,6 +116,8 @@ AFT is **1 of the 3 plugins you'll ever need.** It perceives and acts; Magic Con
 - **`aft_inspect`**: a one-call codebase-health report covering LSP errors and warnings, TODOs, metrics, dead code, unused exports, and duplicates. The Problems and inspections panels an IDE keeps open, on demand.
 - **`grep` / `glob`**: trigram-indexed regex search and file discovery, built in the background, persisted to disk, and kept fresh by a file watcher.
 
+When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.
+
 ---
 
 ## ✋ Motor cortex: act

@@ -626,3 +626,103 @@ describe("hashline edit schema selection", () => {
     ).toBe(false);
   });
 });
+
+describe("truncation contract description parity", () => {
+  const TRUNCATION_SENTENCE =
+    "When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.";
+
+  test("truncation sentence is byte-identical across both plugins for every shared list tool", () => {
+    const opencode = openCodeTools(profileConfigs["REG-V049-OC-ALL"]) as Record<
+      string,
+      { description?: string }
+    >;
+    const pi = capturePiTools(profileConfigs["REG-V049-PI-ALL"]);
+    const sharedListTools = [
+      "aft_callgraph",
+      "aft_outline",
+      "aft_search",
+      "grep",
+      "aft_inspect",
+      "bash",
+    ];
+
+    for (const tool of sharedListTools) {
+      const ocDesc = opencode[tool]?.description ?? "";
+      const piDesc = (pi.get(tool) as { description?: string } | undefined)?.description ?? "";
+
+      const ocSentence = ocDesc.includes(TRUNCATION_SENTENCE) ? TRUNCATION_SENTENCE : null;
+      const piSentence = piDesc.includes(TRUNCATION_SENTENCE) ? TRUNCATION_SENTENCE : null;
+
+      expect(ocSentence, `cross-plugin identity mismatch for ${tool}`).toBe(piSentence);
+      expect(ocSentence, `missing truncation sentence in OpenCode ${tool}`).toBe(
+        TRUNCATION_SENTENCE,
+      );
+      expect(piSentence, `missing truncation sentence in Pi ${tool}`).toBe(TRUNCATION_SENTENCE);
+    }
+  });
+
+  test("truncation sentence appears exactly once per description of every registered surface's tool and in no other tool", () => {
+    const opencode = openCodeTools(profileConfigs["REG-V049-OC-ALL"]) as Record<
+      string,
+      { description?: string }
+    >;
+    const pi = capturePiTools(profileConfigs["REG-V049-PI-ALL"]);
+
+    const countOccurrences = (text: string, sub: string) => {
+      let count = 0;
+      let pos = 0;
+      while ((pos = text.indexOf(sub, pos)) !== -1) {
+        count++;
+        pos += sub.length;
+      }
+      return count;
+    };
+
+    const ocListTools = new Set([
+      "aft_callgraph",
+      "aft_outline",
+      "aft_search",
+      "grep",
+      "glob",
+      "aft_inspect",
+      "bash",
+    ]);
+
+    for (const [name, def] of Object.entries(opencode)) {
+      const occurrences = countOccurrences(def.description ?? "", TRUNCATION_SENTENCE);
+      if (ocListTools.has(name)) {
+        expect(
+          occurrences,
+          `OpenCode tool ${name} must contain truncation sentence exactly once`,
+        ).toBe(1);
+      } else {
+        expect(
+          occurrences,
+          `OpenCode non-list tool ${name} must not contain truncation sentence`,
+        ).toBe(0);
+      }
+    }
+
+    const piListTools = new Set([
+      "aft_callgraph",
+      "aft_outline",
+      "aft_search",
+      "grep",
+      "aft_inspect",
+      "bash",
+    ]);
+
+    for (const [name, def] of pi.entries()) {
+      const occurrences = countOccurrences(def.description ?? "", TRUNCATION_SENTENCE);
+      if (piListTools.has(name)) {
+        expect(occurrences, `Pi tool ${name} must contain truncation sentence exactly once`).toBe(
+          1,
+        );
+      } else {
+        expect(occurrences, `Pi non-list tool ${name} must not contain truncation sentence`).toBe(
+          0,
+        );
+      }
+    }
+  });
+});

@@ -38,7 +38,8 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
     // aft_callgraph) already describe themselves.
     description: [
       "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').",
-    ].join("\n"),
+      "When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
+    ].join("\n\n"),
     args: {
       query: arg(
         z

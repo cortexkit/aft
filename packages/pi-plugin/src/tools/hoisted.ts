@@ -795,7 +795,7 @@ export function registerHoistedTools(
         name: grepName,
         label: grepName,
         description:
-          "Search for a regex pattern across files. Uses AFT's trigram index inside the project root for fast repeated queries, and falls back to ripgrep for paths outside the project root.",
+          "Search for a regex pattern across files. Uses AFT's trigram index inside the project root for fast repeated queries, and falls back to ripgrep for paths outside the project root. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
         promptSnippet: "Fast regex search across files (trigram-indexed inside the project root)",
         promptGuidelines: [`Prefer ${grepName} over bash-invoked find/rg for in-project searches.`],
         parameters: GrepParams,

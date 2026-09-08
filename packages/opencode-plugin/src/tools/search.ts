@@ -151,7 +151,7 @@ export function splitIncludeArg(raw: string): string[] {
 export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const grepTool: ToolDefinition = {
     description:
-      "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Capped at 100 matches; if you hit the cap, narrow with `path` or `include` and re-run.",
+      "Search file contents using regular expressions. Returns matching lines with file paths and line numbers (no surrounding context lines — use `read` for that). Always case-sensitive. Capped at 100 matches; if you hit the cap, narrow with `path` or `include` and re-run. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
     args: {
       pattern: arg(z.string().describe("Regular expression pattern to search for")),
       include: arg(
@@ -214,7 +214,7 @@ export function searchTools(ctx: PluginContext): Record<string, ToolDefinition> 
 
   const globTool: ToolDefinition = {
     description:
-      "Find files matching a glob pattern. Returns matching file paths sorted by modification time.",
+      "Find files matching a glob pattern. Returns matching file paths sorted by modification time. When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
     args: {
       pattern: arg(
         z.string().describe("Glob pattern to match (e.g. '**/*.ts', 'src/**/*.test.*')"),
