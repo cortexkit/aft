@@ -206,9 +206,14 @@ fn timed_out_probe_is_cached_and_second_binary_start_is_fast() {
     assert_eq!(fs::read_to_string(&marker).unwrap(), "x");
 
     let (second_elapsed, second_response) = run_ping(&storage, &home, shell.as_os_str(), &marker);
+    // Same rule as the fallback-path sibling: each run spawns and configures a
+    // fresh binary, so an absolute bound measures runner load (534 ms on a
+    // contended macOS runner, train 48). The cache's observable is the absent
+    // ~2 s timeout probe, so bound the second run relative to the first; the
+    // marker proves the shell was not re-invoked.
     assert!(
-        second_elapsed < Duration::from_millis(500),
-        "cached timeout path took {second_elapsed:?}"
+        second_elapsed + Duration::from_millis(1500) < first_elapsed,
+        "cached timeout path took {second_elapsed:?} against a first run of {first_elapsed:?}"
     );
     assert_eq!(second_response["id"], "1");
     assert_eq!(
