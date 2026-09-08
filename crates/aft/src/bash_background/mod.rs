@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-pub use registry::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry};
+pub use registry::{BgCompletion, BgTaskHealthCounts, BgTaskRegistry, WatchdogPassCause};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]

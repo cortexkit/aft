@@ -240,6 +240,15 @@ pub struct BgTaskRegistry {
     pub(crate) inner: Arc<RegistryInner>,
 }
 
+/// What woke the watchdog pass in which a task was observed terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchdogPassCause {
+    /// A `wake_tx` send (reader or waiter signalled).
+    Wake,
+    /// The periodic ticker.
+    Tick,
+}
+
 pub(crate) struct RegistryInner {
     pub(crate) tasks: Mutex<HashMap<String, Arc<BgTask>>>,
     pub(crate) completions: Mutex<VecDeque<BgCompletion>>,
@@ -267,6 +276,10 @@ pub(crate) struct RegistryInner {
     pub(crate) compression_aggregates: Arc<CompressionAggregateCache>,
     pub(crate) wake_tx: crossbeam_channel::Sender<()>,
     pub(crate) wake_rx: crossbeam_channel::Receiver<()>,
+    /// Which watchdog pass observed each task reach a terminal state: the
+    /// wake channel or the periodic ticker. Tests assert the mechanism from
+    /// this record instead of racing the 500 ms ticker on the wall clock.
+    pub(crate) completion_pass_cause: Mutex<HashMap<String, WatchdogPassCause>>,
     pub(crate) watch_registry: Mutex<WatchRegistry>,
     wait_detach_sessions: Mutex<HashSet<String>>,
     active_wait_sessions: Mutex<HashMap<String, usize>>,
@@ -321,6 +334,16 @@ fn completion_matches_session(completion: &BgCompletion, session_id: Option<&str
 }
 
 impl BgTaskRegistry {
+    /// The watchdog pass cause recorded when `task_id` was first observed
+    /// terminal, if the watchdog (rather than a status poll) observed it.
+    pub fn completion_pass_cause(&self, task_id: &str) -> Option<WatchdogPassCause> {
+        self.inner
+            .completion_pass_cause
+            .lock()
+            .ok()
+            .and_then(|map| map.get(task_id).copied())
+    }
+
     pub fn new(progress_sender: SharedProgressSender) -> Self {
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(1);
         Self {
@@ -342,6 +365,7 @@ impl BgTaskRegistry {
                 compression_aggregates: Arc::new(CompressionAggregateCache::default()),
                 wake_tx,
                 wake_rx,
+                completion_pass_cause: Mutex::new(HashMap::new()),
                 watch_registry: Mutex::new(WatchRegistry::default()),
                 wait_detach_sessions: Mutex::new(HashSet::new()),
                 active_wait_sessions: Mutex::new(HashMap::new()),

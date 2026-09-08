@@ -417,10 +417,18 @@ fn pty_watchdog_wake_channel_triggers_immediate_completion() {
     assert_eq!(completion.status, BgTaskStatus::Completed);
 
     // The command waits for this test to arm it after spawn_pty returns, so the
-    // reader/waiter cannot signal before the task is registered. A completion
-    // under 450ms is below the 500ms watchdog interval, leaving a 50ms guard at
-    // the boundary while still proving the wake channel beat the periodic poll.
-    assert!(started.elapsed() < Duration::from_millis(450));
+    // reader/waiter cannot signal before the task is registered. The watchdog
+    // records which pass observed the task terminal; asserting on that record
+    // proves the wake channel beat the 500 ms periodic poll without racing a
+    // contended runner's scheduler on the wall clock (the earlier 450 ms bound
+    // failed on a loaded Linux CI runner with the mechanism intact). The
+    // elapsed bound that remains is liveness only.
+    assert_eq!(
+        registry.completion_pass_cause(&task_id),
+        Some(aft::bash_background::WatchdogPassCause::Wake),
+        "completion must be observed by a wake-channel pass, not the periodic ticker"
+    );
+    assert!(started.elapsed() < Duration::from_secs(30));
 }
 
 #[test]

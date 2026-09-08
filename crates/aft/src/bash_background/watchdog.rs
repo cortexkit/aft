@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crossbeam_channel::tick;
 
-use super::registry::BgTaskRegistry;
+use super::registry::{BgTaskRegistry, WatchdogPassCause};
 const WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 const FINISHED_RETENTION: Duration = Duration::from_secs(60 * 60);
@@ -15,18 +15,19 @@ pub(crate) fn start(registry: BgTaskRegistry) {
         let cleanup_ticker = tick(CLEANUP_INTERVAL);
         let wake_rx = registry.inner.wake_rx.clone();
         while !registry.inner.shutdown.load(Ordering::SeqCst) {
-            crossbeam_channel::select! {
+            let pass_cause = crossbeam_channel::select! {
                 recv(ticker) -> tick => {
                     if tick.is_err() {
                         break;
                     }
+                    WatchdogPassCause::Tick
                 }
                 recv(cleanup_ticker) -> _ => {
                     registry.cleanup_finished(FINISHED_RETENTION);
                     continue;
                 }
-                recv(wake_rx) -> _ => {}
-            }
+                recv(wake_rx) -> _ => WatchdogPassCause::Wake,
+            };
 
             if registry.inner.shutdown.load(Ordering::SeqCst) {
                 break;
@@ -43,6 +44,9 @@ pub(crate) fn start(registry: BgTaskRegistry) {
                 let _ = registry.poll_task(&task);
                 registry.scan_task_watch_output(&task);
                 if !task.is_running() {
+                    if let Ok(mut causes) = registry.inner.completion_pass_cause.lock() {
+                        causes.entry(task.task_id.clone()).or_insert(pass_cause);
+                    }
                     continue;
                 }
 
