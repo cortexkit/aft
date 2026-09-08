@@ -1164,6 +1164,8 @@ fn quiesce_unbound_root(
         // ConfigureTail cannot release gates, install a watcher, or reserve a
         // callgraph build after this transition becomes visible.
         ctx.mark_subc_unbound();
+        ctx.bash_background()
+            .replace_live_delivery_sessions(HashSet::new());
     }
     let cancelled = executor.cancel_queued_maintenance(root_id);
     // Transient unbind keeps the root WARM: the watcher stays running (its
@@ -2093,6 +2095,26 @@ fn insert_route_channel(
         .insert(channel);
 }
 
+fn sync_bg_live_delivery_sessions(
+    executor: &Executor,
+    root: &ProjectRootId,
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+) {
+    let Some(ctx) = executor.actor_context(root) else {
+        return;
+    };
+    // The loop-owned installed-route table is the lifecycle source of truth:
+    // an originating session is live exactly while this root has an installed,
+    // bash-observation-capable route whose identity names that session.
+    let sessions = routes
+        .values()
+        .filter(|identity| &identity.root == root && identity.trust.allows_bash_observation())
+        .map(|identity| identity.session.clone())
+        .collect();
+    ctx.bash_background()
+        .replace_live_delivery_sessions(sessions);
+}
+
 fn insert_bg_subscription_index(
     bg_sub_by_session: &mut BgSubsBySession,
     root: ProjectRootId,
@@ -2288,6 +2310,7 @@ async fn teardown_installed_route(
     // cannot run before the route is removed and a completion is recorded for replay.
     delay_route_detach_for_test(lifecycle_probe).await;
     if let Some(identity) = remove_route_channel(routes, root_channels, channel) {
+        sync_bg_live_delivery_sessions(executor, &identity.root, routes);
         if let Some(probe) = lifecycle_probe {
             probe.route_detached(channel, &identity.session);
         }
@@ -4171,6 +4194,7 @@ async fn handle_route_bind_completion(
     let replay_key = push::ReplayKey::from_identity(&completion.identity);
     let bind_trust = completion.identity.trust;
     insert_route_channel(routes, root_channels, route_id, completion.identity);
+    sync_bg_live_delivery_sessions(executor, &completion.bind_root_id, routes);
     let restore_watcher = live_roots
         .get(&completion.bind_root_id)
         .is_some_and(|meta| meta.idle_artifacts_evicted || meta.unbound_quiesced);
@@ -4669,6 +4693,7 @@ async fn handle_control_request(
                 root_was_live,
             );
 
+            sync_bg_live_delivery_sessions(executor, &bind_root_id, routes);
             let configure_request_id = configure_req.id.clone();
             installed_route_epochs.insert(route_channel, epoch);
             if let Some(meta) = live_roots.get_mut(&bind_root_id) {
