@@ -105,7 +105,7 @@ pub(super) fn render_document_for_resource(
     render_timeline(&mut output, &discussion);
 
     output.push_str(&format!(
-        "Discussion drill-down: {}/comments/<sel> (for example 3, 3-5, or 3,7).\n\n",
+        "Discussion drill-down: {}/comments/<sel> (for example 3, 3-5, 3,7, or -1).\n\n",
         resource.base_spelling()
     ));
     Ok(output)
@@ -315,21 +315,21 @@ fn render_selected_discussion(
     selector: &GithubCommentSelector,
 ) -> Result<String, GithubReadError> {
     let items = discussion_items(document);
-    if let Some(ordinal) = selector.first_out_of_range(items.len()) {
+    let resolved = selector.resolve(items.len()).map_err(|ordinal| {
         let valid_range = if items.is_empty() {
             "empty".to_string()
         } else {
             format!("1-{}", items.len())
         };
-        return Err(GithubReadError::InvalidCommentSelector(format!(
+        GithubReadError::InvalidCommentSelector(format!(
             "discussion ordinal {ordinal} is out of range; valid range is {valid_range}"
-        )));
-    }
+        ))
+    })?;
 
     let mut output = String::new();
     for (index, item) in items.into_iter().enumerate() {
         let ordinal = index + 1;
-        if !selector.contains(ordinal) {
+        if !resolved.contains(ordinal) {
             continue;
         }
         render_item_heading(&mut output, ordinal, item.author(), item.date());
@@ -824,6 +824,69 @@ mod tests {
         assert!(rendered.contains("## Timeline\n\n### [3] @aft-alfonso[bot]"));
         assert!(selected.contains("Event: closed"));
         assert!(selected.contains("0123456789abcdef"));
+    }
+
+    #[test]
+    fn zoom_parity_via_shared_enumeration() {
+        let document = GithubDocument {
+            repository: "cortexkit/aft".to_string(),
+            kind: GithubDocumentKind::PullRequest,
+            number: 999,
+            title: "Timeline fixture".to_string(),
+            state: "OPEN".to_string(),
+            comments: vec![
+                GithubComment {
+                    author: Some("commenter".to_string()),
+                    body: "First comment".to_string(),
+                    created_at: Some("2026-09-03T05:10:00Z".to_string()),
+                    ..GithubComment::default()
+                },
+                GithubComment {
+                    author: Some("commenter".to_string()),
+                    body: "Last comment".to_string(),
+                    created_at: Some("2026-09-03T06:50:00Z".to_string()),
+                    ..GithubComment::default()
+                },
+            ],
+            timeline: vec![GithubTimelineEvent {
+                actor: Some("aft-alfonso[bot]".to_string()),
+                event: "closed".to_string(),
+                created_at: Some("2026-09-03T06:57:00Z".to_string()),
+                commit_id: Some("0123456789abcdef".to_string()),
+                ..GithubTimelineEvent::default()
+            }],
+            ..GithubDocument::default()
+        };
+        let resource = GithubResource {
+            kind: GithubResourceKind::PullRequest,
+            number: 999,
+            repository: Some("cortexkit/aft".to_string()),
+            comment_selector: None,
+        };
+
+        let outline = render_outline_for_resource(&document, &resource);
+        assert!(outline.contains("[3] event(closed) @aft-alfonso[bot] 2026-09-03 06:57"));
+
+        let positive = render_document_for_resource(
+            &document,
+            &GithubResource {
+                comment_selector: Some(GithubCommentSelector::parse("3").unwrap()),
+                ..resource.clone()
+            },
+        )
+        .unwrap();
+
+        let tail = render_document_for_resource(
+            &document,
+            &GithubResource {
+                comment_selector: Some(GithubCommentSelector::parse("-1").unwrap()),
+                ..resource.clone()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(tail, positive);
+        assert!(tail.contains("Event: closed"));
     }
 
     #[test]

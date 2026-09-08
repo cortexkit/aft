@@ -67,4 +67,4 @@ The latest inline comment remains complete.
 
 Minimized comments: 1
 
-Discussion drill-down: pr://cortexkit/aft/42/comments/<sel> (for example 3, 3-5, or 3,7).
+Discussion drill-down: pr://cortexkit/aft/42/comments/<sel> (for example 3, 3-5, 3,7, or -1).

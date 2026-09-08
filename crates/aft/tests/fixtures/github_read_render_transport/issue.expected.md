@@ -37,4 +37,4 @@ The newest fetched issue comment includes https://github.com/user-attachments/fi
 
 Minimized comments: 2
 
-Discussion drill-down: issue://cortexkit/aft/73/comments/<sel> (for example 3, 3-5, or 3,7).
+Discussion drill-down: issue://cortexkit/aft/73/comments/<sel> (for example 3, 3-5, 3,7, or -1).

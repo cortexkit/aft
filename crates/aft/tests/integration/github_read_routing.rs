@@ -157,7 +157,7 @@ fn github_read_routes_short_and_explicit_forms_without_filesystem_rendering() {
 
     let issue = read_response(&mut aft, "github-issue", "issue://7", json!({}));
     assert_eq!(issue["success"], true, "issue read failed: {issue:#}");
-    assert_eq!(issue["content"].as_str(), Some("# Issue #7: Fixture issue\n\nRepository: owner/repo\nState: OPEN\n\n## Body\n\none\ntwo\nthree\nhttps://github.com/user-attachments/files/7/screenshot.png\n\nDiscussion drill-down: issue://7/comments/<sel> (for example 3, 3-5, or 3,7).\n\n"));
+    assert_eq!(issue["content"].as_str(), Some("# Issue #7: Fixture issue\n\nRepository: owner/repo\nState: OPEN\n\n## Body\n\none\ntwo\nthree\nhttps://github.com/user-attachments/files/7/screenshot.png\n\nDiscussion drill-down: issue://7/comments/<sel> (for example 3, 3-5, 3,7, or -1).\n\n"));
     assert_eq!(
         issue["attachments"],
         json!([]),
@@ -178,7 +178,7 @@ fn github_read_routes_short_and_explicit_forms_without_filesystem_rendering() {
     );
     assert_eq!(
         pull_request["content"].as_str(),
-        Some("# Pull request #9: Fixture pull request\n\nRepository: owner/repo\nState: OPEN\n\n## Body\n\npull request body\n\nDiscussion drill-down: pr://owner/repo/9/comments/<sel> (for example 3, 3-5, or 3,7).\n\n")
+        Some("# Pull request #9: Fixture pull request\n\nRepository: owner/repo\nState: OPEN\n\n## Body\n\npull request body\n\nDiscussion drill-down: pr://owner/repo/9/comments/<sel> (for example 3, 3-5, 3,7, or -1).\n\n")
     );
 
     assert!(aft.shutdown().success());
@@ -248,6 +248,41 @@ fn github_outline_zoom_and_read_share_timeline_ordinals() {
     );
     assert_eq!(selected["success"], true, "selector failed: {selected:#}");
     assert_eq!(selected["content"], zoom["content"]);
+
+    let zoom_tail = aft.send(
+        &json!({
+            "id": "timeline-zoom-tail",
+            "command": "zoom",
+            "file": resource,
+            "symbols": ["-1"],
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        zoom_tail["success"], true,
+        "zoom tail failed: {zoom_tail:#}"
+    );
+
+    let selected_tail = read_response(
+        &mut aft,
+        "timeline-selector-tail",
+        &format!("{resource}/comments/-1"),
+        json!({}),
+    );
+    assert_eq!(
+        selected_tail["success"], true,
+        "selector tail failed: {selected_tail:#}"
+    );
+    assert_eq!(selected_tail["content"], zoom_tail["content"]);
+
+    let selected_last_positive = read_response(
+        &mut aft,
+        "timeline-selector-last",
+        &format!("{resource}/comments/9"),
+        json!({}),
+    );
+    assert_eq!(selected_last_positive["success"], true);
+    assert_eq!(selected_tail["content"], selected_last_positive["content"]);
 
     assert!(aft.shutdown().success());
 }

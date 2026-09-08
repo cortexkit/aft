@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 use std::ops::RangeInclusive;
 
@@ -33,10 +34,47 @@ impl GithubResourceKind {
     }
 }
 
+/// An item in a discussion comment selector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SelectorItem {
+    /// 1-based ordinal range from the start: `start..=end`.
+    Positive(RangeInclusive<usize>),
+    /// 1-based ordinal range from the end:
+    /// `start` is distance from end (e.g. 3 for -3), `end` is distance from end (e.g. 1 for -1).
+    /// In chronological order, `start >= end`.
+    Negative { start: usize, end: usize },
+}
+
+/// One resolved selection of discussion ordinals.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedCommentSelector {
+    ranges: Vec<RangeInclusive<usize>>,
+}
+
+impl ResolvedCommentSelector {
+    pub fn contains(&self, ordinal: usize) -> bool {
+        self.ranges.iter().any(|range| range.contains(&ordinal))
+    }
+
+    pub fn ranges(&self) -> &[RangeInclusive<usize>] {
+        &self.ranges
+    }
+
+    pub fn ordinals(&self) -> BTreeSet<usize> {
+        let mut ordinals = BTreeSet::new();
+        for range in &self.ranges {
+            for ordinal in range.clone() {
+                ordinals.insert(ordinal);
+            }
+        }
+        ordinals
+    }
+}
+
 /// Ordinals selected by a `/comments/<sel>` discussion drill-down.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GithubCommentSelector {
-    ranges: Vec<RangeInclusive<usize>>,
+    items: Vec<SelectorItem>,
 }
 
 impl GithubCommentSelector {
@@ -46,14 +84,47 @@ impl GithubCommentSelector {
     }
 
     pub fn contains(&self, ordinal: usize) -> bool {
-        self.ranges.iter().any(|range| range.contains(&ordinal))
+        self.items.iter().any(|item| match item {
+            SelectorItem::Positive(range) => range.contains(&ordinal),
+            SelectorItem::Negative { .. } => false,
+        })
     }
 
-    pub fn first_out_of_range(&self, valid_end: usize) -> Option<usize> {
-        self.ranges
-            .iter()
-            .flat_map(|range| [*range.start(), *range.end()])
-            .find(|ordinal| *ordinal > valid_end)
+    /// Resolve the selector against a discussion's total item count.
+    ///
+    /// Returns the resolved set of 1-based ordinal ranges, or the first ordinal
+    /// (positive or negative) that was out of range.
+    pub fn resolve(&self, total_count: usize) -> Result<ResolvedCommentSelector, isize> {
+        let mut ranges = Vec::new();
+        for item in &self.items {
+            match item {
+                SelectorItem::Positive(range) => {
+                    if total_count == 0 {
+                        return Err(*range.start() as isize);
+                    }
+                    if *range.start() > total_count {
+                        return Err(*range.start() as isize);
+                    }
+                    if *range.end() > total_count {
+                        return Err(*range.end() as isize);
+                    }
+                    ranges.push(range.clone());
+                }
+                SelectorItem::Negative { start, end } => {
+                    if total_count == 0 || *start > total_count {
+                        return Err(-(*start as isize));
+                    }
+                    let resolved_start = total_count - *start + 1;
+                    let resolved_end = total_count - *end + 1;
+                    ranges.push(resolved_start..=resolved_end);
+                }
+            }
+        }
+        Ok(ResolvedCommentSelector { ranges })
+    }
+
+    pub fn first_out_of_range(&self, valid_end: usize) -> Option<isize> {
+        self.resolve(valid_end).err()
     }
 }
 
@@ -235,7 +306,13 @@ fn parse_comment_selector(
     resource: &str,
     selector: &str,
 ) -> Result<GithubCommentSelector, InvalidGithubResource> {
-    let mut ranges = Vec::new();
+    if selector.is_empty() {
+        return Err(InvalidGithubResource::new(
+            resource,
+            "comment selector is empty",
+        ));
+    }
+    let mut items = Vec::new();
     for item in selector.split(',') {
         if item.is_empty() {
             return Err(InvalidGithubResource::new(
@@ -243,42 +320,91 @@ fn parse_comment_selector(
                 "comment selector contains an empty item",
             ));
         }
-        let range = if let Some((start, end)) = item.split_once('-') {
-            if end.contains('-') {
-                return Err(InvalidGithubResource::new(
-                    resource,
-                    "comment selector ranges contain exactly one hyphen",
-                ));
-            }
-            let start = parse_ordinal(resource, start)?;
-            let end = parse_ordinal(resource, end)?;
-            if start > end {
-                return Err(InvalidGithubResource::new(
-                    resource,
-                    "comment selector range start exceeds its end",
-                ));
-            }
-            start..=end
-        } else {
-            let ordinal = parse_ordinal(resource, item)?;
-            ordinal..=ordinal
-        };
-        ranges.push(range);
+        let parsed = parse_selector_item(resource, item)?;
+        items.push(parsed);
     }
-    if ranges.is_empty() {
-        return Err(InvalidGithubResource::new(
-            resource,
-            "comment selector is empty",
-        ));
-    }
-    Ok(GithubCommentSelector { ranges })
+    Ok(GithubCommentSelector { items })
 }
 
-fn parse_ordinal(resource: &str, value: &str) -> Result<usize, InvalidGithubResource> {
+fn parse_selector_item(resource: &str, item: &str) -> Result<SelectorItem, InvalidGithubResource> {
+    if let Some(rest) = item.strip_prefix('-') {
+        if rest.is_empty() || rest.starts_with('-') {
+            return Err(InvalidGithubResource::new(
+                resource,
+                "comment selector ordinals must be non-zero integers (for example 3, 3-5, 3,7, or -1)",
+            ));
+        }
+        if let Some((start_str, after_hyphen)) = rest.split_once('-') {
+            let start_mag = parse_ordinal_magnitude(resource, start_str)?;
+            if after_hyphen.is_empty() {
+                Ok(SelectorItem::Negative {
+                    start: start_mag,
+                    end: 1,
+                })
+            } else if let Some(end_str) = after_hyphen.strip_prefix('-') {
+                if end_str.contains('-') {
+                    return Err(InvalidGithubResource::new(
+                        resource,
+                        "comment selector ranges contain exactly one hyphen",
+                    ));
+                }
+                let end_mag = parse_ordinal_magnitude(resource, end_str)?;
+                if start_mag < end_mag {
+                    return Err(InvalidGithubResource::new(
+                        resource,
+                        "comment selector range start exceeds its end",
+                    ));
+                }
+                Ok(SelectorItem::Negative {
+                    start: start_mag,
+                    end: end_mag,
+                })
+            } else {
+                Err(InvalidGithubResource::new(
+                    resource,
+                    "comment selector ordinals must be non-zero integers (for example 3, 3-5, 3,7, or -1)",
+                ))
+            }
+        } else {
+            let mag = parse_ordinal_magnitude(resource, rest)?;
+            Ok(SelectorItem::Negative {
+                start: mag,
+                end: mag,
+            })
+        }
+    } else if let Some((start_str, end_str)) = item.split_once('-') {
+        if end_str.contains('-') || end_str.starts_with('-') {
+            return Err(InvalidGithubResource::new(
+                resource,
+                "comment selector ranges contain exactly one hyphen",
+            ));
+        }
+        if end_str.is_empty() {
+            return Err(InvalidGithubResource::new(
+                resource,
+                "comment selector ordinals must be non-zero integers (for example 3, 3-5, 3,7, or -1)",
+            ));
+        }
+        let start = parse_ordinal_magnitude(resource, start_str)?;
+        let end = parse_ordinal_magnitude(resource, end_str)?;
+        if start > end {
+            return Err(InvalidGithubResource::new(
+                resource,
+                "comment selector range start exceeds its end",
+            ));
+        }
+        Ok(SelectorItem::Positive(start..=end))
+    } else {
+        let ordinal = parse_ordinal_magnitude(resource, item)?;
+        Ok(SelectorItem::Positive(ordinal..=ordinal))
+    }
+}
+
+fn parse_ordinal_magnitude(resource: &str, value: &str) -> Result<usize, InvalidGithubResource> {
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(InvalidGithubResource::new(
             resource,
-            "comment selector ordinals must be positive integers",
+            "comment selector ordinals must be non-zero integers (for example 3, 3-5, 3,7, or -1)",
         ));
     }
     let ordinal = value.parse::<usize>().map_err(|_| {
@@ -287,7 +413,7 @@ fn parse_ordinal(resource: &str, value: &str) -> Result<usize, InvalidGithubReso
     if ordinal == 0 {
         return Err(InvalidGithubResource::new(
             resource,
-            "comment selector ordinals must be greater than zero",
+            "comment selector ordinals must be non-zero integers (for example 3, 3-5, 3,7, or -1)",
         ));
     }
     Ok(ordinal)
@@ -362,8 +488,136 @@ mod tests {
             "pr://45/comments/3-5-7",
             "pr://45/comments/3,,7",
             "pr://owner/repo/45/comments/3/extra",
+            "pr://45/comments/--1",
+            "pr://45/comments/-0",
+            "pr://45/comments/1--3",
         ] {
             assert!(parse_resource(value).is_err(), "{value}");
         }
+    }
+
+    #[test]
+    fn comment_selector_parser_table() {
+        // Positive
+        for (input, expected) in [
+            ("3", vec![SelectorItem::Positive(3..=3)]),
+            ("3-5", vec![SelectorItem::Positive(3..=5)]),
+            (
+                "3,7",
+                vec![SelectorItem::Positive(3..=3), SelectorItem::Positive(7..=7)],
+            ),
+        ] {
+            let selector = GithubCommentSelector::parse(input).unwrap();
+            assert_eq!(selector.items, expected, "input: {input}");
+        }
+
+        // Negative
+        for (input, expected) in [
+            ("-1", vec![SelectorItem::Negative { start: 1, end: 1 }]),
+            ("-3", vec![SelectorItem::Negative { start: 3, end: 3 }]),
+            ("-3-", vec![SelectorItem::Negative { start: 3, end: 1 }]),
+            ("-3--1", vec![SelectorItem::Negative { start: 3, end: 1 }]),
+            (
+                "-3,-1",
+                vec![
+                    SelectorItem::Negative { start: 3, end: 3 },
+                    SelectorItem::Negative { start: 1, end: 1 },
+                ],
+            ),
+        ] {
+            let selector = GithubCommentSelector::parse(input).unwrap();
+            assert_eq!(selector.items, expected, "input: {input}");
+        }
+
+        // Mixed
+        for (input, expected) in [
+            (
+                "2,-1",
+                vec![
+                    SelectorItem::Positive(2..=2),
+                    SelectorItem::Negative { start: 1, end: 1 },
+                ],
+            ),
+            (
+                "-3,5",
+                vec![
+                    SelectorItem::Negative { start: 3, end: 3 },
+                    SelectorItem::Positive(5..=5),
+                ],
+            ),
+            (
+                "1-3,-1",
+                vec![
+                    SelectorItem::Positive(1..=3),
+                    SelectorItem::Negative { start: 1, end: 1 },
+                ],
+            ),
+            (
+                "2,-3-",
+                vec![
+                    SelectorItem::Positive(2..=2),
+                    SelectorItem::Negative { start: 3, end: 1 },
+                ],
+            ),
+        ] {
+            let selector = GithubCommentSelector::parse(input).unwrap();
+            assert_eq!(selector.items, expected, "input: {input}");
+        }
+
+        // Malformed (including explicitly required: `--1`, `-0`, `1--3`)
+        for input in [
+            "--1", "-0", "1--3", "0", "1-", "-3-5", "-1--3", "5-3", "3-5-7", "-3--1--2", "-",
+            "---", "", "3,,7", ",1", "1,", "abc", "-abc", "1-abc", "-3--abc",
+        ] {
+            assert!(
+                GithubCommentSelector::parse(input).is_err(),
+                "malformed input must be rejected: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn comment_selector_resolution_against_5_item_fixture() {
+        // -1 -> 5
+        let selector = GithubCommentSelector::parse("-1").unwrap();
+        let resolved = selector.resolve(5).unwrap();
+        assert_eq!(resolved.ordinals(), BTreeSet::from([5]));
+        assert_eq!(resolved.ranges(), &[5..=5]);
+
+        // -3- -> 3..=5
+        let selector = GithubCommentSelector::parse("-3-").unwrap();
+        let resolved = selector.resolve(5).unwrap();
+        assert_eq!(resolved.ranges(), &[3..=5]);
+        assert_eq!(resolved.ordinals(), BTreeSet::from([3, 4, 5]));
+
+        // -3--1 -> 3..=5
+        let selector = GithubCommentSelector::parse("-3--1").unwrap();
+        let resolved = selector.resolve(5).unwrap();
+        assert_eq!(resolved.ranges(), &[3..=5]);
+
+        // 2,-1 -> {2, 5}
+        let selector = GithubCommentSelector::parse("2,-1").unwrap();
+        let resolved = selector.resolve(5).unwrap();
+        assert_eq!(resolved.ordinals(), BTreeSet::from([2, 5]));
+        assert!(resolved.contains(2));
+        assert!(resolved.contains(5));
+        assert!(!resolved.contains(1));
+        assert!(!resolved.contains(3));
+        assert!(!resolved.contains(4));
+
+        // -9 error
+        let selector = GithubCommentSelector::parse("-9").unwrap();
+        let err = selector.resolve(5).unwrap_err();
+        assert_eq!(err, -9);
+
+        // Positive out of range error
+        let selector = GithubCommentSelector::parse("9").unwrap();
+        let err = selector.resolve(5).unwrap_err();
+        assert_eq!(err, 9);
+
+        // Empty discussion error
+        let selector = GithubCommentSelector::parse("-1").unwrap();
+        let err = selector.resolve(0).unwrap_err();
+        assert_eq!(err, -1);
     }
 }

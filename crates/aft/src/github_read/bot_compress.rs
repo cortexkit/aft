@@ -689,6 +689,34 @@ mod tests {
     }
 
     #[test]
+    fn render_selected_discussion_tail_ordinal_returns_last_comment() {
+        let document = fixture(270);
+        let resource_positive = parse_resource("pr://cortexkit/aft/270/comments/71").unwrap();
+        let resource_tail = parse_resource("pr://cortexkit/aft/270/comments/-1").unwrap();
+
+        let rendered_positive =
+            render_document_for_resource(&document, &resource_positive).unwrap();
+        let rendered_tail = render_document_for_resource(&document, &resource_tail).unwrap();
+
+        assert_eq!(rendered_tail, rendered_positive);
+        assert!(rendered_tail.starts_with("### [71] @"));
+
+        let error_tail = render_document_for_resource(
+            &document,
+            &parse_resource("pr://cortexkit/aft/270/comments/-999").unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(error_tail.code(), "invalid_comment_selector");
+        assert!(matches!(
+            error_tail,
+            GithubReadError::InvalidCommentSelector(_)
+        ));
+        assert!(error_tail
+            .to_string()
+            .contains("discussion ordinal -999 is out of range; valid range is 1-71"));
+    }
+
+    #[test]
     fn html_noise_only_known_bot_body_emits_only_its_honest_label() {
         let body = "<!-- cubic:v=fixture -->\n<details><summary>Prompt for AI agents</summary>noise</details>";
         let compressed = compress_discussion_body(Some("cubic-dev-ai"), body);
