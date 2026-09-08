@@ -32,6 +32,7 @@ import {
   consumeBgCompletion,
   formatSystemReminder,
   handlePushedBgCompletion,
+  handlePushedPatternMatch,
   handleSubcBgEventsNudge,
   handleTurnEndBgCompletions,
   ingestBgCompletions,
@@ -662,6 +663,44 @@ describe("Pi background notifications", () => {
 });
 
 describe("Pi subc forced-drain dedup (C-#1 / C-#3)", () => {
+  test("a pushed watch-only tombstone is acked under its row session after delivery", async () => {
+    const bridgeCalls: Array<{ command: string; params: Record<string, unknown> }> = [];
+    const send = mock(async (command: string, params: Record<string, unknown>) => {
+      bridgeCalls.push({ command, params });
+      return { success: true, acked_task_ids: ["task-erased"] };
+    });
+    const { ctx } = harness(send);
+    const sendUserMessage = mock(() => {});
+
+    await handlePushedPatternMatch(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "row-session",
+        runtime: { sendUserMessage },
+      },
+      {
+        task_id: "task-erased",
+        session_id: "row-session",
+        watch_id: "watch-erased",
+        match_text: "watch target erased",
+        match_offset: 0,
+        context:
+          "watch target erased: the background task row was erased before the watch reached a normal terminal result",
+        once: true,
+        reason: "task_exit",
+      },
+    );
+    await waitForMockCallCount(sendUserMessage, 1);
+    await sleep(50);
+
+    expect(sendUserMessage.mock.calls[0]?.[0]).toContain("watch target erased");
+    expect(bridgeCalls).toContainEqual({
+      command: "bash_ack_completions",
+      params: { session_id: "row-session", task_ids: ["task-erased"] },
+    });
+  });
+
   test("an erased-bundle replay is acked after delivery and stays gone on reopen", async () => {
     let pending = true;
     const events: string[] = [];
