@@ -73,6 +73,52 @@ pub fn build_envelope_from_output(
     build_bash_output_envelope(shown, input_line_count)
 }
 
+/// Append the text-surface trailer and return its envelope when compression dropped lines.
+///
+/// The trailer is itself part of the agent-facing line count, so `shown` includes the
+/// one line appended here. Uncompressed text remains byte-identical.
+pub fn append_envelope_trailer(
+    agent_received_output: &mut String,
+    input_line_count: usize,
+) -> Option<ListEnvelope> {
+    let body_lines = count_output_lines(agent_received_output);
+    if body_lines >= input_line_count {
+        return None;
+    }
+
+    let envelope = ListEnvelope::new(
+        body_lines.saturating_add(1),
+        Total::Exact(input_line_count),
+        UNIT,
+        vec![REASON],
+        NARROW,
+    );
+    let trailer = envelope_trailer(&envelope);
+    if !agent_received_output.is_empty() && !agent_received_output.ends_with('\n') {
+        agent_received_output.push('\n');
+    }
+    agent_received_output.push_str(&trailer);
+    Some(envelope)
+}
+
+/// Render a bash envelope through the authorized NDJSON trailer seam.
+///
+/// An empty base isolates the trailer, while array mode asks the shared seam to
+/// render it before bash integrates that text into its output payload.
+pub fn envelope_trailer(envelope: &ListEnvelope) -> String {
+    let mut data = serde_json::Map::new();
+    data.insert(
+        derive_wire_key(LIST_ID, false),
+        serde_json::to_value(envelope).expect("ListEnvelope serialization"),
+    );
+    crate::ndjson_text::build_ndjson_text(
+        "",
+        &serde_json::Value::Object(data),
+        Some(LIST_ID),
+        false,
+    )
+}
+
 /// Attach the bash output list envelope to a JSON response object beside `output`.
 pub fn attach_bash_output_envelope(
     data: &mut serde_json::Map<String, serde_json::Value>,

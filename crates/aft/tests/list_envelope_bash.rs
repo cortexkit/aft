@@ -1,6 +1,12 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+#[path = "helpers/mod.rs"]
+mod test_helpers;
 
 use aft::compress::builtin_filters;
 use aft::compress::caps::DropClass;
@@ -8,14 +14,16 @@ use aft::compress::compress_with_registry_exit_code;
 use aft::compress::toml_filter::build_registry;
 use aft::list_envelope::{derive_wire_key, render_trailer, ListEnvelope, Reason, Total, Unit};
 use aft::list_surfaces::bash::{
-    build_bash_output_envelope, build_envelope_from_output, count_output_lines, wire_key, LIST_ID,
-    NARROW, REASON, REASON_KIND, UNIT, WIRE_KEY,
+    append_envelope_trailer, build_bash_output_envelope, build_envelope_from_output,
+    count_output_lines, wire_key, LIST_ID, NARROW, REASON, REASON_KIND, UNIT, WIRE_KEY,
 };
 use aft::list_surfaces::{ReasonKind, EXCLUSIONS, LIST_SURFACES};
 use aft::ndjson_text::build_ndjson_text;
 use aft::protocol::Response;
 use aft::subc_format::{format_response_with_context, FormatContext};
 use serde_json::Value;
+#[cfg(unix)]
+use test_helpers::{user_config, AftProcess};
 
 fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -390,4 +398,328 @@ fn test_envelope_wire_schema_and_grammar() {
     assert!(!trailer.contains("narrow:"));
     assert!(!trailer.ends_with('.'));
     assert!(!trailer.ends_with(';'));
+}
+
+#[test]
+fn test_append_envelope_trailer_counts_the_agent_facing_trailer_line() {
+    let mut output = "first\nsecond\n".to_string();
+    let envelope = append_envelope_trailer(&mut output, 10).expect("lines were dropped");
+
+    assert_eq!(envelope.shown, 3);
+    assert_eq!(envelope.total, Total::Exact(10));
+    assert_eq!(output.lines().count(), envelope.shown);
+    assert!(output.ends_with("shown 3 of 10 lines (cap)"));
+
+    let mut unchanged = "first\nsecond\n".to_string();
+    assert_eq!(append_envelope_trailer(&mut unchanged, 2), None);
+    assert_eq!(unchanged, "first\nsecond\n");
+}
+
+#[cfg(unix)]
+fn configure_real_bash(aft: &mut AftProcess, project: &Path) {
+    let response = aft.send(
+        &serde_json::json!({
+            "id": "configure-real-bash-envelope",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project,
+            "storage_dir": project.join("storage"),
+            "config": user_config(serde_json::json!({
+                "bash": {
+                    "background": true,
+                    "compress": true,
+                    "rewrite": false,
+                    "foreground_wait_window_ms": 30_000
+                }
+            })),
+        })
+        .to_string(),
+    );
+    assert_eq!(response["success"], true, "configure failed: {response:?}");
+}
+
+#[cfg(unix)]
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+#[cfg(unix)]
+fn real_capped_command() -> String {
+    let input = fixtures_dir().join("capped_4000_in_61_out/input.txt");
+    format!("cat {}", shell_quote(&input))
+}
+
+#[cfg(unix)]
+fn wait_for_real_completion(aft: &mut AftProcess, task_id: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for completion frame for {task_id}"
+        );
+        let Some(frame) = aft.try_read_next_timeout(Duration::from_millis(250)) else {
+            continue;
+        };
+        if frame["type"] == "bash_completed" && frame["task_id"] == task_id {
+            return frame;
+        }
+    }
+}
+
+#[cfg(unix)]
+fn assert_real_bash_envelope(value: &Value, output_key: &str, total: usize) {
+    let output = value[output_key]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing {output_key} in {value:?}"));
+    let envelope: ListEnvelope = serde_json::from_value(
+        value[WIRE_KEY]
+            .as_object()
+            .unwrap_or_else(|| panic!("missing {WIRE_KEY} in {value:?}"))
+            .clone()
+            .into(),
+    )
+    .expect("deserialize bash output envelope");
+    assert_eq!(envelope.shown, output.lines().count());
+    assert_eq!(envelope.total, Total::Exact(total));
+    let trailer = render_trailer(&envelope).expect("cap envelope trailer");
+    assert!(
+        output.ends_with(&trailer),
+        "agent-facing output must end with its trailer: {output:?}"
+    );
+    assert_eq!(
+        output.matches(&trailer).count(),
+        1,
+        "agent-facing output must render its trailer once"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn real_background_completion_and_status_attach_compressor_counts() {
+    let mut aft = AftProcess::spawn();
+    let project = tempfile::tempdir().expect("project tempdir");
+    configure_real_bash(&mut aft, project.path());
+
+    let launch = aft.send(
+        &serde_json::json!({
+            "id": "real-background-capped",
+            "command": "bash",
+            "params": {
+                "command": real_capped_command(),
+                "background": true
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        launch["success"], true,
+        "background launch failed: {launch:?}"
+    );
+    let task_id = launch["task_id"].as_str().expect("task id");
+    let completion = wait_for_real_completion(&mut aft, task_id);
+    assert_real_bash_envelope(&completion, "output_preview", 4000);
+
+    let snapshot = aft.send(
+        &serde_json::json!({
+            "id": "real-background-status",
+            "command": "bash_status",
+            "params": { "task_id": task_id }
+        })
+        .to_string(),
+    );
+    assert_eq!(snapshot["success"], true, "status failed: {snapshot:?}");
+    assert_real_bash_envelope(&snapshot, "output_preview", 4000);
+
+    let drained = aft.send(
+        &serde_json::json!({
+            "id": "real-background-drain",
+            "command": "bash_drain_completions"
+        })
+        .to_string(),
+    );
+    let drained_completion = drained["bg_completions"]
+        .as_array()
+        .expect("drained completions")
+        .iter()
+        .find(|completion| completion["task_id"] == task_id)
+        .unwrap_or_else(|| panic!("missing drained completion for {task_id}: {drained:?}"));
+    assert_real_bash_envelope(drained_completion, "output_preview", 4000);
+
+    let short_launch = aft.send(
+        &serde_json::json!({
+            "id": "real-background-short",
+            "command": "bash",
+            "params": {
+                "command": "printf 'alpha\\nbeta\\n'",
+                "background": true
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        short_launch["success"], true,
+        "short launch failed: {short_launch:?}"
+    );
+    let short_task_id = short_launch["task_id"].as_str().expect("short task id");
+    let short_completion = wait_for_real_completion(&mut aft, short_task_id);
+    assert_eq!(short_completion["output_preview"], "alpha\nbeta\n");
+    assert!(short_completion.get(WIRE_KEY).is_none());
+    assert!(!short_completion["output_preview"]
+        .as_str()
+        .expect("short completion output")
+        .contains("shown "));
+
+    let short_snapshot = aft.send(
+        &serde_json::json!({
+            "id": "real-background-short-status",
+            "command": "bash_status",
+            "params": { "task_id": short_task_id }
+        })
+        .to_string(),
+    );
+    assert_eq!(short_snapshot["output_preview"], "alpha\nbeta\n");
+    assert!(short_snapshot.get(WIRE_KEY).is_none());
+
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn real_foreground_transports_attach_compressor_counts() {
+    let mut aft = AftProcess::spawn();
+    let project = tempfile::tempdir().expect("project tempdir");
+    configure_real_bash(&mut aft, project.path());
+
+    let capped = aft.send(
+        &serde_json::json!({
+            "id": "real-foreground-capped",
+            "command": "bash",
+            "params": {
+                "command": real_capped_command(),
+                "foreground_orchestrate": true,
+                "block_to_completion": true
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        capped["success"], true,
+        "foreground command failed: {capped:?}"
+    );
+    assert_real_bash_envelope(&capped, "output", 4000);
+
+    let response = Response {
+        id: capped["id"].as_str().expect("response id").to_string(),
+        success: true,
+        data: capped.clone(),
+    };
+    let output = capped["output"].as_str().expect("foreground output");
+    let subc_text = format_response_with_context("bash", &response, &FormatContext::default());
+    let ndjson_text = build_ndjson_text(output, &capped, Some(LIST_ID), true);
+    assert_eq!(subc_text, output);
+    assert_eq!(ndjson_text, output);
+    let trailer: ListEnvelope =
+        serde_json::from_value(capped[WIRE_KEY].clone()).expect("foreground envelope");
+    let trailer = render_trailer(&trailer).expect("foreground trailer");
+    assert_eq!(subc_text.matches(&trailer).count(), 1);
+    assert_eq!(ndjson_text.matches(&trailer).count(), 1);
+
+    let short = aft.send(
+        &serde_json::json!({
+            "id": "real-foreground-short",
+            "command": "bash",
+            "params": {
+                "command": "printf 'alpha\\nbeta\\n'",
+                "foreground_orchestrate": true,
+                "block_to_completion": true
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(short["success"], true, "short foreground failed: {short:?}");
+    assert_eq!(short["output"], "alpha\nbeta\n");
+    assert!(short.get(WIRE_KEY).is_none());
+    assert!(!short["output"]
+        .as_str()
+        .expect("short output")
+        .contains("shown "));
+
+    let short_response = Response {
+        id: short["id"].as_str().expect("short response id").to_string(),
+        success: true,
+        data: short.clone(),
+    };
+    let short_subc =
+        format_response_with_context("bash", &short_response, &FormatContext::default());
+    let short_ndjson = build_ndjson_text(
+        short["output"].as_str().expect("short output"),
+        &short,
+        Some(LIST_ID),
+        true,
+    );
+    assert_eq!(short_subc, "alpha\nbeta\n");
+    assert_eq!(short_ndjson, "alpha\nbeta\n");
+
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn real_live_status_stays_raw_without_an_envelope() {
+    let mut aft = AftProcess::spawn();
+    let project = tempfile::tempdir().expect("project tempdir");
+    configure_real_bash(&mut aft, project.path());
+    let input = fixtures_dir().join("capped_4000_in_61_out/input.txt");
+    let command = format!("cat {}; sleep 10", shell_quote(&input));
+
+    let launch = aft.send(
+        &serde_json::json!({
+            "id": "real-live-raw",
+            "command": "bash",
+            "params": { "command": command, "background": true }
+        })
+        .to_string(),
+    );
+    assert_eq!(launch["success"], true, "live launch failed: {launch:?}");
+    let task_id = launch["task_id"].as_str().expect("live task id");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let live = loop {
+        let snapshot = aft.send(
+            &serde_json::json!({
+                "id": "real-live-status",
+                "command": "bash_status",
+                "params": { "task_id": task_id }
+            })
+            .to_string(),
+        );
+        if snapshot["status"] == "running"
+            && snapshot["output_preview"]
+                .as_str()
+                .is_some_and(|output| output.contains("file_4000"))
+        {
+            break snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for raw live tail: {snapshot:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    let output = live["output_preview"].as_str().expect("live output");
+    assert!(output.contains("file_4000"));
+    assert!(!output.contains("shown "));
+    assert!(live.get(WIRE_KEY).is_none());
+
+    let killed = aft.send(
+        &serde_json::json!({
+            "id": "real-live-kill",
+            "command": "bash_kill",
+            "params": { "task_id": task_id }
+        })
+        .to_string(),
+    );
+    assert_eq!(killed["success"], true, "kill failed: {killed:?}");
+    assert!(aft.shutdown().success());
 }

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::bash_background::BgTaskStatus;
+use crate::list_envelope::ListEnvelope;
 
 /// Full payload returned by the `status` command and cached by status push frames.
 pub type StatusPayload = serde_json::Value;
@@ -55,6 +56,8 @@ pub struct BashCompletedFrame {
     /// `bash_status` round-trip for typical short commands.
     #[serde(default)]
     pub output_preview: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bash_output_list_envelope: Option<ListEnvelope>,
     /// True when the task produced more output than `output_preview` shows
     /// (rotated buffer, file > 300 bytes, etc). Plugins use this to render a
     /// `…` prefix and signal that `bash_status` would return more.
@@ -328,6 +331,7 @@ impl BashCompletedFrame {
             exit_code,
             command: command.into(),
             output_preview: output_preview.into(),
+            bash_output_list_envelope: None,
             output_truncated,
             original_tokens,
             compressed_tokens,

@@ -6980,6 +6980,7 @@ pub(crate) mod test_support {
             exit_code: Some(0),
             command: format!("echo {task_id}"),
             output_preview: String::new(),
+            bash_output_list_envelope: None,
             output_truncated: false,
             original_tokens: None,
             compressed_tokens: None,

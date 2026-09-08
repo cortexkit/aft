@@ -779,6 +779,7 @@ fn bash_completed_push(task_id: &str, session_id: &str) -> PushFrame {
         exit_code: Some(0),
         command: format!("echo {task_id}"),
         output_preview: String::new(),
+        bash_output_list_envelope: None,
         output_truncated: false,
         original_tokens: None,
         compressed_tokens: None,

@@ -24,6 +24,7 @@ use crate::compress::CompressionResult;
 use crate::context::SharedProgressSender;
 use crate::db::compression_events::CompressionAggregateCache;
 use crate::harness::Harness;
+use crate::list_envelope::ListEnvelope;
 use crate::protocol::{BashCompletedFrame, BashLongRunningFrame, BashPatternMatchFrame, PushFrame};
 use crate::sandbox_spawn::SpawnPlan;
 
@@ -86,6 +87,8 @@ pub struct BgCompletion {
     /// reattachment).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub output_preview: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bash_output_list_envelope: Option<ListEnvelope>,
     /// True when the captured tail is shorter than the actual output (because
     /// rotation occurred or the output exceeds the preview cap). Plugins use
     /// this to render a `…` prefix and signal that `bash_status` would return
@@ -119,6 +122,8 @@ pub struct BgTaskSnapshot {
     pub child_pid: Option<u32>,
     pub workdir: String,
     pub output_preview: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bash_output_list_envelope: Option<ListEnvelope>,
     pub output_truncated: bool,
     pub output_path: Option<String>,
     pub stderr_path: Option<String>,
@@ -153,6 +158,7 @@ enum TerminalOutputKind {
 struct TerminalOutputCache {
     output_preview: String,
     output_truncated: bool,
+    compression_input_line_count: Option<usize>,
     kind: TerminalOutputKind,
     output_path: Option<String>,
     stderr_path: Option<String>,
@@ -681,6 +687,7 @@ impl BgTaskRegistry {
             return TerminalOutputCache {
                 output_preview: String::new(),
                 output_truncated: false,
+                compression_input_line_count: None,
                 kind: TerminalOutputKind::Raw,
                 output_path: buffer.output_path().map(|path| path.display().to_string()),
                 stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
@@ -3001,7 +3008,10 @@ impl BgTaskRegistry {
             return;
         }
         if let Some(cache) = self.ensure_terminal_output_cache(task) {
-            snapshot.output_preview = cache.output_preview;
+            let mut output_preview = cache.output_preview.clone();
+            let envelope = append_bash_output_envelope(&cache, &mut output_preview);
+            snapshot.output_preview = output_preview;
+            snapshot.bash_output_list_envelope = envelope;
             snapshot.output_truncated = cache.output_truncated;
         }
     }
@@ -3449,13 +3459,20 @@ impl BgTaskRegistry {
         if !snapshot.info.status.is_terminal() {
             return None;
         }
-        let (output_preview, output_truncated) = if snapshot.info.mode == BgMode::Pty {
-            (String::new(), false)
+        let (mut output_preview, output_truncated, cache) = if snapshot.info.mode == BgMode::Pty {
+            (String::new(), false, None)
         } else {
             self.ensure_terminal_output_cache(task)
-                .map(|cache| completion_preview_for_cache(&cache, snapshot.exit_code))
-                .unwrap_or_else(|| (String::new(), false))
+                .map(|cache| {
+                    let (preview, truncated) =
+                        completion_preview_for_cache(&cache, snapshot.exit_code);
+                    (preview, truncated, Some(cache))
+                })
+                .unwrap_or_else(|| (String::new(), false, None))
         };
+        let bash_output_list_envelope = cache
+            .as_ref()
+            .and_then(|cache| append_bash_output_envelope(cache, &mut output_preview));
         Some(BgCompletion {
             task_id: snapshot.info.task_id,
             session_id: task.delivery_session_id.clone(),
@@ -3463,6 +3480,7 @@ impl BgTaskRegistry {
             exit_code: snapshot.exit_code,
             command: snapshot.info.command,
             output_preview,
+            bash_output_list_envelope,
             output_truncated,
             original_tokens: None,
             compressed_tokens: None,
@@ -4213,6 +4231,8 @@ impl BgTaskRegistry {
                 };
             }
         }
+        let bash_output_list_envelope =
+            render.and_then(|cache| append_bash_output_envelope(cache, &mut output_preview));
 
         let token_counts = self.completion_token_counts(
             metadata,
@@ -4227,6 +4247,7 @@ impl BgTaskRegistry {
             exit_code: metadata.exit_code,
             command: metadata.command.clone(),
             output_preview,
+            bash_output_list_envelope,
             output_truncated,
             original_tokens: token_counts.original_tokens,
             compressed_tokens: token_counts.compressed_tokens,
@@ -4582,6 +4603,7 @@ impl BgTaskRegistry {
             completion.compressed_tokens,
             completion.tokens_skipped,
         );
+        frame.bash_output_list_envelope = completion.bash_output_list_envelope;
         frame.status_reason = completion.status_reason;
         sender(PushFrame::BashCompleted(frame));
     }
@@ -4949,6 +4971,7 @@ fn render_compressed_with_recovery(
     // to one, but keep that one when the content had a trailing newline. NOTE:
     // the check must read the ORIGINAL text — strip_plain_truncation_marker_lines
     // rebuilds via `.lines().join("\n")`, which itself drops the trailing newline.
+    let compression_input_line_count = compressed.input_line_count;
     let had_trailing_newline = compressed.text.ends_with('\n');
     let mut text = strip_plain_truncation_marker_lines(&compressed.text)
         .trim_end()
@@ -4979,6 +5002,7 @@ fn render_compressed_with_recovery(
     TerminalOutputCache {
         output_preview,
         output_truncated,
+        compression_input_line_count: Some(compression_input_line_count),
         kind: TerminalOutputKind::Compressed,
         output_path,
         stderr_path,
@@ -5251,6 +5275,7 @@ fn render_structured_output(
         return Some(TerminalOutputCache {
             output_preview,
             output_truncated: true,
+            compression_input_line_count: None,
             kind: TerminalOutputKind::Structured,
             output_path: Some(output_path),
             stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
@@ -5267,6 +5292,7 @@ fn render_structured_output(
     Some(TerminalOutputCache {
         output_preview: stdout.text,
         output_truncated: false,
+        compression_input_line_count: None,
         kind: TerminalOutputKind::Structured,
         output_path: Some(output_path),
         stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
@@ -5291,6 +5317,7 @@ fn render_raw_passthrough(
         return TerminalOutputCache {
             output_preview: raw.text,
             output_truncated: false,
+            compression_input_line_count: None,
             kind: TerminalOutputKind::Raw,
             output_path,
             stderr_path,
@@ -5317,12 +5344,22 @@ fn render_raw_passthrough(
     TerminalOutputCache {
         output_preview,
         output_truncated,
+        compression_input_line_count: None,
         kind: TerminalOutputKind::Raw,
         output_path,
         stderr_path,
         artifact_access,
         recovery: Some(recovery),
     }
+}
+
+fn append_bash_output_envelope(
+    cache: &TerminalOutputCache,
+    output: &mut String,
+) -> Option<ListEnvelope> {
+    cache
+        .compression_input_line_count
+        .and_then(|total| crate::list_surfaces::bash::append_envelope_trailer(output, total))
 }
 
 fn completion_preview_for_cache(
@@ -5652,6 +5689,7 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
         child_pid: metadata.child_pid,
         workdir: metadata.workdir.display().to_string(),
         output_preview: String::new(),
+        bash_output_list_envelope: None,
         output_truncated: false,
         output_path: existing_path(row.stdout_path),
         stderr_path: existing_path(row.stderr_path),
@@ -5708,6 +5746,7 @@ impl BgTask {
             child_pid: metadata.child_pid,
             workdir: metadata.workdir.display().to_string(),
             output_preview,
+            bash_output_list_envelope: None,
             output_truncated,
             output_path: state
                 .buffer
@@ -6264,6 +6303,7 @@ mod tests {
                 exit_code: Some(0),
                 command: "printf memory".to_string(),
                 output_preview: "resident completion output".to_string(),
+                bash_output_list_envelope: None,
                 output_truncated: false,
                 original_tokens: None,
                 compressed_tokens: None,

@@ -317,7 +317,28 @@ pub(crate) fn detach_wait_mode_bash(
 }
 
 fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Response {
-    let output = format_foreground_result(&snapshot);
+    let (output, foreground_envelope) =
+        if let Some(envelope) = snapshot.bash_output_list_envelope.as_ref() {
+            let trailer = crate::list_surfaces::bash::envelope_trailer(envelope);
+            let mut foreground_snapshot = snapshot.clone();
+            foreground_snapshot.output_preview = foreground_snapshot
+                .output_preview
+                .strip_suffix(&trailer)
+                .unwrap_or(&foreground_snapshot.output_preview)
+                .trim_end_matches('\n')
+                .to_string();
+            // The envelope replaces the legacy output-path truncation clause. Exit and
+            // timeout diagnostics still render before the final canonical trailer.
+            foreground_snapshot.output_truncated = false;
+            let mut output = format_foreground_result(&foreground_snapshot);
+            let envelope = crate::list_surfaces::bash::append_envelope_trailer(
+                &mut output,
+                envelope.total.value(),
+            );
+            (output, envelope)
+        } else {
+            (format_foreground_result(&snapshot), None)
+        };
     if snapshot.sandbox_native
         && snapshot.sandbox_unavailable
         && snapshot.exit_code == Some(crate::sandbox_spawn::SANDBOX_UNAVAILABLE_EXIT_CODE)
@@ -334,22 +355,25 @@ fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Res
         );
     }
     let timed_out = snapshot.info.status == BgTaskStatus::TimedOut;
-    Response::success(
-        request_id,
-        json!({
-            "output": output,
-            "task_id": snapshot.info.task_id,
-            "status": snapshot.info.status,
-            "mode": snapshot.info.mode,
-            "exit_code": snapshot.exit_code,
-            "output_preview": snapshot.output_preview,
-            "output_truncated": snapshot.output_truncated,
-            "truncated": snapshot.output_truncated,
-            "output_path": snapshot.output_path,
-            "timed_out": timed_out,
-            "duration_ms": snapshot.info.duration_ms,
-        }),
-    )
+    let mut data = json!({
+        "output": output,
+        "task_id": snapshot.info.task_id,
+        "status": snapshot.info.status,
+        "mode": snapshot.info.mode,
+        "exit_code": snapshot.exit_code,
+        "output_preview": snapshot.output_preview,
+        "output_truncated": snapshot.output_truncated,
+        "truncated": snapshot.output_truncated,
+        "output_path": snapshot.output_path,
+        "timed_out": timed_out,
+        "duration_ms": snapshot.info.duration_ms,
+    });
+    crate::list_surfaces::bash::attach_bash_output_envelope(
+        data.as_object_mut()
+            .expect("foreground bash data is an object"),
+        &foreground_envelope,
+    );
+    Response::success(request_id, data)
 }
 
 fn background_launch_response(request_id: &str, task_id: &str, is_pty: bool) -> Response {
@@ -447,6 +471,7 @@ mod tests {
             child_pid: None,
             workdir: "/tmp".to_string(),
             output_preview: output_preview.to_string(),
+            bash_output_list_envelope: None,
             output_truncated,
             output_path: output_path.map(str::to_string),
             stderr_path: None,
