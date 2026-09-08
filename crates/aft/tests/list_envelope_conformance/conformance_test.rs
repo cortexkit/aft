@@ -4,13 +4,14 @@ use aft::list_envelope::{Reason, Total, Unit};
 use aft::list_surfaces::EXCLUSIONS;
 
 use super::support::{
-    capped_fixtures, complete_builder_results, complete_fixtures, discover_list_cutting_sites,
-    find_call_sites, fixture_pairs, kind_bound_cases, registered_pairs, validate_discovered_cuts,
-    validate_exclusion_reasons, validate_exemption_list, validate_fixture_schema,
-    validate_hub_trigger, validate_kind_bound_case, validate_no_per_reason_drop_counts,
-    validate_pair_coverage, validate_recursive_envelope_keys, validate_registry,
-    validate_renderer_call_sites, validate_trailer, CompletePathExemption,
-    COMPLETE_PATH_EXEMPTIONS, SURFACE_SPECS,
+    capped_fixtures, capped_parity_fixtures, complete_builder_results, complete_fixtures,
+    discover_list_cutting_sites, find_call_sites, fixture_pairs, kind_bound_cases,
+    registered_pairs, render_complete_transports, render_transports,
+    validate_capped_parity_coverage, validate_discovered_cuts, validate_exclusion_reasons,
+    validate_exemption_list, validate_fixture_schema, validate_hub_trigger,
+    validate_kind_bound_case, validate_no_per_reason_drop_counts, validate_pair_coverage,
+    validate_recursive_envelope_keys, validate_registry, validate_renderer_call_sites,
+    validate_trailer, CompletePathExemption, COMPLETE_PATH_EXEMPTIONS, SURFACE_SPECS,
 };
 
 fn assert_no_errors(context: &str, errors: Vec<String>) {
@@ -265,6 +266,45 @@ fn complete_path_exemption_list_is_closed_and_goldens_are_exact() {
             assert!(!fixture.rendered.contains("shown as rollups"));
             assert!(!fixture.rendered.contains("shown as a rollup"));
         }
+        let (subc_text, ndjson_text) = render_complete_transports(&fixture);
+        assert_eq!(
+            subc_text, ndjson_text,
+            "{}: complete-path transport parity mismatch between subc and ndjson",
+            fixture.name
+        );
+        assert_eq!(
+            ndjson_text, fixture.golden,
+            "{}: complete-path ndjson rendering drifted from its pinned golden",
+            fixture.name
+        );
+    }
+}
+
+#[test]
+fn transport_parity_corpus_covers_every_registered_surface_and_is_byte_equal() {
+    let fixtures = capped_parity_fixtures();
+    assert_no_errors(
+        "capped parity coverage",
+        validate_capped_parity_coverage(&fixtures),
+    );
+
+    for fixture in &fixtures {
+        let (subc_text, ndjson_text) = render_transports(fixture);
+        assert_eq!(
+            subc_text, ndjson_text,
+            "{}: transport parity mismatch between subc and ndjson",
+            fixture.name
+        );
+        assert!(
+            subc_text.contains("shown "),
+            "{}: capped fixture subc output must contain trailer",
+            fixture.name
+        );
+        assert!(
+            ndjson_text.contains("shown "),
+            "{}: capped fixture ndjson output must contain trailer",
+            fixture.name
+        );
     }
 }
 

@@ -6,11 +6,12 @@ use aft::list_envelope::{Reason, Total, Unit};
 use aft::list_surfaces::ReasonKind;
 use serde_json::json;
 use support::{
-    capped_fixtures, discover_list_cutting_sites, find_call_sites, kind_bound_cases,
-    validate_discovered_cuts, validate_exemption_list, validate_fixture_schema,
-    validate_hub_trigger, validate_kind_bound_case, validate_recursive_envelope_keys,
-    validate_renderer_call_sites, validate_surface_specs, validate_trailer, CallSite,
-    CompletePathExemption, DiscoveredCut, ReasonSpec, COMPLETE_PATH_EXEMPTIONS, SURFACE_SPECS,
+    capped_fixtures, capped_parity_fixtures, discover_list_cutting_sites, find_call_sites,
+    kind_bound_cases, validate_capped_parity_coverage, validate_discovered_cuts,
+    validate_exemption_list, validate_fixture_schema, validate_hub_trigger,
+    validate_kind_bound_case, validate_recursive_envelope_keys, validate_renderer_call_sites,
+    validate_surface_specs, validate_trailer, CallSite, CompletePathExemption, DiscoveredCut,
+    ReasonSpec, COMPLETE_PATH_EXEMPTIONS, SURFACE_SPECS,
 };
 
 const MUTATED_SEARCH_REASONS: &[ReasonSpec] = &[
@@ -178,4 +179,17 @@ fn adding_an_unregistered_capped_array_fails_registry_free_discovery() {
         validate_discovered_cuts(&discovered),
         ["unregistered list-cutting site at commands/extract.rs:123: primitive 'truncate(' in item 'unregistered_capped_array'"]
     );
+}
+
+#[test]
+fn deleting_one_capped_parity_fixture_fails_the_coverage_guard() {
+    let mut fixtures = capped_parity_fixtures();
+    let initial_len = fixtures.len();
+    fixtures.retain(|f| !(f.command == "callgraph" && f.mode == "callers"));
+    assert_eq!(fixtures.len(), initial_len - 1);
+
+    let errors = validate_capped_parity_coverage(&fixtures);
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].contains("registered surface has no capped parity fixture"));
+    assert!(errors[0].contains("callgraph.callers"));
 }

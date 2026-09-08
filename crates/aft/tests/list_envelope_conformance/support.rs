@@ -8,8 +8,8 @@ use aft::commands::callgraph_store_adapter::callgraph_surface::{
     build_callgraph_envelope, cap_items, hub_selector_activated, HUB_SUMMARY_LIMIT,
 };
 use aft::commands::callgraph_store_adapter::{
-    StoreCallTreeNode, StoreCallerEntry, StoreCallerGroup, StoreCallersResult, StoreImpactCaller,
-    StoreImpactResult,
+    StoreCallTreeNode, StoreCallerEntry, StoreCallerGroup, StoreCallersResult, StoreHubSummary,
+    StoreImpactCaller, StoreImpactResult, HUB_SUMMARY_THRESHOLD,
 };
 use aft::commands::trace_to::trace::{build_trace_data_envelope, build_trace_to_envelope};
 use aft::list_envelope::{derive_wire_key, ListEnvelope, Reason, Total, Unit};
@@ -22,6 +22,7 @@ use aft::list_surfaces::inspect::build_inspect_envelope;
 use aft::list_surfaces::outline::build_outline_files_envelope;
 use aft::list_surfaces::search::{attach_search_envelope, build_search_envelope};
 use aft::list_surfaces::{ExclusionEntry, ReasonKind, EXCLUSIONS, LIST_SURFACES};
+use aft::ndjson_text::build_ndjson_text;
 use aft::protocol::Response;
 use aft::subc_format::{format_response_with_context, FormatContext, OutlineMode};
 use serde_json::{json, Map, Value};
@@ -1246,6 +1247,398 @@ fn make_tree_value(count: usize, depth_limited: bool) -> Value {
         tree_list_envelope: build_callgraph_envelope(Unit::Items, shown, total, 0),
     };
     serde_json::to_value(result).expect("call tree fixture serialization")
+}
+
+fn make_capped_impact_value(count: usize) -> Value {
+    let callers = (1..=count)
+        .map(|i| StoreImpactCaller {
+            caller_symbol: format!("caller{i}"),
+            caller_file: "src/app.ts".to_string(),
+            line: i as u32,
+            signature: None,
+            is_entry_point: false,
+            call_expression: None,
+            parameters: Vec::new(),
+            approximate: None,
+            resolved_by: None,
+        })
+        .collect::<Vec<_>>();
+
+    let summarize = hub_selector_activated(count);
+    let visible_callers = if summarize {
+        callers.into_iter().take(HUB_SUMMARY_LIMIT).collect()
+    } else {
+        callers
+    };
+    let shown = visible_callers.len();
+
+    let hub_summary = if summarize {
+        Some(StoreHubSummary {
+            message: format!("Showing first 20 callers; {count} omitted high-fan-in callers."),
+            total: count,
+            hidden_tests: 0,
+            shown,
+            threshold: HUB_SUMMARY_THRESHOLD,
+            limit: HUB_SUMMARY_LIMIT,
+            counts_are_lower_bounds: false,
+        })
+    } else {
+        None
+    };
+
+    let sites_list_envelope = build_callgraph_envelope(Unit::Sites, shown, count, 0);
+
+    let result = StoreImpactResult {
+        symbol: "target".to_string(),
+        file: "src/app.ts".to_string(),
+        signature: None,
+        parameters: Vec::new(),
+        total_affected: count,
+        hidden_test_callers: 0,
+        affected_files: 1,
+        callers: visible_callers,
+        hub_summary,
+        depth_limited: false,
+        truncated: 0,
+        sites_list_envelope,
+    };
+    serde_json::to_value(result).expect("capped impact fixture serialization")
+}
+
+fn make_capped_callers_value(count: usize) -> Value {
+    let entries = (1..=count)
+        .map(|i| StoreCallerEntry {
+            symbol: format!("caller{i:02}"),
+            line: i as u32,
+            approximate: None,
+            resolved_by: None,
+        })
+        .collect::<Vec<_>>();
+
+    let summarize = hub_selector_activated(count);
+    let visible_entries = if summarize {
+        entries.into_iter().take(HUB_SUMMARY_LIMIT).collect()
+    } else {
+        entries
+    };
+    let shown = visible_entries.len();
+
+    let hub_summary = if summarize {
+        Some(StoreHubSummary {
+            message: format!("Showing first 20 callers; {count} omitted high-fan-in callers."),
+            total: count,
+            hidden_tests: 0,
+            shown,
+            threshold: HUB_SUMMARY_THRESHOLD,
+            limit: HUB_SUMMARY_LIMIT,
+            counts_are_lower_bounds: false,
+        })
+    } else {
+        None
+    };
+
+    let callers_list_envelope = build_callgraph_envelope(Unit::Items, shown, count, 0);
+
+    let result = StoreCallersResult {
+        symbol: "target".to_string(),
+        file: "src/app.ts".to_string(),
+        callers: vec![StoreCallerGroup {
+            file: "src/app.ts".to_string(),
+            callers: visible_entries,
+        }],
+        total_callers: count,
+        hidden_test_callers: 0,
+        hub_summary,
+        scanned_files: 1,
+        depth_limited: false,
+        truncated: 0,
+        callers_list_envelope,
+    };
+    serde_json::to_value(result).expect("capped callers fixture serialization")
+}
+
+fn make_capped_tree_value(count: usize) -> Value {
+    let mut children = (1..=count)
+        .map(|i| StoreCallTreeNode {
+            name: format!("child{i}"),
+            file: "src/app.ts".to_string(),
+            line: (9 + i) as u32,
+            signature: None,
+            resolved: true,
+            approximate: None,
+            resolved_by: None,
+            children: Vec::new(),
+            depth_limited: false,
+            truncated: 0,
+            hidden_test_callers: 0,
+            tree_list_envelope: None,
+        })
+        .collect::<Vec<_>>();
+    let (shown, total) = cap_items(&mut children);
+    let tree_list_envelope = build_callgraph_envelope(Unit::Items, shown, total, 0);
+    let result = StoreCallTreeNode {
+        name: "root".to_string(),
+        file: "src/app.ts".to_string(),
+        line: 1,
+        signature: None,
+        resolved: true,
+        approximate: None,
+        resolved_by: None,
+        children,
+        depth_limited: false,
+        truncated: 0,
+        hidden_test_callers: 0,
+        tree_list_envelope,
+    };
+    serde_json::to_value(result).expect("capped call tree fixture serialization")
+}
+
+#[derive(Clone, Debug)]
+pub struct CappedParityFixture {
+    pub name: &'static str,
+    pub command: &'static str,
+    pub mode: &'static str,
+    pub list_id: &'static str,
+    pub reply: Value,
+}
+
+pub fn capped_parity_fixtures() -> Vec<CappedParityFixture> {
+    vec![
+        CappedParityFixture {
+            name: "callgraph/impact_21",
+            command: "callgraph",
+            mode: "impact",
+            list_id: "payload.sites",
+            reply: make_capped_impact_value(21),
+        },
+        CappedParityFixture {
+            name: "callgraph/callers_21",
+            command: "callgraph",
+            mode: "callers",
+            list_id: "payload.callers",
+            reply: make_capped_callers_value(21),
+        },
+        CappedParityFixture {
+            name: "callgraph/tree_21",
+            command: "callgraph",
+            mode: "call_tree",
+            list_id: "payload.tree",
+            reply: make_capped_tree_value(21),
+        },
+        CappedParityFixture {
+            name: "trace/depth_exhaustion_no_path",
+            command: "callgraph",
+            mode: "trace_to",
+            list_id: "payload.paths",
+            reply: load_json("tests/fixtures/trace/depth_exhaustion_no_path.json"),
+        },
+        CappedParityFixture {
+            name: "trace/trace_data_capped",
+            command: "callgraph",
+            mode: "trace_data",
+            list_id: "payload.hops",
+            reply: load_json("tests/fixtures/trace/trace_data_capped.json"),
+        },
+        CappedParityFixture {
+            name: "search/more_available_only",
+            command: "search",
+            mode: "",
+            list_id: "payload.results",
+            reply: load_json("tests/fixtures/search/more_available_only.json")["data"].clone(),
+        },
+        CappedParityFixture {
+            name: "grep/cap_100_of_1204",
+            command: "grep",
+            mode: "",
+            list_id: "payload.matches",
+            reply: load_json("tests/fixtures/grep/cap_100_of_1204.json"),
+        },
+        CappedParityFixture {
+            name: "glob/executor_cap",
+            command: "glob",
+            mode: "",
+            list_id: "payload.files",
+            reply: load_json("tests/fixtures/glob/executor_cap.json"),
+        },
+        CappedParityFixture {
+            name: "outline/r1_boundary",
+            command: "outline",
+            mode: "files",
+            list_id: "payload.files",
+            reply: load_json("tests/fixtures/outline/r1_boundary.json"),
+        },
+        CappedParityFixture {
+            name: "inspect/todos_capped",
+            command: "inspect",
+            mode: "",
+            list_id: "payload.details",
+            reply: load_json("tests/fixtures/inspect/todos_capped.json")["data"].clone(),
+        },
+        CappedParityFixture {
+            name: "bash/capped_4000_in_61_out",
+            command: "bash",
+            mode: "",
+            list_id: "bash.output",
+            reply: load_json("tests/fixtures/bash/capped_4000_in_61_out/reply.json"),
+        },
+    ]
+}
+
+pub fn validate_capped_parity_coverage(fixtures: &[CappedParityFixture]) -> Vec<String> {
+    let mut errors = Vec::new();
+    let covered: BTreeSet<(&str, &str, &str)> = fixtures
+        .iter()
+        .map(|f| (f.command, f.mode, f.list_id))
+        .collect();
+
+    for surface in SURFACE_SPECS {
+        let key = (surface.command, surface.mode, surface.list_id);
+        if !covered.contains(&key) {
+            let label = if surface.mode.is_empty() {
+                surface.command.to_string()
+            } else {
+                format!("{}.{}", surface.command, surface.mode)
+            };
+            errors.push(format!(
+                "registered surface has no capped parity fixture: {label} ({})",
+                surface.list_id
+            ));
+        }
+    }
+    errors
+}
+
+pub fn render_transports(fixture: &CappedParityFixture) -> (String, String) {
+    let subc_text = render(fixture.command, fixture.mode, &fixture.reply);
+    let base_text = if fixture.command == "bash" {
+        fixture
+            .reply
+            .get("output")
+            .or_else(|| fixture.reply.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    } else if fixture.command == "grep" {
+        fixture
+            .reply
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .replace(" (capped)", "")
+    } else if fixture.command == "glob" {
+        const GLOB_TRUNCATED_MESSAGE: &str =
+            "(Results are truncated: showing first 100 results. Consider using a more specific path or pattern.)";
+        fixture
+            .reply
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .replace(&format!("\n\n{GLOB_TRUNCATED_MESSAGE}"), "")
+            .replace(GLOB_TRUNCATED_MESSAGE, "")
+    } else if fixture.command == "callgraph" {
+        let wire_key = derive_wire_key(fixture.list_id, false);
+        let env: Option<ListEnvelope> = fixture
+            .reply
+            .get(&wire_key)
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        if let Some(trailer) = env
+            .as_ref()
+            .and_then(|e| aft::list_envelope::render_trailer(e))
+        {
+            subc_text
+                .strip_suffix(&format!("\n\n{trailer}"))
+                .or_else(|| subc_text.strip_suffix(&format!("\n{trailer}")))
+                .unwrap_or(&subc_text)
+                .to_string()
+        } else {
+            subc_text.clone()
+        }
+    } else {
+        fixture
+            .reply
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let is_text_surface = fixture.command == "bash";
+    let list_id = if fixture.command == "inspect" {
+        None
+    } else {
+        Some(fixture.list_id)
+    };
+    let mut ndjson_text = build_ndjson_text(&base_text, &fixture.reply, list_id, is_text_surface);
+    if fixture.command == "callgraph"
+        && (fixture.mode == "trace_to" || fixture.mode == "trace_data")
+    {
+        let wire_key = derive_wire_key(fixture.list_id, false);
+        if let Some(val) = fixture.reply.get(&wire_key) {
+            if let Ok(env) = serde_json::from_value::<ListEnvelope>(val.clone()) {
+                if let Some(trailer) = aft::list_envelope::render_trailer(&env) {
+                    ndjson_text =
+                        ndjson_text.replace(&format!("\n\n{trailer}"), &format!("\n{trailer}"));
+                }
+            }
+        }
+    }
+    (subc_text, ndjson_text)
+}
+
+pub fn render_complete_transports(fixture: &CompleteFixture) -> (String, String) {
+    let subc_text = fixture.rendered.clone();
+    let surface = SURFACE_SPECS.iter().find(|s| {
+        if fixture.name.starts_with("callgraph/impact") {
+            s.command == "callgraph" && s.mode == "impact"
+        } else if fixture.name.starts_with("callgraph/caller") {
+            s.command == "callgraph" && s.mode == "callers"
+        } else if fixture.name.starts_with("callgraph/tree") {
+            s.command == "callgraph" && s.mode == "call_tree"
+        } else if fixture.name.starts_with("outline/") {
+            s.command == "outline" && s.mode == "files"
+        } else if fixture.name.starts_with("search/") {
+            s.command == "search"
+        } else if fixture.name.starts_with("grep/") {
+            s.command == "grep"
+        } else if fixture.name.starts_with("glob/") {
+            s.command == "glob"
+        } else if fixture.name.starts_with("inspect/") {
+            s.command == "inspect"
+        } else if fixture.name.starts_with("bash/") {
+            s.command == "bash"
+        } else {
+            false
+        }
+    });
+    let (list_id, is_text_surface) = if let Some(s) = surface {
+        (
+            if s.command == "inspect" {
+                None
+            } else {
+                Some(s.list_id)
+            },
+            s.command == "bash",
+        )
+    } else {
+        (None, false)
+    };
+    let base_text = if is_text_surface {
+        fixture
+            .reply
+            .get("output")
+            .or_else(|| fixture.reply.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or(&fixture.golden)
+    } else if fixture.name.starts_with("callgraph/") {
+        &subc_text
+    } else {
+        fixture
+            .reply
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or(&fixture.golden)
+    };
+    let ndjson_text = build_ndjson_text(base_text, &fixture.reply, list_id, is_text_surface);
+    (subc_text, ndjson_text)
 }
 
 fn push_complete(
