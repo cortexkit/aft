@@ -6,9 +6,19 @@ use aft::views::{
 use rusqlite::Connection;
 use std::collections::BTreeSet;
 use std::fs;
+#[cfg(windows)]
+use std::fs::OpenOptions;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(windows)]
+use std::sync::mpsc;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
+#[cfg(windows)]
+use std::time::Duration;
 use tempfile::tempdir;
 
 fn manifest() -> Manifest {
@@ -75,6 +85,23 @@ struct RecordedSteps(Mutex<Vec<PublicationStep>>);
 impl PublicationObserver for RecordedSteps {
     fn reached(&self, step: PublicationStep) {
         self.0.lock().unwrap().push(step);
+    }
+}
+
+#[cfg(windows)]
+struct BeforeTrigramSignal {
+    checkpoints: AtomicUsize,
+    reached: mpsc::Sender<()>,
+}
+
+#[cfg(windows)]
+impl PublicationObserver for BeforeTrigramSignal {
+    fn reached(&self, step: PublicationStep) {
+        if step == PublicationStep::BlobWalCheckpointed
+            && self.checkpoints.fetch_add(1, Ordering::SeqCst) == 2
+        {
+            let _ = self.reached.send(());
+        }
     }
 }
 
@@ -230,6 +257,51 @@ fn same_root_publishers_conflict_then_retry_from_the_winning_base_without_lost_u
     assert_eq!(
         store.current_generation().unwrap().as_deref(),
         Some("generation-c")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn publication_retries_sync_open_while_reader_holds_the_target() {
+    let directory = tempdir().unwrap();
+    let store = ViewStore::open(directory.path(), "view-key").unwrap();
+    let files = artifacts(directory.path());
+    let held_target = OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&files.trigram_artifact)
+        .unwrap();
+    let (reached_tx, reached_rx) = mpsc::channel();
+    let publisher_store = store.clone();
+
+    let publisher = thread::spawn(move || {
+        let manifest = manifest();
+        let observer = BeforeTrigramSignal {
+            checkpoints: AtomicUsize::new(0),
+            reached: reached_tx,
+        };
+        publisher_store.publish_with_observer(
+            &request("generation-held", None, &manifest, files),
+            &CompleteClosure,
+            Some(&observer),
+        )
+    });
+
+    reached_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("publisher must reach the final artifact before the target is released");
+    // Keep the no-share handle open long enough for the publisher to enter its
+    // bounded open retry; the injected unit regression proves that retry arm.
+    thread::sleep(Duration::from_millis(100));
+    drop(held_target);
+
+    assert_eq!(
+        publisher.join().unwrap().unwrap(),
+        PublishOutcome::Published
+    );
+    assert_eq!(
+        store.current_generation().unwrap().as_deref(),
+        Some("generation-held")
     );
 }
 

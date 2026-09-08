@@ -22,6 +22,7 @@ use std::time::Duration;
 pub const PATH_IDENTITY_VERSION: u8 = 1;
 const POINTER_DATABASE: &str = "pointer.sqlite";
 const POINTER_BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
+const FILE_OPEN_RETRY_TIMEOUT: Duration = Duration::from_millis(5_000);
 
 /// Errors raised while constructing, verifying, or publishing a view.
 #[derive(Debug)]
@@ -910,6 +911,13 @@ fn sync_file(path: &Path) -> Result<()> {
 }
 
 fn open_file_for_sync(path: &Path) -> std::io::Result<File> {
+    // A concurrent SQLite checkpoint can briefly retain a Windows handle that
+    // denies the write-enabled open required by FlushFileBuffers. Retry only
+    // that open; a persistent denial and every later fsync error still surface.
+    retry_while_windows_file_busy(FILE_OPEN_RETRY_TIMEOUT, || open_file_for_sync_once(path))
+}
+
+fn open_file_for_sync_once(path: &Path) -> std::io::Result<File> {
     #[cfg(windows)]
     {
         // FlushFileBuffers rejects read-only handles, so Windows must open
@@ -920,6 +928,39 @@ fn open_file_for_sync(path: &Path) -> std::io::Result<File> {
     {
         File::open(path)
     }
+}
+
+fn retry_while_windows_file_busy<T>(
+    budget: Duration,
+    mut operation: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut backoff = Duration::from_millis(1);
+    loop {
+        match operation() {
+            Err(error) if is_windows_file_busy(&error) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
+}
+
+fn is_windows_file_busy(error: &std::io::Error) -> bool {
+    // PermissionDenied is how Rust reports ERROR_ACCESS_DENIED. Keep this arm
+    // under cfg(test) as well so the retry policy has a portable regression.
+    #[cfg(any(windows, test))]
+    if error.kind() == std::io::ErrorKind::PermissionDenied {
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(5 | 32)) {
+        return true;
+    }
+    #[cfg(not(any(windows, test)))]
+    let _ = error;
+    false
 }
 
 fn sync_parent(path: &Path) -> Result<()> {
@@ -995,6 +1036,25 @@ mod tests {
         fs::write(&artifact, b"durable").expect("artifact");
 
         sync_file(&artifact).expect("flush pre-existing artifact");
+    }
+
+    #[test]
+    fn windows_file_busy_retry_recovers_from_injected_permission_denied() {
+        let mut attempts = 0;
+        let result = retry_while_windows_file_busy(Duration::from_millis(100), || {
+            attempts += 1;
+            if attempts == 1 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected Windows sharing failure",
+                ))
+            } else {
+                Ok("opened")
+            }
+        });
+
+        assert_eq!(result.unwrap(), "opened");
+        assert_eq!(attempts, 2);
     }
 
     #[test]
