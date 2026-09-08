@@ -1,7 +1,7 @@
 {
   "artifact_id": "ART-V049-S6-ACTIVATION-EVIDENCE-001",
   "artifact_version": "0.49.0",
-  "source_commit": "284865d57d5fb763a247ac70c174929ec76fc346",
+  "source_commit": "fd7ce8babf95786ffaf5b8d101763f37e21bd942",
   "previous_version": "0.48.1",
   "candidate_version": "0.49.0",
   "capture_rule": "Each prefix and generated-subc value is a complete byte snapshot. A valid profile has exactly old -> candidate and no mixed snapshot.",
@@ -39,12 +39,12 @@
           "agent_prefix": {
             "complete": true,
             "byte_length": 1376,
-            "sha256": "ced7b010a9b9d76649de9bc8141f70b6ae310d13eb501751809241635a7a9e51"
+            "sha256": "6b8ef6d48012060ffb0a65c99da807fe05dafc71a1cf83002d094b18d2c6fb6c"
           },
           "generated_subc": {
             "complete": true,
-            "byte_length": 45528,
-            "sha256": "ce6b56a9ebc3f3fe0ee3ac9c936cef14c202125ebced89d5ee3c014a566e5c40"
+            "byte_length": 46534,
+            "sha256": "649e1f3a39217df6a31a19656b8e03174b400969eb4bf74c7a29ea7526379c3d"
           }
         }
       ],
@@ -88,12 +88,12 @@
           "agent_prefix": {
             "complete": true,
             "byte_length": 1580,
-            "sha256": "878ed9e21d83b1438a037a595d3acda9500fc249fda7b7969c4173501698e60c"
+            "sha256": "73348c97bb7f290de3ae93c754525dc3971d85ad9253bccf514d2dfc1d41fc27"
           },
           "generated_subc": {
             "complete": true,
-            "byte_length": 45528,
-            "sha256": "ce6b56a9ebc3f3fe0ee3ac9c936cef14c202125ebced89d5ee3c014a566e5c40"
+            "byte_length": 46534,
+            "sha256": "649e1f3a39217df6a31a19656b8e03174b400969eb4bf74c7a29ea7526379c3d"
           }
         }
       ],
@@ -137,12 +137,12 @@
           "agent_prefix": {
             "complete": true,
             "byte_length": 1790,
-            "sha256": "2c065ce7c9ece207499b461b7212ef3ea28699b8e9650242963bd6154977b444"
+            "sha256": "39adb30223be4ff81d7b1fa4c2f337ef58c0511133ccd7deb7b1843c129e521b"
           },
           "generated_subc": {
             "complete": true,
-            "byte_length": 45528,
-            "sha256": "ce6b56a9ebc3f3fe0ee3ac9c936cef14c202125ebced89d5ee3c014a566e5c40"
+            "byte_length": 46534,
+            "sha256": "649e1f3a39217df6a31a19656b8e03174b400969eb4bf74c7a29ea7526379c3d"
           }
         }
       ],
@@ -186,12 +186,12 @@
           "agent_prefix": {
             "complete": true,
             "byte_length": 1539,
-            "sha256": "901c6242b7fa399857e4efcb8b45fc2b8b037398645420961a25218ddae907d0"
+            "sha256": "0d08f41565058365ac945033f1727d00b6c5d7137c5a295e4db44f2188bf7c98"
           },
           "generated_subc": {
             "complete": true,
-            "byte_length": 45528,
-            "sha256": "ce6b56a9ebc3f3fe0ee3ac9c936cef14c202125ebced89d5ee3c014a566e5c40"
+            "byte_length": 46534,
+            "sha256": "649e1f3a39217df6a31a19656b8e03174b400969eb4bf74c7a29ea7526379c3d"
           }
         }
       ],
@@ -235,12 +235,12 @@
           "agent_prefix": {
             "complete": true,
             "byte_length": 1737,
-            "sha256": "f17a694af17fddbf60f62e698769815c439e18a397134f23307657c8c2328a69"
+            "sha256": "905b9376637c5c0713a15958894ca7f1dee4333c5592c308ad8554d665e35a6e"
           },
           "generated_subc": {
             "complete": true,
-            "byte_length": 45528,
-            "sha256": "ce6b56a9ebc3f3fe0ee3ac9c936cef14c202125ebced89d5ee3c014a566e5c40"
+            "byte_length": 46534,
+            "sha256": "649e1f3a39217df6a31a19656b8e03174b400969eb4bf74c7a29ea7526379c3d"
           }
         }
       ],
@@ -284,12 +284,12 @@
           "agent_prefix": {
             "complete": true,
             "byte_length": 2128,
-            "sha256": "ce58d27fe0dcb12cd0b34a2d982840053d40f92816579ba2de3177b65a529449"
+            "sha256": "a2f53f20880ff2abe0f911f67ecf05efb626810758eafcd8f2c02a261deb9961"
           },
           "generated_subc": {
             "complete": true,
-            "byte_length": 45528,
-            "sha256": "ce6b56a9ebc3f3fe0ee3ac9c936cef14c202125ebced89d5ee3c014a566e5c40"
+            "byte_length": 46534,
+            "sha256": "649e1f3a39217df6a31a19656b8e03174b400969eb4bf74c7a29ea7526379c3d"
           }
         }
       ],
