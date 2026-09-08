@@ -1353,15 +1353,30 @@ function isInteractiveTerminal(): boolean {
   return process.stdin.isTTY === true && process.stdout.isTTY === true;
 }
 
+export function renderIssueDescription(description: string): string {
+  let longestBacktickRun = 0;
+  for (const match of description.matchAll(/`+/g)) {
+    longestBacktickRun = Math.max(longestBacktickRun, match[0].length);
+  }
+  const fence = "`".repeat(Math.max(3, longestBacktickRun + 1));
+  return `${fence}\n${description}\n${fence}`;
+}
+
 function issueDescriptionSummaryFromBody(body: string): string {
   const lines = body.split(/\r?\n/);
   const descriptionStart = lines.findIndex((line) => line.trim() === "## Description");
   if (descriptionStart !== -1) {
     const parts: string[] = [];
+    let descriptionFence: string | null = null;
     for (let i = descriptionStart + 1; i < lines.length; i += 1) {
       const trimmed = lines[i].trim();
       if (trimmed.startsWith("## ")) break;
       if (!trimmed) continue;
+      if (descriptionFence === null && parts.length === 0 && /^`{3,}$/.test(trimmed)) {
+        descriptionFence = trimmed;
+        continue;
+      }
+      if (descriptionFence !== null && trimmed === descriptionFence) break;
       parts.push(trimmed);
       if (parts.join(" ").length >= 72) break;
     }
@@ -1518,7 +1533,7 @@ async function runIssueFlow(argv: string[]): Promise<number> {
 
   const rawBody = [
     "## Description",
-    description,
+    renderIssueDescription(description),
     "",
     "## Environment",
     `- AFT CLI: v${report.cliVersion}`,
