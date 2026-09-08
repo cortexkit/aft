@@ -662,6 +662,65 @@ describe("Pi background notifications", () => {
 });
 
 describe("Pi subc forced-drain dedup (C-#1 / C-#3)", () => {
+  test("an erased-bundle replay is acked after delivery and stays gone on reopen", async () => {
+    let pending = true;
+    const events: string[] = [];
+    const bridgeCalls: Array<{ command: string; params: Record<string, unknown> }> = [];
+    const send = mock(async (command: string, params: Record<string, unknown>) => {
+      events.push(command);
+      bridgeCalls.push({ command, params });
+      if (command === "bash_drain_completions") {
+        return {
+          success: true,
+          bg_completions: [],
+          pending_matches: pending
+            ? [
+                {
+                  task_id: "task-erased",
+                  session_id: "s1",
+                  watch_id: "watch-erased",
+                  match_text: "watch target erased",
+                  match_offset: 0,
+                  context: "background task artifacts were erased",
+                  once: true,
+                  reason: "watch_target_erased",
+                },
+              ]
+            : [],
+        };
+      }
+      if (command === "bash_ack_completions") pending = false;
+      return { success: true, acked_task_ids: ["task-erased"] };
+    });
+    const { ctx } = harness(send);
+    const firstSessionMessages = mock(() => events.push("deliver"));
+
+    await handleTurnEndBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      runtime: { sendUserMessage: firstSessionMessages },
+    });
+    await waitForMockCallCount(firstSessionMessages, 1);
+    await sleep(50);
+
+    __resetBgNotificationStateForTests();
+    const reopenedSessionMessages = mock(() => {});
+    await handleTurnEndBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      runtime: { sendUserMessage: reopenedSessionMessages },
+    });
+    await sleep(500);
+
+    expect(reopenedSessionMessages).toHaveBeenCalledTimes(0);
+    const ackCalls = bridgeCalls.filter((call) => call.command === "bash_ack_completions");
+    expect(ackCalls).toHaveLength(1);
+    expect(ackCalls[0]?.params).toEqual({ session_id: "s1", task_ids: ["task-erased"] });
+    expect(events.indexOf("deliver")).toBeLessThan(events.indexOf("bash_ack_completions"));
+  });
+
   test("a forced drain delivers and acknowledges a durable pattern match", async () => {
     const send = mock(async (command: string) =>
       command === "bash_drain_completions"

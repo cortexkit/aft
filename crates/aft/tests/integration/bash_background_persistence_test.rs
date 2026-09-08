@@ -28,12 +28,22 @@ fn spawn_storage_dir(name: &str) -> tempfile::TempDir {
 }
 
 fn configure_background(aft: &mut AftProcess, project: &Path, storage: &Path, session: &str) {
+    configure_background_for_harness(aft, project, storage, session, "opencode");
+}
+
+fn configure_background_for_harness(
+    aft: &mut AftProcess,
+    project: &Path,
+    storage: &Path,
+    session: &str,
+    harness: &str,
+) {
     let response = aft.send(
         &json!({
             "id": format!("cfg-{session}"),
             "session_id": session,
             "command": "configure",
-            "harness": "opencode",
+            "harness": harness,
             "project_root": project,
             "storage_dir": storage,
             "config": user_config(serde_json::json!({
@@ -1361,6 +1371,94 @@ fn completion_durability_replays_undelivered_terminal_task() {
         true
     );
     assert!(aft.shutdown().success());
+}
+
+#[test]
+fn pi_erased_bundle_notification_is_not_replayed_after_ack_and_second_restart() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let release = project.path().join("release-erased-bundle");
+
+    let task_id = {
+        let mut aft = AftProcess::spawn();
+        configure_background_for_harness(&mut aft, project.path(), storage.path(), SESSION, "pi");
+        let command = format!(
+            "while [ ! -e {} ]; do sleep 0.05; done; printf 'completed\\n'",
+            shell_quote_path(&release)
+        );
+        let task_id = spawn_bg(&mut aft, SESSION, &command, Some(30_000));
+        let registered = notify_once(&mut aft, SESSION, &task_id, "never-matches");
+        assert_eq!(
+            registered["success"], true,
+            "watch registration failed: {registered:?}"
+        );
+        fs::write(&release, "release").unwrap();
+        let _ = wait_for_status(&mut aft, SESSION, &task_id, "completed");
+        let frame = wait_for_pattern_frame(&mut aft, &task_id);
+        assert_eq!(frame["reason"], "task_exit");
+        assert!(aft.shutdown().success());
+        task_id
+    };
+
+    let resolved = resolve_task_layout(&session_tasks_dir(storage.path(), SESSION), &task_id)
+        .expect("resolve completed task bundle before erasing it");
+    assert_eq!(
+        task_bundle_files(&resolved.paths),
+        vec![resolved.paths.dir.clone()]
+    );
+    fs::remove_dir_all(&resolved.paths.dir).expect("erase completed task bundle");
+
+    let mut replay = AftProcess::spawn();
+    configure_background_for_harness(&mut replay, project.path(), storage.path(), SESSION, "pi");
+    let first_drain = drain(&mut replay, SESSION);
+    let first_matches = first_drain["pending_matches"]
+        .as_array()
+        .expect("pending matches array");
+    assert_eq!(
+        first_matches
+            .iter()
+            .filter(|entry| entry["task_id"] == task_id)
+            .count(),
+        1,
+        "erased bundle notification must replay exactly once before ack: {first_drain:?}"
+    );
+    let acked = ack(&mut replay, SESSION, &task_id);
+    assert!(
+        acked["acked_task_ids"]
+            .as_array()
+            .expect("acked task IDs")
+            .iter()
+            .any(|entry| entry == &task_id),
+        "erased bundle notification ack failed: {acked:?}"
+    );
+    assert!(replay.shutdown().success());
+
+    let mut second_replay = AftProcess::spawn();
+    configure_background_for_harness(
+        &mut second_replay,
+        project.path(),
+        storage.path(),
+        SESSION,
+        "pi",
+    );
+    let second_drain = drain(&mut second_replay, SESSION);
+    assert!(
+        second_drain["pending_matches"]
+            .as_array()
+            .expect("pending matches array")
+            .iter()
+            .all(|entry| entry["task_id"] != task_id),
+        "acked erased-bundle notification re-delivered after second restart: {second_drain:?}"
+    );
+    assert!(
+        second_drain["bg_completions"]
+            .as_array()
+            .expect("background completions array")
+            .iter()
+            .all(|entry| entry["task_id"] != task_id),
+        "acked erased-bundle completion re-delivered after second restart: {second_drain:?}"
+    );
+    assert!(second_replay.shutdown().success());
 }
 
 #[test]
