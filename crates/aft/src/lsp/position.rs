@@ -171,13 +171,7 @@ pub fn uri_to_path(uri: &lsp_types::Uri) -> Option<PathBuf> {
 }
 
 fn normalize_windows_path_for_uri(path: &str) -> String {
-    if let Some(stripped) = path.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{}", stripped)
-    } else if let Some(stripped) = path.strip_prefix(r"\\?\") {
-        stripped.to_string()
-    } else {
-        path.to_string()
-    }
+    crate::windows_path::non_verbatim_path_text(path).unwrap_or_else(|| path.to_string())
 }
 
 fn split_unc_path(path: &str) -> Option<(&str, &str)> {
@@ -339,6 +333,12 @@ mod tests {
             url_to_path(&uri).expect("path"),
             PathBuf::from(r"\\server\share\dir\file.rs")
         );
+    }
+
+    #[test]
+    fn windows_extended_volume_path_is_not_misrepresented_as_a_file_uri() {
+        let path = Path::new(r"\\?\Volume{1234}\repo\main.rs");
+        assert!(path_to_uri(path).is_err());
     }
 
     // Unix-absolute path syntax; not a valid Windows absolute path so the

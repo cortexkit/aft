@@ -148,6 +148,7 @@ pub mod watcher_filter;
 // decision logic without a real Windows runtime. The module itself only
 // uses portable APIs; only its callers are Windows-gated.
 pub(crate) mod windows_command;
+pub mod windows_path;
 pub mod windows_shell;
 
 #[cfg(test)]

@@ -77,7 +77,8 @@ where
     // batch file through that namespace, and npm shims additionally derive
     // `%~dp0` paths that fail with "The system cannot find the path specified."
     // Convert only the namespace spelling; the path remains canonical.
-    let command_path = cmd_compatible_path(command_path);
+    let command_path = crate::windows_path::non_verbatim_path_text(command_path)
+        .unwrap_or_else(|| command_path.to_string());
 
     let mut command_line = format!("\"\"%{BATCH_COMMAND_ENV}%\"");
     let mut argument_env = Vec::new();
@@ -119,49 +120,6 @@ where
     Ok(command)
 }
 
-#[cfg(windows)]
-fn cmd_compatible_path(path: &str) -> String {
-    for prefix in [r"\\?\UNC\", r"\\??\UNC\", r"\??\UNC\"] {
-        if let Some(tail) = strip_ascii_prefix(path, prefix) {
-            let mut components = tail
-                .split(['\\', '/'])
-                .filter(|component| !component.is_empty());
-            if components.next().is_some() && components.next().is_some() {
-                return format!(r"\\{tail}");
-            }
-            return path.to_string();
-        }
-    }
-
-    for prefix in [r"\\?\", r"\\??\", r"\??\"] {
-        if let Some(tail) = strip_ascii_prefix(path, prefix) {
-            let bytes = tail.as_bytes();
-            if bytes.len() >= 3
-                && bytes[0].is_ascii_alphabetic()
-                && bytes[1] == b':'
-                && matches!(bytes[2], b'\\' | b'/')
-            {
-                return tail.to_string();
-            }
-            // Namespaces such as `\\?\Volume{GUID}\` cannot be safely
-            // converted into a DOS path by dropping their prefix.
-            return path.to_string();
-        }
-    }
-
-    path.to_string()
-}
-
-#[cfg(windows)]
-fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    let head = value.get(..prefix.len())?;
-    if head.eq_ignore_ascii_case(prefix) {
-        value.get(prefix.len()..)
-    } else {
-        None
-    }
-}
-
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
@@ -169,16 +127,16 @@ mod tests {
     #[test]
     fn cmd_compatible_path_only_converts_dos_and_unc_namespaces() {
         assert_eq!(
-            cmd_compatible_path(r"\\?\C:\cache\server.cmd"),
+            crate::windows_path::non_verbatim_path_text(r"\\?\C:\cache\server.cmd").unwrap(),
             r"C:\cache\server.cmd"
         );
         assert_eq!(
-            cmd_compatible_path(r"\\?\unc\host\share\server.cmd"),
+            crate::windows_path::non_verbatim_path_text(r"\\?\unc\host\share\server.cmd").unwrap(),
             r"\\host\share\server.cmd"
         );
         assert_eq!(
-            cmd_compatible_path(r"\\?\Volume{1234}\server.cmd"),
-            r"\\?\Volume{1234}\server.cmd"
+            crate::windows_path::non_verbatim_path_text(r"\\?\Volume{1234}\server.cmd"),
+            None
         );
     }
 

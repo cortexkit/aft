@@ -814,7 +814,7 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     // normalizers must stay in agreement or membership/strip_prefix checks
     // that cross the engine boundary silently miss on Windows.
     #[cfg(windows)]
-    let path = &windows_non_verbatim_path(path);
+    let path = &crate::windows_path::normalize_windows_path(path);
 
     let mut result = PathBuf::new();
     for component in path.components() {
@@ -842,27 +842,6 @@ pub(crate) fn canonicalize_normalized(path: &Path) -> PathBuf {
         Ok(canonical) => normalize_path(&canonical),
         Err(_) => normalize_path(path),
     }
-}
-
-#[cfg(windows)]
-fn windows_non_verbatim_path(path: &Path) -> PathBuf {
-    let mut raw = path.to_string_lossy().replace('/', "\\");
-    if let Some(stripped) = raw.strip_prefix("\\\\?\\UNC\\") {
-        raw = format!("\\\\{stripped}");
-    } else if let Some(stripped) = raw.strip_prefix("\\\\?\\") {
-        raw = stripped.to_string();
-    } else if let Some(stripped) = raw.strip_prefix("\\\\??\\") {
-        raw = stripped.to_string();
-    }
-
-    if raw.as_bytes().get(1) == Some(&b':') {
-        let drive = raw.as_bytes()[0];
-        if drive.is_ascii_lowercase() {
-            raw.replace_range(0..1, &(drive as char).to_ascii_uppercase().to_string());
-        }
-    }
-
-    PathBuf::from(raw)
 }
 
 #[cfg(test)]

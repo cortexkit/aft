@@ -35,18 +35,27 @@ export function canonicalizeProjectRoot(dir: string): string {
 }
 
 /**
- * Strip Windows extended-length verbatim prefixes (`\\?\`, `\\?\UNC\`) and
- * uppercase a lowercase drive letter so `c:\x` and `C:\x` collapse to one
- * identity. Mirrors `cortexkit-paths`' `windows_non_verbatim_path`. No-op off
- * Windows.
+ * Strip only safely convertible Windows extended-length DOS and UNC prefixes,
+ * and uppercase a lowercase drive letter so `c:\x` and `C:\x` collapse to one
+ * identity. Namespaces such as `\\?\Volume{GUID}\` must retain their prefix.
+ * No-op off Windows.
  */
 function normalizeWindowsRoot(p: string): string {
   if (process.platform !== "win32") return p;
   let s = p;
-  if (s.startsWith("\\\\?\\UNC\\")) {
-    s = `\\\\${s.slice("\\\\?\\UNC\\".length)}`;
-  } else if (s.startsWith("\\\\?\\")) {
-    s = s.slice("\\\\?\\".length);
+  const lower = s.toLowerCase();
+  const uncPrefix = ["\\\\?\\unc\\", "\\\\??\\unc\\", "\\??\\unc\\"].find((prefix) =>
+    lower.startsWith(prefix),
+  );
+  if (uncPrefix) {
+    const tail = s.slice(uncPrefix.length);
+    if (tail.split(/[\\/]+/).filter(Boolean).length >= 2) s = `\\\\${tail}`;
+  } else {
+    const dosPrefix = ["\\\\?\\", "\\\\??\\", "\\??\\"].find((prefix) => lower.startsWith(prefix));
+    if (dosPrefix) {
+      const tail = s.slice(dosPrefix.length);
+      if (/^[a-z]:[\\/]/i.test(tail)) s = tail;
+    }
   }
   if (s.length >= 2 && s[1] === ":") {
     const drive = s.charCodeAt(0);
