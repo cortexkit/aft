@@ -199,13 +199,18 @@ fn complete_read(start: GithubReadStart) -> GithubReadCompletion {
     match start {
         GithubReadStart::Immediate(completion) => completion,
         GithubReadStart::Deferred(deferred) => {
-            for _ in 0..1_000 {
+            // The deferred read spawns the fixture `gh` process; a fixed
+            // iteration count was a ~1 s scheduler-time bound that a loaded
+            // Linux runner missed with the read intact (train 44). Wait on the
+            // wall clock with a liveness ceiling instead.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
                 if let Some(completion) = deferred.try_complete() {
                     return completion.expect("fixture GitHub read succeeds");
                 }
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(Duration::from_millis(5));
             }
-            panic!("fixture GitHub read did not complete");
+            panic!("fixture GitHub read did not complete within 30s");
         }
     }
 }
