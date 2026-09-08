@@ -10,3 +10,6 @@ crates/aft/tests/fixtures/pty_render/*.xterm.txt eol=lf
 # Truncation-contract goldens are compared byte-exact against rendered
 # text (`\n` line ends) on every platform; the same Windows autocrlf rule.
 crates/aft/tests/fixtures/callgraph/truncation/*.txt text eol=lf
+# Bash-surface fixtures: input.txt is the compressor input and is compared
+# line-for-line against the rendered output; keep LF on every platform.
+crates/aft/tests/fixtures/bash/** text eol=lf
