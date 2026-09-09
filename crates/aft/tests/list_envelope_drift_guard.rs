@@ -299,7 +299,7 @@ fn surface_matches_file(command: &str, file: &str) -> bool {
         "grep" => file == "commands/grep.rs" || file == "subc_format.rs",
         "glob" => file == "commands/glob.rs" || file == "subc_format.rs",
         "callgraph" => file == "commands/callgraph_store_adapter.rs" || file == "subc_format.rs",
-        "search" => file == "commands/semantic_search.rs" || file == "subc_format.rs",
+        "search" => file == "commands/semantic_search/mod.rs" || file == "subc_format.rs",
         "outline" => file == "commands/outline.rs" || file == "subc_format.rs",
         "inspect" => file == "commands/inspect.rs" || file == "subc_format.rs",
         "bash" => {
