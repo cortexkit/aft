@@ -56,7 +56,7 @@ def sidecar_bytes(manifest_path: Path, reference_bytes: bytes) -> bytes:
 
 def synthetic_documents() -> tuple[dict[str,Any],dict[str,Any],dict[str,Any]]:
     manifest={"schema":"manifest","rows":[{"episode_id":"followup-census:1","include_tests":False,"include_tests_source":"default"}]}
-    row={"episode_id":"followup-census:1","request":{"includeTests":False,"topK":100},"include_tests_source":"default","pages_fetched":1,"collapse_stop_reason":"exhausted"}
+    row={"episode_id":"followup-census:1","request":{"includeTests":False,"topK":100},"requests":[{"includeTests":False,"topK":100}],"request_count":1,"include_tests_source":"default","pages_fetched":1,"collapse_stop_reason":"exhausted","retrieval_depth":1,"ranked_paths":["opened.rs"]}
     metrics={"mrr_at_10":0.5,"hit_at_1":0.5,"hit_at_5":0.8}
     reference={"schema":"aft-search-score-v1","model_id":"fixture","profile":"single_page","capability":{"schema_path":"fixture.json","schema_sha256":"0"*64,"offset_declared":False},"families":{"exact_recall":dict(metrics),"concept_recall":dict(metrics),"real_query":dict(metrics)},"fixture_groups":{"exact_recall":{"g":dict(metrics)},"concept_recall":{"g":dict(metrics)}},"shapes":{"identifier":dict(metrics)},"mechanisms":{"topk_cut":dict(metrics)},"rows":[dict(row)]}
     score=copy.deepcopy(reference); score["rows"]=[dict(row)]; score["fixture_results"]={"harness-goldens":True,"paging":True}
@@ -168,8 +168,14 @@ def run(args:argparse.Namespace)->int:
             if old_result.exit_code: raise InputFault("old_manifest_evaluation:"+";".join(old_result.reasons))
             delta=identity_delta(old_manifest,manifest)
         else: delta={"added":[row["episode_id"] for row in manifest["rows"] if "excluded_reason" not in row],"removed":[],"changed":[]}
-        atomic_write_pair(reference_path,sidecar_path,reference_bytes,sidecar_bytes(manifest_path,reference_bytes),fault=os.environ.get("AFT_REFERENCE_FAULT"))
-        print(json.dumps({"old_reference_sha256":None if old_reference is None else sha256_bytes(canonical_json(old_reference)),"new_reference_sha256":sha256_bytes(reference_bytes),"identity_delta":delta},sort_keys=True)); return 0
+        sidecar_data=sidecar_bytes(manifest_path,reference_bytes)
+        result={"old_reference_sha256":None if old_reference is None else sha256_bytes(canonical_json(old_reference)),"new_reference_sha256":sha256_bytes(reference_bytes),"identity_delta":delta}
+        if args.dry_run:
+            result["dry_run"]=True
+            result["would_write"]=[{"path":str(reference_path),"sha256":sha256_bytes(reference_bytes)},{"path":str(sidecar_path),"sha256":sha256_bytes(sidecar_data)}]
+        else:
+            atomic_write_pair(reference_path,sidecar_path,reference_bytes,sidecar_data,fault=os.environ.get("AFT_REFERENCE_FAULT"))
+        print(json.dumps(result,sort_keys=True)); return 0
     sidecar=binding(reference_path,manifest_path,sidecar_path)
     if not args.score: raise InputFault("missing_score")
     score=read_json(Path(args.score)); reference=read_json(reference_path)
@@ -195,7 +201,7 @@ def run(args:argparse.Namespace)->int:
 
 
 def parser()->argparse.ArgumentParser:
-    p=argparse.ArgumentParser(); p.add_argument("--mode",choices=("evaluate","record-reference","verify"),default="evaluate"); p.add_argument("--manifest",default=str(BENCH/"real-query-manifest.json")); p.add_argument("--reference",default=str(BENCH/"real-query-baseline.json")); p.add_argument("--sidecar",default=str(BENCH/"manifest.sha256")); p.add_argument("--score"); p.add_argument("--descriptor"); p.add_argument("--branch"); p.add_argument("--base-ref",default="HEAD^"); p.add_argument("--head",default="HEAD"); p.add_argument("--model-id",default="aft-search-fixture-v1"); p.add_argument("--manifest-changed",action="store_true"); p.add_argument("--old-score"); p.add_argument("--rebaseline",action="store_true"); p.add_argument("--from-profile"); p.add_argument("--to-profile"); p.add_argument("--self-test",action="store_true"); return p
+    p=argparse.ArgumentParser(); p.add_argument("--mode",choices=("evaluate","record-reference","verify"),default="evaluate"); p.add_argument("--manifest",default=str(BENCH/"real-query-manifest.json")); p.add_argument("--reference",default=str(BENCH/"real-query-baseline.json")); p.add_argument("--sidecar",default=str(BENCH/"manifest.sha256")); p.add_argument("--score"); p.add_argument("--descriptor"); p.add_argument("--branch"); p.add_argument("--base-ref",default="HEAD^"); p.add_argument("--head",default="HEAD"); p.add_argument("--model-id",default="aft-search-fixture-v1"); p.add_argument("--manifest-changed",action="store_true"); p.add_argument("--old-score"); p.add_argument("--rebaseline",action="store_true"); p.add_argument("--from-profile"); p.add_argument("--to-profile"); p.add_argument("--dry-run",action="store_true"); p.add_argument("--self-test",action="store_true"); return p
 
 def main()->int:
     try: return run(parser().parse_args())

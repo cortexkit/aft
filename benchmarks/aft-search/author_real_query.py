@@ -163,10 +163,16 @@ def fixture_vector(text: str) -> list[float]:
 
 def vector_pack(output: Path, contents: dict[str, str], queries: list[str]) -> str:
     template = "aft-search-template-v1"
-    vectors = {
+    vectors: dict[str, list[float]] = {}
+    if output.is_file():
+        existing = json.loads(output.read_text())
+        if existing.get("pinned_sha") == EVIDENCE_SHA and existing.get("embed_template_version") == template:
+            vectors.update(existing.get("vectors", {}))
+    corpus_inputs = list(contents.values()) + ["semantic index fingerprint probe"]
+    vectors.update({
         f"corpus:{EVIDENCE_SHA}:{hashlib.sha256(text.encode()).hexdigest()}:{template}": fixture_vector(text)
-        for text in contents.values()
-    }
+        for text in corpus_inputs
+    })
     vectors.update({f"query:{hashlib.sha256(query.encode()).hexdigest()}:{template}": fixture_vector(query) for query in queries})
     output.write_bytes(canonical_json({"schema": "aft-search-vector-pack-v1", "pinned_sha": EVIDENCE_SHA, "embed_template_version": template, "model_id": "aft-search-fixture-v1", "vectors": vectors}))
     return sha256_file(output)

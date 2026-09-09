@@ -16,11 +16,11 @@ case "${1:-}" in
     ;;
   --real-query)
     shift
-    exec python3 "$benchmark_dir/search_quality.py" --mode verify "$@"
+    exec python3 "$benchmark_dir/run_real_query.py" "$@"
     ;;
   --search-quality)
     shift
-    exec python3 "$benchmark_dir/search_quality.py" "$@"
+    exec python3 "$benchmark_dir/run_search_quality.py" "$@"
     ;;
   --record-vectors)
     shift

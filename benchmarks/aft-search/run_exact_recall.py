@@ -5,34 +5,76 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from run import AftClient, AftProtocolError, binary_sha256, binary_version, git_rev, normalize_result_path
+from search_quality_lib import sha256_file
 from setup_corpus import parse_corpus_toml
 
 
 DEFAULT_READY_TIMEOUT_SECS = 600.0
+PROVISION_COMMAND = "python3 benchmarks/aft-search/provision_corpus.py"
 JsonObject = Dict[str, Any]
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", default="../../target/release/aft", help="Path to the aft binary to measure.")
+    parser.add_argument("--binary", default=os.environ.get("AFT_BINARY_PATH", "../../target/release/aft"), help="Path to the aft binary to measure.")
     parser.add_argument("--corpus", default="corpus/corpus.toml", help="Pinned corpus manifest path.")
     parser.add_argument("--fixtures", default="exact-recall-fixtures.json", help="Exact-recall fixture JSON path.")
     parser.add_argument("--baseline", default="exact-recall-baseline.json", help="Minimum passing metrics.")
     parser.add_argument("--out", default="results/exact-recall.json", help="Detailed JSON output path.")
     parser.add_argument("--summary", default=None, help="Optional Markdown summary file to append.")
     parser.add_argument("--ready-timeout", type=float, default=DEFAULT_READY_TIMEOUT_SECS)
+    parser.add_argument("--check-corpus", action="store_true", help="Validate the offline corpus and exit without running AFT.")
     return parser.parse_args(list(argv))
 
 
 def resolve(script_dir: Path, value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() else (script_dir / path).resolve()
+
+
+class CorpusMissing(FileNotFoundError):
+    """An offline exact-recall checkout is absent or lacks its provision record."""
+
+
+def clone_root_for(corpus_path: Path, corpus: JsonObject) -> Path:
+    clone_root = Path(str(corpus.get("clone_root", ".bench/repos")))
+    return clone_root if clone_root.is_absolute() else corpus_path.parent.parent / clone_root
+
+
+def validate_corpus(corpus_path: Path, corpus: JsonObject, repos: Sequence[JsonObject]) -> Path:
+    clone_root = clone_root_for(corpus_path, corpus)
+    record_path = clone_root / "provisioned.json"
+    try:
+        record = json.loads(record_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        missing = next((str(repo["name"]) for repo in repos if not (clone_root / str(repo["name"]) / ".git").is_dir()), "provision_record")
+        raise CorpusMissing(f"corpus_missing:{missing}:run={PROVISION_COMMAND}")
+    if record.get("schema") != "aft-search-corpus-provision-v1" or record.get("corpus_manifest_sha256") != sha256_file(corpus_path):
+        raise CorpusMissing(f"corpus_missing:provision_record:run={PROVISION_COMMAND}")
+    recorded = {str(row.get("name")): row for row in record.get("repos", []) if isinstance(row, dict)}
+    for repo in repos:
+        name = str(repo["name"])
+        repo_path = clone_root / name
+        if not (repo_path / ".git").is_dir() or name not in recorded:
+            raise CorpusMissing(f"corpus_missing:{name}:run={PROVISION_COMMAND}")
+        expected = str(repo["commit"])
+        actual = git_rev(repo_path)
+        recorded_row = recorded[name]
+        if (
+            actual != expected
+            or recorded_row.get("commit") != expected
+            or recorded_row.get("actual_commit") != expected
+            or recorded_row.get("url") != repo.get("url")
+        ):
+            raise ValueError(f"corpus_commit_mismatch:{name}:expected={expected}:actual={actual}")
+    return clone_root
 
 
 def load_fixtures(path: Path, repo_names: Sequence[str]) -> Tuple[int, List[JsonObject]]:
@@ -165,7 +207,7 @@ def markdown_table(rows: Sequence[JsonObject], metrics: JsonObject, baseline: Js
     return "\n".join(lines)
 
 
-def main(argv: Sequence[str]) -> int:
+def run(argv: Sequence[str]) -> int:
     args = parse_args(argv)
     script_dir = Path(__file__).resolve().parent
     binary = resolve(script_dir, args.binary)
@@ -173,14 +215,16 @@ def main(argv: Sequence[str]) -> int:
     fixtures_path = resolve(script_dir, args.fixtures)
     baseline_path = resolve(script_dir, args.baseline)
     out_path = resolve(script_dir, args.out)
-    if not binary.is_file():
-        raise FileNotFoundError(f"aft binary not found: {binary}")
 
     corpus, repos = parse_corpus_toml(corpus_path)
+    clone_root = validate_corpus(corpus_path, corpus, repos)
+    if args.check_corpus:
+        print(f"corpus_check:ok:{clone_root}")
+        return 0
+    if not binary.is_file():
+        raise FileNotFoundError(f"aft_binary_missing:{binary}")
+
     repo_names = [str(repo["name"]) for repo in repos]
-    clone_root = Path(str(corpus.get("clone_root", ".bench/repos")))
-    if not clone_root.is_absolute():
-        clone_root = corpus_path.parent.parent / clone_root
     sample_count, fixtures = load_fixtures(fixtures_path, repo_names)
     baseline = load_baseline(baseline_path, sample_count)
 
@@ -190,16 +234,10 @@ def main(argv: Sequence[str]) -> int:
     for repo in repos:
         repo_name = str(repo["name"])
         repo_path = clone_root / repo_name
-        if not (repo_path / ".git").exists():
-            raise FileNotFoundError(f"missing pinned corpus checkout: {repo_path}")
-        expected_sha = str(repo["commit"])
-        actual_sha = git_rev(repo_path)
-        if actual_sha != expected_sha:
-            raise ValueError(f"{repo_name} is at {actual_sha}, expected {expected_sha}")
         repo_fixtures = [fixture for fixture in fixtures if fixture["repo"] == repo_name]
         for fixture in repo_fixtures:
             if not (repo_path / str(fixture["expected_file"])).is_file():
-                raise ValueError(f"fixture {fixture['id']} expected file is missing")
+                raise ValueError(f"fixture_file_missing:{fixture['id']}:{fixture['expected_file']}")
 
         client = AftClient(binary, repo_path, args.ready_timeout, semantic_search=False)
         try:
@@ -248,6 +286,14 @@ def main(argv: Sequence[str]) -> int:
         for row in failures:
             print(f"FAIL {row['id']}: expected {row['expected_file']} rank={row['rank']} exact={row['exact_marker']}", file=sys.stderr)
     return 1 if regressed or failures else 0
+
+
+def main(argv: Sequence[str]) -> int:
+    try:
+        return run(argv)
+    except (CorpusMissing, AftProtocolError, FileNotFoundError, OSError, KeyError, ValueError, json.JSONDecodeError) as error:
+        print(str(error), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

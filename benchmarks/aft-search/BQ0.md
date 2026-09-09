@@ -35,3 +35,64 @@ The CI mode exception is narrow: only a complete diff containing the manifest an
 The post-release estimator treats sampled label outcomes and measured-window D/N as independent. D/N is a binomial proportion, covariance is zero, and the delta variance is `q² Var(p_w) + p_w² Var(q)`. This is an explicit approximation, not a precision or improvement claim. Reports place 3,996/6,469 conditional and 3,996/20,183 projected comparisons side by side; the conditional interval is never compared with 0.198.
 
 Required-check registration remains **NOT MET** until the repository owner supplies the external branch-protection PUT receipt.
+
+## BQ0 repair delivery
+
+The exact-recall fixtures target ripgrep, Flask, Fastify, and Turborepo rather
+than the AFT tree, so this repair uses the external-corpus option. Run
+`python3 benchmarks/aft-search/provision_corpus.py` once while network access is
+allowed. It fetches each declared commit at depth one and records
+`.bench/repos/provisioned.json`. `run_exact_recall.py` never fetches; offline
+runs either validate those checkouts or exit 2 as
+`corpus_missing:<name>:run=python3 benchmarks/aft-search/provision_corpus.py`.
+
+`run_real_query.py` extracts the checked-in AFT bundle into a temporary tree,
+uses empty temporary storage and model caches, starts the embedding fixture on
+loopback, and invokes public `search` calls through standalone AFT's NDJSON
+`tool_call` command. `AFT_BINARY_PATH` overrides the default release binary.
+The fixture pack was captured from the actual semantic chunks at the pinned
+product state; unknown texts still return `vector_missing` during gate runs.
+
+The following is the complete 2026-09-09 record-reference dry-run transcript.
+Absolute worktree prefixes are written as `$ROOT`; the executed checkout was
+clean before ignored `.bench` and `target` runtime artifacts were created.
+
+```text
+$ scripts/telemetry/cost-gate.sh --search-quality --mode record-reference --dry-run
+quality_command:python3 $ROOT/benchmarks/aft-search/run_exact_recall.py --corpus $ROOT/benchmarks/aft-search/corpus/corpus.toml --check-corpus
+corpus_check:ok:$ROOT/benchmarks/aft-search/.bench/repos
+quality_exit:0
+quality_corpus:$ROOT/benchmarks/aft-search/.bench/repos
+quality_binary:$ROOT/target/release/aft
+quality_command:python3 $ROOT/benchmarks/aft-search/run_exact_recall.py --binary $ROOT/target/release/aft --corpus $ROOT/benchmarks/aft-search/corpus/corpus.toml --out $ROOT/benchmarks/aft-search/.bench/search-quality/exact.json --ready-timeout 600.0
+## AFT exact-recall gate
+
+| Repository | Family | Passed | Total | Recall | Exact markers |
+| --- | --- | ---: | ---: | ---: | ---: |
+| fastify | sentence | 2 | 2 | 1.000 | 2 |
+| fastify | pair | 2 | 2 | 1.000 | 2 |
+| flask | sentence | 2 | 2 | 1.000 | 2 |
+| flask | pair | 2 | 2 | 1.000 | 2 |
+| ripgrep | sentence | 2 | 2 | 1.000 | 2 |
+| ripgrep | pair | 2 | 2 | 1.000 | 2 |
+| turborepo | sentence | 2 | 2 | 1.000 | 2 |
+| turborepo | pair | 2 | 2 | 1.000 | 2 |
+
+Sentence rank-1: **1.000** (baseline 1.000)
+Pair recall@10: **1.000** (baseline 1.000)
+wrote $ROOT/benchmarks/aft-search/.bench/search-quality/exact.json
+quality_exit:0
+quality_command:python3 $ROOT/benchmarks/aft-search/run_concept_recall.py --output $ROOT/benchmarks/aft-search/.bench/search-quality/concept.json
+quality_exit:0
+quality_command:python3 $ROOT/benchmarks/aft-search/run_real_query.py --manifest $ROOT/benchmarks/aft-search/real-query-manifest.json --profile single_page --binary $ROOT/target/release/aft --schema $ROOT/packages/pi-plugin/src/tools/semantic.ts --exact-score $ROOT/benchmarks/aft-search/.bench/search-quality/exact.json --concept-score $ROOT/benchmarks/aft-search/.bench/search-quality/concept.json --reference $ROOT/benchmarks/aft-search/real-query-baseline.json --output $ROOT/benchmarks/aft-search/.bench/search-quality/score.json --ready-timeout 600.0
+real_query_rows:43
+real_query_score:$ROOT/benchmarks/aft-search/.bench/search-quality/score.json
+real_query_score_sha256:ab320e82ffb95c1b179faa3220ad1df1847fa8f674a5c8918ec3ab8b49ba88f4
+quality_exit:0
+quality_command:python3 $ROOT/benchmarks/aft-search/search_quality.py --mode record-reference --manifest $ROOT/benchmarks/aft-search/real-query-manifest.json --reference $ROOT/benchmarks/aft-search/real-query-baseline.json --sidecar $ROOT/benchmarks/aft-search/manifest.sha256 --base-ref HEAD^ --head HEAD --score $ROOT/benchmarks/aft-search/.bench/search-quality/score.json --dry-run
+{"dry_run":true,"identity_delta":{"added":["followup-census:584","followup-census:832","followup-census:3184","followup-census:4111","followup-census:4112","followup-census:4212","followup-census:7617","followup-census:7656","followup-census:7670","followup-census:7695","followup-census:7744","followup-census:7956","followup-census:8637","followup-census:8676","followup-census:8679","followup-census:8886","followup-census:9034","followup-census:9173","followup-census:9365","followup-census:9372","followup-census:10215","followup-census:10672","followup-census:10820","followup-census:11468","followup-census:12976","followup-census:13398","followup-census:13619","followup-census:14337","followup-census:14369","followup-census:14449","followup-census:14613","followup-census:14964","followup-census:15174","followup-census:16765","followup-census:17173","followup-census:17208","followup-census:17364","followup-census:18091","followup-census:18338","followup-census:18341","followup-census:18413","followup-census:19269","followup-census:19696"],"changed":[],"removed":[]},"new_reference_sha256":"273d6b840788b9cb78afc3370c8b33eb2f8f7af4dbb0802338bb1a97cead9c02","old_reference_sha256":null,"would_write":[{"path":"$ROOT/benchmarks/aft-search/real-query-baseline.json","sha256":"273d6b840788b9cb78afc3370c8b33eb2f8f7af4dbb0802338bb1a97cead9c02"},{"path":"$ROOT/benchmarks/aft-search/manifest.sha256","sha256":"9397b92b4601f61cccb23db917bf3fe0420f8414f1230786f8d9270ce4cedea6"}]}
+quality_exit:0
+exit_code=0
+```
+
+No reference or sidecar was written. Recording that pair remains B0's act.

@@ -5,7 +5,19 @@
   "required": ["schema", "model_id", "profile", "capability", "rows", "families", "fixture_groups", "shapes", "mechanisms", "fixture_results"],
   "properties": {
     "profile": {"enum": ["single_page", "paged"]},
-    "rows": {"type": "array", "items": {"type": "object", "required": ["episode_id", "request", "include_tests_source", "pages_fetched", "collapse_stop_reason"]}},
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["episode_id", "request", "requests", "request_count", "include_tests", "include_tests_source", "pages_fetched", "collapse_stop_reason", "retrieval_depth", "ranked_paths", "metrics"],
+        "properties": {
+          "collapse_stop_reason": {"enum": ["ten_files", "exhausted", "page_cap"]},
+          "retrieval_depth": {"type": "integer", "minimum": 0},
+          "ranked_paths": {"type": "array", "maxItems": 10, "uniqueItems": true},
+          "request_count": {"type": "integer", "minimum": 1}
+        }
+      }
+    },
     "capability": {"type": "object", "required": ["schema_path", "schema_sha256", "offset_declared"]}
   }
 }

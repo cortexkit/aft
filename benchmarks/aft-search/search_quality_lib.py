@@ -390,16 +390,40 @@ def validate_profile_score(score: Mapping[str, Any]) -> None:
             requests = [request] if isinstance(request, Mapping) else []
         if not requests or any(not isinstance(request, Mapping) for request in requests):
             raise InputFault(f"request_bound_violation:{row.get('episode_id')}")
+        if row.get("request") != requests[0]:
+            raise InputFault(f"request_bound_violation:{row.get('episode_id')}:request_recorder")
+        invariance = row.get("invariance_requests", [])
         if profile == "single_page":
-            if len(requests) != 1 or requests[0].get("topK") != 100 or "offset" in requests[0]:
+            if len(requests) != 1 or requests[0].get("topK") != 100 or "offset" in requests[0] or invariance:
                 raise InputFault(f"request_bound_violation:{row.get('episode_id')}:single_page")
         else:
-            expected = list(range(0, len(requests) * 100, 100))
             offsets = [request.get("offset") for request in requests]
-            if not offset_declared or len(requests) > 4 or offsets != expected or any(request.get("topK") != 100 for request in requests):
+            if not offset_declared or len(requests) != 4 or offsets != [0, 100, 200, 300] or any(request.get("topK") != 100 for request in requests):
                 raise InputFault(f"request_bound_violation:{row.get('episode_id')}:paged")
-        if row.get("pages_fetched") != len(requests):
-            raise InputFault(f"request_bound_violation:{row.get('episode_id')}:pages_fetched")
+            expected_invariance = invariance_requests()
+            if not isinstance(invariance, list) or len(invariance) != 3:
+                raise InputFault(f"request_bound_violation:{row.get('episode_id')}:invariance")
+            for observed_plan, expected_plan in zip(invariance, expected_invariance):
+                if not isinstance(observed_plan, list) or len(observed_plan) != len(expected_plan):
+                    raise InputFault(f"request_bound_violation:{row.get('episode_id')}:invariance")
+                grammar = [{key: request.get(key) for key in ("topK", "offset")} for request in observed_plan]
+                if grammar != expected_plan:
+                    raise InputFault(f"request_bound_violation:{row.get('episode_id')}:invariance")
+        request_count = len(requests) + sum(len(plan) for plan in invariance)
+        if row.get("pages_fetched") != len(requests) or row.get("request_count") != request_count:
+            raise InputFault(f"request_bound_violation:{row.get('episode_id')}:request_count")
+        all_requests = list(requests) + [request for plan in invariance for request in plan]
+        if any(
+            request.get("includeTests") is not row.get("request", {}).get("includeTests")
+            or request.get("query") != row.get("request", {}).get("query")
+            for request in all_requests
+        ):
+            raise InputFault(f"replay_input_mismatch:{row.get('episode_id')}:request_set")
+        if not isinstance(row.get("retrieval_depth"), int) or row["retrieval_depth"] < 0:
+            raise InputFault(f"invalid_stop_fields:{row.get('episode_id')}:retrieval_depth")
+        ranked_paths = row.get("ranked_paths")
+        if not isinstance(ranked_paths, list) or len(ranked_paths) > 10 or len(ranked_paths) != len(set(ranked_paths)):
+            raise InputFault(f"invalid_stop_fields:{row.get('episode_id')}:ranked_paths")
 
 
 def included_manifest_ids(manifest: Mapping[str, Any]) -> list[str]:
