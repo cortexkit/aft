@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "tool": "inspect",
+  "controls": [
+    {
+      "id": "inspect-t1-agent-text",
+      "mutated_input": "inspect/T1 result text",
+      "expected_failure": "shape comparison failed",
+      "unaffected_positive_control": "inspect/T2/invalid_arguments"
+    },
+    {
+      "id": "inspect-t2-host-rejection",
+      "mutated_input": "inspect/T2 invalid fixture",
+      "expected_failure": "host schema rejection mismatch",
+      "unaffected_positive_control": "inspect/T1/happy"
+    },
+    {
+      "id": "inspect-parity-shape",
+      "mutated_input": "inspect/T7 projected fixture marker",
+      "expected_failure": "projected V1/V2 parity mismatch",
+      "unaffected_positive_control": "inspect/T1/happy"
+    },
+    {
+      "id": "inspect-t6-supported-reason",
+      "mutated_input": "inspect/T6 triggered_reason",
+      "expected_failure": "inspect..payload.details does not support reason",
+      "unaffected_positive_control": "inspect/T6 complete fixture"
+    },
+    {
+      "id": "inspect-t6-complete-no-trailer",
+      "mutated_input": "inspect/T6 complete fixture",
+      "expected_failure": "complete T6 fixture rendered a truncation trailer",
+      "unaffected_positive_control": "inspect/T6 incomplete fixture"
+    }
+  ]
+}

@@ -1,0 +1,275 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "inspect",
+  "scenarios": [
+    {
+      "schema_version": 1,
+      "id": "inspect/T1/happy",
+      "tool": "inspect",
+      "trajectory": "T1",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the deterministic inspect fixture call.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "inspect-happy",
+                "name": "aft_inspect",
+                "arguments": {
+                  "sections": "todos",
+                  "scope": ".",
+                  "topK": 20
+                },
+                "non_mutating_evidence": {
+                  "reason": "inspect only observes fixture state"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "inspect-happy",
+      "comparison": {
+        "mode": "shape",
+        "rules": [
+          {
+            "kind": "field",
+            "field": "fixture_marker",
+            "pattern": "^(?=[\\s\\S]*(?<value>TODO))[\\s\\S]+$",
+            "min_lines": 1,
+            "max_lines": 10000
+          }
+        ],
+        "expected": {
+          "fixture_marker": "TODO"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "inspect/T2/invalid_arguments",
+      "tool": "inspect",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted inspect call with an invalid argument type.",
+      "fixture": "./fixture",
+      "subcase": "invalid_arguments",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "inspect-invalid",
+                "name": "aft_inspect",
+                "arguments": {
+                  "sections": 42
+                },
+                "non_mutating_evidence": {
+                  "reason": "the host rejects the argument type before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "inspect/T4/abort",
+      "tool": "inspect",
+      "trajectory": "T4",
+      "execution": "shared-server",
+      "prompt": "Start and abort the deferred inspect call.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "inspect-abort",
+                "name": "aft_inspect",
+                "arguments": {
+                  "sections": "all",
+                  "scope": ".",
+                  "topK": 100
+                },
+                "non_mutating_evidence": {
+                  "reason": "aborted inspection does not mutate the project"
+                },
+                "outlives_result": true
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "controls": [
+        {
+          "id": "inspect-abort-control",
+          "after_turn": "call-tool",
+          "delay_ms": 1000,
+          "method": "POST",
+          "path": "/api/session/{{session_id}}/abort",
+          "expected_status": 0,
+          "purpose": "abort"
+        }
+      ],
+      "metadata": {
+        "accepted_exit_codes": [
+          0,
+          130
+        ],
+        "harness_blocker": "ApiControlPlan cannot interpolate the active session id"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "inspect/T6/inspect-payload-details/complete",
+      "tool": "inspect",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the complete inspect..payload.details fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "inspect-t6-inspect-payload-details-complete",
+                "name": "aft_inspect",
+                "arguments": {
+                  "sections": "todos",
+                  "scope": "small",
+                  "topK": 20
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "inspect-t6-inspect-payload-details-complete",
+      "metadata": {
+        "t6": {
+          "surface_id": "inspect..payload.details",
+          "owner": "inspect",
+          "call_id": "inspect-t6-inspect-payload-details-complete",
+          "fixture": "complete"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "inspect/T6/inspect-payload-details/incomplete",
+      "tool": "inspect",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the incomplete inspect..payload.details fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "inspect-t6-inspect-payload-details-incomplete",
+                "name": "aft_inspect",
+                "arguments": {
+                  "sections": "todos",
+                  "scope": "bulk",
+                  "topK": 1
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "inspect-t6-inspect-payload-details-incomplete",
+      "metadata": {
+        "t6": {
+          "surface_id": "inspect..payload.details",
+          "owner": "inspect",
+          "call_id": "inspect-t6-inspect-payload-details-incomplete",
+          "fixture": "incomplete",
+          "triggered_reason": "cap"
+        }
+      }
+    }
+  ]
+}
