@@ -1,0 +1,27 @@
+{
+  "depths": [200, 400, 800, 1600, 3200],
+  "cross_lane": {
+    "semantic_position": 10,
+    "lexical_position": 250,
+    "expected_b0_size": 200,
+    "direct_offset": 200,
+    "direct_top_k": 20
+  },
+  "frozen_scoring": {
+    "semantic_position_a": 10,
+    "lexical_position_a": 250,
+    "shallow_depth": 200,
+    "deep_depth": 400
+  },
+  "boundaries": {
+    "dense_b0_size": 200,
+    "sparse_b0_size": 20,
+    "sparse_b1_index": 20
+  },
+  "exact_only_count": 260,
+  "mixed_exact_count": 150,
+  "n_eff": {
+    "top_k": 1,
+    "expected_effective_target": 2
+  }
+}
