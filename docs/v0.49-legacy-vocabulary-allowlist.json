@@ -5616,6 +5616,177 @@
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
+      "path": "tests/docker/opencode2/scenarios/aft_safety/registration.json",
+      "location": "line 47, column 20",
+      "line": 47,
+      "column": 20,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/aft_safety/registration.json",
+      "location": "line 123, column 16",
+      "line": 123,
+      "column": 16,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/edit/registration.json",
+      "location": "line 25, column 20",
+      "line": 25,
+      "column": 20,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/edit/registration.json",
+      "location": "line 90, column 20",
+      "line": 90,
+      "column": 20,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/edit/registration.json",
+      "location": "line 193, column 20",
+      "line": 193,
+      "column": 20,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/edit/registration.json",
+      "location": "line 258, column 16",
+      "line": 258,
+      "column": 16,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/edit/registration.json",
+      "location": "line 311, column 20",
+      "line": 311,
+      "column": 20,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/edit/registration.json",
+      "location": "line 367, column 20",
+      "line": 367,
+      "column": 20,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/read/registration.json",
+      "location": "line 16, column 129",
+      "line": 16,
+      "column": 129,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/read/registration.json",
+      "location": "line 36, column 139",
+      "line": 36,
+      "column": 139,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/read/registration.json",
+      "location": "line 67, column 129",
+      "line": 67,
+      "column": 129,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/read/registration.json",
+      "location": "line 82, column 128",
+      "line": 82,
+      "column": 128,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/read/registration.json",
+      "location": "line 97, column 135",
+      "line": 97,
+      "column": 135,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/write/registration.json",
+      "location": "line 25, column 20",
+      "line": 25,
+      "column": 20,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/write/registration.json",
+      "location": "line 85, column 20",
+      "line": 85,
+      "column": 20,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/write/registration.json",
+      "location": "line 188, column 20",
+      "line": 188,
+      "column": 20,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/write/registration.json",
+      "location": "line 248, column 16",
+      "line": 248,
+      "column": 16,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/write/registration.json",
+      "location": "line 297, column 20",
+      "line": 297,
+      "column": 20,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/scenarios/write/registration.json",
+      "location": "line 348, column 20",
+      "line": 348,
+      "column": 20,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
       "path": "tests/pi-rpc/aft-tools.test.ts",
       "location": "line 187, column 11",
       "line": 187,
