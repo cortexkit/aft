@@ -1,0 +1,405 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "edit",
+  "scenarios": [
+    {
+      "schema_version": 1,
+      "id": "edit/T1/happy",
+      "tool": "edit",
+      "trajectory": "T1",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the deterministic edit fixture call.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "edit-happy",
+                "name": "edit",
+                "arguments": {
+                  "filePath": "editable.txt",
+                  "edits": [
+                    {
+                      "oldString": "before",
+                      "newString": "after"
+                    }
+                  ]
+                },
+                "disk_effects": [
+                  "editable.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "edit-happy",
+      "comparison": {
+        "mode": "shape",
+        "rules": [
+          {
+            "kind": "field",
+            "field": "fixture_marker",
+            "pattern": "^(?=[\\s\\S]*(?<value>editable\\.txt))[\\s\\S]+$",
+            "min_lines": 1,
+            "max_lines": 10000
+          }
+        ],
+        "expected": {
+          "fixture_marker": "editable.txt"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "edit/T2/invalid_arguments",
+      "tool": "edit",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted edit call with an invalid argument type.",
+      "fixture": "./fixture",
+      "subcase": "invalid_arguments",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "edit-invalid",
+                "name": "edit",
+                "arguments": {
+                  "filePath": 42
+                },
+                "non_mutating_evidence": {
+                  "reason": "the host rejects the argument type before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "edit/T2/missing_target",
+      "tool": "edit",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted edit call without its required target.",
+      "fixture": "./fixture",
+      "subcase": "missing_target",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "edit-missing",
+                "name": "edit",
+                "arguments": {},
+                "non_mutating_evidence": {
+                  "reason": "the host rejects missing required arguments before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "edit/T3/edit_ask_allow",
+      "tool": "edit",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Allow the edit mutation and restore its checkpoint.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "checkpoint",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "edit-checkpoint",
+                "name": "aft_safety",
+                "arguments": {
+                  "op": "checkpoint",
+                  "name": "edit-t3",
+                  "files": [
+                    "editable.txt"
+                  ]
+                },
+                "non_mutating_evidence": {
+                  "reason": "checkpoint creation does not alter the fixture project"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "mutate",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "edit-allow-mutation",
+                "name": "edit",
+                "arguments": {
+                  "filePath": "editable.txt",
+                  "edits": [
+                    {
+                      "oldString": "before",
+                      "newString": "after"
+                    }
+                  ]
+                },
+                "disk_effects": [
+                  "editable.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "restore",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "edit-restore",
+                "name": "aft_safety",
+                "arguments": {
+                  "op": "restore",
+                  "name": "edit-t3"
+                },
+                "disk_effects": [
+                  "editable.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "checkpoint",
+        "mutate",
+        "restore",
+        "finish"
+      ],
+      "restore_evidence": {
+        "operation": "checkpoint_restore",
+        "identifier": "edit-t3",
+        "calls": [
+          {
+            "tool": "aft_safety",
+            "arguments": {
+              "op": "checkpoint",
+              "name": "edit-t3",
+              "files": [
+                "editable.txt"
+              ]
+            }
+          },
+          {
+            "tool": "edit",
+            "arguments": {
+              "filePath": "editable.txt",
+              "edits": [
+                {
+                  "oldString": "before",
+                  "newString": "after"
+                }
+              ]
+            }
+          },
+          {
+            "tool": "aft_safety",
+            "arguments": {
+              "op": "restore",
+              "name": "edit-t3"
+            }
+          }
+        ],
+        "paths": [
+          {
+            "path": "editable.txt",
+            "transition": "edit"
+          }
+        ]
+      },
+      "metadata": {
+        "permission": {
+          "operation": "edit",
+          "reply": "once",
+          "requested_paths": [
+            "editable.txt"
+          ]
+        },
+        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "edit/T3/edit_ask_deny",
+      "tool": "edit",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Deny the edit mutation.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "edit-ask_deny",
+                "name": "edit",
+                "arguments": {
+                  "filePath": "editable.txt",
+                  "edits": [
+                    {
+                      "oldString": "before",
+                      "newString": "after"
+                    }
+                  ]
+                },
+                "non_mutating_evidence": {
+                  "reason": "reject prevents fixture mutation"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "metadata": {
+        "permission": {
+          "operation": "edit",
+          "reply": "reject",
+          "requested_paths": [
+            "editable.txt"
+          ]
+        },
+        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "edit/T3/edit_config_deny",
+      "tool": "edit",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Configuration-deny the edit mutation.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "edit-config_deny",
+                "name": "edit",
+                "arguments": {
+                  "filePath": "editable.txt",
+                  "edits": [
+                    {
+                      "oldString": "before",
+                      "newString": "after"
+                    }
+                  ]
+                },
+                "non_mutating_evidence": {
+                  "reason": "config_deny prevents fixture mutation"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "metadata": {
+        "permission": {
+          "operation": "edit",
+          "reply": "config_deny",
+          "requested_paths": [
+            "editable.txt"
+          ]
+        }
+      }
+    }
+  ]
+}

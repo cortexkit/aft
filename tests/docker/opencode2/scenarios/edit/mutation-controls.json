@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "tool": "edit",
+  "controls": [
+    {
+      "id": "edit-t1-agent-text",
+      "mutated_input": "edit/T1 result text",
+      "expected_failure": "shape comparison failed",
+      "unaffected_positive_control": "edit/T2/invalid_arguments"
+    },
+    {
+      "id": "edit-t2-host-rejection",
+      "mutated_input": "edit/T2 invalid fixture",
+      "expected_failure": "host schema rejection mismatch",
+      "unaffected_positive_control": "edit/T1/happy"
+    },
+    {
+      "id": "edit-parity-shape",
+      "mutated_input": "edit/T7 projected fixture marker",
+      "expected_failure": "projected V1/V2 parity mismatch",
+      "unaffected_positive_control": "edit/T1/happy"
+    },
+    {
+      "id": "edit-permission-path-identity",
+      "mutated_input": "edit/T3 requested path",
+      "expected_failure": "permission path identity mismatch",
+      "unaffected_positive_control": "edit/T1/happy"
+    },
+    {
+      "id": "edit-three-state-intermediate",
+      "mutated_input": "edit/T3 intermediate path state",
+      "expected_failure": "no_effect_observed",
+      "unaffected_positive_control": "edit/T3/edit_ask_deny"
+    },
+    {
+      "id": "edit-restore-state",
+      "mutated_input": "edit/T3 restore call",
+      "expected_failure": "restore_state_mismatch",
+      "unaffected_positive_control": "edit/T3/edit_ask_deny"
+    }
+  ]
+}
