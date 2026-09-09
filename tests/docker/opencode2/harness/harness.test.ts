@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 
 import {
   type HostCliContract,
+  loadHostCliContract,
   loadHostSchemaRejectionContract,
 } from "./contracts.js";
 import {
@@ -714,6 +715,55 @@ describe("producer-backed executable provenance", () => {
     );
     expect(error.unsuppressible).toBe(true);
   });
+});
+
+test("legacy host CLI capture names every field required by the runner", async () => {
+  const contractRoot = await root();
+  await writeFile(
+    join(contractRoot, "host-cli-contract.json"),
+    JSON.stringify({
+      schema_version: 1,
+      host_version: "0.0.0-beta-test",
+      observed_run_id: "probe-run",
+      endpoint_handoff: { run_client_arguments: ["--server", "${endpoint}"] },
+      password_handoff: { observed_run_client_environment: "OPENCODE_SERVER_PASSWORD" },
+      session_start: {},
+      idle_retention: {},
+      shared_server_smoke: { positive_controls: [] },
+    }),
+  );
+  const error = await expectCode(
+    () => loadHostCliContract(contractRoot, "0.0.0-beta-test"),
+    "contract_uncaptured",
+  );
+  expect(error.details.missing_fields).toEqual([
+    "endpoint_handoff.run",
+    "endpoint_handoff.api",
+    "password_handoff.run",
+    "password_handoff.api",
+    "shared_server_smoke.method",
+    "shared_server_smoke.path",
+  ]);
+});
+
+test("transcript-shaped host schema capture satisfies validation", async () => {
+  const contractRoot = await root();
+  await writeFile(
+    join(contractRoot, "host-schema-rejection.json"),
+    JSON.stringify({
+      schema_version: 1,
+      host_version: "0.0.0-beta-test",
+      observed_run_id: "probe-run",
+      observed_instance: { json_event_error: "Invalid arguments for tool read" },
+      agent_visible_contract: { json_event: { type: "tool_use", state_status: "error" } },
+    }),
+  );
+  const contract = await loadHostSchemaRejectionContract(
+    contractRoot,
+    "0.0.0-beta-test",
+  );
+  expect(contract.agent_visible_text).toBe("Invalid arguments for tool read");
+  expect(contract.json_event).toEqual({ type: "tool_use", state_status: "error" });
 });
 
 test("missing host schema rejection contract fails validation instead of earning coverage", async () => {

@@ -9,6 +9,21 @@
   "platform": "linux-x64",
   "transcript": "probe/host-provider-config.txt",
   "guard_transcript": "probe/host-provider-contract-guard.txt",
+  "provider_config": {
+    "openai": {
+      "name": "Deterministic aimock",
+      "package": "@opencode-ai/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "{{AIMOCK_BASE_URL}}/v1",
+        "apiKey": "{env:OPENAI_API_KEY}"
+      },
+      "models": {
+        "mock-model": {
+          "name": "Mock Model"
+        }
+      }
+    }
+  },
   "opencode_json": {
     "providers": {
       "openai": {

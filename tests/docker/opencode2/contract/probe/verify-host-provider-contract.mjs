@@ -65,6 +65,11 @@ const expectedProvider = {
 if (JSON.stringify(contract.opencode_json?.providers?.openai) !== JSON.stringify(expectedProvider)) {
   reportFailure("host_provider_config_invalid:opencode_json.providers.openai");
 }
+const runtimeProvider = structuredClone(expectedProvider);
+runtimeProvider.settings.baseURL = "{{AIMOCK_BASE_URL}}/v1";
+if (JSON.stringify(contract.provider_config?.openai) !== JSON.stringify(runtimeProvider)) {
+  reportFailure("host_provider_config_invalid:provider_config.openai");
+}
 if (!Array.isArray(contract.run_command) || !contract.run_command.includes("openai/mock-model")) {
   reportFailure("host_provider_config_invalid:run_command");
 }

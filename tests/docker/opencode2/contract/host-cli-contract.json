@@ -9,6 +9,14 @@
   "platform": "linux-x64",
   "transcript": "probe/shared-server.txt",
   "endpoint_handoff": {
+    "run": {
+      "kind": "flag",
+      "name": "--server"
+    },
+    "api": {
+      "kind": "flag",
+      "name": "--server"
+    },
     "producer_command": "opencode2 serve --hostname 127.0.0.1 --port 4096",
     "stdout_pattern": "^server listening on (?<endpoint>http://127\\.0\\.0\\.1:[0-9]+)$",
     "run_client_arguments": [
@@ -21,6 +29,14 @@
     ]
   },
   "password_handoff": {
+    "run": {
+      "kind": "env",
+      "name": "OPENCODE_SERVER_PASSWORD"
+    },
+    "api": {
+      "kind": "env",
+      "name": "OPENCODE_SERVER_PASSWORD"
+    },
     "stdout_pattern": "^server password (?<password>\\S+)$",
     "preferred_client_environment": "OPENCODE_PASSWORD=${password}",
     "observed_run_client_environment": "OPENCODE_SERVER_PASSWORD=${password}",
@@ -81,6 +97,9 @@
     }
   },
   "shared_server_smoke": {
+    "method": "GET",
+    "path": "/api/health",
+    "expected_status": 0,
     "serve_processes": 1,
     "positive_controls": [
       {

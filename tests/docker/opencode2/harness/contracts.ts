@@ -85,35 +85,45 @@ export async function loadHostCliContract(
   const endpoint = asRecord(record.endpoint_handoff);
   const password = asRecord(record.password_handoff);
   const smoke = asRecord(record.shared_server_smoke);
-  if (
-    !endpoint ||
-    !password ||
-    !asRecord(record.session_start) ||
-    !asRecord(record.idle_retention) ||
-    typeof smoke?.method !== "string" ||
-    typeof smoke.path !== "string"
-  ) {
-    fail("contract_uncaptured", "host_cli_contract fields", { path }, true);
+  const missingFields = [
+    ...(!endpoint ? ["endpoint_handoff"] : []),
+    ...(!asRecord(endpoint?.run) ? ["endpoint_handoff.run"] : []),
+    ...(!asRecord(endpoint?.api) ? ["endpoint_handoff.api"] : []),
+    ...(!password ? ["password_handoff"] : []),
+    ...(!asRecord(password?.run) ? ["password_handoff.run"] : []),
+    ...(!asRecord(password?.api) ? ["password_handoff.api"] : []),
+    ...(!asRecord(record.session_start) ? ["session_start"] : []),
+    ...(!asRecord(record.idle_retention) ? ["idle_retention"] : []),
+    ...(typeof smoke?.method !== "string" ? ["shared_server_smoke.method"] : []),
+    ...(typeof smoke?.path !== "string" ? ["shared_server_smoke.path"] : []),
+  ];
+  if (missingFields.length > 0) {
+    fail(
+      "contract_uncaptured",
+      "host_cli_contract fields",
+      { path, missing_fields: missingFields },
+      true,
+    );
   }
   return {
     schema_version: 1,
     host_version: identity.hostVersion,
     observed_run_id: identity.runId,
     endpoint_handoff: {
-      run: handoff(endpoint.run, "endpoint_handoff.run"),
-      api: handoff(endpoint.api, "endpoint_handoff.api"),
+      run: handoff(endpoint?.run, "endpoint_handoff.run"),
+      api: handoff(endpoint?.api, "endpoint_handoff.api"),
     },
     password_handoff: {
-      run: handoff(password.run, "password_handoff.run"),
-      api: handoff(password.api, "password_handoff.api"),
+      run: handoff(password?.run, "password_handoff.run"),
+      api: handoff(password?.api, "password_handoff.api"),
     },
     session_start: record.session_start as Record<string, unknown>,
     idle_retention: record.idle_retention as Record<string, unknown>,
     shared_server_smoke: {
-      method: smoke.method,
-      path: smoke.path,
+      method: smoke?.method as string,
+      path: smoke?.path as string,
       expected_status:
-        typeof smoke.expected_status === "number" ? smoke.expected_status : undefined,
+        typeof smoke?.expected_status === "number" ? smoke.expected_status : undefined,
     },
   };
 }
@@ -156,8 +166,15 @@ export async function loadHostSchemaRejectionContract(
   }
   const identity = contractIdentity(record, expectedVersion, "host_schema_rejection");
   const observation = asRecord(record.observation);
-  const agentVisibleText = record.agent_visible_text ?? observation?.agent_visible_text;
-  const jsonEvent = asRecord(record.json_event ?? observation?.json_event);
+  const observedInstance = asRecord(record.observed_instance);
+  const agentVisibleContract = asRecord(record.agent_visible_contract);
+  const agentVisibleText =
+    record.agent_visible_text ??
+    observation?.agent_visible_text ??
+    observedInstance?.json_event_error;
+  const jsonEvent = asRecord(
+    record.json_event ?? observation?.json_event ?? agentVisibleContract?.json_event,
+  );
   if (typeof agentVisibleText !== "string" || agentVisibleText.length === 0 || !jsonEvent) {
     fail("contract_uncaptured", "host_schema_rejection observations", { path }, true);
   }

@@ -1099,5 +1099,8 @@ async function main(): Promise<void> {
 
 main().catch((error) => {
   console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
+  if (error instanceof HarnessError && error.code === "contract_uncaptured") {
+    console.error(`HarnessError details: ${JSON.stringify(error.details)}`);
+  }
   process.exitCode = 1;
 });
