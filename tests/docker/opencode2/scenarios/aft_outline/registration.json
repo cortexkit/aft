@@ -1,0 +1,251 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "outline",
+  "scenarios": [
+    {
+      "schema_version": 1,
+      "id": "outline/T1/happy",
+      "tool": "outline",
+      "trajectory": "T1",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the deterministic outline fixture call.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "outline-happy",
+                "name": "aft_outline",
+                "arguments": {
+                  "target": "sample.ts"
+                },
+                "non_mutating_evidence": {
+                  "reason": "outline only observes fixture state"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "outline-happy",
+      "comparison": {
+        "mode": "shape",
+        "rules": [
+          {
+            "kind": "field",
+            "field": "fixture_marker",
+            "pattern": "^(?=[\\s\\S]*(?<value>uniqueScenarioSymbol))[\\s\\S]+$",
+            "min_lines": 1,
+            "max_lines": 10000
+          }
+        ],
+        "expected": {
+          "fixture_marker": "uniqueScenarioSymbol"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "outline/T2/invalid_arguments",
+      "tool": "outline",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted outline call with an invalid argument type.",
+      "fixture": "./fixture",
+      "subcase": "invalid_arguments",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "outline-invalid",
+                "name": "aft_outline",
+                "arguments": {
+                  "target": 42
+                },
+                "non_mutating_evidence": {
+                  "reason": "the host rejects the argument type before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "outline/T2/missing_target",
+      "tool": "outline",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted outline call without its required target.",
+      "fixture": "./fixture",
+      "subcase": "missing_target",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "outline-missing",
+                "name": "aft_outline",
+                "arguments": {},
+                "non_mutating_evidence": {
+                  "reason": "the host rejects missing required arguments before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "outline/T6/outline-files-payload-files/complete",
+      "tool": "outline",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the complete outline.files.payload.files fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "outline-t6-outline-files-payload-files-complete",
+                "name": "aft_outline",
+                "arguments": {
+                  "target": "small",
+                  "files": true
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "outline-t6-outline-files-payload-files-complete",
+      "metadata": {
+        "t6": {
+          "surface_id": "outline.files.payload.files",
+          "owner": "outline",
+          "call_id": "outline-t6-outline-files-payload-files-complete",
+          "fixture": "complete"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "outline/T6/outline-files-payload-files/incomplete",
+      "tool": "outline",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the incomplete outline.files.payload.files fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "outline-t6-outline-files-payload-files-incomplete",
+                "name": "aft_outline",
+                "arguments": {
+                  "target": "bulk",
+                  "files": true
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "outline-t6-outline-files-payload-files-incomplete",
+      "metadata": {
+        "t6": {
+          "surface_id": "outline.files.payload.files",
+          "owner": "outline",
+          "call_id": "outline-t6-outline-files-payload-files-incomplete",
+          "fixture": "incomplete",
+          "triggered_reason": "budget"
+        }
+      }
+    }
+  ]
+}

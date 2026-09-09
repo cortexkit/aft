@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "tool": "outline",
+  "controls": [
+    {
+      "id": "outline-t1-agent-text",
+      "mutated_input": "outline/T1 result text",
+      "expected_failure": "shape comparison failed",
+      "unaffected_positive_control": "outline/T2/invalid_arguments"
+    },
+    {
+      "id": "outline-t2-host-rejection",
+      "mutated_input": "outline/T2 invalid fixture",
+      "expected_failure": "host schema rejection mismatch",
+      "unaffected_positive_control": "outline/T1/happy"
+    },
+    {
+      "id": "outline-parity-shape",
+      "mutated_input": "outline/T7 projected fixture marker",
+      "expected_failure": "projected V1/V2 parity mismatch",
+      "unaffected_positive_control": "outline/T1/happy"
+    },
+    {
+      "id": "outline-t6-supported-reason",
+      "mutated_input": "outline/T6 triggered_reason",
+      "expected_failure": "outline.files.payload.files does not support reason",
+      "unaffected_positive_control": "outline/T6 complete fixture"
+    },
+    {
+      "id": "outline-t6-complete-no-trailer",
+      "mutated_input": "outline/T6 complete fixture",
+      "expected_failure": "complete T6 fixture rendered a truncation trailer",
+      "unaffected_positive_control": "outline/T6 incomplete fixture"
+    }
+  ]
+}
