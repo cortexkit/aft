@@ -1,0 +1,12 @@
+[package]
+name = "aft-search-query-shape-helper"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+regex = "1"
+serde_json = "1"
+url = "2"

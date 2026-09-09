@@ -1,0 +1,31 @@
+{
+  "schema": "aft-search-fences-v1",
+  "evidence_sha": "30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17",
+  "b1_exhaustive": [
+    "benchmarks/aft-search/** except benchmarks/aft-search/engine-fixtures/**",
+    "scripts/telemetry/cost-gate.sh",
+    "scripts/telemetry/imports-resolve.sh",
+    "scripts/telemetry/mutate.sh",
+    "scripts/telemetry/postA-remeasure.sh",
+    ".github/workflows/tests.yml#search-quality-gate-and-pr-filter"
+  ],
+  "bq0_extglob": [
+    "benchmarks/aft-search/!(engine-fixtures|real-query-baseline.json|manifest.sha256)",
+    "benchmarks/aft-search/!(engine-fixtures|real-query-baseline.json|manifest.sha256)/**",
+    "scripts/telemetry/cost-gate.sh",
+    "scripts/telemetry/imports-resolve.sh",
+    "scripts/telemetry/mutate.sh",
+    "scripts/telemetry/postA-remeasure.sh",
+    ".github/workflows/tests.yml"
+  ],
+  "excluded_product_prefixes": [
+    "crates/aft/src/query_shape.rs",
+    "crates/aft/src/semantic_index.rs",
+    "crates/aft/src/embed/",
+    "crates/aft/src/lib.rs",
+    "crates/aft/src/commands/semantic_search.rs",
+    "crates/aft/src/commands/semantic_search/",
+    "benchmarks/aft-search/engine-fixtures/"
+  ],
+  "required_check_registration": "NOT MET: owner branch-protection PUT receipt not supplied"
+}

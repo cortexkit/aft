@@ -1,0 +1,33 @@
+{
+  "definition_index_sha256": "38629da576b3f7844828fb8a8861a0ef5145ffb46858628718fa7c4bff799d47",
+  "definitions": [
+    {
+      "class": "imported_definition",
+      "definition": "R1 imported from 2026-09-09-aft-search-quality-b2-shape-router-lane-plan-counter-variants-readiness-refire-4.md",
+      "definition_sha256": "8e52d9f98532d1db0aac1b86596755f4867572531016febfecd3e673ced861ee",
+      "ruling": "R1"
+    },
+    {
+      "class": "imported_definition",
+      "definition": "R2 imported from 2026-09-09-aft-search-quality-b2-shape-router-lane-plan-counter-variants-readiness-refire-4.md",
+      "definition_sha256": "b885d27500f2e18e830e859569f524c6e7cc303a37ed0cf6402fbbfa53a5f55c",
+      "ruling": "R2"
+    },
+    {
+      "class": "imported_definition",
+      "definition": "R19 imported from 2026-09-09-aft-search-quality-b2-shape-router-lane-plan-counter-variants-readiness-refire-4.md",
+      "definition_sha256": "9c847d72f812a24a38dabc4e36f7a2bad69961754568448e35a4d486f901b8b6",
+      "ruling": "R19"
+    },
+    {
+      "class": "imported_definition",
+      "definition": "R21 imported from 2026-09-09-aft-search-quality-b2-shape-router-lane-plan-counter-variants-readiness-refire-4.md",
+      "definition_sha256": "235294685e7e490103a6399739724b1857a83cdc4ee1acd16d677ae9ce894502",
+      "ruling": "R21"
+    }
+  ],
+  "document_sha256": "685d43059f3589b2adb93f072d42ebe0f02bfef85fb479c2052b8fa873273cb8",
+  "schema": "aft-search-campaign-ref-v1",
+  "snapshot_sha": "30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17",
+  "source_path": ".cortexkit/alfonso/drafts/2026-09-09-aft-search-quality-b2-shape-router-lane-plan-counter-variants-readiness-refire-4.md"
+}

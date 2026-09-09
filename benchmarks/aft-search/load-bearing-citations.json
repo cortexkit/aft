@@ -1,0 +1,36 @@
+{
+  "citations": [
+    {
+      "end_line": 59,
+      "path": "crates/aft/src/query_shape.rs",
+      "sha256": "0fd0367b04c5710240b4f38f106ddadf199c898e88cb313c849a69edeee5cb98",
+      "start_line": 51
+    },
+    {
+      "end_line": 63,
+      "path": "crates/aft/src/commands/semantic_search/plan_table.rs",
+      "sha256": "f06465de5c62881d65cfa78f05b971f923fd4b1ee897216edfb89d6ef01be36c",
+      "start_line": 9
+    },
+    {
+      "end_line": 69,
+      "path": "packages/pi-plugin/src/tools/semantic.ts",
+      "sha256": "0bd4bf94a9e5f261bd1abbe23aa5c9ce00d5786e7735d8c78bc0e9ab947a7892",
+      "start_line": 42
+    },
+    {
+      "end_line": 14,
+      "path": "scripts/telemetry/cost-gate.sh",
+      "sha256": "29aa0a7b60868e9cf759246fb311c7132a27b2276b3516b002741ded7056ef7b",
+      "start_line": 1
+    },
+    {
+      "end_line": 35,
+      "path": ".github/workflows/tests.yml",
+      "sha256": "7c153514b12d3f0d52598023140c4f872fbc29abfaef971fcc511935578fb473",
+      "start_line": 16
+    }
+  ],
+  "evidence_sha": "30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17",
+  "schema": "aft-search-citations-v1"
+}

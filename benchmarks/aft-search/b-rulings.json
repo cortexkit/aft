@@ -1,0 +1,181 @@
+{
+  "closed_ledger": "R1-R45",
+  "definitions": [
+    {
+      "class": "b1_local",
+      "definition": "P1 input faults precede P2 regressions; only the otherwise-green P3 outcome exits zero.",
+      "definition_sha256": "45decee3502d0550484c592caaf74ae64a68019abbedd041d0a7ad0c095a9957",
+      "ruling": "R5"
+    },
+    {
+      "class": "b1_local",
+      "definition": "The quality predicate combines exact recall, concept recall, and real-query file-rank families.",
+      "definition_sha256": "254f44d1896795bc2750929c26af53aea65dd8980021ee46ed5c518dceb71e9c",
+      "ruling": "R6"
+    },
+    {
+      "class": "b1_local",
+      "definition": "The real-query manifest binds reproducible identity, source, replay, bundle, vector, and label provenance.",
+      "definition_sha256": "a80c50f269f88c8ffcde07c5a354b495ed5182735257883f13c7adb9ee02ac85",
+      "ruling": "R10"
+    },
+    {
+      "class": "b1_local",
+      "definition": "Shared floors protect exact and concept metrics, aggregate real-query MRR, per-shape MRR tolerance, and per-shape hit@5.",
+      "definition_sha256": "8272fc5bfb9ebdaa1316bb48ab34928e83ff29042834ddb6b6868a1781981f1d",
+      "ruling": "R13"
+    },
+    {
+      "class": "b1_local",
+      "definition": "Every production ruling token resolves to exactly one pinned class before scoring.",
+      "definition_sha256": "98c75bf1a724ad3d9cfc3257e2179dc0df29f86990c2d533a33112e7277a13fb",
+      "ruling": "R20"
+    },
+    {
+      "class": "b1_local",
+      "definition": "Retrieval profiles derive offset capability from the published schema and probe declared offset behavior.",
+      "definition_sha256": "cc49e6e2af16c66573cc9e1a4599862587109f3c850768494fdbe8459c313bfb",
+      "ruling": "R22"
+    },
+    {
+      "class": "b1_local",
+      "definition": "Sampling totality records empty and under-populated strata without undefined arithmetic.",
+      "definition_sha256": "c8162114f13e939f372ecc1dc6ac044c0d1efd0f2515a6e4fbb62b7ffe62aca9",
+      "ruling": "R23"
+    },
+    {
+      "class": "b1_local",
+      "definition": "B1 slice fences are pairwise disjoint and their union equals the exhaustive B1 fence.",
+      "definition_sha256": "80524c34190ae96d21b30ade3b6561ae3d1e4f3122a094939753168e1eccd654",
+      "ruling": "R24"
+    },
+    {
+      "class": "b1_local",
+      "definition": "Quality modes are evaluate, verify, and record-reference; vector recording is separate authoring.",
+      "definition_sha256": "0b9e436db94d29740c4eafba73ce7a2f1ae0544c5cf73b96783302ae66e684ec",
+      "ruling": "R25"
+    },
+    {
+      "class": "b1_local",
+      "definition": "Post-release estimation is five-stratum conditional weighting with explicit interval arithmetic.",
+      "definition_sha256": "53d32322553795256ef95558fa5b4b09234833dac783efc6d2a3bd41796e9495",
+      "ruling": "R26"
+    },
+    {
+      "class": "b1_local",
+      "definition": "Rubric and estimator metadata never enter real-query-postA.json or a quality reference.",
+      "definition_sha256": "054627ae89f68bf88b69a90c8e6e2fcce7600c8fc89528c93e1db1ba2e12d30e",
+      "ruling": "R27"
+    },
+    {
+      "class": "b1_local",
+      "definition": "B1 owns benchmark infrastructure and no campaign A or B2 product path.",
+      "definition_sha256": "5088cddd274a627b765351672dc24a0e37bc420a8158e5dd5a647abcec6ffb8f",
+      "ruling": "R28"
+    },
+    {
+      "class": "b1_local",
+      "definition": "Canonical episode identities and scored populations are defended by exact set equality.",
+      "definition_sha256": "86163c4e7b4135750181bcf16f6e5360613f28f6b42a6188f1357da11c199b28",
+      "ruling": "R29"
+    },
+    {
+      "class": "b1_local",
+      "definition": "An empty post-release estimator has exactly labelled_total, population, and estimator fields.",
+      "definition_sha256": "3c32004bfa70d55be986af3f10bfaafdca8c4d1980fdf1dbab05243d92121955",
+      "ruling": "R30"
+    },
+    {
+      "class": "b1_local",
+      "definition": "Replay forwards each recorded includeTests boolean and its recorded or default source.",
+      "definition_sha256": "2444ef92182627014e267cce199ef6aefba5d92f87cdf77248fe5e228ecd6fe4",
+      "ruling": "R31"
+    },
+    {
+      "class": "b1_local",
+      "definition": "Earlier fold closure is superseded by later normative ledger rulings.",
+      "definition_sha256": "92cb9478a23171f2373e6bded34022fa274155a07ae5774569bffce2a0e620d2",
+      "ruling": "R32"
+    },
+    {
+      "class": "b1_local",
+      "definition": "CI evaluates the committed reference except for the narrow full manifest-and-bundle-only verify diff.",
+      "definition_sha256": "2e52871da6d3d562ab72a2026a043cb0c4041f746f9e8856a14fa54424dccea7",
+      "ruling": "R33"
+    },
+    {
+      "class": "b1_local",
+      "definition": "Reports compare conditional 3996/6469 and projected 3996/20183 estimates with denominators.",
+      "definition_sha256": "c508ca49916551890618de5814457d2b56145b241d7dad88e3ff7ed9fbc9d7d2",
+      "ruling": "R34"
+    },
+    {
+      "class": "b1_local",
+      "definition": "Sampling traverses five fixed strata and selects 60 each using BLAKE3-seeded ChaCha8 without redistribution.",
+      "definition_sha256": "407807e4dedcdfe17537e385e4d451a6647458003279d9a6e5ecb291dc5afda4",
+      "ruling": "R35"
+    },
+    {
+      "class": "b1_local",
+      "definition": "Every quality mode rejects zero included benchmark identities as empty_population without reference writes.",
+      "definition_sha256": "73dfb721278a93267055af2e79b0c8a63059c98a4f05041e83681d2d02d798fb",
+      "ruling": "R36"
+    },
+    {
+      "class": "b1_local",
+      "definition": "Mechanism projections are independently rounded estimates totaling 6470, not a 6469-identity partition.",
+      "definition_sha256": "10eef63ac2dd7230bf6ecbcd8dd9fefb0d9f5a9843bd3b9bbe86bad5863c24ae",
+      "ruling": "R37"
+    },
+    {
+      "class": "b1_local",
+      "definition": "All evidence and load-bearing citations are pinned to 30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17.",
+      "definition_sha256": "002f87f877db128a66f4b46e4ed842c5bed68bdca70e48685aac294daad7bddf",
+      "ruling": "R38"
+    },
+    {
+      "class": "b1_local",
+      "definition": "Concept vectors use pinned tree, content or query hash, and template keys; misses are faults.",
+      "definition_sha256": "12dca35fff9e5229de11b57b485043fed55e90721bcafb332baa905653e310ac",
+      "ruling": "R39"
+    },
+    {
+      "class": "b1_local",
+      "definition": "Valid stop tokens are ten_files, exhausted, and page_cap, with page_cap highest precedence; depth_cap is reserved.",
+      "definition_sha256": "c209fba7233108110d02b9915489e272b059331b9048d689aca7d0f8480a728f",
+      "ruling": "R40"
+    },
+    {
+      "class": "b1_local",
+      "definition": "The R33 through R40 disposition was folded before implementation.",
+      "definition_sha256": "be1eab7b38bfab48189a21f4b950797fe19aa2d84e01347b77010d03984607d4",
+      "ruling": "R41"
+    },
+    {
+      "class": "b1_local",
+      "definition": "Manifest maintenance evaluates the old pair green and atomically writes the new reference and sidecar.",
+      "definition_sha256": "27b6913c3cd0047d48845cec77ac09eea3d20a7daa96943f5f1f2509a21a1aa8",
+      "ruling": "R42"
+    },
+    {
+      "class": "b1_local",
+      "definition": "Descriptor class is derived from the evaluated diff; conflicts are faults and undescribed ranking diffs regress.",
+      "definition_sha256": "9aa3aae0455cb84022cf7024b3f0d7b64d66701b5fe5e204b2e2a9314316a75e",
+      "ruling": "R43"
+    },
+    {
+      "class": "b1_local",
+      "definition": "The R42 and R43 disposition was folded before implementation.",
+      "definition_sha256": "8d7fb3bbaa8aea1298b8a30a8558571b9aa749da2809d2ec13a39f123a6ea35e",
+      "ruling": "R44"
+    },
+    {
+      "class": "b1_local",
+      "definition": "The normative resolver ledger closes at R1 through R45 and replaces obsolete closure wording.",
+      "definition_sha256": "9e7522697a0fff1abd3c0affb32d4ab463e259d6b8643e01e317ba8cb72eb7ac",
+      "ruling": "R45"
+    }
+  ],
+  "evidence_sha": "30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17",
+  "schema": "aft-search-ruling-index-v1"
+}

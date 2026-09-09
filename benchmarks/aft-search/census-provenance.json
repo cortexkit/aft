@@ -1,0 +1,19 @@
+{
+  "evidence_sha": "30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17",
+  "identity_population": 6469,
+  "mechanism_estimate_sum": 6470,
+  "mechanism_estimates_are_identity_partition": false,
+  "projection_source": {
+    "path": ".alfonso/data/aft-search-followup-census/mechanism.py",
+    "function": "mechanism_record",
+    "method": "within-stratum labelled shares multiplied by the population and independently rounded"
+  },
+  "retained_labels": 300,
+  "strata": {
+    "code_literal": {"identities": 1718, "retained_labels": 60},
+    "identifier": {"identities": 2015, "retained_labels": 60},
+    "log_excerpt": {"identities": 117, "retained_labels": 60},
+    "nl": {"identities": 1820, "retained_labels": 60},
+    "short": {"identities": 799, "retained_labels": 60}
+  }
+}

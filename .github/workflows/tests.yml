@@ -20,6 +20,7 @@ on:
       - "packages/**"
       - "tests/**"
       - "scripts/**"
+      - "benchmarks/aft-search/**"
       - "docs/**"
       - "ARCHITECTURE.md"
       - "STRUCTURE.md"
@@ -96,3 +97,25 @@ jobs:
     uses: ./.github/workflows/_e2e-suite.yml
     with:
       cargo_profile: stage
+
+  search-quality-gate:
+    name: search-quality-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Resolve pinned benchmark imports
+        run: scripts/telemetry/imports-resolve.sh --spec .cortexkit/alfonso/drafts/2026-09-09-aft-search-quality-b1-real-query-benchmark-manifest-gate-baseline-and-remeasure.md --snapshot 30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17
+      - name: Run harness and mode-selection goldens
+        run: |
+          scripts/telemetry/cost-gate.sh --search-quality --self-test
+          python3 benchmarks/aft-search/ci_quality_mode.py --self-test
+      - name: Evaluate committed search-quality reference
+        env:
+          AFT_SEARCH_NETWORK_POLICY: loopback-only
+          AFT_SEARCH_CACHE_DIR: ${{ runner.temp }}/empty-aft-search-cache
+        run: |
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          mode="$(python3 benchmarks/aft-search/ci_quality_mode.py --base "$base" --head "${{ github.sha }}")"
+          scripts/telemetry/cost-gate.sh --search-quality --mode "$mode" --base-ref "$base" --head "${{ github.sha }}"

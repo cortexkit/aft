@@ -1,0 +1,81 @@
+{
+  "definition_index_sha256": "8a82f9f93a36024ace7d981090450bfce977d08065c82bcbdc1417926f55d868",
+  "definitions": [
+    {
+      "class": "imported_definition",
+      "definition": "R3 imported from 2026-09-09-aft-search-ranking-engine-a-comparator-exact-lane-anchored-fusion-paging-confidence-refire-1.md",
+      "definition_sha256": "402ee483337895565d62d7eefee0ae4bb901464be34afdb11d0292e74913d057",
+      "ruling": "R3"
+    },
+    {
+      "class": "imported_definition",
+      "definition": "R7 imported from 2026-09-09-aft-search-ranking-engine-a-comparator-exact-lane-anchored-fusion-paging-confidence-refire-1.md",
+      "definition_sha256": "389063d9bb8d61b76b0bdaa6779899adf8bcb50432dca9cbba01e2a313928ce5",
+      "ruling": "R7"
+    },
+    {
+      "class": "imported_definition",
+      "definition": "R8 imported from 2026-09-09-aft-search-ranking-engine-a-comparator-exact-lane-anchored-fusion-paging-confidence-refire-1.md",
+      "definition_sha256": "d87c62c1f5e977a63ce414c350c4253a21105afa0225bc3df9d274b4fe82cb4a",
+      "ruling": "R8"
+    },
+    {
+      "class": "imported_definition",
+      "definition": "R9 imported from 2026-09-09-aft-search-ranking-engine-a-comparator-exact-lane-anchored-fusion-paging-confidence-refire-1.md",
+      "definition_sha256": "f731bddabde9dd5a313500c3e9d0286cc6321cf6d7ad4b56441d83e1cc5514d6",
+      "ruling": "R9"
+    },
+    {
+      "class": "imported_definition",
+      "definition": "R11 imported from 2026-09-09-aft-search-ranking-engine-a-comparator-exact-lane-anchored-fusion-paging-confidence-refire-1.md",
+      "definition_sha256": "78fc7722ec596a9b584fcd0ed122034bef11a7d1428e8ff3a6d86e55a755d5e7",
+      "ruling": "R11"
+    },
+    {
+      "class": "imported_definition",
+      "definition": "R12 imported from 2026-09-09-aft-search-ranking-engine-a-comparator-exact-lane-anchored-fusion-paging-confidence-refire-1.md",
+      "definition_sha256": "a3cf7b043a43f4392a485f7094b6bed4341433602e2bdf7838de7d1900e879a2",
+      "ruling": "R12"
+    },
+    {
+      "class": "imported_definition",
+      "definition": "R14 imported from 2026-09-09-aft-search-ranking-engine-a-comparator-exact-lane-anchored-fusion-paging-confidence-refire-1.md",
+      "definition_sha256": "a681bf349ac5d5814e0595233b82600b7396e118261a33d68ecbc579d1433470",
+      "ruling": "R14"
+    },
+    {
+      "class": "imported_definition",
+      "definition": "R15 imported from 2026-09-09-aft-search-ranking-engine-a-comparator-exact-lane-anchored-fusion-paging-confidence-refire-1.md",
+      "definition_sha256": "3a0475861b8677e70941dfd4a2d12d25088bc43ec009b47957d620641eb4ea0d",
+      "ruling": "R15"
+    },
+    {
+      "class": "imported_definition",
+      "definition": "R16 imported from 2026-09-09-aft-search-ranking-engine-a-comparator-exact-lane-anchored-fusion-paging-confidence-refire-1.md",
+      "definition_sha256": "61b1be49e8aa5c3ac8007de59a847c78e8136f6b4af2f8950870f6c39cfb2c08",
+      "ruling": "R16"
+    },
+    {
+      "class": "imported_definition",
+      "definition": "R17 imported from 2026-09-09-aft-search-ranking-engine-a-comparator-exact-lane-anchored-fusion-paging-confidence-refire-1.md",
+      "definition_sha256": "04340b0783387292be700516f3a87e53fb0f434e40f7ed18a2ba73d8e5109a29",
+      "ruling": "R17"
+    },
+    {
+      "class": "imported_definition",
+      "definition": "R18 imported from 2026-09-09-aft-search-ranking-engine-a-comparator-exact-lane-anchored-fusion-paging-confidence-refire-1.md",
+      "definition_sha256": "1d8561ecb54ef8f375258d3ba75f92d45ca144f65ba7b6b0b31f24460459acba",
+      "ruling": "R18"
+    },
+    {
+      "class": "consumer_requirement",
+      "definition": "R4 consumer gate imported from 2026-09-09-aft-search-ranking-engine-a-comparator-exact-lane-anchored-fusion-paging-confidence-refire-1.md",
+      "definition_sha256": "cf13a2eddb83aa70766afb798834ab7fd2764b27b6b62d8de6a69869100d8444",
+      "ruling": "R4"
+    }
+  ],
+  "document_sha256": "40d93b26255b374d8f863c62422b158c5884eae98266ef2b0d1039b2eacd3f39",
+  "schema": "aft-search-campaign-ref-v1",
+  "snapshot_sha": "30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17",
+  "source_path": ".cortexkit/alfonso/drafts/2026-09-09-aft-search-ranking-engine-a-comparator-exact-lane-anchored-fusion-paging-confidence-refire-1.md"
+}

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "aft_search quality score",
+  "type": "object",
+  "required": ["schema", "model_id", "profile", "capability", "rows", "families", "fixture_groups", "shapes", "mechanisms", "fixture_results"],
+  "properties": {
+    "profile": {"enum": ["single_page", "paged"]},
+    "rows": {"type": "array", "items": {"type": "object", "required": ["episode_id", "request", "include_tests_source", "pages_fetched", "collapse_stop_reason"]}},
+    "capability": {"type": "object", "required": ["schema_path", "schema_sha256", "offset_declared"]}
+  }
+}
