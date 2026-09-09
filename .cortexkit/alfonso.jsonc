@@ -3,4 +3,21 @@
   "board": {
     "enabled": true
   },
+  // Temporary panel pins (2026-09-09): the global synthesizer route (opus-5) is
+  // rate-limited until its weekly window resets and two of the four spec seats are
+  // quota-walled (gemini until 2026-09-10 18:44Z; ollama kimi hit its session limit).
+  // sol is pinned explicitly as the second seat (same family as astra, so the
+  // diversity rule only seats it when pinned); opus-5 is listed third so it seats
+  // once its 13:57Z reset passes and simply fails to seat before that. Remove once
+  // the walls lift.
+  "athena": {
+    "synthesizer": { "model": "openai/gpt-6-astra", "variant": "max" },
+    "members": {
+      "spec": [
+        { "model": "openai/gpt-6-astra", "variant": "max" },
+        { "model": "openai/gpt-5.6-sol", "variant": "high" },
+        { "model": "anthropic/claude-opus-5", "variant": "max" }
+      ]
+    }
+  }
 }
