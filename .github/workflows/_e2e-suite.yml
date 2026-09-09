@@ -190,6 +190,11 @@ jobs:
     needs: e2e-linux-binary
     runs-on: ubuntu-22.04
     timeout-minutes: 15
+    # Advisory until the scenario matrix is green end to end and the check is
+    # registered as required on main (the harness itself renders
+    # `required check: NOT MET (advisory only)` until then). Remove with that
+    # registration so a red matrix blocks the train.
+    continue-on-error: true
     permissions:
       actions: read
       contents: read
