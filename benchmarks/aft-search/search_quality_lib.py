@@ -58,6 +58,9 @@ RANKING_FENCE_PREFIXES = (
     "packages/opencode-plugin/",
     "benchmarks/aft-search/engine-fixtures/",
 )
+# The parity cases and fixture-project data currently live inline in
+# tool_call_parity_test.rs. Changes there or in future extracted fixture files
+# count as parity fixture differences.
 TOOL_CALL_PARITY_FIXTURE_SOURCE = "crates/aft/tests/integration/tool_call_parity_test.rs"
 TOOL_CALL_PARITY_FIXTURE_PREFIX = "crates/aft/tests/fixtures/tool_call_parity/"
 
@@ -542,6 +545,13 @@ def _first_row_difference(reference: Mapping[str, Any], score: Mapping[str, Any]
 
 
 def _real_query_score_bytes(document: Mapping[str, Any]) -> bytes:
+    """Return canonical behavior bytes after removing recorder-only provenance.
+
+    A recorded reference rewrites its schema and identifies the old binary and
+    baseline, so those fields differ even when a new binary leaves every query
+    unchanged. The reference binding authenticates that full committed file;
+    rows and exact/concept family results are compared separately here.
+    """
     score = dict(document)
     for key in ("schema", "baseline_path", "baseline_sha256", "binary_sha256", "fixture_groups", "rows"):
         score.pop(key, None)
