@@ -1,0 +1,11 @@
+{
+  "query_token": "abcde",
+  "query_trigram_count": 3,
+  "pool_size": 450,
+  "target_position": 250,
+  "shallow_depth": 200,
+  "deep_depth": 400,
+  "initial_batch_sizes": [50, 400],
+  "equal_score_pool_size": 201,
+  "late_high_score_discovery_position": 220
+}
