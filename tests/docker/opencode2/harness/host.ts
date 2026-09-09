@@ -220,15 +220,46 @@ export async function runApiCommand(options: {
   return waitCaptured(captured, options.timeoutMs ?? 10_000);
 }
 
+const CONTROL_PATH_PLACEHOLDER = /\{\{(permission_id|session_id|task_id)(?::([^{}]+))?\}\}/g;
+
+export type ControlPathValues = Readonly<Record<string, string>>;
+
+export function interpolateControlPath(path: string, values: ControlPathValues): string {
+  const rendered = path.replace(
+    CONTROL_PATH_PLACEHOLDER,
+    (placeholder, kind: string, qualifier: string | undefined) => {
+      const key = qualifier ? `${kind}:${qualifier}` : kind;
+      const value = values[key];
+      if (!value) {
+        fail("scenario_invalid", `control path placeholder has no value: ${placeholder}`, {
+          path,
+          placeholder,
+        });
+      }
+      return encodeURIComponent(value);
+    },
+  );
+  const unresolved = rendered.match(/\{\{[^{}]+\}\}/)?.[0];
+  if (unresolved) {
+    fail("scenario_invalid", `unsupported control path placeholder: ${unresolved}`, {
+      path,
+      placeholder: unresolved,
+    });
+  }
+  return rendered;
+}
+
 export async function runApiControl(
   plan: ApiControlPlan,
-  options: Omit<Parameters<typeof runApiCommand>[0], "method" | "path" | "body">,
+  options: Omit<Parameters<typeof runApiCommand>[0], "method" | "path" | "body"> & {
+    controlPathValues?: ControlPathValues;
+  },
 ): Promise<CommandOutput> {
   if (plan.delay_ms) await Bun.sleep(plan.delay_ms);
   const result = await runApiCommand({
     ...options,
     method: plan.method,
-    path: plan.path,
+    path: interpolateControlPath(plan.path, options.controlPathValues ?? {}),
     body: plan.body,
   });
   const expected = plan.expected_status ?? 0;

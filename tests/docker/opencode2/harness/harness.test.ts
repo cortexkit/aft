@@ -3,7 +3,10 @@ import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { loadHostSchemaRejectionContract } from "./contracts.js";
+import {
+  type HostCliContract,
+  loadHostSchemaRejectionContract,
+} from "./contracts.js";
 import {
   assertThreeStateRestore,
   DiskStateObserver,
@@ -11,6 +14,7 @@ import {
   type PathState,
 } from "./disk-state.js";
 import { HarnessError, type HarnessFailureCode } from "./errors.js";
+import { runApiControl } from "./host.js";
 import { readPermissionAskInventory } from "./inventory.js";
 import { createScenarioIsolation } from "./isolation.js";
 import { CompletionWakeLiveness, WatchPatternLiveness } from "./liveness.js";
@@ -134,6 +138,60 @@ describe("scenario isolation and liveness", () => {
         },
       ]),
     ).toThrow("projection_unparsed:unparsed");
+  });
+});
+
+describe("shared-server controls", () => {
+  test("control path interpolation resolves permission, session, and task ids", async () => {
+    const parent = await root();
+    const executable = join(parent, "capture-api-arguments");
+    const argumentsPath = join(parent, "arguments.txt");
+    await writeFile(executable, '#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGUMENTS_PATH"\n');
+    await chmod(executable, 0o755);
+    const handoff = { kind: "flag", name: "--server" } as const;
+    const contract: HostCliContract = {
+      schema_version: 1,
+      host_version: "test",
+      observed_run_id: "test",
+      endpoint_handoff: { run: handoff, api: handoff },
+      password_handoff: {
+        run: { kind: "env", name: "OPENCODE_SERVER_PASSWORD" },
+        api: { kind: "env", name: "OPENCODE_SERVER_PASSWORD" },
+      },
+      session_start: {},
+      idle_retention: {},
+      shared_server_smoke: { method: "GET", path: "/api/health" },
+    };
+
+    await runApiControl(
+      {
+        id: "interpolation-control",
+        after_turn: "turn",
+        method: "POST",
+        path: "/api/session/{{session_id}}/permission/{{permission_id}}/task/{{task_id:source}}",
+        purpose: "smoke",
+      },
+      {
+        executable,
+        cwd: parent,
+        env: { ...process.env, ARGUMENTS_PATH: argumentsPath },
+        contract,
+        endpoint: "http://127.0.0.1:4096",
+        controlPathValues: {
+          session_id: "session/one",
+          permission_id: "permission two",
+          "task_id:source": "bash-three",
+        },
+      },
+    );
+
+    expect((await readFile(argumentsPath, "utf8")).trim().split("\n")).toEqual([
+      "api",
+      "--server",
+      "http://127.0.0.1:4096",
+      "POST",
+      "/api/session/session%2Fone/permission/permission%20two/task/bash-three",
+    ]);
   });
 });
 

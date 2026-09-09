@@ -10,10 +10,12 @@ import { HarnessError } from "./errors.js";
 import { loadHarnessExtensions } from "./extensions.js";
 import { ScenarioForensics } from "./forensics.js";
 import {
+  runApiCommand,
   runApiControl,
   runSharedServerSmoke,
   startScenarioClient,
   startSharedServer,
+  type ControlPathValues,
   type SharedServerHandle,
 } from "./host.js";
 import { createScenarioIsolation, assertPluginLoadEvidence } from "./isolation.js";
@@ -30,6 +32,7 @@ import {
 } from "./schema-observation.js";
 import { assertTurnLog, readTurnLog } from "./turn-log.js";
 import type {
+  ApiControlPlan,
   HarnessRuntimeEvent,
   ScenarioDefinition,
   ScenarioLifecycleContext,
@@ -102,6 +105,146 @@ function fixturePath(scenario: ScenarioDefinition): string | undefined {
 
 function plannedCalls(scenario: ScenarioDefinition): ToolCallPlan[] {
   return scenario.turns.flatMap(toolCallsInTurn);
+}
+
+function scenarioToolName(name: string): string {
+  const bare = name.startsWith("aft_") ? name.slice(4) : name;
+  if (bare === "ast_grep_search") return "ast_search";
+  if (bare === "ast_grep_replace") return "ast_replace";
+  return bare;
+}
+
+function controlPlans(scenario: ScenarioDefinition): ApiControlPlan[] {
+  const controls = [...(scenario.controls ?? [])];
+  const permission = asRecord(scenario.metadata?.permission);
+  const reply = permission?.reply;
+  if (
+    scenario.trajectory !== "T3" ||
+    (reply !== "once" && reply !== "reject") ||
+    controls.some((control) => control.purpose === "permission")
+  ) {
+    return controls;
+  }
+  const subject = scenario.turns.find((turn) => {
+    if (turn.response.kind !== "tool_calls") return false;
+    return turn.response.calls.some((call) => scenarioToolName(call.name) === scenario.tool);
+  });
+  const subjectCall = subject?.response.kind === "tool_calls"
+    ? subject.response.calls.find((call) => scenarioToolName(call.name) === scenario.tool)
+    : undefined;
+  if (!subject || !subjectCall) {
+    fail("scenario_invalid", `${scenario.id}: permission scenario has no subject tool call`);
+  }
+  const id = `${scenario.id.replaceAll("/", "-")}-permission`;
+  if (controls.some((control) => control.id === id)) return controls;
+  controls.push({
+    id,
+    after_turn: subject.label,
+    delay_ms: 100,
+    method: "POST",
+    path: `/api/session/{{session_id}}/permission/{{permission_id:${subjectCall.id}}}/reply`,
+    body: { reply },
+    expected_status: 0,
+    purpose: "permission",
+  });
+  return controls;
+}
+
+function observeControlPathValues(
+  value: unknown,
+  values: Record<string, string>,
+  sourceCallId?: string,
+): void {
+  if (Array.isArray(value)) {
+    for (const item of value) observeControlPathValues(item, values, sourceCallId);
+    return;
+  }
+  const record = asRecord(value);
+  if (!record) return;
+  const sessionId = record.sessionID ?? record.session_id;
+  if (typeof sessionId === "string") values.session_id = sessionId;
+  const permissionId = record.permissionID ?? record.permission_id;
+  if (typeof permissionId === "string") values.permission_id = permissionId;
+  const taskId = record.taskID ?? record.taskId ?? record.task_id;
+  if (typeof taskId === "string") {
+    values.task_id = taskId;
+    if (sourceCallId) values[`task_id:${sourceCallId}`] = taskId;
+  }
+  if (typeof record.type === "string" && record.type.includes("permission") && typeof record.id === "string") {
+    values.permission_id = record.id;
+  }
+  for (const nested of Object.values(record)) {
+    if (nested !== value) observeControlPathValues(nested, values, sourceCallId);
+  }
+}
+
+function observeTaskId(text: string, callId: string, values: Record<string, string>): void {
+  const taskId = text.match(/\b(?:bash|task)-[A-Za-z0-9_-]+\b/)?.[0];
+  if (!taskId) return;
+  values.task_id = taskId;
+  values[`task_id:${callId}`] = taskId;
+}
+
+function observeHostStream(
+  child: import("node:child_process").ChildProcess,
+  values: Record<string, string>,
+): void {
+  let pending = "";
+  child.stdout?.on("data", (chunk) => {
+    pending += String(chunk);
+    const lines = pending.split("\n");
+    pending = lines.pop() ?? "";
+    for (const line of lines) {
+      try {
+        observeControlPathValues(JSON.parse(line), values);
+      } catch {}
+    }
+  });
+}
+
+async function discoverPermissionRequestId(
+  control: ApiControlPlan,
+  values: Record<string, string>,
+  options: Omit<Parameters<typeof runApiCommand>[0], "method" | "path" | "body">,
+): Promise<void> {
+  const placeholder = control.path.match(/\{\{permission_id(?::([^{}]+))?\}\}/);
+  if (!placeholder) return;
+  const qualifier = placeholder[1];
+  const key = qualifier ? `permission_id:${qualifier}` : "permission_id";
+  if (values[key]) return;
+
+  const deadline = Date.now() + 5_000;
+  while (!values.session_id && Date.now() < deadline) await Bun.sleep(25);
+  const sessionId = values.session_id;
+  if (!sessionId) {
+    fail("host_failed", `${control.id}: active session id was not observed before permission reply`);
+  }
+  while (Date.now() < deadline) {
+    const result = await runApiCommand({
+      ...options,
+      method: "GET",
+      path: `/api/session/${encodeURIComponent(sessionId)}/permission`,
+      timeoutMs: 2_000,
+    });
+    if (result.exit_code === 0) {
+      try {
+        const data = asRecord(JSON.parse(result.stdout))?.data;
+        if (Array.isArray(data)) {
+          const requests = data.map(asRecord).filter((request) => request !== undefined);
+          const matching = qualifier
+            ? requests.find((request) => asRecord(request.source)?.id === qualifier)
+            : requests.at(-1);
+          if (typeof matching?.id === "string") {
+            values.permission_id = matching.id;
+            values[key] = matching.id;
+            return;
+          }
+        }
+      } catch {}
+    }
+    await Bun.sleep(50);
+  }
+  fail("host_failed", `${control.id}: pending permission request id was not observed`);
 }
 
 function restoreCallSequence(scenario: ScenarioDefinition): ToolCallPlan[] {
@@ -247,6 +390,7 @@ async function runOneScenario(options: {
   let restoreCalls: ToolCallPlan[] = [];
   let abortIssuedAt: number | undefined;
   let hostCompletedAt: number | undefined;
+  const controlPathValues: Record<string, string> = {};
 
   const recordFailure = (error: unknown) => {
     firstFailure ??= error;
@@ -279,6 +423,7 @@ async function runOneScenario(options: {
   try {
     mock = new DeterministicScenarioMock(scenario, turnLogPath, {
       beforeTurn: async (turn, request) => {
+        observeControlPathValues(request, controlPathValues);
         if (!disk) return;
         const pseudoExchange = {
           index: -1,
@@ -289,7 +434,10 @@ async function runOneScenario(options: {
         };
         for (const call of plannedCalls(scenario)) {
           if (!begun.has(call.id) || resultObserved.has(call.id)) continue;
-          if (!toolResultForCall([pseudoExchange], call.id)) continue;
+          const observed = toolResultForCall([pseudoExchange], call.id);
+          if (!observed) continue;
+          observeControlPathValues(observed.event, controlPathValues, call.id);
+          observeTaskId(observed.text, call.id, controlPathValues);
           await emit({
             kind: "tool_result_observed",
             call,
@@ -327,22 +475,27 @@ async function runOneScenario(options: {
         const controlServer = server;
         const controlIsolation = isolation;
         const controlContract = options.hostContract;
-        for (const control of (scenario.controls ?? []).filter(
+        for (const control of controlPlans(scenario).filter(
           (candidate) => candidate.after_turn === exchange.label,
         )) {
           const controlPromise = (async () => {
             if (control.delay_ms) await Bun.sleep(control.delay_ms);
+            const apiOptions = {
+              executable: hostExecutable,
+              cwd: controlIsolation.project,
+              env: controlIsolation.env,
+              contract: controlContract,
+              endpoint: controlServer.endpoint,
+              password: controlServer.password,
+            };
+            await discoverPermissionRequestId(control, controlPathValues, apiOptions);
             await emit({ kind: "control_started", control, at: Date.now() });
             if (control.purpose === "abort") abortIssuedAt ??= Date.now();
             const output = await runApiControl(
               { ...control, delay_ms: 0 },
               {
-                executable: hostExecutable,
-                cwd: controlIsolation.project,
-                env: controlIsolation.env,
-                contract: controlContract,
-                endpoint: controlServer.endpoint,
-                password: controlServer.password,
+                ...apiOptions,
+                controlPathValues: controlPathValues as ControlPathValues,
               },
             );
             await forensics.writeJson(`control-${control.id}.json`, output);
@@ -414,6 +567,7 @@ async function runOneScenario(options: {
       server,
       hostGeneration,
     });
+    observeHostStream(client.child, controlPathValues);
     if (options.runSmoke && server && options.hostContract) {
       const smoke = await runSharedServerSmoke({
         executable: hostExecutable,
