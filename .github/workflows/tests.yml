@@ -111,11 +111,38 @@ jobs:
         run: |
           scripts/telemetry/cost-gate.sh --search-quality --self-test
           python3 benchmarks/aft-search/ci_quality_mode.py --self-test
+      - name: Build the product binary the runner executes
+        run: cargo build --release -p agent-file-tools
+      - name: Provision the exact-recall corpus at its pinned commits
+        # The only network-enabled step: the gate itself runs offline against
+        # these clones and fails corpus_missing if they are absent.
+        run: python3 benchmarks/aft-search/provision_corpus.py
       - name: Evaluate committed search-quality reference
         env:
           AFT_SEARCH_NETWORK_POLICY: loopback-only
           AFT_SEARCH_CACHE_DIR: ${{ runner.temp }}/empty-aft-search-cache
+          AFT_BINARY_PATH: ${{ github.workspace }}/target/release/aft
         run: |
-          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          # Bootstrap arm: until B0 records the initial reference pair the
+          # ordinary evaluate cannot run (a missing reference is never
+          # downgraded to verify). Prove the pipeline end to end with the
+          # B0-guarded dry run instead and say so loudly; this arm disappears
+          # the moment real-query-baseline.json exists.
+          if [ ! -f benchmarks/aft-search/real-query-baseline.json ]; then
+            echo "::warning title=search-quality-gate bootstrap::reference pair absent; B0 has not recorded it yet - running record-reference --dry-run only"
+            scripts/telemetry/cost-gate.sh --search-quality --mode record-reference --dry-run
+            exit 0
+          fi
+          # The diff base is the merge-base with main: on a pull request that is
+          # the base branch's tip; on a branch push (train branches, first push of
+          # a new branch where event.before is all zeros) it is main itself.
+          # A base that cannot be resolved is a gate fault by rule (R43), so it
+          # must never be the null sha.
+          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+          else
+            git fetch --no-tags --depth=1 origin main >/dev/null 2>&1 || true
+            base="$(git merge-base origin/main "${{ github.sha }}")"
+          fi
           mode="$(python3 benchmarks/aft-search/ci_quality_mode.py --base "$base" --head "${{ github.sha }}")"
           scripts/telemetry/cost-gate.sh --search-quality --mode "$mode" --base-ref "$base" --head "${{ github.sha }}"
