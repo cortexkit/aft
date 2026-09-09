@@ -1,0 +1,376 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "apply_patch",
+  "scenarios": [
+    {
+      "schema_version": 1,
+      "id": "apply_patch/T1/happy",
+      "tool": "apply_patch",
+      "trajectory": "T1",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the deterministic apply_patch fixture call.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "apply_patch-happy",
+                "name": "apply_patch",
+                "arguments": {
+                  "patchText": "*** Begin Patch\n*** Add File: patched.txt\n+patched by scenario\n*** End Patch"
+                },
+                "disk_effects": [
+                  "patched.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "apply_patch-happy",
+      "comparison": {
+        "mode": "shape",
+        "rules": [
+          {
+            "kind": "field",
+            "field": "fixture_marker",
+            "pattern": "^(?=[\\s\\S]*(?<value>patched\\.txt))[\\s\\S]+$",
+            "min_lines": 1,
+            "max_lines": 10000
+          }
+        ],
+        "expected": {
+          "fixture_marker": "patched.txt"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "apply_patch/T2/invalid_arguments",
+      "tool": "apply_patch",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted apply_patch call with an invalid argument type.",
+      "fixture": "./fixture",
+      "subcase": "invalid_arguments",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "apply_patch-invalid",
+                "name": "apply_patch",
+                "arguments": {
+                  "patchText": 42
+                },
+                "non_mutating_evidence": {
+                  "reason": "the host rejects the argument type before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "apply_patch/T2/missing_target",
+      "tool": "apply_patch",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted apply_patch call without its required target.",
+      "fixture": "./fixture",
+      "subcase": "missing_target",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "apply_patch-missing",
+                "name": "apply_patch",
+                "arguments": {},
+                "non_mutating_evidence": {
+                  "reason": "the host rejects missing required arguments before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "apply_patch/T3/apply_patch_ask_allow",
+      "tool": "apply_patch",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Allow the apply_patch mutation and restore its checkpoint.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "checkpoint",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "apply_patch-checkpoint",
+                "name": "aft_safety",
+                "arguments": {
+                  "op": "checkpoint",
+                  "name": "apply_patch-t3",
+                  "files": [
+                    "patched.txt"
+                  ]
+                },
+                "non_mutating_evidence": {
+                  "reason": "checkpoint creation does not alter the fixture project"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "mutate",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "apply_patch-allow-mutation",
+                "name": "apply_patch",
+                "arguments": {
+                  "patchText": "*** Begin Patch\n*** Add File: patched.txt\n+patched by scenario\n*** End Patch"
+                },
+                "disk_effects": [
+                  "patched.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "restore",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "apply_patch-restore",
+                "name": "aft_safety",
+                "arguments": {
+                  "op": "restore",
+                  "name": "apply_patch-t3"
+                },
+                "disk_effects": [
+                  "patched.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "checkpoint",
+        "mutate",
+        "restore",
+        "finish"
+      ],
+      "restore_evidence": {
+        "operation": "checkpoint_restore",
+        "identifier": "apply_patch-t3",
+        "calls": [
+          {
+            "tool": "aft_safety",
+            "arguments": {
+              "op": "checkpoint",
+              "name": "apply_patch-t3",
+              "files": [
+                "patched.txt"
+              ]
+            }
+          },
+          {
+            "tool": "apply_patch",
+            "arguments": {
+              "patchText": "*** Begin Patch\n*** Add File: patched.txt\n+patched by scenario\n*** End Patch"
+            }
+          },
+          {
+            "tool": "aft_safety",
+            "arguments": {
+              "op": "restore",
+              "name": "apply_patch-t3"
+            }
+          }
+        ],
+        "paths": [
+          {
+            "path": "patched.txt",
+            "transition": "create",
+            "expected_intermediate_sha256": "406e6d91737234e64918ffeee7e3323a23f1574ecc29f000fa690b01add47f6c"
+          }
+        ]
+      },
+      "metadata": {
+        "permission": {
+          "operation": "apply_patch",
+          "reply": "once",
+          "requested_paths": [
+            "patched.txt"
+          ]
+        },
+        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "apply_patch/T3/apply_patch_ask_deny",
+      "tool": "apply_patch",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Deny the apply_patch mutation.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "apply_patch-ask_deny",
+                "name": "apply_patch",
+                "arguments": {
+                  "patchText": "*** Begin Patch\n*** Add File: patched.txt\n+patched by scenario\n*** End Patch"
+                },
+                "non_mutating_evidence": {
+                  "reason": "reject prevents fixture mutation"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "metadata": {
+        "permission": {
+          "operation": "apply_patch",
+          "reply": "reject",
+          "requested_paths": [
+            "patched.txt"
+          ]
+        },
+        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "apply_patch/T3/apply_patch_config_deny",
+      "tool": "apply_patch",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Configuration-deny the apply_patch mutation.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "apply_patch-config_deny",
+                "name": "apply_patch",
+                "arguments": {
+                  "patchText": "*** Begin Patch\n*** Add File: patched.txt\n+patched by scenario\n*** End Patch"
+                },
+                "non_mutating_evidence": {
+                  "reason": "config_deny prevents fixture mutation"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "metadata": {
+        "permission": {
+          "operation": "apply_patch",
+          "reply": "config_deny",
+          "requested_paths": [
+            "patched.txt"
+          ]
+        }
+      }
+    }
+  ]
+}
