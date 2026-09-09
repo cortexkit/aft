@@ -21,7 +21,7 @@ import { CompletionWakeLiveness, WatchPatternLiveness } from "./liveness.js";
 import { materializeTurnPlaceholders, observeThenRespond } from "./mock-server.js";
 import { projectText } from "./projection.js";
 import { verifyExecutableProvenance } from "./provenance.js";
-import { materializeParityScenarios } from "./scenario-loader.js";
+import { loadScenarios, materializeParityScenarios } from "./scenario-loader.js";
 import { assertTurnLog } from "./turn-log.js";
 import { resolveTransportDeadWindow, transportDeadAtTurn } from "./transport-window.js";
 import type { ScenarioDefinition, ScriptedTurn, ToolCallPlan } from "./types.js";
@@ -29,6 +29,8 @@ import {
   applyMutatingTestOverride,
   deriveListSurfaces,
   deriveMutatingTools,
+  deriveV2HarnessProjection,
+  loadToolSchemas,
   validateInventory,
   validateMutatingDeclarations,
 } from "./validation.js";
@@ -298,15 +300,19 @@ describe("source-of-truth derivation", () => {
     const powershell = Object.fromEntries(
       ["T1", "T2", "T3", "T4", "T5", "T6", "T7"].map((trajectory) => [trajectory, "n/a:platform"]),
     ) as never;
+    const projectedControls = ["bash_kill", "bash_status", "bash_watch", "bash_write"];
+    const requiredRows = [
+      ...projectedControls.map((tool) => ({ tool, trajectories: cells })),
+      { tool: "powershell", trajectories: powershell },
+    ];
+    const projection = ["read", ...projectedControls];
+    const schemas = { read: {}, powershell: {} };
     expect(() =>
       validateInventory(
-        {
-          schema_version: 1,
-          platform: "linux",
-          rows: [{ tool: "powershell", trajectories: powershell }],
-        },
-        { read: {} },
+        { schema_version: 1, platform: "linux", rows: requiredRows },
+        schemas,
         "linux",
+        projection,
       ),
     ).toThrow("tool missing matrix row: read");
     expect(() =>
@@ -316,14 +322,55 @@ describe("source-of-truth derivation", () => {
           platform: "linux",
           rows: [
             { tool: "read", trajectories: cells },
+            ...requiredRows,
             { tool: "removed", trajectories: cells },
-            { tool: "powershell", trajectories: powershell },
           ],
         },
-        { read: {} },
+        schemas,
         "linux",
+        projection,
       ),
     ).toThrow("matrix row names removed tool: removed");
+  });
+
+  test("V2 projection inventory matches schema through explicit exclusions in both directions", async () => {
+    const repo = join(import.meta.dir, "../../../..");
+    const scenarios = materializeParityScenarios(
+      await loadScenarios(join(repo, "tests", "docker", "opencode2", "scenarios")),
+    );
+    const projection = deriveV2HarnessProjection(scenarios, "linux");
+    const schemas = await loadToolSchemas(repo);
+    const cells = Object.fromEntries(
+      ["T1", "T2", "T3", "T4", "T5", "T6", "T7"].map((trajectory) => [
+        trajectory,
+        "n/a:test",
+      ]),
+    ) as never;
+    const powershell = Object.fromEntries(
+      ["T1", "T2", "T3", "T4", "T5", "T6", "T7"].map((trajectory) => [
+        trajectory,
+        "n/a:platform",
+      ]),
+    ) as never;
+    const inventory = [...new Set([...projection, "powershell"])].sort();
+    const matrix = {
+      schema_version: 1 as const,
+      platform: "linux",
+      rows: inventory.map((tool) => ({
+        tool,
+        trajectories: tool === "powershell" ? powershell : cells,
+      })),
+    };
+
+    expect(validateInventory(matrix, schemas, "linux", projection)).toEqual(inventory);
+    const schemaWithProjectedControl = { ...schemas, bash_status: {} };
+    expect(() => validateInventory(matrix, schemaWithProjectedControl, "linux", projection)).toThrow(
+      "projection-only tools do not match the explicit exclusion table",
+    );
+    const { powershell: _powershell, ...schemaWithoutPlatformTool } = schemas;
+    expect(() =>
+      validateInventory(matrix, schemaWithoutPlatformTool, "linux", projection),
+    ).toThrow("schema-only tools do not match the explicit exclusion table");
   });
 
   test("T7 is materialized from the same T1 scenario data", () => {

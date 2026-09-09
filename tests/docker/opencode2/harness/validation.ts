@@ -58,7 +58,11 @@ export interface ValidatedInputs {
 
 const TEST_REMOVE_MUTATING = "AFT_OPENCODE2_TEST_REMOVE_MUTATING_TOOL";
 const TEST_EVIDENCE = "AFT_OPENCODE2_TEST_NON_MUTATING_EVIDENCE";
-const PLATFORM_ONLY_TOOLS = ["powershell"];
+
+export const V2_SCHEMA_PROJECTION_EXCLUSIONS = {
+  projection_only: ["bash_kill", "bash_status", "bash_watch", "bash_write"],
+  schema_only: ["powershell"],
+} as const;
 
 function canonicalToolName(name: string): string {
   const aliases: Record<string, string> = {
@@ -173,21 +177,49 @@ export async function loadToolSchemas(
   return record as Record<string, Record<string, unknown>>;
 }
 
+export function deriveV2HarnessProjection(
+  scenarios: readonly ScenarioDefinition[],
+  platform: NodeJS.Platform,
+): string[] {
+  const projection = new Set(scenarios.map((scenario) => canonicalToolName(scenario.tool)));
+  if (platform !== "win32") projection.delete("powershell");
+  return [...projection].sort();
+}
+
+function difference(left: ReadonlySet<string>, right: ReadonlySet<string>): string[] {
+  return [...left].filter((tool) => !right.has(tool)).sort();
+}
+
+function assertExactExclusions(label: string, actual: string[], expected: readonly string[]): void {
+  if (JSON.stringify(actual) !== JSON.stringify([...expected].sort())) {
+    fail("matrix_invalid", `${label} do not match the explicit exclusion table`, {
+      actual,
+      expected,
+    });
+  }
+}
+
 export function validateInventory(
   matrix: ApplicabilityMatrix,
   schemas: Record<string, Record<string, unknown>>,
   platform: NodeJS.Platform,
+  projectedTools: readonly string[],
 ): string[] {
-  const registered = Object.keys(schemas).map(canonicalToolName).sort();
-  if (platform === "linux" && registered.includes("powershell")) {
-    fail(
-      "matrix_invalid",
-      "powershell must be absent from the Linux registration inventory",
-      {},
-      true,
-    );
-  }
-  const inventory = [...new Set([...registered, ...PLATFORM_ONLY_TOOLS])].sort();
+  const schemaInventory = new Set(Object.keys(schemas).map(canonicalToolName));
+  const projection = new Set(projectedTools.map(canonicalToolName));
+  assertExactExclusions(
+    "projection-only tools",
+    difference(projection, schemaInventory),
+    V2_SCHEMA_PROJECTION_EXCLUSIONS.projection_only,
+  );
+  assertExactExclusions(
+    "schema-only tools",
+    difference(schemaInventory, projection),
+    V2_SCHEMA_PROJECTION_EXCLUSIONS.schema_only,
+  );
+  const inventory = [
+    ...new Set([...projection, ...V2_SCHEMA_PROJECTION_EXCLUSIONS.schema_only]),
+  ].sort();
   const rows = new Map<string, MatrixRow>();
   for (const row of matrix.rows) {
     if (rows.has(row.tool)) fail("matrix_invalid", `duplicate matrix row: ${row.tool}`);
@@ -659,7 +691,13 @@ export async function validateHarnessInputs(options: {
     fail("matrix_invalid", `matrix platform ${matrix.platform} does not match ${platform}`);
   }
   const schemas = await loadToolSchemas(options.repoRoot);
-  const inventory = validateInventory(matrix, schemas, matrix.platform as NodeJS.Platform);
+  const projection = deriveV2HarnessProjection(options.scenarios, platform);
+  const inventory = validateInventory(
+    matrix,
+    schemas,
+    matrix.platform as NodeJS.Platform,
+    projection,
+  );
   validateScenarioRows(matrix, options.scenarios, schemas);
   await validatePermissionInventory(options.repoRoot, matrixRoot, options.scenarios);
   await validateT5Inventory(matrixRoot, matrix, schemas);
