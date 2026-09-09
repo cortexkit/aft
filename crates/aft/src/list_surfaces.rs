@@ -272,6 +272,21 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         location_or_primitive: "depth-tier take",
         reason: "engine-internal lexical depth tier over the candidate pool; not an agent-visible list, the search surface attaches the envelope",
     },
+    // The block builder's page cut and the depth-tier observation are engine
+    // cuts inside the search engine; the page the agent sees is the search
+    // surface's, which attaches the envelope and the paging trailer.
+    ExclusionEntry {
+        file: "commands/semantic_search/blocks.rs",
+        enclosing_item: "build",
+        location_or_primitive: "page take",
+        reason: "engine-internal page cut over the frozen block list; the search surface attaches the envelope and paging trailer",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/blocks.rs",
+        enclosing_item: "observe_through_depth",
+        location_or_primitive: "depth-tier take",
+        reason: "engine-internal depth-tier observation over lane candidates; not an agent-visible list",
+    },
     ExclusionEntry {
         file: "commands/bash_status.rs",
         enclosing_item: "handle",
