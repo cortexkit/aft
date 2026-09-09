@@ -289,6 +289,9 @@ function validateScenarioRows(
 
   for (const row of matrix.rows) {
     if (!schemas[row.tool]) continue;
+    // A tool absent on the run's platform is outside the tool universe: every
+    // trajectory cell is n/a:platform and no T2 subcase can exist for it.
+    if (row.trajectories.T2.startsWith("n/a:platform")) continue;
     const t2 = byParent.get(`${row.tool}/T2`) ?? [];
     if (!t2.some((scenario) => scenario.subcase === "invalid_arguments")) {
       fail("matrix_invalid", `${row.tool}/T2 missing invalid_arguments`);
