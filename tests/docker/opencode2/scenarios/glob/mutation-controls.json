@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "tool": "glob",
+  "controls": [
+    {
+      "id": "glob-t1-agent-text",
+      "mutated_input": "glob/T1 result text",
+      "expected_failure": "shape comparison failed",
+      "unaffected_positive_control": "glob/T2/invalid_arguments"
+    },
+    {
+      "id": "glob-t2-host-rejection",
+      "mutated_input": "glob/T2 invalid fixture",
+      "expected_failure": "host schema rejection mismatch",
+      "unaffected_positive_control": "glob/T1/happy"
+    },
+    {
+      "id": "glob-parity-shape",
+      "mutated_input": "glob/T7 projected fixture marker",
+      "expected_failure": "projected V1/V2 parity mismatch",
+      "unaffected_positive_control": "glob/T1/happy"
+    },
+    {
+      "id": "glob-t6-supported-reason",
+      "mutated_input": "glob/T6 triggered_reason",
+      "expected_failure": "glob..payload.files does not support reason",
+      "unaffected_positive_control": "glob/T6 complete fixture"
+    },
+    {
+      "id": "glob-t6-complete-no-trailer",
+      "mutated_input": "glob/T6 complete fixture",
+      "expected_failure": "complete T6 fixture rendered a truncation trailer",
+      "unaffected_positive_control": "glob/T6 incomplete fixture"
+    }
+  ]
+}
