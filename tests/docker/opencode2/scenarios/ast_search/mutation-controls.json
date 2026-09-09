@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "tool": "ast_search",
+  "controls": [
+    {
+      "id": "ast_search-t1-agent-text",
+      "mutated_input": "ast_search/T1 result text",
+      "expected_failure": "shape comparison failed",
+      "unaffected_positive_control": "ast_search/T2/invalid_arguments"
+    },
+    {
+      "id": "ast_search-t2-host-rejection",
+      "mutated_input": "ast_search/T2 invalid fixture",
+      "expected_failure": "host schema rejection mismatch",
+      "unaffected_positive_control": "ast_search/T1/happy"
+    },
+    {
+      "id": "ast_search-parity-shape",
+      "mutated_input": "ast_search/T7 projected fixture marker",
+      "expected_failure": "projected V1/V2 parity mismatch",
+      "unaffected_positive_control": "ast_search/T1/happy"
+    }
+  ]
+}

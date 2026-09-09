@@ -1,0 +1,152 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "ast_search",
+  "scenarios": [
+    {
+      "schema_version": 1,
+      "id": "ast_search/T1/happy",
+      "tool": "ast_search",
+      "trajectory": "T1",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the deterministic ast_search fixture call.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "ast_search-happy",
+                "name": "ast_search",
+                "arguments": {
+                  "pattern": "function $NAME($$$) { $$$ }",
+                  "lang": "typescript",
+                  "paths": [
+                    "sample.ts"
+                  ]
+                },
+                "non_mutating_evidence": {
+                  "reason": "ast_search only observes fixture state"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "ast_search-happy",
+      "comparison": {
+        "mode": "shape",
+        "rules": [
+          {
+            "kind": "field",
+            "field": "fixture_marker",
+            "pattern": "^(?=[\\s\\S]*(?<value>uniqueScenarioSymbol))[\\s\\S]+$",
+            "min_lines": 1,
+            "max_lines": 10000
+          }
+        ],
+        "expected": {
+          "fixture_marker": "uniqueScenarioSymbol"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "ast_search/T2/invalid_arguments",
+      "tool": "ast_search",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted ast_search call with an invalid argument type.",
+      "fixture": "./fixture",
+      "subcase": "invalid_arguments",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "ast_search-invalid",
+                "name": "ast_search",
+                "arguments": {
+                  "pattern": 42
+                },
+                "non_mutating_evidence": {
+                  "reason": "the host rejects the argument type before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "ast_search/T2/missing_target",
+      "tool": "ast_search",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted ast_search call without its required target.",
+      "fixture": "./fixture",
+      "subcase": "missing_target",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "ast_search-missing",
+                "name": "ast_search",
+                "arguments": {},
+                "non_mutating_evidence": {
+                  "reason": "the host rejects missing required arguments before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    }
+  ]
+}
