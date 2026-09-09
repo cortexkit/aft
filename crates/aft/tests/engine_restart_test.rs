@@ -6,6 +6,7 @@ use aft::search_index::exact_lane::ExactLane;
 use aft::search_index::memo::{ExactMemoStore, MemoKey};
 
 #[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)] // `Failed` is the harness verdict the restart fixtures must never produce; kept so the enum reads as the full contract
 enum CrossPageComparisonVerdict {
     Passed,
     Failed,

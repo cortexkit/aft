@@ -7805,11 +7805,18 @@ mod tests {
         project
     }
 
+    /// Stage-naming tests: a deadline wide enough that a listening loopback daemon's
+    /// connect and handshake finish under it even on a loaded Windows runner (train 51:
+    /// 150 ms was blown at the connect stage, so the injected catalog_list delay was
+    /// never reached and the assertion read the connect-stage outcome), with the
+    /// injected stage delay far beyond it so the named stage is the one that times out.
+    const STAGE_TEST_DEADLINE: Duration = Duration::from_secs(2);
+
     #[test]
     fn probe_exceeded_at_catalog_list_names_stage_and_budget_in_status_and_refusal() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
             handshake_delay: Duration::ZERO,
-            catalog_delay: Duration::from_millis(400),
+            catalog_delay: Duration::from_secs(6),
             open_route_delay: Duration::ZERO,
         });
         let temp = tempfile::tempdir().unwrap();
@@ -7831,7 +7838,7 @@ mod tests {
             &paths,
             &project,
             now,
-            Instant::now() + DISCOVERY_BUDGET,
+            Instant::now() + STAGE_TEST_DEADLINE,
             Some(&doc),
         );
         assert_eq!(determination.record.rung, Rung::R1);
@@ -7859,7 +7866,7 @@ mod tests {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
             handshake_delay: Duration::ZERO,
             catalog_delay: Duration::ZERO,
-            open_route_delay: Duration::from_millis(400),
+            open_route_delay: Duration::from_secs(6),
         });
         let temp = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(temp.path().join("state"));
@@ -7880,7 +7887,7 @@ mod tests {
             &paths,
             &project,
             now,
-            Instant::now() + DISCOVERY_BUDGET,
+            Instant::now() + STAGE_TEST_DEADLINE,
             Some(&doc),
         );
         assert_eq!(determination.record.rung, Rung::R1);
