@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "tool": "grep",
+  "controls": [
+    {
+      "id": "grep-t1-agent-text",
+      "mutated_input": "grep/T1 result text",
+      "expected_failure": "shape comparison failed",
+      "unaffected_positive_control": "grep/T2/invalid_arguments"
+    },
+    {
+      "id": "grep-t2-host-rejection",
+      "mutated_input": "grep/T2 invalid fixture",
+      "expected_failure": "host schema rejection mismatch",
+      "unaffected_positive_control": "grep/T1/happy"
+    },
+    {
+      "id": "grep-parity-shape",
+      "mutated_input": "grep/T7 projected fixture marker",
+      "expected_failure": "projected V1/V2 parity mismatch",
+      "unaffected_positive_control": "grep/T1/happy"
+    },
+    {
+      "id": "grep-t6-supported-reason",
+      "mutated_input": "grep/T6 triggered_reason",
+      "expected_failure": "grep..payload.matches does not support reason",
+      "unaffected_positive_control": "grep/T6 complete fixture"
+    },
+    {
+      "id": "grep-t6-complete-no-trailer",
+      "mutated_input": "grep/T6 complete fixture",
+      "expected_failure": "complete T6 fixture rendered a truncation trailer",
+      "unaffected_positive_control": "grep/T6 incomplete fixture"
+    }
+  ]
+}

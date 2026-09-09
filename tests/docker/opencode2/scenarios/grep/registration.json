@@ -1,0 +1,252 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "grep",
+  "scenarios": [
+    {
+      "schema_version": 1,
+      "id": "grep/T1/happy",
+      "tool": "grep",
+      "trajectory": "T1",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the deterministic grep fixture call.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "grep-happy",
+                "name": "grep",
+                "arguments": {
+                  "pattern": "UNIQUE",
+                  "path": "."
+                },
+                "non_mutating_evidence": {
+                  "reason": "grep only observes fixture state"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "grep-happy",
+      "comparison": {
+        "mode": "shape",
+        "rules": [
+          {
+            "kind": "field",
+            "field": "fixture_marker",
+            "pattern": "^(?=[\\s\\S]*(?<value>sample\\.txt))[\\s\\S]+$",
+            "min_lines": 1,
+            "max_lines": 10000
+          }
+        ],
+        "expected": {
+          "fixture_marker": "sample.txt"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "grep/T2/invalid_arguments",
+      "tool": "grep",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted grep call with an invalid argument type.",
+      "fixture": "./fixture",
+      "subcase": "invalid_arguments",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "grep-invalid",
+                "name": "grep",
+                "arguments": {
+                  "pattern": 42
+                },
+                "non_mutating_evidence": {
+                  "reason": "the host rejects the argument type before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "grep/T2/missing_target",
+      "tool": "grep",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted grep call without its required target.",
+      "fixture": "./fixture",
+      "subcase": "missing_target",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "grep-missing",
+                "name": "grep",
+                "arguments": {},
+                "non_mutating_evidence": {
+                  "reason": "the host rejects missing required arguments before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "grep/T6/grep-payload-matches/complete",
+      "tool": "grep",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the complete grep..payload.matches fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "grep-t6-grep-payload-matches-complete",
+                "name": "grep",
+                "arguments": {
+                  "pattern": "UNIQUE",
+                  "path": "."
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "grep-t6-grep-payload-matches-complete",
+      "metadata": {
+        "t6": {
+          "surface_id": "grep..payload.matches",
+          "owner": "grep",
+          "call_id": "grep-t6-grep-payload-matches-complete",
+          "fixture": "complete"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "grep/T6/grep-payload-matches/incomplete",
+      "tool": "grep",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the incomplete grep..payload.matches fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "grep-t6-grep-payload-matches-incomplete",
+                "name": "grep",
+                "arguments": {
+                  "pattern": "MATCH",
+                  "path": "bulk"
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "grep-t6-grep-payload-matches-incomplete",
+      "metadata": {
+        "t6": {
+          "surface_id": "grep..payload.matches",
+          "owner": "grep",
+          "call_id": "grep-t6-grep-payload-matches-incomplete",
+          "fixture": "incomplete",
+          "triggered_reason": "cap"
+        }
+      }
+    }
+  ]
+}
