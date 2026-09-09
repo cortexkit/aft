@@ -19,7 +19,12 @@ import {
   type SharedServerHandle,
 } from "./host.js";
 import { createScenarioIsolation, assertPluginLoadEvidence } from "./isolation.js";
-import { DeterministicScenarioMock, toolCallsInTurn, toolResultForCall } from "./mock-server.js";
+import {
+  DeterministicScenarioMock,
+  materializeTurnPlaceholders,
+  toolCallsInTurn,
+  toolResultForCall,
+} from "./mock-server.js";
 import { readPinnedHostVersion } from "./pin.js";
 import { ProcessObserver } from "./process-observer.js";
 import { AftTaskProbe } from "./task-probe.js";
@@ -469,8 +474,11 @@ async function runOneScenario(options: {
           }
         }
       },
-      afterRequest: async (exchange) => {
+      afterRequest: async (exchange, turn) => {
         await emit({ kind: "mock_exchange", exchange });
+        if (turn) materializeTurnPlaceholders(turn, controlPathValues);
+      },
+      afterResponse: async (exchange) => {
         if (!server || !isolation || !options.hostContract) return;
         const controlServer = server;
         const controlIsolation = isolation;

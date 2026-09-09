@@ -8,6 +8,7 @@ import type {
   ScriptedTurn,
   ToolCallPlan,
 } from "./types.js";
+import { fail } from "./errors.js";
 import { asRecord } from "./util.js";
 
 interface LLMockLike {
@@ -28,7 +29,45 @@ interface LLMockConstructor {
 
 export interface DeterministicMockHooks {
   beforeTurn?: (turn: ScriptedTurn, request: unknown) => void | Promise<void>;
-  afterRequest?: (exchange: RecordedMockExchange) => void | Promise<void>;
+  afterRequest?: (exchange: RecordedMockExchange, turn?: ScriptedTurn) => void | Promise<void>;
+  afterResponse?: (exchange: RecordedMockExchange) => void | Promise<void>;
+}
+
+const TURN_PLACEHOLDER = /\{\{(permission_id|session_id|task_id)(?::([^{}]+))?\}\}/g;
+
+function materializeValue(value: unknown, values: Readonly<Record<string, string>>): unknown {
+  if (typeof value === "string") {
+    return value.replace(
+      TURN_PLACEHOLDER,
+      (placeholder, kind: string, qualifier: string | undefined) => {
+        const key = qualifier ? `${kind}:${qualifier}` : kind;
+        const replacement = values[key];
+        if (!replacement) {
+          fail("scenario_invalid", `scripted turn placeholder has no value: ${placeholder}`);
+        }
+        return replacement;
+      },
+    );
+  }
+  if (Array.isArray(value)) return value.map((entry) => materializeValue(entry, values));
+  const record = asRecord(value);
+  if (!record) return value;
+  return Object.fromEntries(
+    Object.entries(record).map(([key, entry]) => [key, materializeValue(entry, values)]),
+  );
+}
+
+export function materializeTurnPlaceholders(
+  turn: ScriptedTurn,
+  values: Readonly<Record<string, string>>,
+): void {
+  if (turn.response.kind === "text") {
+    turn.response.content = materializeValue(turn.response.content, values) as string;
+    return;
+  }
+  for (const call of turn.response.calls) {
+    call.arguments = materializeValue(call.arguments, values) as Record<string, unknown>;
+  }
 }
 
 function mockResponse(turn: ScriptedTurn): Record<string, unknown> {
@@ -40,6 +79,27 @@ function mockResponse(turn: ScriptedTurn): Record<string, unknown> {
       arguments: JSON.stringify(call.arguments),
     })),
   };
+}
+
+export async function observeThenRespond(
+  turn: ScriptedTurn,
+  request: unknown,
+  index: number,
+  hooks: DeterministicMockHooks,
+): Promise<{ exchange: RecordedMockExchange; response: Record<string, unknown> }> {
+  await hooks.beforeTurn?.(turn, request);
+  const exchange: RecordedMockExchange = {
+    index,
+    label: turn.label,
+    request,
+    response: undefined,
+    observed_at: new Date().toISOString(),
+  };
+  await hooks.afterRequest?.(exchange, turn);
+  const response = mockResponse(turn);
+  exchange.response = response;
+  await hooks.afterResponse?.(exchange);
+  return { exchange, response };
 }
 
 export class DeterministicScenarioMock {
@@ -76,18 +136,14 @@ export class DeterministicScenarioMock {
       mock.on(
         { sequenceIndex: index },
         async (request: unknown) => {
-          await this.hooks.beforeTurn?.(turn, request);
-          const response = mockResponse(turn);
-          appendFileSync(this.turnLogPath, `${turn.label}\n`);
-          const exchange: RecordedMockExchange = {
-            index,
-            label: turn.label,
+          const { exchange, response } = await observeThenRespond(
+            turn,
             request,
-            response,
-            observed_at: new Date().toISOString(),
-          };
+            index,
+            this.hooks,
+          );
+          appendFileSync(this.turnLogPath, `${turn.label}\n`);
           this.exchanges.push(exchange);
-          await this.hooks.afterRequest?.(exchange);
           return response;
         },
         turn.delay_ms ? { streamingProfile: { ttft: turn.delay_ms, tps: 1_000 } } : undefined,

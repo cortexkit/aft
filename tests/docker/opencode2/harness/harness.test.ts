@@ -18,11 +18,12 @@ import { runApiControl } from "./host.js";
 import { readPermissionAskInventory } from "./inventory.js";
 import { createScenarioIsolation } from "./isolation.js";
 import { CompletionWakeLiveness, WatchPatternLiveness } from "./liveness.js";
+import { materializeTurnPlaceholders, observeThenRespond } from "./mock-server.js";
 import { projectText } from "./projection.js";
 import { verifyExecutableProvenance } from "./provenance.js";
 import { materializeParityScenarios } from "./scenario-loader.js";
 import { assertTurnLog } from "./turn-log.js";
-import type { ScenarioDefinition, ToolCallPlan } from "./types.js";
+import type { ScenarioDefinition, ScriptedTurn, ToolCallPlan } from "./types.js";
 import {
   applyMutatingTestOverride,
   deriveListSurfaces,
@@ -192,6 +193,48 @@ describe("shared-server controls", () => {
       "POST",
       "/api/session/session%2Fone/permission/permission%20two/task/bash-three",
     ]);
+  });
+
+  test("mock hooks observe generated ids before materializing the response", async () => {
+    const turn: ScriptedTurn = {
+      label: "arm-watch",
+      response: {
+        kind: "tool_calls",
+        calls: [
+          {
+            id: "watch",
+            name: "bash_watch",
+            arguments: { taskId: "{{task_id:source}}" },
+            non_mutating_evidence: { reason: "the unit fixture only materializes arguments" },
+          },
+        ],
+      },
+    };
+    const order: string[] = [];
+    const { response, exchange } = await observeThenRespond(
+      turn,
+      { messages: [{ role: "tool", content: "taskId: bash-generated" }] },
+      0,
+      {
+        afterRequest: (exchange, observedTurn) => {
+          order.push("observe");
+          const taskId = JSON.stringify(exchange.request).match(/\bbash-[A-Za-z0-9_-]+\b/)?.[0];
+          if (!observedTurn) throw new Error("scripted turn was not supplied to its request hook");
+          materializeTurnPlaceholders(observedTurn, {
+            "task_id:source": taskId ?? "",
+          });
+        },
+        afterResponse: () => {
+          order.push("respond");
+        },
+      },
+    );
+
+    expect(order).toEqual(["observe", "respond"]);
+    expect(JSON.parse(String((response.toolCalls as Array<{ arguments: string }>)[0].arguments))).toEqual(
+      { taskId: "bash-generated" },
+    );
+    expect(exchange.response).toBe(response);
   });
 });
 
