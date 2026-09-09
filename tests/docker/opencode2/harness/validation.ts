@@ -48,7 +48,7 @@ export interface ParityAllowlistEntry {
 
 export interface ValidatedInputs {
   context: HarnessValidationContext;
-  matrix: ApplicabilityMatrix;
+  matrix?: ApplicabilityMatrix;
   inventory: string[];
   mutatingTools: Set<string>;
   surfaces: ListSurface[];
@@ -159,12 +159,18 @@ async function firstExisting(paths: string[]): Promise<string | undefined> {
   return undefined;
 }
 
-export async function loadApplicabilityMatrix(matrixRoot: string): Promise<ApplicabilityMatrix> {
+export async function loadApplicabilityMatrix(
+  matrixRoot: string,
+  required = true,
+): Promise<ApplicabilityMatrix | undefined> {
   const path = await firstExisting([
     join(matrixRoot, "applicability.json"),
     join(matrixRoot, "matrix.json"),
   ]);
-  if (!path) fail("matrix_invalid", `applicability matrix missing under ${matrixRoot}`);
+  if (!path) {
+    if (required) fail("matrix_absent", `applicability matrix missing under ${matrixRoot}`);
+    return undefined;
+  }
   return parseMatrix(await readJson(path));
 }
 
@@ -199,10 +205,8 @@ function assertExactExclusions(label: string, actual: string[], expected: readon
   }
 }
 
-export function validateInventory(
-  matrix: ApplicabilityMatrix,
+function inventoryFromProjection(
   schemas: Record<string, Record<string, unknown>>,
-  platform: NodeJS.Platform,
   projectedTools: readonly string[],
 ): string[] {
   const schemaInventory = new Set(Object.keys(schemas).map(canonicalToolName));
@@ -217,9 +221,16 @@ export function validateInventory(
     difference(schemaInventory, projection),
     V2_SCHEMA_PROJECTION_EXCLUSIONS.schema_only,
   );
-  const inventory = [
-    ...new Set([...projection, ...V2_SCHEMA_PROJECTION_EXCLUSIONS.schema_only]),
-  ].sort();
+  return [...new Set([...projection, ...V2_SCHEMA_PROJECTION_EXCLUSIONS.schema_only])].sort();
+}
+
+export function validateInventory(
+  matrix: ApplicabilityMatrix,
+  schemas: Record<string, Record<string, unknown>>,
+  platform: NodeJS.Platform,
+  projectedTools: readonly string[],
+): string[] {
+  const inventory = inventoryFromProjection(schemas, projectedTools);
   const rows = new Map<string, MatrixRow>();
   for (const row of matrix.rows) {
     if (rows.has(row.tool)) fail("matrix_invalid", `duplicate matrix row: ${row.tool}`);
@@ -682,31 +693,39 @@ export async function validateHarnessInputs(options: {
   env?: NodeJS.ProcessEnv;
   testMode?: boolean;
   observationOnly?: boolean;
+  fullRun?: boolean;
 }): Promise<ValidatedInputs> {
   const platform = options.platform ?? process.platform;
   const matrixRoot = join(options.repoRoot, "tests", "docker", "opencode2", "matrix");
   const contractRoot = join(options.repoRoot, "tests", "docker", "opencode2", "contract");
-  const matrix = await loadApplicabilityMatrix(matrixRoot);
-  if (matrix.platform !== platform && !(platform === "darwin" && matrix.platform === "linux")) {
+  const matrix = await loadApplicabilityMatrix(matrixRoot, options.fullRun === true);
+  if (
+    matrix &&
+    matrix.platform !== platform &&
+    !(platform === "darwin" && matrix.platform === "linux")
+  ) {
     fail("matrix_invalid", `matrix platform ${matrix.platform} does not match ${platform}`);
   }
   const schemas = await loadToolSchemas(options.repoRoot);
   const projection = deriveV2HarnessProjection(options.scenarios, platform);
-  const inventory = validateInventory(
-    matrix,
-    schemas,
-    matrix.platform as NodeJS.Platform,
-    projection,
-  );
-  validateScenarioRows(matrix, options.scenarios, schemas);
-  await validatePermissionInventory(options.repoRoot, matrixRoot, options.scenarios);
-  await validateT5Inventory(matrixRoot, matrix, schemas);
+  const inventory = matrix
+    ? validateInventory(matrix, schemas, matrix.platform as NodeJS.Platform, projection)
+    : projection;
   const surfaces = await deriveListSurfaces(options.repoRoot);
-  validateT6(matrix, options.scenarios, surfaces);
-  const parityAllowlist = await validateParityAllowlist(matrixRoot, options.scenarios);
-  const requiredCheckStatus = await validateRequiredCheckRecord(matrixRoot);
-  const configuredMutatingTools = await loadMutatingTools(matrixRoot);
+  let parityAllowlist: ParityAllowlistEntry[] = [];
+  let requiredCheckStatus: ValidatedInputs["requiredCheckStatus"] = "NOT MET (advisory only)";
+  let configuredMutatingTools: Set<string> | undefined;
+  if (matrix) {
+    validateScenarioRows(matrix, options.scenarios, schemas);
+    await validatePermissionInventory(options.repoRoot, matrixRoot, options.scenarios);
+    await validateT5Inventory(matrixRoot, matrix, schemas);
+    validateT6(matrix, options.scenarios, surfaces);
+    parityAllowlist = await validateParityAllowlist(matrixRoot, options.scenarios);
+    requiredCheckStatus = await validateRequiredCheckRecord(matrixRoot);
+    configuredMutatingTools = await loadMutatingTools(matrixRoot);
+  }
   const derivedMutatingTools = await deriveMutatingTools(options.repoRoot);
+  configuredMutatingTools ??= new Set(derivedMutatingTools);
   for (const tool of derivedMutatingTools) {
     if (!configuredMutatingTools.has(tool)) {
       fail("matrix_invalid", `mutating-tools.json omits product mutation permission: ${tool}`);
@@ -734,7 +753,7 @@ export async function validateHarnessInputs(options: {
   }
   const context: HarnessValidationContext = {
     repo_root: options.repoRoot,
-    platform: matrix.platform as NodeJS.Platform,
+    platform: (matrix?.platform ?? platform) as NodeJS.Platform,
     scenarios: options.scenarios,
     matrix,
     pinned_host_version: options.pinnedHostVersion,

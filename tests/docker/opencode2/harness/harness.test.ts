@@ -31,6 +31,7 @@ import {
   deriveMutatingTools,
   deriveV2HarnessProjection,
   loadToolSchemas,
+  validateHarnessInputs,
   validateInventory,
   validateMutatingDeclarations,
 } from "./validation.js";
@@ -371,6 +372,35 @@ describe("source-of-truth derivation", () => {
     expect(() =>
       validateInventory(matrix, schemaWithoutPlatformTool, "linux", projection),
     ).toThrow("schema-only tools do not match the explicit exclusion table");
+  });
+
+  test("scenario validation tolerates matrix_absent until the full run", async () => {
+    const repo = join(import.meta.dir, "../../../..");
+    const scenarios = materializeParityScenarios(
+      await loadScenarios(join(repo, "tests", "docker", "opencode2", "scenarios", "read")),
+    );
+    const optional = await validateHarnessInputs({
+      repoRoot: repo,
+      scenarios,
+      pinnedHostVersion: "0.0.0-beta-test",
+      platform: "linux",
+      observationOnly: true,
+    });
+    expect(optional.matrix).toBeUndefined();
+    expect(optional.inventory).toEqual(["read"]);
+
+    await expectCode(
+      () =>
+        validateHarnessInputs({
+          repoRoot: repo,
+          scenarios,
+          pinnedHostVersion: "0.0.0-beta-test",
+          platform: "linux",
+          observationOnly: true,
+          fullRun: true,
+        }),
+      "matrix_absent",
+    );
   });
 
   test("T7 is materialized from the same T1 scenario data", () => {

@@ -970,6 +970,7 @@ async function main(): Promise<void> {
     scenarios: allScenarios,
     pinnedHostVersion,
     platform: "linux",
+    fullRun: config.selector === undefined,
   });
   const extensions = await loadHarnessExtensions(join(repoRoot, "tests", "docker", "opencode2"));
   for (const extension of extensions) await extension.validate?.(validated.context);
@@ -1079,7 +1080,14 @@ async function main(): Promise<void> {
   if (!smokeRan && scenarios.some((scenario) => scenario.execution === "shared-server")) {
     throw new Error("shared-server smoke did not run");
   }
-  const report = reportTable(validated.matrix, results, config.selector);
+  const report = validated.matrix
+    ? reportTable(validated.matrix, results, config.selector)
+    : {
+        text: results
+          .map((result) => `${result.id} | ${result.status}${result.failure ? ` | ${result.failure.code}` : ""}`)
+          .join("\n"),
+        failed: results.some((result) => result.status === "failed" && !result.issue),
+      };
   console.log(report.text);
   console.log(`required check: ${validated.requiredCheckStatus}`);
   await writeFile(
