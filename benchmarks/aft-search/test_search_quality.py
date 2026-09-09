@@ -70,6 +70,20 @@ class EngineUnwiredGateTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 2)
         self.assertEqual(result.reasons, ("engine_unwired_mismatch:row=concept_recall.g",))
 
+    def test_engine_unwired_labels_a_missing_family_row_as_mismatch(self) -> None:
+        changed = copy.deepcopy(self.score)
+        del changed["fixture_groups"]["concept_recall"]["g"]
+        result = self.gate(changed)
+        self.assertEqual(result.exit_code, 2)
+        self.assertEqual(result.reasons, ("engine_unwired_mismatch:row=concept_recall.g",))
+
+    def test_engine_unwired_labels_profile_drift_before_profile_validation(self) -> None:
+        changed = copy.deepcopy(self.score)
+        changed["profile"] = "paged"
+        result = self.gate(changed)
+        self.assertEqual(result.exit_code, 2)
+        self.assertEqual(result.reasons, ("engine_unwired_mismatch:row=real_query.score",))
+
     def test_engine_unwired_rejects_inline_parity_fixture_changes(self) -> None:
         result = self.gate(self.score, self.ranking_paths + [TOOL_CALL_PARITY_FIXTURE_SOURCE])
         self.assertEqual(result.exit_code, 2)

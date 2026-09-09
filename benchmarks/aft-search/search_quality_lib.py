@@ -653,14 +653,14 @@ class GateResult:
 
 def total_gate(reference: Mapping[str, Any], score: Mapping[str, Any], manifest: Mapping[str, Any], descriptor: Mapping[str, Any] | None, diff_paths: Sequence[str]) -> GateResult:
     try:
-        validate_scored_population(manifest, score)
-        validate_profile_score(score)
         resolved, missing = resolve_descriptor(descriptor, diff_paths)
-        reasons = evaluate_predicate(reference, score, resolved, missing_ranking_descriptor=missing)
         if resolved["slice_class"] == "engine_unwired":
             difference = _engine_unwired_difference(reference, score, diff_paths)
             if difference:
                 raise InputFault(f"engine_unwired_mismatch:row={difference}")
+        validate_scored_population(manifest, score)
+        validate_profile_score(score)
+        reasons = evaluate_predicate(reference, score, resolved, missing_ranking_descriptor=missing)
     except InputFault as error:
         return GateResult(2, (str(error),))
     return GateResult(1 if reasons else 0, tuple(reasons))

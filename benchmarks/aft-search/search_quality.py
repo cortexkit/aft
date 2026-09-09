@@ -203,9 +203,10 @@ def run(args:argparse.Namespace)->int:
         if receipt.get("head")!=head or receipt.get("manifest_sha256")!=sha256_file(manifest_path) or receipt.get("reference_sha256")!=sha256_file(reference_path): raise InputFault("rebaseline_receipt_mismatch")
         if reference.get("profile")!="single_page" or score.get("profile")!="paged" or score.get("capability",{}).get("offset_declared") is not True or score.get("capability",{}).get("probe_pages_differ") is not True: raise InputFault("rebaseline_profile_capability")
         if {row.get("episode_id") for row in reference.get("rows",[])}!={row.get("episode_id") for row in score.get("rows",[])}: raise InputFault("rebaseline_identity_mismatch")
-    elif score.get("profile")!=reference.get("profile"):
+    elif (descriptor is None or descriptor.get("slice_class") != "engine_unwired") and score.get("profile")!=reference.get("profile"):
         raise InputFault("illegal_profile:reference_profile_mismatch")
-    if score.get("model_id")!=reference.get("model_id"): raise InputFault("corpus_vector_model_mismatch")
+    if (descriptor is None or descriptor.get("slice_class") != "engine_unwired") and score.get("model_id")!=reference.get("model_id"):
+        raise InputFault("corpus_vector_model_mismatch")
     result=total_gate(reference,score,manifest,descriptor,paths)
     for reason in result.reasons: print(reason,file=sys.stderr)
     if result.exit_code or not args.rebaseline: return result.exit_code
