@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "tool": "bash_status",
+  "controls": [
+    {
+      "id": "bash_status-t1-agent-text",
+      "mutated_input": "bash_status/T1 result text",
+      "expected_failure": "shape comparison failed",
+      "unaffected_positive_control": "bash_status/T2/invalid_arguments"
+    },
+    {
+      "id": "bash_status-t2-host-rejection",
+      "mutated_input": "bash_status/T2 invalid fixture",
+      "expected_failure": "host schema rejection mismatch",
+      "unaffected_positive_control": "bash_status/T1/happy"
+    },
+    {
+      "id": "bash_status-parity-shape",
+      "mutated_input": "bash_status/T7 projected fixture marker",
+      "expected_failure": "projected V1/V2 parity mismatch",
+      "unaffected_positive_control": "bash_status/T1/happy"
+    }
+  ]
+}
