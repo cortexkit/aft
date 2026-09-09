@@ -347,6 +347,12 @@
         "minimum": 1,
         "maximum": 100
       },
+      "offset": {
+        "description": "Zero-based result offset (default: 0, max: 100000).",
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 100000
+      },
       "includeTests": {
         "description": "Include test files (*.test.*, *_test.rs, __tests__/, …) plus test-support, fixture, mock, snapshot, and corpus files. Defaults to false.",
         "type": "boolean"
@@ -359,7 +365,7 @@
     "required": [
       "query"
     ],
-    "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete."
+    "description": "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').\n\nUse `offset` to continue a ranked result list from a zero-based position.\n\nWhen a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete."
   },
   "outline": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
