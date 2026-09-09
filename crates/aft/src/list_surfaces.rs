@@ -288,6 +288,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "engine-internal depth-tier observation over lane candidates; not an agent-visible list",
     },
     ExclusionEntry {
+        file: "commands/semantic_search/paging.rs",
+        enclosing_item: "build_l",
+        location_or_primitive: "interval take",
+        reason: "engine-internal interval cut when building L over frozen blocks; the served page's envelope and paging trailer are the search surface's",
+    },
+    ExclusionEntry {
         file: "commands/bash_status.rs",
         enclosing_item: "handle",
         location_or_primitive: "bash_status / bash live-tail",
