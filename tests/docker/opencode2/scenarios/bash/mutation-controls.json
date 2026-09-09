@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "tool": "bash",
+  "controls": [
+    {
+      "id": "bash-t1-agent-text",
+      "mutated_input": "bash/T1 result text",
+      "expected_failure": "shape comparison failed",
+      "unaffected_positive_control": "bash/T2/invalid_arguments"
+    },
+    {
+      "id": "bash-t2-host-rejection",
+      "mutated_input": "bash/T2 invalid fixture",
+      "expected_failure": "host schema rejection mismatch",
+      "unaffected_positive_control": "bash/T1/happy"
+    },
+    {
+      "id": "bash-parity-shape",
+      "mutated_input": "bash/T7 projected fixture marker",
+      "expected_failure": "projected V1/V2 parity mismatch",
+      "unaffected_positive_control": "bash/T1/happy"
+    },
+    {
+      "id": "bash-permission-path-identity",
+      "mutated_input": "bash/T3 requested path",
+      "expected_failure": "permission path identity mismatch",
+      "unaffected_positive_control": "bash/T1/happy"
+    },
+    {
+      "id": "bash-three-state-intermediate",
+      "mutated_input": "bash/T3 intermediate path state",
+      "expected_failure": "no_effect_observed",
+      "unaffected_positive_control": "bash/T3/loop_ask_deny"
+    },
+    {
+      "id": "bash-restore-state",
+      "mutated_input": "bash/T3 restore call",
+      "expected_failure": "restore_state_mismatch",
+      "unaffected_positive_control": "bash/T3/loop_ask_deny"
+    },
+    {
+      "id": "bash-t5-watch-setup-first-match",
+      "mutated_input": "watch command omits WATCH_MATCH",
+      "expected_failure": "setup_timeout:first_match",
+      "unaffected_positive_control": "bash/T5/completion_wake"
+    },
+    {
+      "id": "bash-t5-watch-delivery-suppressed",
+      "mutated_input": "watch delivery consumer",
+      "expected_failure": "delivery_timeout",
+      "unaffected_positive_control": "bash/T5/completion_wake"
+    },
+    {
+      "id": "bash-t5-watch-duplicate",
+      "mutated_input": "one-shot watch re-fires on second matching line",
+      "expected_failure": "duplicate_delivery",
+      "unaffected_positive_control": "bash/T5/completion_wake"
+    },
+    {
+      "id": "bash-t5-watch-fixture-missing",
+      "mutated_input": "bash/T5/watch_pattern_once registration",
+      "expected_failure": "T5 subcase missing",
+      "unaffected_positive_control": "bash/T5/completion_wake"
+    },
+    {
+      "id": "bash-t5-completion-duplicate",
+      "mutated_input": "completion prompt id is re-injected",
+      "expected_failure": "duplicate_delivery",
+      "unaffected_positive_control": "bash/T5/watch_pattern_once"
+    },
+    {
+      "id": "bash-post-result-undeclared-effect",
+      "mutated_input": "completion task writes an undeclared file after its initial result",
+      "expected_failure": "undeclared_disk_effect",
+      "unaffected_positive_control": "bash/T5/completion_wake"
+    },
+    {
+      "id": "bash-surviving-writer-incomplete",
+      "mutated_input": "background writer survives cleanup",
+      "expected_failure": "disk_effect_observation_incomplete",
+      "unaffected_positive_control": "bash/T5/completion_wake"
+    },
+    {
+      "id": "bash-t6-supported-reason",
+      "mutated_input": "bash/T6 triggered_reason",
+      "expected_failure": "bash..bash.output does not support reason",
+      "unaffected_positive_control": "bash/T6 complete fixture"
+    },
+    {
+      "id": "bash-t6-complete-no-trailer",
+      "mutated_input": "bash/T6 complete fixture",
+      "expected_failure": "complete T6 fixture rendered a truncation trailer",
+      "unaffected_positive_control": "bash/T6 incomplete fixture"
+    }
+  ]
+}

@@ -1,0 +1,966 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "bash",
+  "scenarios": [
+    {
+      "schema_version": 1,
+      "id": "bash/T1/happy",
+      "tool": "bash",
+      "trajectory": "T1",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the deterministic bash fixture call.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-happy",
+                "name": "bash",
+                "arguments": {
+                  "command": "printf 'bash-fixture\\n'"
+                },
+                "non_mutating_evidence": {
+                  "reason": "bash only observes fixture state"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "bash-happy",
+      "comparison": {
+        "mode": "shape",
+        "rules": [
+          {
+            "kind": "field",
+            "field": "fixture_marker",
+            "pattern": "^(?=[\\s\\S]*(?<value>bash-fixture))[\\s\\S]+$",
+            "min_lines": 1,
+            "max_lines": 10000
+          }
+        ],
+        "expected": {
+          "fixture_marker": "bash-fixture"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "bash/T2/invalid_arguments",
+      "tool": "bash",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted bash call with an invalid argument type.",
+      "fixture": "./fixture",
+      "subcase": "invalid_arguments",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-invalid",
+                "name": "bash",
+                "arguments": {
+                  "command": 42
+                },
+                "non_mutating_evidence": {
+                  "reason": "the host rejects the argument type before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "bash/T2/missing_target",
+      "tool": "bash",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted bash call without its required target.",
+      "fixture": "./fixture",
+      "subcase": "missing_target",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-missing",
+                "name": "bash",
+                "arguments": {},
+                "non_mutating_evidence": {
+                  "reason": "the host rejects missing required arguments before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "bash/T3/loop_ask_allow",
+      "tool": "bash",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Allow the loop bash permission path and restore its created file.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "checkpoint",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-loop-checkpoint",
+                "name": "aft_safety",
+                "arguments": {
+                  "op": "checkpoint",
+                  "name": "bash-loop-t3",
+                  "files": [
+                    "bash-loop.txt"
+                  ]
+                },
+                "non_mutating_evidence": {
+                  "reason": "checkpoint creation leaves fixture bytes unchanged"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "mutate",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-loop-ask_allow",
+                "name": "bash",
+                "arguments": {
+                  "command": "printf 'loop permission fixture\\n' > bash-loop.txt"
+                },
+                "disk_effects": [
+                  "bash-loop.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "restore",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-loop-restore",
+                "name": "aft_safety",
+                "arguments": {
+                  "op": "restore",
+                  "name": "bash-loop-t3"
+                },
+                "disk_effects": [
+                  "bash-loop.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "checkpoint",
+        "mutate",
+        "restore",
+        "finish"
+      ],
+      "restore_evidence": {
+        "operation": "checkpoint_restore",
+        "identifier": "bash-loop-t3",
+        "calls": [
+          {
+            "tool": "aft_safety",
+            "arguments": {
+              "op": "checkpoint",
+              "name": "bash-loop-t3",
+              "files": [
+                "bash-loop.txt"
+              ]
+            }
+          },
+          {
+            "tool": "bash",
+            "arguments": {
+              "command": "printf 'loop permission fixture\\n' > bash-loop.txt"
+            }
+          },
+          {
+            "tool": "aft_safety",
+            "arguments": {
+              "op": "restore",
+              "name": "bash-loop-t3"
+            }
+          }
+        ],
+        "paths": [
+          {
+            "path": "bash-loop.txt",
+            "transition": "create",
+            "expected_intermediate_sha256": "dcd614c3a961956e98f2d59929e1be48f409e2df5f016ee4070135543323b8e6"
+          }
+        ]
+      },
+      "metadata": {
+        "permission": {
+          "operation": "bash:withPermissionLoop",
+          "reply": "once"
+        },
+        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "bash/T3/loop_ask_deny",
+      "tool": "bash",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Deny the loop bash permission path.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-loop-ask_deny",
+                "name": "bash",
+                "arguments": {
+                  "command": "printf 'loop permission fixture\\n' > bash-loop.txt"
+                },
+                "non_mutating_evidence": {
+                  "reason": "reject prevents the bash write"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "metadata": {
+        "permission": {
+          "operation": "bash:withPermissionLoop",
+          "reply": "reject"
+        },
+        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "bash/T3/loop_config_deny",
+      "tool": "bash",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Configuration-deny the loop bash permission path.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-loop-config_deny",
+                "name": "bash",
+                "arguments": {
+                  "command": "printf 'loop permission fixture\\n' > bash-loop.txt"
+                },
+                "non_mutating_evidence": {
+                  "reason": "config_deny prevents the bash write"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "metadata": {
+        "permission": {
+          "operation": "bash:withPermissionLoop",
+          "reply": "config_deny"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "bash/T3/fallback_ask_allow",
+      "tool": "bash",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Allow the fallback bash permission path and restore its created file.",
+      "fixture": "./fixture",
+      "project_config": {
+        "bash": {
+          "host_fallback": true
+        }
+      },
+      "turns": [
+        {
+          "label": "checkpoint",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-fallback-checkpoint",
+                "name": "aft_safety",
+                "arguments": {
+                  "op": "checkpoint",
+                  "name": "bash-fallback-t3",
+                  "files": [
+                    "bash-fallback.txt"
+                  ]
+                },
+                "non_mutating_evidence": {
+                  "reason": "checkpoint creation leaves fixture bytes unchanged"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "mutate",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-fallback-ask_allow",
+                "name": "bash",
+                "arguments": {
+                  "command": "printf 'fallback permission fixture\\n' > bash-fallback.txt"
+                },
+                "disk_effects": [
+                  "bash-fallback.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "restore",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-fallback-restore",
+                "name": "aft_safety",
+                "arguments": {
+                  "op": "restore",
+                  "name": "bash-fallback-t3"
+                },
+                "disk_effects": [
+                  "bash-fallback.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "checkpoint",
+        "mutate",
+        "restore",
+        "finish"
+      ],
+      "restore_evidence": {
+        "operation": "checkpoint_restore",
+        "identifier": "bash-fallback-t3",
+        "calls": [
+          {
+            "tool": "aft_safety",
+            "arguments": {
+              "op": "checkpoint",
+              "name": "bash-fallback-t3",
+              "files": [
+                "bash-fallback.txt"
+              ]
+            }
+          },
+          {
+            "tool": "bash",
+            "arguments": {
+              "command": "printf 'fallback permission fixture\\n' > bash-fallback.txt"
+            }
+          },
+          {
+            "tool": "aft_safety",
+            "arguments": {
+              "op": "restore",
+              "name": "bash-fallback-t3"
+            }
+          }
+        ],
+        "paths": [
+          {
+            "path": "bash-fallback.txt",
+            "transition": "create",
+            "expected_intermediate_sha256": "93b00328426f1f38ef6f15c8c866a4e1917baedc81f6f3a7d207d53de2a93306"
+          }
+        ]
+      },
+      "metadata": {
+        "permission": {
+          "operation": "bash:host-fallback",
+          "reply": "once"
+        },
+        "harness_blocker": "driver transport-dead stub also prevents the required aft_safety restore calls"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "bash/T3/fallback_ask_deny",
+      "tool": "bash",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Deny the fallback bash permission path.",
+      "fixture": "./fixture",
+      "project_config": {
+        "bash": {
+          "host_fallback": true
+        }
+      },
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-fallback-ask_deny",
+                "name": "bash",
+                "arguments": {
+                  "command": "printf 'fallback permission fixture\\n' > bash-fallback.txt"
+                },
+                "non_mutating_evidence": {
+                  "reason": "reject prevents the bash write"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "metadata": {
+        "permission": {
+          "operation": "bash:host-fallback",
+          "reply": "reject"
+        },
+        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "bash/T3/fallback_config_deny",
+      "tool": "bash",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Configuration-deny the fallback bash permission path.",
+      "fixture": "./fixture",
+      "project_config": {
+        "bash": {
+          "host_fallback": true
+        }
+      },
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-fallback-config_deny",
+                "name": "bash",
+                "arguments": {
+                  "command": "printf 'fallback permission fixture\\n' > bash-fallback.txt"
+                },
+                "non_mutating_evidence": {
+                  "reason": "config_deny prevents the bash write"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "metadata": {
+        "permission": {
+          "operation": "bash:host-fallback",
+          "reply": "config_deny"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "bash/T5/completion_wake",
+      "tool": "bash",
+      "trajectory": "T5",
+      "execution": "shared-server",
+      "prompt": "Start two sequential background tasks and observe one idle wake for each completion.",
+      "fixture": "./fixture",
+      "quiescence_timeout_ms": 30000,
+      "turns": [
+        {
+          "label": "start-first",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-wake-first",
+                "name": "bash",
+                "arguments": {
+                  "command": "sleep 5; printf 'first wake\\n' > completion-one.txt",
+                  "background": true
+                },
+                "disk_effects": [
+                  {
+                    "path": "completion-one.txt",
+                    "phase": "post_result"
+                  }
+                ],
+                "outlives_result": true
+              }
+            ]
+          }
+        },
+        {
+          "label": "idle-first",
+          "response": {
+            "kind": "text",
+            "content": "Waiting for the first completion."
+          }
+        },
+        {
+          "label": "start-second",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-wake-second",
+                "name": "bash",
+                "arguments": {
+                  "command": "sleep 5; printf 'second wake\\n' > completion-two.txt",
+                  "background": true
+                },
+                "disk_effects": [
+                  {
+                    "path": "completion-two.txt",
+                    "phase": "post_result"
+                  }
+                ],
+                "outlives_result": true
+              }
+            ]
+          }
+        },
+        {
+          "label": "idle-second",
+          "response": {
+            "kind": "text",
+            "content": "Waiting for the second completion."
+          }
+        },
+        {
+          "label": "finish-wakes",
+          "response": {
+            "kind": "text",
+            "content": "Both completion wakes observed."
+          }
+        }
+      ],
+      "expected_turns": [
+        "start-first",
+        "idle-first",
+        "start-second",
+        "idle-second",
+        "finish-wakes"
+      ],
+      "metadata": {
+        "t5": {
+          "subcase": "completion_wake",
+          "initial_delivery_deadline_ms": 30000,
+          "duplicate_detection_window": {
+            "source": "product_rearm_ceiling_plus_one_tick",
+            "tick_ms": 50
+          },
+          "sequential_tasks": true
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "bash/T5/watch_pattern_once",
+      "tool": "bash",
+      "trajectory": "T5",
+      "execution": "shared-server",
+      "prompt": "Arm a one-shot watch before two matching stdout records and observe exactly one delivery.",
+      "fixture": "./fixture",
+      "quiescence_timeout_ms": 30000,
+      "turns": [
+        {
+          "label": "start-watch-source",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-watch-source",
+                "name": "bash",
+                "arguments": {
+                  "command": "sleep 3; echo WATCH_MATCH; sleep 1; echo WATCH_MATCH",
+                  "background": true
+                },
+                "non_mutating_evidence": {
+                  "reason": "the watch source writes stdout only"
+                },
+                "outlives_result": true
+              }
+            ]
+          }
+        },
+        {
+          "label": "capture-task-id",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-watch-status",
+                "name": "status",
+                "arguments": {},
+                "non_mutating_evidence": {
+                  "reason": "status keeps the scripted turn open while the task id is captured"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "arm-watch",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-arm-watch",
+                "name": "bash_watch",
+                "arguments": {
+                  "taskId": "{{task_id:bash-watch-source}}",
+                  "pattern": "WATCH_MATCH",
+                  "background": true,
+                  "once": true
+                },
+                "non_mutating_evidence": {
+                  "reason": "arming a watch does not change fixture files"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "idle-watch",
+          "response": {
+            "kind": "text",
+            "content": "Waiting for the watch delivery."
+          }
+        },
+        {
+          "label": "finish-watch",
+          "response": {
+            "kind": "text",
+            "content": "One watch delivery observed."
+          }
+        }
+      ],
+      "expected_turns": [
+        "start-watch-source",
+        "capture-task-id",
+        "arm-watch",
+        "idle-watch",
+        "finish-watch"
+      ],
+      "metadata": {
+        "t5": {
+          "subcase": "watch_pattern_once",
+          "pattern": "WATCH_MATCH",
+          "setup_deadline_ms": 30000,
+          "setup_phases": [
+            "watch_arm",
+            "first_match"
+          ],
+          "initial_delivery_deadline_ms": 30000,
+          "initial_delivery_antecedent": "first matching task io/stdout after watch arm",
+          "duplicate_detection_window": {
+            "source": "product_rearm_ceiling_plus_one_tick",
+            "tick_ms": 50
+          }
+        },
+        "harness_blocker": "HarnessExtension observe receives the second request only after mockResponse has already materialized the bash_watch placeholder"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "bash/T4/abort",
+      "tool": "bash",
+      "trajectory": "T4",
+      "execution": "shared-server",
+      "prompt": "Start and abort the deferred bash call.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-abort",
+                "name": "bash",
+                "arguments": {
+                  "command": "sleep 30"
+                },
+                "non_mutating_evidence": {
+                  "reason": "aborted bash work does not mutate the project"
+                },
+                "outlives_result": true
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "controls": [
+        {
+          "id": "bash-abort-control",
+          "after_turn": "call-tool",
+          "delay_ms": 1000,
+          "method": "POST",
+          "path": "/api/session/{{session_id}}/abort",
+          "expected_status": 0,
+          "purpose": "abort"
+        }
+      ],
+      "metadata": {
+        "accepted_exit_codes": [
+          0,
+          130
+        ],
+        "harness_blocker": "ApiControlPlan cannot interpolate the active session id"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "bash/T6/bash-bash-output/complete",
+      "tool": "bash",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the complete bash..bash.output fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-t6-bash-bash-output-complete",
+                "name": "bash",
+                "arguments": {
+                  "command": "printf 'bash-fixture\\n'"
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "bash-t6-bash-bash-output-complete",
+      "metadata": {
+        "t6": {
+          "surface_id": "bash..bash.output",
+          "owner": "bash",
+          "call_id": "bash-t6-bash-bash-output-complete",
+          "fixture": "complete"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "bash/T6/bash-bash-output/incomplete",
+      "tool": "bash",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the incomplete bash..bash.output fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash-t6-bash-bash-output-incomplete",
+                "name": "bash",
+                "arguments": {
+                  "command": "i=0; while [ $i -lt 2500 ]; do echo bash-output-$i; i=$((i+1)); done"
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "bash-t6-bash-bash-output-incomplete",
+      "metadata": {
+        "t6": {
+          "surface_id": "bash..bash.output",
+          "owner": "bash",
+          "call_id": "bash-t6-bash-bash-output-incomplete",
+          "fixture": "incomplete",
+          "triggered_reason": "cap"
+        }
+      }
+    }
+  ]
+}
