@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "host_version": "0.0.0-beta-19234",
+  "observed_run_id": "s1-debug",
+  "observed_sha": "30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17",
+  "observation_kind": "provider_config_rejection_before_schema_probe",
+  "command": [
+    "opencode2",
+    "run",
+    "--standalone",
+    "--format",
+    "json",
+    "--model",
+    "mock/mock-model"
+  ],
+  "provider_config": {
+    "mock": {
+      "api": "openai",
+      "name": "deterministic aimock",
+      "options": {
+        "baseURL": "http://127.0.0.1:<aimock-port>/v1"
+      },
+      "models": {
+        "mock-model": {
+          "name": "Deterministic mock"
+        }
+      }
+    }
+  },
+  "resolved_config_observation": {
+    "name": "deterministic aimock",
+    "settings": {
+      "baseURL": "openai"
+    },
+    "models": {
+      "mock-model": {
+        "name": "Deterministic mock"
+      }
+    }
+  },
+  "host_event": {
+    "type": "error",
+    "error": {
+      "type": "provider.no-route",
+      "message": "Unsupported package for mock/mock-model: "
+    }
+  },
+  "exit_code": 1,
+  "schema_probe_reached": false
+}

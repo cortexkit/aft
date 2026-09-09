@@ -24,6 +24,13 @@ export interface HostCliContract {
   };
 }
 
+export interface HostProviderConfigContract {
+  schema_version: 1;
+  host_version: string;
+  observed_run_id: string;
+  provider_config: Record<string, unknown>;
+}
+
 export interface HostSchemaRejectionContract {
   schema_version: 1;
   host_version: string;
@@ -109,6 +116,25 @@ export async function loadHostCliContract(
         typeof smoke.expected_status === "number" ? smoke.expected_status : undefined,
     },
   };
+}
+
+export async function loadHostProviderConfigContract(
+  contractRoot: string,
+  pinnedVersion: string,
+): Promise<HostProviderConfigContract> {
+  const path = join(contractRoot, "host-provider-config.json");
+  await access(path).catch(() => {
+    fail("contract_uncaptured", "host_provider_config", { path }, true);
+  });
+  const record = asRecord(await readJson(path));
+  if (record?.schema_version !== 1) {
+    fail("contract_uncaptured", "host_provider_config schema", { path }, true);
+  }
+  contractIdentity(record, pinnedVersion, "host_provider_config");
+  if (!asRecord(record.provider_config)) {
+    fail("contract_uncaptured", `${path}: provider_config observation is missing`);
+  }
+  return record as unknown as HostProviderConfigContract;
 }
 
 export async function loadHostSchemaRejectionContract(

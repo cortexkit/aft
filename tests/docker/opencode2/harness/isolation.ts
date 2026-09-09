@@ -20,6 +20,25 @@ export interface ScenarioIsolation {
   host_config: string;
 }
 
+function materializeProviderConfig(value: unknown, mockBaseUrl: string): unknown {
+  if (typeof value === "string") {
+    return value
+      .replaceAll("{{AIMOCK_BASE_URL}}", mockBaseUrl)
+      .replaceAll("$AIMOCK_BASE_URL", mockBaseUrl);
+  }
+  if (Array.isArray(value))
+    return value.map((entry) => materializeProviderConfig(entry, mockBaseUrl));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [
+        key,
+        materializeProviderConfig(entry, mockBaseUrl),
+      ]),
+    );
+  }
+  return value;
+}
+
 export async function createScenarioIsolation(options: {
   parent: string;
   scenarioId: string;
@@ -28,6 +47,7 @@ export async function createScenarioIsolation(options: {
   mockBaseUrl: string;
   model?: string;
   projectConfig?: Record<string, unknown>;
+  providerConfig?: Record<string, unknown>;
 }): Promise<ScenarioIsolation> {
   const safeId = options.scenarioId.replaceAll(/[^a-zA-Z0-9_.-]+/g, "-");
   await mkdir(options.parent, { recursive: true });
@@ -80,6 +100,16 @@ export async function createScenarioIsolation(options: {
   if (!pluginUrl.startsWith("file://") || !pluginUrl.endsWith(".tgz")) {
     fail("plugin_source_invalid", `plugin source is not a file:// tarball: ${pluginUrl}`, {}, true);
   }
+  const providerConfig = options.providerConfig
+    ? materializeProviderConfig(options.providerConfig, options.mockBaseUrl)
+    : {
+        mock: {
+          api: "openai",
+          name: "deterministic aimock",
+          options: { baseURL: `${options.mockBaseUrl.replace(/\/$/, "")}/v1` },
+          models: { [options.model ?? "mock-model"]: { name: "Deterministic mock" } },
+        },
+      };
   const opencodeDir = join(paths.config, "opencode");
   await mkdir(opencodeDir, { recursive: true });
   const hostConfig = join(opencodeDir, "opencode.json");
@@ -89,14 +119,7 @@ export async function createScenarioIsolation(options: {
       {
         $schema: "https://opencode.ai/config.json",
         plugin: [pluginUrl],
-        provider: {
-          mock: {
-            api: "openai",
-            name: "deterministic aimock",
-            options: { baseURL: `${options.mockBaseUrl.replace(/\/$/, "")}/v1` },
-            models: { [options.model ?? "mock-model"]: { name: "Deterministic mock" } },
-          },
-        },
+        provider: providerConfig,
       },
       null,
       2,

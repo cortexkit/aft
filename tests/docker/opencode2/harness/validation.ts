@@ -1,7 +1,11 @@
 import { access, readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
-import { loadHostCliContract, loadHostSchemaRejectionContract } from "./contracts.js";
+import {
+  loadHostCliContract,
+  loadHostProviderConfigContract,
+  loadHostSchemaRejectionContract,
+} from "./contracts.js";
 import { fail } from "./errors.js";
 import { readPermissionAskInventory, validatePermissionInventory } from "./inventory.js";
 import type {
@@ -685,6 +689,7 @@ export async function validateHarnessInputs(options: {
 
   if (!options.observationOnly) {
     await loadHostCliContract(contractRoot, options.pinnedHostVersion);
+    await loadHostProviderConfigContract(contractRoot, options.pinnedHostVersion);
     if (options.scenarios.some((scenario) => scenario.error_origin === "host")) {
       await loadHostSchemaRejectionContract(contractRoot, options.pinnedHostVersion);
     }

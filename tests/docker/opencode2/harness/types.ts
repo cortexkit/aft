@@ -120,6 +120,7 @@ export interface ScenarioDefinition {
   trajectory: Trajectory;
   execution: ScenarioExecutionMode;
   prompt: string;
+  model?: string;
   auto?: boolean;
   fixture?: string;
   turns: ScriptedTurn[];

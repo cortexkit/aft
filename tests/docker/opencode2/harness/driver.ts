@@ -3,7 +3,7 @@ import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { loadHostCliContract } from "./contracts.js";
+import { loadHostCliContract, loadHostProviderConfigContract } from "./contracts.js";
 import { assertHarnessControlCoverage, runHarnessControlSuite } from "./control-suite.js";
 import { DiskStateObserver, ThreeStateRecorder } from "./disk-state.js";
 import { HarnessError } from "./errors.js";
@@ -122,6 +122,31 @@ function restoreCallSequence(scenario: ScenarioDefinition): ToolCallPlan[] {
   });
 }
 
+function assertT2ProductContract(
+  scenario: ScenarioDefinition,
+  call: ToolCallPlan,
+  text: string,
+  hostStream: string,
+): void {
+  if (
+    scenario.trajectory !== "T2" ||
+    scenario.error_origin !== "product" ||
+    scenario.compare_call_id !== call.id
+  ) {
+    return;
+  }
+  const code = scenario.metadata?.error_code;
+  const steeringPattern = scenario.metadata?.steering_pattern;
+  if (typeof code !== "string" || !hostStream.includes(code)) {
+    throw new Error(
+      `${scenario.id}: JSON event stream does not contain product error code ${String(code)}`,
+    );
+  }
+  if (typeof steeringPattern !== "string" || !new RegExp(steeringPattern).test(text)) {
+    throw new Error(`${scenario.id}: agent-visible text does not match steering pattern`);
+  }
+}
+
 function assertT6Trailer(scenario: ScenarioDefinition, call: ToolCallPlan, text: string): void {
   const t6 = asRecord(scenario.metadata?.t6);
   if (!t6) return;
@@ -190,6 +215,7 @@ async function runOneScenario(options: {
   hostGeneration?: "v1" | "v2";
   hostExecutable?: string;
   applyComparison?: boolean;
+  providerConfig?: Record<string, unknown>;
 }): Promise<{
   result: ScenarioResult;
   smokeRan: boolean;
@@ -340,7 +366,9 @@ async function runOneScenario(options: {
       fixture: fixturePath(scenario),
       pluginTarball: config.pluginTarball,
       mockBaseUrl: mock.url,
+      model: (scenario.model ?? "mock/mock-model").split("/").at(-1),
       projectConfig: scenario.project_config,
+      providerConfig: hostGeneration === "v2" ? options.providerConfig : undefined,
     });
     if (scenario.id.startsWith("bash/T3/fallback_")) {
       isolation.env.AFT_BINARY_PATH = await makeTransportDeadStub(
@@ -431,6 +459,7 @@ async function runOneScenario(options: {
       const observed = toolResultForCall(mock.exchanges, call.id);
       if (!observed) throw new Error(`mock never observed tool result for ${call.id}`);
       observedTexts[call.id] = observed.text;
+      assertT2ProductContract(scenario, call, observed.text, hostStream);
       assertT6Trailer(scenario, call, observed.text);
       if (
         options.applyComparison !== false &&
@@ -727,6 +756,10 @@ async function main(): Promise<void> {
     join(repoRoot, "tests", "docker", "opencode2", "contract"),
     pinnedHostVersion,
   );
+  const providerContract = await loadHostProviderConfigContract(
+    join(repoRoot, "tests", "docker", "opencode2", "contract"),
+    pinnedHostVersion,
+  );
   const pluginVersion = await readPackageVersion();
   const results: ScenarioResult[] = [];
   let smokeRan = false;
@@ -742,6 +775,7 @@ async function main(): Promise<void> {
         extensions,
         runSmoke: false,
         hostGeneration: "v2",
+        providerConfig: providerContract.provider_config,
         applyComparison: true,
       });
       const v1 = config.v1HostExecutable
@@ -804,6 +838,7 @@ async function main(): Promise<void> {
         pluginVersion,
         hostContract,
         extensions,
+        providerConfig: providerContract.provider_config,
         runSmoke: !smokeRan && scenario.execution === "shared-server",
       });
       result = outcome.result;

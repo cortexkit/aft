@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -94,6 +94,13 @@ describe("scenario isolation and liveness", () => {
       fixture,
       pluginTarball: tarball,
       mockBaseUrl: "http://127.0.0.1:1234",
+      providerConfig: {
+        mock: {
+          package: "observed-package",
+          settings: { baseURL: "{{AIMOCK_BASE_URL}}/v1" },
+          models: { "mock-model": { name: "Mock" } },
+        },
+      },
     });
     for (const key of [
       "HOME",
@@ -106,6 +113,8 @@ describe("scenario isolation and liveness", () => {
       expect(isolated.env[key]?.startsWith(isolated.root)).toBe(true);
     }
     expect(isolated.env.OPENCODE_DISABLE_DEFAULT_PLUGINS).toBe("true");
+    const hostConfig = JSON.parse(await readFile(isolated.host_config, "utf8"));
+    expect(hostConfig.provider.mock.settings.baseURL).toBe("http://127.0.0.1:1234/v1");
   });
 
   test("turn-log liveness rejects a missing later turn", () => {
