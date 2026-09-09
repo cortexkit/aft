@@ -251,6 +251,27 @@ pub struct ExclusionEntry {
 
 /// Exclusions from the registry-free discovery scan with non-empty written reasons.
 pub static EXCLUSIONS: &[ExclusionEntry] = &[
+    // The lexical lane's depth tiers are engine-internal cuts over a candidate
+    // pool (D_k = 200..3200); the agent never sees this list. The only cut an
+    // agent sees is the search surface's topK, which carries the envelope.
+    ExclusionEntry {
+        file: "commands/semantic_search/lexical_lane.rs",
+        enclosing_item: "from_scored_candidates",
+        location_or_primitive: "depth-tier truncate",
+        reason: "engine-internal lexical depth tier over the candidate pool; not an agent-visible list, the search surface attaches the envelope",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/lexical_lane.rs",
+        enclosing_item: "enumerate_to_depth",
+        location_or_primitive: "depth-tier take",
+        reason: "engine-internal lexical depth tier over the candidate pool; not an agent-visible list, the search surface attaches the envelope",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/lexical_lane.rs",
+        enclosing_item: "score_complete_selected_pool",
+        location_or_primitive: "depth-tier take",
+        reason: "engine-internal lexical depth tier over the candidate pool; not an agent-visible list, the search surface attaches the envelope",
+    },
     ExclusionEntry {
         file: "commands/bash_status.rs",
         enclosing_item: "handle",
