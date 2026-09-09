@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "tool": "conflicts",
+  "controls": [
+    {
+      "id": "conflicts-t1-agent-text",
+      "mutated_input": "conflicts/T1 result text",
+      "expected_failure": "shape comparison failed",
+      "unaffected_positive_control": "conflicts/T2/invalid_arguments"
+    },
+    {
+      "id": "conflicts-t2-host-rejection",
+      "mutated_input": "conflicts/T2 invalid fixture",
+      "expected_failure": "host schema rejection mismatch",
+      "unaffected_positive_control": "conflicts/T1/happy"
+    },
+    {
+      "id": "conflicts-parity-shape",
+      "mutated_input": "conflicts/T7 projected fixture marker",
+      "expected_failure": "projected V1/V2 parity mismatch",
+      "unaffected_positive_control": "conflicts/T1/happy"
+    }
+  ]
+}
