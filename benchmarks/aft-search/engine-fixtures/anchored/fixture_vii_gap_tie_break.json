@@ -1,0 +1,40 @@
+{
+  "name": "fixture_vii_gap_tie_break",
+  "description": "Equal matched totals use fewer gap characters before the reversed path order in both canonical lane and final block sorting",
+  "query": "connection established {} response received",
+  "source_text": "connection established  response received\n",
+  "retained_runs": [
+    "connection established",
+    "response received"
+  ],
+  "retained_run_lengths": [
+    22,
+    17
+  ],
+  "matched_occurrence_offsets": [
+    0,
+    24
+  ],
+  "matched_occurrences": [
+    [1, 0],
+    [2, 24]
+  ],
+  "matched_total": 39,
+  "denominator": 39,
+  "gap_chars": 2,
+  "threshold_outcome": true,
+  "candidate_a": {
+    "path": "crates/aft/src/a_alpha.rs",
+    "matched_total": 20,
+    "gap_chars": 10
+  },
+  "candidate_b": {
+    "path": "crates/aft/src/z_beta.rs",
+    "matched_total": 20,
+    "gap_chars": 2
+  },
+  "expected_order": [
+    "crates/aft/src/z_beta.rs",
+    "crates/aft/src/a_alpha.rs"
+  ]
+}

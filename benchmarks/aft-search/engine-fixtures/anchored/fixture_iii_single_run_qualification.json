@@ -1,0 +1,21 @@
+{
+  "name": "fixture_iii_single_run_qualification",
+  "description": "Single-run qualification: 21/21 = 100% with a 12+-char run",
+  "query": "2026-09-08T12:00:02 WARN cache eviction failed 4821",
+  "source_text": "warn!(\"cache eviction failed {}\", id);\n",
+  "retained_runs": [
+    "cache eviction failed"
+  ],
+  "retained_run_lengths": [
+    21
+  ],
+  "matched_occurrence_offsets": [
+    7
+  ],
+  "matched_occurrences": [
+    [1, 7]
+  ],
+  "matched_total": 21,
+  "denominator": 21,
+  "threshold_outcome": true
+}

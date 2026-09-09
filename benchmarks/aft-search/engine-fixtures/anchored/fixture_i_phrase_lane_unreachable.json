@@ -1,0 +1,26 @@
+{
+  "name": "fixture_i_phrase_lane_unreachable",
+  "description": "The case the phrase lane cannot reach: log line with variable spans discovered by anchored union and qualifies",
+  "query": "2026-09-08T12:00:01 ERROR opening /tmp/run-4821/a.rs failed for run 12345",
+  "source_text": "error!(\"opening {} failed for run {}\", path, id);\n",
+  "retained_runs": [
+    "opening",
+    "failed for run"
+  ],
+  "retained_run_lengths": [
+    7,
+    14
+  ],
+  "matched_occurrence_offsets": [
+    8,
+    19
+  ],
+  "matched_occurrences": [
+    [1, 8],
+    [2, 19]
+  ],
+  "matched_total": 21,
+  "denominator": 21,
+  "threshold_outcome": true,
+  "expected_rank": 1
+}

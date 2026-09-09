@@ -1,0 +1,23 @@
+{
+  "name": "fixture_ii_decoy_rejected_on_evidence",
+  "description": "Decoy rejected on evidence after being asserted present in candidate set (7/21 = 33.3% < 60%)",
+  "query": "2026-09-08T12:00:01 ERROR opening /tmp/run-4821/a.rs failed for run 12345",
+  "source_text": "info!(\"opening connection to database\");\n",
+  "retained_runs": [
+    "opening",
+    "failed for run"
+  ],
+  "retained_run_lengths": [
+    7,
+    14
+  ],
+  "matched_occurrence_offsets": [
+    7
+  ],
+  "matched_occurrences": [
+    [1, 7]
+  ],
+  "matched_total": 7,
+  "denominator": 21,
+  "threshold_outcome": false
+}

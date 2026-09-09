@@ -1,0 +1,30 @@
+{
+  "name": "fixture_ix_intermediate_occurrence_totality",
+  "description": "Intermediate-occurrence totality ((zeta)/R20 fixture): selects occurrence list [(1,0),(2,5),(3,15)] under any enumeration order",
+  "query": "aaaa {} bbbb {} cccc",
+  "retained_runs": [
+    "aaaa",
+    "bbbb",
+    "cccc"
+  ],
+  "retained_run_lengths": [
+    4,
+    4,
+    4
+  ],
+  "source_text": "aaaa bbbb bbbb cccc",
+  "matched_occurrence_offsets": [
+    0,
+    5,
+    15
+  ],
+  "matched_occurrences": [
+    [1, 0],
+    [2, 5],
+    [3, 15]
+  ],
+  "matched_total": 12,
+  "gap_chars": 7,
+  "denominator": 12,
+  "threshold_outcome": true
+}

@@ -1,0 +1,27 @@
+{
+  "name": "fixture_viii_repeated_runs_canonical_alignment",
+  "description": "Repeated runs: canonical alignment selects adjacent pair (gap 2) over far pair (gap 61), beating gap-5 competitor",
+  "query": "run_alpha_start {} run_omega_end",
+  "retained_runs": [
+    "run_alpha_start",
+    "run_omega_end"
+  ],
+  "retained_run_lengths": [
+    15,
+    13
+  ],
+  "matched_occurrence_offsets": [
+    158,
+    175
+  ],
+  "matched_occurrences": [
+    [1, 158],
+    [2, 175]
+  ],
+  "matched_total": 28,
+  "denominator": 28,
+  "gap_chars": 2,
+  "threshold_outcome": true,
+  "source_text": "run_alpha_start-------------------------------------------------------------run_omega_end\n// spacer line 2\n// spacer line 3\n// spacer line 4\n// spacer line 5\nrun_alpha_start  run_omega_end\n",
+  "competitor_gap": 5
+}

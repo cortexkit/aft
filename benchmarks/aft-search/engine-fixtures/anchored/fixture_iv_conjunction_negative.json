@@ -1,0 +1,23 @@
+{
+  "name": "fixture_iv_conjunction_negative",
+  "description": "Conjunction negative: matched run is 12+ chars but 23/47 = 48.9%, below the evidence floor",
+  "query": "handling inbound request [100] failed to acquire lease",
+  "source_text": "log_error(\"failed to acquire lease\");\n",
+  "retained_runs": [
+    "handling inbound request",
+    "failed to acquire lease"
+  ],
+  "retained_run_lengths": [
+    24,
+    23
+  ],
+  "matched_occurrence_offsets": [
+    11
+  ],
+  "matched_occurrences": [
+    [2, 11]
+  ],
+  "matched_total": 23,
+  "denominator": 47,
+  "threshold_outcome": false
+}

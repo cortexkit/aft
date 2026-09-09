@@ -1,0 +1,13 @@
+{
+  "name": "fixture_v_zero_runs_negative",
+  "description": "Negative: all variable query retains zero runs, anchored lane is skipped",
+  "query": "12345 /tmp/x 2026-09-08",
+  "source_text": "fn main() {}\n",
+  "retained_runs": [],
+  "retained_run_lengths": [],
+  "matched_occurrence_offsets": [],
+  "matched_occurrences": [],
+  "matched_total": 0,
+  "denominator": 0,
+  "threshold_outcome": false
+}

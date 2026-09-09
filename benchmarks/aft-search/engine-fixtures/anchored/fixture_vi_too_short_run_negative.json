@@ -1,0 +1,13 @@
+{
+  "name": "fixture_vi_too_short_run_negative",
+  "description": "Negative: trimmed run 'for' is only 3 chars (< 4 chars required), not retained",
+  "query": "for {}",
+  "source_text": "for item in items {}\n",
+  "retained_runs": [],
+  "retained_run_lengths": [],
+  "matched_occurrence_offsets": [],
+  "matched_occurrences": [],
+  "matched_total": 0,
+  "denominator": 0,
+  "threshold_outcome": false
+}
