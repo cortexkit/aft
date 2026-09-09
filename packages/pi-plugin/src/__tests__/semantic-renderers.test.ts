@@ -84,33 +84,6 @@ describe("semantic renderer", () => {
     );
   });
 
-  test("renderSemanticResult shows the generation-change disclosure once", () => {
-    const output = renderToString(
-      renderSemanticResult(
-        makeResult("", {
-          status: "ready",
-          semantic_status: "ready",
-          interpreted_as: "hybrid",
-          text: "index changed - order re-derived\nbackend page",
-          results: [
-            {
-              file: "/repo/src/auth.ts",
-              name: "login",
-              kind: "function",
-              start_line: 4,
-              end_line: 8,
-            },
-          ],
-        }),
-        { query: "auth", offset: 10, topK: 5 },
-        mockTheme,
-        makeContext({ query: "auth", offset: 10, topK: 5 }),
-      ),
-    );
-
-    expect(output.split("index changed - order re-derived").length - 1).toBe(1);
-  });
-
   test("renderSemanticResult renders file_summary results as summaries", () => {
     const output = renderToString(
       renderSemanticResult(

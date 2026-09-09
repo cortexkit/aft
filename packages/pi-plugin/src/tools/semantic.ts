@@ -4,18 +4,13 @@
  * the ONNX runtime / configured backend is available.
  */
 
-import { homedir } from "node:os";
-import { isAbsolute, resolve } from "node:path";
-import { canonicalizeProjectRoot } from "@cortexkit/aft-bridge";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
-
 import type { PluginContext } from "../types.js";
 import {
   bridgeFor,
   callToolCall,
   isEmptyParam,
-  resolveSessionId,
   textResult,
   withPathAliasPreparation,
 } from "./_shared.js";
@@ -44,72 +39,6 @@ function semanticHonestyNote(response: Record<string, unknown>, theme: Theme): s
   return notes.length > 0 ? theme.fg("warning", `Search status: ${notes.join("; ")}.`) : undefined;
 }
 
-const GENERATION_CHANGED_DISCLOSURE = "index changed - order re-derived";
-
-type SearchContinuityBySession = Map<string, Map<string, string>>;
-
-function normalizeContinuityQuery(query: string): string {
-  return query
-    .trim()
-    .split(/\s+/u)
-    .join(" ")
-    .replace(/[A-Z]/g, (letter) => letter.toLowerCase());
-}
-
-function selectedProjectRoot(cwd: string, pathArg: string | undefined): string {
-  const target = pathArg?.trim();
-  if (!target) return canonicalizeProjectRoot(cwd);
-  const expanded =
-    target === "~"
-      ? homedir()
-      : /^~[/\\]/u.test(target)
-        ? resolve(homedir(), target.slice(2))
-        : target;
-  return canonicalizeProjectRoot(isAbsolute(expanded) ? expanded : resolve(cwd, expanded));
-}
-
-function continuityKey(
-  projectRoot: string,
-  query: string,
-  includeTests: boolean | undefined,
-  topK: number | undefined,
-): string {
-  return JSON.stringify([
-    projectRoot,
-    normalizeContinuityQuery(query),
-    includeTests ?? false,
-    topK ?? 10,
-  ]);
-}
-
-function responseGeneration(response: Record<string, unknown>): string | undefined {
-  const structured = asRecord(response.structuredContent) ?? asRecord(response.structured_content);
-  const plan = asRecord(response.plan) ?? asRecord(structured?.plan);
-  return asString(plan?.snapshot_generation) ?? asString(response.snapshot_generation);
-}
-
-function surfaceSearchText(
-  response: Record<string, unknown>,
-  continuity: SearchContinuityBySession,
-  sessionId: string,
-  key: string,
-): string {
-  const text = asString(response.text) ?? "";
-  const generation = responseGeneration(response);
-  if (generation === undefined) return text;
-
-  let sessionContinuity = continuity.get(sessionId);
-  if (!sessionContinuity) {
-    sessionContinuity = new Map();
-    continuity.set(sessionId, sessionContinuity);
-  }
-  const previous = sessionContinuity.get(key);
-  sessionContinuity.set(key, generation);
-  return previous !== undefined && previous !== generation
-    ? `${GENERATION_CHANGED_DISCLOSURE}\n${text}`
-    : text;
-}
-
 const SearchParams = Type.Object(
   {
     query: Type.String({
@@ -122,14 +51,6 @@ const SearchParams = Type.Object(
         maximum: 100,
         default: 10,
         description: "Maximum number of results (default: 10, max: 100)",
-      }),
-    ),
-    offset: Type.Optional(
-      Type.Integer({
-        minimum: 0,
-        maximum: 100000,
-        default: 0,
-        description: "Zero-based result offset (default: 0, max: 100000).",
       }),
     ),
     includeTests: Type.Optional(
@@ -165,15 +86,7 @@ export function buildSemanticSections(
   const semanticStatus = asString(response.semantic_status) ?? status;
   const interpretedAs = asString(response.interpreted_as) ?? "unknown";
   const queryKind = asString(response.query_kind);
-  const responseText = asString(response.text);
-  const hasGenerationDisclosure =
-    responseText === GENERATION_CHANGED_DISCLOSURE ||
-    responseText?.startsWith(`${GENERATION_CHANGED_DISCLOSURE}\n`) === true;
-  const backendText = hasGenerationDisclosure
-    ? responseText?.slice(GENERATION_CHANGED_DISCLOSURE.length + 1)
-    : responseText;
   const sections = [
-    ...(hasGenerationDisclosure ? [theme.fg("warning", GENERATION_CHANGED_DISCLOSURE)] : []),
     `${theme.fg(semanticStatus === "ready" ? "success" : "warning", `semantic: ${semanticStatus}`)} ${theme.fg("muted", `mode=${interpretedAs}${queryKind ? ` kind=${queryKind}` : ""} query=${JSON.stringify(args.query)} topK=${args.topK ?? 10}`)}`,
   ];
 
@@ -189,7 +102,7 @@ export function buildSemanticSections(
 
   const results = asRecords(response.results);
   if (status !== "ready" && results.length === 0) {
-    sections.push(backendText ?? theme.fg("muted", "Semantic index is not ready."));
+    sections.push(asString(response.text) ?? theme.fg("muted", "Semantic index is not ready."));
     return sections;
   }
 
@@ -282,7 +195,6 @@ export function renderSemanticResult(
 }
 
 export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void {
-  const continuity: SearchContinuityBySession = new Map();
   pi.registerTool(
     withPathAliasPreparation({
       name: "aft_search",
@@ -293,7 +205,6 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
       // the exact bash-grep reflex the system prompt works to suppress.
       description: [
         "Search code with one tool: concepts, identifiers, error strings, regex, literals, and filenames are auto-routed to the right engine and returned ranked. For conceptual 'how does X work' queries, phrase a full natural-language sentence — the semantic lane is NL-aware and matches intent against docstrings and comments ('how does the ORM build and execute a query', 'where is rate limiting handled'), not just keywords. Exact names, strings, and regex stay terse ('^export', 'Cargo.lock').",
-        "Use `offset` to continue a ranked result list from a zero-based position.",
         "When a list is cut, the reply ends with `shown N of M <unit> (<reason>) · narrow: <knobs>`; absence of that line means the list is complete.",
       ].join("\n\n"),
       parameters: SearchParams,
@@ -315,7 +226,6 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const req: Record<string, unknown> = { query: params.query };
         if (params.topK !== undefined) req.topK = params.topK;
-        if (params.offset !== undefined) req.offset = params.offset;
         if (params.includeTests !== undefined) req.includeTests = params.includeTests;
         if (params.path !== undefined) req.path = params.path;
         const response = await callToolCall(
@@ -328,18 +238,7 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
         if (response.success === false) {
           throw new Error(response.text || response.message || "search failed");
         }
-        const text = surfaceSearchText(
-          response,
-          continuity,
-          resolveSessionId(extCtx) ?? "unknown-session",
-          continuityKey(
-            selectedProjectRoot(extCtx.cwd, params.path),
-            params.query,
-            params.includeTests,
-            params.topK,
-          ),
-        );
-        return textResult(text, text === response.text ? response : { ...response, text });
+        return textResult(response.text, response);
       },
       renderCall(args, theme, context) {
         return renderSemanticCall(args, theme, context);
