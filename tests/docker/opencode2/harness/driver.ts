@@ -1,12 +1,12 @@
 #!/usr/bin/env bun
-import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { loadHostCliContract, loadHostProviderConfigContract } from "./contracts.js";
 import { assertHarnessControlCoverage, runHarnessControlSuite } from "./control-suite.js";
 import { DiskStateObserver, ThreeStateRecorder } from "./disk-state.js";
-import { HarnessError } from "./errors.js";
+import { fail, HarnessError } from "./errors.js";
 import { loadHarnessExtensions } from "./extensions.js";
 import { ScenarioForensics } from "./forensics.js";
 import {
@@ -36,6 +36,7 @@ import {
   writeHostSchemaRejectionObservation,
 } from "./schema-observation.js";
 import { assertTurnLog, readTurnLog } from "./turn-log.js";
+import { resolveTransportDeadWindow, transportDeadAtTurn } from "./transport-window.js";
 import type {
   ApiControlPlan,
   HarnessRuntimeEvent,
@@ -51,7 +52,7 @@ import {
   type ParityAllowlistEntry,
   validateHarnessInputs,
 } from "./validation.js";
-import { asRecord, createRunId } from "./util.js";
+import { asRecord, createRunId, runCommand } from "./util.js";
 
 const harnessRoot = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(harnessRoot, "../../../..");
@@ -328,20 +329,69 @@ function errorRecord(error: unknown): ScenarioResult["failure"] {
   };
 }
 
+interface TransportDeadStub {
+  executable: string;
+  marker: string;
+}
+
 async function makeTransportDeadStub(
   isolationRoot: string,
   configuredExecutable: string,
-): Promise<string> {
-  const stub = join(isolationRoot, ".harness-state", "aft-transport-dead");
-  await mkdir(dirname(stub), { recursive: true });
+): Promise<TransportDeadStub> {
+  const stateRoot = join(isolationRoot, ".harness-state");
+  const executable = join(stateRoot, "aft-transport-window");
+  const marker = join(stateRoot, "transport-dead");
+  await mkdir(stateRoot, { recursive: true });
   await writeFile(
-    stub,
-    `#!/bin/sh\nif [ "\${1:-}" = "--version" ] || [ "\${1:-}" = "-V" ]; then exec ${JSON.stringify(
+    executable,
+    `#!/bin/sh\nif { [ "\${1:-}" != "--version" ] && [ "\${1:-}" != "-V" ]; } && [ -f ${JSON.stringify(
+      marker,
+    )} ]; then\n  echo "AFT harness transport unavailable" >&2\n  exit 3\nfi\nexec ${JSON.stringify(
       configuredExecutable,
-    )} "$@"; fi\necho "AFT harness transport unavailable" >&2\nexit 3\n`,
+    )} "$@"\n`,
   );
-  await chmod(stub, 0o755);
-  return stub;
+  await chmod(executable, 0o755);
+  return { executable, marker };
+}
+
+async function killAftBridgeDescendants(
+  serverPid: number | undefined,
+  configuredExecutable: string,
+): Promise<void> {
+  if (!serverPid) return;
+  const processList = await runCommand("ps", ["-eo", "pid=,ppid=,command="], {
+    cwd: repoRoot,
+    timeoutMs: 5_000,
+  });
+  if (processList.exit_code !== 0) {
+    fail("host_failed", "could not inspect the shared-server process tree", {
+      output: processList,
+    });
+  }
+  const rows = processList.stdout
+    .split("\n")
+    .map((line) => line.match(/^\s*(\d+)\s+(\d+)\s+(.+)$/))
+    .filter((match): match is RegExpMatchArray => match !== null)
+    .map((match) => ({ pid: Number(match[1]), parent: Number(match[2]), command: match[3] }));
+  const descendants = new Set([serverPid]);
+  let added = true;
+  while (added) {
+    added = false;
+    for (const row of rows) {
+      if (!descendants.has(row.parent) || descendants.has(row.pid)) continue;
+      descendants.add(row.pid);
+      added = true;
+    }
+  }
+  for (const row of rows) {
+    if (!descendants.has(row.pid) || !row.command.includes(configuredExecutable)) continue;
+    try {
+      process.kill(row.pid, "SIGKILL");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+  }
+  await Bun.sleep(50);
 }
 
 async function readPackageVersion(): Promise<string> {
@@ -396,6 +446,9 @@ async function runOneScenario(options: {
   let abortIssuedAt: number | undefined;
   let hostCompletedAt: number | undefined;
   const controlPathValues: Record<string, string> = {};
+  const transportDeadWindow = resolveTransportDeadWindow(scenario);
+  let transportDeadStub: TransportDeadStub | undefined;
+  let transportDeadActive = false;
 
   const recordFailure = (error: unknown) => {
     firstFailure ??= error;
@@ -428,6 +481,18 @@ async function runOneScenario(options: {
   try {
     mock = new DeterministicScenarioMock(scenario, turnLogPath, {
       beforeTurn: async (turn, request) => {
+        if (transportDeadWindow && transportDeadStub) {
+          const shouldBeDead = transportDeadAtTurn(scenario, transportDeadWindow, turn.label);
+          if (shouldBeDead !== transportDeadActive) {
+            if (shouldBeDead) {
+              await writeFile(transportDeadStub.marker, "transport unavailable\n");
+              await killAftBridgeDescendants(server?.child.pid, config.executable);
+            } else {
+              await rm(transportDeadStub.marker, { force: true });
+            }
+            transportDeadActive = shouldBeDead;
+          }
+        }
         observeControlPathValues(request, controlPathValues);
         if (!disk) return;
         const pseudoExchange = {
@@ -531,11 +596,9 @@ async function runOneScenario(options: {
       projectConfig: scenario.project_config,
       providerConfig: hostGeneration === "v2" ? options.providerConfig : undefined,
     });
-    if (scenario.id.startsWith("bash/T3/fallback_")) {
-      isolation.env.AFT_BINARY_PATH = await makeTransportDeadStub(
-        isolation.root,
-        config.executable,
-      );
+    if (transportDeadWindow) {
+      transportDeadStub = await makeTransportDeadStub(isolation.root, config.executable);
+      isolation.env.AFT_BINARY_PATH = transportDeadStub.executable;
     } else {
       isolation.env.AFT_BINARY_PATH = config.executable;
     }
@@ -657,6 +720,7 @@ async function runOneScenario(options: {
   } catch (error) {
     recordFailure(error);
   } finally {
+    if (transportDeadStub) await rm(transportDeadStub.marker, { force: true });
     await Promise.allSettled(controlPromises);
     try {
       await mock?.stop();

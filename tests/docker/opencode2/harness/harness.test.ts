@@ -23,6 +23,7 @@ import { projectText } from "./projection.js";
 import { verifyExecutableProvenance } from "./provenance.js";
 import { materializeParityScenarios } from "./scenario-loader.js";
 import { assertTurnLog } from "./turn-log.js";
+import { resolveTransportDeadWindow, transportDeadAtTurn } from "./transport-window.js";
 import type { ScenarioDefinition, ScriptedTurn, ToolCallPlan } from "./types.js";
 import {
   applyMutatingTestOverride,
@@ -235,6 +236,57 @@ describe("shared-server controls", () => {
       { taskId: "bash-generated" },
     );
     expect(exchange.response).toBe(response);
+  });
+
+  test("fallback transport revives before the product restore turn", () => {
+    const fallback: ScenarioDefinition = {
+      schema_version: 1,
+      id: "bash/T3/fallback_ask_allow",
+      tool: "bash",
+      trajectory: "T3",
+      execution: "shared-server",
+      prompt: "exercise one transient fallback window",
+      turns: [
+        {
+          label: "checkpoint",
+          response: {
+            kind: "tool_calls",
+            calls: [
+              {
+                id: "checkpoint",
+                name: "aft_safety",
+                arguments: { op: "checkpoint", name: "fallback" },
+              },
+            ],
+          },
+        },
+        {
+          label: "fallback-call",
+          response: {
+            kind: "tool_calls",
+            calls: [{ id: "fallback", name: "bash", arguments: { command: "printf fallback" } }],
+          },
+        },
+        {
+          label: "restore",
+          response: {
+            kind: "tool_calls",
+            calls: [
+              {
+                id: "restore",
+                name: "aft_safety",
+                arguments: { op: "restore", name: "fallback" },
+              },
+            ],
+          },
+        },
+      ],
+    };
+    const window = resolveTransportDeadWindow(fallback);
+    expect(window).toBeDefined();
+    expect(
+      fallback.turns.map((turn) => transportDeadAtTurn(fallback, window!, turn.label)),
+    ).toEqual([false, true, false]);
   });
 });
 

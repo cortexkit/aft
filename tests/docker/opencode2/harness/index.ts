@@ -17,5 +17,6 @@ export * from "./scenario-loader.js";
 export * from "./schema-observation.js";
 export * from "./task-probe.js";
 export * from "./turn-log.js";
+export * from "./transport-window.js";
 export * from "./types.js";
 export * from "./validation.js";

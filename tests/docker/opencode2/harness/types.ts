@@ -130,6 +130,7 @@ export interface ScenarioDefinition {
   error_origin?: "host" | "product";
   subcase?: "invalid_arguments" | "missing_target" | string;
   controls?: ApiControlPlan[];
+  transport_dead?: { from_turn: string; to_turn: string };
   restore_evidence?: RestoreEvidencePlan;
   quiescence_timeout_ms?: number;
   expected_fail_issue?: string;
