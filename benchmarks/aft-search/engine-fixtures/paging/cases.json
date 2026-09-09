@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "sparse": { "offset": 20, "top_k": 10, "expected_depth": 400, "expected_tier": 1 },
+  "start_tier": { "tier_zero_count": 200, "late_offset": 200, "page_size": 100 },
+  "ordinary": { "shown": 10, "total": 200, "depth": 200 },
+  "exhausted_out_of_range": { "offset": 20, "total": 8 },
+  "depth_cap_out_of_range": { "offset": 1000, "total": 400 },
+  "coincidences": {
+    "c1_offset": 3100,
+    "c1_top_k": 10,
+    "c2_offset": 200,
+    "c2_top_k": 10,
+    "c3_offset": 3190,
+    "c3_top_k": 10,
+    "c5_top_k": 1
+  },
+  "above_cap": { "offset": 3200, "top_k": 10, "depth": 3200, "tier": 4 }
+}
