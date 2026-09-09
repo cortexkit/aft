@@ -5608,8 +5608,8 @@
     },
     {
       "path": "tests/docker/opencode2/harness/harness.test.ts",
-      "location": "line 56, column 18",
-      "line": 56,
+      "location": "line 57, column 18",
+      "line": 57,
       "column": 18,
       "token": "filePath",
       "class": "internal-compatibility",
