@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "tool": "move",
+  "controls": [
+    {
+      "id": "move-t1-agent-text",
+      "mutated_input": "move/T1 result text",
+      "expected_failure": "shape comparison failed",
+      "unaffected_positive_control": "move/T2/invalid_arguments"
+    },
+    {
+      "id": "move-t2-host-rejection",
+      "mutated_input": "move/T2 invalid fixture",
+      "expected_failure": "host schema rejection mismatch",
+      "unaffected_positive_control": "move/T1/happy"
+    },
+    {
+      "id": "move-parity-shape",
+      "mutated_input": "move/T7 projected fixture marker",
+      "expected_failure": "projected V1/V2 parity mismatch",
+      "unaffected_positive_control": "move/T1/happy"
+    },
+    {
+      "id": "move-permission-path-identity",
+      "mutated_input": "move/T3 requested path",
+      "expected_failure": "permission path identity mismatch",
+      "unaffected_positive_control": "move/T1/happy"
+    },
+    {
+      "id": "move-three-state-intermediate",
+      "mutated_input": "move/T3 intermediate path state",
+      "expected_failure": "no_effect_observed",
+      "unaffected_positive_control": "move/T3/move_ask_deny"
+    },
+    {
+      "id": "move-restore-state",
+      "mutated_input": "move/T3 restore call",
+      "expected_failure": "restore_state_mismatch",
+      "unaffected_positive_control": "move/T3/move_ask_deny"
+    }
+  ]
+}

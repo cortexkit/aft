@@ -1,0 +1,393 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "move",
+  "scenarios": [
+    {
+      "schema_version": 1,
+      "id": "move/T1/happy",
+      "tool": "move",
+      "trajectory": "T1",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the deterministic move fixture call.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "move-happy",
+                "name": "aft_move",
+                "arguments": {
+                  "path": "move-source.txt",
+                  "destination": "move-destination.txt"
+                },
+                "disk_effects": [
+                  "move-source.txt",
+                  "move-destination.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "move-happy",
+      "comparison": {
+        "mode": "shape",
+        "rules": [
+          {
+            "kind": "field",
+            "field": "fixture_marker",
+            "pattern": "^(?=[\\s\\S]*(?<value>move-source\\.txt))[\\s\\S]+$",
+            "min_lines": 1,
+            "max_lines": 10000
+          }
+        ],
+        "expected": {
+          "fixture_marker": "move-source.txt"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "move/T2/invalid_arguments",
+      "tool": "move",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted move call with an invalid argument type.",
+      "fixture": "./fixture",
+      "subcase": "invalid_arguments",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "move-invalid",
+                "name": "aft_move",
+                "arguments": {
+                  "path": 42
+                },
+                "non_mutating_evidence": {
+                  "reason": "the host rejects the argument type before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "move/T2/missing_target",
+      "tool": "move",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted move call without its required target.",
+      "fixture": "./fixture",
+      "subcase": "missing_target",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "move-missing",
+                "name": "aft_move",
+                "arguments": {},
+                "non_mutating_evidence": {
+                  "reason": "the host rejects missing required arguments before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "move/T3/move_ask_allow",
+      "tool": "move",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Allow the move mutation and restore its checkpoint.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "checkpoint",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "move-checkpoint",
+                "name": "aft_safety",
+                "arguments": {
+                  "op": "checkpoint",
+                  "name": "move-t3",
+                  "files": [
+                    "move-source.txt",
+                    "move-destination.txt"
+                  ]
+                },
+                "non_mutating_evidence": {
+                  "reason": "checkpoint creation does not alter the fixture project"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "mutate",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "move-allow-mutation",
+                "name": "aft_move",
+                "arguments": {
+                  "path": "move-source.txt",
+                  "destination": "move-destination.txt"
+                },
+                "disk_effects": [
+                  "move-source.txt",
+                  "move-destination.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "restore",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "move-restore",
+                "name": "aft_safety",
+                "arguments": {
+                  "op": "restore",
+                  "name": "move-t3"
+                },
+                "disk_effects": [
+                  "move-source.txt",
+                  "move-destination.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "checkpoint",
+        "mutate",
+        "restore",
+        "finish"
+      ],
+      "restore_evidence": {
+        "operation": "checkpoint_restore",
+        "identifier": "move-t3",
+        "calls": [
+          {
+            "tool": "aft_safety",
+            "arguments": {
+              "op": "checkpoint",
+              "name": "move-t3",
+              "files": [
+                "move-source.txt",
+                "move-destination.txt"
+              ]
+            }
+          },
+          {
+            "tool": "aft_move",
+            "arguments": {
+              "path": "move-source.txt",
+              "destination": "move-destination.txt"
+            }
+          },
+          {
+            "tool": "aft_safety",
+            "arguments": {
+              "op": "restore",
+              "name": "move-t3"
+            }
+          }
+        ],
+        "paths": [
+          {
+            "path": "move-source.txt",
+            "transition": "move_source"
+          },
+          {
+            "path": "move-destination.txt",
+            "transition": "move_destination",
+            "paired_path": "move-source.txt"
+          }
+        ]
+      },
+      "metadata": {
+        "permission": {
+          "operation": "move",
+          "reply": "once",
+          "requested_paths": [
+            "move-source.txt",
+            "move-destination.txt"
+          ]
+        },
+        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "move/T3/move_ask_deny",
+      "tool": "move",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Deny the move mutation.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "move-ask_deny",
+                "name": "aft_move",
+                "arguments": {
+                  "path": "move-source.txt",
+                  "destination": "move-destination.txt"
+                },
+                "non_mutating_evidence": {
+                  "reason": "reject prevents fixture mutation"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "metadata": {
+        "permission": {
+          "operation": "move",
+          "reply": "reject",
+          "requested_paths": [
+            "move-source.txt",
+            "move-destination.txt"
+          ]
+        },
+        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "move/T3/move_config_deny",
+      "tool": "move",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Configuration-deny the move mutation.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "move-config_deny",
+                "name": "aft_move",
+                "arguments": {
+                  "path": "move-source.txt",
+                  "destination": "move-destination.txt"
+                },
+                "non_mutating_evidence": {
+                  "reason": "config_deny prevents fixture mutation"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "metadata": {
+        "permission": {
+          "operation": "move",
+          "reply": "config_deny",
+          "requested_paths": [
+            "move-source.txt",
+            "move-destination.txt"
+          ]
+        }
+      }
+    }
+  ]
+}
