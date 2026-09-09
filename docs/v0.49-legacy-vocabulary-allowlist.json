@@ -5598,6 +5598,24 @@
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
+      "path": "tests/docker/opencode2/harness/control-suite.ts",
+      "location": "line 23, column 18",
+      "line": 23,
+      "column": 18,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/harness/harness.test.ts",
+      "location": "line 47, column 18",
+      "line": 47,
+      "column": 18,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
       "path": "tests/pi-rpc/aft-tools.test.ts",
       "location": "line 187, column 11",
       "line": 187,
