@@ -1,0 +1,26 @@
+{
+  "name": "unit_3a_matched_run_char_total_vs_enclosing_region",
+  "description": "21 chars in a 90-char region vs 24 chars in a 30-char region ranks the 24-char candidate first",
+  "candidate_1": {
+    "path": "crates/aft/src/low_chars_wide_region.rs",
+    "tier": "exact",
+    "kind": "anchored",
+    "matched_span": 21,
+    "enclosing_region_width": 90,
+    "gap_chars": 5,
+    "exact_form": true,
+    "generated": false
+  },
+  "candidate_2": {
+    "path": "crates/aft/src/high_chars_narrow_region.rs",
+    "tier": "exact",
+    "kind": "anchored",
+    "matched_span": 24,
+    "enclosing_region_width": 30,
+    "gap_chars": 5,
+    "exact_form": true,
+    "generated": false
+  },
+  "expected_first_normative": "crates/aft/src/high_chars_narrow_region.rs",
+  "expected_first_mutant": "crates/aft/src/low_chars_wide_region.rs"
+}

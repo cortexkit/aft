@@ -1,0 +1,21 @@
+{
+  "name": "definition_over_reference_fixture",
+  "description": "Definition file ranks before reference file even when reference file has more exact occurrences",
+  "definition_candidate": {
+    "path": "crates/aft/src/definition.rs",
+    "tier": "exact",
+    "kind": "definition",
+    "occurrences": null,
+    "exact_form": true,
+    "generated": false
+  },
+  "reference_candidate": {
+    "path": "crates/aft/src/reference.rs",
+    "tier": "exact",
+    "kind": "e1",
+    "occurrences": 15,
+    "exact_form": true,
+    "generated": false
+  },
+  "expected_first": "crates/aft/src/definition.rs"
+}

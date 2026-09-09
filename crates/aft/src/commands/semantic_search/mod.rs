@@ -1,3 +1,59 @@
+pub mod comparator;
+pub mod evidence_descriptor;
+pub mod generation_token;
+pub mod plan_table;
+
+pub use comparator::{r3_cmp, score_free_r3_cmp, CandidateResult, RankedTuple, SymbolOffsetRange};
+pub use evidence_descriptor::{
+    compute_evidence_descriptor, CandidateEvidenceProvider, EvidenceDescriptor, EvidenceKind,
+    EvidenceTier,
+};
+pub use generation_token::GenerationToken;
+pub use plan_table::{
+    verify_pinned_plan_table_at_startup, LanePlanEntry, PlanTable, PlanTableError, SearchLaneKind,
+    SearchShape, PINNED_PLAN_TABLE_JSON,
+};
+
+/// Lane-registration seam: trait defining a participating search lane.
+pub trait SearchLane: Send + Sync {
+    fn kind(&self) -> SearchLaneKind;
+    fn plan_order_index(&self) -> usize {
+        self.kind().default_plan_order_index()
+    }
+}
+
+/// Lane-registration seam: registry holding participating search lanes.
+#[derive(Default)]
+pub struct LaneRegistry {
+    lanes: HashMap<SearchLaneKind, Arc<dyn SearchLane>>,
+}
+
+impl LaneRegistry {
+    pub fn new() -> Self {
+        Self {
+            lanes: HashMap::new(),
+        }
+    }
+
+    pub fn register(&mut self, lane: Arc<dyn SearchLane>) {
+        self.lanes.insert(lane.kind(), lane);
+    }
+
+    pub fn get(&self, kind: SearchLaneKind) -> Option<&Arc<dyn SearchLane>> {
+        self.lanes.get(&kind)
+    }
+
+    pub fn registered_kinds(&self) -> Vec<SearchLaneKind> {
+        let mut kinds: Vec<_> = self.lanes.keys().copied().collect();
+        kinds.sort_by_key(|k| k.default_plan_order_index());
+        kinds
+    }
+}
+
+pub fn register_lane(registry: &mut LaneRegistry, lane: Arc<dyn SearchLane>) {
+    registry.register(lane);
+}
+
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;

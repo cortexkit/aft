@@ -1,0 +1,104 @@
+{
+  "identifier": {
+    "exact": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 0
+    },
+    "lexical": {
+      "weight": 0.8,
+      "rrf_constant": 60.0,
+      "plan_order_index": 1
+    },
+    "semantic": {
+      "weight": 0.2,
+      "rrf_constant": 60.0,
+      "plan_order_index": 2
+    }
+  },
+  "mixed": {
+    "exact": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 0
+    },
+    "lexical": {
+      "weight": 0.6,
+      "rrf_constant": 60.0,
+      "plan_order_index": 1
+    },
+    "semantic": {
+      "weight": 0.4,
+      "rrf_constant": 60.0,
+      "plan_order_index": 2
+    }
+  },
+  "error_code": {
+    "exact": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 0
+    },
+    "lexical": {
+      "weight": 0.9,
+      "rrf_constant": 60.0,
+      "plan_order_index": 1
+    },
+    "semantic": {
+      "weight": 0.1,
+      "rrf_constant": 60.0,
+      "plan_order_index": 2
+    }
+  },
+  "path": {
+    "exact": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 0
+    },
+    "lexical": {
+      "weight": 0.9,
+      "rrf_constant": 60.0,
+      "plan_order_index": 1
+    },
+    "semantic": {
+      "weight": 0.1,
+      "rrf_constant": 60.0,
+      "plan_order_index": 2
+    }
+  },
+  "regex": {
+    "exact": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 0
+    },
+    "lexical": {
+      "weight": 1.0,
+      "rrf_constant": 60.0,
+      "plan_order_index": 1
+    },
+    "semantic": {
+      "weight": 0.0,
+      "rrf_constant": 60.0,
+      "plan_order_index": 2
+    }
+  },
+  "natural_language": {
+    "exact": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 0
+    },
+    "lexical": {
+      "weight": 0.4,
+      "rrf_constant": 60.0,
+      "plan_order_index": 1
+    },
+    "semantic": {
+      "weight": 0.6,
+      "rrf_constant": 60.0,
+      "plan_order_index": 2
+    }
+  }
+}
