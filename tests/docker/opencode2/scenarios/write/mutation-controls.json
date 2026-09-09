@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "tool": "write",
+  "controls": [
+    {
+      "id": "write-t1-agent-text",
+      "mutated_input": "write/T1 result text",
+      "expected_failure": "shape comparison failed",
+      "unaffected_positive_control": "write/T2/invalid_arguments"
+    },
+    {
+      "id": "write-t2-host-rejection",
+      "mutated_input": "write/T2 invalid fixture",
+      "expected_failure": "host schema rejection mismatch",
+      "unaffected_positive_control": "write/T1/happy"
+    },
+    {
+      "id": "write-parity-shape",
+      "mutated_input": "write/T7 projected fixture marker",
+      "expected_failure": "projected V1/V2 parity mismatch",
+      "unaffected_positive_control": "write/T1/happy"
+    },
+    {
+      "id": "write-permission-path-identity",
+      "mutated_input": "write/T3 requested path",
+      "expected_failure": "permission path identity mismatch",
+      "unaffected_positive_control": "write/T1/happy"
+    },
+    {
+      "id": "write-three-state-intermediate",
+      "mutated_input": "write/T3 intermediate path state",
+      "expected_failure": "no_effect_observed",
+      "unaffected_positive_control": "write/T3/write_ask_deny"
+    },
+    {
+      "id": "write-restore-state",
+      "mutated_input": "write/T3 restore call",
+      "expected_failure": "restore_state_mismatch",
+      "unaffected_positive_control": "write/T3/write_ask_deny"
+    }
+  ]
+}

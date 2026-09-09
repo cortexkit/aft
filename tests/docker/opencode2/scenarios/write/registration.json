@@ -1,0 +1,381 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "write",
+  "scenarios": [
+    {
+      "schema_version": 1,
+      "id": "write/T1/happy",
+      "tool": "write",
+      "trajectory": "T1",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the deterministic write fixture call.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "write-happy",
+                "name": "write",
+                "arguments": {
+                  "filePath": "created.txt",
+                  "content": "created by scenario\n"
+                },
+                "disk_effects": [
+                  "created.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "write-happy",
+      "comparison": {
+        "mode": "shape",
+        "rules": [
+          {
+            "kind": "field",
+            "field": "fixture_marker",
+            "pattern": "^(?=[\\s\\S]*(?<value>created\\.txt))[\\s\\S]+$",
+            "min_lines": 1,
+            "max_lines": 10000
+          }
+        ],
+        "expected": {
+          "fixture_marker": "created.txt"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "write/T2/invalid_arguments",
+      "tool": "write",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted write call with an invalid argument type.",
+      "fixture": "./fixture",
+      "subcase": "invalid_arguments",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "write-invalid",
+                "name": "write",
+                "arguments": {
+                  "filePath": 42
+                },
+                "non_mutating_evidence": {
+                  "reason": "the host rejects the argument type before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "write/T2/missing_target",
+      "tool": "write",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted write call without its required target.",
+      "fixture": "./fixture",
+      "subcase": "missing_target",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "write-missing",
+                "name": "write",
+                "arguments": {},
+                "non_mutating_evidence": {
+                  "reason": "the host rejects missing required arguments before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "write/T3/write_ask_allow",
+      "tool": "write",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Allow the write mutation and restore its checkpoint.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "checkpoint",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "write-checkpoint",
+                "name": "aft_safety",
+                "arguments": {
+                  "op": "checkpoint",
+                  "name": "write-t3",
+                  "files": [
+                    "created.txt"
+                  ]
+                },
+                "non_mutating_evidence": {
+                  "reason": "checkpoint creation does not alter the fixture project"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "mutate",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "write-allow-mutation",
+                "name": "write",
+                "arguments": {
+                  "filePath": "created.txt",
+                  "content": "created by scenario\n"
+                },
+                "disk_effects": [
+                  "created.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "restore",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "write-restore",
+                "name": "aft_safety",
+                "arguments": {
+                  "op": "restore",
+                  "name": "write-t3"
+                },
+                "disk_effects": [
+                  "created.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "checkpoint",
+        "mutate",
+        "restore",
+        "finish"
+      ],
+      "restore_evidence": {
+        "operation": "checkpoint_restore",
+        "identifier": "write-t3",
+        "calls": [
+          {
+            "tool": "aft_safety",
+            "arguments": {
+              "op": "checkpoint",
+              "name": "write-t3",
+              "files": [
+                "created.txt"
+              ]
+            }
+          },
+          {
+            "tool": "write",
+            "arguments": {
+              "filePath": "created.txt",
+              "content": "created by scenario\n"
+            }
+          },
+          {
+            "tool": "aft_safety",
+            "arguments": {
+              "op": "restore",
+              "name": "write-t3"
+            }
+          }
+        ],
+        "paths": [
+          {
+            "path": "created.txt",
+            "transition": "create",
+            "expected_intermediate_sha256": "01f48926bce9ab1bdc2045872585ca46280928094b35312cc78f34aa873c4dfc"
+          }
+        ]
+      },
+      "metadata": {
+        "permission": {
+          "operation": "write",
+          "reply": "once",
+          "requested_paths": [
+            "created.txt"
+          ]
+        },
+        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "write/T3/write_ask_deny",
+      "tool": "write",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Deny the write mutation.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "write-ask_deny",
+                "name": "write",
+                "arguments": {
+                  "filePath": "created.txt",
+                  "content": "created by scenario\n"
+                },
+                "non_mutating_evidence": {
+                  "reason": "reject prevents fixture mutation"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "metadata": {
+        "permission": {
+          "operation": "write",
+          "reply": "reject",
+          "requested_paths": [
+            "created.txt"
+          ]
+        },
+        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "write/T3/write_config_deny",
+      "tool": "write",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Configuration-deny the write mutation.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "write-config_deny",
+                "name": "write",
+                "arguments": {
+                  "filePath": "created.txt",
+                  "content": "created by scenario\n"
+                },
+                "non_mutating_evidence": {
+                  "reason": "config_deny prevents fixture mutation"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "metadata": {
+        "permission": {
+          "operation": "write",
+          "reply": "config_deny",
+          "requested_paths": [
+            "created.txt"
+          ]
+        }
+      }
+    }
+  ]
+}
