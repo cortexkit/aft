@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "controls": [
+    "ordinary-undeclared-disk-effect",
+    "test-override-undeclared-disk-effect",
+    "post-result-undeclared-disk-effect",
+    "cancellation-undeclared-disk-effect",
+    "declared-post-result-effect",
+    "surviving-writer-incomplete",
+    "provenance-missing-source",
+    "provenance-disallowed-source",
+    "provenance-substituted-revision",
+    "three-state-create",
+    "three-state-delete",
+    "three-state-edit",
+    "three-state-move"
+  ]
+}

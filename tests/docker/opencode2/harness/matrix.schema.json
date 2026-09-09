@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "OpenCode 2 applicability matrix",
+  "type": "object",
+  "required": ["schema_version", "platform", "rows"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "platform": { "const": "linux" },
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["tool", "trajectories"],
+        "properties": {
+          "tool": { "type": "string" },
+          "trajectories": {
+            "type": "object",
+            "required": ["T1", "T2", "T3", "T4", "T5", "T6", "T7"],
+            "additionalProperties": {
+              "type": "string",
+              "pattern": "^(applicable|n/a:[^:]+|expected_fail:.+)$"
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

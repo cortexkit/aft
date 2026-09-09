@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema_version": 1,
+  "sidecar_name": "build-info.json",
+  "allowed_sources": ["checkout-build", "same-sha-artifact"],
+  "allowed_profiles": ["release", "ci-release"],
+  "required_sidecar_fields": ["git_sha", "build_profile", "sha256", "source"]
+}
