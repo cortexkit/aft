@@ -1,0 +1,687 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "callgraph",
+  "scenarios": [
+    {
+      "schema_version": 1,
+      "id": "callgraph/T1/happy",
+      "tool": "callgraph",
+      "trajectory": "T1",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the deterministic callgraph fixture call.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "callgraph-happy",
+                "name": "aft_callgraph",
+                "arguments": {
+                  "op": "callers",
+                  "path": "sample.ts",
+                  "symbol": "uniqueScenarioSymbol"
+                },
+                "non_mutating_evidence": {
+                  "reason": "callgraph only observes fixture state"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "callgraph-happy",
+      "comparison": {
+        "mode": "shape",
+        "rules": [
+          {
+            "kind": "field",
+            "field": "fixture_marker",
+            "pattern": "^(?=[\\s\\S]*(?<value>uniqueScenarioSymbol))[\\s\\S]+$",
+            "min_lines": 1,
+            "max_lines": 10000
+          }
+        ],
+        "expected": {
+          "fixture_marker": "uniqueScenarioSymbol"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "callgraph/T2/invalid_arguments",
+      "tool": "callgraph",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted callgraph call with an invalid argument type.",
+      "fixture": "./fixture",
+      "subcase": "invalid_arguments",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "callgraph-invalid",
+                "name": "aft_callgraph",
+                "arguments": {
+                  "op": 42
+                },
+                "non_mutating_evidence": {
+                  "reason": "the host rejects the argument type before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "callgraph/T2/missing_target",
+      "tool": "callgraph",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted callgraph call without its required target.",
+      "fixture": "./fixture",
+      "subcase": "missing_target",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "callgraph-missing",
+                "name": "aft_callgraph",
+                "arguments": {},
+                "non_mutating_evidence": {
+                  "reason": "the host rejects missing required arguments before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "callgraph/T6/callgraph-impact-payload-sites/complete",
+      "tool": "callgraph",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the complete callgraph.impact.payload.sites fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "callgraph-t6-callgraph-impact-payload-sites-complete",
+                "name": "aft_callgraph",
+                "arguments": {
+                  "op": "impact",
+                  "path": "sample.ts",
+                  "symbol": "leaf",
+                  "depth": 10
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "callgraph-t6-callgraph-impact-payload-sites-complete",
+      "metadata": {
+        "t6": {
+          "surface_id": "callgraph.impact.payload.sites",
+          "owner": "callgraph",
+          "call_id": "callgraph-t6-callgraph-impact-payload-sites-complete",
+          "fixture": "complete"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "callgraph/T6/callgraph-impact-payload-sites/incomplete",
+      "tool": "callgraph",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the incomplete callgraph.impact.payload.sites fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "callgraph-t6-callgraph-impact-payload-sites-incomplete",
+                "name": "aft_callgraph",
+                "arguments": {
+                  "op": "impact",
+                  "path": "sample.ts",
+                  "symbol": "leaf",
+                  "depth": 1
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "callgraph-t6-callgraph-impact-payload-sites-incomplete",
+      "metadata": {
+        "t6": {
+          "surface_id": "callgraph.impact.payload.sites",
+          "owner": "callgraph",
+          "call_id": "callgraph-t6-callgraph-impact-payload-sites-incomplete",
+          "fixture": "incomplete",
+          "triggered_reason": "depth"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "callgraph/T6/callgraph-callers-payload-callers/complete",
+      "tool": "callgraph",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the complete callgraph.callers.payload.callers fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "callgraph-t6-callgraph-callers-payload-callers-complete",
+                "name": "aft_callgraph",
+                "arguments": {
+                  "op": "callers",
+                  "path": "sample.ts",
+                  "symbol": "leaf",
+                  "depth": 10
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "callgraph-t6-callgraph-callers-payload-callers-complete",
+      "metadata": {
+        "t6": {
+          "surface_id": "callgraph.callers.payload.callers",
+          "owner": "callgraph",
+          "call_id": "callgraph-t6-callgraph-callers-payload-callers-complete",
+          "fixture": "complete"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "callgraph/T6/callgraph-callers-payload-callers/incomplete",
+      "tool": "callgraph",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the incomplete callgraph.callers.payload.callers fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "callgraph-t6-callgraph-callers-payload-callers-incomplete",
+                "name": "aft_callgraph",
+                "arguments": {
+                  "op": "callers",
+                  "path": "sample.ts",
+                  "symbol": "leaf",
+                  "depth": 1
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "callgraph-t6-callgraph-callers-payload-callers-incomplete",
+      "metadata": {
+        "t6": {
+          "surface_id": "callgraph.callers.payload.callers",
+          "owner": "callgraph",
+          "call_id": "callgraph-t6-callgraph-callers-payload-callers-incomplete",
+          "fixture": "incomplete",
+          "triggered_reason": "depth"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "callgraph/T6/callgraph-call-tree-payload-tree/complete",
+      "tool": "callgraph",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the complete callgraph.call_tree.payload.tree fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "callgraph-t6-callgraph-call-tree-payload-tree-complete",
+                "name": "aft_callgraph",
+                "arguments": {
+                  "op": "call_tree",
+                  "path": "sample.ts",
+                  "symbol": "root",
+                  "depth": 10
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "callgraph-t6-callgraph-call-tree-payload-tree-complete",
+      "metadata": {
+        "t6": {
+          "surface_id": "callgraph.call_tree.payload.tree",
+          "owner": "callgraph",
+          "call_id": "callgraph-t6-callgraph-call-tree-payload-tree-complete",
+          "fixture": "complete"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "callgraph/T6/callgraph-call-tree-payload-tree/incomplete",
+      "tool": "callgraph",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the incomplete callgraph.call_tree.payload.tree fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "callgraph-t6-callgraph-call-tree-payload-tree-incomplete",
+                "name": "aft_callgraph",
+                "arguments": {
+                  "op": "call_tree",
+                  "path": "sample.ts",
+                  "symbol": "root",
+                  "depth": 1
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "callgraph-t6-callgraph-call-tree-payload-tree-incomplete",
+      "metadata": {
+        "t6": {
+          "surface_id": "callgraph.call_tree.payload.tree",
+          "owner": "callgraph",
+          "call_id": "callgraph-t6-callgraph-call-tree-payload-tree-incomplete",
+          "fixture": "incomplete",
+          "triggered_reason": "depth"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "callgraph/T6/callgraph-trace-to-payload-paths/complete",
+      "tool": "callgraph",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the complete callgraph.trace_to.payload.paths fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "callgraph-t6-callgraph-trace-to-payload-paths-complete",
+                "name": "aft_callgraph",
+                "arguments": {
+                  "op": "trace_to",
+                  "path": "sample.ts",
+                  "symbol": "leaf",
+                  "depth": 10
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "callgraph-t6-callgraph-trace-to-payload-paths-complete",
+      "metadata": {
+        "t6": {
+          "surface_id": "callgraph.trace_to.payload.paths",
+          "owner": "callgraph",
+          "call_id": "callgraph-t6-callgraph-trace-to-payload-paths-complete",
+          "fixture": "complete"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "callgraph/T6/callgraph-trace-to-payload-paths/incomplete",
+      "tool": "callgraph",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the incomplete callgraph.trace_to.payload.paths fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "callgraph-t6-callgraph-trace-to-payload-paths-incomplete",
+                "name": "aft_callgraph",
+                "arguments": {
+                  "op": "trace_to",
+                  "path": "sample.ts",
+                  "symbol": "leaf",
+                  "depth": 1
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "callgraph-t6-callgraph-trace-to-payload-paths-incomplete",
+      "metadata": {
+        "t6": {
+          "surface_id": "callgraph.trace_to.payload.paths",
+          "owner": "callgraph",
+          "call_id": "callgraph-t6-callgraph-trace-to-payload-paths-incomplete",
+          "fixture": "incomplete",
+          "triggered_reason": "depth"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "callgraph/T6/callgraph-trace-data-payload-hops/complete",
+      "tool": "callgraph",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the complete callgraph.trace_data.payload.hops fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "callgraph-t6-callgraph-trace-data-payload-hops-complete",
+                "name": "aft_callgraph",
+                "arguments": {
+                  "op": "trace_data",
+                  "path": "sample.ts",
+                  "symbol": "root",
+                  "expression": "value",
+                  "depth": 10
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "callgraph-t6-callgraph-trace-data-payload-hops-complete",
+      "metadata": {
+        "t6": {
+          "surface_id": "callgraph.trace_data.payload.hops",
+          "owner": "callgraph",
+          "call_id": "callgraph-t6-callgraph-trace-data-payload-hops-complete",
+          "fixture": "complete"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "callgraph/T6/callgraph-trace-data-payload-hops/incomplete",
+      "tool": "callgraph",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the incomplete callgraph.trace_data.payload.hops fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "callgraph-t6-callgraph-trace-data-payload-hops-incomplete",
+                "name": "aft_callgraph",
+                "arguments": {
+                  "op": "trace_data",
+                  "path": "sample.ts",
+                  "symbol": "root",
+                  "expression": "value",
+                  "depth": 1
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "callgraph-t6-callgraph-trace-data-payload-hops-incomplete",
+      "metadata": {
+        "t6": {
+          "surface_id": "callgraph.trace_data.payload.hops",
+          "owner": "callgraph",
+          "call_id": "callgraph-t6-callgraph-trace-data-payload-hops-incomplete",
+          "fixture": "incomplete",
+          "triggered_reason": "depth"
+        }
+      }
+    }
+  ]
+}
