@@ -95,6 +95,12 @@ jobs:
   e2e:
     name: E2E
     uses: ./.github/workflows/_e2e-suite.yml
+    # The nested e2e-opencode2-linux job reads its own emitted check context
+    # (actions/checks read); a called workflow may not exceed the caller's grant.
+    permissions:
+      contents: read
+      actions: read
+      checks: read
     with:
       cargo_profile: stage
 
