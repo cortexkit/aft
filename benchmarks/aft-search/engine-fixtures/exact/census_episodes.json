@@ -1,0 +1,30 @@
+{
+  "name": "census_episodes",
+  "description": "Census episodes 667, 7617, 15364 rank 1 with [exact] from .alfonso/data/aft-search-followup-census/episodes/",
+  "episodes": [
+    {
+      "episode_id": 667,
+      "census_path": ".alfonso/data/aft-search-followup-census/episodes/0667",
+      "query": "ExecutableDescriptorObservationV2",
+      "expected_file": "docs/chaos-aimock-bootstrap-v2-normative/schema-definitions.v1.json",
+      "file_content": "{\n  \"ExecutableDescriptorObservationV2\": {\n    \"type\": \"object\",\n    \"properties\": {\n      \"openFlags\": { \"type\": \"integer\" },\n      \"resolveFlags\": { \"type\": \"integer\" },\n      \"before\": { \"type\": \"string\" },\n      \"after\": { \"type\": \"string\" },\n      \"stableIdentityEqual\": { \"type\": \"boolean\" },\n      \"sizePolicy\": { \"type\": \"string\" }\n    }\n  }\n}\n",
+      "expected_exact": true
+    },
+    {
+      "episode_id": 7617,
+      "census_path": ".alfonso/data/aft-search-followup-census/episodes/7617",
+      "query": "was not found on PATH",
+      "expected_file": "crates/aft/src/commands/configure.rs",
+      "file_content": "pub fn verify_tool(tool: &str) {\n    slog_warn!(\"configured tool {} was not found on PATH\", tool);\n}\n",
+      "expected_exact": true
+    },
+    {
+      "episode_id": 15364,
+      "census_path": ".alfonso/data/aft-search-followup-census/episodes/15364",
+      "query": "fn mint_id",
+      "expected_file": "crates/prefrontal-core-store/src/lib.rs",
+      "file_content": "pub(crate) fn mint_id(conn: &Connection, prefix: &str) -> rusqlite::Result<String> {\n    Ok(format!(\"{prefix}_{}\", 1))\n}\n",
+      "expected_exact": true
+    }
+  ]
+}

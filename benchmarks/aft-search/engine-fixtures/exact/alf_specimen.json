@@ -1,0 +1,17 @@
+{
+  "name": "alf_specimen",
+  "description": "ALF specimen: character cap -> rooms.rs::cap_chars rank 1; exceeds the {cap}-character cap -> rooms.rs over status_line.rs",
+  "queries": [
+    {
+      "query": "character cap",
+      "expected_rank_1_path": "src/rooms.rs",
+      "expected_symbol": "cap_chars",
+      "expected_tier": "exact"
+    },
+    {
+      "query": "exceeds the {cap}-character cap",
+      "expected_rank_1_path": "src/rooms.rs",
+      "expected_rank_2_path": "src/status_line.rs"
+    }
+  ]
+}

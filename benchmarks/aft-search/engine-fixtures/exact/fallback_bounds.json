@@ -1,0 +1,27 @@
+{
+  "name": "fallback_bounds",
+  "description": "Deterministic fallback bounds naming file limit, result limit, and index not ready",
+  "cases": [
+    {
+      "id": "case_file_limit",
+      "limit_kind": "file limit",
+      "expected_disclosure_pattern": "exact pass: bounded ({N} files, file limit)"
+    },
+    {
+      "id": "case_result_limit",
+      "limit_kind": "result limit",
+      "expected_disclosure_pattern": "exact pass: bounded ({N} files, result limit)"
+    },
+    {
+      "id": "case_index_not_ready",
+      "limit_kind": "index not ready",
+      "expected_disclosure_pattern": "exact pass: bounded ({N} files, index not ready)"
+    },
+    {
+      "id": "case_time_limit_watchdog",
+      "limit_kind": "time limit",
+      "expected_disclosure_pattern": "exact pass: bounded ({N} files, time limit) - page stability void",
+      "stability_void": true
+    }
+  ]
+}

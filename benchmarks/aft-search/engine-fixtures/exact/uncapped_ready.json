@@ -1,0 +1,8 @@
+{
+  "name": "uncapped_ready",
+  "description": "File outside lexical top-50 and outside grep bounded-walk file limit (1,000) containing the phrase is found in ready mode with no bounded disclosure",
+  "total_corpus_files": 1050,
+  "target_file_index": 1020,
+  "query": "unusual whole corpus needle phrase",
+  "expected_disclosure_absent": "exact pass: bounded"
+}

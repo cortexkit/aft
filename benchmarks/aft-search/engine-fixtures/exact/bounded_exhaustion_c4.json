@@ -1,0 +1,9 @@
+{
+  "name": "bounded_exhaustion_c4",
+  "description": "Lexical and semantic exhausted at depth 400 with an eligible E1 match beyond fallback file limit -> S2 shown X of M (exhausted) with lanes_exhausted: true and exact pass: bounded (N files, file limit)",
+  "retrieval_depth": 400,
+  "lanes_exhausted": true,
+  "expected_trailer_reason": "exhausted",
+  "expected_trailer_pattern": "shown {X} of {M} (exhausted)",
+  "expected_bounded_disclosure_pattern": "exact pass: bounded ({N} files, file limit)"
+}

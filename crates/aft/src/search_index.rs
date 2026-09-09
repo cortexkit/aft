@@ -20,6 +20,19 @@ use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::fs_lock;
 use crate::pattern_compile::{self, CompileOpts, CompileResult, CompiledPattern, LiteralSearch};
 
+#[path = "commands/semantic_search/exact_lane.rs"]
+pub mod exact_lane;
+#[path = "commands/semantic_search/memo.rs"]
+pub mod memo;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExactPassMatch {
+    pub path: PathBuf,
+    pub symbol_range: Option<crate::commands::semantic_search::comparator::SymbolOffsetRange>,
+    pub evidence: crate::commands::semantic_search::evidence_descriptor::EvidenceDescriptor,
+    pub content_digest: String,
+}
+
 const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
 const CACHE_MAGIC: u32 = 0x3144_4958; // "XID1" little-endian
 const INDEX_MAGIC: &[u8; 8] = b"AFTIDX01";
@@ -556,6 +569,43 @@ impl SearchIndex {
             .files
     }
 
+    pub fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    /// Evaluates lexical candidates and scores them up to the specified depth limit, applying an optional candidate filter.
+    pub fn lexical_rank_at_depth(
+        &self,
+        query_trigrams: &[u32],
+        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
+        depth: usize,
+    ) -> LexicalRankResult {
+        self.snapshot()
+            .lexical_rank_at_depth(query_trigrams, candidate_filter, depth)
+    }
+
+    /// Discovers and ranks lexical candidates up to the specified depth limit, applying an optional candidate filter.
+    pub fn lexical_discovery_and_rank_at_depth(
+        &self,
+        query_trigrams: &[u32],
+        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
+        depth: usize,
+    ) -> LexicalRankResult {
+        self.snapshot()
+            .lexical_rank_at_depth(query_trigrams, candidate_filter, depth)
+    }
+
+    /// Whole-corpus exact pass over the trigram index in ready mode.
+    pub fn whole_corpus_exact_pass(
+        &self,
+        query: &str,
+        search_root: &Path,
+        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
+    ) -> Vec<ExactPassMatch> {
+        self.snapshot()
+            .whole_corpus_exact_pass(query, search_root, candidate_filter)
+    }
+
     /// Score-rank file candidates and report whether the pre-filter step that
     /// collects candidates reached its internal size limit before ranking.
     pub fn lexical_rank_with_stats(
@@ -663,6 +713,183 @@ impl SearchIndexSnapshot {
             files: ranked,
             engine_capped,
         }
+    }
+
+    /// Evaluates lexical candidates and scores them up to the specified depth limit, applying an optional candidate filter.
+    pub fn lexical_rank_at_depth(
+        &self,
+        query_trigrams: &[u32],
+        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
+        depth: usize,
+    ) -> LexicalRankResult {
+        if query_trigrams.is_empty() || depth == 0 {
+            return LexicalRankResult::default();
+        }
+
+        let mut non_zero: Vec<(u32, usize)> = query_trigrams
+            .iter()
+            .filter_map(|trigram| {
+                let posting_count = self.posting_count(*trigram);
+                (posting_count > 0).then_some((*trigram, posting_count))
+            })
+            .collect();
+        if non_zero.is_empty() {
+            return LexicalRankResult::default();
+        }
+
+        non_zero.sort_unstable_by_key(|(_, posting_count)| *posting_count);
+        let postings_by_trigram = materialize_query_postings(self, query_trigrams);
+
+        let initial_selected = non_zero.len().min(3);
+        let mut candidate_ids = BTreeSet::new();
+        for (trigram, _) in non_zero.iter().take(initial_selected) {
+            if let Some(postings) = postings_by_trigram.get(trigram) {
+                candidate_ids.extend(postings.iter().copied());
+            }
+        }
+        if candidate_ids.len() < depth {
+            for (trigram, _) in non_zero.iter().skip(initial_selected) {
+                if candidate_ids.len() >= depth {
+                    break;
+                }
+                if let Some(postings) = postings_by_trigram.get(trigram) {
+                    candidate_ids.extend(postings.iter().copied());
+                }
+            }
+        }
+
+        let candidate_cap = depth;
+        let pre_filter_candidate_count = candidate_ids.len();
+        let engine_capped = pre_filter_candidate_count > candidate_cap;
+
+        let filtered_candidates = candidate_ids
+            .into_iter()
+            .filter_map(|file_id| {
+                self.files
+                    .get(file_id as usize)
+                    .map(|entry| (file_id, entry))
+            })
+            .filter(|(_, entry)| {
+                if let Some(filter) = candidate_filter {
+                    filter(&entry.path)
+                } else {
+                    true
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut ranked = Vec::new();
+        for (file_id, entry) in filtered_candidates.into_iter().take(candidate_cap) {
+            let score =
+                lexical_score_from_postings(self, query_trigrams, &postings_by_trigram, file_id);
+            if score > 0.0 {
+                ranked.push((entry.path.clone(), score));
+            }
+        }
+
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.truncate(depth);
+        LexicalRankResult {
+            files: ranked,
+            engine_capped,
+        }
+    }
+
+    /// Discovers and ranks lexical candidates up to the specified depth limit, applying an optional candidate filter.
+    pub fn lexical_discovery_and_rank_at_depth(
+        &self,
+        query_trigrams: &[u32],
+        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
+        depth: usize,
+    ) -> LexicalRankResult {
+        self.lexical_rank_at_depth(query_trigrams, candidate_filter, depth)
+    }
+
+    /// Whole-corpus exact pass over the trigram index in ready mode.
+    /// Intersects trigrams for the verbatim phrase (E1) and for content tokens within a 3-line window (E2),
+    /// verifies matches against file content, and records content digests.
+    pub fn whole_corpus_exact_pass(
+        &self,
+        query: &str,
+        search_root: &Path,
+        candidate_filter: Option<&dyn Fn(&Path) -> bool>,
+    ) -> Vec<ExactPassMatch> {
+        let phrase = exact_lane::exact_phrase(query);
+        let norm_phrase = exact_lane::normalize_exact_phrase(phrase);
+        let content_tokens = crate::query_shape::extract_content_tokens(query);
+
+        let mut candidate_file_ids = BTreeSet::new();
+
+        // (a) Verbatim phrase trigrams
+        if phrase.len() >= 3 {
+            let phrase_query = decompose_regex(&regex::escape(phrase));
+            candidate_file_ids.extend(self.candidates(&phrase_query));
+        }
+
+        // (b) Content tokens trigrams (for E2 window match)
+        if content_tokens.len() >= 2 {
+            for token in &content_tokens {
+                if token.len() >= 3 {
+                    let token_query = decompose_regex(&regex::escape(token));
+                    candidate_file_ids.extend(self.candidates(&token_query));
+                }
+            }
+        }
+
+        // If no candidate trigrams (e.g. short query), check active files
+        if candidate_file_ids.is_empty() && (phrase.len() < 3 || content_tokens.is_empty()) {
+            candidate_file_ids.extend(self.active_file_ids());
+        }
+
+        let mut matches = Vec::new();
+        let search_root_canon = canonicalize_for_search_membership(search_root);
+
+        for file_id in candidate_file_ids {
+            let Some(file_entry) = self.files.get(file_id as usize) else {
+                continue;
+            };
+            if file_entry.path.as_os_str().is_empty() {
+                continue;
+            }
+
+            let file_canon = canonicalize_for_search_membership(&file_entry.path);
+            if !is_within_search_root(search_root, &file_entry.path)
+                && !is_within_search_root(&search_root_canon, &file_canon)
+                && !is_within_search_root(&search_root_canon, &file_entry.path)
+            {
+                continue;
+            }
+
+            if let Some(filter) = candidate_filter {
+                if !filter(&file_entry.path) {
+                    continue;
+                }
+            }
+
+            let Ok(bytes) = fs::read(&file_entry.path) else {
+                continue;
+            };
+            let digest = blake3::hash(&bytes).to_hex().to_string();
+            let text = String::from_utf8_lossy(&bytes);
+
+            if let Some(candidates) = exact_lane::verify_exact_matches_in_text(
+                &file_entry.path,
+                &text,
+                &norm_phrase,
+                &content_tokens,
+            ) {
+                for cand in candidates {
+                    matches.push(ExactPassMatch {
+                        path: cand.path,
+                        symbol_range: cand.symbol_range,
+                        evidence: cand.evidence,
+                        content_digest: digest.clone(),
+                    });
+                }
+            }
+        }
+
+        matches
     }
 }
 
