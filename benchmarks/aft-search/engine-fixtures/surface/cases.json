@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "offset_cases": [
+    {
+      "offset": 5,
+      "top_k": 10,
+      "expected_first": "result-0005.rs",
+      "expected_last": "result-0014.rs"
+    },
+    {
+      "offset": 3200,
+      "top_k": 10,
+      "expected_empty": true
+    }
+  ],
+  "invalid_offsets": [-1, 1.5, 100001],
+  "invalid_top_k": 300,
+  "continuity": {
+    "disclosure": "index changed - order re-derived",
+    "before_token": "index-7|process-nonce-a",
+    "after_token_same_index_component": "index-7|process-nonce-b"
+  },
+  "allowed_surface_runtime_edits": [
+    "offset request forwarding",
+    "per-session continuity map keyed by project root, normalized query, includeTests, and topK",
+    "one-line generation-change disclosure"
+  ]
+}
