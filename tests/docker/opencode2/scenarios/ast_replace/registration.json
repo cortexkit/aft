@@ -1,0 +1,153 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "ast_replace",
+  "scenarios": [
+    {
+      "schema_version": 1,
+      "id": "ast_replace/T1/happy",
+      "tool": "ast_replace",
+      "trajectory": "T1",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the deterministic ast_replace fixture call.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "ast_replace-happy",
+                "name": "ast_replace",
+                "arguments": {
+                  "pattern": "return 'fixture'",
+                  "rewrite": "return 'changed'",
+                  "lang": "typescript",
+                  "paths": [
+                    "sample.ts"
+                  ]
+                },
+                "disk_effects": [
+                  "sample.ts"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "ast_replace-happy",
+      "comparison": {
+        "mode": "shape",
+        "rules": [
+          {
+            "kind": "field",
+            "field": "fixture_marker",
+            "pattern": "^(?=[\\s\\S]*(?<value>sample\\.ts))[\\s\\S]+$",
+            "min_lines": 1,
+            "max_lines": 10000
+          }
+        ],
+        "expected": {
+          "fixture_marker": "sample.ts"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "ast_replace/T2/invalid_arguments",
+      "tool": "ast_replace",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted ast_replace call with an invalid argument type.",
+      "fixture": "./fixture",
+      "subcase": "invalid_arguments",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "ast_replace-invalid",
+                "name": "ast_replace",
+                "arguments": {
+                  "pattern": 42
+                },
+                "non_mutating_evidence": {
+                  "reason": "the host rejects the argument type before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "ast_replace/T2/missing_target",
+      "tool": "ast_replace",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted ast_replace call without its required target.",
+      "fixture": "./fixture",
+      "subcase": "missing_target",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "ast_replace-missing",
+                "name": "ast_replace",
+                "arguments": {},
+                "non_mutating_evidence": {
+                  "reason": "the host rejects missing required arguments before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    }
+  ]
+}
