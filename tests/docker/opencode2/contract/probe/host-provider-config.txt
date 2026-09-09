@@ -1,0 +1,35 @@
+OpenCode 2 native provider configuration probe
+run_id: oc2-host-provider-20260909-01
+checkout_sha: 048eaebf2bf604f70a785f9c11f59fcb3e0cf368
+platform: linux/amd64 container (node:24-bookworm-slim)
+binary: @opencode-ai/cli-linux-x64/bin/opencode2
+isolation: HOME and XDG_CONFIG_HOME/XDG_DATA_HOME/XDG_STATE_HOME/XDG_CACHE_HOME point under /probe/xdg; OPENCODE_DISABLE_DEFAULT_PLUGINS=true
+
+Exact provider block written to opencode.json:
+{
+  "providers": {
+    "openai": {
+      "name": "Deterministic aimock",
+      "package": "@opencode-ai/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://127.0.0.1:4010/v1",
+        "apiKey": "{env:OPENAI_API_KEY}"
+      },
+      "models": {
+        "mock-model": {
+          "name": "Mock Model"
+        }
+      }
+    }
+  }
+}
+
+$ OPENAI_API_KEY=sk-mock OPENCODE_SERVER_PASSWORD=<captured server password> opencode2 run --server http://127.0.0.1:4096 --format json --model openai/mock-model "native provider config smoke"
+{"type":"text","timestamp":1788965910485,"sessionID":"ses_f795289ceffefwbN5WkzOUGmv1","part":{"id":"prt_086ad7778001ozjaXSAk4gD0VK_text-0","sessionID":"ses_f795289ceffefwbN5WkzOUGmv1","messageID":"msg_086ad7778001ozjaXSAk4gD0VK","type":"text","text":"native provider contract completed","time":{"start":1788965910455,"end":1788965910485}}}
+[exit 0]
+
+$ opencode2 api --server http://127.0.0.1:4096 GET /api/session/ses_f795289ceffefwbN5WkzOUGmv1
+{"data":{"id":"ses_f795289ceffefwbN5WkzOUGmv1","projectID":"e8824743ee828d8b9f438481d2e11bdfb347d588","model":{"id":"mock-model","providerID":"openai","variant":"default"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"outcome":"succeeded","time":{"created":1788965910120,"updated":1788965910535,"idle":1788965910502},"title":"native provider contract completed","location":{"directory":"/probe/project"}}}
+[exit 0]
+
+The pinned beta accepted the native providers/package/settings shape, routed openai/mock-model to the local OpenAI-compatible endpoint, and persisted providerID=openai on the successful session. This is the positive counterpart to pinned-host-provider-config-rejection.json, where the V1-style `api` key produced provider.no-route before the schema probe.

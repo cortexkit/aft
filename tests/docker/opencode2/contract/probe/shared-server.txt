@@ -1,0 +1,55 @@
+OpenCode 2 shared-server host contract probe
+run_id: oc2-shared-server-20260909-01
+checkout_sha: affdb549240c5e74686858d84eedad11a5cbb316
+platform: linux/amd64 container (node:24-bookworm-slim)
+binary: @opencode-ai/cli-linux-x64/bin/opencode2
+isolation: HOME and XDG_CONFIG_HOME/XDG_DATA_HOME/XDG_STATE_HOME/XDG_CACHE_HOME point under /probe/xdg; OPENCODE_DISABLE_DEFAULT_PLUGINS=true
+secret handling: the one-time server password is redacted below; no committed field contains it
+
+$ opencode2 --version
+opencode2 v0.0.0-beta-19234
+[exit 0]
+
+$ opencode2 serve --hostname 127.0.0.1 --port 4096
+server listening on http://127.0.0.1:4096
+server password <redacted>
+[process remains running]
+
+$ export SERVER_ENDPOINT=http://127.0.0.1:4096
+$ export OPENCODE_SERVER_PASSWORD=<value captured from the preceding server-password line>
+$ opencode2 run --server "$SERVER_ENDPOINT" --format json --model openai/mock-model "shared server smoke"
+{"type":"step_start","timestamp":1788964687019,"sessionID":"ses_f7965359cffejDlsOaDFA51bdd","part":{"id":"prt_0869accab001uElyGskbRuTl8j","sessionID":"ses_f7965359cffejDlsOaDFA51bdd","messageID":"msg_0869acc2a001OENH2EnuKzLEf6","type":"step-start"}}
+{"type":"text","timestamp":1788964687094,"sessionID":"ses_f7965359cffejDlsOaDFA51bdd","part":{"id":"prt_0869acc2a001OENH2EnuKzLEf6_text-0","sessionID":"ses_f7965359cffejDlsOaDFA51bdd","messageID":"msg_0869acc2a001OENH2EnuKzLEf6","type":"text","text":"shared server attachment completed","time":{"start":1788964687019,"end":1788964687094}}}
+[exit 0]
+[run process after final stream record: exited]
+
+$ opencode2 api --server "$SERVER_ENDPOINT" GET /api/health
+{"healthy":true,"version":"0.0.0-beta-19234","pid":31}
+[exit 0]
+
+$ opencode2 api --server "$SERVER_ENDPOINT" GET /api/session/ses_f7965359cffejDlsOaDFA51bdd
+{"data":{"id":"ses_f7965359cffejDlsOaDFA51bdd","projectID":"e8824743ee828d8b9f438481d2e11bdfb347d588","model":{"id":"mock-model","providerID":"openai","variant":"default"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"outcome":"succeeded","time":{"created":1788964686515,"updated":1788964686754,"idle":1788964687104},"location":{"directory":"/probe/project"}}}
+[exit 0]
+[the run client has exited; the one serve process still retains the idle session]
+
+Ordered negative controls
+
+1. WRONG password
+$ OPENCODE_SERVER_PASSWORD=WRONG opencode2 api --server "$SERVER_ENDPOINT" GET /api/health
+Error: Server at http://127.0.0.1:4096 did not provide a compatible V2 health response
+[cause: ClientError: UnsupportedContentType]
+[exit 1]
+
+2. MISSING password
+$ env -u OPENCODE_SERVER_PASSWORD opencode2 api --server "$SERVER_ENDPOINT" GET /api/health
+Error: Server at http://127.0.0.1:4096 did not provide a compatible V2 health response
+[cause: ClientError: UnsupportedContentType]
+[exit 1]
+
+3. Bad endpoint, with the captured password restored
+$ OPENCODE_SERVER_PASSWORD=<captured value> opencode2 api --server http://127.0.0.1:1 GET /api/health
+Error: Could not reach server at http://127.0.0.1:1
+[cause: ClientError: Transport]
+[exit 1]
+
+Only volatile log timestamps and stack frames were omitted from the three negative-control outputs. The stable error line, cause class, order, and exit status are copied from the observed commands.

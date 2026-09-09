@@ -1,0 +1,21 @@
+OpenCode 2 host schema-rejection probe
+run_id: oc2-host-schema-20260909-01
+checkout_sha: affdb549240c5e74686858d84eedad11a5cbb316
+platform: linux/amd64 container (node:24-bookworm-slim)
+binary: @opencode-ai/cli-linux-x64/bin/opencode2
+session_id: ses_f7966fc76ffeTl2ABTv4n8U07F
+isolation: HOME and XDG_CONFIG_HOME/XDG_DATA_HOME/XDG_STATE_HOME/XDG_CACHE_HOME point under /probe/xdg; OPENCODE_DISABLE_DEFAULT_PLUGINS=true
+
+The deterministic OpenAI-compatible mock emitted this tool call for read/T2/invalid_arguments:
+{"name":"read","arguments":"{\"path\":17}"}
+
+$ OPENCODE_SERVER_PASSWORD=<captured server password> opencode2 run --server http://127.0.0.1:4096 --format json --model openai/mock-model "exercise host schema rejection"
+{"type":"step_start","timestamp":1788964571865,"sessionID":"ses_f7966fc76ffeTl2ABTv4n8U07F","part":{"id":"prt_086990ad8001MFasCcytul4NbW","sessionID":"ses_f7966fc76ffeTl2ABTv4n8U07F","messageID":"msg_086990a360014kR7w5pbXTko44","type":"step-start"}}
+{"type":"tool_use","timestamp":1788964572021,"sessionID":"ses_f7966fc76ffeTl2ABTv4n8U07F","part":{"partID":"prt_086990a360014kR7w5pbXTko44_tool-call__WezDiAhkTtofRNn","sessionID":"ses_f7966fc76ffeTl2ABTv4n8U07F","messageID":"msg_086990a360014kR7w5pbXTko44","type":"tool","id":"call__WezDiAhkTtofRNn","tool":"read","state":{"status":"error","input":{"path":17},"error":"Invalid arguments for tool \"read\":\n- path: Expected string\n\nArguments provided:\n{\n  \"path\": 17\n}\n\nUpdate the arguments and call the tool again.","metadata":{},"time":{"start":1788964571932,"end":1788964572005}}}}
+{"type":"text","timestamp":1788964572203,"sessionID":"ses_f7966fc76ffeTl2ABTv4n8U07F","part":{"id":"prt_086990bb3001Tw4r4dBTqAYA3r_text-0","sessionID":"ses_f7966fc76ffeTl2ABTv4n8U07F","messageID":"msg_086990bb3001Tw4r4dBTqAYA3r","type":"text","text":"schema rejection observed","time":{"start":1788964572161,"end":1788964572203}}}
+[exit 0]
+
+The mock's next mock-model request contained roles [system,user,assistant,tool]. Its agent-visible tool message was:
+{"error":{"type":"tool.execution","message":"Invalid arguments for tool \"read\":\n- path: Expected string\n\nArguments provided:\n{\n  \"path\": 17\n}\n\nUpdate the arguments and call the tool again."},"content":[]}
+
+The host rejected the call before invoking read, rendered the steering message in a tool_use record with state.status=error, and handed the same message to the model as error.type=tool.execution. The recovered scripted response made the host run exit 0.

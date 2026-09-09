@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "run_id": "oc2-host-schema-20260909-01",
+  "observed_run_id": "oc2-host-schema-20260909-01",
+  "observed_sha": "affdb549240c5e74686858d84eedad11a5cbb316",
+  "beta_version": "0.0.0-beta-19234",
+  "host_version": "0.0.0-beta-19234",
+  "host": "opencode2",
+  "platform": "linux-x64",
+  "session_id": "ses_f7966fc76ffeTl2ABTv4n8U07F",
+  "transcript": "probe/host-schema-rejection.txt",
+  "guard_transcript": "probe/host-schema-contract-guard.txt",
+  "probe": {
+    "t2_subcase": "read/T2/invalid_arguments",
+    "error_origin": "host",
+    "tool": "read",
+    "arguments": {
+      "path": 17
+    },
+    "run_exit_status": 0
+  },
+  "agent_visible_contract": {
+    "json_event": {
+      "type": "tool_use",
+      "part_type": "tool",
+      "tool_field": "registered tool name",
+      "state_status": "error",
+      "state_input": "arguments object",
+      "state_error": "message string"
+    },
+    "message": {
+      "prefix_template": "Invalid arguments for tool \"{tool}\":",
+      "issue_line_template": "- {path}: {validation_message}",
+      "arguments_header": "Arguments provided:",
+      "arguments_format": "JSON, two-space indentation",
+      "suffix": "Update the arguments and call the tool again."
+    },
+    "model_handoff": {
+      "role": "tool",
+      "error_type": "tool.execution",
+      "message_source": "json_event.part.state.error",
+      "content": []
+    }
+  },
+  "observed_instance": {
+    "json_event_error": "Invalid arguments for tool \"read\":\n- path: Expected string\n\nArguments provided:\n{\n  \"path\": 17\n}\n\nUpdate the arguments and call the tool again.",
+    "model_handoff": {
+      "error": {
+        "type": "tool.execution",
+        "message": "Invalid arguments for tool \"read\":\n- path: Expected string\n\nArguments provided:\n{\n  \"path\": 17\n}\n\nUpdate the arguments and call the tool again."
+      },
+      "content": []
+    }
+  }
+}

@@ -1,0 +1,31 @@
+OpenCode 2 host-provider contract deletion guard
+required rows: every applicable T1 scenario
+representative rows exercised: read/T1, write/T1
+
+Positive control before mutation
+$ node tests/docker/opencode2/contract/probe/verify-host-provider-contract.mjs read/T1 write/T1
+PASS read/T1 host_provider_config 0.0.0-beta-19234 oc2-host-provider-20260909-01
+PASS write/T1 host_provider_config 0.0.0-beta-19234 oc2-host-provider-20260909-01
+[exit 0]
+
+Deletion mutation (performed only after `git add -A` captured the live working state)
+$ echo 'NON-VACUITY BREAK: delete host-provider-config.json'
+NON-VACUITY BREAK: delete host-provider-config.json
+$ rm tests/docker/opencode2/contract/host-provider-config.json
+$ git diff --stat
+ .../opencode2/contract/host-provider-config.json   | 55 ----------------------
+ 1 file changed, 55 deletions(-)
+$ node tests/docker/opencode2/contract/probe/verify-host-provider-contract.mjs read/T1 write/T1
+FAIL read/T1 contract_uncaptured:host_provider_config
+FAIL write/T1 contract_uncaptured:host_provider_config
+[exit 1]
+
+Transcript-backed restoration positive control
+$ git checkout -- tests/docker/opencode2/contract/host-provider-config.json
+$ touch tests/docker/opencode2/contract/host-provider-config.json
+$ git diff --stat
+[no output]
+$ node tests/docker/opencode2/contract/probe/verify-host-provider-contract.mjs read/T1 write/T1
+PASS read/T1 host_provider_config 0.0.0-beta-19234 oc2-host-provider-20260909-01
+PASS write/T1 host_provider_config 0.0.0-beta-19234 oc2-host-provider-20260909-01
+[exit 0]

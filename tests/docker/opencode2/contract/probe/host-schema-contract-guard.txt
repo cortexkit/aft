@@ -1,0 +1,27 @@
+OpenCode 2 host-schema contract deletion guard
+affected subcase: read/T2/invalid_arguments
+
+Positive control before mutation
+$ node tests/docker/opencode2/contract/probe/verify-host-schema-contract.mjs read/T2/invalid_arguments
+PASS read/T2/invalid_arguments host_schema_rejection 0.0.0-beta-19234 oc2-host-schema-20260909-01
+[exit 0]
+
+Deletion mutation (performed only after `git add -A` captured the live working state)
+$ echo 'NON-VACUITY BREAK: delete host-schema-rejection.json'
+NON-VACUITY BREAK: delete host-schema-rejection.json
+$ rm tests/docker/opencode2/contract/host-schema-rejection.json
+$ git diff --stat
+ .../opencode2/contract/host-schema-rejection.json  | 55 ----------------------
+ 1 file changed, 55 deletions(-)
+$ node tests/docker/opencode2/contract/probe/verify-host-schema-contract.mjs read/T2/invalid_arguments
+FAIL read/T2/invalid_arguments contract_uncaptured:host_schema_rejection
+[exit 1]
+
+Transcript-backed restoration positive control
+$ git checkout -- tests/docker/opencode2/contract/host-schema-rejection.json
+$ touch tests/docker/opencode2/contract/host-schema-rejection.json
+$ git diff --stat
+[no output]
+$ node tests/docker/opencode2/contract/probe/verify-host-schema-contract.mjs read/T2/invalid_arguments
+PASS read/T2/invalid_arguments host_schema_rejection 0.0.0-beta-19234 oc2-host-schema-20260909-01
+[exit 0]

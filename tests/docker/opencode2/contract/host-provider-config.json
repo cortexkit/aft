@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "run_id": "oc2-host-provider-20260909-01",
+  "observed_run_id": "oc2-host-provider-20260909-01",
+  "observed_sha": "048eaebf2bf604f70a785f9c11f59fcb3e0cf368",
+  "beta_version": "0.0.0-beta-19234",
+  "host_version": "0.0.0-beta-19234",
+  "host": "opencode2",
+  "platform": "linux-x64",
+  "transcript": "probe/host-provider-config.txt",
+  "guard_transcript": "probe/host-provider-contract-guard.txt",
+  "opencode_json": {
+    "providers": {
+      "openai": {
+        "name": "Deterministic aimock",
+        "package": "@opencode-ai/ai/providers/openai-compatible",
+        "settings": {
+          "baseURL": "http://127.0.0.1:4010/v1",
+          "apiKey": "{env:OPENAI_API_KEY}"
+        },
+        "models": {
+          "mock-model": {
+            "name": "Mock Model"
+          }
+        }
+      }
+    }
+  },
+  "run_command": [
+    "opencode2",
+    "run",
+    "--server",
+    "${endpoint}",
+    "--format",
+    "json",
+    "--model",
+    "openai/mock-model",
+    "${message}"
+  ],
+  "environment": {
+    "OPENAI_API_KEY": "sk-mock"
+  },
+  "observed_session": {
+    "session_id": "ses_f795289ceffefwbN5WkzOUGmv1",
+    "model": {
+      "id": "mock-model",
+      "providerID": "openai",
+      "variant": "default"
+    },
+    "outcome": "succeeded",
+    "run_exit_status": 0
+  },
+  "required_for": "every applicable T1 scenario",
+  "missing_contract_code": "contract_uncaptured:host_provider_config"
+}
