@@ -4,10 +4,11 @@
   "type": "object",
   "required": ["slice_class", "targeted_mechanism", "kind", "fixtures"],
   "properties": {
-    "slice_class": {"enum": ["ranking", "non_ranking"], "description": "Declaration checked against, never substituted for, diff-derived class."},
+    "slice_class": {"enum": ["ranking", "non_ranking", "engine_unwired"], "description": "Declaration checked against the diff-derived class; engine_unwired is allowed only for ranking diffs that prove byte-identical behavior."},
     "targeted_mechanism": {"type": "string"},
     "kind": {"enum": ["ranking", "readiness", "paging", "confidence", "harness"]},
-    "fixtures": {"type": "array", "minItems": 1, "items": {"type": "string"}}
+    "fixtures": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+    "slices": {"type": "array", "minItems": 1, "items": {"type": "string"}}
   },
   "ranking_fence_prefixes": [
     "crates/aft/src/commands/semantic_search.rs",

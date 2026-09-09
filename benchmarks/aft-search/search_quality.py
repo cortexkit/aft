@@ -2,7 +2,7 @@
 """CLI and executable goldens for the B1 search-quality predicate."""
 from __future__ import annotations
 
-import argparse, copy, hashlib, json, os, subprocess, sys, tempfile
+import argparse, copy, hashlib, json, os, re, subprocess, sys, tempfile
 from pathlib import Path
 from typing import Any
 
@@ -33,12 +33,27 @@ def diff_paths(base: str | None, head: str) -> list[str]:
     return [line for line in result.stdout.splitlines() if line]
 
 
+def descriptor_labels(branch: str) -> list[str]:
+    labels = [branch]
+    normalized = branch.replace("/", "-")
+    if normalized not in labels:
+        labels.append(normalized)
+    for train in re.findall(r"(?:^|[-/_])train[-/_](\d+)(?=$|[-/_])", branch):
+        label = f"train-{train}"
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
 def descriptor_path(explicit: str | None, branch: str | None) -> Path | None:
     if explicit: return Path(explicit)
     if not branch:
         result=subprocess.run(["git","branch","--show-current"],cwd=ROOT,text=True,capture_output=True,check=False); branch=result.stdout.strip()
-    candidate=BENCH/"slice-descriptors"/f"{branch}.json"
-    return candidate if candidate.is_file() else None
+    for label in descriptor_labels(branch):
+        candidate=BENCH/"slice-descriptors"/f"{label}.json"
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def binding(reference_path: Path, manifest_path: Path, sidecar_path: Path) -> dict[str, Any]:
@@ -58,8 +73,8 @@ def synthetic_documents() -> tuple[dict[str,Any],dict[str,Any],dict[str,Any]]:
     manifest={"schema":"manifest","rows":[{"episode_id":"followup-census:1","include_tests":False,"include_tests_source":"default"}]}
     row={"episode_id":"followup-census:1","request":{"includeTests":False,"topK":100},"requests":[{"includeTests":False,"topK":100}],"request_count":1,"include_tests_source":"default","pages_fetched":1,"collapse_stop_reason":"exhausted","retrieval_depth":1,"ranked_paths":["opened.rs"]}
     metrics={"mrr_at_10":0.5,"hit_at_1":0.5,"hit_at_5":0.8}
-    reference={"schema":"aft-search-score-v1","model_id":"fixture","profile":"single_page","capability":{"schema_path":"fixture.json","schema_sha256":"0"*64,"offset_declared":False},"families":{"exact_recall":dict(metrics),"concept_recall":dict(metrics),"real_query":dict(metrics)},"fixture_groups":{"exact_recall":{"g":dict(metrics)},"concept_recall":{"g":dict(metrics)}},"shapes":{"identifier":dict(metrics)},"mechanisms":{"topk_cut":dict(metrics)},"rows":[dict(row)]}
-    score=copy.deepcopy(reference); score["rows"]=[dict(row)]; score["fixture_results"]={"harness-goldens":True,"paging":True}
+    reference={"schema":"aft-search-score-v1","model_id":"fixture","profile":"single_page","capability":{"schema_path":"fixture.json","schema_sha256":"0"*64,"offset_declared":False},"families":{"exact_recall":dict(metrics),"concept_recall":dict(metrics),"real_query":dict(metrics)},"fixture_groups":{"exact_recall":{"g":dict(metrics)},"concept_recall":{"g":dict(metrics)}},"shapes":{"identifier":dict(metrics)},"mechanisms":{"topk_cut":dict(metrics)},"fixture_results":{"harness-goldens":True,"paging":True},"rows":[dict(row)]}
+    score=copy.deepcopy(reference); score["rows"]=[dict(row)]
     return manifest,reference,score
 
 

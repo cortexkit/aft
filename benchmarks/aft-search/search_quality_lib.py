@@ -58,6 +58,8 @@ RANKING_FENCE_PREFIXES = (
     "packages/opencode-plugin/",
     "benchmarks/aft-search/engine-fixtures/",
 )
+TOOL_CALL_PARITY_FIXTURE_SOURCE = "crates/aft/tests/integration/tool_call_parity_test.rs"
+TOOL_CALL_PARITY_FIXTURE_PREFIX = "crates/aft/tests/fixtures/tool_call_parity/"
 
 class InputFault(ValueError):
     """An input or harness fault which must take P1/exit 2."""
@@ -488,6 +490,18 @@ def resolve_descriptor(descriptor: Mapping[str, Any] | None, diff_paths: Sequenc
     if descriptor is None:
         return {"slice_class": derived, "targeted_mechanism": "none", "kind": "harness", "fixtures": ["harness-goldens"]}, missing_ranking
     declared = descriptor.get("slice_class")
+    if declared == "engine_unwired":
+        if derived != "ranking":
+            raise InputFault(f"descriptor_class_mismatch:declared={declared}:derived={derived}")
+        fixtures = descriptor.get("fixtures")
+        if (
+            descriptor.get("targeted_mechanism") != "none"
+            or descriptor.get("kind") != "harness"
+            or not isinstance(fixtures, list)
+            or TOOL_CALL_PARITY_FIXTURE_SOURCE not in fixtures
+        ):
+            raise InputFault("malformed_descriptor:engine_unwired")
+        return dict(descriptor), missing_ranking
     if declared != derived:
         raise InputFault(f"descriptor_class_mismatch:declared={declared}:derived={derived}")
     target = descriptor.get("targeted_mechanism")
@@ -510,6 +524,65 @@ def _metric_block(block: Any, name: str) -> Mapping[str, float]:
         if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or not 0 <= value <= 1:
             raise InputFault(f"invalid_metric:{name}:{metric}")
     return block
+
+
+def _first_row_difference(reference: Mapping[str, Any], score: Mapping[str, Any]) -> str | None:
+    old_rows = reference.get("rows", [])
+    new_rows = score.get("rows", [])
+    if not isinstance(old_rows, list) or not isinstance(new_rows, list):
+        return "real_query.rows"
+    for index in range(max(len(old_rows), len(new_rows))):
+        old = old_rows[index] if index < len(old_rows) else None
+        new = new_rows[index] if index < len(new_rows) else None
+        if canonical_json(old) != canonical_json(new):
+            row = new if isinstance(new, Mapping) else old
+            identity = row.get("episode_id") if isinstance(row, Mapping) else None
+            return f"real_query.{identity or index}"
+    return None
+
+
+def _real_query_score_bytes(document: Mapping[str, Any]) -> bytes:
+    score = dict(document)
+    for key in ("schema", "baseline_path", "baseline_sha256", "binary_sha256", "fixture_groups", "rows"):
+        score.pop(key, None)
+    families = document.get("families", {})
+    score["families"] = {"real_query": families.get("real_query") if isinstance(families, Mapping) else None}
+    return canonical_json(score)
+
+
+def _first_family_difference(reference: Mapping[str, Any], score: Mapping[str, Any], family: str) -> str | None:
+    old_families = reference.get("families", {})
+    new_families = score.get("families", {})
+    old_family = old_families.get(family) if isinstance(old_families, Mapping) else None
+    new_family = new_families.get(family) if isinstance(new_families, Mapping) else None
+    if canonical_json(old_family) != canonical_json(new_family):
+        return f"{family}.family"
+    old_fixture_groups = reference.get("fixture_groups", {})
+    new_fixture_groups = score.get("fixture_groups", {})
+    old_groups = old_fixture_groups.get(family, {}) if isinstance(old_fixture_groups, Mapping) else {}
+    new_groups = new_fixture_groups.get(family, {}) if isinstance(new_fixture_groups, Mapping) else {}
+    if not isinstance(old_groups, Mapping) or not isinstance(new_groups, Mapping):
+        return f"{family}.fixture_groups"
+    for group in sorted(set(old_groups) | set(new_groups)):
+        if group not in old_groups or group not in new_groups or canonical_json(old_groups[group]) != canonical_json(new_groups[group]):
+            return f"{family}.{group}"
+    return None
+
+
+def _engine_unwired_difference(reference: Mapping[str, Any], score: Mapping[str, Any], diff_paths: Sequence[str]) -> str | None:
+    row = _first_row_difference(reference, score)
+    if row:
+        return row
+    if _real_query_score_bytes(reference) != _real_query_score_bytes(score):
+        return "real_query.score"
+    for family in ("exact_recall", "concept_recall"):
+        row = _first_family_difference(reference, score, family)
+        if row:
+            return row
+    for path in diff_paths:
+        if path == TOOL_CALL_PARITY_FIXTURE_SOURCE or path.startswith(TOOL_CALL_PARITY_FIXTURE_PREFIX):
+            return f"tool_call_parity.{path}"
+    return None
 
 
 def evaluate_predicate(reference: Mapping[str, Any], score: Mapping[str, Any], descriptor: Mapping[str, Any], *, missing_ranking_descriptor: bool = False) -> list[str]:
@@ -574,6 +647,10 @@ def total_gate(reference: Mapping[str, Any], score: Mapping[str, Any], manifest:
         validate_profile_score(score)
         resolved, missing = resolve_descriptor(descriptor, diff_paths)
         reasons = evaluate_predicate(reference, score, resolved, missing_ranking_descriptor=missing)
+        if resolved["slice_class"] == "engine_unwired":
+            difference = _engine_unwired_difference(reference, score, diff_paths)
+            if difference:
+                raise InputFault(f"engine_unwired_mismatch:row={difference}")
     except InputFault as error:
         return GateResult(2, (str(error),))
     return GateResult(1 if reasons else 0, tuple(reasons))
