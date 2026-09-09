@@ -1,0 +1,29 @@
+{
+  "ready": {
+    "shape": "natural_language",
+    "confidence": "high",
+    "variants": ["opening failed", "open failed"],
+    "embedding_calls": 1,
+    "snapshot_generation": "ready-generation_11111111111111111111111111111111",
+    "retrieval_depth": 200,
+    "depth_tier": 0,
+    "lanes_exhausted": true,
+    "stability_void": false,
+    "trailer": "shown 2 of 2 (exhausted)",
+    "stability_files": ["ready-exact.rs", "ready-non-exact.rs"]
+  },
+  "fallback": {
+    "shape": "identifier",
+    "confidence": "low",
+    "variants": [],
+    "embedding_calls": 0,
+    "snapshot_generation": "fallback-generation_22222222222222222222222222222222",
+    "retrieval_depth": 200,
+    "depth_tier": 0,
+    "lanes_exhausted": true,
+    "stability_void": false,
+    "trailer": "shown 1 of 1 (exhausted)",
+    "bounded_disclosure": "exact pass: bounded (12 files, file limit)",
+    "stability_files": ["fallback.rs"]
+  }
+}
