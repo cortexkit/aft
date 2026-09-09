@@ -192,6 +192,23 @@ export function deriveV2HarnessProjection(
   return [...projection].sort();
 }
 
+/// The V2 projection derived from the committed schema artifact alone: every
+/// direct schema key plus the projection-only decomposed bash tools, minus the
+/// platform-absent keys. An observation-only run (one tool's scenarios during
+/// debugging) validates against this so a scenario subset is never read as
+/// inventory drift; a full run derives the projection from the scenarios so
+/// that a tool with no scenarios is drift.
+export function deriveSchemaProjection(
+  schemas: Record<string, Record<string, unknown>>,
+  platform: NodeJS.Platform,
+): string[] {
+  const projection = new Set(Object.keys(schemas).map(canonicalToolName));
+  for (const tool of V2_SCHEMA_PROJECTION_EXCLUSIONS.projection_only) projection.add(tool);
+  for (const tool of V2_SCHEMA_PROJECTION_EXCLUSIONS.schema_only) projection.delete(tool);
+  if (platform === "win32") projection.add("powershell");
+  return [...projection].sort();
+}
+
 function difference(left: ReadonlySet<string>, right: ReadonlySet<string>): string[] {
   return [...left].filter((tool) => !right.has(tool)).sort();
 }
@@ -257,13 +274,19 @@ function validateScenarioRows(
   matrix: ApplicabilityMatrix,
   scenarios: readonly ScenarioDefinition[],
   schemas: Record<string, Record<string, unknown>>,
+  observationOnly = false,
 ): void {
+  // An observation-only run carries one tool's scenarios; only the rows of
+  // tools present in that set are checked for coverage. A full run checks
+  // every row, so an applicable row with no scenario is drift.
+  const coveredTools = new Set(scenarios.map((scenario) => scenario.tool));
   const byParent = new Map<string, ScenarioDefinition[]>();
   for (const scenario of scenarios) {
     const key = `${scenario.tool}/${scenario.trajectory}`;
     byParent.set(key, [...(byParent.get(key) ?? []), scenario]);
   }
   for (const row of matrix.rows) {
+    if (observationOnly && !coveredTools.has(row.tool)) continue;
     for (const trajectory of TRAJECTORIES) {
       const key = `${row.tool}/${trajectory}`;
       const classification = row.trajectories[trajectory];
@@ -289,6 +312,7 @@ function validateScenarioRows(
 
   for (const row of matrix.rows) {
     if (!schemas[row.tool]) continue;
+    if (observationOnly && !coveredTools.has(row.tool)) continue;
     // A tool absent on the run's platform is outside the tool universe: every
     // trajectory cell is n/a:platform and no T2 subcase can exist for it.
     if (row.trajectories.T2.startsWith("n/a:platform")) continue;
@@ -710,7 +734,9 @@ export async function validateHarnessInputs(options: {
     fail("matrix_invalid", `matrix platform ${matrix.platform} does not match ${platform}`);
   }
   const schemas = await loadToolSchemas(options.repoRoot);
-  const projection = deriveV2HarnessProjection(options.scenarios, platform);
+  const projection = options.observationOnly
+    ? deriveSchemaProjection(schemas, platform)
+    : deriveV2HarnessProjection(options.scenarios, platform);
   const inventory = matrix
     ? validateInventory(matrix, schemas, matrix.platform as NodeJS.Platform, projection)
     : projection;
@@ -719,11 +745,18 @@ export async function validateHarnessInputs(options: {
   let requiredCheckStatus: ValidatedInputs["requiredCheckStatus"] = "NOT MET (advisory only)";
   let configuredMutatingTools: Set<string> | undefined;
   if (matrix) {
-    validateScenarioRows(matrix, options.scenarios, schemas);
-    await validatePermissionInventory(options.repoRoot, matrixRoot, options.scenarios);
+    const observationOnly = options.observationOnly === true;
+    validateScenarioRows(matrix, options.scenarios, schemas, observationOnly);
     await validateT5Inventory(matrixRoot, matrix, schemas);
-    validateT6(matrix, options.scenarios, surfaces);
-    parityAllowlist = await validateParityAllowlist(matrixRoot, options.scenarios);
+    // The set-wide drift guards (every permission operation has its T3
+    // triple, every list surface has both T6 fixtures, the parity allowlist
+    // is complete) assume the whole scenario set; an observation-only run
+    // carries a subset and is not drift.
+    if (!observationOnly) {
+      await validatePermissionInventory(options.repoRoot, matrixRoot, options.scenarios);
+      validateT6(matrix, options.scenarios, surfaces);
+      parityAllowlist = await validateParityAllowlist(matrixRoot, options.scenarios);
+    }
     requiredCheckStatus = await validateRequiredCheckRecord(matrixRoot);
     configuredMutatingTools = await loadMutatingTools(matrixRoot);
   }

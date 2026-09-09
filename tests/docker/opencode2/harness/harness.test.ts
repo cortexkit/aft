@@ -374,33 +374,40 @@ describe("source-of-truth derivation", () => {
     ).toThrow("schema-only tools do not match the explicit exclusion table");
   });
 
-  test("scenario validation tolerates matrix_absent until the full run", async () => {
+  test("an observation-only subset validates against the schema projection; a full run reads it as drift", async () => {
     const repo = join(import.meta.dir, "../../../..");
     const scenarios = materializeParityScenarios(
       await loadScenarios(join(repo, "tests", "docker", "opencode2", "scenarios", "read")),
     );
-    const optional = await validateHarnessInputs({
+    const subset = await validateHarnessInputs({
       repoRoot: repo,
       scenarios,
       pinnedHostVersion: "0.0.0-beta-test",
       platform: "linux",
       observationOnly: true,
     });
-    expect(optional.matrix).toBeUndefined();
-    expect(optional.inventory).toEqual(["read"]);
+    expect(subset.matrix).toBeDefined();
+    expect(subset.inventory).toContain("read");
+    expect(subset.inventory).toContain("apply_patch");
+    // powershell stays in the inventory as a matrix row; on Linux every one of
+    // its cells is n/a:platform and no scenario exists for it.
+    const powershell = subset.matrix?.rows.find((row) => row.tool === "powershell");
+    expect(powershell?.trajectories.T1).toBe("n/a:platform");
 
-    await expectCode(
+    const error = await expectCode(
       () =>
         validateHarnessInputs({
           repoRoot: repo,
           scenarios,
           pinnedHostVersion: "0.0.0-beta-test",
           platform: "linux",
-          observationOnly: true,
           fullRun: true,
         }),
-      "matrix_absent",
+      "matrix_invalid",
     );
+    // A subset on a full run is read as drift at the first guard it reaches:
+    // the scenario-derived projection no longer matches the exclusion table.
+    expect(error.message).toContain("do not match the explicit exclusion table");
   });
 
   test("T7 is materialized from the same T1 scenario data", () => {
