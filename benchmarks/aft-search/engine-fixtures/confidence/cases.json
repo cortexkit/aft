@@ -1,0 +1,66 @@
+{
+  "schema": 1,
+  "page_local_head": {
+    "result_count": 30,
+    "later_offset": 20,
+    "out_of_range_offset": 100
+  },
+  "margin": {
+    "within": [0.50, 0.47],
+    "calibration_flip": [0.50, 0.42],
+    "separated": [0.50, 0.30],
+    "calibrated_margin": 0.12,
+    "calibrated_model_id": "fixture-pack-v1"
+  },
+  "descriptor_pairs": [
+    {
+      "label": "P",
+      "winner_path": "a-exact-form.rs",
+      "loser_path": "z-variant-form.rs",
+      "winner_range": [10, 20],
+      "loser_range": [10, 20],
+      "winner_exact_form": true,
+      "loser_exact_form": false,
+      "winner_generated": false,
+      "loser_generated": false
+    },
+    {
+      "label": "P-prime-adverse-path",
+      "winner_path": "z-exact-form.rs",
+      "loser_path": "a-variant-form.rs",
+      "winner_range": [20, 30],
+      "loser_range": [20, 30],
+      "winner_exact_form": true,
+      "loser_exact_form": false,
+      "winner_generated": false,
+      "loser_generated": false
+    },
+    {
+      "label": "Q",
+      "winner_path": "a-source.rs",
+      "loser_path": "z-generated.rs",
+      "winner_range": [30, 40],
+      "loser_range": [30, 40],
+      "winner_exact_form": false,
+      "loser_exact_form": false,
+      "winner_generated": false,
+      "loser_generated": true
+    },
+    {
+      "label": "Q-prime-adverse-path",
+      "winner_path": "z-source.rs",
+      "loser_path": "a-generated.rs",
+      "winner_range": [40, 50],
+      "loser_range": [40, 50],
+      "winner_exact_form": false,
+      "loser_exact_form": false,
+      "winner_generated": false,
+      "loser_generated": true
+    }
+  ],
+  "head_pair": {
+    "filtered_prefix": 200,
+    "depth_one": 400,
+    "depth_max": 3200
+  }
+}
