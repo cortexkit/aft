@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "tool": "read",
+  "controls": [
+    {
+      "id": "read-permission-path-identity",
+      "mutated_input": "read/T3 call path",
+      "expected_failure": "read/T3 identity assertion names the mismatched path",
+      "unaffected_positive_control": "read/T1/happy"
+    },
+    {
+      "id": "read-permission-denial-is-non-mutating",
+      "mutated_input": "read/T3 denial disk classification",
+      "expected_failure": "mutating_classification_invalid:read",
+      "unaffected_positive_control": "read/T3/read_ask_allow"
+    },
+    {
+      "id": "read-parity-exact",
+      "mutated_input": "read/T7 agent-visible text",
+      "expected_failure": "exact V1/V2 parity mismatch",
+      "unaffected_positive_control": "read/T1/happy"
+    }
+  ]
+}

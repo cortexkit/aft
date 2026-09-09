@@ -1,0 +1,104 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "read",
+  "scenarios": [
+    {
+      "schema_version": 1,
+      "id": "read/T1/happy",
+      "tool": "read",
+      "trajectory": "T1",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Read sample.txt and report its contents.",
+      "fixture": "./fixture",
+      "turns": [
+        {"label": "call-read", "response": {"kind": "tool_calls", "calls": [{"id": "read-happy", "name": "read", "arguments": {"filePath": "sample.txt"}, "non_mutating_evidence": {"reason": "read only observes fixture bytes"}}]}},
+        {"label": "finish", "response": {"kind": "text", "content": "done"}}
+      ],
+      "expected_turns": ["call-read", "finish"],
+      "compare_call_id": "read-happy",
+      "comparison": {"mode": "exact", "expected": "1: alpha\n2: beta"},
+      "metadata": {"path_identity": {"requested": "sample.txt", "expected_project_relative": "sample.txt"}}
+    },
+    {
+      "schema_version": 1,
+      "id": "read/T2/invalid_arguments",
+      "tool": "read",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted invalid read call.",
+      "fixture": "./fixture",
+      "subcase": "invalid_arguments",
+      "error_origin": "host",
+      "turns": [
+        {"label": "call-invalid-read", "response": {"kind": "tool_calls", "calls": [{"id": "read-invalid", "name": "read", "arguments": {"filePath": 42}, "non_mutating_evidence": {"reason": "the host rejects the argument type before execution"}}]}},
+        {"label": "finish", "response": {"kind": "text", "content": "done"}}
+      ],
+      "expected_turns": ["call-invalid-read", "finish"]
+    },
+    {
+      "schema_version": 1,
+      "id": "read/T2/missing_target",
+      "tool": "read",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted read call with no target.",
+      "fixture": "./fixture",
+      "subcase": "missing_target",
+      "error_origin": "host",
+      "turns": [
+        {"label": "call-missing-read", "response": {"kind": "tool_calls", "calls": [{"id": "read-missing", "name": "read", "arguments": {}, "non_mutating_evidence": {"reason": "the host rejects the missing required target before execution"}}]}},
+        {"label": "finish", "response": {"kind": "text", "content": "done"}}
+      ],
+      "expected_turns": ["call-missing-read", "finish"]
+    },
+    {
+      "schema_version": 1,
+      "id": "read/T3/read_ask_allow",
+      "tool": "read",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Read sample.txt after the user allows the read permission.",
+      "fixture": "./fixture",
+      "turns": [
+        {"label": "call-read", "response": {"kind": "tool_calls", "calls": [{"id": "read-allow", "name": "read", "arguments": {"filePath": "sample.txt"}, "non_mutating_evidence": {"reason": "allowed reads do not alter the fixture"}}]}},
+        {"label": "finish", "response": {"kind": "text", "content": "done"}}
+      ],
+      "expected_turns": ["call-read", "finish"],
+      "metadata": {"permission": {"operation": "read", "reply": "once", "requested_path": "sample.txt"}, "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"}
+    },
+    {
+      "schema_version": 1,
+      "id": "read/T3/read_ask_deny",
+      "tool": "read",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Attempt to read sample.txt after the user denies permission.",
+      "fixture": "./fixture",
+      "turns": [
+        {"label": "call-read", "response": {"kind": "tool_calls", "calls": [{"id": "read-deny", "name": "read", "arguments": {"filePath": "sample.txt"}, "non_mutating_evidence": {"reason": "denied reads do not alter the fixture"}}]}},
+        {"label": "finish", "response": {"kind": "text", "content": "done"}}
+      ],
+      "expected_turns": ["call-read", "finish"],
+      "metadata": {"permission": {"operation": "read", "reply": "reject", "requested_path": "sample.txt"}, "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"}
+    },
+    {
+      "schema_version": 1,
+      "id": "read/T3/read_config_deny",
+      "tool": "read",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Attempt to read sample.txt while the host read permission is configured deny.",
+      "fixture": "./fixture",
+      "turns": [
+        {"label": "call-read", "response": {"kind": "tool_calls", "calls": [{"id": "read-config-deny", "name": "read", "arguments": {"filePath": "sample.txt"}, "non_mutating_evidence": {"reason": "configuration-denied reads do not alter the fixture"}}]}},
+        {"label": "finish", "response": {"kind": "text", "content": "done"}}
+      ],
+      "expected_turns": ["call-read", "finish"],
+      "metadata": {"permission": {"operation": "read", "reply": "config_deny", "requested_path": "sample.txt"}}
+    }
+  ]
+}
