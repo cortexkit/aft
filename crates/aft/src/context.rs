@@ -6780,11 +6780,12 @@ impl AppContext {
     /// Notify LSP and optionally wait for diagnostics.
     ///
     /// Call this after `write_format_validate` when the request has `"diagnostics": true`.
-    /// Ensures the matching server is running, sends didOpen/didChange, waits
-    /// briefly for publishDiagnostics, and returns diagnostics for the file.
+    /// Ensures the matching server is running, sends didOpen/didChange, requests
+    /// pull diagnostics when supported, and otherwise waits briefly for
+    /// publishDiagnostics before returning diagnostics for the file.
     ///
-    /// Pre-edit cached diagnostics are never returned: only entries whose version
-    /// matches the post-edit document version are authoritative.
+    /// Pre-edit cached diagnostics are never returned: only entries proven against
+    /// the post-edit document version are authoritative.
     pub fn lsp_notify_and_collect_diagnostics(
         &self,
         file_path: &Path,
@@ -6823,6 +6824,19 @@ impl AppContext {
             return crate::lsp::manager::PostEditWaitOutcome::default();
         }
 
+        // Some LSP 3.17 servers disable publishDiagnostics as soon as the client
+        // advertises pull support. Pull before parking so edits work for those
+        // servers while push-only servers still use the event-driven wait below.
+        let diagnostics_deadline = Instant::now() + timeout;
+        if let Err(err) = lsp.pull_file_diagnostics_with_timeout(file_path, &config, timeout) {
+            crate::slog_warn!(
+                "post-edit LSP diagnostic pull failed for {}: {}",
+                file_path.display(),
+                err
+            );
+        }
+        let remaining = diagnostics_deadline.saturating_duration_since(Instant::now());
+
         // Register the wake receiver while the manager is still locked. Events
         // that raced with registration remain on the raw receiver; events won by
         // another drain path wake this waiter after that path updates the store.
@@ -6830,7 +6844,7 @@ impl AppContext {
             file_path,
             &expected_versions,
             &pre_snapshot,
-            timeout,
+            remaining,
         );
         let mut complete = lsp.poll_post_edit_diagnostics_wait(&mut wait, None);
         drop(lsp);

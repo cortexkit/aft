@@ -942,21 +942,29 @@ impl LspManager {
                 let content = initial_content
                     .as_ref()
                     .expect("content is loaded when any server needs didOpen");
-                let send_result = if let Some(client) = self.clients.get_mut(key) {
-                    client.send_notification::<DidOpenTextDocument>(DidOpenTextDocumentParams {
-                        text_document: TextDocumentItem::new(
-                            uri.clone(),
-                            language_id.clone(),
-                            0,
-                            content.clone(),
+                let (send_result, sent) = if let Some(client) = self.clients.get_mut(key) {
+                    (
+                        client.send_notification::<DidOpenTextDocument>(
+                            DidOpenTextDocumentParams {
+                                text_document: TextDocumentItem::new(
+                                    uri.clone(),
+                                    language_id.clone(),
+                                    0,
+                                    content.clone(),
+                                ),
+                            },
                         ),
-                    })
+                        true,
+                    )
                 } else {
-                    Ok(())
+                    (Ok(()), false)
                 };
                 if let Err(err) = send_result {
                     let _ = self.close_file_for_servers(&canonical_path, &newly_opened);
                     return Err(err);
+                }
+                if sent {
+                    log_did_open_sent(key, &canonical_path, &language_id);
                 }
                 self.documents
                     .entry(key.clone())
@@ -1156,6 +1164,7 @@ impl LspManager {
                         content.to_string(),
                     ),
                 })?;
+                log_did_open_sent(&key, &canonical_path, &language_id);
             }
             self.documents
                 .entry(key.clone())
@@ -1869,6 +1878,27 @@ impl LspManager {
         file_path: &Path,
         config: &Config,
     ) -> Result<Vec<PullFileResult>, LspError> {
+        self.pull_file_diagnostics_inner(file_path, config, None)
+    }
+
+    /// Pull diagnostics within a caller-owned wait budget. This is used after
+    /// edits because a pull-capable server may disable push diagnostics after
+    /// seeing the client's LSP 3.17 diagnostic capability.
+    pub fn pull_file_diagnostics_with_timeout(
+        &mut self,
+        file_path: &Path,
+        config: &Config,
+        timeout: Duration,
+    ) -> Result<Vec<PullFileResult>, LspError> {
+        self.pull_file_diagnostics_inner(file_path, config, Some(Instant::now() + timeout))
+    }
+
+    fn pull_file_diagnostics_inner(
+        &mut self,
+        file_path: &Path,
+        config: &Config,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<PullFileResult>, LspError> {
         let canonical_path = canonicalize_for_lsp(file_path)?;
         // Make sure servers are running and the document is open with fresh
         // content (handles disk-drift via DocumentStore::is_stale_on_disk).
@@ -1917,8 +1947,44 @@ impl LspManager {
                 partial_result_params: Default::default(),
             };
 
-            let outcome = match self.send_pull_request(&key, params) {
+            let request_timeout = deadline
+                .map(|deadline| {
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Self::PULL_FILE_TIMEOUT)
+                })
+                .unwrap_or(Self::PULL_FILE_TIMEOUT);
+            let document_version = self
+                .documents
+                .get(&key)
+                .and_then(|store| store.version(&canonical_path));
+            slog_info!(
+                "lsp_protocol server={} root={} method=textDocument/diagnostic event=sent file={} document_version={}",
+                key.kind.id_str(),
+                key.root.display(),
+                canonical_path.display(),
+                document_version
+                    .map(|version| version.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
+            let outcome = match self.send_pull_request(&key, params, request_timeout) {
                 Ok(report) => {
+                    let report_kind = match &report {
+                        lsp_types::DocumentDiagnosticReportResult::Report(
+                            lsp_types::DocumentDiagnosticReport::Full(_),
+                        ) => "full",
+                        lsp_types::DocumentDiagnosticReportResult::Report(
+                            lsp_types::DocumentDiagnosticReport::Unchanged(_),
+                        ) => "unchanged",
+                        lsp_types::DocumentDiagnosticReportResult::Partial(_) => "partial",
+                    };
+                    slog_info!(
+                        "lsp_protocol server={} root={} method=textDocument/diagnostic event=received file={} report_kind={}",
+                        key.kind.id_str(),
+                        key.root.display(),
+                        canonical_path.display(),
+                        report_kind
+                    );
                     if matches!(
                         &report,
                         lsp_types::DocumentDiagnosticReportResult::Report(
@@ -1931,9 +1997,16 @@ impl LspManager {
                         // unchanged response must inspect only a previous pull cache.
                         self.drain_events();
                     }
-                    self.ingest_document_report(&key, &canonical_path, report)
+                    self.ingest_document_report(&key, &canonical_path, document_version, report)
                 }
                 Err(err) => {
+                    slog_info!(
+                        "lsp_protocol server={} root={} method=textDocument/diagnostic event=failed file={} error={}",
+                        key.kind.id_str(),
+                        key.root.display(),
+                        canonical_path.display(),
+                        err
+                    );
                     if let Some(result) = self.cache_post_initialize_exit(&key, &err) {
                         PullFileOutcome::RequestFailed {
                             reason: server_attempt_result_reason(&result),
@@ -2114,18 +2187,15 @@ impl LspManager {
         &mut self,
         key: &ServerKey,
         params: AftDocumentDiagnosticParams,
+        timeout: Duration,
     ) -> Result<lsp_types::DocumentDiagnosticReportResult, LspError> {
         let client = self
             .clients
             .get_mut(key)
             .ok_or_else(|| LspError::ServerNotReady("server not found".into()))?;
-        // Use the documented 10s pull cap, not the global 30s request timeout —
-        // a stalled pull server must not blow the scoped aft_inspect 8s budget
-        // (or the lsp_diagnostics wait caps) all the way out to 30s.
-        client.send_request_with_timeout::<AftDocumentDiagnosticRequest>(
-            params,
-            Self::PULL_FILE_TIMEOUT,
-        )
+        // The caller caps this below the global 30s request timeout so a stalled
+        // pull server cannot consume the entire inspect or post-edit budget.
+        client.send_request_with_timeout::<AftDocumentDiagnosticRequest>(params, timeout)
     }
 
     /// Store the result of a per-file pull request and return a structured
@@ -2134,6 +2204,7 @@ impl LspManager {
         &mut self,
         key: &ServerKey,
         canonical_path: &Path,
+        document_version: Option<i32>,
         result: lsp_types::DocumentDiagnosticReportResult,
     ) -> PullFileOutcome {
         let report = match result {
@@ -2163,7 +2234,7 @@ impl LspManager {
                     canonical_path.to_path_buf(),
                     stored,
                     result_id,
-                    None,
+                    document_version,
                     provisional,
                 );
                 PullFileOutcome::Full {
@@ -2181,8 +2252,16 @@ impl LspManager {
                     .diagnostics
                     .has_report_for_server_file(key, canonical_path)
                 {
-                    self.diagnostics
-                        .mark_fresh_for_server_file(key, canonical_path);
+                    if let Some(version) = document_version {
+                        self.diagnostics.confirm_for_server_file_version(
+                            key,
+                            canonical_path,
+                            version,
+                        );
+                    } else {
+                        self.diagnostics
+                            .mark_fresh_for_server_file(key, canonical_path);
+                    }
                     let authoritative = self
                         .clients
                         .get(key)
@@ -2534,8 +2613,7 @@ impl LspManager {
             kind: server_kind.clone(),
             root: root.clone(),
         };
-        let client = self.clients.get(&server_key)?;
-        if client.state() != ServerState::Ready || client.diagnostics_are_provisional() {
+        if self.live_publish_drop_reason(&server_key, &file).is_some() {
             return None;
         }
         let document_version = self.documents.get(&server_key)?.version(&file)?;
@@ -2544,15 +2622,50 @@ impl LspManager {
             .entries_for_file(&file)
             .into_iter()
             .find_map(|(stored_key, entry)| (stored_key == &server_key).then_some(entry))?;
-        if entry.stale || entry.provisional || entry.version != Some(document_version) {
-            return None;
-        }
 
         Some(AcceptedDiagnosticSnapshot::new(
             server_key,
             document_version,
             entry.diagnostics.clone(),
         ))
+    }
+
+    fn live_publish_drop_reason(&self, key: &ServerKey, file: &Path) -> Option<&'static str> {
+        let Some(client) = self.clients.get(key) else {
+            return Some("server-not-live");
+        };
+        if client.state() != ServerState::Ready {
+            return Some("server-not-ready");
+        }
+        if client.diagnostics_are_provisional() {
+            return Some("producer-warming");
+        }
+        let Some(document_version) = self
+            .documents
+            .get(key)
+            .and_then(|documents| documents.version(file))
+        else {
+            return Some("document-not-open");
+        };
+        let Some(entry) = self
+            .diagnostics
+            .entries_for_file(file)
+            .into_iter()
+            .find_map(|(stored_key, entry)| (stored_key == key).then_some(entry))
+        else {
+            return Some("report-not-stored");
+        };
+        if entry.stale {
+            return Some("report-stale");
+        }
+        if entry.provisional {
+            return Some("report-provisional");
+        }
+        match entry.version {
+            None => Some("missing-version"),
+            Some(version) if version != document_version => Some("version-mismatch"),
+            Some(_) => None,
+        }
     }
 
     fn handle_event(&mut self, event: &LspEvent) -> Option<PathBuf> {
@@ -2629,31 +2742,72 @@ impl LspManager {
         root: PathBuf,
         params: &serde_json::Value,
     ) -> Option<PathBuf> {
-        if let Ok(publish_params) =
-            serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(params.clone())
-        {
-            let file = uri_to_path(&publish_params.uri)?;
-            let stored = from_lsp_diagnostics(file.clone(), publish_params.diagnostics);
-            // Store with the real ServerKey and the published document version
-            // so observation sources can accept only reports that prove which
-            // in-memory document state they describe. The earlier
-            // `publish_with_kind` path silently dropped both facts.
-            let key = ServerKey { kind: server, root };
-            let provisional = self
-                .clients
-                .get(&key)
-                .is_some_and(|client| client.diagnostics_are_provisional());
-            self.diagnostics.publish_full_with_provisional(
-                key,
-                file.clone(),
-                stored,
-                None,
-                publish_params.version,
-                provisional,
+        let publish_params = match serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(
+            params.clone(),
+        ) {
+            Ok(params) => params,
+            Err(err) => {
+                slog_info!(
+                    "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=dropped-because-invalid-params error={}",
+                    server.id_str(),
+                    root.display(),
+                    err
+                );
+                return None;
+            }
+        };
+        let Some(file) = uri_to_path(&publish_params.uri) else {
+            slog_info!(
+                "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=dropped-because-invalid-uri uri={:?}",
+                server.id_str(),
+                root.display(),
+                publish_params.uri
             );
-            return Some(file);
+            return None;
+        };
+        let diagnostic_count = publish_params.diagnostics.len();
+        let version = publish_params.version;
+        slog_info!(
+            "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=received file={} version={} diagnostics={}",
+            server.id_str(),
+            root.display(),
+            file.display(),
+            version
+                .map(|version| version.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            diagnostic_count
+        );
+        let stored = from_lsp_diagnostics(file.clone(), publish_params.diagnostics);
+        // Store with the real ServerKey and the published document version
+        // so observation sources can accept only reports that prove which
+        // in-memory document state they describe. The earlier
+        // `publish_with_kind` path silently dropped both facts.
+        let key = ServerKey { kind: server, root };
+        let provisional = self
+            .clients
+            .get(&key)
+            .is_some_and(|client| client.diagnostics_are_provisional());
+        self.diagnostics.publish_full_with_provisional(
+            key.clone(),
+            file.clone(),
+            stored,
+            None,
+            version,
+            provisional,
+        );
+        if let Some(reason) = self.live_publish_drop_reason(&key, &file) {
+            slog_info!(
+                "lsp_protocol server={} root={} method=textDocument/publishDiagnostics event=dropped-because-{} file={} version={}",
+                key.kind.id_str(),
+                key.root.display(),
+                reason,
+                file.display(),
+                version
+                    .map(|version| version.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            );
         }
-        None
+        Some(file)
     }
 
     fn handle_server_status(
@@ -3090,8 +3244,19 @@ fn language_id_for_extension(ext: &str) -> &'static str {
         "rs" => "rust",
         "go" => "go",
         "html" | "htm" => "html",
+        "md" | "markdown" | "mdx" | "mkd" | "mkdn" | "mdown" | "mdwn" | "qmd" | "rmd" => "markdown",
         _ => "plaintext",
     }
+}
+
+fn log_did_open_sent(key: &ServerKey, file: &Path, language_id: &str) {
+    slog_info!(
+        "lsp_protocol server={} root={} method=textDocument/didOpen event=sent file={} language_id={} version=0",
+        key.kind.id_str(),
+        key.root.display(),
+        file.display(),
+        language_id
+    );
 }
 
 fn normalize_lookup_path(path: &Path) -> PathBuf {
@@ -3196,6 +3361,20 @@ mod env_binary_override_tests {
             env_binary_override_from(&kind, |_| Some(std::ffi::OsString::from("/bin/lsp"))),
             Some(PathBuf::from("/bin/lsp"))
         );
+    }
+}
+
+#[cfg(test)]
+mod language_id_tests {
+    use super::language_id_for_extension;
+
+    #[test]
+    fn markdown_extensions_use_markdown_language_id() {
+        for extension in [
+            "md", "markdown", "mdx", "mkd", "mkdn", "mdown", "mdwn", "qmd", "rmd",
+        ] {
+            assert_eq!(language_id_for_extension(extension), "markdown");
+        }
     }
 }
 

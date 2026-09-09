@@ -446,6 +446,108 @@ fn pyright_uses_nested_workspace_virtualenv_for_imports() {
 }
 
 #[test]
+fn custom_pull_only_server_reports_diagnostics_on_edit_and_inspect() {
+    let dir = tempdir().expect("tempdir");
+    let root = dir.path().join("workspace");
+    let bin_dir = dir.path().join("bin");
+    fs::create_dir_all(&root).expect("create workspace");
+    fs::create_dir_all(&bin_dir).expect("create binary directory");
+    fs::write(root.join(".rumdl.toml"), "[global]\n").expect("write root marker");
+    let file = root.join("README.md");
+    fs::write(&file, "before\n").expect("write source");
+
+    let fake_server = fake_server_path();
+    let binary_name = fake_server
+        .file_name()
+        .expect("fake server filename")
+        .to_string_lossy()
+        .to_string();
+    fs::copy(&fake_server, bin_dir.join(&binary_name)).expect("install fake custom server");
+
+    let mut aft = AftProcess::spawn_with_env(&[
+        ("AFT_FAKE_LSP_PULL", std::ffi::OsStr::new("1")),
+        ("AFT_FAKE_LSP_DISABLE_PUSH", std::ffi::OsStr::new("1")),
+        (
+            "AFT_FAKE_LSP_SERVER_STATUS",
+            std::ffi::OsStr::new("disabled"),
+        ),
+    ]);
+    let configure = aft.send(
+        &serde_json::json!({
+            "id": "cfg-custom-pull-only",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": root,
+            "lsp_paths_extra": [bin_dir],
+            "config": crate::helpers::user_config(serde_json::json!({
+                "lsp": {
+                    "servers": {
+                        "pull-only-markdown": {
+                            "extensions": ["md"],
+                            "binary": binary_name,
+                            "args": [],
+                            "root_markers": [".rumdl.toml"]
+                        }
+                    }
+                }
+            }))
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:?}"
+    );
+
+    let edit = aft.send(
+        &serde_json::json!({
+            "id": "edit-custom-pull-only",
+            "command": "edit_match",
+            "file": file,
+            "match": "before",
+            "replacement": "after",
+            "diagnostics": true,
+            "wait_ms": 2_000
+        })
+        .to_string(),
+    );
+    assert_eq!(edit["success"], true, "edit failed: {edit:?}");
+    assert_eq!(
+        edit["lsp_complete"], true,
+        "pull response should complete the post-edit wait: {edit:?}"
+    );
+    let edit_diagnostics = edit["lsp_diagnostics"]
+        .as_array()
+        .expect("edit diagnostics array");
+    assert_eq!(edit_diagnostics.len(), 1, "edit response: {edit:?}");
+    assert_eq!(edit_diagnostics[0]["message"], "test pull diagnostic");
+
+    let inspect = aft.send(
+        &serde_json::json!({
+            "id": "inspect-custom-pull-only",
+            "command": "inspect",
+            "scope": file,
+            "sections": ["diagnostics"]
+        })
+        .to_string(),
+    );
+    assert_eq!(inspect["success"], true, "inspect failed: {inspect:?}");
+    assert_eq!(inspect["inspect_terminal"], "fresh", "inspect: {inspect:?}");
+    assert_eq!(inspect["summary"]["diagnostics"]["errors"], 1);
+    let inspect_diagnostics = inspect["details"]["diagnostics"]
+        .as_array()
+        .expect("inspect diagnostics array");
+    assert_eq!(
+        inspect_diagnostics.len(),
+        1,
+        "inspect response: {inspect:?}"
+    );
+    assert_eq!(inspect_diagnostics[0]["message"], "test pull diagnostic");
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn test_diagnostics_stored_after_did_open() {
     let (_temp_dir, _root, files) = rust_workspace_with_files(&["main.rs"]);
     let file = &files[0];

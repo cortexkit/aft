@@ -51,13 +51,12 @@ pub struct DiagnosticEntry {
     /// Optional resultId from a pull response. Sent back as `previousResultId`
     /// on the next pull request to enable `kind: "unchanged"` short-circuiting.
     pub result_id: Option<String>,
-    /// Document version this publish/pull was tagged against, when the
-    /// server provided one. Servers that participate in versioned text
-    /// document sync echo `version` on `publishDiagnostics`; we store it
-    /// so post-edit waiters can reject stale publishes deterministically
-    /// (`version == target_version`) instead of relying on epoch ordering
-    /// alone, which has a race when an old-version publish arrives after
-    /// the pre-edit drain. `None` = server didn't tag the publish.
+    /// Document version this report was proven against. Versioned
+    /// `publishDiagnostics` payloads provide it directly; a synchronous pull
+    /// response is tagged with the client's current document version. Post-edit
+    /// waiters use it to reject stale publishes deterministically instead of
+    /// relying on epoch ordering, which has a race when an old-version publish
+    /// arrives after the pre-edit drain. `None` means no version proof exists.
     pub version: Option<i32>,
     /// True after the filesystem watcher sees this file change outside AFT's
     /// text sync path and before a publish or pull response proves the cached
@@ -280,8 +279,8 @@ impl DiagnosticsStore {
     }
 
     /// Replace diagnostics with full provenance (resultId + document version).
-    /// `version` should be the LSP `version` field from `publishDiagnostics`
-    /// when the server provided one, or `None` otherwise.
+    /// `version` is either the LSP `publishDiagnostics` version or the current
+    /// client document version proven by a synchronous pull response.
     pub fn publish_full(
         &mut self,
         server: ServerKey,
@@ -747,6 +746,28 @@ impl DiagnosticsStore {
         }
         self.touch_existing(&cache_key);
         changed
+    }
+
+    /// Record that a pull `kind: unchanged` response confirmed the cached report
+    /// for a specific in-memory document version. The confirmation is a new
+    /// observation, so its epoch advances even when the cached rows did not change.
+    pub fn confirm_for_server_file_version(
+        &mut self,
+        key: &ServerKey,
+        file: &Path,
+        version: i32,
+    ) -> bool {
+        let cache_key = (key.clone(), file.to_path_buf());
+        let Some(entry) = self.entries.get_mut(&cache_key) else {
+            return false;
+        };
+        self.next_epoch = self.next_epoch.saturating_add(1);
+        self.generation = self.generation.wrapping_add(1);
+        entry.epoch = self.next_epoch;
+        entry.version = Some(version);
+        entry.stale = false;
+        self.touch_existing(&cache_key);
+        true
     }
 
     /// Promote the latest provisional report for each file when its server reaches

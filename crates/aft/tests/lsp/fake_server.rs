@@ -221,6 +221,10 @@ fn changed_diagnostics() -> Value {
     ])
 }
 
+fn push_diagnostics_enabled() -> bool {
+    std::env::var("AFT_FAKE_LSP_DISABLE_PUSH").ok().as_deref() != Some("1")
+}
+
 fn delay_changed_diagnostics_if_requested() {
     if let Some(signal_path) = std::env::var_os("AFT_FAKE_LSP_CHANGE_DELAY_SIGNAL") {
         let _ = std::fs::write(signal_path, b"waiting");
@@ -722,12 +726,16 @@ fn main() -> io::Result<()> {
                         uri.clone(),
                         version.clone(),
                     )?;
-                    write_publish_diagnostics_versioned(
-                        &mut writer,
-                        uri,
-                        opened_diagnostics(),
-                        version,
-                    )?;
+                    if push_diagnostics_enabled() {
+                        write_publish_diagnostics_versioned(
+                            &mut writer,
+                            uri,
+                            opened_diagnostics(),
+                            version,
+                        )?;
+                    } else {
+                        write_publish_diagnostics(&mut writer, uri, json!([]))?;
+                    }
                     if matches!(
                         std::env::var("AFT_FAKE_LSP_SERVER_STATUS").ok().as_deref(),
                         Some("publish_then_quiescent" | "empty_then_quiescent")
@@ -768,12 +776,14 @@ fn main() -> io::Result<()> {
                         uri.clone(),
                         version.clone(),
                     )?;
-                    write_publish_diagnostics_versioned(
-                        &mut writer,
-                        uri,
-                        changed_diagnostics(),
-                        version,
-                    )?;
+                    if push_diagnostics_enabled() {
+                        write_publish_diagnostics_versioned(
+                            &mut writer,
+                            uri,
+                            changed_diagnostics(),
+                            version,
+                        )?;
+                    }
                 }
                 "textDocument/didClose" => {
                     let uri = document_uri(&params);
