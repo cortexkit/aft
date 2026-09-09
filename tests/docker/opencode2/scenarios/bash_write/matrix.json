@@ -1,0 +1,19 @@
+{
+  "$schema": "../../harness/matrix.schema.json",
+  "schema_version": 1,
+  "platform": "linux",
+  "rows": [
+    {
+      "tool": "bash_write",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "n/a:no-permission-operation",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    }
+  ]
+}
