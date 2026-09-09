@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "derivation": "schema.properties.background",
+  "tools": [
+    "bash",
+    "powershell"
+  ]
+}

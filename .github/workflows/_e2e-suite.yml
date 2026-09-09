@@ -73,10 +73,44 @@ jobs:
           bytes=$(stat -c %s "target/$CARGO_PROFILE_DIR/aft")
           printf 'Shared Linux E2E binary: %.2f MiB (%s bytes)\n' "$(awk "BEGIN { print $bytes / 1048576 }")" "$bytes"
 
+      # The OpenCode 2 harness verifies the executable against producer-owned
+      # metadata and requires the checkout SHA in `aft --version`. Keep the
+      # ordinary binary unchanged for existing consumers and publish a sibling
+      # wrapper artifact with both properties for the Docker mount.
+      - name: Prepare same-SHA OpenCode 2 binary artifact
+        run: |
+          artifact_dir="target/opencode2-$CARGO_PROFILE_DIR"
+          mkdir -p "$artifact_dir"
+          cp "target/$CARGO_PROFILE_DIR/aft" "$artifact_dir/aft.real"
+          # shellcheck disable=SC2016
+          printf '%s\n' \
+            '#!/bin/sh' \
+            'set -eu' \
+            'HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"' \
+            'if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-V" ]; then' \
+            "  \"\$HERE/aft.real\" \"\$@\" | sed 's/\$/ ($GITHUB_SHA)/'" \
+            '  exit ${PIPESTATUS:-0}' \
+            'fi' \
+            'exec "$HERE/aft.real" "$@"' > "$artifact_dir/aft"
+          chmod +x "$artifact_dir/aft" "$artifact_dir/aft.real"
+          sha256=$(sha256sum "$artifact_dir/aft" | cut -d ' ' -f 1)
+          manifest_profile="$CARGO_PROFILE"
+          if [ "$manifest_profile" = "stage" ]; then
+            manifest_profile="ci-release"
+          fi
+          printf '{"git_sha":"%s","build_profile":"%s","sha256":"%s","source":"same-sha-artifact"}\n' \
+            "$GITHUB_SHA" "$manifest_profile" "$sha256" > "$artifact_dir/build-info.json"
+
       - uses: actions/upload-artifact@v4
         with:
           name: e2e-linux-${{ inputs.cargo_profile }}-binary
           path: target/${{ env.CARGO_PROFILE_DIR }}/aft
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: e2e-opencode2-${{ inputs.cargo_profile }}-binary
+          path: target/opencode2-${{ env.CARGO_PROFILE_DIR }}/
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
@@ -145,6 +179,105 @@ jobs:
           name: e2e-linux-plugin-log-${{ github.run_attempt }}
           path: e2e-artifacts/linux/aft-plugin.log
           if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # OpenCode 2 Linux Docker e2e — the 15-minute budget applies to this job,
+  # excluding the shared binary producer it depends on. The same local runner
+  # builds the image and executes every applicable matrix row.
+  # ---------------------------------------------------------------------------
+  e2e-opencode2-linux:
+    name: OpenCode 2 (Linux Docker)
+    needs: e2e-linux-binary
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      checks: read
+    env:
+      AFT_E2E_RUN_ID: gha-${{ github.run_id }}-${{ github.run_attempt }}
+      AFT_E2E_ARTIFACT_ROOT: /tmp/opencode2-e2e
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Download same-SHA OpenCode 2 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: e2e-opencode2-${{ inputs.cargo_profile }}-binary
+          path: ${{ runner.temp }}/aft-opencode2
+
+      - name: Restore binary executable permissions
+        run: chmod +x "$RUNNER_TEMP/aft-opencode2/aft" "$RUNNER_TEMP/aft-opencode2/aft.real"
+
+      # A running job's check is already listed for its commit. Capture the API
+      # name instead of guessing GitHub's reusable-workflow context spelling;
+      # this artifact is the input for the chair's later required-check update.
+      - name: Capture emitted check context and run identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_root="$AFT_E2E_ARTIFACT_ROOT/$AFT_E2E_RUN_ID"
+          mkdir -p "$run_root"
+          current=""
+          for attempt in 1 2 3 4 5 6; do
+            if checks=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs"); then
+              current=$(jq -c \
+                --arg run_id "$GITHUB_RUN_ID" \
+                --arg job "OpenCode 2 (Linux Docker)" \
+                '.check_runs[] | select(.details_url | contains("/actions/runs/" + $run_id + "/")) | select(.name | contains($job))' \
+                <<<"$checks" | head -n 1)
+            fi
+            if [ -n "$current" ]; then
+              break
+            fi
+            echo "Check run not listed yet (attempt $attempt/6); retrying in 5 seconds"
+            sleep 5
+          done
+          if [ -z "$current" ]; then
+            echo "::error::The current OpenCode 2 check run was not present in the commit listing"
+            exit 1
+          fi
+          jq -n \
+            --arg context "$(jq -r .name <<<"$current")" \
+            --argjson observed_run_id "$(jq -r .id <<<"$current")" \
+            --arg observed_sha "$GITHUB_SHA" \
+            '{context: $context, observed_run_id: $observed_run_id, observed_sha: $observed_sha}' \
+            > "$run_root/required-check-observation.json"
+          cat "$run_root/required-check-observation.json"
+          echo "required check: NOT MET (advisory only)"
+
+      - name: Run OpenCode 2 matrix
+        env:
+          AFT_BINARY_PATH: ${{ runner.temp }}/aft-opencode2/aft
+        run: bash tests/docker/run-opencode2-test.sh
+
+      - name: Dump per-scenario failure forensics
+        if: failure()
+        run: |
+          if [ ! -d "$AFT_E2E_ARTIFACT_ROOT/$AFT_E2E_RUN_ID/forensics" ]; then
+            echo "No scenario forensics were produced"
+            exit 0
+          fi
+          while IFS= read -r artifact; do
+            echo "::group::${artifact#"$AFT_E2E_ARTIFACT_ROOT/"}"
+            cat "$artifact"
+            echo "::endgroup::"
+          done < <(find "$AFT_E2E_ARTIFACT_ROOT/$AFT_E2E_RUN_ID/forensics" -type f \
+            \( -name failure.json -o -name mock-exchanges.ndjson -o -name host-stream.ndjson -o -name host-stderr.log \) \
+            -print | sort)
+
+      - name: Upload OpenCode 2 forensic artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-opencode2-forensics-${{ github.run_attempt }}
+          path: ${{ env.AFT_E2E_ARTIFACT_ROOT }}/${{ env.AFT_E2E_RUN_ID }}/
+          if-no-files-found: warn
+          retention-days: 14
 
   # ---------------------------------------------------------------------------
   # Pi RPC e2e — exercises the real Pi runtime + AFT Pi plugin via RPC against

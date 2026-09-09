@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "operations": [
+    {
+      "operation": "read",
+      "classification": "applicable"
+    },
+    {
+      "operation": "edit",
+      "classification": "applicable"
+    },
+    {
+      "operation": "write",
+      "classification": "applicable"
+    },
+    {
+      "operation": "apply_patch",
+      "classification": "applicable"
+    },
+    {
+      "operation": "aft_delete",
+      "classification": "applicable"
+    },
+    {
+      "operation": "aft_move",
+      "classification": "applicable"
+    },
+    {
+      "operation": "bash:withPermissionLoop",
+      "classification": "applicable"
+    },
+    {
+      "operation": "bash:host-fallback",
+      "classification": "applicable"
+    }
+  ]
+}

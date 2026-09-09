@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "derivation": "opencode-plugin edit-permission registration metadata",
+  "tools": [
+    "apply_patch",
+    "ast_replace",
+    "bash",
+    "delete",
+    "edit",
+    "import",
+    "move",
+    "safety",
+    "write"
+  ]
+}

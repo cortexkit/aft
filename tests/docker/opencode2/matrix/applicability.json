@@ -1,0 +1,306 @@
+{
+  "schema_version": 1,
+  "platform": "linux",
+  "rows": [
+    {
+      "tool": "apply_patch",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "applicable",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "ast_replace",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "n/a:no-permission-operation",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "ast_search",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "n/a:no-permission-operation",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "bash",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "applicable",
+        "T4": "applicable",
+        "T5": "applicable",
+        "T6": "applicable",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "bash_kill",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "n/a:no-permission-operation",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "bash_status",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "n/a:no-permission-operation",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "bash_watch",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "n/a:no-permission-operation",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "bash_write",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "n/a:no-permission-operation",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "callgraph",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "n/a:no-permission-operation",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "applicable",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "conflicts",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "n/a:no-permission-operation",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "delete",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "applicable",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "edit",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "applicable",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "glob",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "n/a:no-permission-operation",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "applicable",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "grep",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "n/a:no-permission-operation",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "applicable",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "import",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "n/a:no-permission-operation",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "inspect",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "n/a:no-permission-operation",
+        "T4": "applicable",
+        "T5": "n/a:no-background-capability",
+        "T6": "applicable",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "move",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "applicable",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "outline",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "n/a:no-permission-operation",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "applicable",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "powershell",
+      "trajectories": {
+        "T1": "n/a:platform",
+        "T2": "n/a:platform",
+        "T3": "n/a:platform",
+        "T4": "n/a:platform",
+        "T5": "n/a:platform",
+        "T6": "n/a:platform",
+        "T7": "n/a:platform"
+      }
+    },
+    {
+      "tool": "read",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "applicable",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "safety",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "n/a:no-permission-operation",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "search",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "n/a:no-permission-operation",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "applicable",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "status",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "n/a:no-permission-operation",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "write",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "applicable",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    },
+    {
+      "tool": "zoom",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "n/a:no-permission-operation",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    }
+  ]
+}

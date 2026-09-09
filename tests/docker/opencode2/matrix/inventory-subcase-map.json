@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "operations": {
+    "read": {
+      "tool": "read",
+      "subcase_prefix": "read"
+    },
+    "edit": {
+      "tool": "edit",
+      "subcase_prefix": "edit"
+    },
+    "write": {
+      "tool": "write",
+      "subcase_prefix": "write"
+    },
+    "apply_patch": {
+      "tool": "apply_patch",
+      "subcase_prefix": "apply_patch"
+    },
+    "aft_delete": {
+      "tool": "delete",
+      "subcase_prefix": "delete"
+    },
+    "aft_move": {
+      "tool": "move",
+      "subcase_prefix": "move"
+    },
+    "bash:withPermissionLoop": {
+      "tool": "bash",
+      "subcase_prefix": "loop"
+    },
+    "bash:host-fallback": {
+      "tool": "bash",
+      "subcase_prefix": "fallback"
+    }
+  }
+}
