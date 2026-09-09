@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "tool": "delete",
+  "controls": [
+    {
+      "id": "delete-t1-agent-text",
+      "mutated_input": "delete/T1 result text",
+      "expected_failure": "shape comparison failed",
+      "unaffected_positive_control": "delete/T2/invalid_arguments"
+    },
+    {
+      "id": "delete-t2-host-rejection",
+      "mutated_input": "delete/T2 invalid fixture",
+      "expected_failure": "host schema rejection mismatch",
+      "unaffected_positive_control": "delete/T1/happy"
+    },
+    {
+      "id": "delete-parity-shape",
+      "mutated_input": "delete/T7 projected fixture marker",
+      "expected_failure": "projected V1/V2 parity mismatch",
+      "unaffected_positive_control": "delete/T1/happy"
+    },
+    {
+      "id": "delete-permission-path-identity",
+      "mutated_input": "delete/T3 requested path",
+      "expected_failure": "permission path identity mismatch",
+      "unaffected_positive_control": "delete/T1/happy"
+    },
+    {
+      "id": "delete-three-state-intermediate",
+      "mutated_input": "delete/T3 intermediate path state",
+      "expected_failure": "no_effect_observed",
+      "unaffected_positive_control": "delete/T3/delete_ask_deny"
+    },
+    {
+      "id": "delete-restore-state",
+      "mutated_input": "delete/T3 restore call",
+      "expected_failure": "restore_state_mismatch",
+      "unaffected_positive_control": "delete/T3/delete_ask_deny"
+    }
+  ]
+}

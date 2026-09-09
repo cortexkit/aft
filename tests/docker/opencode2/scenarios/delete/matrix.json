@@ -1,0 +1,19 @@
+{
+  "$schema": "../../harness/matrix.schema.json",
+  "schema_version": 1,
+  "platform": "linux",
+  "rows": [
+    {
+      "tool": "delete",
+      "trajectories": {
+        "T1": "applicable",
+        "T2": "applicable",
+        "T3": "applicable",
+        "T4": "n/a:no-abortable-operation",
+        "T5": "n/a:no-background-capability",
+        "T6": "n/a:no-list-surface",
+        "T7": "applicable"
+      }
+    }
+  ]
+}

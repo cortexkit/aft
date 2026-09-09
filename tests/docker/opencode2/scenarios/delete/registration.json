@@ -1,0 +1,385 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "delete",
+  "scenarios": [
+    {
+      "schema_version": 1,
+      "id": "delete/T1/happy",
+      "tool": "delete",
+      "trajectory": "T1",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the deterministic delete fixture call.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "delete-happy",
+                "name": "aft_delete",
+                "arguments": {
+                  "files": [
+                    "delete-me.txt"
+                  ]
+                },
+                "disk_effects": [
+                  "delete-me.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "delete-happy",
+      "comparison": {
+        "mode": "shape",
+        "rules": [
+          {
+            "kind": "field",
+            "field": "fixture_marker",
+            "pattern": "^(?=[\\s\\S]*(?<value>delete-me\\.txt))[\\s\\S]+$",
+            "min_lines": 1,
+            "max_lines": 10000
+          }
+        ],
+        "expected": {
+          "fixture_marker": "delete-me.txt"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "delete/T2/invalid_arguments",
+      "tool": "delete",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted delete call with an invalid argument type.",
+      "fixture": "./fixture",
+      "subcase": "invalid_arguments",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "delete-invalid",
+                "name": "aft_delete",
+                "arguments": {
+                  "files": 42
+                },
+                "non_mutating_evidence": {
+                  "reason": "the host rejects the argument type before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "delete/T2/missing_target",
+      "tool": "delete",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted delete call without its required target.",
+      "fixture": "./fixture",
+      "subcase": "missing_target",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "delete-missing",
+                "name": "aft_delete",
+                "arguments": {},
+                "non_mutating_evidence": {
+                  "reason": "the host rejects missing required arguments before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "delete/T3/delete_ask_allow",
+      "tool": "delete",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Allow the delete mutation and restore its checkpoint.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "checkpoint",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "delete-checkpoint",
+                "name": "aft_safety",
+                "arguments": {
+                  "op": "checkpoint",
+                  "name": "delete-t3",
+                  "files": [
+                    "delete-me.txt"
+                  ]
+                },
+                "non_mutating_evidence": {
+                  "reason": "checkpoint creation does not alter the fixture project"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "mutate",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "delete-allow-mutation",
+                "name": "aft_delete",
+                "arguments": {
+                  "files": [
+                    "delete-me.txt"
+                  ]
+                },
+                "disk_effects": [
+                  "delete-me.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "restore",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "delete-restore",
+                "name": "aft_safety",
+                "arguments": {
+                  "op": "restore",
+                  "name": "delete-t3"
+                },
+                "disk_effects": [
+                  "delete-me.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "checkpoint",
+        "mutate",
+        "restore",
+        "finish"
+      ],
+      "restore_evidence": {
+        "operation": "checkpoint_restore",
+        "identifier": "delete-t3",
+        "calls": [
+          {
+            "tool": "aft_safety",
+            "arguments": {
+              "op": "checkpoint",
+              "name": "delete-t3",
+              "files": [
+                "delete-me.txt"
+              ]
+            }
+          },
+          {
+            "tool": "aft_delete",
+            "arguments": {
+              "files": [
+                "delete-me.txt"
+              ]
+            }
+          },
+          {
+            "tool": "aft_safety",
+            "arguments": {
+              "op": "restore",
+              "name": "delete-t3"
+            }
+          }
+        ],
+        "paths": [
+          {
+            "path": "delete-me.txt",
+            "transition": "delete"
+          }
+        ]
+      },
+      "metadata": {
+        "permission": {
+          "operation": "delete",
+          "reply": "once",
+          "requested_paths": [
+            "delete-me.txt"
+          ]
+        },
+        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "delete/T3/delete_ask_deny",
+      "tool": "delete",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Deny the delete mutation.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "delete-ask_deny",
+                "name": "aft_delete",
+                "arguments": {
+                  "files": [
+                    "delete-me.txt"
+                  ]
+                },
+                "non_mutating_evidence": {
+                  "reason": "reject prevents fixture mutation"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "metadata": {
+        "permission": {
+          "operation": "delete",
+          "reply": "reject",
+          "requested_paths": [
+            "delete-me.txt"
+          ]
+        },
+        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "delete/T3/delete_config_deny",
+      "tool": "delete",
+      "trajectory": "T3",
+      "execution": "shared-server",
+      "prompt": "Configuration-deny the delete mutation.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "delete-config_deny",
+                "name": "aft_delete",
+                "arguments": {
+                  "files": [
+                    "delete-me.txt"
+                  ]
+                },
+                "non_mutating_evidence": {
+                  "reason": "config_deny prevents fixture mutation"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "metadata": {
+        "permission": {
+          "operation": "delete",
+          "reply": "config_deny",
+          "requested_paths": [
+            "delete-me.txt"
+          ]
+        }
+      }
+    }
+  ]
+}
