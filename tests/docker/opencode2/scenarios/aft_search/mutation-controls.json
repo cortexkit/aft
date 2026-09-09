@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "tool": "search",
+  "controls": [
+    {
+      "id": "search-t1-agent-text",
+      "mutated_input": "search/T1 result text",
+      "expected_failure": "shape comparison failed",
+      "unaffected_positive_control": "search/T2/invalid_arguments"
+    },
+    {
+      "id": "search-t2-host-rejection",
+      "mutated_input": "search/T2 invalid fixture",
+      "expected_failure": "host schema rejection mismatch",
+      "unaffected_positive_control": "search/T1/happy"
+    },
+    {
+      "id": "search-parity-shape",
+      "mutated_input": "search/T7 projected fixture marker",
+      "expected_failure": "projected V1/V2 parity mismatch",
+      "unaffected_positive_control": "search/T1/happy"
+    },
+    {
+      "id": "search-t6-supported-reason",
+      "mutated_input": "search/T6 triggered_reason",
+      "expected_failure": "search..payload.results does not support reason",
+      "unaffected_positive_control": "search/T6 complete fixture"
+    },
+    {
+      "id": "search-t6-complete-no-trailer",
+      "mutated_input": "search/T6 complete fixture",
+      "expected_failure": "complete T6 fixture rendered a truncation trailer",
+      "unaffected_positive_control": "search/T6 incomplete fixture"
+    }
+  ]
+}

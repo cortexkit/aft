@@ -1,0 +1,252 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "search",
+  "scenarios": [
+    {
+      "schema_version": 1,
+      "id": "search/T1/happy",
+      "tool": "search",
+      "trajectory": "T1",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the deterministic search fixture call.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "search-happy",
+                "name": "aft_search",
+                "arguments": {
+                  "query": "uniqueScenarioSymbol",
+                  "topK": 10
+                },
+                "non_mutating_evidence": {
+                  "reason": "search only observes fixture state"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "search-happy",
+      "comparison": {
+        "mode": "shape",
+        "rules": [
+          {
+            "kind": "field",
+            "field": "fixture_marker",
+            "pattern": "^(?=[\\s\\S]*(?<value>uniqueScenarioSymbol))[\\s\\S]+$",
+            "min_lines": 1,
+            "max_lines": 10000
+          }
+        ],
+        "expected": {
+          "fixture_marker": "uniqueScenarioSymbol"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "search/T2/invalid_arguments",
+      "tool": "search",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted search call with an invalid argument type.",
+      "fixture": "./fixture",
+      "subcase": "invalid_arguments",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "search-invalid",
+                "name": "aft_search",
+                "arguments": {
+                  "query": 42
+                },
+                "non_mutating_evidence": {
+                  "reason": "the host rejects the argument type before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "search/T2/missing_target",
+      "tool": "search",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted search call without its required target.",
+      "fixture": "./fixture",
+      "subcase": "missing_target",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "search-missing",
+                "name": "aft_search",
+                "arguments": {},
+                "non_mutating_evidence": {
+                  "reason": "the host rejects missing required arguments before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "search/T6/search-payload-results/complete",
+      "tool": "search",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the complete search..payload.results fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "search-t6-search-payload-results-complete",
+                "name": "aft_search",
+                "arguments": {
+                  "query": "uniqueScenarioSymbol",
+                  "topK": 10
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "search-t6-search-payload-results-complete",
+      "metadata": {
+        "t6": {
+          "surface_id": "search..payload.results",
+          "owner": "search",
+          "call_id": "search-t6-search-payload-results-complete",
+          "fixture": "complete"
+        }
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "search/T6/search-payload-results/incomplete",
+      "tool": "search",
+      "trajectory": "T6",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Run the incomplete search..payload.results fixture.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "search-t6-search-payload-results-incomplete",
+                "name": "aft_search",
+                "arguments": {
+                  "query": "bulkScenarioSymbol",
+                  "topK": 1
+                },
+                "non_mutating_evidence": {
+                  "reason": "truncation fixtures only observe project data"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ],
+      "compare_call_id": "search-t6-search-payload-results-incomplete",
+      "metadata": {
+        "t6": {
+          "surface_id": "search..payload.results",
+          "owner": "search",
+          "call_id": "search-t6-search-payload-results-incomplete",
+          "fixture": "incomplete",
+          "triggered_reason": "cap"
+        }
+      }
+    }
+  ]
+}
