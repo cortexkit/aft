@@ -1,0 +1,19 @@
+{
+  "$schema": "../../harness/matrix.schema.json",
+  "schema_version": 1,
+  "platform": "linux",
+  "rows": [
+    {
+      "tool": "powershell",
+      "trajectories": {
+        "T1": "n/a:platform",
+        "T2": "n/a:platform",
+        "T3": "n/a:platform",
+        "T4": "n/a:platform",
+        "T5": "n/a:platform",
+        "T6": "n/a:platform",
+        "T7": "n/a:platform"
+      }
+    }
+  ]
+}

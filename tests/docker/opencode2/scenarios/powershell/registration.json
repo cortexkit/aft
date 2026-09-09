@@ -1,0 +1,6 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "powershell",
+  "scenarios": []
+}

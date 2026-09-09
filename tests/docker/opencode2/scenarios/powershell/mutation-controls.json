@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "tool": "powershell",
+  "controls": [
+    {
+      "id": "powershell-linux-registration-absence",
+      "mutated_input": "a scripted powershell scenario on Linux",
+      "expected_failure": "powershell must not register scenarios on linux",
+      "unaffected_positive_control": "powershell T1-T7 n/a:platform row"
+    }
+  ]
+}
