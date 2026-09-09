@@ -300,7 +300,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "line text preview truncation, not a list truncation",
     },
     ExclusionEntry {
-        file: "commands/semantic_search.rs",
+        file: "commands/semantic_search/mod.rs",
         enclosing_item: "collect_degraded_grep_files, empty_degraded_grep_fallback_names_missing_semantic_coverage, execute_degraded_grep_fallback, handle_external_bounded_lexical_fallback, semantic_unavailable_grep_fallback_response",
         location_or_primitive: "commands::semantic_search degraded grep fallback status",
         reason: "internal fallback search status notes and degraded grep walk markers",
