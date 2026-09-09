@@ -1,0 +1,228 @@
+{
+  "$schema": "../../harness/registration.schema.json",
+  "schema_version": 1,
+  "tool": "safety",
+  "scenarios": [
+    {
+      "schema_version": 1,
+      "id": "safety/T1/checkpoint_restore",
+      "tool": "safety",
+      "trajectory": "T1",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Checkpoint editable.txt, change it, and restore the checkpoint.",
+      "fixture": "./fixture",
+      "turns": [
+        {
+          "label": "checkpoint",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "safety-checkpoint",
+                "name": "aft_safety",
+                "arguments": {
+                  "op": "checkpoint",
+                  "name": "safety-t1",
+                  "files": [
+                    "editable.txt"
+                  ]
+                },
+                "non_mutating_evidence": {
+                  "reason": "checkpoint creation leaves fixture bytes unchanged"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "prepare-mutation",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "safety-write",
+                "name": "write",
+                "arguments": {
+                  "filePath": "editable.txt",
+                  "content": "after safety checkpoint\n"
+                },
+                "disk_effects": [
+                  "editable.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "restore",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "safety-restore",
+                "name": "aft_safety",
+                "arguments": {
+                  "op": "restore",
+                  "name": "safety-t1"
+                },
+                "disk_effects": [
+                  "editable.txt"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "checkpoint",
+        "prepare-mutation",
+        "restore",
+        "finish"
+      ],
+      "compare_call_id": "safety-restore",
+      "comparison": {
+        "mode": "shape",
+        "rules": [
+          {
+            "kind": "field",
+            "field": "checkpoint",
+            "pattern": "^(?=[\\s\\S]*(?<value>safety-t1))[\\s\\S]+$",
+            "min_lines": 1,
+            "max_lines": 10000
+          }
+        ],
+        "expected": {
+          "checkpoint": "safety-t1"
+        }
+      },
+      "restore_evidence": {
+        "operation": "checkpoint_restore",
+        "identifier": "safety-t1",
+        "calls": [
+          {
+            "tool": "aft_safety",
+            "arguments": {
+              "op": "checkpoint",
+              "name": "safety-t1",
+              "files": [
+                "editable.txt"
+              ]
+            }
+          },
+          {
+            "tool": "write",
+            "arguments": {
+              "filePath": "editable.txt",
+              "content": "after safety checkpoint\n"
+            }
+          },
+          {
+            "tool": "aft_safety",
+            "arguments": {
+              "op": "restore",
+              "name": "safety-t1"
+            }
+          }
+        ],
+        "paths": [
+          {
+            "path": "editable.txt",
+            "transition": "edit"
+          }
+        ]
+      }
+    },
+    {
+      "schema_version": 1,
+      "id": "safety/T2/invalid_arguments",
+      "tool": "safety",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted safety call with an invalid argument type.",
+      "fixture": "./fixture",
+      "subcase": "invalid_arguments",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "safety-invalid",
+                "name": "aft_safety",
+                "arguments": {
+                  "op": 42
+                },
+                "non_mutating_evidence": {
+                  "reason": "the host rejects the argument type before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    },
+    {
+      "schema_version": 1,
+      "id": "safety/T2/missing_target",
+      "tool": "safety",
+      "trajectory": "T2",
+      "execution": "standalone",
+      "auto": true,
+      "prompt": "Attempt the scripted safety call without its required target.",
+      "fixture": "./fixture",
+      "subcase": "missing_target",
+      "error_origin": "host",
+      "turns": [
+        {
+          "label": "call-tool",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "safety-missing",
+                "name": "aft_safety",
+                "arguments": {},
+                "non_mutating_evidence": {
+                  "reason": "the host rejects missing required arguments before execution"
+                }
+              }
+            ]
+          }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
+        }
+      ],
+      "expected_turns": [
+        "call-tool",
+        "finish"
+      ]
+    }
+  ]
+}

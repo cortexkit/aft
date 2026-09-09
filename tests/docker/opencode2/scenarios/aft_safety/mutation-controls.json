@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "tool": "safety",
+  "controls": [
+    {
+      "id": "safety-t1-agent-text",
+      "mutated_input": "safety/T1 result text",
+      "expected_failure": "shape comparison failed",
+      "unaffected_positive_control": "safety/T2/invalid_arguments"
+    },
+    {
+      "id": "safety-t2-host-rejection",
+      "mutated_input": "safety/T2 invalid fixture",
+      "expected_failure": "host schema rejection mismatch",
+      "unaffected_positive_control": "safety/T1/happy"
+    },
+    {
+      "id": "safety-parity-shape",
+      "mutated_input": "safety/T7 projected fixture marker",
+      "expected_failure": "projected V1/V2 parity mismatch",
+      "unaffected_positive_control": "safety/T1/happy"
+    },
+    {
+      "id": "safety-three-state-intermediate",
+      "mutated_input": "safety/T1 preparatory write",
+      "expected_failure": "no_effect_observed",
+      "unaffected_positive_control": "safety/T2/invalid_arguments"
+    },
+    {
+      "id": "safety-restore-state",
+      "mutated_input": "safety/T1 restore call",
+      "expected_failure": "restore_state_mismatch",
+      "unaffected_positive_control": "safety/T2/invalid_arguments"
+    }
+  ]
+}
