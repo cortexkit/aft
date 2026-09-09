@@ -9,8 +9,8 @@ from typing import Any
 from search_quality_lib import (
     EVIDENCE_SHA, GateResult, InputFault, STRATA, atomic_write_pair, blake3,
     canonical_json, choose_stop, derive_slice_class, estimator, identity_delta,
-    included_manifest_ids, invariance_requests, profile_requests, row_metrics,
-    sample_plan, sha256_bytes, sha256_file, total_gate, validate_profile_score,
+    included_manifest_ids, invariance_requests, profile_requests, real_query_behavior_diff,
+    row_metrics, sample_plan, sha256_bytes, sha256_file, total_gate, validate_profile_score,
     validate_scored_population,
 )
 
@@ -193,7 +193,8 @@ def run(args:argparse.Namespace)->int:
         print(json.dumps(result,sort_keys=True)); return 0
     sidecar=binding(reference_path,manifest_path,sidecar_path)
     if not args.score: raise InputFault("missing_score")
-    score=read_json(Path(args.score)); reference=read_json(reference_path)
+    score_path=Path(args.score); score=read_json(score_path); reference=read_json(reference_path)
+    diff_path=score_path.with_suffix(".diff.txt"); diff_path.write_text(real_query_behavior_diff(reference,score)); print(f"real_query_diff:{diff_path}")
     path=descriptor_path(args.descriptor,args.branch); descriptor=read_json(path) if path else None
     paths=diff_paths(args.base_ref,args.head)
     if args.rebaseline:

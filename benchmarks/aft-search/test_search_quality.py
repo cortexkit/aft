@@ -49,12 +49,27 @@ class EngineUnwiredGateTests(unittest.TestCase):
             ("engine_unwired_mismatch:row=real_query.followup-census:1",),
         )
 
+    def test_engine_unwired_accepts_cross_python_aggregate_rounding(self) -> None:
+        self.reference["families"]["real_query"]["mrr_at_10"] = 0.1976190476190476
+        self.reference["shapes"]["identifier"]["mrr_at_10"] = 0.1976190476190476
+        self.reference["mechanisms"]["topk_cut"]["mrr_at_10"] = 0.1845238095238095
+        self.reference["census_weighted_mrr_report_only"] = 0.042149841269841275
+        changed = copy.deepcopy(self.reference)
+        changed["families"]["real_query"]["mrr_at_10"] = 0.19761904761904764
+        changed["shapes"]["identifier"]["mrr_at_10"] = 0.19761904761904764
+        changed["mechanisms"]["topk_cut"]["mrr_at_10"] = 0.18452380952380953
+        changed["census_weighted_mrr_report_only"] = 0.04214984126984127
+        self.assertEqual(self.gate(changed).exit_code, 0)
+
     def test_engine_unwired_rejects_real_query_aggregate_drift(self) -> None:
         changed = copy.deepcopy(self.score)
         changed["families"]["real_query"]["mrr_at_10"] = 0.6
         result = self.gate(changed)
         self.assertEqual(result.exit_code, 2)
-        self.assertEqual(result.reasons, ("engine_unwired_mismatch:row=real_query.score",))
+        self.assertEqual(
+            result.reasons,
+            ("engine_unwired_mismatch:row=real_query.families.real_query.mrr_at_10",),
+        )
 
     def test_engine_unwired_rejects_exact_family_drift(self) -> None:
         changed = copy.deepcopy(self.score)
@@ -82,7 +97,7 @@ class EngineUnwiredGateTests(unittest.TestCase):
         changed["profile"] = "paged"
         result = self.gate(changed)
         self.assertEqual(result.exit_code, 2)
-        self.assertEqual(result.reasons, ("engine_unwired_mismatch:row=real_query.score",))
+        self.assertEqual(result.reasons, ("engine_unwired_mismatch:row=real_query.profile",))
 
     def test_engine_unwired_rejects_inline_parity_fixture_changes(self) -> None:
         result = self.gate(self.score, self.ranking_paths + [TOOL_CALL_PARITY_FIXTURE_SOURCE])

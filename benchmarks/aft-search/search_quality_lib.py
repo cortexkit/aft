@@ -7,6 +7,7 @@ validate benchmark inputs without installing packages or consulting a network.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import math
@@ -544,20 +545,73 @@ def _first_row_difference(reference: Mapping[str, Any], score: Mapping[str, Any]
     return None
 
 
-def _real_query_score_bytes(document: Mapping[str, Any]) -> bytes:
-    """Return canonical behavior bytes after removing recorder-only provenance.
+def _quantize_aggregate(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _quantize_aggregate(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_quantize_aggregate(item) for item in value]
+    if isinstance(value, float):
+        return quantize6(value)
+    return value
 
-    A recorded reference rewrites its schema and identifies the old binary and
-    baseline, so those fields differ even when a new binary leaves every query
-    unchanged. The reference binding authenticates that full committed file;
-    rows and exact/concept family results are compared separately here.
+
+def _real_query_score_document(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Return behavior fields with derived floating-point aggregates normalized.
+
+    Python 3.12 changed ``sum`` to use compensated summation, so aggregates made
+    from byte-identical rows can differ from older Python results by one ULP.
+    Rows remain exact; six decimal places remove that runtime-only difference
+    from their derived summaries without weakening row-level comparisons.
     """
     score = dict(document)
     for key in ("schema", "baseline_path", "baseline_sha256", "binary_sha256", "fixture_groups", "rows"):
         score.pop(key, None)
     families = document.get("families", {})
-    score["families"] = {"real_query": families.get("real_query") if isinstance(families, Mapping) else None}
-    return canonical_json(score)
+    real_query = families.get("real_query") if isinstance(families, Mapping) else None
+    score["families"] = {"real_query": _quantize_aggregate(real_query)}
+    for key in ("shapes", "mechanisms", "census_weighted_mrr_report_only"):
+        if key in score:
+            score[key] = _quantize_aggregate(score[key])
+    return score
+
+
+def _real_query_score_bytes(document: Mapping[str, Any]) -> bytes:
+    """Return canonical behavior bytes after removing recorder-only provenance."""
+    return canonical_json(_real_query_score_document(document))
+
+
+def _first_value_difference(reference: Any, score: Any, path: str = "") -> str | None:
+    if isinstance(reference, Mapping) and isinstance(score, Mapping):
+        for key in sorted(set(reference) | set(score)):
+            child = f"{path}.{key}" if path else str(key)
+            if key not in reference or key not in score:
+                return child
+            difference = _first_value_difference(reference[key], score[key], child)
+            if difference:
+                return difference
+        return None
+    if isinstance(reference, list) and isinstance(score, list):
+        for index in range(max(len(reference), len(score))):
+            child = f"{path}[{index}]"
+            if index >= len(reference) or index >= len(score):
+                return child
+            difference = _first_value_difference(reference[index], score[index], child)
+            if difference:
+                return difference
+        return None
+    return path if canonical_json(reference) != canonical_json(score) else None
+
+
+def real_query_behavior_diff(reference: Mapping[str, Any], score: Mapping[str, Any]) -> str:
+    """Build an artifact-friendly diff of rows and normalized score metadata."""
+    old = _real_query_score_document(reference)
+    new = _real_query_score_document(score)
+    old["rows"] = reference.get("rows")
+    new["rows"] = score.get("rows")
+    old_lines = json.dumps(old, indent=2, sort_keys=True, ensure_ascii=False).splitlines()
+    new_lines = json.dumps(new, indent=2, sort_keys=True, ensure_ascii=False).splitlines()
+    lines = list(difflib.unified_diff(old_lines, new_lines, fromfile="reference", tofile="head", lineterm=""))
+    return ("\n".join(lines) + "\n") if lines else "real_query_behavior:equal\n"
 
 
 def _first_family_difference(reference: Mapping[str, Any], score: Mapping[str, Any], family: str) -> str | None:
@@ -583,8 +637,11 @@ def _engine_unwired_difference(reference: Mapping[str, Any], score: Mapping[str,
     row = _first_row_difference(reference, score)
     if row:
         return row
-    if _real_query_score_bytes(reference) != _real_query_score_bytes(score):
-        return "real_query.score"
+    old_score = _real_query_score_document(reference)
+    new_score = _real_query_score_document(score)
+    difference = _first_value_difference(old_score, new_score)
+    if difference:
+        return f"real_query.{difference}"
     for family in ("exact_recall", "concept_recall"):
         row = _first_family_difference(reference, score, family)
         if row:
