@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[allow(dead_code)]
 #[path = "../src/commands/semantic_search/anchored_lane.rs"]
 mod anchored_lane;
 

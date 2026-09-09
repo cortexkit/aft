@@ -18,6 +18,7 @@ pub mod search_index {
     pub use aft::search_index::*;
 }
 
+#[allow(dead_code)]
 #[path = "../src/commands/semantic_search/lexical_lane.rs"]
 mod lexical_lane;
 

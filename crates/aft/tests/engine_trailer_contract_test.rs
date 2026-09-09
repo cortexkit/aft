@@ -15,12 +15,16 @@ mod plan_table {
     pub use aft::commands::semantic_search::plan_table::*;
 }
 
+#[allow(dead_code)]
 #[path = "../src/commands/semantic_search/blocks.rs"]
 mod blocks;
+#[allow(dead_code)]
 #[path = "../src/commands/semantic_search/paging.rs"]
 mod paging;
+#[allow(dead_code)]
 #[path = "../src/commands/semantic_search/scoring.rs"]
 mod scoring;
+#[allow(dead_code)]
 #[path = "../src/commands/semantic_search/trailer.rs"]
 mod trailer;
 
