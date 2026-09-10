@@ -226,16 +226,11 @@ fn slices() -> Vec<Slice> {
                 FenceRule::Exact("packages/pi-plugin/src/__tests__/semantic.test.ts"),
                 FenceRule::Exact("packages/pi-plugin/src/tools/semantic.ts"),
             ],
-            landed_paths: vec![
-                "benchmarks/aft-search/engine-fixtures/surface/cases.json",
-                "crates/aft/src/subc_tool_schemas.json",
-                "crates/aft/tests/engine_surface_contract_test.rs",
-                "packages/opencode-plugin/src/__tests__/semantic.test.ts",
-                "packages/opencode-plugin/src/tools/semantic.ts",
-                "packages/pi-plugin/src/__tests__/semantic-renderers.test.ts",
-                "packages/pi-plugin/src/__tests__/semantic.test.ts",
-                "packages/pi-plugin/src/tools/semantic.ts",
-            ],
+            // A9 is settled but held off main until the integration slice
+            // wires `offset` in the backend (the search-quality gate refuses a
+            // surface that declares an offset the backend does not honor); its
+            // landed paths are recorded when it lands with that slice.
+            landed_paths: vec![],
         },
         Slice {
             id: "A10-fence-and-ownership-audit",
@@ -306,6 +301,17 @@ fn is_b_owned(path: &str) -> bool {
     B_OWNED_EXACT.contains(&path) || path.starts_with(".github/workflows/")
 }
 
+/// Whether any path under a fence rule exists in the tree: an exact file, or
+/// a prefix directory with at least one entry.
+fn fence_exists(root: &Path, rule: FenceRule) -> bool {
+    match rule {
+        FenceRule::Exact(path) => root.join(path).exists(),
+        FenceRule::Prefix(prefix) => fs::read_dir(root.join(prefix))
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false),
+    }
+}
+
 fn validate_slice_map(root: &Path, slices: &[Slice]) -> Result<BTreeMap<String, String>, String> {
     let expected = constraint_paths(root);
     let mut owners = BTreeMap::new();
@@ -336,7 +342,11 @@ fn validate_slice_map(root: &Path, slices: &[Slice]) -> Result<BTreeMap<String, 
 
     for slice in slices {
         for (index, rule) in slice.fence.iter().enumerate() {
-            if !used_rules.contains(&(slice.id, index)) {
+            // A declared fence whose paths do not exist yet (an unlanded
+            // slice) is not outside the union; only a fence that exists in
+            // the tree and is unclaimed by the constraints is.
+            let fence_exists_in_tree = fence_exists(root, *rule);
+            if !used_rules.contains(&(slice.id, index)) && fence_exists_in_tree {
                 return Err(format!(
                     "slice `{}` fence `{}` is outside the constraints union",
                     slice.id,
@@ -363,10 +373,20 @@ fn validate_slice_map(root: &Path, slices: &[Slice]) -> Result<BTreeMap<String, 
         }
     }
 
-    let landed = slices
+    // Every constraint path is either landed by one slice or owned by the
+    // fence of a slice that is settled but not yet on main (an unlanded
+    // slice owns its paths by declaration; landing is by inventory).
+    let mut landed = slices
         .iter()
         .flat_map(|slice| slice.landed_paths.iter().copied())
         .collect::<BTreeSet<_>>();
+    for slice in slices.iter().filter(|slice| slice.landed_paths.is_empty()) {
+        for path in expected.iter() {
+            if slice.fence.iter().any(|rule| rule.matches(path)) {
+                landed.insert(path.as_str());
+            }
+        }
+    }
     let expected_refs = expected.iter().map(String::as_str).collect::<BTreeSet<_>>();
     if landed != expected_refs {
         return Err(format!(
