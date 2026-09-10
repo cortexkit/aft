@@ -121,6 +121,19 @@ function executionArguments(name: string, input: Record<string, unknown>): Recor
   return { filePath: path, ...rest };
 }
 
+function hostPermission(name: string): string | undefined {
+  const bare = bareToolName(name);
+  if (bare === "read") return "read";
+  if (V2_BASH_TOOLS.has(name)) return "bash";
+  if (
+    new Set(["write", "edit", "apply_patch", "delete", "move", "ast_grep_replace", "import"])
+      .has(bare)
+  ) {
+    return "edit";
+  }
+  return undefined;
+}
+
 function assertV2Contract(name: string, input: ReturnType<typeof tool.schema.object>): void {
   if (!V2_TOOL_NAME.test(name)) {
     throw new Error(
@@ -165,9 +178,7 @@ function runtimeFor(
     },
     ask: (request) => {
       if (consumers.requestPermission) return consumers.requestPermission(request, context);
-      return Promise.reject(
-        new Error("V2 permission requests require the host permission endpoint consumer"),
-      );
+      return Promise.resolve();
     },
     progress: context.progress,
   };
@@ -189,7 +200,11 @@ export function projectV2Tool(
     name,
     description: definition.description,
     input,
-    options: { ...sharedOptions, codemode: false },
+    options: {
+      ...sharedOptions,
+      ...(hostPermission(name) ? { permission: hostPermission(name) } : {}),
+      codemode: false,
+    },
     execute: (rawInput, context) =>
       Effect.tryPromise({
         try: async (signal) => {

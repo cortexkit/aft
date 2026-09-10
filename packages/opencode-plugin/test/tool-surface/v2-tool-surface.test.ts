@@ -120,7 +120,7 @@ describe("OpenCode V2 tool surface", () => {
     );
     for (const definition of registration.added) {
       expect(definition.name).toMatch(TOOL_NAME);
-      expect(definition.options).toEqual({ codemode: false });
+      expect(definition.options?.codemode).toBe(false);
       const schema = jsonSchema(definition);
       expect(schema.type).toBe("object");
       expect(schema).not.toHaveProperty("anyOf");
@@ -179,6 +179,9 @@ describe("OpenCode V2 tool surface", () => {
     expect(jsonSchema(projected.get("read") as V2ProviderTool).properties).not.toHaveProperty(
       "filePath",
     );
+    expect(projected.get("read")?.options?.permission).toBe("read");
+    expect(projected.get("apply_patch")?.options?.permission).toBe("edit");
+    expect(projected.get("bash")?.options?.permission).toBe("bash");
   });
 
   test("maps canonical V2 path input back to the shared executor field", async () => {
