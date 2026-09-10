@@ -220,6 +220,8 @@ struct SemanticSearchParams {
     query: String,
     #[serde(default = "default_top_k", alias = "topK")]
     top_k: usize,
+    #[serde(default)]
+    offset: usize,
     #[serde(default, alias = "includeTests")]
     include_tests: bool,
     #[serde(default)]
@@ -348,6 +350,10 @@ fn cancelled_search_response_from_id(request_id: &str) -> Response {
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     use extensions::{DefaultSearchExtensions, QueryFacts, Readiness, Root, SearchExtensions, Token};
 
+    let page_request = match paging::parse_public_page_request(&req.params) {
+        Ok(request) => request,
+        Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
+    };
     let facts = QueryFacts::new(
         req.params
             .get("query")
@@ -356,7 +362,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     );
     let extensions = DefaultSearchExtensions;
     let shape = extensions.classify(&facts);
-    let _variants = extensions.variants(Token {
+    let variants = extensions.variants(Token {
         index: 0,
         text: facts.original_query(),
     });
@@ -378,11 +384,12 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         Readiness::new(symbol_ready, search_index_ready(ctx), semantic_ready),
     );
     let readiness = extensions.sample_readiness(&root);
-    let plan = extensions.plan(&facts, shape, &readiness);
+    let mut plan = extensions.plan(&facts, shape, &readiness);
+    plan.variants = variants.into_iter().map(|variant| variant.text).collect();
 
     let (mut response, embedding_calls) =
         crate::semantic_index::with_search_embedding_call_counter(|| {
-            handle_semantic_search_inner(req, ctx)
+            handle_semantic_search_inner(req, ctx, page_request, &extensions, &plan)
         });
     if response.success {
         attach_search_execution_metadata(&mut response, &plan, embedding_calls);
@@ -398,16 +405,28 @@ fn attach_search_execution_metadata(
     let Some(data) = response.data.as_object_mut() else {
         return;
     };
-    data.insert(
-        "structuredContent".to_string(),
-        serde_json::json!({
-            "plan": plan,
-            "search": { "embedding_calls": embedding_calls },
-        }),
+    let structured = data
+        .entry("structuredContent".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(structured) = structured.as_object_mut() else {
+        return;
+    };
+    structured
+        .entry("plan".to_string())
+        .or_insert_with(|| serde_json::json!(plan));
+    structured.insert(
+        "search".to_string(),
+        serde_json::json!({ "embedding_calls": embedding_calls }),
     );
 }
 
-fn handle_semantic_search_inner(req: &RawRequest, ctx: &AppContext) -> Response {
+fn handle_semantic_search_inner(
+    req: &RawRequest,
+    ctx: &AppContext,
+    page_request: paging::ValidatedPageRequest,
+    extensions: &dyn extensions::SearchExtensions,
+    engine_plan: &extensions::LanePlan,
+) -> Response {
     if search_cancellation_requested() {
         return cancelled_search_response(req);
     }
@@ -426,19 +445,18 @@ fn handle_semantic_search_inner(req: &RawRequest, ctx: &AppContext) -> Response 
         return Response::error(&req.id, "invalid_request", "query must be non-empty");
     }
 
-    // Strip a single pair of surrounding paired quotes from the literal needle.
-    // Many agents and humans reach for the GitHub-code-search / `rg -F "..."`
-    // convention of quoting a phrase, but AFT does pure substring matching by
-    // default, so the quotes themselves become part of the needle and silently
-    // produce zero results. Strip only matched leading+trailing pairs of `"`
-    // or `'` (no escape handling — agents that genuinely want literal quotes
-    // can pass `\"foo\"`-style content which won't be a balanced outer pair).
-    params.query = strip_surrounding_quotes(params.query);
-    if params.query.trim().is_empty() {
-        return Response::error(&req.id, "invalid_request", "query must be non-empty");
+    // Quoting is part of QueryFacts and remains visible to the plan hook. Only
+    // the code-literal execution route removes its balanced delimiter pair.
+    if engine_plan.shape == SearchShape::CodeLiteral {
+        params.query = strip_surrounding_quotes(params.query);
+        if params.query.trim().is_empty() {
+            return Response::error(&req.id, "invalid_request", "query must be non-empty");
+        }
     }
 
-    let top_k = params.top_k.clamp(1, MAX_TOP_K);
+    let top_k = page_request.top_k();
+    params.top_k = top_k;
+    params.offset = page_request.offset();
     let project_root = grep_executor::project_root(ctx);
     let shape = query_shape::classify(&params.query);
     let requested_path = params
@@ -525,12 +543,30 @@ fn handle_semantic_search_inner(req: &RawRequest, ctx: &AppContext) -> Response 
         }
     };
     let mode = choose_mode(&params.query, &shape, lexical_ready, &mut warnings);
+    if lexical_ready
+        && mode != SearchMode::Regex
+        && !engine_plan.contains(SearchLaneKind::Semantic)
+    {
+        return handle_engine_only_search(
+            req,
+            ctx,
+            &params,
+            &shape,
+            semantic_status,
+            warnings,
+            &project_root,
+            page_request,
+            extensions,
+            engine_plan,
+        );
+    }
 
     match mode {
         SearchMode::Regex | SearchMode::Literal => handle_grep_search(
             req,
             ctx,
             &params.query,
+            params.offset,
             top_k,
             &shape,
             mode,
@@ -551,6 +587,9 @@ fn handle_semantic_search_inner(req: &RawRequest, ctx: &AppContext) -> Response 
             semantic_status,
             warnings,
             &project_root,
+            page_request,
+            extensions,
+            engine_plan,
         ),
     }
 }
@@ -1590,6 +1629,7 @@ fn handle_grep_search(
     req: &RawRequest,
     ctx: &AppContext,
     query: &str,
+    offset: usize,
     top_k: usize,
     shape: &QueryShape,
     mode: SearchMode,
@@ -1677,17 +1717,18 @@ fn handle_grep_search(
     };
 
     let literal = effective_mode == SearchMode::Literal;
-    let scope = match grep_executor::resolve_grep_scope(ctx, None, top_k, &req.id) {
+    let fetch_limit = offset.saturating_add(top_k);
+    let scope = match grep_executor::resolve_grep_scope(ctx, None, fetch_limit, &req.id) {
         Ok(scope) => scope,
         Err(response) => return response,
     };
     let params = GrepParams {
         include: Vec::new(),
         exclude: Vec::new(),
-        max_results: top_k,
+        max_results: fetch_limit,
         path_exclusion: grep_path_exclusion(include_tests),
     };
-    let result = grep_executor::execute(ctx, &compiled, &scope, &params);
+    let mut result = grep_executor::execute(ctx, &compiled, &scope, &params);
     if result.fully_degraded {
         warnings.push(degraded_warning(ctx));
     }
@@ -1712,6 +1753,9 @@ fn handle_grep_search(
         );
     }
 
+    let interval_end = offset.saturating_add(top_k);
+    let interval_has_more = result.total_matches > interval_end || result.truncated;
+    result.matches = result.matches.into_iter().skip(offset).take(top_k).collect();
     let result_values = result
         .matches
         .iter()
@@ -1730,7 +1774,7 @@ fn handle_grep_search(
             complete: true,
             text,
             results: result_values,
-            more_available: result.truncated || result.total_matches > result.matches.len(),
+            more_available: interval_has_more,
             engine_capped: result.engine_capped,
             fully_degraded: result.fully_degraded,
             warnings,
@@ -1953,6 +1997,408 @@ fn view_symbol_kind(value: u8) -> SymbolKind {
     }
 }
 
+#[derive(Clone)]
+struct PreparedEngineLane {
+    kind: SearchLaneKind,
+    candidates: Vec<CandidateResult>,
+}
+
+impl SearchLane for PreparedEngineLane {
+    fn kind(&self) -> SearchLaneKind {
+        self.kind
+    }
+
+    fn execute(&self, _input: &LaneInput<'_>) -> LaneExecution {
+        LaneExecution {
+            kind: self.kind,
+            candidates: self.candidates.clone(),
+        }
+    }
+}
+
+struct EngineRanking {
+    results: Vec<HybridResult>,
+    more_available: bool,
+    engine_capped: bool,
+    trailer: String,
+    confidence_line: Option<&'static str>,
+    structured_content: serde_json::Value,
+}
+
+fn run_engine_ranking(
+    ctx: &AppContext,
+    project_root: &Path,
+    query: &str,
+    include_tests: bool,
+    semantic_results: Vec<SemanticResult>,
+    page_request: paging::ValidatedPageRequest,
+    extensions: &dyn extensions::SearchExtensions,
+    plan: &extensions::LanePlan,
+) -> Result<EngineRanking, String> {
+    use blocks::{BlockBuilder, CanonicalLane, CanonicalListKey, LaneCandidate};
+    use confidence::{Confidence, ConfidenceEngine};
+    use exact_lane::ExactLane;
+    use lexical_lane::CanonicalLexicalLane;
+    use provenance::ObservedProvenance;
+    use scoring::ScoringPolicy;
+    use telemetry::{ConfidenceTelemetry, TelemetryAssembler, TelemetryRun};
+    use trailer::{ExactPassState, SearchTrailer};
+
+    let index = try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
+        .and_then(|guard| guard.as_ref().cloned())
+        .unwrap_or_else(SearchIndex::new);
+    let snapshot = index.snapshot();
+    let content_tokens = query_shape::extract_content_tokens(query);
+    let token_refs = content_tokens.iter().map(String::as_str).collect::<Vec<_>>();
+    let query_trigrams = SearchIndex::query_trigrams_from_tokens(&token_refs);
+    let candidate_filter = |path: &Path| {
+        path_allowed_by_include_tests(path, project_root, include_tests)
+    };
+    let lexical = CanonicalLexicalLane::from_snapshot(
+        &snapshot,
+        &query_trigrams,
+        Some(&candidate_filter),
+        lexical_lane::LEXICAL_ENUMERATION_LIMIT,
+    )
+    .map_err(|error| error.to_string())?;
+    let lexical_scores = lexical
+        .canonical_order()
+        .iter()
+        .map(|candidate| (candidate.result.path.clone(), candidate.raw_score))
+        .collect::<HashMap<_, _>>();
+    let lexical_candidates = lexical
+        .canonical_order()
+        .iter()
+        .map(|candidate| candidate.result.clone())
+        .collect::<Vec<_>>();
+
+    let mut semantic_metadata = HashMap::new();
+    let mut seen_semantic_paths = HashSet::new();
+    let mut prepared_semantic = Vec::new();
+    for result in semantic_results {
+        let path = result.file.clone();
+        semantic_metadata.entry(path.clone()).or_insert_with(|| HybridResult {
+            file: result.file.clone(),
+            name: result.name.clone(),
+            kind: result.kind,
+            start_line: result.start_line,
+            end_line: result.end_line,
+            exported: result.exported,
+            score: result.score,
+            source: "semantic",
+            semantic_score: Some(result.score),
+            lexical_score: None,
+            hybrid_boosted: false,
+            exact: false,
+            exact_phrase_count: 0,
+            exact_window_lines: None,
+            fusion_score: 0.0,
+            cap_protected: result.cap_protected,
+            lexical_generated_artifact: false,
+            snippet: result.snippet.clone(),
+        });
+        if seen_semantic_paths.insert(path.clone()) {
+            prepared_semantic.push(CandidateResult {
+                path,
+                symbol_range: None,
+                evidence: EvidenceDescriptor::for_non_exact(false, false),
+                fusion_score: None,
+                lane_score: Some(result.score),
+                best_lane: Some(SearchLaneKind::Semantic),
+            });
+        }
+    }
+
+    let mut registry = LaneRegistry::new();
+    for kind in &plan.selected_lanes {
+        let lane: Arc<dyn SearchLane> = match kind {
+            SearchLaneKind::Exact => Arc::new(ExactLane::new()),
+            SearchLaneKind::Anchored => Arc::new(anchored_lane::AnchoredLane::new()),
+            SearchLaneKind::Lexical => Arc::new(PreparedEngineLane {
+                kind: *kind,
+                candidates: lexical_candidates.clone(),
+            }),
+            SearchLaneKind::Semantic => Arc::new(PreparedEngineLane {
+                kind: *kind,
+                candidates: prepared_semantic.clone(),
+            }),
+            _ => Arc::new(PreparedEngineLane {
+                kind: *kind,
+                candidates: Vec::new(),
+            }),
+        };
+        register_lane(&mut registry, lane);
+    }
+
+    let input = LaneInput {
+        query,
+        root: project_root,
+        include_tests,
+        index: &index,
+    };
+    let mut executions = Vec::new();
+    for kind in &plan.selected_lanes {
+        let lane = registry
+            .get(*kind)
+            .ok_or_else(|| format!("selected lane {kind} was not registered"))?;
+        let execution = extensions.execute_lane(lane.as_ref(), &input);
+        if execution.kind != *kind {
+            return Err(format!(
+                "selected lane {kind} returned execution for {}",
+                execution.kind
+            ));
+        }
+        executions.push(execution);
+    }
+
+    let mut canonical_descriptors = HashMap::new();
+    for candidate in executions
+        .iter()
+        .flat_map(|execution| execution.candidates.iter())
+        .filter(|candidate| candidate.evidence.tier == EvidenceTier::NonExact)
+    {
+        canonical_descriptors
+            .entry((candidate.path.clone(), candidate.symbol_range))
+            .and_modify(|(exact_form, generated): &mut (bool, bool)| {
+                *exact_form |= candidate.evidence.exact_form;
+                *generated &= candidate.evidence.generated;
+            })
+            .or_insert((
+                candidate.evidence.exact_form,
+                candidate.evidence.generated,
+            ));
+    }
+
+    let mut lanes = Vec::new();
+    for execution in executions {
+        let candidates = execution
+            .candidates
+            .into_iter()
+            .map(|candidate| {
+                let is_test = path_is_hidden_test_file(&candidate.path, project_root);
+                match candidate.evidence.tier {
+                    EvidenceTier::Exact => LaneCandidate::exact(
+                        candidate.path,
+                        candidate.symbol_range,
+                        candidate.evidence,
+                        is_test,
+                    ),
+                    EvidenceTier::NonExact => {
+                        let (exact_form, generated) = canonical_descriptors
+                            .get(&(candidate.path.clone(), candidate.symbol_range))
+                            .copied()
+                            .expect("every non-exact candidate has a canonical descriptor");
+                        LaneCandidate::non_exact(
+                            candidate.path,
+                            candidate.symbol_range,
+                            EvidenceDescriptor::for_non_exact(exact_form, generated),
+                            candidate
+                                .lane_score
+                                .expect("prepared non-exact candidates carry a raw lane score"),
+                            is_test,
+                        )
+                    }
+                }
+            })
+            .collect();
+        lanes.push(
+            CanonicalLane::new(execution.kind, candidates).map_err(|error| error.to_string())?,
+        );
+    }
+
+    let generation = GenerationToken::new_with_str(&format!(
+        "{}:{}",
+        ctx.search_index_rx_generation(),
+        ctx.semantic_index_rx_generation()
+    ));
+    let key = CanonicalListKey {
+        project_root: project_root.to_path_buf(),
+        snapshot_generation: generation.as_str().to_string(),
+        normalized_query: exact_lane::normalize_exact_phrase(query),
+        include_tests,
+    };
+    let policy = ScoringPolicy::from_plan_table(&PlanTable::running_table(), plan.shape)
+        .map_err(|error| error.to_string())?;
+    let builder = BlockBuilder::new(key, policy, lanes).map_err(|error| error.to_string())?;
+    let page = paging::serve_public_page(&builder, page_request).map_err(|error| error.to_string())?;
+    let confidence = ConfidenceEngine::running()
+        .evaluate_reply(&page.reply)
+        .map_err(|error| error.to_string())?;
+    let confidence_telemetry = match confidence.confidence {
+        Some(Confidence::High) => Some(ConfidenceTelemetry::High),
+        Some(Confidence::Low) => Some(ConfidenceTelemetry::Low),
+        None => None,
+    };
+    let provenance = ObservedProvenance::from_reply(&page.reply).map_err(|error| error.to_string())?;
+    let structured = TelemetryAssembler::new(&page, provenance)
+        .assemble(TelemetryRun {
+            shape: plan.shape,
+            confidence: confidence_telemetry,
+            variants: plan.variants.clone(),
+            embedding_calls: crate::semantic_index::current_search_embedding_call_count() as usize,
+            snapshot_generation: generation,
+        })
+        .map_err(|error| error.to_string())?;
+    let trailer = SearchTrailer::from_page(&page, ExactPassState::Complete)
+        .map_err(|error| error.to_string())?
+        .render();
+
+    let mut results = Vec::with_capacity(page.reply.page.len());
+    for entry in &page.reply.page {
+        let ranked = &entry.result;
+        let semantic_backed = semantic_metadata.contains_key(&ranked.path);
+        let mut result = semantic_metadata.remove(&ranked.path).unwrap_or_else(|| HybridResult {
+            file: ranked.path.clone(),
+            name: ranked
+                .path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            kind: SymbolKind::FileSummary,
+            start_line: 0,
+            end_line: 0,
+            exported: false,
+            score: 0.0,
+            source: "lexical",
+            semantic_score: None,
+            lexical_score: None,
+            hybrid_boosted: false,
+            exact: false,
+            exact_phrase_count: 0,
+            exact_window_lines: None,
+            fusion_score: 0.0,
+            cap_protected: false,
+            lexical_generated_artifact: ranked.evidence.generated,
+            snippet: String::new(),
+        });
+        result.exact = ranked.evidence.tier == EvidenceTier::Exact;
+        result.exact_phrase_count = ranked.evidence.occurrences.unwrap_or_default();
+        result.exact_window_lines = ranked.evidence.window_lines;
+        result.fusion_score = ranked.fusion_score.unwrap_or(1.0);
+        result.score = ranked.lane_score.unwrap_or(result.fusion_score);
+        result.lexical_score = lexical_scores.get(&ranked.path).copied().or_else(|| {
+            entry
+                .admitted_contributions
+                .iter()
+                .find(|contribution| contribution.lane == SearchLaneKind::Lexical)
+                .map(|contribution| contribution.raw_score)
+        });
+        result.hybrid_boosted = semantic_backed && result.lexical_score.is_some();
+        result.source = match ranked.evidence.tier {
+            EvidenceTier::Exact if semantic_backed => "semantic",
+            EvidenceTier::Exact => match ranked.evidence.kind {
+                EvidenceKind::Anchored => "anchored",
+                _ => "exact",
+            },
+            EvidenceTier::NonExact => match ranked.best_lane {
+                Some(SearchLaneKind::Semantic) => "semantic",
+                Some(SearchLaneKind::Lexical) => "lexical",
+                _ => "hybrid",
+            },
+        };
+        results.push(result);
+    }
+
+    let page_end = page_request
+        .offset()
+        .saturating_add(page_request.top_k());
+    Ok(EngineRanking {
+        results,
+        more_available: page_end < page.reply.canonical_list.len()
+            || !matches!(page.stop_state, paging::StopState::S2Exhausted),
+        engine_capped: matches!(page.stop_state, paging::StopState::S3DepthCap),
+        trailer,
+        confidence_line: confidence.flat_head_line,
+        structured_content: serde_json::to_value(structured).map_err(|error| error.to_string())?,
+    })
+}
+
+fn handle_engine_only_search(
+    req: &RawRequest,
+    ctx: &AppContext,
+    params: &SemanticSearchParams,
+    shape: &QueryShape,
+    semantic_status: &'static str,
+    mut warnings: Vec<String>,
+    project_root: &Path,
+    page_request: paging::ValidatedPageRequest,
+    extensions: &dyn extensions::SearchExtensions,
+    plan: &extensions::LanePlan,
+) -> Response {
+    if semantic_status != "ready" {
+        warnings.push("Semantic search unavailable; using lexical-only fallback.".to_string());
+    }
+    let mut ranked = match run_engine_ranking(
+        ctx,
+        project_root,
+        &params.query,
+        params.include_tests,
+        Vec::new(),
+        page_request,
+        extensions,
+        plan,
+    ) {
+        Ok(ranked) => ranked,
+        Err(error) => return Response::error(&req.id, "search_engine_failed", error),
+    };
+    let snippets_incomplete =
+        enrich_snippets_from_source_with_context(&mut ranked.results, project_root, Some(ctx));
+    let mut text = format_semantic_text(
+        &ranked.results,
+        project_root,
+        ranked.more_available,
+        snippets_incomplete,
+        Some(ctx),
+    );
+    if let Some(line) = ranked.confidence_line {
+        text.push_str("\n\n");
+        text.push_str(line);
+    }
+    text.push_str("\n\n");
+    text.push_str(&ranked.trailer);
+    let mut extras = serde_json::Map::new();
+    extras.insert("structuredContent".to_string(), ranked.structured_content);
+    extras.insert(
+        "lexical_only_fallback".to_string(),
+        serde_json::json!(semantic_status != "ready"),
+    );
+    extras.insert(
+        "semantic_unavailable".to_string(),
+        serde_json::json!(semantic_status != "ready"),
+    );
+    extras.insert(
+        "lexical_engine_capped".to_string(),
+        serde_json::json!(ranked.engine_capped),
+    );
+    search_response(
+        req,
+        SearchResponseParts {
+            query: &params.query,
+            interpreted_as: if semantic_status == "ready" {
+                "engine"
+            } else {
+                "lexical"
+            },
+            query_kind: query_kind_label(shape.kind),
+            semantic_status,
+            status: if semantic_status == "building" {
+                "building"
+            } else {
+                "ready"
+            },
+            complete: semantic_status == "ready",
+            text,
+            results: ranked.results.iter().map(result_to_json).collect(),
+            more_available: ranked.more_available,
+            engine_capped: ranked.engine_capped,
+            fully_degraded: false,
+            warnings,
+            extras,
+        },
+    )
+}
+
 fn handle_semantic_or_hybrid_search(
     req: &RawRequest,
     ctx: &AppContext,
@@ -1965,6 +2411,9 @@ fn handle_semantic_or_hybrid_search(
     semantic_status: &'static str,
     mut warnings: Vec<String>,
     project_root: &Path,
+    page_request: paging::ValidatedPageRequest,
+    extensions: &dyn extensions::SearchExtensions,
+    engine_plan: &extensions::LanePlan,
 ) -> Response {
     let lexical = if mode == SearchMode::Hybrid {
         collect_lexical_files(
@@ -2345,26 +2794,25 @@ fn handle_semantic_or_hybrid_search(
     if semantic_more_available {
         semantic_results.truncate(semantic_limit);
     }
-    rerank_semantic_candidates(&mut semantic_results, &shape, &params.query);
-
-    let mut results = fuse_hybrid_results_with_zoom(
-        semantic_results,
-        lexical.files,
-        &shape,
-        top_k.saturating_add(1),
-        params.include_tests,
+    let mut engine_ranking = match run_engine_ranking(
+        ctx,
         project_root,
-        ctx.tool_enabled("aft_zoom"),
-        Some(&params.query),
-    );
+        &params.query,
+        params.include_tests,
+        semantic_results,
+        page_request,
+        extensions,
+        engine_plan,
+    ) {
+        Ok(ranking) => ranking,
+        Err(error) => return Response::error(&req.id, "search_engine_failed", error),
+    };
     if ctx.shared_artifacts_read_only() {
-        results.retain(|result| result.file.is_file());
+        engine_ranking.results.retain(|result| result.file.is_file());
     }
-    let fused_more_available = results.len() > top_k;
-    if fused_more_available {
-        results.truncate(top_k);
-    }
-    let more_available = fused_more_available || semantic_more_available || lexical.engine_capped;
+    let more_available =
+        engine_ranking.more_available || semantic_more_available || lexical.engine_capped;
+    let mut results = engine_ranking.results;
 
     if mode == SearchMode::Semantic
         && shape.kind == QueryKind::NaturalLanguage
@@ -2405,6 +2853,25 @@ fn handle_semantic_or_hybrid_search(
     let snippets_incomplete =
         enrich_snippets_from_source_with_context(&mut results, project_root, Some(ctx));
 
+    let mut text = format_semantic_text(
+        &results,
+        project_root,
+        more_available,
+        snippets_incomplete,
+        Some(ctx),
+    );
+    if let Some(line) = engine_ranking.confidence_line {
+        text.push_str("\n\n");
+        text.push_str(line);
+    }
+    text.push_str("\n\n");
+    text.push_str(&engine_ranking.trailer);
+    let mut extras = serde_json::Map::new();
+    extras.insert(
+        "structuredContent".to_string(),
+        engine_ranking.structured_content,
+    );
+
     search_response(
         req,
         SearchResponseParts {
@@ -2414,19 +2881,13 @@ fn handle_semantic_or_hybrid_search(
             semantic_status,
             status: "ready",
             complete: true,
-            text: format_semantic_text(
-                &results,
-                project_root,
-                more_available,
-                snippets_incomplete,
-                Some(ctx),
-            ),
+            text,
             results: results.iter().map(result_to_json).collect::<Vec<_>>(),
             more_available,
-            engine_capped: lexical.engine_capped,
+            engine_capped: lexical.engine_capped || engine_ranking.engine_capped,
             fully_degraded: false,
             warnings,
-            extras: serde_json::Map::new(),
+            extras,
         },
     )
 }
@@ -6486,6 +6947,7 @@ mod tests {
                     SemanticSearchParams {
                         query: "borrowed_tree_needle".to_string(),
                         top_k: 10,
+                        offset: 0,
                         include_tests: false,
                         path: None,
                     },
@@ -6522,6 +6984,7 @@ mod tests {
                     SemanticSearchParams {
                         query: "borrowed_tree_needle".to_string(),
                         top_k: 10,
+                        offset: 0,
                         include_tests: false,
                         path: None,
                     },
@@ -6563,6 +7026,7 @@ mod tests {
         let params = SemanticSearchParams {
             query: "budget_disclosure_needle".to_string(),
             top_k: 10,
+            offset: 0,
             include_tests: false,
             path: Some(external.path().display().to_string()),
         };

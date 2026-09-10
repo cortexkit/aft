@@ -1617,7 +1617,7 @@ fn hybrid_semantic_results_report_semantic_source_and_boost_metadata() {
 }
 
 #[test]
-fn lexical_only_fallback_reports_more_available_when_capped_or_over_top_k() {
+fn lexical_only_fallback_pages_beyond_the_old_candidate_cap() {
     let (project, entries) = project_with_repeated_needle_files(6);
     let ctx = test_context(project.path());
     install_lexical_index_entries(&ctx, &entries);
@@ -1662,7 +1662,10 @@ fn lexical_only_fallback_reports_more_available_when_capped_or_over_top_k() {
     );
     assert_eq!(response["status"], "building");
     assert_eq!(response["lexical_only_fallback"], true);
-    assert_eq!(response["engine_capped"], true);
+    assert_eq!(
+        response["engine_capped"], false,
+        "the block engine can page beyond the old fixed lexical candidate cap"
+    );
     assert_eq!(response["more_available"], true);
 }
 
@@ -2058,4 +2061,96 @@ fn quote_strip_only_removes_one_pair() {
         "only outer pair should be stripped"
     );
     assert_eq!(response["success"], true);
+}
+
+#[test]
+fn live_engine_pipeline_ranks_and_pages_with_provenance() {
+    let project = tempfile::tempdir().expect("create project dir");
+    let exact = project.path().join("src/z_exact.rs");
+    let lexical = project.path().join("src/a_lexical.rs");
+    let log = project.path().join("src/logging.rs");
+    std::fs::create_dir_all(exact.parent().unwrap()).expect("create src dir");
+    let exact_source = "pub const MESSAGE: &str = \"needle symbol\";\n".to_string();
+    let lexical_source = "needle needle needle\nfiller\nfiller\nfiller\nsymbol symbol symbol\n".to_string();
+    let log_source = "error!(\"opening {} failed for run {}\", path, id);\n".to_string();
+    std::fs::write(&exact, &exact_source).expect("write exact source");
+    std::fs::write(&lexical, &lexical_source).expect("write lexical source");
+    std::fs::write(&log, &log_source).expect("write log source");
+    let ctx = test_context(project.path());
+    install_lexical_index_entries(
+        &ctx,
+        &[
+            (lexical.clone(), lexical_source),
+            (exact.clone(), exact_source),
+            (log.clone(), log_source),
+        ],
+    );
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+
+    let first_request: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "engine-live-first",
+        "command": "semantic_search",
+        "query": "needle symbol",
+        "top_k": 1,
+        "offset": 0
+    }))
+    .unwrap();
+    let second_request: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "engine-live-second",
+        "command": "semantic_search",
+        "query": "needle symbol",
+        "top_k": 1,
+        "offset": 1
+    }))
+    .unwrap();
+    let first = response_value(handle_semantic_search(&first_request, &ctx));
+    let second = response_value(handle_semantic_search(&second_request, &ctx));
+
+    assert_eq!(first["success"], true, "first page failed: {first:?}");
+    assert_eq!(second["success"], true, "second page failed: {second:?}");
+    assert!(path_ends_with(
+        first["results"][0]["file"].as_str().unwrap(),
+        "src/z_exact.rs"
+    ));
+    assert_ne!(first["results"][0]["file"], second["results"][0]["file"]);
+    assert_eq!(
+        first["structuredContent"]["plan"]["exact_tier"],
+        "e1"
+    );
+    assert!(first["structuredContent"]["plan"]["confidence"].is_string());
+    assert!(!first["structuredContent"]["results"][0]["lane_positions"]
+        .as_object()
+        .expect("lane provenance object")
+        .is_empty());
+    assert!(first["text"]
+        .as_str()
+        .unwrap()
+        .contains("narrow: offset, topK, path, includeTests"));
+
+    let log_request: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "engine-live-anchored",
+        "command": "semantic_search",
+        "query": "2026-09-08T12:00:01 ERROR opening /tmp/run-4821/a.rs failed for run 12345",
+        "top_k": 1
+    }))
+    .unwrap();
+    let log_response = response_value(handle_semantic_search(&log_request, &ctx));
+    assert_eq!(
+        log_response["success"], true,
+        "anchored lane failed: {log_response:?}"
+    );
+    assert!(path_ends_with(
+        log_response["results"][0]["file"].as_str().unwrap(),
+        "src/logging.rs"
+    ));
+    assert_eq!(
+        log_response["structuredContent"]["plan"]["exact_tier"],
+        "anchored"
+    );
+    assert!(log_response["structuredContent"]["plan"]["lanes_run"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("anchored")));
 }

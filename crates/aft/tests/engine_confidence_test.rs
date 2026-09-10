@@ -13,13 +13,10 @@ mod plan_table {
     pub use aft::commands::semantic_search::plan_table::*;
 }
 
-#[allow(dead_code)]
 #[path = "../src/commands/semantic_search/blocks.rs"]
 mod blocks;
-#[allow(dead_code)]
 #[path = "../src/commands/semantic_search/confidence.rs"]
 mod confidence;
-#[allow(dead_code)]
 #[path = "../src/commands/semantic_search/scoring.rs"]
 mod scoring;
 
@@ -724,8 +721,7 @@ fn provenance_is_structurally_unavailable_to_confidence() {
     }
 
     impl StubbedProvenanceCandidate {
-        #[allow(dead_code)]
-        fn lane_positions(&self) -> ! {
+                fn lane_positions(&self) -> ! {
             self.lane_position_reads
                 .set(self.lane_position_reads.get() + 1);
             panic!("confidence must not read lane_positions")

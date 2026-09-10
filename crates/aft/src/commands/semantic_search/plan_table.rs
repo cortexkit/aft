@@ -44,9 +44,9 @@ impl SearchShape {
         match s {
             "identifier" => Some(SearchShape::Identifier),
             "code_literal" => Some(SearchShape::CodeLiteral),
-            "short" => Some(SearchShape::Short),
-            "nl" => Some(SearchShape::NaturalLanguage),
-            "log_excerpt" => Some(SearchShape::LogExcerpt),
+            "short" | "mixed" => Some(SearchShape::Short),
+            "nl" | "natural_language" => Some(SearchShape::NaturalLanguage),
+            "log_excerpt" | "error_code" => Some(SearchShape::LogExcerpt),
             "path" => Some(SearchShape::Path),
             "regex" => Some(SearchShape::Regex),
             _ => None,

@@ -2032,8 +2032,17 @@ fn translate_search(args: Value) -> Result<Translated, TranslateError> {
 
     let mut out = Map::new();
     out.insert("query".to_string(), Value::String(query.to_string()));
-    let top_k = coerce_optional_int_result(map_in.get("topK"), "topK", 1, 100)?.unwrap_or(10);
+    let top_k = match coerce_optional_int_result(map_in.get("topK"), "topK", 0, 100)? {
+        Some(0) => return Err(invalid_request("topK must be between 1 and 100")),
+        Some(value) => value,
+        None => 10,
+    };
     out.insert("top_k".to_string(), Value::Number(top_k.into()));
+    if let Some(offset) =
+        coerce_optional_int_result(map_in.get("offset"), "offset", 0, 100_000)?
+    {
+        out.insert("offset".to_string(), Value::Number(offset.into()));
+    }
     if let Some(include_tests) = map_in.get("includeTests").and_then(Value::as_bool) {
         out.insert("include_tests".to_string(), Value::Bool(include_tests));
     }
@@ -3348,6 +3357,45 @@ mod tests {
             Some(5)
         );
         assert!(translated.args.get("hint").is_none());
+    }
+
+    #[test]
+    fn search_offset_is_forwarded_and_bounded() {
+        let translated = subc_translate_owned(
+            "search",
+            serde_json::json!({"query": "ranked results", "offset": 42}),
+            Path::new("/project"),
+        )
+        .expect("valid search offset");
+        assert_eq!(
+            translated.args.get("offset").and_then(Value::as_u64),
+            Some(42)
+        );
+
+        for offset in [serde_json::json!(-1), serde_json::json!(100_001)] {
+            let error = subc_translate_owned(
+                "search",
+                serde_json::json!({"query": "ranked results", "offset": offset}),
+                Path::new("/project"),
+            )
+            .expect_err("out-of-range search offset must be rejected");
+            assert_eq!(error.code, "invalid_request");
+            assert!(error.message.contains("offset"));
+        }
+    }
+
+    #[test]
+    fn search_top_k_outside_public_bounds_is_invalid_request() {
+        for top_k in [serde_json::json!(0), serde_json::json!(101)] {
+            let error = subc_translate_owned(
+                "search",
+                serde_json::json!({"query": "ranked results", "topK": top_k}),
+                Path::new("/project"),
+            )
+            .expect_err("out-of-range search topK must be rejected");
+            assert_eq!(error.code, "invalid_request");
+            assert!(error.message.contains("topK"));
+        }
     }
 
     // supports_tool() gates whether run_tool_call translates or passes a name

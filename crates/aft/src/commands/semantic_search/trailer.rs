@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
+use crate::list_envelope::{render_trailer, ListEnvelope, Reason, Total, Unit};
 
 use super::paging::{SearchPage, StopState};
 
@@ -121,5 +121,23 @@ impl SearchTrailer {
             vec![reason],
             SEARCH_NARROW_FIELDS,
         )
+    }
+
+    pub fn render(&self) -> String {
+        let shared = render_trailer(&self.shared_envelope_projection())
+            .expect("every search stop state has a list-envelope reason");
+        let shared_reason = match self.stop_state {
+            StopState::S1MoreAtDepth => "cap",
+            StopState::S2Exhausted => "walk",
+            StopState::S3DepthCap => "depth",
+        };
+        let mut rendered = shared.replace(
+            &format!("({shared_reason})"),
+            &format!("({})", stop_reason_word(self.stop_state)),
+        );
+        if let SearchTotal::AtLeast(value) = self.total {
+            rendered = rendered.replace(&format!("≥{value}"), &format!("{value}+"));
+        }
+        rendered
     }
 }

@@ -102,6 +102,7 @@ pub struct LanePlan {
     pub shape: SearchShape,
     pub selected_lanes: Vec<SearchLaneKind>,
     pub readiness: Readiness,
+    pub variants: Vec<String>,
 }
 
 impl LanePlan {
@@ -154,11 +155,11 @@ pub fn classify_query_facts(facts: &QueryFacts) -> SearchShape {
     }
 
     let query_shape = classify(query);
-    if query_shape.kind == QueryKind::Path {
-        return SearchShape::Path;
-    }
     if query_shape.kind == QueryKind::ErrorCode || looks_like_log_excerpt(query) {
         return SearchShape::LogExcerpt;
+    }
+    if query_shape.kind == QueryKind::Path {
+        return SearchShape::Path;
     }
     if query_shape.kind == QueryKind::Identifier {
         return SearchShape::Identifier;
@@ -226,6 +227,7 @@ fn default_lane_plan(shape: SearchShape, readiness: Readiness) -> LanePlan {
         shape,
         selected_lanes,
         readiness,
+        variants: Vec::new(),
     }
 }
 

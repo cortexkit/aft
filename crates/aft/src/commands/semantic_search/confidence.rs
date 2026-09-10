@@ -306,6 +306,16 @@ pub struct ConfidenceEngine {
 }
 
 impl ConfidenceEngine {
+    pub fn running() -> Self {
+        let path = Path::new(CONFIDENCE_THRESHOLD_RELATIVE_PATH);
+        let threshold = ConfidenceThreshold::parse_at_startup(
+            path,
+            include_str!("../../../../../benchmarks/aft-search/engine-fixtures/confidence-threshold.json"),
+        )
+        .expect("embedded confidence threshold must satisfy the engine schema");
+        Self { threshold }
+    }
+
     /// Loads the threshold artifact once and retains the validated value for all
     /// queries served by this engine instance.
     pub fn start(threshold_path: &Path) -> Result<Self, ConfidenceStartupError> {

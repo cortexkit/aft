@@ -226,16 +226,32 @@ fn slices() -> Vec<Slice> {
                 FenceRule::Exact("packages/pi-plugin/src/__tests__/semantic.test.ts"),
                 FenceRule::Exact("packages/pi-plugin/src/tools/semantic.ts"),
             ],
-            // A9 is settled but held off main until the integration slice
-            // wires `offset` in the backend (the search-quality gate refuses a
-            // surface that declares an offset the backend does not honor); its
-            // landed paths are recorded when it lands with that slice.
-            landed_paths: vec![],
+            landed_paths: vec![
+                "benchmarks/aft-search/engine-fixtures/surface/cases.json",
+                "crates/aft/src/subc_tool_schemas.json",
+                "crates/aft/tests/engine_surface_contract_test.rs",
+                "packages/opencode-plugin/src/__tests__/semantic.test.ts",
+                "packages/opencode-plugin/src/tools/semantic.ts",
+                "packages/pi-plugin/src/__tests__/semantic-renderers.test.ts",
+                "packages/pi-plugin/src/__tests__/semantic.test.ts",
+                "packages/pi-plugin/src/tools/semantic.ts",
+            ],
         },
         Slice {
             id: "A10-fence-and-ownership-audit",
             fence: vec![FenceRule::Prefix("crates/aft/tests/engine_audit_")],
             landed_paths: vec![AUDIT_PATH],
+        },
+        Slice {
+            id: "A11-live-engine-integration",
+            fence: vec![
+                FenceRule::Exact("crates/aft/src/commands/semantic_search/extensions.rs"),
+                FenceRule::Exact("crates/aft/tests/engine_search_extensions_test.rs"),
+            ],
+            landed_paths: vec![
+                "crates/aft/src/commands/semantic_search/extensions.rs",
+                "crates/aft/tests/engine_search_extensions_test.rs",
+            ],
         },
     ]
 }
@@ -425,7 +441,7 @@ fn semantic_stage_modules_have_one_owner_and_the_first_slice_owns_the_seam() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         modules.len(),
-        16,
+        17,
         "every semantic lane/stage module is inventoried"
     );
     for module in modules {

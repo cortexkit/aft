@@ -1,0 +1,10 @@
+{
+  "slice_class": "ranking",
+  "targeted_mechanism": "live score-free exact and anchored lanes with block-frozen lexical-semantic fusion",
+  "kind": "ranking",
+  "fixtures": [
+    "crates/aft/tests/integration/aft_search_contract_test.rs",
+    "crates/aft/tests/engine_search_extensions_test.rs"
+  ],
+  "slices": ["A-integration", "B2-prerequisite"]
+}

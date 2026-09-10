@@ -13,13 +13,10 @@ mod plan_table {
     pub use aft::commands::semantic_search::plan_table::*;
 }
 
-#[allow(dead_code)]
 #[path = "../src/commands/semantic_search/blocks.rs"]
 mod blocks;
-#[allow(dead_code)]
 #[path = "../src/commands/semantic_search/confidence.rs"]
 mod confidence;
-#[allow(dead_code)]
 #[path = "../src/commands/semantic_search/scoring.rs"]
 mod scoring;
 

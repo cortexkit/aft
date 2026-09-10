@@ -9,7 +9,7 @@ use super::paging::SearchPage;
 use super::plan_table::{SearchLaneKind, SearchShape};
 use super::provenance::{LanePositions, LanePositionsAccessor, ProvenanceError};
 use super::trailer::{
-    stop_reason_word, ExactPassState, MissingBoundedExactPassDisclosure, SearchTotal, SearchTrailer,
+    ExactPassState, MissingBoundedExactPassDisclosure, SearchTrailer,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,15 +180,7 @@ where
 }
 
 pub fn format_search_trailer(trailer: &SearchTrailer) -> String {
-    let (total, suffix) = match trailer.total {
-        SearchTotal::Exact(total) => (total, ""),
-        SearchTotal::AtLeast(total) => (total, "+"),
-    };
-    format!(
-        "shown {} of {total}{suffix} ({})",
-        trailer.shown,
-        stop_reason_word(trailer.stop_state)
-    )
+    trailer.render()
 }
 
 fn lanes_run(page: &SearchPage) -> Vec<SearchLaneKind> {

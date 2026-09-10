@@ -9,7 +9,7 @@
     "depth_tier": 0,
     "lanes_exhausted": true,
     "stability_void": false,
-    "trailer": "shown 2 of 2 (exhausted)",
+    "trailer": "shown 2 of 2 results (exhausted) · narrow: offset, topK, path, includeTests",
     "stability_files": ["ready-exact.rs", "ready-non-exact.rs"]
   },
   "fallback": {
@@ -22,7 +22,7 @@
     "depth_tier": 0,
     "lanes_exhausted": true,
     "stability_void": false,
-    "trailer": "shown 1 of 1 (exhausted)",
+    "trailer": "shown 1 of 1 results (exhausted) · narrow: offset, topK, path, includeTests",
     "bounded_disclosure": "exact pass: bounded (12 files, file limit)",
     "stability_files": ["fallback.rs"]
   }

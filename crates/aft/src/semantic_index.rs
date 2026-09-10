@@ -40,6 +40,12 @@ pub fn with_search_embedding_call_counter<T>(run: impl FnOnce() -> T) -> (T, u64
     })
 }
 
+pub fn current_search_embedding_call_count() -> u64 {
+    SEARCH_EMBEDDING_CALL_COUNT
+        .try_with(Cell::get)
+        .unwrap_or_default()
+}
+
 fn record_search_embedding_call() {
     let _ = SEARCH_EMBEDDING_CALL_COUNT.try_with(|count| count.set(count.get() + 1));
 }
