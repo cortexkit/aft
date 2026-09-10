@@ -8866,6 +8866,49 @@ mod tests {
         assert_eq!(registry.unacked_wake_count_for_session(Some("session")), 0);
     }
 
+    #[test]
+    fn terminalized_watch_is_one_shot_across_registry_restart_after_ack() {
+        let storage = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(storage.path());
+        let task_id = "bash-0000000000000196";
+        install_delivered_terminal_with_pending_watch(&registry, &db, storage.path(), task_id);
+        {
+            let conn = db.lock().unwrap();
+            let mut row = crate::db::bash_watches::get_bash_pattern_watch(
+                &conn,
+                "opencode",
+                "session",
+                task_id,
+                "watch-00000001",
+            )
+            .unwrap()
+            .unwrap();
+            row.scanning = false;
+            row.pending_match = true;
+            row.match_text = Some(WATCH_TARGET_ERASED_TEXT.to_string());
+            row.match_offset = Some(0);
+            row.match_context = Some(WATCH_TARGET_ERASED_CONTEXT.to_string());
+            crate::db::bash_watches::upsert_bash_pattern_watch(&conn, &row).unwrap();
+        }
+
+        let terminalized = registry.pending_pattern_matches_for_session("session");
+        assert_eq!(terminalized.len(), 1);
+        assert_eq!(terminalized[0].task_id, task_id);
+        assert_eq!(terminalized[0].match_text, WATCH_TARGET_ERASED_TEXT);
+        assert_eq!(
+            registry.ack_completions_for_session(Some("session"), &[task_id.to_string()]),
+            vec![task_id.to_string()]
+        );
+        drop(registry);
+
+        let restarted = BgTaskRegistry::default();
+        restarted.set_harness(Harness::Opencode);
+        restarted.set_db_pool(db);
+        assert!(restarted
+            .pending_pattern_matches_for_session("session")
+            .is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn gc_refuses_to_delete_or_quarantine_a_recorded_live_process() {

@@ -207,6 +207,10 @@ fn erase_persisted_task_row(
     task_id: &str,
 ) -> aft::db::bash_tasks::BashTaskRow {
     let conn = rusqlite::Connection::open(storage.join("aft.db")).expect("open task database");
+    // Production connections enforce the task-to-watch cascade. These tests
+    // deliberately plant legacy corruption so replay can exercise its fallback.
+    conn.pragma_update(None, "foreign_keys", "OFF")
+        .expect("disable cascade for orphan-watch fixture");
     let row = aft::db::bash_tasks::get_bash_task(&conn, harness, session, task_id)
         .expect("read persisted task row")
         .expect("persisted task row");
