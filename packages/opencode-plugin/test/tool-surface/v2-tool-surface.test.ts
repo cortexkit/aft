@@ -215,6 +215,44 @@ describe("OpenCode V2 tool surface", () => {
     expect(executedInput).not.toHaveProperty("path");
   });
 
+  test("only host-permission tools may defer asks to native enforcement", async () => {
+    let domainlessExecuted = false;
+    const base = sharedDefinitions().read;
+    const definition = {
+      ...base,
+      execute: async (_input: unknown, context: { ask(request: unknown): Promise<void> }) => {
+        await context.ask({ permission: "read", patterns: ["sample.txt"], always: ["*"] });
+        domainlessExecuted = true;
+        return "ok";
+      },
+    } as ToolDefinition;
+    const executionContext = {
+      sessionID: "session",
+      messageID: "message",
+      id: "call",
+      agent: "agent",
+      progress: () => Effect.void,
+    };
+
+    await Effect.runPromise(
+      projectV2Tool("read", definition, LOCATION, { nativePermissionOptions: true }).execute(
+        { path: "sample.txt" },
+        executionContext,
+      ),
+    );
+    expect(domainlessExecuted).toBe(true);
+
+    domainlessExecuted = false;
+    await expect(
+      Effect.runPromise(
+        projectV2Tool("aft_callgraph", definition, LOCATION, {
+          nativePermissionOptions: true,
+        }).execute({ filePath: "sample.txt" }, executionContext),
+      ),
+    ).rejects.toThrow("V2 permission requests require host-enforced tool permission options");
+    expect(domainlessExecuted).toBe(false);
+  });
+
   test("keeps provider definition bytes stable without model-aware filtering", () => {
     const definitions = sharedDefinitions();
     const providers = ["openai", "anthropic", "gemini"] as const;
