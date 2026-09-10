@@ -258,7 +258,12 @@ jobs:
       - name: Run OpenCode 2 matrix
         env:
           AFT_BINARY_PATH: ${{ runner.temp }}/aft-opencode2/aft
-        run: bash tests/docker/run-opencode2-test.sh
+        # A matrix that overruns the job budget is cancelled by the runner,
+        # and a cancelled job reads as a cancelled run for every consumer
+        # (train-push refuses the fast-forward). While the matrix is red on
+        # the pinned beta, bound the run one minute inside the job budget so
+        # an overrun is a step failure the advisory job absorbs.
+        run: timeout --signal=TERM --kill-after=30s 12m bash tests/docker/run-opencode2-test.sh
 
       - name: Dump per-scenario failure forensics
         if: failure()
