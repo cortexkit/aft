@@ -115,6 +115,12 @@ function projectArguments(name: string, definition: ToolDefinition): ToolDefinit
   return { path: filePath, ...rest };
 }
 
+function executionArguments(name: string, input: Record<string, unknown>): Record<string, unknown> {
+  if (!V2_PATH_HEADER_TOOLS.has(bareToolName(name)) || !("path" in input)) return input;
+  const { path, ...rest } = input;
+  return { filePath: path, ...rest };
+}
+
 function assertV2Contract(name: string, input: ReturnType<typeof tool.schema.object>): void {
   if (!V2_TOOL_NAME.test(name)) {
     throw new Error(
@@ -188,15 +194,16 @@ export function projectV2Tool(
       Effect.tryPromise({
         try: async (signal) => {
           const runtime = runtimeFor(location, context, signal, consumers);
+          const input = executionArguments(name, rawInput);
           const result =
             consumers.executeBash && V2_BASH_TOOLS.has(name)
               ? await consumers.executeBash({
                   name: name as "bash" | "aft_bash",
-                  input: rawInput,
+                  input,
                   context: runtime,
                   definition,
                 })
-              : await definition.execute(rawInput, runtime as never);
+              : await definition.execute(input, runtime as never);
           return resultContent(result);
         },
         catch: failure,

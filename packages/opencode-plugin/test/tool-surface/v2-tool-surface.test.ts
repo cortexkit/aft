@@ -181,6 +181,37 @@ describe("OpenCode V2 tool surface", () => {
     );
   });
 
+  test("maps canonical V2 path input back to the shared executor field", async () => {
+    let executedInput: Record<string, unknown> | undefined;
+    const definition = sharedDefinitions().read;
+    const projected = projectV2Tool(
+      "read",
+      {
+        ...definition,
+        execute: async (input) => {
+          executedInput = input;
+          return "ok";
+        },
+      },
+      LOCATION,
+    );
+
+    await Effect.runPromise(
+      projected.execute(
+        { path: "sample.txt" },
+        {
+          sessionID: "session",
+          messageID: "message",
+          id: "call",
+          agent: "agent",
+          progress: () => Effect.void,
+        },
+      ),
+    );
+    expect(executedInput).toMatchObject({ filePath: "sample.txt" });
+    expect(executedInput).not.toHaveProperty("path");
+  });
+
   test("keeps provider definition bytes stable without model-aware filtering", () => {
     const definitions = sharedDefinitions();
     const providers = ["openai", "anthropic", "gemini"] as const;
