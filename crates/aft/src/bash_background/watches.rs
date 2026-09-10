@@ -192,9 +192,10 @@ impl WatchRegistry {
     }
 
     pub fn terminalize_erased_task(&mut self, task_id: &str, watch_id: &str) -> bool {
+        let had_watch =
+            self.watches.contains_key(task_id) || self.controlled_tasks.contains(task_id);
         self.clear_task(task_id);
-        self.erased_notifications
-            .insert(format!("{task_id}:{watch_id}"))
+        had_watch && self.erased_notifications.insert(format!("{task_id}:{watch_id}"))
     }
 
     pub fn forget_erased_task(&mut self, task_id: &str) {

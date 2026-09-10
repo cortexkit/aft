@@ -2168,6 +2168,7 @@ impl BgTaskRegistry {
             self.replace_live_delivery_sessions(std::iter::once(session_id.to_string()).collect());
         }
         self.retire_orphaned_watch_tombstones(session_id)?;
+        self.start_watchdog();
         if !self.inner.persisted_gc_started.swap(true, Ordering::SeqCst) {
             // The persisted GC walks every session under the shared storage root
             // (liveness probes, row deletes, quarantines) and scales with the
@@ -4677,9 +4678,6 @@ impl BgTaskRegistry {
     }
 
     fn emit_bash_pattern_match(&self, session_id: &str, pattern_match: PatternMatch) {
-        if !self.originating_session_has_live_route(session_id) {
-            return;
-        }
         let Ok(progress_sender) = self
             .inner
             .progress_sender
@@ -4712,9 +4710,6 @@ impl BgTaskRegistry {
     }
 
     fn emit_bash_watch_erased(&self, session_id: &str, task_id: &str, watch_id: &str) {
-        if !self.originating_session_has_live_route(session_id) {
-            return;
-        }
         let Ok(progress_sender) = self
             .inner
             .progress_sender
@@ -4799,9 +4794,6 @@ impl BgTaskRegistry {
     }
 
     fn emit_bash_watch_exit(&self, frame: BashPatternMatchFrame) {
-        if !self.originating_session_has_live_route(&frame.session_id) {
-            return;
-        }
         let Ok(progress_sender) = self
             .inner
             .progress_sender
@@ -4817,9 +4809,6 @@ impl BgTaskRegistry {
     }
 
     fn emit_bash_completed(&self, completion: BgCompletion) {
-        if !self.originating_session_has_live_route(&completion.session_id) {
-            return;
-        }
         let Ok(progress_sender) = self
             .inner
             .progress_sender
@@ -4932,9 +4921,6 @@ impl BgTaskRegistry {
     }
 
     fn emit_bash_long_running(&self, frame: BashLongRunningFrame) {
-        if !self.originating_session_has_live_route(&frame.session_id) {
-            return;
-        }
         let Ok(progress_sender) = self
             .inner
             .progress_sender
