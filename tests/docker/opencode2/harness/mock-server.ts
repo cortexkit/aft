@@ -71,13 +71,29 @@ export function materializeTurnPlaceholders(
   }
 }
 
+export function hostToolName(name: string): string {
+  if (name === "ast_search") return "ast_grep_search";
+  if (name === "ast_replace") return "ast_grep_replace";
+  return name;
+}
+
+export function hostToolArguments(
+  name: string,
+  input: Record<string, unknown>,
+): Record<string, unknown> {
+  const bare = name.startsWith("aft_") ? name.slice(4) : name;
+  if (!new Set(["read", "write", "edit"]).has(bare) || !("filePath" in input)) return input;
+  const { filePath, ...rest } = input;
+  return { path: filePath, ...rest };
+}
+
 function mockResponse(turn: ScriptedTurn): Record<string, unknown> {
   if (turn.response.kind === "text") return { content: turn.response.content };
   return {
     toolCalls: turn.response.calls.map((call) => ({
       id: call.id,
-      name: call.name,
-      arguments: JSON.stringify(call.arguments),
+      name: hostToolName(call.name),
+      arguments: JSON.stringify(hostToolArguments(call.name, call.arguments)),
     })),
   };
 }
@@ -162,6 +178,7 @@ export class DeterministicScenarioMock {
             !isTitleGenerationRequest(request) && nextTurn === index,
         },
         async (request: unknown) => {
+          nextTurn = index + 1;
           const { exchange, response } = await observeThenRespond(
             turn,
             request,
@@ -170,7 +187,6 @@ export class DeterministicScenarioMock {
           );
           appendFileSync(this.turnLogPath, `${turn.label}\n`);
           this.exchanges.push(exchange);
-          nextTurn = index + 1;
           return response;
         },
         turn.delay_ms ? { streamingProfile: { ttft: turn.delay_ms, tps: 1_000 } } : undefined,

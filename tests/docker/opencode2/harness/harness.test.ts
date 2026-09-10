@@ -22,6 +22,8 @@ import { readPermissionAskInventory } from "./inventory.js";
 import { createScenarioIsolation } from "./isolation.js";
 import { CompletionWakeLiveness, WatchPatternLiveness } from "./liveness.js";
 import {
+  hostToolArguments,
+  hostToolName,
   isTitleGenerationRequest,
   materializeTurnPlaceholders,
   observeThenRespond,
@@ -137,6 +139,14 @@ describe("scenario isolation and liveness", () => {
     }
     expect(isolated.env.OPENCODE_DISABLE_DEFAULT_PLUGINS).toBe("true");
     expect(isolated.env.AFT_BINARY_PATH).toBe("/native/aft");
+    const aftConfig = JSON.parse(
+      await readFile(join(isolated.project, ".cortexkit", "aft.jsonc"), "utf8"),
+    );
+    expect(aftConfig).toMatchObject({
+      tool_surface: "all",
+      semantic_search: true,
+      search_index: true,
+    });
     const hostConfig = JSON.parse(await readFile(isolated.host_config, "utf8"));
     expect(hostConfig.plugin[0]).toEndWith("/xdg-config/aft-opencode-wrapper");
     expect(hostConfig.providers.mock.settings.baseURL).toBe("http://127.0.0.1:1234/v1");
@@ -172,6 +182,16 @@ describe("scenario isolation and liveness", () => {
       "--model",
       "openai/mock-model",
     ]);
+  });
+
+  test("scenario tool aliases use the registered host names", () => {
+    expect(hostToolName("ast_search")).toBe("ast_grep_search");
+    expect(hostToolName("ast_replace")).toBe("ast_grep_replace");
+    expect(hostToolName("read")).toBe("read");
+    expect(hostToolArguments("read", { filePath: "sample.txt", limit: 10 })).toEqual({
+      path: "sample.txt",
+      limit: 10,
+    });
   });
 
   test("title generation is excluded from scripted scenario turns", () => {
