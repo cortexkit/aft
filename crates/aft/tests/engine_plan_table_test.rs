@@ -26,15 +26,15 @@ fn test_running_table_matches_pinned_json() {
 }
 
 #[test]
-fn test_cross_product_totality_18_entries() {
+fn test_cross_product_totality_63_entries() {
     let running = PlanTable::running_table();
-    assert_eq!(running.entries.len(), 6, "must have 6 shapes");
+    assert_eq!(running.entries.len(), 7, "must have 7 shapes");
     for shape in SearchShape::ALL {
         let lanes = running
             .entries
             .get(shape.as_str())
             .unwrap_or_else(|| panic!("missing shape: {}", shape.as_str()));
-        assert_eq!(lanes.len(), 3, "each shape must have exactly 3 lanes");
+        assert_eq!(lanes.len(), 9, "each shape must have exactly 9 lanes");
         for lane in SearchLaneKind::ALL {
             assert!(
                 lanes.contains_key(lane.as_str()),
@@ -129,18 +129,18 @@ fn test_mutation_red_exact_lane_zero_weight_instead_of_null() {
     let mut pinned = PlanTable::running_table();
     pinned
         .entries
-        .get_mut("natural_language")
+        .get_mut("nl")
         .unwrap()
         .get_mut("exact")
         .unwrap()
         .weight = Some(0.0); // zero weight instead of null
 
     let err = running.verify_against(&pinned).unwrap_err();
-    assert_eq!(err.shape, "natural_language");
+    assert_eq!(err.shape, "nl");
     assert_eq!(err.lane, "exact");
     assert_eq!(err.field, "weight");
     let err_msg = err.to_string();
-    assert!(err_msg.contains("(natural_language, exact, weight)"));
+    assert!(err_msg.contains("(nl, exact, weight)"));
 }
 
 #[test]
@@ -149,18 +149,18 @@ fn test_exact_lane_non_null_rrf_constant_is_error() {
     let mut pinned = PlanTable::running_table();
     pinned
         .entries
-        .get_mut("error_code")
+        .get_mut("code_literal")
         .unwrap()
         .get_mut("exact")
         .unwrap()
         .rrf_constant = Some(60.0); // non-null rrf_constant on exact lane
 
     let err = running.verify_against(&pinned).unwrap_err();
-    assert_eq!(err.shape, "error_code");
+    assert_eq!(err.shape, "code_literal");
     assert_eq!(err.lane, "exact");
     assert_eq!(err.field, "rrf_constant");
     let err_msg = err.to_string();
-    assert!(err_msg.contains("(error_code, exact, rrf_constant)"));
+    assert!(err_msg.contains("(code_literal, exact, rrf_constant)"));
 }
 
 #[test]

@@ -4,6 +4,7 @@ pub mod comparator;
 pub mod confidence;
 pub mod evidence_descriptor;
 pub mod exact_lane;
+pub mod extensions;
 pub mod generation_token;
 pub mod lexical_lane;
 pub mod memo;
@@ -25,11 +26,31 @@ pub use plan_table::{
     SearchShape, PINNED_PLAN_TABLE_JSON,
 };
 
-/// Lane-registration seam: trait defining a participating search lane.
+/// Immutable request input passed to a registered lane callback.
+pub struct LaneInput<'a> {
+    pub query: &'a str,
+    pub root: &'a Path,
+    pub include_tests: bool,
+    pub index: &'a SearchIndex,
+}
+
+#[derive(Debug, Clone)]
+pub struct LaneExecution {
+    pub kind: SearchLaneKind,
+    pub candidates: Vec<CandidateResult>,
+}
+
+/// Lane-registration seam: every registration carries its execution callback.
 pub trait SearchLane: Send + Sync {
     fn kind(&self) -> SearchLaneKind;
     fn plan_order_index(&self) -> usize {
         self.kind().default_plan_order_index()
+    }
+    fn execute(&self, _input: &LaneInput<'_>) -> LaneExecution {
+        LaneExecution {
+            kind: self.kind(),
+            candidates: Vec::new(),
+        }
     }
 }
 
@@ -325,6 +346,68 @@ fn cancelled_search_response_from_id(request_id: &str) -> Response {
 }
 
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
+    use extensions::{DefaultSearchExtensions, QueryFacts, Readiness, Root, SearchExtensions, Token};
+
+    let facts = QueryFacts::new(
+        req.params
+            .get("query")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default(),
+    );
+    let extensions = DefaultSearchExtensions;
+    let shape = extensions.classify(&facts);
+    let _variants = extensions.variants(Token {
+        index: 0,
+        text: facts.original_query(),
+    });
+    let semantic_ready = ctx
+        .semantic_index_status()
+        .read()
+        .ok()
+        .is_some_and(|status| matches!(*status, SemanticIndexStatus::Ready { .. }));
+    let symbol_ready = ctx
+        .symbol_cache()
+        .read()
+        .ok()
+        .is_some_and(|cache| cache.len() > 0);
+    let root = Root::new(
+        req.params
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or("."),
+        Readiness::new(symbol_ready, search_index_ready(ctx), semantic_ready),
+    );
+    let readiness = extensions.sample_readiness(&root);
+    let plan = extensions.plan(&facts, shape, &readiness);
+
+    let (mut response, embedding_calls) =
+        crate::semantic_index::with_search_embedding_call_counter(|| {
+            handle_semantic_search_inner(req, ctx)
+        });
+    if response.success {
+        attach_search_execution_metadata(&mut response, &plan, embedding_calls);
+    }
+    response
+}
+
+fn attach_search_execution_metadata(
+    response: &mut Response,
+    plan: &extensions::LanePlan,
+    embedding_calls: u64,
+) {
+    let Some(data) = response.data.as_object_mut() else {
+        return;
+    };
+    data.insert(
+        "structuredContent".to_string(),
+        serde_json::json!({
+            "plan": plan,
+            "search": { "embedding_calls": embedding_calls },
+        }),
+    );
+}
+
+fn handle_semantic_search_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     if search_cancellation_requested() {
         return cancelled_search_response(req);
     }

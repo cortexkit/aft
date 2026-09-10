@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::comparator::{score_free_r3_cmp, CandidateResult};
 use super::evidence_descriptor::EvidenceDescriptor;
 use super::plan_table::SearchLaneKind;
-use super::SearchLane;
+use super::{LaneExecution, LaneInput, SearchLane};
 use crate::search_index::{decompose_regex, SearchIndex};
 
 /// Maximum occurrences considered per run, applied in ascending-offset order.
@@ -236,7 +236,7 @@ pub fn find_run_occurrences(text: &str, run: &str, run_idx: usize) -> Vec<Occurr
 
 /// Test-only injection for proving that canonical selection does not depend on
 /// occurrence enumeration or anchor-window scan order.
-#[cfg(test)]
+#[doc(hidden)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AlignmentTestOrder {
     pub reverse_window_scan: bool,
@@ -253,7 +253,7 @@ pub fn find_canonical_alignment(text: &str, retained_runs: &[String]) -> Option<
     canonical_alignment_from_enumerated(&run_occurrences, &windows)
 }
 
-#[cfg(test)]
+#[doc(hidden)]
 pub fn find_canonical_alignment_with_test_order(
     text: &str,
     retained_runs: &[String],
@@ -568,6 +568,18 @@ impl AnchoredLane {
 
 impl SearchLane for AnchoredLane {
     fn kind(&self) -> SearchLaneKind {
-        SearchLaneKind::Exact
+        SearchLaneKind::Anchored
+    }
+
+    fn execute(&self, input: &LaneInput<'_>) -> LaneExecution {
+        LaneExecution {
+            kind: self.kind(),
+            candidates: self.execute_ready_mode(
+                input.index,
+                input.root,
+                input.query,
+                input.include_tests,
+            ),
+        }
     }
 }

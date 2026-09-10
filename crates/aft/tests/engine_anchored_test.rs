@@ -2,16 +2,12 @@ use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[allow(dead_code)]
-#[path = "../src/commands/semantic_search/anchored_lane.rs"]
-mod anchored_lane;
-
 use aft::commands::semantic_search::comparator::{r3_cmp, CandidateResult, RankedTuple};
 use aft::commands::semantic_search::evidence_descriptor::{
     EvidenceDescriptor, EvidenceKind, EvidenceTier,
 };
 use aft::search_index::SearchIndex;
-use anchored_lane::{
+use aft::commands::semantic_search::anchored_lane::{
     cmp_alignment, discover_anchored_candidate_files, find_canonical_alignment,
     find_canonical_alignment_with_test_order, find_run_occurrences, sort_anchored_canonical,
     split_query, verify_anchored_text, Alignment, AlignmentTestOrder, AnchoredLane, Occurrence,
@@ -128,7 +124,7 @@ fn load_fixture(name: &str) -> AnchoredFixture {
 
 fn assert_five_fixture_values(
     name: &str,
-) -> (AnchoredFixture, anchored_lane::AnchoredVerification) {
+) -> (AnchoredFixture, aft::commands::semantic_search::anchored_lane::AnchoredVerification) {
     let fixture = load_fixture(name);
     fixture
         .validate_integers()

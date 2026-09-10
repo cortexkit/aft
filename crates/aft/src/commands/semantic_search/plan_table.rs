@@ -4,61 +4,52 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::query_shape::QueryKind;
-
 /// Shapes recognized by the search ranking engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchShape {
     Identifier,
-    Mixed,
-    ErrorCode,
+    CodeLiteral,
+    Short,
+    NaturalLanguage,
+    LogExcerpt,
     Path,
     Regex,
-    NaturalLanguage,
 }
 
 impl SearchShape {
-    pub const ALL: [SearchShape; 6] = [
+    pub const ALL: [SearchShape; 7] = [
         SearchShape::Identifier,
-        SearchShape::Mixed,
-        SearchShape::ErrorCode,
+        SearchShape::CodeLiteral,
+        SearchShape::Short,
+        SearchShape::NaturalLanguage,
+        SearchShape::LogExcerpt,
         SearchShape::Path,
         SearchShape::Regex,
-        SearchShape::NaturalLanguage,
     ];
 
     pub fn as_str(&self) -> &'static str {
         match self {
             SearchShape::Identifier => "identifier",
-            SearchShape::Mixed => "mixed",
-            SearchShape::ErrorCode => "error_code",
+            SearchShape::CodeLiteral => "code_literal",
+            SearchShape::Short => "short",
+            SearchShape::NaturalLanguage => "nl",
+            SearchShape::LogExcerpt => "log_excerpt",
             SearchShape::Path => "path",
             SearchShape::Regex => "regex",
-            SearchShape::NaturalLanguage => "natural_language",
         }
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "identifier" => Some(SearchShape::Identifier),
-            "mixed" => Some(SearchShape::Mixed),
-            "error_code" => Some(SearchShape::ErrorCode),
+            "code_literal" => Some(SearchShape::CodeLiteral),
+            "short" => Some(SearchShape::Short),
+            "nl" => Some(SearchShape::NaturalLanguage),
+            "log_excerpt" => Some(SearchShape::LogExcerpt),
             "path" => Some(SearchShape::Path),
             "regex" => Some(SearchShape::Regex),
-            "natural_language" => Some(SearchShape::NaturalLanguage),
             _ => None,
-        }
-    }
-
-    pub fn to_query_kind(&self) -> QueryKind {
-        match self {
-            SearchShape::Identifier => QueryKind::Identifier,
-            SearchShape::Mixed => QueryKind::Mixed,
-            SearchShape::ErrorCode => QueryKind::ErrorCode,
-            SearchShape::Path => QueryKind::Path,
-            SearchShape::Regex => QueryKind::Regex,
-            SearchShape::NaturalLanguage => QueryKind::NaturalLanguage,
         }
     }
 }
@@ -73,41 +64,75 @@ impl fmt::Display for SearchShape {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchLaneKind {
+    Symbol,
     Exact,
+    Anchored,
     Lexical,
+    Variants,
     Semantic,
+    PathLookup,
+    FallbackWalk,
+    ReadinessDisclosure,
 }
 
 impl SearchLaneKind {
-    pub const ALL: [SearchLaneKind; 3] = [
+    pub const ALL: [SearchLaneKind; 9] = [
+        SearchLaneKind::Symbol,
         SearchLaneKind::Exact,
+        SearchLaneKind::Anchored,
         SearchLaneKind::Lexical,
+        SearchLaneKind::Variants,
         SearchLaneKind::Semantic,
+        SearchLaneKind::PathLookup,
+        SearchLaneKind::FallbackWalk,
+        SearchLaneKind::ReadinessDisclosure,
     ];
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            SearchLaneKind::Symbol => "symbol",
             SearchLaneKind::Exact => "exact",
+            SearchLaneKind::Anchored => "anchored",
             SearchLaneKind::Lexical => "lexical",
+            SearchLaneKind::Variants => "variants",
             SearchLaneKind::Semantic => "semantic",
+            SearchLaneKind::PathLookup => "path_lookup",
+            SearchLaneKind::FallbackWalk => "fallback_walk",
+            SearchLaneKind::ReadinessDisclosure => "readiness_disclosure",
         }
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
+            "symbol" => Some(SearchLaneKind::Symbol),
             "exact" => Some(SearchLaneKind::Exact),
+            "anchored" => Some(SearchLaneKind::Anchored),
             "lexical" => Some(SearchLaneKind::Lexical),
+            "variants" => Some(SearchLaneKind::Variants),
             "semantic" => Some(SearchLaneKind::Semantic),
+            "path_lookup" => Some(SearchLaneKind::PathLookup),
+            "fallback_walk" => Some(SearchLaneKind::FallbackWalk),
+            "readiness_disclosure" => Some(SearchLaneKind::ReadinessDisclosure),
             _ => None,
         }
     }
 
     pub fn default_plan_order_index(&self) -> usize {
         match self {
-            SearchLaneKind::Exact => 0,
-            SearchLaneKind::Lexical => 1,
-            SearchLaneKind::Semantic => 2,
+            SearchLaneKind::Symbol => 0,
+            SearchLaneKind::Exact => 1,
+            SearchLaneKind::Anchored => 2,
+            SearchLaneKind::Lexical => 3,
+            SearchLaneKind::Variants => 4,
+            SearchLaneKind::Semantic => 5,
+            SearchLaneKind::PathLookup => 6,
+            SearchLaneKind::FallbackWalk => 7,
+            SearchLaneKind::ReadinessDisclosure => 8,
         }
+    }
+
+    pub const fn is_scored(self) -> bool {
+        matches!(self, Self::Lexical | Self::Semantic)
     }
 }
 
@@ -162,44 +187,30 @@ impl PlanTable {
             let shape_str = shape.as_str().to_string();
             let mut lane_map = BTreeMap::new();
 
-            let query_kind = shape.to_query_kind();
-            let weights = match query_kind {
-                QueryKind::Identifier => (0.8f32, 0.2f32),
-                QueryKind::Path | QueryKind::ErrorCode => (0.9f32, 0.1f32),
-                QueryKind::Regex => (1.0f32, 0.0f32),
-                QueryKind::NaturalLanguage => (0.4f32, 0.6f32),
-                QueryKind::Mixed => (0.6f32, 0.4f32),
+            let weights = match shape {
+                SearchShape::Identifier | SearchShape::Short => (0.8f32, 0.2f32),
+                SearchShape::CodeLiteral | SearchShape::LogExcerpt | SearchShape::Path => {
+                    (0.9f32, 0.1f32)
+                }
+                SearchShape::NaturalLanguage => (0.4f32, 0.6f32),
+                SearchShape::Regex => (1.0f32, 0.0f32),
             };
 
-            // Exact lane: weight is None, rrf_constant is None, plan_order_index is 0
-            lane_map.insert(
-                SearchLaneKind::Exact.as_str().to_string(),
-                LanePlanEntry {
-                    weight: None,
-                    rrf_constant: None,
-                    plan_order_index: SearchLaneKind::Exact.default_plan_order_index(),
-                },
-            );
-
-            // Lexical lane: weight from shape, rrf_constant 60.0, plan_order_index is 1
-            lane_map.insert(
-                SearchLaneKind::Lexical.as_str().to_string(),
-                LanePlanEntry {
-                    weight: Some(weights.0),
-                    rrf_constant: Some(60.0),
-                    plan_order_index: SearchLaneKind::Lexical.default_plan_order_index(),
-                },
-            );
-
-            // Semantic lane: weight from shape, rrf_constant 60.0, plan_order_index is 2
-            lane_map.insert(
-                SearchLaneKind::Semantic.as_str().to_string(),
-                LanePlanEntry {
-                    weight: Some(weights.1),
-                    rrf_constant: Some(60.0),
-                    plan_order_index: SearchLaneKind::Semantic.default_plan_order_index(),
-                },
-            );
+            for lane in SearchLaneKind::ALL {
+                let weight = match lane {
+                    SearchLaneKind::Lexical => Some(weights.0),
+                    SearchLaneKind::Semantic => Some(weights.1),
+                    _ => None,
+                };
+                lane_map.insert(
+                    lane.as_str().to_string(),
+                    LanePlanEntry {
+                        weight,
+                        rrf_constant: weight.map(|_| 60.0),
+                        plan_order_index: lane.default_plan_order_index(),
+                    },
+                );
+            }
 
             entries.insert(shape_str, lane_map);
         }
@@ -428,6 +439,16 @@ mod tests {
     fn running_table_matches_pinned_json() {
         verify_pinned_plan_table_at_startup()
             .expect("pinned plan-table.json must match running table");
+    }
+
+    #[test]
+    #[ignore = "fixture regeneration is an explicit maintainer action"]
+    fn regenerate_pinned_plan_table() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../benchmarks/aft-search/engine-fixtures/plan-table.json");
+        let json = serde_json::to_string_pretty(&PlanTable::running_table())
+            .expect("serialize running plan table");
+        std::fs::write(fixture, format!("{json}\n")).expect("write pinned plan table");
     }
 
     #[test]

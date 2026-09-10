@@ -13,7 +13,7 @@ use crate::commands::semantic_search::comparator::{
 use crate::commands::semantic_search::evidence_descriptor::EvidenceDescriptor;
 use crate::commands::semantic_search::generation_token::GenerationToken;
 use crate::commands::semantic_search::plan_table::SearchLaneKind;
-use crate::commands::semantic_search::SearchLane;
+use crate::commands::semantic_search::{LaneExecution, LaneInput, SearchLane};
 use crate::inspect::job::is_test_file;
 use crate::query_shape::{contains_all_content_tokens, extract_content_tokens};
 use crate::search_index::{SearchIndex, SearchIndexSnapshot};
@@ -310,6 +310,16 @@ impl ExactLane {
 impl SearchLane for ExactLane {
     fn kind(&self) -> SearchLaneKind {
         SearchLaneKind::Exact
+    }
+
+    fn execute(&self, input: &LaneInput<'_>) -> LaneExecution {
+        let snapshot = input.index.snapshot();
+        LaneExecution {
+            kind: self.kind(),
+            candidates: self
+                .execute_ready_mode(&snapshot, input.root, input.query, input.include_tests)
+                .results,
+        }
     }
 }
 

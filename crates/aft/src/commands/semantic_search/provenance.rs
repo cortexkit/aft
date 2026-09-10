@@ -160,7 +160,10 @@ impl<'a> ObservedProvenance<'a> {
             lane_enumeration_counts: &reply.lane_enumeration_counts,
         };
         provenance.tier_depth()?;
-        for lane in [SearchLaneKind::Lexical, SearchLaneKind::Semantic] {
+        for lane in SearchLaneKind::ALL
+            .into_iter()
+            .filter(|lane| lane.is_scored())
+        {
             let observed_count = provenance.observed_count(lane);
             if observed_count > provenance.retrieval_depth {
                 return Err(ProvenanceError::EnumerationPastReachedDepth {
@@ -211,42 +214,39 @@ impl<'a> ObservedProvenance<'a> {
         }
 
         let exact_tier = entry.result.evidence.tier == EvidenceTier::Exact;
-        let encoded = match (exact_tier, attribution.lane) {
-            (true, SearchLaneKind::Exact) => {
-                expect_disposition(attribution, ContributionDisposition::DepthExempt)?;
-                LanePosition::Special {
-                    position: attribution.position,
-                    disposition: SpecialLaneDisposition::DepthExempt,
+        let encoded = if exact_tier {
+            let disposition = match attribution.disposition {
+                ContributionDisposition::DepthExempt => SpecialLaneDisposition::DepthExempt,
+                ContributionDisposition::ProvenanceOnly => SpecialLaneDisposition::ProvenanceOnly,
+                _ => {
+                    expect_disposition(attribution, ContributionDisposition::DepthExempt)?;
+                    unreachable!("expect_disposition returns on a mismatch")
                 }
+            };
+            LanePosition::Special {
+                position: attribution.position,
+                disposition,
             }
-            (true, SearchLaneKind::Lexical | SearchLaneKind::Semantic) => {
-                expect_disposition(attribution, ContributionDisposition::ProvenanceOnly)?;
-                LanePosition::Special {
-                    position: attribution.position,
-                    disposition: SpecialLaneDisposition::ProvenanceOnly,
-                }
-            }
-            (false, SearchLaneKind::Exact) => {
+        } else {
+            if !attribution.lane.is_scored() {
                 return Err(ProvenanceError::ExactContributionOnNonExactResult);
             }
-            (false, SearchLaneKind::Lexical | SearchLaneKind::Semantic) => {
-                let tier_depth = BLOCK_DEPTHS.get(entry.tier_index).copied().ok_or(
-                    ProvenanceError::InvalidRunDepth {
-                        retrieval_depth: self.retrieval_depth,
-                        depth_tier: entry.tier_index,
-                    },
-                )?;
-                let admitted = attribution.position < tier_depth;
-                let expected = if admitted {
-                    ContributionDisposition::Admitted
-                } else {
-                    ContributionDisposition::NotAdmitted
-                };
-                expect_disposition(attribution, expected)?;
-                LanePosition::DepthLimited {
-                    position: attribution.position,
-                    admitted,
-                }
+            let tier_depth = BLOCK_DEPTHS.get(entry.tier_index).copied().ok_or(
+                ProvenanceError::InvalidRunDepth {
+                    retrieval_depth: self.retrieval_depth,
+                    depth_tier: entry.tier_index,
+                },
+            )?;
+            let admitted = attribution.position < tier_depth;
+            let expected = if admitted {
+                ContributionDisposition::Admitted
+            } else {
+                ContributionDisposition::NotAdmitted
+            };
+            expect_disposition(attribution, expected)?;
+            LanePosition::DepthLimited {
+                position: attribution.position,
+                admitted,
             }
         };
         Ok(encoded)
@@ -270,7 +270,17 @@ impl LanePositionsAccessor for ObservedProvenance<'_> {
         }
 
         let exact_tier = entry.result.evidence.tier == EvidenceTier::Exact;
-        if exact_tier && !positions.contains_key(&SearchLaneKind::Exact) {
+        if exact_tier
+            && !positions.values().any(|position| {
+                matches!(
+                    position,
+                    LanePosition::Special {
+                        disposition: SpecialLaneDisposition::DepthExempt,
+                        ..
+                    }
+                )
+            })
+        {
             return Err(ProvenanceError::MissingExactContribution);
         }
         Ok(positions)

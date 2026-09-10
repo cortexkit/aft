@@ -100,26 +100,22 @@ impl CanonicalLane {
                     path: candidate.path.clone(),
                 });
             }
-            match kind {
-                SearchLaneKind::Exact => {
-                    if candidate.evidence.tier != EvidenceTier::Exact
-                        || candidate.raw_score.is_some()
-                    {
-                        return Err(BlockBuildError::InvalidExactCandidate(
-                            candidate.path.clone(),
-                        ));
-                    }
+            match candidate.evidence.tier {
+                EvidenceTier::Exact if candidate.raw_score.is_some() => {
+                    return Err(BlockBuildError::InvalidExactCandidate(
+                        candidate.path.clone(),
+                    ));
                 }
-                SearchLaneKind::Lexical | SearchLaneKind::Semantic => {
-                    if candidate.evidence.tier != EvidenceTier::NonExact
-                        || candidate.raw_score.is_none_or(|score| !score.is_finite())
-                    {
-                        return Err(BlockBuildError::InvalidDepthLimitedCandidate {
-                            lane: kind,
-                            path: candidate.path.clone(),
-                        });
-                    }
+                EvidenceTier::NonExact
+                    if !kind.is_scored()
+                        || candidate.raw_score.is_none_or(|score| !score.is_finite()) =>
+                {
+                    return Err(BlockBuildError::InvalidDepthLimitedCandidate {
+                        lane: kind,
+                        path: candidate.path.clone(),
+                    });
                 }
+                EvidenceTier::Exact | EvidenceTier::NonExact => {}
             }
         }
         Ok(Self { kind, candidates })
@@ -346,7 +342,7 @@ struct CandidateIdentity {
 
 #[derive(Debug, Clone)]
 struct ObservedCandidate<'a> {
-    exact: Vec<(usize, &'a LaneCandidate)>,
+    exact: Vec<(SearchLaneKind, usize, &'a LaneCandidate)>,
     depth_limited: Vec<LaneContribution>,
     depth_evidence: Vec<&'a EvidenceDescriptor>,
 }
@@ -482,29 +478,25 @@ impl BlockBuilder {
     ) -> HashMap<CandidateIdentity, ObservedCandidate<'_>> {
         let mut observed = HashMap::new();
         for lane in &self.lanes {
-            let limit = match lane.kind {
-                SearchLaneKind::Exact => lane.candidates.len(),
-                SearchLaneKind::Lexical | SearchLaneKind::Semantic => {
-                    lane.candidates.len().min(depth)
-                }
-            };
-            for (position, candidate) in lane.candidates.iter().take(limit).enumerate() {
+            for (position, candidate) in lane.candidates.iter().enumerate() {
                 if !self.key.include_tests && candidate.is_test {
+                    continue;
+                }
+                if candidate.evidence.tier == EvidenceTier::NonExact && position >= depth {
                     continue;
                 }
                 let entry = observed
                     .entry(candidate.identity())
                     .or_insert_with(ObservedCandidate::new);
-                match lane.kind {
-                    SearchLaneKind::Exact => entry.exact.push((position, candidate)),
-                    SearchLaneKind::Lexical | SearchLaneKind::Semantic => {
-                        entry.depth_limited.push(LaneContribution {
-                            lane: lane.kind,
-                            position,
-                            raw_score: candidate.raw_score.expect("lane validated at construction"),
-                        });
-                        entry.depth_evidence.push(&candidate.evidence);
-                    }
+                if candidate.evidence.tier == EvidenceTier::Exact {
+                    entry.exact.push((lane.kind, position, candidate));
+                } else {
+                    entry.depth_limited.push(LaneContribution {
+                        lane: lane.kind,
+                        position,
+                        raw_score: candidate.raw_score.expect("lane validated at construction"),
+                    });
+                    entry.depth_evidence.push(&candidate.evidence);
                 }
             }
         }
@@ -530,7 +522,7 @@ impl BlockBuilder {
                 let exact_evidence = candidate
                     .exact
                     .iter()
-                    .map(|(_, exact)| &exact.evidence)
+                    .map(|(_, _, exact)| &exact.evidence)
                     .min_by(|left, right| {
                         exact_evidence_rank(left).cmp(&exact_evidence_rank(right))
                     })
@@ -621,11 +613,13 @@ impl BlockBuilder {
             };
             let mut attribution = Vec::new();
             if entry.result.evidence.tier == EvidenceTier::Exact {
-                attribution.extend(candidate.exact.iter().map(|(position, _)| LaneAttribution {
-                    lane: SearchLaneKind::Exact,
-                    position: *position,
-                    disposition: ContributionDisposition::DepthExempt,
-                }));
+                attribution.extend(candidate.exact.iter().map(
+                    |(lane, position, _)| LaneAttribution {
+                        lane: *lane,
+                        position: *position,
+                        disposition: ContributionDisposition::DepthExempt,
+                    },
+                ));
             }
             for contribution in &candidate.depth_limited {
                 if contribution.position >= reached_depth {
@@ -650,13 +644,15 @@ impl BlockBuilder {
     }
 
     fn has_unconsumed_candidates(&self, depth: usize) -> bool {
-        self.lanes.iter().any(|lane| match lane.kind {
-            SearchLaneKind::Exact => false,
-            SearchLaneKind::Lexical | SearchLaneKind::Semantic => lane
-                .candidates
+        self.lanes.iter().any(|lane| {
+            lane.candidates
                 .iter()
+                .enumerate()
                 .skip(depth.min(lane.candidates.len()))
-                .any(|candidate| self.key.include_tests || !candidate.is_test),
+                .any(|(_, candidate)| {
+                    candidate.evidence.tier == EvidenceTier::NonExact
+                        && (self.key.include_tests || !candidate.is_test)
+                })
         })
     }
 
@@ -664,11 +660,14 @@ impl BlockBuilder {
         self.lanes
             .iter()
             .map(|lane| {
-                let count = match lane.kind {
-                    SearchLaneKind::Exact => lane.candidates.len(),
-                    SearchLaneKind::Lexical | SearchLaneKind::Semantic => {
-                        lane.candidates.len().min(depth)
-                    }
+                let count = if lane
+                    .candidates
+                    .iter()
+                    .all(|candidate| candidate.evidence.tier == EvidenceTier::Exact)
+                {
+                    lane.candidates.len()
+                } else {
+                    lane.candidates.len().min(depth)
                 };
                 (lane.kind, count)
             })

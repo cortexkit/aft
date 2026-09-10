@@ -14,6 +14,7 @@ use crate::local_embed::LocalEmbedder;
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::error::Error;
@@ -25,6 +26,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use url::Url;
+
+tokio::task_local! {
+    static SEARCH_EMBEDDING_CALL_COUNT: Cell<u64>;
+}
+
+/// Run one search request with isolated embedding-call attribution.
+pub fn with_search_embedding_call_counter<T>(run: impl FnOnce() -> T) -> (T, u64) {
+    SEARCH_EMBEDDING_CALL_COUNT.sync_scope(Cell::new(0), || {
+        let output = run();
+        let count = SEARCH_EMBEDDING_CALL_COUNT.with(Cell::get);
+        (output, count)
+    })
+}
+
+fn record_search_embedding_call() {
+    let _ = SEARCH_EMBEDDING_CALL_COUNT.try_with(|count| count.set(count.get() + 1));
+}
 
 const DEFAULT_DIMENSION: usize = 384;
 const MAX_ENTRIES: usize = 1_000_000;
@@ -1236,6 +1254,7 @@ impl SemanticEmbeddingModel {
         texts: Vec<String>,
         policy: EmbeddingRequestPolicy,
     ) -> Result<Vec<Vec<f32>>, String> {
+        record_search_embedding_call();
         match &mut self.engine {
             SemanticEmbeddingEngine::Local(model) => model
                 .embed(&texts)
@@ -7748,6 +7767,38 @@ public class Greeter {
             .unwrap();
 
         assert_eq!(vectors, vec![vec![0.1, 0.2, 0.3], vec![0.4, 0.5, 0.6]]);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn search_embedding_counter_records_only_post_cache_calls() {
+        let (base_url, handle) = start_mock_http_server(|_, path, _| {
+            assert_eq!(path, "/v1/embeddings");
+            "{\"data\":[{\"embedding\":[0.1,0.2,0.3],\"index\":0}]}".to_string()
+        });
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "test-embedding".to_string(),
+            base_url: Some(base_url),
+            api_key_env: None,
+            timeout_ms: 5_000,
+            query_timeout_ms: DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
+            max_batch_size: 64,
+            max_files: 20_000,
+            ..Default::default()
+        };
+        let mut model = SemanticEmbeddingModel::from_config_for_query(&config).unwrap();
+        let ((), calls) = with_search_embedding_call_counter(|| {
+            model
+                .embed_query_cached("same query", QueryBudget::from_config(&config))
+                .unwrap();
+            model
+                .embed_query_cached("same query", QueryBudget::from_config(&config))
+                .unwrap();
+        });
+
+        assert_eq!(calls, 1, "the query-cache hit must not count as an embedding call");
+        assert_eq!(model.query_embedding_cache_stats(), (1, 1, 1));
         handle.join().unwrap();
     }
 
