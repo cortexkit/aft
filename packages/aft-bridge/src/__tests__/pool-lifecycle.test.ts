@@ -105,25 +105,6 @@ describe("BridgePool lifecycle", () => {
     );
   });
 
-  test("unrefs a live bridge process and all stdio handles", () => {
-    const pool = new BridgePool("/fake/aft", { idleTimeoutMs: Infinity });
-    const bridge = pool.getBridge("/project/one-shot");
-    const calls: string[] = [];
-    const stream = (name: string) => ({ unref: () => calls.push(name) });
-    (bridge as unknown as { process: unknown }).process = {
-      exitCode: null,
-      killed: false,
-      unref: () => calls.push("process"),
-      stdin: stream("stdin"),
-      stdout: stream("stdout"),
-      stderr: stream("stderr"),
-    };
-
-    bridge.unrefProcess();
-
-    expect(calls).toEqual(["process", "stdin", "stdout", "stderr"]);
-  });
-
   test("default finite idle timeout starts an unrefed cleanup timer", async () => {
     const pool = new BridgePool("/fake/aft");
     try {

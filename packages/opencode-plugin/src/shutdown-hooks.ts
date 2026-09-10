@@ -149,9 +149,3 @@ export function registerShutdownCleanup(fn: Cleanup): () => void {
     state.cleanups.delete(fn);
   };
 }
-
-export function isOneShotRunProcess(args: readonly string[] = process.argv): boolean {
-  return args.some((argument) => argument === "run");
-}
-
-

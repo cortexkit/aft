@@ -595,16 +595,6 @@ export class BinaryBridge implements AftProjectTransport {
     return this.process !== null && this.process.exitCode === null && !this.process.killed;
   }
 
-  /** Keep a live bridge usable without making it the reason a one-shot host stays alive. */
-  unrefProcess(): void {
-    const process = this.process;
-    if (!process) return;
-    process.unref();
-    for (const stream of [process.stdin, process.stdout, process.stderr]) {
-      (stream as unknown as { unref?: () => void } | null)?.unref?.();
-    }
-  }
-
   private invalidateTransportProcess(error: BridgeTransportUnavailableError): void {
     const proc = this.process;
     if (!proc) return;

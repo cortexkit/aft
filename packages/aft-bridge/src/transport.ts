@@ -43,8 +43,6 @@ export interface AftProjectTransport {
   getCwd(): string;
   getCachedStatus(): StatusSnapshot | null;
   cacheStatusSnapshot(snapshot: StatusSnapshot): void;
-  /** Stop this transport's handles from retaining a one-shot host process. */
-  unrefProcess?(): void;
 }
 
 // The pool of project transports (today: BridgePool).

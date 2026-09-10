@@ -82,11 +82,7 @@ import {
   warmSessionDirectory,
 } from "./shared/session-directory.js";
 import { coerceAftStatus, formatStatusMarkdown } from "./shared/status.js";
-import {
-  isOneShotRunProcess,
-  registerShutdownCleanup,
-  runCleanups,
-} from "./shutdown-hooks.js";
+import { registerShutdownCleanup, runCleanups } from "./shutdown-hooks.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { instrumentToolMap } from "./tool-perf.js";
 import {
@@ -732,9 +728,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   const originalToolCall = pool.toolCall.bind(pool);
   pool.toolCall = async (projectRoot, runtime, name, rawArgs, options) => {
     const result = await originalToolCall(projectRoot, runtime, name, rawArgs, options);
-    const bridge = pool.getActiveBridgeForRoot(projectRoot);
-    subscribeBridgeStatus(bridge);
-    if (isOneShotRunProcess()) bridge?.unrefProcess?.();
+    subscribeBridgeStatus(pool.getActiveBridgeForRoot(projectRoot));
     return result;
   };
 
@@ -978,9 +972,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     return { warnings };
   });
 
-  if (!isOneShotRunProcess()) {
-    rpcServer.start().catch((err) => warn(`RPC server failed to start: ${err}`));
-  }
+  rpcServer.start().catch((err) => warn(`RPC server failed to start: ${err}`));
 
   // --- Startup notifications (fire-and-forget, best-effort) ---
   const notifyOpts: NotificationOptions = {
