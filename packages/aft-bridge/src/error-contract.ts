@@ -18,6 +18,7 @@ import {
   isBridgeTransportTimeout,
 } from "./bridge.js";
 import {
+  isSubcClientClosedError,
   SubcRootGenerationExpiredError,
   SubcRootReapedError,
   SubcTransportShuttingDownError,
@@ -146,6 +147,7 @@ export function isBashTransportDeadError(error: unknown): error is Error {
     error instanceof BridgeTransportUnavailableError ||
     error instanceof SubcTransportShuttingDownError ||
     isConsumerReconnectTransient(error) ||
+    isSubcClientClosedError(error) ||
     error instanceof StaleRouteHandleError ||
     error instanceof SubcRootGenerationExpiredError ||
     error instanceof SubcRootReapedError

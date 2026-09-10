@@ -55,6 +55,7 @@ describe("isBashTransportDeadError", () => {
       new SubcCallError("not_sent", "bind timed out", "module_timeout"),
     ],
     ["connection dropped", new SubcCallError("outcome_unknown", "connection dropped")],
+    ["subc client closed before send", new SubcError("client closed")],
     [
       "stale route after retries",
       new StaleRouteHandleError({ channel: 1, epoch: 1 } as RouteHandle),
@@ -119,6 +120,12 @@ describe("isBashTransportDeadError", () => {
       new BridgeTransportUnknownOutcomeError("write failed"),
     ],
     ["live bridge request timeout", new BridgeTransportTimeoutError("bash", 100, "bridge busy")],
+    [
+      "client-closed text with an engine response",
+      Object.assign(new SubcError("client closed"), {
+        response: { success: false, code: "client_closed_by_engine" },
+      }),
+    ],
     ["ordinary tool failure", new Error("command failed")],
   ];
 
