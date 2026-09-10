@@ -672,14 +672,47 @@ function buildSchema(): Record<string, unknown> {
           "Subconscious (subc) daemon transport selection. User-scoped only — a project config cannot redirect transport. Presence of connection_file switches AFT from a spawned child process to a daemon-supervised module.",
       },
 
-      gh_shim: {
+      github: {
         type: "object",
         properties: {
           enabled: {
             type: "boolean",
             default: true,
             description:
-              "Operator hard-off for child PATH injection and governed gh routing. User-scoped only.",
+              "Master switch for every AFT GitHub integration. When false, shim routing, resource reads, comment writes, and GitHub-specific tool descriptions are all disabled.",
+          },
+          shim: {
+            type: "boolean",
+            default: true,
+            description: "Interpose the governed gh shim in agent child PATHs.",
+          },
+          read: {
+            type: "boolean",
+            default: false,
+            description:
+              "Enable structured issue:// and pr:// reads. github.write=true also enables this to keep comment ordinals visible.",
+          },
+          write: {
+            type: "boolean",
+            default: false,
+            description:
+              "Enable creating and editing issue and pull-request conversation comments.",
+          },
+        },
+        additionalProperties: false,
+        description:
+          "User-scoped GitHub integration gates. Project config cannot change capabilities or host-wide tool descriptions.",
+      },
+
+      gh_shim: {
+        type: "object",
+        properties: {
+          enabled: {
+            type: "boolean",
+            default: true,
+            deprecated: true,
+            description:
+              "Deprecated alias for github.shim; accepted through v0.56.x and removed in v0.57.0.",
           },
           binary_path: {
             type: "string",
@@ -689,7 +722,7 @@ function buildSchema(): Record<string, unknown> {
         },
         additionalProperties: false,
         description:
-          "gh routing shim operator gate. User-scoped only — a project config cannot disable the shim for the user's host.",
+          "Legacy gh shim settings. Use github.shim for the gate; binary_path remains the advanced AFT-image override.",
       },
 
       gh_read: {
@@ -698,13 +731,14 @@ function buildSchema(): Record<string, unknown> {
           enabled: {
             type: "boolean",
             default: false,
+            deprecated: true,
             description:
-              "Enable structured issue:// and pr:// reads. Default false; user-scoped only because it changes the globally registered read-tool surface.",
+              "Deprecated alias for github.read; accepted through v0.56.x and removed in v0.57.0.",
           },
         },
         additionalProperties: false,
-        description:
-          "GitHub resource-read operator gate. User-scoped only — a project config cannot change host-wide behavior or tool descriptions.",
+        deprecated: true,
+        description: "Deprecated alias block for github.read; removed in v0.57.0.",
       },
 
       git: {

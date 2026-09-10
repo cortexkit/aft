@@ -13,7 +13,7 @@ import * as path from "node:path";
 import { coerceBoolean, coerceStringArray, toolErrorFromResponse } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { resolveBashConfig } from "../config.js";
+import { resolveBashConfig, resolveGithubConfig } from "../config.js";
 import { prepareToolMap } from "../normalize-schemas.js";
 import { resolvePromptContext } from "../shared/last-assistant-model.js";
 import type { PluginContext } from "../types.js";
@@ -393,7 +393,7 @@ function readDescription(ghReadEnabled: boolean): string {
 export function createReadTool(ctx: PluginContext): ToolDefinition {
   return prepareToolMap({
     read: {
-      description: readDescription(ctx.config.gh_read?.enabled === true),
+      description: readDescription(resolveGithubConfig(ctx.config).read),
       args: {
         // OpenCode-only exception to the canonical `path` vocabulary: the
         // hoisted read/write/edit trio overrides OpenCode's built-in tools,
@@ -535,12 +535,19 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
 // WRITE tool
 // ---------------------------------------------------------------------------
 
+function isGithubResourcePath(value: string): boolean {
+  return value.startsWith("issue://") || value.startsWith("pr://");
+}
+
 function getWriteDescription(ctx: PluginContext, editToolName: string): string {
   const backupText =
     ctx.config.backup?.enabled === false
       ? "Backup capture is disabled by user config."
       : "Existing files are backed up before overwriting (undo via aft_safety).";
-  return `Write content to a file, creating it and parent directories automatically. ${backupText} Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the \`${editToolName}\` tool.`;
+  const githubText = resolveGithubConfig(ctx.config).write
+    ? ' When enabled, `write("issue://N", content)` or `write("pr://N", content)` publishes a new comment.'
+    : "";
+  return `Write content to a file, creating it and parent directories automatically. ${backupText} Auto-formats when the project has a formatter configured. Use it to create files or replace whole contents; for partial edits, use the \`${editToolName}\` tool.${githubText}`;
 }
 
 function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinition {
@@ -557,6 +564,23 @@ function createWriteTool(ctx: PluginContext, editToolName = "edit"): ToolDefinit
       const argsRecord = args as Record<string, unknown>;
       const file = args.path as string;
       const content = args.content as string;
+      if (isGithubResourcePath(file)) {
+        const rawArgs: Record<string, unknown> = { filePath: file, content };
+        if (!resolveGithubConfig(ctx.config).write) {
+          const data = await callToolCall(ctx, context, "write", rawArgs);
+          throw toolErrorFromResponse("write", data);
+        }
+        const denial = await askEditPermission(context, [file], {
+          filepath: file,
+          diff: content,
+          content,
+        });
+        if (denial) return permissionDeniedResponse(denial);
+        const data = await callToolCall(ctx, context, "write", rawArgs);
+        if (data.success === false) throw toolErrorFromResponse("write", data);
+        return data.text;
+      }
+
       const projectRoot = await resolveProjectRoot(ctx, context);
 
       const filePath = resolvePathFromProjectRoot(projectRoot, file);
@@ -653,7 +677,10 @@ function getEditDescription(ctx: PluginContext, writeToolName: string): string {
     ctx.config.backup?.enabled === false
       ? "- Backup capture is disabled by user config"
       : "- Backs up files before editing (recoverable via aft_safety undo)";
-  return `Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the \`${writeToolName}\` tool — \`edit\` requires an explicit edit mode and will not silently overwrite a file from \`content\` alone.
+  const githubText = resolveGithubConfig(ctx.config).write
+    ? ' GitHub conversation comments can be edited with `edit("issue://N/comments/K", edits=[{oldString, newString}])` or the equivalent `pr://` path.'
+    : "";
+  return `Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the \`${writeToolName}\` tool — \`edit\` requires an explicit edit mode and will not silently overwrite a file from \`content\` alone.${githubText}
 
 **Modes** (determined by which parameters you provide):
 
@@ -831,6 +858,50 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
 
       const file = args.path as string;
       if (!file) throw new Error("'path' parameter is required");
+      if (isGithubResourcePath(file)) {
+        const edits = argsRecord.edits;
+        const onlyFindReplace =
+          Array.isArray(edits) &&
+          edits.length > 0 &&
+          argsRecord.appendContent === undefined &&
+          argsRecord.symbol === undefined &&
+          argsRecord.content === undefined &&
+          edits.every(
+            (entry) =>
+              entry !== null &&
+              typeof entry === "object" &&
+              typeof (entry as Record<string, unknown>).oldString === "string" &&
+              ((entry as Record<string, unknown>).newString === undefined ||
+                typeof (entry as Record<string, unknown>).newString === "string") &&
+              (entry as Record<string, unknown>).startLine === undefined &&
+              (entry as Record<string, unknown>).endLine === undefined &&
+              (entry as Record<string, unknown>).content === undefined,
+          );
+        if (!onlyFindReplace) {
+          throw new Error(
+            "edit: GitHub resources support only edits[] find/replace entries with oldString and optional newString",
+          );
+        }
+        const rawArgs: Record<string, unknown> = { path: file, edits };
+        if (!resolveGithubConfig(ctx.config).write) {
+          const data = await callToolCall(ctx, context, "edit", rawArgs);
+          throw toolErrorFromResponse("edit", data);
+        }
+        const preview = await callToolCall(ctx, context, "edit", rawArgs, { preview: true });
+        if (preview.success === false) throw toolErrorFromResponse("edit", preview);
+        const renderedBody =
+          typeof preview.preview_diff === "string" ? preview.preview_diff : preview.text;
+        const denial = await askEditPermission(context, [file], {
+          filepath: file,
+          diff: renderedBody,
+          content: renderedBody,
+        });
+        if (denial) return permissionDeniedResponse(denial);
+        const data = await callToolCall(ctx, context, "edit", rawArgs);
+        if (data.success === false) throw toolErrorFromResponse("edit", data);
+        return data.text;
+      }
+
       const projectRoot = await resolveProjectRoot(ctx, context);
 
       const filePath = resolvePathFromProjectRoot(projectRoot, file);

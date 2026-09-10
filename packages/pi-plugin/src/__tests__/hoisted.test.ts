@@ -1120,3 +1120,52 @@ describe("file: URL path arguments", () => {
     expect(resolved).toBe("/proj/../%ZZ/x");
   });
 });
+
+describe("GitHub resource mutation permissions", () => {
+  test("write shows the exact body before publishing and denial sends nothing", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "published" }));
+    registerHoistedTools(api, makePluginContext(bridge, { config: { github: { write: true } } }), {
+      hoistRead: false,
+      hoistWrite: true,
+      hoistEdit: false,
+      hoistGrep: false,
+      restrictToProjectRoot: false,
+    });
+    const confirmations: Array<{ title: string; body: string }> = [];
+    const extCtx = {
+      ...makeExtContext(),
+      hasUI: true,
+      ui: {
+        confirm: async (title: string, body: string) => {
+          confirmations.push({ title, body });
+          return false;
+        },
+      },
+      signal: new AbortController().signal,
+    } as ReturnType<typeof makeExtContext>;
+    const body = "Pi-visible GitHub body\nsecond line";
+
+    await expect(
+      executeTool(tools.get("write")!, { path: "issue://7", content: body }, extCtx),
+    ).rejects.toThrow("was not published");
+    expect(confirmations).toEqual([{ title: "Publish GitHub comment?", body }]);
+    expect(calls).toEqual([]);
+  });
+});
+
+describe("conditional GitHub mutation descriptions", () => {
+  test("write and edit advertise resource forms only when github.write is effective", () => {
+    const { api, tools } = makeMockApi();
+    const { bridge } = makeMockBridge();
+    registerHoistedTools(api, makePluginContext(bridge, { config: { github: { write: true } } }), {
+      hoistRead: false,
+      hoistWrite: true,
+      hoistEdit: true,
+      hoistGrep: false,
+      restrictToProjectRoot: false,
+    });
+    expect(tools.get("write")!.description).toContain('write("issue://N", content)');
+    expect(tools.get("edit")!.description).toContain('edit("issue://N/comments/K"');
+  });
+});

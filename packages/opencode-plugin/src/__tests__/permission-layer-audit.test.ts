@@ -1347,3 +1347,56 @@ describe("permission audit regressions", () => {
     expect(calls).toHaveLength(0);
   });
 });
+
+describe("GitHub resource mutation permissions", () => {
+  test("write shows the exact body in an edit-class ask and denial sends nothing", async () => {
+    const askCalls: AskCall[] = [];
+    const { calls, tools } = createHarness((ctx) => {
+      ctx.config = { github: { write: true } } as PluginContext["config"];
+      return hoistedTools(ctx);
+    });
+    const body = "permission-visible GitHub body\nsecond line";
+
+    const result = await tools.write.execute(
+      { filePath: "issue://owner/repo/7", content: body },
+      createSdkContext(
+        process.cwd(),
+        recordingAsk(askCalls, { permission: "edit", error: new RejectedError() }),
+      ),
+    );
+
+    expect(calls).toEqual([]);
+    expect(askCalls).toHaveLength(1);
+    expect(askCalls[0]).toMatchObject({
+      permission: "edit",
+      patterns: ["issue://owner/repo/7"],
+      metadata: { filepath: "issue://owner/repo/7", diff: body, content: body },
+    });
+    expect(askCalls.some((call) => call.permission === "external_directory")).toBe(false);
+    expect(String(result)).toContain("rejected permission");
+  });
+
+  test("write approval publishes only after the edit-class ask", async () => {
+    const askCalls: AskCall[] = [];
+    const { calls, tools } = createHarness(
+      (ctx) => {
+        ctx.config = { github: { write: true } } as PluginContext["config"];
+        return hoistedTools(ctx);
+      },
+      () => ({ success: true, text: "comment published" }),
+    );
+
+    const result = await tools.write.execute(
+      { filePath: "pr://7", content: "approved body" },
+      createSdkContext(process.cwd(), recordingAsk(askCalls)),
+    );
+
+    expect(askCalls.map((call) => call.permission)).toEqual(["edit"]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      command: "write",
+      params: { filePath: "pr://7", content: "approved body" },
+    });
+    expect(result).toBe("comment published");
+  });
+});

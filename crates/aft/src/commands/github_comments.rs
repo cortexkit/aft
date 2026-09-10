@@ -30,6 +30,16 @@ pub(crate) fn handle_comment_write(
         Ok(resource) => resource,
         Err(response) => return response,
     };
+    if crate::edit::wants_preview(&req.params) {
+        return Response::success(
+            &req.id,
+            serde_json::json!({
+                "resource": resource.base_spelling(),
+                "preview_diff": body,
+                "text": body,
+            }),
+        );
+    }
     let working_directory = working_directory(ctx);
     let output = match run_governed_gh(
         ctx,
@@ -181,6 +191,18 @@ pub(crate) fn handle_comment_edit(
         Ok(result) => result,
         Err(response) => return response,
     };
+    if crate::edit::wants_preview(&req.params) {
+        return Response::success(
+            &req.id,
+            serde_json::json!({
+                "resource": resource_spelling,
+                "ordinal": ordinal,
+                "replacements": replacements,
+                "preview_diff": edited_body,
+                "text": edited_body,
+            }),
+        );
+    }
     let patch_body = serde_json::json!({ "body": edited_body }).to_string();
     let args = vec![
         "api".to_string(),

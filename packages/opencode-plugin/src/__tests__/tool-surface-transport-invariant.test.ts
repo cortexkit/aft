@@ -175,3 +175,26 @@ describe("tool surface transport invariance", () => {
     expect(first as string).not.toMatch(/subc|ndjson|daemon|transport/i);
   });
 });
+
+describe("conditional GitHub mutation descriptions", () => {
+  test("write and edit advertise resource forms only when github.write is effective", () => {
+    const base = {
+      pool: fakePool("github-description"),
+      client: {} as PluginContext["client"],
+      storageDir: "/tmp/aft-github-description-test",
+    };
+    const enabled = hoistedTools({
+      ...base,
+      config: { github: { write: true } },
+    } as PluginContext);
+    expect(enabled.write.description).toContain('write("issue://N", content)');
+    expect(enabled.edit.description).toContain('edit("issue://N/comments/K"');
+
+    const disabled = hoistedTools({
+      ...base,
+      config: { github: { enabled: false, write: true } },
+    } as PluginContext);
+    expect(disabled.write.description).not.toContain("issue://N");
+    expect(disabled.edit.description).not.toContain("issue://N/comments/K");
+  });
+});

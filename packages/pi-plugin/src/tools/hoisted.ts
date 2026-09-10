@@ -34,6 +34,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { type Component, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { type Static, Type } from "typebox";
+import { resolveGithubConfig } from "../config.js";
 import type { PluginContext } from "../types.js";
 import {
   bridgeFor,
@@ -52,6 +53,10 @@ import {
   normalizeTerminalText,
   type RenderResultOptionsLike,
 } from "./render-helpers.js";
+
+function isGithubResourcePath(value: string): boolean {
+  return value.startsWith("issue://") || value.startsWith("pr://");
+}
 
 type ReadAttachment = {
   kind?: unknown;
@@ -539,7 +544,7 @@ export function registerHoistedTools(
       withPathAliasPreparation({
         name: readName,
         label: readName,
-        description: readDescription(ctx.config.gh_read?.enabled === true),
+        description: readDescription(resolveGithubConfig(ctx.config).read),
         promptSnippet: "Read file contents (supports offset/limit for large files)",
         promptGuidelines: [`Use ${readName} to examine files instead of cat or sed.`],
         parameters: ReadParams,
@@ -623,11 +628,14 @@ export function registerHoistedTools(
       ctx.config.backup?.enabled === false
         ? "Backup capture is disabled by user config."
         : "Existing files are backed up before overwriting (undo via aft_safety).";
+    const githubWriteDescription = resolveGithubConfig(ctx.config).write
+      ? ' When enabled, `write("issue://N", content)` or `write("pr://N", content)` publishes a new comment.'
+      : "";
     pi.registerTool<typeof WriteParams, FileMutationDetails>(
       withPathAliasPreparation({
         name: writeName,
         label: writeName,
-        description: `Write content to a file, creating it and parent directories automatically. ${writeBackupText} Auto-formats when the project has a formatter configured. Uses \`path\`. For partial edits, use the \`${editName}\` tool.`,
+        description: `Write content to a file, creating it and parent directories automatically. ${writeBackupText} Auto-formats when the project has a formatter configured. Uses \`path\`. For partial edits, use the \`${editName}\` tool.${githubWriteDescription}`,
         promptSnippet: "Create or overwrite files (uses path; auto-formats)",
         promptGuidelines: [`Use ${writeName} only for new files or complete rewrites.`],
         parameters: WriteParams,
@@ -641,6 +649,29 @@ export function registerHoistedTools(
           const filePathArg = mutationFilePathArg(params);
           if (typeof filePathArg !== "string") {
             throw new Error("write: missing required parameter `path`");
+          }
+          if (isGithubResourcePath(filePathArg)) {
+            const bridge = bridgeFor(ctx, extCtx.cwd);
+            const rawArgs: Record<string, unknown> = {
+              filePath: filePathArg,
+              content: params.content,
+            };
+            if (!resolveGithubConfig(ctx.config).write) {
+              const response = await callToolCall(bridge, "write", rawArgs, extCtx);
+              throw toolErrorFromResponse("write", response);
+            }
+            if (!extCtx.hasUI || typeof extCtx.ui?.confirm !== "function") {
+              throw new Error(
+                "Permission denied: publishing a GitHub comment requires an interactive UI.",
+              );
+            }
+            const approved = await extCtx.ui.confirm("Publish GitHub comment?", params.content, {
+              signal: extCtx.signal,
+            });
+            if (!approved) throw new Error("Permission denied: GitHub comment was not published.");
+            const response = await callToolCall(bridge, "write", rawArgs, extCtx);
+            if (response.success === false) throw toolErrorFromResponse("write", response);
+            return buildMutationResult(response);
           }
           // Resolve ~ and relative paths before the permission check. Pass the
           // original path string in the request so the path the agent receives
@@ -728,7 +759,10 @@ export function registerHoistedTools(
         name: editName,
         label: editName,
         description:
-          "Edit part of a file via `appendContent`, batch `edits[]`, or symbol plus `content`. Batch `{ oldString, newString, replaceAll: true }` replaces every match. Provide exactly one mode per call: appendContent, edits[], or symbol plus content (mixing modes is rejected).",
+          "Edit part of a file via `appendContent`, batch `edits[]`, or symbol plus `content`. Batch `{ oldString, newString, replaceAll: true }` replaces every match. Provide exactly one mode per call: appendContent, edits[], or symbol plus content (mixing modes is rejected)." +
+          (resolveGithubConfig(ctx.config).write
+            ? ' GitHub conversation comments can be edited with `edit("issue://N/comments/K", edits=[{oldString, newString}])` or the equivalent `pr://` path.'
+            : ""),
         promptSnippet:
           "Partial file edits via appendContent, edits[], or symbol plus content (exactly one mode per call).",
         promptGuidelines: [
@@ -758,6 +792,50 @@ export function registerHoistedTools(
           const filePathArg = mutationFilePathArg(params);
           if (typeof filePathArg !== "string") {
             throw new Error("edit: missing required parameter `path`");
+          }
+          if (isGithubResourcePath(filePathArg)) {
+            const edits = params.edits;
+            const onlyFindReplace =
+              Array.isArray(edits) &&
+              edits.length > 0 &&
+              params.appendContent === undefined &&
+              params.symbol === undefined &&
+              params.content === undefined &&
+              edits.every(
+                (entry) =>
+                  typeof entry.oldString === "string" &&
+                  (entry.newString === undefined || typeof entry.newString === "string") &&
+                  entry.startLine === undefined &&
+                  entry.endLine === undefined &&
+                  entry.content === undefined,
+              );
+            if (!onlyFindReplace) {
+              throw new Error(
+                "edit: GitHub resources support only edits[] find/replace entries with oldString and optional newString",
+              );
+            }
+            const bridge = bridgeFor(ctx, extCtx.cwd);
+            const rawArgs: Record<string, unknown> = { path: filePathArg, edits };
+            if (!resolveGithubConfig(ctx.config).write) {
+              const response = await callToolCall(bridge, "edit", rawArgs, extCtx);
+              throw toolErrorFromResponse("edit", response);
+            }
+            const preview = await callToolCall(bridge, "edit", rawArgs, extCtx, { preview: true });
+            if (preview.success === false) throw toolErrorFromResponse("edit", preview);
+            const body =
+              typeof preview.preview_diff === "string" ? preview.preview_diff : preview.text;
+            if (!extCtx.hasUI || typeof extCtx.ui?.confirm !== "function") {
+              throw new Error(
+                "Permission denied: editing a GitHub comment requires an interactive UI.",
+              );
+            }
+            const approved = await extCtx.ui.confirm("Edit GitHub comment?", body, {
+              signal: extCtx.signal,
+            });
+            if (!approved) throw new Error("Permission denied: GitHub comment was not edited.");
+            const response = await callToolCall(bridge, "edit", rawArgs, extCtx);
+            if (response.success === false) throw toolErrorFromResponse("edit", response);
+            return buildMutationResult(response);
           }
           if (params.edits !== undefined) validateBatchEdits(params.edits);
           // Resolve ~ and relative paths before the permission check. Pass the
