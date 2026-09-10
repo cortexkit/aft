@@ -54,6 +54,10 @@ class FakeSubscription {
     this.resolveClosed();
   }
 
+  fail(error: Error): void {
+    this.rejectClosed(error);
+  }
+
   unsubscribe(): void {
     this.unsubscribed += 1;
     if (this.unsubscribeGate) {
@@ -105,6 +109,7 @@ class FakeClient implements SubcClientLike {
     identity: BindIdentity,
     opts?: { consumerIdentity?: { module_id: string; launch_nonce: string } | null },
   ): Promise<RouteHandle> {
+    this.assertOpen();
     this.routeOpens.push(identity);
     this.routeConsumerIdentities.push(opts?.consumerIdentity);
     const daemonError = this.routeOpenFailure?.();
@@ -123,6 +128,7 @@ class FakeClient implements SubcClientLike {
     body: unknown,
     options?: { timeoutMs?: number },
   ): Promise<unknown> {
+    this.assertOpen();
     this.requests.push({ route, channel: route.channel, body, options });
     return this.onRequest(route.channel, body);
   }
@@ -132,6 +138,7 @@ class FakeClient implements SubcClientLike {
     _body: unknown,
     onEvent: (event: Uint8Array) => void,
   ): FakeSubscription {
+    this.assertOpen();
     const sub = new FakeSubscription(route.channel, onEvent, this.subscriptionUnsubscribeGate);
     const ingressListener = (event: Uint8Array): void => onEvent(event);
     this.ingress.on("frame", ingressListener);
@@ -150,7 +157,15 @@ class FakeClient implements SubcClientLike {
   }
 
   close(): void {
-    this.closed += 1;
+    if (this.closed > 0) return;
+    this.closed = 1;
+    for (const subscription of this.subscriptions) {
+      subscription.fail(new SubcError("client closed"));
+    }
+  }
+
+  private assertOpen(): void {
+    if (this.closed > 0) throw new SubcError("client closed");
   }
 }
 
@@ -1651,6 +1666,48 @@ describe("SubcTransport bg_events subscription (S3)", () => {
 
     expect(madeClients).toBe(2); // reconnected, not stranded on the dead client
     expect(clients[1]?.subscriptions.length).toBe(1); // resubscribed on the new client
+  });
+
+  test("a locally closed shared client is evicted before tool traffic and bg resubscribe", async () => {
+    let releaseReconnect!: () => void;
+    const reconnectGate = new Promise<void>((resolve) => {
+      releaseReconnect = resolve;
+    });
+    const clients: FakeClient[] = [];
+    let connects = 0;
+    const pool = new SubcTransportPool({
+      connectionFile: "/tmp/fake",
+      harness: "opencode",
+      connect: async () => {
+        connects += 1;
+        const client = new FakeClient(async () =>
+          envelope({ id: "r", success: true, text: `client-${connects}` }),
+        );
+        clients.push(client);
+        return client;
+      },
+      onBgEventsNudge: () => undefined,
+      bgBackoffSleep: async () => reconnectGate,
+    });
+    const transport = pool.getBridge(TEST_PROJECT_ROOT);
+
+    await transport.toolCall("sess-closed", "read", {});
+    await tick();
+    expect(clients[0]?.subscriptions).toHaveLength(1);
+
+    clients[0]?.close();
+    await tick();
+    expect(connects).toBe(1);
+
+    const result = await transport.toolCall("sess-closed", "read", {});
+    expect(result.text).toBe("client-2");
+    expect(connects).toBe(2);
+
+    releaseReconnect();
+    await tick();
+    await tick();
+    expect(clients[1]?.subscriptions).toHaveLength(1);
+    await pool.shutdown();
   });
 
   test("B-#2: the dedicated bg route is closed on the drop→resubscribe path (no leak)", async () => {

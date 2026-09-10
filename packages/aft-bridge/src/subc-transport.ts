@@ -65,6 +65,15 @@ export class SubcTransportShuttingDownError extends SubcCallError {
   }
 }
 
+/** True when subc-client rejected locally because its connection was already closed. */
+export function isSubcClientClosedError(error: unknown): error is SubcError {
+  return error instanceof SubcError && error.message === "client closed";
+}
+
+function isConsumerReconnectRequired(error: unknown): boolean {
+  return isConsumerReconnectTransient(error) || isSubcClientClosedError(error);
+}
+
 /** A held-open event subscription — the slice of subc-client's Subscription we use. */
 export interface SubcSubscriptionLike {
   /** Cancel the subscription (sends Cancel; idempotent); the provider unwinds with StreamEnd. */
@@ -497,7 +506,7 @@ class BgSubscription {
           this.onDormant();
           return;
         }
-        if (isConsumerReconnectTransient(err)) this.dropClient(client);
+        if (isConsumerReconnectRequired(err)) this.dropClient(client);
         if (!reconnecting) beginReconnect();
         this.info(
           "reconnect-error",
@@ -571,7 +580,7 @@ class BgSubscription {
           giveUp("stopped");
           return;
         }
-        if (isConsumerReconnectTransient(err)) this.dropClient(client);
+        if (isConsumerReconnectRequired(err)) this.dropClient(client);
         if (Date.now() - subscribedAt >= BG_STABLE_MS) backoffAttempt = 0;
         beginReconnect();
       } finally {
@@ -1531,7 +1540,7 @@ export class SubcTransportPool implements AftTransportPool {
           if (this.isReapInduced(record)) throw this.annotateReapError(error, record);
           if (error instanceof RouteTornDownError) throw error;
           if (
-            isConsumerReconnectTransient(error) &&
+            isConsumerReconnectRequired(error) &&
             this.isCurrentSession(key, record) &&
             this.client === client
           ) {
@@ -1577,7 +1586,7 @@ export class SubcTransportPool implements AftTransportPool {
           this.isReapInduced(record)
         )
           return;
-        if (isConsumerReconnectTransient(error)) {
+        if (isConsumerReconnectRequired(error)) {
           this.transportFailures = 0;
           this.dropClient(client);
           return;
