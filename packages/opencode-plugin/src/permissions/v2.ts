@@ -44,8 +44,14 @@ export interface V2PermissionClient {
   };
 }
 
-export interface V2PermissionHostContext {
-  client: V2PermissionClient;
+export type V2PermissionHostContext =
+  | V2PermissionClient
+  | {
+      client: V2PermissionClient;
+    };
+
+function permissionClient(host: V2PermissionHostContext): V2PermissionClient {
+  return "client" in host ? host.client : host;
 }
 
 export class PermissionDeniedError extends Error {
@@ -139,13 +145,14 @@ export async function requestPermission(
   const sessionID = requiredContextID(context, "sessionID");
   const messageID = requiredContextID(context, "messageID");
   const id = requiredContextID(context, "id");
-  const subscription = await host.client.event.subscribe();
+  const client = permissionClient(host);
+  const subscription = await client.event.subscribe();
   const iterator = subscription.stream[Symbol.asyncIterator]();
   let streamClaimed = false;
 
   try {
     const result = createResult(
-      await host.client.permission.create({
+      await client.permission.create({
         sessionID,
         action: request.permission,
         resources: [...request.patterns],
