@@ -18,7 +18,7 @@ interface LLMockLike {
     response: unknown,
     options?: unknown,
   ): void;
-  onMessage(pattern: string, response: unknown): void;
+  onMessage(pattern: string | RegExp, response: unknown): void;
   getRequests(): unknown[];
   start(): Promise<void>;
   stop(): Promise<void>;
@@ -103,6 +103,19 @@ export async function observeThenRespond(
   return { exchange, response };
 }
 
+export function isTitleGenerationRequest(request: unknown): boolean {
+  const messages = asRecord(request)?.messages;
+  if (!Array.isArray(messages)) return false;
+  return messages.some((value) => {
+    const message = asRecord(value);
+    return (
+      message?.role === "system" &&
+      typeof message.content === "string" &&
+      message.content.includes("You are a title generator")
+    );
+  });
+}
+
 export class DeterministicScenarioMock {
   readonly scenario: ScenarioDefinition;
   readonly turnLogPath: string;
@@ -137,9 +150,17 @@ export class DeterministicScenarioMock {
     if (!loaded.LLMock) throw new Error("@copilotkit/aimock does not export LLMock");
     const mock = new loaded.LLMock({ port });
     this.#mock = mock;
+    mock.on(
+      { predicate: isTitleGenerationRequest },
+      { content: "Scenario title" },
+    );
+    let nextTurn = 0;
     for (const [index, turn] of this.scenario.turns.entries()) {
       mock.on(
-        { sequenceIndex: index },
+        {
+          predicate: (request) =>
+            !isTitleGenerationRequest(request) && nextTurn === index,
+        },
         async (request: unknown) => {
           const { exchange, response } = await observeThenRespond(
             turn,
@@ -149,25 +170,19 @@ export class DeterministicScenarioMock {
           );
           appendFileSync(this.turnLogPath, `${turn.label}\n`);
           this.exchanges.push(exchange);
+          nextTurn = index + 1;
           return response;
         },
         turn.delay_ms ? { streamingProfile: { ttft: turn.delay_ms, tps: 1_000 } } : undefined,
       );
     }
-    mock.onMessage(".*", async (request: unknown) => {
-      const response = { content: "UNEXPECTED_TURN_FALLBACK" };
-      appendFileSync(this.turnLogPath, "unexpected-fallback\n");
-      const exchange: RecordedMockExchange = {
-        index: this.exchanges.length,
-        label: "unexpected-fallback",
-        request,
-        response,
-        observed_at: new Date().toISOString(),
-      };
-      this.exchanges.push(exchange);
-      await this.hooks.afterRequest?.(exchange);
-      return response;
-    });
+    mock.on(
+      {
+        predicate: (request) =>
+          !isTitleGenerationRequest(request) && nextTurn >= this.scenario.turns.length,
+      },
+      { content: "Scenario complete" },
+    );
     await mock.start();
   }
 

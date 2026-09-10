@@ -44,6 +44,9 @@ export async function createScenarioIsolation(options: {
   scenarioId: string;
   fixture?: string;
   pluginTarball: string;
+  pluginDirectory: string;
+  pluginVersion: string;
+  binaryPath?: string;
   mockBaseUrl: string;
   model?: string;
   projectConfig?: Record<string, unknown>;
@@ -100,6 +103,36 @@ export async function createScenarioIsolation(options: {
   if (!pluginUrl.startsWith("file://") || !pluginUrl.endsWith(".tgz")) {
     fail("plugin_source_invalid", `plugin source is not a file:// tarball: ${pluginUrl}`, {}, true);
   }
+  const pluginWrapper = join(paths.config, "aft-opencode-wrapper");
+  const serverEntry = pathToFileURL(
+    join(options.pluginDirectory, "dist", "entry", "server.js"),
+  ).href;
+  const wrapperModule = (resolvedEntry: string) =>
+    `import { appendFileSync } from "node:fs";\n` +
+    `import plugin from ${JSON.stringify(resolvedEntry)};\n` +
+    `const pluginLog = process.env.AFT_E2E_PLUGIN_LOG;\n` +
+    `if (pluginLog) appendFileSync(pluginLog, ${JSON.stringify(
+      `plugin source=${pluginUrl} resolvedEntry=${resolvedEntry} PLUGIN_VERSION=${options.pluginVersion}\n`,
+    )});\n` +
+    `const effect = plugin.effect;\n` +
+    `export default { ...plugin, effect: effect && ((context) => {\n` +
+    `  if (pluginLog) appendFileSync(pluginLog, "context keys=" + Object.keys(context).sort().join(",") + "\\n");\n` +
+    `  return effect(context);\n` +
+    `}) };\n`;
+  await mkdir(pluginWrapper, { recursive: true });
+  await Promise.all([
+    writeFile(
+      join(pluginWrapper, "package.json"),
+      `${JSON.stringify({
+        name: "aft-opencode-e2e-wrapper",
+        private: true,
+        type: "module",
+        main: "./index.mjs",
+      })}\n`,
+    ),
+    writeFile(join(pluginWrapper, "index.mjs"), wrapperModule(serverEntry)),
+  ]);
+  const pluginDirectoryUrl = pathToFileURL(pluginWrapper).href;
   const providerConfig = options.providerConfig
     ? materializeProviderConfig(options.providerConfig, options.mockBaseUrl)
     : {
@@ -118,7 +151,7 @@ export async function createScenarioIsolation(options: {
     `${JSON.stringify(
       {
         $schema: "https://opencode.ai/config.json",
-        plugin: [pluginUrl],
+        plugin: [pluginDirectoryUrl],
         providers: providerConfig,
       },
       null,
@@ -148,6 +181,7 @@ export async function createScenarioIsolation(options: {
     OPENAI_API_KEY: "sk-opencode2-harness",
     AFT_E2E_PLUGIN_LOG: pluginLog,
     AFT_E2E_ISOLATION_ROOT: root,
+    AFT_BINARY_PATH: options.binaryPath ?? process.env.AFT_BINARY_PATH,
     AFT_CACHE_DIR: join(paths.cache, "aft-cache"),
     AFT_STORAGE_DIR: join(paths.data, "cortexkit", "aft"),
   };

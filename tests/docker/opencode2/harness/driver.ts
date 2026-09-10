@@ -59,9 +59,11 @@ const repoRoot = resolve(harnessRoot, "../../../..");
 
 interface DriverConfig {
   executable: string;
+  nativeExecutable: string;
   hostExecutable: string;
   v1HostExecutable?: string;
   pluginTarball: string;
+  pluginDirectory: string;
   runRoot: string;
   selector?: string;
   validateOnly: boolean;
@@ -88,9 +90,11 @@ async function configuration(): Promise<DriverConfig> {
   );
   return {
     executable: resolve(requiredEnvironment("AFT_BINARY_PATH")),
+    nativeExecutable: resolve(requiredEnvironment("AFT_E2E_NATIVE_BINARY_PATH")),
     hostExecutable: resolve(requiredEnvironment("OPENCODE2_BIN")),
     v1HostExecutable: process.env.OPENCODE1_BIN ? resolve(process.env.OPENCODE1_BIN) : undefined,
     pluginTarball: resolve(requiredEnvironment("AFT_OPENCODE2_PLUGIN_TARBALL")),
+    pluginDirectory: resolve(requiredEnvironment("AFT_OPENCODE2_PLUGIN_DIRECTORY")),
     runRoot,
     selector: process.env.AFT_E2E_SCENARIO ?? argumentValue("--scenario"),
     validateOnly: process.argv.includes("--validate-only"),
@@ -592,6 +596,9 @@ async function runOneScenario(options: {
       scenarioId: scenario.id,
       fixture: fixturePath(scenario),
       pluginTarball: config.pluginTarball,
+      pluginDirectory: config.pluginDirectory,
+      pluginVersion: options.pluginVersion,
+      binaryPath: config.nativeExecutable,
       mockBaseUrl: mock.url,
       model: (scenario.model ?? "mock/mock-model").split("/").at(-1),
       projectConfig: scenario.project_config,
@@ -601,7 +608,7 @@ async function runOneScenario(options: {
       transportDeadStub = await makeTransportDeadStub(isolation.root, config.executable);
       isolation.env.AFT_BINARY_PATH = transportDeadStub.executable;
     } else {
-      isolation.env.AFT_BINARY_PATH = config.executable;
+      isolation.env.AFT_BINARY_PATH = config.nativeExecutable;
     }
     disk = new DiskStateObserver(isolation.project, scenario.id);
     restoreCalls = restoreCallSequence(scenario);

@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { pathToFileURL } from 'node:url';
 
 import {
   type HostCliContract,
@@ -20,7 +21,11 @@ import { runApiControl, startScenarioClient } from "./host.js";
 import { readPermissionAskInventory } from "./inventory.js";
 import { createScenarioIsolation } from "./isolation.js";
 import { CompletionWakeLiveness, WatchPatternLiveness } from "./liveness.js";
-import { materializeTurnPlaceholders, observeThenRespond } from "./mock-server.js";
+import {
+  isTitleGenerationRequest,
+  materializeTurnPlaceholders,
+  observeThenRespond,
+} from "./mock-server.js";
 import { projectText } from "./projection.js";
 import { verifyExecutableProvenance } from "./provenance.js";
 import { loadScenarios, materializeParityScenarios } from "./scenario-loader.js";
@@ -99,11 +104,18 @@ describe("scenario isolation and liveness", () => {
     await writeFile(join(fixture, "file.txt"), "fixture\n");
     const tarball = join(parent, "plugin.tgz");
     await writeFile(tarball, "pack");
+    const pluginDirectory = join(parent, "installed-plugin");
+    await mkdir(join(pluginDirectory, "dist", "entry"), { recursive: true });
+    await writeFile(join(pluginDirectory, "dist", "index.js"), "export default {};\n");
+    await writeFile(join(pluginDirectory, "dist", "entry", "server.js"), "export default {};\n");
     const isolated = await createScenarioIsolation({
       parent: join(parent, "runs"),
       scenarioId: "read/T1/happy",
       fixture,
       pluginTarball: tarball,
+      pluginDirectory,
+      pluginVersion: "1.2.3-test",
+      binaryPath: "/native/aft",
       mockBaseUrl: "http://127.0.0.1:1234",
       providerConfig: {
         mock: {
@@ -124,8 +136,17 @@ describe("scenario isolation and liveness", () => {
       expect(isolated.env[key]?.startsWith(isolated.root)).toBe(true);
     }
     expect(isolated.env.OPENCODE_DISABLE_DEFAULT_PLUGINS).toBe("true");
+    expect(isolated.env.AFT_BINARY_PATH).toBe("/native/aft");
     const hostConfig = JSON.parse(await readFile(isolated.host_config, "utf8"));
+    expect(hostConfig.plugin[0]).toEndWith("/xdg-config/aft-opencode-wrapper");
     expect(hostConfig.providers.mock.settings.baseURL).toBe("http://127.0.0.1:1234/v1");
+    const serverWrapper = await readFile(
+      join(isolated.config, "aft-opencode-wrapper", "index.mjs"),
+      "utf8",
+    );
+    expect(serverWrapper).toContain(pathToFileURL(tarball).href);
+    expect(serverWrapper).toContain("dist/entry/server.js");
+    expect(serverWrapper).toContain("PLUGIN_VERSION=1.2.3-test");
   });
 
   test("the scenario client uses the provider contract model", async () => {
@@ -151,6 +172,17 @@ describe("scenario isolation and liveness", () => {
       "--model",
       "openai/mock-model",
     ]);
+  });
+
+  test("title generation is excluded from scripted scenario turns", () => {
+    const request = (system: string) => ({
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: "control" },
+      ],
+    });
+    expect(isTitleGenerationRequest(request("You are a title generator"))).toBe(true);
+    expect(isTitleGenerationRequest(request("You are a coding agent"))).toBe(false);
   });
 
   test("turn-log liveness rejects a missing later turn", () => {

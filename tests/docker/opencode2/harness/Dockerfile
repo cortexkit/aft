@@ -32,7 +32,10 @@ COPY . .
 RUN bun install --frozen-lockfile && \
     bun run --cwd packages/aft-bridge build && \
     bun run --cwd packages/opencode-plugin build && \
-    mkdir -p /packs && npm pack ./packages/opencode-plugin --pack-destination /packs >/dev/null
+    mkdir -p /packs /plugin/node_modules/@cortexkit/aft-opencode /plugin/node_modules && \
+    npm pack ./packages/opencode-plugin --pack-destination /packs >/dev/null && \
+    tar -xzf /packs/*.tgz -C /plugin/node_modules/@cortexkit/aft-opencode --strip-components=1 && \
+    cp -a node_modules/.bun/effect@4.0.0-rc.112/node_modules/effect /plugin/node_modules/effect
 
 FROM --platform=linux/amd64 node:24-bookworm-slim AS runtime
 ARG OPENCODE2_VERSION
@@ -51,9 +54,12 @@ ENV NODE_PATH="/opt/opencode/node_modules"
 WORKDIR /workspace
 COPY . /workspace
 COPY --from=plugin-builder /packs/*.tgz /opt/aft/packages/aft-opencode.tgz
+COPY --from=plugin-builder /plugin/ /opt/aft/plugin/
 COPY --from=aft-builder /out/ /opt/aft/bin/
 ENV AFT_BINARY_PATH=/opt/aft/bin/aft
+ENV AFT_E2E_NATIVE_BINARY_PATH=/opt/aft/bin/aft.real
 ENV AFT_OPENCODE2_PLUGIN_TARBALL=/opt/aft/packages/aft-opencode.tgz
+ENV AFT_OPENCODE2_PLUGIN_DIRECTORY=/opt/aft/plugin/node_modules/@cortexkit/aft-opencode
 ENV OPENCODE2_BIN=/opt/opencode/node_modules/@opencode-ai/cli-linux-x64/bin/opencode2
 ENV OPENCODE1_BIN=/opt/opencode1/node_modules/.bin/opencode
 ENTRYPOINT ["bun", "tests/docker/opencode2/harness/driver.ts"]
