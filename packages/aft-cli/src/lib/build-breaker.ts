@@ -1,8 +1,27 @@
 import { existsSync, readdirSync } from "node:fs";
+import { createRequire } from "node:module";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
 
 import { CLI } from "./cli.js";
+
+/// `node:sqlite` is loaded on use, never at module load: the CLI is one bundle,
+/// so a static import would make every command (including `setup`) fail to
+/// link on Node < 22.5 with ERR_UNKNOWN_BUILTIN_MODULE before it could say why.
+function loadDatabaseSync(): typeof DatabaseSync {
+  const require = createRequire(import.meta.url);
+  try {
+    return (require("node:sqlite") as { DatabaseSync: typeof DatabaseSync }).DatabaseSync;
+  } catch (error) {
+    const code = (error as { code?: string })?.code;
+    if (code === "ERR_UNKNOWN_BUILTIN_MODULE" || code === "MODULE_NOT_FOUND") {
+      throw new Error(
+        `${CLI} needs Node.js 22.5 or newer for this command (node:sqlite is unavailable on ${process.version})`,
+      );
+    }
+    throw error;
+  }
+}
 
 export const DOCTOR_BUILD_BREAKER_RESET_COMMAND = `${CLI} doctor reset-build-breaker`;
 
@@ -51,7 +70,7 @@ export function readBuildBreakerSuspensions(
   for (const databasePath of buildBreakerDatabases(storageRoot)) {
     let database: DatabaseSync | undefined;
     try {
-      database = new DatabaseSync(databasePath, { readOnly: true });
+      database = new (loadDatabaseSync())(databasePath, { readOnly: true });
       const rows = database
         .prepare(
           `SELECT root_id, domain, corpus_fingerprint, zero_credit_deaths, credited_deaths,
@@ -113,7 +132,7 @@ export function resetBuildBreakerSuspension(
   for (const databasePath of buildBreakerDatabases(storageRoot)) {
     let database: DatabaseSync | undefined;
     try {
-      database = new DatabaseSync(databasePath);
+      database = new (loadDatabaseSync())(databasePath);
       const result = database
         .prepare(
           `UPDATE breaker_records
