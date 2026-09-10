@@ -1,0 +1,26 @@
+[
+  {
+    "input": "HTTPServer",
+    "expected": ["http_server", "http-server", "httpServer", "HttpServer", "HTTP_SERVER", "HTTPServers"]
+  },
+  {
+    "input": "items",
+    "expected": ["Items", "ITEMS", "item"]
+  },
+  {
+    "input": "#abc123_foo",
+    "expected": ["#abc123-foo", "#abc123Foo", "#Abc123Foo", "#ABC123_FOO", "#abc123_foos", "foo"]
+  },
+  {
+    "input": "#abc123_HTTPServer",
+    "expected": ["#abc123_http_server", "#abc123-http-server", "#abc123HttpServer", "#Abc123HttpServer", "#ABC123_HTTP_SERVER", "#abc123_HTTPServers"]
+  },
+  {
+    "input": "status",
+    "expected": ["Status", "STATUS", "statuses"]
+  },
+  {
+    "input": "character cap",
+    "expected": ["Character", "CHARACTER", "characters", "Cap", "CAP", "caps"]
+  }
+]

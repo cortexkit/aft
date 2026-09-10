@@ -1,0 +1,13 @@
+{
+  "episodes": [5985, 13820, 20065],
+  "oracle": {
+    "111": "reachable_via:variants",
+    "110": "reachable_via:variants",
+    "101": "unreachable",
+    "100": "fallback_walk",
+    "011": "reachable_via:variants",
+    "010": "reachable_via:variants",
+    "001": "unreachable",
+    "000": "fallback_walk"
+  }
+}

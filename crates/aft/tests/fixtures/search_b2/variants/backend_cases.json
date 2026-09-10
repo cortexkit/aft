@@ -1,0 +1,34 @@
+[
+  {
+    "name": "definition-present identifier",
+    "query": "HTTPServer",
+    "definition_present": true,
+    "trigram_ready": true,
+    "corpus": ["fn http_server() {}"],
+    "expected_contributors": ["http_server"]
+  },
+  {
+    "name": "definition-absent identifier",
+    "query": "#abc123_foo",
+    "definition_present": false,
+    "trigram_ready": true,
+    "corpus": ["the foo helper is registered"],
+    "expected_contributors": ["foo"]
+  },
+  {
+    "name": "only admitted variants reach the footer",
+    "query": "HTTPServer",
+    "definition_present": false,
+    "trigram_ready": true,
+    "corpus": ["HTTP_SERVER delegates to http-server"],
+    "expected_contributors": ["http-server", "HTTP_SERVER"]
+  },
+  {
+    "name": "trigram unavailable omits variants",
+    "query": "HTTPServer",
+    "definition_present": true,
+    "trigram_ready": false,
+    "corpus": ["fn http_server() {}"],
+    "expected_contributors": []
+  }
+]

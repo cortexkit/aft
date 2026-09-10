@@ -8,6 +8,8 @@
 //! [`SearchExtensions`] implementation to run, and receives the A-side
 //! defaults until B2 installs its own.
 
+pub mod variants;
+
 use crate::commands::semantic_search::extensions::{DefaultSearchExtensions, SearchExtensions};
 
 pub mod embed_counter;
