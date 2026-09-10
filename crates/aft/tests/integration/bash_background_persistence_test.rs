@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
 use super::helpers::{user_config, AftProcess, ReleaseOnDrop};
+use super::test_helpers::{init_test_logger, take_logs};
 
 const SESSION: &str = "persist-session";
 
@@ -604,6 +605,70 @@ fn cross_session_project_restart_sweep_retires_fate_unknown_without_delivery() {
     assert!(registry
         .drain_completions_for_session(Some("session-b"))
         .is_empty());
+}
+
+#[test]
+fn foreign_replay_retires_orphan_when_gc_already_removed_its_layout() {
+    init_test_logger();
+    let storage = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let task_id = "bash-0000000000000200";
+    let paths = task_paths(storage.path(), "session-a", task_id).unwrap();
+    let mut metadata = PersistedTask::starting(
+        task_id.to_string(),
+        "session-a".to_string(),
+        "release-command".to_string(),
+        project.path().to_path_buf(),
+        Some(project.path().to_path_buf()),
+        None,
+        true,
+        true,
+    );
+    metadata.mark_terminal(
+        BgTaskStatus::FateUnknown,
+        None,
+        Some("fixture terminal state".to_string()),
+    );
+    write_task(&paths.json, &metadata).unwrap();
+    fs::write(&paths.stdout, "last release output").unwrap();
+    fs::write(&paths.stderr, "").unwrap();
+
+    let registry = registry();
+    registry.set_harness(aft::harness::Harness::Opencode);
+    let conn = Arc::new(Mutex::new(
+        aft::db::open(&storage.path().join("aft.db")).unwrap(),
+    ));
+    {
+        let db = conn.lock().unwrap();
+        aft::db::bash_tasks::upsert_bash_task(
+            &db,
+            &metadata.to_bash_task_row("opencode", &paths).unwrap(),
+        )
+        .unwrap();
+    }
+    registry.set_db_pool(Arc::clone(&conn));
+
+    registry
+        .replay_session_for_project(storage.path(), "session-a", project.path())
+        .unwrap();
+    fs::remove_dir_all(&paths.dir).expect("simulate persisted GC removing the task layout");
+
+    registry
+        .replay_session_for_project(storage.path(), "session-b", project.path())
+        .expect("a missing orphan layout must not abort replay");
+    let row = aft::db::bash_tasks::get_bash_task(
+        &conn.lock().unwrap(),
+        "opencode",
+        "session-a",
+        task_id,
+    )
+    .unwrap();
+    assert!(row.is_none(), "already-reaped orphan left a durable task row");
+    assert!(take_logs().iter().any(|line| {
+        line.contains(&format!(
+            "orphaned completion already reaped: task_id={task_id} reason=layout_missing"
+        ))
+    }));
 }
 
 #[test]

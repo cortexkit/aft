@@ -2033,6 +2033,37 @@ impl BgTaskRegistry {
         Ok(())
     }
 
+    fn retire_already_reaped_orphaned_completion(
+        &self,
+        originating_session_id: &str,
+        task_id: &str,
+    ) {
+        if let Some((harness, pool)) = self.db_harness_and_pool() {
+            match pool.lock() {
+                Ok(conn) => {
+                    if let Err(error) = crate::db::bash_tasks::delete_bash_task(
+                        &conn,
+                        &harness,
+                        originating_session_id,
+                        task_id,
+                    ) {
+                        crate::slog_warn!(
+                            "failed to delete already-reaped orphaned background completion row: task_id={task_id} error={error}"
+                        );
+                    }
+                }
+                Err(_) => crate::slog_warn!(
+                    "failed to delete already-reaped orphaned background completion row: task_id={task_id} error=database_lock_poisoned"
+                ),
+            }
+        }
+        let _ = self.remove_pending_completion(task_id);
+        self.ack_persisted_watches_for_task(originating_session_id, task_id, true);
+        crate::slog_warn!(
+            "orphaned completion already reaped: task_id={task_id} reason=layout_missing"
+        );
+    }
+
     fn retire_rehydrated_orphaned_completion(
         &self,
         task: &Arc<BgTask>,
@@ -2051,14 +2082,29 @@ impl BgTaskRegistry {
             return Ok(());
         }
 
-        task.set_completion_delivered(true, self)?;
-        let _ = self.remove_pending_completion(&task.task_id);
-        self.ack_persisted_watches_for_task(&task.session_id, &task.task_id, true);
-        crate::slog_info!(
-            "retired orphaned background completion: task_id={} originating_session={}",
-            task.task_id,
-            task.session_id
-        );
+        match task.set_completion_delivered(true, self) {
+            Ok(()) => {
+                let _ = self.remove_pending_completion(&task.task_id);
+                self.ack_persisted_watches_for_task(&task.session_id, &task.task_id, true);
+                crate::slog_info!(
+                    "retired orphaned background completion: task_id={} originating_session={}",
+                    task.task_id,
+                    task.session_id
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Ok(mut state) = task.state.lock() {
+                    state.metadata.completion_delivered = true;
+                }
+                self.retire_already_reaped_orphaned_completion(
+                    &task.session_id,
+                    &task.task_id,
+                );
+            }
+            Err(error) => {
+                return Err(format!("failed to update completion delivery: {error}"));
+            }
+        }
         Ok(())
     }
 
@@ -2193,6 +2239,19 @@ impl BgTaskRegistry {
             let resolved = match resolve_task_layout(&session_dir, &metadata.task_id) {
                 Ok(task) => task,
                 Err(error) => {
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && !Self::persisted_task_process_is_alive(&metadata)
+                        && self.should_retire_foreign_delivery(
+                            &metadata.session_id,
+                            session_id,
+                        )
+                    {
+                        self.retire_already_reaped_orphaned_completion(
+                            &metadata.session_id,
+                            &metadata.task_id,
+                        );
+                        continue;
+                    }
                     if Self::persisted_task_process_is_alive(&metadata) {
                         crate::slog_warn!(
                             "refusing to quarantine unresolved live background task {}: {error}",
@@ -5953,16 +6012,14 @@ impl BgTask {
         &self,
         delivered: bool,
         registry: &BgTaskRegistry,
-    ) -> Result<(), String> {
+    ) -> std::io::Result<()> {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| "background task lock poisoned".to_string())?;
-        let updated = registry
-            .update_task_metadata(&self.paths, |metadata| {
-                metadata.completion_delivered = delivered;
-            })
-            .map_err(|e| format!("failed to update completion delivery: {e}"))?;
+            .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
+        let updated = registry.update_task_metadata(&self.paths, |metadata| {
+            metadata.completion_delivered = delivered;
+        })?;
         state.metadata = updated;
         Ok(())
     }

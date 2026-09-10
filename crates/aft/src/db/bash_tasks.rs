@@ -98,6 +98,19 @@ pub fn delete_delivered_terminal_bash_task(
     Ok(deleted)
 }
 
+pub fn delete_bash_task(
+    conn: &Connection,
+    harness: &str,
+    session_id: &str,
+    task_id: &str,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM bash_tasks
+         WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3",
+        params![harness, session_id, task_id],
+    )
+}
+
 pub fn get_bash_task(
     conn: &Connection,
     harness: &str,
