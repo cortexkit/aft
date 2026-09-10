@@ -3213,6 +3213,15 @@
       "reason": "The V2 projection consumes the V1 trio's filePath header and re-emits it as path."
     },
     {
+      "path": "packages/opencode-plugin/src/tools/definitions/v2.ts",
+      "location": "line 121, column 12",
+      "line": 121,
+      "column": 12,
+      "token": "filePath",
+      "class": "host-display-contract",
+      "reason": "The V2 projection consumes the V1 trio's filePath header and re-emits it as path."
+    },
+    {
       "path": "packages/opencode-plugin/src/tools/hoisted.ts",
       "location": "line 137, column 62",
       "line": 137,
@@ -5608,8 +5617,44 @@
     },
     {
       "path": "tests/docker/opencode2/harness/harness.test.ts",
-      "location": "line 57, column 18",
-      "line": 57,
+      "location": "line 70, column 18",
+      "line": 70,
+      "column": 18,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/harness/harness.test.ts",
+      "location": "line 219, column 40",
+      "line": 219,
+      "column": 40,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/harness/mock-server.ts",
+      "location": "line 85, column 59",
+      "line": 85,
+      "column": 59,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/harness/mock-server.ts",
+      "location": "line 86, column 11",
+      "line": 86,
+      "column": 11,
+      "token": "filePath",
+      "class": "internal-compatibility",
+      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
+    },
+    {
+      "path": "tests/docker/opencode2/harness/mock-server.ts",
+      "location": "line 87, column 18",
+      "line": 87,
       "column": 18,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -5653,8 +5698,8 @@
     },
     {
       "path": "tests/docker/opencode2/scenarios/edit/registration.json",
-      "location": "line 193, column 20",
-      "line": 193,
+      "location": "line 194, column 20",
+      "line": 194,
       "column": 20,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -5662,8 +5707,8 @@
     },
     {
       "path": "tests/docker/opencode2/scenarios/edit/registration.json",
-      "location": "line 258, column 16",
-      "line": 258,
+      "location": "line 259, column 16",
+      "line": 259,
       "column": 16,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -5671,8 +5716,8 @@
     },
     {
       "path": "tests/docker/opencode2/scenarios/edit/registration.json",
-      "location": "line 311, column 20",
-      "line": 311,
+      "location": "line 313, column 20",
+      "line": 313,
       "column": 20,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -5680,8 +5725,8 @@
     },
     {
       "path": "tests/docker/opencode2/scenarios/edit/registration.json",
-      "location": "line 367, column 20",
-      "line": 367,
+      "location": "line 370, column 20",
+      "line": 370,
       "column": 20,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -5707,8 +5752,8 @@
     },
     {
       "path": "tests/docker/opencode2/scenarios/read/registration.json",
-      "location": "line 67, column 129",
-      "line": 67,
+      "location": "line 68, column 129",
+      "line": 68,
       "column": 129,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -5716,8 +5761,8 @@
     },
     {
       "path": "tests/docker/opencode2/scenarios/read/registration.json",
-      "location": "line 82, column 128",
-      "line": 82,
+      "location": "line 84, column 128",
+      "line": 84,
       "column": 128,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -5725,8 +5770,8 @@
     },
     {
       "path": "tests/docker/opencode2/scenarios/read/registration.json",
-      "location": "line 97, column 135",
-      "line": 97,
+      "location": "line 100, column 135",
+      "line": 100,
       "column": 135,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -5752,8 +5797,8 @@
     },
     {
       "path": "tests/docker/opencode2/scenarios/write/registration.json",
-      "location": "line 188, column 20",
-      "line": 188,
+      "location": "line 189, column 20",
+      "line": 189,
       "column": 20,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -5761,8 +5806,8 @@
     },
     {
       "path": "tests/docker/opencode2/scenarios/write/registration.json",
-      "location": "line 248, column 16",
-      "line": 248,
+      "location": "line 249, column 16",
+      "line": 249,
       "column": 16,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -5770,8 +5815,8 @@
     },
     {
       "path": "tests/docker/opencode2/scenarios/write/registration.json",
-      "location": "line 297, column 20",
-      "line": 297,
+      "location": "line 299, column 20",
+      "line": 299,
       "column": 20,
       "token": "filePath",
       "class": "internal-compatibility",
@@ -5779,8 +5824,8 @@
     },
     {
       "path": "tests/docker/opencode2/scenarios/write/registration.json",
-      "location": "line 348, column 20",
-      "line": 348,
+      "location": "line 351, column 20",
+      "line": 351,
       "column": 20,
       "token": "filePath",
       "class": "internal-compatibility",
