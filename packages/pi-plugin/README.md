@@ -37,8 +37,8 @@ All four keep the same agent-facing parameters as Pi's built-ins, so your prompt
 
 | Tool                | What it does                                                                      |
 | ------------------- | --------------------------------------------------------------------------------- |
-| `aft_outline`       | Structural outline for files or directories; with `gh_read.enabled`, indexes GitHub issue and PR discussions |
-| `aft_zoom`          | Symbol-level inspection with call-graph annotations; with `gh_read.enabled`, drills into GitHub discussion ordinals |
+| `aft_outline`       | Structural outline for files or directories; with `github.read`, indexes GitHub issue and PR discussions |
+| `aft_zoom`          | Symbol-level inspection with call-graph annotations; with `github.read`, drills into GitHub discussion ordinals |
 | `aft_search`        | Semantic code search (embeddings, local ONNX or OpenAI-compatible)                |
 | `aft_callgraph`      | Call-graph navigation: callers, call_tree, impact, trace_to, trace_data           |
 | `aft_conflicts`     | One-call merge-conflict inspection across all conflicted files                    |

@@ -109,8 +109,8 @@ AFT is **1 of the 3 plugins you'll ever need.** It perceives and acts; Magic Con
 
 *The IDE's eyes.* How the agent *sees* your codebase: structure, meaning, and relationships instead of a wall of text.
 
-- **`aft_outline`**: every symbol in a file, directory, or remote URL, with its kind, name, line range, visibility, and nested members; when `gh_read.enabled` is on, it also indexes GitHub issue and PR discussions. One call instead of reading the whole file.
-- **`aft_zoom`**: inspect a specific function, class, or type; pass `callgraph: true` to add annotations for what it calls and what calls it, or use a GitHub discussion ordinal when `gh_read.enabled` is on.
+- **`aft_outline`**: every symbol in a file, directory, or remote URL, with its kind, name, line range, visibility, and nested members; when `github.read` is on, it also indexes GitHub issue and PR discussions. One call instead of reading the whole file.
+- **`aft_zoom`**: inspect a specific function, class, or type; pass `callgraph: true` to add annotations for what it calls and what calls it, or use a GitHub discussion ordinal when `github.read` is on.
 - **`aft_search`**: find code by *meaning* when grep keywords fall short. Hybrid semantic + lexical retrieval over an indexed codebase, with local, OpenAI-compatible, or Ollama embedding backends.
 - **`aft_callgraph`**: follow callers, callees, data flow, impact analysis, and the shortest call path between two symbols across the workspace.
 - **`aft_inspect`**: a one-call codebase-health report covering LSP errors and warnings, TODOs, metrics, dead code, unused exports, and duplicates. The Problems and inspections panels an IDE keeps open, on demand.

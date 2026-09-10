@@ -373,15 +373,12 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     "lsp_ty": false
   },
 
-  // Operator hard-off for the `gh` routing shim. Default: true. When false, the
-  // shim short-circuits to byte-transparent passthrough (R1) before any
-  // daemon/catalog probing, so a disabled shim performs zero subc traffic. This
-  // is a fleet-rollout safety gate, not a capability switch. USER-only — a
-  // project config cannot disable the shim for the user's host.
-  "gh_shim": {
-    "enabled": true,
-    // Optional absolute development/deployed AFT image. Defaults to the running image.
-    "binary_path": "/absolute/path/to/aft"
+  // User-only GitHub integration gates.
+  "github": {
+    "enabled": true, // Master switch; false forces every setting below off.
+    "shim": true,    // Interpose the governed gh shim in agent child PATHs.
+    "read": false,   // Enable issue:// and pr:// reads, outlines, and zooms.
+    "write": false   // Create and edit conversation comments.
   },
 
   // Git co-authorship for commits made by AFT-spawned agent children.
@@ -412,23 +409,26 @@ A hashline mutation attempts to register every affected path before changing fil
 
 Hashline mode needs the host's unprefixed `edit` slot. If final surface selection, hoisting, or `disabled_tools` removes that slot, AFT keeps the default edit/read behavior for the session and emits a `hashline_downgraded` warning with reason `edit_not_registered` on the configure-warnings channel.
 
-## `gh` routing shim
+## GitHub integration
 
-AFT maintains `<storage_root>/shims/gh` (or `gh.cmd` on Windows) and prepends that directory only to first-party bash and PTY child processes. The entry dispatches to the running AFT image by default; `gh_shim.binary_path` can select an absolute development or deployed image. The shim routes governed invocations through the daemon seam and passes eligible commands to the first real `gh` later on `PATH`. Set `gh_shim.enabled` to `false` in user config to remove the managed entry and skip child `PATH` injection entirely. The operator's shell startup files and terminal `PATH` are never changed.
-
-## GitHub resource reads
-
-Structured `issue://` and `pr://` reads, concise `aft_outline` indexes, and ordinal `aft_zoom` drill-downs are disabled by default. Set `gh_read.enabled` to `true` in `aft.jsonc` to allow the GitHub read integration to fetch a resource through the user's own `gh` authentication:
+The user-only `github` block controls the complete GitHub surface. `enabled` and `shim` default to `true`; `read` and `write` default to `false`. Setting `enabled: false` forces shim routing, resource reads, comment writes, and GitHub-specific tool-description sentences off, producing zero AFT-originated `gh` traffic. Project `github` blocks are ignored with a configuration warning because repositories cannot grant themselves network-backed capabilities or vary host-wide tool descriptions.
 
 ```jsonc
 {
-  "gh_read": {
-    "enabled": true
+  "github": {
+    "enabled": true,
+    "shim": true,
+    "read": true,
+    "write": false
   }
 }
 ```
 
-This is a user-tier-only, host-wide gate; project `gh_read` blocks are dropped with a configuration warning. A project cannot vary the behavior or read-tool surface because project-specific descriptions would destabilize prompt-prefix caches within one host. While the gate is off, the read description remains byte-identical to the baseline surface and does not advertise resource spellings that would only return a refusal. The setting does not affect the `gh_shim` child-process routing gate.
+`github.write: true` with `github.read: false` is treated as read-enabled and emits a warning naming both keys. This prevents edits from addressing a comment ordinal the agent cannot inspect. Untrusted MCP and forced-restrict binds treat every GitHub integration as disabled regardless of user configuration.
+
+AFT maintains `<storage_root>/shims/gh` (or `gh.cmd` on Windows) and prepends that directory only to governed child processes. The shim routes eligible commands through the existing manifest, identity, classification, and refusal path before calling the first real `gh` later on `PATH`; the operator's shell startup files and terminal `PATH` are never changed. The advanced `gh_shim.binary_path` setting still selects an absolute development or deployed AFT image. `gh_shim.enabled` is a deprecated alias for `github.shim`, and `gh_read.enabled` is a deprecated alias for `github.read`; new keys win conflicts, both aliases emit deprecation warnings, and both aliases are removed in v0.57.0.
+
+When reads are enabled, `read`, `aft_outline`, and `aft_zoom` accept `issue://NUMBER` and `pr://NUMBER`, including `issue://OWNER/REPO/NUMBER` and `pr://OWNER/REPO/NUMBER`. When writes are enabled, `write` on a base resource publishes a conversation comment after the host's edit-class permission prompt displays the exact body. `edit` accepts only an `edits[]` find/replace request on `issue://.../comments/K` or `pr://.../comments/K`; it fetches the live body, applies the normal matcher, and then attempts an id-addressed edit through the governed shim. Review-thread comments are not supported. GitHub comment mutations do not create aft_safety snapshots and cannot be undone through aft_safety.
 
 Every enabled GitHub resource read fetches live data; a prior read never satisfies a later request by itself. Successful live renders are retained only as a fallback copy, scoped to the resolved resource and authentication identity. If a live fetch fails and that copy exists, AFT returns it with this exact first-line disclosure before the rendered document:
 
