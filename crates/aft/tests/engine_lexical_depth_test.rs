@@ -5,21 +5,7 @@ use aft::commands::semantic_search::evidence_descriptor::EvidenceDescriptor;
 use aft::search_index::SearchIndex;
 use serde::{Deserialize, Serialize};
 
-mod comparator {
-    pub use aft::commands::semantic_search::comparator::*;
-}
-mod evidence_descriptor {
-    pub use aft::commands::semantic_search::evidence_descriptor::*;
-}
-mod plan_table {
-    pub use aft::commands::semantic_search::plan_table::*;
-}
-pub mod search_index {
-    pub use aft::search_index::*;
-}
-
-#[path = "../src/commands/semantic_search/lexical_lane.rs"]
-mod lexical_lane;
+use aft::commands::semantic_search::lexical_lane;
 
 use lexical_lane::{
     CanonicalLexicalLane, LanePosition, LexicalCandidate, LEXICAL_DEPTHS,

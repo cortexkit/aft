@@ -4,22 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-mod comparator {
-    pub use aft::commands::semantic_search::comparator::*;
-}
-mod evidence_descriptor {
-    pub use aft::commands::semantic_search::evidence_descriptor::*;
-}
-mod plan_table {
-    pub use aft::commands::semantic_search::plan_table::*;
-}
-
-#[path = "../src/commands/semantic_search/blocks.rs"]
-mod blocks;
-#[path = "../src/commands/semantic_search/paging.rs"]
-mod paging;
-#[path = "../src/commands/semantic_search/scoring.rs"]
-mod scoring;
+use aft::commands::semantic_search::{blocks, evidence_descriptor, paging, plan_table, scoring};
 
 use blocks::{BlockBuilder, CanonicalLane, CanonicalListKey, LaneCandidate};
 use evidence_descriptor::EvidenceDescriptor;

@@ -6,7 +6,6 @@ use aft::search_index::exact_lane::ExactLane;
 use aft::search_index::memo::{ExactMemoStore, MemoKey};
 
 #[derive(Debug, PartialEq, Eq)]
-#[allow(dead_code)] // `Failed` is the harness verdict the restart fixtures must never produce; kept so the enum reads as the full contract
 enum CrossPageComparisonVerdict {
     Passed,
     Failed,
@@ -69,6 +68,7 @@ fn test_restart_fixture_v_token_inequality_and_precondition_refusal() {
     );
 
     // Cross-page stability unit comparison: reported NOT-ATTEMPTED rather than passed
+    let _failure_verdict_remains_part_of_the_contract = CrossPageComparisonVerdict::Failed;
     let verdict = compare_cross_page_stability_units(&token_1, &token_2);
     assert_eq!(
         verdict,

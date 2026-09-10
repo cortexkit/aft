@@ -1,5 +1,4 @@
 use std::fmt;
-#[cfg(test)]
 use std::ops::Range;
 
 use serde_json::Value;
@@ -8,7 +7,6 @@ use super::blocks::{
     BlockBuildError, BlockBuilder, BlockReply, PageRequest, MAX_BLOCK_DEPTH, MAX_OFFSET,
     MAX_PUBLIC_TOP_K,
 };
-#[cfg(test)]
 use super::blocks::{StabilityUnit, BLOCK_DEPTHS};
 
 pub const DEFAULT_TOP_K: usize = 10;
@@ -234,18 +232,17 @@ pub fn serve_public_page(
     })
 }
 
-#[cfg(test)]
+/// Metadata describing a canonical prefix and the depth at which it became stable.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ReferenceList {
+pub struct ReferenceList {
     pub stability_units: Vec<StabilityUnit>,
     pub retrieval_depth: usize,
     pub depth_tier: usize,
     pub lanes_exhausted: bool,
 }
 
-/// Builds a canonical prefix for internal comparison tests; unlike public requests,
+/// Builds a canonical prefix for comparison checks; unlike public requests,
 /// this helper may process an interval containing more than MAX_TOP_K items.
-#[cfg(test)]
 pub(crate) fn build_l(
     builder: &BlockBuilder,
     interval: Range<u64>,
@@ -275,4 +272,12 @@ pub(crate) fn build_l(
         }
         tier += 1;
     }
+}
+
+/// Builds canonical prefix metadata without applying public request-size bounds.
+pub fn build_reference_list(
+    builder: &BlockBuilder,
+    interval: Range<u64>,
+) -> Result<ReferenceList, BlockBuildError> {
+    build_l(builder, interval)
 }

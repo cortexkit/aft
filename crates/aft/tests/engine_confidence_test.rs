@@ -3,22 +3,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-mod comparator {
-    pub use aft::commands::semantic_search::comparator::*;
-}
-mod evidence_descriptor {
-    pub use aft::commands::semantic_search::evidence_descriptor::*;
-}
-mod plan_table {
-    pub use aft::commands::semantic_search::plan_table::*;
-}
-
-#[path = "../src/commands/semantic_search/blocks.rs"]
-mod blocks;
-#[path = "../src/commands/semantic_search/confidence.rs"]
-mod confidence;
-#[path = "../src/commands/semantic_search/scoring.rs"]
-mod scoring;
+use aft::commands::semantic_search::{
+    blocks, comparator, confidence, evidence_descriptor, plan_table, scoring,
+};
 
 use blocks::{
     BlockBuilder, CanonicalLane, CanonicalListKey, LaneCandidate, PageRequest, BLOCK_DEPTHS,
@@ -727,6 +714,9 @@ fn provenance_is_structurally_unavailable_to_confidence() {
             panic!("confidence must not read lane_positions")
         }
     }
+
+    let _provenance_accessor: fn(&StubbedProvenanceCandidate) -> ! =
+        StubbedProvenanceCandidate::lane_positions;
 
     impl ConfidenceCandidate for StubbedProvenanceCandidate {
         fn evidence_descriptor(&self) -> &EvidenceDescriptor {

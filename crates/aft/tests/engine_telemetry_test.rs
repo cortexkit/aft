@@ -3,34 +3,10 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-mod comparator {
-    pub use aft::commands::semantic_search::comparator::*;
-}
-mod evidence_descriptor {
-    pub use aft::commands::semantic_search::evidence_descriptor::*;
-}
-mod generation_token {
-    pub use aft::commands::semantic_search::generation_token::*;
-}
-mod list_envelope {
-    pub use aft::list_envelope::*;
-}
-mod plan_table {
-    pub use aft::commands::semantic_search::plan_table::*;
-}
-
-#[path = "../src/commands/semantic_search/blocks.rs"]
-mod blocks;
-#[path = "../src/commands/semantic_search/paging.rs"]
-mod paging;
-#[path = "../src/commands/semantic_search/provenance.rs"]
-mod provenance;
-#[path = "../src/commands/semantic_search/scoring.rs"]
-mod scoring;
-#[path = "../src/commands/semantic_search/telemetry.rs"]
-mod telemetry;
-#[path = "../src/commands/semantic_search/trailer.rs"]
-mod trailer;
+use aft::commands::semantic_search::{
+    blocks, comparator, evidence_descriptor, generation_token, paging, plan_table, provenance,
+    scoring, telemetry, trailer,
+};
 
 use blocks::{BlockBuilder, CanonicalLane, CanonicalListKey, LaneCandidate};
 use comparator::sort_r3;
