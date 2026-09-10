@@ -35,7 +35,10 @@ pub use model::{
     GithubReview, GithubReviewCommentSection, GithubTimelineEvent,
 };
 pub use normalize::{normalize_structured_document, normalize_timeline_events, NormalizeError};
-pub use render::{render_document, render_outline_for_resource, MAX_RENDERED_COMMENTS_PER_SECTION};
+pub use render::{
+    discussion_ordinal_for_comment_url, discussion_target_at_ordinal, render_document,
+    render_outline_for_resource, GithubDiscussionTarget, MAX_RENDERED_COMMENTS_PER_SECTION,
+};
 pub use resource::{
     parse_resource, GithubCommentSelector, GithubResource, GithubResourceKind,
     InvalidGithubResource,

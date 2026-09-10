@@ -194,6 +194,8 @@ pub struct GithubReadCompletion {
     pub total_lines: usize,
     pub freshness: GithubReadFreshness,
     pub attachments: Vec<GithubImageAttachment>,
+    /// Live structured data retained for mutation flows that must reuse read ordinals.
+    pub document: Option<super::model::GithubDocument>,
 }
 
 /// Handle for a fetch or attachment task that is running away from the request
@@ -476,6 +478,7 @@ impl GithubReadEngine {
                                         GithubReadFreshness::Fetched,
                                         downloader.as_ref(),
                                         waiter.view,
+                                        Some(document.clone()),
                                     )
                                 })
                         }
@@ -487,6 +490,7 @@ impl GithubReadEngine {
                                 GithubReadFreshness::CachedFallback,
                                 downloader.as_ref(),
                                 waiter.view,
+                                None,
                             ),
                             None => Err(error.clone()),
                         },
@@ -558,6 +562,7 @@ fn complete_with_optional_attachments(
     freshness: GithubReadFreshness,
     downloader: &dyn GithubImageDownloader,
     view: GithubReadView,
+    document: Option<super::model::GithubDocument>,
 ) -> Result<GithubReadCompletion, GithubReadError> {
     let attachments = if view == GithubReadView::Document && request.vision_capability == Some(true)
     {
@@ -565,7 +570,13 @@ fn complete_with_optional_attachments(
     } else {
         Vec::new()
     };
-    Ok(complete(canonical_text, selector, freshness, attachments))
+    Ok(complete(
+        canonical_text,
+        selector,
+        freshness,
+        attachments,
+        document,
+    ))
 }
 
 fn complete(
@@ -573,6 +584,7 @@ fn complete(
     selector: GithubReadSelector,
     freshness: GithubReadFreshness,
     attachments: Vec<GithubImageAttachment>,
+    document: Option<super::model::GithubDocument>,
 ) -> GithubReadCompletion {
     let total_lines = canonical_text.lines().count();
     GithubReadCompletion {
@@ -580,6 +592,7 @@ fn complete(
         total_lines,
         freshness,
         attachments,
+        document,
     }
 }
 

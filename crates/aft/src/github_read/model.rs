@@ -69,6 +69,8 @@ pub struct GithubReaction {
 pub struct GithubComment {
     pub author: Option<String>,
     pub body: String,
+    /// Stable browser URL used to correlate a just-created comment with its read ordinal.
+    pub url: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub minimized: bool,

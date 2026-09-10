@@ -221,6 +221,7 @@ fn comment_from(value: &Value) -> GithubComment {
     GithubComment {
         author: actor_login(value.get("author")).or_else(|| value_string(value, "author")),
         body: value_string(value, "body").unwrap_or_default(),
+        url: value_string(value, "url"),
         created_at: value_string(value, "createdAt").or_else(|| value_string(value, "created_at")),
         updated_at: value_string(value, "updatedAt").or_else(|| value_string(value, "updated_at")),
         minimized: value

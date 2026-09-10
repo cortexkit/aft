@@ -40,6 +40,10 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
+    if super::github_comments::is_github_resource_path(file) {
+        return super::github_comments::handle_comment_write(req, ctx, file, content);
+    }
+
     let create_dirs = req
         .params
         .get("create_dirs")

@@ -714,7 +714,7 @@ pub(crate) fn is_github_read_target(file: &str) -> bool {
     file.starts_with("issue://") || file.starts_with("pr://")
 }
 
-fn github_read_engine(ctx: &AppContext) -> Arc<GithubReadEngine> {
+pub(crate) fn github_read_engine(ctx: &AppContext) -> Arc<GithubReadEngine> {
     let database_path = ctx.storage_dir().join("aft.db");
     let mut engines = GITHUB_READ_ENGINES
         .lock()
@@ -1722,6 +1722,7 @@ mod tests {
                     mime: "image/png".to_string(),
                     bytes: vec![137, 80, 78, 71, 13, 10, 26, 10],
                 }],
+                document: None,
             },
             1,
         );

@@ -446,6 +446,43 @@ fn discussion_items(document: &GithubDocument) -> Vec<DiscussionItem<'_>> {
     items
 }
 
+/// The kind of discussion item addressed by a read-visible ordinal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GithubDiscussionTarget<'a> {
+    Comment(&'a GithubComment),
+    ReviewThreadComment,
+    Other,
+}
+
+/// Resolve an ordinal using the same unified ordering rendered by read/outline/zoom.
+pub fn discussion_target_at_ordinal(
+    document: &GithubDocument,
+    ordinal: usize,
+) -> Option<GithubDiscussionTarget<'_>> {
+    let discussion = discussion_items(document);
+    let item = discussion.get(ordinal.checked_sub(1)?)?;
+    Some(match item.kind {
+        DiscussionItemKind::Comment(comment) => GithubDiscussionTarget::Comment(comment),
+        DiscussionItemKind::ReviewComment(_) => GithubDiscussionTarget::ReviewThreadComment,
+        DiscussionItemKind::Review(_) | DiscussionItemKind::Event(_) => {
+            GithubDiscussionTarget::Other
+        }
+    })
+}
+
+/// Find a comment's read-visible ordinal after GitHub returns its browser URL.
+pub fn discussion_ordinal_for_comment_url(
+    document: &GithubDocument,
+    comment_url: &str,
+) -> Option<usize> {
+    let discussion = discussion_items(document);
+    let comment = document
+        .comments
+        .iter()
+        .find(|comment| comment.url.as_deref() == Some(comment_url))?;
+    discussion_ordinal_for_comment(&discussion, comment, false)
+}
+
 fn discussion_ordinal_for_comment(
     discussion: &[DiscussionItem<'_>],
     comment: &GithubComment,
