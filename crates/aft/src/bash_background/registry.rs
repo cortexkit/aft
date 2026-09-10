@@ -9210,7 +9210,7 @@ mod tests {
     }
 
     #[test]
-    fn pattern_watch_rows_become_pending_tombstones_when_task_is_gc_deleted() {
+    fn pattern_watch_rows_are_deleted_when_task_is_gc_deleted() {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path();
         let (registry, db, _frames) = registry_with_db_and_frames(storage);
@@ -9274,12 +9274,9 @@ mod tests {
             &conn, "opencode", "session", task_id,
         )
         .unwrap();
-        assert_eq!(watches.len(), 1, "watch tombstone must remain until ack");
-        assert!(!watches[0].scanning);
-        assert!(watches[0].pending_match);
-        assert_eq!(
-            watches[0].match_text.as_deref(),
-            Some(WATCH_TARGET_ERASED_TEXT)
+        assert!(
+            watches.is_empty(),
+            "task-row GC must cascade to every persisted watch"
         );
     }
 }

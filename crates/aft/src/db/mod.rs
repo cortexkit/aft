@@ -18,7 +18,7 @@ pub mod removal;
 pub mod standing_roots;
 pub mod state;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 8;
+pub const CURRENT_SCHEMA_VERSION: u32 = 9;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -211,6 +211,58 @@ CREATE INDEX idx_bash_tasks_non_terminal_pid
   WHERE status NOT IN ('completed', 'failed', 'killed', 'timed_out', 'fate_unknown');
 "#;
 
+// Watches cannot outlive their task. Rebuilding also drops legacy orphan rows,
+// which cannot satisfy the new composite foreign key.
+const MIGRATION_V9: &str = r#"
+DROP INDEX IF EXISTS idx_bash_pattern_watches_session;
+DROP INDEX IF EXISTS idx_bash_pattern_watches_task;
+ALTER TABLE bash_pattern_watches RENAME TO bash_pattern_watches_without_task_fk;
+CREATE TABLE bash_pattern_watches (
+  harness        TEXT NOT NULL,
+  session_id     TEXT NOT NULL,
+  task_id        TEXT NOT NULL,
+  watch_id       TEXT NOT NULL,
+  pattern_kind   TEXT NOT NULL,
+  pattern        TEXT NOT NULL,
+  once           INTEGER NOT NULL DEFAULT 1,
+  created_at     INTEGER NOT NULL,
+  stdout_offset  INTEGER NOT NULL DEFAULT 0,
+  stderr_offset  INTEGER NOT NULL DEFAULT 0,
+  pty_offset     INTEGER NOT NULL DEFAULT 0,
+  scanning       INTEGER NOT NULL DEFAULT 1,
+  pending_match  INTEGER NOT NULL DEFAULT 0,
+  match_text     TEXT,
+  match_offset   INTEGER,
+  match_context  TEXT,
+  PRIMARY KEY (harness, session_id, task_id, watch_id),
+  FOREIGN KEY (harness, session_id, task_id)
+    REFERENCES bash_tasks (harness, session_id, task_id) ON DELETE CASCADE
+);
+INSERT INTO bash_pattern_watches (
+  harness, session_id, task_id, watch_id, pattern_kind, pattern, once,
+  created_at, stdout_offset, stderr_offset, pty_offset, scanning,
+  pending_match, match_text, match_offset, match_context
+)
+SELECT
+  watch.harness, watch.session_id, watch.task_id, watch.watch_id,
+  watch.pattern_kind, watch.pattern, watch.once, watch.created_at,
+  watch.stdout_offset, watch.stderr_offset, watch.pty_offset, watch.scanning,
+  watch.pending_match, watch.match_text, watch.match_offset, watch.match_context
+FROM bash_pattern_watches_without_task_fk AS watch
+WHERE EXISTS (
+  SELECT 1
+  FROM bash_tasks AS task
+  WHERE task.harness = watch.harness
+    AND task.session_id = watch.session_id
+    AND task.task_id = watch.task_id
+);
+DROP TABLE bash_pattern_watches_without_task_fk;
+CREATE INDEX idx_bash_pattern_watches_session
+  ON bash_pattern_watches (harness, session_id);
+CREATE INDEX idx_bash_pattern_watches_task
+  ON bash_pattern_watches (harness, session_id, task_id);
+"#;
+
 #[derive(Debug)]
 pub enum OpenError {
     Io(std::io::Error),
@@ -353,6 +405,7 @@ fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError>
         6 => tx.execute_batch(MIGRATION_V6),
         7 => tx.execute_batch(MIGRATION_V7),
         8 => tx.execute_batch(MIGRATION_V8),
+        9 => tx.execute_batch(MIGRATION_V9),
         _ => Ok(()),
     }
     .and_then(|()| {
@@ -703,6 +756,63 @@ mod tests {
     }
 
     #[test]
+    fn migration_v9_adds_task_cascade_and_drops_existing_orphan_watches() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let conn = Connection::open(&path).unwrap();
+        for migration in [
+            MIGRATION_V1,
+            MIGRATION_V2,
+            MIGRATION_V3,
+            MIGRATION_V4,
+            MIGRATION_V5,
+            MIGRATION_V6,
+            MIGRATION_V7,
+            MIGRATION_V8,
+        ] {
+            conn.execute_batch(migration).unwrap();
+        }
+        insert_bash_task(&conn, "pi", "session", "bash-attached").unwrap();
+        insert_bash_pattern_watch(&conn, "pi", "session", "bash-attached", "watch-attached")
+            .unwrap();
+        insert_bash_pattern_watch(&conn, "pi", "session", "bash-orphan", "watch-orphan")
+            .unwrap();
+        conn.execute("DELETE FROM schema_version", []).unwrap();
+        conn.execute("INSERT INTO schema_version (version) VALUES (8)", [])
+            .unwrap();
+        drop(conn);
+
+        let conn = open(&path).unwrap();
+        assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
+        let attached: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bash_pattern_watches WHERE task_id = 'bash-attached'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let orphaned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM bash_pattern_watches WHERE task_id = 'bash-orphan'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attached, 1, "migration lost a watch with a live task row");
+        assert_eq!(orphaned, 0, "migration retained a pre-existing orphan watch");
+
+        conn.execute(
+            "DELETE FROM bash_tasks WHERE harness = 'pi' AND session_id = 'session' AND task_id = 'bash-attached'",
+            [],
+        )
+        .unwrap();
+        let watches: i64 = conn
+            .query_row("SELECT COUNT(*) FROM bash_pattern_watches", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(watches, 0, "task deletion did not cascade to its watch");
+    }
+
+    #[test]
     fn migration_v7_adds_machine_scoped_standing_root_tables() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("aft.db");
@@ -909,6 +1019,21 @@ mod tests {
                 "running",
                 1_i64
             ],
+        )
+    }
+
+    fn insert_bash_pattern_watch(
+        conn: &Connection,
+        harness: &str,
+        session_id: &str,
+        task_id: &str,
+        watch_id: &str,
+    ) -> rusqlite::Result<usize> {
+        conn.execute(
+            "INSERT INTO bash_pattern_watches (
+                harness, session_id, task_id, watch_id, pattern_kind, pattern, created_at
+             ) VALUES (?1, ?2, ?3, ?4, 'substring', 'needle', 1)",
+            params![harness, session_id, task_id, watch_id],
         )
     }
 
