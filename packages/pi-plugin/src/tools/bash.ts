@@ -12,6 +12,7 @@ import {
   resolveBashKillTimeout,
   runBashHostFallback,
   sleep,
+  WATCH_TIMEOUT_STEER,
 } from "@cortexkit/aft-bridge";
 import type {
   AgentToolResult,
@@ -1354,7 +1355,8 @@ function formatWaitSummary(waited: BashStatusWaited, details: BashStatusDetails)
     return `Waited ${waited.elapsed_ms}ms; matched ${JSON.stringify(waited.match ?? "")}${stream} at offset ${waited.match_offset ?? 0}.`;
   }
   if (waited.reason === "timeout") {
-    return `Waited ${waited.elapsed_ms}ms; timeout reached without match.`;
+    // A watch deadline is not a failure of the command; see WATCH_TIMEOUT_STEER.
+    return `Waited ${waited.elapsed_ms}ms; timeout reached without match. ${WATCH_TIMEOUT_STEER}`;
   }
   if (waited.reason === "unavailable") {
     return `Waited ${waited.elapsed_ms}ms; the bridge was busy, so task state is unknown. Do not poll; let the task's completion notification wake the session, or use one bash_status snapshot on the next normal tool call.`;

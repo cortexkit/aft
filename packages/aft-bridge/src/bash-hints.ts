@@ -9,6 +9,16 @@ import * as path from "node:path";
 // the original when no hint should fire). The appended "[Hint] ..." line is
 // agent-visible and persists in the tool result.
 
+/**
+ * Appended to a bash_watch reply whose sync deadline passed without a match.
+ * The deadline is a property of the watch, not of the command: a delegated
+ * worker that read the bare "timeout reached" line as its own execution being
+ * interrupted declared a failed result while its 12-minute docker matrix was
+ * still running. The sentence names the state and the move in both roles.
+ */
+export const WATCH_TIMEOUT_STEER =
+  "The command is still running; this deadline is not a failure. Call bash_watch again or do other work in this turn. Only a primary session may end its turn on it (the completion reminder wakes it); a delegated worker must not end its turn or declare a result while the command runs.";
+
 const CONFLICT_HINT =
   "\n\n[Hint] Use aft_conflicts to see all conflict regions across files in a single call.";
 

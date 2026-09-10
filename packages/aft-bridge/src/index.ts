@@ -20,6 +20,7 @@ export {
   commandInvokesCodeSearch,
   maybeAppendConflictsHint,
   maybeAppendGrepSearchHint,
+  WATCH_TIMEOUT_STEER,
 } from "./bash-hints.js";
 export {
   BASH_HOST_FALLBACK_BANNER,

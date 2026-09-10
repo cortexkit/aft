@@ -4,6 +4,7 @@ import {
   isBridgeTransportTimeout,
   isTerminalStatus,
   sleep,
+  WATCH_TIMEOUT_STEER,
 } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
@@ -245,7 +246,11 @@ function formatWatchResultText(
       const stream = waited.match_stream ? ` in ${waited.match_stream}` : "";
       text += `\nWaited ${waited.elapsed_ms}ms; matched ${JSON.stringify(waited.match ?? "")}${stream} at offset ${waited.match_offset ?? 0}.`;
     } else if (waited.reason === "timeout") {
-      text += `\nWaited ${waited.elapsed_ms}ms; timeout reached without match.`;
+      // A watch deadline is not a failure of the command, and a delegated
+      // worker that reads it as one declares a failed result mid-run (a
+      // mason did exactly that on a 12-minute docker matrix). Say what it
+      // is and what to do in both roles.
+      text += `\nWaited ${waited.elapsed_ms}ms; timeout reached without match. ${WATCH_TIMEOUT_STEER}`;
     } else if (waited.reason === "unavailable") {
       text += `\nWaited ${waited.elapsed_ms}ms; the bridge was busy, so task state is unknown. Do not poll; let the task's completion notification wake the session, or use one bash_status snapshot on the next normal tool call.`;
     } else {
