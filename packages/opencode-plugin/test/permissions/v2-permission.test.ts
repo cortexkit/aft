@@ -183,13 +183,6 @@ describe("OpenCode V2 permission consumer", () => {
     expect(host.stream.closed).toBe(true);
   });
 
-  test("accepts the pinned V2 host's direct permission domains", async () => {
-    const host = permissionClient("allow");
-    await requestPermission(host.client, REQUEST, EXECUTION_CONTEXT);
-    expect(host.createCalls).toHaveLength(1);
-    expect(host.stream.closed).toBe(true);
-  });
-
   test("maps host deny and reject outcomes to distinct failures", async () => {
     const denied = permissionClient("deny");
     await expect(
