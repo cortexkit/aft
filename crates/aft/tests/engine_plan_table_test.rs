@@ -23,6 +23,17 @@ fn test_running_table_matches_pinned_json() {
     running
         .verify_against(&table_from_file)
         .expect("file-loaded pinned table must match running table");
+
+    // The product embeds its own copy of the pinned table (a product build
+    // cannot reach outside crates/). The benchmark copy is the one the
+    // fixtures and the gate read; the two must stay byte-identical.
+    let benchmark_bytes =
+        std::fs::read(&fixture_path).expect("benchmark plan-table.json must be readable");
+    assert_eq!(
+        aft::commands::semantic_search::plan_table::PINNED_PLAN_TABLE_JSON.as_bytes(),
+        benchmark_bytes.as_slice(),
+        "crates/aft/assets/search-plan-table.pinned.json must be byte-identical to benchmarks/aft-search/engine-fixtures/plan-table.json"
+    );
 }
 
 #[test]

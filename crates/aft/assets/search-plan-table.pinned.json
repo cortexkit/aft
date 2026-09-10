@@ -1,0 +1,331 @@
+{
+  "code_literal": {
+    "anchored": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 2
+    },
+    "exact": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 1
+    },
+    "fallback_walk": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 7
+    },
+    "lexical": {
+      "weight": 0.9,
+      "rrf_constant": 60.0,
+      "plan_order_index": 3
+    },
+    "path_lookup": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 6
+    },
+    "readiness_disclosure": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 8
+    },
+    "semantic": {
+      "weight": 0.1,
+      "rrf_constant": 60.0,
+      "plan_order_index": 5
+    },
+    "symbol": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 0
+    },
+    "variants": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 4
+    }
+  },
+  "identifier": {
+    "anchored": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 2
+    },
+    "exact": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 1
+    },
+    "fallback_walk": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 7
+    },
+    "lexical": {
+      "weight": 0.8,
+      "rrf_constant": 60.0,
+      "plan_order_index": 3
+    },
+    "path_lookup": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 6
+    },
+    "readiness_disclosure": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 8
+    },
+    "semantic": {
+      "weight": 0.2,
+      "rrf_constant": 60.0,
+      "plan_order_index": 5
+    },
+    "symbol": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 0
+    },
+    "variants": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 4
+    }
+  },
+  "log_excerpt": {
+    "anchored": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 2
+    },
+    "exact": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 1
+    },
+    "fallback_walk": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 7
+    },
+    "lexical": {
+      "weight": 0.9,
+      "rrf_constant": 60.0,
+      "plan_order_index": 3
+    },
+    "path_lookup": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 6
+    },
+    "readiness_disclosure": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 8
+    },
+    "semantic": {
+      "weight": 0.1,
+      "rrf_constant": 60.0,
+      "plan_order_index": 5
+    },
+    "symbol": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 0
+    },
+    "variants": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 4
+    }
+  },
+  "nl": {
+    "anchored": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 2
+    },
+    "exact": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 1
+    },
+    "fallback_walk": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 7
+    },
+    "lexical": {
+      "weight": 0.4,
+      "rrf_constant": 60.0,
+      "plan_order_index": 3
+    },
+    "path_lookup": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 6
+    },
+    "readiness_disclosure": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 8
+    },
+    "semantic": {
+      "weight": 0.6,
+      "rrf_constant": 60.0,
+      "plan_order_index": 5
+    },
+    "symbol": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 0
+    },
+    "variants": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 4
+    }
+  },
+  "path": {
+    "anchored": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 2
+    },
+    "exact": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 1
+    },
+    "fallback_walk": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 7
+    },
+    "lexical": {
+      "weight": 0.9,
+      "rrf_constant": 60.0,
+      "plan_order_index": 3
+    },
+    "path_lookup": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 6
+    },
+    "readiness_disclosure": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 8
+    },
+    "semantic": {
+      "weight": 0.1,
+      "rrf_constant": 60.0,
+      "plan_order_index": 5
+    },
+    "symbol": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 0
+    },
+    "variants": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 4
+    }
+  },
+  "regex": {
+    "anchored": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 2
+    },
+    "exact": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 1
+    },
+    "fallback_walk": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 7
+    },
+    "lexical": {
+      "weight": 1.0,
+      "rrf_constant": 60.0,
+      "plan_order_index": 3
+    },
+    "path_lookup": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 6
+    },
+    "readiness_disclosure": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 8
+    },
+    "semantic": {
+      "weight": 0.0,
+      "rrf_constant": 60.0,
+      "plan_order_index": 5
+    },
+    "symbol": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 0
+    },
+    "variants": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 4
+    }
+  },
+  "short": {
+    "anchored": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 2
+    },
+    "exact": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 1
+    },
+    "fallback_walk": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 7
+    },
+    "lexical": {
+      "weight": 0.8,
+      "rrf_constant": 60.0,
+      "plan_order_index": 3
+    },
+    "path_lookup": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 6
+    },
+    "readiness_disclosure": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 8
+    },
+    "semantic": {
+      "weight": 0.2,
+      "rrf_constant": 60.0,
+      "plan_order_index": 5
+    },
+    "symbol": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 0
+    },
+    "variants": {
+      "weight": null,
+      "rrf_constant": null,
+      "plan_order_index": 4
+    }
+  }
+}

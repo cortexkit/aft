@@ -421,8 +421,15 @@ impl PlanTable {
 }
 
 /// Embedded pinned plan table constant compiled into the binary.
+///
+/// The pinned table is a product input, so it lives beside this module: a
+/// product build must not reach outside `crates/` (the release image copies
+/// only the crate tree). The benchmark keeps its own copy under
+/// `benchmarks/aft-search/engine-fixtures/plan-table.json`, and
+/// `engine_plan_table_test` asserts the two are byte-identical so neither can
+/// drift from the other.
 pub const PINNED_PLAN_TABLE_JSON: &str =
-    include_str!("../../../../../benchmarks/aft-search/engine-fixtures/plan-table.json");
+    include_str!("../../../assets/search-plan-table.pinned.json");
 
 /// Load and verify the pinned plan table at startup against the running table.
 pub fn verify_pinned_plan_table_at_startup() -> Result<(), PlanTableError> {
