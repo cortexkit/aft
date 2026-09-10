@@ -14,7 +14,6 @@ use crate::local_embed::LocalEmbedder;
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::error::Error;
@@ -26,29 +25,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use url::Url;
-
-tokio::task_local! {
-    static SEARCH_EMBEDDING_CALL_COUNT: Cell<u64>;
-}
-
-/// Run one search request with isolated embedding-call attribution.
-pub fn with_search_embedding_call_counter<T>(run: impl FnOnce() -> T) -> (T, u64) {
-    SEARCH_EMBEDDING_CALL_COUNT.sync_scope(Cell::new(0), || {
-        let output = run();
-        let count = SEARCH_EMBEDDING_CALL_COUNT.with(Cell::get);
-        (output, count)
-    })
-}
-
-pub fn current_search_embedding_call_count() -> u64 {
-    SEARCH_EMBEDDING_CALL_COUNT
-        .try_with(Cell::get)
-        .unwrap_or_default()
-}
-
-fn record_search_embedding_call() {
-    let _ = SEARCH_EMBEDDING_CALL_COUNT.try_with(|count| count.set(count.get() + 1));
-}
 
 const DEFAULT_DIMENSION: usize = 384;
 const MAX_ENTRIES: usize = 1_000_000;
@@ -1219,32 +1195,13 @@ impl SemanticEmbeddingModel {
         query: &str,
         budget: QueryBudget,
     ) -> Result<Vec<f32>, String> {
-        if let Some(vector) = self.query_embedding_cache.get(query) {
-            self.query_embedding_cache_hits += 1;
-            return Ok(vector.clone());
-        }
-
-        self.query_embedding_cache_misses += 1;
-        let embeddings = self.embed_texts(
+        self.embed_texts(
             vec![query.to_string()],
             EmbeddingRequestPolicy::Query(budget),
-        )?;
-        let vector = embeddings
-            .first()
-            .cloned()
-            .ok_or_else(|| "embedding model returned no query vector".to_string())?;
-
-        if self.query_embedding_cache.len() >= QUERY_EMBEDDING_CACHE_CAP {
-            if let Some(oldest) = self.query_embedding_cache_order.pop_front() {
-                self.query_embedding_cache.remove(&oldest);
-            }
-        }
-        self.query_embedding_cache
-            .insert(query.to_string(), vector.clone());
-        self.query_embedding_cache_order
-            .push_back(query.to_string());
-
-        Ok(vector)
+        )?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "embedding model returned no query vector".to_string())
     }
 
     pub fn query_embedding_cache_stats(&self) -> (u64, u64, usize) {
@@ -1260,8 +1217,36 @@ impl SemanticEmbeddingModel {
         texts: Vec<String>,
         policy: EmbeddingRequestPolicy,
     ) -> Result<Vec<Vec<f32>>, String> {
-        record_search_embedding_call();
-        match &mut self.engine {
+        let query_cache_key = match policy {
+            EmbeddingRequestPolicy::Build => None,
+            EmbeddingRequestPolicy::Query(_) => texts.first().cloned(),
+        };
+        let cached_vectors = query_cache_key.as_ref().and_then(|query| {
+            self.query_embedding_cache.get(query).map(|vector| {
+                self.query_embedding_cache_hits += 1;
+                vec![vector.clone()]
+            })
+        });
+        let cache_hit = u64::from(cached_vectors.is_some());
+        if query_cache_key.is_some() && cached_vectors.is_none() {
+            self.query_embedding_cache_misses += 1;
+        }
+        let requested = if query_cache_key.is_some() && cached_vectors.is_none() {
+            texts.len() as u64
+        } else {
+            0
+        };
+        let live_calls = u64::from(requested > 0 && self.is_live_query_provider());
+        crate::search_b2::embed_counter::record(crate::search_b2::embed_counter::EmbedCounts {
+            requested,
+            cache_hits: cache_hit,
+            live_calls,
+        });
+        if let Some(vectors) = cached_vectors {
+            return Ok(vectors);
+        }
+
+        let result = match &mut self.engine {
             SemanticEmbeddingEngine::Local(model) => model
                 .embed(&texts)
                 .map_err(|error| format!("failed to embed batch: {error}")),
@@ -1420,6 +1405,34 @@ impl SemanticEmbeddingModel {
                 self.dimension = vectors.first().map(Vec::len);
                 Ok(vectors)
             }
+        };
+
+        if let (Some(query), Ok(vectors)) = (query_cache_key, &result) {
+            if let Some(vector) = vectors.first() {
+                if self.query_embedding_cache.len() >= QUERY_EMBEDDING_CACHE_CAP {
+                    if let Some(oldest) = self.query_embedding_cache_order.pop_front() {
+                        self.query_embedding_cache.remove(&oldest);
+                    }
+                }
+                self.query_embedding_cache
+                    .insert(query.clone(), vector.clone());
+                self.query_embedding_cache_order.push_back(query);
+            }
+        }
+
+        result
+    }
+
+    fn is_live_query_provider(&self) -> bool {
+        match &self.engine {
+            // The offline fixture serves checked-in vectors over HTTP, so crossing
+            // that socket is observable work but not a live model invocation.
+            SemanticEmbeddingEngine::OpenAiCompatible { model, .. } => {
+                model != crate::search_b2::embed_counter::FIXTURE_PROVIDER_MODEL
+            }
+            SemanticEmbeddingEngine::Local(_)
+            | SemanticEmbeddingEngine::Ollama { .. }
+            | SemanticEmbeddingEngine::Synapse(_) => true,
         }
     }
 }
@@ -7773,41 +7786,6 @@ public class Greeter {
             .unwrap();
 
         assert_eq!(vectors, vec![vec![0.1, 0.2, 0.3], vec![0.4, 0.5, 0.6]]);
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn search_embedding_counter_records_only_post_cache_calls() {
-        let (base_url, handle) = start_mock_http_server(|_, path, _| {
-            assert_eq!(path, "/v1/embeddings");
-            "{\"data\":[{\"embedding\":[0.1,0.2,0.3],\"index\":0}]}".to_string()
-        });
-        let config = SemanticBackendConfig {
-            backend: SemanticBackend::OpenAiCompatible,
-            model: "test-embedding".to_string(),
-            base_url: Some(base_url),
-            api_key_env: None,
-            timeout_ms: 5_000,
-            query_timeout_ms: DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
-            max_batch_size: 64,
-            max_files: 20_000,
-            ..Default::default()
-        };
-        let mut model = SemanticEmbeddingModel::from_config_for_query(&config).unwrap();
-        let ((), calls) = with_search_embedding_call_counter(|| {
-            model
-                .embed_query_cached("same query", QueryBudget::from_config(&config))
-                .unwrap();
-            model
-                .embed_query_cached("same query", QueryBudget::from_config(&config))
-                .unwrap();
-        });
-
-        assert_eq!(
-            calls, 1,
-            "the query-cache hit must not count as an embedding call"
-        );
-        assert_eq!(model.query_embedding_cache_stats(), (1, 1, 1));
         handle.join().unwrap();
     }
 

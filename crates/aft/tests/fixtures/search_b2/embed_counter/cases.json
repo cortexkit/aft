@@ -1,0 +1,19 @@
+{
+  "zero_embedding_queries": [
+    "parse_header",
+    "missing_definition",
+    "\"exceeds the cap\"",
+    "\"ab\"",
+    "'ab'",
+    "\"a b c\"",
+    "if (x) return;",
+    "2026-09-08 ERROR worker pid [4821] failed",
+    "src/lib.rs",
+    "^export",
+    "foo.*"
+  ],
+  "semantic_controls": [
+    "character cap",
+    "where does the semantic embedding find this function"
+  ]
+}

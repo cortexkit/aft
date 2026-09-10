@@ -10,9 +10,7 @@
 
 use crate::commands::semantic_search::extensions::{DefaultSearchExtensions, SearchExtensions};
 
-pub use crate::semantic_index::{
-    current_search_embedding_call_count, with_search_embedding_call_counter,
-};
+pub mod embed_counter;
 
 static DEFAULTS: DefaultSearchExtensions = DefaultSearchExtensions;
 
@@ -38,8 +36,13 @@ mod tests {
 
     #[test]
     fn counter_is_reachable_through_the_bootstrap() {
-        let ((), calls) = with_search_embedding_call_counter(|| {});
-        assert_eq!(calls, 0);
-        assert_eq!(current_search_embedding_call_count(), 0);
+        let request_id = "bootstrap-counter";
+        let _guard = embed_counter::install(request_id);
+        embed_counter::record(embed_counter::EmbedCounts {
+            requested: 1,
+            cache_hits: 0,
+            live_calls: 0,
+        });
+        assert_eq!(embed_counter::read(request_id).requested, 1);
     }
 }

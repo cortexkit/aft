@@ -390,12 +390,11 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut plan = extensions.plan(&facts, shape, &readiness);
     plan.variants = variants.into_iter().map(|variant| variant.text).collect();
 
-    let (mut response, embedding_calls) =
-        crate::semantic_index::with_search_embedding_call_counter(|| {
-            handle_semantic_search_inner(req, ctx, page_request, extensions, &plan)
-        });
+    let _embedding_attribution = crate::search_b2::embed_counter::install(req.id.clone());
+    let mut response = handle_semantic_search_inner(req, ctx, page_request, extensions, &plan);
     if response.success {
-        attach_search_execution_metadata(&mut response, &plan, embedding_calls);
+        let embedding_counts = crate::search_b2::embed_counter::read(&req.id);
+        attach_search_execution_metadata(&mut response, &plan, embedding_counts);
     }
     response
 }
@@ -403,7 +402,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
 fn attach_search_execution_metadata(
     response: &mut Response,
     plan: &extensions::LanePlan,
-    embedding_calls: u64,
+    embedding_counts: crate::search_b2::embed_counter::EmbedCounts,
 ) {
     let Some(data) = response.data.as_object_mut() else {
         return;
@@ -414,12 +413,30 @@ fn attach_search_execution_metadata(
     let Some(structured) = structured.as_object_mut() else {
         return;
     };
-    structured
+    let structured_plan = structured
         .entry("plan".to_string())
         .or_insert_with(|| serde_json::json!(plan));
+    if let Some(structured_plan) = structured_plan.as_object_mut() {
+        structured_plan.insert(
+            "embedding_calls".to_string(),
+            serde_json::json!(embedding_counts.requested),
+        );
+        structured_plan.insert(
+            "embedding_cache_hits".to_string(),
+            serde_json::json!(embedding_counts.cache_hits),
+        );
+        structured_plan.insert(
+            "live_embed_calls".to_string(),
+            serde_json::json!(embedding_counts.live_calls),
+        );
+    }
     structured.insert(
         "search".to_string(),
-        serde_json::json!({ "embedding_calls": embedding_calls }),
+        serde_json::json!({
+            "embedding_calls": embedding_counts.requested,
+            "embedding_cache_hits": embedding_counts.cache_hits,
+            "live_embed_calls": embedding_counts.live_calls,
+        }),
     );
 }
 
@@ -2056,6 +2073,7 @@ struct EngineRanking {
 }
 
 fn run_engine_ranking(
+    request_id: &str,
     ctx: &AppContext,
     project_root: &Path,
     query: &str,
@@ -2323,7 +2341,7 @@ fn run_engine_ranking(
             shape: plan.shape,
             confidence: confidence_telemetry,
             variants: plan.variants.clone(),
-            embedding_calls: crate::semantic_index::current_search_embedding_call_count() as usize,
+            embedding_calls: crate::search_b2::embed_counter::read(request_id).requested as usize,
             snapshot_generation: generation,
         })
         .map_err(|error| error.to_string())?;
@@ -2418,6 +2436,7 @@ fn handle_engine_only_search(
         warnings.push("Semantic search unavailable; using lexical-only fallback.".to_string());
     }
     let mut ranked = match run_engine_ranking(
+        &req.id,
         ctx,
         project_root,
         &params.query,
@@ -2895,6 +2914,7 @@ fn handle_semantic_or_hybrid_search(
         semantic_results.truncate(semantic_limit);
     }
     let mut engine_ranking = match run_engine_ranking(
+        &req.id,
         ctx,
         project_root,
         &params.query,
