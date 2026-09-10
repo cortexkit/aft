@@ -237,7 +237,7 @@ export function addCallgraphWarmup(scenario: ScenarioDefinition): ScenarioDefini
   if (target.response.kind !== "tool_calls") return scenario;
   const warmupLabel = `${target.label}-warmup`;
   target.label = warmupLabel;
-  for (const call of target.response.calls) call.id = `${call.id}-warmup`;
+  for (const call of target.response.calls) call.id = `warmup-${call.id}`;
   const turns = scenario.turns.map((turn) => structuredClone(turn));
   turns[index] = { ...turns[index], delay_ms: Math.max(turns[index].delay_ms ?? 0, 2_000) };
   turns.splice(index, 0, target);

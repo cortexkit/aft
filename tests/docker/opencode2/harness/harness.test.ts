@@ -27,6 +27,7 @@ import {
   isTitleGenerationRequest,
   materializeTurnPlaceholders,
   observeThenRespond,
+  toolResultForCall,
 } from "./mock-server.js";
 import { projectText, TRUNCATION_TRAILER_PATTERN } from "./projection.js";
 import { verifyExecutableProvenance } from "./provenance.js";
@@ -219,6 +220,22 @@ describe("scenario isolation and liveness", () => {
       path: "sample.txt",
       limit: 10,
     });
+  });
+
+  test("tool result lookup follows the pinned host's 40-character call ids", () => {
+    const callId = "callgraph-t6-callgraph-impact-payload-sites-incomplete";
+    const exchanges = [
+      {
+        index: 0,
+        label: "turn",
+        request: {
+          messages: [{ role: "tool", tool_call_id: callId.slice(0, 40), content: "done" }],
+        },
+        response: {},
+        observed_at: "now",
+      },
+    ];
+    expect(toolResultForCall(exchanges, callId)?.text).toBe("done");
   });
 
   test("title generation is excluded from scripted scenario turns", () => {
@@ -529,7 +546,7 @@ describe("source-of-truth derivation", () => {
     const warmed = addCallgraphWarmup(input);
     expect(warmed.expected_turns).toEqual(["turn-1-warmup", "turn-1"]);
     expect(warmed.turns[0].response).toMatchObject({
-      calls: [{ id: "call-1-warmup", name: "aft_callgraph" }],
+      calls: [{ id: "warmup-call-1", name: "aft_callgraph" }],
     });
     expect(warmed.turns[1].delay_ms).toBe(2_000);
   });

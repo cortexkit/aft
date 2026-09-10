@@ -218,12 +218,13 @@ export function toolResultForCall(
   exchanges: readonly RecordedMockExchange[],
   callId: string,
 ): { text: string; event: Record<string, unknown> } | undefined {
+  const hostCallId = callId.slice(0, 40);
   for (const exchange of exchanges) {
     const messages = asRecord(exchange.request)?.messages;
     if (!Array.isArray(messages)) continue;
     for (const messageValue of messages) {
       const message = asRecord(messageValue);
-      if (message?.role !== "tool" || messageToolCallId(message) !== callId) continue;
+      if (message?.role !== "tool" || messageToolCallId(message) !== hostCallId) continue;
       const content = message.content;
       if (typeof content === "string") return { text: content, event: message };
       if (Array.isArray(content)) {
