@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Sequence
 
 from run_exact_recall import clone_root_for
+from run_real_query import load_capability
 from search_quality_lib import InputFault
 from setup_corpus import parse_corpus_toml
 
@@ -57,6 +58,8 @@ def selected_profile(args: argparse.Namespace) -> str:
         return args.profile
     if args.rebaseline and args.to_profile:
         return args.to_profile
+    if load_capability(Path(args.schema)).get("offset_declared") is True:
+        return "paged"
     reference = Path(args.reference)
     if args.mode == "evaluate" and reference.is_file():
         value = json.loads(reference.read_text())

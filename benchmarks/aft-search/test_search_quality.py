@@ -1,11 +1,59 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import argparse
 import copy
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
+from run_real_query import load_capability
+from run_search_quality import selected_profile
 from search_quality import descriptor_labels, synthetic_documents
-from search_quality_lib import TOOL_CALL_PARITY_FIXTURE_SOURCE, total_gate
+from search_quality_lib import (
+    TOOL_CALL_PARITY_FIXTURE_SOURCE,
+    total_gate,
+    validate_profile_score,
+)
+
+
+class ProfileSelectionTests(unittest.TestCase):
+    def profile_for_schema(self, schema: dict) -> tuple[str, dict]:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            schema_path = root / "semantic.json"
+            reference_path = root / "reference.json"
+            schema_path.write_text(json.dumps(schema))
+            reference_path.write_text(json.dumps({"profile": "single_page"}))
+            args = argparse.Namespace(
+                profile=None,
+                mode="evaluate",
+                rebaseline=False,
+                to_profile=None,
+                schema=str(schema_path),
+                reference=str(reference_path),
+            )
+            profile = selected_profile(args)
+            return profile, load_capability(schema_path)
+
+    def test_offset_declaring_head_selects_paged_and_runs_probe(self) -> None:
+        profile, capability = self.profile_for_schema(
+            {
+                "properties": {
+                    "offset": {"type": "integer", "minimum": 0, "maximum": 100_000}
+                }
+            }
+        )
+        if profile == "paged":
+            capability["probe_pages_differ"] = True
+        validate_profile_score({"profile": profile, "capability": capability, "rows": []})
+        self.assertEqual(profile, "paged")
+
+    def test_no_offset_head_keeps_single_page_reference_profile(self) -> None:
+        profile, capability = self.profile_for_schema({"properties": {}})
+        self.assertEqual(profile, "single_page")
+        validate_profile_score({"profile": profile, "capability": capability, "rows": []})
 
 
 class EngineUnwiredGateTests(unittest.TestCase):
