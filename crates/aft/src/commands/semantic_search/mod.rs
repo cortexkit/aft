@@ -245,6 +245,162 @@ enum SearchIndexWaitError {
     Contended,
 }
 
+struct RuntimeReadinessSource<'a> {
+    ctx: &'a AppContext,
+}
+
+impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
+    fn sample(&self) -> extensions::ReadinessObservation<'_> {
+        use extensions::{
+            ReadinessObservation, SemanticReadiness, SemanticSnapshot, SymbolIndexStatus,
+            SymbolReadiness, TrigramReadiness,
+        };
+
+        let semantic = match try_read_with_budget(
+            self.ctx.semantic_index_status(),
+            INTERACTIVE_ARTIFACT_READ_BUDGET,
+        ) {
+            Some(status) => {
+                let status = status.clone();
+                if matches!(status, SemanticIndexStatus::Ready { .. }) {
+                    match try_read_with_budget(
+                        self.ctx.semantic_index(),
+                        INTERACTIVE_ARTIFACT_READ_BUDGET,
+                    ) {
+                        Some(index) => {
+                            let evicted = index.is_none();
+                            let snapshot = (!evicted).then(|| SemanticSnapshot::from_guard(index));
+                            SemanticReadiness {
+                                evicted,
+                                status,
+                                snapshot,
+                                lock_contended: false,
+                            }
+                        }
+                        None => SemanticReadiness {
+                            status,
+                            snapshot: None,
+                            evicted: false,
+                            lock_contended: true,
+                        },
+                    }
+                } else {
+                    SemanticReadiness {
+                        status,
+                        snapshot: None,
+                        evicted: false,
+                        lock_contended: false,
+                    }
+                }
+            }
+            None => SemanticReadiness {
+                status: SemanticIndexStatus::Building {
+                    stage: "status_lock".to_string(),
+                    files: None,
+                    entries_done: None,
+                    entries_total: None,
+                },
+                snapshot: None,
+                evicted: false,
+                lock_contended: true,
+            },
+        };
+
+        let trigram =
+            match try_read_with_budget(self.ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET) {
+                Some(index) if index.as_ref().is_some_and(SearchIndex::is_ready) => {
+                    TrigramReadiness {
+                        status: IndexStatus::Ready,
+                        snapshot: index.as_ref().map(SearchIndex::snapshot).map(Arc::new),
+                        evicted: false,
+                        lock_contended: false,
+                    }
+                }
+                Some(index) if index.is_some() => TrigramReadiness {
+                    status: IndexStatus::Building,
+                    snapshot: None,
+                    evicted: false,
+                    lock_contended: false,
+                },
+                Some(_) => {
+                    let receiver = try_read_with_budget(
+                        self.ctx.search_index_rx(),
+                        INTERACTIVE_ARTIFACT_READ_BUDGET,
+                    );
+                    match receiver {
+                        Some(receiver) if receiver.is_some() => TrigramReadiness {
+                            status: IndexStatus::Building,
+                            snapshot: None,
+                            evicted: false,
+                            lock_contended: false,
+                        },
+                        Some(_) => TrigramReadiness {
+                            status: IndexStatus::Fallback,
+                            snapshot: None,
+                            evicted: false,
+                            lock_contended: false,
+                        },
+                        None => TrigramReadiness {
+                            status: IndexStatus::Building,
+                            snapshot: None,
+                            evicted: false,
+                            lock_contended: true,
+                        },
+                    }
+                }
+                None => TrigramReadiness {
+                    status: IndexStatus::Building,
+                    snapshot: None,
+                    evicted: false,
+                    lock_contended: true,
+                },
+            };
+
+        let symbol_cache = self.ctx.symbol_cache();
+        let symbol = match try_read_with_budget(&symbol_cache, INTERACTIVE_ARTIFACT_READ_BUDGET) {
+            Some(cache) if cache.len() > 0 => SymbolReadiness {
+                status: SymbolIndexStatus::Ready,
+                snapshot: Some(Arc::new(cache.clone())),
+                evicted: false,
+                lock_contended: false,
+            },
+            Some(_) => SymbolReadiness {
+                status: SymbolIndexStatus::Building,
+                snapshot: None,
+                evicted: true,
+                lock_contended: false,
+            },
+            None => SymbolReadiness {
+                status: SymbolIndexStatus::Building,
+                snapshot: None,
+                evicted: false,
+                lock_contended: true,
+            },
+        };
+
+        ReadinessObservation {
+            semantic,
+            trigram,
+            symbol,
+        }
+    }
+
+    fn bounded_first_search_wait(&self) -> extensions::ReadinessWait {
+        // A writer-held pointer cannot be advanced by the loader drain below;
+        // preserve the interactive contention bound instead of sleeping 2.5s.
+        if matches!(
+            self.ctx.search_index().try_read(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ) {
+            return extensions::ReadinessWait::Completed;
+        }
+        match search_index_ready_with_budget(self.ctx, first_search_index_load_wait_budget()) {
+            Err(SearchIndexWaitError::Cancelled) => extensions::ReadinessWait::Cancelled,
+            Ok(_) | Err(SearchIndexWaitError::Contended) => extensions::ReadinessWait::Completed,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LexicalCollection {
     files: Vec<(PathBuf, f32)>,
@@ -351,7 +507,7 @@ fn cancelled_search_response_from_id(request_id: &str) -> Response {
 }
 
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
-    use extensions::{QueryFacts, Readiness, Root, Token};
+    use extensions::{QueryFacts, Root, Token};
 
     let page_request = match paging::parse_public_page_request(&req.params) {
         Ok(request) => request,
@@ -371,24 +527,18 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         index: 0,
         text: facts.original_query(),
     });
-    let semantic_ready = ctx
-        .semantic_index_status()
-        .read()
-        .ok()
-        .is_some_and(|status| matches!(*status, SemanticIndexStatus::Ready { .. }));
-    let symbol_ready = ctx
-        .symbol_cache()
-        .read()
-        .ok()
-        .is_some_and(|cache| cache.len() > 0);
+    let readiness_source = RuntimeReadinessSource { ctx };
     let root = Root::new(
         req.params
             .get("path")
             .and_then(|value| value.as_str())
             .unwrap_or("."),
-        Readiness::new(symbol_ready, search_index_ready(ctx), semantic_ready),
+        &readiness_source as &dyn extensions::ReadinessSource,
     );
     let readiness = extensions.sample_readiness(&root);
+    if readiness.cancelled() {
+        return cancelled_search_response(req);
+    }
     let mut plan = extensions.plan(&facts, shape, &readiness);
     plan.variants = variants.into_iter().map(|variant| variant.text).collect();
 
@@ -403,7 +553,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
 
 fn attach_search_execution_metadata(
     response: &mut Response,
-    plan: &extensions::LanePlan,
+    plan: &extensions::LanePlan<'_>,
     embedding_counts: crate::search_b2::embed_counter::EmbedCounts,
 ) {
     let Some(data) = response.data.as_object_mut() else {
@@ -447,7 +597,7 @@ fn handle_semantic_search_inner(
     ctx: &AppContext,
     page_request: paging::ValidatedPageRequest,
     extensions: &dyn extensions::SearchExtensions,
-    engine_plan: &extensions::LanePlan,
+    engine_plan: &extensions::LanePlan<'_>,
 ) -> Response {
     if search_cancellation_requested() {
         return cancelled_search_response(req);
@@ -543,13 +693,8 @@ fn handle_semantic_search_inner(
     let semantic_status = semantic_status_label(&semantic_status_snapshot);
     let mut warnings = Vec::new();
 
-    let search_index_wait_budget = match &semantic_status_snapshot {
-        SemanticIndexStatus::Building { stage, .. } if stage == "loading_artifacts" => {
-            first_search_index_load_wait_budget()
-        }
-        _ => INTERACTIVE_ARTIFACT_READ_BUDGET,
-    };
-    let lexical_ready = match search_index_ready_with_budget(ctx, search_index_wait_budget) {
+    let lexical_ready = match search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET)
+    {
         Ok(ready) => ready,
         Err(SearchIndexWaitError::Cancelled) => return cancelled_search_response(req),
         Err(SearchIndexWaitError::Contended) => {
@@ -2086,7 +2231,7 @@ fn run_engine_ranking(
     semantic_results: Vec<SemanticResult>,
     page_request: paging::ValidatedPageRequest,
     extensions: &dyn extensions::SearchExtensions,
-    plan: &extensions::LanePlan,
+    plan: &extensions::LanePlan<'_>,
 ) -> Result<EngineRanking, String> {
     use blocks::{BlockBuilder, CanonicalLane, CanonicalListKey, LaneCandidate};
     use confidence::{Confidence, ConfidenceEngine};
@@ -2460,7 +2605,7 @@ fn handle_engine_only_search(
     project_root: &Path,
     page_request: paging::ValidatedPageRequest,
     extensions: &dyn extensions::SearchExtensions,
-    plan: &extensions::LanePlan,
+    plan: &extensions::LanePlan<'_>,
 ) -> Response {
     if semantic_status != "ready" {
         warnings.push("Semantic search unavailable; using lexical-only fallback.".to_string());
@@ -2564,7 +2709,7 @@ fn handle_semantic_or_hybrid_search(
     project_root: &Path,
     page_request: paging::ValidatedPageRequest,
     extensions: &dyn extensions::SearchExtensions,
-    engine_plan: &extensions::LanePlan,
+    engine_plan: &extensions::LanePlan<'_>,
 ) -> Response {
     let lexical = if mode == SearchMode::Hybrid {
         collect_lexical_files(

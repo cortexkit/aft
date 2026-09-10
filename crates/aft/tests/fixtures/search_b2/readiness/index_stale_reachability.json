@@ -1,0 +1,44 @@
+{
+  "b1_gate": "unchanged",
+  "rows": [
+    {
+      "episode": 4173,
+      "expectations": {
+        "111": "reachable_via:lexical",
+        "110": "reachable_via:lexical",
+        "101": "unreachable",
+        "100": "unreachable",
+        "011": "reachable_via:lexical",
+        "010": "reachable_via:lexical",
+        "001": "fallback_walk",
+        "000": "fallback_walk"
+      }
+    },
+    {
+      "episode": 2299,
+      "expectations": {
+        "111": "reachable_via:lexical",
+        "110": "reachable_via:lexical",
+        "101": "unreachable",
+        "100": "unreachable",
+        "011": "reachable_via:lexical",
+        "010": "reachable_via:lexical",
+        "001": "fallback_walk",
+        "000": "fallback_walk"
+      }
+    },
+    {
+      "episode": 1776,
+      "expectations": {
+        "111": "reachable_via:lexical",
+        "110": "reachable_via:lexical",
+        "101": "unreachable",
+        "100": "unreachable",
+        "011": "reachable_via:lexical",
+        "010": "reachable_via:lexical",
+        "001": "fallback_walk",
+        "000": "fallback_walk"
+      }
+    }
+  ]
+}

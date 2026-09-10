@@ -11,6 +11,7 @@
 use crate::commands::semantic_search::extensions::{DefaultSearchExtensions, SearchExtensions};
 
 pub mod embed_counter;
+pub mod readiness;
 
 static DEFAULTS: DefaultSearchExtensions = DefaultSearchExtensions;
 
