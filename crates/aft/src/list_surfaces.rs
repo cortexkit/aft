@@ -153,7 +153,7 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "more_available, handle_external_semantic_or_hybrid_search, handle_semantic_or_hybrid_search, fuse_hybrid_results_with_zoom, view_semantic_search, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, truncate_chars",
+                predicate_name: "more_available, handle_external_semantic_or_hybrid_search, handle_semantic_or_hybrid_search, handle_grep_search, run_engine_ranking, fuse_hybrid_results_with_zoom, view_semantic_search, blast_radius_annotation_for_result, enrich_snippets_from_source_reference, enrich_snippets_from_source_with_context, truncate_chars",
             },
         ],
     },

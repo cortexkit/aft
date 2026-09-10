@@ -506,18 +506,20 @@ fn assert_lexical_fallback(response: &Value, semantic_status: &str) {
     assert_eq!(response["semantic_unavailable"], true);
     assert_eq!(response["lexical_only_fallback"], true);
     assert_eq!(response["semantic_status"], semantic_status);
-    // Honesty: the trigram lexical lane produced these results; semantic never
-    // ran. interpreted_as must report what executed ("lexical"), not the routed
-    // hybrid mode that was attempted.
+    // The fallback is index-backed and does not call semantic embeddings.
+    // Exact evidence may promote lexical candidates, but interpreted_as remains
+    // "lexical" to describe the resource that actually executed.
     assert_eq!(response["interpreted_as"], "lexical");
     assert_eq!(response["status"], "ready");
     let results = response["results"].as_array().expect("results array");
     assert!(
-        results.iter().any(|result| result["source"] == "lexical"
-            && result["file"]
-                .as_str()
-                .is_some_and(|file| path_ends_with(file, "src/lib.rs"))),
-        "expected lexical fallback result, got {results:?}"
+        results.iter().any(
+            |result| matches!(result["source"].as_str(), Some("exact" | "lexical"))
+                && result["file"]
+                    .as_str()
+                    .is_some_and(|file| path_ends_with(file, "src/lib.rs"))
+        ),
+        "expected index-backed fallback result, got {results:?}"
     );
     let warnings = response["warnings"].as_array().expect("warnings array");
     assert!(
@@ -1600,8 +1602,8 @@ fn hybrid_semantic_results_report_semantic_source_and_boost_metadata() {
     for result in results {
         let source = result["source"].as_str().expect("result source string");
         assert!(
-            matches!(source, "semantic" | "lexical"),
-            "hybrid response result source must be semantic or lexical, got {source:?}: {result:?}"
+            matches!(source, "exact" | "semantic" | "lexical"),
+            "hybrid response source must identify its winning engine lane, got {source:?}: {result:?}"
         );
         assert_ne!(source, "hybrid");
     }

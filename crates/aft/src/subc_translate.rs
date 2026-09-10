@@ -2032,7 +2032,15 @@ fn translate_search(args: Value) -> Result<Translated, TranslateError> {
 
     let mut out = Map::new();
     out.insert("query".to_string(), Value::String(query.to_string()));
-    let top_k = match coerce_optional_int_result(map_in.get("topK"), "topK", 0, 100)? {
+    let top_k_value =
+        coerce_optional_int_result(map_in.get("topK"), "topK", 0, 100).map_err(|error| {
+            if error.message.starts_with("topK must be between") {
+                invalid_request("topK must be between 1 and 100")
+            } else {
+                error
+            }
+        })?;
+    let top_k = match top_k_value {
         Some(0) => return Err(invalid_request("topK must be between 1 and 100")),
         Some(value) => value,
         None => 10,

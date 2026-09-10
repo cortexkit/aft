@@ -2025,9 +2025,10 @@ impl SearchLane for AugmentedExactLane {
             .candidates
             .extend(self.lexical_verifications.iter().cloned());
         execution.candidates.sort_by(score_free_r3_cmp);
-        execution.candidates.dedup_by(|left, right| {
-            left.path == right.path && left.symbol_range == right.symbol_range
-        });
+        let mut seen = HashSet::new();
+        execution
+            .candidates
+            .retain(|candidate| seen.insert((candidate.path.clone(), candidate.symbol_range)));
         execution
     }
 }
@@ -5741,7 +5742,7 @@ mod tests {
     }
 
     #[test]
-    fn building_status_returns_lexical_fallback_results() {
+    fn building_status_returns_index_backed_fallback_results() {
         let project = tempfile::tempdir().expect("create project dir");
         let source_file = project.path().join("src/lib.rs");
         std::fs::create_dir_all(source_file.parent().expect("source parent"))
@@ -5773,10 +5774,9 @@ mod tests {
         assert_eq!(response["success"], true);
         assert_eq!(response["status"], "building");
         assert_eq!(response["semantic_status"], "building");
-        // While semantic builds, only the lexical lane produced results — so
-        // interpreted_as honestly reports "lexical", not the routed "hybrid"
-        // mode that hasn't executed yet. The "building" status + note convey
-        // that semantic results are still coming.
+        // While semantic builds, only index-backed lanes produce results. The
+        // existing "lexical" label means no embedding lane ran; exact evidence
+        // may still refine those index-backed results.
         assert_eq!(response["interpreted_as"], "lexical");
         assert!(response["note"]
             .as_str()
@@ -5789,13 +5789,13 @@ mod tests {
         let results = response["results"].as_array().expect("results array");
         assert!(
             results.iter().any(|result| {
-                result["source"] == "lexical"
+                matches!(result["source"].as_str(), Some("exact" | "lexical"))
                     && result["file"]
                         .as_str()
                         .expect("file")
                         .ends_with("src/lib.rs")
             }),
-            "expected lexical fallback result, got {results:?}"
+            "expected index-backed fallback result, got {results:?}"
         );
     }
 
