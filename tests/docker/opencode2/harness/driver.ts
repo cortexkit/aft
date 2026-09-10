@@ -663,7 +663,7 @@ async function runOneScenario(options: {
     const host = await client.wait(
       typeof scenario.metadata?.host_timeout_ms === "number"
         ? scenario.metadata.host_timeout_ms
-        : 120_000,
+        : 20_000,
     );
     hostCompletedAt = Date.now();
     await emit({ kind: "host_exit", at: hostCompletedAt, output: host });
