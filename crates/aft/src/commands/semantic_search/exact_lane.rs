@@ -314,11 +314,18 @@ impl SearchLane for ExactLane {
 
     fn execute(&self, input: &LaneInput<'_>) -> LaneExecution {
         let snapshot = input.index.snapshot();
+        let mut candidates = self
+            .execute_ready_mode(&snapshot, input.root, input.query, input.include_tests)
+            .results;
+        if input.shape != crate::commands::semantic_search::SearchShape::Identifier {
+            candidates.retain(|candidate| {
+                candidate.evidence.kind
+                    != crate::commands::semantic_search::EvidenceKind::Definition
+            });
+        }
         LaneExecution {
             kind: self.kind(),
-            candidates: self
-                .execute_ready_mode(&snapshot, input.root, input.query, input.include_tests)
-                .results,
+            candidates,
         }
     }
 }

@@ -75,6 +75,7 @@ fn registered_lane_execution_uses_the_extension_callback() {
 
     let input = LaneInput {
         query: "needle",
+        shape: SearchShape::Identifier,
         root: root.path(),
         include_tests: false,
         index: &index,

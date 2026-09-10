@@ -29,6 +29,7 @@ pub use plan_table::{
 /// Immutable request input passed to a registered lane callback.
 pub struct LaneInput<'a> {
     pub query: &'a str,
+    pub shape: SearchShape,
     pub root: &'a Path,
     pub include_tests: bool,
     pub index: &'a SearchIndex,
@@ -2003,6 +2004,29 @@ struct PreparedEngineLane {
     candidates: Vec<CandidateResult>,
 }
 
+struct AugmentedExactLane {
+    primary: exact_lane::ExactLane,
+    lexical_verifications: Vec<CandidateResult>,
+}
+
+impl SearchLane for AugmentedExactLane {
+    fn kind(&self) -> SearchLaneKind {
+        SearchLaneKind::Exact
+    }
+
+    fn execute(&self, input: &LaneInput<'_>) -> LaneExecution {
+        let mut execution = self.primary.execute(input);
+        execution
+            .candidates
+            .extend(self.lexical_verifications.iter().cloned());
+        execution.candidates.sort_by(score_free_r3_cmp);
+        execution.candidates.dedup_by(|left, right| {
+            left.path == right.path && left.symbol_range == right.symbol_range
+        });
+        execution
+    }
+}
+
 impl SearchLane for PreparedEngineLane {
     fn kind(&self) -> SearchLaneKind {
         self.kind
@@ -2071,6 +2095,31 @@ fn run_engine_ranking(
         .iter()
         .map(|candidate| candidate.result.clone())
         .collect::<Vec<_>>();
+    let lexical_verifications = lexical
+        .canonical_order()
+        .iter()
+        .take(lexical_lane::LEXICAL_ENUMERATION_LIMIT)
+        .filter_map(|candidate| {
+            let (exact, occurrences, window_lines) = lexical_candidate_exactness(
+                &candidate.result.path,
+                query,
+                &content_tokens,
+            );
+            if !exact {
+                return None;
+            }
+            let evidence = if occurrences > 0 {
+                EvidenceDescriptor::for_e1(occurrences, true, false)
+            } else {
+                EvidenceDescriptor::for_e2(window_lines?, true, false)
+            };
+            Some(CandidateResult::new_exact(
+                candidate.result.path.clone(),
+                None,
+                evidence,
+            ))
+        })
+        .collect::<Vec<_>>();
 
     let mut semantic_metadata = HashMap::new();
     let mut seen_semantic_paths = HashSet::new();
@@ -2112,7 +2161,10 @@ fn run_engine_ranking(
     let mut registry = LaneRegistry::new();
     for kind in &plan.selected_lanes {
         let lane: Arc<dyn SearchLane> = match kind {
-            SearchLaneKind::Exact => Arc::new(ExactLane::new()),
+            SearchLaneKind::Exact => Arc::new(AugmentedExactLane {
+                primary: ExactLane::new(),
+                lexical_verifications: lexical_verifications.clone(),
+            }),
             SearchLaneKind::Anchored => Arc::new(anchored_lane::AnchoredLane::new()),
             SearchLaneKind::Lexical => Arc::new(PreparedEngineLane {
                 kind: *kind,
@@ -2132,6 +2184,7 @@ fn run_engine_ranking(
 
     let input = LaneInput {
         query,
+        shape: plan.shape,
         root: project_root,
         include_tests,
         index: &index,
@@ -2351,6 +2404,14 @@ fn handle_engine_only_search(
         snippets_incomplete,
         Some(ctx),
     );
+    if semantic_status == "building" {
+        let disclosure = if ctx.shared_artifacts_read_only() {
+            BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS
+        } else {
+            "Semantic index is rebuilding; lexical fallback results follow."
+        };
+        text = format!("{disclosure}\n\n{text}");
+    }
     if let Some(line) = ranked.confidence_line {
         text.push_str("\n\n");
         text.push_str(line);
@@ -2371,6 +2432,12 @@ fn handle_engine_only_search(
         "lexical_engine_capped".to_string(),
         serde_json::json!(ranked.engine_capped),
     );
+    if semantic_status == "building" {
+        extras.insert(
+            "note".to_string(),
+            serde_json::json!(building_lexical_note(ctx.shared_artifacts_read_only())),
+        );
+    }
     search_response(
         req,
         SearchResponseParts {
@@ -8039,7 +8106,10 @@ mod tests {
         ));
         assert_eq!(response["success"], true);
         assert_eq!(response["interpreted_as"], "lexical");
-        assert_eq!(response["results"][0]["source"], "lexical");
+        assert_eq!(
+            response["results"][0]["source"], "exact",
+            "the live exact lane now owns verbatim identifier matches"
+        );
         assert!(response["results"][0]["file"]
             .as_str()
             .expect("result file")
