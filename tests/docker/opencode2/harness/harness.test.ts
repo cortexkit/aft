@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import {
   type HostCliContract,
   loadHostCliContract,
+  loadHostProviderConfigContract,
   loadHostSchemaRejectionContract,
 } from "./contracts.js";
 import {
@@ -15,7 +16,7 @@ import {
   type PathState,
 } from "./disk-state.js";
 import { HarnessError, type HarnessFailureCode } from "./errors.js";
-import { runApiControl } from "./host.js";
+import { runApiControl, startScenarioClient } from "./host.js";
 import { readPermissionAskInventory } from "./inventory.js";
 import { createScenarioIsolation } from "./isolation.js";
 import { CompletionWakeLiveness, WatchPatternLiveness } from "./liveness.js";
@@ -125,6 +126,30 @@ describe("scenario isolation and liveness", () => {
     expect(isolated.env.OPENCODE_DISABLE_DEFAULT_PLUGINS).toBe("true");
     const hostConfig = JSON.parse(await readFile(isolated.host_config, "utf8"));
     expect(hostConfig.provider.mock.settings.baseURL).toBe("http://127.0.0.1:1234/v1");
+  });
+
+  test("the scenario client uses the provider contract model", async () => {
+    const parent = await root();
+    const executable = join(parent, "capture-run-arguments");
+    const argumentsPath = join(parent, "arguments.txt");
+    await writeFile(executable, '#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGUMENTS_PATH"\n');
+    await chmod(executable, 0o755);
+
+    const client = startScenarioClient({
+      executable,
+      scenario: scenario(call()),
+      cwd: parent,
+      env: { ...process.env, ARGUMENTS_PATH: argumentsPath },
+      processObserver: { trackChild() {} } as never,
+      hostGeneration: "v2",
+      model: "openai/mock-model",
+    });
+    expect((await client.wait()).exit_code).toBe(0);
+    const args = (await readFile(argumentsPath, "utf8")).trim().split("\n");
+    expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2)).toEqual([
+      "--model",
+      "openai/mock-model",
+    ]);
   });
 
   test("turn-log liveness rejects a missing later turn", () => {
@@ -715,6 +740,23 @@ describe("producer-backed executable provenance", () => {
     );
     expect(error.unsuppressible).toBe(true);
   });
+});
+
+test("provider contract supplies the observed run model to the harness", async () => {
+  const contractRoot = await root();
+  await writeFile(
+    join(contractRoot, "host-provider-config.json"),
+    JSON.stringify({
+      schema_version: 1,
+      host_version: "0.0.0-beta-test",
+      observed_run_id: "probe-run",
+      provider_config: { openai: {} },
+      run_command: ["opencode2", "run", "--model", "openai/mock-model", "message"],
+    }),
+  );
+
+  const contract = await loadHostProviderConfigContract(contractRoot, "0.0.0-beta-test");
+  expect(contract.model).toBe("openai/mock-model");
 });
 
 test("legacy host CLI capture names every field required by the runner", async () => {

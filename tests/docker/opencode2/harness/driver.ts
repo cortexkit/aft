@@ -414,6 +414,7 @@ async function runOneScenario(options: {
   hostExecutable?: string;
   applyComparison?: boolean;
   providerConfig?: Record<string, unknown>;
+  providerModel?: string;
 }): Promise<{
   result: ScenarioResult;
   smokeRan: boolean;
@@ -637,6 +638,7 @@ async function runOneScenario(options: {
       contract: options.hostContract,
       server,
       hostGeneration,
+      model: options.providerModel,
     });
     observeHostStream(client.child, controlPathValues);
     if (options.runSmoke && server && options.hostContract) {
@@ -1003,6 +1005,7 @@ async function main(): Promise<void> {
         runSmoke: false,
         hostGeneration: "v2",
         providerConfig: providerContract.provider_config,
+        providerModel: providerContract.model,
         applyComparison: true,
       });
       const v1 = config.v1HostExecutable
@@ -1066,6 +1069,7 @@ async function main(): Promise<void> {
         hostContract,
         extensions,
         providerConfig: providerContract.provider_config,
+        providerModel: providerContract.model,
         runSmoke: !smokeRan && scenario.execution === "shared-server",
       });
       result = outcome.result;

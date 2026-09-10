@@ -161,6 +161,7 @@ export function startScenarioClient(options: {
   contract?: HostCliContract;
   server?: SharedServerHandle;
   hostGeneration?: "v1" | "v2";
+  model?: string;
 }): { child: ChildProcess; wait: (timeoutMs?: number) => Promise<CommandOutput> } {
   const baseArgs = ["run"];
   let args: string[];
@@ -182,7 +183,7 @@ export function startScenarioClient(options: {
     args = attached.args;
     env = attached.env;
   }
-  args.push("--format", "json", "--model", "mock/mock-model");
+  args.push("--format", "json", "--model", options.model ?? options.scenario.model ?? "mock/mock-model");
   if (options.scenario.auto) args.push("--auto");
   args.push(options.scenario.prompt);
   const captured = spawnCaptured(options.executable, args, options.cwd, env);

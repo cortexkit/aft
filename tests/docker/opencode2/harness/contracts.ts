@@ -29,6 +29,7 @@ export interface HostProviderConfigContract {
   host_version: string;
   observed_run_id: string;
   provider_config: Record<string, unknown>;
+  model: string;
 }
 
 export interface HostSchemaRejectionContract {
@@ -144,7 +145,13 @@ export async function loadHostProviderConfigContract(
   if (!asRecord(record.provider_config)) {
     fail("contract_uncaptured", `${path}: provider_config observation is missing`);
   }
-  return record as unknown as HostProviderConfigContract;
+  const runCommand = record.run_command;
+  const modelFlag = Array.isArray(runCommand) ? runCommand.indexOf("--model") : -1;
+  const model = Array.isArray(runCommand) ? runCommand[modelFlag + 1] : undefined;
+  if (modelFlag === -1 || typeof model !== "string" || model.length === 0) {
+    fail("contract_uncaptured", `${path}: run_command model observation is missing`);
+  }
+  return { ...record, model } as unknown as HostProviderConfigContract;
 }
 
 export async function loadHostSchemaRejectionContract(
