@@ -5,6 +5,15 @@
   "gh_read": {
     "enabled": true
   },
+  "gh_shim": {
+    "enabled": true
+  },
+  "github": {
+    "enabled": true,
+    "read": true,
+    "shim": true,
+    "write": false
+  },
   "hoist_builtin_tools": true,
   "restrict_to_project_root": false
 }

@@ -322,7 +322,7 @@ const SubcConfigSchema = z.object({
 });
 
 const GhShimConfigSchema = z.object({
-  /** Operator hard-off for child PATH injection and governed `gh` routing. */
+  /** Deprecated alias for github.shim; removed in v0.57.0. */
   enabled: z.boolean().optional(),
   /** User-tier AFT image used by the managed `gh` entry. Defaults to the running image. */
   binary_path: z
@@ -332,8 +332,19 @@ const GhShimConfigSchema = z.object({
     .optional(),
 });
 
+const GithubConfigSchema = z.object({
+  /** Master switch for every GitHub integration. Default: true. */
+  enabled: z.boolean().optional(),
+  /** Interpose the governed `gh` shim in agent child PATHs. Default: true. */
+  shim: z.boolean().optional(),
+  /** Allow structured issue:// and pr:// reads. Default: false. */
+  read: z.boolean().optional(),
+  /** Allow issue and pull-request comment writes. Default: false. */
+  write: z.boolean().optional(),
+});
+
 const GhReadConfigSchema = z.object({
-  /** User-tier operator opt-in for structured issue:// and pr:// reads. Default: false. */
+  /** Deprecated alias for github.read; removed in v0.57.0. */
   enabled: z.boolean().optional(),
 });
 
@@ -568,9 +579,11 @@ const AftConfigFieldsSchema = z.object({
   bridge: BridgeConfigSchema.optional(),
   /** Subconscious daemon transport selection (USER-only; presence ⇒ subc mode). */
   subc: SubcConfigSchema.optional(),
-  /** `gh` routing shim gate and binary location; user configuration only, enabled by default. */
+  /** User-only master and feature gates for GitHub integration. */
+  github: GithubConfigSchema.optional(),
+  /** Legacy shim config. gh_shim.enabled aliases github.shim until v0.57.0; binary_path remains supported. */
   gh_shim: GhShimConfigSchema.optional(),
-  /** Structured GitHub resource reads. Project config overrides user config. Default: disabled. */
+  /** Deprecated alias block for github.read; removed in v0.57.0. */
   gh_read: GhReadConfigSchema.optional(),
   /** Agent-child Git attribution. Project config may override user config. */
   git: GitConfigSchema.optional(),
@@ -592,6 +605,26 @@ export const AftConfigSchema = z.preprocess(
 );
 
 export type AftConfig = z.infer<typeof AftConfigSchema>;
+export type GithubConfig = z.infer<typeof GithubConfigSchema>;
+
+export interface ResolvedGithubConfig {
+  enabled: boolean;
+  shim: boolean;
+  read: boolean;
+  write: boolean;
+}
+
+/** Resolve master/feature precedence and the write-implies-read safety rule. */
+export function resolveGithubConfig(config: AftConfig): ResolvedGithubConfig {
+  const enabled = config.github?.enabled !== false;
+  const write = enabled && config.github?.write === true;
+  return {
+    enabled,
+    shim: enabled && (config.github?.shim ?? config.gh_shim?.enabled ?? true),
+    read: enabled && ((config.github?.read ?? config.gh_read?.enabled ?? false) || write),
+    write,
+  };
+}
 
 export function toolEnabled(config: AftConfig, toolName: string): boolean {
   return !(config.disabled_tools ?? []).includes(toolName);
@@ -779,7 +812,7 @@ export function resolveProjectOverridesForConfigure(config: AftConfig): Record<s
   if (config.backup !== undefined) overrides.backup = config.backup;
   if (config.worktree !== undefined) overrides.worktree = config.worktree;
   if (config.sandbox !== undefined) overrides.sandbox = config.sandbox;
-  if (config.gh_read !== undefined) overrides.gh_read = config.gh_read;
+  if (config.github !== undefined) overrides.github = resolveGithubConfig(config);
   if (config.git !== undefined) overrides.git = config.git;
 
   return overrides;
@@ -1071,12 +1104,52 @@ function setPath(root: Record<string, unknown>, path: readonly string[], value: 
   parent[path[path.length - 1]] = value;
 }
 
-function migrateRawConfig(
+function migrateGithubAliases(
   rawConfig: Record<string, unknown>,
   configPath: string,
   logger?: Logger,
 ): string[] {
   const oldKeys: string[] = [];
+  const legacyShim = isConfigRecord(rawConfig.gh_shim) ? rawConfig.gh_shim : undefined;
+  if (legacyShim && typeof legacyShim.enabled === "boolean") {
+    logger?.warn(
+      `Deprecated config key gh_shim.enabled at ${configPath}; use github.shim instead (removed in v0.57.0)`,
+    );
+    const githubPresent = Object.hasOwn(rawConfig, "github");
+    const github = isConfigRecord(rawConfig.github) ? rawConfig.github : undefined;
+    if (!githubPresent || (github && !Object.hasOwn(github, "shim"))) {
+      if (!github) rawConfig.github = {};
+      (rawConfig.github as Record<string, unknown>).shim = legacyShim.enabled;
+    }
+    delete legacyShim.enabled;
+    if (Object.keys(legacyShim).length === 0) delete rawConfig.gh_shim;
+    oldKeys.push("gh_shim.enabled");
+  }
+
+  const legacyRead = isConfigRecord(rawConfig.gh_read) ? rawConfig.gh_read : undefined;
+  if (legacyRead && typeof legacyRead.enabled === "boolean") {
+    logger?.warn(
+      `Deprecated config key gh_read.enabled at ${configPath}; use github.read instead (removed in v0.57.0)`,
+    );
+    const githubPresent = Object.hasOwn(rawConfig, "github");
+    const github = isConfigRecord(rawConfig.github) ? rawConfig.github : undefined;
+    if (!githubPresent || (github && !Object.hasOwn(github, "read"))) {
+      if (!github) rawConfig.github = {};
+      (rawConfig.github as Record<string, unknown>).read = legacyRead.enabled;
+    }
+    delete rawConfig.gh_read;
+    oldKeys.push("gh_read.enabled");
+  }
+
+  return oldKeys;
+}
+
+function migrateRawConfig(
+  rawConfig: Record<string, unknown>,
+  configPath: string,
+  logger?: Logger,
+): string[] {
+  const oldKeys: string[] = migrateGithubAliases(rawConfig, configPath, logger);
   for (const migration of CONFIG_MIGRATIONS) {
     if (!Object.hasOwn(rawConfig, migration.oldKey)) continue;
 
@@ -1630,9 +1703,9 @@ const PROJECT_SAFE_TOP_LEVEL_FIELDS = new Set<keyof AftConfig>([
   // "storage_dir" — USER ONLY (controls where AFT writes).
   // "auto_update" — USER ONLY (silently suppressing security updates is a real risk).
   // "bridge" — USER ONLY (governs bridge safety/restart + per-machine transport budget).
-  // "gh_read" — USER ONLY because it changes the global tool description.
-  // Advertising disabled resource spellings wastes prompt tokens and confuses
-  // steering; project-specific surface changes also destabilize prefix caches.
+  // "github" and its deprecated aliases are USER ONLY because they change
+  // capabilities and global tool descriptions. Project-specific surface changes
+  // would also destabilize prefix caches.
 ]);
 
 function pickProjectSafeFields(override: AftConfig): Partial<AftConfig> {
@@ -1673,6 +1746,7 @@ function getStrippedTopLevelKeys(override: AftConfig): string[] {
   if (override.sandbox?.enabled === false) stripped.push("sandbox.enabled");
   if (override.sandbox?.write_allow !== undefined) stripped.push("sandbox.write_allow");
   if (override.subc !== undefined) stripped.push("subc");
+  if (override.github !== undefined) stripped.push("github");
   if (override.gh_shim !== undefined) stripped.push("gh_shim");
   if (override.gh_read !== undefined) stripped.push("gh_read");
   if (override.disabled_tools?.includes("aft_safety")) stripped.push("disabled_tools.aft_safety");

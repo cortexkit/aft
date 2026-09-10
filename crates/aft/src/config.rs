@@ -302,18 +302,35 @@ impl Default for GhShimConfig {
     }
 }
 
-/// Operator opt-in for structured GitHub resource reads.
-///
-/// This gate is user-tier only because it changes the globally registered read
-/// surface. Most users leave it disabled, so advertising issue and pull-request
-/// spellings that can only return a refusal would waste prompt tokens and confuse
-/// tool steering. Project-specific surfaces would also destabilize prompt-prefix
-/// caches within one host.
+/// GitHub integration gates resolved from the user-only `github` block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GithubConfig {
+    /// Master switch. When false, every GitHub integration is disabled.
+    pub enabled: bool,
+    /// Whether AFT interposes the governed `gh` shim in agent child PATHs.
+    pub shim: bool,
+    /// Whether structured `issue://` and `pr://` reads are enabled.
+    pub read: bool,
+    /// Whether issue and pull-request comment writes are enabled.
+    pub write: bool,
+}
+
+impl Default for GithubConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            shim: true,
+            read: false,
+            write: false,
+        }
+    }
+}
+
+/// Effective structured GitHub read gate retained for the read engine API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GhReadConfig {
-    /// When false, `issue://` and `pr://` reads refuse before any cache, `gh`,
-    /// or network activity. Default false keeps the in-flight feature opt-in.
     pub enabled: bool,
 }
 
@@ -524,9 +541,11 @@ pub struct Config {
     pub backup: BackupConfig,
     /// Linked-worktree RAM overlay. Default off; see [`WorktreeConfig`].
     pub worktree: WorktreeConfig,
-    /// `gh` routing shim operator gate. Default on; see [`GhShimConfig`].
+    /// Resolved GitHub integration gates. User configuration only.
+    pub github: GithubConfig,
+    /// Effective `gh` shim gate plus its legacy binary override.
     pub gh_shim: GhShimConfig,
-    /// Structured GitHub resource read gate. Default off; see [`GhReadConfig`].
+    /// Effective structured GitHub read gate retained for the read engine API.
     pub gh_read: GhReadConfig,
     /// Git attribution for AFT-spawned agent children. Default off.
     pub git: GitConfig,
@@ -632,6 +651,7 @@ impl Default for Config {
             inspect: InspectConfig::default(),
             backup: BackupConfig::default(),
             worktree: WorktreeConfig::default(),
+            github: GithubConfig::default(),
             gh_shim: GhShimConfig::default(),
             gh_read: GhReadConfig::default(),
             git: GitConfig::default(),

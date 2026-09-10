@@ -15,11 +15,13 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   loadAftConfig as loadOpenCodeAftConfig,
+  resolveGithubConfig as resolveOpenCodeGithubConfig,
   resolveProjectOverridesForConfigure as resolveOpenCodeProjectOverridesForConfigure,
   type AftConfig as OpenCodeAftConfig,
 } from "../packages/opencode-plugin/src/config.ts";
 import {
   loadAftConfig as loadPiAftConfig,
+  resolveGithubConfig as resolvePiGithubConfig,
   resolveProjectOverridesForConfigure as resolvePiProjectOverridesForConfigure,
   type AftConfig as PiAftConfig,
 } from "../packages/pi-plugin/src/config.ts";
@@ -92,6 +94,14 @@ function goldenParamsFromMerged(
   // golden explicitly to keep the Rust resolver in parity.
   if (merged.gh_shim !== undefined) {
     params.gh_shim = merged.gh_shim;
+  }
+  if (merged.github !== undefined || merged.gh_shim?.enabled !== undefined || merged.gh_read !== undefined) {
+    const github =
+      harness === "pi"
+        ? resolvePiGithubConfig(merged as PiAftConfig)
+        : resolveOpenCodeGithubConfig(merged as OpenCodeAftConfig);
+    params.gh_shim = { ...(params.gh_shim as object | undefined), enabled: github.shim };
+    params.gh_read = { enabled: github.read };
   }
   return sortKeysDeep(params) as Record<string, unknown>;
 }
@@ -479,13 +489,38 @@ const CASES: ParityCase[] = [
   {
     // The gate controls a host-wide tool description, so the project attempt is dropped.
     name: "gh_read_project_dropped",
-    user: { gh_read: { enabled: false } },
-    project: { gh_read: { enabled: true } },
+    user: { github: { read: false } },
+    project: { github: { read: true } },
   },
   {
     name: "gh_read_project_disabled",
-    user: { gh_read: { enabled: true } },
-    project: { gh_read: { enabled: false } },
+    user: { github: { read: true } },
+    project: { github: { read: false } },
+  },
+  {
+    name: "github_all_keys",
+    user: { github: { enabled: true, shim: false, read: true, write: false } },
+  },
+  {
+    name: "github_master_off",
+    user: { github: { enabled: false, shim: true, read: true, write: true } },
+  },
+  {
+    name: "github_write_forces_read",
+    user: { github: { write: true, read: false } },
+  },
+  {
+    name: "github_alias_new_key_wins",
+    user: {
+      github: { shim: true, read: false },
+      gh_shim: { enabled: false },
+      gh_read: { enabled: true },
+    },
+  },
+  {
+    name: "github_alias_project_dropped",
+    user: { github: { read: false } },
+    project: { gh_read: { enabled: true } },
   },
   {
     name: "git_co_author_auto",

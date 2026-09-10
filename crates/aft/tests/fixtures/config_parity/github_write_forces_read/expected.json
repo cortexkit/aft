@@ -3,16 +3,16 @@
   "experimental_bash_compress": true,
   "experimental_bash_rewrite": true,
   "gh_read": {
-    "enabled": false
+    "enabled": true
   },
   "gh_shim": {
-    "enabled": false
+    "enabled": true
   },
   "github": {
     "enabled": true,
-    "read": false,
-    "shim": false,
-    "write": false
+    "read": true,
+    "shim": true,
+    "write": true
   },
   "hoist_builtin_tools": true,
   "restrict_to_project_root": false

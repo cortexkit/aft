@@ -3,14 +3,14 @@
   "experimental_bash_compress": true,
   "experimental_bash_rewrite": true,
   "gh_read": {
-    "enabled": false
+    "enabled": true
   },
   "gh_shim": {
     "enabled": false
   },
   "github": {
     "enabled": true,
-    "read": false,
+    "read": true,
     "shim": false,
     "write": false
   },

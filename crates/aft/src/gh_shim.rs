@@ -1091,12 +1091,26 @@ fn read_user_config_doc() -> Option<String> {
     fs::read_to_string(config_path).ok()
 }
 
-/// Read the `gh_shim.enabled` operator gate from the user config document.
-/// `None` means the key is absent or the document is unparseable, in which case
-/// the shim stays enabled (default true). Only an explicit `false` disables.
+/// Read the effective `github.enabled && github.shim` gate from user config.
+/// The deprecated `gh_shim.enabled` alias remains a fallback for one minor.
 fn gh_shim_enabled_from_config_doc(doc: &str) -> Option<bool> {
     let value: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(doc)).ok()?;
-    value.get("gh_shim")?.get("enabled")?.as_bool()
+    let github = value.get("github");
+    let master = github
+        .and_then(|config| config.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let shim = github
+        .and_then(|config| config.get("shim"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            value
+                .get("gh_shim")
+                .and_then(|config| config.get("enabled"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(true);
+    Some(master && shim)
 }
 
 fn connection_file_from_config_doc(doc: &str) -> Option<PathBuf> {

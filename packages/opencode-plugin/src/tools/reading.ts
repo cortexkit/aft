@@ -1,7 +1,7 @@
 import { coerceBoolean, coerceTargetParam, formatZoomText } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition, ToolResult } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { toolEnabled } from "../config.js";
+import { resolveGithubConfig, toolEnabled } from "../config.js";
 import { prepareToolMap } from "../normalize-schemas.js";
 import type { PluginContext } from "../types.js";
 import {
@@ -62,7 +62,7 @@ interface ZoomBatchResult {
  */
 export function readingTools(ctx: PluginContext): Record<string, ToolDefinition> {
   const zoomEnabled = toolEnabled(ctx.config, "aft_zoom");
-  const ghReadEnabled = ctx.config.gh_read?.enabled === true;
+  const ghReadEnabled = resolveGithubConfig(ctx.config).read;
   const githubOutlineDescription = whenGhReadEnabled(
     ghReadEnabled,
     "GitHub issues and pull requests can be outlined with `issue://NUMBER` or `pr://NUMBER` (including `OWNER/REPO` forms).",

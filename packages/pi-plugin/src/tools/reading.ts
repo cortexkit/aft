@@ -11,7 +11,7 @@ import type {
   Theme,
 } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
-import { toolEnabled } from "../config.js";
+import { resolveGithubConfig, toolEnabled } from "../config.js";
 import type { PluginContext } from "../types.js";
 import {
   bridgeFor,
@@ -351,7 +351,7 @@ export function registerReadingTools(
   surface: ReadingSurface,
 ): void {
   const zoomEnabled = toolEnabled(ctx.config, "aft_zoom");
-  const ghReadEnabled = ctx.config.gh_read?.enabled === true;
+  const ghReadEnabled = resolveGithubConfig(ctx.config).read;
   const githubOutlineDescription = whenGhReadEnabled(
     ghReadEnabled,
     "GitHub issues and pull requests can be outlined with `issue://NUMBER` or `pr://NUMBER` (including `OWNER/REPO` forms).",

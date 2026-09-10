@@ -67,21 +67,43 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
-  test("gh_read honors only the user tier and warns for project overrides", () => {
+  test("github honors only the user tier and warns for project overrides", () => {
     const fixture = createConfigFixture();
     const env = { HOME: fixture.home, XDG_CONFIG_HOME: fixture.xdgConfigHome };
 
-    writeFileSync(fixture.userConfigPath, JSON.stringify({ gh_read: { enabled: false } }));
-    writeFileSync(fixture.projectConfigPath, JSON.stringify({ gh_read: { enabled: true } }));
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ github: { read: false } }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ github: { read: true } }));
     const disabled = runConfigLoader(fixture.projectDirectory, env);
-    expect(JSON.parse(disabled.stdout)).toMatchObject({ gh_read: { enabled: false } });
-    expect(disabled.stderr).toContain("Ignoring gh_read from project config");
+    expect(JSON.parse(disabled.stdout)).toMatchObject({ github: { read: false } });
+    expect(disabled.stderr).toContain("Ignoring github from project config");
 
-    writeFileSync(fixture.userConfigPath, JSON.stringify({ gh_read: { enabled: true } }));
-    writeFileSync(fixture.projectConfigPath, JSON.stringify({ gh_read: { enabled: false } }));
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ github: { read: true } }));
+    writeFileSync(fixture.projectConfigPath, JSON.stringify({ github: { read: false } }));
     const enabled = runConfigLoader(fixture.projectDirectory, env);
-    expect(JSON.parse(enabled.stdout)).toMatchObject({ gh_read: { enabled: true } });
-    expect(enabled.stderr).toContain("Ignoring gh_read from project config");
+    expect(JSON.parse(enabled.stdout)).toMatchObject({ github: { read: true } });
+    expect(enabled.stderr).toContain("Ignoring github from project config");
+  });
+
+  test("deprecated GitHub aliases apply while new keys win", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({
+        github: { shim: true, read: false },
+        gh_shim: { enabled: false },
+        gh_read: { enabled: true },
+      }),
+    );
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+
+    expect(JSON.parse(result.stdout)).toMatchObject({ github: { shim: true, read: false } });
+    expect(result.stderr).toContain("gh_shim.enabled");
+    expect(result.stderr).toContain("github.shim");
+    expect(result.stderr).toContain("gh_read.enabled");
+    expect(result.stderr).toContain("github.read");
   });
 
   test("enabled defaults to true when not configured", () => {
@@ -1163,9 +1185,13 @@ describe("resolveProjectOverridesForConfigure", () => {
     });
   });
 
-  test("forwards gh_read to Rust configure", () => {
-    expect(resolveProjectOverridesForConfigure({ gh_read: { enabled: true } })).toMatchObject({
-      gh_read: { enabled: true },
+  test("forwards effective github gates to Rust configure", () => {
+    expect(
+      resolveProjectOverridesForConfigure({
+        github: { enabled: true, shim: true, read: false, write: true },
+      }),
+    ).toMatchObject({
+      github: { enabled: true, shim: true, read: true, write: true },
     });
   });
 

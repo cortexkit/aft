@@ -1,0 +1,8 @@
+{
+  "github": {
+    "enabled": false,
+    "shim": true,
+    "read": true,
+    "write": true
+  }
+}

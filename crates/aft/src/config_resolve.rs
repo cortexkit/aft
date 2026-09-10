@@ -14,8 +14,8 @@ use serde_json::{Map, Value};
 
 use crate::config::{
     expand_index_root_path, normalize_git_co_author, BackupConfig, Config, GhShimConfig, GitConfig,
-    IdleConfig, IndexConfig, IndexKind, IndexRootConfig, InspectConfig, SandboxConfig,
-    SemanticBackend, SemanticBackendConfig, UserServerDef, WorktreeConfig,
+    GithubConfig, IdleConfig, IndexConfig, IndexKind, IndexRootConfig, InspectConfig,
+    SandboxConfig, SemanticBackend, SemanticBackendConfig, UserServerDef, WorktreeConfig,
     DEFAULT_BASH_WATCH_SYNC_MAX_MS, DEFAULT_IDLE_LSP_TTL_MINUTES, DEFAULT_IDLE_ROOT_TTL_MINUTES,
     DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_BASH_WATCH_SYNC_MAX_MS, MAX_IDLE_LSP_TTL_MINUTES,
     MAX_IDLE_ROOT_TTL_MINUTES, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MAX_SEMANTIC_QUERY_TIMEOUT_MS,
@@ -123,6 +123,7 @@ pub struct RawAftConfig {
     pub idle: Option<RawIdle>,
     pub backup: Option<RawBackup>,
     pub worktree: Option<RawWorktree>,
+    pub github: Option<RawGithub>,
     pub gh_shim: Option<RawGhShim>,
     pub gh_read: Option<RawGhRead>,
     pub git: Option<RawGit>,
@@ -512,6 +513,15 @@ impl RawWorktree {
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
+pub struct RawGithub {
+    pub enabled: Option<bool>,
+    pub shim: Option<bool>,
+    pub read: Option<bool>,
+    pub write: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct RawGhShim {
     pub enabled: Option<bool>,
     #[serde(deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
@@ -624,6 +634,7 @@ pub fn resolve_config_for_harness(
             continue;
         };
         apply_harness_override(&mut raw, harness, tier, &mut warnings);
+        apply_github_aliases(&mut raw, tier, &mut warnings);
         if let Some(RawEditMode::Unknown(value)) = raw.edit_mode.as_ref() {
             warnings.push(ConfigWarning {
                 code: "invalid_edit_mode",
@@ -769,6 +780,52 @@ fn parse_config_partially(raw_config: Map<String, Value>) -> RawAftConfig {
     partial
 }
 
+fn apply_github_aliases(
+    raw: &mut RawAftConfig,
+    tier: &ConfigTier,
+    warnings: &mut Vec<ConfigWarning>,
+) {
+    let legacy_shim = raw.gh_shim.as_ref().and_then(|legacy| legacy.enabled);
+    if let Some(value) = legacy_shim {
+        warnings.push(ConfigWarning {
+            code: "deprecated_config_key",
+            key: "gh_shim.enabled",
+            tier: tier.tier.clone(),
+            value: value.to_string(),
+            message: "gh_shim.enabled is deprecated; use github.shim instead (the alias is removed in v0.57.0)".to_string(),
+        });
+        let github = raw.github.get_or_insert_with(RawGithub::default);
+        if github.shim.is_none() {
+            github.shim = Some(value);
+        }
+        if let Some(legacy) = raw.gh_shim.as_mut() {
+            legacy.enabled = None;
+        }
+        if raw
+            .gh_shim
+            .as_ref()
+            .is_some_and(|legacy| legacy.binary_path.is_none())
+        {
+            raw.gh_shim = None;
+        }
+    }
+
+    if let Some(value) = raw.gh_read.as_ref().and_then(|legacy| legacy.enabled) {
+        warnings.push(ConfigWarning {
+            code: "deprecated_config_key",
+            key: "gh_read.enabled",
+            tier: tier.tier.clone(),
+            value: value.to_string(),
+            message: "gh_read.enabled is deprecated; use github.read instead (the alias is removed in v0.57.0)".to_string(),
+        });
+        let github = raw.github.get_or_insert_with(RawGithub::default);
+        if github.read.is_none() {
+            github.read = Some(value);
+        }
+        raw.gh_read = None;
+    }
+}
+
 fn apply_harness_override(
     raw: &mut RawAftConfig,
     harness: Option<&Harness>,
@@ -897,6 +954,9 @@ fn merge_trusted_config(base: &mut RawAftConfig, override_config: RawAftConfig) 
     }
     if override_config.worktree.is_some() {
         base.worktree = override_config.worktree;
+    }
+    if override_config.github.is_some() {
+        base.github = override_config.github;
     }
     if override_config.gh_shim.is_some() {
         base.gh_shim = override_config.gh_shim;
@@ -1352,6 +1412,9 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
     {
         push_drop(dropped, "backup", tier, USER_ONLY_REASON);
     }
+    if raw.github.is_some() {
+        push_drop(dropped, "github", tier, USER_ONLY_REASON);
+    }
     if raw.gh_shim.is_some() {
         push_drop(dropped, "gh_shim", tier, USER_ONLY_REASON);
     }
@@ -1499,8 +1562,10 @@ fn apply_resolved_config(
     config.inspect = resolve_inspect_config(raw.inspect.as_ref());
     config.backup = resolve_backup_config(raw.backup.as_ref());
     config.worktree = resolve_worktree_config(raw.worktree.as_ref());
+    config.github = resolve_github_config(raw.github.as_ref(), warnings);
     config.gh_shim = resolve_gh_shim_config(raw.gh_shim.as_ref());
-    config.gh_read = resolve_gh_read_config(raw.gh_read.as_ref());
+    config.gh_shim.enabled = config.github.shim;
+    config.gh_read.enabled = config.github.read;
     config.git = resolve_git_config(raw.git.as_ref());
     config.sandbox = resolve_sandbox_config(raw.sandbox.as_ref());
     resolve_lsp_config(raw, config);
@@ -1786,6 +1851,43 @@ fn resolve_worktree_config(raw: Option<&RawWorktree>) -> WorktreeConfig {
     worktree
 }
 
+fn resolve_github_config(
+    raw: Option<&RawGithub>,
+    warnings: &mut Vec<ConfigWarning>,
+) -> GithubConfig {
+    let mut github = GithubConfig::default();
+    if let Some(value) = raw.and_then(|raw| raw.enabled) {
+        github.enabled = value;
+    }
+    if let Some(value) = raw.and_then(|raw| raw.shim) {
+        github.shim = value;
+    }
+    if let Some(value) = raw.and_then(|raw| raw.read) {
+        github.read = value;
+    }
+    if let Some(value) = raw.and_then(|raw| raw.write) {
+        github.write = value;
+    }
+
+    if !github.enabled {
+        github.shim = false;
+        github.read = false;
+        github.write = false;
+    } else if github.write && !github.read {
+        github.read = true;
+        warnings.push(ConfigWarning {
+            code: "github_write_requires_read",
+            key: "github.write",
+            tier: "user".to_string(),
+            value: "true".to_string(),
+            message: "github.write=true requires github.read=true; treating github.read as enabled"
+                .to_string(),
+        });
+    }
+
+    github
+}
+
 fn resolve_gh_shim_config(raw: Option<&RawGhShim>) -> GhShimConfig {
     let mut gh_shim = GhShimConfig::default();
     if let Some(value) = raw.and_then(|raw| raw.enabled) {
@@ -1795,14 +1897,6 @@ fn resolve_gh_shim_config(raw: Option<&RawGhShim>) -> GhShimConfig {
         .and_then(|raw| raw.binary_path.as_ref())
         .map(PathBuf::from);
     gh_shim
-}
-
-fn resolve_gh_read_config(raw: Option<&RawGhRead>) -> crate::config::GhReadConfig {
-    let mut gh_read = crate::config::GhReadConfig::default();
-    if let Some(value) = raw.and_then(|raw| raw.enabled) {
-        gh_read.enabled = value;
-    }
-    gh_read
 }
 
 fn resolve_git_config(raw: Option<&RawGit>) -> GitConfig {
@@ -2590,22 +2684,114 @@ mod tests {
     }
 
     #[test]
-    fn gh_read_is_user_only_and_records_project_drops() {
+    fn github_is_user_only_and_records_project_drops() {
         let remains_disabled = resolve_config(&[
-            tier("user", r#"{"gh_read":{"enabled":false}}"#),
-            tier("project", r#"{"gh_read":{"enabled":true}}"#),
+            tier(
+                "user",
+                r#"{"github":{"enabled":true,"shim":false,"read":false,"write":false}}"#,
+            ),
+            tier(
+                "project",
+                r#"{"github":{"enabled":true,"shim":true,"read":true,"write":true}}"#,
+            ),
         ]);
+        assert!(remains_disabled.config.github.enabled);
+        assert!(!remains_disabled.config.github.shim);
+        assert!(!remains_disabled.config.github.read);
+        assert!(!remains_disabled.config.github.write);
+        assert!(!remains_disabled.config.gh_shim.enabled);
         assert!(!remains_disabled.config.gh_read.enabled);
-        assert_eq!(drop_keys(&remains_disabled), vec!["gh_read"]);
+        assert_eq!(drop_keys(&remains_disabled), vec!["github"]);
         assert_eq!(remains_disabled.dropped[0].tier, "project");
         assert_eq!(remains_disabled.dropped[0].reason, USER_ONLY_REASON);
+    }
 
-        let remains_enabled = resolve_config(&[
-            tier("user", r#"{"gh_read":{"enabled":true}}"#),
-            tier("project", r#"{"gh_read":{"enabled":false}}"#),
+    #[test]
+    fn github_master_off_overrides_every_subfeature() {
+        let result = resolve_config(&[tier(
+            "user",
+            r#"{"github":{"enabled":false,"shim":true,"read":true,"write":true}}"#,
+        )]);
+
+        assert_eq!(
+            result.config.github,
+            GithubConfig {
+                enabled: false,
+                shim: false,
+                read: false,
+                write: false,
+            }
+        );
+        assert!(!result.config.gh_shim.enabled);
+        assert!(!result.config.gh_read.enabled);
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn github_write_forces_read_and_records_a_warning_naming_both_keys() {
+        let result = resolve_config(&[tier("user", r#"{"github":{"write":true,"read":false}}"#)]);
+
+        assert!(result.config.github.write);
+        assert!(result.config.github.read);
+        let warning = result
+            .warnings
+            .iter()
+            .find(|warning| warning.code == "github_write_requires_read")
+            .expect("write-implies-read warning");
+        assert_eq!(warning.key, "github.write");
+        assert!(warning.message.contains("github.write"));
+        assert!(warning.message.contains("github.read"));
+    }
+
+    #[test]
+    fn github_legacy_aliases_apply_warn_and_lose_to_new_keys() {
+        let aliases = resolve_config(&[tier(
+            "user",
+            r#"{"gh_shim":{"enabled":false},"gh_read":{"enabled":true}}"#,
+        )]);
+        assert!(!aliases.config.github.shim);
+        assert!(aliases.config.github.read);
+        assert_eq!(
+            aliases
+                .warnings
+                .iter()
+                .filter(|warning| warning.code == "deprecated_config_key")
+                .count(),
+            2
+        );
+        assert!(aliases.warnings.iter().any(|warning| {
+            warning.key == "gh_shim.enabled" && warning.message.contains("github.shim")
+        }));
+        assert!(aliases.warnings.iter().any(|warning| {
+            warning.key == "gh_read.enabled" && warning.message.contains("github.read")
+        }));
+
+        let new_keys_win = resolve_config(&[tier(
+            "user",
+            r#"{
+              "github":{"shim":true,"read":false},
+              "gh_shim":{"enabled":false},
+              "gh_read":{"enabled":true}
+            }"#,
+        )]);
+        assert!(new_keys_win.config.github.shim);
+        assert!(!new_keys_win.config.github.read);
+    }
+
+    #[test]
+    fn github_legacy_alias_at_project_tier_is_warned_and_ignored() {
+        let result = resolve_config(&[
+            tier("user", r#"{"github":{"read":false}}"#),
+            tier("project", r#"{"gh_read":{"enabled":true}}"#),
         ]);
-        assert!(remains_enabled.config.gh_read.enabled);
-        assert_eq!(drop_keys(&remains_enabled), vec!["gh_read"]);
+
+        assert!(!result.config.github.read);
+        assert_eq!(drop_keys(&result), vec!["github"]);
+        assert!(result.warnings.iter().any(|warning| {
+            warning.key == "gh_read.enabled"
+                && warning.tier == "project"
+                && warning.message.contains("github.read")
+        }));
     }
 
     #[test]
