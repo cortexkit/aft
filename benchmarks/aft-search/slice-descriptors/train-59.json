@@ -1,0 +1,11 @@
+{
+  "slice_class": "engine_unwired",
+  "kind": "engine_unwired",
+  "reason": "search_b2 bootstrap (install_defaults seam), the B2 embedding counter (cache resolution moved inside embed_texts, attribution only), the pinned plan table moved under crates/aft/assets, and the reference re-recorded at the paged profile. No ranking, lane, or scoring behaviour changes; proven by a byte-equal score file against the committed reference.",
+  "fixtures": [
+    "crates/aft/tests/engine_plan_table_test.rs",
+    "crates/aft/tests/search_b2_embed_counter.rs",
+    "crates/aft/tests/engine_search_extensions_test.rs"
+  ],
+  "slices": ["B2-bootstrap", "B2-s3-embedding-counter", "plan-table-relocation", "reference-rebaseline"]
+}
