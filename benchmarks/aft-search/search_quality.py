@@ -79,8 +79,13 @@ def page_zero_evaluation_projection(
             raise InputFault(
                 f"missing_page_zero_ranked_paths:{row.get('episode_id')}"
             )
-        row["ranked_paths"] = paths
-        row["metrics"] = row_metrics(paths, opened_files[row["episode_id"]])
+        scored_paths = paths[:10]
+        row["ranked_paths"] = scored_paths
+        row["metrics"] = row_metrics(scored_paths, opened_files[row["episode_id"]])
+        row["collapse_stop_reason"] = (
+            "ten_files" if len(scored_paths) == 10 else "exhausted"
+        )
+        row["retrieval_depth"] = len(scored_paths)
         request = dict(row.get("requests", [{}])[0])
         request.pop("offset", None)
         row["request"] = request
