@@ -1,12 +1,15 @@
 use std::fmt;
+#[cfg(test)]
 use std::ops::Range;
 
 use serde_json::Value;
 
 use super::blocks::{
-    BlockBuildError, BlockBuilder, BlockReply, PageRequest, StabilityUnit, BLOCK_DEPTHS,
-    MAX_BLOCK_DEPTH, MAX_OFFSET, MAX_PUBLIC_TOP_K,
+    BlockBuildError, BlockBuilder, BlockReply, PageRequest, MAX_BLOCK_DEPTH, MAX_OFFSET,
+    MAX_PUBLIC_TOP_K,
 };
+#[cfg(test)]
+use super::blocks::{StabilityUnit, BLOCK_DEPTHS};
 
 pub const DEFAULT_TOP_K: usize = 10;
 
@@ -231,6 +234,7 @@ pub fn serve_public_page(
     })
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ReferenceList {
     pub stability_units: Vec<StabilityUnit>,
@@ -241,6 +245,7 @@ pub(crate) struct ReferenceList {
 
 /// Builds a canonical prefix for internal comparison tests; unlike public requests,
 /// this helper may process an interval containing more than MAX_TOP_K items.
+#[cfg(test)]
 pub(crate) fn build_l(
     builder: &BlockBuilder,
     interval: Range<u64>,

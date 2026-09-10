@@ -1,7 +1,18 @@
+pub mod anchored_lane;
+pub mod blocks;
 pub mod comparator;
+pub mod confidence;
 pub mod evidence_descriptor;
+pub mod exact_lane;
 pub mod generation_token;
+pub mod lexical_lane;
+pub mod memo;
+pub mod paging;
 pub mod plan_table;
+pub mod provenance;
+pub mod scoring;
+pub mod telemetry;
+pub mod trailer;
 
 pub use comparator::{r3_cmp, score_free_r3_cmp, CandidateResult, RankedTuple, SymbolOffsetRange};
 pub use evidence_descriptor::{

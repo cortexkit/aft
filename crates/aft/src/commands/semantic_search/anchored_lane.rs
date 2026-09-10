@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use aft::commands::semantic_search::comparator::{score_free_r3_cmp, CandidateResult};
-use aft::commands::semantic_search::evidence_descriptor::EvidenceDescriptor;
-use aft::commands::semantic_search::plan_table::SearchLaneKind;
-use aft::commands::semantic_search::SearchLane;
-use aft::search_index::{decompose_regex, SearchIndex};
+use super::comparator::{score_free_r3_cmp, CandidateResult};
+use super::evidence_descriptor::EvidenceDescriptor;
+use super::plan_table::SearchLaneKind;
+use super::SearchLane;
+use crate::search_index::{decompose_regex, SearchIndex};
 
 /// Maximum occurrences considered per run, applied in ascending-offset order.
 pub const MAX_RUN_OCCURRENCES: usize = 64;
