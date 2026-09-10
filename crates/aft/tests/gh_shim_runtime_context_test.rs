@@ -2027,13 +2027,13 @@ impl SlowTestDaemon {
         let key_clone = key.clone();
         let daemon_id_clone = daemon_id;
 
-            let server_task = std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_io()
-                    .enable_time()
-                    .build()
-                    .expect("build daemon tokio runtime");
-                rt.block_on(async move {
+        let server_task = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
+                .expect("build daemon tokio runtime");
+            rt.block_on(async move {
                     let listener =
                         tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
                     let mut connection_count = 0usize;

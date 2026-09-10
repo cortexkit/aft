@@ -944,10 +944,8 @@ fn determine_rung_from_doc(
             .map(RungDetermination::cached)
             .unwrap_or_else(|| RungDetermination::r1(now, R1Reason::DiscoveryBudgetExhausted));
         if determination.record.rung == Rung::R1 {
-            determination.refusal_detail = Some(governance_probe_timeout_text(
-                budget_ms as u64,
-                stage,
-            ));
+            determination.refusal_detail =
+                Some(governance_probe_timeout_text(budget_ms as u64, stage));
         }
         return determination;
     }
