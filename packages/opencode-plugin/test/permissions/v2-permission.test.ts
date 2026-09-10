@@ -183,8 +183,8 @@ describe("OpenCode V2 permission consumer", () => {
     expect(host.stream.closed).toBe(true);
   });
 
-  test("records native permission-option enforcement for a direct V2 host context", () => {
-    expect(hoistedV2ToolConsumers({})).toEqual({ nativePermissionOptions: true });
+  test("keeps direct V2 host contexts fail-closed without a request endpoint", () => {
+    expect(hoistedV2ToolConsumers({})).toEqual({});
   });
 
   test("maps host deny and reject outcomes to distinct failures", async () => {

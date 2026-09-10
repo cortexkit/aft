@@ -17,7 +17,7 @@ export const V2_PERMISSION_ASK_INVENTORY = [
 
 /** Bind shared projected definitions to OpenCode's V2 permission endpoint. */
 export function hoistedV2ToolConsumers(host: V2PermissionHostContext | object): V2ToolConsumers {
-  if (!("client" in host)) return { nativePermissionOptions: true };
+  if (!("client" in host)) return {};
   return {
     requestPermission: (request, context) => requestPermission(host, request, context),
   };

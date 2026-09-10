@@ -48,8 +48,6 @@ export interface V2BashExecution {
 export interface V2ToolConsumers {
   /** Maps legacy tool permission requests to the V2 session permission service. */
   requestPermission?: (request: V2PermissionRequest, context: V2ExecutionContext) => Promise<void>;
-  /** The host rejects denied tool options before invoking the tool body. */
-  nativePermissionOptions?: boolean;
   /** Runs bash through the dedicated V2 executor while preserving the shared schema. */
   executeBash?: (execution: V2BashExecution) => Promise<ToolResult>;
 }
@@ -167,7 +165,6 @@ function runtimeFor(
   context: V2ExecutionContext,
   signal: AbortSignal,
   consumers: V2ToolConsumers,
-  permission: string | undefined,
 ): V2DefinitionRuntime {
   const directory = location.directory;
   const worktree = location.project?.canonical ?? location.project?.directory ?? directory;
@@ -189,11 +186,8 @@ function runtimeFor(
     },
     ask: (request) => {
       if (consumers.requestPermission) return consumers.requestPermission(request, context);
-      if (consumers.nativePermissionOptions && request.permission === permission) {
-        return Promise.resolve();
-      }
       return Promise.reject(
-        new Error("V2 permission requests require host-enforced tool permission options"),
+        new Error("V2 permission requests require the host permission endpoint consumer"),
       );
     },
     progress: context.progress,
@@ -225,7 +219,7 @@ export function projectV2Tool(
     execute: (rawInput, context) =>
       Effect.tryPromise({
         try: async (signal) => {
-          const runtime = runtimeFor(location, context, signal, consumers, permission);
+          const runtime = runtimeFor(location, context, signal, consumers);
           const input = executionArguments(name, rawInput);
           const result =
             consumers.executeBash && V2_BASH_TOOLS.has(name)
