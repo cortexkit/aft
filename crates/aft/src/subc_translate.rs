@@ -2038,9 +2038,7 @@ fn translate_search(args: Value) -> Result<Translated, TranslateError> {
         None => 10,
     };
     out.insert("top_k".to_string(), Value::Number(top_k.into()));
-    if let Some(offset) =
-        coerce_optional_int_result(map_in.get("offset"), "offset", 0, 100_000)?
-    {
+    if let Some(offset) = coerce_optional_int_result(map_in.get("offset"), "offset", 0, 100_000)? {
         out.insert("offset".to_string(), Value::Number(offset.into()));
     }
     if let Some(include_tests) = map_in.get("includeTests").and_then(Value::as_bool) {

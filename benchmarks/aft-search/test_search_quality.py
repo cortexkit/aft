@@ -10,8 +10,13 @@ from pathlib import Path
 
 from run_real_query import load_capability
 from run_search_quality import selected_profile
-from search_quality import descriptor_labels, synthetic_documents
+from search_quality import (
+    descriptor_labels,
+    page_zero_evaluation_projection,
+    synthetic_documents,
+)
 from search_quality_lib import (
+    InputFault,
     TOOL_CALL_PARITY_FIXTURE_SOURCE,
     total_gate,
     validate_profile_score,
@@ -54,6 +59,72 @@ class ProfileSelectionTests(unittest.TestCase):
         profile, capability = self.profile_for_schema({"properties": {}})
         self.assertEqual(profile, "single_page")
         validate_profile_score({"profile": profile, "capability": capability, "rows": []})
+
+
+class PageZeroProjectionTests(unittest.TestCase):
+    def documents(self) -> tuple[dict, dict, dict, dict]:
+        manifest = {"rows": [{"episode_id": "episode:1", "opened_file": "src/opened.py"}]}
+        metrics = {"mrr_at_10": 1.0, "hit_at_1": 1.0, "hit_at_5": 1.0}
+        reference = {
+            "profile": "single_page",
+            "capability": {"offset_declared": False},
+            "families": {"real_query": metrics},
+            "shapes": {"mixed": metrics},
+            "mechanisms": {"other": metrics},
+            "rows": [
+                {
+                    "episode_id": "episode:1",
+                    "pinned_shape": "mixed",
+                    "mechanism": "other",
+                    "census_stratum": "short",
+                    "ranked_paths": ["src/opened.py"],
+                    "metrics": metrics,
+                }
+            ],
+        }
+        score = {
+            "profile": "paged",
+            "capability": {
+                "offset_declared": True,
+                "probe_pages_differ": True,
+            },
+            "families": {"real_query": metrics},
+            "shapes": {"mixed": metrics},
+            "mechanisms": {"other": metrics},
+            "rows": [
+                {
+                    "episode_id": "episode:1",
+                    "pinned_shape": "mixed",
+                    "mechanism": "other",
+                    "census_stratum": "short",
+                    "request": {"topK": 100, "offset": 0},
+                    "requests": [
+                        {"topK": 100, "offset": 0},
+                        {"topK": 100, "offset": 100},
+                    ],
+                    "ranked_paths": ["src/opened.py", "src/later.py"],
+                    "page_zero_ranked_paths": ["src/opened.py"],
+                    "metrics": metrics,
+                }
+            ],
+        }
+        descriptor = {"slice_class": "ranking"}
+        return manifest, reference, score, descriptor
+
+    def test_projection_uses_only_page_zero_and_ignores_later_page_changes(self) -> None:
+        manifest, reference, score, descriptor = self.documents()
+        first = page_zero_evaluation_projection(reference, score, manifest, descriptor)
+        score["rows"][0]["ranked_paths"][-1] = "src/different-later.py"
+        second = page_zero_evaluation_projection(reference, score, manifest, descriptor)
+        self.assertEqual(first["rows"][0]["ranked_paths"], reference["rows"][0]["ranked_paths"])
+        self.assertEqual(first["rows"][0]["metrics"], reference["rows"][0]["metrics"])
+        self.assertEqual(first["rows"][0]["metrics"], second["rows"][0]["metrics"])
+
+    def test_projection_requires_a_successful_declared_offset_probe(self) -> None:
+        manifest, reference, score, descriptor = self.documents()
+        score["capability"]["probe_pages_differ"] = False
+        with self.assertRaisesRegex(InputFault, "reference_profile_mismatch"):
+            page_zero_evaluation_projection(reference, score, manifest, descriptor)
 
 
 class EngineUnwiredGateTests(unittest.TestCase):

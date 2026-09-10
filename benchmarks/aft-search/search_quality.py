@@ -8,7 +8,7 @@ from typing import Any
 
 from search_quality_lib import (
     EVIDENCE_SHA, GateResult, InputFault, STRATA, atomic_write_pair, blake3,
-    canonical_json, choose_stop, derive_slice_class, estimator, identity_delta,
+    aggregate_real_query, canonical_json, choose_stop, derive_slice_class, estimator, identity_delta,
     included_manifest_ids, invariance_requests, profile_requests, real_query_behavior_diff,
     row_metrics, sample_plan, sha256_bytes, sha256_file, total_gate, validate_profile_score,
     validate_scored_population,
@@ -43,6 +43,60 @@ def descriptor_labels(branch: str) -> list[str]:
         if label not in labels:
             labels.append(label)
     return labels
+
+
+def page_zero_evaluation_projection(
+    reference: dict[str, Any],
+    score: dict[str, Any],
+    manifest: dict[str, Any],
+    descriptor: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if score.get("profile") == reference.get("profile"):
+        return score
+    capability = score.get("capability", {})
+    transition_allowed = (
+        descriptor is not None
+        and descriptor.get("slice_class") == "ranking"
+        and reference.get("profile") == "single_page"
+        and score.get("profile") == "paged"
+        and capability.get("offset_declared") is True
+        and capability.get("probe_pages_differ") is True
+    )
+    if not transition_allowed:
+        raise InputFault("illegal_profile:reference_profile_mismatch")
+
+    # The recorded reference currently covers one page. Compare only offset-zero
+    # output until the reference itself records paging, so later pages cannot inflate quality.
+    opened_files = {
+        row["episode_id"]: row["opened_file"] for row in manifest.get("rows", [])
+    }
+    projected = copy.deepcopy(score)
+    projected["profile"] = "single_page"
+    projected["capability"] = copy.deepcopy(reference.get("capability", {}))
+    for row in projected.get("rows", []):
+        paths = row.get("page_zero_ranked_paths")
+        if not isinstance(paths, list):
+            raise InputFault(
+                f"missing_page_zero_ranked_paths:{row.get('episode_id')}"
+            )
+        row["ranked_paths"] = paths
+        row["metrics"] = row_metrics(paths, opened_files[row["episode_id"]])
+        request = dict(row.get("requests", [{}])[0])
+        request.pop("offset", None)
+        row["request"] = request
+        row["requests"] = [request]
+        row["request_count"] = 1
+        row["pages_fetched"] = 1
+        row.pop("invariance_requests", None)
+        row.pop("page_zero_ranked_paths", None)
+    real_query = aggregate_real_query(projected.get("rows", []))
+    projected["families"]["real_query"] = real_query["family"]
+    projected["shapes"] = real_query["shapes"]
+    projected["mechanisms"] = real_query["mechanisms"]
+    projected["census_weighted_mrr_report_only"] = real_query[
+        "census_weighted_mrr_report_only"
+    ]
+    return projected
 
 
 def descriptor_path(explicit: str | None, branch: str | None) -> Path | None:
@@ -204,11 +258,12 @@ def run(args:argparse.Namespace)->int:
         if receipt.get("head")!=head or receipt.get("manifest_sha256")!=sha256_file(manifest_path) or receipt.get("reference_sha256")!=sha256_file(reference_path): raise InputFault("rebaseline_receipt_mismatch")
         if reference.get("profile")!="single_page" or score.get("profile")!="paged" or score.get("capability",{}).get("offset_declared") is not True or score.get("capability",{}).get("probe_pages_differ") is not True: raise InputFault("rebaseline_profile_capability")
         if {row.get("episode_id") for row in reference.get("rows",[])}!={row.get("episode_id") for row in score.get("rows",[])}: raise InputFault("rebaseline_identity_mismatch")
-    elif (descriptor is None or descriptor.get("slice_class") != "engine_unwired") and score.get("profile")!=reference.get("profile"):
-        raise InputFault("illegal_profile:reference_profile_mismatch")
+    evaluation_score = page_zero_evaluation_projection(
+        reference, score, manifest, descriptor
+    )
     if (descriptor is None or descriptor.get("slice_class") != "engine_unwired") and score.get("model_id")!=reference.get("model_id"):
         raise InputFault("corpus_vector_model_mismatch")
-    result=total_gate(reference,score,manifest,descriptor,paths)
+    result=total_gate(reference,evaluation_score,manifest,descriptor,paths)
     for reason in result.reasons: print(reason,file=sys.stderr)
     if result.exit_code or not args.rebaseline: return result.exit_code
     recorded=dict(score); recorded.update({"schema":"aft-search-reference-v1","evidence_sha":EVIDENCE_SHA,"manifest_sha256":sha256_file(manifest_path)})

@@ -37,6 +37,26 @@ class FakeClient:
         }
 
 
+class CrossBoundaryDuplicateClient(FakeClient):
+    def __init__(self) -> None:
+        super().__init__(total=500)
+
+    def search(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
+        request = dict(arguments)
+        self.calls.append(request)
+        offset = int(request.get("offset", 0))
+        top_k = int(request["topK"])
+        paths = [f"src/file{index:03}.py" for index in range(self.total)]
+        paths[99] = paths[0]
+        selected = paths[offset : offset + top_k]
+        return {
+            "success": True,
+            "status": "ready",
+            "results": [{"file": path, "name": Path(path).stem} for path in selected],
+            "more_available": offset + top_k < len(paths),
+        }
+
+
 def manifest(include_tests: bool = True) -> dict[str, Any]:
     return {
         "rows": [
@@ -124,6 +144,21 @@ class RealQueryRunnerTests(unittest.TestCase):
         self.assertEqual(rows[0]["request_count"], 19)
         self.assertTrue(capability["probe_pages_differ"])
         validate_profile_score({"profile": "paged", "capability": capability, "rows": rows})
+
+    def test_page_zero_paths_preserve_cross_boundary_duplicate_cut(self) -> None:
+        capability = {
+            "schema_path": "fixture.json",
+            "schema_sha256": "0" * 64,
+            "offset_declared": True,
+            "offset_bounds": {"minimum": 0, "maximum": 10000},
+        }
+        rows = score_manifest_rows(
+            manifest(), "paged", capability, CrossBoundaryDuplicateClient(), Path(".")
+        )
+        page_zero = rows[0]["page_zero_ranked_paths"]
+        self.assertEqual(len(page_zero), 99)
+        self.assertEqual(page_zero, [f"src/file{index:03}.py" for index in range(99)])
+        self.assertNotIn("src/file099.py", page_zero)
 
     def test_stop_token_precedence_is_page_cap_then_exhausted_then_ten_files(self) -> None:
         self.assertEqual(choose_stop(page_cap=True, exhausted=True, ten_files=True), "page_cap")

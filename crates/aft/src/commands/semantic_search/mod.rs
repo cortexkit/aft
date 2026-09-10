@@ -349,7 +349,9 @@ fn cancelled_search_response_from_id(request_id: &str) -> Response {
 }
 
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
-    use extensions::{DefaultSearchExtensions, QueryFacts, Readiness, Root, SearchExtensions, Token};
+    use extensions::{
+        DefaultSearchExtensions, QueryFacts, Readiness, Root, SearchExtensions, Token,
+    };
 
     let page_request = match paging::parse_public_page_request(&req.params) {
         Ok(request) => request,
@@ -544,9 +546,7 @@ fn handle_semantic_search_inner(
         }
     };
     let mode = choose_mode(&params.query, &shape, lexical_ready, &mut warnings);
-    if lexical_ready
-        && mode != SearchMode::Regex
-        && !engine_plan.contains(SearchLaneKind::Semantic)
+    if lexical_ready && mode != SearchMode::Regex && !engine_plan.contains(SearchLaneKind::Semantic)
     {
         return handle_engine_only_search(
             req,
@@ -1756,7 +1756,12 @@ fn handle_grep_search(
 
     let interval_end = offset.saturating_add(top_k);
     let interval_has_more = result.total_matches > interval_end || result.truncated;
-    result.matches = result.matches.into_iter().skip(offset).take(top_k).collect();
+    result.matches = result
+        .matches
+        .into_iter()
+        .skip(offset)
+        .take(top_k)
+        .collect();
     let result_values = result
         .matches
         .iter()
@@ -2073,11 +2078,13 @@ fn run_engine_ranking(
         .unwrap_or_else(SearchIndex::new);
     let snapshot = index.snapshot();
     let content_tokens = query_shape::extract_content_tokens(query);
-    let token_refs = content_tokens.iter().map(String::as_str).collect::<Vec<_>>();
+    let token_refs = content_tokens
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     let query_trigrams = SearchIndex::query_trigrams_from_tokens(&token_refs);
-    let candidate_filter = |path: &Path| {
-        path_allowed_by_include_tests(path, project_root, include_tests)
-    };
+    let candidate_filter =
+        |path: &Path| path_allowed_by_include_tests(path, project_root, include_tests);
     let lexical = CanonicalLexicalLane::from_snapshot(
         &snapshot,
         &query_trigrams,
@@ -2100,11 +2107,8 @@ fn run_engine_ranking(
         .iter()
         .take(lexical_lane::LEXICAL_ENUMERATION_LIMIT)
         .filter_map(|candidate| {
-            let (exact, occurrences, window_lines) = lexical_candidate_exactness(
-                &candidate.result.path,
-                query,
-                &content_tokens,
-            );
+            let (exact, occurrences, window_lines) =
+                lexical_candidate_exactness(&candidate.result.path, query, &content_tokens);
             if !exact {
                 return None;
             }
@@ -2120,32 +2124,59 @@ fn run_engine_ranking(
             ))
         })
         .collect::<Vec<_>>();
+    let path_lookup_candidates = if plan.shape == SearchShape::Path {
+        lexical
+            .canonical_order()
+            .iter()
+            .filter_map(|candidate| {
+                let file_name = candidate.result.path.file_name()?.to_str()?;
+                query
+                    .split_whitespace()
+                    .any(|token| {
+                        token.trim_matches(|ch: char| {
+                            !ch.is_alphanumeric() && ch != '.' && ch != '_' && ch != '-'
+                        }) == file_name
+                    })
+                    .then(|| {
+                        CandidateResult::new_exact(
+                            candidate.result.path.clone(),
+                            None,
+                            EvidenceDescriptor::for_e1(1, true, false),
+                        )
+                    })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let mut semantic_metadata = HashMap::new();
     let mut seen_semantic_paths = HashSet::new();
     let mut prepared_semantic = Vec::new();
     for result in semantic_results {
         let path = result.file.clone();
-        semantic_metadata.entry(path.clone()).or_insert_with(|| HybridResult {
-            file: result.file.clone(),
-            name: result.name.clone(),
-            kind: result.kind,
-            start_line: result.start_line,
-            end_line: result.end_line,
-            exported: result.exported,
-            score: result.score,
-            source: "semantic",
-            semantic_score: Some(result.score),
-            lexical_score: None,
-            hybrid_boosted: false,
-            exact: false,
-            exact_phrase_count: 0,
-            exact_window_lines: None,
-            fusion_score: 0.0,
-            cap_protected: result.cap_protected,
-            lexical_generated_artifact: false,
-            snippet: result.snippet.clone(),
-        });
+        semantic_metadata
+            .entry(path.clone())
+            .or_insert_with(|| HybridResult {
+                file: result.file.clone(),
+                name: result.name.clone(),
+                kind: result.kind,
+                start_line: result.start_line,
+                end_line: result.end_line,
+                exported: result.exported,
+                score: result.score,
+                source: "semantic",
+                semantic_score: Some(result.score),
+                lexical_score: None,
+                hybrid_boosted: false,
+                exact: false,
+                exact_phrase_count: 0,
+                exact_window_lines: None,
+                fusion_score: 0.0,
+                cap_protected: result.cap_protected,
+                lexical_generated_artifact: false,
+                snippet: result.snippet.clone(),
+            });
         if seen_semantic_paths.insert(path.clone()) {
             prepared_semantic.push(CandidateResult {
                 path,
@@ -2173,6 +2204,10 @@ fn run_engine_ranking(
             SearchLaneKind::Semantic => Arc::new(PreparedEngineLane {
                 kind: *kind,
                 candidates: prepared_semantic.clone(),
+            }),
+            SearchLaneKind::PathLookup => Arc::new(PreparedEngineLane {
+                kind: *kind,
+                candidates: path_lookup_candidates.clone(),
             }),
             _ => Arc::new(PreparedEngineLane {
                 kind: *kind,
@@ -2216,10 +2251,7 @@ fn run_engine_ranking(
                 *exact_form |= candidate.evidence.exact_form;
                 *generated &= candidate.evidence.generated;
             })
-            .or_insert((
-                candidate.evidence.exact_form,
-                candidate.evidence.generated,
-            ));
+            .or_insert((candidate.evidence.exact_form, candidate.evidence.generated));
     }
 
     let mut lanes = Vec::new();
@@ -2273,7 +2305,8 @@ fn run_engine_ranking(
     let policy = ScoringPolicy::from_plan_table(&PlanTable::running_table(), plan.shape)
         .map_err(|error| error.to_string())?;
     let builder = BlockBuilder::new(key, policy, lanes).map_err(|error| error.to_string())?;
-    let page = paging::serve_public_page(&builder, page_request).map_err(|error| error.to_string())?;
+    let page =
+        paging::serve_public_page(&builder, page_request).map_err(|error| error.to_string())?;
     let confidence = ConfidenceEngine::running()
         .evaluate_reply(&page.reply)
         .map_err(|error| error.to_string())?;
@@ -2282,7 +2315,8 @@ fn run_engine_ranking(
         Some(Confidence::Low) => Some(ConfidenceTelemetry::Low),
         None => None,
     };
-    let provenance = ObservedProvenance::from_reply(&page.reply).map_err(|error| error.to_string())?;
+    let provenance =
+        ObservedProvenance::from_reply(&page.reply).map_err(|error| error.to_string())?;
     let structured = TelemetryAssembler::new(&page, provenance)
         .assemble(TelemetryRun {
             shape: plan.shape,
@@ -2300,31 +2334,33 @@ fn run_engine_ranking(
     for entry in &page.reply.page {
         let ranked = &entry.result;
         let semantic_backed = semantic_metadata.contains_key(&ranked.path);
-        let mut result = semantic_metadata.remove(&ranked.path).unwrap_or_else(|| HybridResult {
-            file: ranked.path.clone(),
-            name: ranked
-                .path
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default()
-                .to_string(),
-            kind: SymbolKind::FileSummary,
-            start_line: 0,
-            end_line: 0,
-            exported: false,
-            score: 0.0,
-            source: "lexical",
-            semantic_score: None,
-            lexical_score: None,
-            hybrid_boosted: false,
-            exact: false,
-            exact_phrase_count: 0,
-            exact_window_lines: None,
-            fusion_score: 0.0,
-            cap_protected: false,
-            lexical_generated_artifact: ranked.evidence.generated,
-            snippet: String::new(),
-        });
+        let mut result = semantic_metadata
+            .remove(&ranked.path)
+            .unwrap_or_else(|| HybridResult {
+                file: ranked.path.clone(),
+                name: ranked
+                    .path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                kind: SymbolKind::FileSummary,
+                start_line: 0,
+                end_line: 0,
+                exported: false,
+                score: 0.0,
+                source: "lexical",
+                semantic_score: None,
+                lexical_score: None,
+                hybrid_boosted: false,
+                exact: false,
+                exact_phrase_count: 0,
+                exact_window_lines: None,
+                fusion_score: 0.0,
+                cap_protected: false,
+                lexical_generated_artifact: ranked.evidence.generated,
+                snippet: String::new(),
+            });
         result.exact = ranked.evidence.tier == EvidenceTier::Exact;
         result.exact_phrase_count = ranked.evidence.occurrences.unwrap_or_default();
         result.exact_window_lines = ranked.evidence.window_lines;
@@ -2353,9 +2389,7 @@ fn run_engine_ranking(
         results.push(result);
     }
 
-    let page_end = page_request
-        .offset()
-        .saturating_add(page_request.top_k());
+    let page_end = page_request.offset().saturating_add(page_request.top_k());
     Ok(EngineRanking {
         results,
         more_available: page_end < page.reply.canonical_list.len()
@@ -2873,7 +2907,9 @@ fn handle_semantic_or_hybrid_search(
         Err(error) => return Response::error(&req.id, "search_engine_failed", error),
     };
     if ctx.shared_artifacts_read_only() {
-        engine_ranking.results.retain(|result| result.file.is_file());
+        engine_ranking
+            .results
+            .retain(|result| result.file.is_file());
     }
     let more_available =
         engine_ranking.more_available || semantic_more_available || lexical.engine_capped;

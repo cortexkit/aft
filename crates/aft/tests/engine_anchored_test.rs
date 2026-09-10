@@ -2,17 +2,17 @@ use std::cmp::Ordering;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use aft::commands::semantic_search::comparator::{r3_cmp, CandidateResult, RankedTuple};
-use aft::commands::semantic_search::evidence_descriptor::{
-    EvidenceDescriptor, EvidenceKind, EvidenceTier,
-};
-use aft::search_index::SearchIndex;
 use aft::commands::semantic_search::anchored_lane::{
     cmp_alignment, discover_anchored_candidate_files, find_canonical_alignment,
     find_canonical_alignment_with_test_order, find_run_occurrences, sort_anchored_canonical,
     split_query, verify_anchored_text, Alignment, AlignmentTestOrder, AnchoredLane, Occurrence,
     MAX_RUN_OCCURRENCES,
 };
+use aft::commands::semantic_search::comparator::{r3_cmp, CandidateResult, RankedTuple};
+use aft::commands::semantic_search::evidence_descriptor::{
+    EvidenceDescriptor, EvidenceKind, EvidenceTier,
+};
+use aft::search_index::SearchIndex;
 
 const FIXTURE_NAMES: [&str; 9] = [
     "fixture_i_phrase_lane_unreachable.json",
@@ -124,7 +124,10 @@ fn load_fixture(name: &str) -> AnchoredFixture {
 
 fn assert_five_fixture_values(
     name: &str,
-) -> (AnchoredFixture, aft::commands::semantic_search::anchored_lane::AnchoredVerification) {
+) -> (
+    AnchoredFixture,
+    aft::commands::semantic_search::anchored_lane::AnchoredVerification,
+) {
     let fixture = load_fixture(name);
     fixture
         .validate_integers()

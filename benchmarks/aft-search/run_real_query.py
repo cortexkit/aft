@@ -335,6 +335,10 @@ def score_manifest_rows(
         ten_files = len(collapse_paths(results)) >= 10
         stop = choose_stop(page_cap=page_cap, exhausted=exhausted, ten_files=ten_files)
         ranked_paths, retrieval_depth = _collapse_with_depth(results, stop)
+        page_zero_results = _normalize_results(responses[0], project_root)
+        page_zero_ranked_paths = collapse_paths(
+            page_zero_results, max_paths=len(page_zero_results)
+        )
         invariance_sent: list[list[JsonObject]] = []
         if profile == "paged":
             invariance_sent, invariant_paths = _invariance(client, row, project_root)
@@ -353,6 +357,11 @@ def score_manifest_rows(
                 "collapse_stop_reason": stop,
                 "retrieval_depth": retrieval_depth,
                 "ranked_paths": ranked_paths,
+                **(
+                    {"page_zero_ranked_paths": page_zero_ranked_paths}
+                    if profile == "paged"
+                    else {}
+                ),
                 "metrics": metrics,
                 "pinned_shape": row["pinned_shape"],
                 "mechanism": row["mechanism"],

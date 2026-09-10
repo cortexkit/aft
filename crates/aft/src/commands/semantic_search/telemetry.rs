@@ -8,9 +8,7 @@ use super::generation_token::GenerationToken;
 use super::paging::SearchPage;
 use super::plan_table::{SearchLaneKind, SearchShape};
 use super::provenance::{LanePositions, LanePositionsAccessor, ProvenanceError};
-use super::trailer::{
-    ExactPassState, MissingBoundedExactPassDisclosure, SearchTrailer,
-};
+use super::trailer::{ExactPassState, MissingBoundedExactPassDisclosure, SearchTrailer};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

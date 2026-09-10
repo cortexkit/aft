@@ -126,12 +126,7 @@ pub trait SearchExtensions: Send + Sync {
         root.readiness().clone()
     }
 
-    fn plan(
-        &self,
-        _facts: &QueryFacts,
-        shape: SearchShape,
-        readiness: &Readiness,
-    ) -> LanePlan {
+    fn plan(&self, _facts: &QueryFacts, shape: SearchShape, readiness: &Readiness) -> LanePlan {
         default_lane_plan(shape, readiness.clone())
     }
 

@@ -1,6 +1,6 @@
 {
   "slice_class": "ranking",
-  "targeted_mechanism": "live score-free exact and anchored lanes with block-frozen lexical-semantic fusion",
+  "targeted_mechanism": "phrase_present_not_surfaced",
   "kind": "ranking",
   "fixtures": [
     "crates/aft/tests/integration/aft_search_contract_test.rs",

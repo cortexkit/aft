@@ -7803,7 +7803,10 @@ public class Greeter {
                 .unwrap();
         });
 
-        assert_eq!(calls, 1, "the query-cache hit must not count as an embedding call");
+        assert_eq!(
+            calls, 1,
+            "the query-cache hit must not count as an embedding call"
+        );
         assert_eq!(model.query_embedding_cache_stats(), (1, 1, 1));
         handle.join().unwrap();
     }

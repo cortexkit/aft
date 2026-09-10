@@ -310,7 +310,9 @@ impl ConfidenceEngine {
         let path = Path::new(CONFIDENCE_THRESHOLD_RELATIVE_PATH);
         let threshold = ConfidenceThreshold::parse_at_startup(
             path,
-            include_str!("../../../../../benchmarks/aft-search/engine-fixtures/confidence-threshold.json"),
+            include_str!(
+                "../../../../../benchmarks/aft-search/engine-fixtures/confidence-threshold.json"
+            ),
         )
         .expect("embedded confidence threshold must satisfy the engine schema");
         Self { threshold }

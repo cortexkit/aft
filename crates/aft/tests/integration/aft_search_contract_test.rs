@@ -2069,13 +2069,17 @@ fn live_engine_pipeline_ranks_and_pages_with_provenance() {
     let exact = project.path().join("src/z_exact.rs");
     let lexical = project.path().join("src/a_lexical.rs");
     let log = project.path().join("src/logging.rs");
+    let path_match = project.path().join("src/subc_format.rs");
     std::fs::create_dir_all(exact.parent().unwrap()).expect("create src dir");
     let exact_source = "pub const MESSAGE: &str = \"needle symbol\";\n".to_string();
-    let lexical_source = "needle needle needle\nfiller\nfiller\nfiller\nsymbol symbol symbol\n".to_string();
+    let lexical_source =
+        "needle needle needle\nfiller\nfiller\nfiller\nsymbol symbol symbol\n".to_string();
     let log_source = "error!(\"opening {} failed for run {}\", path, id);\n".to_string();
+    let path_source = "pub fn callgraph_op() {}\n".to_string();
     std::fs::write(&exact, &exact_source).expect("write exact source");
     std::fs::write(&lexical, &lexical_source).expect("write lexical source");
     std::fs::write(&log, &log_source).expect("write log source");
+    std::fs::write(&path_match, &path_source).expect("write path source");
     let ctx = test_context(project.path());
     install_lexical_index_entries(
         &ctx,
@@ -2083,6 +2087,7 @@ fn live_engine_pipeline_ranks_and_pages_with_provenance() {
             (lexical.clone(), lexical_source),
             (exact.clone(), exact_source),
             (log.clone(), log_source),
+            (path_match.clone(), path_source),
         ],
     );
     *ctx.semantic_index_status()
@@ -2115,10 +2120,7 @@ fn live_engine_pipeline_ranks_and_pages_with_provenance() {
         "src/z_exact.rs"
     ));
     assert_ne!(first["results"][0]["file"], second["results"][0]["file"]);
-    assert_eq!(
-        first["structuredContent"]["plan"]["exact_tier"],
-        "e1"
-    );
+    assert_eq!(first["structuredContent"]["plan"]["exact_tier"], "e1");
     assert!(first["structuredContent"]["plan"]["confidence"].is_string());
     assert!(!first["structuredContent"]["results"][0]["lane_positions"]
         .as_object()
@@ -2153,4 +2155,22 @@ fn live_engine_pipeline_ranks_and_pages_with_provenance() {
         .as_array()
         .unwrap()
         .contains(&serde_json::json!("anchored")));
+
+    let path_request: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "engine-live-path",
+        "command": "semantic_search",
+        "query": "callgraph_op subc_format.rs",
+        "top_k": 1
+    }))
+    .unwrap();
+    let path_response = response_value(handle_semantic_search(&path_request, &ctx));
+    assert!(path_ends_with(
+        path_response["results"][0]["file"].as_str().unwrap(),
+        "src/subc_format.rs"
+    ));
+    assert_eq!(
+        path_response["structuredContent"]["results"][0]["lane_positions"]["path_lookup"]
+            ["disposition"],
+        "depth_exempt"
+    );
 }

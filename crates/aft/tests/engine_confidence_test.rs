@@ -721,7 +721,7 @@ fn provenance_is_structurally_unavailable_to_confidence() {
     }
 
     impl StubbedProvenanceCandidate {
-                fn lane_positions(&self) -> ! {
+        fn lane_positions(&self) -> ! {
             self.lane_position_reads
                 .set(self.lane_position_reads.get() + 1);
             panic!("confidence must not read lane_positions")

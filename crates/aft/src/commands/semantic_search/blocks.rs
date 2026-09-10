@@ -613,13 +613,13 @@ impl BlockBuilder {
             };
             let mut attribution = Vec::new();
             if entry.result.evidence.tier == EvidenceTier::Exact {
-                attribution.extend(candidate.exact.iter().map(
-                    |(lane, position, _)| LaneAttribution {
+                attribution.extend(candidate.exact.iter().map(|(lane, position, _)| {
+                    LaneAttribution {
                         lane: *lane,
                         position: *position,
                         disposition: ContributionDisposition::DepthExempt,
-                    },
-                ));
+                    }
+                }));
             }
             for contribution in &candidate.depth_limited {
                 if contribution.position >= reached_depth {
