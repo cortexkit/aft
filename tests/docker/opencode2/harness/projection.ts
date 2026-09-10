@@ -2,7 +2,7 @@ import { fail } from "./errors.js";
 import type { ProjectionRule, ProjectionTypeMap, ScenarioComparison } from "./types.js";
 
 export const TRUNCATION_TRAILER_PATTERN =
-  "^shown (?<shown>\\d+) of (?<total>\\d+) (?<unit>[^ ]+) \\((?<reason>cap|depth|budget|walk)\\) · narrow: (?<narrow>.+)$";
+  "^shown (?<shown>\\d+) of (?:≥)?(?<total>\\d+) (?<unit>[^ ]+) \\((?<reason>cap|depth|budget|walk)\\) · narrow: (?<narrow>.+)$";
 
 function convert(value: string, type: "boolean" | "number" | "string" | undefined): unknown {
   if (type === "number") {

@@ -649,7 +649,7 @@ async function runOneScenario(options: {
       contract: options.hostContract,
       server,
       hostGeneration,
-      model: options.providerModel,
+      model: hostGeneration === "v2" ? options.providerModel : undefined,
     });
     observeHostStream(client.child, controlPathValues);
     if (options.runSmoke && server && options.hostContract) {

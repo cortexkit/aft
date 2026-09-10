@@ -29,9 +29,13 @@ import {
   materializeTurnPlaceholders,
   observeThenRespond,
 } from "./mock-server.js";
-import { projectText } from "./projection.js";
+import { projectText, TRUNCATION_TRAILER_PATTERN } from "./projection.js";
 import { verifyExecutableProvenance } from "./provenance.js";
-import { loadScenarios, materializeParityScenarios } from "./scenario-loader.js";
+import {
+  addCallgraphWarmup,
+  loadScenarios,
+  materializeParityScenarios,
+} from "./scenario-loader.js";
 import { assertTurnLog } from "./turn-log.js";
 import { resolveTransportDeadWindow, transportDeadAtTurn } from "./transport-window.js";
 import type { ScenarioDefinition, ScriptedTurn, ToolCallPlan } from "./types.js";
@@ -151,6 +155,11 @@ describe("scenario isolation and liveness", () => {
     const hostConfig = JSON.parse(await readFile(isolated.host_config, "utf8"));
     expect(hostConfig.plugin[0]).toEndWith("/xdg-config/aft-opencode-wrapper");
     expect(hostConfig.providers.mock.settings.baseURL).toBe("http://127.0.0.1:1234/v1");
+    expect(hostConfig.provider.mock.options.baseURL).toBe("http://127.0.0.1:1234/v1");
+    expect(hostConfig.provider.mock).toMatchObject({
+      api: "openai",
+      models: { "mock-model": { name: "Mock Model" } },
+    });
     const serverWrapper = await readFile(
       join(isolated.config, "aft-opencode-wrapper", "index.mjs"),
       "utf8",
@@ -210,6 +219,13 @@ describe("scenario isolation and liveness", () => {
     expect(() => assertTurnLog(["tool", "result", "final"], ["tool", "result"])).toThrow(
       "turn_log_incomplete",
     );
+  });
+
+  test("truncation trailers accept lower-bound totals", () => {
+    const match = new RegExp(TRUNCATION_TRAILER_PATTERN).exec(
+      "shown 5 of ≥140 files (cap) · narrow: path",
+    );
+    expect(match?.groups).toMatchObject({ shown: "5", total: "140", reason: "cap" });
   });
 
   test("shape projection refuses unparsed agent-visible text", () => {
@@ -488,6 +504,17 @@ describe("source-of-truth derivation", () => {
     // A subset on a full run is read as drift at the first guard it reaches:
     // the scenario-derived projection no longer matches the exclusion table.
     expect(error.message).toContain("do not match the explicit exclusion table");
+  });
+
+  test("callgraph scenarios retry after the background store warms", () => {
+    const input = scenario(call({ name: "aft_callgraph" }));
+    input.tool = "callgraph";
+    const warmed = addCallgraphWarmup(input);
+    expect(warmed.expected_turns).toEqual(["turn-1-warmup", "turn-1"]);
+    expect(warmed.turns[0].response).toMatchObject({
+      calls: [{ id: "call-1-warmup", name: "aft_callgraph" }],
+    });
+    expect(warmed.turns[1].delay_ms).toBe(2_000);
   });
 
   test("T7 is materialized from the same T1 scenario data", () => {

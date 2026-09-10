@@ -56,13 +56,13 @@
           {
             "kind": "field",
             "field": "fixture_marker",
-            "pattern": "^(?=[\\s\\S]*(?<value>editable\\.txt))[\\s\\S]+$",
+            "pattern": "^(?=[\\s\\S]*(?<value>Edited))[\\s\\S]+$",
             "min_lines": 1,
             "max_lines": 10000
           }
         ],
         "expected": {
-          "fixture_marker": "editable.txt"
+          "fixture_marker": "Edited"
         }
       }
     },

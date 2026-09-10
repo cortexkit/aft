@@ -225,6 +225,30 @@ function parseRegistration(value: unknown, path: string): ScenarioRegistration {
   return registration;
 }
 
+export function addCallgraphWarmup(scenario: ScenarioDefinition): ScenarioDefinition {
+  if (scenario.tool !== "callgraph") return scenario;
+  const index = scenario.turns.findIndex(
+    (turn) =>
+      turn.response.kind === "tool_calls" &&
+      turn.response.calls.some((call) => call.name === "aft_callgraph"),
+  );
+  if (index === -1) return scenario;
+  const target = structuredClone(scenario.turns[index]);
+  if (target.response.kind !== "tool_calls") return scenario;
+  const warmupLabel = `${target.label}-warmup`;
+  target.label = warmupLabel;
+  for (const call of target.response.calls) call.id = `${call.id}-warmup`;
+  const turns = scenario.turns.map((turn) => structuredClone(turn));
+  turns[index] = { ...turns[index], delay_ms: Math.max(turns[index].delay_ms ?? 0, 2_000) };
+  turns.splice(index, 0, target);
+  const expectedTurns = [
+    ...(scenario.expected_turns ?? scenario.turns.map((turn) => turn.label)),
+  ];
+  const expectedIndex = expectedTurns.indexOf(scenario.turns[index].label);
+  expectedTurns.splice(expectedIndex === -1 ? index : expectedIndex, 0, warmupLabel);
+  return { ...scenario, turns, expected_turns: expectedTurns };
+}
+
 export async function loadScenarios(root: string): Promise<ScenarioDefinition[]> {
   const files = await discoverScenarioRegistrationFiles(root);
   const loaded = await Promise.all(
@@ -244,7 +268,7 @@ export async function loadScenarios(root: string): Promise<ScenarioDefinition[]>
         });
       }
       ids.set(scenario.id, path);
-      scenarios.push({ ...scenario, registration_path: path });
+      scenarios.push(addCallgraphWarmup({ ...scenario, registration_path: path }));
     }
   }
   return scenarios.sort((left, right) => left.id.localeCompare(right.id));

@@ -152,6 +152,14 @@ export async function createScenarioIsolation(options: {
       {
         $schema: "https://opencode.ai/config.json",
         plugin: [pluginDirectoryUrl],
+        provider: {
+          mock: {
+            api: "openai",
+            name: "aimock",
+            options: { baseURL: `${options.mockBaseUrl}/v1` },
+            models: { "mock-model": { name: "Mock Model" } },
+          },
+        },
         providers: providerConfig,
       },
       null,

@@ -24,7 +24,7 @@
                 "arguments": {
                   "op": "callers",
                   "path": "sample.ts",
-                  "symbol": "uniqueScenarioSymbol"
+                  "symbol": "root"
                 },
                 "non_mutating_evidence": {
                   "reason": "callgraph only observes fixture state"
