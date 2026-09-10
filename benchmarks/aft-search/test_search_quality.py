@@ -31,6 +31,22 @@ class EngineUnwiredGateTests(unittest.TestCase):
     def test_engine_unwired_accepts_byte_equal_ranking_results(self) -> None:
         self.assertEqual(self.gate(self.score).exit_code, 0)
 
+    def test_plugin_paths_outside_the_search_tools_are_non_ranking(self) -> None:
+        from search_quality_lib import derive_slice_class
+
+        self.assertEqual(
+            derive_slice_class(
+                ["packages/opencode-plugin/src/tools/bash_watch.ts", "packages/pi-plugin/src/tools/bash.ts"]
+            ),
+            "non_ranking",
+        )
+        self.assertEqual(
+            derive_slice_class(["packages/opencode-plugin/src/tools/semantic.ts"]), "ranking"
+        )
+        self.assertEqual(
+            derive_slice_class(["packages/pi-plugin/src/__tests__/semantic.test.ts"]), "ranking"
+        )
+
     def test_engine_unwired_rejects_a_non_ranking_diff_class(self) -> None:
         result = self.gate(self.score, ["scripts/telemetry/cost-gate.sh"])
         self.assertEqual(result.exit_code, 2)

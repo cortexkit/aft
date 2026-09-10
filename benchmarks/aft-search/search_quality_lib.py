@@ -55,8 +55,14 @@ RANKING_FENCE_PREFIXES = (
     "crates/aft/src/semantic_index.rs",
     "crates/aft/src/embed/",
     "crates/aft/src/lib.rs",
-    "packages/pi-plugin/",
-    "packages/opencode-plugin/",
+    # Only the plugin files that shape an aft_search request or its rendering
+    # are ranking surface; the rest of each plugin (bash, read, edit, wakes)
+    # cannot move a search score and must not demand a ranking descriptor.
+    "packages/pi-plugin/src/tools/semantic.ts",
+    "packages/pi-plugin/src/__tests__/semantic",
+    "packages/opencode-plugin/src/tools/semantic.ts",
+    "packages/opencode-plugin/src/__tests__/semantic",
+    "crates/aft/src/subc_tool_schemas.json",
     "benchmarks/aft-search/engine-fixtures/",
 )
 # The parity cases and fixture-project data currently live inline in
