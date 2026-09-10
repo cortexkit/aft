@@ -699,7 +699,6 @@ async function runOneScenario(options: {
     threeState?.assertComplete();
     const expectedTurns = scenario.expected_turns ?? scenario.turns.map((turn) => turn.label);
     assertTurnLog(expectedTurns, await readTurnLog(turnLogPath));
-    await forensics.writeExchanges(mock.exchanges);
 
     pluginLog = await readFile(isolation.plugin_log, "utf8");
     await forensics.writeText("plugin.log", pluginLog);
@@ -724,6 +723,30 @@ async function runOneScenario(options: {
   } finally {
     if (transportDeadStub) await rm(transportDeadStub.marker, { force: true });
     await Promise.allSettled(controlPromises);
+    if (mock) {
+      try {
+        await forensics.writeExchanges(mock.exchanges);
+        await forensics.writeJson("mock-requests.json", mock.requests);
+      } catch (error) {
+        recordFailure(error);
+      }
+    }
+    if (isolation) {
+      try {
+        pluginLog = await readFile(isolation.plugin_log, "utf8");
+        await forensics.writeText("plugin.log", pluginLog);
+      } catch (error) {
+        recordFailure(error);
+      }
+    }
+    if (server) {
+      try {
+        await forensics.writeText("shared-server-stdout.log", server.stdout());
+        await forensics.writeText("shared-server-stderr.log", server.stderr());
+      } catch (error) {
+        recordFailure(error);
+      }
+    }
     try {
       await mock?.stop();
     } catch (error) {

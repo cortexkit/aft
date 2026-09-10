@@ -167,7 +167,10 @@ export function startScenarioClient(options: {
   let args: string[];
   let env: NodeJS.ProcessEnv;
   if (options.scenario.execution === "standalone") {
-    args = options.hostGeneration === "v1" ? [...baseArgs] : [...baseArgs, "--standalone"];
+    args =
+      options.hostGeneration === "v1"
+        ? [...baseArgs]
+        : [...baseArgs, "--standalone", "--print-logs"];
     env = { ...options.env };
   } else {
     if (!options.contract || !options.server)

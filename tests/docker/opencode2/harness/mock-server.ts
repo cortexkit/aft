@@ -19,6 +19,7 @@ interface LLMockLike {
     options?: unknown,
   ): void;
   onMessage(pattern: string, response: unknown): void;
+  getRequests(): unknown[];
   start(): Promise<void>;
   stop(): Promise<void>;
 }
@@ -122,6 +123,10 @@ export class DeterministicScenarioMock {
   get url(): string {
     if (!this.#mock) throw new Error("deterministic mock has not started");
     return this.#mock.url;
+  }
+
+  get requests(): unknown[] {
+    return this.#mock?.getRequests() ?? [];
   }
 
   async start(port = 0): Promise<void> {

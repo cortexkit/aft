@@ -146,6 +146,7 @@ describe("scenario isolation and liveness", () => {
     });
     expect((await client.wait()).exit_code).toBe(0);
     const args = (await readFile(argumentsPath, "utf8")).trim().split("\n");
+    expect(args).toContain("--print-logs");
     expect(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2)).toEqual([
       "--model",
       "openai/mock-model",
