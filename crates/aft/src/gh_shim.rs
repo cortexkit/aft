@@ -37,7 +37,12 @@ pub const SCHEMA_FLOOR: u64 = 1;
 pub const ENVELOPE_VERSION: u64 = 2;
 pub const REFUSAL_EXIT_STATUS: i32 = 86;
 const UPSTREAM_FAILURE_EXIT_STATUS: i32 = 1;
-const DISCOVERY_BUDGET: Duration = Duration::from_millis(150);
+const DISCOVERY_BUDGET: Duration = Duration::from_secs(2);
+/// Backoff before the single retry of the whole discovery probe. A loaded host
+/// can blow the per-stage budget before the daemon answers; the daemon is
+/// usually reachable on the second attempt, so refuse only after both attempts
+/// time out.
+const DISCOVERY_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(15);
 const RECENTLY_REACHABLE_WINDOW: Duration = Duration::from_secs(300);
 /// Clock skew tolerated before a manifest's signed issue time counts as being
@@ -81,6 +86,16 @@ const READ_ONLY_ACTION_TUPLES: &[&str] = &[
 const RESERVED_SELF_REPORT: &[&str] = &["--status", "--shim-version"];
 const CO_AUTHOR_LINE_REPORT: &str = "--co-author-line";
 const GOVERNANCE_UNAVAILABLE_TEXT: &str = "the governance daemon is unreachable and this repository's actions are identity-governed; retry after the daemon returns";
+/// Human-readable text for a local discovery-probe deadline expiry. A deadline
+/// that expires on a loaded host does not mean the daemon is unreachable, so
+/// this arm must not say "unreachable". The classification stays
+/// `gh_shim_governance_unavailable` (exit 86) so consumers that distinguish
+/// governance unavailability from other refusals keep working unchanged.
+fn governance_probe_timeout_text(elapsed_ms: u64, stage: ProbeStage) -> String {
+    format!(
+        "governance probe timed out after {elapsed_ms} ms at {stage} (daemon may be busy; host load?) - this repository's actions are identity-governed, so the command was not run; retry"
+    )
+}
 const UNTRUSTED_MANIFEST_KEY_STEERING: &str = "the manifest may be newer than this aft build's trust set - update aft, or install a manifest signed by a trusted key";
 const PRE_PROVENANCE_RECORD: &str = "unrecorded (pre-provenance record)";
 const GH_SHIM_STATE_DIR_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
@@ -452,9 +467,7 @@ fn governed_outcome_status(
             let text = if stage == ProbeStage::Connect {
                 GOVERNANCE_UNAVAILABLE_TEXT.to_string()
             } else {
-                format!(
-                    "governance probe exceeded {elapsed_ms} ms at {stage} (daemon reachable; slow or busy)"
-                )
+                governance_probe_timeout_text(elapsed_ms, stage)
             };
             refuse_governance_unavailable(paths, agent_binding, now, &text)
         }
@@ -875,7 +888,8 @@ fn non_r3_governance_disposition(
 
 fn determine_rung(paths: &StatePaths, cwd: &Path, now: u64) -> RungDetermination {
     // The budget starts before the config read and connection-file stat. This
-    // keeps a slow filesystem from silently extending discovery beyond 150ms.
+    // keeps a slow filesystem from silently extending discovery beyond the
+    // per-stage budget.
     let deadline = std::time::Instant::now() + DISCOVERY_BUDGET;
     let config_doc = read_user_config_doc();
     determine_rung_from_doc(paths, cwd, now, deadline, config_doc.as_deref())
@@ -930,8 +944,9 @@ fn determine_rung_from_doc(
             .map(RungDetermination::cached)
             .unwrap_or_else(|| RungDetermination::r1(now, R1Reason::DiscoveryBudgetExhausted));
         if determination.record.rung == Rung::R1 {
-            determination.refusal_detail = Some(format!(
-                "governance probe exceeded {budget_ms} ms at {stage} (daemon reachable; slow or busy)"
+            determination.refusal_detail = Some(governance_probe_timeout_text(
+                budget_ms as u64,
+                stage,
             ));
         }
         return determination;
@@ -969,7 +984,7 @@ fn determine_rung_from_doc(
         return determination;
     };
 
-    let discovery = probe_governance(
+    let discovery = probe_governance_with_retry(
         paths,
         &connection_file,
         cwd,
@@ -1020,9 +1035,7 @@ fn determine_rung_from_doc(
                 RungDetermination::r2(now, R2Reason::DaemonUnreachable, None, &provenance)
             } else {
                 let budget_ms = DISCOVERY_BUDGET.as_millis();
-                let refusal_text = format!(
-                    "governance probe exceeded {budget_ms} ms at {stage} (daemon reachable; slow or busy)"
-                );
+                let refusal_text = governance_probe_timeout_text(budget_ms as u64, stage);
                 let mut determination = cached
                     .filter(|record| record.fresh_at(now))
                     .map(RungDetermination::cached)
@@ -1117,6 +1130,31 @@ enum ProbeResult {
     NoRoute,
     Unbound,
     TimedOut { stage: ProbeStage },
+}
+
+/// Run the discovery probe once, and on a deadline expiry retry the whole
+/// probe once after a short backoff before refusing. A loaded host can blow
+/// the per-stage budget before the daemon answers; the daemon is usually
+/// reachable on the second attempt. A real connection refusal (not a deadline
+/// expiry) is returned immediately without a retry, because retrying cannot
+/// turn a refused connection into a reachable daemon.
+fn probe_governance_with_retry(
+    paths: &StatePaths,
+    connection_file: &Path,
+    cwd: &Path,
+    deadline: std::time::Instant,
+    agent_id: &str,
+) -> ProbeResult {
+    let first = probe_governance(paths, connection_file, cwd, deadline, agent_id);
+    if !matches!(first, ProbeResult::TimedOut { .. }) {
+        return first;
+    }
+    std::thread::sleep(DISCOVERY_RETRY_BACKOFF);
+    // The retry gets a fresh per-stage budget: the original deadline has
+    // already elapsed after the first attempt plus the backoff, so reusing it
+    // would make the retry time out at the connect stage before it dials.
+    let retry_deadline = std::time::Instant::now() + DISCOVERY_BUDGET;
+    probe_governance(paths, connection_file, cwd, retry_deadline, agent_id)
 }
 
 fn probe_governance(
@@ -3213,6 +3251,11 @@ fn route_governed(
         tokio::time::timeout(call_timeout, async move {
             let options = ConsumerOptions {
                 call_timeout,
+                // The discovery probe already timed out at the connect stage
+                // under the same host load; the governed call must tolerate the
+                // same handshake delay, so its handshake timeout matches the
+                // 5 s call timeout rather than the 2 s default.
+                handshake_timeout: call_timeout,
                 ..ConsumerOptions::default()
             };
             let consumer = SubcConsumer::connect(&connection_file, options)
@@ -7552,6 +7595,11 @@ mod tests {
         handshake_delay: Duration,
         catalog_delay: Duration,
         open_route_delay: Duration,
+        /// When true, the configured stage delays apply only to the first
+        /// accepted connection, so a retried probe (attempt 2) sees a fast
+        /// daemon. Used to prove the discovery retry succeeds when the first
+        /// attempt times out under load.
+        first_connection_only: bool,
     }
 
     struct SlowTestDaemon {
@@ -7584,6 +7632,7 @@ mod tests {
                 rt.block_on(async move {
                     let listener =
                         tokio::net::TcpListener::from_std(std_listener).expect("tokio listener");
+                    let mut connection_count = 0usize;
                     loop {
                         tokio::select! {
                             _ = &mut shutdown_rx => break,
@@ -7591,9 +7640,23 @@ mod tests {
                                 let Ok((mut stream, _)) = accepted else { break; };
                                 let k = key_clone.clone();
                                 let d = daemon_id_clone;
-                                let hs_delay = config.handshake_delay;
-                                let cat_delay = config.catalog_delay;
-                                let open_delay = config.open_route_delay;
+                                let first_connection = connection_count == 0;
+                                connection_count += 1;
+                                let hs_delay = if config.first_connection_only && !first_connection {
+                                    Duration::ZERO
+                                } else {
+                                    config.handshake_delay
+                                };
+                                let cat_delay = if config.first_connection_only && !first_connection {
+                                    Duration::ZERO
+                                } else {
+                                    config.catalog_delay
+                                };
+                                let open_delay = if config.first_connection_only && !first_connection {
+                                    Duration::ZERO
+                                } else {
+                                    config.open_route_delay
+                                };
                                 tokio::spawn(async move {
                                     if hs_delay > Duration::ZERO {
                                         tokio::time::sleep(hs_delay).await;
@@ -7807,9 +7870,11 @@ mod tests {
 
     /// Stage-naming tests: a deadline wide enough that a listening loopback daemon's
     /// connect and handshake finish under it even on a loaded Windows runner (train 51:
-    /// 150 ms was blown at the connect stage, so the injected catalog_list delay was
-    /// never reached and the assertion read the connect-stage outcome), with the
-    /// injected stage delay far beyond it so the named stage is the one that times out.
+    /// the old 150 ms budget was blown at the connect stage, so the injected
+    /// catalog_list delay was never reached and the assertion read the connect-stage
+    /// outcome), with the injected stage delay far beyond it so the named stage is the
+    /// one that times out. The discovery budget is now 2 s per stage, so the injected
+    /// delay must exceed 2 s to force a timeout.
     const STAGE_TEST_DEADLINE: Duration = Duration::from_secs(2);
 
     #[test]
@@ -7818,6 +7883,7 @@ mod tests {
             handshake_delay: Duration::ZERO,
             catalog_delay: Duration::from_secs(6),
             open_route_delay: Duration::ZERO,
+            first_connection_only: false,
         });
         let temp = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(temp.path().join("state"));
@@ -7845,20 +7911,20 @@ mod tests {
         assert_eq!(
             determination.refusal_detail.as_deref(),
             Some(
-                "governance probe exceeded 150 ms at catalog_list (daemon reachable; slow or busy)"
+                "governance probe timed out after 2000 ms at catalog_list (daemon may be busy; host load?) - this repository's actions are identity-governed, so the command was not run; retry"
             )
         );
 
         let last_probe = read_last_probe(&paths).expect("last probe record");
         assert_eq!(last_probe.stage, "catalog_list");
         assert_eq!(last_probe.outcome, "timed_out");
-        assert!(last_probe.elapsed_ms >= 150);
+        assert!(last_probe.elapsed_ms >= 2000);
 
         let report = render_self_report(&paths).expect("self report");
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "catalog_list");
         assert_eq!(status["last_probe"]["outcome"], "timed_out");
-        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
+        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 2000);
     }
 
     #[test]
@@ -7867,6 +7933,7 @@ mod tests {
             handshake_delay: Duration::ZERO,
             catalog_delay: Duration::ZERO,
             open_route_delay: Duration::from_secs(6),
+            first_connection_only: false,
         });
         let temp = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(temp.path().join("state"));
@@ -7893,19 +7960,60 @@ mod tests {
         assert_eq!(determination.record.rung, Rung::R1);
         assert_eq!(
             determination.refusal_detail.as_deref(),
-            Some("governance probe exceeded 150 ms at open_route (daemon reachable; slow or busy)")
+            Some("governance probe timed out after 2000 ms at open_route (daemon may be busy; host load?) - this repository's actions are identity-governed, so the command was not run; retry")
         );
 
         let last_probe = read_last_probe(&paths).expect("last probe record");
         assert_eq!(last_probe.stage, "open_route");
         assert_eq!(last_probe.outcome, "timed_out");
-        assert!(last_probe.elapsed_ms >= 150);
+        assert!(last_probe.elapsed_ms >= 2000);
 
         let report = render_self_report(&paths).expect("self report");
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "open_route");
         assert_eq!(status["last_probe"]["outcome"], "timed_out");
-        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
+        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 2000);
+    }
+
+    #[test]
+    fn discovery_retry_succeeds_when_only_the_first_attempt_times_out() {
+        // The daemon delays only the first accepted connection, so the first
+        // probe attempt times out at the catalog_list stage and the single
+        // retry (after the 250 ms backoff) sees a fast daemon and reaches R3.
+        let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+            handshake_delay: Duration::ZERO,
+            catalog_delay: Duration::from_secs(6),
+            open_route_delay: Duration::ZERO,
+            first_connection_only: true,
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let paths = StatePaths::from_root(temp.path().join("state"));
+        let conn_file = temp.path().join("subc-connection.json");
+        daemon.write_connection_file(&conn_file);
+        let project = write_test_project_repo(temp.path(), "cortexkit/aft");
+
+        let manifest = v12_fixture_manifest();
+        let now = unix_seconds();
+        write_signed_manifest(&paths, manifest, now);
+
+        let doc = json!({
+            "subc": { "connection_file": conn_file.to_str().unwrap() }
+        })
+        .to_string();
+
+        let determination = determine_rung_from_doc(
+            &paths,
+            &project,
+            now,
+            Instant::now() + STAGE_TEST_DEADLINE,
+            Some(&doc),
+        );
+        assert_eq!(determination.record.rung, Rung::R3);
+        assert!(determination.refusal_detail.is_none());
+
+        // The retry succeeded, so the last probe records the successful attempt.
+        let last_probe = read_last_probe(&paths).expect("last probe record");
+        assert_eq!(last_probe.outcome, "ready");
     }
 
     #[test]
@@ -7977,9 +8085,10 @@ mod tests {
     #[test]
     fn probe_connect_stage_budget_exceeded_determines_r2_and_records_last_probe() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
-            handshake_delay: Duration::from_millis(400),
+            handshake_delay: Duration::from_secs(6),
             catalog_delay: Duration::ZERO,
             open_route_delay: Duration::ZERO,
+            first_connection_only: false,
         });
         let temp = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(temp.path().join("state"));
@@ -8009,21 +8118,22 @@ mod tests {
         let last_probe = read_last_probe(&paths).expect("last probe record");
         assert_eq!(last_probe.stage, "connect");
         assert_eq!(last_probe.outcome, "timed_out");
-        assert!(last_probe.elapsed_ms >= 150);
+        assert!(last_probe.elapsed_ms >= 2000);
 
         let report = render_self_report(&paths).expect("self report");
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "connect");
         assert_eq!(status["last_probe"]["outcome"], "timed_out");
-        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
+        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 2000);
     }
 
     #[test]
     fn slow_daemon_connect_delay_fallback_active_determines_r3_and_records_last_probe() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
-            handshake_delay: Duration::from_millis(400),
+            handshake_delay: Duration::from_secs(6),
             catalog_delay: Duration::ZERO,
             open_route_delay: Duration::ZERO,
+            first_connection_only: false,
         });
         let temp = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(temp.path().join("state"));
@@ -8057,21 +8167,22 @@ mod tests {
         let last_probe = read_last_probe(&paths).expect("last probe record");
         assert_eq!(last_probe.stage, "connect");
         assert_eq!(last_probe.outcome, "timed_out");
-        assert!(last_probe.elapsed_ms >= 150);
+        assert!(last_probe.elapsed_ms >= 2000);
 
         let report = render_self_report(&paths).expect("self report");
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "connect");
         assert_eq!(status["last_probe"]["outcome"], "timed_out");
-        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
+        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 2000);
     }
 
     #[test]
     fn slow_daemon_catalog_list_delay_fallback_active_determines_r3_and_records_last_probe() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
             handshake_delay: Duration::ZERO,
-            catalog_delay: Duration::from_millis(400),
+            catalog_delay: Duration::from_secs(6),
             open_route_delay: Duration::ZERO,
+            first_connection_only: false,
         });
         let temp = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(temp.path().join("state"));
@@ -8105,21 +8216,22 @@ mod tests {
         let last_probe = read_last_probe(&paths).expect("last probe record");
         assert_eq!(last_probe.stage, "catalog_list");
         assert_eq!(last_probe.outcome, "timed_out");
-        assert!(last_probe.elapsed_ms >= 150);
+        assert!(last_probe.elapsed_ms >= 2000);
 
         let report = render_self_report(&paths).expect("self report");
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "catalog_list");
         assert_eq!(status["last_probe"]["outcome"], "timed_out");
-        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
+        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 2000);
     }
 
     #[test]
     fn slow_daemon_catalog_list_delay_expired_fallback_refuses_naming_stage() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
             handshake_delay: Duration::ZERO,
-            catalog_delay: Duration::from_millis(400),
+            catalog_delay: Duration::from_secs(6),
             open_route_delay: Duration::ZERO,
+            first_connection_only: false,
         });
         let temp = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(temp.path().join("state"));
@@ -8152,7 +8264,7 @@ mod tests {
         assert_eq!(
             determination.refusal_detail.as_deref(),
             Some(
-                "governance probe exceeded 150 ms at catalog_list (daemon reachable; slow or busy)"
+                "governance probe timed out after 2000 ms at catalog_list (daemon may be busy; host load?) - this repository's actions are identity-governed, so the command was not run; retry"
             )
         );
 
@@ -8160,7 +8272,7 @@ mod tests {
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "catalog_list");
         assert_eq!(status["last_probe"]["outcome"], "timed_out");
-        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
+        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 2000);
     }
 
     #[test]
@@ -8168,7 +8280,8 @@ mod tests {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
             handshake_delay: Duration::ZERO,
             catalog_delay: Duration::ZERO,
-            open_route_delay: Duration::from_millis(400),
+            open_route_delay: Duration::from_secs(6),
+            first_connection_only: false,
         });
         let temp = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(temp.path().join("state"));
@@ -8202,13 +8315,13 @@ mod tests {
         let last_probe = read_last_probe(&paths).expect("last probe record");
         assert_eq!(last_probe.stage, "open_route");
         assert_eq!(last_probe.outcome, "timed_out");
-        assert!(last_probe.elapsed_ms >= 150);
+        assert!(last_probe.elapsed_ms >= 2000);
 
         let report = render_self_report(&paths).expect("self report");
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "open_route");
         assert_eq!(status["last_probe"]["outcome"], "timed_out");
-        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
+        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 2000);
     }
 
     #[test]
@@ -8216,7 +8329,8 @@ mod tests {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
             handshake_delay: Duration::ZERO,
             catalog_delay: Duration::ZERO,
-            open_route_delay: Duration::from_millis(400),
+            open_route_delay: Duration::from_secs(6),
+            first_connection_only: false,
         });
         let temp = tempfile::tempdir().unwrap();
         let paths = StatePaths::from_root(temp.path().join("state"));
@@ -8248,14 +8362,14 @@ mod tests {
         assert_eq!(determination.record.rung, Rung::R1);
         assert_eq!(
             determination.refusal_detail.as_deref(),
-            Some("governance probe exceeded 150 ms at open_route (daemon reachable; slow or busy)")
+            Some("governance probe timed out after 2000 ms at open_route (daemon may be busy; host load?) - this repository's actions are identity-governed, so the command was not run; retry")
         );
 
         let report = render_self_report(&paths).expect("self report");
         let status: Value = serde_json::from_str(&report).expect("status json");
         assert_eq!(status["last_probe"]["stage"], "open_route");
         assert_eq!(status["last_probe"]["outcome"], "timed_out");
-        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 150);
+        assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 2000);
     }
 }
 
