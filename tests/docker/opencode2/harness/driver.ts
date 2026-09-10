@@ -3,7 +3,11 @@ import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { loadHostCliContract, loadHostProviderConfigContract } from "./contracts.js";
+import {
+  loadHostCliContract,
+  loadHostPermissionOptionContract,
+  loadHostProviderConfigContract,
+} from "./contracts.js";
 import { assertHarnessControlCoverage, runHarnessControlSuite } from "./control-suite.js";
 import { DiskStateObserver, ThreeStateRecorder } from "./disk-state.js";
 import { fail, HarnessError } from "./errors.js";
@@ -1021,6 +1025,10 @@ async function main(): Promise<void> {
     pinnedHostVersion,
   );
   const providerContract = await loadHostProviderConfigContract(
+    join(repoRoot, "tests", "docker", "opencode2", "contract"),
+    pinnedHostVersion,
+  );
+  await loadHostPermissionOptionContract(
     join(repoRoot, "tests", "docker", "opencode2", "contract"),
     pinnedHostVersion,
   );

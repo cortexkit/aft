@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url';
 import {
   type HostCliContract,
   loadHostCliContract,
+  loadHostPermissionOptionContract,
   loadHostProviderConfigContract,
   loadHostSchemaRejectionContract,
 } from "./contracts.js";
@@ -810,6 +811,27 @@ test("provider contract supplies the observed run model to the harness", async (
 
   const contract = await loadHostProviderConfigContract(contractRoot, "0.0.0-beta-test");
   expect(contract.model).toBe("openai/mock-model");
+});
+
+test("permission-option contract proves host denial before tool execution", async () => {
+  const contractRoot = await root();
+  await writeFile(
+    join(contractRoot, "host-permission-option.json"),
+    JSON.stringify({
+      schema_version: 1,
+      host_version: "0.0.0-beta-test",
+      observed_run_id: "deny-run",
+      permission: "edit",
+      denied_by_host: true,
+      tool_body_executed: false,
+      disk_sha256_before: "unchanged-sha",
+      disk_sha256_after: "unchanged-sha",
+    }),
+  );
+
+  const contract = await loadHostPermissionOptionContract(contractRoot, "0.0.0-beta-test");
+  expect(contract.denied_by_host).toBe(true);
+  expect(contract.disk_sha256_after).toBe(contract.disk_sha256_before);
 });
 
 test("legacy host CLI capture names every field required by the runner", async () => {
