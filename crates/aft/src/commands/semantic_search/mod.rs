@@ -349,9 +349,7 @@ fn cancelled_search_response_from_id(request_id: &str) -> Response {
 }
 
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
-    use extensions::{
-        DefaultSearchExtensions, QueryFacts, Readiness, Root, SearchExtensions, Token,
-    };
+    use extensions::{QueryFacts, Readiness, Root, Token};
 
     let page_request = match paging::parse_public_page_request(&req.params) {
         Ok(request) => request,
@@ -363,7 +361,9 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             .and_then(|value| value.as_str())
             .unwrap_or_default(),
     );
-    let extensions = DefaultSearchExtensions;
+    // The extensions come from the search_b2 install point: A-side defaults
+    // until campaign B2 installs its router, plans, variants and readiness.
+    let extensions = crate::search_b2::install_defaults();
     let shape = extensions.classify(&facts);
     let variants = extensions.variants(Token {
         index: 0,
@@ -392,7 +392,7 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
 
     let (mut response, embedding_calls) =
         crate::semantic_index::with_search_embedding_call_counter(|| {
-            handle_semantic_search_inner(req, ctx, page_request, &extensions, &plan)
+            handle_semantic_search_inner(req, ctx, page_request, extensions, &plan)
         });
     if response.success {
         attach_search_execution_metadata(&mut response, &plan, embedding_calls);

@@ -126,6 +126,7 @@ pub mod runtime_registry;
 pub mod sandbox_profile;
 pub mod sandbox_spawn;
 pub mod scoped_key;
+pub mod search_b2;
 pub mod search_index;
 pub mod semantic_index;
 pub mod standing_roots;
