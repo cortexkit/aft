@@ -180,6 +180,7 @@ describe("OpenCode V2 tool surface", () => {
       "filePath",
     );
     expect(projected.get("read")?.options?.permission).toBe("read");
+    expect(projected.get("glob")?.options?.permission).toBe("glob");
     expect(projected.get("apply_patch")?.options?.permission).toBe("edit");
     expect(projected.get("bash")?.options?.permission).toBe("bash");
   });

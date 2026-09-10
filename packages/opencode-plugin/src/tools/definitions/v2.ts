@@ -125,11 +125,19 @@ function executionArguments(name: string, input: Record<string, unknown>): Recor
 
 function hostPermission(name: string): string | undefined {
   const bare = bareToolName(name);
-  if (bare === "read") return "read";
+  if (new Set(["read", "glob", "grep"]).has(bare)) return bare;
   if (V2_BASH_TOOLS.has(name)) return "bash";
   if (
-    new Set(["write", "edit", "apply_patch", "delete", "move", "ast_grep_replace", "import"])
-      .has(bare)
+    new Set([
+      "write",
+      "edit",
+      "apply_patch",
+      "delete",
+      "move",
+      "ast_grep_replace",
+      "import",
+      "safety",
+    ]).has(bare)
   ) {
     return "edit";
   }
@@ -181,7 +189,9 @@ function runtimeFor(
     },
     ask: (request) => {
       if (consumers.requestPermission) return consumers.requestPermission(request, context);
-      if (consumers.nativePermissionOptions && permission) return Promise.resolve();
+      if (consumers.nativePermissionOptions && request.permission === permission) {
+        return Promise.resolve();
+      }
       return Promise.reject(
         new Error("V2 permission requests require host-enforced tool permission options"),
       );
