@@ -33,6 +33,13 @@ pub fn handle_edit_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
+    if super::github_comments::is_github_resource_path(file) {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "edit: GitHub resources support only edits[] find/replace entries",
+        );
+    }
 
     let symbol_name = match req.params.get("symbol").and_then(|v| v.as_str()) {
         Some(s) => s,

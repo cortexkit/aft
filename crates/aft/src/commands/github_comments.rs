@@ -83,6 +83,250 @@ pub(crate) fn handle_comment_write(
     )
 }
 
+pub(crate) fn handle_comment_edit(
+    req: &RawRequest,
+    ctx: &AppContext,
+    resource_spelling: &str,
+    match_text: &str,
+    replacement: &str,
+) -> Response {
+    if let Err(response) = require_write_enabled(req, ctx) {
+        return response;
+    }
+    let resource = match parse_resource(resource_spelling) {
+        Ok(resource) => resource,
+        Err(error) => {
+            return Response::error(&req.id, "invalid_resource", format!("edit: {error}"));
+        }
+    };
+    let Some(selector) = resource.comment_selector.as_ref() else {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "edit: GitHub comment paths must use issue://N/comments/K or pr://N/comments/K",
+        );
+    };
+    let Some(ordinal) = selector.single_positive_ordinal() else {
+        return Response::error(
+            &req.id,
+            "invalid_request",
+            "edit: GitHub comments support exactly one positive comment ordinal",
+        );
+    };
+    let base = resource.without_comment_selector();
+    let working_directory = working_directory(ctx);
+    let completion =
+        match reread_resource(req, ctx, &base.base_spelling(), working_directory.clone()) {
+            Ok(completion) => completion,
+            Err(response) => return response,
+        };
+    let Some(document) = completion.document.as_ref() else {
+        return Response::error(
+            &req.id,
+            "github_write_failed",
+            "GitHub comment editing requires a successful live read",
+        );
+    };
+    let comment = match crate::github_read::discussion_target_at_ordinal(document, ordinal) {
+        Some(crate::github_read::GithubDiscussionTarget::Comment(comment)) => comment.clone(),
+        Some(crate::github_read::GithubDiscussionTarget::ReviewThreadComment) => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "Pull-request review-thread comments are out of scope; edit a conversation comment instead",
+            );
+        }
+        Some(crate::github_read::GithubDiscussionTarget::Other) => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "The selected discussion ordinal is not an editable conversation comment; review-thread comments are out of scope",
+            );
+        }
+        None => {
+            return Response::error(
+                &req.id,
+                "invalid_comment_selector",
+                format!("Comment ordinal {ordinal} is outside the live discussion"),
+            );
+        }
+    };
+    let comment_url = match comment.url.as_deref() {
+        Some(url) => url,
+        None => {
+            return Response::error(
+                &req.id,
+                "github_write_failed",
+                "The selected GitHub comment has no stable URL for an id-addressed edit",
+            );
+        }
+    };
+    let comment_id = match issue_comment_id(comment_url) {
+        Some(id) => id,
+        None => {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "Pull-request review-thread comments are out of scope; the selected URL is not an issue comment",
+            );
+        }
+    };
+    let (edited_body, replacements) = match apply_comment_match(
+        req,
+        resource_spelling,
+        &comment.body,
+        match_text,
+        replacement,
+    ) {
+        Ok(result) => result,
+        Err(response) => return response,
+    };
+    let patch_body = serde_json::json!({ "body": edited_body }).to_string();
+    let args = vec![
+        "api".to_string(),
+        "--method".to_string(),
+        "PATCH".to_string(),
+        format!("repos/{}/issues/comments/{comment_id}", document.repository),
+        "--input".to_string(),
+        "-".to_string(),
+    ];
+    let output = match run_governed_gh(ctx, &working_directory, &args, &patch_body) {
+        Ok(output) => output,
+        Err(error) => return Response::error(&req.id, "github_write_failed", error),
+    };
+    if !output.status.success() {
+        return gh_failure_response(req, output, "GitHub comment edit failed");
+    }
+
+    Response::success(
+        &req.id,
+        serde_json::json!({
+            "resource": resource_spelling,
+            "comment_url": comment_url,
+            "ordinal": ordinal,
+            "replacements": replacements,
+            "text": format!("{comment_url}\nComment ordinal: {ordinal}\n{SAFETY_NOTICE}"),
+        }),
+    )
+}
+
+fn apply_comment_match(
+    req: &RawRequest,
+    resource: &str,
+    source: &str,
+    match_text: &str,
+    replacement: &str,
+) -> Result<(String, usize), Response> {
+    let replace_all = req
+        .params
+        .get("replace_all")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let raw_occurrence = req.params.get("occurrence");
+    if replace_all && raw_occurrence.is_some() {
+        return Err(Response::error(
+            &req.id,
+            "invalid_request",
+            "edit_match: 'replaceAll' and 'occurrence' are mutually exclusive",
+        ));
+    }
+    let occurrence = match raw_occurrence {
+        None => None,
+        Some(value) => match value.as_u64() {
+            Some(0) | None => {
+                return Err(Response::error(
+                    &req.id,
+                    "invalid_request",
+                    "edit_match: 'occurrence' must be a positive integer (1-based)",
+                ));
+            }
+            Some(value) if value - 1 <= usize::MAX as u64 => Some((value - 1) as usize),
+            Some(_) => {
+                return Err(Response::error(
+                    &req.id,
+                    "invalid_request",
+                    "edit_match: 'occurrence' exceeds the supported range",
+                ));
+            }
+        },
+    };
+    let matches = crate::fuzzy_match::find_all_fuzzy(source, match_text);
+    if matches.is_empty() {
+        return Err(Response::error(
+            &req.id,
+            "match_not_found",
+            format!(
+                "edit_match: '{}' not found in {}{}",
+                match_text,
+                resource,
+                crate::fuzzy_match::render_nearest_miss_detail(source, match_text)
+            ),
+        ));
+    }
+    if !replace_all {
+        if let Some(index) = occurrence {
+            if index >= matches.len() {
+                return Err(Response::error(
+                    &req.id,
+                    "invalid_request",
+                    format!(
+                        "edit_match: occurrence {} out of range, comment has {} occurrence(s)",
+                        index + 1,
+                        matches.len()
+                    ),
+                ));
+            }
+        }
+    }
+    if matches.len() > 1 && occurrence.is_none() && !replace_all {
+        return Err(Response::error(
+            &req.id,
+            "ambiguous_match",
+            format!(
+                "Found {} matches in the comment. Use 'occurrence' (1-based) or 'replaceAll: true'.",
+                matches.len()
+            ),
+        ));
+    }
+
+    if replace_all {
+        for pair in matches.windows(2) {
+            if pair[0].byte_start + pair[0].byte_len > pair[1].byte_start {
+                return Err(Response::error(
+                    &req.id,
+                    "overlapping_edits",
+                    "edit: replace_all matches overlap; use a more specific match",
+                ));
+            }
+        }
+        let updated = super::edit_match::apply_sorted_non_overlapping_fuzzy_matches(
+            source,
+            &matches,
+            replacement,
+        )
+        .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))?;
+        Ok((updated, matches.len()))
+    } else {
+        let matched = &matches[occurrence.unwrap_or(0)];
+        let mut effective = String::with_capacity(replacement.len().saturating_add(1));
+        super::edit_match::push_fuzzy_replacement(&mut effective, source, matched, replacement);
+        let updated = crate::edit::replace_byte_range(
+            source,
+            matched.byte_start,
+            matched.byte_start + matched.byte_len,
+            &effective,
+        )
+        .map_err(|error| Response::error(&req.id, error.code(), error.to_string()))?;
+        Ok((updated, 1))
+    }
+}
+
+fn issue_comment_id(comment_url: &str) -> Option<u64> {
+    comment_url
+        .split_once("#issuecomment-")
+        .and_then(|(_, id)| id.parse().ok())
+}
+
 pub(crate) fn require_write_enabled(req: &RawRequest, ctx: &AppContext) -> Result<(), Response> {
     if ctx.request_force_restrict(&req.id) {
         return Err(Response::error(

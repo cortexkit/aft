@@ -35,10 +35,6 @@ use crate::protocol::{RawRequest, Response};
 /// `syntax_valid` is absent when syntax validation could not run.
 pub fn handle_edit_match(req: &RawRequest, ctx: &AppContext) -> Response {
     let op_id = crate::backup::new_op_id();
-    if req.params.get("op").and_then(|v| v.as_str()) == Some("append") {
-        return handle_append(req, ctx, &op_id);
-    }
-
     let file = match req.params.get("file").and_then(|v| v.as_str()) {
         Some(f) => f,
         None => {
@@ -49,6 +45,16 @@ pub fn handle_edit_match(req: &RawRequest, ctx: &AppContext) -> Response {
             );
         }
     };
+    if req.params.get("op").and_then(|v| v.as_str()) == Some("append") {
+        if super::github_comments::is_github_resource_path(file) {
+            return Response::error(
+                &req.id,
+                "invalid_request",
+                "edit: GitHub resources support only edits[] find/replace entries",
+            );
+        }
+        return handle_append(req, ctx, &op_id);
+    }
 
     let match_str = match req.params.get("match").and_then(|v| v.as_str()) {
         Some(m) => m,
@@ -83,6 +89,10 @@ pub fn handle_edit_match(req: &RawRequest, ctx: &AppContext) -> Response {
     // No custom escape interpretation. JSON transport already handles escape
     // sequences before the string reaches us. Adding unescape_str on top caused
     // double-interpretation that corrupted source code with literal escapes.
+
+    if super::github_comments::is_github_resource_path(file) {
+        return super::github_comments::handle_comment_edit(req, ctx, file, match_str, replacement);
+    }
 
     // Detect glob pattern. Prefer the literal interpretation when the path
     // already exists on disk, even if its name contains glob metacharacters
@@ -1012,7 +1022,7 @@ fn fuzzy_replacement_restores_newline(
         && !replacement.ends_with('\n')
 }
 
-fn push_fuzzy_replacement(
+pub(crate) fn push_fuzzy_replacement(
     output: &mut String,
     source: &str,
     matched: &crate::fuzzy_match::FuzzyMatch,
@@ -1024,7 +1034,7 @@ fn push_fuzzy_replacement(
     }
 }
 
-fn apply_sorted_non_overlapping_fuzzy_matches(
+pub(crate) fn apply_sorted_non_overlapping_fuzzy_matches(
     source: &str,
     matches: &[crate::fuzzy_match::FuzzyMatch],
     replacement: &str,

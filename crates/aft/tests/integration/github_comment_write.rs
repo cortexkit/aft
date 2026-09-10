@@ -28,7 +28,17 @@ if [ "$1 $2" = "issue comment" ]; then
   exit 0
 fi
 if [ "$1 $2" = "issue view" ]; then
-  printf '%s\n' '{"number":7,"title":"Fixture issue","state":"OPEN","body":"body","url":"https://github.com/owner/repo/issues/7","comments":[{"author":{"login":"aft-bot"},"body":"exact body","createdAt":"2026-09-10T12:00:00Z","updatedAt":"2026-09-10T12:00:00Z","url":"https://github.com/owner/repo/issues/7#issuecomment-901"}]}'
+  printf '%s\n' '{"number":7,"title":"Fixture issue","state":"OPEN","body":"body","url":"https://github.com/owner/repo/issues/7","comments":[{"author":{"login":"aft-bot"},"body":"exact body with stale target","createdAt":"2026-09-10T12:00:00Z","updatedAt":"2026-09-10T12:00:00Z","url":"https://github.com/owner/repo/issues/7#issuecomment-901"}]}'
+  exit 0
+fi
+if [ "$1 $2" = "api --method" ]; then
+  printf '%s\n' "$@" > "$AFT_GITHUB_EDIT_ARGV"
+  cat > "$AFT_GITHUB_EDIT_STDIN"
+  if [ "${AFT_GITHUB_WRITE_REFUSE:-}" = "1" ]; then
+    printf '%s\n' 'fixture shim says bot cannot edit this comment' >&2
+    exit 86
+  fi
+  printf '%s\n' '{}'
   exit 0
 fi
 if [ "$1" = "api" ]; then
@@ -59,6 +69,8 @@ struct Fixture {
     user_config: PathBuf,
     argv: PathBuf,
     stdin: PathBuf,
+    edit_argv: PathBuf,
+    edit_stdin: PathBuf,
     state: PathBuf,
     home: PathBuf,
     xdg_config: PathBuf,
@@ -90,6 +102,8 @@ impl Fixture {
         Self {
             argv: root.path().join("argv.log"),
             stdin: root.path().join("stdin.log"),
+            edit_argv: root.path().join("edit-argv.log"),
+            edit_stdin: root.path().join("edit-stdin.log"),
             state: root.path().join("shim-state"),
             home: root.path().join("home"),
             xdg_config: root.path().join("xdg-config"),
@@ -112,6 +126,8 @@ impl Fixture {
             ("AFT_GH_SHIM_STATE_DIR", self.state.as_os_str()),
             ("AFT_GITHUB_WRITE_ARGV", self.argv.as_os_str()),
             ("AFT_GITHUB_WRITE_STDIN", self.stdin.as_os_str()),
+            ("AFT_GITHUB_EDIT_ARGV", self.edit_argv.as_os_str()),
+            ("AFT_GITHUB_EDIT_STDIN", self.edit_stdin.as_os_str()),
         ];
         if refuse {
             envs.push(("AFT_GITHUB_WRITE_REFUSE", std::ffi::OsStr::new("1")));
@@ -222,4 +238,79 @@ fn write_gate_and_master_off_refuse_before_any_gh_traffic() {
         assert!(!fixture.stdin.exists(), "disabled write sent a body");
         assert!(aft.shutdown().success());
     }
+}
+
+#[test]
+fn edit_fetches_matches_and_patches_the_selected_comment_id() {
+    let fixture = Fixture::new(json!({ "write": true, "read": true }));
+    let mut aft = fixture.spawn(false);
+    let response = aft.send(
+        &json!({
+            "id": "github-edit",
+            "command": "edit_match",
+            "file": "issue://owner/repo/7/comments/1",
+            "match": "stale target",
+            "replacement": "fresh target",
+        })
+        .to_string(),
+    );
+
+    assert_eq!(response["success"], true, "edit failed: {response:#}");
+    assert_eq!(response["ordinal"], 1);
+    assert_eq!(response["replacements"], 1);
+    assert_eq!(
+        fs::read_to_string(&fixture.edit_argv).expect("read edit argv"),
+        "api\n--method\nPATCH\nrepos/owner/repo/issues/comments/901\n--input\n-\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.edit_stdin).expect("read edit stdin"),
+        r#"{"body":"exact body with fresh target"}"#
+    );
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn edit_stale_text_fails_at_match_time_without_posting() {
+    let fixture = Fixture::new(json!({ "write": true, "read": true }));
+    let mut aft = fixture.spawn(false);
+    let response = aft.send(
+        &json!({
+            "id": "github-edit-stale",
+            "command": "edit_match",
+            "file": "issue://7/comments/1",
+            "match": "already changed elsewhere",
+            "replacement": "must not clobber",
+        })
+        .to_string(),
+    );
+
+    assert_eq!(response["success"], false);
+    assert_eq!(response["code"], "match_not_found");
+    assert!(!fixture.edit_argv.exists(), "stale edit reached gh PATCH");
+    assert!(!fixture.edit_stdin.exists(), "stale edit sent a body");
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn edit_surfaces_bot_ownership_refusal_from_the_shim() {
+    let fixture = Fixture::new(json!({ "write": true, "read": true }));
+    let mut aft = fixture.spawn(true);
+    let response = aft.send(
+        &json!({
+            "id": "github-edit-refused",
+            "command": "edit_match",
+            "file": "issue://7/comments/1",
+            "match": "stale target",
+            "replacement": "fresh target",
+        })
+        .to_string(),
+    );
+
+    assert_eq!(response["success"], false);
+    assert_eq!(response["code"], "gh_shim_refused");
+    assert!(response["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("bot cannot edit this comment"));
+    assert!(aft.shutdown().success());
 }

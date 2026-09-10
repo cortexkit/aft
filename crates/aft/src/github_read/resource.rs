@@ -126,6 +126,14 @@ impl GithubCommentSelector {
     pub fn first_out_of_range(&self, valid_end: usize) -> Option<isize> {
         self.resolve(valid_end).err()
     }
+
+    /// Return the one positive ordinal required by comment-edit resource paths.
+    pub fn single_positive_ordinal(&self) -> Option<usize> {
+        match self.items.as_slice() {
+            [SelectorItem::Positive(range)] if range.start() == range.end() => Some(*range.start()),
+            _ => None,
+        }
+    }
 }
 
 /// A validated `issue://` or `pr://` resource.
