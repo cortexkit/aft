@@ -420,3 +420,15 @@ fn test_project_identity_isolation_continuity_key() {
         "no cross-root transition disclosure should fire in B"
     );
 }
+
+#[test]
+fn exact_symbol_verification_clamps_utf8_span_boundaries() {
+    let source = format!("fn unicode_body() {{\n{}\n}}\n", "═".repeat(300));
+    let result = aft::commands::semantic_search::exact_lane::verify_exact_matches_in_text(
+        std::path::Path::new("src/unicode.rs"),
+        &source,
+        "missing phrase",
+        &[],
+    );
+    assert!(result.is_none());
+}

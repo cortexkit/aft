@@ -454,8 +454,12 @@ pub fn scan_symbols_in_text(text: &str) -> Vec<(String, SymbolOffsetRange)> {
 
         if let Some(name) = name_opt {
             let start = line_offset;
-            // Rough symbol span: next 500 chars or end of file
-            let end = (start + 500).min(text.len());
+            // The lightweight span is byte-addressed because downstream ranges
+            // slice UTF-8 source. Clamp the approximate end to a character boundary.
+            let mut end = (start + 500).min(text.len());
+            while end > start && !text.is_char_boundary(end) {
+                end -= 1;
+            }
             symbols.push((name, SymbolOffsetRange::new(start, end)));
         }
 
