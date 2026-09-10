@@ -1132,7 +1132,9 @@ impl BgTaskRegistry {
                         continue;
                     }
                 }
-                notifications.push((row.session_id, row.task_id, row.watch_id));
+                if self.originating_session_has_live_route(&row.session_id) {
+                    notifications.push((row.session_id, row.task_id, row.watch_id));
+                }
             }
             notifications
         };
@@ -1144,7 +1146,7 @@ impl BgTaskRegistry {
                 .lock()
                 .map(|mut registry| registry.terminalize_erased_task(&task_id, &watch_id))
                 .unwrap_or(false);
-            if should_emit {
+            if should_emit && self.originating_session_has_live_route(&session_id) {
                 self.emit_bash_watch_erased(&session_id, &task_id, &watch_id);
             }
         }
@@ -1993,8 +1995,19 @@ impl BgTaskRegistry {
                 .map_err(|error| format!("failed to inspect persisted bash watches: {error}"))?;
             let mut retired = Vec::new();
             for row in rows {
-                if !row.pending_match
-                    || row.match_text.as_deref() != Some(WATCH_TARGET_ERASED_TEXT)
+                let task_exists = match crate::db::bash_tasks::get_bash_task(
+                    &conn,
+                    &harness,
+                    &row.session_id,
+                    &row.task_id,
+                ) {
+                    Ok(task) => task.is_some(),
+                    Err(_) => true,
+                };
+                let is_erased_target = !task_exists
+                    || (row.pending_match
+                        && row.match_text.as_deref() == Some(WATCH_TARGET_ERASED_TEXT));
+                if !is_erased_target
                     || !self.should_retire_foreign_delivery(&row.session_id, binding_session_id)
                 {
                     continue;
@@ -2145,8 +2158,16 @@ impl BgTaskRegistry {
         session_id: &str,
         project_root: Option<&Path>,
     ) -> Result<(), String> {
+        let is_subc_multi_route = self
+            .inner
+            .live_delivery_sessions
+            .lock()
+            .map(|sessions| sessions.len() > 1)
+            .unwrap_or(false);
+        if !is_subc_multi_route {
+            self.replace_live_delivery_sessions(std::iter::once(session_id.to_string()).collect());
+        }
         self.retire_orphaned_watch_tombstones(session_id)?;
-        self.start_watchdog();
         if !self.inner.persisted_gc_started.swap(true, Ordering::SeqCst) {
             // The persisted GC walks every session under the shared storage root
             // (liveness probes, row deletes, quarantines) and scales with the
@@ -4656,6 +4677,9 @@ impl BgTaskRegistry {
     }
 
     fn emit_bash_pattern_match(&self, session_id: &str, pattern_match: PatternMatch) {
+        if !self.originating_session_has_live_route(session_id) {
+            return;
+        }
         let Ok(progress_sender) = self
             .inner
             .progress_sender
@@ -4688,6 +4712,9 @@ impl BgTaskRegistry {
     }
 
     fn emit_bash_watch_erased(&self, session_id: &str, task_id: &str, watch_id: &str) {
+        if !self.originating_session_has_live_route(session_id) {
+            return;
+        }
         let Ok(progress_sender) = self
             .inner
             .progress_sender
@@ -4772,6 +4799,9 @@ impl BgTaskRegistry {
     }
 
     fn emit_bash_watch_exit(&self, frame: BashPatternMatchFrame) {
+        if !self.originating_session_has_live_route(&frame.session_id) {
+            return;
+        }
         let Ok(progress_sender) = self
             .inner
             .progress_sender
@@ -4787,6 +4817,9 @@ impl BgTaskRegistry {
     }
 
     fn emit_bash_completed(&self, completion: BgCompletion) {
+        if !self.originating_session_has_live_route(&completion.session_id) {
+            return;
+        }
         let Ok(progress_sender) = self
             .inner
             .progress_sender
@@ -4899,6 +4932,9 @@ impl BgTaskRegistry {
     }
 
     fn emit_bash_long_running(&self, frame: BashLongRunningFrame) {
+        if !self.originating_session_has_live_route(&frame.session_id) {
+            return;
+        }
         let Ok(progress_sender) = self
             .inner
             .progress_sender

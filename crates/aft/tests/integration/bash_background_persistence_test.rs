@@ -1770,6 +1770,95 @@ fn foreign_session_replay_retires_erased_watch_tombstone_before_second_replay() 
     assert!(second_replay.shutdown().success());
 }
 
+#[test]
+fn two_project_foreign_session_replay_does_not_deliver_erased_watch_tombstone() {
+    const HARNESS: &str = "pi";
+    const ORIGINATING_SESSION: &str = "session-a";
+    const FOREIGN_SESSION: &str = "session-b";
+
+    let project_a = tempfile::tempdir().unwrap();
+    let project_b = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let release = project_a.path().join("release-two-project-erased-watch");
+
+    let mut session_a = AftProcess::spawn();
+    configure_background_for_harness(
+        &mut session_a,
+        project_a.path(),
+        storage.path(),
+        ORIGINATING_SESSION,
+        HARNESS,
+    );
+    let command = format!(
+        "while [ ! -e {} ]; do sleep 0.05; done",
+        shell_quote_path(&release)
+    );
+    let task_id = spawn_bg(&mut session_a, ORIGINATING_SESSION, &command, Some(30_000));
+    let registered = notify(
+        &mut session_a,
+        ORIGINATING_SESSION,
+        &task_id,
+        "never-matches",
+        false,
+    );
+    assert_eq!(
+        registered["success"], true,
+        "watch registration failed: {registered:?}"
+    );
+    let child_pid = status(&mut session_a, ORIGINATING_SESSION, &task_id)["child_pid"]
+        .as_u64()
+        .expect("running child PID") as u32;
+
+    let _ = erase_persisted_task_row(storage.path(), HARNESS, ORIGINATING_SESSION, &task_id);
+    sigkill_aft(session_a);
+    fs::write(&release, "release").unwrap();
+    wait_for_process_exit(child_pid);
+    let resolved = resolve_task_layout(
+        &session_tasks_dir(storage.path(), ORIGINATING_SESSION),
+        &task_id,
+    )
+    .expect("resolve task bundle before erasing it");
+    fs::remove_dir_all(&resolved.paths.dir).expect("erase task bundle");
+
+    let mut session_b = AftProcess::spawn();
+    configure_background_for_harness(
+        &mut session_b,
+        project_b.path(),
+        storage.path(),
+        FOREIGN_SESSION,
+        HARNESS,
+    );
+
+    // Watchdog evaluation runs every 500ms. Waiting confirms no late push frame leaks to session B.
+    std::thread::sleep(Duration::from_millis(800));
+
+    let foreign_drain = drain(&mut session_b, FOREIGN_SESSION);
+    assert!(
+        foreign_drain["pending_matches"]
+            .as_array()
+            .expect("pending matches array")
+            .iter()
+            .all(|entry| entry["task_id"] != task_id),
+        "session B in project B received session A's watch tombstone: {foreign_drain:?}"
+    );
+    assert!(
+        foreign_drain["bg_completions"]
+            .as_array()
+            .expect("background completions array")
+            .iter()
+            .all(|entry| entry["task_id"] != task_id),
+        "session B in project B received session A's completion: {foreign_drain:?}"
+    );
+    let row_gone =
+        persisted_watch_rows_for_harness(storage.path(), HARNESS, ORIGINATING_SESSION, &task_id)
+            .is_empty();
+    assert!(
+        row_gone,
+        "orphaned watch row must be retired after session B configuration"
+    );
+    assert!(session_b.shutdown().success());
+}
+
 fn assert_pi_watch_tombstone_is_not_replayed_after_second_restart(task_row_survives_ack: bool) {
     const HARNESS: &str = "pi";
     const ERASED_TEXT: &str = "watch target erased";
