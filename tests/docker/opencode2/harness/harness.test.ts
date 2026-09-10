@@ -125,7 +125,7 @@ describe("scenario isolation and liveness", () => {
     }
     expect(isolated.env.OPENCODE_DISABLE_DEFAULT_PLUGINS).toBe("true");
     const hostConfig = JSON.parse(await readFile(isolated.host_config, "utf8"));
-    expect(hostConfig.provider.mock.settings.baseURL).toBe("http://127.0.0.1:1234/v1");
+    expect(hostConfig.providers.mock.settings.baseURL).toBe("http://127.0.0.1:1234/v1");
   });
 
   test("the scenario client uses the provider contract model", async () => {

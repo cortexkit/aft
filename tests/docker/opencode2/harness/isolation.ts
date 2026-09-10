@@ -119,7 +119,7 @@ export async function createScenarioIsolation(options: {
       {
         $schema: "https://opencode.ai/config.json",
         plugin: [pluginUrl],
-        provider: providerConfig,
+        providers: providerConfig,
       },
       null,
       2,
