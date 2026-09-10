@@ -104,8 +104,37 @@ jobs:
     with:
       cargo_profile: stage
 
+  search-quality-binary:
+    name: Search quality binary (Linux x64)
+    # The gate rebuilds from source if artifact production is unavailable.
+    continue-on-error: true
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.11
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: search-quality-release
+          cache-on-failure: true
+      - name: Build shared release AFT
+        run: cargo build --release --locked -p agent-file-tools --bin aft
+      - uses: actions/upload-artifact@v4
+        with:
+          name: search-quality-aft-${{ github.sha }}
+          path: target/release/aft
+          if-no-files-found: error
+          retention-days: 1
+
   search-quality-gate:
     name: search-quality-gate
+    needs: search-quality-binary
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -117,8 +146,26 @@ jobs:
         run: |
           scripts/telemetry/cost-gate.sh --search-quality --self-test
           python3 benchmarks/aft-search/ci_quality_mode.py --self-test
-      - name: Build the product binary the runner executes
-        run: cargo build --release -p agent-file-tools
+      - name: Download the shared release AFT
+        id: download-release-aft
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: search-quality-aft-${{ github.sha }}
+          path: target/release
+      - name: Check the shared release AFT
+        id: release-aft
+        shell: bash
+        run: |
+          if [[ -f target/release/aft ]]; then
+            chmod +x target/release/aft
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build the product binary when the artifact is absent
+        if: steps.release-aft.outputs.available != 'true'
+        run: cargo build --release --locked -p agent-file-tools --bin aft
       - name: Provision the exact-recall corpus at its pinned commits
         # The only network-enabled step: the gate itself runs offline against
         # these clones and fails corpus_missing if they are absent.
