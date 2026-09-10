@@ -358,7 +358,6 @@ pub(crate) fn semantic_refresh_quiet_window() -> Duration {
         .map(|ms| ms.min(SEMANTIC_REFRESH_QUIET_WINDOW_MS));
     Duration::from_millis(from_env.unwrap_or(SEMANTIC_REFRESH_QUIET_WINDOW_MS))
 }
-const SEMANTIC_REFRESH_MAX_BATCH_PATHS: usize = 50;
 const SEMANTIC_REFRESH_LIMITER_KIND: &str = "semantic refresh";
 const SEMANTIC_COLD_BUILD_LIMITER_KIND: &str = "semantic post-configure cold build";
 #[cfg(not(test))]
@@ -711,6 +710,8 @@ fn spawn_semantic_refresh_worker(
     mut model: crate::semantic_index::EmbeddingModel,
     max_batch_size: usize,
     max_files: usize,
+    quiet_window: Duration,
+    corpus_refresh_allowed: bool,
     request_rx: crossbeam_channel::Receiver<SemanticRefreshRequest>,
     event_tx: crossbeam_channel::Sender<SemanticRefreshEvent>,
     lifecycle: SubcLifecycleAdmission,
@@ -722,24 +723,21 @@ fn spawn_semantic_refresh_worker(
     thread::spawn(move || {
         log_ctx::with_session(session_id, || {
             while let Ok(first_request) = request_rx.recv() {
-                let mut paths = Vec::new();
+                let mut paths = BTreeSet::new();
                 let mut corpus_requested = false;
                 match first_request {
                     SemanticRefreshRequest::Files {
                         paths: request_paths,
-                    } => {
-                        paths.extend(request_paths);
-                    }
-                    SemanticRefreshRequest::Corpus => {
+                    } => paths.extend(request_paths),
+                    SemanticRefreshRequest::Corpus if corpus_refresh_allowed => {
                         corpus_requested = true;
                     }
+                    SemanticRefreshRequest::Corpus => continue,
                 }
 
-                let mut disconnected = false;
-                let quiet_window = semantic_refresh_quiet_window();
                 let mut deadline = Instant::now() + quiet_window;
 
-                while !corpus_requested && paths.len() < SEMANTIC_REFRESH_MAX_BATCH_PATHS {
+                loop {
                     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                         break;
                     };
@@ -747,37 +745,30 @@ fn spawn_semantic_refresh_worker(
                         Ok(SemanticRefreshRequest::Files {
                             paths: request_paths,
                         }) => {
-                            paths.extend(request_paths);
-                            if paths.len() >= SEMANTIC_REFRESH_MAX_BATCH_PATHS {
-                                break;
+                            if !corpus_requested {
+                                paths.extend(request_paths);
                             }
                             deadline = Instant::now() + quiet_window;
                         }
-                        Ok(SemanticRefreshRequest::Corpus) => {
+                        Ok(SemanticRefreshRequest::Corpus) if corpus_refresh_allowed => {
                             paths.clear();
                             corpus_requested = true;
-                            break;
+                            deadline = Instant::now() + quiet_window;
                         }
+                        Ok(SemanticRefreshRequest::Corpus) => {}
                         Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                            disconnected = true;
-                            break;
-                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
-                }
-
-                if disconnected {
-                    break;
                 }
 
                 if !lifecycle.is_current(generation_flag.as_ref(), generation) {
                     return;
                 }
 
-                // Corpus catch-up and watcher batches share this worker, so both
-                // use the process-wide cap. Watcher batches keep their 15-second
-                // quiet window and acquire immediately when a slot is free; queueing
-                // them behind another root is preferable to bursting a shared backend.
+                // Corpus catch-up and watcher batches share both the quiet window
+                // and the process-wide cap. Acquiring after the window closes lets
+                // the worker re-read the settled tree before it reaches the embedder;
+                // queueing behind another root is preferable to bursting a shared backend.
                 // Interactive QueryBudget embeddings do not run on this worker and
                 // therefore never wait on this maintenance limiter.
                 let Some(_refresh_permit) =
@@ -833,6 +824,9 @@ fn spawn_semantic_refresh_worker(
 
                     let progress_state = SemanticBuildProgress::default();
                     let progress_for_embed = progress_state.clone();
+                    let backend = model.backend().as_str();
+                    let mut embedded_chunks = 0usize;
+                    let mut embed_batches = 0usize;
                     let mut embed = |texts: Vec<String>| {
                         if !lifecycle.is_current(generation_flag.as_ref(), generation) {
                             let snapshot = progress_for_embed.snapshot();
@@ -843,18 +837,35 @@ fn spawn_semantic_refresh_worker(
                             );
                             return Err(SUPERSEDED_SEMANTIC_BUILD.to_string());
                         }
+                        embedded_chunks = embedded_chunks.saturating_add(texts.len());
+                        embed_batches = embed_batches.saturating_add(1);
                         model.embed(texts)
                     };
                     let mut progress = |done: usize, total: usize| {
                         progress_state.report(done, total, max_batch_size);
                     };
-                    match index.refresh_stale_files(
+                    let refresh_result = index.refresh_stale_files(
                         &project_root,
                         &current_files,
                         &mut embed,
                         max_batch_size,
                         &mut progress,
-                    ) {
+                    );
+                    if embed_batches > 0 {
+                        let files = refresh_result
+                            .as_ref()
+                            .map(|summary| summary.changed.saturating_add(summary.added))
+                            .unwrap_or(current_files.len());
+                        slog_info!(
+                            "semantic embedder refresh: root=\"{}\" reason=\"watcher batch\" files={} chunks={} batches={} backend={}",
+                            project_root.display(),
+                            files,
+                            embedded_chunks,
+                            embed_batches,
+                            backend,
+                        );
+                    }
+                    match refresh_result {
                         Ok(summary) => {
                             if !summary.is_noop() {
                                 slog_info!(
@@ -892,8 +903,7 @@ fn spawn_semantic_refresh_worker(
                     continue;
                 }
 
-                paths.sort();
-                paths.dedup();
+                let paths = paths.into_iter().collect::<Vec<_>>();
                 if paths.is_empty() {
                     continue;
                 }
@@ -909,6 +919,9 @@ fn spawn_semantic_refresh_worker(
 
                 let progress_state = SemanticBuildProgress::default();
                 let progress_for_embed = progress_state.clone();
+                let backend = model.backend().as_str();
+                let mut embedded_chunks = 0usize;
+                let mut embed_batches = 0usize;
                 let mut embed = |texts: Vec<String>| {
                     if !lifecycle.is_current(generation_flag.as_ref(), generation) {
                         let snapshot = progress_for_embed.snapshot();
@@ -919,19 +932,36 @@ fn spawn_semantic_refresh_worker(
                         );
                         return Err(SUPERSEDED_SEMANTIC_BUILD.to_string());
                     }
+                    embedded_chunks = embedded_chunks.saturating_add(texts.len());
+                    embed_batches = embed_batches.saturating_add(1);
                     model.embed(texts)
                 };
                 let mut progress = |done: usize, total: usize| {
                     progress_state.report(done, total, max_batch_size);
                 };
-                match index.refresh_invalidated_files(
+                let refresh_result = index.refresh_invalidated_files(
                     &project_root,
                     &paths,
                     &mut embed,
                     max_batch_size,
                     max_files,
                     &mut progress,
-                ) {
+                );
+                if embed_batches > 0 {
+                    let files = refresh_result
+                        .as_ref()
+                        .map(|update| update.summary.changed.saturating_add(update.summary.added))
+                        .unwrap_or(paths.len());
+                    slog_info!(
+                        "semantic embedder refresh: root=\"{}\" reason=\"watcher batch\" files={} chunks={} batches={} backend={}",
+                        project_root.display(),
+                        files,
+                        embedded_chunks,
+                        embed_batches,
+                        backend,
+                    );
+                }
+                match refresh_result {
                     Ok(update) => {
                         if !update.summary.is_noop() {
                             slog_info!(
@@ -971,6 +1001,69 @@ fn spawn_semantic_refresh_worker(
             }
         });
     })
+}
+
+/// Install the live semantic refresh worker only for roots allowed to create
+/// private deltas. Writer roots may process corpus requests; borrow-only roots
+/// require `worktree.ram_overlay` and may process changed-file requests only.
+pub(crate) fn ensure_ready_semantic_refresh_worker(ctx: &AppContext) -> bool {
+    if ctx.semantic_refresh_sender().is_some() {
+        return true;
+    }
+
+    let shared_artifacts_read_only = ctx.shared_artifacts_read_only();
+    if shared_artifacts_read_only && !ctx.ram_overlay_active() {
+        return false;
+    }
+    let Some(project_root) = ctx.canonical_cache_root_opt() else {
+        return false;
+    };
+    let Some(index) = ctx
+        .semantic_index()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+    else {
+        return false;
+    };
+    let config = ctx.config().semantic.clone();
+    let model = match crate::semantic_index::EmbeddingModel::from_config(&config) {
+        Ok(model) => model,
+        Err(error) => {
+            slog_warn!("semantic refresh worker unavailable: {}", error);
+            return false;
+        }
+    };
+    let generation = ctx.configure_generation();
+    let (request_tx, request_rx) = unbounded::<SemanticRefreshRequest>();
+    let (event_tx, event_rx) = unbounded::<SemanticRefreshEvent>();
+    let worker_slot: SemanticRefreshWorkerSlot = Arc::new(Mutex::new(None));
+    ctx.install_semantic_refresh_worker_for_build_epoch(
+        request_tx,
+        event_rx,
+        Arc::clone(&worker_slot),
+        ctx.semantic_index_rx_epoch(),
+    );
+    let handle = spawn_semantic_refresh_worker(
+        project_root,
+        index,
+        model,
+        config.max_batch_size.max(1),
+        config.max_files,
+        semantic_refresh_quiet_window(),
+        !shared_artifacts_read_only,
+        request_rx,
+        event_tx,
+        ctx.subc_lifecycle_admission(),
+        ctx.configure_generation_flag(),
+        generation,
+        SemanticRefreshLimiter(ctx.cold_build_limiter()),
+        log_ctx::current_session(),
+    );
+    if let Ok(mut slot) = worker_slot.lock() {
+        *slot = Some(handle);
+    }
+    true
 }
 
 fn normalize_absolute_path(path: &Path) -> PathBuf {
@@ -3120,6 +3213,7 @@ fn adopt_resident_semantic_index_if_available(
     *ctx.semantic_index_status()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+    let _ = ensure_ready_semantic_refresh_worker(ctx);
     slog_info!("semantic index adopted from matching resident artifact family");
     true
 }
@@ -3314,7 +3408,9 @@ pub(crate) fn restart_semantic_artifacts_after_refresh_disconnect(
             (receiver.is_some(), ctx.semantic_index_rx_epoch())
         };
         if has_build_receiver {
-            if ctx.shared_artifacts_read_only() || build_epoch != disconnected_build_epoch {
+            if (ctx.shared_artifacts_read_only() && !ctx.ram_overlay_active())
+                || build_epoch != disconnected_build_epoch
+            {
                 return true;
             }
             // This build belongs to the refresh worker that just died. If it
@@ -3330,7 +3426,7 @@ pub(crate) fn restart_semantic_artifacts_after_refresh_disconnect(
         drop(config);
         if !semantic_enabled
             || !heavy_root_work_allowed
-            || ctx.shared_artifacts_read_only()
+            || (ctx.shared_artifacts_read_only() && !ctx.ram_overlay_active())
             || ctx.canonical_cache_root_opt().is_none()
         {
             *ctx.semantic_index()
@@ -3963,7 +4059,7 @@ fn schedule_artifact_loads(
                             // This is the hot path for restart on a project with a
                             // handful of edits — avoids re-embedding 4000+ unchanged
                             // files just to pick up 10 changes.
-                            let current_files = match walk_semantic_project_files_bounded(
+                            let mut current_files = match walk_semantic_project_files_bounded(
                                 &root_clone,
                                 max_semantic_files,
                             ) {
@@ -3982,8 +4078,36 @@ fn schedule_artifact_loads(
                                 }
                             };
 
+                            let catch_up_requested = cached.indexed_file_count()
+                                != current_files.len()
+                                || current_files.iter().any(|path| cached.is_file_stale(path));
+                            if catch_up_requested {
+                                thread::sleep(semantic_refresh_quiet_window());
+                                if !semantic_lifecycle.is_current(
+                                    semantic_generation_flag.as_ref(),
+                                    semantic_generation,
+                                ) || semantic_build_epoch_flag.load(Ordering::SeqCst)
+                                    != semantic_build_epoch
+                                {
+                                    return Err(SUPERSEDED_SEMANTIC_BUILD.to_string());
+                                }
+                                current_files = walk_semantic_project_files_bounded(
+                                    &root_clone,
+                                    max_semantic_files,
+                                )
+                                .map_err(|_| {
+                                    format!(
+                                        "too many files (>{}) for semantic indexing (max {})",
+                                        max_semantic_files, max_semantic_files
+                                    )
+                                })?;
+                            }
+
                             let mut cached = cached;
                             let progress_for_embed = semantic_build_progress.clone();
+                            let backend = model.backend().as_str();
+                            let mut embedded_chunks = 0usize;
+                            let mut embed_batches = 0usize;
                             let mut embed = |texts: Vec<String>| {
                                 if semantic_build_epoch_flag.load(Ordering::SeqCst)
                                     != semantic_build_epoch
@@ -3996,6 +4120,8 @@ fn schedule_artifact_loads(
                                     );
                                     return Err(SUPERSEDED_SEMANTIC_BUILD.to_string());
                                 }
+                                embedded_chunks = embedded_chunks.saturating_add(texts.len());
+                                embed_batches = embed_batches.saturating_add(1);
                                 model.embed(texts)
                             };
                             let _ = tx_progress.send(SemanticIndexEvent::Progress {
@@ -4041,14 +4167,29 @@ fn schedule_artifact_loads(
                                         .to_string(),
                                 );
                             };
-                            match cached.refresh_stale_files_with_strategy(
+                            let refresh_result = cached.refresh_stale_files_with_strategy(
                                 &root_clone,
                                 &current_files,
                                 &mut embed,
                                 semantic_config.max_batch_size.max(1),
                                 &mut progress,
                                 verify_strategy,
-                            ) {
+                            );
+                            if embed_batches > 0 {
+                                let files = refresh_result
+                                    .as_ref()
+                                    .map(|summary| summary.changed.saturating_add(summary.added))
+                                    .unwrap_or(current_files.len());
+                                slog_info!(
+                                    "semantic embedder refresh: root=\"{}\" reason=\"bind catch-up\" files={} chunks={} batches={} backend={}",
+                                    root_clone.display(),
+                                    files,
+                                    embedded_chunks,
+                                    embed_batches,
+                                    backend,
+                                );
+                            }
+                            match refresh_result {
                                 Ok(summary) => {
                                     if summary.is_noop() {
                                         slog_info!(
@@ -4445,6 +4586,8 @@ fn schedule_artifact_loads(
                                     model,
                                     semantic_config.max_batch_size.max(1),
                                     semantic_config.max_files,
+                                    semantic_refresh_quiet_window(),
+                                    true,
                                     refresh_rx,
                                     refresh_event_tx,
                                     semantic_lifecycle.clone(),
@@ -6253,6 +6396,7 @@ mod tests {
         project_root: PathBuf,
         config: &SemanticBackendConfig,
         limiter: super::SemanticRefreshLimiter,
+        quiet_window: Duration,
     ) -> (
         TestContext,
         crossbeam_channel::Sender<SemanticRefreshRequest>,
@@ -6270,6 +6414,8 @@ mod tests {
                 .expect("construct semantic refresh model"),
             config.max_batch_size,
             config.max_files,
+            quiet_window,
+            true,
             request_rx,
             event_tx,
             ctx.subc_lifecycle_admission(),
@@ -7517,6 +7663,10 @@ mod tests {
         assert!(response.success);
         assert_eq!(borrower_ctx.cache_role(), "worktree");
         assert!(
+            borrower_ctx.semantic_refresh_sender().is_none(),
+            "borrow-only resident adoption must not spawn a semantic refresh worker"
+        );
+        assert!(
             borrower_ctx.semantic_index_rx().lock().is_none(),
             "resident adoption must not schedule a semantic disk loader"
         );
@@ -7861,6 +8011,7 @@ mod tests {
                 root,
                 &config,
                 super::SemanticRefreshLimiter(Arc::clone(&limiter)),
+                Duration::from_millis(1),
             );
             request_tx
                 .send(SemanticRefreshRequest::Corpus)
@@ -7891,6 +8042,129 @@ mod tests {
     }
 
     #[test]
+    fn semantic_corpus_refresh_rechecks_tree_after_quiet_window() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let server = CountingEmbeddingServer::start();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let storm = root.join("storm");
+        std::fs::create_dir_all(&storm).expect("create storm directory");
+        for index in 0..64 {
+            std::fs::write(
+                storm.join(format!("appeared_{index}.rs")),
+                format!("pub fn appeared_{index}() {{}}\n"),
+            )
+            .expect("write transient storm file");
+        }
+        let config = semantic_refresh_test_config(&server.base_url);
+        let limiter = crate::cold_build_limiter::test_limiter(1);
+        let (_ctx, request_tx, event_rx, worker) = spawn_semantic_corpus_refresh_worker_for_test(
+            root,
+            &config,
+            super::SemanticRefreshLimiter(limiter),
+            Duration::from_millis(300),
+        );
+
+        request_tx
+            .send(SemanticRefreshRequest::Corpus)
+            .expect("queue corpus refresh");
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::remove_dir_all(&storm).expect("remove transient storm");
+        server.release_responses();
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(
+            server.non_probe_input_count(),
+            0,
+            "files gone before the quiet window closed must not be embedded"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut completed = false;
+        while Instant::now() < deadline {
+            match event_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(SemanticRefreshEvent::CorpusCompleted { .. }) => {
+                    completed = true;
+                    break;
+                }
+                Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(completed, "quiet-window corpus refresh did not complete");
+        drop(request_tx);
+        worker.join().expect("semantic refresh worker joins");
+    }
+
+    #[test]
+    fn semantic_file_refresh_reuses_content_restored_inside_quiet_window() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let server = CountingEmbeddingServer::start();
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).expect("canonical root");
+        let source = root.join("lib.rs");
+        let original = "pub fn stable_content() -> bool { true }\n";
+        std::fs::write(&source, original).expect("write original source");
+        let mut local_embed =
+            |texts: Vec<String>| Ok::<_, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);
+        let index =
+            SemanticIndex::build(&root, std::slice::from_ref(&source), &mut local_embed, 64)
+                .expect("build baseline semantic index");
+        let config = semantic_refresh_test_config(&server.base_url);
+        let ctx = test_context();
+        let generation = ctx.configure_generation();
+        let (request_tx, request_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let worker = super::spawn_semantic_refresh_worker(
+            root,
+            index,
+            crate::semantic_index::EmbeddingModel::from_config(&config)
+                .expect("construct semantic refresh model"),
+            config.max_batch_size,
+            config.max_files,
+            Duration::from_millis(300),
+            true,
+            request_rx,
+            event_tx,
+            ctx.subc_lifecycle_admission(),
+            ctx.configure_generation_flag(),
+            generation,
+            super::SemanticRefreshLimiter(crate::cold_build_limiter::test_limiter(1)),
+            None,
+        );
+
+        std::fs::write(&source, "pub fn unstable_content() -> bool { false }\n")
+            .expect("write transient replacement");
+        request_tx
+            .send(SemanticRefreshRequest::Files {
+                paths: vec![source.clone()],
+            })
+            .expect("queue file refresh");
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(&source, original).expect("restore original source");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut completed = false;
+        while Instant::now() < deadline {
+            match event_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(SemanticRefreshEvent::Completed { .. }) => {
+                    completed = true;
+                    break;
+                }
+                Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(completed, "quiet-window file refresh did not complete");
+        assert_eq!(
+            server.non_probe_input_count(),
+            0,
+            "content restored before the quiet window closed must reuse cached vectors"
+        );
+        drop(request_tx);
+        worker.join().expect("semantic refresh worker joins");
+    }
+
+    #[test]
     fn unbound_semantic_refresh_worker_never_takes_a_queued_slot() {
         let _artifact_guard = artifact_owner_test_lock();
         let server = CountingEmbeddingServer::start();
@@ -7911,6 +8185,7 @@ mod tests {
             root,
             &config,
             super::SemanticRefreshLimiter(Arc::clone(&limiter)),
+            Duration::from_millis(1),
         );
         request_tx
             .send(SemanticRefreshRequest::Corpus)

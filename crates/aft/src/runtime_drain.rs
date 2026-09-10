@@ -863,7 +863,8 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                             .filter(|path| watcher_path_is_semantic_source(path))
                             .collect::<Vec<_>>();
                         index.invalidate_files(&refresh_paths);
-                        let corpus_refresh = ctx.take_pending_semantic_corpus_refresh();
+                        let corpus_refresh = ctx.take_pending_semantic_corpus_refresh()
+                            && !ctx.shared_artifacts_read_only();
                         if let Some(root) = ctx.canonical_cache_root_opt() {
                             let semantic_config = ctx.config().semantic.clone();
                             let _ = index.adopt_frozen_base_for_root(&root, &semantic_config);
@@ -919,6 +920,18 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                 status_changed = true;
             }
         }
+    }
+
+    if terminal
+        && matches!(
+            &*ctx
+                .semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SemanticIndexStatus::Ready { .. }
+        )
+    {
+        let _ = crate::commands::configure::ensure_ready_semantic_refresh_worker(ctx);
     }
 
     if terminal
@@ -1199,7 +1212,7 @@ fn maybe_fire_semantic_refresh_probe(ctx: &AppContext) {
             return;
         }
 
-        if ctx.take_pending_semantic_corpus_refresh() {
+        if ctx.take_pending_semantic_corpus_refresh() && !ctx.shared_artifacts_read_only() {
             // Stamp the status BEFORE sending: the worker emits CorpusStarted
             // only after walking the project, and an unbind cancellation in
             // that window preserves corpus intent by reading
@@ -1978,6 +1991,7 @@ pub fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take();
+                ctx.clear_semantic_refresh_worker();
             }
         } else if config.semantic_search
             && ctx.semantic_refresh_sender().is_none()
@@ -2233,7 +2247,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                             });
                         }
                         if heavy_root_work_allowed
-                            && !shared_artifacts_read_only
+                            && (!shared_artifacts_read_only || ctx.ram_overlay_active())
                             && (semantic_build_in_progress || semantic_corpus_refresh_in_progress)
                             && watcher_path_is_semantic_source(path)
                         {
@@ -2299,8 +2313,8 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 },
             ),
             WatcherDrainApplyPhase::SemanticIndex => {
-                // Semantic stays frozen under worktree.ram_overlay: embedding
-                // cost is out of scope. Only a writer root invalidates here.
+                // Every root masks stale shared vectors immediately. A writer or
+                // an enabled RAM overlay also queues a private replacement.
                 let mut invalidated_paths = Vec::new();
                 let completed = apply_watcher_path_phase(
                     WatcherDrainApplyPhase::SemanticIndex,
@@ -2309,10 +2323,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                     started,
                     WATCHER_DRAIN_SLICE_BUDGET,
                     |path| {
-                        if heavy_root_work_allowed
-                            && !shared_artifacts_read_only
-                            && watcher_path_is_semantic_source(path)
-                        {
+                        if heavy_root_work_allowed && watcher_path_is_semantic_source(path) {
                             invalidated_paths.push(path.to_path_buf());
                         }
                     },
@@ -2332,7 +2343,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                                 true
                             })
                         };
-                        if invalidated {
+                        if invalidated && ctx.semantic_refresh_sender().is_some() {
                             let mut status = ctx
                                 .semantic_index_status()
                                 .write()
@@ -5105,7 +5116,7 @@ mod watcher_slice_tests {
         };
         assert!(
             refreshing.is_empty(),
-            "semantic arm must stay frozen under the overlay"
+            "a context without a semantic refresh worker must not report refresh work"
         );
     }
 
