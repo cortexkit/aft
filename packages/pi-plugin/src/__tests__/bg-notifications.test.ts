@@ -701,6 +701,86 @@ describe("Pi subc forced-drain dedup (C-#1 / C-#3)", () => {
     });
   });
 
+  test("drops pushed pattern match frames for a foreign session before sendUserMessage", async () => {
+    const bridgeCalls: Array<{ command: string; params: Record<string, unknown> }> = [];
+    const send = mock(async (command: string, params: Record<string, unknown>) => {
+      bridgeCalls.push({ command, params });
+      return { success: true };
+    });
+    const { ctx } = harness(send);
+    const sendUserMessage = mock(() => {});
+
+    await handlePushedPatternMatch(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "live-session",
+        runtime: { sendUserMessage },
+      },
+      {
+        task_id: "task-foreign",
+        session_id: "foreign-session",
+        watch_id: "watch-foreign",
+        match_text: "watch target erased",
+        match_offset: 0,
+        context:
+          "watch target erased: the background task row was erased before the watch reached a normal terminal result",
+        once: true,
+        reason: "task_exit",
+      },
+    );
+
+    await sleep(250);
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    expect(sessionWarnSpy).toHaveBeenCalledWith(
+      "live-session",
+      expect.stringContaining("dropped frame for foreign session: foreign-session"),
+      expect.objectContaining({
+        dropped_session_id: "foreign-session",
+      }),
+    );
+  });
+
+  test("logPerTaskDeliveryHop logs pattern-match-only deliveries with empty task list", async () => {
+    const bridgeCalls: Array<{ command: string; params: Record<string, unknown> }> = [];
+    const send = mock(async (command: string, params: Record<string, unknown>) => {
+      bridgeCalls.push({ command, params });
+      return { success: true, acked_task_ids: ["task-pattern-only"] };
+    });
+    const { ctx } = harness(send);
+    const sendUserMessage = mock(() => {});
+
+    await handlePushedPatternMatch(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "session-live",
+        runtime: { sendUserMessage },
+      },
+      {
+        task_id: "task-pattern-only",
+        session_id: "session-live",
+        watch_id: "watch-pattern-only",
+        match_text: "matched",
+        match_offset: 0,
+        context: "matched text",
+        once: true,
+        reason: "pattern_match",
+      },
+    );
+
+    await waitForMockCallCount(sendUserMessage, 1);
+    expect(sendUserMessage).toHaveBeenCalled();
+
+    const loggedHop = sessionLogSpy.mock.calls.find(
+      (call) =>
+        typeof call[1] === "string" &&
+        call[1].includes("session inject start") &&
+        (call[2] as Record<string, unknown>)?.watch_id === "watch-pattern-only",
+    );
+    expect(loggedHop).toBeDefined();
+  });
+
   test("an erased-bundle replay is acked after delivery and stays gone on reopen", async () => {
     let pending = true;
     const events: string[] = [];

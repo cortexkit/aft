@@ -145,6 +145,45 @@ const UNKNOWN_COMPLETION_CAP = 32;
 const DEFAULT_SESSION_ID = "__default__";
 const LOG_PREFIX = "[aft-plugin] bg-notifications:";
 const SUBC_NUDGE_LOG_INTERVAL_MS = 60_000;
+const FOREIGN_SESSION_DROP_INTERVAL_MS = 60_000;
+const foreignSessionDropLogState = new Map<string, { lastEmittedAt: number; suppressed: number }>();
+let activeSessionId: string | undefined;
+
+export function setActiveSessionId(sessionId: string | undefined): void {
+  if (sessionId && sessionId.length > 0) {
+    activeSessionId = sessionId;
+  }
+}
+
+export function getActiveSessionId(): string | undefined {
+  return activeSessionId;
+}
+
+function logDroppedForeignSessionFrame(
+  drainContext: DrainContext,
+  droppedSessionId: string,
+  liveSessionId?: string,
+): void {
+  const now = Date.now();
+  const state = foreignSessionDropLogState.get(droppedSessionId);
+  if (state && now - state.lastEmittedAt < FOREIGN_SESSION_DROP_INTERVAL_MS) {
+    state.suppressed += 1;
+    return;
+  }
+  const suppressed = state?.suppressed ?? 0;
+  foreignSessionDropLogState.set(droppedSessionId, { lastEmittedAt: now, suppressed: 0 });
+  sessionWarn(
+    liveSessionId ?? drainContext.sessionID ?? droppedSessionId,
+    `${LOG_PREFIX} dropped frame for foreign session: ${droppedSessionId}`,
+    {
+      event: "bash_pattern_match_foreign_session_dropped",
+      dropped_session_id: droppedSessionId,
+      live_session_id: liveSessionId,
+      canonical_root: drainContext.directory,
+      suppressed,
+    },
+  );
+}
 const DEFAULT_BG_HOP_TIMEOUT_MS = 15_000;
 let bgHopTimeoutMs = DEFAULT_BG_HOP_TIMEOUT_MS;
 const subcNudgesInFlight = new Map<string, Promise<void>>();
@@ -358,6 +397,11 @@ export async function handlePushedPatternMatch(
   drainContext: DrainContext & { client: unknown },
   frame: PatternMatchEntry,
 ): Promise<void> {
+  const liveSession = getActiveSessionId() ?? drainContext.sessionID;
+  if (liveSession && frame.session_id && frame.session_id !== liveSession) {
+    logDroppedForeignSessionFrame(drainContext, frame.session_id, liveSession);
+    return;
+  }
   const state = stateFor(drainContext.sessionID);
   queuePendingPatternMatch(state, { ...frame, ackCompletionOnDelivery: true });
   await triggerWakeIfPending(drainContext, true);
@@ -610,6 +654,17 @@ function logPerTaskDeliveryHop(
   data: Record<string, unknown>,
   level: "info" | "warn" = "info",
 ): void {
+  if (taskIDs.length === 0) {
+    const watchId = (data.watch_id as string | undefined) ?? (data.watchId as string | undefined);
+    logDeliveryHop(
+      drainContext,
+      kind,
+      message,
+      { ...data, task_ids: taskIDs, ...(watchId ? { watch_id: watchId } : {}) },
+      level,
+    );
+    return;
+  }
   for (const taskID of taskIDs) {
     logDeliveryHop(
       drainContext,
@@ -690,8 +745,15 @@ async function triggerWakeIfPending(
 
   scheduleWake(
     state,
-    async (reminder, deliveredCompletions) => {
+    async (reminder, deliveredCompletions, deliveredPatternMatches) => {
+      const liveSession = getActiveSessionId() ?? drainContext.sessionID;
+      if (liveSession && drainContext.sessionID && drainContext.sessionID !== liveSession) {
+        logDroppedForeignSessionFrame(drainContext, drainContext.sessionID, liveSession);
+        return;
+      }
       const taskIDs = deliveredCompletions.map((completion) => completion.task_id);
+      const watchIds = deliveredPatternMatches?.map((m) => m.watch_id) ?? [];
+      const watchId = watchIds.join(",") || undefined;
 
       const getInProcessClient = (): OpenCodeClient => {
         if (!drainContext.client) {
@@ -772,6 +834,7 @@ async function triggerWakeIfPending(
             delivery_id: deliveryID,
             attempt: state.wakeRetryAttempts + 1,
             task_ids: taskIDs,
+            ...(watchId ? { watch_id: watchId, watch_ids: watchIds } : {}),
             directory: drainContext.directory,
             reminder_sha256: hashReminder(reminder),
             reminder_chars: reminder.length,
@@ -964,6 +1027,8 @@ export function __resetBgNotificationStateForTests(): void {
   sessionBgStates.clear();
   subcNudgesInFlight.clear();
   subcNudgeLogState.clear();
+  foreignSessionDropLogState.clear();
+  activeSessionId = undefined;
   bgHopTimeoutMs = DEFAULT_BG_HOP_TIMEOUT_MS;
 }
 
@@ -1166,7 +1231,11 @@ function clearWakeTimerIfNoPending(state: SessionBgState): void {
 
 function scheduleWake(
   state: SessionBgState,
-  sendWake: (reminder: string, completions: readonly BgCompletion[]) => Promise<void>,
+  sendWake: (
+    reminder: string,
+    completions: readonly BgCompletion[],
+    patternMatches?: readonly PatternMatchEntry[],
+  ) => Promise<void>,
   onSendFailure: (err: unknown, hardStopped: boolean) => void,
   sessionID?: string,
   includeDeferredCompletions = true,
@@ -1263,7 +1332,7 @@ function scheduleWake(
     // a forced drain in the delivery window can't re-accept them.
     const ackTargetIds = completionAcks.map((completion) => completion.task_id);
     markDelivering(state, ackTargetIds);
-    void sendWake(reminder, completionAcks)
+    void sendWake(reminder, completionAcks, pendingPatternMatches)
       .then(() => {
         state.retryDelayMs = null;
         state.wakeRetryAttempts = 0;

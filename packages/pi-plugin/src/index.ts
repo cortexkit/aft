@@ -47,11 +47,13 @@ import {
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   appendToolResultBgCompletions,
+  getActiveSessionId,
   handlePushedBgCompletion,
   handlePushedBgLongRunning,
   handlePushedPatternMatch,
   handleSubcBgEventsNudge,
   handleTurnEndBgCompletions,
+  setActiveSessionId,
 } from "./bg-notifications.js";
 import { registerStatusCommand } from "./commands/aft-status.js";
 import {
@@ -610,11 +612,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     },
     onBashPatternMatch: (frame, bridge) => {
       const directory = bridgeDirectoryFromCallback(bridge, process.cwd());
+      const liveSession = getActiveSessionId();
       void handlePushedPatternMatch(
         {
           ctx,
           directory,
-          sessionID: frame.session_id,
+          sessionID: liveSession ?? frame.session_id,
           runtime: pi,
         },
         frame,
@@ -799,7 +802,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // can therefore reveal that its optional built-in PowerShell tool is active
   // only at session start; older hosts use bash.powershell_tool instead.
   let powershellRegistered = surface.hoistPowershell && resolveBashConfig(config).enabled;
-  (pi.on as (event: "session_start", handler: () => unknown) => void)("session_start", () => {
+  (pi.on as (event: "session_start", handler: (_event?: unknown, extCtx?: unknown) => unknown) => void)("session_start", (_event, extCtx) => {
+    const sessionID = extCtx ? resolveSessionId(extCtx as any) : undefined;
+    setActiveSessionId(sessionID);
     if (powershellRegistered) return;
     const liveSurface = resolvePiToolSurface(config, pi);
     if (!liveSurface.hoistPowershell || !resolveBashConfig(config).enabled) return;
@@ -840,6 +845,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     ) => void
   )("tool_result", async (event, extCtx) => {
     const sessionID = resolveSessionId(extCtx);
+    setActiveSessionId(sessionID);
     const bgContent = await appendToolResultBgCompletions(
       { ctx, directory: extCtx.cwd, sessionID },
       event.content,
@@ -861,6 +867,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     ) => void
   )("turn_end", async (_event, extCtx) => {
     const sessionID = resolveSessionId(extCtx);
+    setActiveSessionId(sessionID);
     await handleTurnEndBgCompletions({
       ctx,
       directory: extCtx.cwd,
@@ -894,6 +901,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     ) => void
   )("input", (event, extCtx) => {
     const sessionId = resolveSessionId(extCtx);
+    setActiveSessionId(sessionId);
     signalSyncWatchAbort(sessionId);
     const originalText = event.text;
     const transformedText = stripUserMessageDetachKeyword(originalText);

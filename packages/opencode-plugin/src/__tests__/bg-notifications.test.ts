@@ -47,6 +47,7 @@ import {
   formatSystemReminder,
   handleIdleBgCompletions,
   handlePushedBgCompletion,
+  handlePushedPatternMatch,
   handleSubcBgEventsNudge,
   ingestBgCompletions,
   markBgCompletionDelivered,
@@ -984,6 +985,86 @@ describe("OpenCode background notifications", () => {
     expect(meta?.task_ids).toEqual(["task-1"]);
     expect(meta?.attempt).toBe(1);
     expect(sessionBgStates.get("s1")?.debounceTimer).not.toBeNull();
+  });
+
+  test("drops pushed pattern match frames for a foreign session before promptAsync", async () => {
+    const bridgeCalls: Array<{ command: string; params: Record<string, unknown> }> = [];
+    const send = mock(async (command: string, params: Record<string, unknown>) => {
+      bridgeCalls.push({ command, params });
+      return { success: true };
+    });
+    const { ctx } = harness(send);
+    const promptAsync = mock(async () => {});
+
+    await handlePushedPatternMatch(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "live-session",
+        client: { session: { promptAsync } },
+      },
+      {
+        task_id: "task-foreign",
+        session_id: "foreign-session",
+        watch_id: "watch-foreign",
+        match_text: "watch target erased",
+        match_offset: 0,
+        context:
+          "watch target erased: the background task row was erased before the watch reached a normal terminal result",
+        once: true,
+        reason: "task_exit",
+      },
+    );
+
+    await sleep(250);
+    expect(promptAsync).not.toHaveBeenCalled();
+    expect(sessionWarnSpy).toHaveBeenCalledWith(
+      "live-session",
+      expect.stringContaining("dropped frame for foreign session: foreign-session"),
+      expect.objectContaining({
+        dropped_session_id: "foreign-session",
+      }),
+    );
+  });
+
+  test("logPerTaskDeliveryHop logs pattern-match-only deliveries with empty task list", async () => {
+    const bridgeCalls: Array<{ command: string; params: Record<string, unknown> }> = [];
+    const send = mock(async (command: string, params: Record<string, unknown>) => {
+      bridgeCalls.push({ command, params });
+      return { success: true, acked_task_ids: ["task-pattern-only"] };
+    });
+    const { ctx } = harness(send);
+    const promptAsync = mock(async () => {});
+
+    await handlePushedPatternMatch(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "session-live",
+        client: { session: { promptAsync } },
+      },
+      {
+        task_id: "task-pattern-only",
+        session_id: "session-live",
+        watch_id: "watch-pattern-only",
+        match_text: "matched",
+        match_offset: 0,
+        context: "matched text",
+        once: true,
+        reason: "pattern_match",
+      },
+    );
+
+    await waitForMockCallCount(promptAsync, 1);
+    expect(promptAsync).toHaveBeenCalled();
+
+    const loggedHop = sessionLogSpy.mock.calls.find(
+      (call) =>
+        typeof call[1] === "string" &&
+        call[1].includes("session inject start") &&
+        (call[2] as Record<string, unknown>)?.watch_id === "watch-pattern-only",
+    );
+    expect(loggedHop).toBeDefined();
   });
 });
 

@@ -23,11 +23,13 @@ import {
 import {
   appendInTurnBgCompletions,
   extractSessionID,
+  getActiveSessionId,
   handleIdleBgCompletions,
   handlePushedBgCompletion,
   handlePushedBgLongRunning,
   handlePushedPatternMatch,
   handleSubcBgEventsNudge,
+  setActiveSessionId,
 } from "./bg-notifications.js";
 import {
   buildConfigTierConfigureParams,
@@ -626,11 +628,12 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     },
     onBashPatternMatch: (frame, bridge) => {
       const sessionDir = bridge.getCwd();
+      const liveSession = getActiveSessionId();
       void handlePushedPatternMatch(
         {
           ctx,
           directory: sessionDir,
-          sessionID: frame.session_id,
+          sessionID: liveSession ?? frame.session_id,
           client: input.client,
         },
         frame,

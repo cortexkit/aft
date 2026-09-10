@@ -132,6 +132,45 @@ const UNKNOWN_COMPLETION_CAP = 32;
 const DEFAULT_SESSION_ID = "__default__";
 const LOG_PREFIX = "[aft-pi] bg-notifications:";
 const SUBC_NUDGE_LOG_INTERVAL_MS = 60_000;
+const FOREIGN_SESSION_DROP_INTERVAL_MS = 60_000;
+const foreignSessionDropLogState = new Map<string, { lastEmittedAt: number; suppressed: number }>();
+let activeSessionId: string | undefined;
+
+export function setActiveSessionId(sessionId: string | undefined): void {
+  if (sessionId && sessionId.length > 0) {
+    activeSessionId = sessionId;
+  }
+}
+
+export function getActiveSessionId(): string | undefined {
+  return activeSessionId;
+}
+
+function logDroppedForeignSessionFrame(
+  drainContext: DrainContext,
+  droppedSessionId: string,
+  liveSessionId?: string,
+): void {
+  const now = Date.now();
+  const state = foreignSessionDropLogState.get(droppedSessionId);
+  if (state && now - state.lastEmittedAt < FOREIGN_SESSION_DROP_INTERVAL_MS) {
+    state.suppressed += 1;
+    return;
+  }
+  const suppressed = state?.suppressed ?? 0;
+  foreignSessionDropLogState.set(droppedSessionId, { lastEmittedAt: now, suppressed: 0 });
+  sessionWarn(
+    liveSessionId ?? drainContext.sessionID ?? droppedSessionId,
+    `${LOG_PREFIX} dropped frame for foreign session: ${droppedSessionId}`,
+    {
+      event: "bash_pattern_match_foreign_session_dropped",
+      dropped_session_id: droppedSessionId,
+      live_session_id: liveSessionId,
+      canonical_root: drainContext.directory,
+      suppressed,
+    },
+  );
+}
 const DEFAULT_BG_HOP_TIMEOUT_MS = 15_000;
 let bgHopTimeoutMs = DEFAULT_BG_HOP_TIMEOUT_MS;
 const subcNudgesInFlight = new Map<string, Promise<void>>();
@@ -315,6 +354,11 @@ export async function handlePushedPatternMatch(
   drainContext: DrainContext & { runtime: SendUserMessageRuntime },
   frame: PatternMatchEntry,
 ): Promise<void> {
+  const liveSession = getActiveSessionId() ?? drainContext.sessionID;
+  if (liveSession && frame.session_id && frame.session_id !== liveSession) {
+    logDroppedForeignSessionFrame(drainContext, frame.session_id, liveSession);
+    return;
+  }
   const state = stateFor(drainContext.sessionID);
   queuePendingPatternMatch(state, { ...frame, ackCompletionOnDelivery: true });
   await triggerWakeIfPending(drainContext, true);
@@ -556,6 +600,17 @@ function logPerTaskDeliveryHop(
   data: Record<string, unknown>,
   level: "info" | "warn" = "info",
 ): void {
+  if (taskIDs.length === 0) {
+    const watchId = (data.watch_id as string | undefined) ?? (data.watchId as string | undefined);
+    logDeliveryHop(
+      drainContext,
+      kind,
+      message,
+      { ...data, task_ids: taskIDs, ...(watchId ? { watch_id: watchId } : {}) },
+      level,
+    );
+    return;
+  }
   for (const taskID of taskIDs) {
     logDeliveryHop(
       drainContext,
@@ -624,30 +679,19 @@ async function triggerWakeIfPending(
 
   scheduleWake(
     state,
-    async (reminder, deliveredCompletions) => {
-      // Pi rejects sendUserMessage with "Agent is already processing" when
-      // the agent is mid-turn unless we pass `deliverAs`. Use `steer`:
-      // Pi delivers steering messages after the current tool batch finishes
-      // and BEFORE the next LLM call (see agent-session.ts steer() docs:
-      // "Delivered after the current assistant turn finishes executing its
-      // tool calls, before the next LLM call"). That's exactly when we
-      // want a background-bash completion to land — the agent sees the
-      // result and can incorporate it into the very next thinking step
-      // instead of writing a conclusion that didn't know the build/test
-      // had finished.
-      //
-      // `followUp` would queue until the entire turn ends, which is too
-      // late for tool-loop scenarios where the agent is actively working
-      // on a problem that depends on the bash result.
-      //
-      // Unlike OpenCode, Pi's `sendUserMessage` does not accept any model
-      // or variant fields — it just queues a content string. The next
-      // turn uses Pi's currently-selected model, so there is no per-message
-      // override for us to thread through.
+    async (reminder, deliveredCompletions, deliveredPatternMatches) => {
+      const liveSession = getActiveSessionId() ?? drainContext.sessionID;
+      if (liveSession && drainContext.sessionID && drainContext.sessionID !== liveSession) {
+        logDroppedForeignSessionFrame(drainContext, drainContext.sessionID, liveSession);
+        return;
+      }
       const ackTargetIds = deliveredCompletions.map((completion) => completion.task_id);
+      const watchIds = deliveredPatternMatches?.map((m) => m.watch_id) ?? [];
+      const watchId = watchIds.join(",") || undefined;
       logPerTaskDeliveryHop(drainContext, "inject-start", "session inject start", ackTargetIds, {
         event: "bash_completion_wake_send_user_message_start",
         attempt: state.wakeRetryAttempts + 1,
+        ...(watchId ? { watch_id: watchId, watch_ids: watchIds } : {}),
       });
       try {
         drainContext.runtime.sendUserMessage(reminder, { deliverAs: "steer" });
@@ -661,6 +705,7 @@ async function triggerWakeIfPending(
             event: "bash_completion_wake_send_user_message_error",
             attempt: state.wakeRetryAttempts + 1,
             cause: err instanceof Error ? err.message : String(err),
+            ...(watchId ? { watch_id: watchId, watch_ids: watchIds } : {}),
           },
           "warn",
         );
@@ -669,6 +714,7 @@ async function triggerWakeIfPending(
       logPerTaskDeliveryHop(drainContext, "inject-ok", "session inject ok", ackTargetIds, {
         event: "bash_completion_wake_send_user_message_ok",
         attempt: state.wakeRetryAttempts + 1,
+        ...(watchId ? { watch_id: watchId, watch_ids: watchIds } : {}),
       });
       // Session injection completed synchronously. Only now may these task IDs
       // enter awaiting-ack state and become eligible for daemon acknowledgement.
@@ -755,6 +801,8 @@ export function __resetBgNotificationStateForTests(): void {
   sessionBgStates.clear();
   subcNudgesInFlight.clear();
   subcNudgeLogState.clear();
+  foreignSessionDropLogState.clear();
+  activeSessionId = undefined;
   bgHopTimeoutMs = DEFAULT_BG_HOP_TIMEOUT_MS;
 }
 
@@ -945,7 +993,11 @@ function clearWakeTimerIfNoPending(state: SessionBgState): void {
 
 function scheduleWake(
   state: SessionBgState,
-  sendWake: (reminder: string, completions: readonly BgCompletion[]) => Promise<void>,
+  sendWake: (
+    reminder: string,
+    completions: readonly BgCompletion[],
+    patternMatches?: readonly PatternMatchEntry[],
+  ) => Promise<void>,
   onSendFailure: (err: unknown, hardStopped: boolean) => void,
   includeDeferredCompletions = true,
 ): void {
@@ -1011,7 +1063,7 @@ function scheduleWake(
     // before the sendWake await, so ingest skips them during delivery.
     const ackTargetIds = completionAcks.map((completion) => completion.task_id);
     markDelivering(state, ackTargetIds);
-    void sendWake(reminder, completionAcks)
+    void sendWake(reminder, completionAcks, pendingPatternMatches)
       .then(() => {
         state.retryDelayMs = null;
         state.wakeRetryAttempts = 0;
