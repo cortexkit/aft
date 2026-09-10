@@ -3,6 +3,7 @@
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
     "crates/aft/tests/engine_plan_table_test.rs",
     "crates/aft/tests/search_b2_embed_counter.rs",
     "crates/aft/tests/engine_search_extensions_test.rs"
