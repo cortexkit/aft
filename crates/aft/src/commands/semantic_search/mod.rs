@@ -2790,11 +2790,9 @@ fn handle_semantic_or_hybrid_search(
         return cancelled_search_response(req);
     }
 
-    let semantic_limit = if params.include_tests {
-        semantic_candidate_limit(top_k)
-    } else {
-        MAX_TOP_K
-    };
+    // Candidate enumeration is fixed across page sizes so every requested
+    // interval is cut from the same ranked tuple.
+    let semantic_limit = MAX_TOP_K;
     let semantic_fetch_limit = semantic_limit.saturating_add(1);
     let mut semantic_results = if let Some(view) = pinned_semantic_view.as_ref() {
         match view_semantic_search(
