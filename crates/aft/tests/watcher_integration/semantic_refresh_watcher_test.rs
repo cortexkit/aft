@@ -1,10 +1,11 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread;
 use std::time::Duration;
@@ -28,6 +29,7 @@ struct MockEmbeddingServer {
     // old 500ms delay could be missed entirely when the test's polling thread is
     // starved under full-suite parallel load.
     release_refresh: Arc<AtomicBool>,
+    requests: Arc<Mutex<Vec<Vec<String>>>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -39,6 +41,8 @@ impl MockEmbeddingServer {
         let running_for_thread = Arc::clone(&running);
         let release_refresh = Arc::new(AtomicBool::new(false));
         let release_for_thread = Arc::clone(&release_refresh);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests_for_thread = Arc::clone(&requests);
         let handle = thread::spawn(move || {
             while running_for_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
@@ -49,8 +53,9 @@ impl MockEmbeddingServer {
                         // loop would starve the concurrent query embed behind
                         // it (real backends serve requests concurrently).
                         let release = Arc::clone(&release_for_thread);
+                        let requests = Arc::clone(&requests_for_thread);
                         thread::spawn(move || {
-                            let _ = handle_embedding_request(&mut stream, &release);
+                            let _ = handle_embedding_request(&mut stream, &release, &requests);
                         });
                     }
                     Err(_) => break,
@@ -63,6 +68,7 @@ impl MockEmbeddingServer {
             addr,
             running,
             release_refresh,
+            requests,
             handle: Some(handle),
         }
     }
@@ -71,6 +77,27 @@ impl MockEmbeddingServer {
     /// test has observed `refreshing_count == 1` so the refresh can complete.
     fn release_refresh(&self) {
         self.release_refresh.store(true, Ordering::SeqCst);
+    }
+
+    fn reset_requests(&self) {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+
+    fn non_probe_requests(&self) -> Vec<Vec<String>> {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|inputs| {
+                inputs
+                    .iter()
+                    .any(|input| input != "semantic index fingerprint probe")
+            })
+            .cloned()
+            .collect()
     }
 }
 
@@ -90,6 +117,7 @@ impl Drop for MockEmbeddingServer {
 fn handle_embedding_request(
     stream: &mut TcpStream,
     release_refresh: &Arc<AtomicBool>,
+    requests: &Arc<Mutex<Vec<Vec<String>>>>,
 ) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut buf = Vec::new();
@@ -135,6 +163,10 @@ fn handle_embedding_request(
         Value::String(value) => vec![value.clone()],
         _ => Vec::new(),
     };
+    requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(inputs.clone());
 
     if inputs
         .iter()
@@ -176,6 +208,24 @@ fn embedding_for(text: &str) -> Vec<f32> {
     }
 }
 
+fn semantic_inputs_for_file(root: &Path, source: &Path) -> Vec<String> {
+    let canonical_root = fs::canonicalize(root).expect("canonical semantic root");
+    let canonical_source = fs::canonicalize(source).expect("canonical semantic source");
+    let mut inputs = Vec::new();
+    let mut embed = |texts: Vec<String>| {
+        inputs.extend(texts.iter().cloned());
+        Ok::<_, String>(
+            texts
+                .iter()
+                .map(|text| embedding_for(text))
+                .collect::<Vec<_>>(),
+        )
+    };
+    SemanticIndex::build(&canonical_root, &[canonical_source], &mut embed, 64)
+        .expect("collect expected semantic inputs");
+    inputs
+}
+
 fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
     let temp_dir = tempfile::tempdir().expect("create project dir");
     for (relative_path, content) in files {
@@ -186,6 +236,58 @@ fn setup_project(files: &[(&str, &str)]) -> tempfile::TempDir {
         fs::write(path, content).expect("write fixture");
     }
     temp_dir
+}
+
+fn run_git(root: &Path, args: &[&str]) {
+    let mut command = Command::new("git");
+    crate::test_helpers::apply_hermetic_git_env(command.arg("-C").arg(root));
+    let status = command.args(args).status().expect("run git command");
+    assert!(
+        status.success(),
+        "git {args:?} failed in {}",
+        root.display()
+    );
+}
+
+fn setup_linked_worktree(source: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let fixture = tempfile::tempdir().expect("create linked-worktree fixture");
+    let main = fixture.path().join("main");
+    let worktree = fixture.path().join("worktree");
+    fs::create_dir_all(main.join("src")).expect("create main source directory");
+    fs::write(main.join("src/lib.rs"), source).expect("write tracked source");
+    run_git(&main, &["init", "--quiet"]);
+    run_git(&main, &["add", "."]);
+
+    let mut commit = Command::new("git");
+    crate::test_helpers::apply_hermetic_git_env(commit.arg("-C").arg(&main));
+    let status = commit
+        .args([
+            "-c",
+            "user.name=AFT Test",
+            "-c",
+            "user.email=aft@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ])
+        .status()
+        .expect("commit linked-worktree fixture");
+    assert!(status.success(), "fixture commit failed");
+
+    let worktree_text = worktree.to_string_lossy().into_owned();
+    run_git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            "--quiet",
+            &worktree_text,
+            "HEAD",
+        ],
+    );
+    (fixture, main, worktree)
 }
 
 #[cfg(unix)]
@@ -208,6 +310,16 @@ fn configure_semantic_openai(
     storage_dir: &Path,
     base_url: &str,
 ) -> Value {
+    configure_semantic_openai_with_overlay(aft, root, storage_dir, base_url, false)
+}
+
+fn configure_semantic_openai_with_overlay(
+    aft: &mut AftProcess,
+    root: &Path,
+    storage_dir: &Path,
+    base_url: &str,
+    ram_overlay: bool,
+) -> Value {
     send(
         aft,
         json!({
@@ -219,6 +331,9 @@ fn configure_semantic_openai(
             "config": user_config(serde_json::json!({
                 "search_index": false,
                 "semantic_search": true,
+                "worktree": {
+                    "ram_overlay": ram_overlay
+                },
                 "semantic": {
                     "backend": "openai_compatible",
                     "model": "test-embedding",
@@ -476,6 +591,148 @@ fn refreshing_status_keeps_repeated_same_file_invalidations_until_last_completio
         panic!("semantic status should stay ready");
     };
     assert!(refreshing.is_empty());
+}
+
+#[test]
+fn linked_worktree_semantic_embedding_respects_ram_overlay_and_quiet_window() {
+    let _watcher_guard = crate::helpers::watcher_serial_lock();
+    let original = "pub fn shared_owner_baseline() -> bool { true }\n";
+    let (_fixture, main, worktree) = setup_linked_worktree(original);
+    let storage = tempfile::tempdir().expect("create storage dir");
+    let server = MockEmbeddingServer::start();
+
+    let mut owner = AftProcess::spawn();
+    let configured = configure_semantic_openai(&mut owner, &main, storage.path(), &server.base_url);
+    assert_eq!(
+        configured["success"], true,
+        "owner configure: {configured:?}"
+    );
+    wait_for_semantic_status(&mut owner, "owner semantic index", |response| {
+        response["semantic_index"]["status"] == "ready"
+            && response["semantic_index"]["entries"].as_u64().unwrap_or(0) > 0
+    });
+    assert!(owner.shutdown().success());
+    server.reset_requests();
+
+    let quiet_ms = std::ffi::OsStr::new("2000");
+    let mut borrower =
+        AftProcess::spawn_with_real_watcher_env(&[("AFT_SEMANTIC_QUIET_WINDOW_MS", quiet_ms)]);
+    let configured = configure_semantic_openai_with_overlay(
+        &mut borrower,
+        &worktree,
+        storage.path(),
+        &server.base_url,
+        false,
+    );
+    assert_eq!(
+        configured["success"], true,
+        "borrow configure: {configured:?}"
+    );
+    wait_for_semantic_status(&mut borrower, "borrowed semantic index", |response| {
+        response["cache_role"] == "worktree" && response["semantic_index"]["status"] == "ready"
+    });
+    assert!(
+        server.non_probe_requests().is_empty(),
+        "borrow-only bind must not call the embedder"
+    );
+
+    let source = worktree.join("src/lib.rs");
+    fs::write(
+        &source,
+        "pub fn borrow_only_edit_is_masked() -> bool { false }\n",
+    )
+    .expect("edit borrow-only source");
+    wait_for_semantic_status(&mut borrower, "borrow-only semantic mask", |response| {
+        response["semantic_index"]["status"] == "ready"
+            && response["semantic_index"]["entries"] == 0
+    });
+
+    let storm = worktree.join("storm");
+    fs::create_dir_all(&storm).expect("create borrow-only storm");
+    for index in 0..1_470 {
+        fs::write(
+            storm.join(format!("appeared_{index}.rs")),
+            format!("pub fn borrow_storm_{index}() {{}}\n"),
+        )
+        .expect("write borrow-only storm file");
+    }
+    fs::remove_dir_all(&storm).expect("remove borrow-only storm");
+    for _ in 0..30 {
+        let _ = status(&mut borrower);
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        server.non_probe_requests().is_empty(),
+        "borrow-only edit and appear/vanish storm must not call the embedder"
+    );
+    assert!(borrower.shutdown().success());
+
+    fs::write(&source, original).expect("restore shared baseline before overlay bind");
+    server.reset_requests();
+    let mut overlay =
+        AftProcess::spawn_with_real_watcher_env(&[("AFT_SEMANTIC_QUIET_WINDOW_MS", quiet_ms)]);
+    let configured = configure_semantic_openai_with_overlay(
+        &mut overlay,
+        &worktree,
+        storage.path(),
+        &server.base_url,
+        true,
+    );
+    assert_eq!(
+        configured["success"], true,
+        "overlay configure: {configured:?}"
+    );
+    wait_for_semantic_status(&mut overlay, "overlay semantic index", |response| {
+        response["cache_role"] == "worktree" && response["semantic_index"]["status"] == "ready"
+    });
+    assert!(
+        server.non_probe_requests().is_empty(),
+        "RAM-overlay bind must not run a corpus catch-up"
+    );
+
+    let overlay_contents =
+        "pub fn overlay_changed_file_only() -> &'static str { \"overlay delta\" }\n";
+    fs::write(&source, overlay_contents).expect("edit overlay source");
+    let expected_inputs = semantic_inputs_for_file(&worktree, &source);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while server.non_probe_requests().is_empty() && std::time::Instant::now() < deadline {
+        let _ = status(&mut overlay);
+        thread::sleep(Duration::from_millis(100));
+    }
+    wait_for_semantic_status(&mut overlay, "overlay semantic refresh", |response| {
+        response["semantic_index"]["status"] == "ready"
+            && response["semantic_index"]["refreshing_count"] == 0
+    });
+    let actual_inputs = server
+        .non_probe_requests()
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual_inputs, expected_inputs,
+        "overlay refresh must embed exactly the changed file's chunks"
+    );
+
+    server.reset_requests();
+    fs::create_dir_all(&storm).expect("create overlay storm");
+    for index in 0..1_470 {
+        fs::write(
+            storm.join(format!("appeared_{index}.rs")),
+            format!("pub fn overlay_storm_{index}() {{}}\n"),
+        )
+        .expect("write overlay storm file");
+    }
+    fs::remove_dir_all(&storm).expect("remove overlay storm");
+    for _ in 0..35 {
+        let _ = status(&mut overlay);
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        server.non_probe_requests().is_empty(),
+        "overlay storm files gone inside the quiet window must not be embedded"
+    );
+
+    assert!(overlay.shutdown().success());
 }
 
 #[test]

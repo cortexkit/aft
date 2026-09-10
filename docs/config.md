@@ -163,12 +163,13 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
   // Default: false
   "search_index": false,
 
-  // Linked-worktree RAM overlay for the trigram index. Default: false.
+  // Linked-worktree RAM overlay. Default: false.
   // When true, a borrow-only worktree applies its own file-watcher events to
-  // the in-RAM delta of the borrowed search index (and invalidates the symbol
-  // cache) so grep/search see local edits. RAM cost scales with the number of
-  // changed files. Never writes the shared on-disk cache. Semantic search and
-  // the callgraph stay frozen. User and project tiers may both set this.
+  // private in-RAM search and semantic deltas (and invalidates the symbol cache)
+  // so search sees local edits. Semantic embeddings are created only for files
+  // changed after bind; corpus catch-up remains disabled. RAM cost scales with
+  // the number of changed files. The shared indexes are never written, and the
+  // callgraph stays frozen. User and project tiers may both set this.
   "worktree": {
     "ram_overlay": false
   },
