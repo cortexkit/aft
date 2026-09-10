@@ -22,7 +22,7 @@
                 "id": "ast_search-happy",
                 "name": "ast_search",
                 "arguments": {
-                  "pattern": "function $NAME($$$) { $$$ }",
+                  "pattern": "function $NAME(): string { $$$ }",
                   "lang": "typescript",
                   "paths": [
                     "sample.ts"
