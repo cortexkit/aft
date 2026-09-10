@@ -179,7 +179,7 @@ describe("RevivableTransportPool", () => {
     expect(attempts).toBe(2);
   });
 
-  test("logs the host-quit revival diagnosis", async () => {
+  test("logs the explicit shutdown reason when demand revives the transport", async () => {
     const messages: string[] = [];
     setActiveLogger({
       log: () => undefined,
@@ -192,11 +192,11 @@ describe("RevivableTransportPool", () => {
       makeSubcPool(revivedClient),
     );
 
-    await owner.shutdown();
+    await owner.shutdown("dispose");
     await owner.getBridge(TEST_PROJECT_ROOT).toolCall("session", "read", {});
 
     expect(messages).toContain(
-      "transport was shut down but new demand arrived — reviving (host quit hook fired without process exit?)",
+      "transport was shut down (reason: dispose) but new demand arrived — reviving",
     );
   });
 });

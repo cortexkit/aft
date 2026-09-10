@@ -17,10 +17,18 @@
 
 import { log } from "./logger.js";
 
-type Cleanup = () => Promise<void> | void;
+type Cleanup = (reason: string) => Promise<void> | void;
+type RegisteredCleanup = (reason: string) => Promise<void>;
+
+export interface ShutdownCleanupRegistration {
+  /** Run only this registration's cleanup and remove it from the process-exit registry. */
+  dispose(reason: string): Promise<void>;
+  /** Remove the cleanup without running it. */
+  unregister(): void;
+}
 
 interface GlobalState {
-  cleanups: Set<Cleanup>;
+  cleanups: Set<RegisteredCleanup>;
   installed: boolean;
 }
 
@@ -36,6 +44,7 @@ function getState(): GlobalState {
 }
 
 let runningCleanups = false;
+const cleanupInvocationCounts = new WeakMap<RegisteredCleanup, () => number>();
 
 export async function runCleanups(reason: string): Promise<void> {
   if (runningCleanups) return;
@@ -49,7 +58,7 @@ export async function runCleanups(reason: string): Promise<void> {
     await Promise.allSettled(
       cleanups.map(async (fn) => {
         try {
-          await fn();
+          await fn(reason);
         } catch (err) {
           log(`Cleanup error: ${(err as Error).message}`);
         }
@@ -138,14 +147,45 @@ function installProcessHandlers(): void {
 }
 
 /**
- * Register a shutdown cleanup. Call from plugin initialization; returned
- * function unregisters (use in `dispose` so plugin reloads don't leak).
+ * Register one plugin instance's cleanup for process-exit drains. The returned
+ * registration also owns instance disposal, so removing, running, and
+ * de-duplicating that cleanup cannot drift apart at factory call sites.
  */
-export function registerShutdownCleanup(fn: Cleanup): () => void {
+export function registerShutdownCleanup(fn: Cleanup): ShutdownCleanupRegistration {
   installProcessHandlers();
   const state = getState();
-  state.cleanups.add(fn);
-  return () => {
-    state.cleanups.delete(fn);
+  let cleanupPromise: Promise<void> | null = null;
+  let disposePromise: Promise<void> | null = null;
+  let invocationCount = 0;
+
+  const registeredCleanup: RegisteredCleanup = async (reason) => {
+    invocationCount += 1;
+    cleanupPromise ??= Promise.resolve()
+      .then(() => fn(reason))
+      .catch((err) => {
+        log(`Cleanup error: ${(err as Error).message}`);
+      });
+    await cleanupPromise;
   };
+  cleanupInvocationCounts.set(registeredCleanup, () => invocationCount);
+  state.cleanups.add(registeredCleanup);
+
+  return {
+    dispose(reason) {
+      if (disposePromise) return disposePromise;
+      state.cleanups.delete(registeredCleanup);
+      disposePromise = registeredCleanup(reason);
+      return disposePromise;
+    },
+    unregister() {
+      state.cleanups.delete(registeredCleanup);
+    },
+  };
+}
+
+/** Read the registered callback invocation count without exposing it in production state. */
+export function __shutdownCleanupInvocationCountForTests(cleanup: unknown): number {
+  return typeof cleanup === "function"
+    ? (cleanupInvocationCounts.get(cleanup as RegisteredCleanup)?.() ?? 0)
+    : 0;
 }

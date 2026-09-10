@@ -1,12 +1,28 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { registerShutdownCleanup, runCleanups } from "../shutdown-hooks.js";
+import {
+  __shutdownCleanupInvocationCountForTests,
+  registerShutdownCleanup,
+  runCleanups,
+} from "../shutdown-hooks.js";
+
+type RegisteredCleanup = (reason: string) => Promise<void>;
 
 // Drain the globalThis guard between tests so we can simulate independent loads.
 function resetShutdownHookState(): void {
   const g = globalThis as unknown as Record<string, unknown>;
   delete g.__aftShutdownHooks__;
+}
+
+function registeredCleanups(): Set<RegisteredCleanup> {
+  const state = (
+    globalThis as unknown as {
+      __aftShutdownHooks__?: { cleanups: Set<RegisteredCleanup> };
+    }
+  ).__aftShutdownHooks__;
+  if (!state) throw new Error("shutdown-hook state was not initialized");
+  return state.cleanups;
 }
 
 describe("registerShutdownCleanup", () => {
@@ -15,24 +31,16 @@ describe("registerShutdownCleanup", () => {
   });
 
   test("registers and unregisters a cleanup without error", () => {
-    const unregister = registerShutdownCleanup(() => {});
-    expect(typeof unregister).toBe("function");
-    unregister(); // should not throw
+    const registration = registerShutdownCleanup(() => {});
+    expect(typeof registration.dispose).toBe("function");
+    expect(typeof registration.unregister).toBe("function");
+    registration.unregister();
   });
 
   test("stores multiple cleanups per Node process", () => {
-    const callOrder: number[] = [];
-    registerShutdownCleanup(() => {
-      callOrder.push(1);
-    });
-    registerShutdownCleanup(() => {
-      callOrder.push(2);
-    });
-    // Reach into the global state to verify both landed in the same Set.
-    const state = (globalThis as unknown as Record<string, { cleanups: Set<unknown> }>)
-      .__aftShutdownHooks__;
-    expect(state).toBeDefined();
-    expect(state?.cleanups.size).toBe(2);
+    registerShutdownCleanup(() => {});
+    registerShutdownCleanup(() => {});
+    expect(registeredCleanups().size).toBe(2);
   });
 
   test("installs a single set of OS-level listeners even across reloads", () => {
@@ -47,39 +55,63 @@ describe("registerShutdownCleanup", () => {
     const after2 = process.listenerCount("SIGTERM");
     expect(after2).toBe(after1);
 
-    // Clean up the listener we attached so test runner isn't polluted.
-    const state = (
-      globalThis as unknown as {
-        __aftShutdownHooks__?: { cleanups: Set<unknown>; installed: boolean };
-      }
-    ).__aftShutdownHooks__;
-    if (state) state.cleanups.clear();
+    // Clean up tracked callbacks so this test does not affect a later drain.
+    registeredCleanups().clear();
   });
 
-  test("runCleanups executes registered cleanups and allows later cleanup runs", async () => {
+  test("runCleanups executes registered cleanups with the exit reason and allows later runs", async () => {
     const calls: string[] = [];
-    registerShutdownCleanup(() => {
-      calls.push("first");
+    registerShutdownCleanup((reason) => {
+      calls.push(`first:${reason}`);
     });
 
-    await runCleanups("test");
+    await runCleanups("SIGTERM");
 
-    registerShutdownCleanup(() => {
-      calls.push("second");
+    registerShutdownCleanup((reason) => {
+      calls.push(`second:${reason}`);
     });
-    await runCleanups("test-again");
+    await runCleanups("beforeExit");
 
-    expect(calls).toEqual(["first", "second"]);
+    expect(calls).toEqual(["first:SIGTERM", "second:beforeExit"]);
   });
 
   test("unregister prevents the cleanup from being tracked", () => {
-    const fn = () => {};
-    const unregister = registerShutdownCleanup(fn);
-    const state = (globalThis as unknown as { __aftShutdownHooks__?: { cleanups: Set<unknown> } })
-      .__aftShutdownHooks__;
-    expect(state?.cleanups.has(fn)).toBe(true);
+    const registration = registerShutdownCleanup(() => {});
+    expect(registeredCleanups().size).toBe(1);
 
-    unregister();
-    expect(state?.cleanups.has(fn)).toBe(false);
+    registration.unregister();
+    expect(registeredCleanups().size).toBe(0);
+  });
+
+  test("individual dispose removes its cleanup before the process-exit drain", async () => {
+    const calls: string[] = [];
+    const registration = registerShutdownCleanup((reason) => {
+      calls.push(`owned:${reason}`);
+    });
+    const ownedCleanup = [...registeredCleanups()][0];
+    registerShutdownCleanup((reason) => {
+      calls.push(`sibling:${reason}`);
+    });
+
+    await registration.dispose("dispose");
+    await runCleanups("beforeExit");
+
+    expect(calls).toEqual(["owned:dispose", "sibling:beforeExit"]);
+    expect(__shutdownCleanupInvocationCountForTests(ownedCleanup)).toBe(1);
+    expect(registeredCleanups().has(ownedCleanup)).toBe(false);
+  });
+
+  test("individual dispose is idempotent", async () => {
+    let resourceCleanupCalls = 0;
+    const registration = registerShutdownCleanup(() => {
+      resourceCleanupCalls += 1;
+    });
+    const ownedCleanup = [...registeredCleanups()][0];
+
+    await registration.dispose("dispose");
+    await registration.dispose("dispose");
+
+    expect(resourceCleanupCalls).toBe(1);
+    expect(__shutdownCleanupInvocationCountForTests(ownedCleanup)).toBe(1);
   });
 });

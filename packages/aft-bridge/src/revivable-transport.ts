@@ -31,6 +31,7 @@ export class RevivableTransportPool implements AftTransportPool {
   private revival: Promise<AftTransportPool> | null = null;
   private revivalRetryDelayMs = REVIVAL_RETRY_FLOOR_MS;
   private revivalRetryNotBefore = 0;
+  private shutdownReason: string | null = null;
   private readonly transports = new Map<string, RevivableProjectTransport>();
   private readonly configureOverrides = new Map<string, unknown>();
   private editSlotSurvivesCaptured = false;
@@ -122,12 +123,13 @@ export class RevivableTransportPool implements AftTransportPool {
     return this.activePool.closeSession(projectRoot, session);
   }
 
-  async shutdown(): Promise<void> {
+  async shutdown(reason = "unknown"): Promise<void> {
     const revival = this.revival;
     if (revival) {
       await Promise.allSettled([revival]);
     }
-    await this.activePool.shutdown();
+    this.shutdownReason = reason;
+    await this.activePool.shutdown(reason);
     for (const transport of this.transports.values()) {
       transport.refreshStatusSubscription(null);
     }
@@ -157,7 +159,7 @@ export class RevivableTransportPool implements AftTransportPool {
     }
 
     warn(
-      "transport was shut down but new demand arrived — reviving (host quit hook fired without process exit?)",
+      `transport was shut down (reason: ${this.shutdownReason ?? "unknown"}) but new demand arrived — reviving`,
     );
     const revival = Promise.resolve()
       .then(() => this.createPool())
@@ -166,6 +168,7 @@ export class RevivableTransportPool implements AftTransportPool {
           pool.setConfigureOverride(key, value);
         }
         this.activePool = pool;
+        this.shutdownReason = null;
         this.revivalRetryDelayMs = REVIVAL_RETRY_FLOOR_MS;
         this.revivalRetryNotBefore = 0;
         for (const [root, transport] of this.transports) {

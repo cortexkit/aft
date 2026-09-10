@@ -121,7 +121,7 @@ describe.serial("OpenCode migration bootstrap", () => {
     await hooks.dispose?.();
   });
 
-  test("opencode_plugin_exposes_dispose_that_runs_shutdown_cleanups", async () => {
+  test("opencode_plugin_dispose_does_not_run_unrelated_shutdown_cleanups", async () => {
     const plugin = await loadPlugin();
     const hooks = (await plugin({
       directory: tempDir,
@@ -129,15 +129,16 @@ describe.serial("OpenCode migration bootstrap", () => {
     } as Parameters<OpenCodePlugin>[0])) as {
       dispose?: () => Promise<void>;
     };
-    let cleanupRan = false;
-    registerShutdownCleanup(() => {
-      cleanupRan = true;
+    let unrelatedCleanupRan = false;
+    const unrelated = registerShutdownCleanup(() => {
+      unrelatedCleanupRan = true;
     });
 
     expect(typeof hooks.dispose).toBe("function");
     await hooks.dispose?.();
 
-    expect(cleanupRan).toBe(true);
+    expect(unrelatedCleanupRan).toBe(false);
+    await unrelated.dispose("test teardown");
   });
 
   test("opencode_plugin_aborts_on_migration_error", async () => {

@@ -69,7 +69,8 @@ export interface AftTransportPool {
   replaceBinary(path: string): Promise<string>;
   /** True when this pool instance has reached its terminal shutdown state. */
   isShutdown(): boolean;
-  shutdown(): Promise<void>;
+  /** Shut down this pool, retaining the reason for any later revival diagnostic. */
+  shutdown(reason?: string): Promise<void>;
   /**
    * Release any per-session transport state for `(projectRoot, session)` on
    * session end. Standalone (BridgePool) is a no-op — its bridges are per-project

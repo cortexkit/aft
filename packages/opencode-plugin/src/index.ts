@@ -82,7 +82,7 @@ import {
   warmSessionDirectory,
 } from "./shared/session-directory.js";
 import { coerceAftStatus, formatStatusMarkdown } from "./shared/status.js";
-import { registerShutdownCleanup, runCleanups } from "./shutdown-hooks.js";
+import { registerShutdownCleanup } from "./shutdown-hooks.js";
 import { signalSyncWatchAbort } from "./sync-watch-abort.js";
 import { instrumentToolMap } from "./tool-perf.js";
 import {
@@ -782,10 +782,10 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // get an orderly shutdown when the Node host receives a termination signal.
   // Without this, OS propagates SIGTERM to children before OpenCode calls dispose,
   // and (together with bridge.ts signal handling) we want the shutdown path we
-  // control, not implicit process-group death. Plugin dispose runs this same
-  // cleanup set through runCleanups("dispose") so reloads do not leak children.
+  // control, not implicit process-group death. Instance disposal runs only this
+  // registration; process-exit handlers retain the global drain.
   let clearInspectTier2Idle = () => {};
-  registerShutdownCleanup(async () => {
+  const shutdownCleanup = registerShutdownCleanup(async (reason) => {
     autoUpdateAbort.abort();
     clearInspectTier2Idle();
     for (const unsubscribe of statusUnsubscribes) {
@@ -802,7 +802,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     } catch {
       // best-effort
     }
-    await pool.shutdown();
+    await pool.shutdown(reason);
   });
   rpcServer.handle("status", async (params) => {
     const sessionID = (params.sessionID as string) || "rpc";
@@ -1333,7 +1333,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       };
     },
     dispose: async () => {
-      await runCleanups("dispose");
+      await shutdownCleanup.dispose("dispose");
     },
   };
 }
