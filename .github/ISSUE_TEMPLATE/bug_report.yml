@@ -7,7 +7,7 @@ body:
       value: |
         Thanks for reporting! To make debugging faster, please run:
         ```
-        bunx @cortexkit/aft-opencode@latest doctor --issue
+        npx @cortexkit/aft@latest doctor --issue
         ```
         and paste the generated report in the Diagnostics field below.
 
@@ -31,7 +31,7 @@ body:
     id: diagnostics
     attributes:
       label: Diagnostics
-      description: Paste the output of `bunx @cortexkit/aft-opencode@latest doctor --issue` here, or fill in the sections below manually.
+      description: Paste the output of `npx @cortexkit/aft@latest doctor --issue` here, or fill in the sections below manually.
       render: markdown
 
   - type: input
