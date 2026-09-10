@@ -900,7 +900,12 @@ function parentDisposition(
 ): "expected_fail" | "fail" | "n/a" | "pass" {
   if (classification.startsWith("n/a:")) return "n/a";
   if (classification.startsWith("expected_fail:")) {
-    return results.length > 0 && results.every((result) => result.status === "failed")
+    const issue = classification.slice("expected_fail:".length);
+    const failed = results.filter((result) => result.status === "failed");
+    return failed.length > 0 &&
+      results.every(
+        (result) => result.status === "passed" || (result.status === "failed" && result.issue === issue),
+      )
       ? "expected_fail"
       : "fail";
   }
