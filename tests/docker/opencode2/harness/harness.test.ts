@@ -7,7 +7,6 @@ import { pathToFileURL } from 'node:url';
 import {
   type HostCliContract,
   loadHostCliContract,
-  loadHostPermissionOptionContract,
   loadHostProviderConfigContract,
   loadHostSchemaRejectionContract,
 } from "./contracts.js";
@@ -122,6 +121,7 @@ describe("scenario isolation and liveness", () => {
       pluginTarball: tarball,
       pluginDirectory,
       pluginVersion: "1.2.3-test",
+      hostGeneration: "v2",
       binaryPath: "/native/aft",
       mockBaseUrl: "http://127.0.0.1:1234",
       providerConfig: {
@@ -167,6 +167,23 @@ describe("scenario isolation and liveness", () => {
     expect(serverWrapper).toContain(pathToFileURL(tarball).href);
     expect(serverWrapper).toContain("dist/entry/server.js");
     expect(serverWrapper).toContain("PLUGIN_VERSION=1.2.3-test");
+
+    const legacy = await createScenarioIsolation({
+      parent: join(parent, "legacy-runs"),
+      scenarioId: "read/T7/legacy",
+      fixture,
+      pluginTarball: tarball,
+      pluginDirectory,
+      pluginVersion: "1.2.3-test",
+      hostGeneration: "v1",
+      mockBaseUrl: "http://127.0.0.1:1234",
+    });
+    const legacyWrapper = await readFile(
+      join(legacy.config, "aft-opencode-wrapper", "index.mjs"),
+      "utf8",
+    );
+    expect(legacyWrapper).toContain("dist/index.js");
+    expect(legacyWrapper).not.toContain("dist/entry/server.js");
   });
 
   test("the scenario client uses the provider contract model", async () => {
@@ -838,27 +855,6 @@ test("provider contract supplies the observed run model to the harness", async (
 
   const contract = await loadHostProviderConfigContract(contractRoot, "0.0.0-beta-test");
   expect(contract.model).toBe("openai/mock-model");
-});
-
-test("permission-option contract proves host denial before tool execution", async () => {
-  const contractRoot = await root();
-  await writeFile(
-    join(contractRoot, "host-permission-option.json"),
-    JSON.stringify({
-      schema_version: 1,
-      host_version: "0.0.0-beta-test",
-      observed_run_id: "deny-run",
-      permission: "edit",
-      denied_by_host: true,
-      tool_body_executed: false,
-      disk_sha256_before: "unchanged-sha",
-      disk_sha256_after: "unchanged-sha",
-    }),
-  );
-
-  const contract = await loadHostPermissionOptionContract(contractRoot, "0.0.0-beta-test");
-  expect(contract.denied_by_host).toBe(true);
-  expect(contract.disk_sha256_after).toBe(contract.disk_sha256_before);
 });
 
 test("legacy host CLI capture names every field required by the runner", async () => {

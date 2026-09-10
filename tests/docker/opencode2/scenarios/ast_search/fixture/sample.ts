@@ -1,3 +1,3 @@
-export function uniqueScenarioSymbol(): string {
+function uniqueScenarioSymbol(): string {
   return 'fixture';
 }

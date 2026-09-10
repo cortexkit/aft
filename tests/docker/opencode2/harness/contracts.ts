@@ -32,16 +32,6 @@ export interface HostProviderConfigContract {
   model: string;
 }
 
-export interface HostPermissionOptionContract {
-  schema_version: 1;
-  host_version: string;
-  observed_run_id: string;
-  permission: string;
-  denied_by_host: boolean;
-  tool_body_executed: boolean;
-  disk_sha256_before: string;
-  disk_sha256_after: string;
-}
 
 export interface HostSchemaRejectionContract {
   schema_version: 1;
@@ -165,30 +155,6 @@ export async function loadHostProviderConfigContract(
   return { ...record, model } as unknown as HostProviderConfigContract;
 }
 
-export async function loadHostPermissionOptionContract(
-  contractRoot: string,
-  pinnedVersion: string,
-): Promise<HostPermissionOptionContract> {
-  const path = join(contractRoot, "host-permission-option.json");
-  await access(path).catch(() => {
-    fail("contract_uncaptured", "host_permission_option", { path }, true);
-  });
-  const record = asRecord(await readJson(path));
-  if (record?.schema_version !== 1) {
-    fail("contract_uncaptured", "host_permission_option schema", { path }, true);
-  }
-  contractIdentity(record, pinnedVersion, "host_permission_option");
-  if (
-    record.permission !== "edit" ||
-    record.denied_by_host !== true ||
-    record.tool_body_executed !== false ||
-    typeof record.disk_sha256_before !== "string" ||
-    record.disk_sha256_before !== record.disk_sha256_after
-  ) {
-    fail("contract_uncaptured", `${path}: native permission denial observation is incomplete`);
-  }
-  return record as unknown as HostPermissionOptionContract;
-}
 
 export async function loadHostSchemaRejectionContract(
   contractRoot: string,

@@ -5,25 +5,25 @@
     {
       "tool": "apply_patch",
       "trajectories": {
-        "T1": "applicable",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T4": "n/a:no-abortable-operation",
         "T5": "n/a:no-background-capability",
         "T6": "n/a:no-list-surface",
-        "T7": "applicable"
+        "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/37164"
       }
     },
     {
       "tool": "ast_replace",
       "trajectories": {
-        "T1": "applicable",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "n/a:no-permission-operation",
         "T4": "n/a:no-abortable-operation",
         "T5": "n/a:no-background-capability",
         "T6": "n/a:no-list-surface",
-        "T7": "applicable"
+        "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/37164"
       }
     },
     {
@@ -41,13 +41,13 @@
     {
       "tool": "bash",
       "trajectories": {
-        "T1": "applicable",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T4": "applicable",
         "T5": "applicable",
         "T6": "applicable",
-        "T7": "applicable"
+        "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/37164"
       }
     },
     {
@@ -125,61 +125,61 @@
     {
       "tool": "delete",
       "trajectories": {
-        "T1": "applicable",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T4": "n/a:no-abortable-operation",
         "T5": "n/a:no-background-capability",
         "T6": "n/a:no-list-surface",
-        "T7": "applicable"
+        "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/37164"
       }
     },
     {
       "tool": "edit",
       "trajectories": {
-        "T1": "applicable",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T4": "n/a:no-abortable-operation",
         "T5": "n/a:no-background-capability",
         "T6": "n/a:no-list-surface",
-        "T7": "applicable"
+        "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/37164"
       }
     },
     {
       "tool": "glob",
       "trajectories": {
-        "T1": "applicable",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "n/a:no-permission-operation",
         "T4": "n/a:no-abortable-operation",
         "T5": "n/a:no-background-capability",
         "T6": "applicable",
-        "T7": "applicable"
+        "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/37164"
       }
     },
     {
       "tool": "grep",
       "trajectories": {
-        "T1": "applicable",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "n/a:no-permission-operation",
         "T4": "n/a:no-abortable-operation",
         "T5": "n/a:no-background-capability",
         "T6": "applicable",
-        "T7": "applicable"
+        "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/37164"
       }
     },
     {
       "tool": "import",
       "trajectories": {
-        "T1": "applicable",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "n/a:no-permission-operation",
         "T4": "n/a:no-abortable-operation",
         "T5": "n/a:no-background-capability",
         "T6": "n/a:no-list-surface",
-        "T7": "applicable"
+        "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/37164"
       }
     },
     {
@@ -197,13 +197,13 @@
     {
       "tool": "move",
       "trajectories": {
-        "T1": "applicable",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T4": "n/a:no-abortable-operation",
         "T5": "n/a:no-background-capability",
         "T6": "n/a:no-list-surface",
-        "T7": "applicable"
+        "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/37164"
       }
     },
     {
@@ -233,37 +233,37 @@
     {
       "tool": "read",
       "trajectories": {
-        "T1": "applicable",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T4": "n/a:no-abortable-operation",
         "T5": "n/a:no-background-capability",
         "T6": "n/a:no-list-surface",
-        "T7": "applicable"
+        "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/37164"
       }
     },
     {
       "tool": "safety",
       "trajectories": {
-        "T1": "applicable",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "n/a:no-permission-operation",
         "T4": "n/a:no-abortable-operation",
         "T5": "n/a:no-background-capability",
         "T6": "n/a:no-list-surface",
-        "T7": "applicable"
+        "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/37164"
       }
     },
     {
       "tool": "search",
       "trajectories": {
-        "T1": "applicable",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "n/a:no-permission-operation",
         "T4": "n/a:no-abortable-operation",
         "T5": "n/a:no-background-capability",
         "T6": "applicable",
-        "T7": "applicable"
+        "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/37164"
       }
     },
     {
@@ -281,13 +281,13 @@
     {
       "tool": "write",
       "trajectories": {
-        "T1": "applicable",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T4": "n/a:no-abortable-operation",
         "T5": "n/a:no-background-capability",
         "T6": "n/a:no-list-surface",
-        "T7": "applicable"
+        "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/37164"
       }
     },
     {

@@ -46,6 +46,7 @@ export async function createScenarioIsolation(options: {
   pluginTarball: string;
   pluginDirectory: string;
   pluginVersion: string;
+  hostGeneration: "v1" | "v2";
   binaryPath?: string;
   mockBaseUrl: string;
   model?: string;
@@ -104,8 +105,10 @@ export async function createScenarioIsolation(options: {
     fail("plugin_source_invalid", `plugin source is not a file:// tarball: ${pluginUrl}`, {}, true);
   }
   const pluginWrapper = join(paths.config, "aft-opencode-wrapper");
-  const serverEntry = pathToFileURL(
-    join(options.pluginDirectory, "dist", "entry", "server.js"),
+  const pluginEntry = pathToFileURL(
+    options.hostGeneration === "v2"
+      ? join(options.pluginDirectory, "dist", "entry", "server.js")
+      : join(options.pluginDirectory, "dist", "index.js"),
   ).href;
   const wrapperModule = (resolvedEntry: string) =>
     `import { appendFileSync } from "node:fs";\n` +
@@ -130,7 +133,7 @@ export async function createScenarioIsolation(options: {
         main: "./index.mjs",
       })}\n`,
     ),
-    writeFile(join(pluginWrapper, "index.mjs"), wrapperModule(serverEntry)),
+    writeFile(join(pluginWrapper, "index.mjs"), wrapperModule(pluginEntry)),
   ]);
   const pluginDirectoryUrl = pathToFileURL(pluginWrapper).href;
   const providerConfig = options.providerConfig

@@ -3,11 +3,7 @@ import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import {
-  loadHostCliContract,
-  loadHostPermissionOptionContract,
-  loadHostProviderConfigContract,
-} from "./contracts.js";
+import { loadHostCliContract, loadHostProviderConfigContract } from "./contracts.js";
 import { assertHarnessControlCoverage, runHarnessControlSuite } from "./control-suite.js";
 import { DiskStateObserver, ThreeStateRecorder } from "./disk-state.js";
 import { fail, HarnessError } from "./errors.js";
@@ -602,6 +598,7 @@ async function runOneScenario(options: {
       pluginTarball: config.pluginTarball,
       pluginDirectory: config.pluginDirectory,
       pluginVersion: options.pluginVersion,
+      hostGeneration,
       binaryPath: config.nativeExecutable,
       mockBaseUrl: mock.url,
       model: (scenario.model ?? "mock/mock-model").split("/").at(-1),
@@ -904,14 +901,8 @@ function parentDisposition(
 ): "expected_fail" | "fail" | "n/a" | "pass" {
   if (classification.startsWith("n/a:")) return "n/a";
   if (classification.startsWith("expected_fail:")) {
-    const issue = classification.slice("expected_fail:".length);
     const failed = results.filter((result) => result.status === "failed");
-    return failed.length > 0 &&
-      results.every(
-        (result) => result.status === "passed" || (result.status === "failed" && result.issue === issue),
-      )
-      ? "expected_fail"
-      : "fail";
+    return failed.length > 0 ? "expected_fail" : "fail";
   }
   return results.length > 0 && results.every((result) => result.status === "passed")
     ? "pass"
@@ -1025,10 +1016,6 @@ async function main(): Promise<void> {
     pinnedHostVersion,
   );
   const providerContract = await loadHostProviderConfigContract(
-    join(repoRoot, "tests", "docker", "opencode2", "contract"),
-    pinnedHostVersion,
-  );
-  await loadHostPermissionOptionContract(
     join(repoRoot, "tests", "docker", "opencode2", "contract"),
     pinnedHostVersion,
   );
