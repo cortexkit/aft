@@ -1,6 +1,16 @@
 import { spawn } from "node:child_process";
 import { constants, type Dirent } from "node:fs";
-import { access, cp, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  access,
+  cp,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import {
@@ -35,6 +45,31 @@ setActiveLogger(bridgeLogger);
 // in a test's teardown throws and fails an otherwise-passing test. Cleanup
 // failures must never fail a test — retry a few times, then give up silently
 // (the OS reaps the temp dir, and a leaked temp dir is harmless in CI).
+/**
+ * Remove scratch directories a killed run left behind. Anything older than an
+ * hour cannot belong to a live suite (a single e2e project lives for seconds);
+ * newer siblings may be another worker's run and are left alone.
+ */
+async function sweepStaleScratch(scratchRoot: string): Promise<void> {
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  let entries: string[];
+  try {
+    entries = await readdir(scratchRoot);
+  } catch {
+    return;
+  }
+  await Promise.all(
+    entries.map(async (entry) => {
+      const path = join(scratchRoot, entry);
+      try {
+        if ((await stat(path)).mtimeMs < cutoff) await rm(path, { recursive: true, force: true });
+      } catch {
+        // another run may have removed it first
+      }
+    }),
+  );
+}
+
 async function safeRemoveDir(dir: string): Promise<void> {
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
@@ -329,10 +364,14 @@ export async function createHarness(
   delete factoryConfigOverrides.edit_slot_survives;
 
   // Keep e2e projects outside both the repository and OS temp directories so
-  // external-directory tests cover ordinary out-of-project paths.
-  const tempDir = await mkdtemp(
-    join(dirname(PROJECT_ROOT), `.${options.tempPrefix ?? "aft-plugin-e2e-"}`),
-  );
+  // external-directory tests cover ordinary out-of-project paths (and undo
+  // snapshots are not skipped as they are under /tmp). A dedicated scratch
+  // root, not the repository's parent: a killed run leaves its directory
+  // behind, and 76 of them once accumulated beside the user's projects.
+  const scratchRoot = join(homedir(), ".cache", "aft-plugin-e2e");
+  await mkdir(scratchRoot, { recursive: true });
+  await sweepStaleScratch(scratchRoot);
+  const tempDir = await mkdtemp(join(scratchRoot, options.tempPrefix ?? "e2e-"));
 
   let standaloneBridge: BinaryBridge | undefined;
   let pool: AftTransportPool | undefined;
