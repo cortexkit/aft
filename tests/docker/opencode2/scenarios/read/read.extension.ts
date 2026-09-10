@@ -49,7 +49,7 @@ async function validateReadScenarios(context: HarnessValidationContext): Promise
     T4: "n/a:no-abortable-operation",
     T5: "n/a:no-background-capability",
     T6: "n/a:no-list-surface",
-    T7: "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
+    T7: "expected_fail:https://github.com/anomalyco/opencode/issues/48340",
   };
   if (!row || JSON.stringify(row.trajectories) !== JSON.stringify(expected)) {
     throw new Error("read applicability row does not match the declared T1-T7 contract");

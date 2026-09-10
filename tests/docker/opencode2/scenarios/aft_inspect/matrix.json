@@ -12,7 +12,7 @@
         "T4": "applicable",
         "T5": "n/a:no-background-capability",
         "T6": "applicable",
-        "T7": "applicable"
+        "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/48340"
       }
     }
   ]
