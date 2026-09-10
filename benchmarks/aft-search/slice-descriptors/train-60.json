@@ -1,0 +1,10 @@
+{
+  "slice_class": "ranking",
+  "targeted_mechanism": "none",
+  "kind": "paging",
+  "fixtures": [
+    "commands::semantic_search::tests::repeated_paged_search_reads_exact_candidates_once_per_query_generation",
+    "commands::semantic_search::tests::exact_page_memo_keys_include_corpus_generation"
+  ],
+  "slices": ["exact-page-memo-latency"]
+}

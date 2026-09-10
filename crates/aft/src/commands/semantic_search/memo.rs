@@ -11,6 +11,8 @@ use crate::commands::semantic_search::comparator::{CandidateResult, SymbolOffset
 use crate::commands::semantic_search::evidence_descriptor::EvidenceDescriptor;
 use crate::commands::semantic_search::generation_token::GenerationToken;
 
+const MAX_EXACT_MEMO_ENTRIES: usize = 128;
+
 /// Normalize query for memo key comparison.
 pub fn normalize_query(query: &str) -> String {
     query
@@ -196,6 +198,20 @@ impl ExactMemoStore {
         self.entries.read().contains_key(key)
     }
 
+    #[cfg(test)]
+    pub fn entry_count(&self) -> usize {
+        self.entries.read().len()
+    }
+
+    fn make_room_for(&self, key: &MemoKey) {
+        let mut entries = self.entries.write();
+        if entries.len() < MAX_EXACT_MEMO_ENTRIES || entries.contains_key(key) {
+            return;
+        }
+        entries.clear();
+        self.lifecycle.write().clear();
+    }
+
     /// Read the internal epoch of a key if present.
     pub fn get_epoch(&self, key: &MemoKey) -> Option<usize> {
         self.entries.read().get(key).map(|e| e.epoch)
@@ -302,7 +318,8 @@ impl ExactMemoStore {
             });
         }
 
-        // 2. Cache miss: determine epoch and poison state from lifecycle
+        // 2. Cache miss: keep the per-root query memo bounded before admitting a new key.
+        self.make_room_for(key);
         let (epoch, is_poisoned) = {
             let mut lifecycle = self.lifecycle.write();
             let state = lifecycle.entry(key.clone()).or_default();
@@ -363,5 +380,34 @@ impl ExactMemoStore {
     pub fn clear(&self) {
         self.entries.write().clear();
         self.lifecycle.write().clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_memo_resets_before_exceeding_its_entry_bound() {
+        let memo = ExactMemoStore::new();
+        for index in 0..=MAX_EXACT_MEMO_ENTRIES {
+            let key = MemoKey::new(
+                "/project",
+                GenerationToken::new_with_str("generation"),
+                &format!("query-{index}"),
+                false,
+            );
+            memo.get_or_verify(&key, 0, 1, || {
+                Ok(VerifiedExactSet {
+                    results: Vec::new(),
+                    file_digests: HashMap::new(),
+                    bound_disclosure: None,
+                    stability_void: false,
+                })
+            })
+            .expect("memoize exact result");
+        }
+
+        assert!(memo.entry_count() <= MAX_EXACT_MEMO_ENTRIES);
     }
 }

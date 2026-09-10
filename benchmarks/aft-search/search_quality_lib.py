@@ -516,7 +516,10 @@ def resolve_descriptor(descriptor: Mapping[str, Any] | None, diff_paths: Sequenc
         raise InputFault(f"descriptor_class_mismatch:declared={declared}:derived={derived}")
     target = descriptor.get("targeted_mechanism")
     if derived == "ranking":
-        if target not in MECHANISMS:
+        if target == "none":
+            if descriptor.get("kind") != "paging":
+                raise InputFault("malformed_descriptor:latency_only_ranking")
+        elif target not in MECHANISMS:
             raise InputFault("malformed_descriptor:targeted_mechanism")
     elif target != "none" or descriptor.get("kind") not in {"readiness", "paging", "confidence", "harness"}:
         raise InputFault("malformed_descriptor:non_ranking")
@@ -692,12 +695,13 @@ def evaluate_predicate(reference: Mapping[str, Any], score: Mapping[str, Any], d
             failures.append(f"shape {shape} hit_at_5 below reference")
     if descriptor["slice_class"] == "ranking" and not missing_ranking_descriptor:
         target = descriptor["targeted_mechanism"]
-        old = _metric_block(reference.get("mechanisms", {}).get(target), f"reference.mechanism.{target}")
-        new = _metric_block(score.get("mechanisms", {}).get(target), f"score.mechanism.{target}")
-        if new["mrr_at_10"] <= old["mrr_at_10"]:
-            failures.append(f"targeted mechanism {target} did not improve")
-        if new["hit_at_5"] < old["hit_at_5"]:
-            failures.append(f"targeted mechanism {target} hit_at_5 below reference")
+        if target != "none":
+            old = _metric_block(reference.get("mechanisms", {}).get(target), f"reference.mechanism.{target}")
+            new = _metric_block(score.get("mechanisms", {}).get(target), f"score.mechanism.{target}")
+            if new["mrr_at_10"] <= old["mrr_at_10"]:
+                failures.append(f"targeted mechanism {target} did not improve")
+            if new["hit_at_5"] < old["hit_at_5"]:
+                failures.append(f"targeted mechanism {target} hit_at_5 below reference")
     elif descriptor["slice_class"] == "non_ranking":
         fixture_results = score.get("fixture_results", {})
         for fixture in descriptor["fixtures"]:
@@ -721,6 +725,10 @@ def total_gate(reference: Mapping[str, Any], score: Mapping[str, Any], manifest:
             difference = _engine_unwired_difference(reference, score, diff_paths)
             if difference:
                 raise InputFault(f"engine_unwired_mismatch:row={difference}")
+        if resolved["slice_class"] == "ranking" and resolved["targeted_mechanism"] == "none":
+            difference = _engine_unwired_difference(reference, score, diff_paths)
+            if difference:
+                raise InputFault(f"latency_only_ranking_mismatch:row={difference}")
         validate_scored_population(manifest, score)
         validate_profile_score(score)
         reasons = evaluate_predicate(reference, score, resolved, missing_ranking_descriptor=missing)

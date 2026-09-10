@@ -1811,6 +1811,7 @@ pub struct AppContext {
     callgraph_legacy_migration_summary_logged: Arc<AtomicBool>,
     pending_callgraph_store_paths: crate::callgraph_store::PendingCallGraphStorePaths,
     search_index: RwLock<Option<SearchIndex>>,
+    search_exact_memo: Arc<crate::commands::semantic_search::memo::ExactMemoStore>,
     search_index_rx: RwLock<Option<crossbeam_channel::Receiver<SearchIndex>>>,
     search_index_rx_generation: AtomicU64,
     search_index_rx_epoch: AtomicU64,
@@ -2285,6 +2286,9 @@ impl AppContext {
             callgraph_legacy_migration_summary_logged: Arc::new(AtomicBool::new(false)),
             pending_callgraph_store_paths: Arc::new(parking_lot::Mutex::new(BTreeSet::new())),
             search_index: RwLock::new(None),
+            search_exact_memo: Arc::new(
+                crate::commands::semantic_search::memo::ExactMemoStore::new(),
+            ),
             search_index_rx: RwLock::new(None),
             search_index_rx_generation: AtomicU64::new(0),
             search_index_rx_epoch: AtomicU64::new(0),
@@ -5204,6 +5208,12 @@ impl AppContext {
     /// Access the search index.
     pub fn search_index(&self) -> &RwLock<Option<SearchIndex>> {
         &self.search_index
+    }
+
+    pub(crate) fn search_exact_memo(
+        &self,
+    ) -> Arc<crate::commands::semantic_search::memo::ExactMemoStore> {
+        Arc::clone(&self.search_exact_memo)
     }
 
     /// Access the search-index build receiver.

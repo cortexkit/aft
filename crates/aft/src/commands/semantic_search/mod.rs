@@ -2026,30 +2026,6 @@ struct PreparedEngineLane {
     candidates: Vec<CandidateResult>,
 }
 
-struct AugmentedExactLane {
-    primary: exact_lane::ExactLane,
-    lexical_verifications: Vec<CandidateResult>,
-}
-
-impl SearchLane for AugmentedExactLane {
-    fn kind(&self) -> SearchLaneKind {
-        SearchLaneKind::Exact
-    }
-
-    fn execute(&self, input: &LaneInput<'_>) -> LaneExecution {
-        let mut execution = self.primary.execute(input);
-        execution
-            .candidates
-            .extend(self.lexical_verifications.iter().cloned());
-        execution.candidates.sort_by(score_free_r3_cmp);
-        let mut seen = HashSet::new();
-        execution
-            .candidates
-            .retain(|candidate| seen.insert((candidate.path.clone(), candidate.symbol_range)));
-        execution
-    }
-}
-
 impl SearchLane for PreparedEngineLane {
     fn kind(&self) -> SearchLaneKind {
         self.kind
@@ -2085,7 +2061,6 @@ fn run_engine_ranking(
 ) -> Result<EngineRanking, String> {
     use blocks::{BlockBuilder, CanonicalLane, CanonicalListKey, LaneCandidate};
     use confidence::{Confidence, ConfidenceEngine};
-    use exact_lane::ExactLane;
     use lexical_lane::CanonicalLexicalLane;
     use provenance::ObservedProvenance;
     use scoring::ScoringPolicy;
@@ -2095,6 +2070,11 @@ fn run_engine_ranking(
     let index = try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
         .and_then(|guard| guard.as_ref().cloned())
         .unwrap_or_else(SearchIndex::new);
+    let generation = GenerationToken::new_with_str(&format!(
+        "{}:{}",
+        ctx.search_index_rx_generation(),
+        ctx.semantic_index_rx_generation()
+    ));
     let snapshot = index.snapshot();
     let content_tokens = query_shape::extract_content_tokens(query);
     let token_refs = content_tokens
@@ -2143,6 +2123,32 @@ fn run_engine_ranking(
             ))
         })
         .collect::<Vec<_>>();
+    let mut exact_candidates = if plan.contains(SearchLaneKind::Exact) {
+        exact_lane::ExactLane::with_memo(ctx.search_exact_memo())
+            .search(
+                Some(&index),
+                project_root,
+                generation.clone(),
+                query,
+                include_tests,
+                0,
+                usize::MAX,
+                None,
+            )
+            .map_err(|error| error.to_string())?
+            .results
+    } else {
+        Vec::new()
+    };
+    if plan.shape != SearchShape::Identifier {
+        exact_candidates.retain(|candidate| candidate.evidence.kind != EvidenceKind::Definition);
+    }
+    exact_candidates.extend(lexical_verifications);
+    exact_candidates.sort_by(score_free_r3_cmp);
+    let mut seen_exact = HashSet::new();
+    exact_candidates
+        .retain(|candidate| seen_exact.insert((candidate.path.clone(), candidate.symbol_range)));
+
     let path_lookup_candidates = if plan.shape == SearchShape::Path {
         lexical
             .canonical_order()
@@ -2211,9 +2217,9 @@ fn run_engine_ranking(
     let mut registry = LaneRegistry::new();
     for kind in &plan.selected_lanes {
         let lane: Arc<dyn SearchLane> = match kind {
-            SearchLaneKind::Exact => Arc::new(AugmentedExactLane {
-                primary: ExactLane::new(),
-                lexical_verifications: lexical_verifications.clone(),
+            SearchLaneKind::Exact => Arc::new(PreparedEngineLane {
+                kind: *kind,
+                candidates: exact_candidates.clone(),
             }),
             SearchLaneKind::Anchored => Arc::new(anchored_lane::AnchoredLane::new()),
             SearchLaneKind::Lexical => Arc::new(PreparedEngineLane {
@@ -2310,11 +2316,6 @@ fn run_engine_ranking(
         );
     }
 
-    let generation = GenerationToken::new_with_str(&format!(
-        "{}:{}",
-        ctx.search_index_rx_generation(),
-        ctx.semantic_index_rx_generation()
-    ));
     let key = CanonicalListKey {
         project_root: project_root.to_path_buf(),
         snapshot_generation: generation.as_str().to_string(),
@@ -5385,6 +5386,18 @@ mod tests {
         .expect("build semantic search request")
     }
 
+    fn semantic_page_request(query: &str, top_k: usize, offset: usize) -> RawRequest {
+        serde_json::from_value(serde_json::json!({
+            "id": "semantic-search-page-test",
+            "command": "semantic_search",
+            "query": query,
+            "top_k": top_k,
+            "offset": offset,
+            "hint": "literal",
+        }))
+        .expect("build paged semantic search request")
+    }
+
     fn response_value(response: Response) -> serde_json::Value {
         serde_json::to_value(response).expect("serialize response")
     }
@@ -8168,6 +8181,89 @@ mod tests {
             .as_str()
             .expect("result file")
             .ends_with("src/lib.rs"));
+    }
+
+    #[test]
+    fn repeated_paged_search_reads_exact_candidates_once_per_query_generation() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let source_file = project.path().join("src/lib.rs");
+        std::fs::create_dir_all(source_file.parent().expect("source parent"))
+            .expect("create source dir");
+        std::fs::write(&source_file, "pub fn repeated_page_marker() {}\n").expect("write source");
+        let ctx = test_context(project.path());
+        let mut index = SearchIndex::new();
+        index.index_file(&source_file, b"pub fn repeated_page_marker() {}\n");
+        index.ready = true;
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+
+        let pages = [(100, 0), (100, 100), (100, 200), (100, 300)]
+            .into_iter()
+            .chain((0..10).map(|page| (10, page * 10)))
+            .chain((0..4).map(|page| (25, page * 25)))
+            .chain([(100, 0)]);
+        for (top_k, offset) in pages {
+            let response = response_value(handle_semantic_search(
+                &semantic_page_request("repeated_page_marker", top_k, offset),
+                &ctx,
+            ));
+            assert_eq!(response["success"], true);
+        }
+
+        assert_eq!(ctx.search_exact_memo().verifier_call_count(), 1);
+    }
+
+    #[test]
+    fn exact_page_memo_keys_include_corpus_generation() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let first = project.path().join("src/a.rs");
+        let second = project.path().join("src/b.rs");
+        std::fs::create_dir_all(first.parent().expect("source parent")).expect("create source dir");
+        std::fs::write(&first, "pub fn generation_marker() {}\n").expect("write first source");
+        std::fs::write(&second, "pub fn generation_marker() {}\n").expect("write second source");
+        let ctx = test_context(project.path());
+        let mut index = SearchIndex::new();
+        index.index_file(&first, b"pub fn generation_marker() {}\n");
+        index.index_file(&second, b"pub fn generation_marker() {}\n");
+        index.ready = true;
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+
+        let before = response_value(handle_semantic_search(
+            &semantic_page_request("generation_marker", 1, 0),
+            &ctx,
+        ));
+        assert!(before["results"][0]["file"]
+            .as_str()
+            .expect("first result path")
+            .ends_with("src/a.rs"));
+
+        std::fs::write(&first, "pub fn unrelated() {}\n").expect("edit first source");
+        ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .expect("installed search index")
+            .update_file(&first);
+        ctx.note_search_index_rx_generation(1);
+
+        let after = response_value(handle_semantic_search(
+            &semantic_page_request("generation_marker", 1, 0),
+            &ctx,
+        ));
+        assert!(after["results"][0]["file"]
+            .as_str()
+            .expect("updated result path")
+            .ends_with("src/b.rs"));
+        assert_eq!(ctx.search_exact_memo().verifier_call_count(), 2);
     }
 
     #[test]

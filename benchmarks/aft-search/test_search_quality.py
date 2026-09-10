@@ -247,5 +247,35 @@ class EngineUnwiredGateTests(unittest.TestCase):
         self.assertIn("train-55", descriptor_labels("alfonso/task/r48-engine-unwired-train-55-"))
 
 
+class LatencyOnlyRankingGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manifest, self.reference, self.score = synthetic_documents()
+        self.descriptor = {
+            "slice_class": "ranking",
+            "targeted_mechanism": "none",
+            "kind": "paging",
+            "fixtures": ["repeated-paged-exact-memo"],
+        }
+        self.paths = ["crates/aft/src/commands/semantic_search/memo.rs"]
+
+    def test_latency_only_ranking_accepts_byte_equal_results(self) -> None:
+        result = total_gate(
+            self.reference, self.score, self.manifest, self.descriptor, self.paths
+        )
+        self.assertEqual(result.exit_code, 0)
+
+    def test_latency_only_ranking_rejects_row_drift(self) -> None:
+        changed = copy.deepcopy(self.score)
+        changed["rows"][0]["ranked_paths"] = ["different.rs"]
+        result = total_gate(
+            self.reference, changed, self.manifest, self.descriptor, self.paths
+        )
+        self.assertEqual(result.exit_code, 2)
+        self.assertEqual(
+            result.reasons,
+            ("latency_only_ranking_mismatch:row=real_query.followup-census:1",),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
