@@ -1,7 +1,11 @@
 /// <reference path="../bun-test.d.ts" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { registerShutdownCleanup, runCleanups } from "../shutdown-hooks.js";
+import {
+  isOneShotRunProcess,
+  registerShutdownCleanup,
+  runCleanups,
+} from "../shutdown-hooks.js";
 
 // Drain the globalThis guard between tests so we can simulate independent loads.
 function resetShutdownHookState(): void {
@@ -10,9 +14,15 @@ function resetShutdownHookState(): void {
 }
 
 describe("registerShutdownCleanup", () => {
+  test("detects only the one-shot run command", () => {
+    expect(isOneShotRunProcess(["opencode", "run", "prompt"])).toBe(true);
+    expect(isOneShotRunProcess(["opencode", "serve", "--stdio"])).toBe(false);
+  });
+
   afterEach(() => {
     resetShutdownHookState();
   });
+
 
   test("registers and unregisters a cleanup without error", () => {
     const unregister = registerShutdownCleanup(() => {});
