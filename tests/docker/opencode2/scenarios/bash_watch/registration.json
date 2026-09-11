@@ -14,6 +14,26 @@
       "fixture": "./fixture",
       "turns": [
         {
+          "label": "setup-background",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash_watch-setup",
+                "name": "bash",
+                "arguments": {
+                  "command": "sleep 2; printf 'watch fixture\\n'",
+                  "background": true
+                },
+                "non_mutating_evidence": {
+                  "reason": "the setup task writes stdout only"
+                },
+                "outlives_result": true
+              }
+            ]
+          }
+        },
+        {
           "label": "call-tool",
           "response": {
             "kind": "tool_calls",
@@ -22,7 +42,7 @@
                 "id": "bash_watch-happy",
                 "name": "bash_watch",
                 "arguments": {
-                  "taskId": "{{task_id:setup}}",
+                  "taskId": "{{task_id:bash_watch-setup}}",
                   "timeoutMs": 1000
                 },
                 "non_mutating_evidence": {
@@ -41,6 +61,7 @@
         }
       ],
       "expected_turns": [
+        "setup-background",
         "call-tool",
         "finish"
       ],

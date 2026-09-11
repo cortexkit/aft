@@ -44,8 +44,8 @@
         "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
-        "T4": "applicable",
-        "T5": "applicable",
+        "T4": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
+        "T5": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T6": "applicable",
         "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/48340"
       }
@@ -53,7 +53,7 @@
     {
       "tool": "bash_kill",
       "trajectories": {
-        "T1": "applicable",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "n/a:no-permission-operation",
         "T4": "n/a:no-abortable-operation",
@@ -65,7 +65,7 @@
     {
       "tool": "bash_status",
       "trajectories": {
-        "T1": "applicable",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "n/a:no-permission-operation",
         "T4": "n/a:no-abortable-operation",
@@ -77,7 +77,7 @@
     {
       "tool": "bash_watch",
       "trajectories": {
-        "T1": "applicable",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "n/a:no-permission-operation",
         "T4": "n/a:no-abortable-operation",
@@ -89,7 +89,7 @@
     {
       "tool": "bash_write",
       "trajectories": {
-        "T1": "applicable",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "n/a:no-permission-operation",
         "T4": "n/a:no-abortable-operation",

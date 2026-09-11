@@ -21,7 +21,11 @@ import { HarnessError, type HarnessFailureCode } from "./errors.js";
 import { runApiControl, startScenarioClient } from "./host.js";
 import { readPermissionAskInventory } from "./inventory.js";
 import { createScenarioIsolation } from "./isolation.js";
-import { CompletionWakeLiveness, WatchPatternLiveness } from "./liveness.js";
+import {
+  assertT5HostWakeTranscript,
+  CompletionWakeLiveness,
+  WatchPatternLiveness,
+} from "./liveness.js";
 import {
   hostToolArguments,
   hostToolName,
@@ -715,6 +719,41 @@ describe("source-of-truth derivation", () => {
 });
 
 describe("background liveness clocks", () => {
+  test("completion wake requires one host-transcript steer request", () => {
+    const completionScenario = scenario(call());
+    completionScenario.id = "bash/T5/completion_wake";
+    completionScenario.tool = "bash";
+    completionScenario.trajectory = "T5";
+    completionScenario.execution = "shared-server";
+    completionScenario.metadata = {
+      t5: { source_call_id: "source", wake_turn: "wake-observed" },
+    };
+    const exchange = {
+      index: 0,
+      label: "wake-observed",
+      request: {
+        messages: [
+          {
+            role: "user",
+            content: "<system-reminder>\n[BACKGROUND BASH COMPLETED]\n- task bash-control\n</system-reminder>",
+          },
+        ],
+      },
+      response: {},
+      observed_at: "now",
+    };
+    expect(() =>
+      assertT5HostWakeTranscript(completionScenario, [exchange], {
+        "task_id:source": "bash-control",
+      }),
+    ).not.toThrow();
+    expect(() =>
+      assertT5HostWakeTranscript(completionScenario, [], {
+        "task_id:source": "bash-control",
+      }),
+    ).toThrow("host transcript contains 0 completion steer wakes");
+  });
+
   test("watch setup, stdout antecedent, delivery, and duplicate window pass", () => {
     const clock = new WatchPatternLiveness({
       scenario: "bash/T5/watch_pattern_once",

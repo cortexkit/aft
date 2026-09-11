@@ -20,6 +20,7 @@ import {
   type SharedServerHandle,
 } from "./host.js";
 import { createScenarioIsolation, assertPluginLoadEvidence } from "./isolation.js";
+import { assertT5HostWakeTranscript } from "./liveness.js";
 import {
   DeterministicScenarioMock,
   materializeTurnPlaceholders,
@@ -688,6 +689,7 @@ async function runOneScenario(options: {
     threeState?.assertComplete();
     const expectedTurns = scenario.expected_turns ?? scenario.turns.map((turn) => turn.label);
     assertTurnLog(expectedTurns, await readTurnLog(turnLogPath));
+    assertT5HostWakeTranscript(scenario, mock.exchanges, controlPathValues);
 
     pluginLog = await readFile(isolation.plugin_log, "utf8");
     await forensics.writeText("plugin.log", pluginLog);

@@ -1,3 +1,5 @@
+import type { RecordedMockExchange, ScenarioDefinition } from "./types.js";
+import { asRecord } from "./util.js";
 import { fail } from "./errors.js";
 
 export interface WatchLivenessEvidence {
@@ -164,5 +166,35 @@ export class CompletionWakeLiveness {
     if (now - deliveries[0].at < this.rearmWindowMs) {
       throw new Error(`${this.scenario}: duplicate-detection window has not elapsed`);
     }
+  }
+}
+
+export function assertT5HostWakeTranscript(
+  scenario: ScenarioDefinition,
+  exchanges: readonly RecordedMockExchange[],
+  controlPathValues: Readonly<Record<string, string>>,
+): void {
+  const t5 = asRecord(scenario.metadata?.t5);
+  if (!t5 || typeof t5.wake_turn !== "string" || typeof t5.source_call_id !== "string") return;
+  const taskId = controlPathValues[`task_id:${t5.source_call_id}`];
+  if (!taskId) throw new Error(`${scenario.id}: background source task id was not observed`);
+  const wakeRequests = exchanges.filter((exchange) => {
+    if (exchange.label !== t5.wake_turn) return false;
+    const messages = asRecord(exchange.request)?.messages;
+    if (!Array.isArray(messages)) return false;
+    return messages.some((value) => {
+      const message = asRecord(value);
+      const content = JSON.stringify(message?.content) ?? "";
+      return (
+        message?.role === "user" &&
+        content.includes("[BACKGROUND BASH COMPLETED]") &&
+        content.includes(taskId)
+      );
+    });
+  });
+  if (wakeRequests.length !== 1) {
+    throw new Error(
+      `${scenario.id}: host transcript contains ${wakeRequests.length} completion steer wakes for ${taskId}`,
+    );
   }
 }

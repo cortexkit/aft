@@ -14,6 +14,26 @@
       "fixture": "./fixture",
       "turns": [
         {
+          "label": "setup-background",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash_status-setup",
+                "name": "bash",
+                "arguments": {
+                  "command": "sleep 30",
+                  "background": true
+                },
+                "non_mutating_evidence": {
+                  "reason": "the setup task only waits"
+                },
+                "outlives_result": true
+              }
+            ]
+          }
+        },
+        {
           "label": "call-tool",
           "response": {
             "kind": "tool_calls",
@@ -22,7 +42,7 @@
                 "id": "bash_status-happy",
                 "name": "bash_status",
                 "arguments": {
-                  "taskId": "{{task_id:setup}}"
+                  "taskId": "{{task_id:bash_status-setup}}"
                 },
                 "non_mutating_evidence": {
                   "reason": "bash_status only observes fixture state"
@@ -40,6 +60,7 @@
         }
       ],
       "expected_turns": [
+        "setup-background",
         "call-tool",
         "finish"
       ],

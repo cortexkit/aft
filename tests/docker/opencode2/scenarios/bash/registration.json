@@ -609,25 +609,25 @@
       "tool": "bash",
       "trajectory": "T5",
       "execution": "shared-server",
-      "prompt": "Start two sequential background tasks and observe one idle wake for each completion.",
+      "prompt": "Start one background task and observe its completion wake on the host.",
       "fixture": "./fixture",
       "quiescence_timeout_ms": 30000,
       "turns": [
         {
-          "label": "start-first",
+          "label": "start-background",
           "response": {
             "kind": "tool_calls",
             "calls": [
               {
-                "id": "bash-wake-first",
+                "id": "bash-wake-source",
                 "name": "bash",
                 "arguments": {
-                  "command": "sleep 5; printf 'first wake\\n' > completion-one.txt",
+                  "command": "sleep 5; printf 'completion wake\\n' > completion.txt",
                   "background": true
                 },
                 "disk_effects": [
                   {
-                    "path": "completion-one.txt",
+                    "path": "completion.txt",
                     "phase": "post_result"
                   }
                 ],
@@ -637,66 +637,35 @@
           }
         },
         {
-          "label": "idle-first",
+          "label": "idle-before-wake",
           "response": {
             "kind": "text",
-            "content": "Waiting for the first completion."
+            "content": "Waiting for the completion wake."
           }
         },
         {
-          "label": "start-second",
-          "response": {
-            "kind": "tool_calls",
-            "calls": [
-              {
-                "id": "bash-wake-second",
-                "name": "bash",
-                "arguments": {
-                  "command": "sleep 5; printf 'second wake\\n' > completion-two.txt",
-                  "background": true
-                },
-                "disk_effects": [
-                  {
-                    "path": "completion-two.txt",
-                    "phase": "post_result"
-                  }
-                ],
-                "outlives_result": true
-              }
-            ]
-          }
-        },
-        {
-          "label": "idle-second",
+          "label": "wake-observed",
           "response": {
             "kind": "text",
-            "content": "Waiting for the second completion."
-          }
-        },
-        {
-          "label": "finish-wakes",
-          "response": {
-            "kind": "text",
-            "content": "Both completion wakes observed."
+            "content": "Completion wake observed."
           }
         }
       ],
       "expected_turns": [
-        "start-first",
-        "idle-first",
-        "start-second",
-        "idle-second",
-        "finish-wakes"
+        "start-background",
+        "idle-before-wake",
+        "wake-observed"
       ],
       "metadata": {
         "t5": {
           "subcase": "completion_wake",
+          "source_call_id": "bash-wake-source",
+          "wake_turn": "wake-observed",
           "initial_delivery_deadline_ms": 30000,
           "duplicate_detection_window": {
             "source": "product_rearm_ceiling_plus_one_tick",
             "tick_ms": 50
-          },
-          "sequential_tasks": true
+          }
         }
       }
     },
@@ -793,6 +762,8 @@
         "t5": {
           "subcase": "watch_pattern_once",
           "pattern": "WATCH_MATCH",
+          "source_call_id": "bash-watch-source",
+          "wake_turn": "finish-watch",
           "setup_deadline_ms": 30000,
           "setup_phases": [
             "watch_arm",

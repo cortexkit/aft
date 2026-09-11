@@ -14,6 +14,27 @@
       "fixture": "./fixture",
       "turns": [
         {
+          "label": "setup-pty",
+          "response": {
+            "kind": "tool_calls",
+            "calls": [
+              {
+                "id": "bash_write-setup",
+                "name": "bash",
+                "arguments": {
+                  "command": "read line; printf '%s\\n' \"$line\"",
+                  "pty": true,
+                  "background": true
+                },
+                "non_mutating_evidence": {
+                  "reason": "the PTY setup echoes input to stdout only"
+                },
+                "outlives_result": true
+              }
+            ]
+          }
+        },
+        {
           "label": "call-tool",
           "response": {
             "kind": "tool_calls",
@@ -22,8 +43,8 @@
                 "id": "bash_write-happy",
                 "name": "bash_write",
                 "arguments": {
-                  "taskId": "{{task_id:setup}}",
-                  "input": "fixture input"
+                  "taskId": "{{task_id:bash_write-setup}}",
+                  "input": "fixture input\n"
                 },
                 "non_mutating_evidence": {
                   "reason": "bash_write only observes fixture state"
@@ -41,6 +62,7 @@
         }
       ],
       "expected_turns": [
+        "setup-pty",
         "call-tool",
         "finish"
       ],
@@ -50,14 +72,17 @@
         "rules": [
           {
             "kind": "field",
-            "field": "fixture_marker",
-            "pattern": "^(?=[\\s\\S]*(?<value>task))[\\s\\S]+$",
+            "field": "bytes_written",
+            "pattern": "^[\\s\\S]*\\\"bytes_written\\\": (?<value>\\d+)[\\s\\S]*$",
             "min_lines": 1,
-            "max_lines": 10000
+            "max_lines": 10000,
+            "types": {
+              "value": "number"
+            }
           }
         ],
         "expected": {
-          "fixture_marker": "task"
+          "bytes_written": 14
         }
       }
     },
