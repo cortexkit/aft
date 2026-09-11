@@ -340,6 +340,17 @@ expect_rc 2 "a train ref a later ! pattern excludes refuses"
 # (the run itself is not watched here; the first-run probe rows cover that).
 python3 "$SCRIPT_DIR/lib/workflow-gates.py" --train-ref train/ok --tests-workflow "$dir/work/.github/workflows/tests.yml" 2>/dev/null | grep -q '^trigger|ok$' ||
   fail "a ref the exclusion does not cover must still trigger"
+# Re-inclusion: a positive pattern after the `!` admits the ref again. Both
+# lifted implementations support it because the docs say so; without a row
+# it is the arm that rots quietly.
+write_tests_workflow "$dir/work" "      - $DEFAULT_BRANCH
+      - 'train/**'
+      - '!train/blocked/**'
+      - 'train/blocked/allowed'"
+python3 "$SCRIPT_DIR/lib/workflow-gates.py" --train-ref train/blocked/allowed --tests-workflow "$dir/work/.github/workflows/tests.yml" 2>/dev/null | grep -q '^trigger|ok$' ||
+  fail "a later positive pattern must re-include a ref an earlier ! excluded"
+python3 "$SCRIPT_DIR/lib/workflow-gates.py" --train-ref train/blocked/other --tests-workflow "$dir/work/.github/workflows/tests.yml" 2>/dev/null | grep -q '^trigger|missing$' ||
+  fail "re-inclusion must be exact, not a widening of the exclusion"
 
 # --- refusal: no tests.yml at all ------------------------------------------
 dir="$(new_fixture noworkflow)"
