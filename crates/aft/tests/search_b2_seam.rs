@@ -545,3 +545,52 @@ fn plain_natural_language_verbatim_phrase_runs_exact() {
     assert!(result_files(&response)[0].ends_with("src/subc_format.rs"));
     assert_eq!(response["results"][0]["exact"], true);
 }
+
+#[test]
+fn named_file_precedence_preserves_outside_exact_evidence() {
+    let (base_url, server) = start_embedding_server();
+    let (project, ctx) = path_fact_context(base_url);
+    for file in ["subc_format.rs", "context.rs"] {
+        use std::io::Write as _;
+        writeln!(
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(project.path().join("src").join(file))
+                .expect("open exact precedence fixture"),
+            "// shared_exact subc_format.rs"
+        )
+        .expect("append exact precedence fixture");
+    }
+    *ctx.search_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(SearchIndex::build(project.path()));
+    let response = response_value(handle_semantic_search(
+        &request("r1a-stable-path-precedence", "shared_exact subc_format.rs"),
+        &ctx,
+    ));
+    server.join().expect("embedding server");
+
+    let results = response["results"].as_array().expect("results");
+    let named_position = results
+        .iter()
+        .position(|result| {
+            result["file"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("src/subc_format.rs"))
+        })
+        .expect("named file result");
+    let outside_position = results
+        .iter()
+        .position(|result| {
+            result["file"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("src/context.rs"))
+        })
+        .expect("outside exact result");
+
+    assert_eq!(named_position, 0, "response: {response:?}");
+    assert!(named_position < outside_position, "response: {response:?}");
+    assert_eq!(results[named_position]["exact"], true);
+    assert_eq!(results[outside_position]["exact"], true);
+}

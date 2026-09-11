@@ -2214,6 +2214,11 @@ fn definition_matches_identifier_token(candidate: &CandidateResult, query: &str)
         })
 }
 
+fn path_scope_contains(path_scope: &HashSet<PathBuf>, path: &Path) -> bool {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    path_scope.contains(&path)
+}
+
 fn run_engine_ranking(
     request_id: &str,
     ctx: &AppContext,
@@ -2376,12 +2381,25 @@ fn run_engine_ranking(
     } else {
         Vec::new()
     };
-    if !path_lookup_candidates.is_empty() && plan.query_facts.has_path_token {
-        let path_scope = path_lookup_candidates
-            .iter()
-            .map(|candidate| candidate.path.clone())
-            .collect::<HashSet<_>>();
-        exact_candidates.retain(|candidate| path_scope.contains(&candidate.path));
+    let path_scope =
+        (!path_lookup_candidates.is_empty() && plan.query_facts.has_path_token).then(|| {
+            path_lookup_candidates
+                .iter()
+                .map(|candidate| {
+                    std::fs::canonicalize(&candidate.path)
+                        .unwrap_or_else(|_| candidate.path.clone())
+                })
+                .collect::<HashSet<_>>()
+        });
+    if let Some(path_scope) = &path_scope {
+        let (mut in_scope, out_of_scope): (Vec<_>, Vec<_>) =
+            exact_candidates.into_iter().partition(|candidate| {
+                let path = std::fs::canonicalize(&candidate.path)
+                    .unwrap_or_else(|_| candidate.path.clone());
+                path_scope.contains(&path)
+            });
+        in_scope.extend(out_of_scope);
+        exact_candidates = in_scope;
     }
 
     let mut semantic_metadata = HashMap::new();
@@ -2574,8 +2592,39 @@ fn run_engine_ranking(
     let policy = ScoringPolicy::from_plan_table(&PlanTable::running_table(), plan.shape)
         .map_err(|error| error.to_string())?;
     let builder = BlockBuilder::new(key, policy, lanes).map_err(|error| error.to_string())?;
-    let page =
+    let mut page =
         paging::serve_public_page(&builder, page_request).map_err(|error| error.to_string())?;
+    if let Some(path_scope) = &path_scope {
+        let mut order_index = 0;
+        for block in &mut page.reply.canonical_list.blocks {
+            let entries = std::mem::take(&mut block.entries);
+            let (exact, non_exact): (Vec<_>, Vec<_>) = entries
+                .into_iter()
+                .partition(|entry| entry.result.evidence.tier == EvidenceTier::Exact);
+            let (mut exact_in_scope, exact_outside): (Vec<_>, Vec<_>) = exact
+                .into_iter()
+                .partition(|entry| path_scope_contains(path_scope, &entry.result.path));
+            let (mut non_exact_in_scope, non_exact_outside): (Vec<_>, Vec<_>) = non_exact
+                .into_iter()
+                .partition(|entry| path_scope_contains(path_scope, &entry.result.path));
+            exact_in_scope.extend(exact_outside);
+            exact_in_scope.append(&mut non_exact_in_scope);
+            exact_in_scope.extend(non_exact_outside);
+            for entry in &mut exact_in_scope {
+                entry.r3_order_index = order_index;
+                order_index += 1;
+            }
+            block.entries = exact_in_scope;
+        }
+        page.reply.page = page
+            .reply
+            .canonical_list
+            .entries()
+            .skip(page_request.offset())
+            .take(page_request.top_k())
+            .cloned()
+            .collect();
+    }
     let confidence = ConfidenceEngine::running()
         .evaluate_reply(&page.reply)
         .map_err(|error| error.to_string())?;
