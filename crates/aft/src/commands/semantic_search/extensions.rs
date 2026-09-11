@@ -66,7 +66,13 @@ pub enum SymbolIndexStatus {
 
 /// A semantic index retained without copying its embedding storage.
 #[derive(Clone)]
-pub struct SemanticSnapshot<'a>(Arc<RwLockReadGuard<'a, Option<SemanticIndex>>>);
+pub struct SemanticSnapshot<'a>(SemanticSnapshotStorage<'a>);
+
+#[derive(Clone)]
+enum SemanticSnapshotStorage<'a> {
+    Guard(Arc<RwLockReadGuard<'a, Option<SemanticIndex>>>),
+    Borrowed(Arc<SemanticIndex>),
+}
 
 impl std::fmt::Debug for SemanticSnapshot<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -79,11 +85,18 @@ impl std::fmt::Debug for SemanticSnapshot<'_> {
 
 impl<'a> SemanticSnapshot<'a> {
     pub fn from_guard(guard: RwLockReadGuard<'a, Option<SemanticIndex>>) -> Self {
-        Self(Arc::new(guard))
+        Self(SemanticSnapshotStorage::Guard(Arc::new(guard)))
+    }
+
+    pub fn from_borrowed(index: Arc<SemanticIndex>) -> Self {
+        Self(SemanticSnapshotStorage::Borrowed(index))
     }
 
     pub fn index(&self) -> Option<&SemanticIndex> {
-        self.0.as_ref().as_ref()
+        match &self.0 {
+            SemanticSnapshotStorage::Guard(guard) => guard.as_ref().as_ref(),
+            SemanticSnapshotStorage::Borrowed(index) => Some(index),
+        }
     }
 }
 

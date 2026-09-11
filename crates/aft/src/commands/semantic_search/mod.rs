@@ -93,7 +93,7 @@ use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
@@ -115,7 +115,7 @@ use crate::query_shape::{self, QueryKind, QueryShape};
 use crate::readonly_artifacts::{GitRootResolutionError, ReadOnlyArtifact, ReadOnlyDegradation};
 use crate::search_index::{
     sort_grep_matches_by_mtime_desc, try_read_with_budget, GrepMatch, GrepPathExclusion,
-    GrepResult, IndexStatus, SearchIndex, SearchIndexSnapshot, INTERACTIVE_ARTIFACT_READ_BUDGET,
+    GrepResult, IndexStatus, SearchIndex, INTERACTIVE_ARTIFACT_READ_BUDGET,
 };
 use crate::semantic_index::{
     query_embedding_timeout_budget, strip_query_embedding_timeout_marker, EmbeddingModel,
@@ -125,14 +125,6 @@ use crate::symbols::{Range, Symbol, SymbolKind};
 
 const DEFAULT_TOP_K: usize = 10;
 const MAX_TOP_K: usize = 100;
-const HYBRID_LEXICAL_BOOST: f32 = 1.1;
-const LEXICAL_ONLY_SCORE_CEILING: f32 = 0.25;
-const RRF_K: f32 = 60.0;
-const LEXICAL_ENUMERATION_LIMIT: usize = 50;
-const GENERATED_DIRECTORY_DENSITY_NUMERATOR: usize = 3;
-const GENERATED_DIRECTORY_DENSITY_DENOMINATOR: usize = 5;
-const SEMANTIC_OVERFETCH_MULTIPLIER: usize = 3;
-const SEMANTIC_OVERFETCH_FLOOR: usize = 10;
 const DEGRADED_GREP_FILE_LIMIT: usize = 1_000;
 const DEGRADED_GREP_RESULT_LIMIT: usize = 100;
 const DEGRADED_GREP_WALK_BUDGET: Duration = Duration::from_secs(10);
@@ -213,8 +205,6 @@ pub struct HybridResult {
     pub(crate) exact_phrase_count: usize,
     pub(crate) exact_window_lines: Option<usize>,
     pub(crate) fusion_score: f32,
-    pub(crate) cap_protected: bool,
-    pub(crate) lexical_generated_artifact: bool,
     pub snippet: String,
 }
 
@@ -227,8 +217,6 @@ struct SemanticSearchParams {
     offset: usize,
     #[serde(default, alias = "includeTests")]
     include_tests: bool,
-    #[serde(default)]
-    path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,6 +235,184 @@ enum SearchIndexWaitError {
 
 struct RuntimeReadinessSource<'a> {
     ctx: &'a AppContext,
+}
+
+#[derive(Clone)]
+struct ExternalBorrowedArtifacts {
+    search: ReadOnlyArtifact<Arc<SearchIndex>>,
+    semantic: ReadOnlyArtifact<Arc<SemanticIndex>>,
+    search_generation: GenerationToken,
+}
+
+struct ExternalReadinessSource<'a> {
+    ctx: &'a AppContext,
+    root: &'a Path,
+    storage_dir: Option<&'a Path>,
+    loaded: OnceLock<ExternalBorrowedArtifacts>,
+}
+
+impl<'a> ExternalReadinessSource<'a> {
+    fn new(ctx: &'a AppContext, root: &'a Path, storage_dir: Option<&'a Path>) -> Self {
+        Self {
+            ctx,
+            root,
+            storage_dir,
+            loaded: OnceLock::new(),
+        }
+    }
+
+    fn load(&self) -> &ExternalBorrowedArtifacts {
+        self.loaded.get_or_init(|| {
+            let generation = crate::readonly_artifacts::search_index_artifact_generation(
+                self.root,
+                self.storage_dir,
+            )
+            .map(|artifact| format!("{:?}", artifact.generation))
+            .unwrap_or_else(|| "absent".to_string());
+            ExternalBorrowedArtifacts {
+                search: self
+                    .ctx
+                    .open_borrowed_search_index(self.root, self.storage_dir),
+                semantic: self
+                    .ctx
+                    .open_borrowed_semantic_index(self.root, self.storage_dir),
+                search_generation: GenerationToken::new_with_str(&format!(
+                    "borrowed:{}:{generation}",
+                    self.root.display()
+                )),
+            }
+        })
+    }
+
+    fn loaded(&self) -> Option<&ExternalBorrowedArtifacts> {
+        self.loaded.get()
+    }
+}
+
+impl extensions::ReadinessSource for ExternalReadinessSource<'_> {
+    fn sample(&self) -> extensions::ReadinessObservation<'_> {
+        use extensions::{
+            ReadinessObservation, SemanticReadiness, SemanticSnapshot, SymbolIndexStatus,
+            SymbolReadiness, TrigramReadiness,
+        };
+
+        let Some(artifacts) = self.loaded() else {
+            return ReadinessObservation {
+                semantic: SemanticReadiness {
+                    status: SemanticIndexStatus::Building {
+                        stage: "loading_artifacts".to_string(),
+                        files: None,
+                        entries_done: None,
+                        entries_total: None,
+                    },
+                    snapshot: None,
+                    evicted: false,
+                    lock_contended: false,
+                },
+                trigram: TrigramReadiness {
+                    status: IndexStatus::Building,
+                    snapshot: None,
+                    evicted: false,
+                    lock_contended: false,
+                },
+                symbol: SymbolReadiness {
+                    status: SymbolIndexStatus::Disabled,
+                    snapshot: None,
+                    evicted: false,
+                    lock_contended: false,
+                },
+            };
+        };
+
+        let trigram = match &artifacts.search {
+            ReadOnlyArtifact::Fresh(index)
+            | ReadOnlyArtifact::Stale(crate::readonly_artifacts::ReadOnlyStale { index, .. }) => {
+                TrigramReadiness {
+                    status: IndexStatus::Ready,
+                    snapshot: Some(Arc::new(index.snapshot())),
+                    evicted: false,
+                    lock_contended: false,
+                }
+            }
+            ReadOnlyArtifact::Degraded(_) | ReadOnlyArtifact::Absent => TrigramReadiness {
+                status: IndexStatus::Fallback,
+                snapshot: None,
+                evicted: false,
+                lock_contended: false,
+            },
+            ReadOnlyArtifact::Cancelled => TrigramReadiness {
+                status: IndexStatus::Building,
+                snapshot: None,
+                evicted: false,
+                lock_contended: false,
+            },
+        };
+        let semantic =
+            match &artifacts.semantic {
+                ReadOnlyArtifact::Fresh(index)
+                | ReadOnlyArtifact::Stale(crate::readonly_artifacts::ReadOnlyStale {
+                    index, ..
+                }) if semantic_fingerprint_matches_session(self.ctx, index) => SemanticReadiness {
+                    status: SemanticIndexStatus::ready(),
+                    snapshot: Some(SemanticSnapshot::from_borrowed(Arc::clone(index))),
+                    evicted: false,
+                    lock_contended: false,
+                },
+                ReadOnlyArtifact::Cancelled => SemanticReadiness {
+                    status: SemanticIndexStatus::Building {
+                        stage: "loading_artifacts".to_string(),
+                        files: None,
+                        entries_done: None,
+                        entries_total: None,
+                    },
+                    snapshot: None,
+                    evicted: false,
+                    lock_contended: false,
+                },
+                ReadOnlyArtifact::Degraded(_) => SemanticReadiness {
+                    status: SemanticIndexStatus::Failed(
+                        "borrowed_semantic_index_load_budget".to_string(),
+                    ),
+                    snapshot: None,
+                    evicted: false,
+                    lock_contended: false,
+                },
+                ReadOnlyArtifact::Fresh(_) | ReadOnlyArtifact::Stale(_) => SemanticReadiness {
+                    status: SemanticIndexStatus::Failed("fingerprint_mismatch".to_string()),
+                    snapshot: None,
+                    evicted: false,
+                    lock_contended: false,
+                },
+                ReadOnlyArtifact::Absent => SemanticReadiness {
+                    status: SemanticIndexStatus::Disabled,
+                    snapshot: None,
+                    evicted: false,
+                    lock_contended: false,
+                },
+            };
+
+        ReadinessObservation {
+            semantic,
+            trigram,
+            symbol: SymbolReadiness {
+                status: SymbolIndexStatus::Disabled,
+                snapshot: None,
+                evicted: false,
+                lock_contended: false,
+            },
+        }
+    }
+
+    fn bounded_first_search_wait(&self) -> extensions::ReadinessWait {
+        let artifacts = self.load();
+        if matches!(artifacts.search, ReadOnlyArtifact::Cancelled)
+            || matches!(artifacts.semantic, ReadOnlyArtifact::Cancelled)
+        {
+            extensions::ReadinessWait::Cancelled
+        } else {
+            extensions::ReadinessWait::Completed
+        }
+    }
 }
 
 impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
@@ -402,30 +568,6 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
 }
 
 #[derive(Debug, Clone)]
-struct LexicalCollection {
-    files: Vec<(PathBuf, f32)>,
-    ready: bool,
-    engine_capped: bool,
-    artifact_lock_timed_out: bool,
-}
-
-#[derive(Debug, Clone)]
-struct LexicalCandidate {
-    file: PathBuf,
-    score: f32,
-    generated_artifact: bool,
-    exact: bool,
-    exact_phrase_count: usize,
-    exact_window_lines: Option<usize>,
-    ordinal: usize,
-}
-
-struct GeneratedArtifactCache<'a> {
-    project_root: &'a Path,
-    directory_cache: HashMap<PathBuf, bool>,
-}
-
-#[derive(Debug, Clone)]
 struct DegradedGrepFallbackResult {
     grep: GrepResult,
     file_cap_reached: bool,
@@ -519,6 +661,51 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
             .and_then(|value| value.as_str())
             .unwrap_or_default(),
     );
+    let project_root = grep_executor::project_root(ctx);
+    let requested_path = req
+        .params
+        .get("path")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let external_root = if let Some(requested_path) = requested_path {
+        match ctx.resolve_external_git_root(&project_root, requested_path) {
+            Ok(root) if root != project_root => {
+                if ctx.config().restrict_to_project_root || ctx.request_force_restrict(&req.id) {
+                    return Response::error(
+                        &req.id,
+                        "path_outside_root",
+                        format!(
+                            "aft_search path is outside the configured project root while path restriction is enabled: {}",
+                            root.display()
+                        ),
+                    );
+                }
+                Some(root)
+            }
+            Ok(_) => None,
+            Err(GitRootResolutionError::PathNotFound(path)) => {
+                return Response::error(
+                    &req.id,
+                    "path_not_found",
+                    format!("path does not exist: {}", path.display()),
+                );
+            }
+            Err(GitRootResolutionError::NotAGitRoot) => {
+                return Response::error(
+                    &req.id,
+                    "not_a_git_root",
+                    format!("path is not inside a git repository: {requested_path}"),
+                );
+            }
+            Err(GitRootResolutionError::Other(error)) => {
+                return Response::error(&req.id, "path_resolution_failed", error);
+            }
+        }
+    } else {
+        None
+    };
+
     // The extensions come from the search_b2 install point: A-side defaults
     // until campaign B2 installs its router, plans, variants and readiness.
     let extensions = crate::search_b2::install_defaults();
@@ -527,13 +714,18 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
         index: 0,
         text: facts.original_query(),
     });
-    let readiness_source = RuntimeReadinessSource { ctx };
+    let runtime_source = RuntimeReadinessSource { ctx };
+    let storage_dir = ctx.config().storage_dir.clone();
+    let external_source = external_root
+        .as_deref()
+        .map(|root| ExternalReadinessSource::new(ctx, root, storage_dir.as_deref()));
+    let readiness_source: &dyn extensions::ReadinessSource = external_source
+        .as_ref()
+        .map(|source| source as &dyn extensions::ReadinessSource)
+        .unwrap_or(&runtime_source);
     let root = Root::new(
-        req.params
-            .get("path")
-            .and_then(|value| value.as_str())
-            .unwrap_or("."),
-        &readiness_source as &dyn extensions::ReadinessSource,
+        external_root.as_deref().unwrap_or(&project_root),
+        readiness_source,
     );
     let readiness = extensions.sample_readiness(&root);
     if readiness.cancelled() {
@@ -543,7 +735,14 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     plan.variants = variants.into_iter().map(|variant| variant.text).collect();
 
     let _embedding_attribution = crate::search_b2::embed_counter::install(req.id.clone());
-    let mut response = handle_semantic_search_inner(req, ctx, page_request, extensions, &plan);
+    let mut response = handle_semantic_search_inner(
+        req,
+        ctx,
+        page_request,
+        extensions,
+        &plan,
+        external_source.as_ref(),
+    );
     if response.success {
         let embedding_counts = crate::search_b2::embed_counter::read(&req.id);
         attach_search_execution_metadata(&mut response, &plan, embedding_counts);
@@ -598,6 +797,7 @@ fn handle_semantic_search_inner(
     page_request: paging::ValidatedPageRequest,
     extensions: &dyn extensions::SearchExtensions,
     engine_plan: &extensions::LanePlan<'_>,
+    external_source: Option<&ExternalReadinessSource<'_>>,
 ) -> Response {
     if search_cancellation_requested() {
         return cancelled_search_response(req);
@@ -631,47 +831,17 @@ fn handle_semantic_search_inner(
     params.offset = page_request.offset();
     let project_root = grep_executor::project_root(ctx);
     let shape = query_shape::classify(&params.query);
-    let requested_path = params
-        .path
-        .as_deref()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(str::to_string);
-    if let Some(requested_path) = requested_path {
-        let external_root = match ctx.resolve_external_git_root(&project_root, &requested_path) {
-            Ok(root) => root,
-            Err(GitRootResolutionError::PathNotFound(path)) => {
-                return Response::error(
-                    &req.id,
-                    "path_not_found",
-                    format!("path does not exist: {}", path.display()),
-                );
-            }
-            Err(GitRootResolutionError::NotAGitRoot) => {
-                return Response::error(
-                    &req.id,
-                    "not_a_git_root",
-                    format!("path is not inside a git repository: {requested_path}"),
-                );
-            }
-            Err(GitRootResolutionError::Other(error)) => {
-                return Response::error(&req.id, "path_resolution_failed", error);
-            }
-        };
-
-        if external_root != project_root {
-            if ctx.config().restrict_to_project_root || ctx.request_force_restrict(&req.id) {
-                return Response::error(
-                    &req.id,
-                    "path_outside_root",
-                    format!(
-                        "aft_search path is outside the configured project root while path restriction is enabled: {}",
-                        external_root.display()
-                    ),
-                );
-            }
-            return handle_external_search(req, ctx, params, top_k, shape, external_root);
-        }
+    if let Some(external_source) = external_source {
+        return handle_external_search(
+            req,
+            ctx,
+            params,
+            shape,
+            page_request,
+            extensions,
+            engine_plan,
+            external_source,
+        );
     }
     let semantic_status_snapshot = match try_read_with_budget(
         ctx.semantic_index_status(),
@@ -739,6 +909,9 @@ fn handle_semantic_search_inner(
             warnings,
             &project_root,
             params.include_tests,
+            page_request,
+            extensions,
+            engine_plan,
         ),
         SearchMode::Semantic | SearchMode::Hybrid => handle_semantic_or_hybrid_search(
             req,
@@ -763,47 +936,62 @@ fn handle_external_search(
     req: &RawRequest,
     ctx: &AppContext,
     params: SemanticSearchParams,
-    top_k: usize,
     shape: QueryShape,
-    external_root: PathBuf,
+    page_request: paging::ValidatedPageRequest,
+    extensions: &dyn extensions::SearchExtensions,
+    engine_plan: &extensions::LanePlan<'_>,
+    readiness_source: &ExternalReadinessSource<'_>,
 ) -> Response {
-    let storage_dir = ctx.config().storage_dir.clone();
+    let top_k = page_request.top_k();
+    let external_root = readiness_source.root.to_path_buf();
+    let artifacts = readiness_source
+        .loaded()
+        .expect("external readiness always loads artifacts before execution");
     let mut borrow_metadata = if ctx.daemonless_query_mode() {
-        standing_snapshot_metadata(&external_root, storage_dir.as_deref())
+        standing_snapshot_metadata(&external_root, readiness_source.storage_dir)
     } else {
         ExternalBorrowMetadata::default()
     };
-    let search_index = match ctx.open_borrowed_search_index(&external_root, storage_dir.as_deref())
-    {
-        ReadOnlyArtifact::Fresh(index) => index,
+    let mut warnings = Vec::new();
+    let search_index = match &artifacts.search {
+        ReadOnlyArtifact::Fresh(index) => Arc::clone(index),
         ReadOnlyArtifact::Degraded(degradation) => {
-            return handle_external_borrowed_degraded_fallback(
-                req,
-                ctx,
-                &params,
-                top_k,
-                &shape,
-                &external_root,
-                degradation,
-            );
+            if engine_plan.contains(SearchLaneKind::Semantic) {
+                borrow_metadata.degraded_reason = Some(degradation.reason);
+                warnings.push(
+                    "Borrowed trigram index loading stopped at the interactive budget; continuing with the semantic lane.".to_string(),
+                );
+                Arc::new(SearchIndex::new())
+            } else {
+                return handle_external_borrowed_degraded_fallback(
+                    req,
+                    ctx,
+                    &params,
+                    top_k,
+                    &shape,
+                    &external_root,
+                    *degradation,
+                );
+            }
         }
         ReadOnlyArtifact::Cancelled => return cancelled_search_response(req),
         ReadOnlyArtifact::Absent => {
-            // No index exists for this foreign root. Rather than dead-ending
-            // with a not_indexed error (which reads to an agent as "this tool
-            // can't help here" and pushes it to shell out to grep/bash), do a
-            // bounded, best-effort lexical scan of the root — exactly what the
-            // `grep` tool already does for an unindexed external root — and
-            // disclose that it is lexical-only. Removing the error branch
-            // removes the escape hatch.
-            return handle_external_unindexed_fallback(
-                req,
-                ctx,
-                &params,
-                top_k,
-                &shape,
-                &external_root,
-            );
+            if engine_plan.contains(SearchLaneKind::Semantic) {
+                warnings.push(
+                    "External trigram index is not available; continuing with the semantic lane."
+                        .to_string(),
+                );
+                Arc::new(SearchIndex::new())
+            } else {
+                return handle_external_unindexed_fallback(
+                    req,
+                    ctx,
+                    &params,
+                    top_k,
+                    &shape,
+                    &external_root,
+                );
+            }
         }
         ReadOnlyArtifact::Stale(stale) => {
             borrow_metadata.record_drift(stale.drift_count, stale.ignore_rules_differ);
@@ -811,24 +999,36 @@ fn handle_external_search(
                 "{}",
                 borrowed_drift_log_message("search", &external_root, stale.drift_count)
             );
-            stale.index
+            Arc::clone(&stale.index)
         }
     };
+    if let ReadOnlyArtifact::Stale(stale) = &artifacts.semantic {
+        borrow_metadata.record_drift(stale.drift_count, stale.ignore_rules_differ);
+        crate::slog_warn!(
+            "{}",
+            borrowed_drift_log_message("semantic", &external_root, stale.drift_count)
+        );
+    }
     if borrow_metadata.standing_snapshot {
         borrow_metadata.record_drift(search_index.borrowed_stat_mismatch_count(), false);
     }
 
-    let mut warnings = Vec::new();
     if borrow_metadata.stale_cli_snapshot() {
         warnings.push(STALE_CLI_SNAPSHOT_WARNING.to_string());
     }
-    let mode = choose_mode(&params.query, &shape, true, &mut warnings);
+    let mode = choose_mode(
+        &params.query,
+        &shape,
+        engine_plan.readiness.lexical_index,
+        &mut warnings,
+    );
 
     match mode {
         SearchMode::Regex | SearchMode::Literal => handle_external_grep_search(
             req,
+            ctx,
             &params.query,
-            top_k,
+            page_request,
             &shape,
             mode,
             warnings,
@@ -836,18 +1036,25 @@ fn handle_external_search(
             params.include_tests,
             &search_index,
             &borrow_metadata,
+            extensions,
+            engine_plan,
+            &artifacts.search_generation,
         ),
         SearchMode::Semantic | SearchMode::Hybrid => handle_external_semantic_or_hybrid_search(
             req,
             ctx,
             params,
-            top_k,
             shape,
             mode,
             warnings,
             external_root,
-            search_index,
+            &search_index,
+            &artifacts.semantic,
+            &artifacts.search_generation,
             borrow_metadata,
+            page_request,
+            extensions,
+            engine_plan,
         ),
     }
 }
@@ -1011,8 +1218,9 @@ fn handle_external_bounded_lexical_fallback(
 
 fn handle_external_grep_search(
     req: &RawRequest,
+    ctx: &AppContext,
     query: &str,
-    top_k: usize,
+    page_request: paging::ValidatedPageRequest,
     shape: &QueryShape,
     mode: SearchMode,
     mut warnings: Vec<String>,
@@ -1020,7 +1228,11 @@ fn handle_external_grep_search(
     include_tests: bool,
     search_index: &SearchIndex,
     borrow_metadata: &ExternalBorrowMetadata,
+    extensions: &dyn extensions::SearchExtensions,
+    engine_plan: &extensions::LanePlan<'_>,
+    search_generation: &GenerationToken,
 ) -> Response {
+    let top_k = page_request.top_k();
     let auto_regex = mode == SearchMode::Regex;
     let mut effective_mode = mode;
     let compile_literal_fallback = || -> Result<_, Response> {
@@ -1100,12 +1312,13 @@ fn handle_external_grep_search(
     };
 
     let literal = effective_mode == SearchMode::Literal;
+    let fetch_limit = page_request.offset().saturating_add(top_k);
     let mut result = search_index.snapshot().search_grep_bounded(
         &compiled,
         &[],
         &[],
         external_root,
-        top_k,
+        fetch_limit,
         grep_path_exclusion(include_tests),
         grep_executor::MAX_FALLBACK_WALK_FILES,
         grep_executor::FALLBACK_WALK_BUDGET,
@@ -1115,13 +1328,6 @@ fn handle_external_grep_search(
         .retain(|grep_match| grep_match.file.is_file());
 
     if result.matches.is_empty() {
-        let lexical = collect_lexical_files_from_snapshot(
-            Some(search_index.snapshot()),
-            query,
-            shape,
-            include_tests,
-            external_root,
-        );
         let extras = external_response_extras(external_root, borrow_metadata)
             .as_object()
             .cloned()
@@ -1129,23 +1335,33 @@ fn handle_external_grep_search(
         return stale_cli_snapshot_partial_response(
             zero_result_escalation_response(
                 req,
+                ctx,
                 query,
                 shape,
                 effective_mode,
                 "external",
                 warnings,
-                lexical,
-                top_k,
                 include_tests,
                 external_root,
                 &absolute_display_root(external_root),
-                None,
                 extras,
+                page_request,
+                extensions,
+                engine_plan,
+                Some((search_index, search_generation)),
             ),
             borrow_metadata.stale_cli_snapshot(),
         );
     }
 
+    let interval_end = page_request.offset().saturating_add(top_k);
+    let interval_has_more = result.total_matches > interval_end || result.truncated;
+    result.matches = result
+        .matches
+        .into_iter()
+        .skip(page_request.offset())
+        .take(top_k)
+        .collect();
     let result_source = if literal { "literal" } else { "regex" };
     let result_values = result
         .matches
@@ -1170,7 +1386,7 @@ fn handle_external_grep_search(
             complete: !borrow_metadata.stale_cli_snapshot(),
             text,
             results: result_values,
-            more_available: result.truncated || result.total_matches > result.matches.len(),
+            more_available: interval_has_more,
             engine_capped: result.engine_capped,
             fully_degraded: false,
             warnings,
@@ -1183,60 +1399,35 @@ fn handle_external_semantic_or_hybrid_search(
     req: &RawRequest,
     ctx: &AppContext,
     params: SemanticSearchParams,
-    top_k: usize,
     shape: QueryShape,
     mode: SearchMode,
     mut warnings: Vec<String>,
     external_root: PathBuf,
-    search_index: Arc<SearchIndex>,
+    search_index: &SearchIndex,
+    semantic_artifact: &ReadOnlyArtifact<Arc<SemanticIndex>>,
+    search_generation: &GenerationToken,
     mut borrow_metadata: ExternalBorrowMetadata,
+    page_request: paging::ValidatedPageRequest,
+    extensions: &dyn extensions::SearchExtensions,
+    engine_plan: &extensions::LanePlan<'_>,
 ) -> Response {
-    let lexical = if mode == SearchMode::Hybrid {
-        collect_lexical_files_from_snapshot(
-            Some(search_index.snapshot()),
-            &params.query,
-            &shape,
-            params.include_tests,
-            &external_root,
-        )
-    } else {
-        LexicalCollection {
-            files: Vec::new(),
-            ready: true,
-            engine_capped: false,
-            artifact_lock_timed_out: false,
+    let mut semantic_status = "ready";
+    let semantic_index = match semantic_artifact {
+        ReadOnlyArtifact::Fresh(index)
+        | ReadOnlyArtifact::Stale(crate::readonly_artifacts::ReadOnlyStale { index, .. })
+            if semantic_fingerprint_matches_session(ctx, index) =>
+        {
+            Some(index.as_ref())
         }
-    };
-
-    let storage_dir = ctx.config().storage_dir.clone();
-    let semantic_index = match ctx
-        .open_borrowed_semantic_index(&external_root, storage_dir.as_deref())
-    {
-        ReadOnlyArtifact::Fresh(index) => match semantic_fingerprint_matches_session(ctx, &index) {
-            true => Some(index),
-            false => {
-                warnings.push(
-                    "External semantic index was built for a different embedding backend or model; returning lexical-only results from the trigram index.".to_string(),
-                );
-                None
-            }
-        },
-        ReadOnlyArtifact::Stale(stale) => {
-            borrow_metadata.record_drift(stale.drift_count, stale.ignore_rules_differ);
-            crate::slog_warn!(
-                "{}",
-                borrowed_drift_log_message("semantic", &external_root, stale.drift_count)
+        ReadOnlyArtifact::Fresh(_) | ReadOnlyArtifact::Stale(_) => {
+            semantic_status = "unavailable";
+            warnings.push(
+                "External semantic index was built for a different embedding backend or model; returning lexical-only results from the trigram index.".to_string(),
             );
-            if semantic_fingerprint_matches_session(ctx, &stale.index) {
-                Some(stale.index)
-            } else {
-                warnings.push(
-                    "External semantic index was built for a different embedding backend or model; returning lexical-only results from the trigram index.".to_string(),
-                );
-                None
-            }
+            None
         }
         ReadOnlyArtifact::Degraded(degradation) => {
+            semantic_status = "building";
             warnings.push(
                 "Borrowed semantic index loading stopped at the interactive budget; returning lexical-only results from the trigram index.".to_string(),
             );
@@ -1245,6 +1436,7 @@ fn handle_external_semantic_or_hybrid_search(
         }
         ReadOnlyArtifact::Cancelled => return cancelled_search_response(req),
         ReadOnlyArtifact::Absent => {
+            semantic_status = "unavailable";
             warnings.push(
                 "External semantic index is not available; returning lexical-only results from the trigram index.".to_string(),
             );
@@ -1252,231 +1444,125 @@ fn handle_external_semantic_or_hybrid_search(
         }
     };
 
-    let Some(semantic_index) = semantic_index else {
-        // Hybrid mode already ranked the lexical candidates above; ranking is
-        // the expensive half of an external query, so reuse it and collect
-        // only when the original mode was pure Semantic.
-        let lexical = if mode == SearchMode::Hybrid {
-            lexical
-        } else {
-            collect_lexical_files_from_snapshot(
-                Some(search_index.snapshot()),
-                &params.query,
-                &shape,
-                params.include_tests,
-                &external_root,
-            )
-        };
-        return external_lexical_only_response(
-            req,
-            &params,
-            mode,
-            &shape,
-            "Semantic search is not available for the external root.".to_string(),
-            "unavailable",
-            lexical,
-            warnings,
-            &external_root,
-            top_k,
-            &borrow_metadata,
-            ctx,
-        );
-    };
-
-    let query_vector =
-        match embed_query_for_dimension(&params.query, ctx, Some(semantic_index.dimension())) {
-            Ok(query_vector) => query_vector,
-            Err(error) => {
-                let lexical = if mode == SearchMode::Hybrid {
-                    lexical
-                } else {
-                    collect_lexical_files_from_snapshot(
-                        Some(search_index.snapshot()),
-                        &params.query,
-                        &shape,
-                        params.include_tests,
-                        &external_root,
-                    )
-                };
-                let classified = classify_embed_query_error(&error);
-                return external_lexical_only_response(
-                    req,
-                    &params,
-                    mode,
-                    &shape,
-                    classified.detail,
-                    classified.footer_reason,
-                    lexical,
-                    warnings,
-                    &external_root,
-                    top_k,
-                    &borrow_metadata,
-                    ctx,
-                );
-            }
-        };
-
-    let semantic_limit = if params.include_tests {
-        semantic_candidate_limit(top_k)
+    let mut semantic_more_available = false;
+    let mut semantic_results = if engine_plan.contains(SearchLaneKind::Semantic) {
+        semantic_index
+            .map(|semantic_index| {
+                embed_query_for_dimension(&params.query, ctx, Some(semantic_index.dimension())).map(
+                    |query_vector| {
+                        let mut results = semantic_index.search_filtered(
+                            &query_vector,
+                            MAX_TOP_K.saturating_add(1),
+                            |file| {
+                                path_allowed_by_include_tests(
+                                    file,
+                                    &external_root,
+                                    params.include_tests,
+                                )
+                            },
+                        );
+                        results.retain(|result| result.file.is_file());
+                        semantic_more_available = results.len() > MAX_TOP_K;
+                        if semantic_more_available {
+                            results.truncate(MAX_TOP_K);
+                        }
+                        rerank_semantic_candidates(&mut results, &shape, &params.query);
+                        results
+                    },
+                )
+            })
+            .transpose()
+            .unwrap_or_else(|error| {
+                semantic_status = "unavailable";
+                warnings.push(classify_embed_query_error(&error).detail);
+                None
+            })
+            .unwrap_or_default()
     } else {
-        MAX_TOP_K
+        Vec::new()
     };
-    let semantic_fetch_limit = semantic_limit.saturating_add(1);
-    let mut semantic_results =
-        semantic_index.search_filtered(&query_vector, semantic_fetch_limit, |file| {
-            path_allowed_by_include_tests(file, &external_root, params.include_tests)
-        });
-    semantic_results.retain(|result| result.file.is_file());
-    let semantic_more_available = semantic_results.len() > semantic_limit;
-    if semantic_more_available {
-        semantic_results.truncate(semantic_limit);
-    }
-    rerank_semantic_candidates(&mut semantic_results, &shape, &params.query);
 
-    let mut results = fuse_hybrid_results_with_zoom(
-        semantic_results,
-        lexical.files,
-        &shape,
-        top_k.saturating_add(1),
-        params.include_tests,
+    let mut ranked = match run_engine_ranking(
+        &req.id,
+        ctx,
         &external_root,
-        ctx.tool_enabled("aft_zoom"),
-        Some(&params.query),
-    );
-    results.retain(|result| result.file.is_file());
-    let fused_more_available = results.len() > top_k;
-    if fused_more_available {
-        results.truncate(top_k);
-    }
-    let more_available = fused_more_available || semantic_more_available || lexical.engine_capped;
-
-    if mode == SearchMode::Semantic
-        && shape.kind == QueryKind::NaturalLanguage
-        && results.is_empty()
-        && lexical.ready
-    {
-        let escalation_lexical = collect_lexical_files_from_snapshot(
-            Some(search_index.snapshot()),
-            &params.query,
-            &shape,
-            params.include_tests,
-            &external_root,
-        );
-        let extras = external_response_extras(&external_root, &borrow_metadata)
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
-        return stale_cli_snapshot_partial_response(
-            zero_result_escalation_response(
-                req,
-                &params.query,
-                &shape,
-                mode,
-                "ready",
-                warnings,
-                escalation_lexical,
-                top_k,
-                params.include_tests,
-                &external_root,
-                &absolute_display_root(&external_root),
-                None,
-                extras,
-            ),
-            borrow_metadata.stale_cli_snapshot(),
-        );
-    }
-
+        &params.query,
+        params.include_tests,
+        std::mem::take(&mut semantic_results),
+        page_request,
+        extensions,
+        engine_plan,
+        Some((search_index, search_generation)),
+    ) {
+        Ok(ranked) => ranked,
+        Err(error) => return Response::error(&req.id, "search_engine_failed", error),
+    };
+    ranked.results.retain(|result| result.file.is_file());
+    let more_available = ranked.more_available || semantic_more_available;
     let snippets_incomplete =
-        enrich_snippets_from_source_with_context(&mut results, &external_root, Some(ctx));
+        enrich_snippets_from_source_with_context(&mut ranked.results, &external_root, Some(ctx));
     let display_root = absolute_display_root(&external_root);
-
-    let text = format_semantic_text_with_display_root(
-        &results,
+    let mut text = format_semantic_text_with_display_root(
+        &ranked.results,
         &display_root,
         more_available,
         snippets_incomplete,
         Some(ctx),
     );
+    if semantic_status != "ready" {
+        let disclosure = if semantic_status == "building" {
+            BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS
+        } else {
+            "Semantic search is not available for the external root; lexical engine results follow."
+        };
+        text = format!("{disclosure}\n\n{text}");
+    }
+    if let Some(line) = ranked.confidence_line {
+        text.push_str("\n\n");
+        text.push_str(line);
+    }
+    text.push_str("\n\n");
+    text.push_str(&ranked.trailer);
 
-    search_response(
-        req,
-        SearchResponseParts {
-            query: &params.query,
-            interpreted_as: interpreted_as_label(mode),
-            query_kind: query_kind_label(shape.kind),
-            semantic_status: "ready",
-            status: "ready",
-            complete: !borrow_metadata.stale_cli_snapshot(),
-            text,
-            results: results.iter().map(result_to_json).collect::<Vec<_>>(),
-            more_available,
-            engine_capped: lexical.engine_capped,
-            fully_degraded: false,
-            warnings,
-            extras: external_response_extras(&external_root, &borrow_metadata)
-                .as_object()
-                .cloned()
-                .unwrap_or_default(),
-        },
-    )
-}
-
-fn external_lexical_only_response(
-    req: &RawRequest,
-    params: &SemanticSearchParams,
-    mode: SearchMode,
-    shape: &QueryShape,
-    detail: String,
-    footer_reason: &str,
-    lexical: LexicalCollection,
-    mut warnings: Vec<String>,
-    external_root: &Path,
-    top_k: usize,
-    borrow_metadata: &ExternalBorrowMetadata,
-    ctx: &AppContext,
-) -> Response {
-    let lexical_count = lexical.files.len();
-    let lexical_engine_capped = lexical.engine_capped;
-    let mut results = fuse_hybrid_results_with_zoom(
-        Vec::new(),
-        lexical.files,
-        shape,
-        top_k,
-        params.include_tests,
-        external_root,
-        ctx.tool_enabled("aft_zoom"),
-        Some(&params.query),
-    );
-    results.retain(|result| result.file.is_file());
-    let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
-    warnings.push(
-        "Semantic search unavailable for external root; returning lexical-only fallback results."
-            .to_string(),
-    );
-    let display_root = absolute_display_root(external_root);
-    let text = format_lexical_unavailable_text(&detail, &results, &display_root, footer_reason);
-    let mut extras = semantic_unavailable_extras(true);
-    for (key, value) in external_response_extras(external_root, borrow_metadata)
+    let mut extras = external_response_extras(&external_root, &borrow_metadata)
         .as_object()
         .cloned()
-        .unwrap_or_default()
-    {
-        extras.insert(key, value);
-    }
+        .unwrap_or_default();
+    extras.insert("structuredContent".to_string(), ranked.structured_content);
+    extras.insert(
+        "lexical_only_fallback".to_string(),
+        serde_json::json!(semantic_status != "ready"),
+    );
+    extras.insert(
+        "semantic_unavailable".to_string(),
+        serde_json::json!(semantic_status != "ready"),
+    );
+    extras.insert(
+        "lexical_engine_capped".to_string(),
+        serde_json::json!(ranked.engine_capped),
+    );
 
     search_response(
         req,
         SearchResponseParts {
             query: &params.query,
-            interpreted_as: fallback_executed_label(mode, true),
+            interpreted_as: if semantic_status == "ready" {
+                interpreted_as_label(mode)
+            } else {
+                "lexical"
+            },
             query_kind: query_kind_label(shape.kind),
-            semantic_status: "unavailable",
-            status: "ready",
-            complete: false,
+            semantic_status,
+            status: if semantic_status == "building" {
+                "building"
+            } else {
+                "ready"
+            },
+            complete: semantic_status == "ready" && !borrow_metadata.stale_cli_snapshot(),
             text,
-            results: result_values,
-            more_available: lexical_count > top_k || lexical_engine_capped,
-            engine_capped: lexical_engine_capped,
+            results: ranked.results.iter().map(result_to_json).collect(),
+            more_available,
+            engine_capped: ranked.engine_capped,
             fully_degraded: false,
             warnings,
             extras,
@@ -1539,12 +1625,6 @@ fn default_top_k() -> usize {
     DEFAULT_TOP_K
 }
 
-fn semantic_candidate_limit(top_k: usize) -> usize {
-    top_k
-        .saturating_mul(SEMANTIC_OVERFETCH_MULTIPLIER)
-        .clamp(SEMANTIC_OVERFETCH_FLOOR, MAX_TOP_K)
-}
-
 fn project_relative_path<'a>(path: &'a Path, project_root: &'a Path) -> &'a Path {
     path.strip_prefix(project_root).unwrap_or(path)
 }
@@ -1570,145 +1650,6 @@ fn path_allowed_by_include_tests(path: &Path, project_root: &Path, include_tests
 
 fn grep_path_exclusion(include_tests: bool) -> Option<GrepPathExclusion> {
     (!include_tests).then_some(path_is_hidden_test_file)
-}
-
-fn path_has_unambiguous_generated_artifact_type(path: &Path) -> bool {
-    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    let file_name = file_name.to_ascii_lowercase();
-    if file_name.ends_with(".min.js") || file_name.ends_with(".min.css") {
-        return true;
-    }
-
-    matches!(
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("html" | "htm" | "css" | "map")
-    )
-}
-
-fn path_has_ambiguous_generated_artifact_type(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("json" | "svg" | "docset")
-    )
-}
-
-fn directory_is_generated_artifact_dominated(dir: &Path) -> bool {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return false;
-    };
-
-    let mut file_count = 0usize;
-    let mut generated_count = 0usize;
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_file() {
-            continue;
-        }
-        file_count += 1;
-        if path_has_unambiguous_generated_artifact_type(&entry.path()) {
-            generated_count += 1;
-        }
-    }
-
-    file_count > 0
-        && generated_count * GENERATED_DIRECTORY_DENSITY_DENOMINATOR
-            >= file_count * GENERATED_DIRECTORY_DENSITY_NUMERATOR
-}
-
-impl<'a> GeneratedArtifactCache<'a> {
-    fn new(project_root: &'a Path) -> Self {
-        Self {
-            project_root,
-            directory_cache: HashMap::new(),
-        }
-    }
-
-    fn is_generated_artifact(&mut self, path: &Path) -> bool {
-        if path_has_unambiguous_generated_artifact_type(path) {
-            return true;
-        }
-        if !path_has_ambiguous_generated_artifact_type(path) {
-            return false;
-        }
-
-        let path_is_inside_project = path.starts_with(self.project_root);
-        let mut current = path.parent();
-        while let Some(dir) = current {
-            if path_is_inside_project && !dir.starts_with(self.project_root) {
-                break;
-            }
-            if self.directory_is_generated_artifact_dominated(dir) {
-                return true;
-            }
-            if path_is_inside_project && dir == self.project_root {
-                break;
-            }
-            current = dir.parent();
-        }
-        false
-    }
-
-    fn directory_is_generated_artifact_dominated(&mut self, dir: &Path) -> bool {
-        if let Some(cached) = self.directory_cache.get(dir) {
-            return *cached;
-        }
-
-        let dominated = directory_is_generated_artifact_dominated(dir);
-        self.directory_cache.insert(dir.to_path_buf(), dominated);
-        dominated
-    }
-}
-
-fn lexical_candidates_with_generated_artifact_rank(
-    lexical_files: Vec<(PathBuf, f32)>,
-    project_root: &Path,
-    query: Option<&str>,
-) -> Vec<LexicalCandidate> {
-    let mut generated_cache = GeneratedArtifactCache::new(project_root);
-    let content_tokens = query
-        .map(query_shape::extract_content_tokens)
-        .unwrap_or_default();
-    let mut candidates = lexical_files
-        .into_iter()
-        .enumerate()
-        .map(|(ordinal, (file, score))| {
-            let generated_artifact = generated_cache.is_generated_artifact(&file);
-            let (exact, exact_phrase_count, exact_window_lines) = query
-                .map(|query| lexical_candidate_exactness(&file, query, &content_tokens))
-                .unwrap_or((false, 0, None));
-            LexicalCandidate {
-                file,
-                score,
-                generated_artifact,
-                exact,
-                exact_phrase_count,
-                exact_window_lines,
-                ordinal,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    candidates.sort_by(|a, b| {
-        a.generated_artifact
-            .cmp(&b.generated_artifact)
-            .then_with(|| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| a.ordinal.cmp(&b.ordinal))
-    });
-    candidates
 }
 
 fn lexical_candidate_exactness(
@@ -1802,6 +1743,9 @@ fn handle_grep_search(
     mut warnings: Vec<String>,
     project_root: &Path,
     include_tests: bool,
+    page_request: paging::ValidatedPageRequest,
+    extensions: &dyn extensions::SearchExtensions,
+    engine_plan: &extensions::LanePlan<'_>,
 ) -> Response {
     let auto_regex = mode == SearchMode::Regex;
     let mut effective_mode = mode;
@@ -1900,21 +1844,22 @@ fn handle_grep_search(
 
     let result_source = if literal { "literal" } else { "regex" };
     if result.matches.is_empty() && search_index_ready(ctx) {
-        let lexical = collect_lexical_files(ctx, query, shape, include_tests, project_root);
         return zero_result_escalation_response(
             req,
+            ctx,
             query,
             shape,
             effective_mode,
             semantic_status,
             warnings,
-            lexical,
-            top_k,
             include_tests,
             project_root,
             project_root,
-            Some(ctx),
             serde_json::Map::new(),
+            page_request,
+            extensions,
+            engine_plan,
+            None,
         );
     }
 
@@ -2232,6 +2177,7 @@ fn run_engine_ranking(
     page_request: paging::ValidatedPageRequest,
     extensions: &dyn extensions::SearchExtensions,
     plan: &extensions::LanePlan<'_>,
+    borrowed_index: Option<(&SearchIndex, &GenerationToken)>,
 ) -> Result<EngineRanking, String> {
     use blocks::{BlockBuilder, CanonicalLane, CanonicalListKey, LaneCandidate};
     use confidence::{Confidence, ConfidenceEngine};
@@ -2241,14 +2187,28 @@ fn run_engine_ranking(
     use telemetry::{ConfidenceTelemetry, TelemetryAssembler, TelemetryRun};
     use trailer::{ExactPassState, SearchTrailer};
 
-    let index = try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
-        .and_then(|guard| guard.as_ref().cloned())
-        .unwrap_or_else(SearchIndex::new);
-    let generation = GenerationToken::new_with_str(&format!(
-        "{}:{}",
-        ctx.search_index_rx_generation(),
-        ctx.semantic_index_rx_generation()
-    ));
+    let context_index = borrowed_index
+        .is_none()
+        .then(|| try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET));
+    let empty_index = SearchIndex::new();
+    let index = borrowed_index
+        .map(|(index, _)| index)
+        .or_else(|| {
+            context_index
+                .as_ref()
+                .and_then(|guard| guard.as_ref())
+                .and_then(|guard| guard.as_ref())
+        })
+        .unwrap_or(&empty_index);
+    let generation = borrowed_index
+        .map(|(_, generation)| generation.clone())
+        .unwrap_or_else(|| {
+            GenerationToken::new_with_str(&format!(
+                "{}:{}",
+                ctx.search_index_rx_generation(),
+                ctx.semantic_index_rx_generation()
+            ))
+        });
     let snapshot = index.snapshot();
     let content_tokens = query_shape::extract_content_tokens(query);
     let token_refs = content_tokens
@@ -2372,8 +2332,6 @@ fn run_engine_ranking(
                 exact_phrase_count: 0,
                 exact_window_lines: None,
                 fusion_score: 0.0,
-                cap_protected: result.cap_protected,
-                lexical_generated_artifact: false,
                 snippet: result.snippet.clone(),
             });
         if seen_semantic_paths.insert(path.clone()) {
@@ -2551,8 +2509,6 @@ fn run_engine_ranking(
                 exact_phrase_count: 0,
                 exact_window_lines: None,
                 fusion_score: 0.0,
-                cap_protected: false,
-                lexical_generated_artifact: ranked.evidence.generated,
                 snippet: String::new(),
             });
         result.exact = ranked.evidence.tier == EvidenceTier::Exact;
@@ -2610,6 +2566,10 @@ fn handle_engine_only_search(
     if semantic_status != "ready" {
         warnings.push("Semantic search unavailable; using lexical-only fallback.".to_string());
     }
+    let mut lexical_plan = plan.clone();
+    lexical_plan
+        .selected_lanes
+        .retain(|lane| *lane != SearchLaneKind::Semantic);
     let mut ranked = match run_engine_ranking(
         &req.id,
         ctx,
@@ -2619,7 +2579,8 @@ fn handle_engine_only_search(
         Vec::new(),
         page_request,
         extensions,
-        plan,
+        &lexical_plan,
+        None,
     ) {
         Ok(ranked) => ranked,
         Err(error) => return Response::error(&req.id, "search_engine_failed", error),
@@ -2711,35 +2672,6 @@ fn handle_semantic_or_hybrid_search(
     extensions: &dyn extensions::SearchExtensions,
     engine_plan: &extensions::LanePlan<'_>,
 ) -> Response {
-    let lexical = if mode == SearchMode::Hybrid {
-        collect_lexical_files(
-            ctx,
-            &params.query,
-            &shape,
-            params.include_tests,
-            project_root,
-        )
-    } else {
-        LexicalCollection {
-            files: Vec::new(),
-            ready: lexical_ready,
-            engine_capped: false,
-            artifact_lock_timed_out: false,
-        }
-    };
-
-    if lexical.artifact_lock_timed_out {
-        return artifact_contention_fallback_response(
-            req,
-            ctx,
-            &params,
-            &shape,
-            project_root,
-            top_k,
-            "search index remained busy",
-        );
-    }
-
     match status {
         SemanticIndexStatus::Disabled => {
             return semantic_unavailable_or_fallback_response(
@@ -2753,10 +2685,12 @@ fn handle_semantic_or_hybrid_search(
                 "Semantic search is not enabled.".to_string(),
                 "disabled",
                 false,
-                lexical,
                 warnings,
                 project_root,
                 top_k,
+                page_request,
+                extensions,
+                engine_plan,
             );
         }
         SemanticIndexStatus::Failed(error) => {
@@ -2789,37 +2723,22 @@ fn handle_semantic_or_hybrid_search(
                 detail,
                 footer_reason,
                 false,
-                lexical,
                 warnings,
                 project_root,
                 top_k,
+                page_request,
+                extensions,
+                engine_plan,
             );
         }
-        SemanticIndexStatus::Building {
-            stage,
-            files,
-            entries_done,
-            entries_total,
-        } => {
+        SemanticIndexStatus::Building { .. } => {
             ctx.note_index_query(
                 crate::logging::IndexPlane::Semantic,
                 "semantic_search",
                 0,
                 "building",
             );
-            let borrowed_loading = stage == "loading_artifacts" && ctx.shared_artifacts_read_only();
-            let mut detail = format!("Semantic index is still building (stage: {}).", stage);
-            if let Some(files) = files {
-                detail.push_str(&format!(" files: {}", files));
-            }
-            if let Some(entries_done) = entries_done {
-                detail.push_str(&format!(" entries done: {}", entries_done));
-            }
-            if let Some(entries_total) = entries_total {
-                detail.push_str(&format!(" / {}", entries_total));
-            }
-
-            if mode == SearchMode::Semantic && !lexical.ready {
+            if mode == SearchMode::Semantic && !lexical_ready {
                 return handle_grep_search(
                     req,
                     ctx,
@@ -2832,76 +2751,23 @@ fn handle_semantic_or_hybrid_search(
                     warnings,
                     project_root,
                     params.include_tests,
+                    page_request,
+                    extensions,
+                    engine_plan,
                 );
             }
 
-            let lexical_count = lexical.files.len();
-            let lexical_engine_capped = lexical.engine_capped;
-            let results = fuse_hybrid_results_with_zoom(
-                Vec::new(),
-                lexical.files,
-                &shape,
-                top_k,
-                params.include_tests,
-                project_root,
-                ctx.tool_enabled("aft_zoom"),
-                Some(&params.query),
-            );
-            let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
-            let note = building_lexical_note(borrowed_loading && !results.is_empty());
-            let mut extras = serde_json::Map::new();
-            extras.insert("stage".to_string(), serde_json::json!(stage));
-            extras.insert("files".to_string(), serde_json::json!(files));
-            extras.insert("entries_done".to_string(), serde_json::json!(entries_done));
-            extras.insert(
-                "entries_total".to_string(),
-                serde_json::json!(entries_total),
-            );
-            extras.insert("note".to_string(), serde_json::json!(note));
-            extras.insert(
-                "semantic_rebuilding".to_string(),
-                serde_json::json!(!borrowed_loading),
-            );
-            if borrowed_loading {
-                extras.insert(
-                    "semantic_loading_shared".to_string(),
-                    serde_json::json!(true),
-                );
-            }
-            extras.insert(
-                "lexical_only_fallback".to_string(),
-                serde_json::json!(lexical.ready),
-            );
-
-            return search_response(
+            return handle_engine_only_search(
                 req,
-                SearchResponseParts {
-                    query: &params.query,
-                    // While semantic rebuilds, only the lexical lane produced
-                    // these results (semantic input is empty here). Report
-                    // "lexical" when it ran; the "building" status + the
-                    // semantic_rebuilding/lexical_only_fallback extras tell the
-                    // agent semantic results are still coming.
-                    interpreted_as: fallback_executed_label(mode, lexical.ready),
-                    query_kind: query_kind_label(shape.kind),
-                    semantic_status: "building",
-                    status: "building",
-                    complete: false,
-                    text: format_building_lexical_text(
-                        &detail,
-                        &results,
-                        project_root,
-                        lexical.ready,
-                        stage == "loading_artifacts",
-                        borrowed_loading,
-                    ),
-                    results: result_values,
-                    more_available: lexical_count > top_k || lexical_engine_capped,
-                    engine_capped: lexical_engine_capped,
-                    fully_degraded: false,
-                    warnings,
-                    extras,
-                },
+                ctx,
+                &params,
+                &shape,
+                "building",
+                warnings,
+                project_root,
+                page_request,
+                extensions,
+                engine_plan,
             );
         }
         SemanticIndexStatus::Ready { refreshing, .. } => {
@@ -2967,10 +2833,12 @@ fn handle_semantic_or_hybrid_search(
             detail.to_string(),
             "not_ready",
             false,
-            lexical,
             warnings,
             project_root,
             top_k,
+            page_request,
+            extensions,
+            engine_plan,
         );
     }
 
@@ -2980,18 +2848,6 @@ fn handle_semantic_or_hybrid_search(
             if search_cancellation_requested() {
                 return cancelled_search_response(req);
             }
-            let lexical = if mode == SearchMode::Semantic {
-                collect_lexical_files(
-                    ctx,
-                    &params.query,
-                    &shape,
-                    params.include_tests,
-                    project_root,
-                )
-            } else {
-                lexical
-            };
-
             let classified = classify_embed_query_error(&error);
             return semantic_unavailable_or_fallback_response(
                 req,
@@ -3004,10 +2860,12 @@ fn handle_semantic_or_hybrid_search(
                 classified.detail,
                 classified.footer_reason,
                 true,
-                lexical,
                 warnings,
                 project_root,
                 top_k,
+                page_request,
+                extensions,
+                engine_plan,
             );
         }
     };
@@ -3044,17 +2902,6 @@ fn handle_semantic_or_hybrid_search(
                 })
                 .unwrap_or_default(),
             None => {
-                let lexical = if mode == SearchMode::Semantic {
-                    collect_lexical_files(
-                        ctx,
-                        &params.query,
-                        &shape,
-                        params.include_tests,
-                        project_root,
-                    )
-                } else {
-                    lexical
-                };
                 return semantic_unavailable_or_fallback_response(
                     req,
                     ctx,
@@ -3069,10 +2916,12 @@ fn handle_semantic_or_hybrid_search(
                     ),
                     "artifact contention",
                     true,
-                    lexical,
                     warnings,
                     project_root,
                     top_k,
+                    page_request,
+                    extensions,
+                    engine_plan,
                 );
             }
         }
@@ -3094,6 +2943,7 @@ fn handle_semantic_or_hybrid_search(
         page_request,
         extensions,
         engine_plan,
+        None,
     ) {
         Ok(ranking) => ranking,
         Err(error) => return Response::error(&req.id, "search_engine_failed", error),
@@ -3103,36 +2953,30 @@ fn handle_semantic_or_hybrid_search(
             .results
             .retain(|result| result.file.is_file());
     }
-    let more_available =
-        engine_ranking.more_available || semantic_more_available || lexical.engine_capped;
+    let more_available = engine_ranking.more_available || semantic_more_available;
     let mut results = engine_ranking.results;
 
     if mode == SearchMode::Semantic
         && shape.kind == QueryKind::NaturalLanguage
         && results.is_empty()
-        && lexical.ready
+        && lexical_ready
     {
-        let escalation_lexical = collect_lexical_files(
-            ctx,
-            &params.query,
-            &shape,
-            params.include_tests,
-            project_root,
-        );
         return zero_result_escalation_response(
             req,
+            ctx,
             &params.query,
             &shape,
             mode,
             semantic_status,
             warnings,
-            escalation_lexical,
-            top_k,
             params.include_tests,
             project_root,
             project_root,
-            Some(ctx),
             serde_json::Map::new(),
+            page_request,
+            extensions,
+            engine_plan,
+            None,
         );
     }
 
@@ -3177,7 +3021,7 @@ fn handle_semantic_or_hybrid_search(
             text,
             results: results.iter().map(result_to_json).collect::<Vec<_>>(),
             more_available,
-            engine_capped: lexical.engine_capped || engine_ranking.engine_capped,
+            engine_capped: engine_ranking.engine_capped,
             fully_degraded: false,
             warnings,
             extras,
@@ -3223,57 +3067,75 @@ fn zero_result_escalation_disclosure(mode: SearchMode) -> &'static str {
 }
 
 /// Render the single lexical second chance used after an auto-routed lane
-/// returns no results. Keeping this pass separate makes the one-extra-pass
-/// limit explicit and ensures zero remains an honest result when terms miss too.
+/// returns no results. The escalation uses the same exact and lexical engine
+/// lanes as an ordinary natural-language request.
 fn zero_result_escalation_response(
     req: &RawRequest,
+    ctx: &AppContext,
     query: &str,
     shape: &QueryShape,
     mode: SearchMode,
     semantic_status: &'static str,
     warnings: Vec<String>,
-    lexical: LexicalCollection,
-    top_k: usize,
     include_tests: bool,
     project_root: &Path,
     display_root: &Path,
-    ctx: Option<&AppContext>,
     mut extras: serde_json::Map<String, serde_json::Value>,
+    page_request: paging::ValidatedPageRequest,
+    extensions: &dyn extensions::SearchExtensions,
+    base_plan: &extensions::LanePlan<'_>,
+    borrowed_index: Option<(&SearchIndex, &GenerationToken)>,
 ) -> Response {
-    let lexical_count = lexical.files.len();
-    let lexical_engine_capped = lexical.engine_capped;
-    let mut results = fuse_hybrid_results_with_zoom(
-        Vec::new(),
-        lexical.files,
-        shape,
-        top_k,
-        include_tests,
+    use extensions::QueryFacts;
+
+    let facts = QueryFacts::new(query);
+    let mut escalation_plan =
+        extensions.plan(&facts, SearchShape::NaturalLanguage, &base_plan.readiness);
+    escalation_plan
+        .selected_lanes
+        .retain(|lane| !matches!(*lane, SearchLaneKind::Semantic | SearchLaneKind::Exact));
+    let mut ranked = match run_engine_ranking(
+        &req.id,
+        ctx,
         project_root,
-        ctx.map_or(true, |ctx| ctx.tool_enabled("aft_zoom")),
-        Some(query),
-    );
-    if let Some(ctx) = ctx {
-        if ctx.shared_artifacts_read_only() {
-            results.retain(|result| result.file.is_file());
-        }
+        query,
+        include_tests,
+        Vec::new(),
+        page_request,
+        extensions,
+        &escalation_plan,
+        borrowed_index,
+    ) {
+        Ok(ranked) => ranked,
+        Err(error) => return Response::error(&req.id, "search_engine_failed", error),
+    };
+    if borrowed_index.is_some() {
+        ranked.results.retain(|result| result.file.is_file());
     }
     let snippets_incomplete =
-        enrich_snippets_from_source_with_context(&mut results, project_root, ctx);
+        enrich_snippets_from_source_with_context(&mut ranked.results, project_root, Some(ctx));
     let mut text = format_semantic_text_with_display_root(
-        &results,
+        &ranked.results,
         display_root,
-        lexical_count > top_k || lexical_engine_capped,
+        ranked.more_available,
         snippets_incomplete,
-        ctx,
+        Some(ctx),
     );
     text.push('\n');
     text.push_str(zero_result_escalation_disclosure(mode));
+    if let Some(line) = ranked.confidence_line {
+        text.push_str("\n\n");
+        text.push_str(line);
+    }
+    text.push_str("\n\n");
+    text.push_str(&ranked.trailer);
 
     extras.insert(
         "zero_result_escalation".to_string(),
         serde_json::json!(true),
     );
     extras.insert("escalation_target".to_string(), serde_json::json!("hybrid"));
+    extras.insert("structuredContent".to_string(), ranked.structured_content);
     search_response(
         req,
         SearchResponseParts {
@@ -3284,9 +3146,13 @@ fn zero_result_escalation_response(
             status: "ready",
             complete: true,
             text,
-            results: results.iter().map(result_to_json).collect::<Vec<_>>(),
-            more_available: lexical_count > top_k || lexical_engine_capped,
-            engine_capped: lexical_engine_capped,
+            results: ranked
+                .results
+                .iter()
+                .map(result_to_json)
+                .collect::<Vec<_>>(),
+            more_available: ranked.more_available,
+            engine_capped: ranked.engine_capped,
             fully_degraded: false,
             warnings,
             extras,
@@ -3382,110 +3248,90 @@ fn semantic_unavailable_or_fallback_response(
     mode: SearchMode,
     shape: &QueryShape,
     semantic_status: &'static str,
-    unavailable_status: &'static str,
+    _unavailable_status: &'static str,
     detail: String,
     footer_reason: &str,
-    force_lexical_fallback: bool,
-    lexical: LexicalCollection,
+    _force_lexical_fallback: bool,
     mut warnings: Vec<String>,
     project_root: &Path,
     top_k: usize,
+    page_request: paging::ValidatedPageRequest,
+    extensions: &dyn extensions::SearchExtensions,
+    engine_plan: &extensions::LanePlan<'_>,
 ) -> Response {
-    if lexical.artifact_lock_timed_out {
-        return artifact_contention_fallback_response(
-            req,
+    if engine_plan.readiness.lexical_index {
+        let mut lexical_plan = engine_plan.clone();
+        lexical_plan
+            .selected_lanes
+            .retain(|lane| *lane != SearchLaneKind::Semantic);
+        let mut ranked = match run_engine_ranking(
+            &req.id,
             ctx,
-            params,
-            shape,
             project_root,
-            top_k,
-            "search index remained busy",
-        );
-    }
-    let lexical_ready = (mode == SearchMode::Hybrid || force_lexical_fallback) && lexical.ready;
-    if lexical_ready {
-        let lexical_count = lexical.files.len();
-        let lexical_engine_capped = lexical.engine_capped;
-        let results = fuse_hybrid_results_with_zoom(
-            Vec::new(),
-            lexical.files,
-            shape,
-            top_k,
+            &params.query,
             params.include_tests,
-            project_root,
-            ctx.tool_enabled("aft_zoom"),
-            Some(&params.query),
-        );
-        let result_values = results.iter().map(result_to_json).collect::<Vec<_>>();
+            Vec::new(),
+            page_request,
+            extensions,
+            &lexical_plan,
+            None,
+        ) {
+            Ok(ranked) => ranked,
+            Err(error) => return Response::error(&req.id, "search_engine_failed", error),
+        };
+        let snippets_incomplete =
+            enrich_snippets_from_source_with_context(&mut ranked.results, project_root, Some(ctx));
+        let mut text =
+            format_lexical_unavailable_text(&detail, &ranked.results, project_root, footer_reason);
+        if snippets_incomplete && !ranked.results.is_empty() {
+            text.push_str(
+                "\n\nSome snippets were truncated; use read or aft_zoom for full context.",
+            );
+        }
+        if let Some(line) = ranked.confidence_line {
+            text.push_str("\n\n");
+            text.push_str(line);
+        }
+        text.push_str("\n\n");
+        text.push_str(&ranked.trailer);
         warnings.push(
             "Semantic search unavailable; returning lexical-only fallback results.".to_string(),
         );
+        let mut extras = semantic_unavailable_extras(true);
+        extras.insert("structuredContent".to_string(), ranked.structured_content);
 
         return search_response(
             req,
             SearchResponseParts {
                 query: &params.query,
-                // The trigram lexical lane produced these results; semantic
-                // never ran. Report what executed, not the routed mode.
                 interpreted_as: fallback_executed_label(mode, true),
                 query_kind: query_kind_label(shape.kind),
                 semantic_status,
                 status: "ready",
                 complete: false,
-                text: format_lexical_unavailable_text(
-                    &detail,
-                    &results,
-                    project_root,
-                    footer_reason,
-                ),
-                results: result_values,
-                more_available: lexical_count > top_k || lexical_engine_capped,
-                engine_capped: lexical_engine_capped,
+                text,
+                results: ranked.results.iter().map(result_to_json).collect(),
+                more_available: ranked.more_available,
+                engine_capped: ranked.engine_capped,
                 fully_degraded: false,
                 warnings,
-                extras: semantic_unavailable_extras(true),
+                extras,
             },
         );
     }
 
-    if force_lexical_fallback || semantic_degraded_fallback_available(mode, &lexical) {
-        return semantic_unavailable_grep_fallback_response(
-            req,
-            ctx,
-            params,
-            shape,
-            semantic_status,
-            detail,
-            footer_reason,
-            false,
-            warnings,
-            project_root,
-            top_k,
-        );
-    }
-
-    let mut extras = semantic_unavailable_extras(false);
-    if mode == SearchMode::Hybrid {
-        extras.insert("lexical_unavailable".to_string(), serde_json::json!(true));
-    }
-
-    search_response(
+    semantic_unavailable_grep_fallback_response(
         req,
-        SearchResponseParts {
-            query: &params.query,
-            interpreted_as: interpreted_as_label(mode),
-            query_kind: query_kind_label(shape.kind),
-            semantic_status,
-            status: unavailable_status,
-            complete: false,
-            text: detail,
-            results: Vec::new(),
-            more_available: false,
-            engine_capped: lexical.engine_capped,
-            fully_degraded: false,
-            warnings,
-            extras,
-        },
+        ctx,
+        params,
+        shape,
+        semantic_status,
+        detail,
+        footer_reason,
+        false,
+        warnings,
+        project_root,
+        top_k,
     )
 }
 
@@ -3499,10 +3345,6 @@ fn semantic_unavailable_extras(
         serde_json::json!(lexical_only_fallback),
     );
     extras
-}
-
-fn semantic_degraded_fallback_available(mode: SearchMode, lexical: &LexicalCollection) -> bool {
-    mode == SearchMode::Semantic && !lexical.ready
 }
 
 fn semantic_unavailable_grep_fallback_response(
@@ -3984,75 +3826,6 @@ fn semantic_index_loaded_with_budget(ctx: &AppContext) -> Result<bool, ()> {
     Ok(semantic_index.is_some())
 }
 
-fn collect_lexical_files(
-    ctx: &AppContext,
-    query: &str,
-    shape: &QueryShape,
-    include_tests: bool,
-    project_root: &Path,
-) -> LexicalCollection {
-    let Some(search_index) =
-        try_read_with_budget(ctx.search_index(), INTERACTIVE_ARTIFACT_READ_BUDGET)
-    else {
-        return LexicalCollection {
-            files: Vec::new(),
-            ready: false,
-            engine_capped: false,
-            artifact_lock_timed_out: true,
-        };
-    };
-    let snapshot = search_index
-        .as_ref()
-        .filter(|index| index.ready)
-        .map(SearchIndex::snapshot);
-    collect_lexical_files_from_snapshot(snapshot, query, shape, include_tests, project_root)
-}
-
-fn collect_lexical_files_from_snapshot(
-    snapshot: Option<SearchIndexSnapshot>,
-    query: &str,
-    shape: &QueryShape,
-    include_tests: bool,
-    project_root: &Path,
-) -> LexicalCollection {
-    // No `should_use_lexical` gate here: collect_lexical_files is only called
-    // when choose_mode picked Hybrid, which already means we want the lexical
-    // lane. The shape weight was a second, conflicting gate that suppressed
-    // lexical for short NL concepts routed to Hybrid.
-    //
-    // Use the shared lexical token extraction, including quoted code tokens,
-    // for both the normal hybrid lane and its one-pass zero-result escalation.
-    let tokens = query_shape::extract_lexical_tokens(query, shape);
-    let token_refs = tokens.iter().map(String::as_str).collect::<Vec<_>>();
-    let query_trigrams = SearchIndex::query_trigrams_from_tokens(&token_refs);
-
-    // No extension filter: the trigram index already covers the project's text
-    // files. Gating the lexical candidate set on the *semantic* extension
-    // allow-list made named config/doc files (Cargo.toml, README.md,
-    // package.json) structurally unreachable in hybrid mode — exactly the
-    // literal-filename hits the lexical lane exists to catch.
-    let Some(snapshot) = snapshot else {
-        return LexicalCollection {
-            files: Vec::new(),
-            ready: false,
-            engine_capped: false,
-            artifact_lock_timed_out: false,
-        };
-    };
-    let production_file_filter =
-        |path: &Path| path_allowed_by_include_tests(path, project_root, include_tests);
-    let filter = (!include_tests).then_some(&production_file_filter as &dyn Fn(&Path) -> bool);
-    let ranked =
-        snapshot.lexical_rank_with_stats(&query_trigrams, filter, LEXICAL_ENUMERATION_LIMIT);
-
-    LexicalCollection {
-        files: ranked.files,
-        ready: true,
-        engine_capped: ranked.engine_capped,
-        artifact_lock_timed_out: false,
-    }
-}
-
 fn search_index_ready_with_budget(
     ctx: &AppContext,
     wait_budget: Duration,
@@ -4350,308 +4123,6 @@ fn apply_natural_language_diversity_cap(results: &mut Vec<SemanticResult>) {
     });
 }
 
-fn sort_hybrid_results(results: &mut [HybridResult]) {
-    results.sort_by(|a, b| {
-        b.exact_phrase_count
-            .gt(&0)
-            .cmp(&a.exact_phrase_count.gt(&0))
-            .then_with(|| {
-                if a.exact_phrase_count > 0 && b.exact_phrase_count > 0 {
-                    b.exact_phrase_count
-                        .cmp(&a.exact_phrase_count)
-                        .then_with(|| a.file.cmp(&b.file))
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .then_with(|| b.exact.cmp(&a.exact))
-            .then_with(|| {
-                if a.exact && b.exact {
-                    a.exact_window_lines
-                        .unwrap_or(usize::MAX)
-                        .cmp(&b.exact_window_lines.unwrap_or(usize::MAX))
-                        .then_with(|| a.file.cmp(&b.file))
-                } else {
-                    std::cmp::Ordering::Equal
-                }
-            })
-            .then_with(|| {
-                if a.exact || b.exact {
-                    std::cmp::Ordering::Equal
-                } else {
-                    a.lexical_generated_artifact
-                        .cmp(&b.lexical_generated_artifact)
-                }
-            })
-            .then_with(|| {
-                b.fusion_score
-                    .partial_cmp(&a.fusion_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| {
-                b.score
-                    .partial_cmp(&a.score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| a.file.cmp(&b.file))
-            .then_with(|| a.name.cmp(&b.name))
-    });
-}
-
-pub fn fuse_hybrid_results(
-    semantic: Vec<SemanticResult>,
-    lexical_files: Vec<(PathBuf, f32)>,
-    shape: &QueryShape,
-    top_k: usize,
-    include_tests: bool,
-    project_root: &Path,
-) -> Vec<HybridResult> {
-    fuse_hybrid_results_with_zoom(
-        semantic,
-        lexical_files,
-        shape,
-        top_k,
-        include_tests,
-        project_root,
-        true,
-        None,
-    )
-}
-
-fn fuse_hybrid_results_with_zoom(
-    semantic: Vec<SemanticResult>,
-    lexical_files: Vec<(PathBuf, f32)>,
-    shape: &QueryShape,
-    top_k: usize,
-    include_tests: bool,
-    project_root: &Path,
-    zoom_enabled: bool,
-    query: Option<&str>,
-) -> Vec<HybridResult> {
-    if top_k == 0 {
-        return Vec::new();
-    }
-
-    let mut semantic = semantic
-        .into_iter()
-        .filter(|result| path_allowed_by_include_tests(&result.file, project_root, include_tests))
-        .collect::<Vec<_>>();
-    semantic.sort_by(|a, b| {
-        b.rank_score
-            .partial_cmp(&a.rank_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.file.cmp(&b.file))
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    let lexical_files = lexical_files
-        .into_iter()
-        .filter(|(file, _)| path_allowed_by_include_tests(file, project_root, include_tests))
-        .collect::<Vec<_>>();
-    let lexical_candidates =
-        lexical_candidates_with_generated_artifact_rank(lexical_files, project_root, query);
-
-    if lexical_candidates.is_empty() {
-        let mut results = semantic
-            .into_iter()
-            .enumerate()
-            .map(|(rank, result)| hybrid_from_semantic(result, None, rank, None, shape))
-            .collect::<Vec<_>>();
-        sort_hybrid_results(&mut results);
-        results.truncate(top_k);
-        return results;
-    }
-
-    if semantic.is_empty() {
-        let mut results = lexical_candidates
-            .into_iter()
-            .enumerate()
-            .map(|(rank, candidate)| lexical_only_result(candidate, shape, zoom_enabled, rank))
-            .collect::<Vec<_>>();
-        sort_hybrid_results(&mut results);
-        results.truncate(top_k);
-        return results;
-    }
-
-    // Merge semantic symbol hits and trigram-ranked files with reciprocal-rank
-    // fusion. A file found by both searches receives both rank contributions;
-    // files found by only one search remain eligible. Phrase matches and files
-    // containing every query token within three source lines sort first, before
-    // the final top-k truncation.
-    let lexical_top_files: HashMap<PathBuf, (LexicalCandidate, usize)> = lexical_candidates
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(rank, candidate)| (candidate.file.clone(), (candidate, rank)))
-        .collect();
-    let mut results: Vec<HybridResult> = semantic
-        .into_iter()
-        .enumerate()
-        .map(|(semantic_rank, result)| {
-            let lexical = lexical_top_files.get(&result.file);
-            hybrid_from_semantic(
-                result,
-                lexical.map(|(candidate, _)| candidate),
-                semantic_rank,
-                lexical.map(|(_, rank)| *rank),
-                shape,
-            )
-        })
-        .collect();
-
-    let semantic_files: HashSet<PathBuf> =
-        results.iter().map(|result| result.file.clone()).collect();
-    for (lexical_rank, candidate) in lexical_candidates.into_iter().enumerate() {
-        if !semantic_files.contains(&candidate.file) {
-            results.push(lexical_only_result(
-                candidate,
-                shape,
-                zoom_enabled,
-                lexical_rank,
-            ));
-        }
-    }
-
-    sort_hybrid_results(&mut results);
-    // Natural-language searches previously used the uncapped semantic lane. Keep
-    // those candidates available after adding lexical RRF so enabling both
-    // searches does not discard distinct relevant symbols from the same file.
-    let mut results = if shape.kind == QueryKind::NaturalLanguage {
-        results
-    } else {
-        cap_per_file(results, 2)
-    };
-    sort_hybrid_results(&mut results);
-    results.truncate(top_k);
-    results
-}
-
-fn hybrid_from_semantic(
-    result: SemanticResult,
-    lexical_candidate: Option<&LexicalCandidate>,
-    semantic_rank: usize,
-    lexical_rank: Option<usize>,
-    shape: &QueryShape,
-) -> HybridResult {
-    let semantic_score = result.score;
-    let ranking_score = result.rank_score;
-    let cap_protected = result.cap_protected;
-    let lexical_score = lexical_candidate.map(|candidate| candidate.score);
-    let hybrid_boosted = lexical_candidate.is_some_and(|candidate| !candidate.generated_artifact);
-    let score = if hybrid_boosted {
-        ranking_score * HYBRID_LEXICAL_BOOST
-    } else {
-        ranking_score
-    };
-    let (semantic_weight, lexical_weight) = hybrid_rrf_weights(shape);
-    let fusion_score = semantic_weight * reciprocal_rank(semantic_rank)
-        + lexical_weight * lexical_rank.map(reciprocal_rank).unwrap_or_default();
-
-    HybridResult {
-        file: result.file,
-        name: result.name,
-        kind: result.kind,
-        start_line: result.start_line,
-        end_line: result.end_line,
-        exported: result.exported,
-        snippet: result.snippet,
-        score,
-        source: "semantic",
-        semantic_score: Some(semantic_score),
-        lexical_score,
-        hybrid_boosted,
-        exact: lexical_candidate.is_some_and(|candidate| candidate.exact),
-        exact_phrase_count: lexical_candidate.map_or(0, |candidate| candidate.exact_phrase_count),
-        exact_window_lines: lexical_candidate.and_then(|candidate| candidate.exact_window_lines),
-        fusion_score,
-        cap_protected,
-        lexical_generated_artifact: lexical_candidate
-            .is_some_and(|candidate| candidate.generated_artifact),
-    }
-}
-
-fn lexical_only_result(
-    candidate: LexicalCandidate,
-    shape: &QueryShape,
-    zoom_enabled: bool,
-    lexical_rank: usize,
-) -> HybridResult {
-    let score = if candidate.generated_artifact {
-        0.0
-    } else {
-        // Lexical scores are not cosine-normalized and can exceed the semantic
-        // lane's score scale. Keep lexical-only files visible without letting
-        // broad trigram overlaps evict strong semantic matches.
-        (candidate.score * shape_dependent_lexical_only_weight(shape))
-            .min(LEXICAL_ONLY_SCORE_CEILING)
-    };
-
-    HybridResult {
-        file: candidate.file,
-        name: String::new(),
-        kind: SymbolKind::FileSummary,
-        start_line: 0,
-        end_line: 0,
-        exported: false,
-        score,
-        source: "lexical",
-        semantic_score: None,
-        lexical_score: Some(candidate.score),
-        hybrid_boosted: false,
-        exact: candidate.exact,
-        exact_phrase_count: candidate.exact_phrase_count,
-        exact_window_lines: candidate.exact_window_lines,
-        fusion_score: hybrid_rrf_weights(shape).1 * reciprocal_rank(lexical_rank),
-        cap_protected: false,
-        lexical_generated_artifact: candidate.generated_artifact,
-        snippet: if zoom_enabled {
-            "[lexical match — use aft_zoom or read for context]".to_string()
-        } else {
-            "[lexical match — use read for context]".to_string()
-        },
-    }
-}
-
-fn reciprocal_rank(zero_based_rank: usize) -> f32 {
-    1.0 / (RRF_K + zero_based_rank as f32 + 1.0)
-}
-
-fn hybrid_rrf_weights(shape: &QueryShape) -> (f32, f32) {
-    match shape.kind {
-        // Phrase matches and files containing every normalized query token in
-        // at most three source lines sort before this score. For all remaining
-        // results, lexical rank is a light corroborating signal so scattered
-        // concept words cannot displace the best semantic answer.
-        QueryKind::NaturalLanguage | QueryKind::Mixed => (0.999, 0.001),
-        _ => (shape.weights.semantic, shape.weights.lexical),
-    }
-}
-
-fn shape_dependent_lexical_only_weight(shape: &QueryShape) -> f32 {
-    match shape.kind {
-        QueryKind::Identifier => 0.8,
-        QueryKind::Path | QueryKind::ErrorCode | QueryKind::Mixed => 0.5,
-        QueryKind::NaturalLanguage | QueryKind::Regex => 0.0,
-    }
-}
-
-fn cap_per_file(results: Vec<HybridResult>, cap: usize) -> Vec<HybridResult> {
-    let mut ordinary_counts: HashMap<PathBuf, usize> = HashMap::new();
-    let mut capped = Vec::new();
-    for result in results {
-        if result.cap_protected {
-            capped.push(result);
-            continue;
-        }
-
-        let count = ordinary_counts.entry(result.file.clone()).or_insert(0);
-        if *count < cap {
-            *count += 1;
-            capped.push(result);
-        }
-    }
-    capped
-}
-
 fn format_lexical_unavailable_text(
     detail: &str,
     results: &[HybridResult],
@@ -4696,47 +4167,6 @@ fn building_lexical_note(borrowed_loading_with_results: bool) -> &'static str {
     } else {
         "Semantic index is rebuilding; results are lexical-only fallback results from the trigram index."
     }
-}
-
-fn format_building_lexical_text(
-    detail: &str,
-    results: &[HybridResult],
-    project_root: &Path,
-    lexical_index_ready: bool,
-    loading_artifacts: bool,
-    borrowed_loading: bool,
-) -> String {
-    if results.is_empty() && !lexical_index_ready {
-        if loading_artifacts {
-            return format!(
-                "{detail}\nIndex artifacts are loading for this root; nothing was searched yet because the trigram index is not ready. Retry in a few seconds. [semantic: loading]"
-            );
-        }
-        return format!(
-            "{detail}\nSemantic index is still building and the trigram index is not ready; nothing was searched yet. Retry in a few seconds. [semantic: building]"
-        );
-    }
-
-    let note = building_lexical_note(borrowed_loading && !results.is_empty());
-    if results.is_empty() {
-        return format!(
-            "{detail}\n{note}\nFound 0 lexical fallback result(s). [semantic: rebuilding]"
-        );
-    }
-
-    if borrowed_loading {
-        return format!(
-            "{note}\n\n{}\n\nFound {} lexical fallback result(s). [semantic: loading]",
-            format_result_sections(results, project_root),
-            results.len()
-        );
-    }
-
-    format!(
-        "{detail}\n{note}\n\n{}\n\nFound {} lexical fallback result(s). [semantic: rebuilding]",
-        format_result_sections(results, project_root),
-        results.len()
-    )
 }
 
 /// Top semantic cosine below this floor means the embedder found nothing
@@ -5766,6 +5196,21 @@ mod tests {
     }
 
     #[test]
+    fn external_readiness_reports_building_before_bounded_borrow() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let ctx = test_context(project.path());
+        let source = ExternalReadinessSource::new(&ctx, project.path(), None);
+
+        let observation = extensions::ReadinessSource::sample(&source);
+
+        assert_eq!(observation.trigram.status, IndexStatus::Building);
+        assert!(matches!(
+            observation.semantic.status,
+            SemanticIndexStatus::Building { ref stage, .. } if stage == "loading_artifacts"
+        ));
+    }
+
+    #[test]
     fn short_nl_concept_routes_to_hybrid_when_lexical_ready() {
         // "parse imports" classifies as a two-word lowercase NL concept, but it
         // is a literal code phrase the trigram lane can hit. With lexical ready
@@ -5825,67 +5270,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_tier_precedes_semantic_budget_and_survives_truncation() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let target = project.path().join("src/tool/browser.rs");
-        let cooccurrence = project.path().join("src/tool/other.rs");
-        fs::create_dir_all(target.parent().expect("target parent")).expect("create source dir");
-        fs::write(
-            &target,
-            "// The feature is not wired into the built-in browser tool yet.\n",
-        )
-        .expect("write exact fixture");
-        fs::write(
-            &cooccurrence,
-            "// A browser can be wired later after the tool is built.\n",
-        )
-        .expect("write co-occurrence fixture");
-        let semantic = (0..100)
-            .map(|index| {
-                semantic_candidate(
-                    &project
-                        .path()
-                        .join(format!("src/semantic-{index:03}.rs"))
-                        .display()
-                        .to_string(),
-                    &format!("semanticGuess{index}"),
-                    None,
-                    SymbolKind::Function,
-                    1.0 - index as f32 / 1_000.0,
-                )
-            })
-            .collect::<Vec<_>>();
-        let lexical = vec![(cooccurrence, 2.0), (target.clone(), 1.0)];
-
-        for (query, top_k, must_rank_first) in [
-            ("not wired into the built-in browser tool yet", 5, true),
-            ("wired yet", 10, false),
-            ("wired browser", 100, false),
-        ] {
-            let shape = query_shape::classify(query);
-            let results = fuse_hybrid_results_with_zoom(
-                semantic.clone(),
-                lexical.clone(),
-                &shape,
-                top_k,
-                true,
-                project.path(),
-                true,
-                Some(query),
-            );
-            let rank = results
-                .iter()
-                .position(|result| result.file == target)
-                .unwrap_or_else(|| panic!("exact target missing for {query:?}: {results:?}"));
-            if must_rank_first {
-                assert_eq!(rank, 0, "verbatim sentence must rank first");
-            }
-            assert!(results[rank].exact);
-            assert!(format_result_sections(&results, project.path()).contains("[exact]"));
-        }
-    }
-
-    #[test]
     fn exact_tiers_normalize_phrases_and_bound_token_windows() {
         let project = tempfile::tempdir().expect("create project dir");
         let phrase = project.path().join("phrase.rs");
@@ -5912,50 +5296,6 @@ mod tests {
             lexical_candidate_exactness(&scattered, "alpha beta gamma", &tokens),
             (false, 0, None)
         );
-    }
-
-    #[test]
-    fn semantic_first_concept_guard_rejects_scattered_whole_file_cooccurrence() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let lexical_guess = project.path().join("src/authorization.rs");
-        fs::create_dir_all(lexical_guess.parent().expect("fixture parent"))
-            .expect("create source dir");
-        fs::write(
-            &lexical_guess,
-            "// authorization policy\n// unrelated helper\n// unrelated helper\n// decide access\n",
-        )
-        .expect("write scattered lexical fixture");
-        let semantic_answer = project.path().join("src/policy.rs");
-        let query = "how does authorization policy decide access";
-        let shape = query_shape::classify(query);
-        let results = fuse_hybrid_results_with_zoom(
-            vec![
-                semantic_candidate(
-                    &semantic_answer.display().to_string(),
-                    "evaluatePolicy",
-                    None,
-                    SymbolKind::Function,
-                    0.95,
-                ),
-                semantic_candidate(
-                    &lexical_guess.display().to_string(),
-                    "authorizationHelper",
-                    None,
-                    SymbolKind::Function,
-                    0.90,
-                ),
-            ],
-            vec![(lexical_guess, 4.0)],
-            &shape,
-            5,
-            true,
-            project.path(),
-            true,
-            Some(query),
-        );
-
-        assert_eq!(results[0].file, semantic_answer);
-        assert!(!results[0].exact);
     }
 
     #[test]
@@ -6055,25 +5395,6 @@ mod tests {
         assert!(response["results"]
             .as_array()
             .is_some_and(|results| !results.is_empty()));
-    }
-
-    #[test]
-    fn loading_artifacts_without_lexical_index_reports_one_actionable_status() {
-        let text = format_building_lexical_text(
-            "Semantic index is still building (stage: loading_artifacts).",
-            &[],
-            Path::new("/fixture"),
-            false,
-            true,
-            false,
-        );
-
-        assert!(text.contains("Index artifacts are loading for this root"));
-        assert!(text.contains("nothing was searched yet"));
-        assert!(text.contains("Retry in a few seconds"));
-        assert!(!text.contains("Found 0"));
-        assert!(!text.contains("rebuilding"));
-        assert!(!text.contains(BORROWED_SEMANTIC_LOADING_WITH_LEXICAL_RESULTS));
     }
 
     #[test]
@@ -6625,49 +5946,6 @@ mod tests {
     }
 
     #[test]
-    fn external_regex_zero_results_escalate_when_borrowed_lexical_index_is_ready() {
-        let project = tempfile::tempdir().expect("create project dir");
-        let source_file = project.path().join("src/reminder.rs");
-        std::fs::create_dir_all(source_file.parent().expect("source parent"))
-            .expect("create source dir");
-        std::fs::write(&source_file, "const missing_route = true;\n").expect("write source file");
-        let mut index = SearchIndex::new();
-        index.index_file(
-            &source_file,
-            std::fs::read(&source_file).expect("read source").as_slice(),
-        );
-        index.ready = true;
-        let query = "^missing_route$";
-        let shape = query_shape::classify(query);
-        let response = response_value(handle_external_grep_search(
-            &semantic_request(query, 5),
-            query,
-            5,
-            &shape,
-            SearchMode::Regex,
-            Vec::new(),
-            project.path(),
-            false,
-            &index,
-            &ExternalBorrowMetadata::default(),
-        ));
-
-        assert_eq!(response["success"], true);
-        assert_eq!(response["zero_result_escalation"], true);
-        assert!(response["results"]
-            .as_array()
-            .expect("results")
-            .iter()
-            .any(|result| result["file"]
-                .as_str()
-                .is_some_and(|file| file.ends_with("src/reminder.rs"))));
-        assert!(response["text"]
-            .as_str()
-            .expect("text")
-            .contains("[interpreted_as: regex; no exact match — ranked by terms instead]"));
-    }
-
-    #[test]
     fn quoted_natural_language_runs_lexical_lane_without_zero_escalation() {
         let project = tempfile::tempdir().expect("create project dir");
         let source_file = project.path().join("src/reminder.rs");
@@ -6767,13 +6045,6 @@ mod tests {
         assert!(human.join("; ").contains("; "));
     }
 
-    #[test]
-    fn semantic_candidate_limit_scales_with_small_top_k() {
-        assert_eq!(semantic_candidate_limit(1), SEMANTIC_OVERFETCH_FLOOR);
-        assert_eq!(semantic_candidate_limit(5), 15);
-        assert_eq!(semantic_candidate_limit(100), MAX_TOP_K);
-    }
-
     fn rerank_shape(kind: QueryKind) -> QueryShape {
         QueryShape {
             kind,
@@ -6852,67 +6123,6 @@ mod tests {
                 query, &shape
             ));
         }
-    }
-
-    #[test]
-    fn type_concept_identifier_kind_prior_raises_definitions() {
-        let shape = rerank_shape(QueryKind::Identifier);
-        let candidates = vec![
-            semantic_candidate(
-                "/project/src/engine.ts",
-                "engineCache",
-                None,
-                SymbolKind::Variable,
-                0.80,
-            ),
-            semantic_candidate(
-                "/project/src/engine.ts",
-                "engineState",
-                None,
-                SymbolKind::Variable,
-                0.79,
-            ),
-            semantic_candidate(
-                "/project/src/renderer.ts",
-                "Renderer",
-                Some("Renderer"),
-                SymbolKind::Class,
-                0.75,
-            ),
-        ];
-
-        let mut type_concept_candidates = candidates.clone();
-        rerank_semantic_candidates(
-            &mut type_concept_candidates,
-            &shape,
-            "Engine implementations",
-        );
-        let type_concept_results = fuse_hybrid_results(
-            type_concept_candidates,
-            Vec::new(),
-            &shape,
-            10,
-            true,
-            Path::new("/project"),
-        );
-        assert_eq!(type_concept_results[0].name, "Renderer");
-
-        let mut plain_identifier_candidates = candidates;
-        rerank_semantic_candidates(&mut plain_identifier_candidates, &shape, "engineFactory");
-        assert!(plain_identifier_candidates
-            .iter()
-            .all(|result| (result.rank_score - result.score).abs() < f32::EPSILON));
-        let plain_identifier_results = fuse_hybrid_results(
-            plain_identifier_candidates,
-            Vec::new(),
-            &shape,
-            10,
-            true,
-            Path::new("/project"),
-        );
-        assert_eq!(plain_identifier_results[0].name, "engineCache");
-        assert_eq!(plain_identifier_results[1].name, "engineState");
-        assert_eq!(plain_identifier_results[2].name, "Renderer");
     }
 
     #[test]
@@ -7007,58 +6217,6 @@ mod tests {
     }
 
     #[test]
-    fn natural_language_kind_prior_and_semantic_only_fuse_raise_definitions() {
-        let shape = rerank_shape(QueryKind::NaturalLanguage);
-        let mut candidates = vec![
-            semantic_candidate(
-                "/project/src/engine.ts",
-                "engineFactory",
-                None,
-                SymbolKind::Variable,
-                0.80,
-            ),
-            semantic_candidate(
-                "/project/src/engine.ts",
-                "engineCache",
-                None,
-                SymbolKind::Variable,
-                0.79,
-            ),
-            semantic_candidate(
-                "/project/src/engine.ts",
-                "engineState",
-                None,
-                SymbolKind::Variable,
-                0.78,
-            ),
-            semantic_candidate(
-                "/project/src/engine.ts",
-                "Engine",
-                Some("Engine"),
-                SymbolKind::Class,
-                0.76,
-            ),
-        ];
-
-        rerank_semantic_candidates(&mut candidates, &shape, "Engine implementations");
-        let results = fuse_hybrid_results(
-            candidates,
-            Vec::new(),
-            &shape,
-            10,
-            true,
-            Path::new("/project"),
-        );
-
-        assert_eq!(results[0].name, "Engine");
-        assert_eq!(results[0].semantic_score, Some(0.76));
-        assert!(
-            results[0].score > 0.80,
-            "definition prior should drive semantic-only ordering"
-        );
-    }
-
-    #[test]
     fn natural_language_diversity_cap_limits_repeated_name_kind_clusters() {
         let nl_shape = rerank_shape(QueryKind::NaturalLanguage);
         let mixed_shape = rerank_shape(QueryKind::Mixed);
@@ -7107,159 +6265,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_identifier_definition_boost_and_cap_protection_survive_file_cap() {
-        let shape = rerank_shape(QueryKind::Identifier);
-        let file = "/project/src/allocation.ts";
-        let mut candidates = vec![
-            semantic_candidate(file, "unrelatedField", None, SymbolKind::Variable, 0.99),
-            semantic_candidate(file, "unrelatedMethod", None, SymbolKind::Method, 0.98),
-            semantic_candidate(
-                file,
-                "AllocationService",
-                Some("AllocationService"),
-                SymbolKind::Class,
-                0.80,
-            ),
-            semantic_candidate(file, "allocationService", None, SymbolKind::Variable, 0.79),
-            semantic_candidate(file, "allocate", None, SymbolKind::Method, 0.78),
-        ];
-
-        rerank_semantic_candidates(&mut candidates, &shape, "AllocationService");
-        let class = candidate_rank(&candidates, "AllocationService");
-        assert!(class.rank_score > candidate_rank(&candidates, "allocationService").rank_score);
-        assert!(class.rank_score > candidate_rank(&candidates, "allocate").rank_score);
-        assert!(class.cap_protected);
-
-        let fused = fuse_hybrid_results(
-            candidates,
-            vec![(PathBuf::from(file), 1.0)],
-            &shape,
-            10,
-            true,
-            Path::new("/project"),
-        );
-
-        assert!(fused
-            .iter()
-            .any(|result| result.name == "AllocationService"));
-        assert_eq!(
-            fused
-                .iter()
-                .filter(|result| result.file.as_path() == Path::new(file))
-                .count(),
-            3,
-            "protected exact-name hit should be reserved in addition to two ordinary siblings"
-        );
-    }
-
-    #[test]
-    fn qualified_name_tokens_rank_nested_definitions_over_outer_types() {
-        let nl_shape = rerank_shape(QueryKind::NaturalLanguage);
-        let id_shape = rerank_shape(QueryKind::Identifier);
-        let candidates = vec![
-            semantic_candidate(
-                "/project/src/engine.ts",
-                "Engine",
-                Some("Engine"),
-                SymbolKind::Class,
-                0.80,
-            ),
-            semantic_candidate(
-                "/project/src/engine.ts",
-                "Index",
-                Some("Engine.Index"),
-                SymbolKind::Class,
-                0.70,
-            ),
-        ];
-
-        let mut spaced = candidates.clone();
-        rerank_semantic_candidates(&mut spaced, &nl_shape, "Engine Index");
-        let spaced_results = fuse_hybrid_results(
-            spaced,
-            Vec::new(),
-            &nl_shape,
-            10,
-            true,
-            Path::new("/project"),
-        );
-        assert_eq!(spaced_results[0].name, "Index");
-
-        let mut dotted = candidates;
-        rerank_semantic_candidates(&mut dotted, &id_shape, "Engine.Index");
-        let dotted_results = fuse_hybrid_results(
-            dotted,
-            Vec::new(),
-            &id_shape,
-            10,
-            true,
-            Path::new("/project"),
-        );
-        assert_eq!(dotted_results[0].name, "Index");
-    }
-
-    #[test]
-    fn identifier_engine_factory_and_non_name_shapes_leave_priors_inert() {
-        let identifier_shape = rerank_shape(QueryKind::Identifier);
-        let mut identifier_candidates = vec![
-            semantic_candidate(
-                "/project/src/engine.ts",
-                "engineFactory",
-                None,
-                SymbolKind::Variable,
-                0.80,
-            ),
-            semantic_candidate(
-                "/project/src/engine.ts",
-                "EngineFactory",
-                Some("EngineFactory"),
-                SymbolKind::Class,
-                0.79,
-            ),
-        ];
-
-        rerank_semantic_candidates(
-            &mut identifier_candidates,
-            &identifier_shape,
-            "engineFactory",
-        );
-        assert_eq!(
-            identifier_candidates[0].rank_score,
-            identifier_candidates[0].score
-        );
-        assert_eq!(
-            identifier_candidates[1].rank_score,
-            identifier_candidates[1].score
-        );
-        assert!(!identifier_candidates
-            .iter()
-            .any(|result| result.cap_protected));
-        let identifier_results = fuse_hybrid_results(
-            identifier_candidates,
-            Vec::new(),
-            &identifier_shape,
-            10,
-            true,
-            Path::new("/project"),
-        );
-        assert_eq!(identifier_results[0].name, "engineFactory");
-
-        for kind in [QueryKind::Path, QueryKind::Regex, QueryKind::ErrorCode] {
-            let shape = rerank_shape(kind);
-            let mut candidates = vec![semantic_candidate(
-                "/project/src/engine.ts",
-                "EngineFactory",
-                Some("EngineFactory"),
-                SymbolKind::Class,
-                0.79,
-            )];
-            rerank_semantic_candidates(&mut candidates, &shape, "EngineFactory");
-            assert_eq!(candidates[0].rank_score, candidates[0].score);
-            assert!(!candidates[0].cap_protected);
-        }
-    }
-
-    #[test]
     fn exact_name_boost_does_not_cap_protect_near_zero_common_names() {
         let shape = rerank_shape(QueryKind::Identifier);
         let mut candidates = vec![semantic_candidate(
@@ -7282,6 +6287,12 @@ mod tests {
         let external = tempfile::tempdir().expect("external root");
         let external_root =
             std::fs::canonicalize(external.path()).expect("canonical external root");
+        let git_status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&external_root)
+            .status()
+            .expect("initialize external git fixture");
+        assert!(git_status.success());
         let storage = tempfile::tempdir().expect("storage");
         for file_index in 0..64 {
             let file = external_root.join(format!(
@@ -7309,27 +6320,12 @@ mod tests {
                 ..crate::config::Config::default()
             },
         );
-        let req = semantic_request("borrowed_tree_needle", 10);
-        let shape = query_shape::classify("borrowed_tree_needle");
+        let mut req = semantic_request("borrowed_tree_needle", 10);
+        req.params["path"] = serde_json::json!(external_root);
         let first = crate::readonly_artifacts::with_borrowed_search_load_limits_for_test(
             10_000,
             Duration::from_secs(5),
-            || {
-                response_value(handle_external_search(
-                    &req,
-                    &ctx,
-                    SemanticSearchParams {
-                        query: "borrowed_tree_needle".to_string(),
-                        top_k: 10,
-                        offset: 0,
-                        include_tests: false,
-                        path: None,
-                    },
-                    10,
-                    shape.clone(),
-                    external_root.clone(),
-                ))
-            },
+            || response_value(handle_semantic_search(&req, &ctx)),
         );
         assert_eq!(first["success"], true, "initial borrow failed: {first:?}");
 
@@ -7351,22 +6347,7 @@ mod tests {
         let degraded = crate::readonly_artifacts::with_borrowed_search_load_limits_for_test(
             10,
             Duration::from_secs(5),
-            || {
-                response_value(handle_external_search(
-                    &req,
-                    &ctx,
-                    SemanticSearchParams {
-                        query: "borrowed_tree_needle".to_string(),
-                        top_k: 10,
-                        offset: 0,
-                        include_tests: false,
-                        path: None,
-                    },
-                    10,
-                    shape,
-                    external_root,
-                ))
-            },
+            || response_value(handle_semantic_search(&req, &ctx)),
         );
 
         assert!(
@@ -7402,7 +6383,6 @@ mod tests {
             top_k: 10,
             offset: 0,
             include_tests: false,
-            path: Some(external.path().display().to_string()),
         };
         let shape = query_shape::classify(&params.query);
 
@@ -7439,104 +6419,6 @@ mod tests {
         let message = borrowed_drift_log_message("semantic", Path::new("/borrowed"), 3);
         assert!(message.contains("borrowed semantic index"));
         assert!(message.contains("3 drifted file(s)"));
-    }
-
-    #[test]
-    fn file_summary_snippet_is_regenerated_from_current_disk_content() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("summary.rs");
-        std::fs::write(&path, "pub fn current_disk_symbol() {}\n").expect("write current source");
-        let mut candidate = semantic_candidate(
-            path.to_str().expect("utf8 path"),
-            "summary.rs",
-            None,
-            SymbolKind::FileSummary,
-            0.9,
-        );
-        candidate.snippet = "pub fn stale_persisted_symbol() {}".to_string();
-        let shape = rerank_shape(QueryKind::NaturalLanguage);
-        let mut results =
-            fuse_hybrid_results(vec![candidate], Vec::new(), &shape, 5, true, dir.path());
-
-        enrich_snippets_from_source(&mut results, dir.path());
-
-        assert!(results[0].snippet.contains("current_disk_symbol"));
-        assert!(!results[0].snippet.contains("stale_persisted_symbol"));
-    }
-
-    #[test]
-    fn file_summary_keeps_persisted_snippet_when_source_is_unreadable() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let missing = dir.path().join("missing.rs");
-        let mut candidate = semantic_candidate(
-            missing.to_str().expect("utf8 path"),
-            "missing.rs",
-            None,
-            SymbolKind::FileSummary,
-            0.9,
-        );
-        candidate.snippet = "persisted fallback".to_string();
-        let shape = rerank_shape(QueryKind::NaturalLanguage);
-        let mut results =
-            fuse_hybrid_results(vec![candidate], Vec::new(), &shape, 5, true, dir.path());
-
-        enrich_snippets_from_source(&mut results, dir.path());
-
-        assert_eq!(results[0].snippet, "persisted fallback");
-    }
-
-    #[test]
-    fn boosted_rank_score_keeps_raw_cosine_honesty_checks() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("allocation.rs");
-        let body = (0..30)
-            .map(|index| format!("line{index}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(&path, body).expect("write symbol body");
-        let shape = rerank_shape(QueryKind::Identifier);
-        let mut candidates = vec![SemanticResult {
-            file: path,
-            name: "AllocationService".to_string(),
-            qualified_name: Some("AllocationService".to_string()),
-            kind: SymbolKind::Class,
-            start_line: 0,
-            end_line: 29,
-            exported: false,
-            snippet: String::new(),
-            score: HIGH_CONFIDENCE_COSINE_FLOOR - 0.01,
-            rank_score: HIGH_CONFIDENCE_COSINE_FLOOR - 0.01,
-            cap_protected: false,
-            source: "semantic",
-        }];
-
-        rerank_semantic_candidates(&mut candidates, &shape, "AllocationService");
-        assert!(candidates[0].rank_score > HIGH_CONFIDENCE_COSINE_FLOOR);
-        let mut fused = fuse_hybrid_results(candidates, Vec::new(), &shape, 10, true, dir.path());
-        assert_eq!(
-            fused[0].semantic_score,
-            Some(HIGH_CONFIDENCE_COSINE_FLOOR - 0.01)
-        );
-
-        let incomplete = enrich_snippets_from_source(&mut fused, dir.path());
-        assert!(incomplete);
-        assert!(fused[0].snippet.contains("line19"));
-        assert!(!fused[0].snippet.contains("line29"));
-        assert!(!fused[0].snippet.contains(RANK0_FULL_SYMBOL_NOTICE));
-
-        let mut weak = vec![semantic_candidate(
-            "/project/src/weak.ts",
-            "WeakService",
-            Some("WeakService"),
-            SymbolKind::Class,
-            WEAK_MATCH_COSINE_FLOOR - 0.01,
-        )];
-        rerank_semantic_candidates(&mut weak, &shape, "WeakService");
-        let weak_results =
-            fuse_hybrid_results(weak, Vec::new(), &shape, 10, true, Path::new("/project"));
-        assert!(weak_results[0].score > WEAK_MATCH_COSINE_FLOOR);
-        let text = format_semantic_text(&weak_results, Path::new("/project"), false, false, None);
-        assert!(text.contains("Top match is weak"), "got: {text}");
     }
 
     #[test]
@@ -7604,8 +6486,6 @@ mod tests {
             exact_phrase_count: 0,
             exact_window_lines: None,
             fusion_score: 0.0,
-            cap_protected: false,
-            lexical_generated_artifact: false,
         }];
 
         let text = format_semantic_text(&results, project_root, false, false, None);
@@ -7671,8 +6551,6 @@ mod tests {
             exact_phrase_count: 0,
             exact_window_lines: None,
             fusion_score: 0.0,
-            cap_protected: false,
-            lexical_generated_artifact: false,
         }
     }
 
@@ -7916,8 +6794,6 @@ mod tests {
             exact_phrase_count: 0,
             exact_window_lines: None,
             fusion_score: 0.0,
-            cap_protected: false,
-            lexical_generated_artifact: false,
         }];
 
         let incomplete =
@@ -8019,8 +6895,6 @@ mod tests {
             exact_phrase_count: 0,
             exact_window_lines: None,
             fusion_score: 0.0,
-            cap_protected: false,
-            lexical_generated_artifact: false,
         }];
 
         enrich_snippets_from_source(&mut results, dir.path());
@@ -8075,8 +6949,6 @@ mod tests {
             exact_phrase_count: 0,
             exact_window_lines: None,
             fusion_score: 0.0,
-            cap_protected: false,
-            lexical_generated_artifact: false,
         }];
 
         enrich_snippets_from_source(&mut results, dir.path());
@@ -8125,46 +6997,6 @@ mod tests {
     }
 
     #[test]
-    fn disabled_zoom_steering_uses_read_and_enabled_text_stays_identical() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut results = vec![write_symbol_hit(dir.path(), "a.rs", "foo", 30)];
-        let enabled_ctx = test_context(dir.path());
-        let incomplete =
-            enrich_snippets_from_source_with_context(&mut results, dir.path(), Some(&enabled_ctx));
-        let enabled =
-            format_semantic_text(&results, dir.path(), false, incomplete, Some(&enabled_ctx));
-        assert!(enabled.contains("Zoom any result for full source: aft_zoom <file> <symbol>."));
-        assert!(!enabled.contains("Read any result for full source"));
-
-        let disabled_ctx = test_context(dir.path());
-        disabled_ctx.update_config(|config| {
-            config.disabled_tools.push("aft_zoom".to_string());
-        });
-        let disabled =
-            format_semantic_text(&results, dir.path(), false, incomplete, Some(&disabled_ctx));
-        assert!(
-            disabled.contains("Read any result for full source: read <file> [startLine..endLine].")
-        );
-        assert!(!disabled.contains("aft_zoom"));
-
-        let shape = query_shape::classify("foo");
-        let candidate = LexicalCandidate {
-            file: dir.path().join("a.rs"),
-            score: 1.0,
-            generated_artifact: false,
-            exact: false,
-            exact_phrase_count: 0,
-            exact_window_lines: None,
-            ordinal: 0,
-        };
-        let enabled_lexical = lexical_only_result(candidate.clone(), &shape, true, 0);
-        let disabled_lexical = lexical_only_result(candidate, &shape, false, 0);
-        assert!(enabled_lexical.snippet.contains("aft_zoom"));
-        assert!(disabled_lexical.snippet.contains("use read for context"));
-        assert!(!disabled_lexical.snippet.contains("aft_zoom"));
-    }
-
-    #[test]
     fn no_zoom_hint_when_all_snippets_fit() {
         let dir = tempfile::tempdir().expect("tempdir");
         // Two small symbols (3 lines each), both within their rank budget.
@@ -8199,8 +7031,6 @@ mod tests {
             exact_phrase_count: 0,
             exact_window_lines: None,
             fusion_score: 0.0,
-            cap_protected: false,
-            lexical_generated_artifact: false,
         }];
         // Must not panic; header renders, no snippet body.
         let _ = enrich_snippets_from_source(&mut results, dir.path());
@@ -8268,8 +7098,6 @@ mod tests {
                 exact_phrase_count: 0,
                 exact_window_lines: None,
                 fusion_score: 0.0,
-                cap_protected: false,
-                lexical_generated_artifact: false,
             },
             HybridResult {
                 file: target_file,
@@ -8288,8 +7116,6 @@ mod tests {
                 exact_phrase_count: 0,
                 exact_window_lines: None,
                 fusion_score: 0.0,
-                cap_protected: false,
-                lexical_generated_artifact: false,
             },
         ];
 
@@ -8374,8 +7200,6 @@ mod tests {
             exact_phrase_count: 0,
             exact_window_lines: None,
             fusion_score: 0.0,
-            cap_protected: false,
-            lexical_generated_artifact: false,
         };
 
         let json = result_to_json(&result);

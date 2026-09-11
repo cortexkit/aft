@@ -137,7 +137,6 @@ pub(crate) fn resolve_git_root_from_user_path(
     })
 }
 
-#[cfg(test)]
 pub(crate) fn search_index_artifact_generation(
     project_root: &Path,
     storage_dir: Option<&Path>,
