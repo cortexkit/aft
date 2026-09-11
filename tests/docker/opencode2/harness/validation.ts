@@ -345,9 +345,11 @@ function validateScenarioRows(
   for (const row of matrix.rows) {
     if (!schemas[row.tool]) continue;
     if (observationOnly && !coveredTools.has(row.tool)) continue;
-    // A tool absent on the run's platform is outside the tool universe: every
-    // trajectory cell is n/a:platform and no T2 subcase can exist for it.
-    if (row.trajectories.T2.startsWith("n/a:platform")) continue;
+    // A non-applicable T2 cell (platform-absent tool, or a tool the model
+    // cannot call on this host) has no subcases by rule: scripted scenarios
+    // on n/a rows are refused above, so requiring them here would contradict
+    // that refusal.
+    if (row.trajectories.T2.startsWith("n/a:")) continue;
     const t2 = byParent.get(`${row.tool}/T2`) ?? [];
     if (!t2.some((scenario) => scenario.subcase === "invalid_arguments")) {
       fail("matrix_invalid", `${row.tool}/T2 missing invalid_arguments`);
