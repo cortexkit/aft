@@ -6,13 +6,13 @@
     {
       "tool": "status",
       "trajectories": {
-        "T1": "applicable",
-        "T2": "applicable",
-        "T3": "n/a:no-permission-operation",
-        "T4": "n/a:no-abortable-operation",
-        "T5": "n/a:no-background-capability",
+        "T1": "n/a:host-catalog-transcript-no-model-callable-status-tool",
+        "T2": "n/a:host-catalog-transcript-no-model-callable-status-tool",
+        "T3": "n/a:host-catalog-transcript-no-model-callable-status-tool",
+        "T4": "n/a:host-catalog-transcript-no-model-callable-status-tool",
+        "T5": "n/a:host-catalog-transcript-no-model-callable-status-tool",
         "T6": "n/a:no-list-surface",
-        "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/48340"
+        "T7": "n/a:host-catalog-transcript-no-model-callable-status-tool"
       }
     }
   ]

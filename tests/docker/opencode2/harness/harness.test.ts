@@ -468,10 +468,11 @@ describe("source-of-truth derivation", () => {
     const projectedControls = ["bash_kill", "bash_status", "bash_watch", "bash_write"];
     const requiredRows = [
       ...projectedControls.map((tool) => ({ tool, trajectories: cells })),
+      { tool: "status", trajectories: cells },
       { tool: "powershell", trajectories: powershell },
     ];
     const projection = ["read", ...projectedControls];
-    const schemas = { read: {}, powershell: {} };
+    const schemas = { read: {}, powershell: {}, status: {} };
     expect(() =>
       validateInventory(
         { schema_version: 1, platform: "linux", rows: requiredRows },
@@ -517,7 +518,7 @@ describe("source-of-truth derivation", () => {
         "n/a:platform",
       ]),
     ) as never;
-    const inventory = [...new Set([...projection, "powershell"])].sort();
+    const inventory = [...new Set([...projection, "powershell", "status"])].sort();
     const matrix = {
       schema_version: 1 as const,
       platform: "linux",

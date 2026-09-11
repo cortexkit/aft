@@ -65,6 +65,7 @@ const TEST_EVIDENCE = "AFT_OPENCODE2_TEST_NON_MUTATING_EVIDENCE";
 export const V2_SCHEMA_PROJECTION_EXCLUSIONS = {
   projection_only: ["bash_kill", "bash_status", "bash_watch", "bash_write"],
   schema_only: ["powershell"],
+  host_catalog_only: ["status"],
 } as const;
 
 function canonicalToolName(name: string): string {
@@ -208,6 +209,7 @@ export function deriveSchemaProjection(
   const projection = new Set(Object.keys(schemas).map(canonicalToolName));
   for (const tool of V2_SCHEMA_PROJECTION_EXCLUSIONS.projection_only) projection.add(tool);
   for (const tool of V2_SCHEMA_PROJECTION_EXCLUSIONS.schema_only) projection.delete(tool);
+  for (const tool of V2_SCHEMA_PROJECTION_EXCLUSIONS.host_catalog_only) projection.delete(tool);
   if (platform === "win32") projection.add("powershell");
   return [...projection].sort();
 }
@@ -239,9 +241,18 @@ function inventoryFromProjection(
   assertExactExclusions(
     "schema-only tools",
     difference(schemaInventory, projection),
-    V2_SCHEMA_PROJECTION_EXCLUSIONS.schema_only,
+    [
+      ...V2_SCHEMA_PROJECTION_EXCLUSIONS.schema_only,
+      ...V2_SCHEMA_PROJECTION_EXCLUSIONS.host_catalog_only,
+    ],
   );
-  return [...new Set([...projection, ...V2_SCHEMA_PROJECTION_EXCLUSIONS.schema_only])].sort();
+  return [
+    ...new Set([
+      ...projection,
+      ...V2_SCHEMA_PROJECTION_EXCLUSIONS.schema_only,
+      ...V2_SCHEMA_PROJECTION_EXCLUSIONS.host_catalog_only,
+    ]),
+  ].sort();
 }
 
 export function validateInventory(
@@ -288,7 +299,22 @@ function validateScenarioRows(
     const key = `${scenario.tool}/${scenario.trajectory}`;
     byParent.set(key, [...(byParent.get(key) ?? []), scenario]);
   }
+  const statusUnavailableReason = "n/a:host-catalog-transcript-no-model-callable-status-tool";
+  const hostCatalogOnly = new Set<string>(V2_SCHEMA_PROJECTION_EXCLUSIONS.host_catalog_only);
   for (const row of matrix.rows) {
+    if (hostCatalogOnly.has(row.tool)) {
+      for (const trajectory of TRAJECTORIES) {
+        const classification = row.trajectories[trajectory];
+        if (
+          trajectory === "T6"
+            ? classification !== "n/a:no-list-surface"
+            : classification !== statusUnavailableReason
+        ) {
+          fail("matrix_invalid", `${row.tool}/${trajectory} must name the host catalog transcript`);
+        }
+      }
+      continue;
+    }
     if (observationOnly && !coveredTools.has(row.tool)) continue;
     for (const trajectory of TRAJECTORIES) {
       const key = `${row.tool}/${trajectory}`;
@@ -306,6 +332,9 @@ function validateScenarioRows(
     }
   }
   for (const scenario of scenarios) {
+    if (hostCatalogOnly.has(scenario.tool)) {
+      fail("matrix_invalid", `model-uncallable host catalog row has scripted scenario: ${scenario.id}`);
+    }
     const row = matrix.rows.find((candidate) => candidate.tool === scenario.tool);
     if (!row) fail("matrix_invalid", `scenario names tool outside matrix: ${scenario.id}`);
     if (row.trajectories[scenario.trajectory].startsWith("n/a:")) {
@@ -363,6 +392,7 @@ async function validateT5Inventory(
   for (const tool of declared)
     if (!derived.has(tool)) fail("matrix_invalid", `${tool}/T5 lacks background parameter`);
   for (const row of matrix.rows) {
+    if (V2_SCHEMA_PROJECTION_EXCLUSIONS.host_catalog_only.includes(row.tool as "status")) continue;
     if (row.tool === "powershell" && matrix.platform === "linux") continue;
     const classification = row.trajectories.T5;
     if (derived.has(row.tool) && classification === "n/a:no-background-capability") {

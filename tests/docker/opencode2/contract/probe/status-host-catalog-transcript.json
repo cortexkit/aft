@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-09-11T11:45:49.857Z",
+  "host": "opencode2",
+  "host_version": "0.0.0-beta-19234",
+  "platform": "linux-x64",
+  "scenario": "status/T2/invalid_arguments",
+  "error_origin": "host",
+  "arguments": {
+    "undefined": 42
+  },
+  "transcript": {
+    "model_tool_catalog": "forensics/status/T2/invalid_arguments/mock-requests.json",
+    "catalog_search_result": "The full model-callable function catalog contains no function named status.",
+    "plugin_context": "forensics/status/T2/invalid_arguments/plugin.log",
+    "plugin_context_line": "context keys=agent,aisdk,app,catalog,command,event,experimental,generate,integration,location,mcp,options,permission,plugin,reference,rpc,session,shell,skill,storage,tool,vcs,websearch,worktree"
+  },
+  "host_schema_rejection": "The host cannot schema-reject status arguments because status is absent from the model-callable catalog; no status tool call can be emitted on this pinned host.",
+  "classification_reason": "n/a:host-catalog-transcript-no-model-callable-status-tool",
+  "coverage": "excluded"
+}
