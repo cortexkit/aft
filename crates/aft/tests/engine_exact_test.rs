@@ -548,7 +548,7 @@ fn nl_quoted_span_exact_evidence_ranks_first() {
     assert_eq!(results[0]["exact"], true);
     assert!(response["text"]
         .as_str()
-        .is_some_and(|text| text.contains("src/settle.rs [exact]")));
+        .is_some_and(|text| text.replace('\\', "/").contains("src/settle.rs [exact]")));
     assert!(results[1..].iter().all(|result| result["file"]
         .as_str()
         .is_some_and(|path| path.contains("/src/decoy_"))));
