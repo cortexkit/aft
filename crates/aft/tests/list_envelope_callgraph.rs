@@ -958,6 +958,86 @@ fn create_synthesized_store_with_callers(
     (dir, store, target_file)
 }
 
+fn create_synthesized_store_with_chain() -> (
+    tempfile::TempDir,
+    CallGraphStore,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let dir = tempdir().expect("temp dir");
+    let root = dir.path().to_path_buf();
+    let leaf_file = root.join("leaf.ts");
+    fs::write(
+        &leaf_file,
+        "export function leaf(value: string): string { return value; }\n",
+    )
+    .expect("write leaf");
+    let middle_file = root.join("middle.ts");
+    fs::write(
+        &middle_file,
+        "import { leaf } from './leaf';\n\
+         export function middle(value: string): string { return leaf(value); }\n",
+    )
+    .expect("write middle");
+    let root_file = root.join("root.ts");
+    fs::write(
+        &root_file,
+        "import { middle } from './middle';\n\
+         export function root(value: string): string { return middle(value); }\n",
+    )
+    .expect("write root");
+    let entry_file = root.join("entry.ts");
+    fs::write(
+        &entry_file,
+        "import { root } from './root';\n\
+         export function entry(): string { return root('fixture'); }\n",
+    )
+    .expect("write entry");
+
+    let store = CallGraphStore::open(root.join(".callgraph-store"), root.clone()).expect("open store");
+    store
+        .cold_build(&[
+            leaf_file.clone(),
+            middle_file,
+            root_file.clone(),
+            entry_file,
+        ])
+        .expect("cold build");
+    (dir, store, leaf_file, root_file)
+}
+
+#[test]
+fn real_store_depth_boundaries_count_omitted_callgraph_rows() {
+    let (_dir, store, leaf_file, root_file) = create_synthesized_store_with_chain();
+
+    let callers = callgraph_store_adapter::callers_result(&store, &leaf_file, "leaf", 1, true)
+        .expect("callers result");
+    let callers_envelope = callers
+        .callers_list_envelope
+        .expect("callers depth boundary must emit an envelope");
+    assert_eq!(callers_envelope.shown, 1);
+    assert_eq!(callers_envelope.total, Total::AtLeast(1));
+    assert_eq!(callers_envelope.reason, Some(Reason::Depth));
+
+    let impact = callgraph_store_adapter::impact_result(&store, &leaf_file, "leaf", 1, true)
+        .expect("impact result");
+    let impact_envelope = impact
+        .sites_list_envelope
+        .expect("impact depth boundary must emit an envelope");
+    assert_eq!(impact_envelope.shown, 1);
+    assert_eq!(impact_envelope.total, Total::AtLeast(1));
+    assert_eq!(impact_envelope.reason, Some(Reason::Depth));
+
+    let tree = callgraph_store_adapter::call_tree_result(&store, &root_file, "root", 1, true)
+        .expect("call tree result");
+    let tree_envelope = tree
+        .tree_list_envelope
+        .expect("call tree depth boundary must emit an envelope");
+    assert_eq!(tree_envelope.shown, 1);
+    assert_eq!(tree_envelope.total, Total::AtLeast(1));
+    assert_eq!(tree_envelope.reason, Some(Reason::Depth));
+}
+
 #[test]
 fn test_producer_level_store_hub_capping_and_constants_linkage() {
     // Producer-level test on a real CallGraphStore:

@@ -547,8 +547,12 @@ pub fn callers_result(
         None
     };
 
-    let callers_list_envelope =
-        build_callgraph_envelope(Unit::Items, shown, post_filter_count, truncated);
+    let callers_list_envelope = build_callgraph_envelope(
+        Unit::Items,
+        shown,
+        post_filter_count,
+        truncated.max(usize::from(depth_limited)),
+    );
     let mut groups: BTreeMap<String, Vec<StoreCallerEntry>> = BTreeMap::new();
     for site in visible_sites {
         groups
@@ -608,8 +612,12 @@ pub fn call_tree_result(
     }
     let (shown, total_children) = cap_items(&mut tree.children);
     tree.hidden_test_callers = hidden_test_callers;
-    tree.tree_list_envelope =
-        build_callgraph_envelope(Unit::Items, shown, total_children, tree.truncated);
+    tree.tree_list_envelope = build_callgraph_envelope(
+        Unit::Items,
+        shown,
+        total_children,
+        tree.truncated.max(usize::from(tree.depth_limited)),
+    );
     Ok(tree)
 }
 
@@ -700,8 +708,12 @@ pub fn impact_result(
         None
     };
 
-    let sites_list_envelope =
-        build_callgraph_envelope(Unit::Sites, shown, post_filter_count, truncated);
+    let sites_list_envelope = build_callgraph_envelope(
+        Unit::Sites,
+        shown,
+        post_filter_count,
+        truncated.max(usize::from(depth_limited)),
+    );
     let target_signature = target.representative.signature.clone();
     let target_parameters = target_signature
         .as_deref()
@@ -2124,6 +2136,7 @@ fn collect_callers_recursive(
         let omitted = counts.get(&target).copied().unwrap_or_default();
         if omitted > 0 {
             *depth_limited = true;
+            *truncated = truncated.saturating_add(omitted);
         }
         return Ok(());
     }
@@ -2281,6 +2294,7 @@ fn call_tree_inner(
         }
     } else if !calls.is_empty() {
         depth_limited = true;
+        truncated = calls.len();
     }
 
     visited.remove(&visit_key);
