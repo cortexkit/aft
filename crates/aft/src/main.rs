@@ -153,21 +153,17 @@ fn main() {
     aft::effective_path::log_startup_probe_result();
 
     if std::env::args().nth(1).as_deref() == Some("profile") {
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            let args = std::env::args_os().skip(2).collect::<Vec<_>>();
-            match cli::profile::run(args) {
-                Ok(()) => return,
-                Err(error) => {
-                    eprintln!("{error}");
-                    std::process::exit(error.exit_code());
-                }
+        // Dispatched on every platform: `--memory` reads the daemon's census and
+        // has no OS dependency, and profile::run itself refuses CPU sampling
+        // where it is unsupported. A cfg gate here hid the memory view on
+        // Windows behind the sampler's refusal.
+        let args = std::env::args_os().skip(2).collect::<Vec<_>>();
+        match cli::profile::run(args) {
+            Ok(()) => return,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(error.exit_code());
             }
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            eprintln!("aft profile unavailable: CPU sampling is only supported on macOS and Linux");
-            std::process::exit(1);
         }
     }
 

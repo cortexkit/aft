@@ -1,3 +1,8 @@
+// The CPU sampler's parsers and symbolizers are inert on platforms without
+// `sample`/`perf`; only the memory census view runs there, so the sampler's
+// helpers are unreferenced by construction rather than dead.
+#![cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+
 use rustc_demangle::try_demangle;
 use serde::Serialize;
 use sha2::{Digest, Sha256};

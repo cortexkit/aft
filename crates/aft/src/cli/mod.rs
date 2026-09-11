@@ -1,8 +1,8 @@
 pub mod index;
-// CPU sampling shells out to `sample`/`atos` (macOS) or `perf`/`addr2line` (Linux);
-// other targets get a named refusal from main.rs instead of a stub module.
 pub mod probe_login_shell_path;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+// Compiled everywhere: the memory census view has no OS dependency, and the
+// CPU sampler (`sample`/`atos` on macOS, `perf`/`addr2line` on Linux) refuses
+// by name at runtime where it is unsupported.
 pub mod profile;
 pub mod sandbox_launch;
 pub mod warmup;
