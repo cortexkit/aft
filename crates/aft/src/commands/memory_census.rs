@@ -66,14 +66,25 @@ pub fn render_memory_census(
     }
 
     let process = &snapshot.process;
-    let footprint = process.phys_footprint_bytes.or(process.rss_bytes);
     let slack = process.allocator.retained_slack_bytes.unwrap_or(0);
-    let unattributed_bytes = footprint.map(|held| {
-        i128::from(held)
-            .saturating_sub(i128::from(process.total_attributed_bytes))
-            .saturating_sub(i128::from(slack))
-            .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
-    });
+    // Unattributed = what the process holds beyond the per-root attribution.
+    // phys_footprint already excludes MADV_FREE allocator slack (that is why it
+    // is preferred), so slack is subtracted only on the RSS fallback, where it
+    // is still resident. Attribution is an estimate, so the remainder floors
+    // at zero rather than rendering a negative "unattributed" line.
+    let unattributed_bytes = match (process.phys_footprint_bytes, process.rss_bytes) {
+        (Some(footprint), _) => Some(unattributed_from(
+            footprint,
+            process.total_attributed_bytes,
+            0,
+        )),
+        (None, Some(rss)) => Some(unattributed_from(
+            rss,
+            process.total_attributed_bytes,
+            slack,
+        )),
+        (None, None) => None,
+    };
     json!({
         "roots": roots,
         "process": {
@@ -92,12 +103,37 @@ pub fn render_memory_census(
     })
 }
 
+/// Bytes the process holds beyond the per-root attribution, floored at zero.
+/// `slack` is the retained allocator slack still counted in `held` (zero when
+/// `held` is a physical footprint, which already excludes it).
+fn unattributed_from(held: u64, attributed: u64, slack: u64) -> i64 {
+    held.saturating_sub(attributed)
+        .saturating_sub(slack)
+        .min(i64::MAX as u64) as i64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::memory::{MemoryEstimate, MemorySnapshot, RootMemorySnapshot};
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    /// macOS phys_footprint excludes MADV_FREE slack, so subtracting slack again
+    /// rendered `unattributed: -1023 MB` on the first live run (footprint 3.2 GB,
+    /// attributed 1.1 GB, slack 3.1 GB). Footprint subtracts attribution only;
+    /// the RSS fallback subtracts slack too; neither goes negative.
+    #[test]
+    fn unattributed_never_double_subtracts_slack_or_goes_negative() {
+        let mb = |n: u64| n * 1024 * 1024;
+        assert_eq!(unattributed_from(mb(3221), mb(1100), 0), mb(2121) as i64);
+        assert_eq!(unattributed_from(mb(3221), mb(1100), mb(3144)), 0);
+        assert_eq!(
+            unattributed_from(mb(5000), mb(1100), mb(3144)),
+            mb(756) as i64
+        );
+        assert_eq!(unattributed_from(mb(100), mb(1100), 0), 0);
+    }
 
     #[test]
     fn rendering_a_published_census_does_not_walk_allocator_statistics() {
