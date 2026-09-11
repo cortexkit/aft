@@ -218,6 +218,12 @@ function isDirInsideProject(resolvedRoot: string, dir: string): boolean {
 function collectPathOperands(firstStage: string, startAfterCommand: number): string[] {
   const operands: string[] = [];
   let index = skipSpaces(firstStage, startAfterCommand);
+  // grep's first positional operand is the pattern, not a path (`grep PAT
+  // file`); skipping it lets a dynamic token after it (`grep PAT $LOG`) count
+  // as a path operand. A `$VAR`/backtick token carries no slash, so without this
+  // the grep read as path-less ("in-project cwd") and nudged toward aft_search
+  // for a target it could not see - the logs directory, in the field.
+  let sawPattern = false;
 
   while (index < firstStage.length) {
     const tokenResult = readShellToken(firstStage, index);
@@ -232,7 +238,11 @@ function collectPathOperands(firstStage: string, startAfterCommand: number): str
     index = skipSpaces(firstStage, end);
 
     if (token.startsWith("-")) continue;
-    if (looksLikePathOperand(token)) operands.push(token);
+    if (!sawPattern && !looksLikePathOperand(token)) {
+      sawPattern = true;
+      continue;
+    }
+    if (looksLikePathOperand(token) || isDynamicPathOperand(token)) operands.push(token);
   }
 
   return operands;

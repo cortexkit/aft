@@ -151,6 +151,27 @@ describe("maybeAppendGrepSearchHint", () => {
     expect(result).toBe(`hits\n\n${AFT_SEARCH_HINT}`);
   });
 
+  // A `$VAR` target carries no slash, so the operand collector used to see a
+  // path-less grep and nudge toward aft_search for a target it could not
+  // resolve (a log file under the storage dir, in the field). An unknowable
+  // target must suppress; a dynamic PATTERN with a real in-project path must
+  // not (the control keeps the nudge honest).
+  test("does NOT append when the grep target is a shell variable", () => {
+    const output = "log lines";
+    expect(
+      maybeAppendGrepSearchHint(
+        output,
+        'L=~/.local/share/x/logs/a.log; grep -n "abc123" $L | tail -8 | cut -c1-230',
+        true,
+        projectRoot,
+      ),
+    ).toBe(output);
+    expect(maybeAppendGrepSearchHint(output, "grep -rn foo $DIR", true, projectRoot)).toBe(output);
+    expect(maybeAppendGrepSearchHint("hits", "grep $PAT ./src/file.ts", true, projectRoot)).toBe(
+      `hits\n\n${AFT_SEARCH_HINT}`,
+    );
+  });
+
   test("appends when grep includes an in-project relative path", () => {
     const result = maybeAppendGrepSearchHint("hits", "grep foo ./src/file.ts", true, projectRoot);
     expect(result).toBe(`hits\n\n${AFT_SEARCH_HINT}`);
