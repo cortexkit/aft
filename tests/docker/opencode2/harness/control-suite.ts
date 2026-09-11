@@ -180,7 +180,7 @@ export async function runHarnessControlSuite(root: string): Promise<HarnessContr
     const writerRoot = await freshProject(root, "cross-root-writer");
     const victimRoot = await freshProject(root, "cross-root-victim");
     const writer = new DiskStateObserver(writerRoot, "bash/T1/cross-root-writer");
-    const victim = new DiskStateObserver(victimRoot, "write/T1/cross-root-victim");
+    const victim = new DiskStateObserver(victimRoot, "bash/T1/cross-root-writer");
     await Promise.all([
       writer.beginCall(call({ name: "bash" })),
       victim.beginCall(call()),
@@ -189,7 +189,7 @@ export async function runHarnessControlSuite(root: string): Promise<HarnessContr
     await writer.checkpointCall("control-call", "tool-result", "result");
     evidence.push(
       await expectFailure(
-        "cross-scenario-root-write-attributed-to-victim-root",
+        "cross-scenario-root-write-attributed-to-writer",
         "undeclared_disk_effect",
         () => victim.checkpointCall("control-call", "tool-result", "result"),
         "concurrent-scenario-root-isolation",
