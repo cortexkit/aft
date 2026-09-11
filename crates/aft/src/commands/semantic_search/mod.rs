@@ -114,8 +114,9 @@ use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
 use crate::readonly_artifacts::{GitRootResolutionError, ReadOnlyArtifact, ReadOnlyDegradation};
 use crate::search_index::{
-    sort_grep_matches_by_mtime_desc, try_read_with_budget, GrepMatch, GrepPathExclusion,
-    GrepResult, IndexStatus, SearchIndex, INTERACTIVE_ARTIFACT_READ_BUDGET,
+    sort_grep_matches_by_mtime_desc, try_read_with_budget, walk_project_files_from, GrepMatch,
+    GrepPathExclusion, GrepResult, IndexStatus, PathFilters, SearchIndex,
+    INTERACTIVE_ARTIFACT_READ_BUDGET,
 };
 use crate::semantic_index::{
     query_embedding_timeout_budget, strip_query_embedding_timeout_marker, EmbeddingModel,
@@ -2185,6 +2186,34 @@ struct EngineRanking {
     structured_content: serde_json::Value,
 }
 
+fn definition_matches_identifier_token(candidate: &CandidateResult, query: &str) -> bool {
+    let Some(range) = candidate.symbol_range else {
+        return false;
+    };
+    let Ok(source) = std::fs::read(&candidate.path) else {
+        return false;
+    };
+    let Some(symbol) = source.get(range.start..range.end) else {
+        return false;
+    };
+    query
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|character: char| {
+                !character.is_alphanumeric()
+                    && character != '_'
+                    && character != ':'
+                    && character != '.'
+            })
+        })
+        .filter(|token| crate::search_b2::router::is_identifier_shaped_token(token))
+        .any(|token| {
+            symbol
+                .windows(token.len())
+                .any(|window| window == token.as_bytes())
+        })
+}
+
 fn run_engine_ranking(
     request_id: &str,
     ctx: &AppContext,
@@ -2294,8 +2323,15 @@ fn run_engine_ranking(
         } else {
             Vec::new()
         };
-    if plan.shape != SearchShape::Identifier {
+    let retain_definition_evidence = plan.shape == SearchShape::Identifier
+        || (plan.shape == SearchShape::NaturalLanguage && plan.query_facts.has_identifier_token);
+    if !retain_definition_evidence {
         exact_candidates.retain(|candidate| candidate.evidence.kind != EvidenceKind::Definition);
+    } else if plan.shape == SearchShape::NaturalLanguage {
+        exact_candidates.retain(|candidate| {
+            candidate.evidence.kind != EvidenceKind::Definition
+                || definition_matches_identifier_token(candidate, query)
+        });
     }
     exact_candidates.extend(lexical_verifications);
     exact_candidates.sort_by(score_free_r3_cmp);
@@ -2303,31 +2339,50 @@ fn run_engine_ranking(
     exact_candidates
         .retain(|candidate| seen_exact.insert((candidate.path.clone(), candidate.symbol_range)));
 
-    let path_lookup_candidates = if plan.shape == SearchShape::Path {
-        lexical
-            .canonical_order()
-            .iter()
-            .filter_map(|candidate| {
-                let file_name = candidate.result.path.file_name()?.to_str()?;
-                query
-                    .split_whitespace()
-                    .any(|token| {
-                        token.trim_matches(|ch: char| {
-                            !ch.is_alphanumeric() && ch != '.' && ch != '_' && ch != '-'
-                        }) == file_name
-                    })
-                    .then(|| {
-                        CandidateResult::new_exact(
-                            candidate.result.path.clone(),
-                            None,
-                            EvidenceDescriptor::for_e1(1, true, false),
-                        )
-                    })
+    let path_lookup_candidates = if plan.contains(SearchLaneKind::PathLookup) {
+        let query_path_tokens = query
+            .split_whitespace()
+            .map(|token| {
+                token.trim_matches(|ch: char| {
+                    !ch.is_alphanumeric()
+                        && ch != '.'
+                        && ch != '_'
+                        && ch != '-'
+                        && ch != '/'
+                        && ch != '\\'
+                })
+            })
+            .filter(|token| token.contains('.'))
+            .collect::<Vec<_>>();
+        walk_project_files_from(project_root, project_root, &PathFilters::default())
+            .into_iter()
+            .filter(|path| candidate_filter(path))
+            .filter(|path| {
+                let relative = path
+                    .strip_prefix(project_root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let file_name = path.file_name().and_then(|name| name.to_str());
+                query_path_tokens.iter().any(|token| {
+                    let normalized = token.replace('\\', "/");
+                    file_name == Some(normalized.as_str()) || relative.ends_with(&normalized)
+                })
+            })
+            .map(|path| {
+                CandidateResult::new_exact(path, None, EvidenceDescriptor::for_e1(1, true, false))
             })
             .collect()
     } else {
         Vec::new()
     };
+    if !path_lookup_candidates.is_empty() && plan.query_facts.has_path_token {
+        let path_scope = path_lookup_candidates
+            .iter()
+            .map(|candidate| candidate.path.clone())
+            .collect::<HashSet<_>>();
+        exact_candidates.retain(|candidate| path_scope.contains(&candidate.path));
+    }
 
     let mut semantic_metadata = HashMap::new();
     let mut seen_semantic_paths = HashSet::new();

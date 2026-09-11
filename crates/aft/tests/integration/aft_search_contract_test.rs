@@ -1772,7 +1772,7 @@ fn hybrid_ready_pages_without_legacy_lexical_candidate_cap() {
         .as_str()
         .expect("search text")
         .ends_with(
-            "shown 100 of 200+ results (more at greater depth) · narrow: offset, topK, path, includeTests"
+            "shown 100 of 260+ results (more at greater depth) · narrow: offset, topK, path, includeTests"
         ));
 }
 

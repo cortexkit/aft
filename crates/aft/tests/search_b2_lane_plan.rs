@@ -15,6 +15,7 @@ struct ExpectedFacts {
     exact_input_tokens: usize,
     has_path_token: bool,
     has_timestamp_or_pid: bool,
+    has_identifier_token: bool,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -116,6 +117,7 @@ fn independent_eighty_row_matrix_matches_installed_runtime_hooks() {
                 exact_input_tokens: row.query_facts.exact_input_tokens,
                 has_path_token: row.query_facts.has_path_token,
                 has_timestamp_or_pid: row.query_facts.has_timestamp_or_pid,
+                has_identifier_token: row.query_facts.has_identifier_token,
             },
             "{} {}",
             row.query_class,

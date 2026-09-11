@@ -7,8 +7,6 @@ use crate::commands::semantic_search::extensions::{QueryFacts, RawQuery, Span};
 use crate::commands::semantic_search::plan_table::SearchShape;
 use crate::query_shape::{self, QueryKind};
 
-static IDENTIFIER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_:.$#-]+$").expect("identifier regex"));
 static ISO_TIMESTAMP_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?:^|[^0-9])\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?(?:$|[^0-9])",
@@ -41,6 +39,7 @@ struct Analysis<'a> {
     spans: Vec<DelimitedSpan>,
     tokens: Vec<Range<usize>>,
     has_path_token: bool,
+    has_identifier_token: bool,
     has_timestamp: bool,
     has_pid: bool,
 }
@@ -57,6 +56,7 @@ pub fn classify(raw_query: &RawQuery) -> (SearchShape, QueryFacts) {
         exact_input_tokens: qualifying_exact_tokens(exact_input).count(),
         has_path_token: analysis.has_path_token,
         has_timestamp_or_pid: analysis.has_timestamp || analysis.has_pid,
+        has_identifier_token: analysis.has_identifier_token,
     };
     (shape, facts)
 }
@@ -105,14 +105,15 @@ fn classify_analysis(analysis: &Analysis<'_>) -> SearchShape {
             && span.outer_start == analysis.trim_start
             && span.outer_end == analysis.trim_end
     });
+    let code_syntax_outside_span = has_code_syntax_outside_spans(analysis);
     if whole_quoted
-        || has_code_syntax_outside_spans(analysis)
+        || (code_syntax_outside_span && (analysis.spans.is_empty() || analysis.tokens.len() <= 3))
         || (!analysis.spans.is_empty() && analysis.tokens.len() <= 3)
     {
         return SearchShape::CodeLiteral;
     }
 
-    if analysis.tokens.len() == 1 && IDENTIFIER_RE.is_match(analysis.trimmed) {
+    if analysis.tokens.len() == 1 && analysis.has_identifier_token {
         return SearchShape::Identifier;
     }
 
@@ -132,6 +133,9 @@ fn analyze(raw: &str) -> Analysis<'_> {
     let has_path_token = tokens
         .iter()
         .any(|range| is_authoritative_path_token(&raw[range.clone()]));
+    let has_identifier_token = tokens
+        .iter()
+        .any(|range| is_identifier_shaped_token(&raw[range.clone()]));
     Analysis {
         raw,
         trimmed,
@@ -140,6 +144,7 @@ fn analyze(raw: &str) -> Analysis<'_> {
         spans,
         tokens,
         has_path_token,
+        has_identifier_token,
         has_timestamp: ISO_TIMESTAMP_RE.is_match(trimmed) || CLOCK_TIMESTAMP_RE.is_match(trimmed),
         has_pid: PID_RE.is_match(trimmed),
     }
@@ -243,6 +248,29 @@ fn token_ranges(raw: &str, start: usize, end: usize, spans: &[DelimitedSpan]) ->
         ranges.push(token_start..end);
     }
     ranges
+}
+
+pub(crate) fn is_identifier_shaped_token(token: &str) -> bool {
+    let token = token.trim_matches(|character: char| matches!(character, '"' | '\'' | '`'));
+    let is_name_segment = |segment: &str| {
+        !segment.is_empty()
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    };
+    let qualified = ["::", "."].into_iter().any(|separator| {
+        let segments = token.split(separator).collect::<Vec<_>>();
+        segments.len() >= 2 && segments.iter().all(|segment| is_name_segment(segment))
+    });
+    let snake_segments = token.split('_').collect::<Vec<_>>();
+    let snake_case = snake_segments.len() >= 2
+        && snake_segments
+            .iter()
+            .all(|segment| is_name_segment(segment));
+    let camel_case = token.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        && token.bytes().skip(1).any(|byte| byte.is_ascii_uppercase())
+        && token.bytes().any(|byte| byte.is_ascii_lowercase());
+    qualified || snake_case || camel_case
 }
 
 fn is_authoritative_path_token(token: &str) -> bool {

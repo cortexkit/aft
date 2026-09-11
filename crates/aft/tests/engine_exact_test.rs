@@ -4,6 +4,11 @@ use std::sync::Arc;
 
 use aft::commands::semantic_search::evidence_descriptor::{EvidenceKind, EvidenceTier};
 use aft::commands::semantic_search::generation_token::GenerationToken;
+use aft::commands::semantic_search::handle_semantic_search;
+use aft::config::Config;
+use aft::context::AppContext;
+use aft::parser::TreeSitterProvider;
+use aft::protocol::RawRequest;
 use aft::search_index::exact_lane::ExactLane;
 use aft::search_index::memo::ExactMemoStore;
 use aft::search_index::SearchIndex;
@@ -482,4 +487,72 @@ fn exact_symbol_offsets_are_char_boundaries_on_crlf_multibyte_files() {
         result.is_some(),
         "definition on a CRLF file must still verify"
     );
+}
+
+#[test]
+fn nl_quoted_span_exact_evidence_ranks_first() {
+    let dir = create_temp_corpus();
+    let target = dir.path().join("src/settle.rs");
+    let phrase = "merged_ref is not integrated";
+    fs::write(
+        &target,
+        format!(
+            "pub const SETTLE_ERROR: &str = \"{phrase}\";\n// settle integration checks the campaign ref against caller HEAD\n"
+        ),
+    )
+    .expect("write exact specimen");
+
+    for ordinal in 0..44 {
+        let decoy = dir.path().join(format!("src/decoy_{ordinal:02}.rs"));
+        let dense = concat!(
+            "settle refuses integration checked against which ref main campaign ",
+            "integration_ref caller directory HEAD merged_ref integrated is not "
+        )
+        .repeat(40);
+        fs::write(decoy, format!("// {dense}\n")).expect("write dense decoy");
+    }
+
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            project_root: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        },
+    );
+    *ctx.search_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(SearchIndex::build(dir.path()));
+
+    let query = concat!(
+        "settle refuses \"merged_ref is not integrated\": how is integration checked ",
+        "(against which ref: main, the campaign integration_ref, or the caller directory HEAD)"
+    );
+    let request: RawRequest = serde_json::from_value(serde_json::json!({
+        "id": "nl-quoted-span-exact-evidence",
+        "command": "semantic_search",
+        "query": query,
+        "top_k": 5
+    }))
+    .expect("build engine request");
+    let response = serde_json::to_value(handle_semantic_search(&request, &ctx))
+        .expect("serialize engine response");
+
+    assert_eq!(response["success"], true, "{response:?}");
+    let results = response["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 5);
+    assert!(results[0]["file"]
+        .as_str()
+        .is_some_and(|path| path.ends_with("src/settle.rs")));
+    assert_eq!(results[0]["exact"], true);
+    assert!(response["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("src/settle.rs [exact]")));
+    assert!(results[1..].iter().all(|result| result["file"]
+        .as_str()
+        .is_some_and(|path| path.contains("/src/decoy_"))));
+    assert_eq!(
+        response["structuredContent"]["plan"]["shape"],
+        "natural_language"
+    );
+    assert_eq!(response["structuredContent"]["plan"]["exact_input"], phrase);
 }

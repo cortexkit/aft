@@ -26,6 +26,7 @@ struct RouterCase {
     exact_input_tokens: usize,
     has_path_token: bool,
     has_timestamp_or_pid: bool,
+    has_identifier_token: bool,
 }
 
 fn cases() -> Vec<RouterCase> {
@@ -87,6 +88,7 @@ fn router_golden_pins_precedence_delimiters_and_exact_input() {
             exact_input_tokens,
             has_path_token,
             has_timestamp_or_pid,
+            has_identifier_token,
         } = facts;
         assert_eq!(
             exact_input_tokens, case.exact_input_tokens,
@@ -100,6 +102,11 @@ fn router_golden_pins_precedence_delimiters_and_exact_input() {
         );
         assert_eq!(
             has_timestamp_or_pid, case.has_timestamp_or_pid,
+            "query {:?}",
+            case.query
+        );
+        assert_eq!(
+            has_identifier_token, case.has_identifier_token,
             "query {:?}",
             case.query
         );

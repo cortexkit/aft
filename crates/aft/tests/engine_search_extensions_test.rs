@@ -98,19 +98,26 @@ fn readiness_is_sampled_from_the_root_snapshot() {
 }
 
 #[test]
-fn classify_tuple_passes_all_four_query_facts_to_plan_without_rederivation() {
+fn classify_tuple_passes_all_five_query_facts_to_plan_without_rederivation() {
     let extensions = DefaultSearchExtensions;
     let cases = [
-        ("where do we cap the room name", None, 5),
+        ("where do we cap the room name", None, 5, false),
+        (
+            "where does Tier2PhaseTimings record the final database rollup",
+            None,
+            8,
+            true,
+        ),
         (
             "why does it print \"exceeds the cap\" here",
             Some((19, 34)),
             3,
+            false,
         ),
-        ("why does it print \"ab\" here", Some((19, 21)), 0),
+        ("why does it print \"ab\" here", Some((19, 21)), 0, false),
     ];
 
-    for (query, expected_span, expected_tokens) in cases {
+    for (query, expected_span, expected_tokens, expected_identifier) in cases {
         let raw_query = RawQuery::new(query);
         let (shape, facts) = extensions.classify(&raw_query);
         assert_eq!(shape, SearchShape::NaturalLanguage);
@@ -119,6 +126,10 @@ fn classify_tuple_passes_all_four_query_facts_to_plan_without_rederivation() {
         assert_eq!(facts.exact_input_tokens, expected_tokens, "query: {query}");
         assert!(!facts.has_path_token, "query: {query}");
         assert!(!facts.has_timestamp_or_pid, "query: {query}");
+        assert_eq!(
+            facts.has_identifier_token, expected_identifier,
+            "query: {query}"
+        );
         assert_eq!(
             extensions
                 .plan(&shape, &facts, &Readiness::new(true, true, true))

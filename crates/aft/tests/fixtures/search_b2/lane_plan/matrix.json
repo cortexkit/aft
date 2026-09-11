@@ -8,17 +8,20 @@
       "embedded_span": null,
       "exact_input_tokens": 1,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": true
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "parse_header",
+    "exact_mode": "ready",
     "lanes_run": [
       "symbol",
+      "exact",
       "lexical",
       "variants"
     ],
     "executed_callbacks": [
       "symbol",
+      "exact",
       "lexical",
       "variants"
     ],
@@ -38,15 +41,18 @@
       "embedded_span": null,
       "exact_input_tokens": 1,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": true
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "parse_header",
+    "exact_mode": "ready",
     "lanes_run": [
+      "exact",
       "lexical",
       "variants"
     ],
     "executed_callbacks": [
+      "exact",
       "lexical",
       "variants",
       "readiness_disclosure"
@@ -69,15 +75,18 @@
       "embedded_span": null,
       "exact_input_tokens": 1,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": true
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "parse_header",
+    "exact_mode": "fallback",
     "lanes_run": [
-      "symbol"
+      "symbol",
+      "exact"
     ],
     "executed_callbacks": [
       "symbol",
+      "exact",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {
@@ -98,15 +107,16 @@
       "embedded_span": null,
       "exact_input_tokens": 1,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": true
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "parse_header",
+    "exact_mode": "fallback",
     "lanes_run": [
-      "fallback_walk"
+      "exact"
     ],
     "executed_callbacks": [
-      "fallback_walk",
+      "exact",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {
@@ -128,17 +138,20 @@
       "embedded_span": null,
       "exact_input_tokens": 1,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": true
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "parse_header",
+    "exact_mode": "ready",
     "lanes_run": [
       "symbol",
+      "exact",
       "lexical",
       "variants"
     ],
     "executed_callbacks": [
       "symbol",
+      "exact",
       "lexical",
       "variants"
     ],
@@ -158,15 +171,18 @@
       "embedded_span": null,
       "exact_input_tokens": 1,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": true
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "parse_header",
+    "exact_mode": "ready",
     "lanes_run": [
+      "exact",
       "lexical",
       "variants"
     ],
     "executed_callbacks": [
+      "exact",
       "lexical",
       "variants",
       "readiness_disclosure"
@@ -189,15 +205,18 @@
       "embedded_span": null,
       "exact_input_tokens": 1,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": true
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "parse_header",
+    "exact_mode": "fallback",
     "lanes_run": [
-      "symbol"
+      "symbol",
+      "exact"
     ],
     "executed_callbacks": [
       "symbol",
+      "exact",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {
@@ -218,15 +237,16 @@
       "embedded_span": null,
       "exact_input_tokens": 1,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": true
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "parse_header",
+    "exact_mode": "fallback",
     "lanes_run": [
-      "fallback_walk"
+      "exact"
     ],
     "executed_callbacks": [
-      "fallback_walk",
+      "exact",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {
@@ -248,7 +268,8 @@
       "embedded_span": null,
       "exact_input_tokens": 2,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "character cap",
     "exact_mode": "ready",
@@ -282,7 +303,8 @@
       "embedded_span": null,
       "exact_input_tokens": 2,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "character cap",
     "exact_mode": "ready",
@@ -317,7 +339,8 @@
       "embedded_span": null,
       "exact_input_tokens": 2,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "character cap",
     "exact_mode": "fallback",
@@ -350,7 +373,8 @@
       "embedded_span": null,
       "exact_input_tokens": 2,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "character cap",
     "exact_mode": "fallback",
@@ -382,7 +406,8 @@
       "embedded_span": null,
       "exact_input_tokens": 2,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "character cap",
     "exact_mode": "ready",
@@ -417,7 +442,8 @@
       "embedded_span": null,
       "exact_input_tokens": 2,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "character cap",
     "exact_mode": "ready",
@@ -451,7 +477,8 @@
       "embedded_span": null,
       "exact_input_tokens": 2,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "character cap",
     "exact_mode": "fallback",
@@ -483,7 +510,8 @@
       "embedded_span": null,
       "exact_input_tokens": 2,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "character cap",
     "exact_mode": "fallback",
@@ -514,7 +542,8 @@
       "embedded_span": null,
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "a b",
     "exact_mode": "fallback",
@@ -548,7 +577,8 @@
       "embedded_span": null,
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "a b",
     "exact_mode": "fallback",
@@ -583,7 +613,8 @@
       "embedded_span": null,
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "a b",
     "exact_mode": "fallback",
@@ -616,7 +647,8 @@
       "embedded_span": null,
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "a b",
     "exact_mode": "fallback",
@@ -648,7 +680,8 @@
       "embedded_span": null,
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "a b",
     "exact_mode": "fallback",
@@ -683,7 +716,8 @@
       "embedded_span": null,
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "a b",
     "exact_mode": "fallback",
@@ -717,7 +751,8 @@
       "embedded_span": null,
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "a b",
     "exact_mode": "fallback",
@@ -749,7 +784,8 @@
       "embedded_span": null,
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "a b",
     "exact_mode": "fallback",
@@ -780,7 +816,8 @@
       "embedded_span": null,
       "exact_input_tokens": 3,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "exceeds the cap",
     "exact_mode": "ready",
@@ -808,7 +845,8 @@
       "embedded_span": null,
       "exact_input_tokens": 3,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "exceeds the cap",
     "exact_mode": "ready",
@@ -836,7 +874,8 @@
       "embedded_span": null,
       "exact_input_tokens": 3,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "exceeds the cap",
     "exact_mode": "fallback",
@@ -865,7 +904,8 @@
       "embedded_span": null,
       "exact_input_tokens": 3,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "exceeds the cap",
     "exact_mode": "fallback",
@@ -894,7 +934,8 @@
       "embedded_span": null,
       "exact_input_tokens": 3,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "exceeds the cap",
     "exact_mode": "ready",
@@ -922,7 +963,8 @@
       "embedded_span": null,
       "exact_input_tokens": 3,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "exceeds the cap",
     "exact_mode": "ready",
@@ -950,7 +992,8 @@
       "embedded_span": null,
       "exact_input_tokens": 3,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "exceeds the cap",
     "exact_mode": "fallback",
@@ -979,7 +1022,8 @@
       "embedded_span": null,
       "exact_input_tokens": 3,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "exceeds the cap",
     "exact_mode": "fallback",
@@ -1008,7 +1052,8 @@
       "embedded_span": null,
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "ab",
     "exact_mode": "fallback",
@@ -1036,7 +1081,8 @@
       "embedded_span": null,
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "ab",
     "exact_mode": "fallback",
@@ -1064,7 +1110,8 @@
       "embedded_span": null,
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "ab",
     "exact_mode": "fallback",
@@ -1093,7 +1140,8 @@
       "embedded_span": null,
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "ab",
     "exact_mode": "fallback",
@@ -1122,7 +1170,8 @@
       "embedded_span": null,
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "ab",
     "exact_mode": "fallback",
@@ -1150,7 +1199,8 @@
       "embedded_span": null,
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "ab",
     "exact_mode": "fallback",
@@ -1178,7 +1228,8 @@
       "embedded_span": null,
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "ab",
     "exact_mode": "fallback",
@@ -1207,7 +1258,8 @@
       "embedded_span": null,
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "ab",
     "exact_mode": "fallback",
@@ -1236,15 +1288,18 @@
       "embedded_span": null,
       "exact_input_tokens": 5,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "where do we cap the room name",
+    "exact_mode": "ready",
     "lanes_run": [
+      "exact",
       "lexical",
       "semantic"
     ],
     "executed_callbacks": [
+      "exact",
       "lexical",
       "semantic"
     ],
@@ -1264,15 +1319,18 @@
       "embedded_span": null,
       "exact_input_tokens": 5,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "where do we cap the room name",
+    "exact_mode": "ready",
     "lanes_run": [
+      "exact",
       "lexical",
       "semantic"
     ],
     "executed_callbacks": [
+      "exact",
       "lexical",
       "semantic"
     ],
@@ -1292,14 +1350,17 @@
       "embedded_span": null,
       "exact_input_tokens": 5,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "where do we cap the room name",
+    "exact_mode": "fallback",
     "lanes_run": [
+      "exact",
       "semantic"
     ],
     "executed_callbacks": [
+      "exact",
       "semantic",
       "readiness_disclosure"
     ],
@@ -1321,14 +1382,17 @@
       "embedded_span": null,
       "exact_input_tokens": 5,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "where do we cap the room name",
+    "exact_mode": "fallback",
     "lanes_run": [
+      "exact",
       "semantic"
     ],
     "executed_callbacks": [
+      "exact",
       "semantic",
       "readiness_disclosure"
     ],
@@ -1350,14 +1414,17 @@
       "embedded_span": null,
       "exact_input_tokens": 5,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "where do we cap the room name",
+    "exact_mode": "ready",
     "lanes_run": [
+      "exact",
       "lexical"
     ],
     "executed_callbacks": [
+      "exact",
       "lexical",
       "readiness_disclosure"
     ],
@@ -1379,14 +1446,17 @@
       "embedded_span": null,
       "exact_input_tokens": 5,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "where do we cap the room name",
+    "exact_mode": "ready",
     "lanes_run": [
+      "exact",
       "lexical"
     ],
     "executed_callbacks": [
+      "exact",
       "lexical",
       "readiness_disclosure"
     ],
@@ -1408,15 +1478,16 @@
       "embedded_span": null,
       "exact_input_tokens": 5,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "where do we cap the room name",
+    "exact_mode": "fallback",
     "lanes_run": [
-      "fallback_walk"
+      "exact"
     ],
     "executed_callbacks": [
-      "fallback_walk",
+      "exact",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {
@@ -1438,15 +1509,16 @@
       "embedded_span": null,
       "exact_input_tokens": 5,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "where do we cap the room name",
+    "exact_mode": "fallback",
     "lanes_run": [
-      "fallback_walk"
+      "exact"
     ],
     "executed_callbacks": [
-      "fallback_walk",
+      "exact",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {
@@ -1471,7 +1543,8 @@
       },
       "exact_input_tokens": 3,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "exceeds the cap",
     "exact_mode": "ready",
@@ -1504,7 +1577,8 @@
       },
       "exact_input_tokens": 3,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "exceeds the cap",
     "exact_mode": "ready",
@@ -1537,7 +1611,8 @@
       },
       "exact_input_tokens": 3,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "exceeds the cap",
     "exact_mode": "fallback",
@@ -1571,7 +1646,8 @@
       },
       "exact_input_tokens": 3,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "exceeds the cap",
     "exact_mode": "fallback",
@@ -1605,7 +1681,8 @@
       },
       "exact_input_tokens": 3,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "exceeds the cap",
     "exact_mode": "ready",
@@ -1639,7 +1716,8 @@
       },
       "exact_input_tokens": 3,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "exceeds the cap",
     "exact_mode": "ready",
@@ -1673,7 +1751,8 @@
       },
       "exact_input_tokens": 3,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "exceeds the cap",
     "exact_mode": "fallback",
@@ -1706,7 +1785,8 @@
       },
       "exact_input_tokens": 3,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "exceeds the cap",
     "exact_mode": "fallback",
@@ -1739,7 +1819,8 @@
       },
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "ab",
     "exact_mode": "fallback",
@@ -1772,7 +1853,8 @@
       },
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "ab",
     "exact_mode": "fallback",
@@ -1805,7 +1887,8 @@
       },
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "ab",
     "exact_mode": "fallback",
@@ -1839,7 +1922,8 @@
       },
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "ab",
     "exact_mode": "fallback",
@@ -1873,7 +1957,8 @@
       },
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "ab",
     "exact_mode": "fallback",
@@ -1907,7 +1992,8 @@
       },
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "ab",
     "exact_mode": "fallback",
@@ -1941,7 +2027,8 @@
       },
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "ab",
     "exact_mode": "fallback",
@@ -1974,7 +2061,8 @@
       },
       "exact_input_tokens": 0,
       "has_path_token": false,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
     "exact_input": "ab",
     "exact_mode": "fallback",
@@ -2004,15 +2092,20 @@
       "embedded_span": null,
       "exact_input_tokens": 5,
       "has_path_token": true,
-      "has_timestamp_or_pid": true
+      "has_timestamp_or_pid": true,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "exact_mode": "ready",
     "lanes_run": [
+      "path_lookup",
+      "exact",
       "anchored",
       "lexical"
     ],
     "executed_callbacks": [
+      "path_lookup",
+      "exact",
       "anchored",
       "lexical"
     ],
@@ -2032,15 +2125,20 @@
       "embedded_span": null,
       "exact_input_tokens": 5,
       "has_path_token": true,
-      "has_timestamp_or_pid": true
+      "has_timestamp_or_pid": true,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "exact_mode": "ready",
     "lanes_run": [
+      "path_lookup",
+      "exact",
       "anchored",
       "lexical"
     ],
     "executed_callbacks": [
+      "path_lookup",
+      "exact",
       "anchored",
       "lexical"
     ],
@@ -2060,14 +2158,19 @@
       "embedded_span": null,
       "exact_input_tokens": 5,
       "has_path_token": true,
-      "has_timestamp_or_pid": true
+      "has_timestamp_or_pid": true,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "exact_mode": "fallback",
     "lanes_run": [
+      "path_lookup",
+      "exact",
       "anchored"
     ],
     "executed_callbacks": [
+      "path_lookup",
+      "exact",
       "anchored",
       "readiness_disclosure"
     ],
@@ -2089,14 +2192,19 @@
       "embedded_span": null,
       "exact_input_tokens": 5,
       "has_path_token": true,
-      "has_timestamp_or_pid": true
+      "has_timestamp_or_pid": true,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "exact_mode": "fallback",
     "lanes_run": [
+      "path_lookup",
+      "exact",
       "anchored"
     ],
     "executed_callbacks": [
+      "path_lookup",
+      "exact",
       "anchored",
       "readiness_disclosure"
     ],
@@ -2118,15 +2226,20 @@
       "embedded_span": null,
       "exact_input_tokens": 5,
       "has_path_token": true,
-      "has_timestamp_or_pid": true
+      "has_timestamp_or_pid": true,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "exact_mode": "ready",
     "lanes_run": [
+      "path_lookup",
+      "exact",
       "anchored",
       "lexical"
     ],
     "executed_callbacks": [
+      "path_lookup",
+      "exact",
       "anchored",
       "lexical"
     ],
@@ -2146,15 +2259,20 @@
       "embedded_span": null,
       "exact_input_tokens": 5,
       "has_path_token": true,
-      "has_timestamp_or_pid": true
+      "has_timestamp_or_pid": true,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "exact_mode": "ready",
     "lanes_run": [
+      "path_lookup",
+      "exact",
       "anchored",
       "lexical"
     ],
     "executed_callbacks": [
+      "path_lookup",
+      "exact",
       "anchored",
       "lexical"
     ],
@@ -2174,14 +2292,19 @@
       "embedded_span": null,
       "exact_input_tokens": 5,
       "has_path_token": true,
-      "has_timestamp_or_pid": true
+      "has_timestamp_or_pid": true,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "exact_mode": "fallback",
     "lanes_run": [
+      "path_lookup",
+      "exact",
       "anchored"
     ],
     "executed_callbacks": [
+      "path_lookup",
+      "exact",
       "anchored",
       "readiness_disclosure"
     ],
@@ -2203,14 +2326,19 @@
       "embedded_span": null,
       "exact_input_tokens": 5,
       "has_path_token": true,
-      "has_timestamp_or_pid": true
+      "has_timestamp_or_pid": true,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "exact_mode": "fallback",
     "lanes_run": [
+      "path_lookup",
+      "exact",
       "anchored"
     ],
     "executed_callbacks": [
+      "path_lookup",
+      "exact",
       "anchored",
       "readiness_disclosure"
     ],
@@ -2232,16 +2360,19 @@
       "embedded_span": null,
       "exact_input_tokens": 2,
       "has_path_token": true,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "src/main.rs",
+    "exact_mode": "ready",
     "lanes_run": [
       "path_lookup",
+      "exact",
       "lexical"
     ],
     "executed_callbacks": [
       "path_lookup",
+      "exact",
       "lexical"
     ],
     "embedding_counters_cold": {
@@ -2260,16 +2391,19 @@
       "embedded_span": null,
       "exact_input_tokens": 2,
       "has_path_token": true,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "src/main.rs",
+    "exact_mode": "ready",
     "lanes_run": [
       "path_lookup",
+      "exact",
       "lexical"
     ],
     "executed_callbacks": [
       "path_lookup",
+      "exact",
       "lexical"
     ],
     "embedding_counters_cold": {
@@ -2288,15 +2422,18 @@
       "embedded_span": null,
       "exact_input_tokens": 2,
       "has_path_token": true,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "src/main.rs",
+    "exact_mode": "fallback",
     "lanes_run": [
-      "path_lookup"
+      "path_lookup",
+      "exact"
     ],
     "executed_callbacks": [
       "path_lookup",
+      "exact",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {
@@ -2317,15 +2454,18 @@
       "embedded_span": null,
       "exact_input_tokens": 2,
       "has_path_token": true,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "src/main.rs",
+    "exact_mode": "fallback",
     "lanes_run": [
-      "path_lookup"
+      "path_lookup",
+      "exact"
     ],
     "executed_callbacks": [
       "path_lookup",
+      "exact",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {
@@ -2346,16 +2486,19 @@
       "embedded_span": null,
       "exact_input_tokens": 2,
       "has_path_token": true,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "src/main.rs",
+    "exact_mode": "ready",
     "lanes_run": [
       "path_lookup",
+      "exact",
       "lexical"
     ],
     "executed_callbacks": [
       "path_lookup",
+      "exact",
       "lexical"
     ],
     "embedding_counters_cold": {
@@ -2374,16 +2517,19 @@
       "embedded_span": null,
       "exact_input_tokens": 2,
       "has_path_token": true,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "src/main.rs",
+    "exact_mode": "ready",
     "lanes_run": [
       "path_lookup",
+      "exact",
       "lexical"
     ],
     "executed_callbacks": [
       "path_lookup",
+      "exact",
       "lexical"
     ],
     "embedding_counters_cold": {
@@ -2402,15 +2548,18 @@
       "embedded_span": null,
       "exact_input_tokens": 2,
       "has_path_token": true,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "src/main.rs",
+    "exact_mode": "fallback",
     "lanes_run": [
-      "path_lookup"
+      "path_lookup",
+      "exact"
     ],
     "executed_callbacks": [
       "path_lookup",
+      "exact",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {
@@ -2431,15 +2580,18 @@
       "embedded_span": null,
       "exact_input_tokens": 2,
       "has_path_token": true,
-      "has_timestamp_or_pid": false
+      "has_timestamp_or_pid": false,
+      "has_identifier_token": false
     },
-    "exact_input": null,
-    "exact_mode": "n/a",
+    "exact_input": "src/main.rs",
+    "exact_mode": "fallback",
     "lanes_run": [
-      "path_lookup"
+      "path_lookup",
+      "exact"
     ],
     "executed_callbacks": [
       "path_lookup",
+      "exact",
       "readiness_disclosure"
     ],
     "embedding_counters_cold": {

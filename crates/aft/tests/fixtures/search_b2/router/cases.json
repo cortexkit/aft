@@ -6,7 +6,8 @@
     "exact_input": "foo::bar",
     "exact_input_tokens": 2,
     "has_path_token": false,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": true
   },
   {
     "query": "2026-09-08 ERROR open /tmp/a.rs failed",
@@ -15,7 +16,8 @@
     "exact_input": "2026-09-08 ERROR open /tmp/a.rs failed",
     "exact_input_tokens": 5,
     "has_path_token": true,
-    "has_timestamp_or_pid": true
+    "has_timestamp_or_pid": true,
+    "has_identifier_token": false
   },
   {
     "query": "\"exceeds the cap\"",
@@ -24,7 +26,8 @@
     "exact_input": "exceeds the cap",
     "exact_input_tokens": 3,
     "has_path_token": false,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": false
   },
   {
     "query": "\"ab\"",
@@ -33,7 +36,8 @@
     "exact_input": "ab",
     "exact_input_tokens": 0,
     "has_path_token": false,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": false
   },
   {
     "query": "'ab'",
@@ -42,7 +46,8 @@
     "exact_input": "ab",
     "exact_input_tokens": 0,
     "has_path_token": false,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": false
   },
   {
     "query": "\"a b c\"",
@@ -51,7 +56,8 @@
     "exact_input": "a b c",
     "exact_input_tokens": 0,
     "has_path_token": false,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": false
   },
   {
     "query": "RunStarted {",
@@ -60,7 +66,8 @@
     "exact_input": "RunStarted {",
     "exact_input_tokens": 1,
     "has_path_token": false,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": true
   },
   {
     "query": "if (x) return;",
@@ -69,7 +76,8 @@
     "exact_input": "if (x) return;",
     "exact_input_tokens": 1,
     "has_path_token": false,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": false
   },
   {
     "query": "log \"cap\" here",
@@ -78,16 +86,22 @@
     "exact_input": "log \"cap\" here",
     "exact_input_tokens": 3,
     "has_path_token": false,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": false
   },
   {
     "query": "why does it print \"exceeds the cap\" here",
     "shape": "nl",
-    "embedded_span": { "start": 19, "end": 34, "text": "exceeds the cap" },
+    "embedded_span": {
+      "start": 19,
+      "end": 34,
+      "text": "exceeds the cap"
+    },
     "exact_input": "exceeds the cap",
     "exact_input_tokens": 3,
     "has_path_token": false,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": false
   },
   {
     "query": "where do we cap the room name",
@@ -96,7 +110,8 @@
     "exact_input": "where do we cap the room name",
     "exact_input_tokens": 5,
     "has_path_token": false,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": false
   },
   {
     "query": "character cap",
@@ -105,7 +120,8 @@
     "exact_input": "character cap",
     "exact_input_tokens": 2,
     "has_path_token": false,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": false
   },
   {
     "query": "a b",
@@ -114,7 +130,8 @@
     "exact_input": "a b",
     "exact_input_tokens": 0,
     "has_path_token": false,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": false
   },
   {
     "query": "src/main.rs",
@@ -123,7 +140,8 @@
     "exact_input": "src/main.rs",
     "exact_input_tokens": 2,
     "has_path_token": true,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": false
   },
   {
     "query": "why don't user's cache entries refresh",
@@ -132,7 +150,8 @@
     "exact_input": "why don't user's cache entries refresh",
     "exact_input_tokens": 6,
     "has_path_token": false,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": false
   },
   {
     "query": "why does it print \\\"cap\\\" here",
@@ -141,7 +160,8 @@
     "exact_input": "why does it print \\\"cap\\\" here",
     "exact_input_tokens": 5,
     "has_path_token": false,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": false
   },
   {
     "query": "why does it print \"cap here",
@@ -150,7 +170,8 @@
     "exact_input": "why does it print \"cap here",
     "exact_input_tokens": 5,
     "has_path_token": false,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": false
   },
   {
     "query": "2026-09-08T12:00:01 ERROR worker pid [4821] failed",
@@ -159,16 +180,22 @@
     "exact_input": "2026-09-08T12:00:01 ERROR worker pid [4821] failed",
     "exact_input_tokens": 7,
     "has_path_token": false,
-    "has_timestamp_or_pid": true
+    "has_timestamp_or_pid": true,
+    "has_identifier_token": false
   },
   {
     "query": "why does it print `exceeds the cap` here \"unfinished",
     "shape": "nl",
-    "embedded_span": { "start": 19, "end": 34, "text": "exceeds the cap" },
+    "embedded_span": {
+      "start": 19,
+      "end": 34,
+      "text": "exceeds the cap"
+    },
     "exact_input": "exceeds the cap",
     "exact_input_tokens": 3,
     "has_path_token": false,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": false
   },
   {
     "query": "^export",
@@ -177,7 +204,8 @@
     "exact_input": "^export",
     "exact_input_tokens": 1,
     "has_path_token": false,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": false
   },
   {
     "query": "foo.*",
@@ -186,7 +214,8 @@
     "exact_input": "foo.*",
     "exact_input_tokens": 1,
     "has_path_token": false,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": false
   },
   {
     "query": "foo.rs",
@@ -195,6 +224,7 @@
     "exact_input": "foo.rs",
     "exact_input_tokens": 1,
     "has_path_token": true,
-    "has_timestamp_or_pid": false
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": true
   }
 ]

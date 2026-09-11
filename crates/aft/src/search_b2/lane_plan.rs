@@ -44,10 +44,21 @@ pub fn plan<'a>(
 }
 
 /// Returns the all-ready retrieval row before resource gating.
+///
+/// Chair ruling R2a makes exact evidence shape-independent for every non-regex
+/// query. The exact lane's score-free, admission-exempt result can lead only
+/// when it finds the verbatim phrase, so selecting it cannot displace semantic
+/// ranking when no exact evidence exists. Chair ruling R1a also treats a path
+/// fact as lane-selection evidence without changing the token-count-driven
+/// shape; a runtime-resolved path lookup runs before exact evidence. Chair
+/// ruling R1b selects symbol lookup for natural-language queries only when the
+/// classifier found an identifier-shaped token, leaving ordinary prose
+/// unchanged. Regex remains on its pinned owner.
 pub fn legal_lanes(shape: SearchShape, facts: &QueryFacts) -> Vec<SearchLaneKind> {
-    match shape {
+    let mut lanes = match shape {
         SearchShape::Identifier => vec![
             SearchLaneKind::Symbol,
+            SearchLaneKind::Exact,
             SearchLaneKind::Lexical,
             SearchLaneKind::Variants,
         ],
@@ -59,19 +70,41 @@ pub fn legal_lanes(shape: SearchShape, facts: &QueryFacts) -> Vec<SearchLaneKind
             SearchLaneKind::Semantic,
         ],
         SearchShape::CodeLiteral => vec![SearchLaneKind::Exact, SearchLaneKind::Lexical],
-        SearchShape::NaturalLanguage => {
-            let mut lanes = Vec::with_capacity(3);
-            if facts.embedded_span.is_some() {
-                lanes.push(SearchLaneKind::Exact);
-            }
-            lanes.push(SearchLaneKind::Lexical);
-            lanes.push(SearchLaneKind::Semantic);
-            lanes
-        }
-        SearchShape::LogExcerpt => vec![SearchLaneKind::Anchored, SearchLaneKind::Lexical],
-        SearchShape::Path => vec![SearchLaneKind::PathLookup, SearchLaneKind::Lexical],
+        SearchShape::NaturalLanguage => vec![
+            SearchLaneKind::Exact,
+            SearchLaneKind::Lexical,
+            SearchLaneKind::Semantic,
+        ],
+        SearchShape::LogExcerpt => vec![
+            SearchLaneKind::Exact,
+            SearchLaneKind::Anchored,
+            SearchLaneKind::Lexical,
+        ],
+        SearchShape::Path => vec![
+            SearchLaneKind::PathLookup,
+            SearchLaneKind::Exact,
+            SearchLaneKind::Lexical,
+        ],
         SearchShape::Regex => vec![SearchLaneKind::FallbackWalk],
+    };
+
+    if shape == SearchShape::NaturalLanguage
+        && facts.has_identifier_token
+        && !lanes.contains(&SearchLaneKind::Symbol)
+    {
+        lanes.insert(0, SearchLaneKind::Symbol);
     }
+    if shape != SearchShape::Regex
+        && facts.has_path_token
+        && !lanes.contains(&SearchLaneKind::PathLookup)
+    {
+        let before_exact = lanes
+            .iter()
+            .position(|lane| *lane == SearchLaneKind::Exact)
+            .unwrap_or(0);
+        lanes.insert(before_exact, SearchLaneKind::PathLookup);
+    }
+    lanes
 }
 
 fn lane_is_ready(lane: SearchLaneKind, readiness: &Readiness<'_>) -> bool {

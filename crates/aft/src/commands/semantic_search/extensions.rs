@@ -38,13 +38,16 @@ impl Span {
     }
 }
 
-/// The complete classification facts passed unchanged to lane planning.
+/// The five classification facts passed unchanged to lane planning: the first
+/// embedded span, qualifying exact-token count, path presence, log-marker
+/// presence, and identifier-shaped-token presence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct QueryFacts {
     pub embedded_span: Option<Span>,
     pub exact_input_tokens: usize,
     pub has_path_token: bool,
     pub has_timestamp_or_pid: bool,
+    pub has_identifier_token: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
