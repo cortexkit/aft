@@ -188,6 +188,32 @@ class WatchCiLiveTests(unittest.TestCase):
         self.assertFalse(git_log.exists(), "numeric run IDs must not invoke git")
         self.assertTrue(all(call[:2] == ["run", "view"] for call in self.calls()))
 
+    def test_sha_resolution_asks_for_the_push_run_only(self) -> None:
+        # A sha is not unique across triggers: a scheduled or dispatched re-run
+        # of the same workflow on the same commit lists newest-first, so a
+        # resolver that does not name the trigger latches whichever fired last
+        # and can report a scheduled failure for a push that passed. The event
+        # filter is asserted on the real invocation, not on the resolver's
+        # output, because this repository's fixture sha may carry only one run.
+        self.found_run(self.watch(self.sha))
+        lists = [call for call in self.calls() if call[:2] == ["run", "list"]]
+        self.assertTrue(lists, "sha resolution must list runs")
+        for call in lists:
+            self.assertIn("--event", call, call)
+            self.assertEqual(call[call.index("--event") + 1], "push", call)
+
+    def test_event_override_reaches_the_run_list(self) -> None:
+        self.env["WATCH_CI_EVENT"] = "schedule"
+        result = self.watch(self.sha)
+        lists = [call for call in self.calls() if call[:2] == ["run", "list"]]
+        self.assertTrue(lists, result.stdout + result.stderr)
+        self.assertTrue(all(call[call.index("--event") + 1] == "schedule" for call in lists), lists)
+        # The fixture sha was chosen from push runs; with only scheduled runs
+        # admitted the resolver must refuse by name rather than latch a push run.
+        if result.returncode != 0:
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("event=schedule", result.stderr)
+
 
 if __name__ == "__main__":
     # EXIT 2 WHEN UNARMED, rather than running unittest and reporting "OK (skipped=5)".

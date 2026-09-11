@@ -44,6 +44,13 @@ fi
 # (cost-gate, testbox), so resolving a run BY SHA has to name the gating one or
 # it can latch a run that says nothing about the tests.
 WORKFLOW="${WATCH_CI_WORKFLOW:-tests.yml}"
+# Which trigger produced the run. A sha is not unique across triggers either: a
+# commit that a schedule (or workflow_dispatch) later re-ran carries several
+# runs of the same workflow with possibly different conclusions, and the
+# newest-first list then answers for whichever fired last. A landing asks
+# whether THIS PUSH is green, so the default is the push run; set the event to
+# watch a different trigger's run for the same sha.
+EVENT="${WATCH_CI_EVENT:-push}"
 # How long to wait for a run to appear for a sha: 40 tries, 15s apart, is ten
 # minutes of patience for a queue that normally produces a run in seconds. Both
 # knobs exist so tests can drive the resolver without waiting out that budget.
@@ -92,14 +99,14 @@ if [ -z "$RID" ]; then
     WATCH_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
   fi
   for _ in $(seq 1 "$RESOLVE_ATTEMPTS"); do
-    RID=$("$OPERATOR_GH" run list --repo "$REPO" --workflow "$WORKFLOW" --limit 40 \
+    RID=$("$OPERATOR_GH" run list --repo "$REPO" --workflow "$WORKFLOW" --event "$EVENT" --limit 40 \
       --json databaseId,headSha \
       --jq ".[] | select(.headSha==\"$WATCH_SHA\") | .databaseId" | head -1)
     [ -n "$RID" ] && break
     sleep "$RESOLVE_SLEEP"
   done
   if [ -z "$RID" ]; then
-    echo "no $WORKFLOW run appeared for $WATCH_SHA" >&2
+    echo "no $WORKFLOW run (event=$EVENT) appeared for $WATCH_SHA" >&2
     exit 2
   fi
 fi
