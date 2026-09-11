@@ -1,4 +1,137 @@
 {
   "schema_version": 1,
-  "entries": []
+  "entries": [
+    {
+      "scenario": "callgraph/T7/happy",
+      "tool": "callgraph",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "conflicts/T7/happy",
+      "tool": "conflicts",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "import/T7/happy",
+      "tool": "import",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "inspect/T7/happy",
+      "tool": "inspect",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "outline/T7/happy",
+      "tool": "outline",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "safety/T7/checkpoint_restore",
+      "tool": "safety",
+      "field": "checkpoint",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "search/T7/happy",
+      "tool": "search",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "zoom/T7/happy",
+      "tool": "zoom",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "apply_patch/T7/happy",
+      "tool": "apply_patch",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "ast_replace/T7/happy",
+      "tool": "ast_replace",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "ast_search/T7/happy",
+      "tool": "ast_search",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "bash/T7/happy",
+      "tool": "bash",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "bash_kill/T7/happy",
+      "tool": "bash_kill",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "bash_status/T7/happy",
+      "tool": "bash_status",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "bash_watch/T7/happy",
+      "tool": "bash_watch",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "bash_write/T7/happy",
+      "tool": "bash_write",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "delete/T7/happy",
+      "tool": "delete",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "edit/T7/happy",
+      "tool": "edit",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "glob/T7/happy",
+      "tool": "glob",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "grep/T7/happy",
+      "tool": "grep",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "move/T7/happy",
+      "tool": "move",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    },
+    {
+      "scenario": "write/T7/happy",
+      "tool": "write",
+      "field": "fixture_marker",
+      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+    }
+  ]
 }

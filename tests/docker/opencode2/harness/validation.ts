@@ -518,6 +518,16 @@ async function validateParityAllowlist(
       reason: entry.reason,
     });
   }
+  for (const scenario of scenarios.filter((candidate) => candidate.trajectory === "T7")) {
+    if (!scenario.comparison) fail("matrix_invalid", `T7 requires comparison: ${scenario.id}`);
+    const allowedForScenario = validated.filter((entry) => entry.scenario === scenario.id);
+    if (scenario.comparison.mode === "shape" && allowedForScenario.length === 0) {
+      fail("matrix_invalid", `shape comparison must name a parity allowlist reason: ${scenario.id}`);
+    }
+    if (scenario.comparison.mode === "exact" && allowedForScenario.length > 0) {
+      fail("matrix_invalid", `exact comparison cannot carry parity allowlist: ${scenario.id}`);
+    }
+  }
   return validated;
 }
 
