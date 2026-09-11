@@ -711,6 +711,46 @@ expect_out "base.txt" "rebase conflict names the conflicting file"
 [ "$(origin_ref "$dir" refs/heads/train/conflict)" = "$conflict_sha" ] ||
   fail "rebase conflict moved the train branch"
 
+# --- a train carrying a merge is never auto-rebased -------------------------
+# A plain rebase drops the merge commit and anything recorded only in it (a
+# conflict resolution, an integration fix), exits 0, and lands the reduced
+# tree. BROCA's specimen: the merge-only file vanished silently. The script
+# must refuse the requeue and leave the remote train ref intact.
+dir="$(new_fixture mergetrain)"
+git -C "$dir/work" checkout -qb side
+echo "side" > "$dir/work/side.txt"
+git -C "$dir/work" add side.txt
+git -C "$dir/work" commit -qm "side: add side.txt"
+git -C "$dir/work" checkout -q "$DEFAULT_BRANCH"
+echo "main edit" > "$dir/work/main-edit.txt"
+git -C "$dir/work" add main-edit.txt
+git -C "$dir/work" commit -qm "main: edit"
+git -C "$dir/work" merge -q --no-ff side -m "merge side"
+# The integration fix lives only in the merge commit.
+echo "integration" > "$dir/work/integration.txt"
+git -C "$dir/work" add integration.txt
+git -C "$dir/work" commit -q --amend --no-edit
+merge_sha="$(git -C "$dir/work" rev-parse HEAD)"
+cat > "$dir/ci-state/on-watch.sh" <<HOOK
+#!/usr/bin/env bash
+set -euo pipefail
+export HOME="$HOME"
+DEFAULT_BRANCH="$DEFAULT_BRANCH"
+$(declare -f advance_origin_main)
+advance_origin_main "$dir" "peer moved main"
+HOOK
+chmod +x "$dir/ci-state/on-watch.sh"
+run_train "$dir" mergetrain
+expect_rc 3 "a merge-carrying train refuses the automatic rebase"
+expect_out "not rebasing" "merge refusal says it is not rebasing"
+expect_out "merge $merge_sha" "merge refusal names the merge commit"
+[ "$(git -C "$dir/work" rev-parse HEAD)" = "$merge_sha" ] ||
+  fail "merge refusal moved HEAD"
+[ -f "$dir/work/integration.txt" ] ||
+  fail "merge refusal lost the merge-only file"
+[ "$(origin_ref "$dir" refs/heads/train/mergetrain)" = "$merge_sha" ] ||
+  fail "merge refusal did not leave the remote train ref intact"
+
 # --- stale green never authorizes a land -----------------------------------
 # Round 1 goes green, main moves, the train rebases - and the rebased sha has no
 # run yet. The old sha's green must not be spent on the new one: the script has

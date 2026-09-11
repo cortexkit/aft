@@ -549,6 +549,29 @@ rebase_onto_main() {
   local before="$1"
   local conflicted
   local now
+  local merges
+
+  # A plain rebase linearizes: it replays the non-merge commits and drops the
+  # merge commit itself, so anything recorded only in that merge (a conflict
+  # resolution, an integration fix) vanishes with exit 0 and the reduced tree
+  # is what gets re-tested and landed. --rebase-merges does not help: it
+  # re-performs the merges and loses the same adjustment unless rerere holds
+  # it. A merge is a permitted train shape (see the header), so refuse the
+  # automatic requeue and leave the remote train ref intact for the operator,
+  # who knows what the merge resolved. (BROCA's find, 2026-09-11.)
+  merges="$(git rev-list --merges "$remote_default..$before" 2>/dev/null || true)"
+  if [ -n "$merges" ]; then
+    {
+      printf 'train-push: %s/%s moved and the train carries merge commit(s) — not rebasing.\n' \
+        "$remote" "$default_branch"
+      printf '  A rebase would drop the merge and anything recorded only in it.\n'
+      printf '%s\n' "$merges" | sed 's/^/    merge /'
+      printf '  %s/%s still holds %s. Integrate %s/%s yourself (merge or re-pick),\n' \
+        "$remote" "$train_ref" "$before" "$remote" "$default_branch"
+      printf '  then re-run: scripts/train-push.sh %s\n' "$train_name"
+    } >&2
+    return 1
+  fi
 
   if git rebase "$remote_default"; then
     return 0
