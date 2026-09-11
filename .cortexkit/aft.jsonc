@@ -49,5 +49,11 @@
         ["packages/opencode-plugin/**", "packages/pi-plugin/**"]
       ]
     }
-  }
+  },
+
+  // Content-addressed index views (per-file artifacts keyed by content hash,
+  // per-checkout manifests from the git tree): branch switches become manifest
+  // swaps instead of re-embeds. Default off; enabled here as one of the three
+  // soak repositories before it becomes the default.
+  //"views": { "enabled": true }
 }
