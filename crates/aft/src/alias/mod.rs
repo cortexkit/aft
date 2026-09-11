@@ -8,9 +8,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -19,6 +20,8 @@ use sha2::Digest;
 
 /// The manifest format that stores paths as exact, slash-separated bytes.
 pub const PATH_IDENTITY_VERSION: u32 = 1;
+
+const GIT_METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 
 const ALIAS_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS oid_aliases (
@@ -726,6 +729,71 @@ fn parse_ls_tree_output(output: &[u8]) -> Result<Vec<TrackedPath>, AliasError> {
         .collect()
 }
 
+fn run_command_with_input(
+    command: &mut Command,
+    input: Vec<u8>,
+    timeout: Duration,
+) -> std::io::Result<Output> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "child stdin was not piped")
+    })?;
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "child stdout was not piped")
+    })?;
+    let mut stderr = child.stderr.take().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "child stderr was not piped")
+    })?;
+
+    // Git may produce one output record for every input path. Pump all three
+    // pipes concurrently so no pipe can fill while the parent waits on another.
+    let input_thread = std::thread::spawn(move || stdin.write_all(&input));
+    let stdout_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("child process exceeded {}s deadline", timeout.as_secs()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    let input_result = input_thread
+        .join()
+        .map_err(|_| std::io::Error::other("child stdin pump panicked"))?;
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| std::io::Error::other("child stdout pump panicked"))??;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| std::io::Error::other("child stderr pump panicked"))??;
+    input_result?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 fn git_filter_attributes(
     repo_root: &Path,
     paths: &[TrackedPath],
@@ -734,24 +802,28 @@ fn git_filter_attributes(
         return Ok(BTreeMap::new());
     }
 
-    let mut child = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["check-attr", "--cached", "-z", "--stdin", "filter"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    {
-        let stdin = child.stdin.as_mut().ok_or_else(|| {
-            AliasError::InvalidManifestEntry("missing git check-attr stdin pipe".to_owned())
-        })?;
-        for path in paths {
-            stdin.write_all(&path.rel_path)?;
-            stdin.write_all(&[0])?;
-        }
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(&path.rel_path);
+        input.push(0);
     }
-    let output = child.wait_with_output()?;
+    let started_at = Instant::now();
+    let output = run_command_with_input(
+        Command::new("git").arg("-C").arg(repo_root).args([
+            "check-attr",
+            "--cached",
+            "-z",
+            "--stdin",
+            "filter",
+        ]),
+        input,
+        GIT_METADATA_TIMEOUT,
+    )?;
+    crate::slog_debug!(
+        "git check-attr completed for {} path(s) in {}ms",
+        paths.len(),
+        started_at.elapsed().as_millis()
+    );
     if !output.status.success() {
         return Err(AliasError::Git {
             command: "check-attr --cached -z --stdin filter",
@@ -948,4 +1020,37 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 
 fn path_display(path: &[u8]) -> String {
     String::from_utf8_lossy(path).into_owned()
+}
+
+#[cfg(all(test, unix))]
+mod subprocess_tests {
+    use super::*;
+
+    #[test]
+    fn command_input_and_output_larger_than_pipe_capacity_do_not_deadlock() {
+        let bytes = 4 * 1024 * 1024;
+        let started_at = Instant::now();
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result = run_command_with_input(
+                Command::new("sh")
+                    .arg("-c")
+                    .arg("dd if=/dev/zero bs=1048576 count=4 2>/dev/null; cat >/dev/null"),
+                vec![b'x'; bytes],
+                Duration::from_secs(5),
+            );
+            let _ = done_tx.send(result);
+        });
+        let output = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("subprocess communication deadlocked past the bounded test deadline")
+            .expect("concurrent pipe pumps must finish before the subprocess deadline");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), bytes);
+        assert!(
+            started_at.elapsed() < Duration::from_secs(5),
+            "subprocess communication reached its deadline"
+        );
+    }
 }
