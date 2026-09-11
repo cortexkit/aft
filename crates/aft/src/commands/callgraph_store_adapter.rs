@@ -2911,7 +2911,7 @@ mod trace_to_tests {
         assert_eq!(store.caller_count_target_count(), 1);
         assert_eq!(
             serde_json::to_string(&callers).expect("serialize callers result"),
-            r#"{"symbol":"target","file":"target.ts","callers":[{"file":"hubCaller.ts","callers":[{"symbol":"hubCaller","line":1}]}],"total_callers":21,"hub_summary":{"message":"Next: 21 callers — showing 1; narrow with scope","total":21,"hidden_tests":0,"shown":1,"threshold":20,"limit":15},"scanned_files":4,"depth_limited":true,"truncated":0,"callers_list_envelope":{"shown":1,"total":{"kind":"exact","value":21},"unit":"items","reason":"cap","causes":["cap"],"narrow":["depth","includeTests"]}}"#
+            r#"{"symbol":"target","file":"target.ts","callers":[{"file":"hubCaller.ts","callers":[{"symbol":"hubCaller","line":1}]}],"total_callers":21,"hub_summary":{"message":"Next: 21 callers — showing 1; narrow with scope","total":21,"hidden_tests":0,"shown":1,"threshold":20,"limit":15},"scanned_files":4,"depth_limited":true,"truncated":0,"callers_list_envelope":{"shown":1,"total":{"kind":"at_least","value":1},"unit":"items","reason":"depth","causes":["depth","cap"],"narrow":["depth","includeTests"]}}"#
         );
 
         store.reset_query_counts();
@@ -2924,7 +2924,7 @@ mod trace_to_tests {
         assert_eq!(store.caller_count_target_count(), 1);
         assert_eq!(
             serde_json::to_string(&impact).expect("serialize impact result"),
-            r#"{"symbol":"target","file":"target.ts","parameters":[],"total_affected":21,"affected_files":1,"callers":[{"caller_symbol":"hubCaller","caller_file":"hubCaller.ts","line":1,"is_entry_point":false,"parameters":[]}],"hub_summary":{"message":"Next: 21 affected callers — showing 1; narrow with scope","total":21,"hidden_tests":0,"shown":1,"threshold":20,"limit":15},"depth_limited":true,"truncated":0,"sites_list_envelope":{"shown":1,"total":{"kind":"exact","value":21},"unit":"sites","reason":"cap","causes":["cap"],"narrow":["depth","includeTests"]}}"#
+            r#"{"symbol":"target","file":"target.ts","parameters":[],"total_affected":21,"affected_files":1,"callers":[{"caller_symbol":"hubCaller","caller_file":"hubCaller.ts","line":1,"is_entry_point":false,"parameters":[]}],"hub_summary":{"message":"Next: 21 affected callers — showing 1; narrow with scope","total":21,"hidden_tests":0,"shown":1,"threshold":20,"limit":15},"depth_limited":true,"truncated":0,"sites_list_envelope":{"shown":1,"total":{"kind":"at_least","value":1},"unit":"sites","reason":"depth","causes":["depth","cap"],"narrow":["depth","includeTests"]}}"#
         );
     }
 

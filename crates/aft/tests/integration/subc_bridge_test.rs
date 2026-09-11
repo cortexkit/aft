@@ -1686,7 +1686,25 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     let join_result = daemon.join();
     clear_bridge_state();
 
-    run_result.expect("subc mode exits cleanly");
+    // A fatal-actor teardown must NOT end cleanly: the supervisor reads a
+    // clean exit as "stopped on request" and never respawns (2026-09-11).
+    // Scenarios that deliberately drive one are named here so the contract is
+    // asserted from both sides - a fatal scenario returning Ok is the old
+    // exit-0 defect, and a non-fatal scenario returning ActorFatal is a
+    // teardown that should not have happened.
+    const FATAL_TEARDOWN_SCENARIOS: &[&str] = &[
+        "subc_bridge_mutating_panic_triggers_fatal_teardown",
+        "subc_bridge_pure_read_actor_fatal_response_triggers_fatal_teardown",
+        "subc_bridge_bash_promote_panic_triggers_fatal_teardown",
+    ];
+    if FATAL_TEARDOWN_SCENARIOS.contains(&name) {
+        assert!(
+            matches!(run_result, Err(SubcError::ActorFatal)),
+            "{name}: a fatal teardown must exit through SubcError::ActorFatal, got {run_result:?}"
+        );
+    } else {
+        run_result.expect("subc mode exits cleanly");
+    }
     join_result.expect("fake daemon joins");
     after(&state, &executor_for_check, &roots);
 }

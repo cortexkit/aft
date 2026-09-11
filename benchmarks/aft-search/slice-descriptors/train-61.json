@@ -3,8 +3,10 @@
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
     "crates/aft/tests/search_b2_variants.rs",
-    "crates/aft/tests/search_b2_readiness.rs"
+    "crates/aft/tests/search_b2_readiness.rs",
+    "crates/aft/tests/engine_exact_test.rs"
   ],
-  "slices": ["variants", "readiness"]
+  "slices": ["variants", "readiness", "exact-lane-crlf-offsets", "confidence-pinned-copy"]
 }
