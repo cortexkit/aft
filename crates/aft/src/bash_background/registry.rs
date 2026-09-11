@@ -1056,30 +1056,11 @@ impl BgTaskRegistry {
     }
 
     pub fn has_erased_watch_reference(&self, task_id: &str) -> bool {
-        let Some((harness, pool)) = self.db_harness_and_pool() else {
-            return false;
-        };
-        let Ok(conn) = pool.lock() else {
-            return false;
-        };
-        let rows = match crate::db::bash_watches::list_bash_pattern_watches_by_task_id(
-            &conn, &harness, task_id,
-        ) {
-            Ok(rows) if !rows.is_empty() => rows,
-            _ => return false,
-        };
-        // A persisted tombstone remains authoritative if a stale task row is
-        // restored later. Ack must delete that watch instead of treating it as
-        // an ordinary sticky match that can be terminalized again.
-        if rows.iter().any(|row| {
-            !row.scanning
-                && row.pending_match
-                && row.match_text.as_deref() == Some(WATCH_TARGET_ERASED_TEXT)
-        }) {
-            return true;
-        }
-        crate::db::bash_tasks::list_bash_tasks_by_id(&conn, &harness, task_id)
-            .map(|rows| rows.is_empty())
+        self.evaluate_erased_watch_targets();
+        self.inner
+            .watch_registry
+            .lock()
+            .map(|registry| registry.has_erased_task(task_id))
             .unwrap_or(false)
     }
 
@@ -1087,72 +1068,69 @@ impl BgTaskRegistry {
         let Some((harness, pool)) = self.db_harness_and_pool() else {
             return;
         };
-        let notifications = {
+        // The task deletion cascade removes durable watch rows, so only watches
+        // that are still registered in this process can produce a tombstone.
+        let watched_task_ids = self
+            .inner
+            .watch_registry
+            .lock()
+            .map(|registry| registry.watched_task_ids())
+            .unwrap_or_default();
+        if watched_task_ids.is_empty() {
+            return;
+        }
+
+        let candidates = watched_task_ids
+            .into_iter()
+            .filter_map(|task_id| {
+                let task = self.task(&task_id)?;
+                self.originating_session_has_live_route(&task.session_id)
+                    .then(|| (task.session_id.clone(), task_id))
+            })
+            .collect::<Vec<_>>();
+        let erased_tasks = {
             let Ok(conn) = pool.lock() else {
                 return;
             };
-            let rows = match crate::db::bash_watches::list_bash_pattern_watches(&conn, &harness) {
-                Ok(rows) => rows,
-                Err(error) => {
-                    crate::slog_warn!("failed to inspect bash watch targets: {error}");
-                    return;
-                }
-            };
-            let mut notifications = Vec::new();
-            for mut row in rows {
-                let task_exists = match crate::db::bash_tasks::get_bash_task(
-                    &conn,
-                    &harness,
-                    &row.session_id,
-                    &row.task_id,
-                ) {
-                    Ok(task) => task.is_some(),
+            let mut erased_tasks = Vec::new();
+            for (session_id, task_id) in candidates {
+                match crate::db::bash_tasks::get_bash_task(&conn, &harness, &session_id, &task_id) {
+                    Ok(None) => {
+                        if let Err(error) =
+                            crate::db::bash_watches::delete_bash_pattern_watches_for_task(
+                                &conn,
+                                &harness,
+                                &session_id,
+                                &task_id,
+                            )
+                        {
+                            crate::slog_warn!(
+                                "failed to retire durable watches for erased task {}: {error}",
+                                task_id
+                            );
+                        }
+                        erased_tasks.push((session_id, task_id));
+                    }
+                    Ok(Some(_)) => {}
                     Err(error) => {
                         crate::slog_warn!(
                             "failed to inspect bash watch target {}: {error}",
-                            row.task_id
+                            task_id
                         );
-                        continue;
                     }
-                };
-                if task_exists {
-                    continue;
-                }
-                let already_tombstoned = !row.scanning
-                    && row.pending_match
-                    && row.match_text.as_deref() == Some(WATCH_TARGET_ERASED_TEXT);
-                if !already_tombstoned {
-                    row.scanning = false;
-                    row.pending_match = true;
-                    row.match_text = Some(WATCH_TARGET_ERASED_TEXT.to_string());
-                    row.match_offset = Some(0);
-                    row.match_context = Some(WATCH_TARGET_ERASED_CONTEXT.to_string());
-                    if let Err(error) =
-                        crate::db::bash_watches::upsert_bash_pattern_watch(&conn, &row)
-                    {
-                        crate::slog_warn!(
-                            "failed to terminalize erased bash watch {}/{}: {error}",
-                            row.task_id,
-                            row.watch_id
-                        );
-                        continue;
-                    }
-                }
-                if self.originating_session_has_live_route(&row.session_id) {
-                    notifications.push((row.session_id, row.task_id, row.watch_id));
                 }
             }
-            notifications
+            erased_tasks
         };
 
-        for (session_id, task_id, watch_id) in notifications {
-            let should_emit = self
+        for (session_id, task_id) in erased_tasks {
+            let watch_ids = self
                 .inner
                 .watch_registry
                 .lock()
-                .map(|mut registry| registry.terminalize_erased_task(&task_id, &watch_id))
-                .unwrap_or(false);
-            if should_emit && self.originating_session_has_live_route(&session_id) {
+                .map(|mut registry| registry.terminalize_erased_task(&task_id))
+                .unwrap_or_default();
+            for watch_id in watch_ids {
                 self.emit_bash_watch_erased(&session_id, &task_id, &watch_id);
             }
         }
@@ -3600,9 +3578,8 @@ impl BgTaskRegistry {
                     }
                 }
                 self.clear_task_watch_state(task_id);
-                if let Ok(mut registry) = self.inner.watch_registry.lock() {
-                    registry.forget_erased_task(task_id);
-                }
+                // Retain the process-local erased marker so later status calls still
+                // distinguish this task from an ID that never existed.
                 delivered.push(task_id.clone());
                 continue;
             }

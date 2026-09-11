@@ -224,13 +224,6 @@ fn erase_persisted_task_row(
     row
 }
 
-fn persisted_task_row_exists(storage: &Path, harness: &str, session: &str, task_id: &str) -> bool {
-    let conn = rusqlite::Connection::open(storage.join("aft.db")).expect("open task database");
-    aft::db::bash_tasks::get_bash_task(&conn, harness, session, task_id)
-        .expect("read persisted task row")
-        .is_some()
-}
-
 fn wait_for_process_exit(pid: u32) {
     let started = Instant::now();
     while process_is_alive(pid) {
@@ -1657,7 +1650,7 @@ fn pi_erased_bundle_notification_is_not_replayed_after_ack_and_second_restart() 
 }
 
 #[test]
-fn foreign_session_replay_retires_erased_watch_tombstone_before_second_replay() {
+fn erased_watch_is_process_local_and_never_replays_to_a_foreign_session() {
     const HARNESS: &str = "pi";
     const ORIGINATING_SESSION: &str = "session-a";
     const FOREIGN_SESSION: &str = "session-b";
@@ -1699,11 +1692,11 @@ fn foreign_session_replay_retires_erased_watch_tombstone_before_second_replay() 
     let tombstone_frame = wait_for_pattern_frame(&mut session_a, &task_id);
     assert_eq!(tombstone_frame["reason"], "task_exit");
     assert_eq!(tombstone_frame["match_text"], ERASED_TEXT);
-    let tombstones =
-        persisted_watch_rows_for_harness(storage.path(), HARNESS, ORIGINATING_SESSION, &task_id);
-    assert_eq!(tombstones.len(), 1);
-    assert!(tombstones[0].pending_match);
-    assert_eq!(tombstones[0].match_text.as_deref(), Some(ERASED_TEXT));
+    assert!(
+        persisted_watch_rows_for_harness(storage.path(), HARNESS, ORIGINATING_SESSION, &task_id)
+            .is_empty(),
+        "erased target must have no durable watch row"
+    );
 
     sigkill_aft(session_a);
     fs::write(&release, "release").unwrap();
@@ -1764,7 +1757,7 @@ fn foreign_session_replay_retires_erased_watch_tombstone_before_second_replay() 
     );
     assert!(
         row_gone_after_b_replay,
-        "watch tombstone row survived session B's replay"
+        "erased watch row survived session B's replay"
     );
     assert!(second_replay.shutdown().success());
 }
@@ -1858,13 +1851,13 @@ fn two_project_foreign_session_replay_does_not_deliver_erased_watch_tombstone() 
     assert!(session_b.shutdown().success());
 }
 
-fn assert_pi_watch_tombstone_is_not_replayed_after_second_restart(task_row_survives_ack: bool) {
+fn assert_pi_erased_watch_is_process_local(task_row_survives_restart: bool) {
     const HARNESS: &str = "pi";
     const ERASED_TEXT: &str = "watch target erased";
 
     let project = tempfile::tempdir().unwrap();
     let storage = spawn_storage_dir("storage");
-    let release = project.path().join(if task_row_survives_ack {
+    let release = project.path().join(if task_row_survives_restart {
         "release-erased-watch-with-task-row"
     } else {
         "release-erased-watch"
@@ -1890,17 +1883,12 @@ fn assert_pi_watch_tombstone_is_not_replayed_after_second_restart(task_row_survi
     let first_frame = wait_for_pattern_frame(&mut aft, &task_id);
     assert_eq!(first_frame["reason"], "task_exit");
     assert_eq!(first_frame["match_text"], ERASED_TEXT);
-    let tombstones = persisted_watch_rows_for_harness(storage.path(), HARNESS, SESSION, &task_id);
-    assert_eq!(tombstones.len(), 1);
-    assert!(!tombstones[0].scanning);
-    assert!(tombstones[0].pending_match);
-    assert_eq!(tombstones[0].match_text.as_deref(), Some(ERASED_TEXT));
-    eprintln!(
-        "watch tombstone before restart: task_id={task_id} task_row=false scanning={} pending_match={} match_text={:?}",
-        tombstones[0].scanning, tombstones[0].pending_match, tombstones[0].match_text
+    assert!(
+        persisted_watch_rows_for_harness(storage.path(), HARNESS, SESSION, &task_id).is_empty(),
+        "live tombstone delivery must not recreate a durable watch row"
     );
 
-    if task_row_survives_ack {
+    if task_row_survives_restart {
         let conn = rusqlite::Connection::open(storage.path().join("aft.db"))
             .expect("open task database for row restoration");
         aft::db::bash_tasks::upsert_bash_task(&conn, &task_row)
@@ -1908,7 +1896,7 @@ fn assert_pi_watch_tombstone_is_not_replayed_after_second_restart(task_row_survi
     }
     sigkill_aft(aft);
 
-    if !task_row_survives_ack {
+    if !task_row_survives_restart {
         fs::write(&release, "release").unwrap();
         wait_for_process_exit(child_pid);
         let resolved = resolve_task_layout(&session_tasks_dir(storage.path(), SESSION), &task_id)
@@ -1925,48 +1913,28 @@ fn assert_pi_watch_tombstone_is_not_replayed_after_second_restart(task_row_survi
         HARNESS,
     );
     let first_drain = drain(&mut replay, SESSION);
-    let first_matches = first_drain["pending_matches"]
-        .as_array()
-        .expect("pending matches array");
-    let delivered = first_matches
-        .iter()
-        .filter(|entry| entry["task_id"] == task_id)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        delivered.len(),
-        1,
-        "watch tombstone must replay exactly once before ack: {first_drain:?}"
-    );
-    assert_eq!(delivered[0]["reason"], "task_exit");
-    assert_eq!(delivered[0]["match_text"], ERASED_TEXT);
-    assert_eq!(delivered[0]["session_id"], SESSION);
-    assert_eq!(
-        persisted_task_row_exists(storage.path(), HARNESS, SESSION, &task_id),
-        task_row_survives_ack,
-        "unexpected bash_tasks row state before ack"
-    );
-    eprintln!(
-        "first restart drain: task_id={task_id} session_id={} reason={} match_text={:?} bash_tasks_row={task_row_survives_ack}",
-        delivered[0]["session_id"], delivered[0]["reason"], delivered[0]["match_text"]
-    );
-
-    let acked = ack(&mut replay, SESSION, &task_id);
     assert!(
-        acked["acked_task_ids"]
+        first_drain["pending_matches"]
             .as_array()
-            .expect("acked task IDs")
+            .expect("pending matches array")
             .iter()
-            .any(|entry| entry == &task_id),
-        "watch tombstone ack failed: {acked:?}"
+            .all(|entry| entry["task_id"] != task_id),
+        "process-local watch tombstone replayed after restart: {first_drain:?}"
     );
-    let post_ack_watch_count =
-        persisted_watch_rows_for_harness(storage.path(), HARNESS, SESSION, &task_id).len();
-    eprintln!(
-        "post-ack database: task_id={task_id} bash_tasks_row={} bash_pattern_watches={post_ack_watch_count}",
-        persisted_task_row_exists(storage.path(), HARNESS, SESSION, &task_id)
-    );
+    let first_restart_status = status(&mut replay, SESSION, &task_id);
+    if task_row_survives_restart {
+        assert_eq!(
+            first_restart_status["success"], true,
+            "restored task row must remain addressable: {first_restart_status:?}"
+        );
+    } else {
+        assert_eq!(
+            first_restart_status["code"], "task_not_found",
+            "erased watch must become unknown after restart: {first_restart_status:?}"
+        );
+    }
 
-    if task_row_survives_ack {
+    if task_row_survives_restart {
         sigkill_aft(replay);
         fs::write(&release, "release").unwrap();
         wait_for_process_exit(child_pid);
@@ -1986,10 +1954,6 @@ fn assert_pi_watch_tombstone_is_not_replayed_after_second_restart(task_row_survi
         SESSION,
         HARNESS,
     );
-    // The erased-target evaluator runs every 500 ms. Waiting across two passes
-    // distinguishes an absent acknowledged row from a surviving row that gets
-    // terminalized again after the task row disappears.
-    std::thread::sleep(Duration::from_millis(1_200));
     let second_drain = drain(&mut second_replay, SESSION);
     assert!(
         second_drain["pending_matches"]
@@ -1997,23 +1961,28 @@ fn assert_pi_watch_tombstone_is_not_replayed_after_second_restart(task_row_survi
             .expect("pending matches array")
             .iter()
             .all(|entry| entry["task_id"] != task_id),
-        "acked watch tombstone re-delivered after second restart: {second_drain:?}"
+        "process-local watch tombstone replayed after second restart: {second_drain:?}"
+    );
+    let second_restart_status = status(&mut second_replay, SESSION, &task_id);
+    assert_eq!(
+        second_restart_status["code"], "task_not_found",
+        "erased watch must remain unknown without durable rows: {second_restart_status:?}"
     );
     assert!(
         persisted_watch_rows_for_harness(storage.path(), HARNESS, SESSION, &task_id).is_empty(),
-        "acked watch tombstone row survived the second restart"
+        "erased watch row survived the second restart"
     );
     assert!(second_replay.shutdown().success());
 }
 
 #[test]
-fn pi_erased_watch_tombstone_is_not_replayed_after_ack_and_second_restart() {
-    assert_pi_watch_tombstone_is_not_replayed_after_second_restart(false);
+fn pi_erased_watch_is_unknown_after_restart() {
+    assert_pi_erased_watch_is_process_local(false);
 }
 
 #[test]
-fn pi_erased_watch_tombstone_with_surviving_task_row_is_not_replayed_after_ack() {
-    assert_pi_watch_tombstone_is_not_replayed_after_second_restart(true);
+fn pi_erased_watch_with_restored_task_row_does_not_replay_tombstone() {
+    assert_pi_erased_watch_is_process_local(true);
 }
 
 #[test]

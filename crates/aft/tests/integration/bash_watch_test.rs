@@ -1,4 +1,3 @@
-#[cfg(unix)]
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -23,6 +22,27 @@ fn configure_background(aft: &mut AftProcess) -> tempfile::TempDir {
     );
     assert_eq!(response["success"], true, "configure failed: {response:?}");
     dir
+}
+
+fn configure_background_with_storage(
+    aft: &mut AftProcess,
+    project_root: &Path,
+    storage_dir: &Path,
+) {
+    let response = aft.send(
+        &json!({
+            "id": "cfg-watch-bg-storage",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project_root,
+            "storage_dir": storage_dir,
+            "config": user_config(serde_json::json!({
+                "experimental": { "bash": { "background": true } }
+            })),
+        })
+        .to_string(),
+    );
+    assert_eq!(response["success"], true, "configure failed: {response:?}");
 }
 
 fn notify(aft: &mut AftProcess, task_id: &str, params: Value) -> Value {
@@ -103,6 +123,18 @@ fn wait_for_pattern_frame(aft: &mut AftProcess, task_id: &str) -> Value {
             started.elapsed() < Duration::from_secs(6),
             "timed out waiting for pattern frame"
         );
+    }
+}
+
+fn assert_no_pattern_frame(aft: &mut AftProcess, task_id: &str, duration: Duration) {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        if let Some(frame) = aft.try_read_next_timeout(Duration::from_millis(100)) {
+            assert!(
+                frame["type"] != "bash_pattern_match" || frame["task_id"] != task_id,
+                "watch emitted more than one terminal frame: {frame:?}"
+            );
+        }
     }
 }
 
@@ -503,16 +535,18 @@ fn erased_watch_target_emits_tombstone_and_terminalizes_watch() {
             .contains("background task row was erased"),
         "tombstone must explain the storage failure: {frame:?}"
     );
-    let watch_state: (i64, i64, Option<String>) = conn
+    assert_no_pattern_frame(&mut aft, &task_id, Duration::from_millis(1_200));
+    let remaining_before_ack: i64 = conn
         .query_row(
-            "SELECT scanning, pending_match, match_text
-             FROM bash_pattern_watches
-             WHERE harness = 'opencode' AND task_id = ?1",
+            "SELECT COUNT(*) FROM bash_pattern_watches WHERE task_id = ?1",
             [&task_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| row.get(0),
         )
-        .expect("tombstoned watch row remains pending until ack");
-    assert_eq!(watch_state, (0, 1, Some("watch target erased".into())));
+        .unwrap();
+    assert_eq!(
+        remaining_before_ack, 0,
+        "task deletion must cascade to its durable watch row"
+    );
 
     let ack = aft.send(
         &json!({
@@ -539,21 +573,27 @@ fn erased_watch_target_emits_tombstone_and_terminalizes_watch() {
 
 #[test]
 fn bash_status_distinguishes_erased_watched_task_from_never_existing_task() {
-    let mut aft = AftProcess::spawn();
-    let dir = configure_background(&mut aft);
-    let release = dir.path().join("erased-status-release");
+    let cache = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let storage_dir = project.path().join("task-storage");
+    fs::create_dir_all(&storage_dir).unwrap();
+    let mut aft = AftProcess::spawn_with_env(&[("AFT_CACHE_DIR", cache.path().as_os_str())]);
+    configure_background_with_storage(&mut aft, project.path(), &storage_dir);
+    let release = project.path().join("erased-status-release");
     // Declare after the TempDir: Rust drops locals in reverse declaration order,
     // so this guard writes the sentinel before the TempDir removes its directory.
-    let _release_guard = ReleaseOnDrop::new(release.clone());
+    let release_guard = ReleaseOnDrop::new(release.clone());
     let task_id = spawn(
         &mut aft,
         &release_gate_command(&release, "never-reached-erased-status"),
     );
     let response = notify(&mut aft, &task_id, json!({ "pattern": "not-present" }));
     assert_eq!(response["success"], true, "notify failed: {response:?}");
+    let running = status(&mut aft, &task_id);
+    let child_pid = running["child_pid"].as_u64().expect("gated task child PID") as u32;
 
-    let conn = aft::db::open(&aft.cache_dir().join("aft").join("aft.db"))
-        .expect("open isolated test database");
+    let db_path = storage_dir.join("aft.db");
+    let conn = aft::db::open(&db_path).expect("open isolated test database");
     assert_eq!(
         conn.execute(
             "DELETE FROM bash_tasks WHERE harness = 'opencode' AND task_id = ?1",
@@ -577,16 +617,76 @@ fn bash_status_distinguishes_erased_watched_task_from_never_existing_task() {
         "erased error must not resemble a phantom id: {erased:?}"
     );
 
-    let unknown = status(&mut aft, "bash-000000000000dead");
+    let never_existed_id = "bash-000000000000dead";
+    let unknown = status(&mut aft, never_existed_id);
     assert_eq!(unknown["success"], false);
     assert_eq!(unknown["code"], "task_not_found");
     assert!(!unknown["message"]
         .as_str()
         .unwrap()
         .contains("row was erased"));
-    drop(_release_guard);
 
+    let ack = aft.send(
+        &json!({
+            "id": "ack-erased-status",
+            "command": "bash_ack_completions",
+            "params": { "task_ids": [&task_id] }
+        })
+        .to_string(),
+    );
+    assert_eq!(ack["acked_task_ids"], json!([task_id]));
+    let erased_after_ack = status(&mut aft, &task_id);
+    assert_eq!(
+        erased_after_ack["code"], "task_erased",
+        "ack must not erase the process-lifetime status distinction: {erased_after_ack:?}"
+    );
+
+    drop(release_guard);
+    let child_deadline = Instant::now() + Duration::from_secs(3);
+    while aft::bash_background::process::is_process_alive(child_pid)
+        && Instant::now() < child_deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !aft::bash_background::process::is_process_alive(child_pid),
+        "gated child {child_pid} did not exit after release"
+    );
     assert!(aft.shutdown().success());
+
+    conn.execute(
+        "DELETE FROM bash_tasks WHERE harness = 'opencode' AND task_id = ?1",
+        [&task_id],
+    )
+    .expect("remove any terminal row written before shutdown");
+    let durable_rows: (i64, i64) = conn
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM bash_tasks WHERE harness = 'opencode' AND task_id = ?1),
+                (SELECT COUNT(*) FROM bash_pattern_watches WHERE harness = 'opencode' AND task_id = ?1)",
+            [&task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        durable_rows,
+        (0, 0),
+        "restart fixture must contain no durable task or watch row"
+    );
+    drop(conn);
+    let task_artifacts = storage_dir.join("opencode").join("bash-tasks");
+    fs::remove_dir_all(&task_artifacts).expect("remove erased task artifacts before restart");
+
+    let mut restarted = AftProcess::spawn_with_env(&[("AFT_CACHE_DIR", cache.path().as_os_str())]);
+    configure_background_with_storage(&mut restarted, project.path(), &storage_dir);
+    for unknown_id in [&task_id[..], never_existed_id] {
+        let after_restart = status(&mut restarted, unknown_id);
+        assert_eq!(
+            after_restart["code"], "task_not_found",
+            "process restart must forget the in-memory erased distinction: {after_restart:?}"
+        );
+    }
+    assert!(restarted.shutdown().success());
 }
 
 #[test]

@@ -78,6 +78,8 @@ pub struct WatchRegistry {
     scan_overlaps: HashMap<String, Vec<u8>>,
     controlled_tasks: HashSet<String>,
     matched_tasks: HashSet<String>,
+    /// Process-local tombstones keep `bash_status` informative after the durable
+    /// task and watch rows are gone. They intentionally disappear on restart.
     erased_notifications: HashSet<String>,
     next_watch: u64,
 }
@@ -170,6 +172,10 @@ impl WatchRegistry {
             .unwrap_or_default()
     }
 
+    pub fn watched_task_ids(&self) -> Vec<String> {
+        self.watches.keys().cloned().collect()
+    }
+
     /// Drop in-memory watches whose ids are no longer durable (acked once-watches).
     pub fn retain_watch_ids(&mut self, task_id: &str, keep: &HashSet<String>) {
         if let Some(watches) = self.watches.get_mut(task_id) {
@@ -191,14 +197,23 @@ impl WatchRegistry {
             .retain(|key, _| key != task_id && !key.starts_with(&prefix));
     }
 
-    pub fn terminalize_erased_task(&mut self, task_id: &str, watch_id: &str) -> bool {
-        let had_watch =
-            self.watches.contains_key(task_id) || self.controlled_tasks.contains(task_id);
+    pub fn terminalize_erased_task(&mut self, task_id: &str) -> Vec<String> {
+        let watch_ids = self.watch_ids(task_id);
         self.clear_task(task_id);
-        had_watch
-            && self
-                .erased_notifications
-                .insert(format!("{task_id}:{watch_id}"))
+        watch_ids
+            .into_iter()
+            .filter(|watch_id| {
+                self.erased_notifications
+                    .insert(format!("{task_id}:{watch_id}"))
+            })
+            .collect()
+    }
+
+    pub fn has_erased_task(&self, task_id: &str) -> bool {
+        let prefix = format!("{task_id}:");
+        self.erased_notifications
+            .iter()
+            .any(|notification| notification.starts_with(&prefix))
     }
 
     pub fn forget_erased_task(&mut self, task_id: &str) {
