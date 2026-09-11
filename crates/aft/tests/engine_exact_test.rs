@@ -551,7 +551,7 @@ fn nl_quoted_span_exact_evidence_ranks_first() {
         .is_some_and(|text| text.replace('\\', "/").contains("src/settle.rs [exact]")));
     assert!(results[1..].iter().all(|result| result["file"]
         .as_str()
-        .is_some_and(|path| path.contains("/src/decoy_"))));
+        .is_some_and(|path| path.replace('\\', "/").contains("/src/decoy_"))));
     assert_eq!(
         response["structuredContent"]["plan"]["shape"],
         "natural_language"
