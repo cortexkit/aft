@@ -21,7 +21,11 @@ use std::thread;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
-use subc_client_rs::ConsumerOptions;
+use subc_client_rs::{CallOptions, CloseRouteOptions, ConsumerOptions};
+use subc_protocol::manifest::ProviderRole;
+use subc_protocol::{BindIdentity, RouteTarget};
+
+use aft::commands::memory_census::MEMORY_CENSUS_OPERATION;
 
 const DEFAULT_SECONDS: u64 = 4;
 const TOP_THREADS: usize = 5;
@@ -64,8 +68,8 @@ pub fn run(args: Vec<OsString>) -> Result<(), ProfileError> {
     if args.memory {
         let census = match fetch_memory_census() {
             Ok(census) => census,
-            Err(reason) => {
-                println!("AFT memory census unavailable: no daemon is connected ({reason}).");
+            Err(_) => {
+                println!("AFT memory census unavailable: no daemon is connected.");
                 return Ok(());
             }
         };
@@ -184,17 +188,67 @@ fn fetch_memory_census() -> Result<serde_json::Value, String> {
             aft::fleet_status::connect_subc_consumer(&connection_file, ConsumerOptions::default())
                 .await
                 .map_err(|error| format!("daemon connection failed: {error}"))?;
-        // subc-client-rs 0.3.0 exposes catalog_list as its only public
-        // channel-0 control primitive; it does not expose a generic control
-        // request method. Do not substitute call(): that opens a data route.
-        let _catalog = consumer
+        let catalog = consumer
             .catalog_list()
             .await
-            .map_err(|error| format!("channel-0 control connection failed: {error}"))?;
-        Err(
-            "subc-client-rs has no generic channel-0 control request API for memory.census"
-                .to_string(),
-        )
+            .map_err(|error| format!("daemon catalog failed: {error}"))?;
+        let advertises_census = catalog.modules.iter().any(|entry| {
+            entry.module_id == "aft"
+                && entry.roles.iter().any(|role| {
+                    matches!(
+                        role,
+                        ProviderRole::ManagementSurface { operations, .. }
+                            if operations.iter().any(|operation| {
+                                operation.name == MEMORY_CENSUS_OPERATION
+                            })
+                    )
+                })
+        });
+        if !advertises_census {
+            return Err("daemon does not advertise AFT's memory census".to_string());
+        }
+
+        let project_root = std::env::current_dir()
+            .map_err(|error| format!("could not resolve the profile working directory: {error}"))?;
+        let route = consumer
+            .open_route(
+                RouteTarget::ManagementSurface {
+                    module_id: "aft".to_string(),
+                },
+                BindIdentity {
+                    project_root,
+                    harness: "aft-profile".to_string(),
+                    session: format!("aft-profile-{}", std::process::id()),
+                },
+                CallOptions::default(),
+            )
+            .await
+            .map_err(|error| format!("memory census route failed: {error}"))?;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "op": MEMORY_CENSUS_OPERATION,
+            "params": {},
+        }))
+        .map_err(|error| format!("could not encode memory census request: {error}"))?;
+        let response = consumer
+            .request(&route, body, CallOptions::default())
+            .await
+            .map_err(|error| format!("memory census request failed: {error}"));
+        let _ = consumer
+            .close_handle(&route, CloseRouteOptions::default())
+            .await;
+        let response = response?;
+        let envelope: serde_json::Value = serde_json::from_slice(&response)
+            .map_err(|error| format!("invalid memory census response: {error}"))?;
+        if envelope.get("op").and_then(serde_json::Value::as_str) != Some(MEMORY_CENSUS_OPERATION)
+            || envelope.get("status").and_then(serde_json::Value::as_str) != Some("ok")
+        {
+            return Err("daemon returned an unsuccessful memory census".to_string());
+        }
+        envelope
+            .get("data")
+            .filter(|data| data.is_object())
+            .cloned()
+            .ok_or_else(|| "memory census response did not contain object data".to_string())
     })
 }
 
