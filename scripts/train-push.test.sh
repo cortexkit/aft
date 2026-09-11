@@ -320,6 +320,27 @@ expect_out "add \`train/**\` to on.push.branches" "narrow trigger prints the one
 [ -z "$(origin_ref "$dir" refs/heads/train/notrigger)" ] ||
   fail "narrow trigger refusal still pushed a train branch"
 
+# --- refusal: a later `!` pattern excludes the train ref --------------------
+# GitHub evaluates a branches list in order: `train/**` includes the ref and a
+# later `!train/blocked/**` excludes it again. A first-match reading approved
+# the push and the train hung waiting for a run that could never appear,
+# which reads as a CI outage rather than a misconfiguration (BROCA's
+# specimen). The trigger probe cannot catch it: its own ref is included.
+dir="$(new_fixture excluded)"
+write_tests_workflow "$dir/work" "      - $DEFAULT_BRANCH
+      - 'train/**'
+      - '!train/blocked/**'"
+git -C "$dir/work" add .github/workflows/tests.yml
+git -C "$dir/work" commit -qm "excluding trigger"
+run_train "$dir" blocked/release
+expect_rc 2 "a train ref a later ! pattern excludes refuses"
+[ -z "$(origin_ref "$dir" refs/heads/train/blocked/release)" ] ||
+  fail "excluded ref refusal still pushed a train branch"
+# Control: a sibling ref outside the exclusion is still accepted by the scan
+# (the run itself is not watched here; the first-run probe rows cover that).
+python3 "$SCRIPT_DIR/lib/workflow-gates.py" --train-ref train/ok --tests-workflow "$dir/work/.github/workflows/tests.yml" 2>/dev/null | grep -q '^trigger|ok$' ||
+  fail "a ref the exclusion does not cover must still trigger"
+
 # --- refusal: no tests.yml at all ------------------------------------------
 dir="$(new_fixture noworkflow)"
 git -C "$dir/work" rm -q .github/workflows/tests.yml
@@ -699,7 +720,7 @@ chmod +x "$dir/ci-state/on-watch.sh"
 run_train "$dir" stalegreen
 expect_rc 2 "a rebased sha with no run does not land on the old sha's green"
 expect_out "(round 2 of 3)" "stale green forced a second round"
-expect_out "no tests.yml run appeared" "stale green waited for the rebased sha's run"
+expect_out "no tests.yml run (event=push) appeared" "stale green waited for the rebased sha's run"
 rebased_sha="$(git -C "$dir/work" rev-parse HEAD)"
 [ "$rebased_sha" != "$old_sha" ] || fail "stale green case never rebased"
 [ "$(origin_ref "$dir" refs/heads/train/stalegreen)" = "$rebased_sha" ] ||

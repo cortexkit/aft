@@ -257,7 +257,24 @@ def push_matches(workflow: dict[str, Any], train_ref: str) -> bool:
         # branches-ignore list is a filter we do not interpret; treat it as a
         # match and let the trigger probe be the judge.
         return True
-    return any(fnmatch.fnmatchcase(train_ref, pattern) for pattern in branches)
+    return branch_patterns_include(train_ref, branches)
+
+
+def branch_patterns_include(ref: str, patterns: list[str]) -> bool:
+    """Evaluate a GitHub `branches:` list the way GitHub does: in order, a
+    positive pattern includes the ref, a later `!` pattern excludes it, and a
+    later positive pattern re-includes it. `any()` over the positives approved
+    branches GitHub would never build (BROCA's specimen: `train/**` followed by
+    `!train/blocked/**`), and the trigger probe cannot catch that because its
+    own ref is one the list legitimately includes."""
+    included = False
+    for pattern in patterns:
+        if pattern.startswith("!"):
+            if fnmatch.fnmatchcase(ref, pattern[1:]):
+                included = False
+        elif fnmatch.fnmatchcase(ref, pattern):
+            included = True
+    return included
 
 
 def step_label(step: Any) -> str:
