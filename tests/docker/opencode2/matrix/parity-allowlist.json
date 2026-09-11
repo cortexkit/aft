@@ -94,8 +94,8 @@
     {
       "scenario": "bash_write/T7/happy",
       "tool": "bash_write",
-      "field": "fixture_marker",
-      "reason": "Comparison projects the deterministic fixture marker because host transports add presentation text around the tool result."
+      "field": "bytes_written",
+      "reason": "Comparison projects the byte count the write reports because host transports add presentation text around the tool result."
     },
     {
       "scenario": "delete/T7/happy",
