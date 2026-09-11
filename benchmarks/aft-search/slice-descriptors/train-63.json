@@ -1,0 +1,12 @@
+{
+  "slice_class": "ranking",
+  "targeted_mechanism": "wrong_lane_nl",
+  "kind": "ranking",
+  "fixtures": [
+    "crates/aft/tests/search_b2_router.rs",
+    "crates/aft/tests/search_b2_lane_plan.rs",
+    "crates/aft/tests/search_b2_seam.rs",
+    "crates/aft/tests/integration/aft_search_contract_test.rs"
+  ],
+  "slices": ["b2-router-and-plan"]
+}
