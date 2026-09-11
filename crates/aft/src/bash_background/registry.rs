@@ -276,6 +276,7 @@ pub(crate) struct RegistryInner {
     pub(crate) compression_aggregates: Arc<CompressionAggregateCache>,
     pub(crate) wake_tx: crossbeam_channel::Sender<()>,
     pub(crate) wake_rx: crossbeam_channel::Receiver<()>,
+    terminal_transition: tokio::sync::Notify,
     /// Which watchdog pass observed each task reach a terminal state: the
     /// wake channel or the periodic ticker. Tests assert the mechanism from
     /// this record instead of racing the 500 ms ticker on the wall clock.
@@ -369,6 +370,7 @@ impl BgTaskRegistry {
                 compression_aggregates: Arc::new(CompressionAggregateCache::default()),
                 wake_tx,
                 wake_rx,
+                terminal_transition: tokio::sync::Notify::new(),
                 completion_pass_cause: Mutex::new(HashMap::new()),
                 watch_registry: Mutex::new(WatchRegistry::default()),
                 live_delivery_sessions: Mutex::new(HashSet::new()),
@@ -656,6 +658,18 @@ impl BgTaskRegistry {
             .unwrap_or(false)
     }
 
+    pub(crate) fn wait_mode_detach_pending(&self, session_id: &str) -> bool {
+        self.inner
+            .wait_detach_sessions
+            .lock()
+            .map(|detach| detach.contains(session_id))
+            .unwrap_or(false)
+    }
+
+    pub(crate) async fn terminal_transition_notified(&self) {
+        self.inner.terminal_transition.notified().await;
+    }
+
     /// Install the output-compression callback. Called by `main.rs` after
     /// `AppContext` is constructed so that snapshot/completion paths can
     /// invoke `compress::compress_with_registry` without holding a context
@@ -813,6 +827,7 @@ impl BgTaskRegistry {
             emit_frame,
             cache.as_ref(),
         );
+        self.inner.terminal_transition.notify_waiters();
         Ok(())
     }
 
@@ -2825,6 +2840,17 @@ impl BgTaskRegistry {
             stderr_offset,
             pty_offset,
         );
+    }
+
+    pub(crate) fn observed_status(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        preview_bytes: usize,
+    ) -> Option<BgTaskSnapshot> {
+        validate_task_id(task_id).ok()?;
+        let task = self.task_for_session(task_id, session_id)?;
+        Some(self.snapshot_with_terminal_cache(&task, preview_bytes))
     }
 
     pub fn status(

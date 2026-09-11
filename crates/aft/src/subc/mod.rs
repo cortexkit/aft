@@ -154,8 +154,8 @@ mod wire;
 
 use self::health::{
     build_health_report, warn_slow_pending_binds, warn_slow_running_interactive_jobs,
-    DispatchPathMetrics, HealthRollupCache, HealthRollupWorker, ReapBlockerCensus,
-    ResponseTaskGuard,
+    DeferredBashWaitGuard, DispatchPathMetrics, HealthRollupCache, HealthRollupWorker,
+    ReapBlockerCensus, ResponseTaskGuard,
 };
 use self::manifest::{
     build_manifest, command_lane, control_flags, control_ops, is_bash_family_tool,

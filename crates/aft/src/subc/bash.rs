@@ -471,6 +471,7 @@ pub(super) fn submit_deferred_bash(
                 wait_window_ms,
                 detach_on_user_message,
             }) => {
+                let _deferred_wait = DeferredBashWaitGuard::new(&task_metrics);
                 run_deferred_bash_wait(
                     executor,
                     completion_tx,
@@ -541,17 +542,30 @@ async fn run_deferred_bash_wait(
     format_context: crate::subc_format::FormatContext,
     cancel: BashWaitCancel,
 ) {
+    let Some(wait_ctx) = executor.actor_context(&root) else {
+        send_bash_deferred_completion(
+            &completion_tx,
+            &metrics,
+            route,
+            corr,
+            flags,
+            ver,
+            root,
+            request_id,
+            None,
+            false,
+        )
+        .await;
+        return;
+    };
+    let registry = wait_ctx.bash_background().clone();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                if let Some(ctx) = executor.actor_context(&root) {
-                    if detach_on_user_message {
-                        ctx.bash_background()
-                            .end_wait_mode_session(&session_id, &task_id);
-                    } else {
-                        ctx.bash_background()
-                            .unregister_foreground_task(&session_id, &task_id);
-                    }
+                if detach_on_user_message {
+                    registry.end_wait_mode_session(&session_id, &task_id);
+                } else {
+                    registry.unregister_foreground_task(&session_id, &task_id);
                 }
                 send_bash_deferred_completion(
                     &completion_tx,
@@ -568,7 +582,22 @@ async fn run_deferred_bash_wait(
                 .await;
                 break;
             }
-            _ = tokio::time::sleep(PENDING_POLL_INTERVAL) => {
+            _ = async {
+                tokio::select! {
+                    _ = registry.terminal_transition_notified() => {}
+                    _ = tokio::time::sleep(PENDING_POLL_INTERVAL) => {}
+                }
+            } => {
+                let observed = registry.observed_status(&task_id, &session_id, 0);
+                let target_finished = observed
+                    .as_ref()
+                    .is_none_or(|snapshot| snapshot.info.status.is_terminal());
+                let detach_pending = detach_on_user_message
+                    && registry.wait_mode_detach_pending(&session_id);
+                let promotion_due = !block_to_completion && Instant::now() >= deadline;
+                if !target_finished && !detach_pending && !promotion_due {
+                    continue;
+                }
                 let (poll_control_tx, poll_control_rx) = oneshot::channel::<BashPollControl>();
                 let (poll_text_tx, poll_text_rx) = oneshot::channel::<String>();
                 let root_for_poll = root.clone();
@@ -959,6 +988,14 @@ pub(super) fn bash_denied_untrusted_response(request_id: impl Into<String>) -> R
 
 #[cfg(test)]
 mod grant_path_tests {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    use super::*;
+
     #[test]
     fn foreground_background_and_pty_share_submit_deferred_spawn_path() {
         let source = include_str!("bash.rs");
@@ -981,5 +1018,161 @@ mod grant_path_tests {
             .expect("foreground branch");
         assert!(dispatch < mode_branch && mode_branch < foreground_wait);
         assert!(submit.contains("with_authenticated_principal"));
+    }
+
+    fn running_bash_stub(req: RawRequest, ctx: &AppContext) -> Response {
+        let raw_params = req
+            .params
+            .get("params")
+            .cloned()
+            .unwrap_or_else(|| req.params.clone());
+        let command = raw_params
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or("sleep 1");
+        crate::bash_background::spawn(
+            &req.id,
+            req.session(),
+            command,
+            crate::bash_background::BashShell::Bash,
+            std::path::PathBuf::from("/bin/bash"),
+            None,
+            None,
+            raw_params.get("timeout").and_then(Value::as_u64),
+            ctx,
+            false,
+            false,
+            false,
+            false,
+            24,
+            80,
+            Vec::new(),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn cap_many_deferred_bash_waits_leave_maintenance_admission_available() {
+        let executor = Arc::new(Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 6,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        }));
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let (completion_tx, mut completion_rx) = mpsc::channel(16);
+        let (poll_touch_tx, mut poll_touch_rx) = mpsc::channel(16);
+        let mut roots = Vec::new();
+
+        for index in 0..5 {
+            let (dir, root) = super::super::test_support::test_root(&format!("bash-wait-{index}"));
+            executor.register_actor(root.clone(), super::super::test_support::test_ctx());
+            roots.push((dir, root));
+        }
+
+        for (index, (_, root)) in roots.iter().take(4).enumerate() {
+            let connection = PersistentCancelSignal::new();
+            let route = PersistentCancelSignal::new();
+            submit_deferred_bash(
+                &executor,
+                &completion_tx,
+                &poll_touch_tx,
+                &metrics,
+                running_bash_stub,
+                root.clone(),
+                root.as_path().to_path_buf(),
+                format!("session-{index}"),
+                format!("wait-{index}"),
+                RouteChannel {
+                    channel: index as u16 + 1,
+                    epoch: 1,
+                },
+                index as u64 + 1,
+                Flags::new(false, Priority::Passive, false),
+                PROTOCOL_VERSION,
+                json!({
+                    "command": "sleep 1",
+                    "wait": true,
+                    "timeout": 5_000,
+                }),
+                crate::subc_format::FormatContext::default(),
+                BashWaitCancel { connection, route },
+                BindTrust::FirstParty,
+                crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
+                None,
+                None,
+            );
+        }
+
+        let waits_started_by = Instant::now() + Duration::from_secs(2);
+        while metrics
+            .deferred_bash_waits_in_flight
+            .load(Ordering::Relaxed)
+            < 4
+        {
+            assert!(
+                Instant::now() < waits_started_by,
+                "all deferred bash waits should park off executor workers"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Every caller keeps its tool call open until the command actually exits.
+        assert!(completion_rx.try_recv().is_err());
+
+        // Let at least one legacy poll interval elapse: an on-worker waiter would
+        // have occupied all four maintenance-eligible seats by now.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(completion_rx.try_recv().is_err());
+
+        let admitted = executor.submit_maintenance_async(
+            roots[4].1.clone(),
+            Lane::MaintenanceCommit,
+            "fresh-configure-tail".to_string(),
+            Box::new(|_| Response::success("fresh-configure-tail", json!({ "drained": true }))),
+        );
+        let response = tokio::time::timeout(Duration::from_millis(75), admitted)
+            .await
+            .expect("maintenance admission must not wait for deferred bash")
+            .expect("executor maintenance response");
+        assert!(response.success);
+        let maintenance_released_by = Instant::now() + Duration::from_millis(75);
+        loop {
+            let running = executor
+                .try_dispatch_liveness_snapshot()
+                .expect("dispatch liveness")
+                .running
+                .maintenance;
+            if running == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < maintenance_released_by,
+                "configure tail must release its maintenance slot promptly"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Require each long command's ordinary terminal response and exact formatted text.
+        for _ in 0..4 {
+            let completion = tokio::time::timeout(Duration::from_secs(3), completion_rx.recv())
+                .await
+                .expect("deferred completion deadline")
+                .expect("deferred completion");
+            let result = completion.result.expect("terminal bash result");
+            assert!(result.response.success);
+            assert_eq!(result.text, "");
+            tokio::time::timeout(Duration::from_secs(1), poll_touch_rx.recv())
+                .await
+                .expect("poll touch deadline")
+                .expect("poll touch");
+        }
+        assert_eq!(
+            metrics
+                .deferred_bash_waits_in_flight
+                .load(Ordering::Relaxed),
+            0
+        );
     }
 }

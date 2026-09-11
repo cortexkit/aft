@@ -268,6 +268,7 @@ pub(super) struct DispatchPathMetrics {
     pub(super) maintenance_queued: AtomicUsize,
     pub(super) bash_deferred_queued: AtomicUsize,
     pub(super) bash_poll_touch_queued: AtomicUsize,
+    pub(super) deferred_bash_waits_in_flight: AtomicUsize,
     pub(super) reliable_push_budget_deferrals: AtomicU64,
     pub(super) maintenance_budget_deferrals: AtomicU64,
     pub(super) response_tasks_live: AtomicUsize,
@@ -294,6 +295,7 @@ impl DispatchPathMetrics {
             maintenance_queued: AtomicUsize::new(0),
             bash_deferred_queued: AtomicUsize::new(0),
             bash_poll_touch_queued: AtomicUsize::new(0),
+            deferred_bash_waits_in_flight: AtomicUsize::new(0),
             reliable_push_budget_deferrals: AtomicU64::new(0),
             maintenance_budget_deferrals: AtomicU64::new(0),
             response_tasks_live: AtomicUsize::new(0),
@@ -594,6 +596,7 @@ impl DispatchPathMetrics {
                 "bash_deferred": self.bash_deferred_queued.load(Ordering::Relaxed),
                 "bash_poll_touch": self.bash_poll_touch_queued.load(Ordering::Relaxed),
             },
+            "deferred_bash_waits_in_flight": self.deferred_bash_waits_in_flight.load(Ordering::Relaxed),
             "budget_deferrals": {
                 "reliable_push": self.reliable_push_budget_deferrals.load(Ordering::Relaxed),
                 "maintenance": self.maintenance_budget_deferrals.load(Ordering::Relaxed),
@@ -608,6 +611,29 @@ impl DispatchPathMetrics {
                 "live": self.response_tasks_live.load(Ordering::Relaxed),
             },
         })
+    }
+}
+
+pub(super) struct DeferredBashWaitGuard {
+    metrics: Arc<DispatchPathMetrics>,
+}
+
+impl DeferredBashWaitGuard {
+    pub(super) fn new(metrics: &Arc<DispatchPathMetrics>) -> Self {
+        metrics
+            .deferred_bash_waits_in_flight
+            .fetch_add(1, Ordering::Relaxed);
+        Self {
+            metrics: Arc::clone(metrics),
+        }
+    }
+}
+
+impl Drop for DeferredBashWaitGuard {
+    fn drop(&mut self) {
+        self.metrics
+            .deferred_bash_waits_in_flight
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1836,6 +1862,37 @@ mod tests {
     }
 
     #[test]
+    fn health_report_exposes_deferred_bash_waits_in_flight() {
+        let executor = Executor::new();
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let app = App::default_shared();
+        let guard = DeferredBashWaitGuard::new(&metrics);
+
+        let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
+        assert_eq!(
+            report
+                .metrics
+                .as_ref()
+                .and_then(
+                    |metrics| metrics["dispatch_path"]["deferred_bash_waits_in_flight"].as_u64()
+                ),
+            Some(1)
+        );
+
+        drop(guard);
+        let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
+        assert_eq!(
+            report
+                .metrics
+                .as_ref()
+                .and_then(
+                    |metrics| metrics["dispatch_path"]["deferred_bash_waits_in_flight"].as_u64()
+                ),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn health_report_includes_nonblocking_dispatch_liveness_for_queued_interactive() {
         let executor = Executor::with_config(crate::executor::ExecutorConfig {
             pool_size: 2,
@@ -1898,6 +1955,15 @@ mod tests {
             .and_then(|metrics| metrics.get("dispatch_liveness"))
             .expect("dispatch_liveness metric");
         assert_eq!(dispatch.get("scheduler_busy"), None);
+        assert_eq!(
+            report
+                .metrics
+                .as_ref()
+                .and_then(
+                    |metrics| metrics["dispatch_path"]["deferred_bash_waits_in_flight"].as_u64()
+                ),
+            Some(0)
+        );
         assert_eq!(dispatch["interactive"]["queued"].as_u64(), Some(1));
         assert!(dispatch["interactive"]["oldest_age_ms"].as_u64().is_some());
 
