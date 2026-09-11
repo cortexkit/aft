@@ -426,7 +426,7 @@ describe("OpenCode bash adapter", () => {
     expect(ask.mock.calls[0][0]).toEqual({
       permission: "bash",
       patterns: [
-        `AFT UNAVAILABLE - host fallback execution:\n\nExact command:\n${command}\n\nWorking directory:\n${PROJECT_CWD}`,
+        `AFT UNAVAILABLE (transport down) - host fallback execution:\n\nExact command:\n${command}\n\nWorking directory:\n${PROJECT_CWD}`,
       ],
       always: [],
       metadata: { command, cwd: PROJECT_CWD, host_fallback: true },

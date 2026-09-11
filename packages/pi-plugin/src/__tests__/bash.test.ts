@@ -945,7 +945,7 @@ describe("bash tool adapter", () => {
     expect(confirmations).toEqual([
       {
         title: "AFT unavailable — run command on host?",
-        message: `AFT UNAVAILABLE - host fallback execution:\n\nExact command:\n${command}\n\nWorking directory:\n${projectRoot}`,
+        message: `AFT UNAVAILABLE (transport down) - host fallback execution:\n\nExact command:\n${command}\n\nWorking directory:\n${projectRoot}`,
       },
     ]);
   }, 20_000);

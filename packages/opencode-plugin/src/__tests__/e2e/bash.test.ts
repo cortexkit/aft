@@ -733,7 +733,7 @@ test("OpenCode executes project-enabled host fallback when the bridge binary is 
     const markerAt = pattern.indexOf(marker);
     expect(markerAt).toBeGreaterThan(0);
     expect(pattern.slice(0, markerAt)).toBe(
-      `AFT UNAVAILABLE - host fallback execution:\n\nExact command:\n${command}`,
+      `AFT UNAVAILABLE (transport down) - host fallback execution:\n\nExact command:\n${command}`,
     );
     expect(await realPath(pattern.slice(markerAt + marker.length))).toBe(await realPath(project));
   } finally {

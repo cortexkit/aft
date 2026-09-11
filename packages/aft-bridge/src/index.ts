@@ -106,7 +106,9 @@ export {
   type AftToolErrorCause,
   adaptToolError,
   BASH_TRANSPORT_DISPOSITION,
+  type BashHostFallbackCause,
   BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION,
+  classifyBashHostFallbackError,
   isBashTransportDeadError,
   toolErrorFromResponse,
 } from "./error-contract.js";

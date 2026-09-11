@@ -2,8 +2,8 @@ import {
   BASH_HOST_FALLBACK_REFUSAL,
   type BridgeRequestOptions,
   bashHostFallbackAskPattern,
+  classifyBashHostFallbackError,
   coerceBoolean,
-  isBashTransportDeadError,
   maybeAppendGrepSearchHint,
   resolveBashKillTimeout,
   runBashHostFallback,
@@ -428,7 +428,8 @@ export function createBashTool(
           },
         );
       } catch (error) {
-        if (!bashCfg.host_fallback || !isBashTransportDeadError(error)) throw error;
+        const fallbackCause = classifyBashHostFallbackError(error);
+        if (!bashCfg.host_fallback || fallbackCause === undefined) throw error;
         if (rawRequestedBackground) {
           throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; background:true is unsupported.`);
         }
@@ -437,7 +438,7 @@ export function createBashTool(
         }
 
         const projectRoot = projectRootFor(context);
-        const pattern = bashHostFallbackAskPattern(command, projectRoot);
+        const pattern = bashHostFallbackAskPattern(command, projectRoot, fallbackCause);
         await runAsk(
           context.ask({
             permission: "bash",

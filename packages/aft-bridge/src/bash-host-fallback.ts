@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import type { BashHostFallbackCause } from "./error-contract.js";
 import { withPathPrepended } from "./path-env.js";
 import { resolveCortexKitStorageRoot, resolveStoragePath } from "./storage-paths.js";
 
@@ -92,8 +93,12 @@ export function hostFallbackPathWithShims(
   return pathKey === undefined ? undefined : normalized[pathKey];
 }
 
-export function bashHostFallbackAskPattern(command: string, cwd: string): string {
-  return `AFT UNAVAILABLE - host fallback execution:\n\nExact command:\n${command}\n\nWorking directory:\n${cwd}`;
+export function bashHostFallbackAskPattern(
+  command: string,
+  cwd: string,
+  cause: BashHostFallbackCause = "transport down",
+): string {
+  return `AFT UNAVAILABLE (${cause}) - host fallback execution:\n\nExact command:\n${command}\n\nWorking directory:\n${cwd}`;
 }
 
 function appendTail(chunks: Buffer[], chunk: Buffer): { chunks: Buffer[]; truncated: boolean } {

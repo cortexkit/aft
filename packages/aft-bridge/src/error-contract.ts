@@ -9,6 +9,7 @@
 import {
   isConsumerReconnectTransient,
   StaleRouteHandleError,
+  SubcCallError,
   SubcError,
 } from "@cortexkit/subc-client";
 
@@ -133,25 +134,69 @@ function hasEngineResponse(error: Error): boolean {
   return causeResponse !== null && typeof causeResponse === "object";
 }
 
-/**
- * True only when bash could not reach a live AFT engine. A structured engine
- * response wins over every code below because it proves the request reached AFT.
- */
-export function isBashTransportDeadError(error: unknown): error is Error {
-  if (!(error instanceof Error) || hasEngineResponse(error) || isRouteGoodbyeError(error)) {
-    return false;
-  }
-  if (error instanceof BridgeTransportUnknownOutcomeError) return false;
+const SUBC_MODULE_DOWN_CODES = new Set([
+  "unknown_module",
+  "module_reloading",
+  "module_warming",
+  "target_unavailable",
+]);
 
-  return (
-    error instanceof BridgeTransportUnavailableError ||
-    error instanceof SubcTransportShuttingDownError ||
+export type BashHostFallbackCause =
+  | "module down"
+  | "bind timed out"
+  | "route closed before dispatch"
+  | "transport down";
+
+function classifySubcPreDispatchError(error: Error): BashHostFallbackCause | undefined {
+  if (!(error instanceof SubcError) && !(error instanceof SubcCallError)) return undefined;
+  if (error instanceof SubcCallError && error.kind !== "not_sent") return undefined;
+
+  if (error.code === "module_timeout") return "bind timed out";
+  if (SUBC_MODULE_DOWN_CODES.has(error.code ?? "")) return "module down";
+  if (error instanceof SubcCallError && error.code === "route_closed") {
+    return "route closed before dispatch";
+  }
+  return undefined;
+}
+
+/**
+ * Classify failures that prove bash never reached AFT, including daemon replies
+ * that reject route binding before a module channel exists. A structured engine
+ * response always wins because it proves AFT executed enough of the request to
+ * return a logical result.
+ *
+ * A raw `SubcError("route closed by closeRoute", "route_closed")` is intentionally
+ * absent. The raw request path creates it after a request is pending but exposes
+ * no queued/write marker, so its outcome may be unknown. A future transport can
+ * safely admit that case by using subc-client's managed request path and passing
+ * through `SubcCallError.kind === "not_sent"`.
+ */
+export function classifyBashHostFallbackError(error: unknown): BashHostFallbackCause | undefined {
+  if (!(error instanceof Error) || hasEngineResponse(error) || isRouteGoodbyeError(error)) {
+    return undefined;
+  }
+  if (error instanceof BridgeTransportUnknownOutcomeError) return undefined;
+  if (error instanceof SubcTransportShuttingDownError) return "transport down";
+
+  const subcPreDispatch = classifySubcPreDispatchError(error);
+  if (subcPreDispatch !== undefined) return subcPreDispatch;
+  if (error instanceof SubcCallError) {
+    return error.kind === "not_sent" ? "transport down" : undefined;
+  }
+  if (error instanceof StaleRouteHandleError) return "route closed before dispatch";
+
+  return error instanceof BridgeTransportUnavailableError ||
     isConsumerReconnectTransient(error) ||
     isSubcClientClosedError(error) ||
-    error instanceof StaleRouteHandleError ||
     error instanceof SubcRootGenerationExpiredError ||
     error instanceof SubcRootReapedError
-  );
+    ? "transport down"
+    : undefined;
+}
+
+/** True only when bash could not reach a live AFT engine. */
+export function isBashTransportDeadError(error: unknown): error is Error {
+  return classifyBashHostFallbackError(error) !== undefined;
 }
 
 function isTransportClassError(error: unknown): boolean {

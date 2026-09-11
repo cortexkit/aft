@@ -3,8 +3,8 @@ import {
   BASH_HOST_FALLBACK_REFUSAL,
   type BridgeRequestOptions,
   bashHostFallbackAskPattern,
+  classifyBashHostFallbackError,
   coerceBoolean,
-  isBashTransportDeadError,
   isBridgeTransportTimeout,
   isTerminalStatus,
   maybeAppendConflictsHint,
@@ -611,7 +611,8 @@ export function registerBashTool(
           isPowerShell ? "powershell" : "bash",
         );
       } catch (error) {
-        if (isPowerShell || !bashCfg.host_fallback || !isBashTransportDeadError(error)) throw error;
+        const fallbackCause = classifyBashHostFallbackError(error);
+        if (isPowerShell || !bashCfg.host_fallback || fallbackCause === undefined) throw error;
         if (rawRequestedBackground) {
           throw new Error(`${BASH_HOST_FALLBACK_REFUSAL}; background:true is unsupported.`);
         }
@@ -626,7 +627,7 @@ export function registerBashTool(
         }
 
         const projectRoot = extCtx.cwd;
-        const pattern = bashHostFallbackAskPattern(bridgeCommand, projectRoot);
+        const pattern = bashHostFallbackAskPattern(bridgeCommand, projectRoot, fallbackCause);
         const approved = await extCtx.ui.confirm(
           "AFT unavailable — run command on host?",
           pattern,

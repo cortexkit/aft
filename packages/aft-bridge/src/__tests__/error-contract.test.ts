@@ -18,6 +18,7 @@ import {
   adaptToolError,
   BASH_TRANSPORT_DISPOSITION,
   BRIDGE_TRANSPORT_UNKNOWN_OUTCOME_DISPOSITION,
+  classifyBashHostFallbackError,
   isBashTransportDeadError,
   isRouteOpenReloadWindowError,
   SUBC_MODULE_RESTART_DISPOSITION,
@@ -33,28 +34,17 @@ function routeGoodbyeError(): SubcError {
   return new SubcError("route closed by subc (GOODBYE)");
 }
 
+/** Mirror subc-client's daemon Error-frame decoding into its public typed error. */
+function daemonErrorBody(code: string, message: string): SubcError {
+  return new SubcError(message, code);
+}
+
 describe("isBashTransportDeadError", () => {
   const transportDead: Array<[string, Error]> = [
     ["bridge spawn failure", new BridgeTransportUnavailableError("spawn failed")],
     ["standalone bridge shutdown", new BridgeTransportUnavailableError("Bridge is shutting down")],
     ["subc transport shutdown", new SubcTransportShuttingDownError()],
-    [
-      "module endpoint unavailable after retries",
-      new SubcCallError("not_sent", "module unavailable", "unknown_module"),
-    ],
-    [
-      "module reloading after retries",
-      new SubcCallError("not_sent", "module reloading", "module_reloading"),
-    ],
-    [
-      "target unavailable after retries",
-      new SubcCallError("not_sent", "target unavailable", "target_unavailable"),
-    ],
-    [
-      "bind timeout after retries",
-      new SubcCallError("not_sent", "bind timed out", "module_timeout"),
-    ],
-    ["connection dropped", new SubcCallError("outcome_unknown", "connection dropped")],
+    ["managed request rejected before send", new SubcCallError("not_sent", "client down")],
     ["subc client closed before send", new SubcError("client closed")],
     [
       "stale route after retries",
@@ -84,6 +74,59 @@ describe("isBashTransportDeadError", () => {
       expect(isBashTransportDeadError(error)).toBe(true);
     });
   }
+
+  test("accepts the module-unavailable daemon error body as module down", () => {
+    const error = daemonErrorBody(
+      "module_warming",
+      "module_id 'aft' is supervised but not available (state=stopped, enabled=true, live=false) The AFT daemon module did not return within the 15s reload window.",
+    );
+
+    expect(classifyBashHostFallbackError(error)).toBe("module down");
+    expect(isBashTransportDeadError(error)).toBe(true);
+  });
+
+  test("accepts the route.bind timeout daemon error body as bind timed out", () => {
+    const error = daemonErrorBody(
+      "module_timeout",
+      "module_id 'aft' did not answer route.bind within 12s",
+    );
+
+    expect(classifyBashHostFallbackError(error)).toBe("bind timed out");
+    expect(isBashTransportDeadError(error)).toBe(true);
+  });
+
+  test("route-closed fallback requires proof that dispatch never started", () => {
+    const beforeDispatch = new StaleRouteHandleError({
+      channel: 1,
+      epoch: 1,
+    } as RouteHandle);
+    const whilePending = new SubcError("route closed by closeRoute", "route_closed");
+
+    expect(classifyBashHostFallbackError(beforeDispatch)).toBe("route closed before dispatch");
+    expect(isBashTransportDeadError(beforeDispatch)).toBe(true);
+    expect(classifyBashHostFallbackError(whilePending)).toBeUndefined();
+    expect(isBashTransportDeadError(whilePending)).toBe(false);
+  });
+
+  test("rejects a managed outcome-unknown call because dispatch may have executed", () => {
+    const error = new SubcCallError(
+      "outcome_unknown",
+      "connection dropped after request bytes were queued",
+    );
+
+    expect(classifyBashHostFallbackError(error)).toBeUndefined();
+    expect(isBashTransportDeadError(error)).toBe(false);
+  });
+
+  test("rejects a post-execution AFT error response", () => {
+    const error = new AftToolError("permission required", "permission_required", {
+      success: false,
+      code: "permission_required",
+    });
+
+    expect(classifyBashHostFallbackError(error)).toBeUndefined();
+    expect(isBashTransportDeadError(error)).toBe(false);
+  });
 
   const engineAlive: Array<[string, Error]> = [
     [

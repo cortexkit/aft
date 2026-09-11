@@ -2,23 +2,120 @@
 
 import { describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { SubcError } from "@cortexkit/subc-client";
 import {
   BASH_HOST_FALLBACK_BANNER,
   bashHostFallbackAskPattern,
   hostFallbackPathWithShims,
   runBashHostFallback,
 } from "../bash-host-fallback.js";
+import { classifyBashHostFallbackError } from "../error-contract.js";
 import { resolveCortexKitStorageRoot } from "../storage-paths.js";
 
+interface FakeBashTransport {
+  send(command: "bash"): Promise<Record<string, unknown>>;
+}
+
+async function callWithHostFallback(options: {
+  transport: FakeBashTransport;
+  hostFallback: boolean;
+  command: string;
+  projectRoot: string;
+  ask: (pattern: string) => Promise<boolean>;
+}): Promise<Record<string, unknown>> {
+  try {
+    return await options.transport.send("bash");
+  } catch (error) {
+    const cause = classifyBashHostFallbackError(error);
+    if (!options.hostFallback || cause === undefined) throw error;
+    const approved = await options.ask(
+      bashHostFallbackAskPattern(options.command, options.projectRoot, cause),
+    );
+    if (!approved) throw new Error("Permission denied: AFT host fallback execution was denied.");
+    return await runBashHostFallback({
+      command: options.command,
+      projectRoot: options.projectRoot,
+      timeoutMs: 5_000,
+    });
+  }
+}
+
+function moduleUnavailableTransport(): FakeBashTransport {
+  return {
+    send: async () => {
+      throw new SubcError(
+        "module_id 'aft' is supervised but not available (state=stopped, enabled=true, live=false) The AFT daemon module did not return within the 15s reload window.",
+        "module_warming",
+      );
+    },
+  };
+}
+
+function markerCommand(marker: string): string {
+  const script = `(async () => { const fs = await import("node:fs"); fs.writeFileSync(${JSON.stringify(marker)}, "ran"); process.stdout.write("host-fallback-ran"); })()`;
+  const encoded = Buffer.from(script).toString("base64");
+  return `${JSON.stringify(process.execPath)} -e "eval(Buffer.from('${encoded}', 'base64').toString())"`;
+}
+
 describe("bash host fallback", () => {
-  test("permission pattern carries the exact command and project root", () => {
+  test.each([
+    "module down",
+    "bind timed out",
+    "route closed before dispatch",
+  ] as const)("permission pattern names the %s cause and carries the exact command and project root", (cause) => {
     const command = "printf 'exact  value'\nprintf done";
     const cwd = "/tmp/project with spaces";
 
-    expect(bashHostFallbackAskPattern(command, cwd)).toBe(
-      `AFT UNAVAILABLE - host fallback execution:\n\nExact command:\n${command}\n\nWorking directory:\n${cwd}`,
+    expect(bashHostFallbackAskPattern(command, cwd, cause)).toBe(
+      `AFT UNAVAILABLE (${cause}) - host fallback execution:\n\nExact command:\n${command}\n\nWorking directory:\n${cwd}`,
     );
+  });
+
+  test("module-unavailable fallback executes the approved command on the host", async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), "aft-host-fallback-approved-"));
+    const marker = join(projectRoot, "ran.txt");
+    const prompts: string[] = [];
+    try {
+      const result = await callWithHostFallback({
+        transport: moduleUnavailableTransport(),
+        hostFallback: true,
+        command: markerCommand(marker),
+        projectRoot,
+        ask: async (pattern) => {
+          prompts.push(pattern);
+          return true;
+        },
+      });
+
+      expect(existsSync(marker), String(result.output)).toBe(true);
+      expect(result.output).toContain("host-fallback-ran");
+      expect(prompts).toHaveLength(1);
+      expect(prompts[0]).toStartWith("AFT UNAVAILABLE (module down)");
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("module-unavailable fallback does not execute a declined command", async () => {
+    const projectRoot = await mkdtemp(join(tmpdir(), "aft-host-fallback-declined-"));
+    const marker = join(projectRoot, "ran.txt");
+    try {
+      await expect(
+        callWithHostFallback({
+          transport: moduleUnavailableTransport(),
+          hostFallback: true,
+          command: markerCommand(marker),
+          projectRoot,
+          ask: async () => false,
+        }),
+      ).rejects.toThrow("host fallback execution was denied");
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      await rm(projectRoot, { recursive: true, force: true });
+    }
   });
 
   test("captures real stdout and stderr with banner and exit code", async () => {
