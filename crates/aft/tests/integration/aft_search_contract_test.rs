@@ -1053,11 +1053,11 @@ fn external_semantic_fingerprint_mismatch_returns_lexical_only_note() {
     );
     let results = response["results"].as_array().expect("results array");
     assert!(
-        results.iter().any(|result| result["source"] == "lexical"
+        results.iter().any(|result| result["source"] == "exact"
             && result["file"].as_str().is_some_and(|file| {
                 Path::new(file).is_absolute() && file.replace('\\', "/").ends_with("src/lib.rs")
             })),
-        "expected absolute lexical result from external project: {response:?}"
+        "expected absolute exact-lane result from external project: {response:?}"
     );
 }
 
@@ -1672,7 +1672,7 @@ fn lexical_only_fallback_pages_beyond_the_old_candidate_cap() {
 }
 
 #[test]
-fn hybrid_ready_reports_more_available_when_lexical_engine_capped() {
+fn hybrid_ready_pages_without_legacy_lexical_candidate_cap() {
     let (project, entries) = project_with_repeated_needle_files(210);
     let (base_url, handle) = start_mock_embedding_server();
     let ctx = openai_context(project.path(), base_url);
@@ -1697,7 +1697,7 @@ fn hybrid_ready_reports_more_available_when_lexical_engine_capped() {
     assert_eq!(response["status"], "ready");
     assert_eq!(response["complete"], true);
     assert_eq!(response["interpreted_as"], "hybrid");
-    assert_eq!(response["engine_capped"], true);
+    assert_eq!(response["engine_capped"], false);
     assert_eq!(response["more_available"], true);
     handle.join().expect("embedding server thread");
 }
@@ -2174,5 +2174,86 @@ fn live_engine_pipeline_ranks_and_pages_with_provenance() {
         path_response["structuredContent"]["results"][0]["lane_positions"]["path_lookup"]
             ["disposition"],
         "depth_exempt"
+    );
+}
+
+#[test]
+fn external_borrowed_engine_exact_phrase_beats_sixty_dense_decoys() {
+    const QUERY: &str = "settle refuses \"merged_ref is not integrated\": how is integration checked (against which ref: main, the campaign integration_ref, or the caller directory HEAD)";
+
+    let _git_env = crate::test_helpers::hermetic_git_env_guard();
+    let external = tempfile::tempdir().expect("external project");
+    init_git(external.path());
+    let src = external.path().join("crates/prefrontal-core-module/src");
+    fs::create_dir_all(&src).expect("create external source tree");
+    for index in 0..65 {
+        let mut decoy = String::new();
+        for _ in 0..30 {
+            decoy.push_str(
+                "merged_ref settle integrated refuses not is how integration checked against which ref main the campaign integration_ref or caller directory HEAD\n",
+            );
+        }
+        fs::write(src.join(format!("decoy_{index:03}.rs")), decoy).expect("write dense decoy");
+    }
+    let target = src.join("worktree.rs");
+    let mut target_source =
+        format!("// {QUERY}\npub const INTEGRATION_FAILURE: &str = \"integration failed\";\n");
+    for line in 0..5_000 {
+        target_source.push_str(&format!("// unrelated specimen padding {line}\n"));
+    }
+    fs::write(&target, target_source).expect("write exact specimen");
+    commit_all(external.path());
+
+    let fixture_index = SearchIndex::build(external.path());
+    let shape = aft::query_shape::classify(QUERY);
+    let tokens = aft::query_shape::extract_lexical_tokens(QUERY, &shape);
+    let token_refs = tokens.iter().map(String::as_str).collect::<Vec<_>>();
+    let query_trigrams = SearchIndex::query_trigrams_from_tokens(&token_refs);
+    let fixture_snapshot = fixture_index.snapshot();
+    let lexical_candidates =
+        aft::commands::semantic_search::lexical_lane::CanonicalLexicalLane::from_snapshot(
+            &fixture_snapshot,
+            &query_trigrams,
+            None,
+            50,
+        )
+        .expect("enumerate fixture lexical lane");
+    let specimen_lexical_rank = lexical_candidates
+        .canonical_order()
+        .iter()
+        .position(|candidate| candidate.result.path.file_name() == target.file_name())
+        .expect("specimen has lexical candidates");
+    assert!(
+        specimen_lexical_rank >= 50,
+        "the exact specimen must remain outside the legacy candidate cap; rank was {specimen_lexical_rank}"
+    );
+
+    let storage = tempfile::tempdir().expect("storage");
+    persist_search_index(external.path(), storage.path());
+    let session = tempfile::tempdir().expect("session project");
+    let ctx = test_context_with_storage(session.path(), storage.path());
+    let response = response_value(handle_semantic_search(
+        &request_with_path(QUERY, None, external.path()),
+        &ctx,
+    ));
+
+    assert_eq!(
+        response["success"], true,
+        "external search failed: {response:?}"
+    );
+    assert_eq!(response["borrowed"], true);
+    assert!(path_ends_with(
+        response["results"][0]["file"]
+            .as_str()
+            .expect("rank-one file"),
+        "crates/prefrontal-core-module/src/worktree.rs"
+    ));
+    assert_eq!(response["results"][0]["source"], "exact");
+    let text = response["text"].as_str().expect("search text");
+    assert_eq!(
+        text.matches("narrow: offset, topK, path, includeTests")
+            .count(),
+        1,
+        "external engine reply must contain exactly one trailer: {text}"
     );
 }
