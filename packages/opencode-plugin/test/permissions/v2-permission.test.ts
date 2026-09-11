@@ -187,6 +187,22 @@ describe("OpenCode V2 permission consumer", () => {
     expect(hoistedV2ToolConsumers({})).toEqual({});
   });
 
+  test("V2 bash exposes a host-visible Error when the permission endpoint is unavailable", async () => {
+    const definition = {
+      description: "permission refusal probe",
+      args: {},
+      execute: async (_input: unknown, runtime: { ask(request: unknown): Promise<void> }) => {
+        await runtime.ask({ permission: "bash", patterns: ["printf fixture"], always: [] });
+        return "unreachable";
+      },
+    };
+    const bash = projectV2Tool("bash", definition as never, LOCATION);
+
+    await expect(execute(bash, {})).rejects.toThrow(
+      'The "bash" operation was refused because the OpenCode V2 host did not provide a permission request endpoint.',
+    );
+  });
+
   test("maps host deny and reject outcomes to distinct failures", async () => {
     const denied = permissionClient("deny");
     await expect(
@@ -299,10 +315,9 @@ describe("OpenCode V2 permission consumer", () => {
         name === "aft_delete"
           ? { files: ["file.ts"] }
           : { path: "file.ts", destination: "moved.ts" };
-      await expect(execute(tools[name], input)).rejects.toMatchObject({
-        _tag: "Tool.Error",
-        message: "Permission denied.",
-      });
+      const denied = execute(tools[name], input);
+      await expect(denied).rejects.toBeInstanceOf(PermissionDeniedError);
+      await expect(denied).rejects.toThrow("Permission denied.");
       expect(host.createCalls[0]).toMatchObject({
         action: "edit",
         metadata: { action: name === "aft_delete" ? "delete" : "move" },

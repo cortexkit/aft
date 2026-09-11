@@ -1,0 +1,29 @@
+OpenCode 2 bash T1 attribution probe
+host_version: 0.0.0-beta-19234
+cached_image: aft-e2e-opencode2-linux
+image_checkout_sha: 0a5a1a13c191264dcb42f9d15c39090aabf078c2
+scenario: bash/T1/happy
+isolation: AFT_E2E_CONCURRENCY=1; private HOME/TMPDIR/XDG roots
+
+Host command:
+opencode2 run --standalone --print-logs --format json --model openai/mock-model --auto "Run the deterministic bash fixture call."
+
+Raw host event:
+{"type":"tool_use","sessionID":"ses_f6f2f6203ffe4RJqQ8p7t6YerB","part":{"type":"tool","id":"bash-happy","tool":"bash","state":{"status":"error","input":{"command":"printf 'bash-fixture\\n'"},"error":"[object Object]","metadata":{"providerCall":{"executed":false},"providerResult":{"executed":false},"rawInput":"{\"command\":\"printf 'bash-fixture\\\\n'\"}"}}}}
+
+Host stderr evidence:
+timestamp=2026-09-11T14:13:04.986Z level=INFO message="cli starting" version=0.0.0-beta-19234 channel=beta
+timestamp=2026-09-11T14:13:06.232Z level=INFO msg="loading plugin" entrypoint=file:///.../aft-opencode-wrapper/index.mjs
+
+Plugin log evidence immediately before rejection:
+context keys=agent,aisdk,app,catalog,command,event,experimental,generate,integration,location,mcp,options,permission,plugin,reference,rpc,session,shell,skill,storage,tool,vcs,websearch,worktree
+[aft-plugin] Spawning binary: /opt/aft/bin/aft.real
+
+Reconstructed rejected value from the exact image source revision:
+{"_tag":"Tool.Error","message":"undefined is not an object (evaluating 'host.client.event')","error":{"name":"TypeError","message":"undefined is not an object (evaluating 'host.client.event')"}}
+
+Verdict:
+The exact value stringified by the host was AFT's plain Tool.Error projection object. Its nested error was a plugin TypeError from requestPermission dereferencing host.client.event on the pinned V2 context, which has no client key. It was not a permission_required payload and not a genuine host object. Issue 37164 still explains the missing V2 requester API, but it does not explain the unreadable [object Object] text; AFT's non-Error rejection caused that text.
+
+Post-fix refusal event (same pinned host, no harness permission consumer):
+{"type":"tool_use","part":{"type":"tool","id":"bash-happy","tool":"bash","state":{"status":"error","input":{"command":"printf 'bash-fixture\\n'"},"error":"The \"bash\" operation was refused because the OpenCode V2 host did not provide a permission request endpoint."}}}

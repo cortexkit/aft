@@ -6,11 +6,11 @@
     {
       "tool": "bash",
       "trajectories": {
-        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164#tests/docker/opencode2/contract/probe/bash-t1-permission-refusal.txt",
         "T2": "applicable",
-        "T3": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
-        "T4": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
-        "T5": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
+        "T3": "expected_fail:https://github.com/anomalyco/opencode/issues/37164#tests/docker/opencode2/contract/probe/bash-t1-permission-refusal.txt",
+        "T4": "expected_fail:https://github.com/anomalyco/opencode/issues/37164#tests/docker/opencode2/contract/probe/bash-t1-permission-refusal.txt",
+        "T5": "expected_fail:https://github.com/anomalyco/opencode/issues/37164#tests/docker/opencode2/contract/probe/bash-t1-permission-refusal.txt",
         "T6": "applicable",
         "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/48340"
       }

@@ -67,12 +67,16 @@ export interface V2ProviderTool {
   ): Effect.Effect<Record<string, unknown>, unknown>;
 }
 
-function failure(error: unknown): Record<string, unknown> {
-  return {
-    _tag: "Tool.Error",
-    message: error instanceof Error ? error.message : String(error),
-    error,
-  };
+function failure(error: unknown): Error {
+  if (error instanceof Error) return error;
+  const detail = (() => {
+    try {
+      return JSON.stringify(error) ?? String(error);
+    } catch {
+      return String(error);
+    }
+  })();
+  return new Error(`V2 tool execution rejected with a non-Error value: ${detail}`);
 }
 
 function resultContent(result: ToolResult): Record<string, unknown> {
@@ -187,7 +191,9 @@ function runtimeFor(
     ask: (request) => {
       if (consumers.requestPermission) return consumers.requestPermission(request, context);
       return Promise.reject(
-        new Error("V2 permission requests require the host permission endpoint consumer"),
+        new Error(
+          `The "${request.permission}" operation was refused because the OpenCode V2 host did not provide a permission request endpoint.`,
+        ),
       );
     },
     progress: context.progress,
