@@ -1015,7 +1015,11 @@ fn external_semantic_search_hides_drift_prose_and_refreshes_file_summary_snippet
     let session_project = tempfile::tempdir().expect("session project");
     let ctx = openai_context_with_storage(session_project.path(), storage.path(), base_url);
     let response = response_value(handle_semantic_search(
-        &request_with_path("needle_symbol", Some("semantic"), external_project.path()),
+        &request_with_path(
+            "where is needle_symbol implemented today",
+            Some("semantic"),
+            external_project.path(),
+        ),
         &ctx,
     ));
 
@@ -1728,7 +1732,7 @@ fn lexical_only_fallback_pages_beyond_the_old_candidate_cap() {
 }
 
 #[test]
-fn hybrid_ready_pages_without_legacy_lexical_candidate_cap() {
+fn identifier_ready_reports_more_available_when_lexical_fallback_is_capped() {
     let (project, entries) = project_with_repeated_needle_files(210);
     let (base_url, embedding_requests, handle) = start_no_request_embedding_server();
     let ctx = openai_context(project.path(), base_url);
@@ -1752,8 +1756,8 @@ fn hybrid_ready_pages_without_legacy_lexical_candidate_cap() {
     );
     assert_eq!(response["status"], "ready");
     assert_eq!(response["complete"], true);
-    assert_eq!(response["interpreted_as"], "hybrid");
-    assert_eq!(response["engine_capped"], false);
+    assert_eq!(response["interpreted_as"], "engine");
+    assert_eq!(response["engine_capped"], true);
     assert_eq!(response["more_available"], true);
     assert_eq!(embedding_requests.load(Ordering::SeqCst), 0);
     assert_eq!(
@@ -2333,6 +2337,16 @@ fn external_borrowed_engine_exact_phrase_beats_sixty_dense_decoys() {
         "the exact specimen must remain outside the legacy candidate cap; rank was {specimen_lexical_rank}"
     );
 
+    let in_root_ctx = test_context(external.path());
+    *in_root_ctx
+        .search_index()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fixture_index);
+    let in_root_response = response_value(handle_semantic_search(
+        &request_with_top_k(QUERY, None, 5),
+        &in_root_ctx,
+    ));
+
     let storage = tempfile::tempdir().expect("storage");
     persist_search_index(external.path(), storage.path());
     let session = tempfile::tempdir().expect("session project");
@@ -2354,6 +2368,31 @@ fn external_borrowed_engine_exact_phrase_beats_sixty_dense_decoys() {
         "crates/prefrontal-core-module/src/worktree.rs"
     ));
     assert_eq!(response["results"][0]["source"], "exact");
+    let ranked_signature = |value: &Value| {
+        value["results"]
+            .as_array()
+            .expect("ranked results")
+            .iter()
+            .map(|result| {
+                (
+                    result["file"]
+                        .as_str()
+                        .and_then(|path| path.rsplit('/').next())
+                        .expect("ranked filename")
+                        .to_string(),
+                    result["source"]
+                        .as_str()
+                        .expect("result source")
+                        .to_string(),
+                    result["exact"].as_bool().expect("exact marker"),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ranked_signature(&response),
+        ranked_signature(&in_root_response)
+    );
     let text = response["text"].as_str().expect("search text");
     assert_eq!(
         text.matches("narrow: offset, topK, path, includeTests")

@@ -3269,11 +3269,11 @@ fn zero_result_escalation_response(
     base_plan: &extensions::LanePlan<'_>,
     borrowed_index: Option<(&SearchIndex, &GenerationToken)>,
 ) -> Response {
-    use extensions::QueryFacts;
+    use extensions::RawQuery;
 
-    let facts = QueryFacts::new(query);
+    let (_, facts) = extensions.classify(&RawQuery::new(query));
     let mut escalation_plan =
-        extensions.plan(&facts, SearchShape::NaturalLanguage, &base_plan.readiness);
+        extensions.plan(&SearchShape::NaturalLanguage, &facts, &base_plan.readiness);
     escalation_plan
         .selected_lanes
         .retain(|lane| !matches!(*lane, SearchLaneKind::Semantic | SearchLaneKind::Exact));
