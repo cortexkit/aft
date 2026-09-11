@@ -305,16 +305,21 @@ pub struct ConfidenceEngine {
     threshold: ConfidenceThreshold,
 }
 
+/// The pinned threshold is a product input, so it lives beside the crate
+/// (`crates/aft/assets/`): a product build must not reach outside `crates/`
+/// (the release and Docker images copy only the crate tree). The benchmark
+/// keeps its own copy at `CONFIDENCE_THRESHOLD_RELATIVE_PATH`, and
+/// `engine_confidence_threshold_test` asserts the two are byte-identical so
+/// neither can drift from the other.
+pub const PINNED_CONFIDENCE_THRESHOLD_JSON: &str =
+    include_str!("../../../assets/search-confidence-threshold.pinned.json");
+
 impl ConfidenceEngine {
     pub fn running() -> Self {
         let path = Path::new(CONFIDENCE_THRESHOLD_RELATIVE_PATH);
-        let threshold = ConfidenceThreshold::parse_at_startup(
-            path,
-            include_str!(
-                "../../../../../benchmarks/aft-search/engine-fixtures/confidence-threshold.json"
-            ),
-        )
-        .expect("embedded confidence threshold must satisfy the engine schema");
+        let threshold =
+            ConfidenceThreshold::parse_at_startup(path, PINNED_CONFIDENCE_THRESHOLD_JSON)
+                .expect("embedded confidence threshold must satisfy the engine schema");
         Self { threshold }
     }
 
