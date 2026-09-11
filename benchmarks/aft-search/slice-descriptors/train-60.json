@@ -4,7 +4,8 @@
   "kind": "paging",
   "fixtures": [
     "commands::semantic_search::tests::repeated_paged_search_reads_exact_candidates_once_per_query_generation",
-    "commands::semantic_search::tests::exact_page_memo_keys_include_corpus_generation"
+    "commands::semantic_search::tests::exact_page_memo_keys_include_corpus_generation",
+    "commands::semantic_search::tests::building_trigram_index_identifier_uses_bounded_walk"
   ],
   "slices": ["exact-page-memo-latency"]
 }

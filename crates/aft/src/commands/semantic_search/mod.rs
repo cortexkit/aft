@@ -142,6 +142,8 @@ const DEGRADED_GREP_WALK_BUDGET: Duration = Duration::from_secs(10);
 const FIRST_SEARCH_INDEX_LOAD_WAIT_BUDGET: Duration = Duration::from_millis(2_500);
 const SEARCH_INDEX_LOAD_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(2);
 const SUPPRESS_STATUS_BAR_FIELD: &str = "_aft_suppress_status_bar";
+const TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE: &str =
+    "trigram index building; results from a bounded walk";
 
 #[cfg(test)]
 thread_local! {
@@ -1785,7 +1787,31 @@ fn handle_grep_search(
         .map(|grep_match| grep_match_to_json(grep_match, result_source))
         .collect::<Vec<_>>();
     let interpreted_as = interpreted_as_label(effective_mode);
-    let text = format_grep_search_text(&result, project_root, interpreted_as);
+    let trigram_index_building = semantic_status == "building"
+        && matches!(
+            result.index_status,
+            IndexStatus::Building | IndexStatus::Fallback
+        );
+    let mut text = format_grep_search_text(&result, project_root, interpreted_as);
+    let mut extras = serde_json::Map::new();
+    if trigram_index_building {
+        let envelope = bounded_walk_search_envelope(
+            result_values.len(),
+            interval_has_more,
+            result.engine_capped,
+        );
+        text = format!(
+            "{TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE}\n\n{text}\n\n{}",
+            crate::list_envelope::render_trailer(&envelope)
+                .expect("bounded-walk search envelopes always have a reason")
+        );
+        extras.insert(
+            crate::list_surfaces::search::SEARCH_WIRE_KEY.to_string(),
+            serde_json::json!(envelope),
+        );
+        extras.insert("lexical_only_fallback".to_string(), serde_json::json!(true));
+        extras.insert("semantic_unavailable".to_string(), serde_json::json!(true));
+    }
     search_response(
         req,
         SearchResponseParts {
@@ -1793,15 +1819,19 @@ fn handle_grep_search(
             interpreted_as,
             query_kind: query_kind_label(shape.kind),
             semantic_status,
-            status: "ready",
-            complete: true,
+            status: if trigram_index_building {
+                "partial"
+            } else {
+                "ready"
+            },
+            complete: !trigram_index_building,
             text,
             results: result_values,
             more_available: interval_has_more,
             engine_capped: result.engine_capped,
             fully_degraded: result.fully_degraded,
             warnings,
-            extras: serde_json::Map::new(),
+            extras,
         },
     )
 }
@@ -2645,23 +2675,19 @@ fn handle_semantic_or_hybrid_search(
                 detail.push_str(&format!(" / {}", entries_total));
             }
 
-            if natural_language_degraded_fallback_available(mode, &shape) {
-                return semantic_unavailable_grep_fallback_response(
+            if mode == SearchMode::Semantic && !lexical.ready {
+                return handle_grep_search(
                     req,
                     ctx,
-                    &params,
+                    &params.query,
+                    params.offset,
+                    top_k,
                     &shape,
+                    SearchMode::Literal,
                     "building",
-                    detail,
-                    if borrowed_loading {
-                        "loading"
-                    } else {
-                        "building"
-                    },
-                    borrowed_loading,
                     warnings,
                     project_root,
-                    top_k,
+                    params.include_tests,
                 );
             }
 
@@ -3278,7 +3304,7 @@ fn semantic_unavailable_or_fallback_response(
         );
     }
 
-    if force_lexical_fallback || semantic_degraded_fallback_available(mode, shape, &lexical) {
+    if force_lexical_fallback || semantic_degraded_fallback_available(mode, &lexical) {
         return semantic_unavailable_grep_fallback_response(
             req,
             ctx,
@@ -3331,20 +3357,8 @@ fn semantic_unavailable_extras(
     extras
 }
 
-fn semantic_degraded_fallback_available(
-    mode: SearchMode,
-    shape: &QueryShape,
-    lexical: &LexicalCollection,
-) -> bool {
-    if natural_language_degraded_fallback_available(mode, shape) {
-        return true;
-    }
-
-    mode == SearchMode::Semantic && !lexical.ready && shape.weights.should_use_lexical
-}
-
-fn natural_language_degraded_fallback_available(mode: SearchMode, shape: &QueryShape) -> bool {
-    mode == SearchMode::Semantic && shape.kind == QueryKind::NaturalLanguage
+fn semantic_degraded_fallback_available(mode: SearchMode, lexical: &LexicalCollection) -> bool {
+    mode == SearchMode::Semantic && !lexical.ready
 }
 
 fn semantic_unavailable_grep_fallback_response(
@@ -3453,6 +3467,32 @@ fn semantic_unavailable_grep_fallback_response(
             warnings,
             extras,
         },
+    )
+}
+
+fn bounded_walk_search_envelope(
+    shown: usize,
+    more_available: bool,
+    engine_capped: bool,
+) -> crate::list_envelope::ListEnvelope {
+    let mut causes = vec![crate::list_envelope::Reason::Walk];
+    if engine_capped {
+        causes.push(crate::list_envelope::Reason::Budget);
+    }
+    if more_available {
+        causes.push(crate::list_envelope::Reason::Cap);
+    }
+    let total = if more_available {
+        crate::list_envelope::Total::AtLeast(shown.saturating_add(1))
+    } else {
+        crate::list_envelope::Total::AtLeast(shown)
+    };
+    crate::list_envelope::ListEnvelope::new(
+        shown,
+        total,
+        crate::list_envelope::Unit::Results,
+        causes,
+        crate::list_surfaces::search::SEARCH_NARROW,
     )
 }
 
@@ -5966,11 +6006,10 @@ mod tests {
             tx.send(index).expect("publish search index");
         });
 
-        // Decision-evidence form: non-empty results ARE the proof the query
-        // waited for the publish (without waiting, status is Building and the
-        // reply is the honest "nothing was searched yet"). Elapsed-time bounds
-        // were removed because a loaded runner can deschedule either the
-        // publisher thread or this thread past any tight wall-clock budget;
+        // Decision-evidence form: non-empty index-backed results prove the query
+        // waited for publication rather than taking the partial bounded walk.
+        // Elapsed-time bounds were removed because a loaded runner can deschedule
+        // either the publisher thread or this thread past any tight wall-clock budget;
         // the generous budget below is a hang catch, not a timing assertion.
         let response =
             with_first_search_index_load_wait_budget_for_test(Duration::from_secs(30), || {
@@ -5988,6 +6027,58 @@ mod tests {
             .as_str()
             .expect("response text")
             .contains("nothing was searched yet"));
+    }
+
+    #[test]
+    fn building_trigram_index_identifier_uses_bounded_walk() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let source_file = project.path().join("needle.ts");
+        std::fs::write(
+            &source_file,
+            "export const fresh_root_needle = 'fresh_root_needle';\n",
+        )
+        .expect("write source file");
+
+        let ctx = test_context(project.path());
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+            stage: "loading_artifacts".to_string(),
+            files: None,
+            entries_done: None,
+            entries_total: None,
+        };
+        let (_tx, rx) = crossbeam_channel::unbounded::<SearchIndex>();
+        ctx.install_search_index_rx(rx, ctx.configure_generation());
+
+        let response =
+            with_first_search_index_load_wait_budget_for_test(Duration::from_millis(40), || {
+                response_value(handle_semantic_search(
+                    &semantic_request("fresh_root_needle", 5),
+                    &ctx,
+                ))
+            });
+
+        assert_eq!(response["success"], true);
+        assert_eq!(response["status"], "partial");
+        assert_eq!(response["complete"], false);
+        assert_eq!(response["semantic_status"], "building");
+        assert_eq!(response["interpreted_as"], "literal");
+        let results = response["results"].as_array().expect("results array");
+        assert!(results.iter().any(|result| {
+            result["file"]
+                .as_str()
+                .is_some_and(|file| file.ends_with("needle.ts"))
+        }));
+        let text = response["text"].as_str().expect("response text");
+        assert!(text.contains(TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE));
+        assert!(text.contains("(walk)"));
+        assert!(!text.contains("(exhausted)"));
+        assert_eq!(response["results_list_envelope"]["reason"], "walk");
+        assert_eq!(
+            response["results_list_envelope"]["total"]["kind"],
+            "at_least"
+        );
     }
 
     #[test]
@@ -6016,10 +6107,12 @@ mod tests {
 
         assert!(started.elapsed() >= wait_budget);
         assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(response["status"], "partial");
         let text = response["text"].as_str().expect("response text");
-        assert!(text.contains("nothing was searched yet"));
-        assert!(text.contains("Retry in a few seconds"));
-        assert!(!text.contains("Found 0"));
+        assert!(text.contains(TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE));
+        assert!(text.contains("Found 0 match"));
+        assert!(text.contains("(walk)"));
+        assert!(!text.contains("(exhausted)"));
     }
 
     #[test]
