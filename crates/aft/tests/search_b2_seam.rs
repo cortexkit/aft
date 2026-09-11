@@ -577,7 +577,7 @@ fn named_file_precedence_preserves_outside_exact_evidence() {
         .position(|result| {
             result["file"]
                 .as_str()
-                .is_some_and(|path| path.ends_with("src/subc_format.rs"))
+                .is_some_and(|path| path.replace('\\', "/").ends_with("src/subc_format.rs"))
         })
         .expect("named file result");
     let outside_position = results
@@ -585,7 +585,7 @@ fn named_file_precedence_preserves_outside_exact_evidence() {
         .position(|result| {
             result["file"]
                 .as_str()
-                .is_some_and(|path| path.ends_with("src/context.rs"))
+                .is_some_and(|path| path.replace('\\', "/").ends_with("src/context.rs"))
         })
         .expect("outside exact result");
 

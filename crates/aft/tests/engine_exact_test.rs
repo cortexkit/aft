@@ -540,9 +540,11 @@ fn nl_quoted_span_exact_evidence_ranks_first() {
     assert_eq!(response["success"], true, "{response:?}");
     let results = response["results"].as_array().expect("results array");
     assert_eq!(results.len(), 5);
+    // Rendered paths carry the host separator; the suffix check normalizes so
+    // the assertion holds on Windows.
     assert!(results[0]["file"]
         .as_str()
-        .is_some_and(|path| path.ends_with("src/settle.rs")));
+        .is_some_and(|path| path.replace('\\', "/").ends_with("src/settle.rs")));
     assert_eq!(results[0]["exact"], true);
     assert!(response["text"]
         .as_str()
