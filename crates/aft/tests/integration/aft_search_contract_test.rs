@@ -1747,7 +1747,9 @@ fn identifier_ready_reports_more_available_when_lexical_fallback_is_capped() {
 
     let mut identifier_request = request_with_top_k("needle_symbol", None, 100);
     identifier_request.id = "identifier-ready-fallback-cap-no-semantic".to_string();
-    let response = response_value(handle_semantic_search(&identifier_request, &ctx));
+    let raw_response = handle_semantic_search(&identifier_request, &ctx);
+    let rendered = aft::subc_format::format_response("search", &raw_response, false);
+    let response = response_value(raw_response);
     handle.join().expect("negative embedding server thread");
 
     assert_eq!(
@@ -1772,12 +1774,8 @@ fn identifier_ready_reports_more_available_when_lexical_fallback_is_capped() {
         response["structuredContent"]["search"]["live_embed_calls"],
         0
     );
-    assert!(response["text"]
-        .as_str()
-        .expect("search text")
-        .ends_with(
-            "shown 100 of 260+ results (more at greater depth) · narrow: offset, topK, path, includeTests"
-        ));
+    assert!(rendered
+        .ends_with("shown 100 of ≥260 results (cap) · narrow: offset, topK, path, includeTests"));
 }
 
 #[test]
@@ -2221,7 +2219,9 @@ fn live_engine_pipeline_ranks_and_pages_with_provenance() {
         "offset": 1
     }))
     .unwrap();
-    let first = response_value(handle_semantic_search(&first_request, &ctx));
+    let first_raw = handle_semantic_search(&first_request, &ctx);
+    let first_rendered = aft::subc_format::format_response("search", &first_raw, false);
+    let first = response_value(first_raw);
     let second = response_value(handle_semantic_search(&second_request, &ctx));
 
     assert_eq!(first["success"], true, "first page failed: {first:?}");
@@ -2237,10 +2237,7 @@ fn live_engine_pipeline_ranks_and_pages_with_provenance() {
         .as_object()
         .expect("lane provenance object")
         .is_empty());
-    assert!(first["text"]
-        .as_str()
-        .unwrap()
-        .contains("narrow: offset, topK, path, includeTests"));
+    assert!(first_rendered.contains("narrow: offset, topK, path, includeTests"));
 
     let log_request: RawRequest = serde_json::from_value(serde_json::json!({
         "id": "engine-live-anchored",
@@ -2351,10 +2348,10 @@ fn external_borrowed_engine_exact_phrase_beats_sixty_dense_decoys() {
     persist_search_index(external.path(), storage.path());
     let session = tempfile::tempdir().expect("session project");
     let ctx = test_context_with_storage(session.path(), storage.path());
-    let response = response_value(handle_semantic_search(
-        &request_with_path(QUERY, None, external.path()),
-        &ctx,
-    ));
+    let raw_response =
+        handle_semantic_search(&request_with_path(QUERY, None, external.path()), &ctx);
+    let rendered = aft::subc_format::format_response("search", &raw_response, false);
+    let response = response_value(raw_response);
 
     assert_eq!(
         response["success"], true,
@@ -2393,11 +2390,12 @@ fn external_borrowed_engine_exact_phrase_beats_sixty_dense_decoys() {
         ranked_signature(&response),
         ranked_signature(&in_root_response)
     );
-    let text = response["text"].as_str().expect("search text");
     assert_eq!(
-        text.matches("narrow: offset, topK, path, includeTests")
+        rendered
+            .lines()
+            .filter(|line| line.starts_with("shown "))
             .count(),
         1,
-        "external engine reply must contain exactly one trailer: {text}"
+        "external engine reply must contain exactly one trailer: {rendered}"
     );
 }

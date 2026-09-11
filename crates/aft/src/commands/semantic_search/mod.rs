@@ -109,6 +109,7 @@ use crate::config::IndexKind;
 use crate::context::{AppContext, SemanticIndexStatus};
 use crate::grep_executor::{self, GrepParams};
 use crate::inspect::job::{is_test_file, is_test_support_file};
+use crate::list_envelope::ListEnvelope;
 use crate::pattern_compile::{self, CompileOpts, CompileResult};
 use crate::protocol::{RawRequest, Response};
 use crate::query_shape::{self, QueryKind, QueryShape};
@@ -1199,10 +1200,15 @@ fn handle_external_bounded_lexical_fallback(
         );
     }
 
+    let more_available =
+        result.walk_truncated || result.truncated || result.total_matches > result.matches.len();
     let mut extras = external_response_extras(external_root, &borrow_metadata)
         .as_object()
         .cloned()
         .unwrap_or_default();
+    let envelope =
+        bounded_walk_search_envelope(result_values.len(), more_available, result.engine_capped);
+    crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, &envelope);
     if let Some(degradation) = degradation {
         extras.insert(
             "borrowed_index_degraded_reason".to_string(),
@@ -1224,9 +1230,7 @@ fn handle_external_bounded_lexical_fallback(
             complete: degradation.is_none() && !result.walk_truncated,
             text,
             results: result_values,
-            more_available: result.walk_truncated
-                || result.truncated
-                || result.total_matches > result.matches.len(),
+            more_available,
             engine_capped: result.engine_capped,
             fully_degraded: true,
             warnings,
@@ -1390,10 +1394,15 @@ fn handle_external_grep_search(
     let interpreted_as = interpreted_as_label(effective_mode);
     let display_root = absolute_display_root(external_root);
     let text = format_grep_search_text(&result, &display_root, interpreted_as);
-    let extras = external_response_extras(external_root, borrow_metadata)
+    let mut extras = external_response_extras(external_root, borrow_metadata)
         .as_object()
         .cloned()
         .unwrap_or_default();
+    if let Some(envelope) =
+        search_cut_envelope(result_values.len(), interval_has_more, result.engine_capped)
+    {
+        crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, &envelope);
+    }
     search_response(
         req,
         SearchResponseParts {
@@ -1540,13 +1549,14 @@ fn handle_external_semantic_or_hybrid_search(
         text.push_str("\n\n");
         text.push_str(line);
     }
-    text.push_str("\n\n");
-    text.push_str(&ranked.trailer);
-
     let mut extras = external_response_extras(&external_root, &borrow_metadata)
         .as_object()
         .cloned()
         .unwrap_or_default();
+    crate::list_surfaces::search::attach_projected_search_envelope(
+        &mut extras,
+        &ranked.results_list_envelope,
+    );
     extras.insert("structuredContent".to_string(), ranked.structured_content);
     extras.insert(
         "lexical_only_fallback".to_string(),
@@ -1919,6 +1929,10 @@ fn handle_grep_search(
         );
         extras.insert("lexical_only_fallback".to_string(), serde_json::json!(true));
         extras.insert("semantic_unavailable".to_string(), serde_json::json!(true));
+    } else if let Some(envelope) =
+        search_cut_envelope(result_values.len(), interval_has_more, result.engine_capped)
+    {
+        crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, &envelope);
     }
     search_response(
         req,
@@ -2181,7 +2195,7 @@ struct EngineRanking {
     results: Vec<HybridResult>,
     more_available: bool,
     engine_capped: bool,
-    trailer: String,
+    results_list_envelope: ListEnvelope,
     confidence_line: Option<&'static str>,
     structured_content: serde_json::Value,
 }
@@ -2660,9 +2674,9 @@ fn run_engine_ranking(
             ),
         );
     }
-    let trailer = SearchTrailer::from_page(&page, ExactPassState::Complete)
+    let results_list_envelope = SearchTrailer::from_page(&page, ExactPassState::Complete)
         .map_err(|error| error.to_string())?
-        .render();
+        .shared_envelope_projection();
 
     let mut results = Vec::with_capacity(page.reply.page.len());
     for entry in &page.reply.page {
@@ -2728,7 +2742,7 @@ fn run_engine_ranking(
             || !matches!(page.stop_state, paging::StopState::S2Exhausted),
         engine_capped: identifier_exact_capped
             || matches!(page.stop_state, paging::StopState::S3DepthCap),
-        trailer,
+        results_list_envelope,
         confidence_line: confidence.flat_head_line,
         structured_content,
     })
@@ -2789,9 +2803,11 @@ fn handle_engine_only_search(
         text.push_str("\n\n");
         text.push_str(line);
     }
-    text.push_str("\n\n");
-    text.push_str(&ranked.trailer);
     let mut extras = serde_json::Map::new();
+    crate::list_surfaces::search::attach_projected_search_envelope(
+        &mut extras,
+        &ranked.results_list_envelope,
+    );
     extras.insert("structuredContent".to_string(), ranked.structured_content);
     extras.insert(
         "lexical_only_fallback".to_string(),
@@ -3184,9 +3200,11 @@ fn handle_semantic_or_hybrid_search(
         text.push_str("\n\n");
         text.push_str(line);
     }
-    text.push_str("\n\n");
-    text.push_str(&engine_ranking.trailer);
     let mut extras = serde_json::Map::new();
+    crate::list_surfaces::search::attach_projected_search_envelope(
+        &mut extras,
+        &engine_ranking.results_list_envelope,
+    );
     extras.insert(
         "structuredContent".to_string(),
         engine_ranking.structured_content,
@@ -3310,9 +3328,10 @@ fn zero_result_escalation_response(
         text.push_str("\n\n");
         text.push_str(line);
     }
-    text.push_str("\n\n");
-    text.push_str(&ranked.trailer);
-
+    crate::list_surfaces::search::attach_projected_search_envelope(
+        &mut extras,
+        &ranked.results_list_envelope,
+    );
     extras.insert(
         "zero_result_escalation".to_string(),
         serde_json::json!(true),
@@ -3348,10 +3367,20 @@ fn search_response(req: &RawRequest, parts: SearchResponseParts<'_>) -> Response
         return cancelled_search_response(req);
     }
     let result_count = parts.result_count();
+    let envelope_supplied = parts
+        .extras
+        .contains_key(crate::list_surfaces::search::SEARCH_WIRE_KEY);
+    let text = if envelope_supplied {
+        parts
+            .text
+            .replace(" More results available; raise topK to see more.", "")
+    } else {
+        parts.text
+    };
     let mut object = serde_json::Map::new();
     object.insert("status".to_string(), serde_json::json!(parts.status));
     object.insert("complete".to_string(), serde_json::json!(parts.complete));
-    object.insert("text".to_string(), serde_json::json!(parts.text));
+    object.insert("text".to_string(), serde_json::json!(text));
     object.insert("query".to_string(), serde_json::json!(parts.query));
     object.insert(
         "interpreted_as".to_string(),
@@ -3385,12 +3414,6 @@ fn search_response(req: &RawRequest, parts: SearchResponseParts<'_>) -> Response
     if !parts.warnings.is_empty() {
         object.insert("warnings".to_string(), serde_json::json!(parts.warnings));
     }
-    crate::list_surfaces::search::attach_search_envelope(
-        &mut object,
-        result_count,
-        parts.more_available,
-        parts.engine_capped,
-    );
     for (key, value) in parts.extras {
         object.insert(key, value);
     }
@@ -3475,12 +3498,14 @@ fn semantic_unavailable_or_fallback_response(
             text.push_str("\n\n");
             text.push_str(line);
         }
-        text.push_str("\n\n");
-        text.push_str(&ranked.trailer);
         warnings.push(
             "Semantic search unavailable; returning lexical-only fallback results.".to_string(),
         );
         let mut extras = semantic_unavailable_extras(true);
+        crate::list_surfaces::search::attach_projected_search_envelope(
+            &mut extras,
+            &ranked.results_list_envelope,
+        );
         extras.insert("structuredContent".to_string(), ranked.structured_content);
 
         return search_response(
@@ -3611,6 +3636,10 @@ fn semantic_unavailable_grep_fallback_response(
         );
     }
 
+    let envelope =
+        bounded_walk_search_envelope(result_values.len(), more_available, result.engine_capped);
+    crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, &envelope);
+
     search_response(
         req,
         SearchResponseParts {
@@ -3637,6 +3666,34 @@ fn semantic_unavailable_grep_fallback_response(
             extras,
         },
     )
+}
+
+fn search_cut_envelope(
+    shown: usize,
+    more_available: bool,
+    engine_capped: bool,
+) -> Option<ListEnvelope> {
+    if !more_available && !engine_capped {
+        return None;
+    }
+    let mut causes = Vec::with_capacity(2);
+    if engine_capped {
+        causes.push(crate::list_envelope::Reason::Budget);
+    }
+    if more_available {
+        causes.push(crate::list_envelope::Reason::Cap);
+    }
+    Some(ListEnvelope::new(
+        shown,
+        crate::list_envelope::Total::AtLeast(if more_available {
+            shown.saturating_add(1)
+        } else {
+            shown
+        }),
+        crate::list_envelope::Unit::Results,
+        causes,
+        crate::list_surfaces::search::SEARCH_NARROW,
+    ))
 }
 
 fn bounded_walk_search_envelope(
@@ -7442,6 +7499,48 @@ mod tests {
         assert_eq!(json["source"], "semantic");
         assert_eq!(json["semantic_score"], 0.75);
         assert!(json["lexical_score"].is_null());
+    }
+
+    #[test]
+    fn engine_reply_renders_one_shared_envelope_trailer_with_offset() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let mut index = SearchIndex::new();
+        for file_number in 0..6 {
+            let source_file = project.path().join(format!("src/file_{file_number}.rs"));
+            std::fs::create_dir_all(source_file.parent().expect("source parent"))
+                .expect("create source dir");
+            let source = format!("pub fn shared_trailer_marker_{file_number}() {{}}\n");
+            std::fs::write(&source_file, &source).expect("write source");
+            index.index_file(&source_file, source.as_bytes());
+        }
+        index.ready = true;
+
+        let ctx = test_context(project.path());
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+
+        let response = handle_semantic_search(
+            &semantic_request_with_hint("shared_trailer_marker", 3, "literal"),
+            &ctx,
+        );
+        assert!(response.success, "engine search failed: {response:?}");
+        assert!(response.data.get("results_list_envelope").is_some());
+        let rendered = crate::subc_format::format_response("search", &response, false);
+        let trailer_lines = rendered
+            .lines()
+            .filter(|line| line.starts_with("shown "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            trailer_lines.len(),
+            1,
+            "engine reply must render exactly one trailer: {rendered}"
+        );
+        assert!(trailer_lines[0].ends_with(" · narrow: offset, topK, path, includeTests"));
+        assert!(!rendered.contains("More results available; raise topK to see more."));
     }
 
     #[test]

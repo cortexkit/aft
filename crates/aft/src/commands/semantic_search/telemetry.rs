@@ -177,10 +177,6 @@ where
     }
 }
 
-pub fn format_search_trailer(trailer: &SearchTrailer) -> String {
-    trailer.render()
-}
-
 fn lanes_run(page: &SearchPage) -> Vec<SearchLaneKind> {
     let mut lanes = page
         .reply

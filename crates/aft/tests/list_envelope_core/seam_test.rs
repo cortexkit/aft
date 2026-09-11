@@ -115,7 +115,7 @@ fn seam_search_suppresses_legacy_clauses_and_renders_trailer_when_envelope_prese
         Total::AtLeast(11),
         Unit::Results,
         vec![Reason::Budget, Reason::Cap],
-        &["topK", "path", "includeTests"],
+        &["offset", "topK", "path", "includeTests"],
     );
     data["results_list_envelope"] = serde_json::to_value(&envelope).unwrap();
     let resp_present = Response {
@@ -129,7 +129,7 @@ fn seam_search_suppresses_legacy_clauses_and_renders_trailer_when_envelope_prese
     assert!(formatted_present.contains("fully degraded"));
     assert!(formatted_present.contains("partial/incomplete"));
     assert!(formatted_present
-        .contains("shown 10 of ≥11 results (budget) · narrow: topK, path, includeTests"));
+        .contains("shown 10 of ≥11 results (budget) · narrow: offset, topK, path, includeTests"));
 }
 
 #[test]

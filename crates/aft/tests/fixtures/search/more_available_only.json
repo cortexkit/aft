@@ -33,6 +33,7 @@
         "cap"
       ],
       "narrow": [
+        "offset",
         "topK",
         "path",
         "includeTests"

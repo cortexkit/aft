@@ -54,12 +54,18 @@ fn registered_cause_sets_have_pinned_kind_bounds_and_units() {
     let cases = kind_bound_cases();
     let expected_case_count = SURFACE_SPECS
         .iter()
-        .map(|surface| (1usize << surface.reasons.len()) - 1)
+        .map(|surface| {
+            if surface.command == "search" {
+                5
+            } else {
+                (1usize << surface.reasons.len()) - 1
+            }
+        })
         .sum::<usize>();
     assert_eq!(
         cases.len(),
         expected_case_count,
-        "the table must enumerate every non-empty registered cause set"
+        "the table must enumerate every valid producer-specific cause set"
     );
 
     let mut errors = Vec::new();
@@ -84,6 +90,20 @@ fn registered_cause_sets_have_pinned_kind_bounds_and_units() {
     assert_eq!(search_both.expected_reason, Reason::Budget);
     assert_eq!(search_both.expected_causes, [Reason::Budget, Reason::Cap]);
     assert_eq!(search_both.expected_total, Total::AtLeast(11));
+
+    let search_walk = cases
+        .iter()
+        .find(|case| case.name == "search:walk")
+        .expect("explicit engine exhaustion row");
+    assert_eq!(search_walk.expected_reason, Reason::Walk);
+    assert_eq!(search_walk.expected_total, Total::Exact(10));
+
+    let search_depth = cases
+        .iter()
+        .find(|case| case.name == "search:depth")
+        .expect("explicit engine depth row");
+    assert_eq!(search_depth.expected_reason, Reason::Depth);
+    assert_eq!(search_depth.expected_total, Total::AtLeast(10));
 
     let grep_cap = cases
         .iter()
@@ -118,7 +138,7 @@ fn capped_fixtures_have_pinned_wire_schema() {
     assert_eq!(mixed.unit, Unit::Results);
     assert_eq!(mixed.reason, Some(Reason::Budget));
     assert_eq!(mixed.causes, [Reason::Budget, Reason::Cap]);
-    assert_eq!(mixed.narrow, ["topK", "path", "includeTests"]);
+    assert_eq!(mixed.narrow, ["offset", "topK", "path", "includeTests"]);
 
     for (name, envelope) in complete_builder_results() {
         assert_eq!(

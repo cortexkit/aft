@@ -1,12 +1,47 @@
 use aft::list_envelope::{derive_wire_key, render_trailer, ListEnvelope, Reason, Total, Unit};
 use aft::list_surfaces::search::{
-    attach_search_envelope, build_search_envelope, SEARCH_COMMAND, SEARCH_LIST_ID, SEARCH_WIRE_KEY,
+    attach_projected_search_envelope, SEARCH_COMMAND, SEARCH_LIST_ID, SEARCH_WIRE_KEY,
 };
 use aft::list_surfaces::{find_surface, ReasonKind};
 use aft::ndjson_text::build_ndjson_text;
 use aft::protocol::Response;
 use aft::subc_format::{format_response_with_context, FormatContext};
 use serde_json::{json, Value};
+
+fn fixture_search_envelope(
+    shown: usize,
+    more_available: bool,
+    engine_capped: bool,
+) -> Option<ListEnvelope> {
+    if !more_available && !engine_capped {
+        return None;
+    }
+    let mut causes = Vec::new();
+    if engine_capped {
+        causes.push(Reason::Budget);
+    }
+    if more_available {
+        causes.push(Reason::Cap);
+    }
+    Some(ListEnvelope::new(
+        shown,
+        Total::AtLeast(if more_available { shown + 1 } else { shown }),
+        Unit::Results,
+        causes,
+        &["offset", "topK", "path", "includeTests"],
+    ))
+}
+
+fn attach_fixture_search_envelope(
+    map: &mut serde_json::Map<String, Value>,
+    shown: usize,
+    more_available: bool,
+    engine_capped: bool,
+) {
+    if let Some(envelope) = fixture_search_envelope(shown, more_available, engine_capped) {
+        attach_projected_search_envelope(map, &envelope);
+    }
+}
 
 fn load_fixture(name: &str) -> Value {
     let path = format!(
@@ -46,10 +81,26 @@ fn surface_registry_search_entry() {
     assert_eq!(surface.command, "search");
     assert_eq!(surface.list_id, "payload.results");
     assert_eq!(surface.unit, Unit::Results);
-    assert_eq!(surface.narrow, &["topK", "path", "includeTests"]);
+    assert_eq!(surface.narrow, &["offset", "topK", "path", "includeTests"]);
 
-    // Must have exactly Budget (Bounding) and Cap (Selecting)
-    assert_eq!(surface.reasons.len(), 2);
+    // Engine projections emit Walk/Depth/Cap; legacy envelopes emit Budget/Cap.
+    assert_eq!(surface.reasons.len(), 4);
+    let walk_entry = surface
+        .reasons
+        .iter()
+        .find(|r| r.reason == Reason::Walk)
+        .expect("walk reason registered");
+    assert_eq!(walk_entry.kind, ReasonKind::Bounding);
+    assert!(walk_entry.predicate_name.contains("S2Exhausted"));
+
+    let depth_entry = surface
+        .reasons
+        .iter()
+        .find(|r| r.reason == Reason::Depth)
+        .expect("depth reason registered");
+    assert_eq!(depth_entry.kind, ReasonKind::Bounding);
+    assert!(depth_entry.predicate_name.contains("S3DepthCap"));
+
     let budget_entry = surface
         .reasons
         .iter()
@@ -71,20 +122,23 @@ fn surface_registry_search_entry() {
 fn search_envelope_more_available_only_shown_10() {
     // Acceptance criteria:
     // `more_available` only, shown 10:
-    // `shown 10 of ≥11 results (cap) · narrow: topK, path, includeTests`,
+    // `shown 10 of ≥11 results (cap) · narrow: offset, topK, path, includeTests`,
     // `total = {"kind":"at_least","value":11}`, `causes: ["cap"]`.
-    let envelope = build_search_envelope(10, true, false).expect("envelope produced");
+    let envelope = fixture_search_envelope(10, true, false).expect("envelope produced");
     assert_eq!(envelope.shown, 10);
     assert_eq!(envelope.total, Total::AtLeast(11));
     assert_eq!(envelope.unit, Unit::Results);
     assert_eq!(envelope.reason, Some(Reason::Cap));
     assert_eq!(envelope.causes, vec![Reason::Cap]);
-    assert_eq!(envelope.narrow, vec!["topK", "path", "includeTests"]);
+    assert_eq!(
+        envelope.narrow,
+        vec!["offset", "topK", "path", "includeTests"]
+    );
 
     let rendered = render_trailer(&envelope).expect("trailer rendered");
     assert_eq!(
         rendered,
-        "shown 10 of ≥11 results (cap) · narrow: topK, path, includeTests"
+        "shown 10 of ≥11 results (cap) · narrow: offset, topK, path, includeTests"
     );
 
     let serialized = serde_json::to_value(&envelope).expect("serialize envelope");
@@ -97,7 +151,7 @@ fn search_envelope_more_available_only_shown_10() {
     assert_eq!(serialized["unit"], "results");
     assert_eq!(
         serialized["narrow"],
-        json!(["topK", "path", "includeTests"])
+        json!(["offset", "topK", "path", "includeTests"])
     );
 }
 
@@ -105,20 +159,23 @@ fn search_envelope_more_available_only_shown_10() {
 fn search_envelope_engine_capped_only_shown_10() {
     // Acceptance criteria:
     // `engine_capped` only, shown 10:
-    // `shown 10 of ≥10 results (budget) · narrow: topK, path, includeTests`,
+    // `shown 10 of ≥10 results (budget) · narrow: offset, topK, path, includeTests`,
     // `AtLeast(10)`, `causes: ["budget"]`.
-    let envelope = build_search_envelope(10, false, true).expect("envelope produced");
+    let envelope = fixture_search_envelope(10, false, true).expect("envelope produced");
     assert_eq!(envelope.shown, 10);
     assert_eq!(envelope.total, Total::AtLeast(10));
     assert_eq!(envelope.unit, Unit::Results);
     assert_eq!(envelope.reason, Some(Reason::Budget));
     assert_eq!(envelope.causes, vec![Reason::Budget]);
-    assert_eq!(envelope.narrow, vec!["topK", "path", "includeTests"]);
+    assert_eq!(
+        envelope.narrow,
+        vec!["offset", "topK", "path", "includeTests"]
+    );
 
     let rendered = render_trailer(&envelope).expect("trailer rendered");
     assert_eq!(
         rendered,
-        "shown 10 of ≥10 results (budget) · narrow: topK, path, includeTests"
+        "shown 10 of ≥10 results (budget) · narrow: offset, topK, path, includeTests"
     );
 
     let serialized = serde_json::to_value(&envelope).expect("serialize envelope");
@@ -135,26 +192,29 @@ fn search_envelope_engine_capped_only_shown_10() {
 fn search_envelope_both_flags_shown_10_mixed_cause_schema_example() {
     // Acceptance criteria:
     // Both flags, shown 10:
-    // `shown 10 of ≥11 results (budget) · narrow: topK, path, includeTests`,
+    // `shown 10 of ≥11 results (budget) · narrow: offset, topK, path, includeTests`,
     // `AtLeast(11)`, `causes: ["budget","cap"]`;
     // this fixture is registered as the pinned mixed-cause wire example consumed by the envelope schema test.
-    let envelope = build_search_envelope(10, true, true).expect("envelope produced");
+    let envelope = fixture_search_envelope(10, true, true).expect("envelope produced");
     assert_eq!(envelope.shown, 10);
     assert_eq!(envelope.total, Total::AtLeast(11));
     assert_eq!(envelope.unit, Unit::Results);
     assert_eq!(envelope.reason, Some(Reason::Budget));
     assert_eq!(envelope.causes, vec![Reason::Budget, Reason::Cap]);
-    assert_eq!(envelope.narrow, vec!["topK", "path", "includeTests"]);
+    assert_eq!(
+        envelope.narrow,
+        vec!["offset", "topK", "path", "includeTests"]
+    );
 
     let rendered = render_trailer(&envelope).expect("trailer rendered");
     assert_eq!(
         rendered,
-        "shown 10 of ≥11 results (budget) · narrow: topK, path, includeTests"
+        "shown 10 of ≥11 results (budget) · narrow: offset, topK, path, includeTests"
     );
 
     // Validate wire schema per R15 pinned specification:
     // Exactly {"shown": <int>, "total": {"kind": "at_least", "value": <int>}, "unit": "results",
-    // "reason": "budget", "causes": ["budget", "cap"], "narrow": ["topK", "path", "includeTests"]}
+    // "reason": "budget", "causes": ["budget", "cap"], "narrow": ["offset", "topK", "path", "includeTests"]}
     let serialized = serde_json::to_value(&envelope).expect("serialize envelope");
     let obj = serialized.as_object().expect("envelope is an object");
     assert_eq!(obj.get("shown"), Some(&json!(10)));
@@ -167,7 +227,7 @@ fn search_envelope_both_flags_shown_10_mixed_cause_schema_example() {
     assert_eq!(obj.get("causes"), Some(&json!(["budget", "cap"])));
     assert_eq!(
         obj.get("narrow"),
-        Some(&json!(["topK", "path", "includeTests"]))
+        Some(&json!(["offset", "topK", "path", "includeTests"]))
     );
 
     // Causes must be ordered by precedence descending: Budget (rank 2) > Cap (rank 1)
@@ -181,7 +241,7 @@ fn search_envelope_both_flags_shown_10_mixed_cause_schema_example() {
 fn search_complete_4_result_answer() {
     // Acceptance criteria:
     // A complete 4-result answer renders no trailer, serializes no envelope and stays byte-identical to its pre-spec golden.
-    let envelope = build_search_envelope(4, false, false);
+    let envelope = fixture_search_envelope(4, false, false);
     assert!(
         envelope.is_none(),
         "complete answer must return no envelope"
@@ -189,7 +249,7 @@ fn search_complete_4_result_answer() {
 
     let mut map = serde_json::Map::new();
     map.insert("query".into(), json!("foo"));
-    attach_search_envelope(&mut map, 4, false, false);
+    attach_fixture_search_envelope(&mut map, 4, false, false);
     assert!(
         !map.contains_key("results_list_envelope"),
         "complete reply must not serialize results_list_envelope"
@@ -204,7 +264,7 @@ fn subc_format_search_more_available_only_suppresses_legacy_and_renders_trailer(
         "more_available": true,
         "engine_capped": false,
     });
-    attach_search_envelope(data.as_object_mut().unwrap(), 10, true, false);
+    attach_fixture_search_envelope(data.as_object_mut().unwrap(), 10, true, false);
 
     let resp = Response {
         id: "1".into(),
@@ -215,7 +275,8 @@ fn subc_format_search_more_available_only_suppresses_legacy_and_renders_trailer(
     let formatted = format_response_with_context(SEARCH_COMMAND, &resp, &ctx);
 
     assert!(
-        formatted.contains("shown 10 of ≥11 results (cap) · narrow: topK, path, includeTests"),
+        formatted
+            .contains("shown 10 of ≥11 results (cap) · narrow: offset, topK, path, includeTests"),
         "expected trailer in formatted output: {formatted}"
     );
     // Legacy honesty notes must be suppressed
@@ -237,7 +298,7 @@ fn subc_format_search_engine_capped_only_suppresses_legacy_and_renders_trailer()
         "more_available": false,
         "engine_capped": true,
     });
-    attach_search_envelope(data.as_object_mut().unwrap(), 10, false, true);
+    attach_fixture_search_envelope(data.as_object_mut().unwrap(), 10, false, true);
 
     let resp = Response {
         id: "2".into(),
@@ -248,7 +309,9 @@ fn subc_format_search_engine_capped_only_suppresses_legacy_and_renders_trailer()
     let formatted = format_response_with_context(SEARCH_COMMAND, &resp, &ctx);
 
     assert!(
-        formatted.contains("shown 10 of ≥10 results (budget) · narrow: topK, path, includeTests"),
+        formatted.contains(
+            "shown 10 of ≥10 results (budget) · narrow: offset, topK, path, includeTests"
+        ),
         "expected trailer in formatted output: {formatted}"
     );
     assert!(!formatted.contains("more results available"));
@@ -268,7 +331,7 @@ fn subc_format_search_both_flags_preserves_status_text_and_json_markers() {
         "fully_degraded": true,
         "complete": false,
     });
-    attach_search_envelope(data.as_object_mut().unwrap(), 10, true, true);
+    attach_fixture_search_envelope(data.as_object_mut().unwrap(), 10, true, true);
 
     // JSON flags must be retained
     assert_eq!(data["more_available"], true);
@@ -286,7 +349,9 @@ fn subc_format_search_both_flags_preserves_status_text_and_json_markers() {
 
     // Trailer must be rendered
     assert!(
-        formatted.contains("shown 10 of ≥11 results (budget) · narrow: topK, path, includeTests"),
+        formatted.contains(
+            "shown 10 of ≥11 results (budget) · narrow: offset, topK, path, includeTests"
+        ),
         "expected trailer: {formatted}"
     );
     // Legacy flags suppressed from note
@@ -317,7 +382,7 @@ fn complete_4_result_answer_is_byte_identical_to_pre_spec_golden() {
         "fully_degraded": false,
         "complete": true,
     });
-    attach_search_envelope(data.as_object_mut().unwrap(), 4, false, false);
+    attach_fixture_search_envelope(data.as_object_mut().unwrap(), 4, false, false);
 
     // Envelope not present
     assert!(data.get("results_list_envelope").is_none());
@@ -418,7 +483,7 @@ fn envelope_schema_test_search_fixtures() {
         // 4. narrow order matches registered order
         assert_eq!(
             env.narrow,
-            vec!["topK", "path", "includeTests"],
+            vec!["offset", "topK", "path", "includeTests"],
             "fixture '{name}': narrow order mismatch"
         );
 
@@ -504,7 +569,7 @@ fn live_handle_semantic_search_attaches_envelope_when_more_available() {
     assert_eq!(resp.data["engine_capped"], true);
     assert_eq!(resp.data["result_count"], 3);
 
-    // results_list_envelope must be attached with both flags (budget > cap)
+    // The degraded walk owns the envelope projection; telemetry flags remain separate.
     let env_val = resp
         .data
         .get("results_list_envelope")
@@ -512,13 +577,14 @@ fn live_handle_semantic_search_attaches_envelope_when_more_available() {
     let env: ListEnvelope = serde_json::from_value(env_val.clone()).unwrap();
     assert_eq!(env.shown, 3);
     assert_eq!(env.total, Total::AtLeast(4));
-    assert_eq!(env.reason, Some(Reason::Budget));
-    assert_eq!(env.causes, vec![Reason::Budget, Reason::Cap]);
+    assert_eq!(env.reason, Some(Reason::Walk));
+    assert_eq!(env.causes, vec![Reason::Walk, Reason::Budget, Reason::Cap]);
     assert_eq!(env.unit, Unit::Results);
 
     // Formatted subc response renders trailer
     let formatted = format_response_with_context(SEARCH_COMMAND, &resp, &FormatContext::default());
-    assert!(formatted.contains("shown 3 of ≥4 results (budget) · narrow: topK, path, includeTests"));
+    assert!(formatted
+        .contains("shown 3 of ≥4 results (walk) · narrow: offset, topK, path, includeTests"));
 
     // Now search with top_k = 10 (greater than 6 matches) -> more_available = false, complete
     let req_complete: aft::protocol::RawRequest = serde_json::from_value(json!({
@@ -533,12 +599,18 @@ fn live_handle_semantic_search_attaches_envelope_when_more_available() {
     assert!(resp_complete.success);
     assert_eq!(resp_complete.data["more_available"], false);
     assert_eq!(resp_complete.data["engine_capped"], false);
-    assert!(
-        resp_complete.data.get("results_list_envelope").is_none(),
-        "complete search must not have envelope"
-    );
+    let complete_envelope: ListEnvelope =
+        serde_json::from_value(resp_complete.data["results_list_envelope"].clone())
+            .expect("degraded walk carries its shared envelope");
+    assert_eq!(complete_envelope.reason, Some(Reason::Walk));
+    assert_eq!(complete_envelope.total, Total::AtLeast(6));
     let formatted_complete =
         format_response_with_context(SEARCH_COMMAND, &resp_complete, &FormatContext::default());
-    assert!(!formatted_complete.contains("shown "));
-    assert!(!formatted_complete.contains("results ("));
+    assert_eq!(
+        formatted_complete
+            .lines()
+            .filter(|line| line.starts_with("shown "))
+            .collect::<Vec<_>>(),
+        ["shown 6 of ≥6 results (walk) · narrow: offset, topK, path, includeTests"]
+    );
 }

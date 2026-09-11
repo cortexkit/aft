@@ -6,14 +6,6 @@ use super::paging::{SearchPage, StopState};
 
 pub const SEARCH_NARROW_FIELDS: &[&str] = &["offset", "topK", "path", "includeTests"];
 
-pub const fn stop_reason_word(stop_state: StopState) -> &'static str {
-    match stop_state {
-        StopState::S1MoreAtDepth => "more at greater depth",
-        StopState::S2Exhausted => "exhausted",
-        StopState::S3DepthCap => "depth cap",
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchTotal {
     Exact(usize),
@@ -21,13 +13,6 @@ pub enum SearchTotal {
 }
 
 impl SearchTotal {
-    pub const fn campaign_suffix(self) -> &'static str {
-        match self {
-            Self::Exact(_) => "",
-            Self::AtLeast(_) => "+",
-        }
-    }
-
     fn shared_total(self) -> Total {
         match self {
             Self::Exact(value) => Total::Exact(value),
@@ -105,9 +90,7 @@ impl SearchTrailer {
         })
     }
 
-    /// Projects search totals and narrow fields into the shared list-envelope grammar.
-    /// The stop reason word remains explicit so the surface registry can preserve
-    /// search-specific semantics without duplicating the envelope format.
+    /// Projects the engine stop state into the shared list-envelope grammar.
     pub fn shared_envelope_projection(&self) -> ListEnvelope {
         let reason = match self.stop_state {
             StopState::S1MoreAtDepth => Reason::Cap,
@@ -121,24 +104,5 @@ impl SearchTrailer {
             vec![reason],
             SEARCH_NARROW_FIELDS,
         )
-    }
-
-    pub fn render(&self) -> String {
-        let shared =
-            crate::subc_format::render_envelope_trailer(&self.shared_envelope_projection())
-                .expect("every search stop state has a list-envelope reason");
-        let shared_reason = match self.stop_state {
-            StopState::S1MoreAtDepth => "cap",
-            StopState::S2Exhausted => "walk",
-            StopState::S3DepthCap => "depth",
-        };
-        let mut rendered = shared.replace(
-            &format!("({shared_reason})"),
-            &format!("({})", stop_reason_word(self.stop_state)),
-        );
-        if let SearchTotal::AtLeast(value) = self.total {
-            rendered = rendered.replace(&format!("≥{value}"), &format!("{value}+"));
-        }
-        rendered
     }
 }

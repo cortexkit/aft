@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-use aft::list_envelope::render_trailer;
+use aft::list_envelope::{render_trailer, Reason};
+use aft::list_surfaces::find_surface;
 
 use aft::commands::semantic_search::{
     blocks, evidence_descriptor, paging, plan_table, scoring, trailer,
@@ -14,7 +15,7 @@ use paging::{
 };
 use plan_table::{PlanTable, SearchLaneKind, SearchShape};
 use scoring::ScoringPolicy;
-use trailer::{stop_reason_word, ExactPassState, SearchTotal, SearchTrailer};
+use trailer::{ExactPassState, SearchTotal, SearchTrailer};
 
 fn candidates(count: usize) -> Vec<LaneCandidate> {
     (0..count)
@@ -51,22 +52,9 @@ fn page(label: &str, candidate_count: usize, offset: usize, top_k: usize) -> Sea
     serve_public_page(&builder, request).expect("served page")
 }
 
-fn render_with_search_reason(trailer: &SearchTrailer) -> String {
-    let shared = render_trailer(&trailer.shared_envelope_projection())
-        .expect("search stop always has a shared envelope reason");
-    let shared_reason = match trailer.stop_state {
-        StopState::S1MoreAtDepth => "cap",
-        StopState::S2Exhausted => "walk",
-        StopState::S3DepthCap => "depth",
-    };
-    let mut rendered = shared.replace(
-        &format!("({shared_reason})"),
-        &format!("({})", stop_reason_word(trailer.stop_state)),
-    );
-    if let SearchTotal::AtLeast(value) = trailer.total {
-        rendered = rendered.replace(&format!("≥{value}"), &format!("{value}+"));
-    }
-    rendered
+fn render_shared(trailer: &SearchTrailer) -> String {
+    render_trailer(&trailer.shared_envelope_projection())
+        .expect("search stop always has a shared envelope reason")
 }
 
 #[test]
@@ -101,8 +89,8 @@ fn named_stop_forms_use_exhaustion_then_cap_then_more_precedence() {
     assert_eq!(ordinary.stop_state, StopState::S1MoreAtDepth);
     assert_eq!(ordinary.total, SearchTotal::AtLeast(200));
     assert_eq!(
-        render_with_search_reason(&ordinary),
-        "shown 10 of 200+ results (more at greater depth) · narrow: offset, topK, path, includeTests"
+        render_shared(&ordinary),
+        "shown 10 of ≥200 results (cap) · narrow: offset, topK, path, includeTests"
     );
 
     let exhausted =
@@ -111,8 +99,8 @@ fn named_stop_forms_use_exhaustion_then_cap_then_more_precedence() {
     assert_eq!(exhausted.stop_state, StopState::S2Exhausted);
     assert_eq!(exhausted.total, SearchTotal::Exact(8));
     assert_eq!(
-        render_with_search_reason(&exhausted),
-        "shown 0 of 8 results (exhausted) · narrow: offset, topK, path, includeTests"
+        render_shared(&exhausted),
+        "shown 0 of 8 results (walk) · narrow: offset, topK, path, includeTests"
     );
 
     let depth_cap =
@@ -121,8 +109,8 @@ fn named_stop_forms_use_exhaustion_then_cap_then_more_precedence() {
     assert_eq!(depth_cap.stop_state, StopState::S3DepthCap);
     assert_eq!(depth_cap.total, SearchTotal::AtLeast(3200));
     assert_eq!(
-        render_with_search_reason(&depth_cap),
-        "shown 0 of 3200+ results (depth cap) · narrow: offset, topK, path, includeTests"
+        render_shared(&depth_cap),
+        "shown 0 of ≥3200 results (depth) · narrow: offset, topK, path, includeTests"
     );
 }
 
@@ -132,17 +120,17 @@ fn coincidence_forms_print_exactly_one_agreeing_reason() {
         (
             page("c1-cap-wins-over-satisfied", 3201, 3100, 10),
             StopState::S3DepthCap,
-            "shown 10 of 3200+ results (depth cap) · narrow: offset, topK, path, includeTests",
+            "shown 10 of ≥3200 results (depth) · narrow: offset, topK, path, includeTests",
         ),
         (
             page("c2-exhaustion-wins-over-satisfied", 210, 200, 10),
             StopState::S2Exhausted,
-            "shown 10 of 210 results (exhausted) · narrow: offset, topK, path, includeTests",
+            "shown 10 of 210 results (walk) · narrow: offset, topK, path, includeTests",
         ),
         (
             page("c3-exhaustion-wins-over-cap", 3200, 3190, 10),
             StopState::S2Exhausted,
-            "shown 10 of 3200 results (exhausted) · narrow: offset, topK, path, includeTests",
+            "shown 10 of 3200 results (walk) · narrow: offset, topK, path, includeTests",
         ),
     ];
 
@@ -150,10 +138,10 @@ fn coincidence_forms_print_exactly_one_agreeing_reason() {
         let trailer =
             SearchTrailer::from_page(&page, ExactPassState::Complete).expect("coincidence trailer");
         assert_eq!(trailer.stop_state, expected_state);
-        let rendered = render_with_search_reason(&trailer);
+        let rendered = render_shared(&trailer);
         assert_eq!(rendered, expected_text);
         assert_eq!(
-            ["(exhausted)", "(depth cap)", "(more at greater depth)"]
+            ["(walk)", "(depth)", "(cap)"]
                 .into_iter()
                 .filter(|reason| rendered.contains(reason))
                 .count(),
@@ -199,47 +187,85 @@ fn exhausted_bounded_exact_pass_requires_its_disclosure_in_the_same_reply() {
 }
 
 #[test]
-fn shared_renderer_parity_differs_only_by_search_reason_and_total_notation() {
-    for trailer in [
-        SearchTrailer {
-            shown: 10,
-            total: SearchTotal::AtLeast(200),
-            stop_state: StopState::S1MoreAtDepth,
-        },
-        SearchTrailer {
-            shown: 0,
-            total: SearchTotal::Exact(8),
-            stop_state: StopState::S2Exhausted,
-        },
-        SearchTrailer {
-            shown: 0,
-            total: SearchTotal::AtLeast(400),
-            stop_state: StopState::S3DepthCap,
-        },
+fn shared_projection_is_the_only_trailer_grammar() {
+    for (trailer, expected) in [
+        (
+            SearchTrailer {
+                shown: 10,
+                total: SearchTotal::AtLeast(200),
+                stop_state: StopState::S1MoreAtDepth,
+            },
+            "shown 10 of ≥200 results (cap) · narrow: offset, topK, path, includeTests",
+        ),
+        (
+            SearchTrailer {
+                shown: 0,
+                total: SearchTotal::Exact(8),
+                stop_state: StopState::S2Exhausted,
+            },
+            "shown 0 of 8 results (walk) · narrow: offset, topK, path, includeTests",
+        ),
+        (
+            SearchTrailer {
+                shown: 0,
+                total: SearchTotal::AtLeast(400),
+                stop_state: StopState::S3DepthCap,
+            },
+            "shown 0 of ≥400 results (depth) · narrow: offset, topK, path, includeTests",
+        ),
     ] {
-        let shared = render_trailer(&trailer.shared_envelope_projection()).unwrap();
-        let search = render_with_search_reason(&trailer);
+        let rendered = render_shared(&trailer);
+        assert_eq!(rendered, expected);
+        assert_eq!(rendered.matches("shown ").count(), 1);
+    }
+}
+
+#[test]
+fn shared_projection_serializes_reason_and_total_for_every_stop_state() {
+    for (trailer, expected_reason, expected_total) in [
+        (
+            SearchTrailer {
+                shown: 10,
+                total: SearchTotal::AtLeast(200),
+                stop_state: StopState::S1MoreAtDepth,
+            },
+            "cap",
+            serde_json::json!({"kind": "at_least", "value": 200}),
+        ),
+        (
+            SearchTrailer {
+                shown: 8,
+                total: SearchTotal::Exact(8),
+                stop_state: StopState::S2Exhausted,
+            },
+            "walk",
+            serde_json::json!({"kind": "exact", "value": 8}),
+        ),
+        (
+            SearchTrailer {
+                shown: 10,
+                total: SearchTotal::AtLeast(3200),
+                stop_state: StopState::S3DepthCap,
+            },
+            "depth",
+            serde_json::json!({"kind": "at_least", "value": 3200}),
+        ),
+    ] {
+        let envelope = serde_json::to_value(trailer.shared_envelope_projection())
+            .expect("serialize shared envelope");
+        assert_eq!(envelope["reason"], expected_reason);
+        assert_eq!(envelope["total"], expected_total);
         assert_eq!(
-            shared.matches("shown ").count(),
-            1,
-            "shared renderer owns the trailer grammar"
+            envelope["narrow"],
+            serde_json::json!(["offset", "topK", "path", "includeTests"])
         );
-        assert_eq!(search.matches("shown ").count(), 1);
-        assert!(search.ends_with(" · narrow: offset, topK, path, includeTests"));
-        assert!(search.contains(stop_reason_word(trailer.stop_state)));
-        if trailer.stop_state == StopState::S3DepthCap {
-            assert_eq!(
-                search,
-                "shown 0 of 400+ results (depth cap) · narrow: offset, topK, path, includeTests"
-            );
-        }
-        assert_eq!(
-            trailer.total.campaign_suffix(),
-            if matches!(trailer.total, SearchTotal::Exact(_)) {
-                ""
-            } else {
-                "+"
-            }
+        let reason: Reason = serde_json::from_value(envelope["reason"].clone())
+            .expect("deserialize projected reason");
+        let surface =
+            find_surface("search", "", "payload.results").expect("search surface is registered");
+        assert!(
+            surface.reasons.iter().any(|entry| entry.reason == reason),
+            "projected reason {reason:?} must be declared by the search surface"
         );
     }
 }

@@ -11,6 +11,8 @@ use aft::commands::callgraph_store_adapter::{
     StoreCallTreeNode, StoreCallerEntry, StoreCallerGroup, StoreCallersResult, StoreHubSummary,
     StoreImpactCaller, StoreImpactResult, HUB_SUMMARY_THRESHOLD,
 };
+use aft::commands::semantic_search::paging::StopState;
+use aft::commands::semantic_search::trailer::{SearchTotal, SearchTrailer};
 use aft::commands::trace_to::trace::{build_trace_data_envelope, build_trace_to_envelope};
 use aft::list_envelope::{derive_wire_key, ListEnvelope, Reason, Total, Unit};
 use aft::list_surfaces::bash::{
@@ -20,12 +22,47 @@ use aft::list_surfaces::glob::build_glob_envelope;
 use aft::list_surfaces::grep::build_grep_envelope_from_parts;
 use aft::list_surfaces::inspect::build_inspect_envelope;
 use aft::list_surfaces::outline::build_outline_files_envelope;
-use aft::list_surfaces::search::{attach_search_envelope, build_search_envelope};
+use aft::list_surfaces::search::attach_projected_search_envelope;
 use aft::list_surfaces::{ExclusionEntry, ReasonKind, EXCLUSIONS, LIST_SURFACES};
 use aft::ndjson_text::build_ndjson_text;
 use aft::protocol::Response;
 use aft::subc_format::{format_response_with_context, FormatContext, OutlineMode};
 use serde_json::{json, Map, Value};
+
+fn fixture_search_envelope(
+    shown: usize,
+    more_available: bool,
+    engine_capped: bool,
+) -> Option<ListEnvelope> {
+    if !more_available && !engine_capped {
+        return None;
+    }
+    let mut causes = Vec::new();
+    if engine_capped {
+        causes.push(Reason::Budget);
+    }
+    if more_available {
+        causes.push(Reason::Cap);
+    }
+    Some(ListEnvelope::new(
+        shown,
+        Total::AtLeast(if more_available { shown + 1 } else { shown }),
+        Unit::Results,
+        causes,
+        &["offset", "topK", "path", "includeTests"],
+    ))
+}
+
+fn attach_fixture_search_envelope(
+    map: &mut Map<String, Value>,
+    shown: usize,
+    more_available: bool,
+    engine_capped: bool,
+) {
+    if let Some(envelope) = fixture_search_envelope(shown, more_available, engine_capped) {
+        attach_projected_search_envelope(map, &envelope);
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReasonSpec {
@@ -76,6 +113,26 @@ const DEPTH_BUDGET_CAP: &[ReasonSpec] = &[
     },
 ];
 const BUDGET_CAP: &[ReasonSpec] = &[
+    ReasonSpec {
+        reason: Reason::Budget,
+        kind: ReasonKind::Bounding,
+    },
+    ReasonSpec {
+        reason: Reason::Cap,
+        kind: ReasonKind::Selecting,
+    },
+];
+// Engine replies project stop states to Cap, Walk, or Depth; legacy external and
+// degraded replies continue to derive Budget or Cap from their truncation flags.
+const SEARCH_REASONS: &[ReasonSpec] = &[
+    ReasonSpec {
+        reason: Reason::Walk,
+        kind: ReasonKind::Bounding,
+    },
+    ReasonSpec {
+        reason: Reason::Depth,
+        kind: ReasonKind::Bounding,
+    },
     ReasonSpec {
         reason: Reason::Budget,
         kind: ReasonKind::Bounding,
@@ -152,8 +209,8 @@ pub const SURFACE_SPECS: &[SurfaceSpec] = &[
         mode: "",
         list_id: "payload.results",
         unit: Unit::Results,
-        narrow: &["topK", "path", "includeTests"],
-        reasons: BUDGET_CAP,
+        narrow: &["offset", "topK", "path", "includeTests"],
+        reasons: SEARCH_REASONS,
     },
     SurfaceSpec {
         command: "grep",
@@ -244,7 +301,23 @@ fn build_case_envelope(surface: SurfaceSpec, fired: &[Reason]) -> Option<ListEnv
             build_trace_to_envelope(15, total, has(Reason::Depth), has(Reason::Budget))
         }
         ("callgraph", "trace_data") => build_trace_data_envelope(5, has(Reason::Depth)),
-        ("search", "") => build_search_envelope(10, has(Reason::Cap), has(Reason::Budget)),
+        ("search", "") if has(Reason::Walk) => Some(
+            SearchTrailer {
+                shown: 10,
+                total: SearchTotal::Exact(10),
+                stop_state: StopState::S2Exhausted,
+            }
+            .shared_envelope_projection(),
+        ),
+        ("search", "") if has(Reason::Depth) => Some(
+            SearchTrailer {
+                shown: 10,
+                total: SearchTotal::AtLeast(10),
+                stop_state: StopState::S3DepthCap,
+            }
+            .shared_envelope_projection(),
+        ),
+        ("search", "") => fixture_search_envelope(10, has(Reason::Cap), has(Reason::Budget)),
         ("grep", "") => {
             if has(Reason::Walk) && has(Reason::Cap) {
                 build_grep_envelope_from_parts(100, 100, 100, true, true, 0)
@@ -296,6 +369,8 @@ fn expected_total(surface: SurfaceSpec, fired: &[Reason]) -> Total {
             }
         }
         ("callgraph", "trace_data") => Total::AtLeast(5),
+        ("search", "") if has(Reason::Walk) => Total::Exact(10),
+        ("search", "") if has(Reason::Depth) => Total::AtLeast(10),
         ("search", "") => Total::AtLeast(if has(Reason::Cap) { 11 } else { 10 }),
         ("grep", "") => {
             if has(Reason::Walk) {
@@ -336,6 +411,12 @@ pub fn kind_bound_cases() -> Vec<KindBoundCase> {
                 .map(|(_, spec)| spec.reason)
                 .collect::<Vec<_>>();
             let expected_causes = sorted_causes(&fired);
+            if surface.command == "search"
+                && (fired.contains(&Reason::Walk) || fired.contains(&Reason::Depth))
+                && fired.len() != 1
+            {
+                continue;
+            }
             let expected_reason = expected_causes[0];
             cases.push(KindBoundCase {
                 name: format!("{}:{}", surface_name(surface), cause_name(&fired)),
@@ -512,7 +593,12 @@ pub fn validate_kind_bound_case(case: &KindBoundCase) -> Vec<String> {
             .iter()
             .any(|entry| entry.reason == *reason && entry.kind == ReasonKind::Bounding)
     });
-    if has_bounding && envelope.total.is_exact() {
+    let engine_exhausted_walk = case.surface.command == "search"
+        && case.fired.as_slice() == [Reason::Walk]
+        && envelope.total.is_exact();
+    // Search uses `walk` for an engine lane set that was fully exhausted. That
+    // completed walk proves an exact total instead of a lower bound.
+    if has_bounding && envelope.total.is_exact() && !engine_exhausted_walk {
         errors.push(format!(
             "{}: a Bounding cause cannot produce an Exact total",
             case.name
@@ -782,7 +868,7 @@ pub fn capped_fixtures() -> Vec<FixtureRecord> {
         "more_available": true,
         "engine_capped": false
     });
-    attach_search_envelope(
+    attach_fixture_search_envelope(
         generated_search.as_object_mut().expect("search object"),
         10,
         true,
@@ -1829,7 +1915,7 @@ pub fn complete_builder_results() -> Vec<(&'static str, Option<ListEnvelope>)> {
             build_trace_to_envelope(1, 1, false, false),
         ),
         ("callgraph.trace_data", build_trace_data_envelope(2, false)),
-        ("search", build_search_envelope(4, false, false)),
+        ("search", fixture_search_envelope(4, false, false)),
         (
             "grep",
             build_grep_envelope_from_parts(4, 4, 4, false, false, 0),

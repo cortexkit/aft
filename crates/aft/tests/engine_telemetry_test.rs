@@ -5,9 +5,12 @@ use serde_json::{json, Value};
 
 use aft::commands::semantic_search::{
     blocks, comparator, evidence_descriptor, generation_token, paging, plan_table, provenance,
-    scoring, telemetry, trailer,
+    scoring, trailer,
 };
 
+use aft::commands::semantic_search::telemetry::{
+    ConfidenceTelemetry, StructuredContent, TelemetryAssembler, TelemetryRun,
+};
 use blocks::{BlockBuilder, CanonicalLane, CanonicalListKey, LaneCandidate};
 use comparator::sort_r3;
 use evidence_descriptor::EvidenceDescriptor;
@@ -16,9 +19,6 @@ use paging::{parse_public_page_request, serve_public_page, SearchPage};
 use plan_table::{PlanTable, SearchLaneKind, SearchShape};
 use provenance::{LanePositions, LanePositionsAccessor, ObservedProvenance, ProvenanceError};
 use scoring::ScoringPolicy;
-use telemetry::{
-    format_search_trailer, ConfidenceTelemetry, StructuredContent, TelemetryAssembler, TelemetryRun,
-};
 use trailer::ExactPassState;
 
 #[derive(Debug, Deserialize)]
@@ -351,7 +351,11 @@ fn assert_decision_fixture(page: &SearchPage, mode: &ModeFixture, exact_pass: Ex
     let trailer = decisions
         .assemble_trailer(exact_pass)
         .expect("fixture trailer");
-    assert_eq!(format_search_trailer(&trailer), mode.trailer);
+    assert_eq!(
+        aft::list_envelope::render_trailer(&trailer.shared_envelope_projection())
+            .expect("fixture envelope has a reason"),
+        mode.trailer
+    );
 }
 
 #[test]

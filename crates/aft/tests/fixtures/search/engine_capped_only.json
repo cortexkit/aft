@@ -33,6 +33,7 @@
         "budget"
       ],
       "narrow": [
+        "offset",
         "topK",
         "path",
         "includeTests"
