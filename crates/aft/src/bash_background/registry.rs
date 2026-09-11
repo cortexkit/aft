@@ -492,6 +492,12 @@ impl BgTaskRegistry {
         self.inner.compression_aggregates.clear();
     }
 
+    pub(crate) fn record_live_delivery_session(&self, session_id: &str) {
+        if let Ok(mut live_sessions) = self.inner.live_delivery_sessions.lock() {
+            live_sessions.insert(session_id.to_string());
+        }
+    }
+
     pub(crate) fn replace_live_delivery_sessions(&self, sessions: HashSet<String>) {
         if let Ok(mut live_sessions) = self.inner.live_delivery_sessions.lock() {
             *live_sessions = sessions;
@@ -1572,6 +1578,7 @@ impl BgTaskRegistry {
             }),
         });
 
+        self.record_live_delivery_session(&task.session_id);
         self.inner
             .tasks
             .lock()
@@ -1763,6 +1770,7 @@ impl BgTaskRegistry {
             }),
         });
 
+        self.record_live_delivery_session(&task.session_id);
         self.inner
             .tasks
             .lock()
@@ -1910,6 +1918,7 @@ impl BgTaskRegistry {
             }),
         });
 
+        self.record_live_delivery_session(&task.session_id);
         self.inner
             .tasks
             .lock()
@@ -2002,6 +2011,10 @@ impl BgTaskRegistry {
                     &row.task_id,
                 ) {
                     Ok(task) => task.is_some(),
+                    // Fail-safe retention on transient DB error: destructive retirement
+                    // requires confirmed absence (Ok(None)). Treating a transient SQLite
+                    // read error as absent would permanently delete active watches on lock
+                    // contention; defer retirement until a clean read verifies absence.
                     Err(_) => true,
                 };
                 let is_erased_target = !task_exists
@@ -2089,7 +2102,8 @@ impl BgTaskRegistry {
             .map(|state| {
                 state.metadata.status.is_terminal()
                     && !state.metadata.completion_delivered
-                    && self.should_retire_foreign_delivery(&task.session_id, binding_session_id)
+                    && (self.should_retire_foreign_delivery(&task.session_id, binding_session_id)
+                        || !task.paths.dir.exists())
             })?;
         if !should_retire {
             return Ok(());
@@ -2158,15 +2172,10 @@ impl BgTaskRegistry {
         session_id: &str,
         project_root: Option<&Path>,
     ) -> Result<(), String> {
-        let is_subc_multi_route = self
-            .inner
-            .live_delivery_sessions
-            .lock()
-            .map(|sessions| sessions.len() > 1)
-            .unwrap_or(false);
-        if !is_subc_multi_route {
-            self.replace_live_delivery_sessions(std::iter::once(session_id.to_string()).collect());
-        }
+        // Standalone NDJSON: every session for a project replays through the same
+        // bridge, so replay unions this session into live delivery routes.
+        // Only subc route synchronization (subc/mod.rs:2120) replaces the whole set.
+        self.record_live_delivery_session(session_id);
         self.retire_orphaned_watch_tombstones(session_id)?;
         self.start_watchdog();
         if !self.inner.persisted_gc_started.swap(true, Ordering::SeqCst) {
@@ -2263,10 +2272,10 @@ impl BgTaskRegistry {
                 Err(error) => {
                     if error.kind() == std::io::ErrorKind::NotFound
                         && !Self::persisted_task_process_is_alive(&metadata)
-                        && self.should_retire_foreign_delivery(
+                        && (self.should_retire_foreign_delivery(
                             &metadata.session_id,
                             session_id,
-                        )
+                        ) || &metadata.session_id != session_id)
                     {
                         self.retire_already_reaped_orphaned_completion(
                             &metadata.session_id,
@@ -2548,6 +2557,7 @@ impl BgTaskRegistry {
         once: bool,
     ) -> Result<String, &'static str> {
         let task = self.task(&task_id).ok_or("task_not_found")?;
+        self.record_live_delivery_session(&task.session_id);
         validate_task_id(&task_id).map_err(|_| "invalid_task_id")?;
         let (mode, terminal_at_registration) = task
             .state
@@ -3922,6 +3932,7 @@ impl BgTaskRegistry {
                 pending_terminal_override: None,
             }),
         });
+        self.record_live_delivery_session(&task.session_id);
         self.inner
             .tasks
             .lock()
@@ -4678,6 +4689,9 @@ impl BgTaskRegistry {
     }
 
     fn emit_bash_pattern_match(&self, session_id: &str, pattern_match: PatternMatch) {
+        if !self.originating_session_has_live_route(session_id) {
+            return;
+        }
         let Ok(progress_sender) = self
             .inner
             .progress_sender
@@ -4710,6 +4724,9 @@ impl BgTaskRegistry {
     }
 
     fn emit_bash_watch_erased(&self, session_id: &str, task_id: &str, watch_id: &str) {
+        if !self.originating_session_has_live_route(session_id) {
+            return;
+        }
         let Ok(progress_sender) = self
             .inner
             .progress_sender
@@ -4794,6 +4811,9 @@ impl BgTaskRegistry {
     }
 
     fn emit_bash_watch_exit(&self, frame: BashPatternMatchFrame) {
+        if !self.originating_session_has_live_route(&frame.session_id) {
+            return;
+        }
         let Ok(progress_sender) = self
             .inner
             .progress_sender
@@ -4809,6 +4829,9 @@ impl BgTaskRegistry {
     }
 
     fn emit_bash_completed(&self, completion: BgCompletion) {
+        if !self.originating_session_has_live_route(&completion.session_id) {
+            return;
+        }
         let Ok(progress_sender) = self
             .inner
             .progress_sender
@@ -4921,6 +4944,9 @@ impl BgTaskRegistry {
     }
 
     fn emit_bash_long_running(&self, frame: BashLongRunningFrame) {
+        if !self.originating_session_has_live_route(&frame.session_id) {
+            return;
+        }
         let Ok(progress_sender) = self
             .inner
             .progress_sender
@@ -8929,6 +8955,115 @@ mod tests {
         assert!(restarted
             .pending_pattern_matches_for_session("session")
             .is_empty());
+    }
+
+    #[test]
+    fn standalone_same_project_multi_session_replay_preserves_earlier_session_delivery() {
+        let storage = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let (registry, _db, frames) = registry_with_db_and_frames(storage.path());
+
+        // Session A replays for the project, spawns a watched task, and spawns a completion task.
+        registry
+            .replay_session_for_project(storage.path(), "session-a", project.path())
+            .unwrap();
+
+        let task_watch = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                LONG_RUNNING_COMMAND,
+                "session-a".to_string(),
+                project.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                storage.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(project.path().to_path_buf()),
+            )
+            .unwrap();
+        registry
+            .register_watch(
+                task_watch.clone(),
+                WatchPattern::Substring("READY".into()),
+                true,
+            )
+            .unwrap();
+
+        let task_comp = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                LONG_RUNNING_COMMAND,
+                "session-a".to_string(),
+                project.path().to_path_buf(),
+                HashMap::new(),
+                Some(Duration::from_secs(30)),
+                storage.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(project.path().to_path_buf()),
+            )
+            .unwrap();
+
+        // Session B replays for the same project on the shared standalone bridge.
+        registry
+            .replay_session_for_project(storage.path(), "session-b", project.path())
+            .unwrap();
+
+        // Session A's watched task produces matching output.
+        let watch_handle = registry.task_for_session(&task_watch, "session-a").unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&watch_handle.paths.stdout)
+            .unwrap()
+            .write_all(b"READY\n")
+            .unwrap();
+        registry.scan_task_watch_output(&watch_handle);
+
+        // Session A's background completion task completes.
+        let comp_handle = registry.task_for_session(&task_comp, "session-a").unwrap();
+        fs::write(&comp_handle.paths.exit, "0\n").unwrap();
+        comp_handle.mark_terminal_now();
+        comp_handle
+            .state
+            .lock()
+            .unwrap()
+            .metadata
+            .mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        registry
+            .post_terminal_transition(&comp_handle, true)
+            .unwrap();
+
+        let captured = frames.lock().unwrap();
+        let pattern_matches = captured
+            .iter()
+            .filter_map(|frame| match frame {
+                PushFrame::BashPatternMatch(frame) => Some(frame),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            pattern_matches.iter().any(|f| f.task_id == task_watch
+                && f.session_id == "session-a"
+                && f.match_text == "READY"),
+            "session A pattern match must be emitted after session B replay: {pattern_matches:?}"
+        );
+
+        let completions = captured
+            .iter()
+            .filter_map(|frame| match frame {
+                PushFrame::BashCompleted(frame) => Some(frame),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            completions
+                .iter()
+                .any(|f| f.task_id == task_comp && f.session_id == "session-a"),
+            "session A completion must be emitted after session B replay: {completions:?}"
+        );
     }
 
     #[cfg(unix)]
