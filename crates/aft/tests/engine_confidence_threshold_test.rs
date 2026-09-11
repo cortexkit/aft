@@ -83,7 +83,8 @@ fn pinned_threshold_is_byte_identical_to_the_benchmark_fixture() {
     let benchmark = fs::read_to_string(shipped_threshold_path())
         .expect("benchmark confidence threshold must be readable");
     assert_eq!(
-        confidence::PINNED_CONFIDENCE_THRESHOLD_JSON, benchmark,
+        confidence::PINNED_CONFIDENCE_THRESHOLD_JSON,
+        benchmark,
         "crates/aft/assets/search-confidence-threshold.pinned.json must equal {}",
         CONFIDENCE_THRESHOLD_RELATIVE_PATH
     );

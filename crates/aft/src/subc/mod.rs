@@ -7179,7 +7179,11 @@ mod tests {
 
     #[test]
     fn fatal_panic_responses_are_detected_and_noted() {
-        let panic = Response::error("req-fatal", "actor_fatal", "start byte index 7 is not a char boundary");
+        let panic = Response::error(
+            "req-fatal",
+            "actor_fatal",
+            "start byte index 7 is not a char boundary",
+        );
         assert!(note_fatal_panic_response(&panic));
         let ordinary = Response::error("req-ok", "invalid_request", "missing field");
         assert!(!note_fatal_panic_response(&ordinary));

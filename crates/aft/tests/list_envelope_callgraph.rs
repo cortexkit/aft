@@ -994,7 +994,8 @@ fn create_synthesized_store_with_chain() -> (
     )
     .expect("write entry");
 
-    let store = CallGraphStore::open(root.join(".callgraph-store"), root.clone()).expect("open store");
+    let store =
+        CallGraphStore::open(root.join(".callgraph-store"), root.clone()).expect("open store");
     store
         .cold_build(&[
             leaf_file.clone(),

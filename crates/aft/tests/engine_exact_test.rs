@@ -439,7 +439,9 @@ fn exact_symbol_verification_clamps_utf8_span_boundaries() {
 /// on a 21 MB CRLF file with an em dash). Offsets must be true byte positions.
 #[test]
 fn exact_symbol_offsets_are_char_boundaries_on_crlf_multibyte_files() {
-    use aft::commands::semantic_search::exact_lane::{scan_symbols_in_text, verify_exact_matches_in_text};
+    use aft::commands::semantic_search::exact_lane::{
+        scan_symbols_in_text, verify_exact_matches_in_text,
+    };
 
     // Enough CRLF lines that the accumulated drift exceeds the width of the
     // multibyte characters in the final line, then a symbol line whose
@@ -461,7 +463,8 @@ fn exact_symbol_offsets_are_char_boundaries_on_crlf_multibyte_files() {
             "{name}: range {range:?} is not boundary-aligned"
         );
         assert!(
-            source[range.start..].starts_with("fn ") || source[range.start..].starts_with("pub struct "),
+            source[range.start..].starts_with("fn ")
+                || source[range.start..].starts_with("pub struct "),
             "{name}: start {} does not point at the symbol line",
             range.start
         );
@@ -475,5 +478,8 @@ fn exact_symbol_offsets_are_char_boundaries_on_crlf_multibyte_files() {
         "after_dashes",
         &["after_dashes".to_string()],
     );
-    assert!(result.is_some(), "definition on a CRLF file must still verify");
+    assert!(
+        result.is_some(),
+        "definition on a CRLF file must still verify"
+    );
 }
