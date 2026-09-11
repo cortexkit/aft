@@ -1,0 +1,10 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/search_b2_variants.rs",
+    "crates/aft/tests/search_b2_readiness.rs"
+  ],
+  "slices": ["variants", "readiness"]
+}
