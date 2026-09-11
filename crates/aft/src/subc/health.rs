@@ -1066,7 +1066,19 @@ fn dispatch_liveness_metrics(executor: &Executor) -> Value {
             "running": {
                 "interactive": snapshot.running.interactive,
                 "maintenance": snapshot.running.maintenance,
+                "oldest_worker_owned_maintenance_age_ms": snapshot
+                    .running
+                    .oldest_worker_owned_maintenance_age_ms,
+                "completion_owned": {
+                    "interactive": snapshot.running.completion_owned_interactive,
+                    "maintenance": snapshot.running.completion_owned_maintenance,
+                },
+                "phantom": {
+                    "interactive": snapshot.running.phantom_interactive,
+                    "maintenance": snapshot.running.phantom_maintenance,
+                },
             },
+            "phantom_running_maintenance": snapshot.phantom_running_maintenance,
             "interactive_reserve": snapshot.interactive_reserve,
             "maintenance_cap": snapshot.maintenance_cap,
         }),
@@ -1965,6 +1977,15 @@ mod tests {
             Some(0)
         );
         assert_eq!(dispatch["interactive"]["queued"].as_u64(), Some(1));
+        assert_eq!(
+            dispatch["running"]["phantom"]["interactive"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            dispatch["running"]["phantom"]["maintenance"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(dispatch["phantom_running_maintenance"].as_u64(), Some(0));
         assert!(dispatch["interactive"]["oldest_age_ms"].as_u64().is_some());
 
         for _ in 0..2 {

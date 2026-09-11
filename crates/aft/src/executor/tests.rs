@@ -864,7 +864,8 @@ fn bind_blocker_snapshot_names_a_stuck_reader_occupant() {
         let mut state = executor.inner.state.lock();
         let running = state
             .running_jobs
-            .get_mut(&(root.clone(), "abandoned-inspect".to_string()))
+            .values_mut()
+            .find(|job| job.root_id == root && job.request_id == "abandoned-inspect")
             .expect("running inspect census entry");
         running.started_at = Instant::now() - READER_STUCK_CENSUS_AGE - Duration::from_secs(1);
     }
@@ -2613,7 +2614,8 @@ fn bind_blocker_snapshot_labels_reader_parked_before_execution_as_zombie() {
             .state
             .lock()
             .running_jobs
-            .get(&(root.clone(), "parked-before-execution".to_string()))
+            .values()
+            .find(|job| job.root_id == root && job.request_id == "parked-before-execution")
             .is_some_and(|job| !job.execution_started.load(Ordering::Acquire));
         if admitted {
             break;
@@ -2691,7 +2693,8 @@ fn cancelling_dispatched_reader_releases_barrier_before_epoch_writer_exits() {
             .state
             .lock()
             .running_jobs
-            .get(&(root.clone(), "dead-route-reader".to_string()))
+            .values()
+            .find(|job| job.root_id == root && job.request_id == "dead-route-reader")
             .is_some_and(|job| !job.execution_started.load(Ordering::Acquire));
         if parked {
             break;
@@ -2734,4 +2737,219 @@ fn cancelling_dispatched_reader_releases_barrier_before_epoch_writer_exits() {
     assert_eq!(executed.load(Ordering::Acquire), 0);
     bind.recv_timeout(Duration::from_secs(1))
         .expect("bind completes after the external epoch writer exits");
+}
+
+#[track_caller]
+fn wait_for_maintenance_inflight(executor: &Executor, expected: usize, label: &str) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let snapshot = executor
+            .try_dispatch_liveness_snapshot()
+            .expect("dispatch liveness snapshot");
+        if snapshot.running.maintenance == expected {
+            assert_eq!(
+                snapshot.phantom_running_maintenance, 0,
+                "{label} left a maintenance reservation without a completion owner"
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label}: expected {expected} running maintenance job(s), observed {}",
+            snapshot.running.maintenance
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[track_caller]
+fn assert_follow_up_maintenance_admitted(
+    executor: &Executor,
+    root: ProjectRootId,
+    request_id: &str,
+) {
+    wait_for_maintenance_inflight(executor, 0, request_id);
+    let follow_up = executor.submit_maintenance_async(
+        root,
+        Lane::MaintenanceCommit,
+        request_id.to_string(),
+        Box::new(|_| ok("follow-up-maintenance")),
+    );
+    assert!(recv_async(follow_up, request_id).success);
+    wait_for_maintenance_inflight(executor, 0, request_id);
+}
+
+#[test]
+fn maintenance_panic_releases_reservation_and_admits_another_actor() {
+    let executor = test_executor(2, 1, 1, 2);
+    let (_panic_dir, panic_root) = test_root("maintenance-panic-owner");
+    let (_other_dir, other_root) = test_root("maintenance-panic-follow-up");
+    executor.register_actor(panic_root.clone(), test_ctx());
+    executor.register_actor(other_root.clone(), test_ctx());
+
+    let panicked = executor.submit_maintenance_async(
+        panic_root,
+        Lane::MaintenanceCommit,
+        "maintenance-panic".to_string(),
+        Box::new(|_| panic!("maintenance completion guard panic sentinel")),
+    );
+    let response = recv_async(panicked, "panicked maintenance job");
+    assert!(!response.success);
+    assert_follow_up_maintenance_admitted(&executor, other_root, "after-maintenance-panic");
+}
+
+#[test]
+fn dropped_maintenance_receiver_releases_reservation_and_admits_another_actor() {
+    let executor = test_executor(2, 1, 1, 2);
+    let (_dropped_dir, dropped_root) = test_root("maintenance-dropped-receiver");
+    let (_other_dir, other_root) = test_root("maintenance-dropped-follow-up");
+    executor.register_actor(dropped_root.clone(), test_ctx());
+    executor.register_actor(other_root.clone(), test_ctx());
+
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    let dropped = executor.submit_maintenance_async(
+        dropped_root,
+        Lane::MaintenanceCommit,
+        "dropped-maintenance-receiver".to_string(),
+        Box::new(move |_| {
+            done_tx.send(()).expect("signal dropped receiver job");
+            ok("dropped-maintenance-receiver")
+        }),
+    );
+    drop(dropped);
+    done_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("maintenance job runs after its receiver is dropped");
+    assert_follow_up_maintenance_admitted(&executor, other_root, "after-dropped-receiver");
+}
+
+#[test]
+fn cancelled_maintenance_cold_build_wait_releases_reservation_and_admits_another_actor() {
+    let executor = test_executor(2, 1, 1, 2);
+    let (_cancel_dir, cancel_root) = test_root("maintenance-cold-build-cancel");
+    let (_other_dir, other_root) = test_root("maintenance-cold-build-follow-up");
+    executor.register_actor(cancel_root.clone(), test_ctx());
+    executor.register_actor(other_root.clone(), test_ctx());
+
+    let limiter = crate::cold_build_limiter::test_limiter(1);
+    let held = crate::cold_build_limiter::try_acquire_classified_with_limiter(
+        &limiter,
+        &crate::cold_build_limiter::ColdBuildAdmissionRequest::new(
+            "held-cold-build-slot",
+            crate::cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
+        ),
+    )
+    .expect("hold isolated cold-build slot");
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let waiting_limiter = Arc::clone(&limiter);
+    let (waiting, cancellation) = executor.submit_maintenance_cancellable_async(
+        cancel_root.clone(),
+        Lane::MaintenanceCommit,
+        "cancelled-cold-build-wait".to_string(),
+        Box::new(move |_| {
+            started_tx.send(()).expect("signal cold-build wait");
+            let permit = crate::cold_build_limiter::acquire_blocking_while_cancellable_with_limiter(
+                &waiting_limiter,
+                "executor completion guard cancellation test",
+                crate::cold_build_limiter::ColdBuildAdmissionRequest::new(
+                    "cancelled-cold-build-wait",
+                    crate::cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
+                ),
+                || true,
+                current_job_cancelled,
+            );
+            assert!(permit.is_none(), "cancelled wait must not acquire a slot");
+            Response::error(
+                "cancelled-cold-build-wait",
+                "request_cancelled",
+                "cancelled while waiting for cold-build capacity",
+            )
+        }),
+    );
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("maintenance cold-build wait starts");
+    assert_eq!(
+        executor.cancel_job(&cancel_root, &cancellation),
+        JobCancelOutcome::RunningSignalled
+    );
+    let response = recv_async(waiting, "cancelled maintenance cold-build wait");
+    assert_eq!(response.data["code"], "request_cancelled");
+    drop(held);
+    assert_follow_up_maintenance_admitted(&executor, other_root, "after-cold-build-cancel");
+}
+
+#[test]
+fn removed_actor_running_maintenance_releases_reservation_for_another_actor() {
+    let executor = test_executor(2, 1, 1, 2);
+    let (_removed_dir, removed_root) = test_root("maintenance-removed-actor");
+    let (_other_dir, other_root) = test_root("maintenance-removed-follow-up");
+    executor.register_actor(removed_root.clone(), test_ctx());
+    executor.register_actor(other_root.clone(), test_ctx());
+
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    let running = executor.submit_maintenance_async(
+        removed_root.clone(),
+        Lane::MaintenanceCommit,
+        "removed-actor-maintenance".to_string(),
+        Box::new(move |_| {
+            started_tx.send(()).expect("signal removed actor job");
+            release_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("release removed actor job");
+            ok("removed-actor-maintenance")
+        }),
+    );
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("removed actor maintenance starts");
+    executor.remove_actor(&removed_root);
+    release_tx.send(()).expect("release removed actor job");
+    assert!(recv_async(running, "removed actor maintenance completion").success);
+    assert_follow_up_maintenance_admitted(&executor, other_root, "after-actor-removal");
+}
+
+#[test]
+fn duplicate_maintenance_request_ids_keep_distinct_completion_owners() {
+    let executor = test_executor(4, 2, 2, 2);
+    let (_shared_dir, shared_root) = test_root("duplicate-maintenance-id");
+    let (_other_dir, other_root) = test_root("duplicate-maintenance-follow-up");
+    executor.register_actor(shared_root.clone(), test_ctx());
+    executor.register_actor(other_root.clone(), test_ctx());
+
+    let (started_tx, started_rx) = crossbeam_channel::bounded(2);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(2);
+    let mut jobs = Vec::new();
+    for index in 0..2 {
+        let started_tx = started_tx.clone();
+        let release_rx = release_rx.clone();
+        jobs.push(executor.submit_maintenance_async(
+            shared_root.clone(),
+            Lane::PureRead,
+            "duplicate-maintenance-id".to_string(),
+            Box::new(move |_| {
+                started_tx.send(index).expect("signal duplicate-id job");
+                release_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("release duplicate-id job");
+                ok(format!("duplicate-maintenance-id-{index}"))
+            }),
+        ));
+    }
+    for _ in 0..2 {
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("both duplicate-id maintenance jobs start");
+    }
+    wait_for_maintenance_inflight(&executor, 2, "duplicate maintenance request ids");
+    let snapshot = executor.try_dispatch_liveness_snapshot().unwrap();
+    assert_eq!(snapshot.running.completion_owned_maintenance, 2);
+
+    release_tx.send(()).unwrap();
+    release_tx.send(()).unwrap();
+    for job in jobs {
+        assert!(recv_async(job, "duplicate-id maintenance completion").success);
+    }
+    assert_follow_up_maintenance_admitted(&executor, other_root, "after-duplicate-request-ids");
 }

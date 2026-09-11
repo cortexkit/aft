@@ -7,7 +7,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
-        Arc,
+        Arc, Weak,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -194,6 +194,13 @@ pub struct DispatchClassQueueSnapshot {
 pub struct DispatchRunningSnapshot {
     pub interactive: usize,
     pub maintenance: usize,
+    pub completion_owned_interactive: usize,
+    pub completion_owned_maintenance: usize,
+    /// Age of the oldest maintenance reservation still owned by a dispatched
+    /// worker. This distinguishes a blocked worker from a phantom reservation.
+    pub oldest_worker_owned_maintenance_age_ms: Option<u64>,
+    pub phantom_interactive: usize,
+    pub phantom_maintenance: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +208,7 @@ pub struct DispatchLivenessSnapshot {
     pub interactive: DispatchClassQueueSnapshot,
     pub maintenance: DispatchClassQueueSnapshot,
     pub running: DispatchRunningSnapshot,
+    pub phantom_running_maintenance: usize,
     pub interactive_reserve: usize,
     pub maintenance_cap: usize,
 }
@@ -216,6 +224,11 @@ struct DispatchLivenessAtomics {
     maintenance_oldest_enqueued_ms_plus_one: AtomicU64,
     interactive_running: AtomicUsize,
     maintenance_running: AtomicUsize,
+    completion_owned_interactive: AtomicUsize,
+    completion_owned_maintenance: AtomicUsize,
+    oldest_worker_owned_maintenance_started_ms_plus_one: AtomicU64,
+    phantom_interactive: AtomicUsize,
+    phantom_maintenance: AtomicUsize,
 }
 
 impl DispatchLivenessAtomics {
@@ -228,6 +241,11 @@ impl DispatchLivenessAtomics {
             maintenance_oldest_enqueued_ms_plus_one: AtomicU64::new(0),
             interactive_running: AtomicUsize::new(0),
             maintenance_running: AtomicUsize::new(0),
+            completion_owned_interactive: AtomicUsize::new(0),
+            completion_owned_maintenance: AtomicUsize::new(0),
+            oldest_worker_owned_maintenance_started_ms_plus_one: AtomicU64::new(0),
+            phantom_interactive: AtomicUsize::new(0),
+            phantom_maintenance: AtomicUsize::new(0),
         }
     }
 
@@ -264,6 +282,26 @@ impl DispatchLivenessAtomics {
             .store(snapshot.running.interactive, Ordering::Release);
         self.maintenance_running
             .store(snapshot.running.maintenance, Ordering::Release);
+        self.completion_owned_interactive.store(
+            snapshot.running.completion_owned_interactive,
+            Ordering::Release,
+        );
+        self.completion_owned_maintenance.store(
+            snapshot.running.completion_owned_maintenance,
+            Ordering::Release,
+        );
+        self.oldest_worker_owned_maintenance_started_ms_plus_one
+            .store(
+                encode_oldest(
+                    snapshot.running.completion_owned_maintenance,
+                    snapshot.running.oldest_worker_owned_maintenance_age_ms,
+                ),
+                Ordering::Relaxed,
+            );
+        self.phantom_interactive
+            .store(snapshot.running.phantom_interactive, Ordering::Release);
+        self.phantom_maintenance
+            .store(snapshot.running.phantom_maintenance, Ordering::Release);
         self.interactive_queued
             .store(snapshot.interactive.queued, Ordering::Release);
         self.maintenance_queued
@@ -297,7 +335,21 @@ impl DispatchLivenessAtomics {
             running: DispatchRunningSnapshot {
                 interactive: self.interactive_running.load(Ordering::Acquire),
                 maintenance: self.maintenance_running.load(Ordering::Acquire),
+                completion_owned_interactive: self
+                    .completion_owned_interactive
+                    .load(Ordering::Acquire),
+                completion_owned_maintenance: self
+                    .completion_owned_maintenance
+                    .load(Ordering::Acquire),
+                oldest_worker_owned_maintenance_age_ms: decode_oldest(
+                    self.completion_owned_maintenance.load(Ordering::Acquire),
+                    self.oldest_worker_owned_maintenance_started_ms_plus_one
+                        .load(Ordering::Relaxed),
+                ),
+                phantom_interactive: self.phantom_interactive.load(Ordering::Acquire),
+                phantom_maintenance: self.phantom_maintenance.load(Ordering::Acquire),
             },
+            phantom_running_maintenance: self.phantom_maintenance.load(Ordering::Acquire),
             interactive_reserve: config.interactive_reserve,
             maintenance_cap: config.maintenance_cap,
         }
@@ -574,6 +626,7 @@ struct RunningJob {
     lane: Lane,
     started_at: Instant,
     execution_started: Arc<AtomicBool>,
+    completion_ownership: Weak<JobCompletionOwnership>,
     occupancy_reported: bool,
 }
 
@@ -615,6 +668,7 @@ impl Executor {
         let (run_tx, run_rx) = crossbeam_channel::unbounded();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
 
+        let scheduler_event_tx = event_tx.clone();
         let scheduler_state = Arc::clone(&state);
         let scheduler_heavy = Arc::clone(&heavy);
         let scheduler_violations = Arc::clone(&nonrunnable_dispatches);
@@ -628,6 +682,7 @@ impl Executor {
                     scheduler_state,
                     scheduler_heavy,
                     run_tx,
+                    scheduler_event_tx,
                     event_rx,
                     scheduler_violations,
                     scheduler_completed_interactive,
@@ -640,7 +695,6 @@ impl Executor {
         let mut worker_handles = Vec::with_capacity(effective.pool_size);
         for worker_id in 0..effective.pool_size {
             let worker_rx = run_rx.clone();
-            let worker_events = event_tx.clone();
             // Workers run every tool call, including tree-sitter walks over
             // whatever a URL or file turns out to contain. The standalone loop
             // runs those on the 8 MiB main thread; the 2 MiB default for spawned
@@ -649,7 +703,7 @@ impl Executor {
             let handle = thread::Builder::new()
                 .name(format!("aft-executor-worker-{worker_id}"))
                 .stack_size(EXECUTOR_WORKER_STACK_BYTES)
-                .spawn(move || worker_loop(worker_rx, worker_events))
+                .spawn(move || worker_loop(worker_rx))
                 .expect("spawn AFT executor worker");
             worker_handles.push(handle);
         }
@@ -1013,6 +1067,29 @@ impl Executor {
         self.submit_maintenance_async_with_key(root_id, lane, request_id, job, None)
     }
 
+    #[cfg(test)]
+    fn submit_maintenance_cancellable_async(
+        &self,
+        root_id: ProjectRootId,
+        lane: Lane,
+        request_id: String,
+        job: ExecutorJob,
+    ) -> (oneshot::Receiver<Response>, JobCancellation) {
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let cancellation = JobCancellation::new();
+        self.submit_with_completion_cancellable(
+            root_id,
+            JobClass::Maintenance,
+            lane,
+            request_id,
+            job,
+            CompletionSender::Async(completion_tx),
+            Some(cancellation.clone()),
+            None,
+        );
+        (completion_rx, cancellation)
+    }
+
     pub(crate) fn submit_coalescable_maintenance_async(
         &self,
         root_id: ProjectRootId,
@@ -1314,7 +1391,8 @@ struct SchedulerState {
     interactive_inflight: usize,
     maintenance_inflight: usize,
     config: EffectiveConfig,
-    running_jobs: HashMap<(ProjectRootId, String), RunningJob>,
+    running_jobs: HashMap<u64, RunningJob>,
+    next_job_id: u64,
 }
 
 impl SchedulerState {
@@ -1328,11 +1406,32 @@ impl SchedulerState {
             maintenance_inflight: 0,
             config,
             running_jobs: HashMap::new(),
+            next_job_id: 1,
         }
     }
 
     fn dispatch_liveness_snapshot(&self) -> DispatchLivenessSnapshot {
+        self.assert_running_invariants();
         let now = Instant::now();
+        let (completion_owned_interactive, completion_owned_maintenance) = self
+            .running_jobs
+            .values()
+            .filter(|job| job.completion_ownership.strong_count() > 0)
+            .fold((0, 0), |(interactive, maintenance), job| {
+                match job.job_class {
+                    JobClass::Interactive => (interactive + 1, maintenance),
+                    JobClass::Maintenance => (interactive, maintenance + 1),
+                }
+            });
+        let oldest_worker_owned_maintenance_age_ms = self
+            .running_jobs
+            .values()
+            .filter(|job| {
+                job.job_class == JobClass::Maintenance
+                    && job.completion_ownership.strong_count() > 0
+            })
+            .map(|job| duration_millis_u64(now.saturating_duration_since(job.started_at)))
+            .max();
         let mut interactive = QueueSnapshotAccumulator::default();
         let mut maintenance = QueueSnapshotAccumulator::default();
         for actor in self.actors.values() {
@@ -1346,10 +1445,51 @@ impl SchedulerState {
             running: DispatchRunningSnapshot {
                 interactive: self.interactive_inflight,
                 maintenance: self.maintenance_inflight,
+                completion_owned_interactive,
+                completion_owned_maintenance,
+                oldest_worker_owned_maintenance_age_ms,
+                phantom_interactive: self
+                    .interactive_inflight
+                    .saturating_sub(completion_owned_interactive),
+                phantom_maintenance: self
+                    .maintenance_inflight
+                    .saturating_sub(completion_owned_maintenance),
             },
+            phantom_running_maintenance: self
+                .maintenance_inflight
+                .saturating_sub(completion_owned_maintenance),
             interactive_reserve: self.config.interactive_reserve,
             maintenance_cap: self.config.maintenance_cap,
         }
+    }
+
+    fn assert_running_invariants(&self) {
+        let interactive = self
+            .running_jobs
+            .values()
+            .filter(|job| job.job_class == JobClass::Interactive)
+            .count();
+        let maintenance = self
+            .running_jobs
+            .values()
+            .filter(|job| job.job_class == JobClass::Maintenance)
+            .count();
+        debug_assert_eq!(self.interactive_inflight, interactive);
+        debug_assert_eq!(self.maintenance_inflight, maintenance);
+        debug_assert_eq!(
+            self.idle_workers + self.running_jobs.len(),
+            self.config.pool_size
+        );
+        debug_assert!(self
+            .running_jobs
+            .values()
+            .all(|job| job.completion_ownership.strong_count() > 0));
+    }
+
+    fn next_job_id(&mut self) -> u64 {
+        let job_id = self.next_job_id;
+        self.next_job_id = self.next_job_id.wrapping_add(1).max(1);
+        job_id
     }
 
     fn mutating_lane_snapshots(&self) -> Vec<MutatingLaneSnapshot> {
@@ -2020,15 +2160,55 @@ struct RunJob {
     heavy_permit: Option<HeavyPermit>,
     cancellation: Option<JobCancellation>,
     execution_started: Arc<AtomicBool>,
+    completion_guard: Option<JobCompletionGuard>,
+}
+
+struct JobCompletionOwnership;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobCompletionOutcome {
+    Completed,
+    Panicked,
+    Abandoned,
 }
 
 struct CompletionEvent {
-    root_id: ProjectRootId,
-    request_id: String,
-    job_class: JobClass,
-    lane: Lane,
+    job_id: u64,
     heavy_permit: Option<HeavyPermit>,
-    panicked: bool,
+    outcome: JobCompletionOutcome,
+    ownership: Arc<JobCompletionOwnership>,
+}
+
+struct JobCompletionGuard {
+    event_tx: Sender<SchedulerEvent>,
+    event: Option<CompletionEvent>,
+}
+
+impl JobCompletionGuard {
+    fn new(event_tx: Sender<SchedulerEvent>, event: CompletionEvent) -> Self {
+        Self {
+            event_tx,
+            event: Some(event),
+        }
+    }
+
+    fn set_outcome(&mut self, outcome: JobCompletionOutcome) {
+        if let Some(event) = self.event.as_mut() {
+            event.outcome = outcome;
+        }
+    }
+}
+
+impl Drop for JobCompletionGuard {
+    fn drop(&mut self) {
+        let Some(mut event) = self.event.take() else {
+            return;
+        };
+        if std::thread::panicking() {
+            event.outcome = JobCompletionOutcome::Panicked;
+        }
+        let _ = self.event_tx.send(SchedulerEvent::Completed(event));
+    }
 }
 
 enum SchedulerEvent {
@@ -2041,6 +2221,7 @@ fn scheduler_loop(
     state: Arc<Mutex<SchedulerState>>,
     heavy: Arc<HeavySemaphore>,
     run_tx: Sender<RunJob>,
+    event_tx: Sender<SchedulerEvent>,
     event_rx: Receiver<SchedulerEvent>,
     nonrunnable_dispatches: Arc<AtomicUsize>,
     completed_interactive: Arc<AtomicU64>,
@@ -2060,7 +2241,13 @@ fn scheduler_loop(
             );
 
             if !shutdown {
-                dispatch_runnable(&mut state, &heavy, &run_tx, &nonrunnable_dispatches);
+                dispatch_runnable(
+                    &mut state,
+                    &heavy,
+                    &run_tx,
+                    &event_tx,
+                    &nonrunnable_dispatches,
+                );
             }
             dispatch_liveness.record(&state.dispatch_liveness_snapshot());
         }
@@ -2083,23 +2270,19 @@ fn process_scheduler_event_batch(
         let Some(current) = event.take().or_else(|| event_rx.try_recv().ok()) else {
             break;
         };
-        note_completion_event(&current, completed_interactive, completed_maintenance);
-        if process_scheduler_event(current, state) {
+        if process_scheduler_event(current, state, completed_interactive, completed_maintenance) {
             return true;
         }
     }
     false
 }
 
-fn note_completion_event(
-    event: &SchedulerEvent,
+fn note_completed_class(
+    job_class: JobClass,
     completed_interactive: &AtomicU64,
     completed_maintenance: &AtomicU64,
 ) {
-    let SchedulerEvent::Completed(event) = event else {
-        return;
-    };
-    match event.job_class {
+    match job_class {
         JobClass::Interactive => {
             completed_interactive.fetch_add(1, Ordering::Relaxed);
         }
@@ -2109,33 +2292,59 @@ fn note_completion_event(
     }
 }
 
-fn process_scheduler_event(event: SchedulerEvent, state: &mut SchedulerState) -> bool {
+fn process_scheduler_event(
+    event: SchedulerEvent,
+    state: &mut SchedulerState,
+    completed_interactive: &AtomicU64,
+    completed_maintenance: &AtomicU64,
+) -> bool {
     match event {
         SchedulerEvent::Wake => false,
         SchedulerEvent::Completed(event) => {
-            complete_job(state, event);
+            if let Some(job_class) = complete_job(state, event) {
+                note_completed_class(job_class, completed_interactive, completed_maintenance);
+            }
             false
         }
         SchedulerEvent::Shutdown => true,
     }
 }
 
-fn complete_job(state: &mut SchedulerState, event: CompletionEvent) {
+fn complete_job(state: &mut SchedulerState, event: CompletionEvent) -> Option<JobClass> {
     let CompletionEvent {
+        job_id,
+        heavy_permit,
+        outcome,
+        ownership,
+    } = event;
+    let Some(running) = state.running_jobs.remove(&job_id) else {
+        log::error!("executor completion: unknown job_id={job_id} outcome={outcome:?}");
+        return None;
+    };
+    debug_assert!(running
+        .completion_ownership
+        .upgrade()
+        .is_some_and(|current| Arc::ptr_eq(&current, &ownership)));
+
+    let RunningJob {
         root_id,
         request_id,
         job_class,
         lane,
-        heavy_permit,
-        panicked,
-    } = event;
-    state.running_jobs.remove(&(root_id.clone(), request_id));
+        ..
+    } = running;
+    log::debug!(
+        "executor completion: job_id={job_id} class={job_class:?} lane={lane:?} outcome={outcome:?} request_id={request_id} root={}",
+        root_id.as_path().display()
+    );
 
     match job_class {
         JobClass::Interactive => {
+            debug_assert!(state.interactive_inflight > 0);
             state.interactive_inflight = state.interactive_inflight.saturating_sub(1);
         }
         JobClass::Maintenance => {
+            debug_assert!(state.maintenance_inflight > 0);
             state.maintenance_inflight = state.maintenance_inflight.saturating_sub(1);
         }
     }
@@ -2159,20 +2368,24 @@ fn complete_job(state: &mut SchedulerState, event: CompletionEvent) {
             }
         }
 
-        if panicked && lane == Lane::Mutating {
+        if outcome == JobCompletionOutcome::Panicked && lane == Lane::Mutating {
             actor.fatal = true;
             actor.fail_queued_jobs();
         }
     }
 
     drop(heavy_permit);
+    drop(ownership);
     state.idle_workers += 1;
+    state.assert_running_invariants();
+    Some(job_class)
 }
 
 fn dispatch_runnable(
     state: &mut SchedulerState,
     heavy: &Arc<HeavySemaphore>,
     run_tx: &Sender<RunJob>,
+    event_tx: &Sender<SchedulerEvent>,
     nonrunnable_dispatches: &AtomicUsize,
 ) {
     while state.idle_workers > 0 && !state.actor_order.is_empty() {
@@ -2184,6 +2397,7 @@ fn dispatch_runnable(
             JobClass::Interactive,
             heavy,
             run_tx,
+            event_tx,
             nonrunnable_dispatches,
             &mut dispatch_failed,
         );
@@ -2197,6 +2411,7 @@ fn dispatch_runnable(
                 JobClass::Maintenance,
                 heavy,
                 run_tx,
+                event_tx,
                 nonrunnable_dispatches,
                 &mut dispatch_failed,
             );
@@ -2216,6 +2431,7 @@ fn dispatch_runnable_class(
     job_class: JobClass,
     heavy: &Arc<HeavySemaphore>,
     run_tx: &Sender<RunJob>,
+    event_tx: &Sender<SchedulerEvent>,
     nonrunnable_dispatches: &AtomicUsize,
     dispatch_failed: &mut bool,
 ) -> bool {
@@ -2266,9 +2482,20 @@ fn dispatch_runnable_class(
             try_admit_actor(&root_id, actor, job_class, &state.config, heavy)
         };
 
-        if let Some(run_job) = run_job {
-            state.running_jobs.insert(
-                (run_job.root_id.clone(), run_job.request_id.clone()),
+        if let Some(mut run_job) = run_job {
+            let job_id = state.next_job_id();
+            let ownership = Arc::new(JobCompletionOwnership);
+            run_job.completion_guard = Some(JobCompletionGuard::new(
+                event_tx.clone(),
+                CompletionEvent {
+                    job_id,
+                    heavy_permit: run_job.heavy_permit.take(),
+                    outcome: JobCompletionOutcome::Abandoned,
+                    ownership: Arc::clone(&ownership),
+                },
+            ));
+            let replaced = state.running_jobs.insert(
+                job_id,
                 RunningJob {
                     root_id: run_job.root_id.clone(),
                     request_id: run_job.request_id.clone(),
@@ -2277,14 +2504,24 @@ fn dispatch_runnable_class(
                     lane: run_job.lane,
                     started_at: Instant::now(),
                     execution_started: Arc::clone(&run_job.execution_started),
+                    completion_ownership: Arc::downgrade(&ownership),
                     occupancy_reported: false,
                 },
             );
+            debug_assert!(replaced.is_none());
             state.idle_workers -= 1;
             match job_class {
                 JobClass::Interactive => state.interactive_inflight += 1,
                 JobClass::Maintenance => state.maintenance_inflight += 1,
             }
+            state.assert_running_invariants();
+            log::debug!(
+                "executor dispatch: job_id={job_id} class={:?} lane={:?} request_id={} root={}",
+                run_job.job_class,
+                run_job.lane,
+                run_job.request_id,
+                run_job.root_id.as_path().display()
+            );
             made_progress = true;
             if run_tx.send(run_job).is_err() {
                 nonrunnable_dispatches.fetch_add(1, Ordering::AcqRel);
@@ -2417,10 +2654,11 @@ fn try_admit_actor(
         heavy_permit,
         cancellation: queued.cancellation,
         execution_started: Arc::new(AtomicBool::new(false)),
+        completion_guard: None,
     })
 }
 
-fn worker_loop(run_rx: Receiver<RunJob>, event_tx: Sender<SchedulerEvent>) {
+fn worker_loop(run_rx: Receiver<RunJob>) {
     while let Ok(mut run_job) = run_rx.recv() {
         let response =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_lane_job(&mut run_job)));
@@ -2437,15 +2675,15 @@ fn worker_loop(run_rx: Receiver<RunJob>, event_tx: Sender<SchedulerEvent>) {
         if let Some(completion) = run_job.completion.take() {
             completion.send(response);
         }
-        let completion = CompletionEvent {
-            root_id: run_job.root_id,
-            request_id: run_job.request_id,
-            job_class: run_job.job_class,
-            lane: run_job.lane,
-            heavy_permit: run_job.heavy_permit.take(),
-            panicked,
-        };
-        let _ = event_tx.send(SchedulerEvent::Completed(completion));
+        run_job
+            .completion_guard
+            .as_mut()
+            .expect("dispatched executor job is missing its completion guard")
+            .set_outcome(if panicked {
+                JobCompletionOutcome::Panicked
+            } else {
+                JobCompletionOutcome::Completed
+            });
     }
 }
 
