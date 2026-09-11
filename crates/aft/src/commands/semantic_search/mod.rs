@@ -6100,12 +6100,11 @@ mod tests {
 
         let wait_budget = Duration::from_millis(40);
         let started = Instant::now();
-        let response = with_first_search_index_load_wait_budget_for_test(wait_budget, || {
-            response_value(handle_semantic_search(
-                &semantic_request("still_loading", 5),
-                &ctx,
-            ))
+        let raw_response = with_first_search_index_load_wait_budget_for_test(wait_budget, || {
+            handle_semantic_search(&semantic_request("still_loading", 5), &ctx)
         });
+        let rendered = crate::subc_format::format_response("search", &raw_response, false);
+        let response = response_value(raw_response);
 
         assert!(started.elapsed() >= wait_budget);
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -6113,8 +6112,9 @@ mod tests {
         let text = response["text"].as_str().expect("response text");
         assert!(text.contains(TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE));
         assert!(text.contains("Found 0 match"));
-        assert!(text.contains("(walk)"));
-        assert!(!text.contains("(exhausted)"));
+        // The trailer is the shared formatter's, appended from the wire envelope.
+        assert_eq!(rendered.matches("(walk)").count(), 1, "{rendered}");
+        assert!(!rendered.contains("(exhausted)"));
     }
 
     #[test]
