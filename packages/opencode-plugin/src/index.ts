@@ -30,7 +30,6 @@ import {
   handlePushedPatternMatch,
   handleSubcBgEventsNudge,
   observeOpenCodeBgNotificationEvent,
-  setActiveSessionId,
 } from "./bg-notifications.js";
 import {
   buildConfigTierConfigureParams,

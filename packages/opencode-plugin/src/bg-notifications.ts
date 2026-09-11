@@ -856,8 +856,8 @@ function queueWakeRefire(state: SessionBgState, admission: WakeAdmission): void 
       clearWakeAdmission(state, admission);
       return;
     }
-    if (state.refiredWakeDeliveryIds.has(admission.deliveryID)) return;
     rememberWakeDelivery(state, admission.deliveryID, state.refiredWakeDeliveryIds);
+    admission.refireQueued = false;
     const refireMessageID = wakeMessageID();
     admission.admittedMessageIDs.add(refireMessageID);
     const refireBody = { ...admission.requestBody, messageID: refireMessageID };
@@ -879,6 +879,13 @@ function queueWakeRefire(state: SessionBgState, admission: WakeAdmission): void 
           cause: "idle_without_turn",
           admitted_message_id: refireMessageID,
         });
+        if (state.wakeAdmissions.get(admission.deliveryID) === admission) {
+          admission.confirmationTimer = setTimeout(
+            () => clearWakeAdmission(state, admission),
+            wakeConfirmationWindowMs,
+          );
+          admission.confirmationTimer.unref?.();
+        }
       } catch (err) {
         logWakeAdmissionOutcome(
           admission,
@@ -891,7 +898,6 @@ function queueWakeRefire(state: SessionBgState, admission: WakeAdmission): void 
           },
           "warn",
         );
-      } finally {
         clearWakeAdmission(state, admission);
       }
     })();

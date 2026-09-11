@@ -387,6 +387,62 @@ describe("OpenCode background notifications", () => {
     expect(findTraceEvent("bash_completion_wake_refired")).toBeUndefined();
   });
 
+  test("unrelated assistant message does not confirm an admitted wake", async () => {
+    __setWakeConfirmationWindowForTests(100);
+    observeOpenCodeBgNotificationEvent({
+      type: "session.status",
+      properties: { sessionID: "s1", status: { type: "idle" } },
+    });
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness((command) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-1", "npm test")] }
+        : { success: true, acked_task_ids: ["task-1"] },
+    );
+    const promptAsync = mock(async () => {});
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: makeClient(promptAsync),
+    });
+    await waitForMockCallCount(promptAsync, 1);
+    const admittedMessageID = (promptAsync.mock.calls[0][0] as { body: { messageID: string } }).body
+      .messageID;
+
+    observeOpenCodeBgNotificationEvent({
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "msg-assistant-unrelated",
+          sessionID: "s1",
+          role: "assistant",
+          parentID: "msg-different-parent",
+        },
+      },
+    });
+    expect(findTraceEvent("bash_completion_wake_confirmed")).toBeUndefined();
+
+    observeOpenCodeBgNotificationEvent({
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "msg-assistant-related",
+          sessionID: "s1",
+          role: "assistant",
+          parentID: admittedMessageID,
+        },
+      },
+    });
+    await sleep(125);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(findTraceEvent("bash_completion_wake_confirmed")).toEqual(
+      expect.objectContaining({ assistant_message_id: "msg-assistant-related" }),
+    );
+  });
+
   test("admitted wake confirms from an idle-to-busy edge without refiring", async () => {
     __setWakeConfirmationWindowForTests(50);
     observeOpenCodeBgNotificationEvent({
@@ -421,6 +477,39 @@ describe("OpenCode background notifications", () => {
     expect(findTraceEvent("bash_completion_wake_refired")).toBeUndefined();
   });
 
+  test("busy admission waits for idle instead of refiring at the confirmation timeout", async () => {
+    __setWakeConfirmationWindowForTests(50);
+    observeOpenCodeBgNotificationEvent({
+      type: "session.status",
+      properties: { sessionID: "s1", status: { type: "busy" } },
+    });
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness((command) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-1", "npm test")] }
+        : { success: true, acked_task_ids: ["task-1"] },
+    );
+    const promptAsync = mock(async () => {});
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: makeClient(promptAsync),
+    });
+    await waitForMockCallCount(promptAsync, 1);
+    await sleep(75);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(findTraceEvent("bash_completion_wake_refired")).toBeUndefined();
+
+    observeOpenCodeBgNotificationEvent({
+      type: "session.idle",
+      properties: { sessionID: "s1" },
+    });
+    await waitForMockCallCount(promptAsync, 2);
+  });
+
   test("idle-at-admission timeout refires exactly once per delivery", async () => {
     __setWakeConfirmationWindowForTests(50);
     observeOpenCodeBgNotificationEvent({
@@ -449,6 +538,13 @@ describe("OpenCode background notifications", () => {
     expect(findTraceEvent("bash_completion_wake_refired")).toEqual(
       expect.objectContaining({ delivery_id: expect.any(String) }),
     );
+
+    observeOpenCodeBgNotificationEvent({
+      type: "session.idle",
+      properties: { sessionID: "s1" },
+    });
+    await sleep(25);
+    expect(promptAsync).toHaveBeenCalledTimes(2);
 
     observeOpenCodeBgNotificationEvent({
       type: "message.updated",
