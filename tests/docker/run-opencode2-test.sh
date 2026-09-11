@@ -41,6 +41,7 @@ run_args=(
   --env "AFT_CHECKOUT_SHA=$GIT_SHA"
   --env "AFT_E2E_RUN_ID=$RUN_ID"
   --env "AFT_E2E_RUN_ROOT=/artifacts/$RUN_ID"
+  --env "AFT_E2E_CONCURRENCY=${AFT_E2E_CONCURRENCY:-4}"
 )
 if [[ -n "${AFT_E2E_SCENARIO:-}" ]]; then
   run_args+=(--env "AFT_E2E_SCENARIO=$AFT_E2E_SCENARIO")

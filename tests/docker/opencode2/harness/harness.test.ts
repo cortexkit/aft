@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from 'node:url';
 
+import { mapWithConcurrency, parseE2EConcurrency } from "./concurrency.js";
 import {
   type HostCliContract,
   loadHostCliContract,
@@ -89,6 +90,52 @@ function scenario(toolCall: ToolCallPlan): ScenarioDefinition {
     ],
   };
 }
+
+describe("bounded scenario concurrency", () => {
+  test("defaults to four and rejects invalid worker counts", () => {
+    expect(parseE2EConcurrency(undefined)).toBe(4);
+    expect(parseE2EConcurrency("1")).toBe(1);
+    for (const invalid of ["0", "-1", "1.5", "not-a-number"]) {
+      expect(() => parseE2EConcurrency(invalid)).toThrow("must be a positive integer");
+    }
+  });
+
+  test("caps active work and preserves input order instead of completion order", async () => {
+    const gates = Array.from({ length: 4 }, () => {
+      let release = () => {};
+      const promise = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return { promise, release };
+    });
+    const started: number[] = [];
+    const completed: number[] = [];
+    let active = 0;
+    let maximumActive = 0;
+    const running = mapWithConcurrency(["zero", "one", "two", "three"], 2, async (value, index) => {
+      started.push(index);
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await gates[index].promise;
+      active -= 1;
+      completed.push(index);
+      return value;
+    });
+
+    while (started.length < 2) await Bun.sleep(1);
+    expect(started).toEqual([0, 1]);
+    gates[1].release();
+    while (started.length < 3) await Bun.sleep(1);
+    gates[2].release();
+    while (started.length < 4) await Bun.sleep(1);
+    gates[3].release();
+    gates[0].release();
+
+    expect(await running).toEqual(["zero", "one", "two", "three"]);
+    expect(completed).toEqual([1, 2, 3, 0]);
+    expect(maximumActive).toBe(2);
+  });
+});
 
 async function expectCode(
   action: () => Promise<unknown>,
@@ -742,6 +789,48 @@ describe("tagged disk states and restore", () => {
 });
 
 describe("whole-root asynchronous observation controls", () => {
+  test("concurrent-scenario-root-isolation", async () => {
+    const firstRoot = await root();
+    const secondRoot = await root();
+    const first = new DiskStateObserver(firstRoot, "write/T1/concurrent-first");
+    const second = new DiskStateObserver(secondRoot, "write/T1/concurrent-second");
+    await Promise.all([
+      first.beginCall(call({ disk_effects: ["effect.txt"] })),
+      second.beginCall(call({ disk_effects: ["effect.txt"] })),
+    ]);
+    await Promise.all([
+      writeFile(join(firstRoot, "effect.txt"), "first scenario\n"),
+      writeFile(join(secondRoot, "effect.txt"), "second scenario\n"),
+    ]);
+    await Promise.all([
+      first.checkpointCall("call-1", "tool-result", "result"),
+      second.checkpointCall("call-1", "tool-result", "result"),
+    ]);
+    expect(first.failures).toEqual([]);
+    expect(second.failures).toEqual([]);
+  });
+
+  test("cross-scenario-root-write-is-attributed-to-victim-root", async () => {
+    const writerRoot = await root();
+    const victimRoot = await root();
+    const writer = new DiskStateObserver(writerRoot, "bash/T1/cross-root-writer");
+    const victim = new DiskStateObserver(victimRoot, "write/T1/cross-root-victim");
+    await Promise.all([writer.beginCall(call({ name: "bash" })), victim.beginCall(call())]);
+
+    await writeFile(join(victimRoot, "escaped.txt"), "cross-root effect\n");
+    await writer.checkpointCall("call-1", "tool-result", "result");
+    const error = await expectCode(
+      () => victim.checkpointCall("call-1", "tool-result", "result"),
+      "undeclared_disk_effect",
+    );
+    expect(writer.failures).toEqual([]);
+    expect(error.details).toMatchObject({
+      scenario: "write/T1/cross-root-victim",
+      originating_call: "call-1",
+      path: "escaped.txt",
+    });
+  });
+
   test("ordinary-undeclared-disk-effect", async () => {
     const project = await root();
     const observer = new DiskStateObserver(project, "write/T1/ordinary-control");

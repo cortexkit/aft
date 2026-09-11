@@ -160,6 +160,7 @@ export interface ScenarioResult {
   issue?: string;
   failure?: { code: string; message: string; details?: Record<string, unknown> };
   forensic_dir: string;
+  elapsed_ms?: number;
 }
 
 export interface HarnessValidationContext {

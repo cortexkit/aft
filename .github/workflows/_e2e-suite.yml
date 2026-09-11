@@ -202,6 +202,7 @@ jobs:
     env:
       AFT_E2E_RUN_ID: gha-${{ github.run_id }}-${{ github.run_attempt }}
       AFT_E2E_ARTIFACT_ROOT: /tmp/opencode2-e2e
+      AFT_E2E_CONCURRENCY: "4"
     steps:
       - uses: actions/checkout@v5
 

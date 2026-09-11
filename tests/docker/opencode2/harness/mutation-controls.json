@@ -1,6 +1,8 @@
 {
   "schema_version": 1,
   "controls": [
+    "concurrent-scenario-root-isolation",
+    "cross-scenario-root-write-attributed-to-victim-root",
     "ordinary-undeclared-disk-effect",
     "test-override-undeclared-disk-effect",
     "post-result-undeclared-disk-effect",

@@ -3,6 +3,7 @@ import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { parseE2EConcurrency, mapWithConcurrency } from "./concurrency.js";
 import { loadHostCliContract, loadHostProviderConfigContract } from "./contracts.js";
 import { assertHarnessControlCoverage, runHarnessControlSuite } from "./control-suite.js";
 import { DiskStateObserver, ThreeStateRecorder } from "./disk-state.js";
@@ -66,6 +67,7 @@ interface DriverConfig {
   pluginDirectory: string;
   runRoot: string;
   selector?: string;
+  concurrency: number;
   validateOnly: boolean;
   captureSchemaObservation?: string;
   checkoutSha?: string;
@@ -97,6 +99,7 @@ async function configuration(): Promise<DriverConfig> {
     pluginDirectory: resolve(requiredEnvironment("AFT_OPENCODE2_PLUGIN_DIRECTORY")),
     runRoot,
     selector: process.env.AFT_E2E_SCENARIO ?? argumentValue("--scenario"),
+    concurrency: parseE2EConcurrency(process.env.AFT_E2E_CONCURRENCY),
     validateOnly: process.argv.includes("--validate-only"),
     captureSchemaObservation:
       process.env.AFT_OPENCODE2_SCHEMA_OBSERVATION ?? argumentValue("--capture-schema-observation"),
@@ -402,6 +405,7 @@ async function runOneScenario(options: {
   observedTexts: Record<string, string>;
 }> {
   const { scenario, config } = options;
+  const startedAt = Date.now();
   const hostGeneration = options.hostGeneration ?? "v2";
   const hostExecutable = options.hostExecutable ?? config.hostExecutable;
   const forensicId =
@@ -837,6 +841,7 @@ async function runOneScenario(options: {
       }
     }
   }
+  result.elapsed_ms = Date.now() - startedAt;
   return { result, smokeRan, observedTexts };
 }
 
@@ -919,7 +924,7 @@ function reportTable(
       lines.push(`${row.tool} | ${trajectory} | ${applicability} | ${renderedDisposition}`);
       for (const child of children) {
         lines.push(
-          `  ${child.id} | ${child.status}${child.failure ? ` | ${child.failure.code}` : ""}`,
+          `  ${child.id} | ${child.status}${child.failure ? ` | ${child.failure.code}` : ""} | ${child.elapsed_ms ?? 0}ms`,
         );
       }
     }
@@ -974,6 +979,7 @@ async function main(): Promise<void> {
   const scenarioRoot = join(repoRoot, "tests", "docker", "opencode2", "scenarios");
   const allScenarios = materializeParityScenarios(await loadScenarios(scenarioRoot));
   const scenarios = filterScenarios(allScenarios, config.selector);
+  console.log(`running ${scenarios.length} scenarios with concurrency ${config.concurrency}`);
   const validated = await validateHarnessInputs({
     repoRoot,
     scenarios: allScenarios,
@@ -997,10 +1003,13 @@ async function main(): Promise<void> {
     pinnedHostVersion,
   );
   const pluginVersion = await readPackageVersion();
-  const results: ScenarioResult[] = [];
-  let smokeRan = false;
-  for (const scenario of scenarios) {
+  const smokeScenarioId = scenarios.find(
+    (scenario) => scenario.execution === "shared-server" && scenario.trajectory !== "T7",
+  )?.id;
+  const outcomes = await mapWithConcurrency(scenarios, config.concurrency, async (scenario) => {
+    const startedAt = Date.now();
     let result: ScenarioResult;
+    let smokeRan = false;
     if (scenario.trajectory === "T7") {
       const v2 = await runOneScenario({
         scenario,
@@ -1077,14 +1086,22 @@ async function main(): Promise<void> {
         extensions,
         providerConfig: providerContract.provider_config,
         providerModel: providerContract.model,
-        runSmoke: !smokeRan && scenario.execution === "shared-server",
+        runSmoke: scenario.id === smokeScenarioId,
       });
       result = outcome.result;
-      smokeRan ||= outcome.smokeRan;
+      smokeRan = outcome.smokeRan;
     }
-    results.push(result);
+    result.elapsed_ms = Date.now() - startedAt;
+    return { result, smokeRan };
+  });
+  const orderedOutcomes = outcomes.toSorted((left, right) =>
+    left.result.id.localeCompare(right.result.id),
+  );
+  const results = orderedOutcomes.map((outcome) => outcome.result);
+  const smokeRan = orderedOutcomes.some((outcome) => outcome.smokeRan);
+  for (const result of results) {
     if (result.status === "failed") {
-      console.error(`FAIL ${scenario.id}: ${result.failure?.message}`);
+      console.error(`FAIL ${result.id}: ${result.failure?.message}`);
       console.error(`forensics: ${result.forensic_dir}`);
     }
   }
@@ -1095,7 +1112,10 @@ async function main(): Promise<void> {
     ? reportTable(validated.matrix, results, config.selector)
     : {
         text: results
-          .map((result) => `${result.id} | ${result.status}${result.failure ? ` | ${result.failure.code}` : ""}`)
+          .map(
+            (result) =>
+              `${result.id} | ${result.status}${result.failure ? ` | ${result.failure.code}` : ""} | ${result.elapsed_ms ?? 0}ms`,
+          )
           .join("\n"),
         failed: results.some((result) => result.status === "failed" && !result.issue),
       };
@@ -1105,7 +1125,7 @@ async function main(): Promise<void> {
     join(config.runRoot, "report.json"),
     `${JSON.stringify({ pinned_host_version: pinnedHostVersion, results }, null, 2)}\n`,
   );
-  if (report.failed) process.exitCode = 1;
+  process.exit(report.failed ? 1 : 0);
 }
 
 main().catch((error) => {

@@ -9,7 +9,7 @@ ARG CARGO_PROFILE=release
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
-COPY benchmarks/aft-search/engine-fixtures/plan-table.json benchmarks/aft-search/engine-fixtures/plan-table.json
+COPY benchmarks/aft-search/engine-fixtures/*.json benchmarks/aft-search/engine-fixtures/
 RUN test -n "$AFT_GIT_SHA" && cargo build --locked --profile "$CARGO_PROFILE" -p agent-file-tools
 RUN mkdir -p /out && cp "/build/target/$CARGO_PROFILE/aft" /out/aft.real && \
     printf '%s\n' \

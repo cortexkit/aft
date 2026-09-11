@@ -55,7 +55,7 @@ async function expectFailure(
     return {
       control,
       expected,
-      observed: error.message,
+      observed: `${error.message}${typeof error.details.scenario === "string" ? ` scenario=${error.details.scenario}` : ""}`,
       outcome: "passed",
       unaffected_positive_control: unaffectedPositiveControl,
     };
@@ -150,6 +150,55 @@ export async function assertHarnessControlCoverage(
 export async function runHarnessControlSuite(root: string): Promise<HarnessControlEvidence[]> {
   await mkdir(root, { recursive: true });
   const evidence: HarnessControlEvidence[] = [];
+
+  {
+    const firstRoot = await freshProject(root, "concurrent-first");
+    const secondRoot = await freshProject(root, "concurrent-second");
+    const first = new DiskStateObserver(firstRoot, "write/T1/concurrent-first");
+    const second = new DiskStateObserver(secondRoot, "write/T1/concurrent-second");
+    await Promise.all([
+      first.beginCall(call({ disk_effects: ["effect.txt"] })),
+      second.beginCall(call({ disk_effects: ["effect.txt"] })),
+    ]);
+    await Promise.all([
+      writeFile(join(firstRoot, "effect.txt"), "first scenario\n"),
+      writeFile(join(secondRoot, "effect.txt"), "second scenario\n"),
+    ]);
+    await Promise.all([
+      first.checkpointCall("control-call", "tool-result", "result"),
+      second.checkpointCall("control-call", "tool-result", "result"),
+    ]);
+    evidence.push({
+      control: "concurrent-scenario-root-isolation",
+      expected: "pass",
+      observed: "pass",
+      outcome: "passed",
+    });
+  }
+
+  {
+    const writerRoot = await freshProject(root, "cross-root-writer");
+    const victimRoot = await freshProject(root, "cross-root-victim");
+    const writer = new DiskStateObserver(writerRoot, "bash/T1/cross-root-writer");
+    const victim = new DiskStateObserver(victimRoot, "write/T1/cross-root-victim");
+    await Promise.all([
+      writer.beginCall(call({ name: "bash" })),
+      victim.beginCall(call()),
+    ]);
+    await writeFile(join(victimRoot, "escaped.txt"), "cross-root effect\n");
+    await writer.checkpointCall("control-call", "tool-result", "result");
+    evidence.push(
+      await expectFailure(
+        "cross-scenario-root-write-attributed-to-victim-root",
+        "undeclared_disk_effect",
+        () => victim.checkpointCall("control-call", "tool-result", "result"),
+        "concurrent-scenario-root-isolation",
+      ),
+    );
+    if (writer.failures.length > 0) {
+      throw new Error("the writer observer consumed a sibling root's disk effect");
+    }
+  }
 
   {
     const project = await freshProject(root, "ordinary");
