@@ -1,0 +1,11 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/tests/integration/aft_search_contract_test.rs",
+    "crates/aft/tests/engine_exact_test.rs"
+  ],
+  "slices": ["external-path-search-through-engine", "wait-off-worker", "wake-admitted-vs-scheduled"]
+}
