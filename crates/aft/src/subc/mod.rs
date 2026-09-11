@@ -2445,6 +2445,10 @@ enum ModuleLoopExit {
     /// The connection ended without a Goodbye. Indexes still flush, but the
     /// process must exit non-zero so the supervisor restarts it.
     ConnectionLost,
+    /// An actor went fatal (worker panic on a mutating job) and the loop tore
+    /// the module down. Index flushes are skipped because the state that
+    /// panicked cannot be trusted, and the process exits non-zero for the
+    /// same reason as `ConnectionLost`.
     SkipSearchFlush,
 }
 
@@ -2530,10 +2534,39 @@ fn run_subc_mode_inner(
     }
 
     match loop_result {
-        Ok(ModuleLoopExit::ConnectionLost) => Err(SubcError::ConnectionLost),
-        Ok(_) => Ok(()),
+        Ok(exit) => module_loop_exit_result(exit),
         Err(error) => Err(error),
     }
+}
+
+/// Maps how the module loop ended onto the process outcome the supervisor
+/// reads. Only a daemon-requested stop may exit 0: the supervisor never
+/// respawns a clean exit, so every other ending must surface as an error.
+fn module_loop_exit_result(exit: ModuleLoopExit) -> Result<(), SubcError> {
+    match exit {
+        ModuleLoopExit::Graceful => Ok(()),
+        ModuleLoopExit::ConnectionLost => Err(SubcError::ConnectionLost),
+        ModuleLoopExit::SkipSearchFlush => Err(SubcError::ActorFatal),
+    }
+}
+
+/// Records a fatal panic response in the module log before the teardown it
+/// triggers. The panic text otherwise lives only in the error frame sent to
+/// the caller, which leaves the crash undiagnosable from the host afterwards.
+fn note_fatal_panic_response(response: &Response) -> bool {
+    let fatal = response_is_fatal_panic(response);
+    if fatal {
+        log::error!(
+            "subc attach: request {} returned a fatal panic response; tearing the module down: {}",
+            response.id,
+            response
+                .data
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("(no message)")
+        );
+    }
+    fatal
 }
 
 fn flush_actor_indexes_on_graceful_shutdown(actor_contexts: &[Arc<AppContext>]) {
@@ -5703,7 +5736,7 @@ async fn handle_tool_call(
                         return;
                     }
                     let result = ToolCallResult { text, response };
-                    let fatal = response_is_fatal_panic(&result.response);
+                    let fatal = note_fatal_panic_response(&result.response);
                     match build_tool_response_frame_with_limit(
                         ver,
                         route,
@@ -5871,7 +5904,7 @@ async fn handle_tool_call(
             return;
         }
         let result = ToolCallResult { text, response };
-        let fatal = response_is_fatal_panic(&result.response);
+        let fatal = note_fatal_panic_response(&result.response);
         match build_tool_response_frame_with_limit(
             ver,
             route,
@@ -6102,7 +6135,7 @@ async fn deliver_resolved_subc_response(
         Some(&finalizer),
         Some(&mut entry.phase_trace),
     );
-    let fatal = response_is_fatal_panic(&result.response);
+    let fatal = note_fatal_panic_response(&result.response);
     let response_frame = build_tool_response_frame_with_limit(
         entry.ver,
         entry.route,
@@ -7127,6 +7160,30 @@ mod tests {
     };
     use super::*;
     use crate::bash_background::BgTaskStatus;
+
+    /// Only a daemon-requested stop may exit 0. The supervisor never respawns
+    /// a clean exit, so a fatal-actor teardown that mapped to Ok(()) left the
+    /// module down host-wide until a manual start (2026-09-11).
+    #[test]
+    fn only_a_graceful_goodbye_maps_to_a_clean_exit() {
+        assert!(module_loop_exit_result(ModuleLoopExit::Graceful).is_ok());
+        assert!(matches!(
+            module_loop_exit_result(ModuleLoopExit::ConnectionLost),
+            Err(SubcError::ConnectionLost)
+        ));
+        assert!(matches!(
+            module_loop_exit_result(ModuleLoopExit::SkipSearchFlush),
+            Err(SubcError::ActorFatal)
+        ));
+    }
+
+    #[test]
+    fn fatal_panic_responses_are_detected_and_noted() {
+        let panic = Response::error("req-fatal", "actor_fatal", "start byte index 7 is not a char boundary");
+        assert!(note_fatal_panic_response(&panic));
+        let ordinary = Response::error("req-ok", "invalid_request", "missing field");
+        assert!(!note_fatal_panic_response(&ordinary));
+    }
 
     fn attach_error(kind: io::ErrorKind) -> SubcError {
         SubcError::Connect {

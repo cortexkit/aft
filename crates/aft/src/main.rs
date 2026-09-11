@@ -34,6 +34,9 @@ use std::time::{Duration, Instant};
 /// the supervisor respawns the module (it reads exit 0 as a stop request and
 /// never respawns), distinct from 1 (attach/auth failure) and 2 (usage).
 const SUBC_CONNECTION_LOST_EXIT_CODE: i32 = 3;
+/// Distinct from a lost connection so the supervisor's ledger separates "the
+/// daemon went away" from "a worker panicked"; both must respawn.
+const SUBC_ACTOR_FATAL_EXIT_CODE: i32 = 4;
 
 /// Parse `--subc <connection-file>` / `--subc=<path>` from argv. Returns `None`
 /// when absent (standalone mode). The presence of the flag is the subc-mode
@@ -212,6 +215,12 @@ fn main() {
                     "subc connection lost after attach; exiting for supervisor restart"
                 );
                 std::process::exit(SUBC_CONNECTION_LOST_EXIT_CODE);
+            }
+            Err(aft::subc::SubcError::ActorFatal) => {
+                aft::slog_error!(
+                    "executor actor went fatal after attach; exiting for supervisor restart"
+                );
+                std::process::exit(SUBC_ACTOR_FATAL_EXIT_CODE);
             }
             Err(error) => {
                 aft::slog_error!("subc attach failed: {error}");

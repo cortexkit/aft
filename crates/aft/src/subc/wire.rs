@@ -867,6 +867,13 @@ pub enum SubcError {
     /// supervisor restarts it, because the supervisor reads exit 0 as "asked
     /// to stop" and never respawns (fleet-wide outage 2026-09-06, 4.5 h).
     ConnectionLost,
+    /// A worker panicked on a mutating job and the executor marked its actor
+    /// fatal; the module tore itself down. Like `ConnectionLost` this must
+    /// exit non-zero: the first such teardown (2026-09-11, a search-lane
+    /// panic) exited 0, the supervisor read it as "stopped on request", and
+    /// every seat on the host lost its tools until an operator ran a manual
+    /// start.
+    ActorFatal,
     HelloRejected {
         body: Option<ErrorBody>,
     },
@@ -915,6 +922,10 @@ impl fmt::Display for SubcError {
             Self::ConnectionLost => write!(
                 f,
                 "subc daemon connection ended without a channel-0 Goodbye; exiting for supervisor restart"
+            ),
+            Self::ActorFatal => write!(
+                f,
+                "an executor actor panicked and the module tore itself down; exiting for supervisor restart"
             ),
             Self::HelloRejected { body } => match body {
                 Some(b) => write!(f, "subc rejected ModuleHello: {} ({})", b.code, b.message),
