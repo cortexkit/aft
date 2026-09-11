@@ -106,6 +106,7 @@ mod parser_test;
 mod pascal_test;
 mod pins_gc_test;
 mod preview_diff_test;
+mod profile_memory_test;
 mod protocol_test;
 mod publication_cas_test;
 mod quarto_test;
