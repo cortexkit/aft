@@ -241,7 +241,8 @@
           "owner": "glob",
           "call_id": "glob-t6-glob-payload-files-incomplete",
           "fixture": "incomplete",
-          "triggered_reason": "cap"
+          "triggered_reason": "cap",
+          "expected_trailer": "shown 5 of ≥140 files (cap) · narrow: path"
         }
       }
     }

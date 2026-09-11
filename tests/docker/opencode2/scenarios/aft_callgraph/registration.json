@@ -249,7 +249,8 @@
           "owner": "callgraph",
           "call_id": "callgraph-t6-callgraph-impact-payload-sites-incomplete",
           "fixture": "incomplete",
-          "triggered_reason": "depth"
+          "triggered_reason": "depth",
+          "expected_trailer": "shown 1 of ≥1 sites (depth) · narrow: depth, includeTests"
         }
       }
     },
@@ -356,7 +357,8 @@
           "owner": "callgraph",
           "call_id": "callgraph-t6-callgraph-callers-payload-callers-incomplete",
           "fixture": "incomplete",
-          "triggered_reason": "depth"
+          "triggered_reason": "depth",
+          "expected_trailer": "shown 1 of ≥1 items (depth) · narrow: depth, includeTests"
         }
       }
     },
@@ -463,7 +465,8 @@
           "owner": "callgraph",
           "call_id": "callgraph-t6-callgraph-call-tree-payload-tree-incomplete",
           "fixture": "incomplete",
-          "triggered_reason": "depth"
+          "triggered_reason": "depth",
+          "expected_trailer": "shown 1 of ≥1 items (depth) · narrow: depth, includeTests"
         }
       }
     },
@@ -570,7 +573,8 @@
           "owner": "callgraph",
           "call_id": "callgraph-t6-callgraph-trace-to-payload-paths-incomplete",
           "fixture": "incomplete",
-          "triggered_reason": "depth"
+          "triggered_reason": "depth",
+          "expected_trailer": "shown 0 of ≥0 paths (depth) · narrow: depth, includeTests"
         }
       }
     },
@@ -649,7 +653,7 @@
                 "arguments": {
                   "op": "trace_data",
                   "path": "sample.ts",
-                  "symbol": "root",
+                  "symbol": "dataRoot",
                   "expression": "value",
                   "depth": 1
                 },
@@ -679,7 +683,8 @@
           "owner": "callgraph",
           "call_id": "callgraph-t6-callgraph-trace-data-payload-hops-incomplete",
           "fixture": "incomplete",
-          "triggered_reason": "depth"
+          "triggered_reason": "depth",
+          "expected_trailer": "shown 1 of ≥1 hops (depth) · narrow: depth"
         }
       }
     }

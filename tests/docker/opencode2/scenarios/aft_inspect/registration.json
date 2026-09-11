@@ -267,7 +267,8 @@
           "owner": "inspect",
           "call_id": "inspect-t6-inspect-payload-details-incomplete",
           "fixture": "incomplete",
-          "triggered_reason": "cap"
+          "triggered_reason": "cap",
+          "expected_trailer": "shown 1 of 100 items (cap) · narrow: topK, scope, sections"
         }
       }
     }

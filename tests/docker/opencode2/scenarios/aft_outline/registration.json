@@ -214,7 +214,7 @@
                 "id": "outline-t6-outline-files-payload-files-incomplete",
                 "name": "aft_outline",
                 "arguments": {
-                  "target": "bulk",
+                  "target": ".",
                   "files": true
                 },
                 "non_mutating_evidence": {
@@ -243,7 +243,8 @@
           "owner": "outline",
           "call_id": "outline-t6-outline-files-payload-files-incomplete",
           "fixture": "incomplete",
-          "triggered_reason": "budget"
+          "triggered_reason": "budget",
+          "expected_trailer": "shown 6 of 116 files (budget) · narrow: path"
         }
       }
     }

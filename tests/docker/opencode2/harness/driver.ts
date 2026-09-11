@@ -28,7 +28,7 @@ import {
 import { readPinnedHostVersion } from "./pin.js";
 import { ProcessObserver } from "./process-observer.js";
 import { AftTaskProbe } from "./task-probe.js";
-import { assertComparison, projectText, TRUNCATION_TRAILER_PATTERN } from "./projection.js";
+import { assertComparison, assertT6Trailer, projectText } from "./projection.js";
 import { verifyExecutableProvenance } from "./provenance.js";
 import { filterScenarios, loadScenarios, materializeParityScenarios } from "./scenario-loader.js";
 import {
@@ -297,29 +297,6 @@ function assertT2ProductContract(
   }
   if (typeof steeringPattern !== "string" || !new RegExp(steeringPattern).test(text)) {
     throw new Error(`${scenario.id}: agent-visible text does not match steering pattern`);
-  }
-}
-
-function assertT6Trailer(scenario: ScenarioDefinition, call: ToolCallPlan, text: string): void {
-  const t6 = asRecord(scenario.metadata?.t6);
-  if (!t6) return;
-  const subjectCall = t6.call_id ?? scenario.compare_call_id;
-  if (subjectCall !== call.id) return;
-  const matches = [...text.matchAll(new RegExp(TRUNCATION_TRAILER_PATTERN, "gm"))];
-  if (t6.fixture === "complete" && matches.length !== 0) {
-    throw new Error(`${scenario.id}: complete T6 fixture rendered a truncation trailer`);
-  }
-  if (t6.fixture === "incomplete") {
-    if (matches.length !== 1) {
-      throw new Error(`${scenario.id}: incomplete T6 fixture rendered ${matches.length} trailers`);
-    }
-    if (matches[0].groups?.reason !== t6.triggered_reason) {
-      throw new Error(
-        `${scenario.id}: trailer reason ${String(matches[0].groups?.reason)} does not equal ${String(
-          t6.triggered_reason,
-        )}`,
-      );
-    }
   }
 }
 

@@ -244,7 +244,8 @@
           "owner": "search",
           "call_id": "search-t6-search-payload-results-incomplete",
           "fixture": "incomplete",
-          "triggered_reason": "cap"
+          "triggered_reason": "cap",
+          "expected_trailer": "shown 1 of ≥2 results (cap) · narrow: topK, path, includeTests"
         }
       }
     }

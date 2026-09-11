@@ -29,7 +29,7 @@ import {
   observeThenRespond,
   toolResultForCall,
 } from "./mock-server.js";
-import { projectText, TRUNCATION_TRAILER_PATTERN } from "./projection.js";
+import { assertT6Trailer, projectText, TRUNCATION_TRAILER_PATTERN } from "./projection.js";
 import { verifyExecutableProvenance } from "./provenance.js";
 import {
   addCallgraphWarmup,
@@ -46,6 +46,7 @@ import {
   deriveV2HarnessProjection,
   loadToolSchemas,
   validateHarnessInputs,
+  validateT6,
   validateInventory,
   validateMutatingDeclarations,
 } from "./validation.js";
@@ -260,6 +261,39 @@ describe("scenario isolation and liveness", () => {
       "shown 5 of ≥140 files (cap) · narrow: path",
     );
     expect(match?.groups).toMatchObject({ shown: "5", total: "140", reason: "cap" });
+  });
+
+  test("T6 requires the product-rendered trailer line byte for byte", () => {
+    const fixture = scenario(call({ id: "t6", name: "glob", arguments: {} }));
+    fixture.id = "glob/T6/incomplete";
+    fixture.tool = "glob";
+    fixture.trajectory = "T6";
+    fixture.metadata = {
+      t6: {
+        fixture: "incomplete",
+        call_id: "t6",
+        triggered_reason: "cap",
+        expected_trailer: "shown 5 of ≥140 files (cap) · narrow: path",
+      },
+    };
+    expect(() =>
+      assertT6Trailer(
+        fixture,
+        fixture.turns[0].response.kind === "tool_calls"
+          ? fixture.turns[0].response.calls[0]
+          : call(),
+        "files\nshown 5 of ≥140 files (cap) · narrow: path",
+      ),
+    ).not.toThrow();
+    expect(() =>
+      assertT6Trailer(
+        fixture,
+        fixture.turns[0].response.kind === "tool_calls"
+          ? fixture.turns[0].response.calls[0]
+          : call(),
+        "files\nshown 5 of ≥141 files (cap) · narrow: path",
+      ),
+    ).toThrow("does not exactly equal");
   });
 
   test("shape projection refuses unparsed agent-visible text", () => {
@@ -580,6 +614,26 @@ describe("source-of-truth derivation", () => {
     expect(
       surfaces.find((surface) => surface.id === "outline.files.payload.files")?.reasons,
     ).toEqual(["budget", "walk"]);
+    expect(surfaces.find((surface) => surface.id === "grep..payload.matches")).toMatchObject({
+      unit: "rows",
+      narrow: ["path", "include", "exclude"],
+    });
+    const matrix = JSON.parse(
+      await readFile(join(repo, "tests/docker/opencode2/matrix/applicability.json"), "utf8"),
+    );
+    const scenarios = materializeParityScenarios(
+      await loadScenarios(join(repo, "tests/docker/opencode2/scenarios")),
+    );
+    const incompatibleGlob = scenarios.find(
+      (candidate) => candidate.id === "glob/T6/glob-payload-files/incomplete",
+    );
+    if (!incompatibleGlob) throw new Error("incomplete glob fixture missing");
+    incompatibleGlob.metadata = structuredClone(incompatibleGlob.metadata);
+    (incompatibleGlob.metadata?.t6 as Record<string, unknown>).expected_trailer =
+      "shown 5 of ≥140 files (cap) · narrow: include";
+    expect(() => validateT6(matrix, scenarios, surfaces)).toThrow(
+      "expected trailer disagrees with the registry",
+    );
   });
 
   test("mutating tools derive from product permission metadata in both directions", async () => {

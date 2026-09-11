@@ -1,5 +1,12 @@
 import { fail } from "./errors.js";
-import type { ProjectionRule, ProjectionTypeMap, ScenarioComparison } from "./types.js";
+import type {
+  ProjectionRule,
+  ProjectionTypeMap,
+  ScenarioComparison,
+  ScenarioDefinition,
+  ToolCallPlan,
+} from "./types.js";
+import { asRecord } from "./util.js";
 
 export const TRUNCATION_TRAILER_PATTERN =
   "^shown (?<shown>\\d+) of (?:≥)?(?<total>\\d+) (?<unit>[^ ]+) \\((?<reason>cap|depth|budget|walk)\\) · narrow: (?<narrow>.+)$";
@@ -86,6 +93,42 @@ export function projectText(
     }
   }
   return projected;
+}
+
+export function assertT6Trailer(
+  scenario: ScenarioDefinition,
+  call: ToolCallPlan,
+  text: string,
+): void {
+  const t6 = asRecord(scenario.metadata?.t6);
+  if (!t6) return;
+  const subjectCall = t6.call_id ?? scenario.compare_call_id;
+  if (subjectCall !== call.id) return;
+  const matches = [...text.matchAll(new RegExp(TRUNCATION_TRAILER_PATTERN, "gm"))];
+  if (t6.fixture === "complete" && matches.length !== 0) {
+    throw new Error(`${scenario.id}: complete T6 fixture rendered a truncation trailer`);
+  }
+  if (t6.fixture === "incomplete") {
+    if (matches.length !== 1) {
+      throw new Error(`${scenario.id}: incomplete T6 fixture rendered ${matches.length} trailers`);
+    }
+    if (matches[0].groups?.reason !== t6.triggered_reason) {
+      throw new Error(
+        `${scenario.id}: trailer reason ${String(matches[0].groups?.reason)} does not equal ${String(
+          t6.triggered_reason,
+        )}`,
+      );
+    }
+    if (t6.expected_trailer !== undefined) {
+      if (typeof t6.expected_trailer !== "string" || matches[0][0] !== t6.expected_trailer) {
+        throw new Error(
+          `${scenario.id}: trailer ${JSON.stringify(matches[0][0])} does not exactly equal ${JSON.stringify(
+            t6.expected_trailer,
+          )}`,
+        );
+      }
+    }
+  }
 }
 
 export function assertComparison(actual: string, comparison: ScenarioComparison): void {

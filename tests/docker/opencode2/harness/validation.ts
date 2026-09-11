@@ -8,6 +8,7 @@ import {
 } from "./contracts.js";
 import { fail } from "./errors.js";
 import { readPermissionAskInventory, validatePermissionInventory } from "./inventory.js";
+import { TRUNCATION_TRAILER_PATTERN } from "./projection.js";
 import type {
   HarnessValidationContext,
   ScenarioDefinition,
@@ -36,6 +37,8 @@ export interface ListSurface {
   mode: string;
   list_id: string;
   owner: string;
+  unit: string;
+  narrow: string[];
   reasons: string[];
 }
 
@@ -400,15 +403,23 @@ export async function deriveListSurfaces(repoRoot: string): Promise<ListSurface[
         true,
       );
     }
+    const unit = body.match(/unit:\s*Unit::([A-Za-z]+)/)?.[1]?.toLowerCase();
+    const narrowBody = body.match(/narrow:\s*&\[(?<narrow>[^\]]*)\]/)?.groups?.narrow;
     const reasons = [...body.matchAll(/reason:\s*Reason::(Cap|Depth|Budget|Walk)/g)].map((match) =>
       match[1].toLowerCase(),
     );
+    if (unit === undefined || narrowBody === undefined) {
+      fail("matrix_invalid", "LIST_SURFACES render contract is incomplete", { entry: body.slice(0, 200) });
+    }
+    const narrow = [...narrowBody.matchAll(/"([^"]+)"/g)].map((match) => match[1]);
     return {
       id: `${command}.${mode}.${listId}`,
       command,
       mode,
       list_id: listId,
       owner: ownerForCommand(command),
+      unit,
+      narrow,
       reasons,
     };
   });
@@ -508,7 +519,7 @@ async function validateRequiredCheckRecord(
   return complete ? "MET" : "NOT MET (advisory only)";
 }
 
-function validateT6(
+export function validateT6(
   matrix: ApplicabilityMatrix,
   scenarios: readonly ScenarioDefinition[],
   surfaces: readonly ListSurface[],
@@ -566,6 +577,27 @@ function validateT6(
         (typeof reason !== "string" || !surface.reasons.includes(reason))
       ) {
         fail("matrix_invalid", `${surface.id} does not support reason ${String(reason)}`);
+      }
+      const fixtureKind = fixture.t6?.fixture;
+      const expectedTrailer = fixture.t6?.expected_trailer;
+      if (fixtureKind === "complete" && expectedTrailer !== undefined) {
+        fail("matrix_invalid", `${fixture.scenario.id} complete fixture must not expect a trailer`);
+      }
+      if (fixtureKind === "incomplete" && surface.owner !== "bash") {
+        if (typeof expectedTrailer !== "string") {
+          fail("matrix_invalid", `${fixture.scenario.id} must declare its exact expected trailer`);
+        }
+        const match = new RegExp(TRUNCATION_TRAILER_PATTERN).exec(expectedTrailer);
+        if (!match || match[0] !== expectedTrailer) {
+          fail("matrix_invalid", `${fixture.scenario.id} expected trailer is not canonical`);
+        }
+        if (
+          match.groups?.reason !== reason ||
+          match.groups?.unit !== surface.unit ||
+          match.groups?.narrow !== surface.narrow.join(", ")
+        ) {
+          fail("matrix_invalid", `${fixture.scenario.id} expected trailer disagrees with the registry`);
+        }
       }
     }
     const kinds = new Set(fixtures.map(({ t6 }) => t6?.fixture));
