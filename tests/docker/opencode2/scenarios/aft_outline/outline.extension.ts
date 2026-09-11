@@ -1,4 +1,4 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { HarnessExtension, HarnessValidationContext, ScenarioLifecycleContext } from "../../harness/types.js";
@@ -17,7 +17,29 @@ async function validate(context: HarnessValidationContext): Promise<void> {
   const controls = JSON.parse(await readFile(join(here, "mutation-controls.json"), "utf8"));
   if (!Array.isArray(controls.controls) || controls.controls.length < 3) throw new Error("outline" + " mutation controls missing");
 }
+const BUDGET_SCENARIO_ID = "outline/T6/outline-files-payload-files/incomplete";
+// The budget row needs enough rendered outline bytes to cross the 30 KB
+// budget, and a directory of many short-named files would just roll up into
+// one row, so the file NAMES carry the bulk. Those names make checkout paths
+// longer than Windows MAX_PATH, and a committed fixture that cannot be checked
+// out fails every Windows job before it builds; so the bulk is generated into
+// the isolated scenario root (Linux container) instead of living in git.
+const BUDGET_BULK_FILES = 110;
+const BUDGET_BULK_NAME_PAD = "x".repeat(215);
+async function writeBudgetBulk(projectRoot: string): Promise<void> {
+  const dir = join(projectRoot, "source-bulk");
+  await mkdir(dir, { recursive: true });
+  for (let index = 0; index < BUDGET_BULK_FILES; index += 1) {
+    const ordinal = String(index).padStart(3, "0");
+    await writeFile(
+      join(dir, `budget-source-${ordinal}-${BUDGET_BULK_NAME_PAD}.ts`),
+      `export const fixture${index} = ${index};\n`,
+    );
+  }
+}
+
 async function beforeScenario(context: ScenarioLifecycleContext): Promise<void> {
+  if (context.scenario.id === BUDGET_SCENARIO_ID) await writeBudgetBulk(context.project_root);
   if (!context.scenario.id.endsWith("_config_deny")) return;
   const path = join(dirname(context.project_root), "xdg-config", "opencode", "opencode.json");
   const config = JSON.parse(await readFile(path, "utf8"));
