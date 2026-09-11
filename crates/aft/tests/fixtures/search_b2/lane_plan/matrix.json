@@ -1,0 +1,2454 @@
+[
+  {
+    "query_class": "identifier/long",
+    "readiness": "111",
+    "query": "parse_header",
+    "shape": "identifier",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 1,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "symbol",
+      "lexical",
+      "variants"
+    ],
+    "executed_callbacks": [
+      "symbol",
+      "lexical",
+      "variants"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "identifier/long",
+    "readiness": "110",
+    "query": "parse_header",
+    "shape": "identifier",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 1,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "lexical",
+      "variants"
+    ],
+    "executed_callbacks": [
+      "lexical",
+      "variants",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "symbol cache disabled; definition-first skipped"
+    ]
+  },
+  {
+    "query_class": "identifier/long",
+    "readiness": "101",
+    "query": "parse_header",
+    "shape": "identifier",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 1,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "symbol"
+    ],
+    "executed_callbacks": [
+      "symbol",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "identifier/long",
+    "readiness": "100",
+    "query": "parse_header",
+    "shape": "identifier",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 1,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "fallback_walk"
+    ],
+    "executed_callbacks": [
+      "fallback_walk",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped",
+      "symbol cache disabled; definition-first skipped"
+    ]
+  },
+  {
+    "query_class": "identifier/long",
+    "readiness": "011",
+    "query": "parse_header",
+    "shape": "identifier",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 1,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "symbol",
+      "lexical",
+      "variants"
+    ],
+    "executed_callbacks": [
+      "symbol",
+      "lexical",
+      "variants"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "identifier/long",
+    "readiness": "010",
+    "query": "parse_header",
+    "shape": "identifier",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 1,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "lexical",
+      "variants"
+    ],
+    "executed_callbacks": [
+      "lexical",
+      "variants",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "symbol cache disabled; definition-first skipped"
+    ]
+  },
+  {
+    "query_class": "identifier/long",
+    "readiness": "001",
+    "query": "parse_header",
+    "shape": "identifier",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 1,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "symbol"
+    ],
+    "executed_callbacks": [
+      "symbol",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "identifier/long",
+    "readiness": "000",
+    "query": "parse_header",
+    "shape": "identifier",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 1,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "fallback_walk"
+    ],
+    "executed_callbacks": [
+      "fallback_walk",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped",
+      "symbol cache disabled; definition-first skipped"
+    ]
+  },
+  {
+    "query_class": "short/long",
+    "readiness": "111",
+    "query": "character cap",
+    "shape": "short",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 2,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "character cap",
+    "exact_mode": "ready",
+    "lanes_run": [
+      "symbol",
+      "exact",
+      "lexical",
+      "variants",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "symbol",
+      "exact",
+      "lexical",
+      "variants",
+      "semantic"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "short/long",
+    "readiness": "110",
+    "query": "character cap",
+    "shape": "short",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 2,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "character cap",
+    "exact_mode": "ready",
+    "lanes_run": [
+      "exact",
+      "lexical",
+      "variants",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical",
+      "variants",
+      "semantic",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "symbol cache disabled; definition-first skipped"
+    ]
+  },
+  {
+    "query_class": "short/long",
+    "readiness": "101",
+    "query": "character cap",
+    "shape": "short",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 2,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "character cap",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "symbol",
+      "exact",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "symbol",
+      "exact",
+      "semantic",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "short/long",
+    "readiness": "100",
+    "query": "character cap",
+    "shape": "short",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 2,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "character cap",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "semantic",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped",
+      "symbol cache disabled; definition-first skipped"
+    ]
+  },
+  {
+    "query_class": "short/long",
+    "readiness": "011",
+    "query": "character cap",
+    "shape": "short",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 2,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "character cap",
+    "exact_mode": "ready",
+    "lanes_run": [
+      "symbol",
+      "exact",
+      "lexical",
+      "variants"
+    ],
+    "executed_callbacks": [
+      "symbol",
+      "exact",
+      "lexical",
+      "variants",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "short/long",
+    "readiness": "010",
+    "query": "character cap",
+    "shape": "short",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 2,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "character cap",
+    "exact_mode": "ready",
+    "lanes_run": [
+      "exact",
+      "lexical",
+      "variants"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical",
+      "variants",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "symbol cache disabled; definition-first skipped",
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "short/long",
+    "readiness": "001",
+    "query": "character cap",
+    "shape": "short",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 2,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "character cap",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "symbol",
+      "exact"
+    ],
+    "executed_callbacks": [
+      "symbol",
+      "exact",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped",
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "short/long",
+    "readiness": "000",
+    "query": "character cap",
+    "shape": "short",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 2,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "character cap",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped",
+      "symbol cache disabled; definition-first skipped",
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "short/tiny",
+    "readiness": "111",
+    "query": "a b",
+    "shape": "short",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "a b",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "symbol",
+      "exact",
+      "lexical",
+      "variants",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "symbol",
+      "exact",
+      "lexical",
+      "variants",
+      "semantic"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "short/tiny",
+    "readiness": "110",
+    "query": "a b",
+    "shape": "short",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "a b",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact",
+      "lexical",
+      "variants",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical",
+      "variants",
+      "semantic",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "symbol cache disabled; definition-first skipped"
+    ]
+  },
+  {
+    "query_class": "short/tiny",
+    "readiness": "101",
+    "query": "a b",
+    "shape": "short",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "a b",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "symbol",
+      "exact",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "symbol",
+      "exact",
+      "semantic",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "short/tiny",
+    "readiness": "100",
+    "query": "a b",
+    "shape": "short",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "a b",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "semantic",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped",
+      "symbol cache disabled; definition-first skipped"
+    ]
+  },
+  {
+    "query_class": "short/tiny",
+    "readiness": "011",
+    "query": "a b",
+    "shape": "short",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "a b",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "symbol",
+      "exact",
+      "lexical",
+      "variants"
+    ],
+    "executed_callbacks": [
+      "symbol",
+      "exact",
+      "lexical",
+      "variants",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "short/tiny",
+    "readiness": "010",
+    "query": "a b",
+    "shape": "short",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "a b",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact",
+      "lexical",
+      "variants"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical",
+      "variants",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "symbol cache disabled; definition-first skipped",
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "short/tiny",
+    "readiness": "001",
+    "query": "a b",
+    "shape": "short",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "a b",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "symbol",
+      "exact"
+    ],
+    "executed_callbacks": [
+      "symbol",
+      "exact",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped",
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "short/tiny",
+    "readiness": "000",
+    "query": "a b",
+    "shape": "short",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "a b",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped",
+      "symbol cache disabled; definition-first skipped",
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "code_literal/long",
+    "readiness": "111",
+    "query": "\"exceeds the cap\"",
+    "shape": "code_literal",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 3,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "exceeds the cap",
+    "exact_mode": "ready",
+    "lanes_run": [
+      "exact",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "code_literal/long",
+    "readiness": "110",
+    "query": "\"exceeds the cap\"",
+    "shape": "code_literal",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 3,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "exceeds the cap",
+    "exact_mode": "ready",
+    "lanes_run": [
+      "exact",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "code_literal/long",
+    "readiness": "101",
+    "query": "\"exceeds the cap\"",
+    "shape": "code_literal",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 3,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "exceeds the cap",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "code_literal/long",
+    "readiness": "100",
+    "query": "\"exceeds the cap\"",
+    "shape": "code_literal",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 3,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "exceeds the cap",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "code_literal/long",
+    "readiness": "011",
+    "query": "\"exceeds the cap\"",
+    "shape": "code_literal",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 3,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "exceeds the cap",
+    "exact_mode": "ready",
+    "lanes_run": [
+      "exact",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "code_literal/long",
+    "readiness": "010",
+    "query": "\"exceeds the cap\"",
+    "shape": "code_literal",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 3,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "exceeds the cap",
+    "exact_mode": "ready",
+    "lanes_run": [
+      "exact",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "code_literal/long",
+    "readiness": "001",
+    "query": "\"exceeds the cap\"",
+    "shape": "code_literal",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 3,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "exceeds the cap",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "code_literal/long",
+    "readiness": "000",
+    "query": "\"exceeds the cap\"",
+    "shape": "code_literal",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 3,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "exceeds the cap",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "code_literal/tiny",
+    "readiness": "111",
+    "query": "\"ab\"",
+    "shape": "code_literal",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "ab",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "code_literal/tiny",
+    "readiness": "110",
+    "query": "\"ab\"",
+    "shape": "code_literal",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "ab",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "code_literal/tiny",
+    "readiness": "101",
+    "query": "\"ab\"",
+    "shape": "code_literal",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "ab",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "code_literal/tiny",
+    "readiness": "100",
+    "query": "\"ab\"",
+    "shape": "code_literal",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "ab",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "code_literal/tiny",
+    "readiness": "011",
+    "query": "\"ab\"",
+    "shape": "code_literal",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "ab",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "code_literal/tiny",
+    "readiness": "010",
+    "query": "\"ab\"",
+    "shape": "code_literal",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "ab",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "code_literal/tiny",
+    "readiness": "001",
+    "query": "\"ab\"",
+    "shape": "code_literal",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "ab",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "code_literal/tiny",
+    "readiness": "000",
+    "query": "\"ab\"",
+    "shape": "code_literal",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "ab",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "nl/plain",
+    "readiness": "111",
+    "query": "where do we cap the room name",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "lexical",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "lexical",
+      "semantic"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "nl/plain",
+    "readiness": "110",
+    "query": "where do we cap the room name",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "lexical",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "lexical",
+      "semantic"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "nl/plain",
+    "readiness": "101",
+    "query": "where do we cap the room name",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "semantic",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "nl/plain",
+    "readiness": "100",
+    "query": "where do we cap the room name",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "semantic",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "nl/plain",
+    "readiness": "011",
+    "query": "where do we cap the room name",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "lexical",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "nl/plain",
+    "readiness": "010",
+    "query": "where do we cap the room name",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "lexical",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "nl/plain",
+    "readiness": "001",
+    "query": "where do we cap the room name",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "fallback_walk"
+    ],
+    "executed_callbacks": [
+      "fallback_walk",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped",
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "nl/plain",
+    "readiness": "000",
+    "query": "where do we cap the room name",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "fallback_walk"
+    ],
+    "executed_callbacks": [
+      "fallback_walk",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped",
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "nl/quoted-long",
+    "readiness": "111",
+    "query": "why does it print \"exceeds the cap\" here",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": {
+        "start": 19,
+        "end": 34
+      },
+      "exact_input_tokens": 3,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "exceeds the cap",
+    "exact_mode": "ready",
+    "lanes_run": [
+      "exact",
+      "lexical",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical",
+      "semantic"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "nl/quoted-long",
+    "readiness": "110",
+    "query": "why does it print \"exceeds the cap\" here",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": {
+        "start": 19,
+        "end": 34
+      },
+      "exact_input_tokens": 3,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "exceeds the cap",
+    "exact_mode": "ready",
+    "lanes_run": [
+      "exact",
+      "lexical",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical",
+      "semantic"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "nl/quoted-long",
+    "readiness": "101",
+    "query": "why does it print \"exceeds the cap\" here",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": {
+        "start": 19,
+        "end": 34
+      },
+      "exact_input_tokens": 3,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "exceeds the cap",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "semantic",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "nl/quoted-long",
+    "readiness": "100",
+    "query": "why does it print \"exceeds the cap\" here",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": {
+        "start": 19,
+        "end": 34
+      },
+      "exact_input_tokens": 3,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "exceeds the cap",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "semantic",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "nl/quoted-long",
+    "readiness": "011",
+    "query": "why does it print \"exceeds the cap\" here",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": {
+        "start": 19,
+        "end": 34
+      },
+      "exact_input_tokens": 3,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "exceeds the cap",
+    "exact_mode": "ready",
+    "lanes_run": [
+      "exact",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "nl/quoted-long",
+    "readiness": "010",
+    "query": "why does it print \"exceeds the cap\" here",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": {
+        "start": 19,
+        "end": 34
+      },
+      "exact_input_tokens": 3,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "exceeds the cap",
+    "exact_mode": "ready",
+    "lanes_run": [
+      "exact",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "nl/quoted-long",
+    "readiness": "001",
+    "query": "why does it print \"exceeds the cap\" here",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": {
+        "start": 19,
+        "end": 34
+      },
+      "exact_input_tokens": 3,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "exceeds the cap",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped",
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "nl/quoted-long",
+    "readiness": "000",
+    "query": "why does it print \"exceeds the cap\" here",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": {
+        "start": 19,
+        "end": 34
+      },
+      "exact_input_tokens": 3,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "exceeds the cap",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped",
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "nl/quoted-tiny",
+    "readiness": "111",
+    "query": "why does it print \"ab\" here",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": {
+        "start": 19,
+        "end": 21
+      },
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "ab",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact",
+      "lexical",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical",
+      "semantic"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "nl/quoted-tiny",
+    "readiness": "110",
+    "query": "why does it print \"ab\" here",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": {
+        "start": 19,
+        "end": 21
+      },
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "ab",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact",
+      "lexical",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical",
+      "semantic"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "nl/quoted-tiny",
+    "readiness": "101",
+    "query": "why does it print \"ab\" here",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": {
+        "start": 19,
+        "end": 21
+      },
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "ab",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "semantic",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "nl/quoted-tiny",
+    "readiness": "100",
+    "query": "why does it print \"ab\" here",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": {
+        "start": 19,
+        "end": 21
+      },
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "ab",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact",
+      "semantic"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "semantic",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 1,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "nl/quoted-tiny",
+    "readiness": "011",
+    "query": "why does it print \"ab\" here",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": {
+        "start": 19,
+        "end": 21
+      },
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "ab",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "nl/quoted-tiny",
+    "readiness": "010",
+    "query": "why does it print \"ab\" here",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": {
+        "start": 19,
+        "end": 21
+      },
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "ab",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "lexical",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "nl/quoted-tiny",
+    "readiness": "001",
+    "query": "why does it print \"ab\" here",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": {
+        "start": 19,
+        "end": 21
+      },
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "ab",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped",
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "nl/quoted-tiny",
+    "readiness": "000",
+    "query": "why does it print \"ab\" here",
+    "shape": "nl",
+    "query_facts": {
+      "embedded_span": {
+        "start": 19,
+        "end": 21
+      },
+      "exact_input_tokens": 0,
+      "has_path_token": false,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": "ab",
+    "exact_mode": "fallback",
+    "lanes_run": [
+      "exact"
+    ],
+    "executed_callbacks": [
+      "exact",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped",
+      "semantic index disabled; semantic lane skipped"
+    ]
+  },
+  {
+    "query_class": "log_excerpt/std",
+    "readiness": "111",
+    "query": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "shape": "log_excerpt",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": true,
+      "has_timestamp_or_pid": true
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "anchored",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "anchored",
+      "lexical"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "log_excerpt/std",
+    "readiness": "110",
+    "query": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "shape": "log_excerpt",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": true,
+      "has_timestamp_or_pid": true
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "anchored",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "anchored",
+      "lexical"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "log_excerpt/std",
+    "readiness": "101",
+    "query": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "shape": "log_excerpt",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": true,
+      "has_timestamp_or_pid": true
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "anchored"
+    ],
+    "executed_callbacks": [
+      "anchored",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "log_excerpt/std",
+    "readiness": "100",
+    "query": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "shape": "log_excerpt",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": true,
+      "has_timestamp_or_pid": true
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "anchored"
+    ],
+    "executed_callbacks": [
+      "anchored",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "log_excerpt/std",
+    "readiness": "011",
+    "query": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "shape": "log_excerpt",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": true,
+      "has_timestamp_or_pid": true
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "anchored",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "anchored",
+      "lexical"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "log_excerpt/std",
+    "readiness": "010",
+    "query": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "shape": "log_excerpt",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": true,
+      "has_timestamp_or_pid": true
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "anchored",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "anchored",
+      "lexical"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "log_excerpt/std",
+    "readiness": "001",
+    "query": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "shape": "log_excerpt",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": true,
+      "has_timestamp_or_pid": true
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "anchored"
+    ],
+    "executed_callbacks": [
+      "anchored",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "log_excerpt/std",
+    "readiness": "000",
+    "query": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "shape": "log_excerpt",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 5,
+      "has_path_token": true,
+      "has_timestamp_or_pid": true
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "anchored"
+    ],
+    "executed_callbacks": [
+      "anchored",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "path/std",
+    "readiness": "111",
+    "query": "src/main.rs",
+    "shape": "path",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 2,
+      "has_path_token": true,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "path_lookup",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "path_lookup",
+      "lexical"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "path/std",
+    "readiness": "110",
+    "query": "src/main.rs",
+    "shape": "path",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 2,
+      "has_path_token": true,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "path_lookup",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "path_lookup",
+      "lexical"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "path/std",
+    "readiness": "101",
+    "query": "src/main.rs",
+    "shape": "path",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 2,
+      "has_path_token": true,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "path_lookup"
+    ],
+    "executed_callbacks": [
+      "path_lookup",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "path/std",
+    "readiness": "100",
+    "query": "src/main.rs",
+    "shape": "path",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 2,
+      "has_path_token": true,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "path_lookup"
+    ],
+    "executed_callbacks": [
+      "path_lookup",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "path/std",
+    "readiness": "011",
+    "query": "src/main.rs",
+    "shape": "path",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 2,
+      "has_path_token": true,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "path_lookup",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "path_lookup",
+      "lexical"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "path/std",
+    "readiness": "010",
+    "query": "src/main.rs",
+    "shape": "path",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 2,
+      "has_path_token": true,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "path_lookup",
+      "lexical"
+    ],
+    "executed_callbacks": [
+      "path_lookup",
+      "lexical"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": []
+  },
+  {
+    "query_class": "path/std",
+    "readiness": "001",
+    "query": "src/main.rs",
+    "shape": "path",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 2,
+      "has_path_token": true,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "path_lookup"
+    ],
+    "executed_callbacks": [
+      "path_lookup",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  },
+  {
+    "query_class": "path/std",
+    "readiness": "000",
+    "query": "src/main.rs",
+    "shape": "path",
+    "query_facts": {
+      "embedded_span": null,
+      "exact_input_tokens": 2,
+      "has_path_token": true,
+      "has_timestamp_or_pid": false
+    },
+    "exact_input": null,
+    "exact_mode": "n/a",
+    "lanes_run": [
+      "path_lookup"
+    ],
+    "executed_callbacks": [
+      "path_lookup",
+      "readiness_disclosure"
+    ],
+    "embedding_counters_cold": {
+      "embedding_calls": 0,
+      "embedding_cache_hits": 0,
+      "live_embed_calls": 0
+    },
+    "footer_lines": [
+      "trigram index disabled; lexical lane skipped"
+    ]
+  }
+]

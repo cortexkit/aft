@@ -1,0 +1,200 @@
+[
+  {
+    "query": "foo::bar",
+    "shape": "identifier",
+    "embedded_span": null,
+    "exact_input": "foo::bar",
+    "exact_input_tokens": 2,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "shape": "log_excerpt",
+    "embedded_span": null,
+    "exact_input": "2026-09-08 ERROR open /tmp/a.rs failed",
+    "exact_input_tokens": 5,
+    "has_path_token": true,
+    "has_timestamp_or_pid": true
+  },
+  {
+    "query": "\"exceeds the cap\"",
+    "shape": "code_literal",
+    "embedded_span": null,
+    "exact_input": "exceeds the cap",
+    "exact_input_tokens": 3,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "\"ab\"",
+    "shape": "code_literal",
+    "embedded_span": null,
+    "exact_input": "ab",
+    "exact_input_tokens": 0,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "'ab'",
+    "shape": "code_literal",
+    "embedded_span": null,
+    "exact_input": "ab",
+    "exact_input_tokens": 0,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "\"a b c\"",
+    "shape": "code_literal",
+    "embedded_span": null,
+    "exact_input": "a b c",
+    "exact_input_tokens": 0,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "RunStarted {",
+    "shape": "code_literal",
+    "embedded_span": null,
+    "exact_input": "RunStarted {",
+    "exact_input_tokens": 1,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "if (x) return;",
+    "shape": "code_literal",
+    "embedded_span": null,
+    "exact_input": "if (x) return;",
+    "exact_input_tokens": 1,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "log \"cap\" here",
+    "shape": "code_literal",
+    "embedded_span": null,
+    "exact_input": "log \"cap\" here",
+    "exact_input_tokens": 3,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "why does it print \"exceeds the cap\" here",
+    "shape": "nl",
+    "embedded_span": { "start": 19, "end": 34, "text": "exceeds the cap" },
+    "exact_input": "exceeds the cap",
+    "exact_input_tokens": 3,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "where do we cap the room name",
+    "shape": "nl",
+    "embedded_span": null,
+    "exact_input": "where do we cap the room name",
+    "exact_input_tokens": 5,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "character cap",
+    "shape": "short",
+    "embedded_span": null,
+    "exact_input": "character cap",
+    "exact_input_tokens": 2,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "a b",
+    "shape": "short",
+    "embedded_span": null,
+    "exact_input": "a b",
+    "exact_input_tokens": 0,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "src/main.rs",
+    "shape": "path",
+    "embedded_span": null,
+    "exact_input": "src/main.rs",
+    "exact_input_tokens": 2,
+    "has_path_token": true,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "why don't user's cache entries refresh",
+    "shape": "nl",
+    "embedded_span": null,
+    "exact_input": "why don't user's cache entries refresh",
+    "exact_input_tokens": 6,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "why does it print \\\"cap\\\" here",
+    "shape": "code_literal",
+    "embedded_span": null,
+    "exact_input": "why does it print \\\"cap\\\" here",
+    "exact_input_tokens": 5,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "why does it print \"cap here",
+    "shape": "nl",
+    "embedded_span": null,
+    "exact_input": "why does it print \"cap here",
+    "exact_input_tokens": 5,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "2026-09-08T12:00:01 ERROR worker pid [4821] failed",
+    "shape": "log_excerpt",
+    "embedded_span": null,
+    "exact_input": "2026-09-08T12:00:01 ERROR worker pid [4821] failed",
+    "exact_input_tokens": 7,
+    "has_path_token": false,
+    "has_timestamp_or_pid": true
+  },
+  {
+    "query": "why does it print `exceeds the cap` here \"unfinished",
+    "shape": "nl",
+    "embedded_span": { "start": 19, "end": 34, "text": "exceeds the cap" },
+    "exact_input": "exceeds the cap",
+    "exact_input_tokens": 3,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "^export",
+    "shape": "regex",
+    "embedded_span": null,
+    "exact_input": "^export",
+    "exact_input_tokens": 1,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "foo.*",
+    "shape": "regex",
+    "embedded_span": null,
+    "exact_input": "foo.*",
+    "exact_input_tokens": 1,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false
+  },
+  {
+    "query": "foo.rs",
+    "shape": "path",
+    "embedded_span": null,
+    "exact_input": "foo.rs",
+    "exact_input_tokens": 1,
+    "has_path_token": true,
+    "has_timestamp_or_pid": false
+  }
+]

@@ -402,6 +402,40 @@ fn start_mock_embedding_server() -> (String, thread::JoinHandle<()>) {
     )
 }
 
+fn start_no_request_embedding_server() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind no-request embedding server");
+    listener
+        .set_nonblocking(true)
+        .expect("set no-request server nonblocking");
+    let address = listener.local_addr().expect("no-request server address");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let requests_for_thread = Arc::clone(&requests);
+    let handle = thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    requests_for_thread.fetch_add(1, Ordering::SeqCst);
+                    let mut request = [0_u8; 4096];
+                    let _ = stream.read(&mut request);
+                    let body = r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes());
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept no-request embedding connection: {error}"),
+            }
+        }
+    });
+    (format!("http://{address}"), requests, handle)
+}
+
 fn start_mock_embedding_error_server() -> (String, thread::JoinHandle<()>) {
     start_mock_embedding_server_with_response("400 Bad Request", r#"{"error":"embedding boom"}"#)
 }
@@ -1133,8 +1167,9 @@ fn natural_language_exact_phrase_marks_rank_one_lexical_fallback() {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
+    let exact_query = format!("\"{sentence}\" where is this");
     let response = response_value(handle_semantic_search(
-        &request_with_top_k(sentence, None, 5),
+        &request_with_top_k(&exact_query, None, 5),
         &ctx,
     ));
     let first = &response["results"][0];
@@ -1212,7 +1247,10 @@ fn slow_query_embedding_degrades_within_budget_and_next_query_retries_fresh() {
         Some(SemanticIndex::new(project.path().to_path_buf(), 3));
 
     let started = Instant::now();
-    let semantic_request = request_with("needle_symbol", Some("semantic"));
+    let semantic_request = request_with(
+        "where is the needle symbol implementation",
+        Some("semantic"),
+    );
     let degraded = response_value(handle_semantic_search(&semantic_request, &ctx));
     let elapsed = started.elapsed();
 
@@ -1567,8 +1605,10 @@ fn degraded_grep_filters_test_support_files_unless_requested() {
 }
 
 #[test]
-fn hybrid_semantic_results_report_semantic_source_and_boost_metadata() {
+fn hybrid_semantic_contribution_reports_separate_boost_metadata() {
     let (project, source_file, source) = project_with_needle();
+    let source = format!("{source}// found\n");
+    std::fs::write(&source_file, &source).expect("write hybrid source");
     let mut embed =
         |texts: Vec<String>| Ok::<Vec<Vec<f32>>, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);
     let semantic_index = SemanticIndex::build(
@@ -1580,7 +1620,7 @@ fn hybrid_semantic_results_report_semantic_source_and_boost_metadata() {
     .expect("build semantic index");
     let (base_url, handle) = start_mock_embedding_server();
     let ctx = openai_context(project.path(), base_url);
-    install_lexical_index(&ctx, &source_file, source);
+    install_lexical_index(&ctx, &source_file, &source);
     *ctx.semantic_index_status()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
@@ -1588,7 +1628,10 @@ fn hybrid_semantic_results_report_semantic_source_and_boost_metadata() {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(semantic_index);
 
-    let response = response_value(handle_semantic_search(&request("needle_symbol"), &ctx));
+    let query = "where is needle_symbol found";
+    let mut hybrid_request = request(query);
+    hybrid_request.id = "hybrid-semantic-contribution".to_string();
+    let response = response_value(handle_semantic_search(&hybrid_request, &ctx));
 
     assert_eq!(
         response["success"], true,
@@ -1608,14 +1651,27 @@ fn hybrid_semantic_results_report_semantic_source_and_boost_metadata() {
         assert_ne!(source, "hybrid");
     }
 
-    let boosted = results
+    let contributed = results
         .iter()
-        .find(|result| result["source"] == "semantic" && result["lexical_score"].is_number())
-        .expect("semantic result should carry separate lexical boost metadata");
-    assert_eq!(boosted["hybrid_boosted"], true);
-    assert!(boosted.get("hybrid_boosted").is_some());
-
+        .find(|result| result["semantic_score"].is_number() && result["lexical_score"].is_number())
+        .expect("one result should carry separate semantic and lexical scores");
+    assert_eq!(contributed["hybrid_boosted"], true);
     handle.join().expect("embedding server thread");
+
+    *ctx.semantic_index_status()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Building {
+        stage: "test_unavailable".to_string(),
+        files: None,
+        entries_done: None,
+        entries_total: None,
+    };
+    let mut lexical_request = request(query);
+    lexical_request.id = "hybrid-semantic-unavailable-control".to_string();
+    let lexical = response_value(handle_semantic_search(&lexical_request, &ctx));
+    let lexical_result = &lexical["results"][0];
+    assert!(lexical_result["semantic_score"].is_null());
+    assert_eq!(lexical_result["hybrid_boosted"], false);
 }
 
 #[test]
@@ -1628,7 +1684,7 @@ fn lexical_only_fallback_pages_beyond_the_old_candidate_cap() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
 
     let response = response_value(handle_semantic_search(
-        &request_with_top_k("needle_symbol", None, 5),
+        &request_with_top_k("needle symbol needle symbol", None, 5),
         &ctx,
     ));
 
@@ -1654,7 +1710,7 @@ fn lexical_only_fallback_pages_beyond_the_old_candidate_cap() {
     };
 
     let response = response_value(handle_semantic_search(
-        &request_with_top_k("needle_symbol", None, 100),
+        &request_with_top_k("needle symbol needle symbol", None, 100),
         &ctx,
     ));
 
@@ -1674,7 +1730,7 @@ fn lexical_only_fallback_pages_beyond_the_old_candidate_cap() {
 #[test]
 fn hybrid_ready_pages_without_legacy_lexical_candidate_cap() {
     let (project, entries) = project_with_repeated_needle_files(210);
-    let (base_url, handle) = start_mock_embedding_server();
+    let (base_url, embedding_requests, handle) = start_no_request_embedding_server();
     let ctx = openai_context(project.path(), base_url);
     install_lexical_index_entries(&ctx, &entries);
     *ctx.semantic_index_status()
@@ -1685,21 +1741,39 @@ fn hybrid_ready_pages_without_legacy_lexical_candidate_cap() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) =
         Some(SemanticIndex::new(project.path().to_path_buf(), 3));
 
-    let response = response_value(handle_semantic_search(
-        &request_with_top_k("needle_symbol", None, 100),
-        &ctx,
-    ));
+    let mut identifier_request = request_with_top_k("needle_symbol", None, 100);
+    identifier_request.id = "identifier-ready-fallback-cap-no-semantic".to_string();
+    let response = response_value(handle_semantic_search(&identifier_request, &ctx));
+    handle.join().expect("negative embedding server thread");
 
     assert_eq!(
         response["success"], true,
-        "ready hybrid query should succeed: {response:?}"
+        "ready identifier query should succeed: {response:?}"
     );
     assert_eq!(response["status"], "ready");
     assert_eq!(response["complete"], true);
     assert_eq!(response["interpreted_as"], "hybrid");
     assert_eq!(response["engine_capped"], false);
     assert_eq!(response["more_available"], true);
-    handle.join().expect("embedding server thread");
+    assert_eq!(embedding_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        response["structuredContent"]["search"]["embedding_calls"],
+        0
+    );
+    assert_eq!(
+        response["structuredContent"]["search"]["embedding_cache_hits"],
+        0
+    );
+    assert_eq!(
+        response["structuredContent"]["search"]["live_embed_calls"],
+        0
+    );
+    assert!(response["text"]
+        .as_str()
+        .expect("search text")
+        .ends_with(
+            "shown 100 of 200+ results (more at greater depth) · narrow: offset, topK, path, includeTests"
+        ));
 }
 
 #[test]
@@ -1727,7 +1801,11 @@ fn semantic_ready_reports_more_available_when_semantic_lane_overflows() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(semantic_index);
 
     let response = response_value(handle_semantic_search(
-        &request_with_top_k("needle_symbol", Some("semantic"), 100),
+        &request_with_top_k(
+            "where is the needle symbol implementation",
+            Some("semantic"),
+            100,
+        ),
         &ctx,
     ));
 
@@ -1827,7 +1905,7 @@ fn excluded_test_results_do_not_starve_default_semantic_search() {
 }
 
 #[test]
-fn hybrid_ready_reports_no_more_available_when_under_top_k_without_caps() {
+fn identifier_ready_reports_no_more_available_when_under_top_k_without_caps() {
     let (project, source_file, source) = project_with_needle();
     let mut embed =
         |texts: Vec<String>| Ok::<Vec<Vec<f32>>, String>(vec![vec![0.1, 0.2, 0.3]; texts.len()]);
@@ -1838,7 +1916,7 @@ fn hybrid_ready_reports_no_more_available_when_under_top_k_without_caps() {
         16,
     )
     .expect("build semantic index");
-    let (base_url, handle) = start_mock_embedding_server();
+    let (base_url, embedding_requests, handle) = start_no_request_embedding_server();
     let ctx = openai_context(project.path(), base_url);
     install_lexical_index(&ctx, &source_file, source);
     *ctx.semantic_index_status()
@@ -1848,25 +1926,37 @@ fn hybrid_ready_reports_no_more_available_when_under_top_k_without_caps() {
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(semantic_index);
 
-    let response = response_value(handle_semantic_search(
-        &request_with_top_k("needle_symbol", None, 5),
-        &ctx,
-    ));
+    let mut identifier_request = request_with_top_k("needle_symbol", None, 5);
+    identifier_request.id = "identifier-ready-under-top-k-no-semantic".to_string();
+    let response = response_value(handle_semantic_search(&identifier_request, &ctx));
+    handle.join().expect("negative embedding server thread");
 
     assert_eq!(
         response["success"], true,
-        "ready hybrid query should succeed: {response:?}"
+        "ready identifier query should succeed: {response:?}"
     );
     assert_eq!(response["status"], "ready");
     assert_eq!(response["complete"], true);
-    assert_eq!(response["interpreted_as"], "hybrid");
+    assert_eq!(response["interpreted_as"], "engine");
     assert_eq!(response["engine_capped"], false);
     assert!(
         response["result_count"].as_u64().expect("result_count") < 5,
         "test setup should stay under top_k: {response:?}"
     );
     assert_eq!(response["more_available"], false);
-    handle.join().expect("embedding server thread");
+    assert_eq!(embedding_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        response["structuredContent"]["search"]["embedding_calls"],
+        0
+    );
+    assert_eq!(
+        response["structuredContent"]["search"]["embedding_cache_hits"],
+        0
+    );
+    assert_eq!(
+        response["structuredContent"]["search"]["live_embed_calls"],
+        0
+    );
 }
 
 #[test]
@@ -1929,9 +2019,9 @@ fn auto_short_identifier_tokens_use_literal_scan() {
 }
 
 #[test]
-fn hybrid_ready_semantic_reports_complete_success() {
+fn identifier_ready_reports_complete_success_without_semantic() {
     let (project, source_file, source) = project_with_needle();
-    let (base_url, handle) = start_mock_embedding_server();
+    let (base_url, embedding_requests, handle) = start_no_request_embedding_server();
     let ctx = openai_context(project.path(), base_url);
     install_lexical_index(&ctx, &source_file, source);
     *ctx.semantic_index_status()
@@ -1942,7 +2032,10 @@ fn hybrid_ready_semantic_reports_complete_success() {
         .unwrap_or_else(std::sync::PoisonError::into_inner) =
         Some(SemanticIndex::new(project.path().to_path_buf(), 3));
 
-    let response = response_value(handle_semantic_search(&request("needle_symbol"), &ctx));
+    let mut identifier_request = request("needle_symbol");
+    identifier_request.id = "identifier-ready-complete-no-semantic".to_string();
+    let response = response_value(handle_semantic_search(&identifier_request, &ctx));
+    handle.join().expect("negative embedding server thread");
 
     assert_eq!(
         response["success"], true,
@@ -1951,8 +2044,20 @@ fn hybrid_ready_semantic_reports_complete_success() {
     assert_eq!(response["complete"], true);
     assert_eq!(response["status"], "ready");
     assert_eq!(response["semantic_status"], "ready");
-    assert_eq!(response["interpreted_as"], "hybrid");
-    handle.join().expect("embedding server thread");
+    assert_eq!(response["interpreted_as"], "engine");
+    assert_eq!(embedding_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        response["structuredContent"]["search"]["embedding_calls"],
+        0
+    );
+    assert_eq!(
+        response["structuredContent"]["search"]["embedding_cache_hits"],
+        0
+    );
+    assert_eq!(
+        response["structuredContent"]["search"]["live_embed_calls"],
+        0
+    );
 }
 
 /// Surrounding paired quotes in literal queries are stripped before matching.
@@ -2077,7 +2182,7 @@ fn live_engine_pipeline_ranks_and_pages_with_provenance() {
     let lexical_source =
         "needle needle needle\nfiller\nfiller\nfiller\nsymbol symbol symbol\n".to_string();
     let log_source = "error!(\"opening {} failed for run {}\", path, id);\n".to_string();
-    let path_source = "pub fn callgraph_op() {}\n".to_string();
+    let path_source = "pub fn subc_format() { callgraph_op(); }\n".to_string();
     std::fs::write(&exact, &exact_source).expect("write exact source");
     std::fs::write(&lexical, &lexical_source).expect("write lexical source");
     std::fs::write(&log, &log_source).expect("write log source");
@@ -2161,7 +2266,7 @@ fn live_engine_pipeline_ranks_and_pages_with_provenance() {
     let path_request: RawRequest = serde_json::from_value(serde_json::json!({
         "id": "engine-live-path",
         "command": "semantic_search",
-        "query": "callgraph_op subc_format.rs",
+        "query": "subc_format.rs",
         "top_k": 1
     }))
     .unwrap();

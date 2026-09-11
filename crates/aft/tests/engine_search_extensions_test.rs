@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aft::commands::semantic_search::extensions::{
-    DefaultSearchExtensions, QueryFacts, Readiness, Root, SearchExtensions,
+    DefaultSearchExtensions, RawQuery, Readiness, Root, SearchExtensions,
 };
 use aft::commands::semantic_search::{
     LaneExecution, LaneInput, LaneRegistry, SearchLane, SearchLaneKind, SearchShape,
@@ -28,7 +28,7 @@ impl SearchLane for CountingLane {
 }
 
 #[test]
-fn query_facts_preserve_quotes_and_classify_all_seven_shapes() {
+fn raw_query_preserves_quotes_and_default_classification_covers_all_seven_shapes() {
     let extensions = DefaultSearchExtensions;
     let cases = [
         ("handleRequest", SearchShape::Identifier),
@@ -47,9 +47,10 @@ fn query_facts_preserve_quotes_and_classify_all_seven_shapes() {
     ];
 
     for (query, expected) in cases {
-        let facts = QueryFacts::new(query);
-        assert_eq!(facts.original_query(), query);
-        assert_eq!(extensions.classify(&facts), expected, "query: {query}");
+        let raw_query = RawQuery::new(query);
+        let (shape, _facts) = extensions.classify(&raw_query);
+        assert_eq!(raw_query.original_query(), query);
+        assert_eq!(shape, expected, "query: {query}");
     }
 }
 
@@ -58,9 +59,9 @@ fn default_plan_omits_semantic_for_code_literals_and_logs() {
     let extensions = DefaultSearchExtensions;
     let readiness = Readiness::new(true, true, true);
     for query in ["\"literal phrase\"", "2026-09-10 ERROR worker failed"] {
-        let facts = QueryFacts::new(query);
-        let shape = extensions.classify(&facts);
-        let plan = extensions.plan(&facts, shape, &readiness);
+        let raw_query = RawQuery::new(query);
+        let (shape, facts) = extensions.classify(&raw_query);
+        let plan = extensions.plan(&shape, &facts, &readiness);
         assert!(!plan.contains(SearchLaneKind::Semantic), "query: {query}");
     }
 }
@@ -94,4 +95,36 @@ fn readiness_is_sampled_from_the_root_snapshot() {
     let expected = Readiness::new(false, true, false);
     let root = Root::new(".", expected.clone());
     assert_eq!(extensions.sample_readiness(&root), expected);
+}
+
+#[test]
+fn classify_tuple_passes_all_four_query_facts_to_plan_without_rederivation() {
+    let extensions = DefaultSearchExtensions;
+    let cases = [
+        ("where do we cap the room name", None, 5),
+        (
+            "why does it print \"exceeds the cap\" here",
+            Some((19, 34)),
+            3,
+        ),
+        ("why does it print \"ab\" here", Some((19, 21)), 0),
+    ];
+
+    for (query, expected_span, expected_tokens) in cases {
+        let raw_query = RawQuery::new(query);
+        let (shape, facts) = extensions.classify(&raw_query);
+        assert_eq!(shape, SearchShape::NaturalLanguage);
+        let span = facts.embedded_span.map(|span| (span.start, span.end));
+        assert_eq!(span, expected_span, "query: {query}");
+        assert_eq!(facts.exact_input_tokens, expected_tokens, "query: {query}");
+        assert!(!facts.has_path_token, "query: {query}");
+        assert!(!facts.has_timestamp_or_pid, "query: {query}");
+        assert_eq!(
+            extensions
+                .plan(&shape, &facts, &Readiness::new(true, true, true))
+                .query_facts,
+            facts,
+            "query: {query}"
+        );
+    }
 }

@@ -11,29 +11,40 @@ use crate::query_shape::{classify, looks_like_regex, QueryKind};
 use crate::search_index::{IndexStatus, SearchIndexSnapshot};
 use crate::semantic_index::SemanticIndex;
 
-/// Original request facts captured before any lane-specific query normalization.
+/// Original request text retained before lane-specific normalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueryFacts {
-    original_query: String,
-}
+pub struct RawQuery(String);
 
-impl QueryFacts {
+impl RawQuery {
     pub fn new(query: impl Into<String>) -> Self {
-        Self {
-            original_query: query.into(),
-        }
+        Self(query.into())
     }
 
     pub fn original_query(&self) -> &str {
-        &self.original_query
+        &self.0
     }
+}
 
-    pub fn tokens(&self) -> impl Iterator<Item = Token<'_>> {
-        self.original_query
-            .split_whitespace()
-            .enumerate()
-            .map(|(index, text)| Token { index, text })
+/// Byte range of a delimiter's verbatim interior in [`RawQuery`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl Span {
+    pub fn extract<'a>(&self, raw_query: &'a str) -> Option<&'a str> {
+        raw_query.get(self.start..self.end)
     }
+}
+
+/// The complete classification facts passed unchanged to lane planning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QueryFacts {
+    pub embedded_span: Option<Span>,
+    pub exact_input_tokens: usize,
+    pub has_path_token: bool,
+    pub has_timestamp_or_pid: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,10 +352,25 @@ impl<'a> Readiness<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExactMode {
+    Ready,
+    Fallback,
+    #[serde(rename = "n/a")]
+    NotApplicable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LanePlan<'a> {
     pub shape: SearchShape,
+    pub query_facts: QueryFacts,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exact_input: Option<String>,
+    pub exact_mode: ExactMode,
+    #[serde(rename = "lanes_run")]
     pub selected_lanes: Vec<SearchLaneKind>,
+    pub executed_callbacks: Vec<SearchLaneKind>,
     pub readiness: Readiness<'a>,
     pub variants: Vec<String>,
 }
@@ -358,8 +384,8 @@ impl LanePlan<'_> {
 /// A-side extension seam. Later ranking campaigns can override one hook at a
 /// time while the base engine remains independently buildable.
 pub trait SearchExtensions: Send + Sync {
-    fn classify(&self, facts: &QueryFacts) -> SearchShape {
-        classify_query_facts(facts)
+    fn classify(&self, raw_query: &RawQuery) -> (SearchShape, QueryFacts) {
+        classify_raw_query(raw_query)
     }
 
     fn variants(&self, _token: Token<'_>) -> Vec<TokenVariant> {
@@ -372,11 +398,11 @@ pub trait SearchExtensions: Send + Sync {
 
     fn plan<'a>(
         &self,
-        _facts: &QueryFacts,
-        shape: SearchShape,
+        shape: &SearchShape,
+        facts: &QueryFacts,
         readiness: &Readiness<'a>,
     ) -> LanePlan<'a> {
-        default_lane_plan(shape, readiness.clone())
+        default_lane_plan(*shape, facts, readiness.clone())
     }
 
     fn execute_lane(&self, lane: &dyn SearchLane, input: &LaneInput<'_>) -> LaneExecution {
@@ -389,32 +415,36 @@ pub struct DefaultSearchExtensions;
 
 impl SearchExtensions for DefaultSearchExtensions {}
 
-pub fn classify_query_facts(facts: &QueryFacts) -> SearchShape {
-    let query = facts.original_query().trim();
-    if looks_like_regex(query) {
-        return SearchShape::Regex;
-    }
-    if is_quoted(query) {
-        return SearchShape::CodeLiteral;
-    }
-
-    let query_shape = classify(query);
-    if query_shape.kind == QueryKind::ErrorCode || looks_like_log_excerpt(query) {
-        return SearchShape::LogExcerpt;
-    }
-    if query_shape.kind == QueryKind::Path {
-        return SearchShape::Path;
-    }
-    if query_shape.kind == QueryKind::Identifier {
-        return SearchShape::Identifier;
-    }
-    if query.split_whitespace().count() <= 2 {
-        return SearchShape::Short;
-    }
-    SearchShape::NaturalLanguage
+/// Preserves the pre-B2 classifier while emitting the new explicit facts tuple.
+pub fn classify_raw_query(raw_query: &RawQuery) -> (SearchShape, QueryFacts) {
+    let query = raw_query.original_query().trim();
+    let shape = if looks_like_regex(query) {
+        SearchShape::Regex
+    } else if is_quoted(query) {
+        SearchShape::CodeLiteral
+    } else {
+        let query_shape = classify(query);
+        if query_shape.kind == QueryKind::ErrorCode || looks_like_log_excerpt(query) {
+            SearchShape::LogExcerpt
+        } else if query_shape.kind == QueryKind::Path {
+            SearchShape::Path
+        } else if query_shape.kind == QueryKind::Identifier {
+            SearchShape::Identifier
+        } else if query.split_whitespace().count() <= 2 {
+            SearchShape::Short
+        } else {
+            SearchShape::NaturalLanguage
+        }
+    };
+    let (_, facts) = crate::search_b2::router::classify(raw_query);
+    (shape, facts)
 }
 
-fn default_lane_plan<'a>(shape: SearchShape, readiness: Readiness<'a>) -> LanePlan<'a> {
+fn default_lane_plan<'a>(
+    shape: SearchShape,
+    facts: &QueryFacts,
+    readiness: Readiness<'a>,
+) -> LanePlan<'a> {
     let mut selected_lanes = match shape {
         SearchShape::Identifier => vec![
             SearchLaneKind::Symbol,
@@ -467,8 +497,19 @@ fn default_lane_plan<'a>(shape: SearchShape, readiness: Readiness<'a>) -> LanePl
         selected_lanes.push(SearchLaneKind::ReadinessDisclosure);
     }
 
+    let exact_mode = if !selected_lanes.contains(&SearchLaneKind::Exact) {
+        ExactMode::NotApplicable
+    } else if readiness.lexical_index && facts.exact_input_tokens > 0 {
+        ExactMode::Ready
+    } else {
+        ExactMode::Fallback
+    };
     LanePlan {
         shape,
+        query_facts: facts.clone(),
+        exact_input: None,
+        exact_mode,
+        executed_callbacks: selected_lanes.clone(),
         selected_lanes,
         readiness,
         variants: Vec::new(),

@@ -1,0 +1,14 @@
+{
+  "fixture": "quoted-long embedded exact",
+  "observed_readiness": "010",
+  "oracle": {
+    "111": "reachable_via:exact",
+    "110": "reachable_via:exact",
+    "101": "fallback_walk",
+    "100": "fallback_walk",
+    "011": "reachable_via:exact",
+    "010": "reachable_via:exact",
+    "001": "fallback_walk",
+    "000": "fallback_walk"
+  }
+}

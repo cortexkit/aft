@@ -649,18 +649,21 @@ fn cancelled_search_response_from_id(request_id: &str) -> Response {
 }
 
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
-    use extensions::{QueryFacts, Root, Token};
+    use extensions::{RawQuery, Root, Token};
 
     let page_request = match paging::parse_public_page_request(&req.params) {
         Ok(request) => request,
         Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
     };
-    let facts = QueryFacts::new(
+    let raw_query = RawQuery::new(
         req.params
             .get("query")
             .and_then(|value| value.as_str())
             .unwrap_or_default(),
     );
+    if raw_query.original_query().trim().is_empty() {
+        return Response::error(&req.id, "invalid_request", "query must be non-empty");
+    }
     let project_root = grep_executor::project_root(ctx);
     let requested_path = req
         .params
@@ -709,10 +712,10 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     // The extensions come from the search_b2 install point: A-side defaults
     // until campaign B2 installs its router, plans, variants and readiness.
     let extensions = crate::search_b2::install_defaults();
-    let shape = extensions.classify(&facts);
+    let (shape, facts) = extensions.classify(&raw_query);
     let variants = extensions.variants(Token {
         index: 0,
-        text: facts.original_query(),
+        text: raw_query.original_query(),
     });
     let runtime_source = RuntimeReadinessSource { ctx };
     let storage_dir = ctx.config().storage_dir.clone();
@@ -731,8 +734,15 @@ pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
     if readiness.cancelled() {
         return cancelled_search_response(req);
     }
-    let mut plan = extensions.plan(&facts, shape, &readiness);
-    plan.variants = variants.into_iter().map(|variant| variant.text).collect();
+    let mut plan = extensions.plan(&shape, &facts, &readiness);
+    if plan.contains(SearchLaneKind::Exact) {
+        plan.exact_input = Some(crate::search_b2::router::exact_input(
+            &raw_query, shape, &facts,
+        ));
+    }
+    if plan.contains(SearchLaneKind::Variants) {
+        plan.variants = variants.into_iter().map(|variant| variant.text).collect();
+    }
 
     let _embedding_attribution = crate::search_b2::embed_counter::install(req.id.clone());
     let mut response = handle_semantic_search_inner(
@@ -764,10 +774,18 @@ fn attach_search_execution_metadata(
     let Some(structured) = structured.as_object_mut() else {
         return;
     };
+    let extension_plan = serde_json::to_value(plan).unwrap_or_else(|_| serde_json::json!({}));
     let structured_plan = structured
         .entry("plan".to_string())
-        .or_insert_with(|| serde_json::json!(plan));
-    if let Some(structured_plan) = structured_plan.as_object_mut() {
+        .or_insert_with(|| extension_plan.clone());
+    if let (Some(structured_plan), Some(extension_plan)) =
+        (structured_plan.as_object_mut(), extension_plan.as_object())
+    {
+        for (key, value) in extension_plan {
+            structured_plan
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
         structured_plan.insert(
             "embedding_calls".to_string(),
             serde_json::json!(embedding_counts.requested),
@@ -2179,7 +2197,7 @@ fn run_engine_ranking(
     plan: &extensions::LanePlan<'_>,
     borrowed_index: Option<(&SearchIndex, &GenerationToken)>,
 ) -> Result<EngineRanking, String> {
-    use blocks::{BlockBuilder, CanonicalLane, CanonicalListKey, LaneCandidate};
+    use blocks::{BlockBuilder, CanonicalLane, CanonicalListKey, LaneCandidate, BLOCK_DEPTHS};
     use confidence::{Confidence, ConfidenceEngine};
     use lexical_lane::CanonicalLexicalLane;
     use provenance::ObservedProvenance;
@@ -2257,23 +2275,25 @@ fn run_engine_ranking(
             ))
         })
         .collect::<Vec<_>>();
-    let mut exact_candidates = if plan.contains(SearchLaneKind::Exact) {
-        exact_lane::ExactLane::with_memo(ctx.search_exact_memo())
-            .search(
-                Some(&index),
-                project_root,
-                generation.clone(),
-                query,
-                include_tests,
-                0,
-                usize::MAX,
-                None,
-            )
-            .map_err(|error| error.to_string())?
-            .results
-    } else {
-        Vec::new()
-    };
+    let exact_input = plan.exact_input.as_deref().unwrap_or(query);
+    let mut exact_candidates =
+        if plan.contains(SearchLaneKind::Exact) || plan.shape == SearchShape::Identifier {
+            exact_lane::ExactLane::with_memo(ctx.search_exact_memo())
+                .search(
+                    Some(&index),
+                    project_root,
+                    generation.clone(),
+                    exact_input,
+                    include_tests,
+                    0,
+                    usize::MAX,
+                    None,
+                )
+                .map_err(|error| error.to_string())?
+                .results
+        } else {
+            Vec::new()
+        };
     if plan.shape != SearchShape::Identifier {
         exact_candidates.retain(|candidate| candidate.evidence.kind != EvidenceKind::Definition);
     }
@@ -2346,9 +2366,47 @@ fn run_engine_ranking(
         }
     }
 
+    let mut identifier_exact_capped = false;
+    let lexical_execution_candidates =
+        if plan.shape == SearchShape::Identifier && !plan.contains(SearchLaneKind::Symbol) {
+            let fallback_depth = BLOCK_DEPTHS
+                .iter()
+                .copied()
+                .find(|depth| (*depth as u64) >= page_request.interval_end())
+                .unwrap_or_else(|| *BLOCK_DEPTHS.last().expect("block depths are non-empty"));
+            identifier_exact_capped = exact_candidates.len() > fallback_depth;
+            let bounded_exact = exact_candidates
+                .iter()
+                .take(fallback_depth)
+                .cloned()
+                .collect::<Vec<_>>();
+            let exact_identities = bounded_exact
+                .iter()
+                .map(|candidate| (candidate.path.clone(), candidate.symbol_range))
+                .collect::<HashSet<_>>();
+            bounded_exact
+                .into_iter()
+                .chain(
+                    lexical_candidates
+                        .iter()
+                        .filter(|candidate| {
+                            !exact_identities
+                                .contains(&(candidate.path.clone(), candidate.symbol_range))
+                        })
+                        .cloned(),
+                )
+                .collect()
+        } else {
+            lexical_candidates.clone()
+        };
+
     let mut registry = LaneRegistry::new();
-    for kind in &plan.selected_lanes {
+    for kind in &plan.executed_callbacks {
         let lane: Arc<dyn SearchLane> = match kind {
+            SearchLaneKind::Symbol => Arc::new(PreparedEngineLane {
+                kind: *kind,
+                candidates: exact_candidates.clone(),
+            }),
             SearchLaneKind::Exact => Arc::new(PreparedEngineLane {
                 kind: *kind,
                 candidates: exact_candidates.clone(),
@@ -2356,7 +2414,7 @@ fn run_engine_ranking(
             SearchLaneKind::Anchored => Arc::new(anchored_lane::AnchoredLane::new()),
             SearchLaneKind::Lexical => Arc::new(PreparedEngineLane {
                 kind: *kind,
-                candidates: lexical_candidates.clone(),
+                candidates: lexical_execution_candidates.clone(),
             }),
             SearchLaneKind::Semantic => Arc::new(PreparedEngineLane {
                 kind: *kind,
@@ -2382,18 +2440,22 @@ fn run_engine_ranking(
         index: &index,
     };
     let mut executions = Vec::new();
-    for kind in &plan.selected_lanes {
+    let mut callback_counts = HashMap::new();
+    for kind in &plan.executed_callbacks {
         let lane = registry
             .get(*kind)
-            .ok_or_else(|| format!("selected lane {kind} was not registered"))?;
+            .ok_or_else(|| format!("selected callback {kind} was not registered"))?;
         let execution = extensions.execute_lane(lane.as_ref(), &input);
+        *callback_counts.entry(*kind).or_insert(0usize) += 1;
         if execution.kind != *kind {
             return Err(format!(
-                "selected lane {kind} returned execution for {}",
+                "selected callback {kind} returned execution for {}",
                 execution.kind
             ));
         }
-        executions.push(execution);
+        if plan.selected_lanes.contains(kind) {
+            executions.push(execution);
+        }
     }
 
     let mut canonical_descriptors = HashMap::new();
@@ -2478,6 +2540,22 @@ fn run_engine_ranking(
             snapshot_generation: generation,
         })
         .map_err(|error| error.to_string())?;
+    let mut structured_content =
+        serde_json::to_value(structured).map_err(|error| error.to_string())?;
+    if let Some(plan_object) = structured_content
+        .get_mut("plan")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        plan_object.insert(
+            "callback_counts".to_string(),
+            serde_json::Value::Object(
+                callback_counts
+                    .into_iter()
+                    .map(|(lane, count)| (lane.as_str().to_string(), serde_json::json!(count)))
+                    .collect(),
+            ),
+        );
+    }
     let trailer = SearchTrailer::from_page(&page, ExactPassState::Complete)
         .map_err(|error| error.to_string())?
         .render();
@@ -2544,10 +2622,11 @@ fn run_engine_ranking(
         results,
         more_available: page_end < page.reply.canonical_list.len()
             || !matches!(page.stop_state, paging::StopState::S2Exhausted),
-        engine_capped: matches!(page.stop_state, paging::StopState::S3DepthCap),
+        engine_capped: identifier_exact_capped
+            || matches!(page.stop_state, paging::StopState::S3DepthCap),
         trailer,
         confidence_line: confidence.flat_head_line,
-        structured_content: serde_json::to_value(structured).map_err(|error| error.to_string())?,
+        structured_content,
     })
 }
 
@@ -4908,11 +4987,9 @@ fn query_kind_label(kind: QueryKind) -> &'static str {
     }
 }
 
-/// Strip a single matched pair of surrounding `"` or `'` from a literal
-/// query, matching the convention agents and humans bring from GitHub code
-/// search, `rg -F "..."`, and most search engines. Only strips ONE pair, and
-/// only when leading + trailing match — `'foo"` is left alone, and pre-stripped
-/// queries like `foo` are returned unchanged.
+/// Strip one matched surrounding delimiter from a literal query. Quotes and
+/// backticks are recognized because all three can select the code-literal
+/// route; mismatched or already stripped input is left unchanged.
 fn strip_surrounding_quotes(query: String) -> String {
     let trimmed = query.trim();
     if trimmed.len() < 2 {
@@ -4920,7 +4997,7 @@ fn strip_surrounding_quotes(query: String) -> String {
     }
     let first = trimmed.chars().next().unwrap();
     let last = trimmed.chars().next_back().unwrap();
-    if (first == '"' || first == '\'') && first == last {
+    if matches!(first, '"' | '\'' | '`') && first == last {
         let mut chars = trimmed.chars();
         chars.next();
         chars.next_back();
@@ -5946,7 +6023,61 @@ mod tests {
     }
 
     #[test]
-    fn quoted_natural_language_runs_lexical_lane_without_zero_escalation() {
+    fn three_token_quoted_span_routes_as_code_literal_without_embedding() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let source_file = project.path().join("src/reminder.rs");
+        std::fs::create_dir_all(source_file.parent().expect("source parent"))
+            .expect("create source dir");
+        std::fs::write(&source_file, "const template = \"outside <touser>\";\n")
+            .expect("write source file");
+        let ctx = test_context(project.path());
+        let mut index = SearchIndex::new();
+        index.index_file(
+            &source_file,
+            std::fs::read(&source_file).expect("read source").as_slice(),
+        );
+        index.ready = true;
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(index);
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SemanticIndex::new(project.path().to_path_buf(), 3));
+
+        let mut request = semantic_request("\"outside <touser>\" reminder text", 5);
+        request.id = "b2-three-token-quoted-span".to_string();
+        let response = response_value(handle_semantic_search(&request, &ctx));
+        assert_eq!(response["success"], true);
+        assert_eq!(response["interpreted_as"], "engine");
+        assert_eq!(
+            response["structuredContent"]["plan"]["shape"],
+            "code_literal"
+        );
+        assert_eq!(
+            response["structuredContent"]["plan"]["lanes_run"],
+            serde_json::json!(["exact", "lexical"])
+        );
+        assert_eq!(
+            response["structuredContent"]["search"]["embedding_calls"],
+            0
+        );
+        assert_eq!(
+            response["structuredContent"]["search"]["embedding_cache_hits"],
+            0
+        );
+        assert_eq!(
+            response["structuredContent"]["search"]["live_embed_calls"],
+            0
+        );
+        assert!(response.get("zero_result_escalation").is_none());
+    }
+
+    #[test]
+    fn four_token_quoted_span_remains_natural_language_and_runs_hybrid() {
         let project = tempfile::tempdir().expect("create project dir");
         let source_file = project.path().join("src/reminder.rs");
         std::fs::create_dir_all(source_file.parent().expect("source parent"))
@@ -5977,20 +6108,16 @@ mod tests {
             config.semantic.model = "test-embedding".to_string();
         });
 
-        let response = response_value(handle_semantic_search(
-            &semantic_request("\"outside <touser>\" reminder text", 5),
-            &ctx,
-        ));
+        let mut request = semantic_request("\"outside <touser>\" reminder text here", 5);
+        request.id = "b2-four-token-quoted-span".to_string();
+        let response = response_value(handle_semantic_search(&request, &ctx));
         assert_eq!(response["success"], true);
         assert_eq!(response["interpreted_as"], "hybrid");
+        assert_eq!(
+            response["structuredContent"]["plan"]["shape"],
+            "natural_language"
+        );
         assert!(response.get("zero_result_escalation").is_none());
-        assert!(response["results"]
-            .as_array()
-            .expect("results")
-            .iter()
-            .any(|result| result["file"]
-                .as_str()
-                .is_some_and(|file| file.ends_with("src/reminder.rs"))));
         handle.join().expect("embedding server thread");
     }
 

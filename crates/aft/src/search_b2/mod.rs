@@ -4,36 +4,67 @@
 //! from their first commit; ownership of everything under `search_b2/`
 //! transfers to campaign B2 at its first slice.
 //!
-//! The engine never names B2's types: it asks this module for the
-//! [`SearchExtensions`] implementation to run, and receives the A-side
-//! defaults until B2 installs its own.
-
-pub mod variants;
-
-use crate::commands::semantic_search::extensions::{DefaultSearchExtensions, SearchExtensions};
+//! The engine asks this module for one [`SearchExtensions`] implementation;
+//! every B2 hook is composed here without making the engine name a concrete
+//! router, planner, readiness sampler, variant pipeline, or counter.
 
 pub mod embed_counter;
+pub mod lane_plan;
 pub mod readiness;
+pub mod router;
+pub mod variants;
 
-static DEFAULTS: DefaultSearchExtensions = DefaultSearchExtensions;
+use crate::commands::semantic_search::extensions::{
+    LanePlan, QueryFacts, RawQuery, Readiness, SearchExtensions, Token, TokenVariant,
+};
+use crate::commands::semantic_search::plan_table::SearchShape;
 
-/// The [`SearchExtensions`] the live search path runs. Returns the A-side
-/// defaults until B2's slices replace the installation.
+#[derive(Debug, Default, Clone, Copy)]
+struct B2SearchExtensions;
+
+impl SearchExtensions for B2SearchExtensions {
+    fn classify(&self, raw_query: &RawQuery) -> (SearchShape, QueryFacts) {
+        router::classify(raw_query)
+    }
+
+    fn variants(&self, token: Token<'_>) -> Vec<TokenVariant> {
+        variants::generate_variants(token)
+    }
+
+    fn plan<'a>(
+        &self,
+        shape: &SearchShape,
+        facts: &QueryFacts,
+        readiness: &Readiness<'a>,
+    ) -> LanePlan<'a> {
+        lane_plan::plan(shape, facts, readiness)
+    }
+}
+
+static EXTENSIONS: B2SearchExtensions = B2SearchExtensions;
+
+/// Returns the single extension set used by the live search path.
 pub fn install_defaults() -> &'static dyn SearchExtensions {
-    &DEFAULTS
+    &EXTENSIONS
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::semantic_search::extensions::{classify_query_facts, QueryFacts};
+    use crate::commands::semantic_search::extensions::{
+        classify_raw_query, DefaultSearchExtensions,
+    };
 
     #[test]
-    fn defaults_classify_like_the_engine() {
-        let facts = QueryFacts::new("fn parse_manifest");
+    fn default_classifier_remains_available_beside_the_b2_installation() {
+        let raw_query = RawQuery::new("fn parse_manifest");
         assert_eq!(
-            install_defaults().classify(&facts),
-            classify_query_facts(&facts)
+            DefaultSearchExtensions.classify(&raw_query),
+            classify_raw_query(&raw_query)
+        );
+        assert_eq!(
+            install_defaults().classify(&raw_query).0,
+            SearchShape::Short
         );
     }
 

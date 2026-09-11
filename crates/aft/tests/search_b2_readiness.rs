@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use aft::commands::semantic_search::extensions::{
-    DefaultSearchExtensions, QueryFacts, ReadinessObservation, ReadinessSource, ReadinessWait,
-    Root, SearchExtensions, SemanticReadiness, SemanticSnapshot, SymbolIndexStatus,
-    SymbolReadiness, TrigramReadiness,
+    DefaultSearchExtensions, RawQuery, ReadinessObservation, ReadinessSource, ReadinessWait, Root,
+    SearchExtensions, SemanticReadiness, SemanticSnapshot, SymbolIndexStatus, SymbolReadiness,
+    TrigramReadiness,
 };
 use aft::commands::semantic_search::plan_table::{SearchLaneKind, SearchShape};
 use aft::context::SemanticIndexStatus;
@@ -421,8 +421,10 @@ fn transition_during_wait_changes_the_selected_plan() {
     assert!(readiness.semantic_index);
     assert!(!readiness.lexical_index);
     assert_eq!(reason(&readiness, "trigram:"), "building:trigram_index");
-    let facts = QueryFacts::new("where does semantic readiness change the plan");
-    let plan = DefaultSearchExtensions.plan(&facts, SearchShape::NaturalLanguage, &readiness);
+    let raw_query = RawQuery::new("where does semantic readiness change the plan");
+    let (shape, facts) = DefaultSearchExtensions.classify(&raw_query);
+    assert_eq!(shape, SearchShape::NaturalLanguage);
+    let plan = DefaultSearchExtensions.plan(&shape, &facts, &readiness);
     assert!(plan.contains(SearchLaneKind::Semantic));
     assert!(!plan.contains(SearchLaneKind::Lexical));
     assert_eq!(source.sample_count.load(Ordering::SeqCst), 2);
