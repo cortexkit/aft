@@ -849,11 +849,15 @@ describe("whole-root asynchronous observation controls", () => {
     expect(second.failures).toEqual([]);
   });
 
-  test("cross-scenario-root-write-is-attributed-to-writer", async () => {
+  // Concurrent scenarios each own a root and an observer. A write that lands
+  // in another scenario's root is reported by THAT root's observer under the
+  // victim's scenario id: per-root observation cannot know the writer, only
+  // where the effect landed, and two observers must never blur.
+  test("cross-scenario-root-write-attributed-to-victim-root", async () => {
     const writerRoot = await root();
     const victimRoot = await root();
     const writer = new DiskStateObserver(writerRoot, "bash/T1/cross-root-writer");
-    const victim = new DiskStateObserver(victimRoot, "bash/T1/cross-root-writer");
+    const victim = new DiskStateObserver(victimRoot, "read/T1/cross-root-victim");
     await Promise.all([writer.beginCall(call({ name: "bash" })), victim.beginCall(call())]);
 
     await writeFile(join(victimRoot, "escaped.txt"), "cross-root effect\n");
@@ -864,7 +868,7 @@ describe("whole-root asynchronous observation controls", () => {
     );
     expect(writer.failures).toEqual([]);
     expect(error.details).toMatchObject({
-      scenario: "bash/T1/cross-root-writer",
+      scenario: "read/T1/cross-root-victim",
       originating_call: "call-1",
       path: "escaped.txt",
     });

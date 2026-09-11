@@ -180,7 +180,7 @@ export async function runHarnessControlSuite(root: string): Promise<HarnessContr
     const writerRoot = await freshProject(root, "cross-root-writer");
     const victimRoot = await freshProject(root, "cross-root-victim");
     const writer = new DiskStateObserver(writerRoot, "bash/T1/cross-root-writer");
-    const victim = new DiskStateObserver(victimRoot, "bash/T1/cross-root-writer");
+    const victim = new DiskStateObserver(victimRoot, "read/T1/cross-root-victim");
     await Promise.all([
       writer.beginCall(call({ name: "bash" })),
       victim.beginCall(call()),
@@ -189,9 +189,23 @@ export async function runHarnessControlSuite(root: string): Promise<HarnessContr
     await writer.checkpointCall("control-call", "tool-result", "result");
     evidence.push(
       await expectFailure(
-        "cross-scenario-root-write-attributed-to-writer",
+        "cross-scenario-root-write-attributed-to-victim-root",
         "undeclared_disk_effect",
-        () => victim.checkpointCall("control-call", "tool-result", "result"),
+        async () => {
+          try {
+            await victim.checkpointCall("control-call", "tool-result", "result");
+          } catch (error) {
+            // The effect must be reported under the VICTIM root's scenario id;
+            // a writer-labelled or unlabelled report would let two concurrent
+            // observers blur, which is what this control exists to refuse.
+            if (error instanceof HarnessError && error.details.scenario !== "read/T1/cross-root-victim") {
+              throw new Error(
+                `cross-root effect attributed to ${String(error.details.scenario)}, expected the victim root read/T1/cross-root-victim`,
+              );
+            }
+            throw error;
+          }
+        },
         "concurrent-scenario-root-isolation",
       ),
     );
