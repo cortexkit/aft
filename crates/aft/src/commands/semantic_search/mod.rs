@@ -1800,11 +1800,10 @@ fn handle_grep_search(
             interval_has_more,
             result.engine_capped,
         );
-        text = format!(
-            "{TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE}\n\n{text}\n\n{}",
-            crate::list_envelope::render_trailer(&envelope)
-                .expect("bounded-walk search envelopes always have a reason")
-        );
+        // The trailer is not rendered here: the shared formatters append it
+        // from the wire envelope below, and the contract keeps every trailer
+        // on that one path so no tool can print it twice or word it differently.
+        text = format!("{TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE}\n\n{text}");
         extras.insert(
             crate::list_surfaces::search::SEARCH_WIRE_KEY.to_string(),
             serde_json::json!(envelope),
@@ -6051,13 +6050,12 @@ mod tests {
         let (_tx, rx) = crossbeam_channel::unbounded::<SearchIndex>();
         ctx.install_search_index_rx(rx, ctx.configure_generation());
 
-        let response =
+        let raw_response =
             with_first_search_index_load_wait_budget_for_test(Duration::from_millis(40), || {
-                response_value(handle_semantic_search(
-                    &semantic_request("fresh_root_needle", 5),
-                    &ctx,
-                ))
+                handle_semantic_search(&semantic_request("fresh_root_needle", 5), &ctx)
             });
+        let rendered = crate::subc_format::format_response("search", &raw_response, false);
+        let response = response_value(raw_response);
 
         assert_eq!(response["success"], true);
         assert_eq!(response["status"], "partial");
@@ -6072,9 +6070,13 @@ mod tests {
         }));
         let text = response["text"].as_str().expect("response text");
         assert!(text.contains(TRIGRAM_BUILDING_BOUNDED_WALK_DISCLOSURE));
-        assert!(text.contains("(walk)"));
+        // The handler never renders the trailer itself; the shared formatter
+        // appends it from the wire envelope exactly once.
+        assert!(!text.contains("(walk)"));
         assert!(!text.contains("(exhausted)"));
         assert_eq!(response["results_list_envelope"]["reason"], "walk");
+        assert_eq!(rendered.matches("(walk)").count(), 1, "{rendered}");
+        assert!(!rendered.contains("(exhausted)"));
         assert_eq!(
             response["results_list_envelope"]["total"]["kind"],
             "at_least"

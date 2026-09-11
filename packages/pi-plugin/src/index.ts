@@ -44,7 +44,7 @@ import {
   resolveCortexKitStorageRoot,
   setActiveLogger,
 } from "@cortexkit/aft-bridge";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   appendToolResultBgCompletions,
   getActiveSessionId,
@@ -802,8 +802,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // can therefore reveal that its optional built-in PowerShell tool is active
   // only at session start; older hosts use bash.powershell_tool instead.
   let powershellRegistered = surface.hoistPowershell && resolveBashConfig(config).enabled;
-  (pi.on as (event: "session_start", handler: (_event?: unknown, extCtx?: unknown) => unknown) => void)("session_start", (_event, extCtx) => {
-    const sessionID = extCtx ? resolveSessionId(extCtx as any) : undefined;
+  (
+    pi.on as (
+      event: "session_start",
+      handler: (_event?: unknown, extCtx?: unknown) => unknown,
+    ) => void
+  )("session_start", (_event, extCtx) => {
+    const sessionID = extCtx ? resolveSessionId(extCtx as ExtensionContext) : undefined;
     setActiveSessionId(sessionID);
     if (powershellRegistered) return;
     const liveSurface = resolvePiToolSurface(config, pi);
