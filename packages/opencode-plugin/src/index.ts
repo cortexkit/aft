@@ -29,6 +29,7 @@ import {
   handlePushedBgLongRunning,
   handlePushedPatternMatch,
   handleSubcBgEventsNudge,
+  observeOpenCodeBgNotificationEvent,
   setActiveSessionId,
 } from "./bg-notifications.js";
 import {
@@ -1154,6 +1155,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     event: async (eventInput: { event: { type: string; properties?: unknown } }) => {
       await autoUpdateEventHook(eventInput);
       const eventType = eventInput.event.type;
+      observeOpenCodeBgNotificationEvent(eventInput.event);
       const sessionID = extractSessionID(eventInput.event.properties);
       // OpenCode's lifecycle vocabulary publishes session.deleted for explicit
       // remove() cleanup, not session.shutdown. Deletion-only cleanup is enough:

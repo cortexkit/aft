@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import {
   type AftProjectTransport,
   type BgNudgeRef,
@@ -121,6 +121,11 @@ type SessionBgState = {
    * for the FIFO OOM backstop cap.
    */
   deliveredAwaitingAckTaskIds: Set<string>;
+  hostStatus: "idle" | "busy" | "retry" | undefined;
+  wakeAdmissions: Map<string, WakeAdmission>;
+  confirmedWakeDeliveryIds: Set<string>;
+  refiredWakeDeliveryIds: Set<string>;
+  wakeDeliveryOrder: string[];
   lastSeenAt: number;
 };
 
@@ -140,6 +145,7 @@ export const SESSION_BG_STATE_IDLE_TTL_MS = 60 * 60 * 1000;
 const DEBOUNCE_STEP_MS = 200;
 const DEBOUNCE_CAP_MS = 1000;
 const MAX_WAKE_SEND_ATTEMPTS = 5;
+const DEFAULT_WAKE_CONFIRMATION_WINDOW_MS = 5_000;
 const UNKNOWN_COMPLETION_TTL_MS = 5000;
 const UNKNOWN_COMPLETION_CAP = 32;
 const DEFAULT_SESSION_ID = "__default__";
@@ -186,6 +192,9 @@ function logDroppedForeignSessionFrame(
 }
 const DEFAULT_BG_HOP_TIMEOUT_MS = 15_000;
 let bgHopTimeoutMs = DEFAULT_BG_HOP_TIMEOUT_MS;
+let wakeConfirmationWindowMs = DEFAULT_WAKE_CONFIRMATION_WINDOW_MS;
+let lastWakeMessageTimestamp = 0;
+let wakeMessageCounter = 0;
 const subcNudgesInFlight = new Map<string, Promise<void>>();
 const subcNudgeLogState = new Map<string, { lastEmittedAt: number; suppressed: number }>();
 
@@ -209,11 +218,29 @@ interface DrainContext {
   resolvedBridge?: AftProjectTransport;
 }
 
+interface OpenCodeSessionApi {
+  promptAsync?: (input: unknown) => Promise<unknown> | unknown;
+  messages?: (input: { path: { id: string } }) => Promise<{ data?: unknown[] }>;
+}
+
 interface OpenCodeClient {
-  session?: {
-    promptAsync?: (input: unknown) => Promise<unknown> | unknown;
-    messages?: (input: { path: { id: string } }) => Promise<{ data?: unknown[] }>;
+  session?: OpenCodeSessionApi;
+}
+
+interface WakeAdmission {
+  deliveryID: string;
+  admittedAt: number;
+  admittedMessageIDs: Set<string>;
+  requestBody: Record<string, unknown>;
+  sessionApi: OpenCodeSessionApi & {
+    promptAsync: NonNullable<OpenCodeSessionApi["promptAsync"]>;
   };
+  drainContext: DrainContext;
+  taskIDs: string[];
+  watchId?: string;
+  confirmationTimer: NodeJS.Timeout | null;
+  refireTimer: NodeJS.Timeout | null;
+  refireQueued: boolean;
 }
 
 /**
@@ -716,6 +743,259 @@ function promptAsyncFailure(response: unknown): string | null {
   return null;
 }
 
+/**
+ * Preassign an OpenCode-compatible ascending message ID because promptAsync
+ * returns 204 without the admitted user row. The ID lets message.updated
+ * correlate an assistant's parentID with this wake delivery.
+ */
+function wakeMessageID(): string {
+  const timestamp = Date.now();
+  if (timestamp !== lastWakeMessageTimestamp) {
+    lastWakeMessageTimestamp = timestamp;
+    wakeMessageCounter = 0;
+  }
+  wakeMessageCounter += 1;
+  const encoded = BigInt(timestamp) * 0x1000n + BigInt(wakeMessageCounter);
+  const timeBytes = Buffer.alloc(6);
+  for (let index = 0; index < timeBytes.length; index += 1) {
+    timeBytes[index] = Number((encoded >> BigInt(40 - 8 * index)) & 0xffn);
+  }
+  const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+  const random = randomBytes(14);
+  let suffix = "";
+  for (const byte of random) suffix += alphabet[byte % alphabet.length];
+  return `msg_${timeBytes.toString("hex")}${suffix}`;
+}
+
+function logWakeAdmissionOutcome(
+  admission: WakeAdmission,
+  kind: string,
+  message: string,
+  data: Record<string, unknown>,
+  level: "info" | "warn" = "info",
+): void {
+  logPerTaskDeliveryHop(
+    admission.drainContext,
+    kind,
+    message,
+    admission.taskIDs,
+    {
+      delivery_id: admission.deliveryID,
+      ...(admission.watchId ? { watch_id: admission.watchId } : {}),
+      ...data,
+    },
+    level,
+  );
+}
+
+function clearWakeAdmission(state: SessionBgState, admission: WakeAdmission): void {
+  if (admission.confirmationTimer) clearTimeout(admission.confirmationTimer);
+  if (admission.refireTimer) clearTimeout(admission.refireTimer);
+  admission.confirmationTimer = null;
+  admission.refireTimer = null;
+  state.wakeAdmissions.delete(admission.deliveryID);
+}
+
+function rememberWakeDelivery(
+  state: SessionBgState,
+  deliveryID: string,
+  target: Set<string>,
+): void {
+  const alreadyKnown =
+    state.confirmedWakeDeliveryIds.has(deliveryID) || state.refiredWakeDeliveryIds.has(deliveryID);
+  target.add(deliveryID);
+  if (alreadyKnown) return;
+  state.wakeDeliveryOrder.push(deliveryID);
+  while (state.wakeDeliveryOrder.length > CONSUMED_TASKIDS_CAP) {
+    const oldest = state.wakeDeliveryOrder.shift();
+    if (!oldest) break;
+    state.confirmedWakeDeliveryIds.delete(oldest);
+    state.refiredWakeDeliveryIds.delete(oldest);
+  }
+}
+
+function confirmWakeAdmission(
+  state: SessionBgState,
+  admission: WakeAdmission,
+  signal: "assistant_parent" | "idle_busy_edge",
+  observedMessageID?: string,
+): void {
+  if (state.confirmedWakeDeliveryIds.has(admission.deliveryID)) return;
+  rememberWakeDelivery(state, admission.deliveryID, state.confirmedWakeDeliveryIds);
+  if (admission.confirmationTimer) clearTimeout(admission.confirmationTimer);
+  admission.confirmationTimer = null;
+  logWakeAdmissionOutcome(admission, `confirm-${signal}`, "wake scheduled turn confirmed", {
+    event: "bash_completion_wake_confirmed",
+    signal,
+    admitted_message_ids: [...admission.admittedMessageIDs],
+    ...(observedMessageID ? { assistant_message_id: observedMessageID } : {}),
+  });
+  if (!admission.refireQueued || state.refiredWakeDeliveryIds.has(admission.deliveryID)) {
+    clearWakeAdmission(state, admission);
+  }
+}
+
+function queueWakeRefire(state: SessionBgState, admission: WakeAdmission): void {
+  if (
+    admission.refireQueued ||
+    state.refiredWakeDeliveryIds.has(admission.deliveryID) ||
+    state.confirmedWakeDeliveryIds.has(admission.deliveryID)
+  ) {
+    return;
+  }
+  admission.refireQueued = true;
+  if (admission.confirmationTimer) clearTimeout(admission.confirmationTimer);
+  admission.confirmationTimer = null;
+  admission.refireTimer = setTimeout(() => {
+    admission.refireTimer = null;
+    if (state.confirmedWakeDeliveryIds.has(admission.deliveryID)) {
+      logWakeAdmissionOutcome(admission, "refire-suppressed", "wake refire suppressed", {
+        event: "bash_completion_wake_refire_suppressed",
+        cause: "turn_observed_before_refire",
+      });
+      clearWakeAdmission(state, admission);
+      return;
+    }
+    if (state.refiredWakeDeliveryIds.has(admission.deliveryID)) return;
+    rememberWakeDelivery(state, admission.deliveryID, state.refiredWakeDeliveryIds);
+    const refireMessageID = wakeMessageID();
+    admission.admittedMessageIDs.add(refireMessageID);
+    const refireBody = { ...admission.requestBody, messageID: refireMessageID };
+    void (async () => {
+      try {
+        const response = await withBgHopTimeout(
+          Promise.resolve(
+            admission.sessionApi.promptAsync({
+              path: { id: admission.drainContext.sessionID },
+              body: refireBody,
+            }),
+          ),
+          "session promptAsync confirmation refire",
+        );
+        const failure = promptAsyncFailure(response);
+        if (failure) throw new Error(failure);
+        logWakeAdmissionOutcome(admission, "refired", "wake refired after idle admission", {
+          event: "bash_completion_wake_refired",
+          cause: "idle_without_turn",
+          admitted_message_id: refireMessageID,
+        });
+      } catch (err) {
+        logWakeAdmissionOutcome(
+          admission,
+          "refire-error",
+          "wake refire failed",
+          {
+            event: "bash_completion_wake_prompt_async_error",
+            injection_mode: "confirmation-refire",
+            cause: err instanceof Error ? err.message : String(err),
+          },
+          "warn",
+        );
+      } finally {
+        clearWakeAdmission(state, admission);
+      }
+    })();
+  }, 0);
+  admission.refireTimer.unref?.();
+}
+
+function registerWakeAdmission(
+  state: SessionBgState,
+  admission: Omit<
+    WakeAdmission,
+    "admittedAt" | "confirmationTimer" | "refireTimer" | "refireQueued"
+  >,
+): void {
+  if (
+    state.confirmedWakeDeliveryIds.has(admission.deliveryID) ||
+    state.refiredWakeDeliveryIds.has(admission.deliveryID) ||
+    state.wakeAdmissions.has(admission.deliveryID)
+  ) {
+    return;
+  }
+  const tracked: WakeAdmission = {
+    ...admission,
+    admittedAt: Date.now(),
+    confirmationTimer: null,
+    refireTimer: null,
+    refireQueued: false,
+  };
+  state.wakeAdmissions.set(tracked.deliveryID, tracked);
+  tracked.confirmationTimer = setTimeout(() => {
+    tracked.confirmationTimer = null;
+    if (state.hostStatus === "idle") queueWakeRefire(state, tracked);
+  }, wakeConfirmationWindowMs);
+  tracked.confirmationTimer.unref?.();
+}
+
+/**
+ * Observe the OpenCode event hook already owned by the plugin. Unknown and
+ * malformed event shapes are ignored so host event delivery can never fail.
+ */
+export function observeOpenCodeBgNotificationEvent(event: unknown): void {
+  try {
+    if (!event || typeof event !== "object") return;
+    const record = event as Record<string, unknown>;
+    const properties = record.properties;
+    if (!properties || typeof properties !== "object") return;
+    const props = properties as Record<string, unknown>;
+
+    if (record.type === "message.updated") {
+      const info = props.info;
+      if (!info || typeof info !== "object") return;
+      const message = info as Record<string, unknown>;
+      if (
+        message.role !== "assistant" ||
+        typeof message.sessionID !== "string" ||
+        typeof message.parentID !== "string"
+      ) {
+        return;
+      }
+      const state = sessionBgStates.get(message.sessionID);
+      if (!state) return;
+      for (const admission of state.wakeAdmissions.values()) {
+        if (admission.admittedMessageIDs.has(message.parentID)) {
+          confirmWakeAdmission(
+            state,
+            admission,
+            "assistant_parent",
+            typeof message.id === "string" ? message.id : undefined,
+          );
+        }
+      }
+      return;
+    }
+
+    if (record.type !== "session.status" && record.type !== "session.idle") return;
+    const sessionID = typeof props.sessionID === "string" ? props.sessionID : undefined;
+    if (!sessionID) return;
+    const nextStatus =
+      record.type === "session.idle"
+        ? "idle"
+        : props.status && typeof props.status === "object"
+          ? (props.status as Record<string, unknown>).type
+          : undefined;
+    if (nextStatus !== "idle" && nextStatus !== "busy" && nextStatus !== "retry") return;
+    const state = stateFor(sessionID);
+    const previousStatus = state.hostStatus;
+    state.hostStatus = nextStatus;
+    if (nextStatus === "busy" && previousStatus === "idle") {
+      const observedAt = Date.now();
+      for (const admission of state.wakeAdmissions.values()) {
+        if (observedAt >= admission.admittedAt) {
+          confirmWakeAdmission(state, admission, "idle_busy_edge");
+        }
+      }
+      return;
+    }
+    if (nextStatus === "idle") {
+      for (const admission of state.wakeAdmissions.values()) queueWakeRefire(state, admission);
+    }
+  } catch {
+    // Host event handling is best-effort and must not disrupt unrelated plugin hooks.
+  }
+}
+
 async function triggerWakeIfPending(
   drainContext: DrainContext & { client: unknown },
   skipDrain: boolean,
@@ -830,8 +1110,11 @@ async function triggerWakeIfPending(
           mode: "mirrored-context" | "model-free-fallback",
         ): Promise<string> => {
           const deliveryID = `aftdel_${randomUUID()}`;
+          const admittedMessageID = wakeMessageID();
+          const requestBody = { ...attemptBody, messageID: admittedMessageID };
           const wakeMeta = {
             delivery_id: deliveryID,
+            admitted_message_id: admittedMessageID,
             attempt: state.wakeRetryAttempts + 1,
             task_ids: taskIDs,
             ...(watchId ? { watch_id: watchId, watch_ids: watchIds } : {}),
@@ -864,7 +1147,7 @@ async function triggerWakeIfPending(
               Promise.resolve(
                 sessionApi.promptAsync({
                   path: { id: drainContext.sessionID },
-                  body: attemptBody,
+                  body: requestBody,
                 }),
               ),
               "session promptAsync injection",
@@ -893,6 +1176,15 @@ async function triggerWakeIfPending(
             delivery_id: deliveryID,
             attempt: state.wakeRetryAttempts + 1,
             injection_mode: mode,
+          });
+          registerWakeAdmission(state, {
+            deliveryID,
+            admittedMessageIDs: new Set([admittedMessageID]),
+            requestBody,
+            sessionApi,
+            drainContext,
+            taskIDs: [...taskIDs],
+            watchId,
           });
           return deliveryID;
         };
@@ -1020,9 +1312,14 @@ export function __setBgNotificationHopTimeoutForTests(timeoutMs: number): void {
   bgHopTimeoutMs = timeoutMs;
 }
 
+export function __setWakeConfirmationWindowForTests(timeoutMs: number): void {
+  wakeConfirmationWindowMs = timeoutMs;
+}
+
 export function __resetBgNotificationStateForTests(): void {
   for (const state of sessionBgStates.values()) {
     if (state.debounceTimer) clearTimeout(state.debounceTimer);
+    for (const admission of state.wakeAdmissions.values()) clearWakeAdmission(state, admission);
   }
   sessionBgStates.clear();
   subcNudgesInFlight.clear();
@@ -1030,6 +1327,9 @@ export function __resetBgNotificationStateForTests(): void {
   foreignSessionDropLogState.clear();
   activeSessionId = undefined;
   bgHopTimeoutMs = DEFAULT_BG_HOP_TIMEOUT_MS;
+  wakeConfirmationWindowMs = DEFAULT_WAKE_CONFIRMATION_WINDOW_MS;
+  lastWakeMessageTimestamp = 0;
+  wakeMessageCounter = 0;
 }
 
 function bridgeForDrain(drainContext: DrainContext): AftProjectTransport {
@@ -1398,6 +1698,11 @@ function stateFor(sessionID: string | undefined): SessionBgState {
       consumedTaskOrder: [],
       deliveringTaskIds: new Set(),
       deliveredAwaitingAckTaskIds: new Set(),
+      hostStatus: undefined,
+      wakeAdmissions: new Map(),
+      confirmedWakeDeliveryIds: new Set(),
+      refiredWakeDeliveryIds: new Set(),
+      wakeDeliveryOrder: [],
       lastSeenAt: now,
     };
     sessionBgStates.set(key, state);
@@ -1459,6 +1764,7 @@ function cleanupIdleSessionStates(now: number): void {
     if (state.outstandingTaskIds.size > 0) continue;
     if (state.lastSeenAt >= cutoff) continue;
     if (state.debounceTimer) clearTimeout(state.debounceTimer);
+    for (const admission of state.wakeAdmissions.values()) clearWakeAdmission(state, admission);
     sessionBgStates.delete(sessionID);
   }
 }

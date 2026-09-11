@@ -41,6 +41,7 @@ afterAll(() => {
 import {
   __resetBgNotificationStateForTests,
   __setBgNotificationHopTimeoutForTests,
+  __setWakeConfirmationWindowForTests,
   appendInTurnBgCompletions,
   consumeBgCompletion,
   formatPatternMatchReminder,
@@ -53,6 +54,7 @@ import {
   markBgCompletionDelivered,
   markExplicitControl,
   markTaskWaiting,
+  observeOpenCodeBgNotificationEvent,
   SESSION_BG_STATE_IDLE_TTL_MS,
   sessionBgStates,
   trackBgTask,
@@ -307,10 +309,12 @@ describe("OpenCode background notifications", () => {
     const payload = promptAsync.mock.calls[0][0] as {
       body: {
         noReply: boolean;
+        messageID: string;
         parts: Array<{ text: string; synthetic?: boolean; ignored?: boolean }>;
       };
     };
     expect(payload.body.noReply).toBe(false);
+    expect(payload.body.messageID).toMatch(/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
     expect(payload.body.parts[0].text).toContain("- task task-1 (exit 0)");
     expect(payload.body.parts[0].text).not.toContain(": npm test");
     // #129: the agent-directed wake part MUST be synthetic (model-visible,
@@ -318,6 +322,236 @@ describe("OpenCode background notifications", () => {
     // and MUST NOT be `ignored` (which would strip it from the model call).
     expect(payload.body.parts[0].synthetic).toBe(true);
     expect(payload.body.parts[0].ignored).toBeUndefined();
+  });
+
+  test("unknown host event shapes are ignored without throwing", () => {
+    const malformedEvents: unknown[] = [
+      null,
+      [],
+      { type: "message.updated", properties: { info: { role: "assistant" } } },
+      { type: "session.status", properties: { sessionID: "s1", status: "busy" } },
+      { type: "unrelated", properties: { sessionID: "s1" } },
+    ];
+
+    for (const event of malformedEvents) {
+      expect(() => observeOpenCodeBgNotificationEvent(event)).not.toThrow();
+    }
+    expect(sessionBgStates.has("s1")).toBe(false);
+  });
+
+  test("admitted wake confirms from an assistant child without refiring", async () => {
+    __setWakeConfirmationWindowForTests(50);
+    observeOpenCodeBgNotificationEvent({
+      type: "session.status",
+      properties: { sessionID: "s1", status: { type: "idle" } },
+    });
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness((command) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-1", "npm test")] }
+        : { success: true, acked_task_ids: ["task-1"] },
+    );
+    const promptAsync = mock(async () => {});
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: makeClient(promptAsync),
+    });
+    await waitForMockCallCount(promptAsync, 1);
+    const admittedMessageID = (promptAsync.mock.calls[0][0] as { body: { messageID: string } }).body
+      .messageID;
+
+    observeOpenCodeBgNotificationEvent({
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "msg-assistant-1",
+          sessionID: "s1",
+          role: "assistant",
+          parentID: admittedMessageID,
+        },
+      },
+    });
+    await sleep(75);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(findTraceEvent("bash_completion_wake_confirmed")).toEqual(
+      expect.objectContaining({
+        delivery_id: expect.any(String),
+        signal: "assistant_parent",
+        assistant_message_id: "msg-assistant-1",
+      }),
+    );
+    expect(findTraceEvent("bash_completion_wake_refired")).toBeUndefined();
+  });
+
+  test("admitted wake confirms from an idle-to-busy edge without refiring", async () => {
+    __setWakeConfirmationWindowForTests(50);
+    observeOpenCodeBgNotificationEvent({
+      type: "session.status",
+      properties: { sessionID: "s1", status: { type: "idle" } },
+    });
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness((command) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-1", "npm test")] }
+        : { success: true, acked_task_ids: ["task-1"] },
+    );
+    const promptAsync = mock(async () => {});
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: makeClient(promptAsync),
+    });
+    await waitForMockCallCount(promptAsync, 1);
+    observeOpenCodeBgNotificationEvent({
+      type: "session.status",
+      properties: { sessionID: "s1", status: { type: "busy" } },
+    });
+    await sleep(75);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(findTraceEvent("bash_completion_wake_confirmed")).toEqual(
+      expect.objectContaining({ signal: "idle_busy_edge" }),
+    );
+    expect(findTraceEvent("bash_completion_wake_refired")).toBeUndefined();
+  });
+
+  test("idle-at-admission timeout refires exactly once per delivery", async () => {
+    __setWakeConfirmationWindowForTests(50);
+    observeOpenCodeBgNotificationEvent({
+      type: "session.status",
+      properties: { sessionID: "s1", status: { type: "idle" } },
+    });
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness((command) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-1", "npm test")] }
+        : { success: true, acked_task_ids: ["task-1"] },
+    );
+    const promptAsync = mock(async () => {});
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: makeClient(promptAsync),
+    });
+    await waitForMockCallCount(promptAsync, 1);
+    const firstMessageID = (promptAsync.mock.calls[0][0] as { body: { messageID: string } }).body
+      .messageID;
+
+    await waitForMockCallCount(promptAsync, 2);
+    expect(findTraceEvent("bash_completion_wake_refired")).toEqual(
+      expect.objectContaining({ delivery_id: expect.any(String) }),
+    );
+
+    observeOpenCodeBgNotificationEvent({
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "msg-assistant-late",
+          sessionID: "s1",
+          role: "assistant",
+          parentID: firstMessageID,
+        },
+      },
+    });
+    observeOpenCodeBgNotificationEvent({
+      type: "session.idle",
+      properties: { sessionID: "s1" },
+    });
+    await sleep(50);
+
+    expect(promptAsync).toHaveBeenCalledTimes(2);
+    expect(sessionBgStates.get("s1")?.refiredWakeDeliveryIds.size).toBe(1);
+  });
+
+  test("late assistant child suppresses a queued refire before it commits", async () => {
+    observeOpenCodeBgNotificationEvent({
+      type: "session.status",
+      properties: { sessionID: "s1", status: { type: "busy" } },
+    });
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness((command) =>
+      command === "bash_drain_completions"
+        ? { success: true, bg_completions: [completion("task-1", "npm test")] }
+        : { success: true, acked_task_ids: ["task-1"] },
+    );
+    const promptAsync = mock(async () => {});
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: makeClient(promptAsync),
+    });
+    await waitForMockCallCount(promptAsync, 1);
+    const admittedMessageID = (promptAsync.mock.calls[0][0] as { body: { messageID: string } }).body
+      .messageID;
+
+    observeOpenCodeBgNotificationEvent({
+      type: "session.idle",
+      properties: { sessionID: "s1" },
+    });
+    observeOpenCodeBgNotificationEvent({
+      type: "message.updated",
+      properties: {
+        info: {
+          id: "msg-assistant-raced",
+          sessionID: "s1",
+          role: "assistant",
+          parentID: admittedMessageID,
+        },
+      },
+    });
+    await sleep(25);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(findTraceEvent("bash_completion_wake_refire_suppressed")).toEqual(
+      expect.objectContaining({
+        delivery_id: expect.any(String),
+        cause: "turn_observed_before_refire",
+      }),
+    );
+  });
+
+  test("promptAsync failure does not create an admission confirmation refire", async () => {
+    observeOpenCodeBgNotificationEvent({
+      type: "session.status",
+      properties: { sessionID: "s1", status: { type: "idle" } },
+    });
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({ success: true, bg_completions: [] }));
+    const promptAsync = mock(async () => {
+      throw new Error("send failed");
+    });
+
+    await handleIdleBgCompletions({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client: makeClient(promptAsync),
+    });
+    await handlePushedBgCompletion(
+      {
+        ctx,
+        directory: "/tmp/project",
+        sessionID: "s1",
+        client: makeClient(promptAsync),
+      },
+      completion("task-1", "npm test"),
+    );
+    await waitForMockCallCount(promptAsync, 1);
+
+    expect(sessionBgStates.get("s1")?.wakeAdmissions.size).toBe(0);
+    expect(findTraceEvent("bash_completion_wake_refired")).toBeUndefined();
+    expect(findTraceEvent("bash_completion_wake_refire_suppressed")).toBeUndefined();
+    expect(sessionBgStates.get("s1")?.pendingCompletions).toHaveLength(1);
   });
 
   test("turn-end wake invokes promptAsync on its receiver, as the generated SDK requires (#297)", async () => {
