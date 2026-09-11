@@ -660,14 +660,13 @@ fn foreign_replay_retires_orphan_when_gc_already_removed_its_layout() {
     registry
         .replay_session_for_project(storage.path(), "session-b", project.path())
         .expect("a missing orphan layout must not abort replay");
-    let row = aft::db::bash_tasks::get_bash_task(
-        &conn.lock().unwrap(),
-        "opencode",
-        "session-a",
-        task_id,
-    )
-    .unwrap();
-    assert!(row.is_none(), "already-reaped orphan left a durable task row");
+    let row =
+        aft::db::bash_tasks::get_bash_task(&conn.lock().unwrap(), "opencode", "session-a", task_id)
+            .unwrap();
+    assert!(
+        row.is_none(),
+        "already-reaped orphan left a durable task row"
+    );
     assert!(take_logs().iter().any(|line| {
         line.contains(&format!(
             "orphaned completion already reaped: task_id={task_id} reason=layout_missing"

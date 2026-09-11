@@ -775,8 +775,7 @@ mod tests {
         insert_bash_task(&conn, "pi", "session", "bash-attached").unwrap();
         insert_bash_pattern_watch(&conn, "pi", "session", "bash-attached", "watch-attached")
             .unwrap();
-        insert_bash_pattern_watch(&conn, "pi", "session", "bash-orphan", "watch-orphan")
-            .unwrap();
+        insert_bash_pattern_watch(&conn, "pi", "session", "bash-orphan", "watch-orphan").unwrap();
         conn.execute("DELETE FROM schema_version", []).unwrap();
         conn.execute("INSERT INTO schema_version (version) VALUES (8)", [])
             .unwrap();
@@ -799,7 +798,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(attached, 1, "migration lost a watch with a live task row");
-        assert_eq!(orphaned, 0, "migration retained a pre-existing orphan watch");
+        assert_eq!(
+            orphaned, 0,
+            "migration retained a pre-existing orphan watch"
+        );
 
         conn.execute(
             "DELETE FROM bash_tasks WHERE harness = 'pi' AND session_id = 'session' AND task_id = 'bash-attached'",
@@ -807,7 +809,9 @@ mod tests {
         )
         .unwrap();
         let watches: i64 = conn
-            .query_row("SELECT COUNT(*) FROM bash_pattern_watches", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM bash_pattern_watches", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(watches, 0, "task deletion did not cascade to its watch");
     }

@@ -2123,10 +2123,7 @@ impl BgTaskRegistry {
                 if let Ok(mut state) = task.state.lock() {
                     state.metadata.completion_delivered = true;
                 }
-                self.retire_already_reaped_orphaned_completion(
-                    &task.session_id,
-                    &task.task_id,
-                );
+                self.retire_already_reaped_orphaned_completion(&task.session_id, &task.task_id);
             }
             Err(error) => {
                 return Err(format!("failed to update completion delivery: {error}"));
@@ -2272,10 +2269,8 @@ impl BgTaskRegistry {
                 Err(error) => {
                     if error.kind() == std::io::ErrorKind::NotFound
                         && !Self::persisted_task_process_is_alive(&metadata)
-                        && (self.should_retire_foreign_delivery(
-                            &metadata.session_id,
-                            session_id,
-                        ) || &metadata.session_id != session_id)
+                        && (self.should_retire_foreign_delivery(&metadata.session_id, session_id)
+                            || &metadata.session_id != session_id)
                     {
                         self.retire_already_reaped_orphaned_completion(
                             &metadata.session_id,
@@ -9026,12 +9021,11 @@ mod tests {
         let comp_handle = registry.task_for_session(&task_comp, "session-a").unwrap();
         fs::write(&comp_handle.paths.exit, "0\n").unwrap();
         comp_handle.mark_terminal_now();
-        comp_handle
-            .state
-            .lock()
-            .unwrap()
-            .metadata
-            .mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        comp_handle.state.lock().unwrap().metadata.mark_terminal(
+            BgTaskStatus::Completed,
+            Some(0),
+            None,
+        );
         registry
             .post_terminal_transition(&comp_handle, true)
             .unwrap();
