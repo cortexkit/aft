@@ -368,7 +368,13 @@ pub fn verify_exact_matches_in_text(
     // 1. Check symbols first (for symbol-level candidates like `cap_chars`)
     let symbols = scan_symbols_in_text(text);
     for (name, range) in &symbols {
-        let sym_text = &text[range.start..range.end.min(text.len())];
+        // The scanner guarantees boundary-aligned offsets; a non-aligned range
+        // is a scanner bug, and skipping the symbol is the right failure here
+        // because a panic on this path takes the whole search actor down.
+        let Some(sym_text) = text.get(range.start..range.end.min(text.len())) else {
+            debug_assert!(false, "symbol range {range:?} is not char-boundary aligned");
+            continue;
+        };
         let norm_sym_text = normalize_exact_phrase(sym_text);
         if !norm_phrase.is_empty() && norm_sym_text.contains(norm_phrase) {
             let occ = norm_sym_text.matches(norm_phrase).count();
@@ -432,11 +438,22 @@ pub fn verify_exact_matches_in_text(
 }
 
 /// Lightweight symbol scanner finding functions / structs / classes in source files.
+///
+/// Offsets are true byte positions into `text`. The walk uses
+/// `split_inclusive('\n')` rather than `lines()` because `lines()` strips a
+/// trailing `\r` as well as the `\n`, so summing `line.len() + 1` drifts one
+/// byte left per CRLF line; on a large CRLF file with non-ASCII content the
+/// drifted start landed inside a multibyte character and slicing it panicked
+/// the search actor.
 pub fn scan_symbols_in_text(text: &str) -> Vec<(String, SymbolOffsetRange)> {
     let mut symbols = Vec::new();
     let mut current_offset = 0;
 
-    for line in text.lines() {
+    for segment in text.split_inclusive('\n') {
+        let line = segment
+            .strip_suffix('\n')
+            .map(|line| line.strip_suffix('\r').unwrap_or(line))
+            .unwrap_or(segment);
         let trimmed = line.trim_start();
         let leading_spaces = line.len() - trimmed.len();
         let line_offset = current_offset + leading_spaces;
@@ -461,6 +478,7 @@ pub fn scan_symbols_in_text(text: &str) -> Vec<(String, SymbolOffsetRange)> {
 
         if let Some(name) = name_opt {
             let start = line_offset;
+            debug_assert!(text.is_char_boundary(start));
             // The lightweight span is byte-addressed because downstream ranges
             // slice UTF-8 source. Clamp the approximate end to a character boundary.
             let mut end = (start + 500).min(text.len());
@@ -470,7 +488,7 @@ pub fn scan_symbols_in_text(text: &str) -> Vec<(String, SymbolOffsetRange)> {
             symbols.push((name, SymbolOffsetRange::new(start, end)));
         }
 
-        current_offset += line.len() + 1; // +1 for newline
+        current_offset += segment.len();
     }
 
     symbols

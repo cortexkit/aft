@@ -432,3 +432,48 @@ fn exact_symbol_verification_clamps_utf8_span_boundaries() {
     );
     assert!(result.is_none());
 }
+
+/// CRLF line endings drift `lines()`-based offsets one byte left per line;
+/// after enough lines the drifted symbol start lands inside a multibyte
+/// character and slicing it panics the search actor (production, 2026-09-11,
+/// on a 21 MB CRLF file with an em dash). Offsets must be true byte positions.
+#[test]
+fn exact_symbol_offsets_are_char_boundaries_on_crlf_multibyte_files() {
+    use aft::commands::semantic_search::exact_lane::{scan_symbols_in_text, verify_exact_matches_in_text};
+
+    // Enough CRLF lines that the accumulated drift exceeds the width of the
+    // multibyte characters in the final line, then a symbol line whose
+    // computed start would fall inside one of them.
+    let mut source = String::new();
+    for index in 0..8 {
+        source.push_str(&format!("// filler line {index}\r\n"));
+    }
+    source.push_str("// ——— em dashes before the symbol ———\r\n");
+    source.push_str("fn after_dashes() {}\r\n");
+    source.push_str("pub struct Trailing {}\r\n");
+
+    let symbols = scan_symbols_in_text(&source);
+    let names: Vec<&str> = symbols.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["after_dashes", "Trailing"]);
+    for (name, range) in &symbols {
+        assert!(
+            source.is_char_boundary(range.start) && source.is_char_boundary(range.end),
+            "{name}: range {range:?} is not boundary-aligned"
+        );
+        assert!(
+            source[range.start..].starts_with("fn ") || source[range.start..].starts_with("pub struct "),
+            "{name}: start {} does not point at the symbol line",
+            range.start
+        );
+    }
+
+    // The verifier must not panic on the same input, and must still find the
+    // definition when the query names it.
+    let result = verify_exact_matches_in_text(
+        std::path::Path::new("src/crlf.rs"),
+        &source,
+        "after_dashes",
+        &["after_dashes".to_string()],
+    );
+    assert!(result.is_some(), "definition on a CRLF file must still verify");
+}
