@@ -3644,13 +3644,48 @@ impl BgTaskRegistry {
                     delivered.push(task_id.clone());
                 }
             } else if let Some(session_id) = session_id {
-                // Task may have been cleaned from memory; still clear durable watches.
-                self.ack_persisted_watches_for_task(session_id, task_id, true);
+                // Another root actor can receive the session's ack while the task is
+                // still owned by its original registry. Consult the shared row rather
+                // than treating absence from this process-local map as terminal.
+                let terminal = self
+                    .persisted_task_is_terminal(session_id, task_id)
+                    .unwrap_or(true);
+                self.ack_persisted_watches_for_task(session_id, task_id, terminal);
+                if terminal {
+                    self.mark_persisted_completion_delivered(session_id, task_id);
+                }
                 delivered.push(task_id.clone());
             }
         }
 
         delivered
+    }
+
+    fn persisted_task_is_terminal(&self, session_id: &str, task_id: &str) -> Option<bool> {
+        let (harness, pool) = self.db_harness_and_pool()?;
+        let conn = pool.lock().ok()?;
+        let row = crate::db::bash_tasks::get_bash_task(&conn, &harness, session_id, task_id)
+            .ok()
+            .flatten()?;
+        Some(matches!(
+            row.status.as_str(),
+            "completed" | "failed" | "killed" | "timed_out" | "fate_unknown"
+        ))
+    }
+
+    fn mark_persisted_completion_delivered(&self, session_id: &str, task_id: &str) {
+        let Some((harness, pool)) = self.db_harness_and_pool() else {
+            return;
+        };
+        let Ok(conn) = pool.lock() else {
+            return;
+        };
+        let _ = conn.execute(
+            "UPDATE bash_tasks SET completion_delivered = 1
+             WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3
+               AND status IN ('completed', 'failed', 'killed', 'timed_out', 'fate_unknown')",
+            rusqlite::params![harness, session_id, task_id],
+        );
     }
 
     fn sync_memory_watches_after_ack(&self, task_id: &str) {

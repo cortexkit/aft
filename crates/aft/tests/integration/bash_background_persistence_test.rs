@@ -1986,6 +1986,72 @@ fn pi_erased_watch_with_restored_task_row_does_not_replay_tombstone() {
 }
 
 #[test]
+fn mid_run_ack_from_rebound_root_preserves_later_watch() {
+    const WATCH_A: &str = "EARLY-WATCH-MATCH";
+    const WATCH_B: &str = "LATE-WATCH-MATCH";
+
+    let project = tempfile::tempdir().unwrap();
+    let rebound_project = tempfile::tempdir().unwrap();
+    let storage = spawn_storage_dir("storage");
+    let release_a = project.path().join("release-watch-a");
+    let release_b = project.path().join("release-watch-b");
+    let release_exit = project.path().join("release-exit");
+    let _release_a_guard = ReleaseOnDrop::new(release_a.clone());
+    let _release_b_guard = ReleaseOnDrop::new(release_b.clone());
+    let _release_exit_guard = ReleaseOnDrop::new(release_exit.clone());
+    let command = format!(
+        "while [ ! -e {} ]; do sleep 0.05; done; printf '%s\\n' '{}'; while [ ! -e {} ]; do sleep 0.05; done; printf '%s\\n' '{}'; while [ ! -e {} ]; do sleep 0.05; done",
+        shell_quote_path(&release_a),
+        WATCH_A,
+        shell_quote_path(&release_b),
+        WATCH_B,
+        shell_quote_path(&release_exit),
+    );
+
+    let mut owner = AftProcess::spawn();
+    configure_background(&mut owner, project.path(), storage.path(), SESSION);
+    let task_id = spawn_bg(&mut owner, SESSION, &command, Some(120_000));
+    let watch_a = notify_once(&mut owner, SESSION, &task_id, WATCH_A);
+    assert_eq!(watch_a["success"], true, "watch A failed: {watch_a:?}");
+
+    drop(_release_a_guard);
+    let frame_a = wait_for_pattern_frame(&mut owner, &task_id);
+    assert_eq!(frame_a["match_text"], WATCH_A);
+
+    let watch_b = notify_once(&mut owner, SESSION, &task_id, WATCH_B);
+    assert_eq!(watch_b["success"], true, "watch B failed: {watch_b:?}");
+    assert_ne!(watch_a["watch_id"], watch_b["watch_id"]);
+
+    // The session has rebound to another project actor. Its ack registry does not
+    // own this still-running task, but the shared durable rows remain authoritative.
+    let mut rebound = AftProcess::spawn();
+    configure_background(
+        &mut rebound,
+        rebound_project.path(),
+        storage.path(),
+        SESSION,
+    );
+    let ack_a = ack(&mut rebound, SESSION, &task_id);
+    assert_eq!(ack_a["success"], true, "watch A ack failed: {ack_a:?}");
+    assert!(ack_a["acked_task_ids"]
+        .as_array()
+        .expect("acked task IDs")
+        .iter()
+        .any(|acked_task_id| acked_task_id == &task_id));
+    assert!(rebound.shutdown().success());
+
+    sigkill_aft(owner);
+    let mut restored = AftProcess::spawn();
+    configure_background(&mut restored, project.path(), storage.path(), SESSION);
+
+    drop(_release_b_guard);
+    let frame_b = wait_for_pattern_frame(&mut restored, &task_id);
+    assert_eq!(frame_b["match_text"], WATCH_B);
+    drop(_release_exit_guard);
+    assert!(restored.shutdown().success());
+}
+
+#[test]
 fn unacked_once_watch_replays_after_unread_rearm_crash_until_ack() {
     const MATCH_TEXT: &str = "PENDING-ONCE-MATCH";
 
