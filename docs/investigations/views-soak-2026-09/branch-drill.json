@@ -1,21 +1,7 @@
 {
-  "arm_artifacts": [
-    "branch-drill-views-on.json",
-    "branch-drill-views-off.json"
-  ],
   "baseline": "/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline-owned",
   "baseline_storage": "/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline-storage",
-  "connection_file": "/Users/ufukaltinok/.local/share/cortexkit/run/subc-connection.json",
-  "defects": [
-    "views-on HEAD\u2192a085bf62a459 did not return both correct probes after full readiness",
-    "a085bf62a459\u2192HEAD reused HEAD with puts=1942 and embeds=4",
-    "views-on HEAD\u2192refs/remotes/upstream/v2-timeouts did not return both correct probes after full readiness",
-    "HEAD\u2192refs/remotes/upstream/v2-timeouts did not publish a new pointer generation",
-    "refs/remotes/upstream/v2-timeouts\u2192HEAD did not publish a new pointer generation",
-    "refs/remotes/upstream/v2-timeouts\u2192HEAD reused HEAD with puts=1944 and embeds=0",
-    "views-off HEAD\u2192a085bf62a459 did not return both correct probes after full readiness",
-    "views-off HEAD\u2192refs/remotes/upstream/v2-timeouts did not return both correct probes after full readiness"
-  ],
+  "defects": [],
   "health_after": {
     "dispatch_liveness": {
       "interactive": {
@@ -44,17 +30,17 @@
       }
     },
     "memory_process": {
-      "allocator_observation_age_ms": 20,
-      "allocator_slack_bytes": 10042580288,
+      "allocator_observation_age_ms": 33,
+      "allocator_slack_bytes": 9519484160,
       "allocator_slack_label": "reclaimable by relief",
       "allocator_slack_measured": true,
-      "last_relief_at_ms": 13861898,
+      "last_relief_at_ms": 21065208,
       "last_relief_freed_bytes": 0,
-      "phys_footprint_bytes": 5236355576,
-      "rss_bytes": 3544432640,
-      "sqlite_bytes": 47528544,
-      "total_attributed_bytes": 2082525026,
-      "unattributed_bytes": 3153830550
+      "phys_footprint_bytes": 6073430952,
+      "rss_bytes": 5414551552,
+      "sqlite_bytes": 19085696,
+      "total_attributed_bytes": 2990830407,
+      "unattributed_bytes": 3082600545
     }
   },
   "health_before": {
@@ -85,24 +71,24 @@
       }
     },
     "memory_process": {
-      "allocator_observation_age_ms": 20,
-      "allocator_slack_bytes": 9891504976,
+      "allocator_observation_age_ms": 22,
+      "allocator_slack_bytes": 9465421248,
       "allocator_slack_label": "reclaimable by relief",
       "allocator_slack_measured": true,
-      "last_relief_at_ms": 11160661,
+      "last_relief_at_ms": 20765110,
       "last_relief_freed_bytes": 0,
-      "phys_footprint_bytes": 4572803456,
-      "rss_bytes": 7128678400,
-      "sqlite_bytes": 12553248,
-      "total_attributed_bytes": 2374508137,
-      "unattributed_bytes": 2198295319
+      "phys_footprint_bytes": 6551516528,
+      "rss_bytes": 5510414336,
+      "sqlite_bytes": 29317712,
+      "total_attributed_bytes": 2960799184,
+      "unattributed_bytes": 3590717344
     }
   },
   "measurement_subjects": {
     "views_off": "standalone_owned_baseline",
-    "views_on": "running_subc_daemon"
+    "views_on": "standalone_views_on"
   },
-  "observed_at": "2026-09-12T12:35:49Z",
+  "observed_at": "2026-09-12T15:11:02Z",
   "refs": {
     "anchor": {
       "changed_files": 300,
@@ -120,32 +106,39 @@
       "sha": "b85cf3d67fe3d36a8d04f4247fc781045d5b3dee"
     },
     "head": "5716f8ba60e79ec60ec485b6e5291c0b0bc1f252",
-    "observed_at": "2026-09-12T12:35:49Z"
+    "observed_at": "2026-09-12T15:11:02Z"
   },
   "root": "/Users/ufukaltinok/Work/OSS/opencode",
   "rows": [
     {
       "changed_files": 300,
-      "correctness": "timeout",
-      "cpu_s": 280.97,
+      "correctness": "correct",
+      "cpu_s": 57.79,
       "embedded_files": 0,
       "embeds": 0,
-      "generation_after": "15-a632b1603f62b77a16c041435b34764810ec2919461ae14fba9c2a70b49fdace",
-      "generation_before": "14-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
-      "last_callgraph": {
-        "code": "symbol_not_found",
-        "message": "symbol 'activeInfo' not found in /Users/ufukaltinok/Work/OSS/opencode/packages/core/src/plugin.ts",
-        "success": false,
-        "text": "callers: symbol_not_found \u2014 symbol 'activeInfo' not found in /Users/ufukaltinok/Work/OSS/opencode/packages/core/src/plugin.ts"
-      },
-      "last_search": {
-        "result_count": 20,
-        "status": "ready",
-        "success": true,
-        "text": "packages/core/src/plugin.ts [exact]\n  plugin [file summary]\n      export * as Plugin from \"./plugin.js\"\n      export { Event, ID, Info, Source, State } from \"@opencode-ai/schema/plugin\"\n      import { Plugin } from \"@opencode-ai/schema/plugin\"\n      import { Node } from \"@opencode-ai/util/effect/app-node\"\n      import { LayerNode } from \"@opencode-ai/util/effect/layer-node\"\n      import type { PersistentPty } from \"./persistent-pty.js\"\n      import { Cause, Context, Effect, Exit, Latch, Layer, Logger, References, Scope, Semaphore } from \"effect\"\n      import { Bus } from \"./bus.js\"\n      import { KV } from \"./kv.js\"\n      import { PluginHost } from \"./plugin/host.js\"\n      import { type Failure, type Generation, Service } from \"./plugin/service.js\"\n      import { State } from \"./state.js\"\n      export { awaitActivation, type Generation, type Interface, Service } from \"./plugin/service.js\"\n      const layer = Layer.effect(\n        Service,\n        Effect.gen(function* () {\n          const bus = yield* Bus.Service\n          const kv = yield* KV.Service\n          const scope = yield* Scope.make()\n          const active = new Map<Plugin.ID, { readonly plugin: Generation; readonly scope: Scope.Closeable }>()\n  plugin [file summary]\n      export * as Plugin from \"./plugin.js\"\n      export { Event, ID, Info, Source, State } from \"@opencode-ai/schema/plugin\"\n      import { Plugin } from \"@opencode-ai/schema/plugin\"\n      import { Node } from \"@opencode-ai/util/effect/app-node\"\n      import { LayerNode } from \"@opencode-ai/util/effect/layer-node\"\n\npackages/schema/src/config/compaction.ts [lexical match]\n\npackages/schema/src/session-status-event.ts [lexical match]\n\npackages/schema/src/session-stats.ts [lexical match]\n\npackages/schema/src/agent.ts [lexical match]\n\npackages/protocol/src/groups/shell.ts [lexical match]\n\npackages/core/src/v1/config/provider.ts [lexical match]\n\npackages/cli/src/commands/handlers/auth/logout.ts [lexical match]\n\npackages/schema/src/config/agent.ts [\u2026"
-      },
-      "measurement_pid_after": 72895,
-      "measurement_pid_before": 72895,
+      "generation_after": "6-a632b1603f62b77a16c041435b34764810ec2919461ae14fba9c2a70b49fdace",
+      "generation_before": "5-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "index_events": [
+        "2026-09-12T15:03:59Z [aft] index_event kind=build_started plane=tier2 build_id=b-32099-1 root=/Users/ufukaltinok/Work/OSS/opencode key=aa69d52ef2dcad4d category=dead_code files=0",
+        "2026-09-12T15:03:59Z [aft] index_event kind=build_ready plane=tier2 build_id=b-32099-1 root=/Users/ufukaltinok/Work/OSS/opencode key=aa69d52ef2dcad4d category=dead_code elapsed_ms=553 files=0 contributions=4912",
+        "2026-09-12T15:03:59Z [aft] index_event kind=build_started plane=tier2 build_id=b-32099-2 root=/Users/ufukaltinok/Work/OSS/opencode key=aa69d52ef2dcad4d category=unused_exports files=0",
+        "2026-09-12T15:03:59Z [aft] index_event kind=build_ready plane=tier2 build_id=b-32099-2 root=/Users/ufukaltinok/Work/OSS/opencode key=aa69d52ef2dcad4d category=unused_exports elapsed_ms=503 files=0 contributions=4912",
+        "2026-09-12T15:04:00Z [aft] index_event kind=build_started plane=tier2 build_id=b-32099-3 root=/Users/ufukaltinok/Work/OSS/opencode key=aa69d52ef2dcad4d category=duplicates files=0",
+        "2026-09-12T15:04:00Z [aft] index_event kind=build_ready plane=tier2 build_id=b-32099-3 root=/Users/ufukaltinok/Work/OSS/opencode key=aa69d52ef2dcad4d category=duplicates elapsed_ms=630 files=0 contributions=4912",
+        "2026-09-12T15:04:01Z [aft] index_event kind=build_started plane=tier2 build_id=b-32099-4 root=/Users/ufukaltinok/Work/OSS/opencode key=aa69d52ef2dcad4d category=cycles files=8",
+        "2026-09-12T15:04:01Z [aft] index_event kind=build_ready plane=tier2 build_id=b-32099-4 root=/Users/ufukaltinok/Work/OSS/opencode key=aa69d52ef2dcad4d category=cycles elapsed_ms=658 files=8 contributions=4912",
+        "2026-09-12T15:04:01Z [aft] index_event kind=build_started plane=tier2 build_id=b-32099-5 root=/Users/ufukaltinok/Work/OSS/opencode key=aa69d52ef2dcad4d category=complexity files=0",
+        "2026-09-12T15:04:01Z [aft] index_event kind=build_ready plane=tier2 build_id=b-32099-5 root=/Users/ufukaltinok/Work/OSS/opencode key=aa69d52ef2dcad4d category=complexity elapsed_ms=419 files=0 contributions=4912",
+        "2026-09-12T15:04:16Z [aft] [ses_views-branch-views-on-1789225434] index_event kind=view_publication plane=views root=/Users/ufukaltinok/Work/OSS/opencode outcome=pending candidates=7045 blob_puts=0 pending_paths=260 head_ms=64 assembly_ms=1770 blob_ms=200 materialize_ms=0 pointer_ms=0 total_ms=2072 derived_bytes=0",
+        "2026-09-12T15:05:10Z [aft] [ses_views-branch-views-on-1789225434] index_event kind=view_publication plane=views root=/Users/ufukaltinok/Work/OSS/opencode outcome=published candidates=7045 blob_puts=0 pending_paths=0 head_ms=46 assembly_ms=1701 blob_ms=208 materialize_ms=43767 pointer_ms=7263 total_ms=53049 derived_bytes=269889536"
+      ],
+      "last_callgraph": null,
+      "last_search": null,
+      "manifest_fingerprint_after": "4b5c2543317f465023b095a2c8f2dd9334cd098f377da60f8f6dd4c188528f23",
+      "manifest_fingerprint_before": "322b78e53d463f91c42eab93d7bc5098489c2c7af7724924c316056e06cda8d3",
+      "manifest_fingerprint_expected": null,
+      "measurement_pid_after": 32099,
+      "measurement_pid_before": 32099,
       "measurement_pid_changed": false,
       "mode": "views-on",
       "probe": {
@@ -154,30 +147,45 @@
         "token": "activeInfo"
       },
       "publication": "published",
-      "publication_blob_puts": null,
-      "publication_ms": 38290,
-      "puts": 1942,
-      "puts_source": "head_reuse",
+      "publication_blob_puts": 0,
+      "publication_ms": 72491,
+      "puts": 0,
+      "puts_source": "publication_log",
       "query_embedding_calls": 0,
       "readiness_error": null,
-      "readiness_ms": 299771,
-      "rss_delta_mb": 1362.719,
-      "switch": "HEAD\u2192a085bf62a459",
+      "readiness_ms": 72490,
+      "readiness_observations": [
+        {
+          "callgraph": null,
+          "elapsed_ms": 684,
+          "search": "ready",
+          "semantic": "ready"
+        }
+      ],
+      "rss_delta_mb": 2534.734,
+      "switch": "HEAD→a085bf62a459",
       "target": "a085bf62a459c21d90a89bcae006e969df60d944",
-      "time_to_correct_ms": null
+      "time_to_correct_ms": 72738
     },
     {
       "changed_files": 300,
       "correctness": "correct",
-      "cpu_s": 62.0,
-      "embedded_files": 272,
-      "embeds": 4,
-      "generation_after": "16-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
-      "generation_before": "15-a632b1603f62b77a16c041435b34764810ec2919461ae14fba9c2a70b49fdace",
+      "cpu_s": 58.3,
+      "embedded_files": 0,
+      "embeds": 0,
+      "generation_after": "7-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "generation_before": "6-a632b1603f62b77a16c041435b34764810ec2919461ae14fba9c2a70b49fdace",
+      "index_events": [
+        "2026-09-12T15:05:33Z [aft] [ses_views-branch-views-on-1789225434] index_event kind=view_publication plane=views root=/Users/ufukaltinok/Work/OSS/opencode outcome=pending candidates=7060 blob_puts=0 pending_paths=272 head_ms=79 assembly_ms=3371 blob_ms=919 materialize_ms=0 pointer_ms=0 total_ms=4436 derived_bytes=0",
+        "2026-09-12T15:06:23Z [aft] [ses_views-branch-views-on-1789225434] index_event kind=view_publication plane=views root=/Users/ufukaltinok/Work/OSS/opencode outcome=published candidates=7060 blob_puts=0 pending_paths=0 head_ms=56 assembly_ms=2889 blob_ms=337 materialize_ms=40034 pointer_ms=4702 total_ms=48106 derived_bytes=269889536"
+      ],
       "last_callgraph": null,
       "last_search": null,
-      "measurement_pid_after": 72895,
-      "measurement_pid_before": 72895,
+      "manifest_fingerprint_after": "322b78e53d463f91c42eab93d7bc5098489c2c7af7724924c316056e06cda8d3",
+      "manifest_fingerprint_before": "4b5c2543317f465023b095a2c8f2dd9334cd098f377da60f8f6dd4c188528f23",
+      "manifest_fingerprint_expected": "322b78e53d463f91c42eab93d7bc5098489c2c7af7724924c316056e06cda8d3",
+      "measurement_pid_after": 32099,
+      "measurement_pid_before": 32099,
       "measurement_pid_changed": false,
       "mode": "views-on",
       "probe": {
@@ -186,40 +194,45 @@
         "token": "TimelineDetailControl"
       },
       "publication": "published",
-      "publication_blob_puts": null,
-      "publication_ms": 55343,
-      "puts": 1942,
-      "puts_source": "head_reuse",
+      "publication_blob_puts": 0,
+      "publication_ms": 72000,
+      "puts": 0,
+      "puts_source": "publication_log",
       "query_embedding_calls": 0,
       "readiness_error": null,
-      "readiness_ms": 55343,
-      "rss_delta_mb": 607.594,
-      "switch": "a085bf62a459\u2192HEAD",
+      "readiness_ms": 22239,
+      "readiness_observations": [
+        {
+          "callgraph": null,
+          "elapsed_ms": 1603,
+          "search": "ready",
+          "semantic": "ready"
+        }
+      ],
+      "rss_delta_mb": 453.969,
+      "switch": "a085bf62a459→HEAD",
       "target": "5716f8ba60e79ec60ec485b6e5291c0b0bc1f252",
-      "time_to_correct_ms": 56434
+      "time_to_correct_ms": 71999
     },
     {
       "changed_files": 298,
-      "correctness": "timeout",
-      "cpu_s": 279.1,
+      "correctness": "correct",
+      "cpu_s": 51.97,
       "embedded_files": 0,
       "embeds": 0,
-      "generation_after": "16-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
-      "generation_before": "16-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
-      "last_callgraph": {
-        "code": "symbol_not_found",
-        "message": "symbol 'activeInfo' not found in /Users/ufukaltinok/Work/OSS/opencode/packages/core/src/plugin.ts",
-        "success": false,
-        "text": "callers: symbol_not_found \u2014 symbol 'activeInfo' not found in /Users/ufukaltinok/Work/OSS/opencode/packages/core/src/plugin.ts"
-      },
-      "last_search": {
-        "result_count": 20,
-        "status": "ready",
-        "success": true,
-        "text": "packages/core/src/plugin.ts [exact]\n  plugin [file summary]\n      export * as Plugin from \"./plugin.js\"\n      export { Event, ID, Info, Source, State } from \"@opencode-ai/schema/plugin\"\n      import { Plugin } from \"@opencode-ai/schema/plugin\"\n      import { Node } from \"@opencode-ai/util/effect/app-node\"\n      import { LayerNode } from \"@opencode-ai/util/effect/layer-node\"\n      import type { PersistentPty } from \"./persistent-pty.js\"\n      import { Cause, Context, Effect, Exit, Latch, Layer, Logger, References, Scope, Semaphore } from \"effect\"\n      import { Bus } from \"./bus.js\"\n      import { KV } from \"./kv.js\"\n      import { PluginHost } from \"./plugin/host.js\"\n      import { type Failure, type Generation, Service } from \"./plugin/service.js\"\n      import { State } from \"./state.js\"\n      export { awaitActivation, type Generation, type Interface, Service } from \"./plugin/service.js\"\n      const layer = Layer.effect(\n        Service,\n        Effect.gen(function* () {\n          const bus = yield* Bus.Service\n          const kv = yield* KV.Service\n          const scope = yield* Scope.make()\n          const active = new Map<Plugin.ID, { readonly plugin: Generation; readonly scope: Scope.Closeable }>()\n  plugin [file summary]\n      export * as Plugin from \"./plugin.js\"\n      export { Event, ID, Info, Source, State } from \"@opencode-ai/schema/plugin\"\n      import { Plugin } from \"@opencode-ai/schema/plugin\"\n      import { Node } from \"@opencode-ai/util/effect/app-node\"\n      import { LayerNode } from \"@opencode-ai/util/effect/layer-node\"\n\npackages/schema/src/config/compaction.ts [lexical match]\n\npackages/schema/src/session-status-event.ts [lexical match]\n\npackages/schema/src/session-stats.ts [lexical match]\n\npackages/schema/src/agent.ts [lexical match]\n\npackages/protocol/src/groups/shell.ts [lexical match]\n\npackages/core/src/v1/config/provider.ts [lexical match]\n\npackages/cli/src/commands/handlers/auth/logout.ts [lexical match]\n\npackages/schema/src/config/agent.ts [\u2026"
-      },
-      "measurement_pid_after": 72895,
-      "measurement_pid_before": 72895,
+      "generation_after": "8-9b78b886a6aa677b308f467d4a850d44127b534fcb1ef184767ecdb66a0bccab",
+      "generation_before": "7-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "index_events": [
+        "2026-09-12T15:06:43Z [aft] [ses_views-branch-views-on-1789225434] index_event kind=view_publication plane=views root=/Users/ufukaltinok/Work/OSS/opencode outcome=pending candidates=7045 blob_puts=0 pending_paths=260 head_ms=132 assembly_ms=2495 blob_ms=297 materialize_ms=0 pointer_ms=0 total_ms=2972 derived_bytes=0",
+        "2026-09-12T15:07:27Z [aft] [ses_views-branch-views-on-1789225434] index_event kind=view_publication plane=views root=/Users/ufukaltinok/Work/OSS/opencode outcome=published candidates=7045 blob_puts=0 pending_paths=0 head_ms=58 assembly_ms=2460 blob_ms=285 materialize_ms=35783 pointer_ms=4380 total_ms=43054 derived_bytes=269889536"
+      ],
+      "last_callgraph": null,
+      "last_search": null,
+      "manifest_fingerprint_after": "2d6d879d2a496ba71f3ebfccba8783bbdbd6afca5101737bcc84b334c48b526c",
+      "manifest_fingerprint_before": "322b78e53d463f91c42eab93d7bc5098489c2c7af7724924c316056e06cda8d3",
+      "manifest_fingerprint_expected": null,
+      "measurement_pid_after": 32099,
+      "measurement_pid_before": 32099,
       "measurement_pid_changed": false,
       "mode": "views-on",
       "probe": {
@@ -227,31 +240,46 @@
         "symbol": "activeInfo",
         "token": "activeInfo"
       },
-      "publication": "timeout",
-      "publication_blob_puts": null,
-      "publication_ms": null,
-      "puts": 1954,
-      "puts_source": "head_reuse",
+      "publication": "published",
+      "publication_blob_puts": 0,
+      "publication_ms": 64156,
+      "puts": 0,
+      "puts_source": "publication_log",
       "query_embedding_calls": 0,
       "readiness_error": null,
-      "readiness_ms": 299662,
-      "rss_delta_mb": -1312.484,
-      "switch": "HEAD\u2192refs/remotes/upstream/v2-timeouts",
+      "readiness_ms": 15376,
+      "readiness_observations": [
+        {
+          "callgraph": null,
+          "elapsed_ms": 1186,
+          "search": "ready",
+          "semantic": "ready"
+        }
+      ],
+      "rss_delta_mb": 318.406,
+      "switch": "HEAD→refs/remotes/upstream/v2-timeouts",
       "target": "b85cf3d67fe3d36a8d04f4247fc781045d5b3dee",
-      "time_to_correct_ms": null
+      "time_to_correct_ms": 64156
     },
     {
       "changed_files": 298,
       "correctness": "correct",
-      "cpu_s": 25.6,
+      "cpu_s": 49.43,
       "embedded_files": 0,
       "embeds": 0,
-      "generation_after": "16-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
-      "generation_before": "16-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "generation_after": "9-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "generation_before": "8-9b78b886a6aa677b308f467d4a850d44127b534fcb1ef184767ecdb66a0bccab",
+      "index_events": [
+        "2026-09-12T15:07:48Z [aft] [ses_views-branch-views-on-1789225434] index_event kind=view_publication plane=views root=/Users/ufukaltinok/Work/OSS/opencode outcome=pending candidates=7060 blob_puts=0 pending_paths=272 head_ms=57 assembly_ms=2501 blob_ms=286 materialize_ms=0 pointer_ms=0 total_ms=2891 derived_bytes=0",
+        "2026-09-12T15:08:29Z [aft] [ses_views-branch-views-on-1789225434] index_event kind=view_publication plane=views root=/Users/ufukaltinok/Work/OSS/opencode outcome=published candidates=7060 blob_puts=0 pending_paths=0 head_ms=51 assembly_ms=2452 blob_ms=276 materialize_ms=33472 pointer_ms=3472 total_ms=39797 derived_bytes=269889536"
+      ],
       "last_callgraph": null,
       "last_search": null,
-      "measurement_pid_after": 72895,
-      "measurement_pid_before": 72895,
+      "manifest_fingerprint_after": "322b78e53d463f91c42eab93d7bc5098489c2c7af7724924c316056e06cda8d3",
+      "manifest_fingerprint_before": "2d6d879d2a496ba71f3ebfccba8783bbdbd6afca5101737bcc84b334c48b526c",
+      "manifest_fingerprint_expected": "322b78e53d463f91c42eab93d7bc5098489c2c7af7724924c316056e06cda8d3",
+      "measurement_pid_after": 32099,
+      "measurement_pid_before": 32099,
       "measurement_pid_changed": false,
       "mode": "views-on",
       "probe": {
@@ -259,39 +287,54 @@
         "symbol": "TimelineDetailControl",
         "token": "TimelineDetailControl"
       },
-      "publication": "timeout",
-      "publication_blob_puts": null,
-      "publication_ms": null,
-      "puts": 1944,
-      "puts_source": "head_reuse",
+      "publication": "published",
+      "publication_blob_puts": 0,
+      "publication_ms": 60874,
+      "puts": 0,
+      "puts_source": "publication_log",
       "query_embedding_calls": 0,
       "readiness_error": null,
-      "readiness_ms": 9529,
-      "rss_delta_mb": 251.188,
-      "switch": "refs/remotes/upstream/v2-timeouts\u2192HEAD",
+      "readiness_ms": 60874,
+      "readiness_observations": [
+        {
+          "callgraph": null,
+          "elapsed_ms": 1323,
+          "search": "ready",
+          "semantic": "ready"
+        }
+      ],
+      "rss_delta_mb": -3.188,
+      "switch": "refs/remotes/upstream/v2-timeouts→HEAD",
       "target": "5716f8ba60e79ec60ec485b6e5291c0b0bc1f252",
-      "time_to_correct_ms": 11979
+      "time_to_correct_ms": 61087
     },
     {
       "changed_files": 300,
-      "correctness": "timeout",
-      "cpu_s": 124.55,
+      "correctness": "correct",
+      "cpu_s": 42.16,
       "embedded_files": 260,
       "embeds": 3,
       "generation_after": null,
       "generation_before": null,
-      "last_callgraph": {
-        "success": true,
-        "text": "1 caller \u00b7 1 file group\npackages/core/src/plugin.ts\n  \u21b3 layer:119"
-      },
-      "last_search": {
-        "result_count": 20,
-        "status": "ready",
-        "success": true,
-        "text": "packages/core/src/plugin.ts [exact]\n  plugin [file summary]\n      export * as Plugin from \"./plugin.js\"\n      export { Event, ID, Info, Source, State } from \"@opencode-ai/schema/plugin\"\n      import { Plugin } from \"@opencode-ai/schema/plugin\"\n      import { Node } from \"@opencode-ai/util/effect/app-node\"\n      import { LayerNode } from \"@opencode-ai/util/effect/layer-node\"\n      import type { PersistentPty } from \"./persistent-pty.js\"\n      import { Cause, Context, Effect, Exit, Latch, Layer, Logger, References, Scope, Semaphore } from \"effect\"\n      import { Bus } from \"./bus.js\"\n      import { KV } from \"./kv.js\"\n      import { PluginHost } from \"./plugin/host.js\"\n      import { type Failure, type Generation, Service } from \"./plugin/service.js\"\n      import { State } from \"./state.js\"\n      export { awaitActivation, type Generation, type Interface, Service } from \"./plugin/service.js\"\n      const layer = Layer.effect(\n        Service,\n        Effect.gen(function* () {\n          const bus = yield* Bus.Service\n          const kv = yield* KV.Service\n          const scope = yield* Scope.make()\n          const active = new Map<Plugin.ID, { readonly plugin: Generation; readonly scope: Scope.Closeable }>()\n  plugin [file summary]\n      export * as Plugin from \"./plugin.js\"\n      export { Event, ID, Info, Source, State } from \"@opencode-ai/schema/plugin\"\n      import { Plugin } from \"@opencode-ai/schema/plugin\"\n      import { Node } from \"@opencode-ai/util/effect/app-node\"\n      import { LayerNode } from \"@opencode-ai/util/effect/layer-node\"\n\npackages/schema/src/config/compaction.ts [lexical match]\n\npackages/schema/src/session-status-event.ts [lexical match]\n\npackages/schema/src/session-stats.ts [lexical match]\n\npackages/schema/src/agent.ts [lexical match]\n\npackages/protocol/src/groups/shell.ts [lexical match]\n\npackages/core/src/v1/config/provider.ts [lexical match]\n\npackages/cli/src/commands/handlers/auth/logout.ts [lexical match]\n\npackages/schema/src/config/agent.ts [\u2026"
-      },
-      "measurement_pid_after": 41930,
-      "measurement_pid_before": 41930,
+      "index_events": [
+        "2026-09-12T15:08:35Z [aft] index_event kind=build_started plane=tier2 build_id=b-68184-1 root=/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline-owned key=aa69d52ef2dcad4d category=dead_code files=0",
+        "2026-09-12T15:08:35Z [aft] index_event kind=build_ready plane=tier2 build_id=b-68184-1 root=/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline-owned key=aa69d52ef2dcad4d category=dead_code elapsed_ms=641 files=0 contributions=4912",
+        "2026-09-12T15:08:36Z [aft] index_event kind=build_started plane=tier2 build_id=b-68184-2 root=/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline-owned key=aa69d52ef2dcad4d category=unused_exports files=0",
+        "2026-09-12T15:08:36Z [aft] index_event kind=build_ready plane=tier2 build_id=b-68184-2 root=/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline-owned key=aa69d52ef2dcad4d category=unused_exports elapsed_ms=597 files=0 contributions=4912",
+        "2026-09-12T15:08:37Z [aft] index_event kind=build_started plane=tier2 build_id=b-68184-3 root=/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline-owned key=aa69d52ef2dcad4d category=duplicates files=0",
+        "2026-09-12T15:08:37Z [aft] index_event kind=build_ready plane=tier2 build_id=b-68184-3 root=/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline-owned key=aa69d52ef2dcad4d category=duplicates elapsed_ms=799 files=0 contributions=4912",
+        "2026-09-12T15:08:38Z [aft] index_event kind=build_started plane=tier2 build_id=b-68184-4 root=/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline-owned key=aa69d52ef2dcad4d category=cycles files=8",
+        "2026-09-12T15:08:38Z [aft] index_event kind=build_ready plane=tier2 build_id=b-68184-4 root=/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline-owned key=aa69d52ef2dcad4d category=cycles elapsed_ms=754 files=8 contributions=4912",
+        "2026-09-12T15:08:38Z [aft] index_event kind=build_started plane=tier2 build_id=b-68184-5 root=/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline-owned key=aa69d52ef2dcad4d category=complexity files=0",
+        "2026-09-12T15:08:38Z [aft] index_event kind=build_ready plane=tier2 build_id=b-68184-5 root=/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline-owned key=aa69d52ef2dcad4d category=complexity elapsed_ms=504 files=0 contributions=4912"
+      ],
+      "last_callgraph": null,
+      "last_search": null,
+      "manifest_fingerprint_after": null,
+      "manifest_fingerprint_before": null,
+      "manifest_fingerprint_expected": null,
+      "measurement_pid_after": 68184,
+      "measurement_pid_before": 68184,
       "measurement_pid_changed": false,
       "mode": "views-off",
       "probe": {
@@ -306,24 +349,36 @@
       "puts_source": "not_applicable",
       "query_embedding_calls": 0,
       "readiness_error": null,
-      "readiness_ms": 299845,
-      "rss_delta_mb": 96.188,
-      "switch": "HEAD\u2192a085bf62a459",
+      "readiness_ms": 36605,
+      "readiness_observations": [
+        {
+          "callgraph": null,
+          "elapsed_ms": 911,
+          "search": "ready",
+          "semantic": "ready"
+        }
+      ],
+      "rss_delta_mb": 2732.812,
+      "switch": "HEAD→a085bf62a459",
       "target": "a085bf62a459c21d90a89bcae006e969df60d944",
-      "time_to_correct_ms": null
+      "time_to_correct_ms": 36871
     },
     {
       "changed_files": 300,
       "correctness": "correct",
-      "cpu_s": 39.72,
+      "cpu_s": 41.78,
       "embedded_files": 272,
       "embeds": 4,
       "generation_after": null,
       "generation_before": null,
+      "index_events": [],
       "last_callgraph": null,
       "last_search": null,
-      "measurement_pid_after": 41930,
-      "measurement_pid_before": 41930,
+      "manifest_fingerprint_after": null,
+      "manifest_fingerprint_before": null,
+      "manifest_fingerprint_expected": null,
+      "measurement_pid_after": 68184,
+      "measurement_pid_before": 68184,
       "measurement_pid_changed": false,
       "mode": "views-off",
       "probe": {
@@ -338,32 +393,36 @@
       "puts_source": "not_applicable",
       "query_embedding_calls": 0,
       "readiness_error": null,
-      "readiness_ms": 28167,
-      "rss_delta_mb": 1870.0,
-      "switch": "a085bf62a459\u2192HEAD",
+      "readiness_ms": 34445,
+      "readiness_observations": [
+        {
+          "callgraph": null,
+          "elapsed_ms": 1168,
+          "search": "ready",
+          "semantic": "ready"
+        }
+      ],
+      "rss_delta_mb": 140.766,
+      "switch": "a085bf62a459→HEAD",
       "target": "5716f8ba60e79ec60ec485b6e5291c0b0bc1f252",
-      "time_to_correct_ms": 29250
+      "time_to_correct_ms": 35297
     },
     {
       "changed_files": 298,
-      "correctness": "timeout",
-      "cpu_s": 120.13,
+      "correctness": "correct",
+      "cpu_s": 47.56,
       "embedded_files": 260,
       "embeds": 3,
       "generation_after": null,
       "generation_before": null,
-      "last_callgraph": {
-        "success": true,
-        "text": "1 caller \u00b7 1 file group\npackages/core/src/plugin.ts\n  \u21b3 layer:118"
-      },
-      "last_search": {
-        "result_count": 20,
-        "status": "ready",
-        "success": true,
-        "text": "packages/core/src/plugin.ts [exact]\n  plugin [file summary]\n      export * as Plugin from \"./plugin.js\"\n      export { Event, ID, Info, Source, State } from \"@opencode-ai/schema/plugin\"\n      import { Plugin } from \"@opencode-ai/schema/plugin\"\n      import { Node } from \"@opencode-ai/util/effect/app-node\"\n      import { LayerNode } from \"@opencode-ai/util/effect/layer-node\"\n      import type { PersistentPty } from \"./persistent-pty.js\"\n      import { Cause, Context, Effect, Exit, Latch, Layer, Logger, References, Scope, Semaphore } from \"effect\"\n      import { Bus } from \"./bus.js\"\n      import { KV } from \"./kv.js\"\n      import { PluginHost } from \"./plugin/host.js\"\n      import { type Failure, type Generation, Service } from \"./plugin/service.js\"\n      import { State } from \"./state.js\"\n      export { awaitActivation, type Generation, type Interface, Service } from \"./plugin/service.js\"\n      const layer = Layer.effect(\n        Service,\n        Effect.gen(function* () {\n          const bus = yield* Bus.Service\n          const kv = yield* KV.Service\n          const scope = yield* Scope.make()\n          const active = new Map<Plugin.ID, { readonly plugin: Generation; readonly scope: Scope.Closeable }>()\n  plugin [file summary]\n      export * as Plugin from \"./plugin.js\"\n      export { Event, ID, Info, Source, State } from \"@opencode-ai/schema/plugin\"\n      import { Plugin } from \"@opencode-ai/schema/plugin\"\n      import { Node } from \"@opencode-ai/util/effect/app-node\"\n      import { LayerNode } from \"@opencode-ai/util/effect/layer-node\"\n\npackages/schema/src/config/compaction.ts [lexical match]\n\npackages/schema/src/session-status-event.ts [lexical match]\n\npackages/schema/src/session-stats.ts [lexical match]\n\npackages/schema/src/agent.ts [lexical match]\n\npackages/protocol/src/groups/shell.ts [lexical match]\n\npackages/core/src/v1/config/provider.ts [lexical match]\n\npackages/cli/src/commands/handlers/auth/logout.ts [lexical match]\n\npackages/schema/src/config/agent.ts [\u2026"
-      },
-      "measurement_pid_after": 41930,
-      "measurement_pid_before": 41930,
+      "index_events": [],
+      "last_callgraph": null,
+      "last_search": null,
+      "manifest_fingerprint_after": null,
+      "manifest_fingerprint_before": null,
+      "manifest_fingerprint_expected": null,
+      "measurement_pid_after": 68184,
+      "measurement_pid_before": 68184,
       "measurement_pid_changed": false,
       "mode": "views-off",
       "probe": {
@@ -378,24 +437,36 @@
       "puts_source": "not_applicable",
       "query_embedding_calls": 0,
       "readiness_error": null,
-      "readiness_ms": 299914,
-      "rss_delta_mb": -47.609,
-      "switch": "HEAD\u2192refs/remotes/upstream/v2-timeouts",
+      "readiness_ms": 38495,
+      "readiness_observations": [
+        {
+          "callgraph": null,
+          "elapsed_ms": 1130,
+          "search": "ready",
+          "semantic": "ready"
+        }
+      ],
+      "rss_delta_mb": 14.875,
+      "switch": "HEAD→refs/remotes/upstream/v2-timeouts",
       "target": "b85cf3d67fe3d36a8d04f4247fc781045d5b3dee",
-      "time_to_correct_ms": null
+      "time_to_correct_ms": 39241
     },
     {
       "changed_files": 298,
       "correctness": "correct",
-      "cpu_s": 43.07,
+      "cpu_s": 39.6,
       "embedded_files": 272,
       "embeds": 4,
       "generation_after": null,
       "generation_before": null,
+      "index_events": [],
       "last_callgraph": null,
       "last_search": null,
-      "measurement_pid_after": 41930,
-      "measurement_pid_before": 41930,
+      "manifest_fingerprint_after": null,
+      "manifest_fingerprint_before": null,
+      "manifest_fingerprint_expected": null,
+      "measurement_pid_after": 68184,
+      "measurement_pid_before": 68184,
       "measurement_pid_changed": false,
       "mode": "views-off",
       "probe": {
@@ -410,11 +481,19 @@
       "puts_source": "not_applicable",
       "query_embedding_calls": 0,
       "readiness_error": null,
-      "readiness_ms": 30445,
-      "rss_delta_mb": 35.031,
-      "switch": "refs/remotes/upstream/v2-timeouts\u2192HEAD",
+      "readiness_ms": 32123,
+      "readiness_observations": [
+        {
+          "callgraph": null,
+          "elapsed_ms": 982,
+          "search": "ready",
+          "semantic": "ready"
+        }
+      ],
+      "rss_delta_mb": 8.703,
+      "switch": "refs/remotes/upstream/v2-timeouts→HEAD",
       "target": "5716f8ba60e79ec60ec485b6e5291c0b0bc1f252",
-      "time_to_correct_ms": 31333
+      "time_to_correct_ms": 33031
     }
   ],
   "run1_artifact": "branch-drill-run1-confounded.json",
@@ -422,19 +501,19 @@
   "warmups": {
     "views-off": {
       "ceiling_ms": 1200000,
-      "measurement_pid": 41930,
-      "readiness_detail_ms": 2622,
+      "measurement_pid": 68184,
+      "readiness_detail_ms": 2725,
       "storage": "/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline-storage",
       "subject": "standalone_owned_baseline",
-      "total_ms": 2987
+      "total_ms": 3159
     },
     "views-on": {
       "ceiling_ms": 1200000,
-      "measurement_pid": 72895,
-      "readiness_detail_ms": 175,
-      "storage": "/Users/ufukaltinok/.local/share/cortexkit/aft",
-      "subject": "running_subc_daemon",
-      "total_ms": 637
+      "measurement_pid": 32099,
+      "readiness_detail_ms": 1156,
+      "storage": "/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/views-on-storage",
+      "subject": "standalone_views_on",
+      "total_ms": 3857
     }
   }
 }

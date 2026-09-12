@@ -2,41 +2,40 @@
 
 ## Finding
 
-The running daemon still refreshes the legacy semantic index across branch switches; views do not yet prevent switch-back re-embedding. Daemon log evidence from the original investigation recorded roughly 259 files at 08:14, 08:30, and 08:35Z. The corrected run independently captured a085bf62a459→HEAD: 272 files/4 batches.
+The isolated views-on subject exercises content-addressed publication without restarting or mutating the live daemon. Views-on used 0 embed batches across the four switches; the legacy arm used 14.
 
-## Run 2 — daemon views-on, warm owned baseline
+## Run 3 — isolated views-on, warm owned baseline
 
-Observed at `2026-09-12T12:35:49Z` against `5716f8ba60e7`.
+Observed at `2026-09-12T15:11:02Z` against `5716f8ba60e7`.
 
 - A: first-parent commit `a085bf62a459` (300 changed files)
 - B: branch `refs/remotes/upstream/v2-timeouts` (`b85cf3d67fe3`, 298 changed files)
-- Views-on subject: running AFT subc daemon; warm-up `637 ms`.
-- Views-off subject: standalone AFT on an independent baseline clone and isolated storage; warm-up `2987 ms`.
+- Views-on subject: standalone AFT with isolated view storage; warm-up `3857 ms`.
+- Views-off subject: standalone AFT on an independent baseline clone and isolated storage; warm-up `3159 ms`.
 
-`cpu_s` and `rss_delta_mb` use the active subject PID for each row. The daemon PID is resolved again at every views-on switch; PID changes are recorded as defects rather than subtracting unrelated processes.
+`cpu_s` and `rss_delta_mb` use the active standalone subject PID for each row. PID changes are recorded as defects rather than subtracting unrelated processes.
 
 | switch | on publication_ms | on puts | on embeds | on cpu_s | on rss_delta_mb | on correct_ms | off publication_ms | off puts | off embeds | off cpu_s | off rss_delta_mb | off correct_ms |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| HEAD→a085bf62a459 | 38290 | 1942 | 0 | 280.97 | 1362.719 | timeout | — | — | 3 | 124.55 | 96.188 | timeout |
-| a085bf62a459→HEAD | 55343 | 1942 | 4 | 62.0 | 607.594 | 56434 | — | — | 4 | 39.72 | 1870.0 | 29250 |
-| HEAD→refs/remotes/upstream/v2-timeouts | — | 1954 | 0 | 279.1 | -1312.484 | timeout | — | — | 3 | 120.13 | -47.609 | timeout |
-| refs/remotes/upstream/v2-timeouts→HEAD | — | 1944 | 0 | 25.6 | 251.188 | 11979 | — | — | 4 | 43.07 | 35.031 | 31333 |
+| HEAD→a085bf62a459 | 72491 | 0 | 0 | 57.79 | 2534.734 | 72738 | — | — | 3 | 42.16 | 2732.812 | 36871 |
+| a085bf62a459→HEAD | 72000 | 0 | 0 | 58.3 | 453.969 | 71999 | — | — | 4 | 41.78 | 140.766 | 35297 |
+| HEAD→refs/remotes/upstream/v2-timeouts | 64156 | 0 | 0 | 51.97 | 318.406 | 64156 | — | — | 3 | 47.56 | 14.875 | 39241 |
+| refs/remotes/upstream/v2-timeouts→HEAD | 60874 | 0 | 0 | 49.43 | -3.188 | 61087 | — | — | 4 | 39.6 | 8.703 | 33031 |
 
-### Run 2 observations
+### Four mechanisms
 
-- The two forward-switch timeout labels mean the fully-ready stores did not agree with the selected target-only callgraph probe; they are post-readiness correctness failures, not cold-build artifacts.
-- Publication-log attribution is imperfect when other view-enabled roots publish concurrently: puts rows should be read together with `publication_log_offset` and the retained JSON observations.
+1. **Forward correctness had both a probe defect and a publication defect.** The Run 2 search query was free text and candidate selection proved only that a name existed on the target; `callers` needs a symbol with a resolvable call site. The drill now uses an exact word-boundary query, requires at least two target occurrences, and verifies both search and a non-empty callers result. A pre-fix instrumented run still showed the product defect: status reported search/semantic `ready` after 934 ms, then `index_event ... outcome=pending ... pending_paths=1`, repeated `callers ... symbol_not_found` for 300 s, and no published event. The semantic-refresh completion path did not retry the pending view publication, so callgraph queries remained pinned to HEAD. Completion now publishes the pending paths; all Run 3 probes converge.
+2. **Switch-back embeddings came from the legacy semantic watcher worker.** Views publication did not suppress the resident `SemanticIndex` refresh, which embedded every watcher-invalidated path from the live checkout. The worker now derives the view semantic full key from source bytes, path, producer version, and model fingerprint, loads an existing `SemanticBlob`, and embeds only misses. Both return legs report zero embed calls; this final warm run also reused vectors on both forward legs.
+3. **The missing generations were failed publications, not valid no-ops.** The target fingerprints are `4b5c2543317f465023...` (A) and `2d6d879d2a496ba71f...` (B), distinct from HEAD `322b78e53d463f91c...`. Run 2 retained the HEAD fingerprint after `outcome=pending`; it had not published an identical manifest. The drill now classifies publication by manifest fingerprint rather than generation alone, and semantic completion publishes the distinct target manifest.
+4. **The puts count mixed roots.** Publication counters without `root=` admitted concurrent work from other roots. View publication phase events and publication summaries now use the same `root=<canonical checkout>` grammar as other `index_event` lines, and the drill accepts counters/events only for the measured root. Run 3 records zero blob puts on every switch.
 
-### Run 2 defects
+### Cost attribution
 
-- views-on HEAD→a085bf62a459 did not return both correct probes after full readiness
-- a085bf62a459→HEAD reused HEAD with puts=1942 and embeds=4
-- views-on HEAD→refs/remotes/upstream/v2-timeouts did not return both correct probes after full readiness
-- HEAD→refs/remotes/upstream/v2-timeouts did not publish a new pointer generation
-- refs/remotes/upstream/v2-timeouts→HEAD did not publish a new pointer generation
-- refs/remotes/upstream/v2-timeouts→HEAD reused HEAD with puts=1944 and embeds=0
-- views-off HEAD→a085bf62a459 did not return both correct probes after full readiness
-- views-off HEAD→refs/remotes/upstream/v2-timeouts did not return both correct probes after full readiness
+The earlier views-on sample was 281 CPU-s and +1.3 GB RSS versus 125 CPU-s for legacy. Run 3 phase events rule out blob insertion and embedding as the views-only cause: every views row has `blob_puts=0` and zero embed batches. On the two forward publications, `derived.sqlite` materialization took 43,767 ms and 35,783 ms, versus only 1,701/2,460 ms for manifest assembly and 208/285 ms for blob lookup; pointer publication added 7,263/4,380 ms. Materialization therefore consumed 82-83% of the published phase. The checkpointed database is 269,889,536 bytes (257.4 MiB); building a temporary generation alongside the published one accounts for about 514.8 MiB, matching the known ~517 MiB materialization footprint. The remaining RSS variation is process cache/allocator residency. The follow-up target is consequently incremental `derived.sqlite` materialization: remove the 35.8-43.8 s full rewrite and roughly 257 MiB temporary generation per switch.
+
+### Run 3 defects
+
+No correctness, publication, PID-change, or switch-back reuse defect observed.
 
 ## Run 1 — confounded (historical)
 
