@@ -789,6 +789,14 @@ def manifest_entry_count(view_dir: Path, generation: str | None = None) -> int:
     return len(load_manifest(path)["entries"])
 
 
+def manifest_fingerprint(view_dir: Path, generation: str | None = None) -> str | None:
+    generation = generation if generation is not None else current_generation(view_dir)
+    if generation is None:
+        return None
+    manifest = load_manifest(view_dir / f"manifest-{generation}.json")
+    return hashlib.sha256(canonical_json_bytes(manifest["entries"])).hexdigest()
+
+
 def view_accounting(storage_root: Path, root: Path, scope: str) -> dict[str, Any]:
     view_dir = storage_root / "views" / scope
     if not view_dir.is_dir():

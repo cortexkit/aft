@@ -12,6 +12,7 @@ from pathlib import Path
 from branch_drill import (
     delta_metrics,
     log_metrics,
+    publication_outcome,
     search_is_correct,
     search_query_for_token,
     symbols_in_source,
@@ -22,6 +23,7 @@ from common import (
     current_generation,
     first_differing_line,
     manifest_entry_count,
+    manifest_fingerprint,
     parse_cpu_time,
     strip_jsonc,
 )
@@ -58,6 +60,12 @@ class CommonTests(unittest.TestCase):
             )
             self.assertEqual(current_generation(view), "7-deadbeef")
             self.assertEqual(manifest_entry_count(view), 1)
+            fingerprint = manifest_fingerprint(view, "7-deadbeef")
+            (view / "manifest-8-cafebabe.json").write_text(
+                json.dumps({"path_identity_version": 1, "entries": [{"rel_path": "b.py"}]}),
+                encoding="utf-8",
+            )
+            self.assertNotEqual(fingerprint, manifest_fingerprint(view, "8-cafebabe"))
 
     def test_output_normalizes_both_checkout_prefixes(self) -> None:
         left = Path("/tmp/source-root")
@@ -102,6 +110,20 @@ class BranchDrillTests(unittest.TestCase):
             ]
         )
         self.assertEqual(log_metrics(text, root), (2, 2, 2, 3))
+
+    def test_publication_expectation_distinguishes_noop_from_missing_publish(self) -> None:
+        self.assertEqual(
+            publication_outcome("1-head", "1-head", "head-fp", "head-fp", "head-fp"),
+            "no_op",
+        )
+        self.assertEqual(
+            publication_outcome("1-head", "1-head", "head-fp", "head-fp", "branch-fp"),
+            "missing",
+        )
+        self.assertEqual(
+            publication_outcome("1-head", "2-branch", "head-fp", "branch-fp", "branch-fp"),
+            "published",
+        )
 
     def test_source_symbol_extraction_covers_drill_languages(self) -> None:
         source = "\n".join(

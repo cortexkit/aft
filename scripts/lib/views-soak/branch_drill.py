@@ -29,6 +29,7 @@ from common import (
     git_text,
     health_snapshot,
     manifest_entry_count,
+    manifest_fingerprint,
     markdown_cell,
     read_jsonc,
     resolve_root,
@@ -318,6 +319,22 @@ def log_metrics(text: str, root: Path) -> tuple[int | None, int | None, int, int
     return reuse_puts, publication_puts, embed_calls, embedded_files
 
 
+def publication_outcome(
+    before_generation: str | None,
+    after_generation: str | None,
+    before_fingerprint: str | None,
+    after_fingerprint: str | None,
+    expected_fingerprint: str | None,
+) -> str:
+    if after_generation != before_generation:
+        if expected_fingerprint is not None and after_fingerprint != expected_fingerprint:
+            return "mismatched"
+        return "published"
+    if expected_fingerprint is not None and after_fingerprint == expected_fingerprint:
+        return "no_op"
+    return "missing"
+
+
 def delta_metrics(before: ProcessSample, after: ProcessSample) -> tuple[float, float]:
     return (
         round(max(0.0, after.cpu_s - before.cpu_s), 3),
@@ -350,9 +367,13 @@ def perform_switch(
     views_on: bool,
     view_dir: Path,
     storage: Path,
+    expected_manifest_fingerprint: str | None,
     standalone_pid: int | None = None,
 ) -> dict[str, Any]:
     before_generation = current_generation(view_dir) if views_on else None
+    before_manifest_fingerprint = (
+        manifest_fingerprint(view_dir, before_generation) if views_on else None
+    )
     before_entries = manifest_entry_count(view_dir, before_generation) if views_on else 0
     before_pid = find_subc_daemon_pid() if views_on else standalone_pid
     if before_pid is None:
@@ -439,6 +460,9 @@ def perform_switch(
         log_text = client.log_since(log_mark)
     reuse_puts, publication_puts, embed_calls, embedded_files = log_metrics(log_text, checkout)
     after_generation = current_generation(view_dir) if views_on else None
+    after_manifest_fingerprint = (
+        manifest_fingerprint(view_dir, after_generation) if views_on else None
+    )
     after_entries = manifest_entry_count(view_dir, after_generation) if views_on else 0
     puts: int | None = None
     puts_source = "not_applicable"
@@ -451,7 +475,17 @@ def perform_switch(
             puts_source = "entries_delta"
 
     timed_out = time_to_correct_ms is None
-    publication_missing = views_on and publication_ms is None
+    publication = (
+        publication_outcome(
+            before_generation,
+            after_generation,
+            before_manifest_fingerprint,
+            after_manifest_fingerprint,
+            expected_manifest_fingerprint,
+        )
+        if views_on
+        else "not_applicable"
+    )
     return {
         "mode": mode,
         "switch": label,
@@ -460,6 +494,9 @@ def perform_switch(
         "probe": asdict(probe),
         "generation_before": before_generation,
         "generation_after": after_generation,
+        "manifest_fingerprint_before": before_manifest_fingerprint,
+        "manifest_fingerprint_after": after_manifest_fingerprint,
+        "manifest_fingerprint_expected": expected_manifest_fingerprint,
         "publication_ms": publication_ms,
         "puts": puts,
         "puts_source": puts_source,
@@ -476,7 +513,7 @@ def perform_switch(
         "readiness_error": readiness_error,
         "time_to_correct_ms": time_to_correct_ms,
         "correctness": "timeout" if timed_out else "correct",
-        "publication": "timeout" if publication_missing else ("published" if views_on else "not_applicable"),
+        "publication": publication,
         "last_search": response_observation(last_search) if timed_out else None,
         "last_callgraph": response_observation(last_callgraph) if timed_out else None,
     }
@@ -508,6 +545,11 @@ def run_mode(
     view_dir = storage / "views" / scope
     rows: list[dict[str, Any]] = []
     warm_started = time.monotonic()
+    known_manifest_fingerprints: dict[str, str] = {}
+    if views_on:
+        initial_fingerprint = manifest_fingerprint(view_dir)
+        if initial_fingerprint is not None:
+            known_manifest_fingerprints[head] = initial_fingerprint
 
     def exercise(client: ToolClient, standalone_pid: int | None) -> None:
         stable = select_stable_symbols(client, checkout, count=1)
@@ -520,8 +562,7 @@ def run_mode(
         for source, target, label, changed_files in transitions:
             if git_text(checkout, "rev-parse", "HEAD") != source:
                 raise SoakError(f"{mode} sequence drift before {label}")
-            rows.append(
-                perform_switch(
+            row = perform_switch(
                     mode=mode,
                     checkout=checkout,
                     source_root=source_root,
@@ -533,9 +574,14 @@ def run_mode(
                     views_on=views_on,
                     view_dir=view_dir,
                     storage=storage,
+                    expected_manifest_fingerprint=known_manifest_fingerprints.get(target),
                     standalone_pid=standalone_pid,
                 )
-            )
+            rows.append(row)
+            if views_on and row["publication"] in {"published", "no_op"}:
+                fingerprint = row["manifest_fingerprint_after"]
+                if fingerprint is not None:
+                    known_manifest_fingerprints[target] = fingerprint
 
     warmup: dict[str, Any] = {
         "ceiling_ms": 1_200_000,
@@ -796,8 +842,11 @@ def main(argv: list[str]) -> int:
             defects.append(
                 f"{row['mode']} {row['switch']} did not return both correct probes after full readiness"
             )
-        if row["mode"] == "views-on" and row["publication"] != "published":
-            defects.append(f"{row['switch']} did not publish a new pointer generation")
+        if row["mode"] == "views-on" and row["publication"] in {"missing", "mismatched"}:
+            defects.append(
+                f"{row['switch']} did not publish the expected manifest "
+                f"(outcome={row['publication']})"
+            )
         if row["measurement_pid_changed"]:
             defects.append(
                 f"{row['mode']} {row['switch']} measurement PID changed from "
