@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar"
+  ],
+  "slices": [
+    "views-publication-off-barrier",
+    "views-generation-owned-derived-files"
+  ],
+  "note": "views/executor/runtime_drain only; no ranking-fence file in the diff, class non_ranking by derivation."
+}
