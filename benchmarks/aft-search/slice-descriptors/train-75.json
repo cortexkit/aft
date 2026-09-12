@@ -1,10 +1,9 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "harness-goldens",
-    "profile-grammar"
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
   "slices": [
     "views-publication-off-barrier",
@@ -12,5 +11,5 @@
     "watcher-backend-generation-capture",
     "train-push-pid-lock"
   ],
-  "note": "views/executor/callgraph_store join seam/watcher_backend/scripts only; no ranking-fence file in the diff, class non_ranking by derivation."
+  "note": "commands/semantic_search/mod.rs touched only by a one-field test fixture update (ViewRuntimeSnapshot.query_pin); no ranking change, rows byte-identical to the reference - the gate byte-equality predicate is the proof."
 }
