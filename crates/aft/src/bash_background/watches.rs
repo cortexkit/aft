@@ -178,11 +178,19 @@ impl WatchRegistry {
 
     /// Drop in-memory watches whose ids are no longer durable (acked once-watches).
     pub fn retain_watch_ids(&mut self, task_id: &str, keep: &HashSet<String>) {
-        if let Some(watches) = self.watches.get_mut(task_id) {
+        let watches_empty = if let Some(watches) = self.watches.get_mut(task_id) {
             watches.retain(|watch| keep.contains(&watch.watch_id));
-            if watches.is_empty() {
-                self.watches.remove(task_id);
-            }
+            watches.is_empty()
+        } else {
+            true
+        };
+        if watches_empty {
+            self.clear_task(task_id);
+        } else {
+            // This synchronization follows an ack that cleared every durable
+            // pending match. Remaining watches still control the task, but no
+            // acknowledged match may suppress its eventual completion.
+            self.matched_tasks.remove(task_id);
         }
     }
 

@@ -159,6 +159,21 @@ fn wait_for_pattern_frame(aft: &mut AftProcess, task_id: &str) -> Value {
     }
 }
 
+fn wait_for_completion_frame(aft: &mut AftProcess, task_id: &str) -> Value {
+    let started = Instant::now();
+    loop {
+        if let Some(frame) = aft.try_read_next_timeout(Duration::from_millis(200)) {
+            if frame["type"] == "bash_completed" && frame["task_id"] == task_id {
+                return frame;
+            }
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "timed out waiting for completion frame for {task_id}"
+        );
+    }
+}
+
 fn shell_quote_path(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
@@ -1986,7 +2001,7 @@ fn pi_erased_watch_with_restored_task_row_does_not_replay_tombstone() {
 }
 
 #[test]
-fn mid_run_ack_from_rebound_root_preserves_later_watch() {
+fn mid_run_ack_from_rebound_root_preserves_later_watch_and_completion() {
     const WATCH_A: &str = "EARLY-WATCH-MATCH";
     const WATCH_B: &str = "LATE-WATCH-MATCH";
 
@@ -2047,7 +2062,28 @@ fn mid_run_ack_from_rebound_root_preserves_later_watch() {
     drop(_release_b_guard);
     let frame_b = wait_for_pattern_frame(&mut restored, &task_id);
     assert_eq!(frame_b["match_text"], WATCH_B);
+    let ack_b = ack(&mut restored, SESSION, &task_id);
+    assert_eq!(ack_b["success"], true, "watch B ack failed: {ack_b:?}");
+
     drop(_release_exit_guard);
+    let completion = wait_for_completion_frame(&mut restored, &task_id);
+    assert_eq!(completion["status"], "completed");
+    assert_eq!(completion["exit_code"], 0);
+    let final_ack = ack(&mut restored, SESSION, &task_id);
+    assert_eq!(
+        final_ack["success"], true,
+        "completion ack failed: {final_ack:?}"
+    );
+
+    let conn = rusqlite::Connection::open(storage.path().join("aft.db"))
+        .expect("open task database");
+    let row = aft::db::bash_tasks::get_bash_task(&conn, "opencode", SESSION, &task_id)
+        .expect("read task row")
+        .expect("persisted task row");
+    assert!(
+        row.completion_delivered,
+        "completion ack must persist delivery: {row:?}"
+    );
     assert!(restored.shutdown().success());
 }
 
