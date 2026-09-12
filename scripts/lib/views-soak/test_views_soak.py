@@ -9,7 +9,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from branch_drill import delta_metrics, log_metrics, search_is_correct, symbols_in_source
+from branch_drill import (
+    delta_metrics,
+    log_metrics,
+    search_is_correct,
+    search_query_for_token,
+    symbols_in_source,
+)
 from common import (
     ProcessSample,
     canonical_output,
@@ -110,6 +116,9 @@ class BranchDrillTests(unittest.TestCase):
             symbols_in_source(source),
             ["alphaProbe", "gamma_probe", "delta_probe", "epsilonProbe"],
         )
+
+    def test_switch_probe_uses_a_regex_that_surfaces_the_exact_identifier(self) -> None:
+        self.assertEqual(search_query_for_token("activeInfo"), r"\bactiveInfo\b")
 
     def test_search_correctness_requires_a_real_result_hit(self) -> None:
         self.assertTrue(

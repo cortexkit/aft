@@ -249,6 +249,11 @@ def choose_branch(
     raise SoakError("no third branch has bidirectional correctness probes: " + "; ".join(failures))
 
 
+def search_query_for_token(token: str) -> str:
+    """Force the search lane to return an exact token-bearing match."""
+    return rf"\b{re.escape(token)}\b"
+
+
 def search_is_correct(response: Mapping[str, Any], token: str) -> bool:
     if response.get("success") is not True or response.get("status") != "ready":
         return False
@@ -387,7 +392,9 @@ def perform_switch(
             generation = current_generation(view_dir)
             if generation is not None and generation != before_generation:
                 publication_ms = round((time.monotonic() - started) * 1000)
-        last_search = client.tool("search", {"query": probe.token, "topK": 20})
+        last_search = client.tool(
+            "search", {"query": search_query_for_token(probe.token), "topK": 20}
+        )
         query_embedding_calls += extract_embedding_calls(last_search)
         last_callgraph = client.tool(
             "callgraph",
