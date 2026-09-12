@@ -8,6 +8,8 @@ use crate::context::{
 use crate::log_ctx;
 use crate::lsp::client::LspEvent;
 use crate::protocol::PushFrame;
+#[cfg(test)]
+use crate::watcher_filter::RescanReason;
 use crate::watcher_filter::{watcher_path_is_infra_skip, WatcherDispatchEvent};
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -2597,9 +2599,10 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                         state.pending_paths.extend(paths);
                     }
                 }
-                Ok(WatcherDispatchEvent::RescanRequired) => {
+                Ok(WatcherDispatchEvent::RescanRequired(reason)) => {
                     dispatch_events_received += 1;
                     state.rescan_required = true;
+                    state.rescan_reason = reason;
                     state.pending_paths.clear();
                     state.phase = WatcherDrainPhase::Collect;
                     state.semantic_refresh_paths.clear();
@@ -2681,7 +2684,15 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
 
     if state.rescan_required {
         crate::logging::note_watcher_overflow();
-        aft::slog_warn!("watcher overflow: forcing project rescan");
+        let root = ctx
+            .canonical_cache_root_opt()
+            .or_else(|| ctx.config().project_root.clone())
+            .unwrap_or_else(|| PathBuf::from("<unconfigured>"));
+        aft::slog_warn!(
+            "watcher overflow: forcing project rescan reason={} root={}",
+            state.rescan_reason.as_str(),
+            root.display()
+        );
         if ctx.heavy_root_work_allowed() {
             ctx.rebuild_gitignore();
         } else {
@@ -3724,7 +3735,7 @@ mod tests {
             )
         );
         watcher_tx
-            .send(WatcherDispatchEvent::RescanRequired)
+            .send(WatcherDispatchEvent::RescanRequired(RescanReason::Unknown))
             .unwrap();
 
         // While unbound the drain must not consume (and then lose) the
@@ -4859,7 +4870,8 @@ mod watcher_slice_tests {
         assert!(first.has_more);
         assert_eq!(ctx.watcher_drain_pending_path_count(), 3);
 
-        tx.send(WatcherDispatchEvent::RescanRequired).unwrap();
+        tx.send(WatcherDispatchEvent::RescanRequired(RescanReason::Unknown))
+            .unwrap();
         let second = drain_watcher_events_bounded(&ctx, 2);
 
         assert_eq!(second.processed, 0);

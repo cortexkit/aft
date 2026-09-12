@@ -381,7 +381,7 @@ fn inject_dispatch_events(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut path_count = 0usize;
     for event in events {
         let dispatch = if event.get("rescan").and_then(Value::as_bool) == Some(true) {
-            WatcherDispatchEvent::RescanRequired
+            WatcherDispatchEvent::RescanRequired(aft::watcher_filter::RescanReason::Unknown)
         } else {
             let Some(paths) = event.get("paths").and_then(Value::as_array) else {
                 return Response::error(

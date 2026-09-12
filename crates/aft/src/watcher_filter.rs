@@ -40,10 +40,35 @@ impl WatcherFilterConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RescanReason {
+    KernelDropped,
+    UserDropped,
+    Unknown,
+}
+
+impl RescanReason {
+    fn from_event_info(info: Option<&str>) -> Self {
+        match info {
+            Some("rescan: kernel dropped") => Self::KernelDropped,
+            Some("rescan: user dropped") => Self::UserDropped,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::KernelDropped => "kernel_dropped",
+            Self::UserDropped => "user_dropped",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WatcherDispatchEvent {
     Paths(Vec<PathBuf>),
-    RescanRequired,
+    RescanRequired(RescanReason),
     IgnoreRulesChanged { path: PathBuf },
     RootDeleted,
     Error(String),
@@ -390,9 +415,10 @@ impl WatcherFilterThread {
             match raw_rx.recv_timeout(self.next_recv_timeout()) {
                 Ok(Ok(event)) => {
                     if event.need_rescan() {
+                        let reason = RescanReason::from_event_info(event.info());
                         self.raw_paths.clear();
                         self.flush_deadline = None;
-                        if !self.send_dispatch(WatcherDispatchEvent::RescanRequired) {
+                        if !self.send_dispatch(WatcherDispatchEvent::RescanRequired(reason)) {
                             return;
                         }
                         continue;
@@ -632,16 +658,23 @@ mod tests {
         let mut granular = notify::Event::new(EventKind::Create(CreateKind::File));
         granular.paths.push(pending);
         raw_tx.send(Ok(granular)).unwrap();
-        raw_tx
-            .send(Ok(
-                notify::Event::new(EventKind::Other).set_flag(Flag::Rescan)
-            ))
-            .unwrap();
-
-        let event = dispatch_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("rescan event");
-        assert_eq!(event, WatcherDispatchEvent::RescanRequired);
+        for (info, expected) in [
+            (Some("rescan: kernel dropped"), RescanReason::KernelDropped),
+            (Some("rescan: user dropped"), RescanReason::UserDropped),
+            (None, RescanReason::Unknown),
+        ] {
+            let mut event = notify::Event::new(EventKind::Other).set_flag(Flag::Rescan);
+            if let Some(info) = info {
+                event = event.set_info(info);
+            }
+            raw_tx.send(Ok(event)).unwrap();
+            assert_eq!(
+                dispatch_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("rescan event"),
+                WatcherDispatchEvent::RescanRequired(expected)
+            );
+        }
         assert!(
             dispatch_rx
                 .recv_timeout(WATCHER_FLUSH_WINDOW + Duration::from_millis(100))

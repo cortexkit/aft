@@ -3318,7 +3318,9 @@ mod watcher_filter_tests {
 
         let watcher_tx = install_watcher_rx(&ctx);
         watcher_tx
-            .send(WatcherDispatchEvent::RescanRequired)
+            .send(WatcherDispatchEvent::RescanRequired(
+                aft::watcher_filter::RescanReason::Unknown,
+            ))
             .unwrap();
 
         drain_watcher_events(&ctx);
@@ -3648,10 +3650,14 @@ mod watcher_filter_tests {
         let watcher_tx = install_watcher_rx(&ctx);
         watcher_tx.send(watcher_paths_event(file.clone())).unwrap();
         watcher_tx
-            .send(WatcherDispatchEvent::RescanRequired)
+            .send(WatcherDispatchEvent::RescanRequired(
+                aft::watcher_filter::RescanReason::Unknown,
+            ))
             .unwrap();
         watcher_tx
-            .send(WatcherDispatchEvent::RescanRequired)
+            .send(WatcherDispatchEvent::RescanRequired(
+                aft::watcher_filter::RescanReason::Unknown,
+            ))
             .unwrap();
         watcher_tx.send(watcher_paths_event(file)).unwrap();
 
