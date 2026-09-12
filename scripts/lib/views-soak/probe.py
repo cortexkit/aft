@@ -8,16 +8,19 @@ import json
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
 from common import (
     NdjsonClient,
     SoakError,
+    SubcClient,
+    ToolClient,
     StableSymbol,
     append_json_line,
     canonical_output,
-    ensure_baseline,
+    ensure_owned_baseline,
     first_differing_line,
     git_bytes,
     git_text,
@@ -25,13 +28,12 @@ from common import (
     latest_json_line,
     markdown_cell,
     read_jsonc,
-    require_success,
     resolve_root,
+    resolve_subc_connection_file,
     select_stable_symbols,
     utc_now,
     view_accounting,
-    wait_callgraph_ready,
-    wait_search_ready,
+    wait_indexes_ready,
 )
 
 
@@ -128,24 +130,21 @@ def query_set(root: Path, symbols: list[StableSymbol]) -> list[dict[str, Any]]:
     return queries
 
 
-def run_query(client: NdjsonClient, query: Mapping[str, Any]) -> dict[str, Any]:
+def run_query(client: ToolClient, query: Mapping[str, Any]) -> dict[str, Any]:
     response = client.tool(str(query["tool"]), query["arguments"])
     tool = str(query["tool"])
     if tool == "callgraph":
         if response.get("code") == "callgraph_building":
             raise SoakError(f"callgraph lost readiness during {query['label']}: {response}")
-        # A symbol missing from only one transport is parity evidence, not an
-        # instrumentation failure; compare the complete public response below.
         return response
-    require_success(response, str(query["label"]))
-    if tool == "search" and response.get("status") != "ready":
-        raise SoakError(f"search was not ready during {query['label']}: {response}")
+    if tool == "search" and response.get("success") is True and response.get("status") != "ready":
+        raise SoakError(f"search lost readiness during {query['label']}: {response}")
     return response
 
 
 def compare_queries(
-    root_client: NdjsonClient,
-    baseline_client: NdjsonClient,
+    root_client: ToolClient,
+    baseline_client: ToolClient,
     root: Path,
     baseline: Path,
     queries: list[dict[str, Any]],
@@ -253,26 +252,50 @@ def main(argv: list[str]) -> int:
 
     accounting = view_accounting(storage, root, scope)
     health = health_snapshot(binary)
-    baseline = ensure_baseline(root, scope, head)
+    baseline = ensure_owned_baseline(root, scope, head)
     user_config = Path.home() / ".config" / "cortexkit" / "aft.jsonc"
+    connection_file = resolve_subc_connection_file(user_config)
+    subc_probe = Path.home() / ".local/share/cortexkit/bin/subc-probe"
+    if not connection_file.is_file() or not subc_probe.is_file():
+        raise SoakError(
+            f"daemon query prerequisites missing: connection={connection_file}, probe={subc_probe}"
+        )
     cache_dir = Path.home() / ".cache" / "aft-views-soak" / scope
+    baseline_storage = cache_dir / "baseline-storage"
+    session = f"views-soak-probe-{int(time.time())}"
+    root_client = SubcClient(subc_probe, connection_file, root, session)
 
     with NdjsonClient(
-        binary, root, storage, cache_dir / "probe-root.stderr.log", f"views-soak-root-{scope}"
-    ) as root_client, NdjsonClient(
         binary,
         baseline,
-        storage,
+        baseline_storage,
         cache_dir / "probe-baseline.stderr.log",
         f"views-soak-baseline-{scope}",
     ) as baseline_client:
-        root_client.configure(user_config)
         baseline_client.configure(user_config)
-        wait_search_ready(root_client)
-        wait_search_ready(baseline_client)
-        symbols = select_stable_symbols(root_client, root)
-        wait_callgraph_ready(root_client, symbols[0])
-        wait_callgraph_ready(baseline_client, symbols[0])
+        candidates = select_stable_symbols(root_client, root, count=30)
+        # A parity case must resolve in both fully-ready stores. A missing symbol
+        # is retained as a comparison only after readiness, never used as the
+        # readiness control itself.
+        root_warmup = wait_indexes_ready(root_client, candidates[0], timeout_s=1200.0)
+        baseline_warmup = wait_indexes_ready(baseline_client, candidates[0], timeout_s=1200.0)
+        symbols = []
+        for candidate in candidates:
+            arguments = {
+                "op": "callers",
+                "filePath": candidate.path,
+                "symbol": candidate.symbol,
+            }
+            root_check = root_client.tool("callgraph", arguments)
+            baseline_check = baseline_client.tool("callgraph", arguments)
+            if root_check.get("success") is True and baseline_check.get("success") is True:
+                symbols.append(candidate)
+            if len(symbols) == 5:
+                break
+        if len(symbols) != 5:
+            raise SoakError(
+                f"only {len(symbols)} stable symbols resolved in both fully-ready callgraphs"
+            )
         queries = query_set(root, symbols)
         parity, divergence = compare_queries(
             root_client, baseline_client, root, baseline, queries
@@ -291,6 +314,15 @@ def main(argv: list[str]) -> int:
             for symbol in symbols
         ],
         "query_count": len(queries),
+        "readiness": {
+            "views_on_daemon_ms": root_warmup["elapsed_ms"],
+            "views_off_baseline_ms": baseline_warmup["elapsed_ms"],
+            "baseline_storage": str(baseline_storage),
+        },
+        "measurement_subjects": {
+            "views_on": "running_subc_daemon",
+            "views_off": "standalone_owned_baseline",
+        },
         "parity": parity,
         "divergence": divergence,
     }

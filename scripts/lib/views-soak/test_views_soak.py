@@ -94,7 +94,7 @@ class BranchDrillTests(unittest.TestCase):
                 'semantic embedder refresh: root="/tmp/other" reason="watcher batch" files=3 chunks=4 batches=7 backend=x',
             ]
         )
-        self.assertEqual(log_metrics(text, root), (2, 2, 2))
+        self.assertEqual(log_metrics(text, root), (2, 2, 2, 3))
 
     def test_source_symbol_extraction_covers_drill_languages(self) -> None:
         source = "\n".join(

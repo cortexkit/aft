@@ -1,0 +1,282 @@
+{
+  "baseline": "/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline-owned",
+  "baseline_storage": "/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline-storage",
+  "connection_file": "/Users/ufukaltinok/.local/share/cortexkit/run/subc-connection.json",
+  "defects": [
+    "views-on HEAD→a085bf62a459 did not return both correct probes after full readiness",
+    "a085bf62a459→HEAD reused HEAD with puts=1942 and embeds=4",
+    "views-on HEAD→refs/remotes/upstream/v2-timeouts did not return both correct probes after full readiness",
+    "HEAD→refs/remotes/upstream/v2-timeouts did not publish a new pointer generation",
+    "refs/remotes/upstream/v2-timeouts→HEAD did not publish a new pointer generation",
+    "refs/remotes/upstream/v2-timeouts→HEAD reused HEAD with puts=1944 and embeds=0"
+  ],
+  "health_after": {
+    "dispatch_liveness": {
+      "interactive": {
+        "oldest_age_ms": null,
+        "queued": 0
+      },
+      "interactive_reserve": 2,
+      "maintenance": {
+        "oldest_age_ms": null,
+        "queued": 0
+      },
+      "maintenance_cap": 6,
+      "phantom_running_maintenance": 0,
+      "running": {
+        "completion_owned": {
+          "interactive": 0,
+          "maintenance": 0
+        },
+        "interactive": 0,
+        "maintenance": 0,
+        "oldest_worker_owned_maintenance_age_ms": null,
+        "phantom": {
+          "interactive": 0,
+          "maintenance": 0
+        }
+      }
+    },
+    "memory_process": {
+      "allocator_observation_age_ms": 20,
+      "allocator_slack_bytes": 9901456400,
+      "allocator_slack_label": "reclaimable by relief",
+      "allocator_slack_measured": true,
+      "last_relief_at_ms": 11761289,
+      "last_relief_freed_bytes": 0,
+      "phys_footprint_bytes": 4788466192,
+      "rss_bytes": 8082374656,
+      "sqlite_bytes": 12574016,
+      "total_attributed_bytes": 2331292295,
+      "unattributed_bytes": 2457173897
+    }
+  },
+  "health_before": {
+    "dispatch_liveness": {
+      "interactive": {
+        "oldest_age_ms": null,
+        "queued": 0
+      },
+      "interactive_reserve": 2,
+      "maintenance": {
+        "oldest_age_ms": null,
+        "queued": 0
+      },
+      "maintenance_cap": 6,
+      "phantom_running_maintenance": 0,
+      "running": {
+        "completion_owned": {
+          "interactive": 0,
+          "maintenance": 0
+        },
+        "interactive": 0,
+        "maintenance": 0,
+        "oldest_worker_owned_maintenance_age_ms": null,
+        "phantom": {
+          "interactive": 0,
+          "maintenance": 0
+        }
+      }
+    },
+    "memory_process": {
+      "allocator_observation_age_ms": 20,
+      "allocator_slack_bytes": 9891504976,
+      "allocator_slack_label": "reclaimable by relief",
+      "allocator_slack_measured": true,
+      "last_relief_at_ms": 11160661,
+      "last_relief_freed_bytes": 0,
+      "phys_footprint_bytes": 4572803456,
+      "rss_bytes": 7128678400,
+      "sqlite_bytes": 12553248,
+      "total_attributed_bytes": 2374508137,
+      "unattributed_bytes": 2198295319
+    }
+  },
+  "measurement_subjects": {
+    "views_off": "standalone_owned_baseline",
+    "views_on": "running_subc_daemon"
+  },
+  "observed_at": "2026-09-12T12:35:49Z",
+  "refs": {
+    "anchor": {
+      "changed_files": 300,
+      "in_requested_range": true,
+      "kind": "first_parent_commit",
+      "requested_range": [
+        200,
+        400
+      ],
+      "sha": "a085bf62a459c21d90a89bcae006e969df60d944"
+    },
+    "branch": {
+      "changed_files": 298,
+      "ref": "refs/remotes/upstream/v2-timeouts",
+      "sha": "b85cf3d67fe3d36a8d04f4247fc781045d5b3dee"
+    },
+    "head": "5716f8ba60e79ec60ec485b6e5291c0b0bc1f252",
+    "observed_at": "2026-09-12T12:35:49Z"
+  },
+  "root": "/Users/ufukaltinok/Work/OSS/opencode",
+  "rows": [
+    {
+      "changed_files": 300,
+      "correctness": "timeout",
+      "cpu_s": 280.97,
+      "embedded_files": 0,
+      "embeds": 0,
+      "generation_after": "15-a632b1603f62b77a16c041435b34764810ec2919461ae14fba9c2a70b49fdace",
+      "generation_before": "14-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "last_callgraph": {
+        "code": "symbol_not_found",
+        "message": "symbol 'activeInfo' not found in /Users/ufukaltinok/Work/OSS/opencode/packages/core/src/plugin.ts",
+        "success": false,
+        "text": "callers: symbol_not_found — symbol 'activeInfo' not found in /Users/ufukaltinok/Work/OSS/opencode/packages/core/src/plugin.ts"
+      },
+      "last_search": {
+        "result_count": 20,
+        "status": "ready",
+        "success": true,
+        "text": "packages/core/src/plugin.ts [exact]\n  plugin [file summary]\n      export * as Plugin from \"./plugin.js\"\n      export { Event, ID, Info, Source, State } from \"@opencode-ai/schema/plugin\"\n      import { Plugin } from \"@opencode-ai/schema/plugin\"\n      import { Node } from \"@opencode-ai/util/effect/app-node\"\n      import { LayerNode } from \"@opencode-ai/util/effect/layer-node\"\n      import type { PersistentPty } from \"./persistent-pty.js\"\n      import { Cause, Context, Effect, Exit, Latch, Layer, Logger, References, Scope, Semaphore } from \"effect\"\n      import { Bus } from \"./bus.js\"\n      import { KV } from \"./kv.js\"\n      import { PluginHost } from \"./plugin/host.js\"\n      import { type Failure, type Generation, Service } from \"./plugin/service.js\"\n      import { State } from \"./state.js\"\n      export { awaitActivation, type Generation, type Interface, Service } from \"./plugin/service.js\"\n      const layer = Layer.effect(\n        Service,\n        Effect.gen(function* () {\n          const bus = yield* Bus.Service\n          const kv = yield* KV.Service\n          const scope = yield* Scope.make()\n          const active = new Map<Plugin.ID, { readonly plugin: Generation; readonly scope: Scope.Closeable }>()\n  plugin [file summary]\n      export * as Plugin from \"./plugin.js\"\n      export { Event, ID, Info, Source, State } from \"@opencode-ai/schema/plugin\"\n      import { Plugin } from \"@opencode-ai/schema/plugin\"\n      import { Node } from \"@opencode-ai/util/effect/app-node\"\n      import { LayerNode } from \"@opencode-ai/util/effect/layer-node\"\n\npackages/schema/src/config/compaction.ts [lexical match]\n\npackages/schema/src/session-status-event.ts [lexical match]\n\npackages/schema/src/session-stats.ts [lexical match]\n\npackages/schema/src/agent.ts [lexical match]\n\npackages/protocol/src/groups/shell.ts [lexical match]\n\npackages/core/src/v1/config/provider.ts [lexical match]\n\npackages/cli/src/commands/handlers/auth/logout.ts [lexical match]\n\npackages/schema/src/config/agent.ts […"
+      },
+      "measurement_pid_after": 72895,
+      "measurement_pid_before": 72895,
+      "measurement_pid_changed": false,
+      "mode": "views-on",
+      "probe": {
+        "path": "packages/core/src/plugin.ts",
+        "symbol": "activeInfo",
+        "token": "activeInfo"
+      },
+      "publication": "published",
+      "publication_blob_puts": null,
+      "publication_ms": 38290,
+      "puts": 1942,
+      "puts_source": "head_reuse",
+      "query_embedding_calls": 0,
+      "readiness_error": null,
+      "readiness_ms": 299771,
+      "rss_delta_mb": 1362.719,
+      "switch": "HEAD→a085bf62a459",
+      "target": "a085bf62a459c21d90a89bcae006e969df60d944",
+      "time_to_correct_ms": null
+    },
+    {
+      "changed_files": 300,
+      "correctness": "correct",
+      "cpu_s": 62.0,
+      "embedded_files": 272,
+      "embeds": 4,
+      "generation_after": "16-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "generation_before": "15-a632b1603f62b77a16c041435b34764810ec2919461ae14fba9c2a70b49fdace",
+      "last_callgraph": null,
+      "last_search": null,
+      "measurement_pid_after": 72895,
+      "measurement_pid_before": 72895,
+      "measurement_pid_changed": false,
+      "mode": "views-on",
+      "probe": {
+        "path": "packages/app/src/settings/timeline-detail.tsx",
+        "symbol": "TimelineDetailControl",
+        "token": "TimelineDetailControl"
+      },
+      "publication": "published",
+      "publication_blob_puts": null,
+      "publication_ms": 55343,
+      "puts": 1942,
+      "puts_source": "head_reuse",
+      "query_embedding_calls": 0,
+      "readiness_error": null,
+      "readiness_ms": 55343,
+      "rss_delta_mb": 607.594,
+      "switch": "a085bf62a459→HEAD",
+      "target": "5716f8ba60e79ec60ec485b6e5291c0b0bc1f252",
+      "time_to_correct_ms": 56434
+    },
+    {
+      "changed_files": 298,
+      "correctness": "timeout",
+      "cpu_s": 279.1,
+      "embedded_files": 0,
+      "embeds": 0,
+      "generation_after": "16-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "generation_before": "16-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "last_callgraph": {
+        "code": "symbol_not_found",
+        "message": "symbol 'activeInfo' not found in /Users/ufukaltinok/Work/OSS/opencode/packages/core/src/plugin.ts",
+        "success": false,
+        "text": "callers: symbol_not_found — symbol 'activeInfo' not found in /Users/ufukaltinok/Work/OSS/opencode/packages/core/src/plugin.ts"
+      },
+      "last_search": {
+        "result_count": 20,
+        "status": "ready",
+        "success": true,
+        "text": "packages/core/src/plugin.ts [exact]\n  plugin [file summary]\n      export * as Plugin from \"./plugin.js\"\n      export { Event, ID, Info, Source, State } from \"@opencode-ai/schema/plugin\"\n      import { Plugin } from \"@opencode-ai/schema/plugin\"\n      import { Node } from \"@opencode-ai/util/effect/app-node\"\n      import { LayerNode } from \"@opencode-ai/util/effect/layer-node\"\n      import type { PersistentPty } from \"./persistent-pty.js\"\n      import { Cause, Context, Effect, Exit, Latch, Layer, Logger, References, Scope, Semaphore } from \"effect\"\n      import { Bus } from \"./bus.js\"\n      import { KV } from \"./kv.js\"\n      import { PluginHost } from \"./plugin/host.js\"\n      import { type Failure, type Generation, Service } from \"./plugin/service.js\"\n      import { State } from \"./state.js\"\n      export { awaitActivation, type Generation, type Interface, Service } from \"./plugin/service.js\"\n      const layer = Layer.effect(\n        Service,\n        Effect.gen(function* () {\n          const bus = yield* Bus.Service\n          const kv = yield* KV.Service\n          const scope = yield* Scope.make()\n          const active = new Map<Plugin.ID, { readonly plugin: Generation; readonly scope: Scope.Closeable }>()\n  plugin [file summary]\n      export * as Plugin from \"./plugin.js\"\n      export { Event, ID, Info, Source, State } from \"@opencode-ai/schema/plugin\"\n      import { Plugin } from \"@opencode-ai/schema/plugin\"\n      import { Node } from \"@opencode-ai/util/effect/app-node\"\n      import { LayerNode } from \"@opencode-ai/util/effect/layer-node\"\n\npackages/schema/src/config/compaction.ts [lexical match]\n\npackages/schema/src/session-status-event.ts [lexical match]\n\npackages/schema/src/session-stats.ts [lexical match]\n\npackages/schema/src/agent.ts [lexical match]\n\npackages/protocol/src/groups/shell.ts [lexical match]\n\npackages/core/src/v1/config/provider.ts [lexical match]\n\npackages/cli/src/commands/handlers/auth/logout.ts [lexical match]\n\npackages/schema/src/config/agent.ts […"
+      },
+      "measurement_pid_after": 72895,
+      "measurement_pid_before": 72895,
+      "measurement_pid_changed": false,
+      "mode": "views-on",
+      "probe": {
+        "path": "packages/core/src/plugin.ts",
+        "symbol": "activeInfo",
+        "token": "activeInfo"
+      },
+      "publication": "timeout",
+      "publication_blob_puts": null,
+      "publication_ms": null,
+      "puts": 1954,
+      "puts_source": "head_reuse",
+      "query_embedding_calls": 0,
+      "readiness_error": null,
+      "readiness_ms": 299662,
+      "rss_delta_mb": -1312.484,
+      "switch": "HEAD→refs/remotes/upstream/v2-timeouts",
+      "target": "b85cf3d67fe3d36a8d04f4247fc781045d5b3dee",
+      "time_to_correct_ms": null
+    },
+    {
+      "changed_files": 298,
+      "correctness": "correct",
+      "cpu_s": 25.6,
+      "embedded_files": 0,
+      "embeds": 0,
+      "generation_after": "16-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "generation_before": "16-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "last_callgraph": null,
+      "last_search": null,
+      "measurement_pid_after": 72895,
+      "measurement_pid_before": 72895,
+      "measurement_pid_changed": false,
+      "mode": "views-on",
+      "probe": {
+        "path": "packages/app/src/settings/timeline-detail.tsx",
+        "symbol": "TimelineDetailControl",
+        "token": "TimelineDetailControl"
+      },
+      "publication": "timeout",
+      "publication_blob_puts": null,
+      "publication_ms": null,
+      "puts": 1944,
+      "puts_source": "head_reuse",
+      "query_embedding_calls": 0,
+      "readiness_error": null,
+      "readiness_ms": 9529,
+      "rss_delta_mb": 251.188,
+      "switch": "refs/remotes/upstream/v2-timeouts→HEAD",
+      "target": "5716f8ba60e79ec60ec485b6e5291c0b0bc1f252",
+      "time_to_correct_ms": 11979
+    }
+  ],
+  "run1_artifact": "branch-drill-run1-confounded.json",
+  "schema_version": 2,
+  "warmups": {
+    "views-on": {
+      "ceiling_ms": 1200000,
+      "measurement_pid": 72895,
+      "readiness_detail_ms": 175,
+      "storage": "/Users/ufukaltinok/.local/share/cortexkit/aft",
+      "subject": "running_subc_daemon",
+      "total_ms": 637
+    }
+  }
+}

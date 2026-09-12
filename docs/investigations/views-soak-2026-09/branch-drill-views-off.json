@@ -1,0 +1,274 @@
+{
+  "baseline": "/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline-owned",
+  "baseline_storage": "/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline-storage",
+  "connection_file": "/Users/ufukaltinok/.local/share/cortexkit/run/subc-connection.json",
+  "defects": [
+    "views-off HEAD→a085bf62a459 did not return both correct probes after full readiness",
+    "views-off HEAD→refs/remotes/upstream/v2-timeouts did not return both correct probes after full readiness"
+  ],
+  "health_after": {
+    "dispatch_liveness": {
+      "interactive": {
+        "oldest_age_ms": null,
+        "queued": 0
+      },
+      "interactive_reserve": 2,
+      "maintenance": {
+        "oldest_age_ms": null,
+        "queued": 0
+      },
+      "maintenance_cap": 6,
+      "phantom_running_maintenance": 0,
+      "running": {
+        "completion_owned": {
+          "interactive": 0,
+          "maintenance": 0
+        },
+        "interactive": 0,
+        "maintenance": 0,
+        "oldest_worker_owned_maintenance_age_ms": null,
+        "phantom": {
+          "interactive": 0,
+          "maintenance": 0
+        }
+      }
+    },
+    "memory_process": {
+      "allocator_observation_age_ms": 20,
+      "allocator_slack_bytes": 10042580288,
+      "allocator_slack_label": "reclaimable by relief",
+      "allocator_slack_measured": true,
+      "last_relief_at_ms": 13861898,
+      "last_relief_freed_bytes": 0,
+      "phys_footprint_bytes": 5236355576,
+      "rss_bytes": 3544432640,
+      "sqlite_bytes": 47528544,
+      "total_attributed_bytes": 2082525026,
+      "unattributed_bytes": 3153830550
+    }
+  },
+  "health_before": {
+    "dispatch_liveness": {
+      "interactive": {
+        "oldest_age_ms": null,
+        "queued": 0
+      },
+      "interactive_reserve": 2,
+      "maintenance": {
+        "oldest_age_ms": null,
+        "queued": 0
+      },
+      "maintenance_cap": 6,
+      "phantom_running_maintenance": 0,
+      "running": {
+        "completion_owned": {
+          "interactive": 0,
+          "maintenance": 0
+        },
+        "interactive": 0,
+        "maintenance": 0,
+        "oldest_worker_owned_maintenance_age_ms": null,
+        "phantom": {
+          "interactive": 0,
+          "maintenance": 0
+        }
+      }
+    },
+    "memory_process": {
+      "allocator_observation_age_ms": 22,
+      "allocator_slack_bytes": 9952360432,
+      "allocator_slack_label": "reclaimable by relief",
+      "allocator_slack_measured": true,
+      "last_relief_at_ms": 13261649,
+      "last_relief_freed_bytes": 0,
+      "phys_footprint_bytes": 4610404832,
+      "rss_bytes": 6684557312,
+      "sqlite_bytes": 14158800,
+      "total_attributed_bytes": 2294022544,
+      "unattributed_bytes": 2316382288
+    }
+  },
+  "measurement_subjects": {
+    "views_off": "standalone_owned_baseline",
+    "views_on": "running_subc_daemon"
+  },
+  "observed_at": "2026-09-12T13:10:49Z",
+  "refs": {
+    "anchor": {
+      "changed_files": 300,
+      "in_requested_range": true,
+      "kind": "first_parent_commit",
+      "requested_range": [
+        200,
+        400
+      ],
+      "sha": "a085bf62a459c21d90a89bcae006e969df60d944"
+    },
+    "branch": {
+      "changed_files": 298,
+      "ref": "refs/remotes/upstream/v2-timeouts",
+      "sha": "b85cf3d67fe3d36a8d04f4247fc781045d5b3dee"
+    },
+    "head": "5716f8ba60e79ec60ec485b6e5291c0b0bc1f252",
+    "observed_at": "2026-09-12T13:10:49Z"
+  },
+  "root": "/Users/ufukaltinok/Work/OSS/opencode",
+  "rows": [
+    {
+      "changed_files": 300,
+      "correctness": "timeout",
+      "cpu_s": 124.55,
+      "embedded_files": 260,
+      "embeds": 3,
+      "generation_after": null,
+      "generation_before": null,
+      "last_callgraph": {
+        "success": true,
+        "text": "1 caller · 1 file group\npackages/core/src/plugin.ts\n  ↳ layer:119"
+      },
+      "last_search": {
+        "result_count": 20,
+        "status": "ready",
+        "success": true,
+        "text": "packages/core/src/plugin.ts [exact]\n  plugin [file summary]\n      export * as Plugin from \"./plugin.js\"\n      export { Event, ID, Info, Source, State } from \"@opencode-ai/schema/plugin\"\n      import { Plugin } from \"@opencode-ai/schema/plugin\"\n      import { Node } from \"@opencode-ai/util/effect/app-node\"\n      import { LayerNode } from \"@opencode-ai/util/effect/layer-node\"\n      import type { PersistentPty } from \"./persistent-pty.js\"\n      import { Cause, Context, Effect, Exit, Latch, Layer, Logger, References, Scope, Semaphore } from \"effect\"\n      import { Bus } from \"./bus.js\"\n      import { KV } from \"./kv.js\"\n      import { PluginHost } from \"./plugin/host.js\"\n      import { type Failure, type Generation, Service } from \"./plugin/service.js\"\n      import { State } from \"./state.js\"\n      export { awaitActivation, type Generation, type Interface, Service } from \"./plugin/service.js\"\n      const layer = Layer.effect(\n        Service,\n        Effect.gen(function* () {\n          const bus = yield* Bus.Service\n          const kv = yield* KV.Service\n          const scope = yield* Scope.make()\n          const active = new Map<Plugin.ID, { readonly plugin: Generation; readonly scope: Scope.Closeable }>()\n  plugin [file summary]\n      export * as Plugin from \"./plugin.js\"\n      export { Event, ID, Info, Source, State } from \"@opencode-ai/schema/plugin\"\n      import { Plugin } from \"@opencode-ai/schema/plugin\"\n      import { Node } from \"@opencode-ai/util/effect/app-node\"\n      import { LayerNode } from \"@opencode-ai/util/effect/layer-node\"\n\npackages/schema/src/config/compaction.ts [lexical match]\n\npackages/schema/src/session-status-event.ts [lexical match]\n\npackages/schema/src/session-stats.ts [lexical match]\n\npackages/schema/src/agent.ts [lexical match]\n\npackages/protocol/src/groups/shell.ts [lexical match]\n\npackages/core/src/v1/config/provider.ts [lexical match]\n\npackages/cli/src/commands/handlers/auth/logout.ts [lexical match]\n\npackages/schema/src/config/agent.ts […"
+      },
+      "measurement_pid_after": 41930,
+      "measurement_pid_before": 41930,
+      "measurement_pid_changed": false,
+      "mode": "views-off",
+      "probe": {
+        "path": "packages/core/src/plugin.ts",
+        "symbol": "activeInfo",
+        "token": "activeInfo"
+      },
+      "publication": "not_applicable",
+      "publication_blob_puts": null,
+      "publication_ms": null,
+      "puts": null,
+      "puts_source": "not_applicable",
+      "query_embedding_calls": 0,
+      "readiness_error": null,
+      "readiness_ms": 299845,
+      "rss_delta_mb": 96.188,
+      "switch": "HEAD→a085bf62a459",
+      "target": "a085bf62a459c21d90a89bcae006e969df60d944",
+      "time_to_correct_ms": null
+    },
+    {
+      "changed_files": 300,
+      "correctness": "correct",
+      "cpu_s": 39.72,
+      "embedded_files": 272,
+      "embeds": 4,
+      "generation_after": null,
+      "generation_before": null,
+      "last_callgraph": null,
+      "last_search": null,
+      "measurement_pid_after": 41930,
+      "measurement_pid_before": 41930,
+      "measurement_pid_changed": false,
+      "mode": "views-off",
+      "probe": {
+        "path": "packages/app/src/settings/timeline-detail.tsx",
+        "symbol": "TimelineDetailControl",
+        "token": "TimelineDetailControl"
+      },
+      "publication": "not_applicable",
+      "publication_blob_puts": null,
+      "publication_ms": null,
+      "puts": null,
+      "puts_source": "not_applicable",
+      "query_embedding_calls": 0,
+      "readiness_error": null,
+      "readiness_ms": 28167,
+      "rss_delta_mb": 1870.0,
+      "switch": "a085bf62a459→HEAD",
+      "target": "5716f8ba60e79ec60ec485b6e5291c0b0bc1f252",
+      "time_to_correct_ms": 29250
+    },
+    {
+      "changed_files": 298,
+      "correctness": "timeout",
+      "cpu_s": 120.13,
+      "embedded_files": 260,
+      "embeds": 3,
+      "generation_after": null,
+      "generation_before": null,
+      "last_callgraph": {
+        "success": true,
+        "text": "1 caller · 1 file group\npackages/core/src/plugin.ts\n  ↳ layer:118"
+      },
+      "last_search": {
+        "result_count": 20,
+        "status": "ready",
+        "success": true,
+        "text": "packages/core/src/plugin.ts [exact]\n  plugin [file summary]\n      export * as Plugin from \"./plugin.js\"\n      export { Event, ID, Info, Source, State } from \"@opencode-ai/schema/plugin\"\n      import { Plugin } from \"@opencode-ai/schema/plugin\"\n      import { Node } from \"@opencode-ai/util/effect/app-node\"\n      import { LayerNode } from \"@opencode-ai/util/effect/layer-node\"\n      import type { PersistentPty } from \"./persistent-pty.js\"\n      import { Cause, Context, Effect, Exit, Latch, Layer, Logger, References, Scope, Semaphore } from \"effect\"\n      import { Bus } from \"./bus.js\"\n      import { KV } from \"./kv.js\"\n      import { PluginHost } from \"./plugin/host.js\"\n      import { type Failure, type Generation, Service } from \"./plugin/service.js\"\n      import { State } from \"./state.js\"\n      export { awaitActivation, type Generation, type Interface, Service } from \"./plugin/service.js\"\n      const layer = Layer.effect(\n        Service,\n        Effect.gen(function* () {\n          const bus = yield* Bus.Service\n          const kv = yield* KV.Service\n          const scope = yield* Scope.make()\n          const active = new Map<Plugin.ID, { readonly plugin: Generation; readonly scope: Scope.Closeable }>()\n  plugin [file summary]\n      export * as Plugin from \"./plugin.js\"\n      export { Event, ID, Info, Source, State } from \"@opencode-ai/schema/plugin\"\n      import { Plugin } from \"@opencode-ai/schema/plugin\"\n      import { Node } from \"@opencode-ai/util/effect/app-node\"\n      import { LayerNode } from \"@opencode-ai/util/effect/layer-node\"\n\npackages/schema/src/config/compaction.ts [lexical match]\n\npackages/schema/src/session-status-event.ts [lexical match]\n\npackages/schema/src/session-stats.ts [lexical match]\n\npackages/schema/src/agent.ts [lexical match]\n\npackages/protocol/src/groups/shell.ts [lexical match]\n\npackages/core/src/v1/config/provider.ts [lexical match]\n\npackages/cli/src/commands/handlers/auth/logout.ts [lexical match]\n\npackages/schema/src/config/agent.ts […"
+      },
+      "measurement_pid_after": 41930,
+      "measurement_pid_before": 41930,
+      "measurement_pid_changed": false,
+      "mode": "views-off",
+      "probe": {
+        "path": "packages/core/src/plugin.ts",
+        "symbol": "activeInfo",
+        "token": "activeInfo"
+      },
+      "publication": "not_applicable",
+      "publication_blob_puts": null,
+      "publication_ms": null,
+      "puts": null,
+      "puts_source": "not_applicable",
+      "query_embedding_calls": 0,
+      "readiness_error": null,
+      "readiness_ms": 299914,
+      "rss_delta_mb": -47.609,
+      "switch": "HEAD→refs/remotes/upstream/v2-timeouts",
+      "target": "b85cf3d67fe3d36a8d04f4247fc781045d5b3dee",
+      "time_to_correct_ms": null
+    },
+    {
+      "changed_files": 298,
+      "correctness": "correct",
+      "cpu_s": 43.07,
+      "embedded_files": 272,
+      "embeds": 4,
+      "generation_after": null,
+      "generation_before": null,
+      "last_callgraph": null,
+      "last_search": null,
+      "measurement_pid_after": 41930,
+      "measurement_pid_before": 41930,
+      "measurement_pid_changed": false,
+      "mode": "views-off",
+      "probe": {
+        "path": "packages/app/src/settings/timeline-detail.tsx",
+        "symbol": "TimelineDetailControl",
+        "token": "TimelineDetailControl"
+      },
+      "publication": "not_applicable",
+      "publication_blob_puts": null,
+      "publication_ms": null,
+      "puts": null,
+      "puts_source": "not_applicable",
+      "query_embedding_calls": 0,
+      "readiness_error": null,
+      "readiness_ms": 30445,
+      "rss_delta_mb": 35.031,
+      "switch": "refs/remotes/upstream/v2-timeouts→HEAD",
+      "target": "5716f8ba60e79ec60ec485b6e5291c0b0bc1f252",
+      "time_to_correct_ms": 31333
+    }
+  ],
+  "run1_artifact": "branch-drill-run1-confounded.json",
+  "schema_version": 2,
+  "warmups": {
+    "views-off": {
+      "ceiling_ms": 1200000,
+      "measurement_pid": 41930,
+      "readiness_detail_ms": 2622,
+      "storage": "/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline-storage",
+      "subject": "standalone_owned_baseline",
+      "total_ms": 2987
+    }
+  }
+}

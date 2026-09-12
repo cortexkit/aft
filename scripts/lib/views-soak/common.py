@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Protocol, Sequence
 
 
 SOAK_SCOPE_BY_ROOT = {
@@ -78,6 +78,109 @@ class SwitchProbe:
     path: str
     symbol: str
     token: str
+
+
+class ToolClient(Protocol):
+    def status(self, timeout_s: float = 300.0) -> dict[str, Any]: ...
+
+    def tool(
+        self, name: str, arguments: Mapping[str, Any], timeout_s: float = 240.0
+    ) -> dict[str, Any]: ...
+
+
+class SubcClient:
+    """Tool client for the already-running AFT module through subc-probe."""
+
+    def __init__(
+        self,
+        probe_binary: Path,
+        connection_file: Path,
+        project_root: Path,
+        session_id: str,
+        harness: str = "runner",
+    ) -> None:
+        self.probe_binary = probe_binary.resolve()
+        self.connection_file = connection_file.resolve()
+        self.project_root = project_root.resolve()
+        self.session_id = session_id
+        self.harness = harness
+
+    def tool(
+        self, name: str, arguments: Mapping[str, Any], timeout_s: float = 240.0
+    ) -> dict[str, Any]:
+        command = [
+            self.probe_binary,
+            "--subc",
+            self.connection_file,
+            "--module-id",
+            "aft",
+            "--root",
+            self.project_root,
+            "--harness",
+            self.harness,
+            "--session",
+            self.session_id,
+            "--tool",
+            name,
+            "--args",
+            canonical_json_bytes(dict(arguments)).decode("utf-8"),
+        ]
+        deadline = time.monotonic() + timeout_s
+        last_error = ""
+        while time.monotonic() < deadline:
+            remaining = max(1.0, deadline - time.monotonic())
+            result = run_checked(
+                command,
+                timeout_s=min(remaining, 120.0),
+                allowed=(0, 1),
+            )
+            if result.returncode == 0:
+                try:
+                    response = json.loads(result.stdout)
+                except json.JSONDecodeError as error:
+                    raise SoakError(
+                        f"subc-probe returned invalid JSON for {name}: "
+                        f"{result.stdout.decode('utf-8', errors='replace')[-4000:]}"
+                    ) from error
+                if not isinstance(response, dict):
+                    raise SoakError(
+                        f"subc-probe returned a non-object response for {name}: {response!r}"
+                    )
+                structured = response.get("structuredContent")
+                if isinstance(structured, dict):
+                    unwrapped = dict(structured)
+                    if "text" not in unwrapped:
+                        content = response.get("content")
+                        if isinstance(content, list):
+                            texts = [
+                                str(item["text"])
+                                for item in content
+                                if isinstance(item, dict) and "text" in item
+                            ]
+                            if texts:
+                                unwrapped["text"] = "\n".join(texts)
+                    if response.get("isError") is True and "success" not in unwrapped:
+                        unwrapped["success"] = False
+                    return unwrapped
+                return response
+            last_error = (result.stderr + result.stdout).decode("utf-8", errors="replace")
+            if not any(
+                marker in last_error.lower()
+                for marker in (
+                    "reloading",
+                    "route closed",
+                    "temporarily unavailable",
+                    "timed out after",
+                )
+            ):
+                raise SoakError(f"subc-probe failed for {name}: {last_error[-4000:]}")
+            time.sleep(0.5)
+        raise SoakError(f"subc-probe timed out for {name}: {last_error[-4000:]}")
+
+    def status(self, timeout_s: float = 300.0) -> dict[str, Any]:
+        response = self.tool("status", {}, timeout_s=timeout_s)
+        require_success(response, "daemon status")
+        return response
 
 
 class NdjsonClient:
@@ -394,6 +497,36 @@ def ensure_baseline(root: Path, scope: str, head: str) -> Path:
     return baseline
 
 
+def ensure_owned_baseline(root: Path, scope: str, head: str) -> Path:
+    """Create an independent local clone so standalone indexes are writable."""
+    baseline = Path.home() / ".cache" / "aft-views-soak" / scope / "baseline-owned"
+    baseline.parent.mkdir(parents=True, exist_ok=True)
+    head_ref = git_text(root, "rev-parse", f"{head}^{{commit}}")
+    if baseline.exists():
+        if not (baseline / ".git").is_dir():
+            raise SoakError(f"owned baseline exists but is not an independent clone: {baseline}")
+        git_text(baseline, "fetch", "--quiet", str(root), head_ref)
+        git_text(baseline, "checkout", "--quiet", "--detach", "--force", head_ref)
+    else:
+        git_text(root, "clone", "--quiet", "--shared", "--no-checkout", str(root), str(baseline))
+        git_text(baseline, "checkout", "--quiet", "--detach", head)
+    write_views_off_config(root, baseline)
+    return baseline
+
+
+def resolve_subc_connection_file(user_config: Path) -> Path:
+    config = read_jsonc(user_config)
+    subc = config.get("subc")
+    raw = subc.get("connection_file") if isinstance(subc, dict) else None
+    if isinstance(raw, str) and raw.strip():
+        value = raw.strip()
+        if value.startswith("~"):
+            return (Path.home() / value[1:].lstrip("/\\")).resolve()
+        path = Path(value)
+        return path.resolve() if path.is_absolute() else (Path.home() / path).resolve()
+    return (Path.home() / ".local/share/cortexkit/run/subc-connection.json").resolve()
+
+
 def wait_search_ready(client: NdjsonClient, timeout_s: float = 300.0) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_s
     last_status: dict[str, Any] = {}
@@ -425,7 +558,7 @@ def wait_search_ready(client: NdjsonClient, timeout_s: float = 300.0) -> dict[st
 
 
 def wait_callgraph_ready(
-    client: NdjsonClient, symbol: StableSymbol | SwitchProbe, timeout_s: float = 300.0
+    client: ToolClient, symbol: StableSymbol | SwitchProbe, timeout_s: float = 300.0
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_s
     last: dict[str, Any] = {}
@@ -442,8 +575,68 @@ def wait_callgraph_ready(
     raise SoakError(f"callgraph readiness timed out: {json.dumps(last, sort_keys=True)}")
 
 
+def wait_indexes_ready(
+    client: ToolClient,
+    control: StableSymbol | SwitchProbe,
+    *,
+    timeout_s: float = 1200.0,
+) -> dict[str, Any]:
+    """Wait until search, semantic, and callgraph can all serve real queries."""
+    started = time.monotonic()
+    deadline = started + timeout_s
+    last_status: dict[str, Any] = {}
+    last_callgraph: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        remaining = max(1.0, deadline - time.monotonic())
+        last_status = client.status(timeout_s=min(300.0, remaining))
+        search = last_status.get("search_index")
+        semantic = last_status.get("semantic_index")
+        callgraph = last_status.get("callgraph_store")
+        if not isinstance(callgraph, Mapping):
+            memory = last_status.get("memory")
+            roots = memory.get("roots") if isinstance(memory, Mapping) else None
+            root_memory = (
+                roots.get(str(getattr(client, "project_root", "")))
+                if isinstance(roots, Mapping)
+                else None
+            )
+            callgraph = root_memory.get("callgraph") if isinstance(root_memory, Mapping) else None
+        search_state = search.get("status") if isinstance(search, Mapping) else None
+        semantic_state = semantic.get("status") if isinstance(semantic, Mapping) else None
+        callgraph_state = callgraph.get("status") if isinstance(callgraph, Mapping) else None
+        if search_state == "failed" or semantic_state == "failed" or callgraph_state == "failed":
+            raise SoakError(
+                "index failed while waiting for full readiness: "
+                + json.dumps(last_status, sort_keys=True)
+            )
+        search_ready = search_state == "ready"
+        semantic_ready = semantic_state in {"ready", "disabled"}
+        callgraph_ready = callgraph_state == "ready"
+        if search_ready and semantic_ready and not callgraph_ready:
+            last_callgraph = client.tool(
+                "callgraph",
+                {"op": "callers", "filePath": control.path, "symbol": control.symbol},
+                timeout_s=min(300.0, remaining),
+            )
+            callgraph_ready = last_callgraph.get("success") is True or last_callgraph.get("code") == "symbol_not_found"
+        if search_ready and semantic_ready and callgraph_ready:
+            return {
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+                "status": last_status,
+                "callgraph_probe": public_response(last_callgraph) if last_callgraph else None,
+            }
+        time.sleep(0.25)
+    raise SoakError(
+        "full index readiness timed out: "
+        + json.dumps(
+            {"status": last_status, "callgraph_probe": public_response(last_callgraph)},
+            sort_keys=True,
+        )
+    )
+
+
 def select_stable_symbols(
-    client: NdjsonClient,
+    client: ToolClient,
     root: Path,
     *,
     count: int = 5,

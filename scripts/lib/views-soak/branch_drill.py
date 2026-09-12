@@ -17,10 +17,12 @@ from common import (
     NdjsonClient,
     ProcessSample,
     SoakError,
+    SubcClient,
     SwitchProbe,
+    ToolClient,
     assert_clean_worktree,
     current_generation,
-    ensure_baseline,
+    ensure_owned_baseline,
     extract_embedding_calls,
     find_subc_daemon_pid,
     git_bytes,
@@ -29,14 +31,13 @@ from common import (
     manifest_entry_count,
     markdown_cell,
     read_jsonc,
-    require_success,
     resolve_root,
+    resolve_subc_connection_file,
     run_checked,
     sample_process,
     select_stable_symbols,
     utc_now,
-    wait_callgraph_ready,
-    wait_search_ready,
+    wait_indexes_ready,
     write_json,
     write_views_off_config,
 )
@@ -53,7 +54,8 @@ PUBLICATION_RE = re.compile(
     r"blob_puts=(?P<puts>\d+) pending_paths=(?P<pending>\d+)"
 )
 EMBED_RE = re.compile(
-    r'semantic embedder refresh: root="(?P<root>[^"]+)" .*? batches=(?P<batches>\d+)\b'
+    r'semantic embedder refresh: root="(?P<root>[^"]+)" .*? files=(?P<files>\d+) '
+    r'chunks=(?P<chunks>\d+) batches=(?P<batches>\d+)\b'
 )
 FUNCTION_PATTERNS = (
     re.compile(r"(?m)^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\b"),
@@ -204,11 +206,15 @@ def choose_anchor(
     )
 
 
-def branch_priority(ref: str) -> tuple[int, str]:
+def branch_priority(root: Path, head: str, ref: str) -> tuple[int, int, str]:
     short = ref.removeprefix("refs/heads/").removeprefix("refs/remotes/")
     basename = short.rsplit("/", 1)[-1]
-    priorities = {"dev": 0, "main": 1, "master": 2, "next": 3}
-    return priorities.get(basename, 10), ref
+    priorities = {"dev": 1, "main": 1, "master": 1, "next": 1}
+    sha = git_text(root, "rev-parse", f"{ref}^{{commit}}")
+    distance = changed_file_count(root, head, sha)
+    # Prefer a moderate-churn branch over a multi-thousand-file trunk fork; the
+    # drill needs a distinct branch, not an artificial machine saturation test.
+    return abs(distance - 300), priorities.get(basename, 0), ref
 
 
 def choose_branch(
@@ -224,7 +230,7 @@ def choose_branch(
         "refs/remotes",
     ).splitlines()
     failures: list[str] = []
-    for ref in sorted(refs, key=branch_priority):
+    for ref in sorted(refs, key=lambda candidate: branch_priority(root, head, candidate)):
         if ref.endswith("/HEAD"):
             continue
         sha = git_text(root, "rev-parse", f"{ref}^{{commit}}")
@@ -257,28 +263,37 @@ def callgraph_is_correct(response: Mapping[str, Any]) -> bool:
     return response.get("success") is True
 
 
-def settle_after_correct(client: NdjsonClient, timeout_s: float = 60.0) -> None:
-    deadline = time.monotonic() + timeout_s
-    quiet_since = time.monotonic()
-    previous_size = client.log_mark()
-    while time.monotonic() < deadline:
-        status = client.status()
-        semantic = status.get("semantic_index")
-        refreshing = semantic.get("refreshing_count", 0) if isinstance(semantic, Mapping) else 0
-        size = client.log_mark()
-        if size != previous_size or refreshing:
-            quiet_since = time.monotonic()
-            previous_size = size
-        if not refreshing and time.monotonic() - quiet_since >= 1.0:
-            return
-        time.sleep(0.1)
-    raise SoakError("AFT did not become quiet after a correct branch-switch answer")
+def file_log_mark(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except FileNotFoundError:
+        return 0
 
 
-def log_metrics(text: str, root: Path) -> tuple[int | None, int | None, int]:
+def file_log_since(path: Path, mark: int) -> str:
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return ""
+    chunks: list[str] = []
+    if size < mark:
+        rotated = Path(str(path) + ".1")
+        if rotated.is_file():
+            with rotated.open(encoding="utf-8", errors="replace") as handle:
+                handle.seek(min(mark, rotated.stat().st_size))
+                chunks.append(handle.read())
+        mark = 0
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        handle.seek(min(mark, size))
+        chunks.append(handle.read())
+    return "".join(chunks)
+
+
+def log_metrics(text: str, root: Path) -> tuple[int | None, int | None, int, int]:
     reuse_puts: int | None = None
     publication_puts: int | None = None
     embed_calls = 0
+    embedded_files = 0
     root_texts = {str(root), str(root.resolve())}
     for line in text.splitlines():
         reuse = REUSE_RE.search(line)
@@ -290,7 +305,8 @@ def log_metrics(text: str, root: Path) -> tuple[int | None, int | None, int]:
         embed = EMBED_RE.search(line)
         if embed and embed.group("root") in root_texts:
             embed_calls += int(embed.group("batches"))
-    return reuse_puts, publication_puts, embed_calls
+            embedded_files += int(embed.group("files"))
+    return reuse_puts, publication_puts, embed_calls, embedded_files
 
 
 def delta_metrics(before: ProcessSample, after: ProcessSample) -> tuple[float, float]:
@@ -321,16 +337,27 @@ def perform_switch(
     changed_files: int,
     label: str,
     probe: SwitchProbe,
-    client: NdjsonClient,
+    client: ToolClient,
     views_on: bool,
     view_dir: Path,
-    daemon_pid: int,
+    storage: Path,
+    standalone_pid: int | None = None,
 ) -> dict[str, Any]:
     before_generation = current_generation(view_dir) if views_on else None
     before_entries = manifest_entry_count(view_dir, before_generation) if views_on else 0
-    before_process = sample_process(client.proc.pid)
-    before_daemon = sample_process(daemon_pid)
-    log_mark = client.log_mark()
+    before_pid = find_subc_daemon_pid() if views_on else standalone_pid
+    if before_pid is None:
+        raise SoakError(f"{mode} has no measurement process")
+    before_process = sample_process(before_pid)
+    if views_on:
+        log_path = storage / "logs" / f"aft-{before_pid}.log"
+        log_mark = file_log_mark(log_path)
+    else:
+        if not isinstance(client, NdjsonClient):
+            raise SoakError("views-off measurement requires a standalone client")
+        log_path = client.stderr_path
+        log_mark = client.log_mark()
+
     started = time.monotonic()
     checkout_args = ["checkout", "--quiet", "--detach"]
     if not views_on:
@@ -343,42 +370,63 @@ def perform_switch(
     deadline = started + 300.0
     publication_ms: int | None = None
     time_to_correct_ms: int | None = None
+    readiness_ms: int | None = None
+    readiness_error: str | None = None
     query_embedding_calls = 0
     last_search: dict[str, Any] = {}
     last_callgraph: dict[str, Any] = {}
-    next_probe_at = started
     while time.monotonic() < deadline:
-        now = time.monotonic()
+        remaining = max(1.0, deadline - time.monotonic())
+        try:
+            ready = wait_indexes_ready(client, probe, timeout_s=min(60.0, remaining))
+            readiness_ms = round((time.monotonic() - started) * 1000)
+        except (SoakError, subprocess.SubprocessError) as error:
+            readiness_error = str(error)
+            break
         if views_on and publication_ms is None:
             generation = current_generation(view_dir)
             if generation is not None and generation != before_generation:
-                publication_ms = round((now - started) * 1000)
-        if time_to_correct_ms is None and now >= next_probe_at:
-            last_search = client.tool("search", {"query": probe.token, "topK": 20})
-            query_embedding_calls += extract_embedding_calls(last_search)
-            last_callgraph = client.tool(
-                "callgraph",
-                {"op": "callers", "filePath": probe.path, "symbol": probe.symbol},
-            )
-            if search_is_correct(last_search, probe.token) and callgraph_is_correct(last_callgraph):
-                time_to_correct_ms = round((time.monotonic() - started) * 1000)
-            next_probe_at = time.monotonic() + 0.15
-        if time_to_correct_ms is not None and (not views_on or publication_ms is not None):
+                publication_ms = round((time.monotonic() - started) * 1000)
+        last_search = client.tool("search", {"query": probe.token, "topK": 20})
+        query_embedding_calls += extract_embedding_calls(last_search)
+        last_callgraph = client.tool(
+            "callgraph",
+            {"op": "callers", "filePath": probe.path, "symbol": probe.symbol},
+        )
+        if search_is_correct(last_search, probe.token) and callgraph_is_correct(last_callgraph):
+            time_to_correct_ms = round((time.monotonic() - started) * 1000)
             break
-        time.sleep(0.05)
-    timed_out = time_to_correct_ms is None
-    publication_missing = views_on and publication_ms is None
-    settle_error: str | None = None
+        time.sleep(0.25)
+
+    if views_on and publication_ms is None:
+        generation = current_generation(view_dir)
+        if generation is not None and generation != before_generation:
+            publication_ms = round((time.monotonic() - started) * 1000)
+    # A ready status after the answer ensures refresh-completion logs have reached
+    # the daemon drain before the byte range is read.
     try:
-        settle_after_correct(client)
-    except SoakError as error:
-        settle_error = str(error)
-    after_process = sample_process(client.proc.pid)
-    after_daemon = sample_process(daemon_pid)
-    process_cpu_s, process_rss_delta_mb = delta_metrics(before_process, after_process)
-    daemon_cpu_s, daemon_rss_delta_mb = delta_metrics(before_daemon, after_daemon)
-    log_text = client.log_since(log_mark)
-    reuse_puts, publication_puts, embed_calls = log_metrics(log_text, checkout)
+        client.status(timeout_s=300.0)
+    except (SoakError, subprocess.SubprocessError) as error:
+        readiness_error = readiness_error or str(error)
+    time.sleep(0.5)
+
+    after_pid = find_subc_daemon_pid() if views_on else standalone_pid
+    pid_changed = after_pid != before_pid
+    after_process = sample_process(after_pid) if after_pid is not None else None
+    if pid_changed or after_process is None:
+        process_cpu_s = None
+        process_rss_delta_mb = None
+    else:
+        process_cpu_s, process_rss_delta_mb = delta_metrics(before_process, after_process)
+
+    if views_on:
+        log_text = file_log_since(log_path, log_mark)
+        if pid_changed and after_pid is not None:
+            log_text += file_log_since(storage / "logs" / f"aft-{after_pid}.log", 0)
+    else:
+        assert isinstance(client, NdjsonClient)
+        log_text = client.log_since(log_mark)
+    reuse_puts, publication_puts, embed_calls, embedded_files = log_metrics(log_text, checkout)
     after_generation = current_generation(view_dir) if views_on else None
     after_entries = manifest_entry_count(view_dir, after_generation) if views_on else 0
     puts: int | None = None
@@ -387,13 +435,12 @@ def perform_switch(
         if reuse_puts is not None:
             puts = reuse_puts
             puts_source = "head_reuse"
-        elif publication_puts is not None:
-            puts = publication_puts
-            puts_source = "publication_log"
         else:
             puts = abs(after_entries - before_entries)
             puts_source = "entries_delta"
 
+    timed_out = time_to_correct_ms is None
+    publication_missing = views_on and publication_ms is None
     return {
         "mode": mode,
         "switch": label,
@@ -407,34 +454,24 @@ def perform_switch(
         "puts_source": puts_source,
         "publication_blob_puts": publication_puts,
         "embeds": embed_calls,
+        "embedded_files": embedded_files,
         "query_embedding_calls": query_embedding_calls,
         "cpu_s": process_cpu_s,
         "rss_delta_mb": process_rss_delta_mb,
-        "system_daemon_cpu_s": daemon_cpu_s,
-        "system_daemon_rss_delta_mb": daemon_rss_delta_mb,
+        "measurement_pid_before": before_pid,
+        "measurement_pid_after": after_pid,
+        "measurement_pid_changed": pid_changed,
+        "readiness_ms": readiness_ms,
+        "readiness_error": readiness_error,
         "time_to_correct_ms": time_to_correct_ms,
         "correctness": "timeout" if timed_out else "correct",
         "publication": "timeout" if publication_missing else ("published" if views_on else "not_applicable"),
-        "settle_error": settle_error,
         "last_search": response_observation(last_search) if timed_out else None,
         "last_callgraph": response_observation(last_callgraph) if timed_out else None,
     }
 
 
-def wait_initial_view(client: NdjsonClient, view_dir: Path, timeout_s: float = 300.0) -> None:
-    deadline = time.monotonic() + timeout_s
-    last: dict[str, Any] = {}
-    while time.monotonic() < deadline:
-        last = client.status()
-        views = last.get("views")
-        if (
-            isinstance(views, Mapping)
-            and views.get("generation", 0)
-            and current_generation(view_dir) is not None
-        ):
-            return
-        time.sleep(0.1)
-    raise SoakError(f"initial views publication did not settle: {last}")
+
 
 
 def run_mode(
@@ -449,24 +486,26 @@ def run_mode(
     storage: Path,
     scope: str,
     views_on: bool,
-    daemon_pid: int,
-) -> tuple[list[dict[str, Any]], int]:
+    connection_file: Path,
+    subc_probe: Path,
+    baseline_storage: Path,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if git_text(checkout, "rev-parse", "HEAD") != head:
+        raise SoakError(f"{mode} did not start at HEAD")
     cache_dir = Path.home() / ".cache" / "aft-views-soak" / scope
     user_config = Path.home() / ".config" / "cortexkit" / "aft.jsonc"
     view_dir = storage / "views" / scope
-    if git_text(checkout, "rev-parse", "HEAD") != head:
-        raise SoakError(f"{mode} did not start at HEAD")
-    stderr_path = cache_dir / f"branch-drill-{mode}.stderr.log"
     rows: list[dict[str, Any]] = []
-    measurement_pid = 0
-    with NdjsonClient(binary, checkout, storage, stderr_path, f"views-branch-{mode}") as client:
-        measurement_pid = client.proc.pid
-        client.configure(user_config)
-        wait_search_ready(client)
+    warm_started = time.monotonic()
+
+    def exercise(client: ToolClient, standalone_pid: int | None) -> None:
         stable = select_stable_symbols(client, checkout, count=1)
-        wait_callgraph_ready(client, stable[0])
-        if views_on:
-            wait_initial_view(client, view_dir)
+        ready = wait_indexes_ready(client, stable[0], timeout_s=1200.0)
+        warmup["readiness_detail_ms"] = ready["elapsed_ms"]
+        warmup["total_ms"] = round((time.monotonic() - warm_started) * 1000)
+        warmup["measurement_pid"] = (
+            find_subc_daemon_pid() if views_on else standalone_pid
+        )
         for source, target, label, changed_files in transitions:
             if git_text(checkout, "rev-parse", "HEAD") != source:
                 raise SoakError(f"{mode} sequence drift before {label}")
@@ -482,26 +521,70 @@ def run_mode(
                     client=client,
                     views_on=views_on,
                     view_dir=view_dir,
-                    daemon_pid=daemon_pid,
+                    storage=storage,
+                    standalone_pid=standalone_pid,
                 )
             )
-    return rows, measurement_pid
+
+    warmup: dict[str, Any] = {
+        "ceiling_ms": 1_200_000,
+        "storage": str(storage if views_on else baseline_storage),
+        "subject": "running_subc_daemon" if views_on else "standalone_owned_baseline",
+    }
+    if views_on:
+        client = SubcClient(
+            subc_probe,
+            connection_file,
+            checkout,
+            f"views-branch-daemon-{int(time.time())}",
+        )
+        exercise(client, None)
+    else:
+        stderr_path = cache_dir / "branch-drill-views-off.stderr.log"
+        with NdjsonClient(
+            binary,
+            checkout,
+            baseline_storage,
+            stderr_path,
+            f"views-branch-baseline-{int(time.time())}",
+        ) as client:
+            client.configure(user_config)
+            exercise(client, client.proc.pid)
+    return rows, warmup
 
 
-def render_table(rows: list[dict[str, Any]], refs: Mapping[str, Any], defects: list[str]) -> str:
+def render_table(
+    rows: list[dict[str, Any]],
+    refs: Mapping[str, Any],
+    defects: list[str],
+    warmups: Mapping[str, Any],
+    previous: Mapping[str, Any] | None,
+) -> str:
     by_mode = {(row["mode"], row["switch"]): row for row in rows}
     switches = [row["switch"] for row in rows if row["mode"] == "views-on"]
+    embedded_events = [row for row in rows if row["mode"] == "views-on" and row["embedded_files"]]
+    embedded_summary = ", ".join(
+        f"{row['switch']}: {row['embedded_files']} files/{row['embeds']} batches"
+        for row in embedded_events
+    ) or "no refresh lines captured"
     lines = [
         "# opencode views branch-switch drill",
+        "",
+        "## Finding",
+        "",
+        "The running daemon still refreshes the legacy semantic index across branch switches; views do not yet prevent switch-back re-embedding. "
+        f"This run captured {embedded_summary}.",
+        "",
+        "## Run 2 — daemon views-on, warm owned baseline",
         "",
         f"Observed at `{refs['observed_at']}` against `{refs['head'][:12]}`.",
         "",
         f"- A: first-parent commit `{refs['anchor']['sha'][:12]}` ({refs['anchor']['changed_files']} changed files)",
         f"- B: branch `{refs['branch']['ref']}` (`{refs['branch']['sha'][:12]}`, {refs['branch']['changed_files']} changed files)",
-        f"- Standalone measurement PIDs: views-on `{refs['measurement_pids']['views-on']}`, views-off `{refs['measurement_pids']['views-off']}`",
-        f"- Running subc daemon PID (sampled separately in JSON): `{refs['system_daemon_pid']}`",
+        f"- Views-on subject: running AFT subc daemon; warm-up `{warmups['views-on']['total_ms']} ms`.",
+        f"- Views-off subject: standalone AFT on an independent baseline clone and isolated storage; warm-up `{warmups['views-off']['total_ms']} ms`.",
         "",
-        "`cpu_s` and `rss_delta_mb` measure the placed standalone AFT process that owns each drill watcher; the running subc daemon deltas are retained in the JSON rows.",
+        "`cpu_s` and `rss_delta_mb` use the active subject PID for each row. The daemon PID is resolved again at every views-on switch; PID changes are recorded as defects rather than subtracting unrelated processes.",
         "",
         "| switch | on publication_ms | on puts | on embeds | on cpu_s | on rss_delta_mb | on correct_ms | off publication_ms | off puts | off embeds | off cpu_s | off rss_delta_mb | off correct_ms |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -514,22 +597,61 @@ def render_table(rows: list[dict[str, Any]], refs: Mapping[str, Any], defects: l
             "—" if on["publication_ms"] is None else on["publication_ms"],
             on["puts"],
             on["embeds"],
-            on["cpu_s"],
-            on["rss_delta_mb"],
+            "—" if on["cpu_s"] is None else on["cpu_s"],
+            "—" if on["rss_delta_mb"] is None else on["rss_delta_mb"],
             "timeout" if on["time_to_correct_ms"] is None else on["time_to_correct_ms"],
             "—" if off["publication_ms"] is None else off["publication_ms"],
             "—" if off["puts"] is None else off["puts"],
             off["embeds"],
-            off["cpu_s"],
-            off["rss_delta_mb"],
+            "—" if off["cpu_s"] is None else off["cpu_s"],
+            "—" if off["rss_delta_mb"] is None else off["rss_delta_mb"],
             "timeout" if off["time_to_correct_ms"] is None else off["time_to_correct_ms"],
         )
         lines.append("| " + " | ".join(markdown_cell(value) for value in values) + " |")
-    lines.extend(["", "## Defects", ""])
+    lines.extend(["", "### Run 2 defects", ""])
     if defects:
         lines.extend(f"- {defect}" for defect in defects)
     else:
-        lines.append("No switch-back reuse defect observed.")
+        lines.append("No correctness, publication, PID-change, or switch-back reuse defect observed.")
+
+    if previous is not None:
+        lines.extend(
+            [
+                "",
+                "## Run 1 — confounded (historical)",
+                "",
+                "Run 1 used a standalone views-on process and a cold read-only baseline. Its parity divergence and timeout rows are readiness artifacts, not views parity findings. The raw record remains in `branch-drill-run1-confounded.json`.",
+                "",
+                "| switch | on publication_ms | on puts | on embeds | on cpu_s | on rss_delta_mb | on correct_ms | off cpu_s | off rss_delta_mb | off correct_ms |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        previous_rows = previous.get("rows", [])
+        previous_by_mode = {
+            (row["mode"], row["switch"]): row
+            for row in previous_rows
+            if isinstance(row, dict)
+        }
+        for switch in [
+            row["switch"]
+            for row in previous_rows
+            if isinstance(row, dict) and row.get("mode") == "views-on"
+        ]:
+            on = previous_by_mode[("views-on", switch)]
+            off = previous_by_mode[("views-off", switch)]
+            values = (
+                switch,
+                "—" if on["publication_ms"] is None else on["publication_ms"],
+                on["puts"],
+                on["embeds"],
+                on["cpu_s"],
+                on["rss_delta_mb"],
+                "timeout" if on["time_to_correct_ms"] is None else on["time_to_correct_ms"],
+                off["cpu_s"],
+                off["rss_delta_mb"],
+                "timeout" if off["time_to_correct_ms"] is None else off["time_to_correct_ms"],
+            )
+            lines.append("| " + " | ".join(markdown_cell(value) for value in values) + " |")
     lines.append("")
     return "\n".join(lines)
 
@@ -546,6 +668,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--storage",
         type=Path,
         default=Path.home() / ".local" / "share" / "cortexkit" / "aft",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("both", "views-on", "views-off"),
+        default="both",
+        help="Run both arms or one arm for resource-constrained evidence capture",
     )
     return parser.parse_args(argv)
 
@@ -564,6 +692,14 @@ def main(argv: list[str]) -> int:
         raise SoakError("opencode soak root does not have views.enabled: true")
     assert_clean_worktree(root, "opencode soak root")
 
+    user_config = Path.home() / ".config/cortexkit/aft.jsonc"
+    connection_file = resolve_subc_connection_file(user_config)
+    subc_probe = Path.home() / ".local/share/cortexkit/bin/subc-probe"
+    if not connection_file.is_file() or not subc_probe.is_file():
+        raise SoakError(
+            f"daemon query prerequisites missing: connection={connection_file}, probe={subc_probe}"
+        )
+
     original_head = git_text(root, "rev-parse", "HEAD")
     original_branch = git_text(root, "symbolic-ref", "--quiet", "--short", "HEAD", allowed=(0, 1))
     original_config = (root / ".cortexkit" / "aft.jsonc").read_bytes()
@@ -576,48 +712,58 @@ def main(argv: list[str]) -> int:
         (original_head, branch[1], f"HEAD→{branch[0]}", branch[2]),
         (branch[1], original_head, f"{branch[0]}→HEAD", branch[2]),
     ]
-    baseline = ensure_baseline(root, scope, original_head)
-    daemon_pid = find_subc_daemon_pid()
+    baseline = ensure_owned_baseline(root, scope, original_head)
+    baseline_storage = Path.home() / ".cache/aft-views-soak" / scope / "baseline-storage"
     health_before = health_snapshot(binary)
-    daemon_before = sample_process(daemon_pid)
     rows: list[dict[str, Any]] = []
-    measurement_pids: dict[str, int] = {}
+    warmups: dict[str, Any] = {}
 
     try:
-        on_rows, measurement_pids["views-on"] = run_mode(
-            mode="views-on",
-            checkout=root,
-            source_root=root,
-            head=original_head,
-            transitions=transitions,
-            probes=probes,
-            binary=binary,
-            storage=storage,
-            scope=scope,
-            views_on=True,
-            daemon_pid=daemon_pid,
-        )
-        rows.extend(on_rows)
+        if args.mode in {"both", "views-on"}:
+            on_rows, warmups["views-on"] = run_mode(
+                mode="views-on",
+                checkout=root,
+                source_root=root,
+                head=original_head,
+                transitions=transitions,
+                probes=probes,
+                binary=binary,
+                storage=storage,
+                scope=scope,
+                views_on=True,
+                connection_file=connection_file,
+                subc_probe=subc_probe,
+                baseline_storage=baseline_storage,
+            )
+            rows.extend(on_rows)
 
-        git_text(baseline, "checkout", "--quiet", "--detach", "--force", original_head)
-        write_views_off_config(root, baseline)
-        off_rows, measurement_pids["views-off"] = run_mode(
-            mode="views-off",
-            checkout=baseline,
-            source_root=root,
-            head=original_head,
-            transitions=transitions,
-            probes=probes,
-            binary=binary,
-            storage=storage,
-            scope=scope,
-            views_on=False,
-            daemon_pid=daemon_pid,
-        )
-        rows.extend(off_rows)
+        if args.mode in {"both", "views-off"}:
+            for target in {target for _, target, _, _ in transitions}:
+                git_text(baseline, "fetch", "--quiet", str(root), target)
+            git_text(baseline, "checkout", "--quiet", "--detach", "--force", original_head)
+            write_views_off_config(root, baseline)
+            off_rows, warmups["views-off"] = run_mode(
+                mode="views-off",
+                checkout=baseline,
+                source_root=root,
+                head=original_head,
+                transitions=transitions,
+                probes=probes,
+                binary=binary,
+                storage=storage,
+                scope=scope,
+                views_on=False,
+                connection_file=connection_file,
+                subc_probe=subc_probe,
+                baseline_storage=baseline_storage,
+            )
+            rows.extend(off_rows)
     finally:
         current = git_text(root, "rev-parse", "HEAD", allowed=(0, 128))
-        if current != original_head or (original_branch and git_text(root, "symbolic-ref", "--quiet", "--short", "HEAD", allowed=(0, 1)) != original_branch):
+        current_branch = git_text(
+            root, "symbolic-ref", "--quiet", "--short", "HEAD", allowed=(0, 1)
+        )
+        if current != original_head or (original_branch and current_branch != original_branch):
             if original_branch:
                 git_text(root, "checkout", "--quiet", original_branch)
             else:
@@ -628,20 +774,24 @@ def main(argv: list[str]) -> int:
     if (root / ".cortexkit" / "aft.jsonc").read_bytes() != original_config:
         raise SoakError("opencode project config did not restore byte-for-byte")
     assert_clean_worktree(root, "restored opencode soak root")
-    daemon_after = sample_process(daemon_pid)
-    daemon_cpu_s, daemon_rss_delta_mb = delta_metrics(daemon_before, daemon_after)
     health_after = health_snapshot(binary)
 
     defects = []
     for row in rows:
+        if row["readiness_error"]:
+            defects.append(f"{row['mode']} {row['switch']} readiness failed: {row['readiness_error']}")
+            continue
         if row["correctness"] != "correct":
             defects.append(
-                f"{row['mode']} {row['switch']} did not return both correct probes within 300 seconds"
+                f"{row['mode']} {row['switch']} did not return both correct probes after full readiness"
             )
         if row["mode"] == "views-on" and row["publication"] != "published":
             defects.append(f"{row['switch']} did not publish a new pointer generation")
-        if row["settle_error"]:
-            defects.append(f"{row['mode']} {row['switch']} did not settle: {row['settle_error']}")
+        if row["measurement_pid_changed"]:
+            defects.append(
+                f"{row['mode']} {row['switch']} measurement PID changed from "
+                f"{row['measurement_pid_before']} to {row['measurement_pid_after']}"
+            )
         if row["mode"] == "views-on" and row["target"] == original_head and (
             row["puts"] != 0 or row["embeds"] != 0
         ):
@@ -661,31 +811,40 @@ def main(argv: list[str]) -> int:
             "in_requested_range": 200 <= anchor[2] <= 400,
         },
         "branch": {"ref": branch[0], "sha": branch[1], "changed_files": branch[2]},
-        "measurement_pids": measurement_pids,
-        "system_daemon_pid": daemon_pid,
     }
+    previous_path = RESULT_DIR / "branch-drill-run1-confounded.json"
+    previous = json.loads(previous_path.read_text(encoding="utf-8")) if previous_path.is_file() else None
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "observed_at": observed_at,
         "root": str(root),
         "baseline": str(baseline),
+        "baseline_storage": str(baseline_storage),
+        "connection_file": str(connection_file),
         "refs": refs,
+        "measurement_subjects": {
+            "views_on": "running_subc_daemon",
+            "views_off": "standalone_owned_baseline",
+        },
+        "warmups": warmups,
         "health_before": health_before,
         "health_after": health_after,
-        "system_daemon_total": {
-            "cpu_s": daemon_cpu_s,
-            "rss_delta_mb": daemon_rss_delta_mb,
-        },
         "rows": rows,
         "defects": defects,
+        "run1_artifact": previous_path.name if previous is not None else None,
     }
-    json_path = RESULT_DIR / "branch-drill.json"
-    markdown_path = RESULT_DIR / "branch-drill.md"
+    json_path = RESULT_DIR / (
+        "branch-drill.json" if args.mode == "both" else f"branch-drill-{args.mode}.json"
+    )
     write_json(json_path, result)
-    markdown_path.parent.mkdir(parents=True, exist_ok=True)
-    markdown_path.write_text(render_table(rows, refs, defects), encoding="utf-8")
     print(f"wrote {json_path}")
-    print(f"wrote {markdown_path}")
+    if args.mode == "both":
+        markdown_path = RESULT_DIR / "branch-drill.md"
+        markdown_path.parent.mkdir(parents=True, exist_ok=True)
+        markdown_path.write_text(
+            render_table(rows, refs, defects, warmups, previous), encoding="utf-8"
+        )
+        print(f"wrote {markdown_path}")
     if defects:
         print("views branch drill defects:")
         for defect in defects:
