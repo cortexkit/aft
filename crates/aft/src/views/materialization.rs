@@ -16,25 +16,37 @@ pub fn materialize_manifest_view_database(
     materialize(database_path, callgraph_blob_database, manifest, None).map(|_| ())
 }
 
-/// Counts actual affected graph rows, excluding readiness and materialization metadata.
+/// Counts affected graph and dependency-cache rows, excluding readiness and metadata.
 /// Replacements count both the deletion and insertion; relinks include refs and edges.
+/// Resolution counters describe work performed, not SQLite writes.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MaterializeStats {
     pub deleted: usize,
     pub inserted: usize,
     pub relinked_deleted: usize,
     pub relinked_inserted: usize,
+    pub dependency_deleted: usize,
+    pub dependency_inserted: usize,
+    pub dependent_files: usize,
+    pub resolved_files: usize,
+    pub resolved_refs: usize,
+    pub full_resolution: bool,
 }
 
 impl MaterializeStats {
-    pub fn rows_written(&self) -> usize {
+    pub fn graph_rows_written(&self) -> usize {
         self.deleted + self.inserted + self.relinked_deleted + self.relinked_inserted
+    }
+
+    pub fn rows_written(&self) -> usize {
+        self.graph_rows_written() + self.dependency_deleted + self.dependency_inserted
     }
 }
 
 /// Apply to a private copy of the base generation's database, never a published file.
 /// The caller owns copying, durability and pointer publication. All graph changes and
-/// the fingerprint commit atomically; errors roll back to the supplied base.
+/// the fingerprint commit atomically; errors roll back to the supplied base. An old
+/// binding-cache schema takes the cold path; a mismatched manifest is refused.
 pub fn apply_manifest_diff(
     database_path: &Path,
     base_manifest: &crate::views::Manifest,
@@ -49,7 +61,7 @@ pub fn apply_manifest_diff(
     )
 }
 
-const MATERIALIZATION_VERSION: &str = "1";
+const MATERIALIZATION_VERSION: &str = "2";
 
 fn fingerprint(manifest: &crate::views::Manifest) -> Result<String> {
     let bytes = manifest
@@ -62,7 +74,7 @@ fn materialize(
     database_path: &Path,
     callgraph_blob_database: &Path,
     manifest: &crate::views::Manifest,
-    base: Option<&crate::views::Manifest>,
+    mut base: Option<&crate::views::Manifest>,
 ) -> Result<MaterializeStats> {
     let mut connection = if base.is_some() {
         Connection::open_with_flags(database_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?
@@ -74,7 +86,7 @@ fn materialize(
     }
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    if let Some(base) = base {
+    if let Some(base_manifest) = base {
         let recorded: Option<String> = transaction
             .query_row(
                 "SELECT v FROM meta WHERE k = 'view_manifest_fingerprint'",
@@ -89,18 +101,18 @@ fn materialize(
                 |row| row.get(0),
             )
             .optional()?;
-        if recorded.as_deref() != Some(fingerprint(base)?.as_str())
-            || version.as_deref() != Some(MATERIALIZATION_VERSION)
-        {
+        if recorded.as_deref() != Some(fingerprint(base_manifest)?.as_str()) {
             return Err(CallGraphStoreError::Unavailable(
-                "derived manifest fingerprint or schema mismatch; cold materialization required"
-                    .into(),
+                "derived manifest fingerprint mismatch; cold materialization required".into(),
             ));
         }
-        if base == manifest {
+        if version.as_deref() != Some(MATERIALIZATION_VERSION) {
+            base = None;
+        } else if base_manifest == manifest {
             return Ok(MaterializeStats::default());
         }
     }
+    transaction.execute_batch("CREATE TABLE IF NOT EXISTS view_bindings (file_path TEXT PRIMARY KEY, payload TEXT NOT NULL)")?;
     let changed = base.map(|base| {
         base.entries()
             .chain(manifest.entries())
@@ -108,7 +120,33 @@ fn materialize(
             .map(|(path, _)| path.as_bytes().to_vec())
             .collect::<BTreeSet<_>>()
     });
-    let mut stats = MaterializeStats::default();
+    let cached = if base.is_some() {
+        load_bindings(&transaction)?
+    } else {
+        BTreeMap::new()
+    };
+    let selected = match (&changed, base) {
+        (Some(changed), Some(base)) if !requires_full_resolution(base, manifest, changed) => {
+            Some(dependent_closure(&transaction, changed)?)
+        }
+        _ => None,
+    };
+    let mut stats = MaterializeStats {
+        full_resolution: selected.is_none(),
+        dependent_files: selected.as_ref().map_or(0, |selected| {
+            selected
+                .iter()
+                .filter(|path| {
+                    !changed
+                        .as_ref()
+                        .expect("incremental paths")
+                        .contains(path.as_bytes())
+                        && cached.contains_key(*path)
+                })
+                .count()
+        }),
+        ..MaterializeStats::default()
+    };
     if let Some(changed) = &changed {
         for path in changed {
             let Ok(path) = std::str::from_utf8(path) else {
@@ -123,10 +161,19 @@ fn materialize(
             stats.deleted +=
                 transaction.execute("DELETE FROM nodes WHERE file_path = ?1", [path])?;
             stats.deleted += transaction.execute("DELETE FROM files WHERE path = ?1", [path])?;
+            stats.dependency_deleted += transaction
+                .execute("DELETE FROM file_dependencies WHERE file_path = ?1", [path])?;
+            stats.dependency_deleted +=
+                transaction.execute("DELETE FROM view_bindings WHERE file_path = ?1", [path])?;
         }
     } else {
         for table in ["edges", "refs", "nodes", "files"] {
             stats.deleted += transaction.execute(&format!("DELETE FROM {table}"), [])?;
+        }
+    }
+    if changed.is_none() {
+        for table in ["file_dependencies", "view_bindings"] {
+            stats.dependency_deleted += transaction.execute(&format!("DELETE FROM {table}"), [])?;
         }
     }
     let blob_connection = Connection::open(callgraph_blob_database)?;
@@ -224,9 +271,47 @@ fn materialize(
     let reader = ManifestViewBlobReader {
         connection: &blob_connection,
     };
-    let joined = join::JoinResult::from_manifest(manifest, &reader)
+    let joined = join::join_selected_manifest(manifest, &reader, selected.as_ref(), &cached)
         .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
-    for row in joined.rows {
+    stats.resolved_refs = joined.result.rows.len();
+    stats.resolved_files = joined
+        .bindings
+        .keys()
+        .filter(|path| selected.as_ref().is_none_or(|set| set.contains(*path)))
+        .count();
+    for (path, binding) in &joined.bindings {
+        let old = cached.get(path).filter(|_| {
+            changed
+                .as_ref()
+                .is_some_and(|paths| !paths.contains(path.as_bytes()))
+        });
+        if old == Some(binding) {
+            continue;
+        }
+        let empty = BTreeSet::new();
+        let previous = old.map_or(&empty, |old| &old.dependencies);
+        for dependency in previous.difference(&binding.dependencies) {
+            stats.dependency_deleted += transaction.execute(
+                "DELETE FROM file_dependencies WHERE file_path=?1 AND dep_file=?2",
+                params![path, dependency],
+            )?;
+        }
+        for dependency in binding.dependencies.difference(previous) {
+            stats.dependency_inserted += transaction.execute(
+                "INSERT INTO file_dependencies(file_path, dep_file) VALUES(?1, ?2)",
+                params![path, dependency],
+            )?;
+        }
+        stats.dependency_deleted +=
+            transaction.execute("DELETE FROM view_bindings WHERE file_path=?1", [path])?;
+        let payload = serde_json::to_string(binding)
+            .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+        stats.dependency_inserted += transaction.execute(
+            "INSERT INTO view_bindings(file_path, payload) VALUES(?1, ?2)",
+            params![path, payload],
+        )?;
+    }
+    for row in joined.result.rows {
         let caller_path = String::from_utf8(row.caller_path.clone()).map_err(|_| {
             CallGraphStoreError::Unavailable("non-UTF-8 manifest caller path".to_string())
         })?;
@@ -400,3 +485,66 @@ const fn manifest_ref_kind(kind: join::BlobRefKind) -> &'static str {
 
 #[cfg(test)]
 mod tests;
+
+fn load_bindings(
+    connection: &Connection,
+) -> Result<BTreeMap<String, join::ViewBindingDependencies>> {
+    let mut statement = connection.prepare("SELECT file_path, payload FROM view_bindings")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    rows.map(|row| {
+        let (path, payload) = row?;
+        let binding = serde_json::from_str(&payload)
+            .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+        Ok((path, binding))
+    })
+    .collect()
+}
+
+fn dependent_closure(
+    connection: &Connection,
+    changed: &BTreeSet<Vec<u8>>,
+) -> Result<BTreeSet<String>> {
+    let mut selected = changed
+        .iter()
+        .filter_map(|path| String::from_utf8(path.clone()).ok())
+        .collect::<BTreeSet<_>>();
+    let mut pending = selected.iter().cloned().collect::<Vec<_>>();
+    let mut dependents =
+        connection.prepare("SELECT file_path FROM file_dependencies WHERE dep_file = ?1")?;
+    while let Some(path) = pending.pop() {
+        for caller in dependents.query_map([path], |row| row.get::<_, String>(0))? {
+            let caller = caller?;
+            if selected.insert(caller.clone()) {
+                pending.push(caller);
+            }
+        }
+    }
+    Ok(selected)
+}
+
+fn requires_full_resolution(
+    base: &crate::views::Manifest,
+    next: &crate::views::Manifest,
+    changed: &BTreeSet<Vec<u8>>,
+) -> bool {
+    changed.iter().any(|path| {
+        join::view_resolution_config(path)
+            || base
+                .entries()
+                .chain(next.entries())
+                .any(|(candidate, entry)| {
+                    candidate.as_bytes() == path
+                        && matches!(
+                            entry,
+                            crate::views::ManifestEntry::Regular {
+                                resolution_input: true,
+                                ..
+                            } | crate::views::ManifestEntry::Synthetic { .. }
+                                | crate::views::ManifestEntry::Symlink { .. }
+                                | crate::views::ManifestEntry::Gitlink { .. }
+                        )
+                })
+    })
+}

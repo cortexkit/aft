@@ -12,7 +12,12 @@ struct Fixture {
 
 fn manifest(blobs: &Connection, files: &[(&str, &str)]) -> Manifest {
     Manifest::new(files.iter().map(|(path, source)| {
-        let blob = join::CallgraphBlob::extract(source, "typescript", "fixture").unwrap();
+        let language = if path.ends_with(".rs") {
+            "rust"
+        } else {
+            "typescript"
+        };
+        let blob = join::CallgraphBlob::extract(source, language, "fixture").unwrap();
         let payload = blob.to_bytes().unwrap();
         let key = blake3::hash(&payload);
         blobs
@@ -138,14 +143,24 @@ fn incremental_writes_only_owned_rows_and_relinks() {
             deleted: 4,
             inserted: 5,
             relinked_deleted: 2,
-            relinked_inserted: 2
+            relinked_inserted: 2,
+            dependency_deleted: 2,
+            dependency_inserted: 2,
+            dependent_files: 1,
+            resolved_files: 3,
+            resolved_refs: 2,
+            full_resolution: false,
         }
     );
-    assert_eq!(stats.rows_written(), 13);
+    assert_eq!(stats.graph_rows_written(), 13);
+    assert_eq!(stats.rows_written(), 17);
+    assert_eq!(stats.dependent_files, 1);
+    assert_eq!(stats.resolved_files, 3);
+    assert!(!stats.full_resolution);
 }
 
 #[test]
-fn mismatched_base_and_schema_are_rejected_without_changes() {
+fn mismatched_base_is_rejected_and_old_schema_is_cold_upgraded() {
     let f = fixture();
     let (_, copy) = prepare(&f);
     let before = snapshot(&copy);
@@ -158,9 +173,11 @@ fn mismatched_base_and_schema_are_rejected_without_changes() {
             [],
         )
         .unwrap();
-    let before = snapshot(&copy);
-    assert!(apply_manifest_diff(&copy, &f.base, &f.next, &f.blobs).is_err());
-    assert_eq!(snapshot(&copy), before);
+    let stats = apply_manifest_diff(&copy, &f.base, &f.next, &f.blobs).unwrap();
+    assert!(stats.full_resolution);
+    let cold = f.dir.path().join("upgraded-cold.sqlite");
+    materialize_manifest_view_database(&cold, &f.blobs, &f.next).unwrap();
+    assert_eq!(snapshot(&copy), snapshot(&cold));
 }
 
 #[test]
@@ -245,12 +262,13 @@ fn bench_real_manifest_diff() {
         next.entries().count(),
         changed.len()
     );
-    let temp = tempfile::tempdir_in(&input).unwrap();
-    let original = temp.path().join("base.sqlite");
+    let temp = tempfile::tempdir_in(&input).unwrap().keep();
+    println!("measurement databases: {}", temp.display());
+    let original = temp.join("base.sqlite");
     materialize_manifest_view_database(&original, &blobs, &base).unwrap();
     let mut outputs = Vec::new();
     for incremental in [false, true] {
-        let db = temp.path().join(if incremental {
+        let db = temp.join(if incremental {
             "incremental.sqlite"
         } else {
             "cold.sqlite"
@@ -271,7 +289,7 @@ fn bench_real_manifest_diff() {
         println!("incremental={incremental} wall_s={elapsed:.3} cpu_s={:.3} physical_bytes={} logical_bytes={} wal_bytes={wal} stats={stats:?}", after.2-before.2, after.0-before.0, after.1-before.1);
         outputs.push(snapshot(&db));
     }
-    assert_eq!(outputs[0], outputs[1], "real manifest row parity");
+    assert_snapshot_parity(&outputs[0], &outputs[1]);
 }
 
 #[test]
@@ -332,4 +350,272 @@ fn selected_join_seam_matches_existing_cold_join_and_retains_missing_candidates(
             .filter(|row| selected.contains(std::str::from_utf8(&row.caller_path).unwrap()))
             .collect()
     );
+}
+
+#[test]
+fn new_reexport_target_invalidates_transitive_unchanged_importer() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let barrel = "export * from './new';";
+    let facade = "export * from './barrel';";
+    let caller = "import { fresh } from './facade'; export function caller() { return fresh(); }";
+    let base = manifest(
+        &conn,
+        &[
+            ("barrel.ts", barrel),
+            ("facade.ts", facade),
+            ("caller.ts", caller),
+            ("other.ts", "export function other() {}"),
+        ],
+    );
+    let next = manifest(
+        &conn,
+        &[
+            ("barrel.ts", barrel),
+            ("facade.ts", facade),
+            ("caller.ts", caller),
+            ("other.ts", "export function other() {}"),
+            ("new.ts", "export function fresh() { return 1; }"),
+        ],
+    );
+    let db = f.dir.path().join("reexport.sqlite");
+    let cold = f.dir.path().join("reexport-cold.sqlite");
+    materialize_manifest_view_database(&db, &f.blobs, &base).unwrap();
+    let stats = apply_manifest_diff(&db, &base, &next, &f.blobs).unwrap();
+    materialize_manifest_view_database(&cold, &f.blobs, &next).unwrap();
+    let actual = snapshot(&db);
+    for (table, expected) in snapshot(&cold) {
+        assert_eq!(actual[&table], expected, "table {table}");
+    }
+    assert_eq!(stats.dependent_files, 3);
+    assert_eq!(stats.resolved_files, 4);
+    assert!(!stats.full_resolution);
+    assert_eq!(actual["edges"].len(), 1);
+}
+
+#[test]
+fn resolver_configuration_names_force_full_resolution() {
+    let f = fixture();
+    for name in [
+        "package.json",
+        "tsconfig.json",
+        "pnpm-workspace.yaml",
+        "Cargo.toml",
+    ] {
+        let mut next = f.base.clone();
+        next.insert(
+            RelPath::new(name.as_bytes()).unwrap(),
+            ManifestEntry::Regular {
+                mode: 0o100644,
+                planes: RegularPlanes {
+                    callgraph: None,
+                    semantic: None,
+                },
+                resolution_input: false,
+            },
+        )
+        .unwrap();
+        let db = f.dir.path().join(format!("config-{name}.sqlite"));
+        materialize_manifest_view_database(&db, &f.blobs, &f.base).unwrap();
+        assert!(
+            apply_manifest_diff(&db, &f.base, &next, &f.blobs)
+                .unwrap()
+                .full_resolution,
+            "{name}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "controlled 300-path offline write/CPU measurement"]
+fn bench_controlled_300_path_diff() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let files = (0..5056).map(|i| (format!("file_{i}.ts"), format!("export function value_{i}() {{ return 1; }} export function caller_{i}() {{ return value_{i}(); }}"))).collect::<Vec<_>>();
+    let next_files = files
+        .iter()
+        .enumerate()
+        .map(|(i, (path, source))| {
+            (
+                path.clone(),
+                if i < 300 {
+                    format!("\n{source}")
+                } else {
+                    source.clone()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let base = manifest(
+        &conn,
+        &files
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let next = manifest(
+        &conn,
+        &next_files
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        base.entries()
+            .filter(|(path, entry)| next.get(path) != Some(entry))
+            .count(),
+        300
+    );
+    let original = f.dir.path().join("controlled-base.sqlite");
+    materialize_manifest_view_database(&original, &f.blobs, &base).unwrap();
+    let mut outputs = Vec::new();
+    for incremental in [false, true] {
+        let db = f
+            .dir
+            .path()
+            .join(format!("controlled-{incremental}.sqlite"));
+        std::fs::copy(&original, &db).unwrap();
+        let keeper = Connection::open(&db).unwrap();
+        keeper
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let before = usage();
+        let start = std::time::Instant::now();
+        let stats = materialize(&db, &f.blobs, &next, incremental.then_some(&base)).unwrap();
+        let elapsed = start.elapsed().as_secs_f64();
+        let after = usage();
+        let wal = std::fs::metadata(format!("{}-wal", db.display()))
+            .unwrap()
+            .len();
+        println!("controlled 300/5056 incremental={incremental} wall_s={elapsed:.3} cpu_s={:.3} physical_bytes={} logical_bytes={} wal_bytes={wal} stats={stats:?}", after.2-before.2, after.0-before.0, after.1-before.1);
+        outputs.push(snapshot(&db));
+    }
+    assert_eq!(outputs[0], outputs[1]);
+}
+
+#[test]
+fn added_rust_module_invalidates_missing_candidate() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let lib = "mod future; pub fn caller() { future::fresh(); }";
+    let base = manifest(&conn, &[("src/lib.rs", lib)]);
+    let next = manifest(
+        &conn,
+        &[("src/lib.rs", lib), ("src/future.rs", "pub fn fresh() {}")],
+    );
+    let db = f.dir.path().join("rust.sqlite");
+    let cold = f.dir.path().join("rust-cold.sqlite");
+    materialize_manifest_view_database(&db, &f.blobs, &base).unwrap();
+    let stats = apply_manifest_diff(&db, &base, &next, &f.blobs).unwrap();
+    materialize_manifest_view_database(&cold, &f.blobs, &next).unwrap();
+    assert_eq!(snapshot(&db), snapshot(&cold));
+    assert_eq!(stats.dependent_files, 1);
+    assert!(!stats.full_resolution);
+}
+
+#[test]
+fn changed_tsconfig_relinks_unchanged_importer_with_cold_parity() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let mut base = manifest(
+        &conn,
+        &[
+            (
+                "caller.ts",
+                "import { target } from '@lib'; export function caller() { return target(); }",
+            ),
+            ("one.ts", "export function target() {}"),
+            ("two.ts", "export function target() {}"),
+        ],
+    );
+    let set_config = |manifest: &mut Manifest, target: &str| {
+        let source =
+            format!(r#"{{"compilerOptions":{{"baseUrl":".","paths":{{"@lib":["{target}"]}}}}}}"#);
+        let payload = join::CallgraphBlob::config(source.into_bytes(), "fixture")
+            .to_bytes()
+            .unwrap();
+        let key = blake3::hash(&payload);
+        conn.execute(
+            "INSERT INTO blob_payloads VALUES (?1, ?2)",
+            params![key.as_bytes().as_slice(), payload],
+        )
+        .unwrap();
+        manifest
+            .insert(
+                RelPath::new(b"tsconfig.json".to_vec()).unwrap(),
+                ManifestEntry::Regular {
+                    mode: 0o100644,
+                    planes: RegularPlanes {
+                        callgraph: Some(key.to_hex().to_string()),
+                        semantic: None,
+                    },
+                    resolution_input: true,
+                },
+            )
+            .unwrap();
+    };
+    let mut next = base.clone();
+    set_config(&mut base, "one.ts");
+    set_config(&mut next, "two.ts");
+    let db = f.dir.path().join("tsconfig.sqlite");
+    let cold = f.dir.path().join("tsconfig-cold.sqlite");
+    materialize_manifest_view_database(&db, &f.blobs, &base).unwrap();
+    let stats = apply_manifest_diff(&db, &base, &next, &f.blobs).unwrap();
+    materialize_manifest_view_database(&cold, &f.blobs, &next).unwrap();
+    assert_eq!(snapshot(&db), snapshot(&cold));
+    assert!(stats.full_resolution);
+    let target: String = Connection::open(&db)
+        .unwrap()
+        .query_row("SELECT target_file FROM edges", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(target, "two.ts");
+}
+
+#[cfg(target_os = "macos")]
+fn assert_snapshot_parity(
+    expected: &BTreeMap<String, Vec<String>>,
+    actual: &BTreeMap<String, Vec<String>>,
+) {
+    for (table, rows) in expected {
+        if rows != &actual[table] {
+            let expected = rows.iter().collect::<BTreeSet<_>>();
+            let actual = actual[table].iter().collect::<BTreeSet<_>>();
+            let missing = expected.difference(&actual).collect::<Vec<_>>();
+            let extra = actual.difference(&expected).collect::<Vec<_>>();
+            panic!(
+                "table {table}: missing={} extra={}; first missing={:?}; first extra={:?}",
+                missing.len(),
+                extra.len(),
+                missing
+                    .first()
+                    .map(|row| row.chars().take(1000).collect::<String>()),
+                extra
+                    .first()
+                    .map(|row| row.chars().take(1000).collect::<String>())
+            );
+        }
+    }
+}
+
+#[test]
+fn binding_dependencies_exclude_existing_workspace_directory_probes() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let manifest = manifest(
+        &conn,
+        &[
+            (
+                "caller.ts",
+                "import { target } from './dir'; export function caller() { return target(); }",
+            ),
+            ("dir/index.ts", "export function target() {}"),
+        ],
+    );
+    let reader = ManifestViewBlobReader { connection: &conn };
+    let cold = join::join_selected_manifest(&manifest, &reader, None, &BTreeMap::new()).unwrap();
+    assert!(!cold.bindings["caller.ts"].dependencies.contains("dir"));
+    assert!(cold.bindings["caller.ts"]
+        .dependencies
+        .contains("dir/index.ts"));
 }
