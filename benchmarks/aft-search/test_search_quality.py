@@ -18,9 +18,52 @@ from search_quality import (
 from search_quality_lib import (
     InputFault,
     TOOL_CALL_PARITY_FIXTURE_SOURCE,
+    included_manifest_ids,
     total_gate,
+    validate_included_row_mechanisms,
+    validate_manifest_relabels,
     validate_profile_score,
 )
+
+
+class ManifestMechanismTests(unittest.TestCase):
+    def manifest(self) -> dict:
+        return {
+            "rows": [
+                {
+                    "episode_id": "followup-census:1",
+                    "mechanism": "phrase_present_not_surfaced",
+                },
+                {
+                    "episode_id": "followup-census:2",
+                    "mechanism": "not_a_search_failure",
+                },
+            ]
+        }
+
+    def test_included_rows_have_one_mechanism_each(self) -> None:
+        manifest = self.manifest()
+        validate_included_row_mechanisms(manifest)
+        for invalid in (None, ["phrase_present_not_surfaced", "not_a_search_failure"]):
+            changed = copy.deepcopy(manifest)
+            changed["rows"][0]["mechanism"] = invalid
+            with self.subTest(invalid=invalid):
+                with self.assertRaisesRegex(InputFault, "malformed_schema:mechanism"):
+                    validate_included_row_mechanisms(changed)
+
+    def test_relabelled_row_carries_reason_without_changing_population(self) -> None:
+        old_manifest = self.manifest()
+        new_manifest = copy.deepcopy(old_manifest)
+        new_manifest["rows"][0]["mechanism"] = "not_a_search_failure"
+        new_manifest["rows"][0]["relabel_reason"] = (
+            "pinned_sha=30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17: wiring=0"
+        )
+        validate_manifest_relabels(old_manifest, new_manifest)
+        self.assertEqual(included_manifest_ids(old_manifest), included_manifest_ids(new_manifest))
+
+        del new_manifest["rows"][0]["relabel_reason"]
+        with self.assertRaisesRegex(InputFault, "manifest_relabel_reason_missing"):
+            validate_manifest_relabels(old_manifest, new_manifest)
 
 
 class ProfileSelectionTests(unittest.TestCase):

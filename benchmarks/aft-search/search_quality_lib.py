@@ -438,10 +438,38 @@ def validate_profile_score(score: Mapping[str, Any]) -> None:
             raise InputFault(f"invalid_stop_fields:{row.get('episode_id')}:ranked_paths")
 
 
+def validate_included_row_mechanisms(manifest: Mapping[str, Any]) -> None:
+    rows = manifest.get("rows")
+    if not isinstance(rows, list):
+        raise InputFault("malformed_schema:manifest_rows")
+    for row in rows:
+        if "excluded_reason" in row:
+            continue
+        mechanism = row.get("mechanism")
+        if not isinstance(mechanism, str) or mechanism not in MECHANISMS:
+            raise InputFault(
+                f"malformed_schema:mechanism:{row.get('episode_id')}:{mechanism}"
+            )
+
+
+def validate_manifest_relabels(
+    old_manifest: Mapping[str, Any], new_manifest: Mapping[str, Any]
+) -> None:
+    old_rows = {row.get("episode_id"): row for row in old_manifest.get("rows", [])}
+    for row in new_manifest.get("rows", []):
+        old_row = old_rows.get(row.get("episode_id"))
+        if old_row is None or old_row.get("mechanism") == row.get("mechanism"):
+            continue
+        reason = row.get("relabel_reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise InputFault(f"manifest_relabel_reason_missing:{row.get('episode_id')}")
+
+
 def included_manifest_ids(manifest: Mapping[str, Any]) -> list[str]:
     rows = manifest.get("rows")
     if not isinstance(rows, list):
         raise InputFault("malformed_schema:manifest_rows")
+    validate_included_row_mechanisms(manifest)
     ids = [str(row.get("episode_id", "")) for row in rows]
     duplicates = sorted(item for item, count in Counter(ids).items() if count > 1)
     if duplicates:
