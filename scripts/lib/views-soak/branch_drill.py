@@ -447,7 +447,7 @@ def perform_switch(
         query_embedding_calls += extract_embedding_calls(last_search)
         last_callgraph = client.tool(
             "callgraph",
-            {"op": "callers", "filePath": probe.path, "symbol": probe.symbol},
+            {"op": "callers", "path": probe.path, "symbol": probe.symbol},
         )
         if search_is_correct(last_search, probe.token) and callgraph_is_correct(last_callgraph):
             time_to_correct_ms = round((time.monotonic() - started) * 1000)

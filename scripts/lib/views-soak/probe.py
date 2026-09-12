@@ -87,7 +87,7 @@ def query_set(root: Path, symbols: list[StableSymbol]) -> list[dict[str, Any]]:
                     "symbol": symbol.symbol,
                     "arguments": {
                         "op": operation,
-                        "filePath": symbol.path,
+                        "path": symbol.path,
                         "symbol": symbol.symbol,
                         "depth": 3 if operation != "callers" else 1,
                     },
@@ -283,7 +283,7 @@ def main(argv: list[str]) -> int:
         for candidate in candidates:
             arguments = {
                 "op": "callers",
-                "filePath": candidate.path,
+                "path": candidate.path,
                 "symbol": candidate.symbol,
             }
             root_check = root_client.tool("callgraph", arguments)

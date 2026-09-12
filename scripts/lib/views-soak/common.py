@@ -562,7 +562,7 @@ def wait_callgraph_ready(
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_s
     last: dict[str, Any] = {}
-    arguments = {"op": "callers", "filePath": symbol.path, "symbol": symbol.symbol}
+    arguments = {"op": "callers", "path": symbol.path, "symbol": symbol.symbol}
     while time.monotonic() < deadline:
         last = client.tool("callgraph", arguments)
         code = str(last.get("code", ""))
@@ -615,7 +615,7 @@ def wait_indexes_ready(
         if search_ready and semantic_ready and not callgraph_ready:
             last_callgraph = client.tool(
                 "callgraph",
-                {"op": "callers", "filePath": control.path, "symbol": control.symbol},
+                {"op": "callers", "path": control.path, "symbol": control.symbol},
                 timeout_s=min(300.0, remaining),
             )
             callgraph_ready = last_callgraph.get("success") is True or last_callgraph.get("code") == "symbol_not_found"
