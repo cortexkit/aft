@@ -1,0 +1,16 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar"
+  ],
+  "slices": [
+    "views-publication-off-barrier",
+    "views-incremental-materialization",
+    "watcher-backend-generation-capture",
+    "train-push-pid-lock"
+  ],
+  "note": "views/executor/callgraph_store join seam/watcher_backend/scripts only; no ranking-fence file in the diff, class non_ranking by derivation."
+}
