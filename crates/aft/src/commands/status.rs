@@ -332,6 +332,8 @@ impl AppContext {
         // status never walks allocator zones on a request worker.
         let memory = serde_json::to_value(self.memory_snapshot(memory_root.as_deref()))
             .unwrap_or(serde_json::Value::Null);
+        let watcher = serde_json::to_value(self.watcher_counters().snapshot())
+            .unwrap_or(serde_json::Value::Null);
         // The control-path status response reads the health worker's published
         // lifecycle snapshot; it never probes processes or opens a database.
         let lifecycle = self.app().lifecycle_census_snapshot();
@@ -378,6 +380,7 @@ impl AppContext {
             "lsp_servers": lsp_count,
             "symbol_cache": symbol_cache_stats,
             "memory": memory,
+            "watcher": watcher,
             "lsp": lifecycle.lsp,
             "threads": lifecycle.threads,
             "sqlite": lifecycle.sqlite,
@@ -505,6 +508,9 @@ mod tests {
         assert!(response.data["canonical_root"].is_null());
         assert!(response.data["runtime"]["callgraph_commits_60s_total"].is_u64());
         assert!(response.data["runtime"]["callgraph_pages_or_bytes_written_60s_total"].is_u64());
+        assert_eq!(response.data["watcher"]["raw_events_total"], 0);
+        assert_eq!(response.data["watcher"]["raw_events_since_last_rescan"], 0);
+        assert_eq!(response.data["watcher"]["rescans_kernel_dropped_total"], 0);
         assert!(response.data["backup_skipped_too_large_total"].is_u64());
         assert!(response.data["backup_skipped_temp_path_total"].is_u64());
 
