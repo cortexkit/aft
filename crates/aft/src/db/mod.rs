@@ -18,7 +18,26 @@ pub mod removal;
 pub mod standing_roots;
 pub mod state;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 9;
+pub const CURRENT_SCHEMA_VERSION: u32 = 10;
+
+const MIGRATION_V10: &str = r#"
+CREATE TABLE compression_event_rollups (
+  harness TEXT NOT NULL,
+  project_key TEXT NOT NULL,
+  session_is_null INTEGER NOT NULL,
+  session_id TEXT NOT NULL,
+  events INTEGER NOT NULL,
+  original_tokens INTEGER NOT NULL,
+  compressed_tokens INTEGER NOT NULL,
+  PRIMARY KEY (harness, project_key, session_is_null, session_id)
+);
+CREATE INDEX idx_compression_created ON compression_events(created_at, id);
+CREATE TABLE compression_retention_cursor (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  created_at INTEGER NOT NULL,
+  event_id INTEGER NOT NULL
+);
+"#;
 
 const MIGRATION_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -406,6 +425,7 @@ fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError>
         7 => tx.execute_batch(MIGRATION_V7),
         8 => tx.execute_batch(MIGRATION_V8),
         9 => tx.execute_batch(MIGRATION_V9),
+        10 => tx.execute_batch(MIGRATION_V10),
         _ => Ok(()),
     }
     .and_then(|()| {

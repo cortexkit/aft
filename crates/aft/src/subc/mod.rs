@@ -3653,6 +3653,7 @@ where
                 // so maintenance does not block the actor from handling the
                 // first request that arrives after a route bind is acknowledged.
                 crate::logging::maybe_sweep_logs();
+                crate::db::compression_events::maybe_spawn_retention(shared_app.db());
                 let reaped_lsp_children = shared_app
                     .lsp_child_registry()
                     .reap_children_with_gone_cwd_or_reclaimed_root();

@@ -322,3 +322,6 @@ mod tests {
         assert_eq!(cfg.type_checker_timeout_secs, 30);
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod disk_write_hunt;
