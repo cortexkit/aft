@@ -5390,7 +5390,9 @@ fn open_view_runtime_for_configure(
     let report = alias_store
         .report_head_checkout(&job.canonical_cache_root, &previous_paths)
         .map_err(|error| error.to_string())?;
-    slog_debug!(
+    // Info level so the soak observable (how much of HEAD the view reuses, and
+    // how many paths a publication will touch) is readable from the daemon log.
+    slog_info!(
         "content-addressed view HEAD reuse {}/{} for {}",
         report.numerator,
         report.denominator,
@@ -5419,6 +5421,11 @@ fn open_view_runtime_for_configure(
             .collect::<BTreeSet<_>>()
     };
     if !pending_paths.is_empty() {
+        slog_info!(
+            "content-addressed view publication scheduled: {} path(s) for {}",
+            pending_paths.len(),
+            job.canonical_cache_root.display()
+        );
         let mut status = crate::path_status::PathStatusStore::open(view.view_dir())
             .map_err(|error| error.to_string())?;
         for path in &pending_paths {

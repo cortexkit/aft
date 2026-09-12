@@ -819,7 +819,10 @@ fn git_filter_attributes(
         input,
         GIT_METADATA_TIMEOUT,
     )?;
-    crate::slog_debug!(
+    // Info level: the daemon does not emit debug, and this is the only line an
+    // operator can read to see that a large root's attribute pass finished
+    // (the write-then-read form of this call once blocked executor workers).
+    crate::slog_info!(
         "git check-attr completed for {} path(s) in {}ms",
         paths.len(),
         started_at.elapsed().as_millis()
