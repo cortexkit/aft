@@ -17,7 +17,6 @@ from common import (
     NdjsonClient,
     ProcessSample,
     SoakError,
-    SubcClient,
     SwitchProbe,
     ToolClient,
     assert_clean_worktree,
@@ -33,7 +32,6 @@ from common import (
     markdown_cell,
     read_jsonc,
     resolve_root,
-    resolve_subc_connection_file,
     run_checked,
     sample_process,
     select_stable_symbols,
@@ -375,18 +373,17 @@ def perform_switch(
         manifest_fingerprint(view_dir, before_generation) if views_on else None
     )
     before_entries = manifest_entry_count(view_dir, before_generation) if views_on else 0
-    before_pid = find_subc_daemon_pid() if views_on else standalone_pid
+    daemon_subject = views_on and standalone_pid is None
+    before_pid = find_subc_daemon_pid() if daemon_subject else standalone_pid
     if before_pid is None:
         raise SoakError(f"{mode} has no measurement process")
     before_process = sample_process(before_pid)
-    if views_on:
-        log_path = storage / "logs" / f"aft-{before_pid}.log"
-        log_mark = file_log_mark(log_path)
-    else:
-        if not isinstance(client, NdjsonClient):
-            raise SoakError("views-off measurement requires a standalone client")
+    if isinstance(client, NdjsonClient):
         log_path = client.stderr_path
         log_mark = client.log_mark()
+    else:
+        log_path = storage / "logs" / f"aft-{before_pid}.log"
+        log_mark = file_log_mark(log_path)
 
     started = time.monotonic()
     checkout_args = ["checkout", "--quiet", "--detach"]
@@ -403,6 +400,7 @@ def perform_switch(
     readiness_ms: int | None = None
     readiness_error: str | None = None
     query_embedding_calls = 0
+    readiness_observations: list[dict[str, Any]] = []
     last_search: dict[str, Any] = {}
     last_callgraph: dict[str, Any] = {}
     while time.monotonic() < deadline:
@@ -410,6 +408,22 @@ def perform_switch(
         try:
             ready = wait_indexes_ready(client, probe, timeout_s=min(60.0, remaining))
             readiness_ms = round((time.monotonic() - started) * 1000)
+            status = ready.get("status", {})
+            search_status = status.get("search_index", {})
+            semantic_status = status.get("semantic_index", {})
+            callgraph_status = status.get("callgraph_store", {})
+            states = {
+                "search": search_status.get("status"),
+                "semantic": semantic_status.get("status"),
+                "callgraph": callgraph_status.get("status"),
+            }
+            previous = (
+                {key: readiness_observations[-1][key] for key in states}
+                if readiness_observations
+                else None
+            )
+            if states != previous:
+                readiness_observations.append({"elapsed_ms": readiness_ms, **states})
         except (SoakError, subprocess.SubprocessError) as error:
             readiness_error = str(error)
             break
@@ -442,7 +456,7 @@ def perform_switch(
         readiness_error = readiness_error or str(error)
     time.sleep(0.5)
 
-    after_pid = find_subc_daemon_pid() if views_on else standalone_pid
+    after_pid = find_subc_daemon_pid() if daemon_subject else standalone_pid
     pid_changed = after_pid != before_pid
     after_process = sample_process(after_pid) if after_pid is not None else None
     if pid_changed or after_process is None:
@@ -451,14 +465,19 @@ def perform_switch(
     else:
         process_cpu_s, process_rss_delta_mb = delta_metrics(before_process, after_process)
 
-    if views_on:
+    if isinstance(client, NdjsonClient):
+        log_text = client.log_since(log_mark)
+    else:
         log_text = file_log_since(log_path, log_mark)
         if pid_changed and after_pid is not None:
             log_text += file_log_since(storage / "logs" / f"aft-{after_pid}.log", 0)
-    else:
-        assert isinstance(client, NdjsonClient)
-        log_text = client.log_since(log_mark)
     reuse_puts, publication_puts, embed_calls, embedded_files = log_metrics(log_text, checkout)
+    root_markers = {f"root={checkout}", f"root={checkout.resolve()}"}
+    index_events = [
+        line
+        for line in log_text.splitlines()
+        if "index_event " in line and any(marker in line for marker in root_markers)
+    ][-200:]
     after_generation = current_generation(view_dir) if views_on else None
     after_manifest_fingerprint = (
         manifest_fingerprint(view_dir, after_generation) if views_on else None
@@ -510,6 +529,8 @@ def perform_switch(
         "measurement_pid_after": after_pid,
         "measurement_pid_changed": pid_changed,
         "readiness_ms": readiness_ms,
+        "readiness_observations": readiness_observations,
+        "index_events": index_events,
         "readiness_error": readiness_error,
         "time_to_correct_ms": time_to_correct_ms,
         "correctness": "timeout" if timed_out else "correct",
@@ -534,8 +555,6 @@ def run_mode(
     storage: Path,
     scope: str,
     views_on: bool,
-    connection_file: Path,
-    subc_probe: Path,
     baseline_storage: Path,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if git_text(checkout, "rev-parse", "HEAD") != head:
@@ -556,9 +575,7 @@ def run_mode(
         ready = wait_indexes_ready(client, stable[0], timeout_s=1200.0)
         warmup["readiness_detail_ms"] = ready["elapsed_ms"]
         warmup["total_ms"] = round((time.monotonic() - warm_started) * 1000)
-        warmup["measurement_pid"] = (
-            find_subc_daemon_pid() if views_on else standalone_pid
-        )
+        warmup["measurement_pid"] = standalone_pid
         for source, target, label, changed_files in transitions:
             if git_text(checkout, "rev-parse", "HEAD") != source:
                 raise SoakError(f"{mode} sequence drift before {label}")
@@ -586,27 +603,20 @@ def run_mode(
     warmup: dict[str, Any] = {
         "ceiling_ms": 1_200_000,
         "storage": str(storage if views_on else baseline_storage),
-        "subject": "running_subc_daemon" if views_on else "standalone_owned_baseline",
+        "subject": "standalone_views_on" if views_on else "standalone_owned_baseline",
     }
-    if views_on:
-        client = SubcClient(
-            subc_probe,
-            connection_file,
-            checkout,
-            f"views-branch-daemon-{int(time.time())}",
-        )
-        exercise(client, None)
-    else:
-        stderr_path = cache_dir / "branch-drill-views-off.stderr.log"
-        with NdjsonClient(
-            binary,
-            checkout,
-            baseline_storage,
-            stderr_path,
-            f"views-branch-baseline-{int(time.time())}",
-        ) as client:
-            client.configure(user_config)
-            exercise(client, client.proc.pid)
+    subject = "views-on" if views_on else "views-off"
+    stderr_path = cache_dir / f"branch-drill-{subject}.stderr.log"
+    subject_storage = storage if views_on else baseline_storage
+    with NdjsonClient(
+        binary,
+        checkout,
+        subject_storage,
+        stderr_path,
+        f"views-branch-{subject}-{int(time.time())}",
+    ) as client:
+        client.configure(user_config)
+        exercise(client, client.proc.pid)
     return rows, warmup
 
 
@@ -629,16 +639,16 @@ def render_table(
         "",
         "## Finding",
         "",
-        "The running daemon still refreshes the legacy semantic index across branch switches; views do not yet prevent switch-back re-embedding. "
+        "The isolated views-on subject exercises content-addressed publication without restarting or mutating the live daemon. "
         f"This run captured {embedded_summary}.",
         "",
-        "## Run 2 — daemon views-on, warm owned baseline",
+        "## Run 3 — isolated views-on, warm owned baseline",
         "",
         f"Observed at `{refs['observed_at']}` against `{refs['head'][:12]}`.",
         "",
         f"- A: first-parent commit `{refs['anchor']['sha'][:12]}` ({refs['anchor']['changed_files']} changed files)",
         f"- B: branch `{refs['branch']['ref']}` (`{refs['branch']['sha'][:12]}`, {refs['branch']['changed_files']} changed files)",
-        f"- Views-on subject: running AFT subc daemon; warm-up `{warmups['views-on']['total_ms']} ms`.",
+        f"- Views-on subject: standalone AFT with isolated view storage; warm-up `{warmups['views-on']['total_ms']} ms`.",
         f"- Views-off subject: standalone AFT on an independent baseline clone and isolated storage; warm-up `{warmups['views-off']['total_ms']} ms`.",
         "",
         "`cpu_s` and `rss_delta_mb` use the active subject PID for each row. The daemon PID is resolved again at every views-on switch; PID changes are recorded as defects rather than subtracting unrelated processes.",
@@ -665,7 +675,7 @@ def render_table(
             "timeout" if off["time_to_correct_ms"] is None else off["time_to_correct_ms"],
         )
         lines.append("| " + " | ".join(markdown_cell(value) for value in values) + " |")
-    lines.extend(["", "### Run 2 defects", ""])
+    lines.extend(["", "### Run 3 defects", ""])
     if defects:
         lines.extend(f"- {defect}" for defect in defects)
     else:
@@ -724,7 +734,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--storage",
         type=Path,
-        default=Path.home() / ".local" / "share" / "cortexkit" / "aft",
+        default=(
+            Path.home()
+            / ".cache"
+            / "aft-views-soak"
+            / "0f3900af641f5248"
+            / "views-on-storage"
+        ),
+        help="isolated storage for the standalone views-on subject",
     )
     parser.add_argument(
         "--mode",
@@ -748,14 +765,6 @@ def main(argv: list[str]) -> int:
     if not isinstance(config.get("views"), dict) or config["views"].get("enabled") is not True:
         raise SoakError("opencode soak root does not have views.enabled: true")
     assert_clean_worktree(root, "opencode soak root")
-
-    user_config = Path.home() / ".config/cortexkit/aft.jsonc"
-    connection_file = resolve_subc_connection_file(user_config)
-    subc_probe = Path.home() / ".local/share/cortexkit/bin/subc-probe"
-    if not connection_file.is_file() or not subc_probe.is_file():
-        raise SoakError(
-            f"daemon query prerequisites missing: connection={connection_file}, probe={subc_probe}"
-        )
 
     original_head = git_text(root, "rev-parse", "HEAD")
     original_branch = git_text(root, "symbolic-ref", "--quiet", "--short", "HEAD", allowed=(0, 1))
@@ -788,8 +797,6 @@ def main(argv: list[str]) -> int:
                 storage=storage,
                 scope=scope,
                 views_on=True,
-                connection_file=connection_file,
-                subc_probe=subc_probe,
                 baseline_storage=baseline_storage,
             )
             rows.extend(on_rows)
@@ -810,8 +817,6 @@ def main(argv: list[str]) -> int:
                 storage=storage,
                 scope=scope,
                 views_on=False,
-                connection_file=connection_file,
-                subc_probe=subc_probe,
                 baseline_storage=baseline_storage,
             )
             rows.extend(off_rows)
@@ -880,10 +885,9 @@ def main(argv: list[str]) -> int:
         "root": str(root),
         "baseline": str(baseline),
         "baseline_storage": str(baseline_storage),
-        "connection_file": str(connection_file),
         "refs": refs,
         "measurement_subjects": {
-            "views_on": "running_subc_daemon",
+            "views_on": "standalone_views_on",
             "views_off": "standalone_owned_baseline",
         },
         "warmups": warmups,

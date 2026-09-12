@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use rusqlite::{Connection, OptionalExtension};
 
@@ -62,14 +63,17 @@ pub fn head_tree_fingerprint(entries: &[crate::alias::TrackedPath]) -> String {
 }
 
 pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
+    let publication_started = Instant::now();
     let view = ViewStore::open(&request.storage, &request.scope)?;
     let current_generation = view.current_generation()?;
     let previous = current_generation
         .as_deref()
         .map(|generation| view.load_manifest(generation))
         .transpose()?;
+    let head_started = Instant::now();
     let head = head_tree_entries(&request.project_root)
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+    let head_ms = head_started.elapsed().as_millis();
     let mut callgraph = BlobStore::open(
         &request.storage,
         request.family.clone(),
@@ -95,6 +99,7 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
         })
         .unwrap_or_default();
     let rebuild_all = request.changed_paths.is_empty();
+    let assembly_started = Instant::now();
     let mut pending_paths = BTreeSet::new();
     let mut candidates = Vec::with_capacity(head.len());
 
@@ -213,6 +218,9 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
         }
     }
 
+    let candidate_count = candidates.len();
+    let assembly_ms = assembly_started.elapsed().as_millis();
+
     if request.require_semantic {
         for candidate in &candidates {
             let missing = matches!(
@@ -244,6 +252,7 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
         &keys,
     )
     .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+    let blob_started = Instant::now();
     let mut blob_puts = 0;
     for candidate in &candidates {
         let (Some(key), Some(payload)) = (&candidate.key, &candidate.payload) else {
@@ -270,6 +279,7 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
         }
     }
 
+    let blob_ms = blob_started.elapsed().as_millis();
     let mut status = PathStatusStore::open(view.view_dir())
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
     if !pending_paths.is_empty() {
@@ -282,6 +292,20 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
                 )
                 .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
         }
+        log_publication_profile(
+            request,
+            "pending",
+            candidate_count,
+            blob_puts,
+            pending_paths.len(),
+            head_ms,
+            assembly_ms,
+            blob_ms,
+            0,
+            0,
+            publication_started.elapsed().as_millis(),
+            0,
+        );
         return Ok(AssemblyReport {
             generation: current_generation,
             manifest: previous,
@@ -312,6 +336,20 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
         && previous.as_ref() == Some(&manifest)
     {
         pin.release();
+        log_publication_profile(
+            request,
+            "no_op",
+            candidate_count,
+            blob_puts,
+            pending_paths.len(),
+            head_ms,
+            assembly_ms,
+            blob_ms,
+            0,
+            0,
+            publication_started.elapsed().as_millis(),
+            0,
+        );
         return Ok(AssemblyReport {
             generation: current_generation,
             manifest: None,
@@ -320,12 +358,14 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
             published: false,
         });
     }
+    let materialize_started = Instant::now();
     crate::callgraph_store::materialize_manifest_view_database(
         status.path(),
         callgraph.path(),
         &manifest,
     )
     .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+    let materialize_ms = materialize_started.elapsed().as_millis();
     let trigram = view.view_dir().join("trigram.bin");
     fs::write(&trigram, [])?;
     let artifacts = PublicationArtifacts {
@@ -342,6 +382,7 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
         callgraph: callgraph.path().to_path_buf(),
         trigram,
     };
+    let pointer_started = Instant::now();
     let publication = view.publish(
         &PublicationRequest {
             generation: &next_generation,
@@ -352,12 +393,30 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
         },
         &closure,
     )?;
+    let pointer_ms = pointer_started.elapsed().as_millis();
     pin.release();
     let published = matches!(publication, PublishOutcome::Published);
     let generation = match publication {
         PublishOutcome::Published => Some(next_generation),
         PublishOutcome::Conflict { current_generation } => current_generation,
     };
+    let derived_bytes = fs::metadata(status.path())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    log_publication_profile(
+        request,
+        if published { "published" } else { "conflict" },
+        candidate_count,
+        blob_puts,
+        pending_paths.len(),
+        head_ms,
+        assembly_ms,
+        blob_ms,
+        materialize_ms,
+        pointer_ms,
+        publication_started.elapsed().as_millis(),
+        derived_bytes,
+    );
     Ok(AssemblyReport {
         generation,
         manifest: published.then_some(manifest),
@@ -365,6 +424,38 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
         pending_paths,
         published,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_publication_profile(
+    request: &AssemblyRequest,
+    outcome: &str,
+    candidates: usize,
+    blob_puts: usize,
+    pending_paths: usize,
+    head_ms: u128,
+    assembly_ms: u128,
+    blob_ms: u128,
+    materialize_ms: u128,
+    pointer_ms: u128,
+    total_ms: u128,
+    derived_bytes: u64,
+) {
+    crate::slog_info!(
+        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} pointer_ms={} total_ms={} derived_bytes={}",
+        request.project_root.display(),
+        outcome,
+        candidates,
+        blob_puts,
+        pending_paths,
+        head_ms,
+        assembly_ms,
+        blob_ms,
+        materialize_ms,
+        pointer_ms,
+        total_ms,
+        derived_bytes,
+    );
 }
 
 fn is_resolution_input(path: &[u8]) -> bool {
