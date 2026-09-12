@@ -2226,6 +2226,83 @@ struct ReusableEmbedding {
 
 type ChunkReuseMap = HashMap<PathBuf, HashMap<blake3::Hash, Vec<ReusableEmbedding>>>;
 
+const SEMANTIC_BLOB_PAYLOAD_VERSION: u8 = 1;
+
+fn extend_reuse_map_from_semantic_blob(
+    reuse_map: &mut ChunkReuseMap,
+    file: &Path,
+    payload: &[u8],
+    expected_fingerprint: &str,
+    expected_dimension: usize,
+) -> Result<(), String> {
+    let mut reader = CountingReader::with_bytes_read(Cursor::new(payload), 0);
+    let version = read_u8_stream(&mut reader, "missing semantic blob version")?;
+    if version != SEMANTIC_BLOB_PAYLOAD_VERSION {
+        return Err(format!("unsupported semantic blob version {version}"));
+    }
+    for (label, expected) in [
+        ("chunker", crate::blob_store::SEMANTIC_PRODUCER_VERSION),
+        ("template", crate::blob_store::SEMANTIC_PRODUCER_VERSION),
+        ("model", expected_fingerprint),
+    ] {
+        let actual = read_string_stream(&mut reader, Some(payload.len()))?;
+        if actual != expected {
+            return Err(format!("semantic blob {label} fingerprint mismatch"));
+        }
+    }
+    let entry_count = read_u32_stream(&mut reader)? as usize;
+    if entry_count > MAX_ENTRIES {
+        return Err(format!("too many semantic blob entries {entry_count}"));
+    }
+    let vector_bytes = expected_dimension
+        .checked_mul(F32_BYTES)
+        .ok_or_else(|| "semantic blob vector length overflow".to_string())?;
+    for _ in 0..entry_count {
+        let _name = read_string_stream(&mut reader, Some(payload.len()))?;
+        let _qualified_name = read_string_stream(&mut reader, Some(payload.len()))?;
+        let _kind = read_u8_stream(&mut reader, "missing semantic blob symbol kind")?;
+        let _start_line = read_u32_stream(&mut reader)?;
+        let _end_line = read_u32_stream(&mut reader)?;
+        let _exported = read_u8_stream(&mut reader, "missing semantic blob export flag")?;
+        let _snippet = read_string_stream(&mut reader, Some(payload.len()))?;
+        let embed_text = read_string_stream(&mut reader, Some(payload.len()))?;
+        let raw_vector = read_blob_bytes(&mut reader, payload.len())?;
+        if raw_vector.len() != vector_bytes {
+            return Err(format!(
+                "semantic blob vector has {} bytes, expected {vector_bytes}",
+                raw_vector.len()
+            ));
+        }
+        let vector = raw_vector
+            .chunks_exact(F32_BYTES)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte float")))
+            .collect::<Vec<_>>();
+        reuse_map
+            .entry(file.to_path_buf())
+            .or_default()
+            .entry(blake3::hash(embed_text.as_bytes()))
+            .or_default()
+            .push(ReusableEmbedding { embed_text, vector });
+    }
+    if reader.bytes_read() != payload.len() {
+        return Err("trailing bytes after semantic blob payload".to_string());
+    }
+    Ok(())
+}
+
+fn read_blob_bytes<R: Read>(
+    reader: &mut CountingReader<R>,
+    total_len: usize,
+) -> Result<Vec<u8>, String> {
+    let len = read_u32_stream(reader)? as usize;
+    if reader.bytes_read().saturating_add(len) > total_len {
+        return Err("unexpected end of semantic blob bytes".to_string());
+    }
+    let mut bytes = vec![0; len];
+    read_exact_stream(reader, &mut bytes, "unexpected end of semantic blob bytes")?;
+    Ok(bytes)
+}
+
 /// Search result from a semantic query
 #[derive(Debug, Clone)]
 pub struct SemanticResult {
@@ -2655,6 +2732,47 @@ impl SemanticIndex {
         reuse_map
     }
 
+    fn extend_reuse_map_from_blob_store<R>(
+        &self,
+        project_root: &Path,
+        files: impl IntoIterator<Item = PathBuf>,
+        reuse_map: &mut ChunkReuseMap,
+        reuse_blob: &mut R,
+    ) where
+        R: FnMut(&Path) -> Option<Vec<u8>>,
+    {
+        let Some(fingerprint) = self.fingerprint().map(SemanticIndexFingerprint::as_string) else {
+            return;
+        };
+        let mut reused_files = 0usize;
+        for file in files {
+            let Some(payload) = reuse_blob(&file) else {
+                continue;
+            };
+            match extend_reuse_map_from_semantic_blob(
+                reuse_map,
+                &file,
+                &payload,
+                &fingerprint,
+                self.dimension,
+            ) {
+                Ok(()) => reused_files += 1,
+                Err(error) => slog_warn!(
+                    "semantic blob reuse rejected for {}: {}",
+                    file.display(),
+                    error
+                ),
+            }
+        }
+        if reused_files > 0 {
+            slog_info!(
+                "semantic refresh reused content-addressed vectors: root={} files={}",
+                project_root.display(),
+                reused_files
+            );
+        }
+    }
+
     fn reusable_vector_for_chunk(
         reuse_map: &ChunkReuseMap,
         chunk: &SemanticChunk,
@@ -3038,6 +3156,32 @@ impl SemanticIndex {
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
         P: FnMut(usize, usize),
     {
+        self.refresh_stale_files_with_strategy_and_blob_reuse(
+            project_root,
+            current_files,
+            embed_fn,
+            max_batch_size,
+            progress,
+            verify_strategy,
+            &mut |_| None,
+        )
+    }
+
+    pub(crate) fn refresh_stale_files_with_strategy_and_blob_reuse<F, P, R>(
+        &mut self,
+        project_root: &Path,
+        current_files: &[PathBuf],
+        embed_fn: &mut F,
+        max_batch_size: usize,
+        progress: &mut P,
+        verify_strategy: cache_freshness::VerifyStrategy,
+        reuse_blob: &mut R,
+    ) -> Result<RefreshSummary, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        P: FnMut(usize, usize),
+        R: FnMut(&Path) -> Option<Vec<u8>>,
+    {
         self.materialize_shared_base();
         self.backfill_missing_file_sizes();
 
@@ -3169,8 +3313,14 @@ impl SemanticIndex {
             });
         }
 
-        let reuse_map = self.build_chunk_reuse_map(&changed);
+        let mut reuse_map = self.build_chunk_reuse_map(&changed);
         let (chunks, fresh_metadata) = Self::collect_chunks(project_root, &to_embed);
+        self.extend_reuse_map_from_blob_store(
+            project_root,
+            fresh_metadata.keys().cloned(),
+            &mut reuse_map,
+            reuse_blob,
+        );
         let changed_set: HashSet<&Path> = changed.iter().map(PathBuf::as_path).collect();
         let vanished = to_embed
             .iter()
@@ -3286,6 +3436,32 @@ impl SemanticIndex {
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
         P: FnMut(usize, usize),
     {
+        self.refresh_invalidated_files_with_blob_reuse(
+            project_root,
+            paths,
+            embed_fn,
+            max_batch_size,
+            max_files,
+            progress,
+            &mut |_| None,
+        )
+    }
+
+    pub(crate) fn refresh_invalidated_files_with_blob_reuse<F, P, R>(
+        &mut self,
+        project_root: &Path,
+        paths: &[PathBuf],
+        embed_fn: &mut F,
+        max_batch_size: usize,
+        max_files: usize,
+        progress: &mut P,
+        reuse_blob: &mut R,
+    ) -> Result<InvalidatedFilesRefresh, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        P: FnMut(usize, usize),
+        R: FnMut(&Path) -> Option<Vec<u8>>,
+    {
         self.materialize_shared_base();
         self.backfill_missing_file_sizes();
 
@@ -3312,7 +3488,7 @@ impl SemanticIndex {
             .filter(|path| self.file_mtimes.contains_key(*path))
             .cloned()
             .collect();
-        let reuse_map = self.build_chunk_reuse_map(&requested_paths);
+        let mut reuse_map = self.build_chunk_reuse_map(&requested_paths);
 
         // The watcher path has already invalidated these files in the request
         // thread's live index. Mirror that behavior here before inserting any
@@ -3348,6 +3524,12 @@ impl SemanticIndex {
         }
 
         let (mut chunks, mut fresh_metadata) = Self::collect_chunks(project_root, &existing_paths);
+        self.extend_reuse_map_from_blob_store(
+            project_root,
+            fresh_metadata.keys().cloned(),
+            &mut reuse_map,
+            reuse_blob,
+        );
 
         let retained_file_count = self.file_mtimes.len();
         let changed_successful_count = existing_paths

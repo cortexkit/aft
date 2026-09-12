@@ -311,6 +311,16 @@ fn configure_context(
     server: &MockEmbeddingServer,
     ram_overlay: bool,
 ) -> Arc<AppContext> {
+    configure_context_with_views(root, storage, server, ram_overlay, false)
+}
+
+fn configure_context_with_views(
+    root: &Path,
+    storage: &Path,
+    server: &MockEmbeddingServer,
+    ram_overlay: bool,
+    views_enabled: bool,
+) -> Arc<AppContext> {
     let ctx = Arc::new(AppContext::new(
         Box::new(TreeSitterProvider::new()),
         Config::default(),
@@ -325,6 +335,7 @@ fn configure_context(
             "search_index": true,
             "semantic_search": true,
             "callgraph_store": true,
+            "views": { "enabled": views_enabled },
             "worktree": { "ram_overlay": ram_overlay },
             "semantic": {
                 "backend": "openai_compatible",
@@ -502,6 +513,61 @@ fn run_row(label: &str, row: impl FnOnce()) {
     );
 }
 
+fn wait_for_semantic_branch(ctx: &AppContext, branch: char) {
+    let other = if branch == 'A' { 'B' } else { 'A' };
+    let deadline = Instant::now() + ROW_DEADLINE;
+    loop {
+        wait_until_ready(ctx);
+        let present = grep(ctx, &format!("target{branch}"));
+        let absent = grep(ctx, &format!("target{other}"));
+        if present["index_status"] == "Ready"
+            && present["total_matches"].as_u64().unwrap_or(0) > 0
+            && absent["total_matches"] == 0
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "branch {branch} did not become searchable"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn views_round_trip_reuses_semantic_blobs_without_embedding() {
+    let _watcher_guard = crate::helpers::watcher_serial_lock();
+    let server = MockEmbeddingServer::start();
+    let repo = RepoFixture::new(40, 20);
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = configure_context_with_views(&repo.root, storage.path(), &server, false, true);
+
+    wait_for_semantic_branch(&ctx, 'A');
+    let family = aft::search_index::artifact_cache_key(&repo.root);
+    let semantic_blobs = aft::blob_store::BlobStore::open(
+        storage.path(),
+        family,
+        aft::blob_store::BlobPlane::Semantic,
+    )
+    .expect("open semantic blob store");
+    assert!(
+        semantic_blobs.usage().expect("semantic blob usage").rows > 0,
+        "initial views publication must persist A's semantic vectors"
+    );
+    drop(semantic_blobs);
+    git(&repo.root, &["checkout", "-q", "B"]);
+    wait_for_semantic_branch(&ctx, 'B');
+    let before_return = server.batch_count();
+    git(&repo.root, &["checkout", "-q", "A"]);
+    wait_for_semantic_branch(&ctx, 'A');
+
+    assert_eq!(
+        server.batch_count().saturating_sub(before_return),
+        0,
+        "views-on return switch must reuse A's content-addressed vectors"
+    );
+}
+
 #[test]
 fn branch_switch_e2e_matrix() {
     let _watcher_guard = crate::helpers::watcher_serial_lock();
@@ -564,8 +630,6 @@ fn branch_switch_e2e_matrix() {
                 return_batches, 1,
                 "current return switch embeds one coalesced batch"
             );
-            // TODO: once content-addressed semantic storage reuses A's embeddings on the
-            // return switch, replace the assertion above with assert_eq!(return_batches, 0).
         });
 
         run_row("rebase", || {

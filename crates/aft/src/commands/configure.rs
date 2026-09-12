@@ -706,6 +706,67 @@ fn semantic_build_retry_backoff(attempt: usize) -> Duration {
     Duration::from_secs(secs)
 }
 
+#[derive(Clone, Debug)]
+struct SemanticViewBlobSource {
+    storage: PathBuf,
+    family: String,
+}
+
+impl From<ViewRuntimeSnapshot> for SemanticViewBlobSource {
+    fn from(snapshot: ViewRuntimeSnapshot) -> Self {
+        Self {
+            storage: snapshot.storage,
+            family: snapshot.family,
+        }
+    }
+}
+
+fn open_semantic_view_blob_store(
+    source: Option<SemanticViewBlobSource>,
+) -> Option<crate::blob_store::BlobStore> {
+    let source = source?;
+    match crate::blob_store::BlobStore::open(
+        &source.storage,
+        source.family,
+        crate::blob_store::BlobPlane::Semantic,
+    ) {
+        Ok(store) => Some(store),
+        Err(error) => {
+            slog_warn!("semantic view blob reuse unavailable: {}", error);
+            None
+        }
+    }
+}
+
+fn semantic_view_blob_for_path(
+    store: Option<&crate::blob_store::BlobStore>,
+    project_root: &Path,
+    path: &Path,
+    model_fingerprint: &str,
+) -> Option<Vec<u8>> {
+    let store = store?;
+    let relative = path.strip_prefix(project_root).ok()?;
+    let relative = crate::views::RelPath::from_os_path(relative).ok()?;
+    let source = fs::read(path).ok()?;
+    let key = crate::blob_store::SemanticKey::for_current(
+        &source,
+        relative.as_bytes(),
+        model_fingerprint,
+    )
+    .full_key();
+    match store.get(&key) {
+        Ok(payload) => payload,
+        Err(error) => {
+            slog_warn!(
+                "semantic view blob lookup failed for {}: {}",
+                path.display(),
+                error
+            );
+            None
+        }
+    }
+}
+
 fn spawn_semantic_refresh_worker(
     project_root: PathBuf,
     mut index: SemanticIndex,
@@ -714,6 +775,7 @@ fn spawn_semantic_refresh_worker(
     max_files: usize,
     quiet_window: Duration,
     corpus_refresh_allowed: bool,
+    view_blob_source: Option<SemanticViewBlobSource>,
     request_rx: crossbeam_channel::Receiver<SemanticRefreshRequest>,
     event_tx: crossbeam_channel::Sender<SemanticRefreshEvent>,
     lifecycle: SubcLifecycleAdmission,
@@ -724,6 +786,7 @@ fn spawn_semantic_refresh_worker(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         log_ctx::with_session(session_id, || {
+            let semantic_blob_store = open_semantic_view_blob_store(view_blob_source);
             while let Ok(first_request) = request_rx.recv() {
                 let mut paths = BTreeSet::new();
                 let mut corpus_requested = false;
@@ -846,12 +909,27 @@ fn spawn_semantic_refresh_worker(
                     let mut progress = |done: usize, total: usize| {
                         progress_state.report(done, total, max_batch_size);
                     };
-                    let refresh_result = index.refresh_stale_files(
+                    let model_fingerprint = index
+                        .fingerprint()
+                        .map(crate::semantic_index::SemanticIndexFingerprint::as_string);
+                    let mut reuse_blob = |path: &Path| {
+                        model_fingerprint.as_deref().and_then(|fingerprint| {
+                            semantic_view_blob_for_path(
+                                semantic_blob_store.as_ref(),
+                                &project_root,
+                                path,
+                                fingerprint,
+                            )
+                        })
+                    };
+                    let refresh_result = index.refresh_stale_files_with_strategy_and_blob_reuse(
                         &project_root,
                         &current_files,
                         &mut embed,
                         max_batch_size,
                         &mut progress,
+                        VerifyStrategy::Strict,
+                        &mut reuse_blob,
                     );
                     if embed_batches > 0 {
                         let files = refresh_result
@@ -941,13 +1019,27 @@ fn spawn_semantic_refresh_worker(
                 let mut progress = |done: usize, total: usize| {
                     progress_state.report(done, total, max_batch_size);
                 };
-                let refresh_result = index.refresh_invalidated_files(
+                let model_fingerprint = index
+                    .fingerprint()
+                    .map(crate::semantic_index::SemanticIndexFingerprint::as_string);
+                let mut reuse_blob = |path: &Path| {
+                    model_fingerprint.as_deref().and_then(|fingerprint| {
+                        semantic_view_blob_for_path(
+                            semantic_blob_store.as_ref(),
+                            &project_root,
+                            path,
+                            fingerprint,
+                        )
+                    })
+                };
+                let refresh_result = index.refresh_invalidated_files_with_blob_reuse(
                     &project_root,
                     &paths,
                     &mut embed,
                     max_batch_size,
                     max_files,
                     &mut progress,
+                    &mut reuse_blob,
                 );
                 if embed_batches > 0 {
                     let files = refresh_result
@@ -1028,7 +1120,26 @@ pub(crate) fn ensure_ready_semantic_refresh_worker(ctx: &AppContext) -> bool {
     else {
         return false;
     };
-    let config = ctx.config().semantic.clone();
+    let runtime_config = ctx.config();
+    let view_blob_source = runtime_config
+        .views
+        .enabled
+        .then(|| {
+            ctx.view_runtime_snapshot()
+                .map(SemanticViewBlobSource::from)
+                .or_else(|| {
+                    runtime_config
+                        .storage_dir
+                        .clone()
+                        .map(|storage| SemanticViewBlobSource {
+                            storage,
+                            family: ctx.memoized_artifact_cache_key(&project_root),
+                        })
+                })
+        })
+        .flatten();
+    let config = runtime_config.semantic.clone();
+    drop(runtime_config);
     let model = match crate::semantic_index::EmbeddingModel::from_config(&config) {
         Ok(model) => model,
         Err(error) => {
@@ -1054,6 +1165,7 @@ pub(crate) fn ensure_ready_semantic_refresh_worker(ctx: &AppContext) -> bool {
         config.max_files,
         semantic_refresh_quiet_window(),
         !shared_artifacts_read_only,
+        view_blob_source,
         request_rx,
         event_tx,
         ctx.subc_lifecycle_admission(),
@@ -3523,7 +3635,20 @@ fn schedule_artifact_loads(
     let storage_dir = config.storage_dir.clone();
     let search_index_max_file_size = config.search_index_max_file_size;
     let semantic_config = config.semantic.clone();
+    let views_enabled = config.views.enabled;
     drop(config);
+    let semantic_view_blob_source = views_enabled
+        .then(|| {
+            ctx.view_runtime_snapshot()
+                .map(SemanticViewBlobSource::from)
+                .or_else(|| {
+                    storage_dir.clone().map(|storage| SemanticViewBlobSource {
+                        storage,
+                        family: project_key.clone(),
+                    })
+                })
+        })
+        .flatten();
     let is_worktree_bridge = ctx.is_worktree_bridge();
     let configure_generation = ctx.configure_generation();
     let configure_content_generation = ctx.configure_content_generation();
@@ -3930,11 +4055,14 @@ fn schedule_artifact_loads(
         let semantic_build_epoch_flag = ctx.semantic_build_epoch_flag();
         let semantic_lifecycle = subc_lifecycle.clone();
         let semantic_fingerprint_generation_flag = ctx.semantic_fingerprint_generation_flag();
+        let semantic_view_blob_source_for_worker = semantic_view_blob_source.clone();
         let session_id_for_bg2 = log_ctx::current_session();
         let (start_tx, start_rx) = crossbeam_channel::bounded::<()>(1);
         semantic_artifact_load_start = Some(start_tx);
         thread::spawn(move || {
             let _terminal_guard = semantic_rx_terminal_guard;
+            let semantic_blob_store =
+                open_semantic_view_blob_store(semantic_view_blob_source.clone());
             if !wait_for_semantic_artifact_start(&start_rx, &root_clone) {
                 #[cfg(test)]
                 note_configure_artifact_load_cancellation_for_test();
@@ -4169,14 +4297,24 @@ fn schedule_artifact_loads(
                                         .to_string(),
                                 );
                             };
-                            let refresh_result = cached.refresh_stale_files_with_strategy(
-                                &root_clone,
-                                &current_files,
-                                &mut embed,
-                                semantic_config.max_batch_size.max(1),
-                                &mut progress,
-                                verify_strategy,
-                            );
+                            let mut reuse_blob = |path: &Path| {
+                                semantic_view_blob_for_path(
+                                    semantic_blob_store.as_ref(),
+                                    &root_clone,
+                                    path,
+                                    &fingerprint_key,
+                                )
+                            };
+                            let refresh_result = cached
+                                .refresh_stale_files_with_strategy_and_blob_reuse(
+                                    &root_clone,
+                                    &current_files,
+                                    &mut embed,
+                                    semantic_config.max_batch_size.max(1),
+                                    &mut progress,
+                                    verify_strategy,
+                                    &mut reuse_blob,
+                                );
                             if embed_batches > 0 {
                                 let files = refresh_result
                                     .as_ref()
@@ -4590,6 +4728,7 @@ fn schedule_artifact_loads(
                                     semantic_config.max_files,
                                     semantic_refresh_quiet_window(),
                                     true,
+                                    semantic_view_blob_source_for_worker,
                                     refresh_rx,
                                     refresh_event_tx,
                                     semantic_lifecycle.clone(),
