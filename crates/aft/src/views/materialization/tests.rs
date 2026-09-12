@@ -619,3 +619,18 @@ fn binding_dependencies_exclude_existing_workspace_directory_probes() {
         .dependencies
         .contains("dir/index.ts"));
 }
+
+#[test]
+fn legacy_generation_without_diff_metadata_cold_upgrades() {
+    let f = fixture();
+    let (_, copy) = prepare(&f);
+    Connection::open(&copy).unwrap().execute_batch(
+        "DELETE FROM meta WHERE k IN ('view_manifest_fingerprint', 'view_materialization_version');
+         DROP TABLE view_bindings; DELETE FROM file_dependencies;"
+    ).unwrap();
+    let stats = apply_manifest_diff(&copy, &f.base, &f.next, &f.blobs).unwrap();
+    assert!(stats.full_resolution);
+    let cold = f.dir.path().join("legacy-upgraded-cold.sqlite");
+    materialize_manifest_view_database(&cold, &f.blobs, &f.next).unwrap();
+    assert_eq!(snapshot(&copy), snapshot(&cold));
+}

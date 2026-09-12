@@ -88,6 +88,21 @@ fn branch_switch_reuses_unchanged_blobs_and_puts_only_changed_files() {
         "every file is new content on the first publish"
     );
 
+    // The trigger is copied with the base database. A full rewrite on publication
+    // would delete this unchanged file and fail instead of hiding extra work.
+    let view = aft::views::ViewStore::open(storage.path(), "main-view").unwrap();
+    let database = view
+        .derived_path(initial.generation.as_deref().unwrap())
+        .unwrap();
+    rusqlite::Connection::open(database)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER preserve_untouched_file BEFORE DELETE ON files
+         WHEN old.path = 'file_319.rs'
+         BEGIN SELECT RAISE(ABORT, 'unchanged file rewritten'); END;",
+        )
+        .unwrap();
+
     // A real branch: 300 of the 320 files change content on it.
     git(project.path(), &["checkout", "--quiet", "-b", "feature"]);
     let mut changed = BTreeSet::new();

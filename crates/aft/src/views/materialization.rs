@@ -101,12 +101,15 @@ fn materialize(
                 |row| row.get(0),
             )
             .optional()?;
-        if recorded.as_deref() != Some(fingerprint(base_manifest)?.as_str()) {
+        if recorded.is_none() && version.is_none() {
+            // Cloned generations written before diff metadata existed must be
+            // rebuilt; their graph cannot safely seed dependency invalidation.
+            base = None;
+        } else if recorded.as_deref() != Some(fingerprint(base_manifest)?.as_str()) {
             return Err(CallGraphStoreError::Unavailable(
                 "derived manifest fingerprint mismatch; cold materialization required".into(),
             ));
-        }
-        if version.as_deref() != Some(MATERIALIZATION_VERSION) {
+        } else if version.as_deref() != Some(MATERIALIZATION_VERSION) {
             base = None;
         } else if base_manifest == manifest {
             return Ok(MaterializeStats::default());

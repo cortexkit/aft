@@ -407,18 +407,34 @@ pub fn prepare_checkout(
     }
     prepared.profile.enter(2, phase)?;
     let derived = view.derived_path(&next_generation)?;
+    let mut cloned_base = false;
     if let Some(base) = current_generation.as_deref() {
         let base_path = view.derived_path(base)?;
         if base_path.is_file() {
             super::generation::clone_derived(&base_path, &derived)?;
+            cloned_base = true;
         }
     }
-    crate::callgraph_store::materialize_manifest_view_database(
-        &derived,
-        callgraph.path(),
-        &manifest,
-    )
-    .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+    if let Some(base_manifest) = previous.as_ref().filter(|_| cloned_base) {
+        let stats = super::materialization::apply_manifest_diff(
+            &derived,
+            base_manifest,
+            &manifest,
+            callgraph.path(),
+        )
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+        log::info!(
+            "view manifest diff: generation={} stats={stats:?}",
+            next_generation
+        );
+    } else {
+        crate::callgraph_store::materialize_manifest_view_database(
+            &derived,
+            callgraph.path(),
+            &manifest,
+        )
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+    }
     let trigram = view.trigram_path(&next_generation)?;
     fs::write(&trigram, [])?;
     let artifacts = PublicationArtifacts {
