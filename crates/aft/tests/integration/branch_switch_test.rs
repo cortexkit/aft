@@ -513,22 +513,25 @@ fn run_row(label: &str, row: impl FnOnce()) {
     );
 }
 
-fn wait_for_semantic_branch(ctx: &AppContext, branch: char) {
+fn wait_for_views_branch(ctx: &AppContext, root: &Path, branch: char) {
     let other = if branch == 'A' { 'B' } else { 'A' };
     let deadline = Instant::now() + ROW_DEADLINE;
     loop {
-        wait_until_ready(ctx);
+        let _ = wait_until_ready(ctx);
         let present = grep(ctx, &format!("target{branch}"));
         let absent = grep(ctx, &format!("target{other}"));
+        let caller_result = callers(ctx, root, branch);
         if present["index_status"] == "Ready"
             && present["total_matches"].as_u64().unwrap_or(0) > 0
             && absent["total_matches"] == 0
+            && caller_result["success"] == true
+            && caller_result["total_callers"].as_u64().unwrap_or(0) > 0
         {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "branch {branch} did not become searchable"
+            "views branch {branch} did not converge: present={present:#} absent={absent:#} callers={caller_result:#}"
         );
         thread::sleep(Duration::from_millis(25));
     }
@@ -542,7 +545,7 @@ fn views_round_trip_reuses_semantic_blobs_without_embedding() {
     let storage = tempfile::tempdir().unwrap();
     let ctx = configure_context_with_views(&repo.root, storage.path(), &server, false, true);
 
-    wait_for_semantic_branch(&ctx, 'A');
+    wait_for_views_branch(&ctx, &repo.root, 'A');
     let family = aft::search_index::artifact_cache_key(&repo.root);
     let semantic_blobs = aft::blob_store::BlobStore::open(
         storage.path(),
@@ -556,10 +559,10 @@ fn views_round_trip_reuses_semantic_blobs_without_embedding() {
     );
     drop(semantic_blobs);
     git(&repo.root, &["checkout", "-q", "B"]);
-    wait_for_semantic_branch(&ctx, 'B');
+    wait_for_views_branch(&ctx, &repo.root, 'B');
     let before_return = server.batch_count();
     git(&repo.root, &["checkout", "-q", "A"]);
-    wait_for_semantic_branch(&ctx, 'A');
+    wait_for_views_branch(&ctx, &repo.root, 'A');
 
     assert_eq!(
         server.batch_count().saturating_sub(before_return),
