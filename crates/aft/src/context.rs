@@ -967,8 +967,9 @@ struct ViewRuntimeState {
 }
 
 pub(crate) struct PreparedViewUpdate {
-    snapshot: ViewRuntimeSnapshot,
-    pin: Option<crate::pins::QueryPin>,
+    snapshot: Option<ViewRuntimeSnapshot>,
+    pin: Option<Arc<crate::pins::QueryPin>>,
+    retired: Option<ViewRuntimeState>,
     assembly: crate::views::assembly::PreparedAssembly,
     pub(crate) content_generation: u64,
 }
@@ -4461,13 +4462,14 @@ impl AppContext {
             .transpose()
             .map_err(|error| error.to_string())?;
         Ok(PreparedViewUpdate {
-            snapshot: ViewRuntimeSnapshot {
+            snapshot: Some(ViewRuntimeSnapshot {
                 generation,
                 manifest,
                 pending_paths: report.pending_paths.clone(),
                 ..snapshot
-            },
-            pin,
+            }),
+            pin: pin.map(Arc::new),
+            retired: None,
             assembly,
             content_generation,
         })
@@ -4488,8 +4490,19 @@ impl AppContext {
             .assembly
             .commit()
             .map_err(|error| error.to_string())?;
-        if report.generation == prepared.snapshot.generation {
-            self.install_view_runtime(prepared.snapshot.clone(), prepared.pin.take());
+        if let Some(snapshot) = prepared
+            .snapshot
+            .take()
+            .filter(|snapshot| report.generation == snapshot.generation)
+        {
+            prepared.retired = self
+                .view_runtime
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .replace(ViewRuntimeState {
+                    snapshot,
+                    pin: prepared.pin.take(),
+                });
         }
         Ok(report)
     }

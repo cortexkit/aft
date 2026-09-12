@@ -71,6 +71,10 @@ impl ViewStore {
                 .or_else(|| {
                     name.strip_prefix("trigram-")
                         .and_then(|s| s.strip_suffix(".bin"))
+                })
+                .or_else(|| {
+                    name.strip_prefix(".manifest-")
+                        .and_then(|s| s.split_once(".json.tmp.").map(|(generation, _)| generation))
                 });
             if let Some(generation) = generation {
                 generations.insert(generation.to_owned());
@@ -114,6 +118,21 @@ impl ViewStore {
     }
 
     pub(super) fn remove_generation_files(&self, generation: &str) {
+        if super::validate_generation(generation).is_err() {
+            return;
+        }
+        let temporary_prefix = format!(".manifest-{generation}.json.tmp.");
+        if let Ok(entries) = fs::read_dir(self.view_dir()) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&temporary_prefix))
+                {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
         for path in [
             self.derived_path(generation),
             self.trigram_path(generation),
@@ -136,7 +155,11 @@ impl ViewStore {
 pub(super) fn clone_derived(source: &Path, destination: &Path) -> Result<()> {
     let started = Instant::now();
     let mechanism = if try_clone(source, destination) {
-        "reflink"
+        if cfg!(target_os = "macos") {
+            "clonefile"
+        } else {
+            "reflink"
+        }
     } else {
         let _ = fs::remove_file(destination);
         fs::copy(source, destination)?;

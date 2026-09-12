@@ -5359,17 +5359,12 @@ fn run_configure_maintenance_unit(
                             .view_runtime_snapshot()
                             .is_some_and(|view| !view.pending_paths.is_empty())
                     {
-                        if let Some(_permit) = ctx.cold_build_limiter().try_acquire() {
-                            if let Err(error) = crate::executor::view_publication::schedule(
-                                ctx,
-                                BTreeSet::new(),
-                                !ctx.shared_artifacts_read_only(),
-                            ) {
-                                slog_warn!(
-                                    "content-addressed initial publication failed: {}",
-                                    error
-                                );
-                            }
+                        if let Err(error) = crate::executor::view_publication::schedule(
+                            ctx,
+                            BTreeSet::new(),
+                            !ctx.shared_artifacts_read_only(),
+                        ) {
+                            slog_warn!("content-addressed initial publication failed: {}", error);
                         }
                     }
                 }

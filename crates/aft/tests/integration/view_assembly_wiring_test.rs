@@ -309,3 +309,107 @@ fn changed_path_does_not_inherit_previous_semantic_blob() {
     assert!(!report.published);
     assert_eq!(report.pending_paths, BTreeSet::from([rel_path]));
 }
+
+#[cfg(unix)]
+#[test]
+fn publication_crash_child() {
+    let Some(root) = std::env::var_os("AFT_VIEW_CRASH_ROOT") else {
+        return;
+    };
+    let storage = std::env::var_os("AFT_VIEW_CRASH_STORAGE").unwrap();
+    let root = std::path::PathBuf::from(root);
+    let storage = std::path::PathBuf::from(storage);
+    let _prepared = aft::views::assembly::prepare_checkout(
+        &request(
+            &storage,
+            &root,
+            "crash-family",
+            "crash-view",
+            BTreeSet::new(),
+            true,
+        ),
+        &mut |phase| {
+            if phase == "cas" {
+                // The generation is durable but has not left the off-barrier
+                // build. SIGKILL must not expose it through the current pointer.
+                fs::write(storage.join("build-gated"), b"ready").unwrap();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn killed_off_barrier_build_preserves_pointer_and_sweeps_generation() {
+    let project = tempdir().unwrap();
+    let storage = tempdir().unwrap();
+    git(project.path(), &["init", "--quiet"]);
+    fs::write(project.path().join("tracked.rs"), "pub fn previous() {}\n").unwrap();
+    commit(project.path(), "previous");
+    let initial = publish_checkout(&request(
+        storage.path(),
+        project.path(),
+        "crash-family",
+        "crash-view",
+        BTreeSet::new(),
+        true,
+    ))
+    .unwrap()
+    .generation
+    .unwrap();
+    fs::write(project.path().join("tracked.rs"), "pub fn partial() {}\n").unwrap();
+    commit(project.path(), "partial");
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "view_assembly_wiring_test::publication_crash_child",
+            "--nocapture",
+        ])
+        .env("AFT_VIEW_CRASH_ROOT", project.path())
+        .env("AFT_VIEW_CRASH_STORAGE", storage.path())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !storage.path().join("build-gated").is_file() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child did not reach the off-barrier publication gate");
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child exited before gate"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let view = aft::views::ViewStore::open(storage.path(), "crash-view").unwrap();
+    child.kill().unwrap();
+    let status = child.wait().unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    assert_eq!(
+        view.current_generation().unwrap().as_deref(),
+        Some(initial.as_str())
+    );
+    assert_eq!(
+        view.sweep_generations().unwrap(),
+        1,
+        "one killed generation must be reclaimed"
+    );
+    for entry in fs::read_dir(view.view_dir()).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        if name.starts_with("derived-")
+            || name.starts_with("trigram-")
+            || name.starts_with("manifest-")
+        {
+            assert!(name.contains(&initial), "orphan generation file: {name}");
+        }
+    }
+    assert!(view.derived_path(&initial).unwrap().is_file());
+    assert!(view.load_manifest(&initial).is_ok());
+}

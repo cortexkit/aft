@@ -954,11 +954,8 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
             ctx.view_runtime_snapshot()
                 .map(|snapshot| snapshot.pending_paths),
         ) {
-            if let Some(_permit) = ctx.cold_build_limiter().try_acquire() {
-                if let Err(error) = crate::executor::view_publication::schedule(ctx, pending, true)
-                {
-                    aft::slog_warn!("semantic-ready view publication failed: {}", error);
-                }
+            if let Err(error) = crate::executor::view_publication::schedule(ctx, pending, true) {
+                aft::slog_warn!("semantic-ready view publication failed: {}", error);
             }
         }
     }
@@ -2573,10 +2570,6 @@ fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSliceState) {
         .filter_map(|path| aft::views::RelPath::from_os_path(path).ok())
         .map(|path| path.as_bytes().to_vec())
         .collect::<BTreeSet<_>>();
-    let Some(_permit) = ctx.cold_build_limiter().try_acquire() else {
-        state.view_publication_due = Some(Instant::now() + Duration::from_millis(100));
-        return;
-    };
     match crate::executor::view_publication::schedule(
         ctx,
         changed,

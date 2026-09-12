@@ -165,7 +165,11 @@ pub(crate) fn schedule(
                         if token.cancel_requested_before_commit() {
                             return Err("view publication superseded".to_owned());
                         }
+                        #[cfg(test)]
+                        let cas_started = Instant::now();
                         let report = target.ctx.commit_view_update(&mut prepared)?;
+                        #[cfg(test)]
+                        tests::record_cas(target.ctx.canonical_cache_root(), cas_started.elapsed());
                         let _ = token.try_seal_committed();
                         report
                     };

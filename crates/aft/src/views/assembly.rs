@@ -74,6 +74,7 @@ pub struct PreparedAssembly {
     publication: Option<super::PreparedPublication>,
     files: Option<(ViewStore, String)>,
     pin: Option<AssemblyPin>,
+    _base_pin: Option<crate::pins::QueryPin>,
     profile: PublicationProfile,
 }
 
@@ -102,7 +103,13 @@ impl PreparedAssembly {
             }
         }
         self.profile.finish();
-        Ok(self.report.clone())
+        Ok(AssemblyReport {
+            generation: self.report.generation.take(),
+            manifest: self.report.manifest.take(),
+            blob_puts: self.report.blob_puts,
+            pending_paths: std::mem::take(&mut self.report.pending_paths),
+            published: self.report.published,
+        })
     }
 }
 
@@ -129,6 +136,11 @@ pub fn prepare_checkout(
     profile.enter(0, phase)?;
     let view = ViewStore::open(&request.storage, &request.scope)?;
     let current_generation = view.current_generation()?;
+    let base_pin = current_generation
+        .as_deref()
+        .map(|generation| crate::pins::QueryPin::acquire(view.view_dir(), generation))
+        .transpose()
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
     let previous = current_generation
         .as_deref()
         .map(|generation| view.load_manifest(generation))
@@ -314,6 +326,7 @@ pub fn prepare_checkout(
         publication: None,
         files: Some((view.clone(), next_generation.clone())),
         pin: Some(pin),
+        _base_pin: base_pin,
         profile,
     };
     prepared.profile.enter(1, phase)?;

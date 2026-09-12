@@ -10,6 +10,16 @@ use crate::{
 use crossbeam_channel::{Receiver, Sender};
 use std::{path::Path, time::Duration};
 
+static CAS_TIMINGS: LazyLock<Mutex<HashMap<PathBuf, Vec<Duration>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+pub(super) fn record_cas(root: PathBuf, elapsed: Duration) {
+    eprintln!(
+        "view pointer CAS and handle swap: {} ms",
+        elapsed.as_millis()
+    );
+    CAS_TIMINGS.lock().entry(root).or_default().push(elapsed);
+}
+
 struct GateEntry {
     phase: &'static str,
     started: Sender<u64>,
@@ -82,6 +92,10 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        let _ = env_logger::Builder::new()
+            .is_test(true)
+            .filter_module("aft::views::generation", log::LevelFilter::Info)
+            .try_init();
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let root_path = std::fs::canonicalize(project.path()).unwrap();
@@ -244,6 +258,9 @@ fn publication_build_does_not_delay_same_root_bind_and_read() {
     let previous = fixture.view.current_generation().unwrap();
     drop(gate);
     fixture.wait_idle();
+    assert!(CAS_TIMINGS.lock()[fixture.root.as_path()]
+        .iter()
+        .all(|elapsed| *elapsed < Duration::from_millis(50)));
     assert!(
         bound.is_ok() && read_result.is_ok() && elapsed < Duration::from_secs(1),
         "bind+read blocked for {elapsed:?}"
@@ -301,4 +318,69 @@ fn superseded_publication_cancels_before_derived_and_removes_generation_files() 
         "newer"
     )
     .is_ok());
+}
+
+#[test]
+fn generation_sweep_waits_for_the_last_query_handle() {
+    let fixture = Fixture::new();
+    let CallgraphStoreAccess::Ready(previous_reader) = fixture.ctx.callgraph_store_for_ops() else {
+        panic!("previous reader unavailable")
+    };
+    fixture.change("next");
+    fixture.schedule();
+    fixture.wait_idle();
+    assert_eq!(fixture.view.sweep_generations().unwrap(), 0);
+    assert!(fixture
+        .view
+        .derived_path(&fixture.initial)
+        .unwrap()
+        .is_file());
+    assert!(crate::callgraph_store::CallGraphRead::node_for(
+        &previous_reader,
+        Path::new("tracked.rs"),
+        "previous"
+    )
+    .is_ok());
+    drop(previous_reader);
+    assert_eq!(fixture.view.sweep_generations().unwrap(), 1);
+    assert!(!fixture
+        .view
+        .derived_path(&fixture.initial)
+        .unwrap()
+        .exists());
+    assert!(!fixture
+        .view
+        .manifest_path(&fixture.initial)
+        .unwrap()
+        .exists());
+}
+
+#[test]
+fn publication_health_reports_root_and_each_off_lane_phase() {
+    let fixture = Fixture::new();
+    for phase in ["manifest", "blobs", "derived", "cas"] {
+        fixture.change(&format!("phase_{phase}"));
+        let gate = Gate::new(fixture.root.as_path(), phase);
+        fixture.schedule();
+        let id = gate.started();
+        let health = health_snapshot();
+        let job = health
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|job| job["id"] == id)
+            .unwrap();
+        assert_eq!(
+            job["root"],
+            fixture.root.as_path().to_string_lossy().as_ref()
+        );
+        assert_eq!(job["phase"], phase);
+        assert_eq!(job["barrier_holder"], false);
+        assert!(
+            !fixture.executor.actor_is_idle(&fixture.root),
+            "an off-lane build must prevent actor retirement"
+        );
+        drop(gate);
+        fixture.wait_idle();
+    }
 }
