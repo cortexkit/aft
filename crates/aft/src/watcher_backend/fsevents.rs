@@ -462,6 +462,7 @@ mod tests {
         let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
         let generation = Arc::new(AtomicU64::new(1));
         let (tx, rx) = mpsc::channel();
+        thread::sleep(Duration::from_millis(100));
         let watcher = ProjectWatcher::create(
             canonical_root.clone(),
             Vec::new(),
@@ -507,7 +508,10 @@ mod tests {
         drop(watcher);
 
         let raw_event_count = events.len();
-        let raw_paths = events.into_iter().flat_map(|event| event.paths);
+        let raw_paths = events
+            .into_iter()
+            .filter(|event| crate::watcher_filter::watcher_event_invalidates(&event.kind))
+            .flat_map(|event| event.paths);
         let filtered = filter_watcher_raw_paths_for_test(
             &WatcherFilterConfig::new(canonical_root, None),
             &matcher,
