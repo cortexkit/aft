@@ -40,7 +40,7 @@ cargo test -p agent-file-tools --test callgraph_refresh_bench \
   bench_refresh_files_on_store_copy -- --ignored --nocapture
 ```
 
-For the retained diagnostic baseline, add `AFT_CALLGRAPH_WRITE_AMP_BASELINE=1`. That switch restores unconditional same-file row replacement, `synchronous=FULL`, and the former 1,000-page autocheckpoint threshold; it is only an offline comparison seam.
+The baseline numbers below were taken with the pre-fix behaviour (unconditional same-file row replacement, `synchronous=FULL`, the 1,000-page autocheckpoint). That behaviour is not a switch in the product: to re-measure it, apply it as a scratch edit in `crates/aft/src/callgraph_store/mod.rs` (the three pragma sites in `configure_connection`/`configure_build_connection`/the reader opener and the `stored_extract_matches` guard in `refresh_files_profiled`), run the probe, and revert.
 
 ## What `refresh_files` writes
 

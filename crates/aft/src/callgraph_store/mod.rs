@@ -89,10 +89,6 @@ const STAGED_RESOLVE_CURSOR: &str = "resolve_cursor";
 const STAGED_BUILD_PHASE: &str = "staged_build_phase";
 const STAGED_CORPUS_FINGERPRINT: &str = "staged_corpus_fingerprint";
 
-fn write_amplification_baseline_enabled() -> bool {
-    std::env::var_os("AFT_CALLGRAPH_WRITE_AMP_BASELINE").is_some()
-}
-
 type ColdBuildSwapObserver = dyn Fn(&Path, &Path) + Send + Sync + 'static;
 pub type ColdBuildPhaseObserver = dyn Fn(&'static str) + Send + Sync + 'static;
 #[cfg(test)]
@@ -4355,9 +4351,7 @@ impl CallGraphStore {
                 let Some(extract) = changed_extracts.get(rel_path) else {
                     continue;
                 };
-                if !write_amplification_baseline_enabled()
-                    && stored_extract_matches(&tx, rel_path, extract, &index)?
-                {
+                if stored_extract_matches(&tx, rel_path, extract, &index)? {
                     unchanged_extracts += 1;
                     update_file_fresh_metadata(
                         &tx,
@@ -7155,15 +7149,7 @@ fn open_readonly_connection(path: &Path) -> Result<TrackedConnection> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
         SqliteStore::CallgraphGeneration,
     )?;
-    conn.pragma_update(
-        None,
-        "synchronous",
-        if write_amplification_baseline_enabled() {
-            "FULL"
-        } else {
-            "NORMAL"
-        },
-    )?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.busy_timeout(reader_busy_timeout())?;
     conn.execute_batch("PRAGMA query_only=ON;")?;
     Ok(conn)
@@ -7205,20 +7191,11 @@ fn configure_connection(conn: &Connection) -> Result<()> {
     // failing immediately, especially under Windows byte-range locking.
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    let baseline = write_amplification_baseline_enabled();
-    conn.pragma_update(
-        None,
-        "synchronous",
-        if baseline { "FULL" } else { "NORMAL" },
-    )?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(
         None,
         "wal_autocheckpoint",
-        if baseline {
-            1_000
-        } else {
-            CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES
-        },
+        CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES,
     )?;
     conn.pragma_update(None, "cache_size", CALLGRAPH_SQLITE_CACHE_KIB)?;
     Ok(())
@@ -7231,15 +7208,7 @@ fn configure_build_connection(conn: &Connection) -> Result<()> {
     // can contend with a connection finishing an earlier staged transaction.
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(
-        None,
-        "synchronous",
-        if write_amplification_baseline_enabled() {
-            "FULL"
-        } else {
-            "NORMAL"
-        },
-    )?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.pragma_update(None, "cache_size", CALLGRAPH_SQLITE_CACHE_KIB)?;
     Ok(())
 }

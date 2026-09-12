@@ -522,34 +522,23 @@ struct WriteAmplificationMeasurement {
     output_blocks: u64,
 }
 
-/// Compare the shipped configuration with the legacy full-scan configuration,
-/// which scans 1,000 pages and skips row-difference checks. Keep this test ignored
-/// because it performs 50 edits for an offline write-amplification measurement.
+/// Measure the shipped refresh configuration over 50 graph-neutral edits. The
+/// legacy baseline (unconditional row replacement, `synchronous=FULL`, the
+/// 1,000-page autocheckpoint) is no longer a switch in the product; to compare
+/// against it, apply that behaviour as a scratch edit in `callgraph_store/mod.rs`
+/// (see docs/investigations/callgraph-refresh-write-amplification-2026-09.md),
+/// run this measurement, and revert. Ignored because it performs 50 edits.
 #[test]
 #[ignore = "offline write-amplification measurement"]
-fn measure_write_amplification_ab() {
-    let baseline = run_write_amplification_sequence(true);
-    let optimized = run_write_amplification_sequence(false);
-    let byte_ratio = if baseline.directory_delta_bytes == 0 {
-        None
-    } else {
-        Some(optimized.directory_delta_bytes as f64 / baseline.directory_delta_bytes as f64)
-    };
-    let block_ratio = if baseline.output_blocks == 0 {
-        None
-    } else {
-        Some(optimized.output_blocks as f64 / baseline.output_blocks as f64)
-    };
+fn measure_write_amplification() {
+    let measurement = run_write_amplification_sequence();
     eprintln!(
-        "write_amplification_ab baseline={{directory_delta_bytes:{}, output_blocks:{}}} optimized={{directory_delta_bytes:{}, output_blocks:{}}} ratios={{bytes:{byte_ratio:?}, blocks:{block_ratio:?}}}",
-        baseline.directory_delta_bytes,
-        baseline.output_blocks,
-        optimized.directory_delta_bytes,
-        optimized.output_blocks,
+        "write_amplification directory_delta_bytes={} output_blocks={}",
+        measurement.directory_delta_bytes, measurement.output_blocks,
     );
 }
 
-fn run_write_amplification_sequence(baseline: bool) -> WriteAmplificationMeasurement {
+fn run_write_amplification_sequence() -> WriteAmplificationMeasurement {
     let temp = tempfile::tempdir().expect("measurement temp dir");
     let project_root = temp.path().join("project");
     let store_dir = project_root.join(".store-write-amp");
@@ -568,12 +557,6 @@ fn run_write_amplification_sequence(baseline: bool) -> WriteAmplificationMeasure
         files.push(path);
     }
 
-    let previous = std::env::var_os("AFT_CALLGRAPH_WRITE_AMP_BASELINE");
-    if baseline {
-        std::env::set_var("AFT_CALLGRAPH_WRITE_AMP_BASELINE", "1");
-    } else {
-        std::env::remove_var("AFT_CALLGRAPH_WRITE_AMP_BASELINE");
-    }
     let (store, _) =
         CallGraphStore::cold_build_with_lease(store_dir.clone(), project_root.clone(), &files)
             .expect("cold-build measurement store");
@@ -597,10 +580,6 @@ fn run_write_amplification_sequence(baseline: bool) -> WriteAmplificationMeasure
         directory_delta_bytes,
         output_blocks: output_blocks().saturating_sub(before_blocks),
     };
-    match previous {
-        Some(value) => std::env::set_var("AFT_CALLGRAPH_WRITE_AMP_BASELINE", value),
-        None => std::env::remove_var("AFT_CALLGRAPH_WRITE_AMP_BASELINE"),
-    }
     measurement
 }
 
