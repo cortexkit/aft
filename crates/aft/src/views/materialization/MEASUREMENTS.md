@@ -65,3 +65,57 @@ cargo test -p agent-file-tools --lib views::materialization::tests
 The real probe prints and retains its measured database directory under the offline input so parity failures can be inspected without rerunning the expensive cold build. The comparison reports only the first mismatching table and a bounded row sample.
 
 The small edit/add/remove fixture writes exactly **13 graph rows + 6 dependency/surface-cache rows**. The original full rewrite performs **23 graph writes**. Mutation controls demonstrate that skipping incoming relinks fails edge parity, forcing a full rewrite fails exact work counts, skipping transitive dependents fails the new-reexport edge, and omitting missing canonical probes fails the Rust module-addition fixture. Each mutation is restored before any commit.
+
+## Release branch drill after integration
+
+Two both-arm runs used this worktree's optimized `aft` binary, copied warm non-view caches, and a fresh view directory so the warm-up built the matching materialization schema. The opencode checkout and baseline were restored by the drill; the live daemon and live view storage were not subjects. Generated reports in the investigation directory were copied to `target/` and restored rather than committed over the existing investigation.
+
+### First run: dependency closure without consumer-surface pruning
+
+| switch | publication ms | views CPU s | legacy CPU s | views correct ms | legacy correct ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HEAD → a085bf62a459 | 67,657 | 72.18 | 30.23 | 67,930 | 27,354 |
+| a085bf62a459 → HEAD | 63,562 | 68.32 | 28.01 | 63,562 | 23,646 |
+| HEAD → upstream/v2-timeouts | 61,571 | 66.47 | 28.85 | 61,571 | 24,329 |
+| upstream/v2-timeouts → HEAD | 63,312 | 68.82 | 30.98 | 63,640 | 25,963 |
+
+All correctness probes converged. The drill incorrectly reported 15 puts from the absolute manifest membership delta because it did not parse the new root-owned publication phase profile. Actual profile counters were zero. The attribution fix now prefers those profiles; its unit test goes red if they are ignored.
+
+### Final run: consumer surfaces, unique binding positions, lazy row emission
+
+Measured code: `d81a33a4` (optimized build), observed **2026-09-12T20:04:02Z**. Warm-up: views 76,294 ms; legacy 5,506 ms. This is the actual captured table; the script's static narrative and historical SHA label are not reused as attribution.
+
+| switch | on publication_ms | on puts | on embeds | on cpu_s | on rss_delta_mb | on correct_ms | off publication_ms | off puts | off embeds | off cpu_s | off rss_delta_mb | off correct_ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| HEAD→a085bf62a459 | 70103 | 0 | 0 | 77.64 | 1935.953 | 70646 | — | — | 3 | 78.1 | 2689.516 | 65825 |
+| a085bf62a459→HEAD | 70415 | 0 | 0 | 75.7 | 25.078 | 71031 | — | — | 4 | 68.71 | 101.141 | 56743 |
+| HEAD→refs/remotes/upstream/v2-timeouts | 66092 | 0 | 0 | 71.48 | -45.141 | 66092 | — | — | 3 | 68.03 | -331.625 | 55434 |
+| refs/remotes/upstream/v2-timeouts→HEAD | 64636 | 0 | 0 | 70.63 | -87.438 | 65024 | — | — | 4 | 60.58 | -447.469 | 52275 |
+
+Every correctness probe passed, every views publication put/embedded zero blobs/batches, and the script reported no defects. **The stronger shipping criterion is still unmet: views does not beat legacy on every case.** It is slower to correctness on all four transitions, and uses more CPU on three. Do not treat a zero-defect script exit as a performance pass. The substantially different legacy CPU times between runs also rule out presenting these wall/CPU observations as a controlled cross-run speedup.
+
+Profile attribution for the final run:
+
+| switch | unchanged consumers re-resolved | current files resolved | references resolved | derived phase ms | CAS ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| HEAD → A | 296 | 556 | 93,230 | 37,632 | 13 |
+| A → HEAD | 296 | 569 | 95,222 | 35,499 | 17 |
+| HEAD → B | 323 | 583 | 96,254 | 34,951 | 13 |
+| B → HEAD | 323 | 596 | 98,078 | 33,174 | 13 |
+
+Compared with the first run's 1,335 / 1,146 unchanged dependents and 188,185 / 174,750 forward references, selection is materially smaller. However, complete symbol-index reconstruction, emitting tens of thousands of changed-owner rows, and persisted surface-query cache size remain material costs. The final derived database is approximately 424–428 MB versus 335–339 MB before surface recording. This delivery establishes parity, bounded writes and narrower resolution; it does not establish that enabling views is ready to ship.
+
+Retained local evidence: `target/branch-drill-surface.json`, `target/branch-drill-surface.stderr.log`, and `target/view-diff-input/.tmpuNg1g2/{base,cold,incremental}.sqlite`. These are offline artifacts, not live stores.
+
+### Offline measurement of the real 300-Git-path transition
+
+The final drill produced a better input pair than the older retained artifact: its generations 1 → 2 correspond to HEAD → A, **300 changed Git paths and 276 changed manifest entries**. Those immutable manifests and the closed blob database were copied inside this worktree and measured separately with the same benchmark. This is additional offline measurement, not another drill run. The initial read-only Python backup opener returned `SQLITE_CANTOPEN`; a main-file clone of the closed, WAL-free callgraph blob database succeeded instead.
+
+| operation | physical bytes | logical bytes | WAL bytes | wall seconds | CPU seconds |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Full rewrite | 846,159,872 | 1,340,615,544 | 422,897,432 | 263.089 | 208.216 |
+| Incremental | 379,342,848 | 487,851,246 | 143,586,152 | 291.479 | 167.437 |
+
+Every-table parity passes on this real transition. Incremental work is 110,596 graph-row operations plus 36,923 dependency/surface-cache operations, versus 821,633 plus 344,787 cold; 296 unchanged consumers / 556 total files / 93,230 references are resolved. **The requested tens-of-MiB write target is not met on this larger real transition:** incremental physical writes are 361.77 MiB, though below 806.96 MiB cold. Wall time also did not improve in this offline sample. The successful 17-entry measurement must not be substituted for this larger case. Combined with the final drill, this is an explicit remaining acceptance gap, not a shipping recommendation.
+
+Retained databases: `target/view-diff-real-300-input/.tmpoSckwe/{base,cold,incremental}.sqlite`.
