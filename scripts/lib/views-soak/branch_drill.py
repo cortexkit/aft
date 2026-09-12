@@ -47,11 +47,11 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 RESULT_DIR = REPO_ROOT / "docs" / "investigations" / "views-soak-2026-09"
 OPENCODE_ROOT = Path.home() / "Work" / "OSS" / "opencode"
 REUSE_RE = re.compile(
-    r"content-addressed view HEAD reuse (?P<reused>\d+)/(?P<total>\d+) for (?P<root>.+)$"
+    r"content-addressed view HEAD reuse (?P<reused>\d+)/(?P<total>\d+) root=(?P<root>.+)$"
 )
 PUBLICATION_RE = re.compile(
     r"content-addressed view publication published=(?P<published>true|false) "
-    r"blob_puts=(?P<puts>\d+) pending_paths=(?P<pending>\d+)"
+    r"blob_puts=(?P<puts>\d+) pending_paths=(?P<pending>\d+) root=(?P<root>.+)$"
 )
 EMBED_RE = re.compile(
     r'semantic embedder refresh: root="(?P<root>[^"]+)" .*? files=(?P<files>\d+) '
@@ -305,7 +305,11 @@ def log_metrics(text: str, root: Path) -> tuple[int | None, int | None, int, int
         if reuse and reuse.group("root") in root_texts:
             reuse_puts = int(reuse.group("total")) - int(reuse.group("reused"))
         publication = PUBLICATION_RE.search(line)
-        if publication and publication.group("published") == "true":
+        if (
+            publication
+            and publication.group("published") == "true"
+            and publication.group("root") in root_texts
+        ):
             publication_puts = int(publication.group("puts"))
         embed = EMBED_RE.search(line)
         if embed and embed.group("root") in root_texts:

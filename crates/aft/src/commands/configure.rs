@@ -5395,7 +5395,7 @@ fn open_view_runtime_for_configure(
     // Info level so the soak observable (how much of HEAD the view reuses, and
     // how many paths a publication will touch) is readable from the daemon log.
     slog_info!(
-        "content-addressed view HEAD reuse {}/{} for {}",
+        "content-addressed view HEAD reuse {}/{} root={}",
         report.numerator,
         report.denominator,
         job.canonical_cache_root.display()
@@ -5424,7 +5424,7 @@ fn open_view_runtime_for_configure(
     };
     if !pending_paths.is_empty() {
         slog_info!(
-            "content-addressed view publication scheduled: {} path(s) for {}",
+            "content-addressed view publication scheduled paths={} root={}",
             pending_paths.len(),
             job.canonical_cache_root.display()
         );

@@ -93,9 +93,10 @@ class BranchDrillTests(unittest.TestCase):
         root = Path("/tmp/opencode")
         text = "\n".join(
             [
-                "content-addressed view HEAD reuse 98/100 for /tmp/opencode",
-                "content-addressed view HEAD reuse 0/50 for /tmp/other",
-                "content-addressed view publication published=true blob_puts=2 pending_paths=0",
+                "content-addressed view HEAD reuse 98/100 root=/tmp/opencode",
+                "content-addressed view HEAD reuse 0/50 root=/tmp/other",
+                "content-addressed view publication published=true blob_puts=2 pending_paths=0 root=/tmp/opencode",
+                "content-addressed view publication published=true blob_puts=49 pending_paths=0 root=/tmp/other",
                 'semantic embedder refresh: root="/tmp/opencode" reason="watcher batch" files=3 chunks=4 batches=2 backend=x',
                 'semantic embedder refresh: root="/tmp/other" reason="watcher batch" files=3 chunks=4 batches=7 backend=x',
             ]

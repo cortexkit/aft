@@ -2548,16 +2548,21 @@ fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSliceState) {
     match ctx.publish_view_paths(changed, !ctx.shared_artifacts_read_only()) {
         Ok(report) => {
             aft::slog_info!(
-                "content-addressed view publication published={} blob_puts={} pending_paths={}",
+                "content-addressed view publication published={} blob_puts={} pending_paths={} root={}",
                 report.published,
                 report.blob_puts,
-                report.pending_paths.len()
+                report.pending_paths.len(),
+                root.display()
             );
             state.view_publication_paths.clear();
             state.view_publication_due = None;
         }
         Err(error) => {
-            aft::slog_warn!("content-addressed view publication failed: {}", error);
+            aft::slog_warn!(
+                "content-addressed view publication failed root={} error={}",
+                root.display(),
+                error
+            );
             state.view_publication_due = Some(Instant::now() + Duration::from_secs(1));
         }
     }
