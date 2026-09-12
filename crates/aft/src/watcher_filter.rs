@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,6 +17,7 @@ pub const WATCHER_MAX_BATCH_PATHS: usize = 1024;
 pub const WATCHER_DISPATCH_CHANNEL_CAPACITY: usize = 1024;
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const FSEVENTS_EXCLUSION_LIMIT: usize = 8;
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 const EXCLUSION_FILE_COUNT_CAP: usize = 50_000;
 const ROOT_DELETED_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const GITIGNORE_REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -278,6 +280,7 @@ fn watcher_path_is_ignored(matcher: Option<&Gitignore>, path: &Path) -> bool {
 /// exclusions does not require a second walk. Counting stops at 50,000 files
 /// per excluded subtree because larger values are equivalent for prioritising
 /// high-churn directories and should not delay watcher startup.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) fn derive_excluded_subtrees(
     root: &Path,
     matcher: &SharedGitignore,

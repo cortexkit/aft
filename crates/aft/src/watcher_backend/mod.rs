@@ -61,6 +61,7 @@ pub(crate) fn create_project_watcher(
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn log_exclusions(root: &std::path::Path, exclusions: &[PathBuf]) {
     let rendered = exclusions
         .iter()
