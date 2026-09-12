@@ -930,6 +930,66 @@ TRAIN_PUSH_TEST_REPO="" run_train "$dir" slug
 expect_rc 0 "a github-shaped origin lands without REPO"
 expect_out "example/derived" "the slug is derived from origin's configured URL"
 
+# --- concurrent trains: a live pid refuses, a stale lock clears, a leftover
+# ref lists its delete and proceeds, and the lock is claimed before any ref
+# moves (names mirror BROCA's suite so the two copies stay comparable) -------
+# test_clean_state_does_not_refuse_for_concurrency
+dir="$(new_fixture pidlock-clean)"
+add_train_commit "$dir/work" "clean"
+run_train "$dir" clean
+expect_rc 0 "a clean state lands without a concurrency refusal"
+expect_no_out "is RUNNING as pid" "no train was reported running"
+# test_the_lock_is_claimed_before_any_ref_moves: the lock must exist even on a
+# run that never reached the push - a lock written after the push would leave
+# the resolve-HEAD-to-push window uncovered, the hole the ref-based guard had.
+dir="$(new_fixture lock-order)"
+add_train_commit "$dir/work" "lock-order"
+echo "failure" > "$dir/ci-state/conclusion"
+echo "Unit / broken" > "$dir/ci-state/failed_job"
+run_train "$dir" lockorder
+expect_rc 1 "the CI-red run stops before landing"
+if [ -e "$dir/work/.git/train-push-locks/lockorder.lock" ]; then
+  ok "the lock was claimed before the push, so it exists after a run that never landed"
+else
+  fail "the lock was not claimed before the push"
+fi
+# test_a_live_lock_refuses_and_names_the_pid
+dir="$(new_fixture live-lock)"
+add_train_commit "$dir/work" "live"
+mkdir -p "$dir/work/.git/train-push-locks"
+sleep 60 &
+sleeper=$!
+echo "$sleeper" > "$dir/work/.git/train-push-locks/other.lock"
+run_train "$dir" live
+kill "$sleeper" 2>/dev/null || true
+expect_rc 2 "a live lock refuses the second train"
+expect_out "train other is RUNNING as pid $sleeper" "the refusal names the train and its pid"
+if [ -z "$(origin_ref "$dir" refs/heads/train/live)" ]; then
+  ok "the refused train pushed no ref"
+else
+  fail "the refused train pushed a ref"
+fi
+# test_a_stale_lock_is_cleared_and_does_not_refuse
+dir="$(new_fixture stale-lock)"
+add_train_commit "$dir/work" "stale"
+mkdir -p "$dir/work/.git/train-push-locks"
+echo "2147483000" > "$dir/work/.git/train-push-locks/gone.lock"
+run_train "$dir" stale
+expect_rc 0 "a stale lock (dead pid) does not refuse"
+if [ -e "$dir/work/.git/train-push-locks/gone.lock" ]; then
+  fail "the stale lock was not cleared"
+else
+  ok "the stale lock was cleared by the scan"
+fi
+# test_a_leftover_ref_lists_its_delete_and_proceeds
+dir="$(new_fixture leftover-ref)"
+add_train_commit "$dir/work" "leftover"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/abandoned"
+run_train "$dir" leftover
+expect_rc 0 "a leftover ref with no live train proceeds"
+expect_out "git push origin --delete train/abandoned" "the leftover ref's delete is composed"
+expect_out "cannot race this train" "the run says why it proceeds"
+
 if [ "$failures" -ne 0 ]; then
   printf 'train-push.test.sh: %s check(s) failed\n' "$failures" >&2
   exit 1

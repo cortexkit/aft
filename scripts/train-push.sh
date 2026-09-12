@@ -26,6 +26,15 @@
 # never a force. gated-push.sh stays for the work whose failures only reproduce
 # locally (watcher/fseventsd, macOS exec assessment).
 #
+# EDIT THIS FILE BY WRITE-TEMP-THEN-RENAME, NEVER IN PLACE. A running bash holds
+# an open fd and reads on by byte offset, so an in-place write (same inode) makes
+# a live train resume at the wrong offset and die on a syntax error in code it
+# never reached - "line 789: syntax error near unexpected token `('" in a file
+# that passes `bash -n` before and after. A rename into place (new inode) leaves
+# the live run on the old bytes. Measured both ways by BROCA; AFT restored bytes
+# under a live train once. Nothing lands from such a death: it happens before
+# the landing push, and the ref left behind is the recoverable repush state.
+#
 # A MERGE IS ITSELF A TRAIN PUSH. Under required status checks, a merge commit
 # made locally has no check of its own - main's protection sees an unchecked
 # sha and refuses the push, however green both sides were separately. So do the
@@ -160,6 +169,62 @@ train_ref="train/$train_name"
 if ! git check-ref-format "refs/heads/$train_ref"; then
   refuse "'$train_name' is not a usable branch name component"
 fi
+
+# REFUSE A CONCURRENT TRAIN. Two trains overlap the moment one is backgrounded and
+# another started - which is exactly what an operator wants to do, because a train
+# takes minutes and waiting is dull. They are not concurrent-safe: each resolves
+# HEAD and moves refs on one remote, so the second can land the first's commits,
+# or find main already where it meant to put it and report a failure over a
+# landing that succeeded. That false failure is the mild outcome; the dangerous
+# one is a train landing a sha its CI never tested.
+#
+# A remote train/* ref is NOT the signal: a ref outlives its process (a red CI
+# leaves the ref as the repush target, and the same train name is re-run round
+# after round), and a ref arrives late (a train between resolve-HEAD and push
+# holds no ref yet, so a second train in that window would be permitted - the
+# exact concurrency to refuse). A pid is the direct observable. The lock below
+# is a record, not a mutex: it means nothing unless its process is alive, so a
+# SIGKILLed train (no trap runs) leaves a file the next scan clears. No EXIT
+# trap on purpose - bash traps are global and a function further down sets one.
+#
+# Limit: the lock is local, refs are remote, so this sees trains on this box
+# only. One operator, one box here; a second machine driving the same remote is
+# invisible to it, which is why leftover refs are still listed below.
+# (Lifted from BROCA's train-push, 98b68a85.)
+train_lock_dir="$(git rev-parse --git-dir 2>/dev/null)/train-push-locks"
+mkdir -p "$train_lock_dir" 2>/dev/null || true
+live_trains=0
+for lock in "$train_lock_dir"/*.lock; do
+  [ -e "$lock" ] || continue
+  lock_pid="$(cat "$lock" 2>/dev/null || true)"
+  lock_name="$(basename "$lock" .lock)"
+  if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+    live_trains=$((live_trains + 1))
+    printf 'train-push: train %s is RUNNING as pid %s\n' "$lock_name" "$lock_pid" >&2
+  else
+    rm -f "$lock" 2>/dev/null || true
+  fi
+done
+if [ "$live_trains" -gt 0 ]; then
+  printf '  wait for it, or kill it if you know it is wedged.\n' >&2
+  refuse "a train is already running on this machine; wait for it"
+fi
+
+# Leftover refs do not refuse - no process drives them, so they cannot race this
+# train. They are listed with the delete composed, because the operator reaching
+# this line is usually mid-CI-failure and composing `--delete train/<name>` by
+# hand next to several refs is where the wrong one gets deleted.
+stale_refs=$(git ls-remote --heads "$remote" 'train/*' 2>/dev/null | wc -l | tr -d ' ')
+if [ "${stale_refs:-0}" -gt 0 ]; then
+  printf 'train-push: %s train ref(s) on %s with no live train here:\n' \
+    "$stale_refs" "$remote" >&2
+  git ls-remote --heads "$remote" 'train/*' 2>/dev/null |
+    sed "s|.*refs/heads/|    git push $remote --delete |" >&2
+  printf '  (proceeding: a ref without a process cannot race this train)\n' >&2
+fi
+
+# Claim the lock for THIS train before any ref moves.
+printf '%s\n' "$$" > "$train_lock_dir/${train_name}.lock" 2>/dev/null || true
 
 # Operator tooling runs on the upstream gh; the shim is only for agent commands.
 # Sourced up front because the trigger probe, the default-branch fallback, and
