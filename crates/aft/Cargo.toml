@@ -22,6 +22,9 @@ path = "src/main.rs"
 name = "fake-lsp-server"
 path = "tests/lsp/fake_server.rs"
 
+[features]
+semantic-chunk-census = []
+
 [dependencies]
 log = "0.4"
 env_logger = "0.11"

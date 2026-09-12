@@ -4620,12 +4620,13 @@ impl<'a> SourceLineCache<'a> {
     }
 }
 
-/// Build enriched embedding text from a symbol with cAST-style context
-fn build_embed_text_with_lines(
+/// Build enriched embedding text from a symbol with cAST-style context.
+fn build_embed_text_with_lines_and_caps(
     symbol: &Symbol,
     line_cache: &SourceLineCache<'_>,
     file: &Path,
     project_root: &Path,
+    caps: ChunkCaps,
 ) -> String {
     let relative = file
         .strip_prefix(project_root)
@@ -4661,7 +4662,10 @@ fn build_embed_text_with_lines(
         // llama.cpp server's 512-token cap), aborting the whole index build
         // and silently degrading every search to lexical. 400 chars keeps the
         // identifying head of the signature without blowing the budget.
-        text.push_str(&format!(" signature:{}", truncate_chars(sig, 400)));
+        text.push_str(&format!(
+            " signature:{}",
+            truncate_chars(sig, caps.signature_chars)
+        ));
     }
 
     // Add body snippet (first ~300 chars of symbol body)
@@ -4671,12 +4675,12 @@ fn build_embed_text_with_lines(
     if start < end {
         let body: String = line_cache.lines[start..end]
             .iter()
-            .take(15) // max 15 lines
+            .take(caps.body_lines)
             .copied()
             .collect::<Vec<&str>>()
             .join("\n");
-        let snippet = if body.len() > 300 {
-            format!("{}...", &body[..body.floor_char_boundary(300)])
+        let snippet = if body.len() > caps.body_chars {
+            format!("{}...", &body[..body.floor_char_boundary(caps.body_chars)])
         } else {
             body
         };
@@ -4687,19 +4691,55 @@ fn build_embed_text_with_lines(
     // backend's per-input budget regardless of which field grew. Most
     // backends cap a physical batch around 512 tokens; ~1600 chars stays
     // comfortably under that for typical English/code (≈4 chars/token).
-    truncate_chars(&text, MAX_EMBED_TEXT_CHARS)
+    truncate_chars(&text, caps.total_chars)
 }
 
 #[cfg(test)]
 fn build_embed_text(symbol: &Symbol, source: &str, file: &Path, project_root: &Path) -> String {
     let line_cache = SourceLineCache::new(source);
-    build_embed_text_with_lines(symbol, &line_cache, file, project_root)
+    build_embed_text_with_lines_and_caps(
+        symbol,
+        &line_cache,
+        file,
+        project_root,
+        ChunkCaps::default(),
+    )
 }
 
 /// Upper bound on characters in a single chunk's `embed_text`. Keeps any one
 /// input below typical embedding-backend physical batch limits (~512 tokens)
 /// so an oversized symbol cannot abort the whole index build.
 const MAX_EMBED_TEXT_CHARS: usize = 1600;
+
+#[cfg(feature = "semantic-chunk-census")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkCaps {
+    pub signature_chars: usize,
+    pub body_lines: usize,
+    pub body_chars: usize,
+    pub total_chars: usize,
+}
+
+#[cfg(not(feature = "semantic-chunk-census"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkCaps {
+    signature_chars: usize,
+    body_lines: usize,
+    body_chars: usize,
+    total_chars: usize,
+}
+
+impl Default for ChunkCaps {
+    fn default() -> Self {
+        Self {
+            signature_chars: 400,
+            body_lines: 15,
+            body_chars: 300,
+            total_chars: MAX_EMBED_TEXT_CHARS,
+        }
+    }
+}
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
@@ -4769,6 +4809,24 @@ fn build_file_summary_chunk_with_lines(
     top_exports: &[&str],
     top_export_signatures: &[Option<&str>],
 ) -> SemanticChunk {
+    build_file_summary_chunk_with_lines_and_caps(
+        file,
+        project_root,
+        line_cache,
+        top_exports,
+        top_export_signatures,
+        ChunkCaps::default(),
+    )
+}
+
+fn build_file_summary_chunk_with_lines_and_caps(
+    file: &Path,
+    project_root: &Path,
+    line_cache: &SourceLineCache<'_>,
+    top_exports: &[&str],
+    top_export_signatures: &[Option<&str>],
+    caps: ChunkCaps,
+) -> SemanticChunk {
     let relative = file.strip_prefix(project_root).unwrap_or(file);
     let rel_path = relative.to_string_lossy();
     let parent_dir = relative
@@ -4811,7 +4869,7 @@ fn build_file_summary_chunk_with_lines(
                     .map(|stem| stem.to_string_lossy().to_string())
                     .unwrap_or_default()
             ),
-            MAX_EMBED_TEXT_CHARS,
+            caps.total_chars,
         ),
         snippet,
     }
@@ -4960,6 +5018,31 @@ fn collect_semantic_file(
     Ok((indexed_metadata, chunks))
 }
 
+#[cfg(feature = "semantic-chunk-census")]
+#[doc(hidden)]
+pub fn collect_file_chunks_for_census(
+    project_root: &Path,
+    file: &Path,
+    census_caps: ChunkCaps,
+) -> Result<(Vec<SemanticChunk>, Vec<SemanticChunk>), String> {
+    if !is_semantic_indexed_extension(file) {
+        return Err("unsupported file extension".to_string());
+    }
+    let lang = detect_language(file).ok_or_else(|| "unsupported file extension".to_string())?;
+    if fs::metadata(file).is_ok_and(|metadata| metadata.len() > MAX_SEMANTIC_FILE_BYTES) {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let source = fs::read_to_string(file).map_err(|error| error.to_string())?;
+    let tree =
+        parse_source_with_cached_parser(file, &source, lang).map_err(|error| error.to_string())?;
+    let symbols =
+        extract_symbols_from_tree(&source, &tree, lang).map_err(|error| error.to_string())?;
+    let today = symbols_to_chunks(file, &symbols, &source, project_root);
+    let census = symbols_to_chunks_with_caps(file, &symbols, &source, project_root, census_caps);
+    Ok((today, census))
+}
+
 #[cfg(test)]
 fn collect_file_chunks(project_root: &Path, file: &Path) -> Result<Vec<SemanticChunk>, String> {
     if !is_semantic_indexed_extension(file) {
@@ -5066,6 +5149,16 @@ fn symbols_to_chunks(
     source: &str,
     project_root: &Path,
 ) -> Vec<SemanticChunk> {
+    symbols_to_chunks_with_caps(file, symbols, source, project_root, ChunkCaps::default())
+}
+
+fn symbols_to_chunks_with_caps(
+    file: &Path,
+    symbols: &[Symbol],
+    source: &str,
+    project_root: &Path,
+    caps: ChunkCaps,
+) -> Vec<SemanticChunk> {
     let line_cache = SourceLineCache::new(source);
     let mut chunks = Vec::new();
     let top_exports_with_signatures = symbols
@@ -5091,12 +5184,13 @@ fn symbols_to_chunks(
             .iter()
             .map(|(_, signature)| *signature)
             .collect::<Vec<_>>();
-        chunks.push(build_file_summary_chunk_with_lines(
+        chunks.push(build_file_summary_chunk_with_lines_and_caps(
             file,
             project_root,
             &line_cache,
             &top_exports,
             &top_export_signatures,
+            caps,
         ));
     }
 
@@ -5119,7 +5213,8 @@ fn symbols_to_chunks(
             continue;
         }
 
-        let embed_text = build_embed_text_with_lines(symbol, &line_cache, file, project_root);
+        let embed_text =
+            build_embed_text_with_lines_and_caps(symbol, &line_cache, file, project_root, caps);
         let snippet = build_snippet_with_lines(symbol, &line_cache);
 
         chunks.push(SemanticChunk {
@@ -8178,6 +8273,48 @@ public class Greeter {
             MAX_EMBED_TEXT_CHARS,
             text.chars().count()
         );
+    }
+
+    #[test]
+    fn unbounded_chunk_caps_preserve_full_signature_and_body() {
+        let project_root = PathBuf::from("/proj");
+        let file = project_root.join("long.rs");
+        let source = (0..20)
+            .map(|line| format!("line_{line:02}_{}", "body".repeat(20)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut symbol = make_symbol(SymbolKind::Function, "long_function", 0, 19);
+        symbol.signature = Some(format!(
+            "fn long_function({}) SIGNATURE_END",
+            "x".repeat(500)
+        ));
+        let line_cache = SourceLineCache::new(&source);
+
+        let today = build_embed_text_with_lines_and_caps(
+            &symbol,
+            &line_cache,
+            &file,
+            &project_root,
+            ChunkCaps::default(),
+        );
+        let full = build_embed_text_with_lines_and_caps(
+            &symbol,
+            &line_cache,
+            &file,
+            &project_root,
+            ChunkCaps {
+                signature_chars: usize::MAX,
+                body_lines: usize::MAX,
+                body_chars: usize::MAX,
+                total_chars: usize::MAX,
+            },
+        );
+
+        assert!(!today.contains("SIGNATURE_END"));
+        assert!(!today.contains("line_19"));
+        assert!(full.contains("SIGNATURE_END"));
+        assert!(full.contains("line_19"));
+        assert!(full.len() > today.len());
     }
 
     /// Code symbols (functions, classes, methods, structs, etc.) must still
