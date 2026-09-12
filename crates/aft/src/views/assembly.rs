@@ -301,6 +301,25 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
             .into_iter()
             .map(|candidate| (candidate.path, candidate.entry)),
     )?;
+    // A publication that reproduces the current manifest byte for byte is a
+    // no-op: callers fire on triggers that often leave HEAD untouched (a
+    // semantic refresh completing, a watcher batch of ignored edits), and each
+    // redundant generation costs a full derived-database materialization and
+    // a pointer swap. Keep the current generation and report nothing published.
+    if current_generation
+        .as_deref()
+        .is_some_and(|generation| generation.ends_with(&request.desired_head))
+        && previous.as_ref() == Some(&manifest)
+    {
+        pin.release();
+        return Ok(AssemblyReport {
+            generation: current_generation,
+            manifest: None,
+            blob_puts,
+            pending_paths,
+            published: false,
+        });
+    }
     crate::callgraph_store::materialize_manifest_view_database(
         status.path(),
         callgraph.path(),

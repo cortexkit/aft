@@ -177,3 +177,89 @@ fn borrow_only_view_never_puts_a_missing_shared_blob_and_reports_pending() {
     assert!(!report.published);
     assert!(report.pending_paths.contains(b"lib.rs".as_slice()));
 }
+
+#[test]
+fn republishing_an_unchanged_checkout_keeps_the_current_generation() {
+    let project = tempdir().unwrap();
+    let storage = tempdir().unwrap();
+    git(project.path(), &["init", "--quiet"]);
+    for index in 0..8 {
+        fs::write(
+            project.path().join(format!("file_{index}.rs")),
+            format!("pub fn value_{index}() -> usize {{ {index} }}\n"),
+        )
+        .unwrap();
+    }
+    commit(project.path(), "base");
+    let family = "unchanged-republish-family";
+    let scope = "unchanged-view";
+    let initial = publish_checkout(&request(
+        storage.path(),
+        project.path(),
+        family,
+        scope,
+        BTreeSet::new(),
+        true,
+    ))
+    .unwrap();
+    assert!(initial.published);
+    let generation = initial.generation.clone().expect("first generation");
+    let view_dir = aft::views::ViewStore::open(storage.path(), scope)
+        .unwrap()
+        .view_dir()
+        .to_path_buf();
+    let manifest_count = || {
+        fs::read_dir(&view_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("manifest-"))
+            .count()
+    };
+    let manifests_after_first = manifest_count();
+
+    // The semantic-ready trigger republishes with an empty changed set (a full
+    // rebuild); with HEAD untouched it must not mint a second generation.
+    let repeat = publish_checkout(&request(
+        storage.path(),
+        project.path(),
+        family,
+        scope,
+        BTreeSet::new(),
+        true,
+    ))
+    .unwrap();
+    assert!(!repeat.published, "unchanged checkout must not republish");
+    assert_eq!(repeat.generation.as_deref(), Some(generation.as_str()));
+    assert_eq!(
+        manifest_count(),
+        manifests_after_first,
+        "no new manifest file for an unchanged checkout"
+    );
+    assert_eq!(
+        aft::views::ViewStore::open(storage.path(), scope)
+            .unwrap()
+            .current_generation()
+            .unwrap()
+            .as_deref(),
+        Some(generation.as_str())
+    );
+
+    // A real content change still publishes a new generation.
+    fs::write(
+        project.path().join("file_0.rs"),
+        "pub fn value_0() -> usize { 100 }\n",
+    )
+    .unwrap();
+    commit(project.path(), "change");
+    let changed = publish_checkout(&request(
+        storage.path(),
+        project.path(),
+        family,
+        scope,
+        BTreeSet::from([b"file_0.rs".to_vec()]),
+        true,
+    ))
+    .unwrap();
+    assert!(changed.published);
+    assert_ne!(changed.generation.as_deref(), Some(generation.as_str()));
+}
