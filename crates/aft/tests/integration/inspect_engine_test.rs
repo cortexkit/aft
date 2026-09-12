@@ -67,6 +67,12 @@ fn test_worker(worker_count: Arc<AtomicUsize>, sleep_for: Duration, count: u64) 
     })
 }
 
+/// Liveness ceiling for "the pool started my worker". Nothing in these tests
+/// asserts speed; the bound exists only so a wedged pool fails instead of
+/// hanging, and it must survive a contended CI runner starting the pool cold
+/// (Windows shard 3 missed a 2 s bound once with the worker still pending).
+const WORKER_START_LIVENESS: Duration = Duration::from_secs(30);
+
 fn wait_for_worker_count(worker_count: &AtomicUsize, expected: usize, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -234,7 +240,7 @@ fn inspect_engine_deduplicates_in_flight_waiters() {
         first_manager.submit_category(first_snapshot, InspectCategory::DeadCode, first_scope)
     });
 
-    wait_for_worker_count(worker_count.as_ref(), 1, Duration::from_secs(2));
+    wait_for_worker_count(worker_count.as_ref(), 1, WORKER_START_LIVENESS);
 
     let second_manager = Arc::clone(&manager);
     let second = thread::spawn(move || {
@@ -336,7 +342,7 @@ fn inspect_engine_roots_share_bounded_named_thread_pool() {
         )
     });
 
-    wait_for_worker_count(worker_count.as_ref(), 2, Duration::from_secs(2));
+    wait_for_worker_count(worker_count.as_ref(), 2, WORKER_START_LIVENESS);
     let named_threads = inspect_pool_thread_count_for_test();
     assert!(
         named_threads > 0,
@@ -389,7 +395,7 @@ fn inspect_engine_small_root_interleaves_with_large_scan() {
         )
     });
     assert!(
-        wait_for_flag(large_started.as_ref(), Duration::from_secs(2)),
+        wait_for_flag(large_started.as_ref(), WORKER_START_LIVENESS),
         "large scan did not start"
     );
 
