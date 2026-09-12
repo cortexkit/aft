@@ -8,7 +8,8 @@ This audit starts at `427895e45278924df01fee8353fb36806ec2c1ae`, after the callg
 | --- | ---: | ---: | ---: | --- |
 | Re-materialize an existing view from its unchanged real manifest | 517.519 | 974.103 | 258.938 | O(corpus); file incremental materialization follow-up. Existing assembly already skips an identical manifest. |
 | Persist the AFT family's semantic snapshot | 145.469 | 150.438 | n/a | O(corpus); file delta persistence follow-up, not a format change here. |
-| Read largest retained bash session, 28,451 rows, SQL ordering | 54.141 | 118.801 | 0 | Disk-backed sorter; targeted ordering fix follows. |
+| Read largest retained bash session, 28,451 rows, SQL ordering | 54.141 | 119.078 | 0 | Controlled baseline through production reader; fixed below. |
+| Same session read, Rust ordering | **0.000** | **0.000** | 0 | Fixed: same rows and legacy ordering, no SQLite sorter. |
 | Read largest session's backup history, 4,631 rows | 2.461 | 3.164 | 0 | Smaller disk sorter; file follow-up. |
 | Removal-health read | 1.863 | 2.410 | 0 | Activity aggregation temporary storage; not a write transaction. |
 | Fold/prune 500 expired compression events | 0.004 | 1.508 | 1.477 | Bounded maintenance, lifetime totals preserved. Checkpoint adds 5.824 physical MiB. |
@@ -67,7 +68,7 @@ The requested stores have no hot-path VACUUM, ANALYZE or REINDEX. AFT schema mig
 
 | Read / source | Qualifying rows in capture / bound | Plan / disposition |
 | --- | ---: | --- |
-| `db/bash_tasks.rs::list_bash_tasks_for_session` | largest session 28,451 | session-status index + **USE TEMP B-TREE FOR ORDER BY**; 54.141 physical MiB/read |
+| `db/bash_tasks.rs::list_bash_tasks_for_session` | largest session 28,451 | baseline: session-status index + **USE TEMP B-TREE FOR ORDER BY**, 54.141 physical MiB/read; fixed: indexed unordered read + Rust ordering, zero measured writes |
 | `list_replayable_bash_tasks_for_project` | selected project 0 replayable; table 383,885 | project-lookup index + temp ORDER BY; predicate may select large undelivered history |
 | `list_bash_tasks_by_id` | missing task probe 0 | harness prefix scan + temp ORDER BY; 6.9 seconds, zero physical writes in this probe |
 | `find_bash_task_for_project` | LIMIT 1 | `(harness,project_key,task_id,started_at DESC)` covers filtering/order |
@@ -182,3 +183,32 @@ USE TEMP B-TREE FOR ORDER BY
 - `RUSTFLAGS='-D warnings' cargo check -p agent-file-tools --all-targets`: passed.
 - `RUSTFLAGS='-D warnings' cargo check -p agent-file-tools --target x86_64-pc-windows-gnu --all-targets`: passed.
 - Both ignored measurement probes passed. Scoped AFT inspection completed but had no authoritative Rust diagnostics; Cargo checks, not the diagnostic summary, are the compile gate.
+
+## Session-history sorter fix (separate commit)
+
+`list_bash_tasks_for_session` already materializes a vector of complete task rows. Its SQL ORDER BY caused SQLite to spill the large command/metadata columns, not just timestamps and IDs. Keep the existing indexed filter and row mapper, remove SQL ordering, and sort that required vector by `(started_at, task_id)` in Rust. Both columns are NOT NULL; signed-integer and UTF-8 string comparison preserve SQLite INTEGER/BINARY order. The session primary key makes task IDs unique, so there are no unspecified equal-tuple row ties to resolve differently.
+
+The updated query probe calls the production reader as well as retaining the diagnostic SQL baseline. With the old SQL ORDER BY temporarily restored in the production query, the real function wrote **56,770,560 physical bytes / 124,862,609 logical bytes** for 28,451 rows. With the fix it wrote **zero physical and logical bytes**. This is not merely a plan estimate. The earlier raw-query probe reported 124,571,793 logical bytes; filesystem accounting varies slightly between runs while the physical sorter cost was identical. No schema/index or durability setting changes accompany this fix.
+
+`session_history_preserves_sqlite_order_without_a_temp_sort` compares every mapped row against an independent legacy SQL query, pins negative/extreme timestamps and equal-timestamp ASCII/non-ASCII IDs, verifies harness isolation, and checks the **production query constant's** EQP. Reintroducing the legacy ORDER BY produced this failure, after the output-equality checks had passed:
+
+```text
+NON-VACUITY BREAK: restore the disk sorter
+session_history_preserves_sqlite_order_without_a_temp_sort ... FAILED
+session history must not spill task rows:
+SEARCH bash_tasks USING INDEX idx_bash_tasks_session_status (harness=? AND session_id=?)
+USE TEMP B-TREE FOR ORDER BY
+0 passed; 1 failed (only this exact test selected)
+bench_disk_write_query_plans ... ok (diagnostic probe, not the guard)
+```
+
+Applied diff: `crates/aft/src/db/bash_tasks.rs | 3 ++-`; restored diff: empty. The mutation was never committed.
+
+Verification after restoration:
+
+- Full `cargo test -p agent-file-tools --lib`: 3,150 passed, 21 ignored.
+- `cargo test -p agent-file-tools --test integration bash`: 271 passed.
+- `cargo test -p agent-file-tools --test integration db_read_fallback_test`: 12 passed.
+- `cargo test -p agent-file-tools --test integration tool_call_parity_test`: 12 passed.
+- Native and `--target x86_64-pc-windows-gnu` `cargo check -p agent-file-tools --all-targets` with `RUSTFLAGS='-D warnings'`: both passed.
+- Full integration was not rerun for this narrow read change; its unchanged callgraph-worktree failures and isolated LSP deadline rerun are documented above. No failing baseline test was rewritten.

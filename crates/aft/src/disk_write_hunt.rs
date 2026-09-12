@@ -212,6 +212,11 @@ fn bench_disk_write_query_plans() {
         .unwrap();
     let (harness, session, project): (String, String, String) = conn.query_row(
         "SELECT harness, session_id, project_key FROM bash_tasks GROUP BY harness, session_id ORDER BY count(*) DESC LIMIT 1", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+    let rows = measure("session-tasks-production", || {
+        crate::db::bash_tasks::list_bash_tasks_for_session(&conn, &harness, &session).unwrap()
+    });
+    eprintln!("hunt production session rows={}", rows.len());
+    drop(rows);
     for (name, sql, parameters) in [
         ("session-tasks", "SELECT * FROM bash_tasks WHERE harness = ?1 AND session_id = ?2 ORDER BY started_at, task_id", vec![harness.clone(), session.clone()]),
         ("project-replay", "SELECT * FROM bash_tasks WHERE harness = ?1 AND project_key = ?2 AND (status NOT IN ('completed', 'failed', 'killed', 'timed_out', 'fate_unknown') OR completion_delivered = 0) ORDER BY started_at, task_id", vec![harness.clone(), project]),

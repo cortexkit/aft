@@ -129,24 +129,27 @@ pub fn get_bash_task(
     .optional()
 }
 
+const SESSION_TASKS_SQL: &str =
+    "SELECT harness, session_id, task_id, project_key, command, cwd, status,
+                exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
+                compressed, timeout_ms, completion_delivered, output_bytes, metadata
+         FROM bash_tasks
+         WHERE harness = ?1 AND session_id = ?2";
+
 pub fn list_bash_tasks_for_session(
     conn: &Connection,
     harness: &str,
     session_id: &str,
 ) -> rusqlite::Result<Vec<BashTaskRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT harness, session_id, task_id, project_key, command, cwd, status,
-                exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
-                compressed, timeout_ms, completion_delivered, output_bytes, metadata
-         FROM bash_tasks
-         WHERE harness = ?1 AND session_id = ?2
-         ORDER BY started_at ASC, task_id ASC",
-    )?;
-
-    let rows = stmt
+    let mut stmt = conn.prepare(SESSION_TASKS_SQL)?;
+    let mut rows = stmt
         .query_map(params![harness, session_id], map_bash_task_row)?
-        .collect();
-    rows
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Task rows carry large command/metadata payloads. Sorting them in SQLite
+    // spills entire rows to a temporary file for long-lived sessions. Keep the
+    // legacy integer/BINARY order, but sort the already-required result vector.
+    rows.sort_by(|a, b| (a.started_at, &a.task_id).cmp(&(b.started_at, &b.task_id)));
+    Ok(rows)
 }
 
 pub fn list_bash_tasks_by_id(
@@ -231,4 +234,65 @@ fn map_bash_task_row(row: &Row<'_>) -> rusqlite::Result<BashTaskRow> {
         output_bytes: row.get(17)?,
         metadata: row.get::<_, Option<String>>(18)?.unwrap_or_default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_history_preserves_sqlite_order_without_a_temp_sort() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&temp.path().join("aft.db")).unwrap();
+        for (task, started, status) in [
+            ("é", 4, "running"),
+            ("a", 4, "completed"),
+            ("z", -1, "failed"),
+            ("A", 4, "failed"),
+            ("aa", 4, "running"),
+            ("first", i64::MIN, "completed"),
+        ] {
+            conn.execute("INSERT INTO bash_tasks
+                (harness, session_id, task_id, project_key, command, cwd, status, started_at, metadata)
+                VALUES ('opencode', 'session', ?1, 'project', ?2, '.', ?3, ?4, ?5)",
+                params![task, "command".repeat(8192), status, started, format!("metadata-{task}")]).unwrap();
+        }
+        let legacy = conn
+            .prepare(
+                "SELECT harness, session_id, task_id, project_key, command, cwd, status,
+            exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
+            compressed, timeout_ms, completion_delivered, output_bytes, metadata
+            FROM bash_tasks WHERE harness = ?1 AND session_id = ?2
+            ORDER BY started_at ASC, task_id ASC",
+            )
+            .unwrap()
+            .query_map(params!["opencode", "session"], map_bash_task_row)
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let actual = list_bash_tasks_for_session(&conn, "opencode", "session").unwrap();
+        assert_eq!(format!("{actual:?}"), format!("{legacy:?}"));
+        assert_eq!(
+            actual
+                .iter()
+                .map(|r| r.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "z", "A", "a", "aa", "é"]
+        );
+        assert!(list_bash_tasks_for_session(&conn, "other", "session")
+            .unwrap()
+            .is_empty());
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {SESSION_TASKS_SQL}"))
+            .unwrap()
+            .query_map(params!["opencode", "session"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            !plan.contains("TEMP B-TREE"),
+            "session history must not spill task rows: {plan}"
+        );
+    }
 }
