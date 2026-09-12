@@ -924,6 +924,11 @@ impl HealthRollupCache {
         (snapshot, age_ms)
     }
 
+    #[cfg(test)]
+    pub(super) fn refresh_count_for_test(&self) -> u64 {
+        self.refreshes.load(Ordering::Acquire)
+    }
+
     pub(super) fn memory_census(&self) -> Value {
         self.snapshot().0.memory_census.clone()
     }

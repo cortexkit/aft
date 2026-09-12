@@ -4810,7 +4810,8 @@ async fn handle_control_request(
                 }
             });
 
-            health_rollup_cache.refresh(executor, shared_app);
+            // Bind completion wakes the health worker. A synchronous census here
+            // scans every hosted root before the transport can accept another frame.
             Ok(())
         }
         ModuleControlRequest::HealthCheck {} => {
@@ -7205,6 +7206,179 @@ mod tests {
                 source: io::Error::new(kind, "constructed auth failure"),
             },
         }
+    }
+
+    fn cpu_hunt_process_cpu_us() -> u64 {
+        #[cfg(unix)]
+        {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            // getrusage initializes the output on success; no pointer escapes.
+            if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0 {
+                let usage = unsafe { usage.assume_init() };
+                return (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as u64 * 1_000_000
+                    + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as u64;
+            }
+        }
+        0
+    }
+
+    #[test]
+    fn route_bind_does_not_recompute_fleet_health() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("bind runtime");
+        runtime.block_on(async {
+            let (dir, root) = test_root("bind-health-work-count");
+            let app = App::default_shared();
+            let executor = Arc::new(Executor::new());
+            let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
+            let mut fixture_dirs = Vec::new();
+            // The opt-in probe accepts only an already-copied artifact below this
+            // checkout's target directory; normal tests never open a live store.
+            if let Some(copy) = std::env::var_os("AFT_CPU_HUNT_STORE_COPY") {
+                let copy = std::fs::canonicalize(copy).expect("copied store exists");
+                let project = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .expect("crates directory")
+                    .parent()
+                    .expect("checkout directory")
+                    .canonicalize()
+                    .expect("canonical checkout");
+                assert!(copy.starts_with(project.join("target")));
+                for index in 0..36 {
+                    let actor = if index == 0 {
+                        Arc::clone(&ctx)
+                    } else {
+                        Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()))
+                    };
+                    actor.update_config(|config| config.project_root = Some(project.clone()));
+                    *actor.callgraph_store().write().expect("store slot") = Some(Arc::new(
+                        crate::callgraph_store::CallGraphStore::open_readonly(
+                            copy.clone(),
+                            project.clone(),
+                        )
+                        .expect("open copied graph")
+                        .expect("copied graph ready"),
+                    ));
+                    if index > 0 {
+                        let (fixture, id) = test_root(&format!("cpu-hunt-{index}"));
+                        assert!(executor.register_actor(id, actor));
+                        fixture_dirs.push(fixture);
+                    }
+                }
+            }
+            assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+            let cache = HealthRollupCache::new();
+            if !fixture_dirs.is_empty() {
+                let started = Instant::now();
+                let cpu = cpu_hunt_process_cpu_us();
+                cache.refresh(&executor, &app);
+                eprintln!(
+                    "cpu_hunt health_rollup wall_us={} cpu_us={}",
+                    started.elapsed().as_micros(),
+                    cpu_hunt_process_cpu_us().saturating_sub(cpu)
+                );
+                let started = Instant::now();
+                let cpu = cpu_hunt_process_cpu_us();
+                std::hint::black_box(ctx.build_status_snapshot());
+                eprintln!(
+                    "cpu_hunt status wall_us={} cpu_us={}",
+                    started.elapsed().as_micros(),
+                    cpu_hunt_process_cpu_us().saturating_sub(cpu)
+                );
+            }
+            let refreshes_before = cache.refresh_count_for_test();
+            let metrics = Arc::new(DispatchPathMetrics::new());
+            let (writer_tx, _writer_rx) = mpsc::channel(8);
+            let (completion_tx, mut completion_rx) = mpsc::channel(8);
+            let (lossy_tx, _lossy_rx) = mpsc::channel(8);
+            let (reliable_tx, _reliable_rx) = mpsc::unbounded_channel();
+            let senders = PushSenders {
+                lossy_tx,
+                reliable_tx,
+                lossy_overflow: Arc::new(push::LossyOverflow::default()),
+                lossy_seq: Arc::new(AtomicU64::new(0)),
+                fleet_status_client: FleetStatusClient::channel(1).0,
+            };
+            let request = ModuleControlRequest::RouteBind {
+                route_channel: 1,
+                epoch: 1,
+                target: RouteTarget::ToolProvider {
+                    module_id: "aft".to_string(),
+                },
+                identity: subc_protocol::BindIdentity {
+                    project_root: root.as_path().to_path_buf(),
+                    harness: "opencode".to_string(),
+                    session: "bind-health-work-count".to_string(),
+                },
+                principal: Some(subc_protocol::Principal::Direct),
+                consumer_capabilities: None,
+                admission_facts: Default::default(),
+            };
+            let frame = Frame::build_with_version(
+                PROTOCOL_VERSION,
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                1,
+                serde_json::to_vec(&request).expect("bind body"),
+            )
+            .expect("bind frame");
+            let mut pending_binds = HashMap::new();
+            let started = Instant::now();
+            let cpu = cpu_hunt_process_cpu_us();
+            handle_control_request(
+                &writer_tx,
+                &frame,
+                &app,
+                &executor,
+                &mut HashMap::new(),
+                &mut pending_binds,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut HashSet::new(),
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &Arc::new(StdMutex::new(HashMap::new())),
+                &mut PendingSubcResponses::default(),
+                &mut RetryBuffer::new(),
+                &mut HashMap::new(),
+                &Arc::new(Notify::new()),
+                &completion_tx,
+                &metrics,
+                None,
+                &cache,
+                &senders,
+                |request, _| Response::success(request.id, json!({})),
+                Some(&dir.path().join("absent-user-config.json")),
+                usize::MAX,
+            )
+            .await
+            .expect("admit route bind");
+            eprintln!(
+                "route_bind_health admission_us={} cpu_us={} refreshes={}",
+                started.elapsed().as_micros(),
+                cpu_hunt_process_cpu_us().saturating_sub(cpu),
+                cache.refresh_count_for_test() - refreshes_before
+            );
+            let completion = tokio::time::timeout(Duration::from_secs(5), completion_rx.recv())
+                .await
+                .expect("configure completes")
+                .expect("completion delivered");
+            assert!(completion.configure_response.success);
+            assert_eq!(pending_binds.len(), 1, "the bind must reach admission");
+            assert_eq!(
+                cache.refresh_count_for_test() - refreshes_before,
+                0,
+                "route admission must not perform a fleet-wide health census"
+            );
+        });
     }
 
     #[test]

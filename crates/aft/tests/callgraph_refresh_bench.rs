@@ -47,11 +47,13 @@ fn bench_refresh_files_on_store_copy() {
     let page_size = sqlite_page_size(store.sqlite_path());
     let wal_path = sqlite_sidecar(store.sqlite_path(), "-wal");
     let refresh_usage_before = process_write_usage();
+    let refresh_cpu_before = process_cpu_us();
     let refresh_started = Instant::now();
     let (stats, profile) = store
         .refresh_files_profiled(std::slice::from_ref(&changed_file))
         .expect("profile one-file refresh");
     let refresh_elapsed = refresh_started.elapsed();
+    let refresh_cpu_us = process_cpu_us().saturating_sub(refresh_cpu_before);
     let refresh_usage = process_write_usage().delta(refresh_usage_before);
     let wal_bytes = fs::metadata(&wal_path)
         .map(|metadata| metadata.len())
@@ -65,6 +67,7 @@ fn bench_refresh_files_on_store_copy() {
     let truncate_checkpoint = wal_checkpoint(store.sqlite_path(), "TRUNCATE");
     sync_sqlite_file_set(store.sqlite_path());
 
+    eprintln!("refresh_cpu_us={refresh_cpu_us}");
     eprintln!("refresh_files stats: {stats:?}");
     eprintln!("refresh_files phases: {}", profile.report());
     eprintln!(
@@ -379,9 +382,12 @@ fn measure_snapshot_read(db: &Path) {
         .unwrap_or(0);
     let usage_before = process_write_usage();
     let started = Instant::now();
+    let cpu_before = process_cpu_us();
     let snapshot = project_dead_code_snapshot(db).expect("project dead-code snapshot");
+    let cpu_us = process_cpu_us().saturating_sub(cpu_before);
     let elapsed = started.elapsed();
     let usage = process_write_usage().delta(usage_before);
+    eprintln!("snapshot_cpu_us={cpu_us}");
     let wal_after = fs::metadata(&wal)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
@@ -395,6 +401,20 @@ fn measure_snapshot_read(db: &Path) {
         usage.physical_bytes,
         usage.logical_bytes,
     );
+}
+
+fn process_cpu_us() -> u64 {
+    #[cfg(unix)]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // getrusage initializes the output on success; no pointer escapes.
+        if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0 {
+            let usage = unsafe { usage.assume_init() };
+            return (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as u64 * 1_000_000
+                + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as u64;
+        }
+    }
+    0
 }
 
 #[derive(Clone, Copy, Debug, Default)]
