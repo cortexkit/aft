@@ -1,13 +1,12 @@
 {
-  "slice_class": "ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
-  "kind": "ranking",
+  "kind": "harness",
   "fixtures": [
-    "crates/aft/tests/engine_generated_test.rs",
     "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
   "slices": [
-    "search-generated-evidence"
+    "reference-rebaseline-train-65"
   ],
-  "note": "Generated-artifact evidence (field 6) restored at one classification site; real-query rows carry no generated artifacts so rows are expected byte-equal to the post-train-65 reference recorded in this train."
+  "note": "Audited rebaseline only: the reference pair was recorded on the train-65 binary (B2 router + one shared trailer moved rows). No engine change rides this train; rows are byte-equal by construction."
 }
