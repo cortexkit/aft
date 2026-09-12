@@ -122,13 +122,21 @@ def symbols_in_source(source: str) -> list[str]:
     return symbols
 
 
-def git_grep_has(root: Path, ref: str, token: str) -> bool:
+def git_grep_occurrences(root: Path, ref: str, token: str) -> int:
     result = run_checked(
-        ["git", "-C", root, "grep", "-w", "-e", token, ref, "--"],
+        ["git", "-C", root, "grep", "-n", "-w", "-e", token, ref, "--"],
         allowed=(0, 1),
         timeout_s=120.0,
     )
-    return result.returncode == 0
+    return len(result.stdout.splitlines()) if result.returncode == 0 else 0
+
+
+def probe_has_definition_and_reference_evidence(occurrences: int) -> bool:
+    return occurrences >= 2
+
+
+def git_grep_has(root: Path, ref: str, token: str) -> bool:
+    return git_grep_occurrences(root, ref, token) > 0
 
 
 def find_switch_probe(root: Path, source: str, target: str) -> SwitchProbe:
@@ -142,7 +150,9 @@ def find_switch_probe(root: Path, source: str, target: str) -> SwitchProbe:
             continue
         text = result.stdout.decode("utf-8", errors="replace")
         for symbol in symbols_in_source(text):
-            if not git_grep_has(root, target, symbol):
+            if not probe_has_definition_and_reference_evidence(
+                git_grep_occurrences(root, target, symbol)
+            ):
                 continue
             if git_grep_has(root, source, symbol):
                 continue
