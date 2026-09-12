@@ -267,9 +267,17 @@ fn publication_build_does_not_delay_same_root_bind_and_read() {
     let previous = fixture.view.current_generation().unwrap();
     drop(gate);
     fixture.wait_idle();
-    assert!(CAS_TIMINGS.lock()[fixture.job_root().as_path()]
-        .iter()
-        .all(|elapsed| *elapsed < Duration::from_millis(50)));
+    // The barrier-excludes-the-build proof is the bind+read above completing
+    // while `derived` was gated, not this number. The CAS timing is a liveness
+    // ceiling only: its fsync+rename exceeded 50 ms on a contended Windows
+    // runner, which says nothing about whether the build ran under the barrier.
+    let cas_timings = CAS_TIMINGS.lock()[fixture.job_root().as_path()].clone();
+    assert!(
+        cas_timings
+            .iter()
+            .all(|elapsed| *elapsed < Duration::from_secs(2)),
+        "pointer CAS exceeded the liveness ceiling: {cas_timings:?}"
+    );
     assert!(
         bound.is_ok() && read_result.is_ok() && elapsed < Duration::from_secs(1),
         "bind+read blocked for {elapsed:?}"
