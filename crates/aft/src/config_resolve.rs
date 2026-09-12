@@ -287,6 +287,8 @@ pub struct RawSemantic {
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
     pub max_batch_size: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
+    pub max_input_tokens: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
     pub max_files: Option<usize>,
 }
 
@@ -299,6 +301,7 @@ impl RawSemantic {
             && self.timeout_ms.is_none()
             && self.query_timeout_ms.is_none()
             && self.max_batch_size.is_none()
+            && self.max_input_tokens.is_none()
             && self.max_files.is_none()
     }
 }
@@ -1158,6 +1161,7 @@ fn merge_semantic_config(
         timeout_ms: None,
         query_timeout_ms: None,
         max_batch_size: None,
+        max_input_tokens: None,
         max_files: None,
     });
 
@@ -1170,6 +1174,9 @@ fn merge_semantic_config(
         }
         if project.max_batch_size.is_some() {
             semantic.max_batch_size = project.max_batch_size;
+        }
+        if project.max_input_tokens.is_some() {
+            semantic.max_input_tokens = project.max_input_tokens;
         }
         if project.max_files.is_some() {
             semantic.max_files = project.max_files;
@@ -1705,6 +1712,9 @@ fn resolve_semantic_config(
     }
     if let Some(value) = raw.max_batch_size {
         semantic.max_batch_size = value.min(MAX_SEMANTIC_BATCH_SIZE);
+    }
+    if let Some(value) = raw.max_input_tokens {
+        semantic.max_input_tokens = Some(value);
     }
     if let Some(value) = raw.max_files {
         semantic.max_files = value;
@@ -2497,6 +2507,7 @@ mod tests {
                 "timeout_ms": 12345,
                 "query_timeout_ms": 2345,
                 "max_batch_size": 12,
+                "max_input_tokens": 2048,
                 "max_files": 3456
               },
               "inspect": { "enabled": false, "diagnostics_timeout_ms": 15000 },
@@ -2549,6 +2560,7 @@ mod tests {
         assert_eq!(result.config.semantic.timeout_ms, 12345);
         assert_eq!(result.config.semantic.query_timeout_ms, 2345);
         assert_eq!(result.config.semantic.max_batch_size, 12);
+        assert_eq!(result.config.semantic.max_input_tokens, Some(2048));
         assert_eq!(result.config.semantic.max_files, 3456);
         assert!(!result.config.inspect.enabled);
         assert_eq!(result.config.inspect.diagnostics_timeout_ms, 15_000);
@@ -3128,7 +3140,8 @@ mod tests {
                     "base_url": "https://user.example.test",
                     "api_key_env": "USER_KEY",
                     "model": "user-model",
-                    "query_timeout_ms": 900
+                    "query_timeout_ms": 900,
+                    "max_input_tokens": 512
                   },
                   "lsp": {
                     "servers": {
@@ -3156,7 +3169,8 @@ mod tests {
                     "api_key_env": "PROJECT_KEY",
                     "model": "project-model",
                     "timeout_ms": 2222,
-                    "query_timeout_ms": 2222
+                    "query_timeout_ms": 2222,
+                    "max_input_tokens": 960
                   },
                   "lsp": {
                     "servers": {
@@ -3191,6 +3205,7 @@ mod tests {
         assert_eq!(result.config.semantic.model, "project-model");
         assert_eq!(result.config.semantic.timeout_ms, 2222);
         assert_eq!(result.config.semantic.query_timeout_ms, 900);
+        assert_eq!(result.config.semantic.max_input_tokens, Some(960));
         assert_eq!(result.config.lsp_servers.len(), 1);
         assert_eq!(result.config.lsp_servers[0].binary, "rust-analyzer");
         assert!(result.config.disabled_lsp.contains("user-disabled"));

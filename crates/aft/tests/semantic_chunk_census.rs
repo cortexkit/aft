@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 
 use aft::parser::{detect_language, LangId};
 use aft::semantic_index::{
-    collect_file_chunks_for_census, is_semantic_indexed_extension, ChunkCaps, SemanticChunk,
+    collect_file_chunks_for_census, is_semantic_indexed_extension, EmbedTextCaps, SemanticChunk,
 };
 use aft::symbols::SymbolKind;
 use serde::{Deserialize, Serialize};
@@ -114,6 +114,74 @@ struct TokenizerInfo {
 }
 
 #[test]
+#[ignore = "full-corpus investigation; prints the measured symbol-header maximum"]
+fn embed_text_header_census() {
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .expect("HOME is required to locate corpora");
+    let uncapped = EmbedTextCaps {
+        signature_chars: usize::MAX,
+        body_lines: usize::MAX,
+        body_chars: usize::MAX,
+        total_chars: usize::MAX,
+    };
+    let mut global_max = (0, String::new());
+
+    for (name, relative) in CORPORA {
+        let root = home.join(relative);
+        assert!(
+            root.is_dir(),
+            "census corpus is missing: {}",
+            root.display()
+        );
+        let mut files = aft::callgraph::walk_project_files(&root)
+            .filter(|path| is_semantic_indexed_extension(path))
+            .collect::<Vec<_>>();
+        files.sort();
+        let mut corpus_max = (0, String::new());
+
+        for file in files {
+            let Ok((_, chunks)) = collect_file_chunks_for_census(&root, &file, uncapped) else {
+                continue;
+            };
+            for chunk in chunks {
+                if matches!(chunk.kind, SymbolKind::FileSummary) {
+                    continue;
+                }
+                let header_end = [
+                    chunk.embed_text.find(" signature:"),
+                    chunk.embed_text.find(" body:"),
+                ]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or(chunk.embed_text.len());
+                let header_chars = chunk.embed_text[..header_end].chars().count();
+                let source = format!(
+                    "{}::{}",
+                    file.strip_prefix(&root).unwrap_or(&file).display(),
+                    chunk.name
+                );
+                if header_chars > corpus_max.0 {
+                    corpus_max = (header_chars, source.clone());
+                }
+                if header_chars > global_max.0 {
+                    global_max = (header_chars, format!("{name}:{source}"));
+                }
+            }
+        }
+        eprintln!(
+            "header-census: {name}: max={} source={}",
+            corpus_max.0, corpus_max.1
+        );
+    }
+    eprintln!(
+        "header-census: global: max={} source={}",
+        global_max.0, global_max.1
+    );
+}
+
+#[test]
 #[ignore = "full-corpus investigation; writes a report when AFT_SEMANTIC_CENSUS_OUT is set"]
 fn semantic_chunk_census() {
     let home = env::var_os("HOME")
@@ -211,7 +279,7 @@ fn measure_corpus(
     let mut oversized_files = 0;
     let mut probe_rows = vec![None; PROBE_TARGETS.len()];
     let mut probe_batch = Vec::new();
-    let uncapped = ChunkCaps {
+    let uncapped = EmbedTextCaps {
         signature_chars: usize::MAX,
         body_lines: usize::MAX,
         body_chars: usize::MAX,
@@ -790,7 +858,7 @@ fn render_report(
     writeln!(report).unwrap();
     writeln!(
         report,
-        "The census used `callgraph::walk_project_files` followed by `is_semantic_indexed_extension`, matching the semantic snapshot's gitignore/global-ignore/`.aftignore` filtering and supported semantic extensions. Files over `MAX_SEMANTIC_FILE_BYTES` (4 MiB) were left at zero chunks, as in production. Each eligible file was parsed once by the production tree-sitter parser and converted twice by the production semantic chunker: today's default caps (signature 400 chars, body 15 lines / 300 bytes, total 1,600 chars) and `ChunkCaps` with all four values set to `usize::MAX`. Large corpora were processed as non-overlapping file-range shards and the cached row records were checked for contiguous, gap-free coverage before aggregation; this bounds parser/tokenizer memory without changing the sorted file set."
+        "The census used `callgraph::walk_project_files` followed by `is_semantic_indexed_extension`, matching the semantic snapshot's gitignore/global-ignore/`.aftignore` filtering and supported semantic extensions. Files over `MAX_SEMANTIC_FILE_BYTES` (4 MiB) were left at zero chunks, as in production. Each eligible file was parsed once by the production tree-sitter parser and converted twice by the production semantic chunker: today's default caps (signature 400 chars, body 15 lines / 300 bytes, total 1,600 chars) and `EmbedTextCaps` with all four values set to `usize::MAX`. Large corpora were processed as non-overlapping file-range shards and the cached row records were checked for contiguous, gap-free coverage before aggregation; this bounds parser/tokenizer memory without changing the sorted file set."
     )
     .unwrap();
     writeln!(report).unwrap();

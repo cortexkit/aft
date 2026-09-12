@@ -234,6 +234,10 @@ pub struct SemanticIndexFingerprint {
     pub dimension: usize,
     #[serde(default = "default_chunking_version")]
     pub chunking_version: u32,
+    /// Exact caps used to construct symbol embedding rows. Including them in the
+    /// fingerprint prevents cache reuse across incompatible chunk shapes.
+    #[serde(default)]
+    pub embed_text_caps: EmbedTextCaps,
     /// The Synapse fingerprint and table epoch identify the served vector space
     /// so indexes built against incompatible embeddings are rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -265,6 +269,7 @@ impl SemanticIndexFingerprint {
             base_url,
             dimension,
             chunking_version: default_chunking_version(),
+            embed_text_caps: EmbedTextCaps::from_config(config),
             synapse_fingerprint: None,
             synapse_table_epoch: None,
             synapse_equivalent_to: Vec::new(),
@@ -292,6 +297,7 @@ impl SemanticIndexFingerprint {
             || self.base_url != current.base_url
             || self.dimension != current.dimension
             || self.chunking_version != current.chunking_version
+            || self.embed_text_caps != current.embed_text_caps
             || self.synapse_table_epoch != current.synapse_table_epoch
         {
             return false;
@@ -387,6 +393,12 @@ fn format_fingerprint_mismatch_details(
         diffs.push(format!(
             "chunking version cached={} current={}",
             cached.chunking_version, current.chunking_version
+        ));
+    }
+    if cached.embed_text_caps != current.embed_text_caps {
+        diffs.push(format!(
+            "embed text caps cached={:?} current={:?}",
+            cached.embed_text_caps, current.embed_text_caps
         ));
     }
     if cached.synapse_table_epoch != current.synapse_table_epoch {
@@ -2612,6 +2624,7 @@ impl SemanticIndex {
     fn collect_chunks(
         project_root: &Path,
         files: &[PathBuf],
+        embed_text_caps: EmbedTextCaps,
     ) -> (Vec<SemanticChunk>, HashMap<PathBuf, IndexedFileMetadata>) {
         let collect_started = Instant::now();
         let collect_one = |file: &Path, sched: Duration| {
@@ -2619,7 +2632,7 @@ impl SemanticIndex {
                 sched,
                 ..SemanticCollectPhaseTimings::default()
             };
-            let result = collect_semantic_file(project_root, file, &mut phases);
+            let result = collect_semantic_file(project_root, file, embed_text_caps, &mut phases);
             (file.to_path_buf(), result, phases)
         };
         let per_file: Vec<CollectedSemanticFile> = if files.len() <= 2 {
@@ -3032,8 +3045,28 @@ impl SemanticIndex {
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
     {
+        Self::build_with_caps(
+            project_root,
+            files,
+            embed_fn,
+            max_batch_size,
+            EmbedTextCaps::default(),
+        )
+    }
+
+    /// Build using explicitly resolved symbol-row caps.
+    pub fn build_with_caps<F>(
+        project_root: &Path,
+        files: &[PathBuf],
+        embed_fn: &mut F,
+        max_batch_size: usize,
+        embed_text_caps: EmbedTextCaps,
+    ) -> Result<Self, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+    {
         let (_guard, scope, mut failure_guard) = begin_semantic_index_build(project_root);
-        let (chunks, file_mtimes) = Self::collect_chunks(project_root, files);
+        let (chunks, file_mtimes) = Self::collect_chunks(project_root, files, embed_text_caps);
         let mut should_continue = || true;
         let result = Self::build_from_chunks(
             project_root,
@@ -3061,7 +3094,8 @@ impl SemanticIndex {
         P: FnMut(usize, usize),
     {
         let (_guard, scope, mut failure_guard) = begin_semantic_index_build(project_root);
-        let (chunks, file_mtimes) = Self::collect_chunks(project_root, files);
+        let (chunks, file_mtimes) =
+            Self::collect_chunks(project_root, files, EmbedTextCaps::default());
         let total_chunks = chunks.len();
         progress(0, total_chunks);
         let mut should_continue = || true;
@@ -3094,8 +3128,33 @@ impl SemanticIndex {
         P: FnMut(usize, usize),
         C: FnMut() -> bool,
     {
+        Self::build_with_progress_and_cancellation_caps(
+            project_root,
+            files,
+            embed_fn,
+            max_batch_size,
+            EmbedTextCaps::default(),
+            progress,
+            should_continue,
+        )
+    }
+
+    pub fn build_with_progress_and_cancellation_caps<F, P, C>(
+        project_root: &Path,
+        files: &[PathBuf],
+        embed_fn: &mut F,
+        max_batch_size: usize,
+        embed_text_caps: EmbedTextCaps,
+        progress: &mut P,
+        should_continue: &mut C,
+    ) -> Result<Self, String>
+    where
+        F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        P: FnMut(usize, usize),
+        C: FnMut() -> bool,
+    {
         let (_guard, scope, mut failure_guard) = begin_semantic_index_build(project_root);
-        let (chunks, file_mtimes) = Self::collect_chunks(project_root, files);
+        let (chunks, file_mtimes) = Self::collect_chunks(project_root, files, embed_text_caps);
         let total_chunks = chunks.len();
         progress(0, total_chunks);
         let result = Self::build_from_chunks(
@@ -3314,7 +3373,13 @@ impl SemanticIndex {
         }
 
         let mut reuse_map = self.build_chunk_reuse_map(&changed);
-        let (chunks, fresh_metadata) = Self::collect_chunks(project_root, &to_embed);
+        let embed_text_caps = self
+            .fingerprint
+            .as_ref()
+            .map(|fingerprint| fingerprint.embed_text_caps)
+            .unwrap_or_default();
+        let (chunks, fresh_metadata) =
+            Self::collect_chunks(project_root, &to_embed, embed_text_caps);
         self.extend_reuse_map_from_blob_store(
             project_root,
             fresh_metadata.keys().cloned(),
@@ -3523,7 +3588,13 @@ impl SemanticIndex {
             });
         }
 
-        let (mut chunks, mut fresh_metadata) = Self::collect_chunks(project_root, &existing_paths);
+        let embed_text_caps = self
+            .fingerprint
+            .as_ref()
+            .map(|fingerprint| fingerprint.embed_text_caps)
+            .unwrap_or_default();
+        let (mut chunks, mut fresh_metadata) =
+            Self::collect_chunks(project_root, &existing_paths, embed_text_caps);
         self.extend_reuse_map_from_blob_store(
             project_root,
             fresh_metadata.keys().cloned(),
@@ -4808,7 +4879,7 @@ fn build_embed_text_with_lines_and_caps(
     line_cache: &SourceLineCache<'_>,
     file: &Path,
     project_root: &Path,
-    caps: ChunkCaps,
+    caps: EmbedTextCaps,
 ) -> String {
     let relative = file
         .strip_prefix(project_root)
@@ -4850,7 +4921,7 @@ fn build_embed_text_with_lines_and_caps(
         ));
     }
 
-    // Add body snippet (first ~300 chars of symbol body)
+    // Add the leading symbol body within the resolved backend budget.
     let start = (symbol.range.start_line as usize).min(line_cache.len());
     // range.end_line is inclusive 0-based; +1 makes it an exclusive slice bound.
     let end = (symbol.range.end_line as usize + 1).min(line_cache.len());
@@ -4870,9 +4941,7 @@ fn build_embed_text_with_lines_and_caps(
     }
 
     // Final defense-in-depth clamp: no single embed_text may exceed the
-    // backend's per-input budget regardless of which field grew. Most
-    // backends cap a physical batch around 512 tokens; ~1600 chars stays
-    // comfortably under that for typical English/code (≈4 chars/token).
+    // resolved backend budget regardless of which field grew.
     truncate_chars(&text, caps.total_chars)
 }
 
@@ -4884,40 +4953,62 @@ fn build_embed_text(symbol: &Symbol, source: &str, file: &Path, project_root: &P
         &line_cache,
         file,
         project_root,
-        ChunkCaps::default(),
+        EmbedTextCaps::default(),
     )
 }
 
-/// Upper bound on characters in a single chunk's `embed_text`. Keeps any one
-/// input below typical embedding-backend physical batch limits (~512 tokens)
-/// so an oversized symbol cannot abort the whole index build.
+/// Legacy whole-row character cap retained when no remote token budget is set.
 const MAX_EMBED_TEXT_CHARS: usize = 1600;
+const DEFAULT_SIGNATURE_CHARS: usize = 400;
+const DEFAULT_BODY_LINES: usize = 15;
+const DEFAULT_BODY_CHARS: usize = 300;
+/// Maximum `name/file/kind/name` header measured across the six September 2026
+/// semantic-census corpora. Reserving this many characters keeps the configured
+/// token budget an upper bound even for the longest observed header.
+pub const MAX_EMBED_TEXT_HEADER_CHARS: usize = 457;
+const CHARS_PER_TOKEN_NUMERATOR: usize = 7;
+const CHARS_PER_TOKEN_DENOMINATOR: usize = 2;
 
-#[cfg(feature = "semantic-chunk-census")]
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChunkCaps {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbedTextCaps {
     pub signature_chars: usize,
     pub body_lines: usize,
     pub body_chars: usize,
     pub total_chars: usize,
 }
 
-#[cfg(not(feature = "semantic-chunk-census"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ChunkCaps {
-    signature_chars: usize,
-    body_lines: usize,
-    body_chars: usize,
-    total_chars: usize,
+impl EmbedTextCaps {
+    pub fn from_config(config: &SemanticBackendConfig) -> Self {
+        let defaults = Self::default();
+        if config.backend == SemanticBackend::Fastembed {
+            return defaults;
+        }
+        let Some(max_input_tokens) = config.max_input_tokens else {
+            return defaults;
+        };
+
+        let total_chars = max_input_tokens.saturating_mul(CHARS_PER_TOKEN_NUMERATOR)
+            / CHARS_PER_TOKEN_DENOMINATOR;
+        let body_chars = total_chars.saturating_sub(
+            defaults
+                .signature_chars
+                .saturating_add(MAX_EMBED_TEXT_HEADER_CHARS),
+        );
+        Self {
+            signature_chars: defaults.signature_chars,
+            body_lines: usize::MAX,
+            body_chars,
+            total_chars,
+        }
+    }
 }
 
-impl Default for ChunkCaps {
+impl Default for EmbedTextCaps {
     fn default() -> Self {
         Self {
-            signature_chars: 400,
-            body_lines: 15,
-            body_chars: 300,
+            signature_chars: DEFAULT_SIGNATURE_CHARS,
+            body_lines: DEFAULT_BODY_LINES,
+            body_chars: DEFAULT_BODY_CHARS,
             total_chars: MAX_EMBED_TEXT_CHARS,
         }
     }
@@ -4997,7 +5088,7 @@ fn build_file_summary_chunk_with_lines(
         line_cache,
         top_exports,
         top_export_signatures,
-        ChunkCaps::default(),
+        EmbedTextCaps::default(),
     )
 }
 
@@ -5007,7 +5098,7 @@ fn build_file_summary_chunk_with_lines_and_caps(
     line_cache: &SourceLineCache<'_>,
     top_exports: &[&str],
     top_export_signatures: &[Option<&str>],
-    caps: ChunkCaps,
+    caps: EmbedTextCaps,
 ) -> SemanticChunk {
     let relative = file.strip_prefix(project_root).unwrap_or(file);
     let rel_path = relative.to_string_lossy();
@@ -5145,7 +5236,7 @@ fn canonicalize_existing_or_deleted_path(path: &Path) -> PathBuf {
 /// the source bytes), and `par_iter` collection parses many files at once, so an
 /// unbounded read here is an OOM vector on a repo with a few multi-MB generated/
 /// vendored/minified files. A file this large yields almost no useful embedding
-/// anyway (each chunk's embed_text is clamped to MAX_EMBED_TEXT_CHARS), so we
+/// anyway (each chunk's embed_text is bounded by its resolved backend caps), so we
 /// track it (0 chunks) instead of reading it — freshness then skips it on later
 /// refreshes. 4 MiB keeps essentially all hand-written source while capping the
 /// pathological tail.
@@ -5154,6 +5245,7 @@ const MAX_SEMANTIC_FILE_BYTES: u64 = 4 * 1024 * 1024;
 fn collect_semantic_file(
     project_root: &Path,
     file: &Path,
+    embed_text_caps: EmbedTextCaps,
     phases: &mut SemanticCollectPhaseTimings,
 ) -> Result<(IndexedFileMetadata, Vec<SemanticChunk>), String> {
     let read_hash_started = Instant::now();
@@ -5196,7 +5288,14 @@ fn collect_semantic_file(
         return Ok((indexed_metadata, Vec::new()));
     };
 
-    let chunks = collect_file_chunks_from_source_timed(project_root, file, lang, &source, phases)?;
+    let chunks = collect_file_chunks_from_source_timed(
+        project_root,
+        file,
+        lang,
+        &source,
+        embed_text_caps,
+        phases,
+    )?;
     Ok((indexed_metadata, chunks))
 }
 
@@ -5205,7 +5304,7 @@ fn collect_semantic_file(
 pub fn collect_file_chunks_for_census(
     project_root: &Path,
     file: &Path,
-    census_caps: ChunkCaps,
+    census_caps: EmbedTextCaps,
 ) -> Result<(Vec<SemanticChunk>, Vec<SemanticChunk>), String> {
     if !is_semantic_indexed_extension(file) {
         return Err("unsupported file extension".to_string());
@@ -5252,6 +5351,7 @@ fn collect_file_chunks_from_source(
         file,
         lang,
         source,
+        EmbedTextCaps::default(),
         &mut SemanticCollectPhaseTimings::default(),
     )
 }
@@ -5261,6 +5361,7 @@ fn collect_file_chunks_from_source_timed(
     file: &Path,
     lang: crate::parser::LangId,
     source: &str,
+    embed_text_caps: EmbedTextCaps,
     phases: &mut SemanticCollectPhaseTimings,
 ) -> Result<Vec<SemanticChunk>, String> {
     let parse_started = Instant::now();
@@ -5276,7 +5377,7 @@ fn collect_file_chunks_from_source_timed(
     let symbols = symbols_result?;
 
     let build_started = Instant::now();
-    let chunks = symbols_to_chunks(file, &symbols, source, project_root);
+    let chunks = symbols_to_chunks_with_caps(file, &symbols, source, project_root, embed_text_caps);
     phases.build += build_started.elapsed();
     Ok(chunks)
 }
@@ -5325,13 +5426,20 @@ fn qualified_name_for_symbol(symbol: &Symbol) -> Option<String> {
 }
 
 /// Convert symbols to semantic chunks with enriched context
+#[cfg(any(test, feature = "semantic-chunk-census"))]
 fn symbols_to_chunks(
     file: &Path,
     symbols: &[Symbol],
     source: &str,
     project_root: &Path,
 ) -> Vec<SemanticChunk> {
-    symbols_to_chunks_with_caps(file, symbols, source, project_root, ChunkCaps::default())
+    symbols_to_chunks_with_caps(
+        file,
+        symbols,
+        source,
+        project_root,
+        EmbedTextCaps::default(),
+    )
 }
 
 fn symbols_to_chunks_with_caps(
@@ -5339,7 +5447,7 @@ fn symbols_to_chunks_with_caps(
     symbols: &[Symbol],
     source: &str,
     project_root: &Path,
-    caps: ChunkCaps,
+    caps: EmbedTextCaps,
 ) -> Vec<SemanticChunk> {
     let line_cache = SourceLineCache::new(source);
     let mut chunks = Vec::new();
@@ -5366,13 +5474,12 @@ fn symbols_to_chunks_with_caps(
             .iter()
             .map(|(_, signature)| *signature)
             .collect::<Vec<_>>();
-        chunks.push(build_file_summary_chunk_with_lines_and_caps(
+        chunks.push(build_file_summary_chunk_with_lines(
             file,
             project_root,
             &line_cache,
             &top_exports,
             &top_export_signatures,
-            caps,
         ));
     }
 
@@ -5536,7 +5643,8 @@ mod tests {
             path
         });
         let project_root = lf_root.path();
-        let (chunks, _) = SemanticIndex::collect_chunks(project_root, &fixture_files);
+        let (chunks, _) =
+            SemanticIndex::collect_chunks(project_root, &fixture_files, EmbedTextCaps::default());
         let normalized = chunks
             .iter()
             .map(|chunk| {
@@ -5603,6 +5711,7 @@ mod tests {
                     &file,
                     crate::parser::LangId::Rust,
                     &source,
+                    EmbedTextCaps::default(),
                     &mut phases,
                 )
                 .unwrap();
@@ -8458,6 +8567,92 @@ public class Greeter {
     }
 
     #[test]
+    fn embed_text_caps_resolve_per_backend_without_changing_defaults() {
+        let defaults = EmbedTextCaps::default();
+
+        let mut local = SemanticBackendConfig {
+            max_input_tokens: Some(960),
+            ..SemanticBackendConfig::default()
+        };
+        assert_eq!(EmbedTextCaps::from_config(&local), defaults);
+
+        local.backend = SemanticBackend::OpenAiCompatible;
+        local.base_url = Some("http://127.0.0.1:1234/v1".to_string());
+        local.max_input_tokens = None;
+        assert_eq!(EmbedTextCaps::from_config(&local), defaults);
+
+        local.max_input_tokens = Some(531);
+        let expanded = EmbedTextCaps::from_config(&local);
+        assert_eq!(expanded.signature_chars, 400);
+        assert_eq!(expanded.body_lines, usize::MAX);
+        assert_eq!(expanded.body_chars, 1001);
+        assert_eq!(expanded.total_chars, 1858);
+
+        for backend in [SemanticBackend::Ollama, SemanticBackend::Synapse] {
+            local.backend = backend;
+            assert_eq!(EmbedTextCaps::from_config(&local), expanded);
+        }
+    }
+
+    #[test]
+    fn semantic_fingerprint_changes_when_embed_text_caps_change() {
+        let mut config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "test-embedding".to_string(),
+            base_url: Some("http://127.0.0.1:1234/v1".to_string()),
+            ..SemanticBackendConfig::default()
+        };
+        let legacy = SemanticIndexFingerprint::for_config_dimension(&config, 1024);
+
+        config.max_input_tokens = Some(531);
+        let expanded = SemanticIndexFingerprint::for_config_dimension(&config, 1024);
+
+        assert_ne!(legacy.embed_text_caps, expanded.embed_text_caps);
+        assert_ne!(legacy.as_string(), expanded.as_string());
+        assert!(!legacy.matches(&expanded));
+    }
+
+    #[test]
+    fn file_summary_embed_text_is_independent_of_symbol_caps() {
+        let project_root = PathBuf::from("/proj");
+        let file = project_root.join("src/long.rs");
+        let source = "//! module docs\npub fn exported() {}\n";
+        let mut symbol = make_symbol(SymbolKind::Function, "exported", 1, 1);
+        symbol.exported = true;
+        symbol.signature = Some("pub fn exported()".to_string());
+
+        let legacy = symbols_to_chunks_with_caps(
+            &file,
+            std::slice::from_ref(&symbol),
+            source,
+            &project_root,
+            EmbedTextCaps::default(),
+        );
+        let expanded = symbols_to_chunks_with_caps(
+            &file,
+            &[symbol],
+            source,
+            &project_root,
+            EmbedTextCaps {
+                signature_chars: 400,
+                body_lines: usize::MAX,
+                body_chars: 2500,
+                total_chars: 3357,
+            },
+        );
+
+        let legacy_summary = legacy
+            .iter()
+            .find(|chunk| chunk.kind == SymbolKind::FileSummary)
+            .expect("legacy file summary");
+        let expanded_summary = expanded
+            .iter()
+            .find(|chunk| chunk.kind == SymbolKind::FileSummary)
+            .expect("expanded file summary");
+        assert_eq!(legacy_summary.embed_text, expanded_summary.embed_text);
+    }
+
+    #[test]
     fn unbounded_chunk_caps_preserve_full_signature_and_body() {
         let project_root = PathBuf::from("/proj");
         let file = project_root.join("long.rs");
@@ -8477,14 +8672,14 @@ public class Greeter {
             &line_cache,
             &file,
             &project_root,
-            ChunkCaps::default(),
+            EmbedTextCaps::default(),
         );
         let full = build_embed_text_with_lines_and_caps(
             &symbol,
             &line_cache,
             &file,
             &project_root,
-            ChunkCaps {
+            EmbedTextCaps {
                 signature_chars: usize::MAX,
                 body_lines: usize::MAX,
                 body_chars: usize::MAX,

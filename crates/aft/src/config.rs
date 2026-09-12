@@ -189,6 +189,10 @@ pub struct SemanticBackendConfig {
     #[serde(default = "default_semantic_query_timeout_ms")]
     pub query_timeout_ms: u64,
     pub max_batch_size: usize,
+    /// Optional whole-row input budget for remote embedding backends. When absent,
+    /// chunk construction retains the legacy MiniLM-era limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<usize>,
     /// Maximum number of project files to semantically index. Guards local
     /// fastembed memory (model + embeddings + batch buffers) on huge project
     /// roots; remote backends that embed server-side can raise it freely.
@@ -228,6 +232,7 @@ impl Default for SemanticBackendConfig {
             timeout_ms: 25_000,
             query_timeout_ms: DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
             max_batch_size: 64,
+            max_input_tokens: None,
             max_files: 20_000,
             subc_connection_file: None,
             route_project_root: None,

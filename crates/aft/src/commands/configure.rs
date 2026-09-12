@@ -4132,6 +4132,7 @@ fn schedule_artifact_loads(
                     let mut model =
                         crate::semantic_index::EmbeddingModel::from_config(&semantic_config)?;
                     let fingerprint = model.fingerprint(&semantic_config)?;
+                    let embed_text_caps = fingerprint.embed_text_caps;
                     let fingerprint_key = fingerprint.as_string();
                     let _semantic_cache_lock = (!is_worktree_bridge_for_semantic)
                         .then(|| ())
@@ -4480,11 +4481,12 @@ fn schedule_artifact_loads(
                     };
                     let mut build_is_current =
                         || semantic_build_epoch_flag.load(Ordering::SeqCst) == semantic_build_epoch;
-                    let index = SemanticIndex::build_with_progress_and_cancellation(
+                    let index = SemanticIndex::build_with_progress_and_cancellation_caps(
                         &root_clone,
                         &files,
                         &mut embed,
                         batch_size,
+                        embed_text_caps,
                         &mut progress,
                         &mut build_is_current,
                     )?;

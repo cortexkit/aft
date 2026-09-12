@@ -469,12 +469,14 @@ fn build_semantic(config: &Config, unit: &SnapshotUnit) -> Result<UnitResult, St
     let files = unit.semantic_files.as_deref().unwrap_or_default();
     let mut model = SemanticEmbeddingModel::from_config(&config.semantic)?;
     let fingerprint = model.fingerprint(&config.semantic)?;
+    let embed_text_caps = fingerprint.embed_text_caps;
     let mut embed = |texts: Vec<String>| model.embed(texts);
-    let mut index = SemanticIndex::build(
+    let mut index = SemanticIndex::build_with_caps(
         &unit.entry.resolved_target,
         files,
         &mut embed,
         config.semantic.max_batch_size.max(1),
+        embed_text_caps,
     )?;
     index.set_fingerprint(fingerprint);
     let persisted = publish_if_current(unit, || {
