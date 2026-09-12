@@ -152,6 +152,15 @@ impl Fixture {
             initial,
         }
     }
+    /// The root spelling the publication job records and reports: the context's
+    /// canonical cache root (a `std::fs::canonicalize` result, verbatim on
+    /// Windows). `ProjectRootId::as_path()` is a different spelling there, so
+    /// gates, timing tables and health rows are keyed on this one.
+    fn job_root(&self) -> PathBuf {
+        self.ctx
+            .canonical_cache_root_opt()
+            .expect("fixture configured a canonical cache root")
+    }
     fn change(&self, symbol: &str) {
         std::fs::write(
             self.project.path().join("tracked.rs"),
@@ -216,12 +225,12 @@ fn commit(root: &Path) {
 fn publication_build_does_not_delay_same_root_bind_and_read() {
     let fixture = Fixture::new();
     fixture.change("next");
-    let gate = Gate::new(fixture.root.as_path(), "derived");
+    let gate = Gate::new(fixture.job_root().as_path(), "derived");
     fixture.schedule();
     gate.started();
     let health = health_snapshot();
     assert!(health.as_array().unwrap().iter().any(|job| job["root"]
-        == fixture.root.as_path().to_string_lossy().as_ref()
+        == fixture.job_root().as_path().to_string_lossy().as_ref()
         && job["phase"] == "derived"
         && job["barrier_holder"] == false));
     let start = Instant::now();
@@ -258,7 +267,7 @@ fn publication_build_does_not_delay_same_root_bind_and_read() {
     let previous = fixture.view.current_generation().unwrap();
     drop(gate);
     fixture.wait_idle();
-    assert!(CAS_TIMINGS.lock()[fixture.root.as_path()]
+    assert!(CAS_TIMINGS.lock()[fixture.job_root().as_path()]
         .iter()
         .all(|elapsed| *elapsed < Duration::from_millis(50)));
     assert!(
@@ -276,7 +285,7 @@ fn publication_build_does_not_delay_same_root_bind_and_read() {
 fn superseded_publication_cancels_before_derived_and_removes_generation_files() {
     let fixture = Fixture::new();
     fixture.change("older");
-    let gate = Gate::new(fixture.root.as_path(), "blobs");
+    let gate = Gate::new(fixture.job_root().as_path(), "blobs");
     fixture.schedule();
     let older = gate.started();
     fixture.change("newer");
@@ -294,7 +303,7 @@ fn superseded_publication_cancels_before_derived_and_removes_generation_files() 
     fixture.wait_idle();
     assert_eq!(fixture.view.current_generation().unwrap(), newer);
     assert!(
-        !PHASES.lock()[fixture.root.as_path()]
+        !PHASES.lock()[fixture.job_root().as_path()]
             .iter()
             .any(|(id, phase)| *id == older && phase == "derived"),
         "superseded assembly entered derived phase instead of cancelling"
@@ -360,7 +369,7 @@ fn publication_health_reports_root_and_each_off_lane_phase() {
     let fixture = Fixture::new();
     for phase in ["manifest", "blobs", "derived", "cas"] {
         fixture.change(&format!("phase_{phase}"));
-        let gate = Gate::new(fixture.root.as_path(), phase);
+        let gate = Gate::new(fixture.job_root().as_path(), phase);
         fixture.schedule();
         let id = gate.started();
         let health = health_snapshot();
@@ -372,7 +381,7 @@ fn publication_health_reports_root_and_each_off_lane_phase() {
             .unwrap();
         assert_eq!(
             job["root"],
-            fixture.root.as_path().to_string_lossy().as_ref()
+            fixture.job_root().as_path().to_string_lossy().as_ref()
         );
         assert_eq!(job["phase"], phase);
         assert_eq!(job["barrier_holder"], false);
