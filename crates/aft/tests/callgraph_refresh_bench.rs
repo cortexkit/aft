@@ -451,7 +451,7 @@ fn process_write_usage() -> ProcessWriteUsage {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn process_write_usage() -> ProcessWriteUsage {
     unsafe {
         let mut usage = std::mem::zeroed();
@@ -464,6 +464,13 @@ fn process_write_usage() -> ProcessWriteUsage {
             ProcessWriteUsage::default()
         }
     }
+}
+
+// Windows has no rusage; the harness still runs there but reports zero I/O
+// deltas, so the WAL-frame measurements remain the comparable numbers.
+#[cfg(not(unix))]
+fn process_write_usage() -> ProcessWriteUsage {
+    ProcessWriteUsage::default()
 }
 
 fn mib(bytes: u64) -> f64 {
