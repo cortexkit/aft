@@ -4914,10 +4914,15 @@ mod watcher_slice_tests {
         assert_eq!(snapshot.rescans_unknown_total, 0);
         assert!(snapshot.last_rescan_at_ms.is_some());
         assert!(snapshot.last_rescan_cost_ms.is_some());
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("kind=watcher_rescan plane=watcher"));
-        assert!(lines[0].contains("reason=kernel_dropped"));
-        assert!(lines[0].contains("raw_events_since_last=2"));
+        // Other tests on this thread pool emit index_event lines too; the
+        // capture is process-wide, so select this test's line by content.
+        let rescan_lines = lines
+            .iter()
+            .filter(|line| line.contains("kind=watcher_rescan plane=watcher"))
+            .collect::<Vec<_>>();
+        assert_eq!(rescan_lines.len(), 1, "lines: {lines:?}");
+        assert!(rescan_lines[0].contains("reason=kernel_dropped"));
+        assert!(rescan_lines[0].contains("raw_events_since_last=2"));
     }
 
     #[test]
