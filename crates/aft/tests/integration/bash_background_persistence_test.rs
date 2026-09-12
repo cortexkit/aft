@@ -2062,8 +2062,17 @@ fn mid_run_ack_from_rebound_root_preserves_later_watch_and_completion() {
     drop(_release_b_guard);
     let frame_b = wait_for_pattern_frame(&mut restored, &task_id);
     assert_eq!(frame_b["match_text"], WATCH_B);
-    let ack_b = ack(&mut restored, SESSION, &task_id);
+
+    let mut rebound = AftProcess::spawn();
+    configure_background(
+        &mut rebound,
+        rebound_project.path(),
+        storage.path(),
+        SESSION,
+    );
+    let ack_b = ack(&mut rebound, SESSION, &task_id);
     assert_eq!(ack_b["success"], true, "watch B ack failed: {ack_b:?}");
+    assert!(rebound.shutdown().success());
 
     drop(_release_exit_guard);
     let completion = wait_for_completion_frame(&mut restored, &task_id);

@@ -3640,7 +3640,7 @@ impl BgTaskRegistry {
                 } else {
                     // Mid-run pattern-match ack must not flip completion_delivered —
                     // the task is still running and will need a real completion later.
-                    self.sync_memory_watches_after_ack(task_id);
+                    self.sync_memory_watches_from_persistence(task_id);
                     delivered.push(task_id.clone());
                 }
             } else if let Some(session_id) = session_id {
@@ -3688,7 +3688,7 @@ impl BgTaskRegistry {
         );
     }
 
-    fn sync_memory_watches_after_ack(&self, task_id: &str) {
+    fn sync_memory_watches_from_persistence(&self, task_id: &str) {
         let Some((harness, pool)) = self.db_harness_and_pool() else {
             return;
         };
@@ -3707,9 +3707,10 @@ impl BgTaskRegistry {
         ) else {
             return;
         };
+        let has_pending_match = rows.iter().any(|row| row.pending_match);
         let remaining: HashSet<String> = rows.into_iter().map(|row| row.watch_id).collect();
         if let Ok(mut registry) = self.inner.watch_registry.lock() {
-            registry.retain_watch_ids(task_id, &remaining);
+            registry.reconcile_watch_ids(task_id, &remaining, has_pending_match);
         }
     }
 
@@ -4547,6 +4548,9 @@ impl BgTaskRegistry {
         // real-world bash usage.
         self.record_compression_event_if_applicable(metadata, &token_counts);
 
+        // A session ack can arrive through another root actor. Reconcile with
+        // the shared rows before task-local watch flags decide terminal routing.
+        self.sync_memory_watches_from_persistence(&metadata.task_id);
         let (watch_controlled, watch_matched) = self.task_watch_state(&metadata.task_id);
         if watch_controlled {
             if !watch_matched && !metadata.completion_delivered {
