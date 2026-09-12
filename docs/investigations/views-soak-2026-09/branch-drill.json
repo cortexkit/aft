@@ -1,0 +1,419 @@
+{
+  "baseline": "/Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline",
+  "defects": [
+    "views-on HEAD→a085bf62a459 did not return both correct probes within 300 seconds",
+    "HEAD→a085bf62a459 did not publish a new pointer generation",
+    "a085bf62a459→HEAD reused HEAD with puts=0 and embeds=4",
+    "views-on HEAD→refs/heads/dev did not return both correct probes within 300 seconds",
+    "HEAD→refs/heads/dev did not publish a new pointer generation",
+    "views-on refs/heads/dev→HEAD did not return both correct probes within 300 seconds",
+    "views-off HEAD→a085bf62a459 did not return both correct probes within 300 seconds",
+    "views-off a085bf62a459→HEAD did not return both correct probes within 300 seconds",
+    "views-off HEAD→refs/heads/dev did not return both correct probes within 300 seconds"
+  ],
+  "health_after": {
+    "dispatch_liveness": {
+      "interactive": {
+        "oldest_age_ms": null,
+        "queued": 0
+      },
+      "interactive_reserve": 2,
+      "maintenance": {
+        "oldest_age_ms": null,
+        "queued": 0
+      },
+      "maintenance_cap": 6,
+      "phantom_running_maintenance": 0,
+      "running": {
+        "completion_owned": {
+          "interactive": 0,
+          "maintenance": 1
+        },
+        "interactive": 0,
+        "maintenance": 1,
+        "oldest_worker_owned_maintenance_age_ms": 439348,
+        "phantom": {
+          "interactive": 0,
+          "maintenance": 0
+        }
+      }
+    },
+    "memory_process": {
+      "allocator_observation_age_ms": 217,
+      "allocator_slack_bytes": 6953333904,
+      "allocator_slack_label": "reclaimable by relief",
+      "allocator_slack_measured": true,
+      "last_relief_at_ms": 31260725,
+      "last_relief_freed_bytes": 0,
+      "phys_footprint_bytes": 9920067240,
+      "rss_bytes": 4754866176,
+      "sqlite_bytes": 39569088,
+      "total_attributed_bytes": 3722228965,
+      "unattributed_bytes": 6197838275
+    }
+  },
+  "health_before": {
+    "dispatch_liveness": {
+      "interactive": {
+        "oldest_age_ms": null,
+        "queued": 0
+      },
+      "interactive_reserve": 2,
+      "maintenance": {
+        "oldest_age_ms": null,
+        "queued": 0
+      },
+      "maintenance_cap": 6,
+      "phantom_running_maintenance": 0,
+      "running": {
+        "completion_owned": {
+          "interactive": 0,
+          "maintenance": 0
+        },
+        "interactive": 0,
+        "maintenance": 0,
+        "oldest_worker_owned_maintenance_age_ms": null,
+        "phantom": {
+          "interactive": 0,
+          "maintenance": 0
+        }
+      }
+    },
+    "memory_process": {
+      "allocator_observation_age_ms": 33,
+      "allocator_slack_bytes": 7541039056,
+      "allocator_slack_label": "reclaimable by relief",
+      "allocator_slack_measured": true,
+      "last_relief_at_ms": 29159914,
+      "last_relief_freed_bytes": 0,
+      "phys_footprint_bytes": 7318761832,
+      "rss_bytes": 2010480640,
+      "sqlite_bytes": 13961280,
+      "total_attributed_bytes": 3769659433,
+      "unattributed_bytes": 3549102399
+    }
+  },
+  "observed_at": "2026-09-12T09:02:03Z",
+  "refs": {
+    "anchor": {
+      "changed_files": 300,
+      "in_requested_range": true,
+      "kind": "first_parent_commit",
+      "requested_range": [
+        200,
+        400
+      ],
+      "sha": "a085bf62a459c21d90a89bcae006e969df60d944"
+    },
+    "branch": {
+      "changed_files": 5735,
+      "ref": "refs/heads/dev",
+      "sha": "def7220bfc65b84046e597e9be772eae81f663ff"
+    },
+    "head": "5716f8ba60e79ec60ec485b6e5291c0b0bc1f252",
+    "measurement_pids": {
+      "views-off": 57515,
+      "views-on": 22933
+    },
+    "observed_at": "2026-09-12T09:02:03Z",
+    "system_daemon_pid": 62424
+  },
+  "root": "/Users/ufukaltinok/Work/OSS/opencode",
+  "rows": [
+    {
+      "changed_files": 300,
+      "correctness": "timeout",
+      "cpu_s": 103.91,
+      "embeds": 3,
+      "generation_after": "6-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "generation_before": "6-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "last_callgraph": {
+        "code": "symbol_not_found",
+        "message": "symbol 'activeInfo' not found in /Users/ufukaltinok/Work/OSS/opencode/packages/core/src/plugin.ts",
+        "success": false,
+        "text": "callers: symbol_not_found — symbol 'activeInfo' not found in /Users/ufukaltinok/Work/OSS/opencode/packages/core/src/plugin.ts"
+      },
+      "last_search": {
+        "result_count": 20,
+        "status": "ready",
+        "success": true,
+        "text": "packages/core/src/plugin.ts [exact]\n  plugin [file summary]\n      export * as Plugin from \"./plugin.js\"\n      export { Event, ID, Info, Source, State } from \"@opencode-ai/schema/plugin\"\n      import { Plugin } from \"@opencode-ai/schema/plugin\"\n      import { Node } from \"@opencode-ai/util/effect/app-node\"\n      import { LayerNode } from \"@opencode-ai/util/effect/layer-node\"\n      import type { PersistentPty } from \"./persistent-pty.js\"\n      import { Cause, Context, Effect, Exit, Latch, Layer, Logger, References, Scope, Semaphore } from \"effect\"\n      import { Bus } from \"./bus.js\"\n      import { KV } from \"./kv.js\"\n      import { PluginHost } from \"./plugin/host.js\"\n      import { type Failure, type Generation, Service } from \"./plugin/service.js\"\n      import { State } from \"./state.js\"\n      export { awaitActivation, type Generation, type Interface, Service } from \"./plugin/service.js\"\n      const layer = Layer.effect(\n        Service,\n        Effect.gen(function* () {\n          const bus = yield* Bus.Service\n          const kv = yield* KV.Service\n          const scope = yield* Scope.make()\n          const active = new Map<Plugin.ID, { readonly plugin: Generation; readonly scope: Scope.Closeable }>()\n  plugin [file summary]\n      export * as Plugin from \"./plugin.js\"\n      export { Event, ID, Info, Source, State } from \"@opencode-ai/schema/plugin\"\n      import { Plugin } from \"@opencode-ai/schema/plugin\"\n      import { Node } from \"@opencode-ai/util/effect/app-node\"\n      import { LayerNode } from \"@opencode-ai/util/effect/layer-node\"\n\npackages/schema/src/config/compaction.ts [lexical match]\n\npackages/schema/src/session-status-event.ts [lexical match]\n\npackages/schema/src/session-stats.ts [lexical match]\n\npackages/schema/src/agent.ts [lexical match]\n\npackages/protocol/src/groups/shell.ts [lexical match]\n\npackages/core/src/v1/config/provider.ts [lexical match]\n\npackages/cli/src/commands/handlers/auth/logout.ts [lexical match]\n\npackages/schema/src/config/agent.ts […"
+      },
+      "mode": "views-on",
+      "probe": {
+        "path": "packages/core/src/plugin.ts",
+        "symbol": "activeInfo",
+        "token": "activeInfo"
+      },
+      "publication": "timeout",
+      "publication_blob_puts": null,
+      "publication_ms": null,
+      "puts": 0,
+      "puts_source": "entries_delta",
+      "query_embedding_calls": 0,
+      "rss_delta_mb": -288.0,
+      "settle_error": null,
+      "switch": "HEAD→a085bf62a459",
+      "system_daemon_cpu_s": 362.1,
+      "system_daemon_rss_delta_mb": 3247.141,
+      "target": "a085bf62a459c21d90a89bcae006e969df60d944",
+      "time_to_correct_ms": null
+    },
+    {
+      "changed_files": 300,
+      "correctness": "correct",
+      "cpu_s": 111.97,
+      "embeds": 4,
+      "generation_after": "7-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "generation_before": "6-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "last_callgraph": null,
+      "last_search": null,
+      "mode": "views-on",
+      "probe": {
+        "path": "packages/app/src/settings/timeline-detail.tsx",
+        "symbol": "TimelineDetailControl",
+        "token": "TimelineDetailControl"
+      },
+      "publication": "published",
+      "publication_blob_puts": 0,
+      "publication_ms": 111284,
+      "puts": 0,
+      "puts_source": "publication_log",
+      "query_embedding_calls": 0,
+      "rss_delta_mb": 2905.906,
+      "settle_error": null,
+      "switch": "a085bf62a459→HEAD",
+      "system_daemon_cpu_s": 118.28,
+      "system_daemon_rss_delta_mb": -1875.234,
+      "target": "5716f8ba60e79ec60ec485b6e5291c0b0bc1f252",
+      "time_to_correct_ms": 4637
+    },
+    {
+      "changed_files": 5735,
+      "correctness": "timeout",
+      "cpu_s": 81.07,
+      "embeds": 0,
+      "generation_after": "7-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "generation_before": "7-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "last_callgraph": {
+        "code": "symbol_not_found",
+        "message": "symbol 'createKeys' not found in /Users/ufukaltinok/Work/OSS/opencode/.opencode/plugins/tui-smoke.tsx",
+        "success": false,
+        "text": "callers: symbol_not_found — symbol 'createKeys' not found in /Users/ufukaltinok/Work/OSS/opencode/.opencode/plugins/tui-smoke.tsx"
+      },
+      "last_search": {
+        "result_count": 20,
+        "status": "building",
+        "success": true,
+        "text": "Semantic index is rebuilding; lexical fallback results follow.\n\n.opencode/plugins/tui-smoke.tsx [exact]\n  tui-smoke [file summary]\n      /** @jsxImportSource @opentui/solid */\n      import { useTerminalDimensions, type JSX } from \"@opentui/solid\"\n      import { useBindings, useKeymapSelector } from \"@opentui/keymap/solid\"\n      import { RGBA, VignetteEffect, type KeyEvent, type Renderable } from \"@opentui/core\"\n      import { createBindingLookup, type BindingConfig } from \"@opentui/keymap/extras\"\n      import type { TuiPlugin, TuiPluginApi, TuiPluginMeta, TuiPluginModule, TuiSlotPlugin } from \"@opencode-ai/plugin/tui\"\n      const tabs = [\"overview\", \"counter\", \"help\"]\n      const command = {\n        modal: \"smoke_modal\",\n        screen: \"smoke_screen\",\n        alert: \"smoke_alert\",\n        confirm: \"smoke_confirm\",\n        prompt: \"smoke_prompt\",\n        select: \"smoke_select\",\n        host: \"smoke_host\",\n        home: \"smoke_home\",\n        toast: \"smoke_toast\",\n        dialog_close: \"smoke_dialog_close\",\n        local_push: \"smoke_local_push\",\n        local_pop: \"smoke_local_pop\",\n  tui-smoke [file summary]\n      /** @jsxImportSource @opentui/solid */\n      import { useTerminalDimensions, type JSX } from \"@opentui/solid\"\n      import { useBindings, useKeymapSelector } from \"@opentui/keymap/solid\"\n      import { RGBA, VignetteEffect, type KeyEvent, type Renderable } from \"@opentui/core\"\n      import { createBindingLookup, type BindingConfig } from \"@opentui/keymap/extras\"\n\npackages/app/src/pages/session/session-layout.ts [lexical match]\n\npackages/console/app/src/routes/zen/util/modelTpsLimiter.ts [lexical match]\n\npackages/console/app/src/routes/workspace/[id]/new-user-section.tsx [lexical match]\n\npackages/console/app/src/routes/zen/util/stickyProviderTracker.ts [lexical match]\n\npackages/console/core/src/provider.ts [lexical match]\n\npackages/console/app/src/routes/workspace/[id]/keys/key-section.tsx [lexical match]\n\npackages/console/app/src/routes/zen/util/trialLimit…"
+      },
+      "mode": "views-on",
+      "probe": {
+        "path": ".opencode/plugins/tui-smoke.tsx",
+        "symbol": "createKeys",
+        "token": "createKeys"
+      },
+      "publication": "timeout",
+      "publication_blob_puts": null,
+      "publication_ms": null,
+      "puts": 0,
+      "puts_source": "entries_delta",
+      "query_embedding_calls": 0,
+      "rss_delta_mb": -3030.219,
+      "settle_error": null,
+      "switch": "HEAD→refs/heads/dev",
+      "system_daemon_cpu_s": 212.26,
+      "system_daemon_rss_delta_mb": -1709.344,
+      "target": "def7220bfc65b84046e597e9be772eae81f663ff",
+      "time_to_correct_ms": null
+    },
+    {
+      "changed_files": 5735,
+      "correctness": "timeout",
+      "cpu_s": 156.48,
+      "embeds": 0,
+      "generation_after": "8-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "generation_before": "7-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1",
+      "last_callgraph": {
+        "success": true,
+        "text": "1 caller · 1 file group\ninfra/app.ts\n  ↳ <top-level>:63"
+      },
+      "last_search": {
+        "result_count": 20,
+        "status": "building",
+        "success": true,
+        "text": "Semantic index is rebuilding; lexical fallback results follow.\n\ninfra/app.ts [exact]\n  app [file summary]\n      import { domain } from \"./stage\"\n      import { createWebApp } from \"./webapp\"\n      const GITHUB_APP_ID = new sst.Secret(\"GITHUB_APP_ID\")\n      const GITHUB_APP_PRIVATE_KEY = new sst.Secret(\"GITHUB_APP_PRIVATE_KEY\")\n      export const EMAILOCTOPUS_API_KEY = new sst.Secret(\"EMAILOCTOPUS_API_KEY\")\n      const ADMIN_SECRET = new sst.Secret(\"ADMIN_SECRET\")\n      const DISCORD_SUPPORT_BOT_TOKEN = new sst.Secret(\"DISCORD_SUPPORT_BOT_TOKEN\")\n      const DISCORD_SUPPORT_CHANNEL_ID = new sst.Secret(\"DISCORD_SUPPORT_CHANNEL_ID\")\n      const FEISHU_APP_ID = new sst.Secret(\"FEISHU_APP_ID\")\n      const FEISHU_APP_SECRET = new sst.Secret(\"FEISHU_APP_SECRET\")\n      const bucket = new sst.cloudflare.Bucket(\"Bucket\")\n      export const api = new sst.cloudflare.Worker(\"Api\", {\n        domain: `api.${domain}`,\n        handler: \"packages/function/src/api.ts\",\n        environment: {\n          WEB_DOMAIN: domain,\n        },\n        url: true,\n        link: [\n          bucket,\n\nsst.config.ts [exact]\n  sst.config [file summary]\n      /// <reference path=\"./.sst/platform/config.d.ts\" />\n      export default $config({\n        app(input) {\n          return {\n            name: \"opencode\",\n\ninfra/webapp.ts [exact]\n  webapp [file summary]\n      export function createWebApp(domain: string) {\n        return new sst.cloudflare.StaticSite(\"WebApp\", {\n          domain,\n          path: \"packages/app\",\n          environment:\n\ninfra/console.ts [lexical match]\n\npackages/desktop/src/main/ipc-handlers/menu.ts [lexical match]\n\npackages/desktop/src/main/lifecycle/index.ts [lexical match]\n\npackages/app/src/entry.tsx [lexical match]\n\npackages/console/app/src/i18n/en.ts [lexical match]\n\npackages/ai/AGENTS.md [lexical match]\n\npackages/desktop/src/main/native/menu-actions.ts [lexical match]\n\npackages/desktop/src/main/windows/index.ts [lexical match]\n\npackages/app/README.md [lexical match]\n\npackages/con…"
+      },
+      "mode": "views-on",
+      "probe": {
+        "path": "infra/webapp.ts",
+        "symbol": "createWebApp",
+        "token": "createWebApp"
+      },
+      "publication": "published",
+      "publication_blob_puts": 0,
+      "publication_ms": 212902,
+      "puts": 0,
+      "puts_source": "publication_log",
+      "query_embedding_calls": 0,
+      "rss_delta_mb": 2407.453,
+      "settle_error": null,
+      "switch": "refs/heads/dev→HEAD",
+      "system_daemon_cpu_s": 265.16,
+      "system_daemon_rss_delta_mb": 2587.656,
+      "target": "5716f8ba60e79ec60ec485b6e5291c0b0bc1f252",
+      "time_to_correct_ms": null
+    },
+    {
+      "changed_files": 300,
+      "correctness": "timeout",
+      "cpu_s": 242.74,
+      "embeds": 0,
+      "generation_after": null,
+      "generation_before": null,
+      "last_callgraph": {
+        "code": "symbol_not_found",
+        "message": "symbol 'activeInfo' not found in /Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline/packages/core/src/plugin.ts",
+        "success": false,
+        "text": "callers: symbol_not_found — symbol 'activeInfo' not found in /Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline/packages/core/src/plugin.ts"
+      },
+      "last_search": {
+        "result_count": 4,
+        "status": "partial",
+        "success": true,
+        "text": "trigram index building; results from a bounded walk\n\npackages/core/src/plugin.ts\n94:                 const nextInventory = [...definitions.map(activeInfo), ...failures]\n114:                   const nextInventory = definitions.slice(0, prefix).map(activeInfo)\n119:                       nextInventory.push(activeInfo(definition))\n170: function activeInfo(plugin: Generation): Plugin.Info {\n\nFound 4 match across 1 file [index: fallback]\n[interpreted_as: literal]\nSearch status: fully degraded; partial/incomplete.\n\nshown 4 of ≥4 results (walk) · narrow: offset, topK, path, includeTests"
+      },
+      "mode": "views-off",
+      "probe": {
+        "path": "packages/core/src/plugin.ts",
+        "symbol": "activeInfo",
+        "token": "activeInfo"
+      },
+      "publication": "not_applicable",
+      "publication_blob_puts": null,
+      "publication_ms": null,
+      "puts": null,
+      "puts_source": "not_applicable",
+      "query_embedding_calls": 0,
+      "rss_delta_mb": 13.562,
+      "settle_error": null,
+      "switch": "HEAD→a085bf62a459",
+      "system_daemon_cpu_s": 84.94,
+      "system_daemon_rss_delta_mb": 630.328,
+      "target": "a085bf62a459c21d90a89bcae006e969df60d944",
+      "time_to_correct_ms": null
+    },
+    {
+      "changed_files": 300,
+      "correctness": "timeout",
+      "cpu_s": 224.99,
+      "embeds": 0,
+      "generation_after": null,
+      "generation_before": null,
+      "last_callgraph": {
+        "code": "symbol_not_found",
+        "message": "symbol 'TimelineDetailControl' not found in /Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline/packages/app/src/settings/timeline-detail.tsx",
+        "success": false,
+        "text": "callers: symbol_not_found — symbol 'TimelineDetailControl' not found in /Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline/packages/app/src/settings/timeline-detail.tsx"
+      },
+      "last_search": {
+        "result_count": 0,
+        "status": "ready",
+        "success": true,
+        "text": "Semantic index is reloading from the shared read-only snapshot; retry shortly.\n0 lexical matches; the semantic lane is unavailable (reloading), so prose-style queries may match only via semantic. Retry in a few seconds. [semantic: reloading]\nSearch status: fully degraded; partial/incomplete.\n\nshown 0 of ≥1 results (walk) · narrow: offset, topK, path, includeTests"
+      },
+      "mode": "views-off",
+      "probe": {
+        "path": "packages/app/src/settings/timeline-detail.tsx",
+        "symbol": "TimelineDetailControl",
+        "token": "TimelineDetailControl"
+      },
+      "publication": "not_applicable",
+      "publication_blob_puts": null,
+      "publication_ms": null,
+      "puts": null,
+      "puts_source": "not_applicable",
+      "query_embedding_calls": 0,
+      "rss_delta_mb": -4.797,
+      "settle_error": null,
+      "switch": "a085bf62a459→HEAD",
+      "system_daemon_cpu_s": 154.76,
+      "system_daemon_rss_delta_mb": 859.516,
+      "target": "5716f8ba60e79ec60ec485b6e5291c0b0bc1f252",
+      "time_to_correct_ms": null
+    },
+    {
+      "changed_files": 5735,
+      "correctness": "timeout",
+      "cpu_s": 214.63,
+      "embeds": 0,
+      "generation_after": null,
+      "generation_before": null,
+      "last_callgraph": {
+        "code": "symbol_not_found",
+        "message": "symbol 'createKeys' not found in /Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline/.opencode/plugins/tui-smoke.tsx",
+        "success": false,
+        "text": "callers: symbol_not_found — symbol 'createKeys' not found in /Users/ufukaltinok/.cache/aft-views-soak/0f3900af641f5248/baseline/.opencode/plugins/tui-smoke.tsx"
+      },
+      "last_search": {
+        "result_count": 3,
+        "status": "partial",
+        "success": true,
+        "text": "trigram index building; results from a bounded walk\n\n.opencode/plugins/tui-smoke.tsx\n113: function createKeys(input: SmokeBindings | undefined) {\n117: type Keys = ReturnType<typeof createKeys>\n989:   const keys = createKeys(value.keybinds)\n\nFound 3 match across 1 file [index: fallback]\n[interpreted_as: literal]\nSearch status: fully degraded; partial/incomplete.\n\nshown 3 of ≥3 results (walk) · narrow: offset, topK, path, includeTests"
+      },
+      "mode": "views-off",
+      "probe": {
+        "path": ".opencode/plugins/tui-smoke.tsx",
+        "symbol": "createKeys",
+        "token": "createKeys"
+      },
+      "publication": "not_applicable",
+      "publication_blob_puts": null,
+      "publication_ms": null,
+      "puts": null,
+      "puts_source": "not_applicable",
+      "query_embedding_calls": 0,
+      "rss_delta_mb": -6.328,
+      "settle_error": null,
+      "switch": "HEAD→refs/heads/dev",
+      "system_daemon_cpu_s": 118.75,
+      "system_daemon_rss_delta_mb": -1145.141,
+      "target": "def7220bfc65b84046e597e9be772eae81f663ff",
+      "time_to_correct_ms": null
+    },
+    {
+      "changed_files": 5735,
+      "correctness": "correct",
+      "cpu_s": 3.11,
+      "embeds": 0,
+      "generation_after": null,
+      "generation_before": null,
+      "last_callgraph": null,
+      "last_search": null,
+      "mode": "views-off",
+      "probe": {
+        "path": "infra/webapp.ts",
+        "symbol": "createWebApp",
+        "token": "createWebApp"
+      },
+      "publication": "not_applicable",
+      "publication_blob_puts": null,
+      "publication_ms": null,
+      "puts": null,
+      "puts_source": "not_applicable",
+      "query_embedding_calls": 0,
+      "rss_delta_mb": 10.719,
+      "settle_error": null,
+      "switch": "refs/heads/dev→HEAD",
+      "system_daemon_cpu_s": 3.31,
+      "system_daemon_rss_delta_mb": -1.234,
+      "target": "5716f8ba60e79ec60ec485b6e5291c0b0bc1f252",
+      "time_to_correct_ms": 7504
+    }
+  ],
+  "schema_version": 1,
+  "system_daemon_total": {
+    "cpu_s": 1323.66,
+    "rss_delta_mb": 2617.781
+  }
+}
