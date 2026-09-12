@@ -1018,9 +1018,10 @@ impl ParseBlob {
             .collect::<Vec<_>>();
         let abs = facts.root.join(path);
         let mut raw_refs = Vec::new();
-        for raw in &self.refs {
+        for (position, raw) in self.refs.iter().enumerate() {
+            let position = u32::try_from(position).expect("reference vector fits u32");
             let dependencies =
-                if let Some(dependencies) = cached.and_then(|cache| cache.get(&raw.ordinal)) {
+                if let Some(dependencies) = cached.and_then(|cache| cache.get(&position)) {
                     dependencies.clone()
                 } else if raw.kind == BlobRefKind::Module {
                     super::rust_external_module_target(
@@ -1312,13 +1313,19 @@ mod manifest_integration_tests;
 /// parse blobs. The owner must invalidate these whenever a probed path changes.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct ViewBindingDependencies {
+    // AST ordinals can collide for structural references. Vector positions are
+    // unique and stable within the immutable caller blob used to validate reuse.
     pub references: BTreeMap<u32, BTreeSet<String>>,
     pub dependencies: BTreeSet<String>,
+    binding_probes: BTreeSet<String>,
+    resolved_dependencies: BTreeSet<String>,
+    surface_queries: Vec<(ViewSurfaceQuery, String)>,
 }
 
 pub(crate) struct SelectedManifestJoin {
     pub result: JoinResult,
     pub bindings: BTreeMap<String, ViewBindingDependencies>,
+    pub resolved_callers: BTreeSet<String>,
 }
 
 /// Configuration files read by the manifest resolver's workspace/package and
@@ -1332,12 +1339,27 @@ pub(crate) fn view_resolution_config(path: &[u8]) -> bool {
     )
 }
 
+/// All memo tables are scoped to one immutable manifest join. Hits still record
+/// the caller's probes, so memoization cannot hide a future invalidation edge.
 struct ViewBindingFacts<'a> {
     inner: Rc<dyn ProjectFacts + 'a>,
     probes: std::cell::RefCell<BTreeSet<String>>,
+    canonical_cache: std::cell::RefCell<HashMap<Vec<u8>, Option<Vec<u8>>>>,
+    file_cache: std::cell::RefCell<HashMap<Vec<u8>, bool>>,
+    config_cache: std::cell::RefCell<HashMap<Vec<u8>, Option<Arc<[u8]>>>>,
+    directory_cache: std::cell::RefCell<HashMap<Vec<u8>, Vec<super::facts::DirEntry>>>,
 }
 
 impl ViewBindingFacts<'_> {
+    fn file_fact(&self, rel: &[u8]) -> bool {
+        if let Some(value) = self.file_cache.borrow().get(rel) {
+            return *value;
+        }
+        let value = self.inner.is_file(rel);
+        self.file_cache.borrow_mut().insert(rel.to_vec(), value);
+        value
+    }
+
     fn record(&self, path: &[u8]) {
         // Config changes invalidate every caller separately. Persist source probes,
         // including misses, to catch a newly added module or an earlier candidate.
@@ -1365,7 +1387,7 @@ impl ViewBindingFacts<'_> {
 
 impl ProjectFacts for ViewBindingFacts<'_> {
     fn is_file(&self, rel: &[u8]) -> bool {
-        let is_file = self.inner.is_file(rel);
+        let is_file = self.file_fact(rel);
         if is_file {
             self.record(rel);
         }
@@ -1376,7 +1398,14 @@ impl ProjectFacts for ViewBindingFacts<'_> {
     }
     fn config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
         self.record(rel);
-        self.inner.config_bytes(rel)
+        if let Some(value) = self.config_cache.borrow().get(rel) {
+            return value.clone();
+        }
+        let value = self.inner.config_bytes(rel);
+        self.config_cache
+            .borrow_mut()
+            .insert(rel.to_vec(), value.clone());
+        value
     }
     fn symlink_target(&self, rel: &[u8]) -> Option<&[u8]> {
         self.inner.symlink_target(rel)
@@ -1384,20 +1413,31 @@ impl ProjectFacts for ViewBindingFacts<'_> {
     fn canonical(&self, rel: &[u8]) -> Option<Vec<u8>> {
         // FactPaths canonicalizes before testing existence, so misses must be
         // recorded here as well as in is_file (not only after canonicalization).
-        let canonical = self.inner.canonical(rel);
+        let cached = self.canonical_cache.borrow().get(rel).cloned();
+        let canonical = cached.unwrap_or_else(|| {
+            let value = self.inner.canonical(rel);
+            self.canonical_cache
+                .borrow_mut()
+                .insert(rel.to_vec(), value.clone());
+            value
+        });
         // Existing directory probes are workspace-discovery implementation detail:
         // memo hits may omit them. Configuration changes invalidate that discovery
         // globally, while file probes and misses remain stable caller dependencies.
-        if canonical
-            .as_ref()
-            .is_none_or(|path| self.inner.is_file(path))
-        {
+        if canonical.as_ref().is_none_or(|path| self.file_fact(path)) {
             self.record(rel);
         }
         canonical
     }
     fn list_dir(&self, rel: &[u8]) -> Vec<super::facts::DirEntry> {
-        self.inner.list_dir(rel)
+        if let Some(value) = self.directory_cache.borrow().get(rel) {
+            return value.clone();
+        }
+        let value = self.inner.list_dir(rel);
+        self.directory_cache
+            .borrow_mut()
+            .insert(rel.to_vec(), value.clone());
+        value
     }
 }
 
@@ -1411,6 +1451,36 @@ pub(crate) fn join_selected_manifest(
     selected: Option<&BTreeSet<String>>,
     cached: &BTreeMap<String, ViewBindingDependencies>,
 ) -> Result<SelectedManifestJoin, ManifestJoinError> {
+    join_manifest_with_surfaces(manifest, blobs, selected, cached, None)
+}
+
+/// Rebind only changed callers or callers that probed changed membership. Other
+/// candidates replay their prior consumer-specific surface queries and retain
+/// their reference rows when every answer is unchanged.
+pub(crate) fn join_selected_manifest_reusing_surfaces(
+    manifest: &Manifest,
+    blobs: &impl ManifestBlobReader,
+    selected: Option<&BTreeSet<String>>,
+    cached: &BTreeMap<String, ViewBindingDependencies>,
+    changed: &BTreeSet<String>,
+    membership_changed: &BTreeSet<String>,
+) -> Result<SelectedManifestJoin, ManifestJoinError> {
+    join_manifest_with_surfaces(
+        manifest,
+        blobs,
+        selected,
+        cached,
+        Some((changed, membership_changed)),
+    )
+}
+
+fn join_manifest_with_surfaces(
+    manifest: &Manifest,
+    blobs: &impl ManifestBlobReader,
+    selected: Option<&BTreeSet<String>>,
+    cached: &BTreeMap<String, ViewBindingDependencies>,
+    reuse: Option<(&BTreeSet<String>, &BTreeSet<String>)>,
+) -> Result<SelectedManifestJoin, ManifestJoinError> {
     let loaded = manifest_payloads(manifest, blobs)?;
     let reader = |key: &BlobKey| loaded.get(key).cloned();
     let facts = Rc::new(ViewBindingFacts {
@@ -1419,6 +1489,10 @@ pub(crate) fn join_selected_manifest(
             blobs: &reader,
         }),
         probes: Default::default(),
+        canonical_cache: Default::default(),
+        file_cache: Default::default(),
+        config_cache: Default::default(),
+        directory_cache: Default::default(),
     });
     let root = Path::new("/");
     let paths = FactPaths {
@@ -1445,7 +1519,15 @@ pub(crate) fn join_selected_manifest(
             continue;
         };
         let resolve = selected.is_none_or(|set| set.contains(rel));
-        let cache = (!resolve).then(|| cached.get(rel)).flatten();
+        let cache = cached.get(rel).filter(|cache| {
+            if let Some((changed, membership)) = reuse {
+                selected.is_some()
+                    && !changed.contains(rel)
+                    && cache.dependencies.is_disjoint(membership)
+            } else {
+                !resolve
+            }
+        });
         facts.take();
         let extract =
             blob.bind_with_dependencies(rel, &paths, cache.map(|cache| &cache.references))?;
@@ -1459,10 +1541,19 @@ pub(crate) fn join_selected_manifest(
                 .refs
                 .iter()
                 .zip(&extract.raw_refs)
-                .map(|(raw, bound)| (raw.ordinal, bound.dependencies.clone()))
+                .enumerate()
+                .map(|(position, (_, bound))| {
+                    (
+                        u32::try_from(position).expect("reference vector fits u32"),
+                        bound.dependencies.clone(),
+                    )
+                })
                 .collect();
+            binding.binding_probes = facts.take();
             binding.dependencies = binding.references.values().flatten().cloned().collect();
-            binding.dependencies.extend(facts.take());
+            binding
+                .dependencies
+                .extend(binding.binding_probes.iter().cloned());
         }
         bindings.insert(rel.to_string(), binding);
         if resolve {
@@ -1495,15 +1586,68 @@ pub(crate) fn join_selected_manifest(
         resolution_order: Vec::new(),
         unbound_non_utf8_paths,
     };
+    let resolved_callers = bindings
+        .keys()
+        .filter(|path| {
+            if selected.is_some_and(|set| !set.contains(*path)) {
+                return false;
+            }
+            let Some((changed, _)) = reuse else {
+                return true;
+            };
+            if selected.is_none() || changed.contains(*path) {
+                return true;
+            }
+            cached.get(*path).is_none_or(|old| {
+                old.surface_queries
+                    .iter()
+                    .any(|(query, expected)| query.answer(&index) != *expected)
+            })
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for (path, binding) in &mut bindings {
+        if resolved_callers.contains(path) {
+            binding.resolved_dependencies.clear();
+            binding.surface_queries.clear();
+        } else if let Some(old) = cached.get(path) {
+            binding.resolved_dependencies = old.resolved_dependencies.clone();
+            binding.surface_queries = old.surface_queries.clone();
+        }
+    }
+    let surface_index = ViewSurfaceIndex {
+        inner: &index,
+        queries: Default::default(),
+    };
+    let mut queries = BTreeMap::<String, BTreeMap<ViewSurfaceQuery, String>>::new();
     work.sort_by(|a, b| (&a.0, a.1 .0).cmp(&(&b.0, b.1 .0)));
     for (key, (kind, raw)) in work {
+        let caller = std::str::from_utf8(&key.caller_path).expect("bound UTF-8 caller");
+        if !resolved_callers.contains(caller) {
+            continue;
+        }
         facts.take();
-        let resolved = super::resolve_ref(raw, &index)
+        let resolved = super::resolve_ref(raw, &surface_index)
             .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
         let caller = std::str::from_utf8(&key.caller_path).expect("bound UTF-8 caller");
         let binding = bindings.get_mut(caller).expect("bound caller dependencies");
-        binding.dependencies.extend(resolved.dependencies);
-        binding.dependencies.extend(facts.take());
+        queries
+            .entry(caller.to_string())
+            .or_default()
+            .extend(surface_index.take());
+        let basis = binding
+            .references
+            .values()
+            .flatten()
+            .chain(binding.binding_probes.iter())
+            .collect::<BTreeSet<_>>();
+        binding.resolved_dependencies.extend(
+            resolved
+                .dependencies
+                .into_iter()
+                .chain(facts.take())
+                .filter(|dependency| !basis.contains(dependency)),
+        );
         result.rows.insert(DerivedRow {
             caller_blob_key: key.caller_blob_key.clone(),
             ref_ordinal: key.ref_ordinal,
@@ -1519,5 +1663,210 @@ pub(crate) fn join_selected_manifest(
         });
         result.resolution_order.push(key);
     }
-    Ok(SelectedManifestJoin { result, bindings })
+    for (path, binding) in &mut bindings {
+        if let Some(queries) = queries.remove(path) {
+            binding.surface_queries = queries.into_iter().collect();
+        }
+        binding.dependencies = binding
+            .references
+            .values()
+            .flatten()
+            .cloned()
+            .chain(binding.binding_probes.iter().cloned())
+            .chain(binding.resolved_dependencies.iter().cloned())
+            .chain(
+                binding
+                    .surface_queries
+                    .iter()
+                    .flat_map(|(query, _)| query.dependencies()),
+            )
+            .collect();
+    }
+    Ok(SelectedManifestJoin {
+        result,
+        bindings,
+        resolved_callers,
+    })
+}
+
+/// Consumer-specific export surface: record the answers the resolver actually
+/// used, rather than invalidating every caller when an unrelated export changes.
+/// Querying these answers against a new index is cheaper than walking references
+/// and is sound only while the caller's immutable parse blob remains unchanged.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+enum ViewSurfaceQuery {
+    Language(String),
+    Module(String, String),
+    Parent(String),
+    Reexports(String),
+    Node(String, String),
+    Callable(String, String),
+    Alias(String, String),
+    Export(String, String),
+    Default(String),
+    Contains(String),
+    Crate(String),
+    Inline(String, Vec<String>, String),
+}
+
+fn surface_value(value: &impl Serialize) -> String {
+    blake3::hash(&serde_json::to_vec(value).expect("resolver surface serializes"))
+        .to_hex()
+        .to_string()
+}
+
+fn reexport_surface(value: &[super::ReexportIndex]) -> String {
+    surface_value(
+        &value
+            .iter()
+            .map(|entry| {
+                (
+                    &entry.target_file,
+                    entry.named.iter().collect::<BTreeMap<_, _>>(),
+                    entry.wildcard,
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+pub(crate) const VIEW_RUST_MODULE_DOMAIN: &str = "\0view:rust-module-index";
+
+impl ViewSurfaceQuery {
+    fn dependencies(&self) -> Vec<String> {
+        match self {
+            Self::Crate(_) => Vec::new(),
+            Self::Parent(file) | Self::Inline(file, ..) => {
+                vec![file.clone(), VIEW_RUST_MODULE_DOMAIN.into()]
+            }
+            Self::Language(file)
+            | Self::Module(file, _)
+            | Self::Reexports(file)
+            | Self::Node(file, _)
+            | Self::Callable(file, _)
+            | Self::Alias(file, _)
+            | Self::Export(file, _)
+            | Self::Default(file)
+            | Self::Contains(file) => vec![file.clone()],
+        }
+    }
+
+    fn answer(&self, index: &impl super::ResolverIndex) -> String {
+        match self {
+            Self::Language(file) => {
+                surface_value(&index.lang_for(file).map(|lang| format!("{lang:?}")))
+            }
+            Self::Module(file, module) => surface_value(&index.module_target(file, module)),
+            Self::Parent(file) => surface_value(&index.module_parent(file)),
+            Self::Reexports(file) => reexport_surface(&index.reexports_for(file)),
+            Self::Node(file, symbol) => surface_value(&index.node_for_symbol(file, symbol)),
+            Self::Callable(file, node) => surface_value(&index.node_is_callable(file, node)),
+            Self::Alias(file, symbol) => surface_value(&index.export_alias(file, symbol)),
+            Self::Export(file, symbol) => surface_value(&index.has_export(file, symbol)),
+            Self::Default(file) => surface_value(&index.default_export(file)),
+            Self::Contains(file) => surface_value(&index.contains_file(file)),
+            Self::Crate(name) => surface_value(&index.crate_src_prefix(name)),
+            Self::Inline(file, segments, symbol) => {
+                surface_value(&index.inline_scoped_target(file, segments, symbol))
+            }
+        }
+    }
+}
+
+struct ViewSurfaceIndex<'a, I> {
+    inner: &'a I,
+    queries: std::cell::RefCell<BTreeMap<ViewSurfaceQuery, String>>,
+}
+
+impl<I> ViewSurfaceIndex<'_, I> {
+    fn record(&self, query: ViewSurfaceQuery, value: &impl Serialize) {
+        self.queries
+            .borrow_mut()
+            .insert(query, surface_value(value));
+    }
+    fn take(&self) -> BTreeMap<ViewSurfaceQuery, String> {
+        std::mem::take(&mut *self.queries.borrow_mut())
+    }
+}
+
+impl<I: super::ResolverIndex> super::ResolverIndex for ViewSurfaceIndex<'_, I> {
+    fn caller_data(&self, file: &str) -> Option<&FileCallData> {
+        // resolve_ref reads only its own caller data; changed callers never reuse
+        // surface answers, so the immutable blob itself guards this input.
+        self.inner.caller_data(file)
+    }
+    fn lang_for(&self, file: &str) -> Option<LangId> {
+        let value = self.inner.lang_for(file);
+        self.record(
+            ViewSurfaceQuery::Language(file.into()),
+            &value.map(|lang| format!("{lang:?}")),
+        );
+        value
+    }
+    fn module_target(&self, file: &str, module: &str) -> Option<String> {
+        let value = self.inner.module_target(file, module);
+        self.record(ViewSurfaceQuery::Module(file.into(), module.into()), &value);
+        value
+    }
+    fn module_parent(&self, file: &str) -> Option<(String, String)> {
+        let value = self.inner.module_parent(file);
+        self.record(ViewSurfaceQuery::Parent(file.into()), &value);
+        value
+    }
+    fn reexports_for(&self, file: &str) -> Vec<super::ReexportIndex> {
+        let value = self.inner.reexports_for(file);
+        self.queries.borrow_mut().insert(
+            ViewSurfaceQuery::Reexports(file.into()),
+            reexport_surface(&value),
+        );
+        value
+    }
+    fn node_for_symbol(&self, file: &str, symbol: &str) -> Option<String> {
+        let value = self.inner.node_for_symbol(file, symbol);
+        self.record(ViewSurfaceQuery::Node(file.into(), symbol.into()), &value);
+        value
+    }
+    fn node_is_callable(&self, file: &str, node: &str) -> bool {
+        let value = self.inner.node_is_callable(file, node);
+        self.record(ViewSurfaceQuery::Callable(file.into(), node.into()), &value);
+        value
+    }
+    fn export_alias(&self, file: &str, symbol: &str) -> Option<String> {
+        let value = self.inner.export_alias(file, symbol);
+        self.record(ViewSurfaceQuery::Alias(file.into(), symbol.into()), &value);
+        value
+    }
+    fn has_export(&self, file: &str, symbol: &str) -> bool {
+        let value = self.inner.has_export(file, symbol);
+        self.record(ViewSurfaceQuery::Export(file.into(), symbol.into()), &value);
+        value
+    }
+    fn default_export(&self, file: &str) -> Option<String> {
+        let value = self.inner.default_export(file);
+        self.record(ViewSurfaceQuery::Default(file.into()), &value);
+        value
+    }
+    fn contains_file(&self, file: &str) -> bool {
+        let value = self.inner.contains_file(file);
+        self.record(ViewSurfaceQuery::Contains(file.into()), &value);
+        value
+    }
+    fn crate_src_prefix(&self, name: &str) -> Option<String> {
+        let value = self.inner.crate_src_prefix(name);
+        self.record(ViewSurfaceQuery::Crate(name.into()), &value);
+        value
+    }
+    fn inline_scoped_target(
+        &self,
+        file: &str,
+        segments: &[String],
+        symbol: &str,
+    ) -> Option<(String, String)> {
+        let value = self.inner.inline_scoped_target(file, segments, symbol);
+        self.record(
+            ViewSurfaceQuery::Inline(file.into(), segments.to_vec(), symbol.into()),
+            &value,
+        );
+        value
+    }
 }
