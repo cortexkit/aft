@@ -9,7 +9,6 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::unbounded;
-use notify::{RecursiveMode, Watcher};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -504,21 +503,6 @@ fn resolve_home_dir() -> Option<PathBuf> {
     Some(std::fs::canonicalize(&raw).unwrap_or(raw))
 }
 
-fn create_project_watcher(
-    root_path: PathBuf,
-    extra_watch_paths: Vec<PathBuf>,
-    tx: mpsc::Sender<notify::Result<notify::Event>>,
-) -> notify::Result<notify::RecommendedWatcher> {
-    let mut watcher = notify::recommended_watcher(tx)?;
-    watcher.watch(&root_path, RecursiveMode::Recursive)?;
-    for path in extra_watch_paths {
-        if path.exists() {
-            watcher.watch(&path, RecursiveMode::NonRecursive)?;
-        }
-    }
-    Ok(watcher)
-}
-
 fn external_ignore_watch_paths(ctx: &AppContext, root_path: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(global_ignore) = ignore::gitignore::gitconfig_excludes_path() {
@@ -651,7 +635,22 @@ fn start_project_watcher(ctx: &AppContext, root_path: &Path) {
         return;
     }
     let extra_watch_paths = external_ignore_watch_paths(ctx, root_path);
-    start_project_watcher_with(ctx, root_path, extra_watch_paths, create_project_watcher);
+    let matcher = ctx.shared_gitignore();
+    let matcher_generation = ctx.gitignore_generation();
+    start_project_watcher_with(
+        ctx,
+        root_path,
+        extra_watch_paths,
+        move |root, extra_watch_paths, tx| {
+            crate::watcher_backend::create_project_watcher(
+                root,
+                extra_watch_paths,
+                tx,
+                matcher,
+                matcher_generation,
+            )
+        },
+    );
 }
 
 fn install_project_watcher(ctx: &AppContext, root_path: &Path) {

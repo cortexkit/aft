@@ -143,6 +143,7 @@ pub mod url_fetch;
 pub mod views;
 pub(crate) mod walk_boundary;
 pub mod watcher;
+pub(crate) mod watcher_backend;
 pub mod watcher_filter;
 // Compiled on all platforms so cross-platform unit tests in
 // `commands::bash::try_spawn_with_fallback` can exercise the retry
