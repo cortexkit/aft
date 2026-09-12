@@ -551,34 +551,37 @@ fn start_project_watcher_with<W, E, F>(
     let (start_tx, start_rx) = mpsc::channel::<Result<(), String>>();
     let start_tx = sync_start.then_some(start_tx);
 
-    let join = thread::spawn(move || {
-        log_ctx::with_session(session_id_for_bg, || {
-            let attach_with_start =
-                move |root: PathBuf,
-                      extra_watch_paths: Vec<PathBuf>,
-                      tx: mpsc::Sender<notify::Result<notify::Event>>| {
-                    let result = attach(root, extra_watch_paths, tx);
-                    if let Some(start_tx) = start_tx {
-                        let _ = start_tx.send(
-                            result
-                                .as_ref()
-                                .map(|_| ())
-                                .map_err(|error| format!("watcher init failed: {error}")),
-                        );
-                    }
-                    result
-                };
-            watcher_filter::run_watcher_thread(
-                filter_config,
-                extra_watch_paths,
-                shared_gitignore,
-                gitignore_generation,
-                dispatch_tx,
-                thread_shutdown,
-                attach_with_start,
-            );
-        });
-    });
+    let join = thread::Builder::new()
+        .name("aft-watcher-filter".to_string())
+        .spawn(move || {
+            log_ctx::with_session(session_id_for_bg, || {
+                let attach_with_start =
+                    move |root: PathBuf,
+                          extra_watch_paths: Vec<PathBuf>,
+                          tx: mpsc::Sender<notify::Result<notify::Event>>| {
+                        let result = attach(root, extra_watch_paths, tx);
+                        if let Some(start_tx) = start_tx {
+                            let _ = start_tx.send(
+                                result
+                                    .as_ref()
+                                    .map(|_| ())
+                                    .map_err(|error| format!("watcher init failed: {error}")),
+                            );
+                        }
+                        result
+                    };
+                watcher_filter::run_watcher_thread(
+                    filter_config,
+                    extra_watch_paths,
+                    shared_gitignore,
+                    gitignore_generation,
+                    dispatch_tx,
+                    thread_shutdown,
+                    attach_with_start,
+                );
+            });
+        })
+        .expect("spawn watcher filter thread");
 
     ctx.install_watcher_runtime(dispatch_rx, WatcherThreadHandle::new(shutdown, join));
 
