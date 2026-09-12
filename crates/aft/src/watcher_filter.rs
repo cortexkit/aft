@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
@@ -13,6 +14,8 @@ pub type SharedGitignore = Arc<RwLock<Option<Arc<Gitignore>>>>;
 pub const WATCHER_FLUSH_WINDOW: Duration = Duration::from_millis(250);
 pub const WATCHER_MAX_BATCH_PATHS: usize = 1024;
 pub const WATCHER_DISPATCH_CHANNEL_CAPACITY: usize = 1024;
+pub(crate) const FSEVENTS_EXCLUSION_LIMIT: usize = 8;
+const EXCLUSION_FILE_COUNT_CAP: usize = 50_000;
 const ROOT_DELETED_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const GITIGNORE_REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DISPATCH_SEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -248,7 +251,7 @@ pub fn canonicalize_watcher_path(path: PathBuf) -> PathBuf {
     }
 }
 
-fn watcher_path_is_ignored_by_matcher(matcher: &SharedGitignore, path: &Path) -> bool {
+pub(crate) fn watcher_path_is_ignored_by_matcher(matcher: &SharedGitignore, path: &Path) -> bool {
     if watcher_path_is_infra_skip(path) {
         return true;
     }
@@ -256,16 +259,98 @@ fn watcher_path_is_ignored_by_matcher(matcher: &SharedGitignore, path: &Path) ->
     let guard = matcher
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(matcher) = guard.as_ref() {
-        if path.starts_with(matcher.path()) {
-            let is_dir = path.is_dir();
-            return matcher
-                .matched_path_or_any_parents(path, is_dir)
-                .is_ignore();
+    watcher_path_is_ignored(guard.as_deref(), path)
+}
+
+fn watcher_path_is_ignored(matcher: Option<&Gitignore>, path: &Path) -> bool {
+    matcher.is_some_and(|matcher| {
+        path.starts_with(matcher.path())
+            && matcher
+                .matched_path_or_any_parents(path, path.is_dir())
+                .is_ignore()
+    })
+}
+
+/// Find ignored directory boundaries that an OS watcher can omit entirely.
+///
+/// The traversal counts files while it discovers each boundary, so ordering
+/// exclusions does not require a second walk. Counting stops at 50,000 files
+/// per excluded subtree because larger values are equivalent for prioritising
+/// high-churn directories and should not delay watcher startup.
+pub(crate) fn derive_excluded_subtrees(
+    root: &Path,
+    matcher: &SharedGitignore,
+    max_paths: Option<usize>,
+) -> Vec<PathBuf> {
+    #[derive(Debug)]
+    struct Candidate {
+        path: PathBuf,
+        file_count: usize,
+        is_git: bool,
+    }
+
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let matcher = matcher
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let root_git = root.join(".git");
+    let mut candidates = Vec::<Candidate>::new();
+    let mut stack = vec![(root, None::<usize>)];
+
+    while let Some((directory, owner)) = stack.pop() {
+        if owner.is_some_and(|index| candidates[index].file_count >= EXCLUSION_FILE_COUNT_CAP) {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if let Some(index) = owner {
+                    stack.push((path, Some(index)));
+                    continue;
+                }
+                let is_git = path == root_git;
+                if is_git || watcher_path_is_ignored(matcher.as_deref(), &path) {
+                    let index = candidates.len();
+                    candidates.push(Candidate {
+                        path: path.clone(),
+                        file_count: 0,
+                        is_git,
+                    });
+                    stack.push((path, Some(index)));
+                } else {
+                    stack.push((path, None));
+                }
+            } else if let Some(index) = owner {
+                candidates[index].file_count = candidates[index]
+                    .file_count
+                    .saturating_add(1)
+                    .min(EXCLUSION_FILE_COUNT_CAP);
+            }
         }
     }
 
-    false
+    candidates.sort_by(|left, right| {
+        right
+            .is_git
+            .cmp(&left.is_git)
+            .then_with(|| right.file_count.cmp(&left.file_count))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    let mut paths = candidates
+        .into_iter()
+        .map(|candidate| candidate.path)
+        .collect::<Vec<_>>();
+    if let Some(max_paths) = max_paths {
+        paths.truncate(max_paths);
+    }
+    paths
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -597,6 +682,52 @@ mod tests {
         let matcher = builder.build().unwrap();
         let matcher = (matcher.num_ignores() > 0).then(|| Arc::new(matcher));
         Arc::new(RwLock::new(matcher))
+    }
+
+    #[test]
+    fn exclusion_derivation_orders_caps_and_skips_missing_directories() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        let names = (0..10)
+            .map(|index| format!("ignored-{index:02}"))
+            .collect::<Vec<_>>();
+        for (index, name) in names.iter().enumerate() {
+            let directory = root.path().join(name);
+            std::fs::create_dir(&directory).unwrap();
+            for file_index in 0..=index {
+                std::fs::write(directory.join(format!("file-{file_index}")), "x").unwrap();
+            }
+        }
+        std::fs::write(
+            root.path().join(".gitignore"),
+            format!(
+                "{}missing/\n",
+                names
+                    .iter()
+                    .map(|name| format!("{name}/\n"))
+                    .collect::<String>()
+            ),
+        )
+        .unwrap();
+        let matcher = shared_matcher(root.path());
+
+        let exclusions =
+            derive_excluded_subtrees(root.path(), &matcher, Some(FSEVENTS_EXCLUSION_LIMIT));
+
+        assert_eq!(exclusions.len(), FSEVENTS_EXCLUSION_LIMIT);
+        assert_eq!(
+            exclusions[0],
+            std::fs::canonicalize(root.path().join(".git")).unwrap()
+        );
+        assert_eq!(
+            exclusions[1..],
+            names[3..]
+                .iter()
+                .rev()
+                .map(|name| std::fs::canonicalize(root.path().join(name)).unwrap())
+                .collect::<Vec<_>>()
+        );
+        assert!(!exclusions.iter().any(|path| path.ends_with("missing")));
     }
 
     #[test]
