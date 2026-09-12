@@ -8125,6 +8125,9 @@ impl crate::language::LanguageProvider for TreeSitterProvider {
 }
 
 #[cfg(test)]
+// Some tests here are `cfg(debug_assertions)` (they lean on debug-only seams);
+// helpers only they use read as dead in release-profile test builds.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod tests {
     use super::*;
     use crate::language::LanguageProvider;

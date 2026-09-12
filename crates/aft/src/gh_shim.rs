@@ -2177,9 +2177,12 @@ const RELEASE_MANIFEST_TRUST_SET: &[Option<ManifestTrustKey>; 2] = &[
     None,                          // cold standby (filled by a future custody release)
 ];
 
-#[cfg(debug_assertions)]
+// The dev test key exists in debug images and in test builds of any profile
+// (so `cargo test --release` compiles); it never enters a release trust set,
+// so the release-profile lib tests that verify under it are debug-only below.
+#[cfg(any(debug_assertions, test))]
 const DEV_MANIFEST_KEY_ID: &str = "gh-routing-dev-test-key-v1";
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 const DEV_MANIFEST_PUBLIC_KEY: [u8; 32] = [
     0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
     0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a,
@@ -4252,6 +4255,10 @@ fn unix_seconds() -> u64 {
 }
 
 #[cfg(test)]
+// Release-profile test builds carry no dev key in the trust set, so the tests
+// that verify under it are `cfg(debug_assertions)` and the helpers only they
+// use read as dead there; the module compiles in both profiles.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod tests {
     use super::*;
     use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -5605,6 +5612,7 @@ mod tests {
         assert!(manifest.validate().unwrap_err().contains("adds"));
     }
 
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn signed_cache_rejects_tampering_and_old_schema_floor() {
         let directory = tempfile::tempdir().unwrap();
@@ -6609,6 +6617,7 @@ mod tests {
         ));
     }
 
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn dev_signed_admin_api_dispatch_requires_bypass_and_audits_delegation() {
         use std::cell::Cell;
@@ -6861,6 +6870,7 @@ mod tests {
         assert!(write_seam_state(&paths, SeamState::default()).is_err());
     }
 
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn raw_bytes_round_trip_verifies_then_parses_from_the_fixture_envelope() {
         let envelope: SignedManifest = serde_json::from_str(include_str!(
@@ -6911,6 +6921,7 @@ mod tests {
         ));
     }
 
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn future_issued_at_fixture_is_refused_and_aged_fixture_serves_governed_classification() {
         let directory = tempfile::tempdir().unwrap();
@@ -7091,6 +7102,7 @@ mod tests {
         ));
     }
 
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn regressed_invalid_artifact_refuses_governed_and_admin_and_passes_mechanical() {
         let directory = tempfile::tempdir().unwrap();
@@ -7167,6 +7179,7 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn self_report_exposes_manifest_and_rung_record_provenance() {
         let directory = tempfile::tempdir().unwrap();
@@ -7284,6 +7297,7 @@ mod tests {
         assert!(text.ends_with(UNTRUSTED_MANIFEST_KEY_STEERING));
     }
 
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn version_high_water_refuses_rollbacks_and_status_reports_them() {
         let directory = tempfile::tempdir().unwrap();
@@ -7473,6 +7487,7 @@ mod tests {
             .unwrap_or_default()
     }
 
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn activation_retains_every_accepted_manifest_with_exact_bytes() {
         let directory = tempfile::tempdir().unwrap();
@@ -7580,6 +7595,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn retained_manifest_is_mode_0600() {
         use std::os::unix::fs::PermissionsExt;
@@ -7889,6 +7905,7 @@ mod tests {
     /// delay must exceed 2 s to force a timeout.
     const STAGE_TEST_DEADLINE: Duration = Duration::from_secs(2);
 
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn probe_exceeded_at_catalog_list_names_stage_and_budget_in_status_and_refusal() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
@@ -7939,6 +7956,7 @@ mod tests {
         assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 2000);
     }
 
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn probe_exceeded_at_open_route_names_stage_and_budget_in_status_and_refusal() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
@@ -7987,6 +8005,7 @@ mod tests {
         assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 2000);
     }
 
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn discovery_retry_succeeds_when_only_the_first_attempt_times_out() {
         // The daemon delays only the first accepted connection, so the first
@@ -8028,6 +8047,7 @@ mod tests {
         assert_eq!(last_probe.outcome, "ready");
     }
 
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn probe_connect_refused_keeps_unreachable_outcome() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
@@ -8094,6 +8114,7 @@ mod tests {
         assert_eq!(status["last_probe"]["outcome"], "unreachable");
     }
 
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn probe_connect_stage_budget_exceeded_determines_r2_and_records_last_probe() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
@@ -8139,6 +8160,7 @@ mod tests {
         assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 2000);
     }
 
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn slow_daemon_connect_delay_fallback_active_determines_r3_and_records_last_probe() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
@@ -8188,6 +8210,7 @@ mod tests {
         assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 2000);
     }
 
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn slow_daemon_catalog_list_delay_fallback_active_determines_r3_and_records_last_probe() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
@@ -8237,6 +8260,7 @@ mod tests {
         assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 2000);
     }
 
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn slow_daemon_catalog_list_delay_expired_fallback_refuses_naming_stage() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
@@ -8287,6 +8311,7 @@ mod tests {
         assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 2000);
     }
 
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn slow_daemon_open_route_delay_fallback_active_determines_r3_and_records_last_probe() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
@@ -8336,6 +8361,7 @@ mod tests {
         assert!(status["last_probe"]["elapsed_ms"].as_u64().unwrap() >= 2000);
     }
 
+    #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn slow_daemon_open_route_delay_expired_fallback_refuses_naming_stage() {
         let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
