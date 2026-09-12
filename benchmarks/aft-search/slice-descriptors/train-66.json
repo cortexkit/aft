@@ -1,0 +1,13 @@
+{
+  "slice_class": "ranking",
+  "targeted_mechanism": "none",
+  "kind": "ranking",
+  "fixtures": [
+    "crates/aft/tests/engine_generated_test.rs",
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "search-generated-evidence"
+  ],
+  "note": "Generated-artifact evidence (field 6) restored at one classification site; real-query rows carry no generated artifacts so rows are expected byte-equal to the post-train-65 reference recorded in this train."
+}
