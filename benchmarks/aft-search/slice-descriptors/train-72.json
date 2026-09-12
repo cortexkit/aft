@@ -1,0 +1,16 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "callgraph-refresh-write-amplification",
+    "disk-write-hunt-retention-and-history-sort",
+    "cpu-hunt-bind-census-and-projection-reuse",
+    "tier2-dead-code-incremental-projection",
+    "watcher-knobs-fsevents-exclusions"
+  ],
+  "note": "Fence touched only through crates/aft/src/lib.rs module declarations (disk_write_hunt, watcher_backend). No engine, index, or plugin search file in the diff; search rows are expected byte-identical to the reference and the gate's byte-equality predicate is the proof."
+}
