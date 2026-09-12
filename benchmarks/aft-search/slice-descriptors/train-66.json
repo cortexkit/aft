@@ -1,5 +1,5 @@
 {
-  "slice_class": "engine_unwired",
+  "slice_class": "non_ranking",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
@@ -8,5 +8,5 @@
   "slices": [
     "reference-rebaseline-train-65"
   ],
-  "note": "Audited rebaseline only: the reference pair was recorded on the train-65 binary (B2 router + one shared trailer moved rows). No engine change rides this train; rows are byte-equal by construction."
+  "note": "Audited rebaseline only (reference pair recorded on the train-65 binary after the B2 router and the one shared trailer moved rows). No engine file in the diff, so the class is non_ranking by derivation."
 }
