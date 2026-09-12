@@ -1343,7 +1343,17 @@ impl ViewBindingFacts<'_> {
         // including misses, to catch a newly added module or an earlier candidate.
         if !view_resolution_config(path) {
             if let Ok(path) = std::str::from_utf8(path) {
-                self.probes.borrow_mut().insert(path.to_string());
+                let mut parts = Vec::new();
+                for part in path.split('/') {
+                    match part {
+                        "" | "." => {}
+                        ".." => {
+                            parts.pop();
+                        }
+                        _ => parts.push(part),
+                    }
+                }
+                self.probes.borrow_mut().insert(parts.join("/"));
             }
         }
     }
@@ -1369,6 +1379,9 @@ impl ProjectFacts for ViewBindingFacts<'_> {
         self.inner.symlink_target(rel)
     }
     fn canonical(&self, rel: &[u8]) -> Option<Vec<u8>> {
+        // FactPaths canonicalizes before testing existence, so misses must be
+        // recorded here as well as in is_file (not only after canonicalization).
+        self.record(rel);
         self.inner.canonical(rel)
     }
     fn list_dir(&self, rel: &[u8]) -> Vec<super::facts::DirEntry> {
