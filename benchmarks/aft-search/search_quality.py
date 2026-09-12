@@ -129,7 +129,7 @@ def sidecar_bytes(manifest_path: Path, reference_bytes: bytes) -> bytes:
 
 
 def synthetic_documents() -> tuple[dict[str,Any],dict[str,Any],dict[str,Any]]:
-    manifest={"schema":"manifest","rows":[{"episode_id":"followup-census:1","include_tests":False,"include_tests_source":"default"}]}
+    manifest={"schema":"manifest","rows":[{"episode_id":"followup-census:1","include_tests":False,"include_tests_source":"default","mechanism":"topk_cut"}]}
     row={"episode_id":"followup-census:1","request":{"includeTests":False,"topK":100},"requests":[{"includeTests":False,"topK":100}],"request_count":1,"include_tests_source":"default","pages_fetched":1,"collapse_stop_reason":"exhausted","retrieval_depth":1,"ranked_paths":["opened.rs"]}
     metrics={"mrr_at_10":0.5,"hit_at_1":0.5,"hit_at_5":0.8}
     reference={"schema":"aft-search-score-v1","model_id":"fixture","profile":"single_page","capability":{"schema_path":"fixture.json","schema_sha256":"0"*64,"offset_declared":False},"families":{"exact_recall":dict(metrics),"concept_recall":dict(metrics),"real_query":dict(metrics)},"fixture_groups":{"exact_recall":{"g":dict(metrics)},"concept_recall":{"g":dict(metrics)}},"shapes":{"identifier":dict(metrics)},"mechanisms":{"topk_cut":dict(metrics)},"fixture_results":{"harness-goldens":True,"paging":True},"rows":[dict(row)]}

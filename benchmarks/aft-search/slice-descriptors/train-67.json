@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar"
+  ],
+  "slices": [
+    "b1-manifest-relabel-phrase-rows"
+  ]
+}
