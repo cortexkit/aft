@@ -2084,8 +2084,8 @@ fn mid_run_ack_from_rebound_root_preserves_later_watch_and_completion() {
         "completion ack failed: {final_ack:?}"
     );
 
-    let conn = rusqlite::Connection::open(storage.path().join("aft.db"))
-        .expect("open task database");
+    let conn =
+        rusqlite::Connection::open(storage.path().join("aft.db")).expect("open task database");
     let row = aft::db::bash_tasks::get_bash_task(&conn, "opencode", SESSION, &task_id)
         .expect("read task row")
         .expect("persisted task row");
