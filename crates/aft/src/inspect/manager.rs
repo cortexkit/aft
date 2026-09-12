@@ -6060,6 +6060,132 @@ export function bannerUnused() {}
         );
     }
 
+    fn assert_fresh_refresh_reuses_projection(job: InspectJob, target: PathBuf) {
+        let manager = InspectManager::new();
+        let (projections, _observer_reset) = count_projections();
+        let started = Instant::now();
+        let first = manager
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
+            .expect("initial projection");
+        let cold_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        let callgraph_dir =
+            callgraph_store_dir_from_inspect_dir(&job.inspect_dir, &job.project_root)
+                .expect("copied graph directory");
+        let writer = CallGraphStore::open_ready_no_rebuild(callgraph_dir, job.project_root.clone())
+            .expect("open writer")
+            .expect("ready graph");
+        let revision_before = writer
+            .projection_write_revision()
+            .expect("initial revision");
+        let started = Instant::now();
+        let (_, profile) = writer
+            .refresh_files_profiled(&[target])
+            .expect("already-fresh refresh");
+        let revision_after = writer
+            .projection_write_revision()
+            .expect("revision after refresh");
+        drop(writer);
+        let second = manager
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
+            .expect("projection after fresh refresh");
+        eprintln!("fresh_refresh_projection initial_ms={cold_ms:.3} refresh_and_snapshot_ms={:.3} index_loads={} projections={} outbound_rows={}",
+            started.elapsed().as_secs_f64() * 1_000.0,
+            profile.index_loads, projections.load(std::sync::atomic::Ordering::SeqCst),
+            first.outbound_calls.len());
+        assert_eq!(
+            profile.index_loads, 0,
+            "a fresh refresh must not load the corpus resolver index"
+        );
+        assert_eq!(
+            revision_after, revision_before,
+            "no written rows means no projection invalidation"
+        );
+        assert_eq!(
+            projections.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a duplicate refresh must not re-project the corpus"
+        );
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn projection_cache_reuses_snapshot_after_already_fresh_refresh() {
+        let (_dir, root, _inspect_dir, job) = published_projection_fixture();
+        assert_fresh_refresh_reuses_projection(job, root.join("src/target.ts"));
+    }
+
+    #[test]
+    fn projection_cache_invalidates_after_deleting_a_file_without_dependents() {
+        let (_dir, root, inspect_dir, job) = published_projection_fixture();
+        let manager = InspectManager::new();
+        let (projections, _observer_reset) = count_projections();
+        let first = manager
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
+            .expect("initial projection");
+        let target = root.join("src/main.ts");
+        assert!(first.files.contains(&target));
+        let graph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).unwrap();
+        let writer = CallGraphStore::open_ready_no_rebuild(graph_dir, root.clone())
+            .expect("open writer")
+            .expect("ready graph");
+        std::fs::remove_file(&target).expect("remove unreferenced entry file");
+        let (stats, profile) = writer
+            .refresh_files_profiled(std::slice::from_ref(&target))
+            .expect("refresh deletion");
+        assert_eq!(stats.deleted_files, vec!["src/main.ts"]);
+        assert_eq!(
+            profile.index_loads, 0,
+            "deletion without surviving callers needs no resolver"
+        );
+        drop(writer);
+        let second = manager
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
+            .expect("projection after deletion");
+        assert!(!second.files.contains(&target));
+        assert_eq!(
+            projections.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "row deletion must invalidate even when no resolver was loaded"
+        );
+    }
+
+    #[test]
+    #[ignore = "offline probe requires a normalized production graph copy below target"]
+    fn profile_fresh_refresh_projection_on_store_copy() {
+        let project = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .expect("checkout root");
+        let storage = PathBuf::from(
+            std::env::var_os("AFT_CPU_HUNT_STORAGE_COPY")
+                .expect("set AFT_CPU_HUNT_STORAGE_COPY to an offline copied storage root"),
+        )
+        .canonicalize()
+        .expect("copied storage");
+        assert!(
+            storage.starts_with(project.join("target")),
+            "never probe a live artifact"
+        );
+        let target = project.join("crates/aft/tests/engine_comparator_test.rs");
+        let inspect_dir = storage.join("inspect");
+        let key = crate::search_index::artifact_cache_key(&project);
+        crate::root_cache::configure_artifact_access(&project, &key, false);
+        let graph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir, &project).unwrap();
+        let writer = CallGraphStore::open_ready_no_rebuild(graph_dir, project.clone())
+            .expect("open copied graph")
+            .expect("copied graph ready");
+        writer
+            .refresh_files(std::slice::from_ref(&target))
+            .expect("normalize copied freshness");
+        drop(writer);
+        let mut job = snapshot_job(&project, &inspect_dir, true);
+        job.callgraph_writer = false;
+        assert_fresh_refresh_reuses_projection(job, target);
+    }
+
     #[test]
     fn projection_cache_invalidates_on_in_place_refresh_for_readonly_scans() {
         let (_dir, root, inspect_dir, job) = published_projection_fixture();

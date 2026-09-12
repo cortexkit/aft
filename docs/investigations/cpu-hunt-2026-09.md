@@ -8,6 +8,8 @@ The work-count regression exercises the actual RouteBind handler and waits for s
 
 Other expensive mechanisms remain; their measurements and follow-ups are recorded below. In particular, removing a census from admission does not make the periodic census incremental, nor does it eliminate census construction by LSP status signals.
 
+**A second fix preserves exact dead-code snapshot reuse after an already-fresh duplicate refresh.** Generation-and-write-revision caching already existed, but `refresh_files` rebuilt the whole resolver index and incremented the revision even when it wrote no rows. The shortcut now skips that index and preserves the revision only for a genuinely write-free transaction. On the copied 330,998-row artifact, duplicate refresh plus snapshot retrieval fell from **9,031.213 ms to 68.139 ms**: resolver builds **1 → 0**, total projections across the initial scan and repeat **2 → 1**. Real graph changes, deletions and stale-backend repairs still invalidate. This does not make genuinely changed-file projection incremental; see the detailed follow-up below.
+
 ## Provenance and safety
 
 - Source under investigation: `427895e45278924df01fee8353fb36806ec2c1ae`.
@@ -30,12 +32,12 @@ Rank here is **investigation priority**, combining repeated live stack occupancy
 
 | Priority | Kind / trigger | Scales with | Fires per observed hour | Measured cost | Disposition |
 |---:|---|---|---:|---|---|
-| 1 | RouteBind → synchronous health rollup | all hosted roots and their retained subsystem data; allocator zones | **501.61** (8,746 lines; busiest hour 4,649) | copied 36-actor admission **6.602 → 2.309 ms**; main-thread rollup stack in 5,686 / 6,563 inclusive samples | **Fixed**: no census on admission |
-| 2 | health worker refresh | roots, memory estimates, allocator zones, durable breaker rows, lifecycle inventory | not logged; timeout is 3 s **after** work, plus coalesced bind-completion wakes (not an exact 1,200/h) | copied 36-actor rollup **8.781 ms wall / 8.765 ms CPU**; worker rollup in 4,813 / 5,281 inclusive samples | Filed: incremental component census |
-| 3 | LSP diagnostics/exits and configure Status → `build_status_snapshot` | roots, subsystem sizes, checkpoint entries, cache directories | no per-signal counter in retained logs | copied fleet status **30.592 ms wall / 13.916 ms CPU**; status/checkpoint frames on seven executor workers in both samples | Filed: separate status notification from census |
-| 4 | tier-2 dead-code projection | all files, exports and outbound graph rows | **25.92** (452 timed lines; busiest hour 47) | copied **3,024 ms wall / 2,868.144 ms CPU**, 330,998 outbound rows; logged median 1,659 ms | Filed: per-file projection updates |
+| 1 | tier-2 dead-code projection | all files, exports and outbound graph rows | **25.92** (452 timed lines; busiest hour 47) | copied full read **3,024 ms wall / 2,868.144 ms CPU**; placed-card worst snapshot **368,546 ms**; duplicate refresh + lookup **9,031.213 → 68.139 ms** | **Fixed write-free duplicate refresh**; genuine changes still filed |
+| 2 | RouteBind → synchronous health rollup | all hosted roots and their retained subsystem data; allocator zones | **501.61** (8,746 lines; busiest hour 4,649) | copied 36-actor admission **6.602 → 2.309 ms**; main-thread rollup stack in 5,686 / 6,563 inclusive samples | **Fixed**: no census on admission |
+| 3 | health worker refresh | roots, memory estimates, allocator zones, durable breaker rows, lifecycle inventory | not logged; timeout is 3 s **after** work, plus coalesced bind-completion wakes (not an exact 1,200/h) | copied 36-actor rollup **8.781 ms wall / 8.765 ms CPU**; worker rollup in 4,813 / 5,281 inclusive samples | Filed: incremental component census |
+| 4 | LSP diagnostics/exits and configure Status → `build_status_snapshot` | roots, subsystem sizes, checkpoint entries, cache directories | no per-signal counter in retained logs | copied fleet status **30.592 ms wall / 13.916 ms CPU**; status/checkpoint frames on seven executor workers in both samples | Filed: separate status notification from census |
 | 5 | one-file callgraph refresh | whole project resolution index despite graph-neutral extraction | **8.60** (150 tier-2 refresh lines; watcher refreshes not counted here) | copied **2,750 ms wall / 2,563.655 ms CPU**, index load 2,003 ms, only four WAL frames | Filed: resolution index amplification |
-| 6 | tier-2 dead-code category reuse miss | contribution set plus graph reachability | **18.81** (328 timed lines) | logged median **5,392 ms**, max 384,043 ms | Filed; contains row 4, not additive |
+| 6 | tier-2 dead-code category reuse miss | contribution set plus graph reachability | **18.81** (328 timed lines) | logged median **5,392 ms**, max 384,043 ms | Filed; contains row 1, not additive |
 | 7 | tier-2 duplicates reuse miss | cached contributions / occurrences | **18.53** (323 timed lines) | logged median **985 ms**, max 364,349 ms | Logged cost; no isolated offline category probe |
 | 8 | tier-2 unused-exports reuse miss | imports/exports and contributions | **18.53** (323 timed lines) | logged median **1,114 ms**, max 361,500 ms | Logged cost; no isolated offline category probe |
 | 9 | tier-2 complexity reuse miss | files / cached contributions | **18.53** (323 timed lines) | logged median **886 ms**, max 363,903 ms | Logged cost; no isolated offline category probe |
@@ -69,7 +71,7 @@ For the fully timed subset, summed elapsed milliseconds per observed hour rank: 
 | subc drain tick / pending response poll | retry buffers, wake subscriptions, pending binds / responses, occupancy snapshots | 250 ms / 100 ms; 1,032 perf tick reports = 59.19/h, reports are not drain executions |
 | subc idle reaping | roots, path existence, lifecycle/eviction checks | 30 min idle TTL; 171 reap reports = 9.81/h; reports can be rate-limited |
 | standing actor tick | standing-root reconciliation and coalesced per-root passes | 250 ms scheduling opportunity; N/L |
-| `subc/health.rs` rollup | two sets of root memory estimates, process observations, root health, breaker state, lifecycle inventory | worker timeout/wakes plus pre-fix RouteBind; see rows 1–2 |
+| `subc/health.rs` rollup | two sets of root memory estimates, process observations, root health, breaker state, lifecycle inventory | worker timeout/wakes plus pre-fix RouteBind; see rows 2–3 |
 | health stuck-watch / occupancy diagnostics | subscriptions, tasks, running jobs | watch scan 60 s; stuck age/log interval 10 min; occupancy threshold 60 s; N/L |
 | `bash_background/watchdog.rs` | task polling, output/watch scanning, child reaping, reminders | 500 ms running-task poll; cleanup 60 s, finished retention 1 h; N/L |
 | `response_finalize.rs` | per-session completions, fleet status, alert finalization, status-bar counts | each agent-visible response; N/L |
@@ -155,8 +157,8 @@ Tool response rendering and the parity fixture are unchanged. Health diagnostics
 
 1. **Periodic health still repeats root work.** `build_health_diagnostic_rollup` calls `memory_root_snapshot` and then `memory_root_rollup` for every root; both call `memory_estimates`. Process memory assembly also invokes allocator observations. The copied 36-root baseline is 8.781 ms; live stacks show substantially more retained-state work. A correct incremental design needs component revisions / accounting counters, not a time cache that silently changes status semantics.
 2. **LSP/configure status amplification remains.** `drain_lsp_events_bounded` signals by constructing `build_status_snapshot`, and the configure Status stage does the same. Copied-fleet status costs 30.592 ms. Add a dirty/status notification seam and make the payload owner publish snapshots, preserving freshness/ordering and per-session fields. No stale-cache shortcut is introduced here.
-3. **Dead-code projection remains O(graph).** The 330,998-row read costs 3,024 ms / 2,868.144 ms CPU. Incremental projection must preserve both old and new caller effects, deletions, dispatch edges and revision identity; merely skipping a refresh can return stale dead-code results.
-4. **Graph-neutral refresh still builds the resolver index.** After the preceding write-amplification fix it writes just four frames, but `ProjectIndex::from_db_and_callers` still costs 2,003 ms in a 2,750 ms refresh. `stored_extract_matches` currently needs that index for resolved-reference equality, so removing the index call unconditionally is not safe.
+3. **Genuinely changed graph projection remains O(graph).** The 330,998-row read costs 3,024 ms / 2,868.144 ms CPU. Already-fresh duplicate refreshes now preserve cache identity, but incremental projection must preserve both old and new caller effects, deletions, dispatch edges and revision identity; merely skipping a refresh can return stale dead-code results.
+4. **Stale-but-graph-neutral extraction still builds the resolver index.** After the preceding write-amplification fix it writes just four frames, but `ProjectIndex::from_db_and_callers` still costs 2,003 ms in a 2,750 ms forced-stale refresh. `stored_extract_matches` currently needs that index for resolved-reference equality, so removing the index call unconditionally is not safe. The second fix covers already-fresh inputs with no caller extracts, not this forced-stale extraction case.
 5. **Zero bound routes does not imply literally zero per-root work.** `due_maintenance_jobs` sorts live roots, and quiesced roots still permit LSP drains. The health worker traverses registered actors independently of route count. Configure jobs cancel on quiescence and Watcher/ConfigureTail/CompletionDrains are excluded by the unbound predicate. 1,098 quiesce lines (62.97/h) establish the transition is common. LSP exit draining is legitimate teardown work; a claim of nil idle work would need a steady-state counter test, which is not provided here.
 6. **Views publication, per-import package walks, and git attribute pumping are not ranked as measured fixes in this delivery.** No matching successful view-publication lines appeared in the selected daemon logs. That is an instrumentation/coverage limitation, not evidence that the originally reported 74-second operation disappeared. Semantic ready publication already skips an empty pending set; nonempty publication and configure ViewLoad still deserve a copied semantic/views artifact probe. No new before/after numbers are claimed for them.
 7. **The ranking is incomplete where frequencies are unlogged.** The five priority mechanisms above were measured offline; duplicates/unused-exports/complexity/cycles have logged elapsed costs but not isolated offline category measurements. There is no complete global frequency × CPU ordering, invocation count for every hook, allocation census, or measured zero-route steady-state bound in this delivery.
@@ -171,3 +173,77 @@ Tool response rendering and the parity fixture are unchanged. Health diagnostics
 - `RUSTFLAGS='-D warnings' cargo check -p agent-file-tools --target x86_64-pc-windows-gnu --all-targets`: passed.
 - Copied production callgraph probe and fixed copied-store admission probe: passed.
 - `aft_inspect` returned incomplete diagnostic coverage for the Rust files; Cargo checks, not that empty diagnostic list, are the authority.
+
+## Follow-up: placed-card dead-code amplification and exact cache reuse
+
+The placed card's first 90 minutes (09:16:39–10:46:39 UTC) contain **22** `perf tier2 phases category=dead_code` lines, **16** with snapshot time over 2 seconds. The earlier supplied census of 21 / 15 preceded the last 10:37:52 entry. Examples verified directly in `aft-72895.log`:
+
+| Root | Snapshot ms | Scan files | Rollup ms |
+|---|---:|---:|---:|
+| prefrontal, 10:33:13 | 12,961 | 11 | 8,455 |
+| magic-context, 10:34:18 | 21,200 | 22 | 6,507 |
+| OSS opencode, 10:24:57 | **368,546** | 1,035 | 6,708 |
+
+The scan-file count is the phase log's value, not necessarily watcher-batch size. The small watcher batches reported with these incidents are evidence of amplification; they do not mean only those rows are read by snapshot projection. The 330,998-row copied fixture in this investigation belongs to AFT, not a measured row count for the OSS opencode store. Phase elapsed times also include waits, so the six-minute sample must not be interpreted as six minutes of pure projection CPU without an isolated reproduction.
+
+### Why caching by generation alone is not safe
+
+`InspectManager` already caches an `Arc<CallgraphSnapshot>` by canonical project root, cold-build generation (or legacy database path), **and durable write revision**. `project_dead_code_snapshot_with_revision` reads rows and revision in one read transaction. Two unchanged reads already reuse the Arc. In-place refresh does not mint a new cold-build generation; a generation-only cache would therefore return old symbols after edits. Existing tests exercise both in-place mutation and newly published generation invalidation, and remain green.
+
+The actionable redundant work was lower down: an already-fresh `refresh_files` still constructed `ProjectIndex::from_db_and_callers` and unconditionally bumped `projection_write_revision`. This occurred even when all input rows were HotFresh and `clear_stale_backend_status_for_file` updated zero rows. The next inspect saw a new revision and re-read the entire graph for no changed database state.
+
+### Mechanism change
+
+After applying freshness repairs and deletions, `refresh_files` can return early when `caller_extracts` is empty. It compares the connection's actual SQLite `total_changes` before and after those operations:
+
+- **No written rows:** commit the read-only transaction without changing the durable revision; do not record a write commit or load the resolver. The existing manager cache remains valid.
+- **Any written rows:** advance the revision in the same transaction, even with no callers to resolve. This includes deletion without dependents and stale-backend repair. A new regression deletes an unreferenced entry file and verifies that the resolver is skipped but the next projection removes that file.
+- **Surviving caller extracts:** preserve the existing resolver, graph equality, dependency refresh, method-dispatch and revision behavior.
+
+This uses the existing generation/revision protocol, without a schema change, time-based stale cache, or weakening of real-edit invalidation. It only avoids corpus work on confirmed-fresh duplicate events. The fraction of live watcher batches already refreshed by another path was **not measured**, so the full six-minute incident is not claimed solved.
+
+### Copied-artifact before/after and non-vacuity
+
+`inspect::manager::guard_tests::profile_fresh_refresh_projection_on_store_copy` is an ignored opt-in unit benchmark that uses the real manager cache. It normalizes the selected copied row, projects once, runs an already-fresh refresh of that file, and asks the same manager for a snapshot again. The copied storage must be below the checkout's `target` directory with `callgraph/<artifact-key>` layout. It neither reads nor changes the live store.
+
+```sh
+AFT_CPU_HUNT_STORAGE_COPY="$PWD/target/cpu-hunt-local/projection-storage" \
+XDG_DATA_HOME="$PWD/target/cpu-hunt-local/test-data-home" \
+cargo test -p agent-file-tools --lib \
+  profile_fresh_refresh_projection_on_store_copy -- --ignored --nocapture
+```
+
+| Measurement | Original refresh path | Fixed path |
+|---|---:|---:|
+| Initial projection wall ms (separate warm-up) | 8,580.097 | 6,453.533 |
+| Already-fresh refresh + second snapshot wall ms | **9,031.213** | **68.139** |
+| Resolver-index builds during refresh | **1** | **0** |
+| Total projections across initial + second lookup | **2** | **1** |
+| Outbound rows in initial snapshot | 330,998 | 330,998 |
+
+A prior fixed measurement was 123.619 ms for refresh + second lookup, also with zero resolver builds and one total projection. CPU was not separately collected for this combined cache-path comparison; the isolated uncached projection CPU measurement is in the earlier table.
+
+The fixed source was staged; the empty-caller shortcut was then disabled with `NON-VACUITY BREAK`. The diff stat changed from empty to `crates/aft/src/callgraph_store/mod.rs | 3 ++-`, and returned to empty after restoring/touching the staged file. The small regression produced:
+
+```text
+fresh_refresh_projection initial_ms=169.874 refresh_and_snapshot_ms=76.918 index_loads=1 projections=2 outbound_rows=1
+assertion `left == right` failed: a fresh refresh must not load the corpus resolver index
+  left: 1
+ right: 0
+test inspect::manager::guard_tests::projection_cache_reuses_snapshot_after_already_fresh_refresh ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3167 filtered out
+```
+
+A separate run of the copied-store probe against the same mutation also failed exactly its named test, with `index_loads=1 projections=2` and the 9,031.213 ms figure above. Under that mutation the two positive invalidation controls **did not fail**:
+
+- `inspect::manager::guard_tests::projection_cache_invalidates_on_in_place_refresh_for_readonly_scans`
+- `inspect::manager::guard_tests::projection_cache_invalidates_when_cold_build_publishes_new_generation`
+
+### Final gates for the projection fix
+
+- Full library with isolated default storage and serial test execution: `XDG_DATA_HOME=... cargo test -p agent-file-tools --lib -- --test-threads=1` — **3,149 passed, 20 ignored**. This avoids the default-database schema mismatch and the parallel/order failures described above, without changing tests.
+- `cargo test -p agent-file-tools --test integration callgraph`: initially **67 passed, 10 failed** because in-repository fixtures inherited this checkout's read-only worktree identity; the diagnostic error explicitly said the persisted store was unavailable in a read-only worktree. With `GIT_CEILING_DIRECTORIES="$PWD/crates/aft/tests/fixtures"` and isolated default storage, the same suite passed **77 tests**. This fences only fixture ancestor discovery; no parent checkout or daemon is warmed to make the test pass.
+- `cargo test -p agent-file-tools --test integration inspect`: **222 passed, 5 ignored**.
+- `cargo test -p agent-file-tools --test integration tool_call_parity_test`: **12 passed**; parity source remains byte-identical to the task base.
+- Native and `--target x86_64-pc-windows-gnu` **all-target** Cargo checks with `RUSTFLAGS='-D warnings'`: passed after the final code edits.
+- Comment clarity review: no flagged changed comments. Formatter and diff whitespace checks: passed.

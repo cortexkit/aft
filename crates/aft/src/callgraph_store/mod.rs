@@ -2028,6 +2028,7 @@ pub struct RefreshFilesProfile {
     pub row_inserts: Duration,
     pub dependent_parse: Duration,
     pub index_load: Duration,
+    pub index_loads: usize,
     pub ref_resolution: Duration,
     pub method_dispatch: Duration,
     pub commit: Duration,
@@ -4296,7 +4297,36 @@ impl CallGraphStore {
             profile.row_deletes += started.elapsed();
         }
 
+        // Already-fresh inputs have no callers to resolve. Keep the durable
+        // projection identity when even backend freshness needed no write, so
+        // a duplicate watcher/tier-2 refresh can reuse the existing snapshot.
+        if caller_extracts.is_empty() {
+            let wrote_rows = tx.total_changes() != total_changes_before;
+            if wrote_rows {
+                bump_projection_write_revision(&tx)?;
+            }
+            let started = Instant::now();
+            commit_incremental_if_current(tx)?;
+            if wrote_rows {
+                self.record_commit(total_changes_before, &conn);
+            }
+            profile.commit += started.elapsed();
+            profile.total = total_started.elapsed();
+            return Ok((
+                IncrementalStats {
+                    changed_files: changed,
+                    surface_changed: surface_changed.into_iter().collect(),
+                    deleted_files: deleted.into_iter().collect(),
+                    dependency_selected_refs,
+                    refreshed_own_files: 0,
+                    unchanged_extract_files: 0,
+                },
+                profile,
+            ));
+        }
+
         let started = Instant::now();
+        profile.index_loads += 1;
         let index = ProjectIndex::from_db_and_callers(
             &tx,
             &self.project_root,
