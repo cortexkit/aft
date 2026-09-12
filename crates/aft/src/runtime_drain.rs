@@ -944,9 +944,18 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
             SemanticIndexStatus::Ready { .. }
         )
     {
-        if let Some(_permit) = ctx.cold_build_limiter().try_acquire() {
-            if let Err(error) = ctx.publish_view_paths(BTreeSet::new(), true) {
-                aft::slog_warn!("semantic-ready view publication failed: {}", error);
+        // A refresh completing only matters to the view for the paths whose
+        // semantic plane was still pending; republishing the whole checkout
+        // on every refresh re-derived every entry and rescanned the live index
+        // for nothing (soak finding, 2026-09-12).
+        if let Some(pending) = semantic_ready_view_publication_paths(
+            ctx.view_runtime_snapshot()
+                .map(|snapshot| snapshot.pending_paths),
+        ) {
+            if let Some(_permit) = ctx.cold_build_limiter().try_acquire() {
+                if let Err(error) = ctx.publish_view_paths(pending, true) {
+                    aft::slog_warn!("semantic-ready view publication failed: {}", error);
+                }
             }
         }
     }
@@ -2491,6 +2500,17 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
     state.semantic_refresh_paths.clear();
 }
 
+/// Paths the view still owes a semantic plane, or `None` when a completed
+/// refresh has nothing to publish. An absent view runtime (views off, or the
+/// load failed) and an empty pending set both mean "do nothing": the current
+/// generation already covers HEAD, and re-deriving it would only mint a
+/// duplicate.
+fn semantic_ready_view_publication_paths(
+    pending: Option<BTreeSet<Vec<u8>>>,
+) -> Option<BTreeSet<Vec<u8>>> {
+    pending.filter(|paths| !paths.is_empty())
+}
+
 fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSliceState) {
     if !ctx.config().views.enabled
         || !matches!(state.phase, WatcherDrainPhase::Collect)
@@ -2976,6 +2996,22 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::context::{default_language_provider_factory, AppContext};
+
+    #[test]
+    fn semantic_ready_publication_is_skipped_unless_paths_are_pending() {
+        assert_eq!(semantic_ready_view_publication_paths(None), None);
+        assert_eq!(
+            semantic_ready_view_publication_paths(Some(BTreeSet::new())),
+            None,
+            "an up-to-date view must not republish when a refresh completes"
+        );
+        let pending = BTreeSet::from([b"src/lib.rs".to_vec()]);
+        assert_eq!(
+            semantic_ready_view_publication_paths(Some(pending.clone())),
+            Some(pending),
+            "only the paths still owed a semantic plane are published"
+        );
+    }
 
     fn watcher_context(
         root: &Path,
