@@ -1098,6 +1098,7 @@ fn build_health_diagnostic_rollup(
         fully_ready: bool,
         attributed_bytes: u64,
         repair_entries_60s: Option<u64>,
+        watcher: Option<crate::context::WatcherCountersSnapshot>,
         standing: Option<StandingHealthEntry>,
     }
 
@@ -1174,6 +1175,7 @@ fn build_health_diagnostic_rollup(
             fully_ready,
             attributed_bytes,
             repair_entries_60s,
+            watcher: Some(ctx.watcher_counters().snapshot()),
             standing,
         });
     }
@@ -1192,6 +1194,7 @@ fn build_health_diagnostic_rollup(
             fully_ready: false,
             attributed_bytes: 0,
             repair_entries_60s: None,
+            watcher: None,
             standing: Some(standing),
         });
     }
@@ -1225,10 +1228,11 @@ fn build_health_diagnostic_rollup(
             let mut snapshot = candidate.health;
             snapshot.callgraph_repair_entries_60s = candidate.repair_entries_60s;
             let root_label = snapshot.project_root.clone();
-            (
-                root_label,
-                standing_root_health_value(snapshot, candidate.standing.as_ref()),
-            )
+            let mut value = standing_root_health_value(snapshot, candidate.standing.as_ref());
+            if let (Some(object), Some(watcher)) = (value.as_object_mut(), candidate.watcher) {
+                object.insert("watcher".to_string(), json!(watcher));
+            }
+            (root_label, value)
         })
         .collect();
     roots.sort_by(|(left, _), (right, _)| left.cmp(right));
@@ -2266,7 +2270,22 @@ mod tests {
             drr_quantum: 1,
         });
         let (_dir, root) = test_root("health-snapshot-age-coverage");
-        assert!(executor.register_actor(root.clone(), test_ctx()));
+        let ctx = test_ctx();
+        let watcher = ctx.watcher_counters();
+        watcher.note_raw_event();
+        watcher.note_raw_event();
+        watcher.note_invalidating_event();
+        watcher.note_paths_after_gitignore(7);
+        watcher.note_paths_dispatched(6);
+        assert_eq!(
+            watcher
+                .begin_rescan(crate::watcher_filter::RescanReason::UserDropped)
+                .raw_events,
+            2
+        );
+        watcher.finish_rescan(42, Some(-4096));
+        watcher.note_raw_event();
+        assert!(executor.register_actor(root.clone(), ctx));
         let app = crate::context::App::default_shared();
         let metrics = DispatchPathMetrics::new();
         let cache = HealthRollupCache::new();
@@ -2279,6 +2298,18 @@ mod tests {
         assert!(absent["snapshot_age_ms"].is_u64());
         assert_eq!(absent["callgraph_repair_roots_annotated"].as_u64(), Some(0));
         assert_eq!(absent["callgraph_repair_roots_total"].as_u64(), Some(1));
+        let watcher = &absent["roots"][0]["watcher"];
+        assert_eq!(watcher["raw_events_total"].as_u64(), Some(3));
+        assert_eq!(watcher["raw_events_since_last_rescan"].as_u64(), Some(1));
+        assert_eq!(watcher["invalidating_events_total"].as_u64(), Some(1));
+        assert_eq!(watcher["paths_after_gitignore_total"].as_u64(), Some(7));
+        assert_eq!(watcher["paths_dispatched_total"].as_u64(), Some(6));
+        assert_eq!(watcher["rescans_kernel_dropped_total"].as_u64(), Some(0));
+        assert_eq!(watcher["rescans_user_dropped_total"].as_u64(), Some(1));
+        assert_eq!(watcher["rescans_unknown_total"].as_u64(), Some(0));
+        assert!(watcher["last_rescan_at_ms"].is_u64());
+        assert_eq!(watcher["last_rescan_cost_ms"].as_u64(), Some(42));
+        assert_eq!(watcher["last_rescan_rss_delta_bytes"].as_i64(), Some(-4096));
 
         let _project_key = crate::search_index::artifact_cache_key(root.as_path());
         refresh_until_root_count(&cache, &executor, &app, 1);

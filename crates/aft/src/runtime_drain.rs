@@ -1949,6 +1949,15 @@ pub fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
     refresh_project_corpus(ctx, "ignore-rule change", true)
 }
 
+fn watcher_rescan_rss_bytes() -> Option<u64> {
+    crate::memory::rss_bytes()
+}
+
+fn watcher_rescan_rss_delta(before: Option<u64>, after: Option<u64>) -> Option<i64> {
+    let delta = i128::from(after?) - i128::from(before?);
+    Some(delta.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64)
+}
+
 pub fn refresh_project_after_watcher_rescan(ctx: &AppContext) -> bool {
     if ctx.canonical_cache_root_opt().is_none() {
         return false;
@@ -2688,6 +2697,8 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             .canonical_cache_root_opt()
             .or_else(|| ctx.config().project_root.clone())
             .unwrap_or_else(|| PathBuf::from("<unconfigured>"));
+        let watcher_counters = ctx.watcher_counters();
+        let interval = watcher_counters.begin_rescan(state.rescan_reason);
         aft::slog_warn!(
             "watcher overflow: forcing project rescan reason={} root={}",
             state.rescan_reason.as_str(),
@@ -2698,7 +2709,19 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         } else {
             ctx.clear_gitignore();
         }
+        let rss_before = watcher_rescan_rss_bytes();
+        let rescan_started = Instant::now();
         state.status_changed |= refresh_project_after_watcher_rescan(ctx);
+        let cost_ms = rescan_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let rss_delta_bytes = watcher_rescan_rss_delta(rss_before, watcher_rescan_rss_bytes());
+        watcher_counters.finish_rescan(cost_ms, rss_delta_bytes);
+        crate::logging::log_watcher_rescan(
+            &root,
+            state.rescan_reason,
+            cost_ms,
+            rss_delta_bytes,
+            interval.raw_events,
+        );
         state.scheduler_changed_path_count =
             aft::inspect::tier2_scheduler::TIER2_REFRESH_STORM_PATH_THRESHOLD + 1;
         if state.status_changed {
@@ -4870,13 +4893,31 @@ mod watcher_slice_tests {
         assert!(first.has_more);
         assert_eq!(ctx.watcher_drain_pending_path_count(), 3);
 
-        tx.send(WatcherDispatchEvent::RescanRequired(RescanReason::Unknown))
-            .unwrap();
-        let second = drain_watcher_events_bounded(&ctx, 2);
+        let counters = ctx.watcher_counters();
+        counters.note_raw_event();
+        counters.note_raw_event();
+        tx.send(WatcherDispatchEvent::RescanRequired(
+            RescanReason::KernelDropped,
+        ))
+        .unwrap();
+        let (second, lines) =
+            crate::logging::capture_index_events(|| drain_watcher_events_bounded(&ctx, 2));
 
         assert_eq!(second.processed, 0);
         assert!(!second.has_more);
         assert_eq!(ctx.watcher_drain_pending_path_count(), 0);
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.raw_events_total, 2);
+        assert_eq!(snapshot.raw_events_since_last_rescan, 0);
+        assert_eq!(snapshot.rescans_kernel_dropped_total, 1);
+        assert_eq!(snapshot.rescans_user_dropped_total, 0);
+        assert_eq!(snapshot.rescans_unknown_total, 0);
+        assert!(snapshot.last_rescan_at_ms.is_some());
+        assert!(snapshot.last_rescan_cost_ms.is_some());
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("kind=watcher_rescan plane=watcher"));
+        assert!(lines[0].contains("reason=kernel_dropped"));
+        assert!(lines[0].contains("raw_events_since_last=2"));
     }
 
     #[test]

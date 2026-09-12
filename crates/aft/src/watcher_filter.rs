@@ -21,13 +21,16 @@ const DISPATCH_SEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub struct WatcherFilterConfig {
     pub project_root: PathBuf,
     pub git_common_dir: Option<PathBuf>,
+    counters: Arc<crate::context::WatcherCounters>,
 }
 
 impl WatcherFilterConfig {
     pub fn new(project_root: PathBuf, git_common_dir: Option<PathBuf>) -> Self {
+        let counters = crate::context::watcher_counters_for_root(&project_root);
         Self {
             project_root,
             git_common_dir,
+            counters,
         }
     }
 
@@ -414,6 +417,7 @@ impl WatcherFilterThread {
 
             match raw_rx.recv_timeout(self.next_recv_timeout()) {
                 Ok(Ok(event)) => {
+                    self.config.counters.note_raw_event();
                     if event.need_rescan() {
                         let reason = RescanReason::from_event_info(event.info());
                         self.raw_paths.clear();
@@ -423,8 +427,11 @@ impl WatcherFilterThread {
                         }
                         continue;
                     }
-                    if watcher_event_invalidates(&event.kind) && !self.push_raw_paths(event.paths) {
-                        return;
+                    if watcher_event_invalidates(&event.kind) {
+                        self.config.counters.note_invalidating_event();
+                        if !self.push_raw_paths(event.paths) {
+                            return;
+                        }
                     }
                 }
                 Ok(Err(error)) => {
@@ -520,12 +527,19 @@ impl WatcherFilterThread {
 
         let filtered = filter_canonical_paths(&self.config, &self.matcher, raw_paths);
         debug_assert_eq!(filtered.ignore_file_changed, ignore_file_changed);
+        self.config
+            .counters
+            .note_paths_after_gitignore(filtered.changed.len());
         if filtered.changed.is_empty() {
             return true;
         }
-        self.send_dispatch(WatcherDispatchEvent::Paths(
-            filtered.changed.into_iter().collect(),
-        ))
+        let paths = filtered.changed.into_iter().collect::<Vec<_>>();
+        let path_count = paths.len();
+        if !self.send_dispatch(WatcherDispatchEvent::Paths(paths)) {
+            return false;
+        }
+        self.config.counters.note_paths_dispatched(path_count);
+        true
     }
 
     fn wait_for_gitignore_rebuild(&self, observed_generation: u64) -> bool {
@@ -646,6 +660,7 @@ mod tests {
         let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
         let (raw_tx, raw_rx) = mpsc::channel();
         let config = WatcherFilterConfig::new(root, None);
+        let counters = Arc::clone(&config.counters);
         let mut filter = WatcherFilterThread::new(
             config,
             matcher,
@@ -681,10 +696,78 @@ mod tests {
                 .is_err(),
             "pending granular paths should be cleared by a rescan signal"
         );
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.raw_events_total, 4);
+        assert_eq!(snapshot.invalidating_events_total, 1);
+        assert_eq!(snapshot.paths_after_gitignore_total, 0);
+        assert_eq!(snapshot.paths_dispatched_total, 0);
 
         shutdown.store(true, Ordering::SeqCst);
         drop(raw_tx);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn watcher_thread_records_filter_pipeline_counters() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let changed = root.join("changed.rs");
+        std::fs::write(&changed, "fn changed() {}\n").unwrap();
+        let matcher = Arc::new(RwLock::new(None));
+        let generation = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let config = WatcherFilterConfig::new(root, None);
+        let counters = Arc::clone(&config.counters);
+        let mut filter = WatcherFilterThread::new(
+            config,
+            matcher,
+            generation,
+            dispatch_tx,
+            Arc::clone(&shutdown),
+        );
+        let handle = thread::spawn(move || filter.run(raw_rx));
+
+        let mut event = notify::Event::new(EventKind::Create(CreateKind::File));
+        event.paths.push(changed.clone());
+        raw_tx.send(Ok(event)).unwrap();
+        assert_eq!(
+            dispatch_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("filtered paths"),
+            WatcherDispatchEvent::Paths(vec![changed])
+        );
+
+        shutdown.store(true, Ordering::SeqCst);
+        drop(raw_tx);
+        handle.join().unwrap();
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.raw_events_total, 1);
+        assert_eq!(snapshot.raw_events_since_last_rescan, 1);
+        assert_eq!(snapshot.invalidating_events_total, 1);
+        assert_eq!(snapshot.invalidating_events_since_last_rescan, 1);
+        assert_eq!(snapshot.paths_after_gitignore_total, 1);
+        assert_eq!(snapshot.paths_after_gitignore_since_last_rescan, 1);
+        assert_eq!(snapshot.paths_dispatched_total, 1);
+        assert_eq!(snapshot.paths_dispatched_since_last_rescan, 1);
+    }
+
+    #[test]
+    fn configured_context_and_filter_thread_share_root_counters() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let ctx = crate::context::AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config::default(),
+        );
+        ctx.update_config(|config| config.project_root = Some(root.clone()));
+        let config = WatcherFilterConfig::new(root, None);
+
+        config.counters.note_raw_event();
+
+        assert_eq!(ctx.watcher_counters().snapshot().raw_events_total, 1);
     }
 
     #[test]

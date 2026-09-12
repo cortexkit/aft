@@ -1347,6 +1347,10 @@ fn process_rss_bytes() -> Option<u64> {
     None
 }
 
+pub(crate) fn rss_bytes() -> Option<u64> {
+    process_rss_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

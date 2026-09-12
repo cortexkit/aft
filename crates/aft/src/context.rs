@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, BufWriter};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -657,6 +657,168 @@ pub(crate) enum WatcherDrainPhase {
         remaining: usize,
         oversized_inline_batch: bool,
     },
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct WatcherCountersSnapshot {
+    pub(crate) raw_events_total: u64,
+    pub(crate) raw_events_since_last_rescan: u64,
+    pub(crate) invalidating_events_total: u64,
+    pub(crate) invalidating_events_since_last_rescan: u64,
+    pub(crate) paths_after_gitignore_total: u64,
+    pub(crate) paths_after_gitignore_since_last_rescan: u64,
+    pub(crate) paths_dispatched_total: u64,
+    pub(crate) paths_dispatched_since_last_rescan: u64,
+    pub(crate) rescans_kernel_dropped_total: u64,
+    pub(crate) rescans_user_dropped_total: u64,
+    pub(crate) rescans_unknown_total: u64,
+    pub(crate) last_rescan_at_ms: Option<u64>,
+    pub(crate) last_rescan_cost_ms: Option<u64>,
+    pub(crate) last_rescan_rss_delta_bytes: Option<i64>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct WatcherCounters {
+    raw_events_total: AtomicU64,
+    raw_events_since_last_rescan: AtomicU64,
+    invalidating_events_total: AtomicU64,
+    invalidating_events_since_last_rescan: AtomicU64,
+    paths_after_gitignore_total: AtomicU64,
+    paths_after_gitignore_since_last_rescan: AtomicU64,
+    paths_dispatched_total: AtomicU64,
+    paths_dispatched_since_last_rescan: AtomicU64,
+    rescans_kernel_dropped_total: AtomicU64,
+    rescans_user_dropped_total: AtomicU64,
+    rescans_unknown_total: AtomicU64,
+    last_rescan_at_ms: AtomicU64,
+    last_rescan_cost_ms: AtomicU64,
+    last_rescan_rss_delta_bytes: AtomicI64,
+    last_rescan_rss_delta_known: AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WatcherRescanInterval {
+    pub(crate) raw_events: u64,
+}
+
+impl WatcherCounters {
+    pub(crate) fn note_raw_event(&self) {
+        self.raw_events_total.fetch_add(1, Ordering::Relaxed);
+        self.raw_events_since_last_rescan
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_invalidating_event(&self) {
+        self.invalidating_events_total
+            .fetch_add(1, Ordering::Relaxed);
+        self.invalidating_events_since_last_rescan
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_paths_after_gitignore(&self, count: usize) {
+        let count = count as u64;
+        self.paths_after_gitignore_total
+            .fetch_add(count, Ordering::Relaxed);
+        self.paths_after_gitignore_since_last_rescan
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_paths_dispatched(&self, count: usize) {
+        let count = count as u64;
+        self.paths_dispatched_total
+            .fetch_add(count, Ordering::Relaxed);
+        self.paths_dispatched_since_last_rescan
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub(crate) fn begin_rescan(
+        &self,
+        reason: crate::watcher_filter::RescanReason,
+    ) -> WatcherRescanInterval {
+        match reason {
+            crate::watcher_filter::RescanReason::KernelDropped => {
+                &self.rescans_kernel_dropped_total
+            }
+            crate::watcher_filter::RescanReason::UserDropped => &self.rescans_user_dropped_total,
+            crate::watcher_filter::RescanReason::Unknown => &self.rescans_unknown_total,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+
+        let raw_events = self.raw_events_since_last_rescan.swap(0, Ordering::Relaxed);
+        self.invalidating_events_since_last_rescan
+            .swap(0, Ordering::Relaxed);
+        self.paths_after_gitignore_since_last_rescan
+            .swap(0, Ordering::Relaxed);
+        self.paths_dispatched_since_last_rescan
+            .swap(0, Ordering::Relaxed);
+        WatcherRescanInterval { raw_events }
+    }
+
+    pub(crate) fn finish_rescan(&self, cost_ms: u64, rss_delta_bytes: Option<i64>) {
+        self.last_rescan_cost_ms.store(cost_ms, Ordering::Relaxed);
+        if let Some(delta) = rss_delta_bytes {
+            self.last_rescan_rss_delta_bytes
+                .store(delta, Ordering::Relaxed);
+            self.last_rescan_rss_delta_known
+                .store(true, Ordering::Relaxed);
+        } else {
+            self.last_rescan_rss_delta_known
+                .store(false, Ordering::Relaxed);
+        }
+        let at_ms = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        self.last_rescan_at_ms.store(at_ms, Ordering::Release);
+    }
+
+    pub(crate) fn snapshot(&self) -> WatcherCountersSnapshot {
+        let last_rescan_at_ms = self.last_rescan_at_ms.load(Ordering::Acquire);
+        WatcherCountersSnapshot {
+            raw_events_total: self.raw_events_total.load(Ordering::Relaxed),
+            raw_events_since_last_rescan: self.raw_events_since_last_rescan.load(Ordering::Relaxed),
+            invalidating_events_total: self.invalidating_events_total.load(Ordering::Relaxed),
+            invalidating_events_since_last_rescan: self
+                .invalidating_events_since_last_rescan
+                .load(Ordering::Relaxed),
+            paths_after_gitignore_total: self.paths_after_gitignore_total.load(Ordering::Relaxed),
+            paths_after_gitignore_since_last_rescan: self
+                .paths_after_gitignore_since_last_rescan
+                .load(Ordering::Relaxed),
+            paths_dispatched_total: self.paths_dispatched_total.load(Ordering::Relaxed),
+            paths_dispatched_since_last_rescan: self
+                .paths_dispatched_since_last_rescan
+                .load(Ordering::Relaxed),
+            rescans_kernel_dropped_total: self.rescans_kernel_dropped_total.load(Ordering::Relaxed),
+            rescans_user_dropped_total: self.rescans_user_dropped_total.load(Ordering::Relaxed),
+            rescans_unknown_total: self.rescans_unknown_total.load(Ordering::Relaxed),
+            last_rescan_at_ms: (last_rescan_at_ms != 0).then_some(last_rescan_at_ms),
+            last_rescan_cost_ms: (last_rescan_at_ms != 0)
+                .then(|| self.last_rescan_cost_ms.load(Ordering::Relaxed)),
+            last_rescan_rss_delta_bytes: (last_rescan_at_ms != 0
+                && self.last_rescan_rss_delta_known.load(Ordering::Relaxed))
+            .then(|| self.last_rescan_rss_delta_bytes.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+static WATCHER_COUNTERS_BY_ROOT: std::sync::OnceLock<
+    Mutex<BTreeMap<PathBuf, Arc<WatcherCounters>>>,
+> = std::sync::OnceLock::new();
+
+pub(crate) fn watcher_counters_for_root(root: &Path) -> Arc<WatcherCounters> {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let registry = WATCHER_COUNTERS_BY_ROOT.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(counters) = registry.get(&root) {
+        return Arc::clone(counters);
+    }
+    let counters = Arc::new(WatcherCounters::default());
+    registry.insert(root, Arc::clone(&counters));
+    counters
 }
 
 #[derive(Debug)]
@@ -1875,6 +2037,7 @@ pub struct AppContext {
     watcher_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>>,
     watcher_drain_slice: parking_lot::Mutex<Option<WatcherDrainSliceState>>,
     watcher_thread: parking_lot::Mutex<Option<WatcherThreadHandle>>,
+    watcher_counters: RwLock<Arc<WatcherCounters>>,
     lsp_manager: parking_lot::Mutex<LspManager>,
     configure_generation: Arc<AtomicU64>,
     /// Advances only when the warm configuration changes, not on route
@@ -2232,6 +2395,11 @@ impl AppContext {
         config: Config,
     ) -> Self {
         let bash_compress_enabled = config.experimental_bash_compress;
+        let watcher_counters = config
+            .project_root
+            .as_deref()
+            .map(watcher_counters_for_root)
+            .unwrap_or_else(|| Arc::new(WatcherCounters::default()));
         let (configure_warnings_tx, configure_warnings_rx) = crossbeam_channel::unbounded();
         let progress_sender: SharedProgressSender = Arc::new(Mutex::new(None));
         let status_emitter = StatusEmitter::new(Arc::clone(&progress_sender));
@@ -2335,6 +2503,7 @@ impl AppContext {
             watcher_rx: parking_lot::Mutex::new(None),
             watcher_drain_slice: parking_lot::Mutex::new(None),
             watcher_thread: parking_lot::Mutex::new(None),
+            watcher_counters: RwLock::new(watcher_counters),
             lsp_manager: parking_lot::Mutex::new(lsp_manager),
             configure_generation: Arc::new(AtomicU64::new(0)),
             configure_content_generation: Arc::new(AtomicU64::new(0)),
@@ -3763,6 +3932,11 @@ impl AppContext {
     /// Atomically publish a fully-built configuration snapshot.
     pub fn set_config(&self, config: Config) {
         let next = Arc::new(config);
+        let next_watcher_counters = next
+            .project_root
+            .as_deref()
+            .map(watcher_counters_for_root)
+            .unwrap_or_else(|| Arc::new(WatcherCounters::default()));
         let project_root_changed = {
             let mut guard = self
                 .config
@@ -3777,6 +3951,10 @@ impl AppContext {
         };
         if project_root_changed {
             self.path_restriction_root_memo.lock().take();
+            *self
+                .watcher_counters
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = next_watcher_counters;
         }
     }
 
@@ -6437,6 +6615,15 @@ impl AppContext {
     /// Access the file watcher handle (kept alive to continue watching).
     pub fn watcher(&self) -> &parking_lot::Mutex<Option<RecommendedWatcher>> {
         &self.watcher
+    }
+
+    pub(crate) fn watcher_counters(&self) -> Arc<WatcherCounters> {
+        Arc::clone(
+            &self
+                .watcher_counters
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// Access the pre-filtered watcher event receiver.

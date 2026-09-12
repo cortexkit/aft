@@ -432,10 +432,7 @@ fn remember_in_flight(event: &IndexEvent) {
     }
 }
 
-/// Write one greppable `index_event` info line through the house slog path.
-pub(crate) fn log_index_event(event: IndexEvent) {
-    remember_in_flight(&event);
-    let line = format_index_event_line(&event);
+fn emit_index_event_line(line: String) {
     #[cfg(test)]
     if let Ok(mut slot) = INDEX_EVENT_CAPTURE.lock() {
         if let Some(events) = slot.as_mut() {
@@ -443,6 +440,37 @@ pub(crate) fn log_index_event(event: IndexEvent) {
         }
     }
     crate::slog_info!("{}", line);
+}
+
+/// Write one greppable `index_event` info line through the house slog path.
+pub(crate) fn log_index_event(event: IndexEvent) {
+    remember_in_flight(&event);
+    emit_index_event_line(format_index_event_line(&event));
+}
+
+pub(crate) fn log_watcher_rescan(
+    root: &Path,
+    reason: crate::watcher_filter::RescanReason,
+    cost_ms: u64,
+    rss_delta_bytes: Option<i64>,
+    raw_events_since_last: u64,
+) {
+    let reason = sanitize_index_value(reason.as_str());
+    let rss_delta = rss_delta_bytes
+        .map(|delta| delta.to_string())
+        .unwrap_or_else(|| "unavailable".to_string());
+    let prefix = "index_event kind=watcher_rescan plane=watcher root=";
+    let suffix = format!(
+        " reason={reason} cost_ms={cost_ms} rss_delta_bytes={rss_delta} raw_events_since_last={raw_events_since_last}"
+    );
+    let mut root = sanitize_index_value(&normalize_index_root(root));
+    let root_budget = INDEX_EVENT_MAX_BYTES
+        .saturating_sub(prefix.len())
+        .saturating_sub(suffix.len());
+    if root.len() > root_budget {
+        root = left_truncate_root(&root, root_budget);
+    }
+    emit_index_event_line(format!("{prefix}{root}{suffix}"));
 }
 
 /// Emit an event for the current thread's index-build scope, if any.
@@ -1787,6 +1815,44 @@ mod tests {
         std::fs::write(root.join(file_name), contents).expect("write fixture");
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         (temp, root)
+    }
+
+    #[test]
+    fn watcher_rescan_event_reports_reason_cost_rss_and_interval_count() {
+        let (_, lines) = capture_index_events(|| {
+            log_watcher_rescan(
+                Path::new("/tmp/watcher root"),
+                crate::watcher_filter::RescanReason::KernelDropped,
+                42,
+                Some(-4096),
+                137,
+            );
+        });
+        assert_index_event_grammar(&lines);
+        assert_eq!(lines.len(), 1);
+        let fields = index_event_fields(&lines[0]);
+        assert_eq!(
+            fields.get("kind").map(String::as_str),
+            Some("watcher_rescan")
+        );
+        assert_eq!(fields.get("plane").map(String::as_str), Some("watcher"));
+        assert_eq!(
+            fields.get("root").map(String::as_str),
+            Some("/tmp/watcher_root")
+        );
+        assert_eq!(
+            fields.get("reason").map(String::as_str),
+            Some("kernel_dropped")
+        );
+        assert_eq!(fields.get("cost_ms").map(String::as_str), Some("42"));
+        assert_eq!(
+            fields.get("rss_delta_bytes").map(String::as_str),
+            Some("-4096")
+        );
+        assert_eq!(
+            fields.get("raw_events_since_last").map(String::as_str),
+            Some("137")
+        );
     }
 
     #[test]
