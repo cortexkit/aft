@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "embed-body-cap-ab-runner",
+    "embed-text-caps-plumbing-default-preserving"
+  ],
+  "note": "semantic_index.rs gains per-backend EmbedTextCaps behind semantic.max_input_tokens; the key is unset on every benchmark and production config, so chunk text and rows are byte-identical to the reference. The gate's byte-equality predicate is the proof."
+}

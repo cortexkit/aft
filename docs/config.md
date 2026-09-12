@@ -200,7 +200,7 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
   //
   // USER-only fields: "backend", "base_url", "api_key_env" (project config cannot
   // inject these — strict-allowlist trust boundary). Project config can still tune
-  // "model", "timeout_ms", "max_batch_size", "max_files".
+  // "model", "timeout_ms", "max_batch_size", "max_files", "max_input_tokens".
   //
   // Switching "backend", "model", or "base_url" deletes the persisted index and
   // rebuilds from scratch on next session start (necessary because dimensions and
@@ -216,7 +216,11 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
                                         // Raise for slow providers; on timeout, search degrades to
                                         // lexical for that query instead of failing.
     "max_batch_size": 64,               // embeddings batched in groups of this size
-    "max_files": 20000                  // max files indexed (default 20000); raise for remote backends
+    "max_files": 20000,                 // max files indexed (default 20000); raise for remote backends
+    // "max_input_tokens": 512          // advanced: per-row token budget for remote backends; widens the
+                                        // symbol-body slice each chunk embeds (default keeps the 512-safe
+                                        // caps; fastembed ignores it). Changing it rebuilds the index.
+                                        // Measured 2026-09: longer bodies did not improve retrieval.
   },
 
   // Restrict all file operations to the project root directory.
