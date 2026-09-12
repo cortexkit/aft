@@ -275,3 +275,9 @@ Each observer cell is `raw / invalidating / after-gitignore / dispatched / kerne
 | control_unwatched | 481.146 | no | 0 / 0 / 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 / 0 / 0 | 0 / 0 / 0 / 0 / 0 / 0 / 0 | 34888 / 34549 / 2 / 2 / 0 / 0 / 0 | 0 |
 
 Both Cargo commands exited 0. The watched build ran from `2026-09-12T07:44:20.079876Z` to `2026-09-12T07:53:11.007949Z`; the control ran from `2026-09-12T07:54:11.191373Z` to `2026-09-12T08:01:12.202359Z`. The live log inode remained 1317952824 throughout, so the byte-window counts were not affected by rotation.
+
+## Windows watcher implementation gap
+
+The Windows arm remains on `notify` 8.2 because its public `Config` has no `ReadDirectoryChangesW` buffer-size knob and does not expose completion errors or byte counts to AFT's event handler. Consequently AFT cannot request the approved 1 MiB buffer, retry at 64 KiB on `ERROR_INVALID_PARAMETER`, or translate `ERROR_NOTIFY_ENUM_DIR` and successful zero-byte completions into `Flag::Rescan` with info `windows overflow` without replacing or patching notify's Windows backend.
+
+The filed implementation gap is to add those three controls in notify's `src/windows.rs` (preferably as public configuration and typed overflow events), then set 1 MiB from `watcher_backend` while retaining the existing recursive notify watcher. Until that API exists, Windows keeps notify's 16 KiB buffer and its current overflow behavior; the cross-target warning gate below verifies that this explicit no-op arm remains buildable.
