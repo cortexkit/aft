@@ -144,8 +144,8 @@ fn incremental_writes_only_owned_rows_and_relinks() {
             inserted: 5,
             relinked_deleted: 2,
             relinked_inserted: 2,
-            dependency_deleted: 2,
-            dependency_inserted: 2,
+            dependency_deleted: 3,
+            dependency_inserted: 3,
             dependent_files: 1,
             resolved_files: 3,
             resolved_refs: 2,
@@ -153,7 +153,7 @@ fn incremental_writes_only_owned_rows_and_relinks() {
         }
     );
     assert_eq!(stats.graph_rows_written(), 13);
-    assert_eq!(stats.rows_written(), 17);
+    assert_eq!(stats.rows_written(), 19);
     assert_eq!(stats.dependent_files, 1);
     assert_eq!(stats.resolved_files, 3);
     assert!(!stats.full_resolution);
@@ -387,8 +387,8 @@ fn new_reexport_target_invalidates_transitive_unchanged_importer() {
     for (table, expected) in snapshot(&cold) {
         assert_eq!(actual[&table], expected, "table {table}");
     }
-    assert_eq!(stats.dependent_files, 3);
-    assert_eq!(stats.resolved_files, 4);
+    assert_eq!(stats.dependent_files, 1);
+    assert_eq!(stats.resolved_files, 2);
     assert!(!stats.full_resolution);
     assert_eq!(actual["edges"].len(), 1);
 }
@@ -633,4 +633,155 @@ fn legacy_generation_without_diff_metadata_cold_upgrades() {
     let cold = f.dir.path().join("legacy-upgraded-cold.sqlite");
     materialize_manifest_view_database(&cold, &f.blobs, &f.next).unwrap();
     assert_eq!(snapshot(&copy), snapshot(&cold));
+}
+
+#[test]
+fn unrelated_export_surface_change_skips_reresolving_unchanged_binding_caller() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let caller = "import { target } from './target'; export function caller() { return target(); }";
+    let base = manifest(
+        &conn,
+        &[
+            ("caller.ts", caller),
+            (
+                "target.ts",
+                "const anchor = 0; export function target() { return 1; }",
+            ),
+        ],
+    );
+    let next = manifest(
+        &conn,
+        &[
+            ("caller.ts", caller),
+            (
+                "target.ts",
+                "const anchor = 0; export function target() { return 1; } export function unrelated() {}",
+            ),
+        ],
+    );
+    let db = f.dir.path().join("unrelated-surface.sqlite");
+    let cold = f.dir.path().join("unrelated-surface-cold.sqlite");
+    materialize_manifest_view_database(&db, &f.blobs, &base).unwrap();
+    let stats = apply_manifest_diff(&db, &base, &next, &f.blobs).unwrap();
+    materialize_manifest_view_database(&cold, &f.blobs, &next).unwrap();
+    assert_eq!(snapshot(&db), snapshot(&cold));
+    assert_eq!(stats.dependent_files, 0);
+    assert_eq!(stats.resolved_refs, 0);
+}
+
+#[test]
+fn used_export_surface_change_reresolves_unchanged_binding_caller() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let caller = "import { target } from './target'; export function caller() { return target(); }";
+    let base = manifest(
+        &conn,
+        &[
+            ("caller.ts", caller),
+            ("target.ts", "export function target() { return 1; }"),
+        ],
+    );
+    let next = manifest(
+        &conn,
+        &[
+            ("caller.ts", caller),
+            ("target.ts", "export function replacement() { return 1; }"),
+        ],
+    );
+    let db = f.dir.path().join("used-surface.sqlite");
+    let cold = f.dir.path().join("used-surface-cold.sqlite");
+    materialize_manifest_view_database(&db, &f.blobs, &base).unwrap();
+    let stats = apply_manifest_diff(&db, &base, &next, &f.blobs).unwrap();
+    materialize_manifest_view_database(&cold, &f.blobs, &next).unwrap();
+    let actual = snapshot(&db);
+    for (table, expected) in snapshot(&cold) {
+        assert_eq!(actual[&table], expected, "table {table}");
+    }
+    assert_eq!(stats.dependent_files, 1);
+    assert_eq!(stats.resolved_refs, 2);
+}
+
+#[test]
+fn colliding_structural_ordinals_keep_distinct_bindings_and_first_reference_rows() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let initial = manifest(
+        &conn,
+        &[
+            (
+                "caller.ts",
+                "import { one } from './barrel'; export function caller() { return one(); }",
+            ),
+            ("barrel.ts", "export * from './one'; export * from './two';"),
+            ("one.ts", "export function one() {}"),
+            ("two.ts", "export function two() {}"),
+        ],
+    );
+    let barrel = RelPath::new(b"barrel.ts".to_vec()).unwrap();
+    let ManifestEntry::Regular { planes, .. } = initial.get(&barrel).unwrap() else {
+        unreachable!()
+    };
+    let payload: Vec<u8> = conn
+        .query_row(
+            "SELECT payload FROM blob_payloads WHERE full_key=?1",
+            [decode_manifest_full_key(planes.callgraph.as_deref().unwrap()).unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut blob = join::CallgraphBlob::from_bytes(&payload).unwrap();
+    let join::CallgraphBlob::Parse(parse) = &mut blob else {
+        unreachable!()
+    };
+    let reexports = parse
+        .refs
+        .iter()
+        .enumerate()
+        .filter(|(_, reference)| reference.kind == join::BlobRefKind::Reexport)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(reexports.len(), 2);
+    parse.refs[reexports[1]].ordinal = parse.refs[reexports[0]].ordinal;
+    let first_module = parse.refs[reexports[0]].module_path.clone().unwrap();
+    let payload = blob.to_bytes().unwrap();
+    let key = blake3::hash(&payload);
+    conn.execute(
+        "INSERT INTO blob_payloads VALUES(?1, ?2)",
+        params![key.as_bytes().as_slice(), payload],
+    )
+    .unwrap();
+    let manifest = Manifest::new(initial.entries().map(|(path, entry)| {
+        let mut entry = entry.clone();
+        if path == &barrel {
+            if let ManifestEntry::Regular { planes, .. } = &mut entry {
+                planes.callgraph = Some(key.to_hex().to_string());
+            }
+        }
+        (path.clone(), entry)
+    }))
+    .unwrap();
+    let reader = ManifestViewBlobReader { connection: &conn };
+    let cold = join::join_selected_manifest(&manifest, &reader, None, &BTreeMap::new()).unwrap();
+    let selected = BTreeSet::from(["caller.ts".to_string()]);
+    let cached =
+        join::join_selected_manifest(&manifest, &reader, Some(&selected), &cold.bindings).unwrap();
+    assert_eq!(
+        cached.result.rows,
+        cold.result
+            .rows
+            .into_iter()
+            .filter(|row| row.caller_path == b"caller.ts")
+            .collect()
+    );
+    let db = f.dir.path().join("colliding.sqlite");
+    materialize_manifest_view_database(&db, &f.blobs, &manifest).unwrap();
+    let module: String = Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT module_path FROM refs WHERE caller_file='barrel.ts'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(module, first_module);
 }

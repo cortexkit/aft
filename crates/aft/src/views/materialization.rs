@@ -61,7 +61,7 @@ pub fn apply_manifest_diff(
     )
 }
 
-const MATERIALIZATION_VERSION: &str = "2";
+const MATERIALIZATION_VERSION: &str = "3";
 
 fn fingerprint(manifest: &crate::views::Manifest) -> Result<String> {
     let bytes = manifest
@@ -136,18 +136,6 @@ fn materialize(
     };
     let mut stats = MaterializeStats {
         full_resolution: selected.is_none(),
-        dependent_files: selected.as_ref().map_or(0, |selected| {
-            selected
-                .iter()
-                .filter(|path| {
-                    !changed
-                        .as_ref()
-                        .expect("incremental paths")
-                        .contains(path.as_bytes())
-                        && cached.contains_key(*path)
-                })
-                .count()
-        }),
         ..MaterializeStats::default()
     };
     if let Some(changed) = &changed {
@@ -182,7 +170,14 @@ fn materialize(
     let blob_connection = Connection::open(callgraph_blob_database)?;
     let mut parsed = BTreeMap::new();
     let mut nodes = HashMap::new();
+    let mut loaded_paths = BTreeSet::new();
     for (path, entry) in manifest.entries() {
+        if changed
+            .as_ref()
+            .is_some_and(|paths| !paths.contains(path.as_bytes()))
+        {
+            continue;
+        }
         let crate::views::ManifestEntry::Regular {
             planes,
             resolution_input,
@@ -215,6 +210,7 @@ fn materialize(
         let path = String::from_utf8(path.as_bytes().to_vec()).map_err(|_| {
             CallGraphStoreError::Unavailable("non-UTF-8 manifest callgraph path".to_string())
         })?;
+        loaded_paths.insert(path.clone());
         let write_owned = changed
             .as_ref()
             .is_none_or(|paths| paths.contains(path.as_bytes()));
@@ -265,8 +261,14 @@ fn materialize(
                 parse
                     .refs
                     .iter()
-                    .map(|reference| (reference.ordinal, reference.clone()))
-                    .collect::<BTreeMap<_, _>>(),
+                    .fold(BTreeMap::new(), |mut by_ordinal, reference| {
+                        // Match the cold writer's original first-reference lookup
+                        // when structural references share an AST ordinal.
+                        by_ordinal
+                            .entry(reference.ordinal)
+                            .or_insert_with(|| reference.clone());
+                        by_ordinal
+                    }),
             );
         }
     }
@@ -274,13 +276,37 @@ fn materialize(
     let reader = ManifestViewBlobReader {
         connection: &blob_connection,
     };
-    let joined = join::join_selected_manifest(manifest, &reader, selected.as_ref(), &cached)
-        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+    let changed_strings = changed.as_ref().map_or_else(BTreeSet::new, |paths| {
+        paths
+            .iter()
+            .filter_map(|path| String::from_utf8(path.clone()).ok())
+            .collect()
+    });
+    let membership_changed = base.map_or_else(BTreeSet::new, |base| {
+        base.entries()
+            .chain(manifest.entries())
+            .filter(|(path, _)| {
+                base.get(path).map(crate::views::ManifestEntry::kind)
+                    != manifest.get(path).map(crate::views::ManifestEntry::kind)
+            })
+            .filter_map(|(path, _)| String::from_utf8(path.as_bytes().to_vec()).ok())
+            .collect()
+    });
+    let joined = join::join_selected_manifest_reusing_surfaces(
+        manifest,
+        &reader,
+        selected.as_ref(),
+        &cached,
+        &changed_strings,
+        &membership_changed,
+    )
+    .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
     stats.resolved_refs = joined.result.rows.len();
-    stats.resolved_files = joined
-        .bindings
-        .keys()
-        .filter(|path| selected.as_ref().is_none_or(|set| set.contains(*path)))
+    stats.resolved_files = joined.resolved_callers.len();
+    stats.dependent_files = joined
+        .resolved_callers
+        .iter()
+        .filter(|path| !changed_strings.contains(*path) && changed.is_some())
         .count();
     for (path, binding) in &joined.bindings {
         let old = cached.get(path).filter(|_| {
@@ -318,6 +344,28 @@ fn materialize(
         let caller_path = String::from_utf8(row.caller_path.clone()).map_err(|_| {
             CallGraphStoreError::Unavailable("non-UTF-8 manifest caller path".to_string())
         })?;
+        ensure_manifest_path(
+            &caller_path,
+            manifest,
+            &blob_connection,
+            &mut loaded_paths,
+            &mut parsed,
+            &mut nodes,
+        )?;
+        if let Some(target) = row
+            .target_path
+            .as_ref()
+            .and_then(|path| std::str::from_utf8(path).ok())
+        {
+            ensure_manifest_path(
+                target,
+                manifest,
+                &blob_connection,
+                &mut loaded_paths,
+                &mut parsed,
+                &mut nodes,
+            )?;
+        }
         let Some(parse) = parsed.get(&caller_path) else {
             continue;
         };
@@ -513,6 +561,12 @@ fn dependent_closure(
         .iter()
         .filter_map(|path| String::from_utf8(path.clone()).ok())
         .collect::<BTreeSet<_>>();
+    if !changed.is_empty() {
+        // Rust inline-module and parent queries can inspect the crate-wide index.
+        // Recheck that domain even for non-.rs paths: explicit module paths may
+        // name other extensions, and membership changes can expose new modules.
+        selected.insert(join::VIEW_RUST_MODULE_DOMAIN.to_string());
+    }
     let mut pending = selected.iter().cloned().collect::<Vec<_>>();
     let mut dependents =
         connection.prepare("SELECT file_path FROM file_dependencies WHERE dep_file = ?1")?;
@@ -550,4 +604,74 @@ fn requires_full_resolution(
                         )
                 })
     })
+}
+
+/// Unchanged blobs are decoded for row emission only when a selected reference
+/// actually needs their caller data or target IDs. The join builds its own index;
+/// decoding every blob again here would erase much of the incremental saving.
+fn ensure_manifest_path(
+    path: &str,
+    manifest: &crate::views::Manifest,
+    blobs: &Connection,
+    loaded: &mut BTreeSet<String>,
+    parsed: &mut BTreeMap<String, BTreeMap<u32, join::BlobRef>>,
+    nodes: &mut HashMap<(String, String), String>,
+) -> Result<()> {
+    if !loaded.insert(path.to_string()) {
+        return Ok(());
+    }
+    let Ok(rel) = crate::views::RelPath::new(path.as_bytes().to_vec()) else {
+        return Ok(());
+    };
+    let Some(crate::views::ManifestEntry::Regular {
+        planes,
+        resolution_input,
+        ..
+    }) = manifest.get(&rel)
+    else {
+        return Ok(());
+    };
+    let Some(key) = &planes.callgraph else {
+        return Ok(());
+    };
+    let key_bytes = decode_manifest_full_key(key).ok_or_else(|| {
+        CallGraphStoreError::Unavailable(format!("invalid manifest callgraph key {key}"))
+    })?;
+    let payload = blobs
+        .query_row(
+            "SELECT payload FROM blob_payloads WHERE full_key=?1",
+            [key_bytes],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            CallGraphStoreError::Unavailable(format!("missing manifest callgraph blob {key}"))
+        })?;
+    let blob = join::CallgraphBlob::from_bytes(&payload)
+        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+    let Some(parse) = blob.parse() else {
+        return Ok(());
+    };
+    for symbol in &parse.symbols {
+        let id = format!("view:{path}:{}:{}", symbol.scoped_name, symbol.ordinal);
+        nodes.insert((path.to_string(), symbol.scoped_name.clone()), id.clone());
+        nodes
+            .entry((path.to_string(), symbol.name.clone()))
+            .or_insert(id);
+    }
+    if !resolution_input {
+        parsed.insert(
+            path.to_string(),
+            parse
+                .refs
+                .iter()
+                .fold(BTreeMap::new(), |mut by_ordinal, reference| {
+                    by_ordinal
+                        .entry(reference.ordinal)
+                        .or_insert_with(|| reference.clone());
+                    by_ordinal
+                }),
+        );
+    }
+    Ok(())
 }

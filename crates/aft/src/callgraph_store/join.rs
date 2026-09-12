@@ -1445,6 +1445,7 @@ impl ProjectFacts for ViewBindingFacts<'_> {
 /// dependencies avoid resolving unchanged imports merely to rebuild that index.
 /// `selected=None` is the cold path; otherwise the owner supplies the transitive
 /// reverse-dependency closure and caches from the same base generation.
+#[cfg(test)]
 pub(crate) fn join_selected_manifest(
     manifest: &Manifest,
     blobs: &impl ManifestBlobReader,
