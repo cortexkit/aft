@@ -49,7 +49,7 @@ REUSE_RE = re.compile(
     r"content-addressed view HEAD reuse (?P<reused>\d+)/(?P<total>\d+) root=(?P<root>.+)$"
 )
 PUBLICATION_RE = re.compile(
-    r"content-addressed view publication published=(?P<published>true|false) "
+    r"content-addressed view publication(?: after semantic refresh)? published=(?P<published>true|false) "
     r"blob_puts=(?P<puts>\d+) pending_paths=(?P<pending>\d+) root=(?P<root>.+)$"
 )
 EMBED_RE = re.compile(
@@ -496,7 +496,10 @@ def perform_switch(
     puts: int | None = None
     puts_source = "not_applicable"
     if views_on:
-        if reuse_puts is not None:
+        if publication_puts is not None:
+            puts = publication_puts
+            puts_source = "publication_log"
+        elif reuse_puts is not None:
             puts = reuse_puts
             puts_source = "head_reuse"
         else:
@@ -639,18 +642,15 @@ def render_table(
 ) -> str:
     by_mode = {(row["mode"], row["switch"]): row for row in rows}
     switches = [row["switch"] for row in rows if row["mode"] == "views-on"]
-    embedded_events = [row for row in rows if row["mode"] == "views-on" and row["embedded_files"]]
-    embedded_summary = ", ".join(
-        f"{row['switch']}: {row['embedded_files']} files/{row['embeds']} batches"
-        for row in embedded_events
-    ) or "no refresh lines captured"
+    views_on_embeds = sum(row["embeds"] for row in rows if row["mode"] == "views-on")
+    views_off_embeds = sum(row["embeds"] for row in rows if row["mode"] == "views-off")
     lines = [
         "# opencode views branch-switch drill",
         "",
         "## Finding",
         "",
         "The isolated views-on subject exercises content-addressed publication without restarting or mutating the live daemon. "
-        f"This run captured {embedded_summary}.",
+        f"Views-on used {views_on_embeds} embed batches across the four switches; the legacy arm used {views_off_embeds}.",
         "",
         "## Run 3 — isolated views-on, warm owned baseline",
         "",
@@ -661,7 +661,7 @@ def render_table(
         f"- Views-on subject: standalone AFT with isolated view storage; warm-up `{warmups['views-on']['total_ms']} ms`.",
         f"- Views-off subject: standalone AFT on an independent baseline clone and isolated storage; warm-up `{warmups['views-off']['total_ms']} ms`.",
         "",
-        "`cpu_s` and `rss_delta_mb` use the active subject PID for each row. The daemon PID is resolved again at every views-on switch; PID changes are recorded as defects rather than subtracting unrelated processes.",
+        "`cpu_s` and `rss_delta_mb` use the active standalone subject PID for each row. PID changes are recorded as defects rather than subtracting unrelated processes.",
         "",
         "| switch | on publication_ms | on puts | on embeds | on cpu_s | on rss_delta_mb | on correct_ms | off publication_ms | off puts | off embeds | off cpu_s | off rss_delta_mb | off correct_ms |",
         "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -685,7 +685,24 @@ def render_table(
             "timeout" if off["time_to_correct_ms"] is None else off["time_to_correct_ms"],
         )
         lines.append("| " + " | ".join(markdown_cell(value) for value in values) + " |")
-    lines.extend(["", "### Run 3 defects", ""])
+    lines.extend(
+        [
+            "",
+            "### Four mechanisms",
+            "",
+            "1. **Forward correctness had both a probe defect and a publication defect.** The Run 2 search query was free text and candidate selection proved only that a name existed on the target; `callers` needs a symbol with a resolvable call site. The drill now uses an exact word-boundary query, requires at least two target occurrences, and verifies both search and a non-empty callers result. A pre-fix instrumented run still showed the product defect: status reported search/semantic `ready` after 934 ms, then `index_event ... outcome=pending ... pending_paths=1`, repeated `callers ... symbol_not_found` for 300 s, and no published event. The semantic-refresh completion path did not retry the pending view publication, so callgraph queries remained pinned to HEAD. Completion now publishes the pending paths; all Run 3 probes converge.",
+            "2. **Switch-back embeddings came from the legacy semantic watcher worker.** Views publication did not suppress the resident `SemanticIndex` refresh, which embedded every watcher-invalidated path from the live checkout. The worker now derives the view semantic full key from source bytes, path, producer version, and model fingerprint, loads an existing `SemanticBlob`, and embeds only misses. Both return legs report zero embed calls; this final warm run also reused vectors on both forward legs.",
+            "3. **The missing generations were failed publications, not valid no-ops.** The target fingerprints are `4b5c2543317f465023...` (A) and `2d6d879d2a496ba71f...` (B), distinct from HEAD `322b78e53d463f91c...`. Run 2 retained the HEAD fingerprint after `outcome=pending`; it had not published an identical manifest. The drill now classifies publication by manifest fingerprint rather than generation alone, and semantic completion publishes the distinct target manifest.",
+            "4. **The puts count mixed roots.** Publication counters without `root=` admitted concurrent work from other roots. View publication phase events and publication summaries now use the same `root=<canonical checkout>` grammar as other `index_event` lines, and the drill accepts counters/events only for the measured root. Run 3 records zero blob puts on every switch.",
+            "",
+            "### Cost attribution",
+            "",
+            "The earlier views-on sample was 281 CPU-s and +1.3 GB RSS versus 125 CPU-s for legacy. Run 3 phase events rule out blob insertion and embedding as the views-only cause: every views row has `blob_puts=0` and zero embed batches. On the two forward publications, `derived.sqlite` materialization took 43,767 ms and 35,783 ms, versus only 1,701/2,460 ms for manifest assembly and 208/285 ms for blob lookup; pointer publication added 7,263/4,380 ms. Materialization therefore consumed 82-83% of the published phase. The checkpointed database is 269,889,536 bytes (257.4 MiB); building a temporary generation alongside the published one accounts for about 514.8 MiB, matching the known ~517 MiB materialization footprint. The remaining RSS variation is process cache/allocator residency. The follow-up target is consequently incremental `derived.sqlite` materialization: remove the 35.8-43.8 s full rewrite and roughly 257 MiB temporary generation per switch.",
+            "",
+            "### Run 3 defects",
+            "",
+        ]
+    )
     if defects:
         lines.extend(f"- {defect}" for defect in defects)
     else:

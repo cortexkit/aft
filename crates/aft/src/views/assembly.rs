@@ -429,7 +429,39 @@ fn log_publication_profile(
     total_ms: u128,
     derived_bytes: u64,
 ) {
-    crate::slog_info!(
+    let line = publication_profile_line(
+        request,
+        outcome,
+        candidates,
+        blob_puts,
+        pending_paths,
+        head_ms,
+        assembly_ms,
+        blob_ms,
+        materialize_ms,
+        pointer_ms,
+        total_ms,
+        derived_bytes,
+    );
+    crate::slog_info!("{}", line);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publication_profile_line(
+    request: &AssemblyRequest,
+    outcome: &str,
+    candidates: usize,
+    blob_puts: usize,
+    pending_paths: usize,
+    head_ms: u128,
+    assembly_ms: u128,
+    blob_ms: u128,
+    materialize_ms: u128,
+    pointer_ms: u128,
+    total_ms: u128,
+    derived_bytes: u64,
+) -> String {
+    format!(
         "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} pointer_ms={} total_ms={} derived_bytes={}",
         request.project_root.display(),
         outcome,
@@ -443,7 +475,29 @@ fn log_publication_profile(
         pointer_ms,
         total_ms,
         derived_bytes,
-    );
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publication_profile_line_attributes_the_canonical_root() {
+        let request = AssemblyRequest {
+            storage: PathBuf::from("/storage"),
+            project_root: PathBuf::from("/checkout"),
+            family: "family".to_string(),
+            scope: "scope".to_string(),
+            desired_head: "head".to_string(),
+            changed_paths: BTreeSet::new(),
+            semantic_keys: BTreeMap::new(),
+            require_semantic: false,
+            allow_blob_put: true,
+        };
+        let line = publication_profile_line(&request, "published", 3, 2, 1, 5, 6, 7, 8, 9, 10, 11);
+        assert!(line.contains("plane=views root=/checkout outcome=published"));
+    }
 }
 
 fn is_resolution_input(path: &[u8]) -> bool {
