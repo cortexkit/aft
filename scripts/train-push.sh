@@ -190,25 +190,61 @@ fi
 # Limit: the lock is local, refs are remote, so this sees trains on this box
 # only. One operator, one box here; a second machine driving the same remote is
 # invisible to it, which is why leftover refs are still listed below.
-# (Lifted from BROCA's train-push, 98b68a85.)
+# (Lifted from BROCA's train-push, d588cb6c.)
 train_lock_dir="$(git rev-parse --git-dir 2>/dev/null)/train-push-locks"
 mkdir -p "$train_lock_dir" 2>/dev/null || true
-live_trains=0
-for lock in "$train_lock_dir"/*.lock; do
-  [ -e "$lock" ] || continue
-  lock_pid="$(cat "$lock" 2>/dev/null || true)"
-  lock_name="$(basename "$lock" .lock)"
-  if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
-    live_trains=$((live_trains + 1))
-    printf 'train-push: train %s is RUNNING as pid %s\n' "$lock_name" "$lock_pid" >&2
-  else
-    rm -f "$lock" 2>/dev/null || true
+train_lock_held="$train_lock_dir/held"
+
+# ACQUIRE BEFORE ANY NETWORK WORK, AND ACQUIRE ATOMICALLY. A scan-then-write
+# guard with a `git ls-remote` between the scan and the write admitted two
+# trains started together: the window is a network round trip, and "background
+# one train, start another" lands inside it by construction (BROCA's audit
+# found it in the guard written to fix an ordering bug; 98b68a85 -> d588cb6c).
+# `mkdir` is the POSIX atomic primitive: EEXIST if it exists, so of N racers
+# exactly one wins and there is no check-then-act to lose.
+#
+# The owner file is written after the directory exists, leaving a two-syscall
+# window where the lock is held by someone who has not said who they are. An
+# unreadable owner is treated as live and refused, never recovered: dispossessing
+# a process mid-acquisition gives two live trains, the thing this guard exists
+# to prevent; refusing costs one `rm -rf` the message names. Fail closed.
+train_lock_attempts=0
+while true; do
+  if mkdir "$train_lock_held" 2>/dev/null; then
+    printf '%s %s\n' "$$" "$train_name" > "$train_lock_held/owner"
+    break
+  fi
+
+  owner_pid="$(awk 'NR==1{print $1}' "$train_lock_held/owner" 2>/dev/null || true)"
+  owner_name="$(awk 'NR==1{print $2}' "$train_lock_held/owner" 2>/dev/null || true)"
+
+  if [ -z "$owner_pid" ]; then
+    printf 'train-push: the train lock is held with no readable owner.\n' >&2
+    printf '  a train was killed between taking the lock and recording its pid.\n' >&2
+    printf '  if you are sure no train is running:  rm -rf %s\n' "$train_lock_held" >&2
+    refuse "train lock held by an unidentified owner; refusing rather than dispossessing it"
+  fi
+
+  if kill -0 "$owner_pid" 2>/dev/null; then
+    printf 'train-push: train %s is RUNNING as pid %s\n' "${owner_name:-?}" "$owner_pid" >&2
+    printf '  wait for it, or kill it if you know it is wedged.\n' >&2
+    refuse "a train is already running on this machine; wait for it"
+  fi
+
+  # Stale owner. Claim the removal with a rename, not an rm: two processes
+  # finding the same stale owner would both delete and both acquire, and the
+  # second delete would take the first one's fresh lock. rename(2) of the
+  # directory to an unused name fails ENOENT for whoever arrives second, so
+  # exactly one recovers; the loser loops and meets the winner's live lock.
+  if mv "$train_lock_held" "$train_lock_held.stale.$$" 2>/dev/null; then
+    rm -rf "$train_lock_held.stale.$$" 2>/dev/null || true
+  fi
+
+  train_lock_attempts=$((train_lock_attempts + 1))
+  if [ "$train_lock_attempts" -ge 3 ]; then
+    refuse "could not acquire the train lock after clearing a stale owner; try again"
   fi
 done
-if [ "$live_trains" -gt 0 ]; then
-  printf '  wait for it, or kill it if you know it is wedged.\n' >&2
-  refuse "a train is already running on this machine; wait for it"
-fi
 
 # Leftover refs do not refuse - no process drives them, so they cannot race this
 # train. They are listed with the delete composed, because the operator reaching
@@ -222,9 +258,6 @@ if [ "${stale_refs:-0}" -gt 0 ]; then
     sed "s|.*refs/heads/|    git push $remote --delete |" >&2
   printf '  (proceeding: a ref without a process cannot race this train)\n' >&2
 fi
-
-# Claim the lock for THIS train before any ref moves.
-printf '%s\n' "$$" > "$train_lock_dir/${train_name}.lock" 2>/dev/null || true
 
 # Operator tooling runs on the upstream gh; the shim is only for agent commands.
 # Sourced up front because the trigger probe, the default-branch fallback, and

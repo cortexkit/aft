@@ -930,17 +930,20 @@ TRAIN_PUSH_TEST_REPO="" run_train "$dir" slug
 expect_rc 0 "a github-shaped origin lands without REPO"
 expect_out "example/derived" "the slug is derived from origin's configured URL"
 
-# --- concurrent trains: a live pid refuses, a stale lock clears, a leftover
-# ref lists its delete and proceeds, and the lock is claimed before any ref
-# moves (names mirror BROCA's suite so the two copies stay comparable) -------
+# --- concurrent trains: mkdir-atomic lock; a live owner refuses, a stale owner
+# is replaced, a leftover ref lists its delete and proceeds, the lock is taken
+# before any ref moves, and two trains started together cannot both be admitted
+# (names mirror BROCA's suite so the two copies stay comparable) --------------
+lock_held() { printf '%s/work/.git/train-push-locks/held' "$1"; }
+plant_owner() { mkdir -p "$(lock_held "$1")"; printf '%s %s\n' "$2" "$3" > "$(lock_held "$1")/owner"; }
 # test_clean_state_does_not_refuse_for_concurrency
 dir="$(new_fixture pidlock-clean)"
 add_train_commit "$dir/work" "clean"
 run_train "$dir" clean
 expect_rc 0 "a clean state lands without a concurrency refusal"
 expect_no_out "is RUNNING as pid" "no train was reported running"
-# test_the_lock_is_claimed_before_any_ref_moves: the lock must exist even on a
-# run that never reached the push - a lock written after the push would leave
+# test_the_lock_is_claimed_before_any_ref_moves: the owner must be recorded even
+# on a run that never reached the push - a lock taken after the push would leave
 # the resolve-HEAD-to-push window uncovered, the hole the ref-based guard had.
 dir="$(new_fixture lock-order)"
 add_train_commit "$dir/work" "lock-order"
@@ -948,18 +951,16 @@ echo "failure" > "$dir/ci-state/conclusion"
 echo "Unit / broken" > "$dir/ci-state/failed_job"
 run_train "$dir" lockorder
 expect_rc 1 "the CI-red run stops before landing"
-if [ -e "$dir/work/.git/train-push-locks/lockorder.lock" ]; then
-  ok "the lock was claimed before the push, so it exists after a run that never landed"
-else
-  fail "the lock was not claimed before the push"
-fi
+case "$(cat "$(lock_held "$dir")/owner" 2>/dev/null)" in
+  *" lockorder") ok "this train owns the lock after a run that never landed" ;;
+  *) fail "the lock was not claimed before the push" ;;
+esac
 # test_a_live_lock_refuses_and_names_the_pid
 dir="$(new_fixture live-lock)"
 add_train_commit "$dir/work" "live"
-mkdir -p "$dir/work/.git/train-push-locks"
 sleep 60 &
 sleeper=$!
-echo "$sleeper" > "$dir/work/.git/train-push-locks/other.lock"
+plant_owner "$dir" "$sleeper" other
 run_train "$dir" live
 kill "$sleeper" 2>/dev/null || true
 expect_rc 2 "a live lock refuses the second train"
@@ -969,18 +970,26 @@ if [ -z "$(origin_ref "$dir" refs/heads/train/live)" ]; then
 else
   fail "the refused train pushed a ref"
 fi
-# test_a_stale_lock_is_cleared_and_does_not_refuse
+# test_a_stale_lock_is_cleared_and_does_not_refuse: a dead owner is replaced by
+# rename-claim, so this train's name ends up in the owner file.
 dir="$(new_fixture stale-lock)"
 add_train_commit "$dir/work" "stale"
-mkdir -p "$dir/work/.git/train-push-locks"
-echo "2147483000" > "$dir/work/.git/train-push-locks/gone.lock"
+plant_owner "$dir" 2147483000 gone
 run_train "$dir" stale
 expect_rc 0 "a stale lock (dead pid) does not refuse"
-if [ -e "$dir/work/.git/train-push-locks/gone.lock" ]; then
-  fail "the stale lock was not cleared"
-else
-  ok "the stale lock was cleared by the scan"
-fi
+case "$(cat "$(lock_held "$dir")/owner" 2>/dev/null)" in
+  *" gone") fail "the stale owner was obeyed instead of replaced" ;;
+  *" stale") ok "the stale owner was replaced by this train" ;;
+  *) fail "the owner file is neither the stale owner nor this train" ;;
+esac
+# an unreadable owner (killed between mkdir and the owner write) is refused,
+# never dispossessed
+dir="$(new_fixture unowned-lock)"
+add_train_commit "$dir/work" "unowned"
+mkdir -p "$(lock_held "$dir")"
+run_train "$dir" unowned
+expect_rc 2 "a lock with no readable owner refuses"
+expect_out "rm -rf" "the refusal names the manual clear"
 # test_a_leftover_ref_lists_its_delete_and_proceeds
 dir="$(new_fixture leftover-ref)"
 add_train_commit "$dir/work" "leftover"
@@ -989,6 +998,49 @@ run_train "$dir" leftover
 expect_rc 0 "a leftover ref with no live train proceeds"
 expect_out "git push origin --delete train/abandoned" "the leftover ref's delete is composed"
 expect_out "cannot race this train" "the run says why it proceeds"
+# test_two_trains_started_together_cannot_both_be_admitted: against a local bare
+# origin `ls-remote` is microseconds, so two processes never land in a window
+# that genuinely exists; a git shim that makes ls-remote take 0.5 s widens the
+# real race rather than inventing one. Exactly one name may own the lock and
+# the other must have been refused.
+dir="$(new_fixture race)"
+add_train_commit "$dir/work" "race"
+mkdir -p "$dir/fixturebin"
+real_git="$(command -v git)"
+printf '#!/bin/bash\nfor a in "$@"; do [ "$a" = "ls-remote" ] && sleep 0.5; done\nexec %s "$@"\n' "$real_git" > "$dir/fixturebin/git"
+chmod +x "$dir/fixturebin/git"
+(
+  cd "$dir/work" && PATH="$dir/fixturebin:$BIN_DIR:$PATH" REPO=example/repo \
+    OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" TRAIN_PUSH_TEST_STATE="$dir/ci-state" \
+    WATCH_CI_RESOLVE_ATTEMPTS=1 WATCH_CI_RESOLVE_SLEEP=0 TRAIN_PUSH_PROBE_ATTEMPTS=2 TRAIN_PUSH_PROBE_SLEEP=0 \
+    "$TRAIN_PUSH" racer-a > "$dir/racer-a.out" 2>&1
+) &
+racer_a=$!
+(
+  cd "$dir/work" && PATH="$dir/fixturebin:$BIN_DIR:$PATH" REPO=example/repo \
+    OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" TRAIN_PUSH_TEST_STATE="$dir/ci-state" \
+    WATCH_CI_RESOLVE_ATTEMPTS=1 WATCH_CI_RESOLVE_SLEEP=0 TRAIN_PUSH_PROBE_ATTEMPTS=2 TRAIN_PUSH_PROBE_SLEEP=0 \
+    "$TRAIN_PUSH" racer-b > "$dir/racer-b.out" 2>&1
+) &
+racer_b=$!
+wait "$racer_a" || true
+wait "$racer_b" || true
+race_owner="$(cat "$(lock_held "$dir")/owner" 2>/dev/null)"
+case "$race_owner" in
+  *" racer-a") race_loser="racer-b" ;;
+  *" racer-b") race_loser="racer-a" ;;
+  *) race_loser="" ;;
+esac
+if [ -n "$race_loser" ]; then
+  ok "exactly one racer owns the lock (${race_owner#* })"
+  if grep -q "a train is already running" "$dir/$race_loser.out"; then
+    ok "the loser ($race_loser) was refused, not admitted"
+  else
+    fail "the loser ($race_loser) was admitted alongside the winner"
+  fi
+else
+  fail "the lock owner is not a single racer: '$race_owner'"
+fi
 
 if [ "$failures" -ne 0 ]; then
   printf 'train-push.test.sh: %s check(s) failed\n' "$failures" >&2
