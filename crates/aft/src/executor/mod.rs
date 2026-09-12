@@ -1,4 +1,5 @@
 mod single_flight;
+pub(crate) mod view_publication;
 
 #[cfg(test)]
 mod tests;
@@ -1746,7 +1747,9 @@ impl ActorState {
     }
 
     fn is_idle(&self) -> bool {
-        self.actor_total_inflight == 0 && !self.has_queued_jobs()
+        self.actor_total_inflight == 0
+            && !self.has_queued_jobs()
+            && !view_publication::running_for_context(&self.ctx)
     }
 
     fn has_queued_jobs_for(&self, job_class: JobClass) -> bool {
@@ -2688,6 +2691,8 @@ fn worker_loop(run_rx: Receiver<RunJob>) {
 }
 
 fn run_lane_job(run_job: &mut RunJob) -> Response {
+    let _actor_scope =
+        view_publication::ActorScope::install(Arc::clone(&run_job.ctx), Arc::clone(&run_job.epoch));
     let _cancellation_ctx = JobCancellationContextGuard::install(run_job.cancellation.clone());
     let missing_request_id = run_job.request_id.clone();
     let job = std::mem::replace(

@@ -7744,6 +7744,7 @@ mod tests {
         )])
         .unwrap();
         let view = crate::context::ViewRuntimeSnapshot {
+            query_pin: None,
             storage: storage.path().to_path_buf(),
             family: "semantic-reader-family".to_string(),
             scope: "semantic-reader-view".to_string(),

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::unbounded;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use crate::cache_freshness::{self, VerifyArtifact, VerifyStrategy, WarmVerifyPlan};
 use crate::config::{Config, SemanticBackendConfig};
@@ -5125,6 +5125,11 @@ fn run_configure_view_sweep(ctx: &AppContext) {
     let Some(view) = ctx.view_runtime_snapshot() else {
         return;
     };
+    if let Ok(store) = crate::views::ViewStore::open(&view.storage, &view.scope) {
+        if let Err(error) = store.sweep_generations() {
+            slog_warn!("content-addressed generation sweep failed: {}", error);
+        }
+    }
     let Some(manifest) = view.manifest.as_ref() else {
         return;
     };
@@ -5156,10 +5161,18 @@ fn run_configure_view_sweep(ctx: &AppContext) {
             | crate::views::ManifestEntry::Gitlink { .. } => {}
         }
     }
-    let mut generation_keys = BTreeMap::new();
-    if let Some(generation) = view.generation.clone() {
-        generation_keys.insert(generation, retained_keys.clone());
-    }
+    let generation_keys = match crate::views::ViewStore::open(&view.storage, &view.scope)
+        .and_then(|store| store.blob_references_by_generation())
+    {
+        Ok(references) => references,
+        Err(error) => {
+            slog_warn!(
+                "content-addressed generation reference scan failed: {}",
+                error
+            );
+            return;
+        }
+    };
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -5347,7 +5360,8 @@ fn run_configure_maintenance_unit(
                             .is_some_and(|view| !view.pending_paths.is_empty())
                     {
                         if let Some(_permit) = ctx.cold_build_limiter().try_acquire() {
-                            if let Err(error) = ctx.publish_view_paths(
+                            if let Err(error) = crate::executor::view_publication::schedule(
+                                ctx,
                                 BTreeSet::new(),
                                 !ctx.shared_artifacts_read_only(),
                             ) {
@@ -5584,6 +5598,7 @@ fn open_view_runtime_for_configure(
         .map_err(|error| error.to_string())?;
     ctx.install_view_runtime(
         ViewRuntimeSnapshot {
+            query_pin: None,
             storage: job.storage_root.clone(),
             family,
             scope,

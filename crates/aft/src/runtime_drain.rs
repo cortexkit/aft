@@ -955,7 +955,8 @@ pub fn drain_semantic_index_events(ctx: &AppContext) {
                 .map(|snapshot| snapshot.pending_paths),
         ) {
             if let Some(_permit) = ctx.cold_build_limiter().try_acquire() {
-                if let Err(error) = ctx.publish_view_paths(pending, true) {
+                if let Err(error) = crate::executor::view_publication::schedule(ctx, pending, true)
+                {
                     aft::slog_warn!("semantic-ready view publication failed: {}", error);
                 }
             }
@@ -1655,18 +1656,10 @@ fn publish_semantic_ready_view(ctx: &AppContext) {
     let Some(root) = ctx.canonical_cache_root_opt() else {
         return;
     };
-    let Some(_permit) = ctx.cold_build_limiter().try_acquire() else {
-        crate::slog_info!(
-            "content-addressed view publication deferred after semantic refresh: cold-build capacity busy"
-        );
-        return;
-    };
-    match ctx.publish_view_paths(paths, !ctx.shared_artifacts_read_only()) {
-        Ok(report) => crate::slog_info!(
-            "content-addressed view publication after semantic refresh published={} blob_puts={} pending_paths={} root={}",
-            report.published,
-            report.blob_puts,
-            report.pending_paths.len(),
+    match crate::executor::view_publication::schedule(ctx, paths, !ctx.shared_artifacts_read_only())
+    {
+        Ok(()) => crate::slog_info!(
+            "content-addressed view publication scheduled after semantic refresh root={}",
             root.display()
         ),
         Err(error) => crate::slog_warn!(
@@ -2584,13 +2577,14 @@ fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSliceState) {
         state.view_publication_due = Some(Instant::now() + Duration::from_millis(100));
         return;
     };
-    match ctx.publish_view_paths(changed, !ctx.shared_artifacts_read_only()) {
-        Ok(report) => {
+    match crate::executor::view_publication::schedule(
+        ctx,
+        changed,
+        !ctx.shared_artifacts_read_only(),
+    ) {
+        Ok(()) => {
             aft::slog_info!(
-                "content-addressed view publication published={} blob_puts={} pending_paths={} root={}",
-                report.published,
-                report.blob_puts,
-                report.pending_paths.len(),
+                "content-addressed view publication scheduled root={}",
                 root.display()
             );
             state.view_publication_paths.clear();

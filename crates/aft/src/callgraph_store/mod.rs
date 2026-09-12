@@ -1891,6 +1891,7 @@ pub struct CallGraphStore {
 #[derive(Debug)]
 pub struct ReadonlyCallGraphStore {
     inner: CallGraphStore,
+    _view_pin: Option<Arc<crate::pins::QueryPin>>,
 }
 
 pub trait CallGraphRead {
@@ -4985,8 +4986,17 @@ impl ReadonlyCallGraphStore {
         project_root: PathBuf,
         family: String,
         view_dir: PathBuf,
+        generation: &str,
+        pin: Option<Arc<crate::pins::QueryPin>>,
     ) -> Result<Self> {
-        let sqlite_path = view_dir.join("derived.sqlite");
+        let generation_path = view_dir.join(format!("derived-{generation}.sqlite"));
+        // Older publications used one checkout-wide database. Keep them readable
+        // until the first generation-owned publication replaces their handle.
+        let sqlite_path = if generation_path.is_file() {
+            generation_path
+        } else {
+            view_dir.join("derived.sqlite")
+        };
         let conn = open_readonly_connection(&sqlite_path)?;
         ensure_database_ready(&conn)?;
         let mut inner = CallGraphStore::from_connection(
@@ -5002,7 +5012,10 @@ impl ReadonlyCallGraphStore {
         );
         inner.manifest_view = true;
         inner.database_ready.store(true, AtomicOrdering::Release);
-        Ok(Self::from_inner(inner))
+        Ok(Self {
+            inner,
+            _view_pin: pin,
+        })
     }
 
     pub fn reader_kind(&self) -> &'static str {
@@ -5014,7 +5027,10 @@ impl ReadonlyCallGraphStore {
     }
 
     fn from_inner(inner: CallGraphStore) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            _view_pin: None,
+        }
     }
 
     pub fn project_root(&self) -> &Path {

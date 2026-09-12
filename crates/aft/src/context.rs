@@ -950,6 +950,7 @@ impl Drop for CallGraphStoreBuildSettlement {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ViewRuntimeSnapshot {
+    pub(crate) query_pin: Option<Arc<crate::pins::QueryPin>>,
     pub(crate) storage: PathBuf,
     pub(crate) family: String,
     pub(crate) scope: String,
@@ -962,7 +963,14 @@ pub(crate) struct ViewRuntimeSnapshot {
 #[derive(Debug)]
 struct ViewRuntimeState {
     snapshot: ViewRuntimeSnapshot,
+    pin: Option<Arc<crate::pins::QueryPin>>,
+}
+
+pub(crate) struct PreparedViewUpdate {
+    snapshot: ViewRuntimeSnapshot,
     pin: Option<crate::pins::QueryPin>,
+    assembly: crate::views::assembly::PreparedAssembly,
+    pub(crate) content_generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -4307,7 +4315,10 @@ impl AppContext {
         *self
             .view_runtime
             .write()
-            .unwrap_or_else(|error| error.into_inner()) = Some(ViewRuntimeState { snapshot, pin });
+            .unwrap_or_else(|error| error.into_inner()) = Some(ViewRuntimeState {
+            snapshot,
+            pin: pin.map(Arc::new),
+        });
     }
 
     pub(crate) fn clear_view_runtime(&self) {
@@ -4361,7 +4372,11 @@ impl AppContext {
             .unwrap_or_else(|error| error.into_inner())
             .as_ref()
             .filter(|state| state.pin.is_some() && state.snapshot.generation.is_some())
-            .map(|state| state.snapshot.clone())
+            .map(|state| {
+                let mut snapshot = state.snapshot.clone();
+                snapshot.query_pin = state.pin.clone();
+                snapshot
+            })
     }
 
     pub(crate) fn publish_view_paths(
@@ -4369,6 +4384,19 @@ impl AppContext {
         changed_paths: BTreeSet<Vec<u8>>,
         allow_blob_put: bool,
     ) -> Result<crate::views::assembly::AssemblyReport, String> {
+        let mut prepared =
+            self.prepare_view_paths(changed_paths, allow_blob_put, &mut |_| Ok(()))?;
+        self.commit_view_update(&mut prepared)
+    }
+
+    pub(crate) fn prepare_view_paths(
+        &self,
+        changed_paths: BTreeSet<Vec<u8>>,
+        allow_blob_put: bool,
+        phase: &mut impl FnMut(&str) -> crate::views::Result<()>,
+    ) -> Result<PreparedViewUpdate, String> {
+        let content_generation = self.configure_content_generation();
+        phase("manifest").map_err(|error| error.to_string())?;
         let snapshot = self
             .view_runtime_snapshot()
             .ok_or_else(|| "view runtime is not configured".to_string())?;
@@ -4403,8 +4431,8 @@ impl AppContext {
         } else {
             BTreeMap::new()
         };
-        let report =
-            crate::views::assembly::publish_checkout(&crate::views::assembly::AssemblyRequest {
+        let assembly = crate::views::assembly::prepare_checkout(
+            &crate::views::assembly::AssemblyRequest {
                 storage: snapshot.storage.clone(),
                 project_root: root,
                 family: snapshot.family.clone(),
@@ -4414,8 +4442,11 @@ impl AppContext {
                 semantic_keys,
                 require_semantic: semantic_search,
                 allow_blob_put,
-            })
-            .map_err(|error| error.to_string())?;
+            },
+            phase,
+        )
+        .map_err(|error| error.to_string())?;
+        let report = assembly.report();
         let view = crate::views::ViewStore::open(&snapshot.storage, &snapshot.scope)
             .map_err(|error| error.to_string())?;
         let generation = report.generation.clone();
@@ -4429,15 +4460,37 @@ impl AppContext {
             .map(|generation| crate::pins::QueryPin::acquire(view.view_dir(), generation))
             .transpose()
             .map_err(|error| error.to_string())?;
-        self.install_view_runtime(
-            ViewRuntimeSnapshot {
+        Ok(PreparedViewUpdate {
+            snapshot: ViewRuntimeSnapshot {
                 generation,
                 manifest,
                 pending_paths: report.pending_paths.clone(),
                 ..snapshot
             },
             pin,
-        );
+            assembly,
+            content_generation,
+        })
+    }
+
+    /// Called only at the actor's short publication barrier. All filesystem
+    /// construction and query-pin acquisition have already completed.
+    pub(crate) fn commit_view_update(
+        &self,
+        prepared: &mut PreparedViewUpdate,
+    ) -> Result<crate::views::assembly::AssemblyReport, String> {
+        if self.configure_content_generation() != prepared.content_generation
+            || !self.config().views.enabled
+        {
+            return Err("view publication configuration was superseded".to_owned());
+        }
+        let report = prepared
+            .assembly
+            .commit()
+            .map_err(|error| error.to_string())?;
+        if report.generation == prepared.snapshot.generation {
+            self.install_view_runtime(prepared.snapshot.clone(), prepared.pin.take());
+        }
         Ok(report)
     }
 
@@ -4721,6 +4774,8 @@ impl AppContext {
                         project_root,
                         view.family,
                         view.view_dir,
+                        view.generation.as_deref().expect("pinned generation"),
+                        view.query_pin,
                     ) {
                         Ok(store) => CallgraphStoreAccess::Ready(Arc::new(store)),
                         Err(error) => CallgraphStoreAccess::Error(error),

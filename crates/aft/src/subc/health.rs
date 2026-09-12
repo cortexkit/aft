@@ -597,6 +597,7 @@ impl DispatchPathMetrics {
                 "bash_poll_touch": self.bash_poll_touch_queued.load(Ordering::Relaxed),
             },
             "deferred_bash_waits_in_flight": self.deferred_bash_waits_in_flight.load(Ordering::Relaxed),
+            "off_lane_jobs": crate::executor::view_publication::health_snapshot(),
             "budget_deferrals": {
                 "reliable_push": self.reliable_push_budget_deferrals.load(Ordering::Relaxed),
                 "maintenance": self.maintenance_budget_deferrals.load(Ordering::Relaxed),

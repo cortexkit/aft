@@ -9,6 +9,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 pub mod assembly;
+mod generation;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -538,6 +539,55 @@ pub enum PublishOutcome {
     Conflict { current_generation: Option<String> },
 }
 
+/// An immutable, durable generation waiting for its short pointer transaction.
+/// Construction is private so callers cannot expose an unprepared manifest.
+#[derive(Debug)]
+pub struct PreparedPublication {
+    store: ViewStore,
+    generation: String,
+    base_generation: Option<String>,
+    pointer: Connection,
+}
+
+impl PreparedPublication {
+    pub fn commit(mut self) -> Result<PublishOutcome> {
+        // FULL synchronizes the commit record in the pointer WAL. No artifact
+        // checkpoint, manifest scan, or directory traversal belongs in this gate.
+        let transaction = self
+            .pointer
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = transaction.execute(
+            "UPDATE pointer SET generation = ?1 WHERE generation = ?2",
+            params![
+                self.generation,
+                self.base_generation.as_deref().unwrap_or_default()
+            ],
+        )?;
+        let outcome = if updated == 1 {
+            PublishOutcome::Published
+        } else {
+            let current: String = transaction.query_row(
+                "SELECT generation FROM pointer WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            PublishOutcome::Conflict {
+                current_generation: (!current.is_empty()).then_some(current),
+            }
+        };
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    fn commit_with_observer(
+        self,
+        observer: Option<&dyn PublicationObserver>,
+    ) -> Result<PublishOutcome> {
+        self.store
+            .commit_prepared(&self.generation, self.base_generation.as_deref(), observer)
+    }
+}
+
 /// SQLite settings required for the per-view pointer connection.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PointerPragmas {
@@ -624,6 +674,18 @@ impl ViewStore {
         closure: &impl PublicationClosure,
         observer: Option<&dyn PublicationObserver>,
     ) -> Result<PublishOutcome> {
+        let prepared = self.prepare_with_observer(request, closure, observer)?;
+        prepared.commit_with_observer(observer)
+    }
+
+    /// Performs closure validation and all generation-sized durability work without
+    /// changing the pointer. The returned token is the only input needed by CAS.
+    pub fn prepare_with_observer(
+        &self,
+        request: &PublicationRequest<'_>,
+        closure: &impl PublicationClosure,
+        observer: Option<&dyn PublicationObserver>,
+    ) -> Result<PreparedPublication> {
         validate_generation(request.generation)?;
         if request.manifest.path_identity_version != PATH_IDENTITY_VERSION {
             return Err(ViewError::InvalidManifest(
@@ -657,10 +719,26 @@ impl ViewStore {
         sync_directory(&self.view_dir)?;
         observe(observer, PublicationStep::ManifestParentFsynced);
 
-        let outcome = self.compare_and_swap_pointer(
-            request.generation,
-            request.base_generation.unwrap_or_default(),
-        )?;
+        let pointer = self.open_pointer_connection()?;
+        pointer.pragma_update(None, "synchronous", "FULL")?;
+        pointer.busy_timeout(Duration::from_millis(20))?;
+        sync_directory(&self.view_dir)?;
+        Ok(PreparedPublication {
+            pointer,
+            store: self.clone(),
+            generation: request.generation.to_owned(),
+            base_generation: request.base_generation.map(str::to_owned),
+        })
+    }
+
+    fn commit_prepared(
+        &self,
+        generation: &str,
+        base_generation: Option<&str>,
+        observer: Option<&dyn PublicationObserver>,
+    ) -> Result<PublishOutcome> {
+        let outcome =
+            self.compare_and_swap_pointer(generation, base_generation.unwrap_or_default())?;
         observe(observer, PublicationStep::PointerCas);
 
         if outcome == PublishOutcome::Published {

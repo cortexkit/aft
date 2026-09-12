@@ -63,7 +63,70 @@ pub fn head_tree_fingerprint(entries: &[crate::alias::TrackedPath]) -> String {
 }
 
 pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
-    let publication_started = Instant::now();
+    let mut prepared = prepare_checkout(request, &mut |_| Ok(()))?;
+    prepared.commit()
+}
+
+/// Owns the unpublished files and assembly pin until CAS succeeds or the build
+/// is dropped. Cancellation and errors follow the same cleanup path.
+pub struct PreparedAssembly {
+    report: AssemblyReport,
+    publication: Option<super::PreparedPublication>,
+    files: Option<(ViewStore, String)>,
+    pin: Option<AssemblyPin>,
+    profile: PublicationProfile,
+}
+
+impl PreparedAssembly {
+    pub fn report(&self) -> &AssemblyReport {
+        &self.report
+    }
+
+    pub fn commit(&mut self) -> Result<AssemblyReport> {
+        if let Some(publication) = self.publication.take() {
+            let pointer_started = Instant::now();
+            let outcome = publication.commit();
+            self.profile.pointer_ms = pointer_started.elapsed().as_millis();
+            match outcome? {
+                PublishOutcome::Published => {
+                    self.report.published = true;
+                    self.files = None;
+                    self.profile.outcome = "published";
+                }
+                PublishOutcome::Conflict { current_generation } => {
+                    self.profile.outcome = "conflict";
+                    return Err(ViewError::InvalidManifest(format!(
+                        "publication base changed to {current_generation:?}"
+                    )));
+                }
+            }
+        }
+        self.profile.finish();
+        Ok(self.report.clone())
+    }
+}
+
+impl Drop for PreparedAssembly {
+    fn drop(&mut self) {
+        if let Some((view, generation)) = &self.files {
+            if view
+                .current_generation()
+                .is_ok_and(|current| current.as_deref() != Some(generation))
+            {
+                view.remove_generation_files(generation);
+            }
+        }
+        // Keep the pin alive until generation cleanup has finished.
+        self.pin.take();
+    }
+}
+
+pub fn prepare_checkout(
+    request: &AssemblyRequest,
+    phase: &mut impl FnMut(&str) -> Result<()>,
+) -> Result<PreparedAssembly> {
+    let mut profile = PublicationProfile::new(&request.project_root);
+    profile.enter(0, phase)?;
     let view = ViewStore::open(&request.storage, &request.scope)?;
     let current_generation = view.current_generation()?;
     let previous = current_generation
@@ -73,7 +136,7 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
     let head_started = Instant::now();
     let head = head_tree_entries(&request.project_root)
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-    let head_ms = head_started.elapsed().as_millis();
+    profile.head_ms = head_started.elapsed().as_millis();
     let mut callgraph = BlobStore::open(
         &request.storage,
         request.family.clone(),
@@ -206,8 +269,8 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
         }
     }
 
-    let candidate_count = candidates.len();
-    let assembly_ms = assembly_started.elapsed().as_millis();
+    profile.candidates = candidates.len();
+    profile.assembly_ms = assembly_started.elapsed().as_millis();
 
     if request.require_semantic {
         for candidate in &candidates {
@@ -232,7 +295,7 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
         .filter_map(|candidate| candidate.key.clone())
         .collect::<Vec<_>>();
     let next_generation = next_generation(current_generation.as_deref(), &request.desired_head);
-    let mut pin = AssemblyPin::create(
+    let pin = AssemblyPin::create(
         view.view_dir(),
         request.family.clone(),
         request.scope.clone(),
@@ -240,14 +303,31 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
         &keys,
     )
     .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-    let blob_started = Instant::now();
+    let mut prepared = PreparedAssembly {
+        report: AssemblyReport {
+            generation: current_generation.clone(),
+            manifest: previous.clone(),
+            blob_puts: 0,
+            pending_paths: BTreeSet::new(),
+            published: false,
+        },
+        publication: None,
+        files: Some((view.clone(), next_generation.clone())),
+        pin: Some(pin),
+        profile,
+    };
+    prepared.profile.enter(1, phase)?;
     let mut blob_puts = 0;
     for candidate in &candidates {
         let (Some(key), Some(payload)) = (&candidate.key, &candidate.payload) else {
             continue;
         };
         if request.allow_blob_put {
-            pin.renew_if_due()
+            prepared
+                .pin
+                .as_mut()
+                .expect("assembly pin")
+                .renew_if_due()
                 .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
             let put = callgraph
                 .put(key, payload)
@@ -267,7 +347,8 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
         }
     }
 
-    let blob_ms = blob_started.elapsed().as_millis();
+    prepared.profile.blob_puts = blob_puts;
+    prepared.profile.pending_paths = pending_paths.len();
     let mut status = PathStatusStore::open(view.view_dir())
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
     if !pending_paths.is_empty() {
@@ -280,27 +361,10 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
                 )
                 .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
         }
-        log_publication_profile(
-            request,
-            "pending",
-            candidate_count,
-            blob_puts,
-            pending_paths.len(),
-            head_ms,
-            assembly_ms,
-            blob_ms,
-            0,
-            0,
-            publication_started.elapsed().as_millis(),
-            0,
-        );
-        return Ok(AssemblyReport {
-            generation: current_generation,
-            manifest: previous,
-            blob_puts,
-            pending_paths,
-            published: false,
-        });
+        prepared.profile.outcome = "pending";
+        prepared.report.blob_puts = blob_puts;
+        prepared.report.pending_paths = pending_paths;
+        return Ok(prepared);
     }
     for candidate in &candidates {
         status
@@ -323,45 +387,33 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
         .is_some_and(|generation| generation.ends_with(&request.desired_head))
         && previous.as_ref() == Some(&manifest)
     {
-        pin.release();
-        log_publication_profile(
-            request,
-            "no_op",
-            candidate_count,
-            blob_puts,
-            pending_paths.len(),
-            head_ms,
-            assembly_ms,
-            blob_ms,
-            0,
-            0,
-            publication_started.elapsed().as_millis(),
-            0,
-        );
-        return Ok(AssemblyReport {
-            generation: current_generation,
-            manifest: None,
-            blob_puts,
-            pending_paths,
-            published: false,
-        });
+        prepared.profile.outcome = "no_op";
+        prepared.report.manifest = None;
+        prepared.report.blob_puts = blob_puts;
+        return Ok(prepared);
     }
-    let materialize_started = Instant::now();
+    prepared.profile.enter(2, phase)?;
+    let derived = view.derived_path(&next_generation)?;
+    if let Some(base) = current_generation.as_deref() {
+        let base_path = view.derived_path(base)?;
+        if base_path.is_file() {
+            super::generation::clone_derived(&base_path, &derived)?;
+        }
+    }
     crate::callgraph_store::materialize_manifest_view_database(
-        status.path(),
+        &derived,
         callgraph.path(),
         &manifest,
     )
     .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-    let materialize_ms = materialize_started.elapsed().as_millis();
-    let trigram = view.view_dir().join("trigram.bin");
+    let trigram = view.trigram_path(&next_generation)?;
     fs::write(&trigram, [])?;
     let artifacts = PublicationArtifacts {
         blob_databases: vec![
             semantic.path().to_path_buf(),
             callgraph.path().to_path_buf(),
         ],
-        derived_database: status.path().to_path_buf(),
+        derived_database: derived.clone(),
         trigram_artifact: trigram.clone(),
         alias_database: aliases.path().to_path_buf(),
     };
@@ -370,8 +422,7 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
         callgraph: callgraph.path().to_path_buf(),
         trigram,
     };
-    let pointer_started = Instant::now();
-    let publication = view.publish(
+    let publication = view.prepare_with_observer(
         &PublicationRequest {
             generation: &next_generation,
             base_generation: current_generation.as_deref(),
@@ -380,101 +431,107 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
             closure_requirements: ClosureRequirements::default(),
         },
         &closure,
+        None,
     )?;
-    let pointer_ms = pointer_started.elapsed().as_millis();
-    pin.release();
-    let published = matches!(publication, PublishOutcome::Published);
-    let generation = match publication {
-        PublishOutcome::Published => Some(next_generation),
-        PublishOutcome::Conflict { current_generation } => current_generation,
-    };
-    let derived_bytes = fs::metadata(status.path())
+    prepared.profile.derived_bytes = fs::metadata(&derived)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
-    log_publication_profile(
-        request,
-        if published { "published" } else { "conflict" },
-        candidate_count,
-        blob_puts,
-        pending_paths.len(),
-        head_ms,
-        assembly_ms,
-        blob_ms,
-        materialize_ms,
-        pointer_ms,
-        publication_started.elapsed().as_millis(),
-        derived_bytes,
-    );
-    Ok(AssemblyReport {
-        generation,
-        manifest: published.then_some(manifest),
+    prepared.profile.enter(3, phase)?;
+    prepared.publication = Some(publication);
+    prepared.report = AssemblyReport {
+        generation: Some(next_generation),
+        manifest: Some(manifest),
         blob_puts,
         pending_paths,
-        published,
-    })
+        published: false,
+    };
+    Ok(prepared)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn log_publication_profile(
-    request: &AssemblyRequest,
-    outcome: &str,
+/// One profile follows the same boundaries as cancellation and health reporting.
+/// It survives preparation so CAS time is included, and logs only after the
+/// prepared generation leaves the actor barrier (including failed attempts).
+struct PublicationProfile {
+    root: PathBuf,
+    outcome: &'static str,
     candidates: usize,
     blob_puts: usize,
     pending_paths: usize,
     head_ms: u128,
     assembly_ms: u128,
-    blob_ms: u128,
-    materialize_ms: u128,
     pointer_ms: u128,
+    phase_ms: [u128; 4],
+    active_phase: Option<usize>,
+    phase_started: Instant,
+    started: Instant,
     total_ms: u128,
     derived_bytes: u64,
-) {
-    let line = publication_profile_line(
-        request,
-        outcome,
-        candidates,
-        blob_puts,
-        pending_paths,
-        head_ms,
-        assembly_ms,
-        blob_ms,
-        materialize_ms,
-        pointer_ms,
-        total_ms,
-        derived_bytes,
-    );
-    crate::slog_info!("{}", line);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn publication_profile_line(
-    request: &AssemblyRequest,
-    outcome: &str,
-    candidates: usize,
-    blob_puts: usize,
-    pending_paths: usize,
-    head_ms: u128,
-    assembly_ms: u128,
-    blob_ms: u128,
-    materialize_ms: u128,
-    pointer_ms: u128,
-    total_ms: u128,
-    derived_bytes: u64,
-) -> String {
+impl PublicationProfile {
+    fn new(root: &Path) -> Self {
+        let now = Instant::now();
+        Self {
+            root: root.to_owned(),
+            outcome: "cancelled_or_failed",
+            candidates: 0,
+            blob_puts: 0,
+            pending_paths: 0,
+            head_ms: 0,
+            assembly_ms: 0,
+            pointer_ms: 0,
+            phase_ms: [0; 4],
+            active_phase: Some(0),
+            phase_started: now,
+            started: now,
+            total_ms: 0,
+            derived_bytes: 0,
+        }
+    }
+
+    fn enter(&mut self, phase: usize, callback: &mut impl FnMut(&str) -> Result<()>) -> Result<()> {
+        self.checkpoint();
+        self.active_phase = Some(phase);
+        self.phase_started = Instant::now();
+        callback(["manifest", "blobs", "derived", "cas"][phase])
+    }
+
+    fn checkpoint(&mut self) {
+        if let Some(phase) = self.active_phase.take() {
+            self.phase_ms[phase] += self.phase_started.elapsed().as_millis();
+        }
+    }
+
+    fn finish(&mut self) {
+        self.checkpoint();
+        self.total_ms = self.started.elapsed().as_millis();
+    }
+}
+
+impl Drop for PublicationProfile {
+    fn drop(&mut self) {
+        if self.active_phase.is_some() {
+            self.finish();
+        }
+        log_publication_profile(self);
+    }
+}
+
+fn log_publication_profile(profile: &PublicationProfile) {
+    crate::slog_info!("{}", publication_profile_line(profile));
+}
+
+fn publication_profile_line(profile: &PublicationProfile) -> String {
+    // Retain the existing drill fields alongside the shared phase names. The
+    // pointer transaction is a subset of the cas phase, which also includes
+    // waiting to acquire the actor barrier.
     format!(
-        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} pointer_ms={} total_ms={} derived_bytes={}",
-        request.project_root.display(),
-        outcome,
-        candidates,
-        blob_puts,
-        pending_paths,
-        head_ms,
-        assembly_ms,
-        blob_ms,
-        materialize_ms,
-        pointer_ms,
-        total_ms,
-        derived_bytes,
+        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} pointer_ms={} total_ms={} derived_bytes={}",
+        profile.root.display(), profile.outcome, profile.candidates, profile.blob_puts,
+        profile.pending_paths, profile.phase_ms[0], profile.phase_ms[1],
+        profile.phase_ms[2], profile.phase_ms[3], profile.head_ms, profile.assembly_ms,
+        profile.phase_ms[1], profile.phase_ms[2], profile.pointer_ms,
+        profile.total_ms, profile.derived_bytes,
     )
 }
 
@@ -484,19 +541,13 @@ mod tests {
 
     #[test]
     fn publication_profile_line_attributes_the_canonical_root() {
-        let request = AssemblyRequest {
-            storage: PathBuf::from("/storage"),
-            project_root: PathBuf::from("/checkout"),
-            family: "family".to_string(),
-            scope: "scope".to_string(),
-            desired_head: "head".to_string(),
-            changed_paths: BTreeSet::new(),
-            semantic_keys: BTreeMap::new(),
-            require_semantic: false,
-            allow_blob_put: true,
-        };
-        let line = publication_profile_line(&request, "published", 3, 2, 1, 5, 6, 7, 8, 9, 10, 11);
+        let mut profile = PublicationProfile::new(Path::new("/checkout"));
+        profile.outcome = "published";
+        profile.phase_ms = [5, 6, 7, 8];
+        let line = publication_profile_line(&profile);
         assert!(line.contains("plane=views root=/checkout outcome=published"));
+        assert!(line.contains("manifest_ms=5 blobs_ms=6 derived_ms=7 cas_ms=8"));
+        assert_eq!(line.matches("index_event kind=view_publication").count(), 1);
     }
 }
 
@@ -513,7 +564,16 @@ fn next_generation(current: Option<&str>, desired_head: &str) -> String {
         .map(generation_number)
         .unwrap_or(0)
         .saturating_add(1);
-    format!("{generation}-{desired_head}")
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!(
+        "{generation}-{}-{nanos}-{serial}-{desired_head}",
+        std::process::id()
+    )
 }
 
 fn generation_number(generation: &str) -> u64 {
