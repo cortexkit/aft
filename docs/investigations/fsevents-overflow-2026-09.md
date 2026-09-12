@@ -281,3 +281,14 @@ Both Cargo commands exited 0. The watched build ran from `2026-09-12T07:44:20.07
 The Windows arm remains on `notify` 8.2 because its public `Config` has no `ReadDirectoryChangesW` buffer-size knob and does not expose completion errors or byte counts to AFT's event handler. Consequently AFT cannot request the approved 1 MiB buffer, retry at 64 KiB on `ERROR_INVALID_PARAMETER`, or translate `ERROR_NOTIFY_ENUM_DIR` and successful zero-byte completions into `Flag::Rescan` with info `windows overflow` without replacing or patching notify's Windows backend.
 
 The filed implementation gap is to add those three controls in notify's `src/windows.rs` (preferably as public configuration and typed overflow events), then set 1 MiB from `watcher_backend` while retaining the existing recursive notify watcher. Until that API exists, Windows keeps notify's 16 KiB buffer and its current overflow behavior; the cross-target warning gate below verifies that this explicit no-op arm remains buildable.
+
+## After: excluded-backend watched build (2026-09-12)
+
+The follow-up used the task worktree as the watched root and a fresh, initially absent `target/watcher-knobs-clean-release-20260912T140753` as `CARGO_TARGET_DIR`. A standalone debug AFT process (PID 37261) was configured directly over stdin/stdout with its own cache under the already-excluded root `target/`; it was never attached to the SubC daemon. The observer sampled `status.watcher` immediately before the build and 60 seconds after Cargo exited. Filter-thread CPU is the macOS `proc_pidinfo` user-plus-system time delta for the named `aft-watcher-filter` thread over the same window.
+
+| Backend | Build duration | Raw events Δ | Invalidating events Δ | Paths after gitignore Δ | Paths dispatched Δ | Kernel rescans Δ | User rescans Δ | Unknown rescans Δ | Filter-thread CPU |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| notify 8.2 baseline | 530.926 s | 34,888 | 34,549 | 2 | 2 | 0 | 0 | 0 | not captured |
+| excluded FSEvents backend | 383.676 s | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 64.321 ms |
+
+The clean release build exited 0. Because the stream excluded the existing top-level `target/` subtree before Cargo started, none of the build's target artifacts reached the raw channel; raw delivery therefore fell from 34,888 events to zero, with no rescan of any kind. The filter thread consumed only 64.321 ms of CPU over the build plus the 60-second drain window.
