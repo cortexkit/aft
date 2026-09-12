@@ -1377,6 +1377,7 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
         let mut status_changed = false;
         let mut replay_refresh_paths = Vec::new();
         let mut schedule_breaker_probe = false;
+        let mut view_refresh_completed = false;
         for event in events {
         match event {
             SemanticRefreshEvent::Started { paths } => {
@@ -1417,6 +1418,7 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                     index.apply_refresh_update(added_entries, updated_metadata, &completed_paths);
                 }
                 mark_semantic_refresh_success(ctx, &completed_paths);
+                view_refresh_completed = true;
                 let mut status = ctx
                     .semantic_index_status()
                     .write()
@@ -1464,6 +1466,7 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     SemanticIndexStatus::ready();
+                view_refresh_completed = true;
                 status_changed = true;
             }
             SemanticRefreshEvent::Failed { paths, error } => {
@@ -1608,10 +1611,11 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
         }
         }
 
-        (status_changed, schedule_breaker_probe)
+        (status_changed, schedule_breaker_probe, view_refresh_completed)
     },
     );
-    let Some((mut status_changed, schedule_breaker_probe)) = committed else {
+    let Some((mut status_changed, schedule_breaker_probe, view_refresh_completed)) = committed
+    else {
         return;
     };
     if schedule_breaker_probe && semantic_refresh_circuit_is_open(ctx) {
@@ -1632,8 +1636,43 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
 
     maybe_fire_semantic_refresh_probe(ctx);
 
+    if view_refresh_completed {
+        publish_semantic_ready_view(ctx);
+    }
+
     if status_changed {
         ctx.status_emitter().signal(ctx.build_status_snapshot());
+    }
+}
+
+fn publish_semantic_ready_view(ctx: &AppContext) {
+    let Some(paths) = semantic_ready_view_publication_paths(
+        ctx.view_runtime_snapshot()
+            .map(|snapshot| snapshot.pending_paths),
+    ) else {
+        return;
+    };
+    let Some(root) = ctx.canonical_cache_root_opt() else {
+        return;
+    };
+    let Some(_permit) = ctx.cold_build_limiter().try_acquire() else {
+        crate::slog_info!(
+            "content-addressed view publication deferred after semantic refresh: cold-build capacity busy"
+        );
+        return;
+    };
+    match ctx.publish_view_paths(paths, !ctx.shared_artifacts_read_only()) {
+        Ok(report) => crate::slog_info!(
+            "content-addressed view publication after semantic refresh published={} blob_puts={} pending_paths={} root={}",
+            report.published,
+            report.blob_puts,
+            report.pending_paths.len(),
+            root.display()
+        ),
+        Err(error) => crate::slog_warn!(
+            "content-addressed view publication after semantic refresh failed: {}",
+            error
+        ),
     }
 }
 

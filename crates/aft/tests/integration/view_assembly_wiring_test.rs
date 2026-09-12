@@ -1,8 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use aft::blob_store::{BlobPlane, BlobStore, SemanticKey};
 use aft::views::assembly::{head_tree_fingerprint, publish_checkout, AssemblyRequest};
 use tempfile::tempdir;
 
@@ -262,4 +263,49 @@ fn republishing_an_unchanged_checkout_keeps_the_current_generation() {
     .unwrap();
     assert!(changed.published);
     assert_ne!(changed.generation.as_deref(), Some(generation.as_str()));
+}
+
+#[test]
+fn changed_path_does_not_inherit_previous_semantic_blob() {
+    let project = tempdir().unwrap();
+    let storage = tempdir().unwrap();
+    git(project.path(), &["init", "--quiet"]);
+    let rel_path = b"lib.rs".to_vec();
+    let first_source = b"pub fn first() {}\n";
+    fs::write(project.path().join("lib.rs"), first_source).unwrap();
+    commit(project.path(), "first");
+
+    let family = "semantic-switch-family";
+    let semantic_key =
+        SemanticKey::for_current(first_source, &rel_path, "fixture-model").full_key();
+    BlobStore::open(storage.path(), family, BlobPlane::Semantic)
+        .unwrap()
+        .put(&semantic_key, b"fixture-vector")
+        .unwrap();
+    let mut initial = request(
+        storage.path(),
+        project.path(),
+        family,
+        "semantic-view",
+        BTreeSet::new(),
+        true,
+    );
+    initial.require_semantic = true;
+    initial.semantic_keys = BTreeMap::from([(rel_path.clone(), semantic_key.to_hex())]);
+    assert!(publish_checkout(&initial).unwrap().published);
+
+    fs::write(project.path().join("lib.rs"), "pub fn second() {}\n").unwrap();
+    commit(project.path(), "second");
+    let mut switched = request(
+        storage.path(),
+        project.path(),
+        family,
+        "semantic-view",
+        BTreeSet::from([rel_path.clone()]),
+        true,
+    );
+    switched.require_semantic = true;
+    let report = publish_checkout(&switched).unwrap();
+    assert!(!report.published);
+    assert_eq!(report.pending_paths, BTreeSet::from([rel_path]));
 }

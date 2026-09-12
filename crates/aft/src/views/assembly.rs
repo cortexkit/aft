@@ -189,19 +189,7 @@ pub fn publish_checkout(request: &AssemblyRequest) -> Result<AssemblyReport> {
                     entry: ManifestEntry::Regular {
                         mode: if executable { 0o100755 } else { 0o100644 },
                         planes: RegularPlanes {
-                            semantic: request
-                                .semantic_keys
-                                .get(&tracked.rel_path)
-                                .cloned()
-                                .or_else(|| {
-                                    previous_entries.get(&tracked.rel_path).and_then(|entry| {
-                                        if let ManifestEntry::Regular { planes, .. } = entry {
-                                            planes.semantic.clone()
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                }),
+                            semantic: request.semantic_keys.get(&tracked.rel_path).cloned(),
                             callgraph: callgraph_key,
                         },
                         resolution_input,
