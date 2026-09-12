@@ -1,5 +1,5 @@
 use crate::db::{SqliteStore, TrackedConnection};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -50,6 +50,13 @@ pub fn project_dead_code_snapshot(db_path: &Path) -> Result<CallgraphSnapshot> {
 pub(crate) fn project_dead_code_snapshot_with_revision(
     db_path: &Path,
 ) -> Result<(Option<u64>, CallgraphSnapshot)> {
+    project_dead_code_snapshot_incremental(db_path, None)
+}
+
+pub(crate) fn project_dead_code_snapshot_incremental(
+    db_path: &Path,
+    previous: Option<(u64, &CallgraphSnapshot)>,
+) -> Result<(Option<u64>, CallgraphSnapshot)> {
     if !db_path.is_file() {
         return Err(CallGraphStoreError::Unavailable(format!(
             "database does not exist: {}",
@@ -84,12 +91,52 @@ pub(crate) fn project_dead_code_snapshot_with_revision(
             "callgraph has stale files pending refresh".to_string(),
         ));
     }
+    let changed = match (previous, write_revision) {
+        (Some((revision, _)), Some(current)) => projection_delta_since(&tx, revision, current)?,
+        _ => None,
+    };
     let mut paths = SnapshotPathResolver::new(&project_root);
-    let files = project_files_from_store(&tx, &mut paths)?;
-    let exported_symbols = exported_symbols_from_store(&tx, &mut paths)?;
-    let outbound_calls = outbound_calls_from_store(&tx, &mut paths)?;
+    let (files, exported_symbols, outbound_calls, entry_point_symbols) =
+        if let (Some(changed), Some((_, previous))) = (changed, previous) {
+            let mut replacements = BTreeMap::new();
+            let mut file_replacements = BTreeMap::new();
+            let mut export_replacements = BTreeMap::new();
+            let mut roots = previous.entry_point_symbols.clone();
+            for file in &changed {
+                let path = paths.resolve(file);
+                file_replacements.insert(
+                    path.clone(),
+                    project_files_from_store(&tx, &mut paths, Some(file))?,
+                );
+                export_replacements.insert(
+                    path.clone(),
+                    exported_symbols_from_store(&tx, &mut paths, Some(file))?,
+                );
+                roots.remove(&path);
+                roots.extend(entry_point_symbols_from_store(&tx, &mut paths, Some(file))?);
+                replacements.insert(path, outbound_calls_for_file(&tx, &mut paths, file)?);
+            }
+            let calls = splice_files(&previous.outbound_calls, replacements, |call| {
+                &call.caller_file
+            });
+            (
+                splice_files(&previous.files, file_replacements, |path| path),
+                splice_files(&previous.exported_symbols, export_replacements, |export| {
+                    &export.file
+                }),
+                calls,
+                roots,
+            )
+        } else {
+            record_full_projection();
+            (
+                project_files_from_store(&tx, &mut paths, None)?,
+                exported_symbols_from_store(&tx, &mut paths, None)?,
+                outbound_calls_from_store(&tx, &mut paths)?,
+                entry_point_symbols_from_store(&tx, &mut paths, None)?,
+            )
+        };
     let entry_points = entry_points_for_files(&project_root, &files);
-    let entry_point_symbols = entry_point_symbols_from_store(&tx, &mut paths)?;
     let snapshot = CallgraphSnapshot {
         generated_at: Some(SystemTime::now()),
         files,
@@ -101,6 +148,126 @@ pub(crate) fn project_dead_code_snapshot_with_revision(
     tx.commit()?;
 
     Ok((write_revision, snapshot))
+}
+
+fn splice_files<T: Clone>(
+    previous: &[T],
+    replacements: BTreeMap<PathBuf, Vec<T>>,
+    file: impl Fn(&T) -> &PathBuf,
+) -> Vec<T> {
+    let mut result = Vec::with_capacity(previous.len());
+    let mut old = previous.iter().peekable();
+    for (path, replacement) in replacements {
+        while old.peek().is_some_and(|item| file(item) < &path) {
+            result.push(old.next().expect("peeked item").clone());
+        }
+        while old.peek().is_some_and(|item| file(item) == &path) {
+            old.next();
+        }
+        result.extend(replacement);
+    }
+    result.extend(old.cloned());
+    result
+}
+
+// A bounded durable journal lets a reader bridge multiple watcher transactions.
+// Missing entries (including writes by older binaries) always force a cold read.
+const DELTA_HISTORY: u64 = 64;
+const MAX_DELTA_BYTES: usize = 256 * 1024;
+
+pub(super) fn extend_projection_dependents(
+    conn: &Connection,
+    file: &str,
+    callers: &mut BTreeSet<String>,
+) -> Result<()> {
+    let mut statement = conn.prepare(
+        "SELECT caller_file FROM refs WHERE target_file = ?1
+         UNION SELECT r.caller_file FROM edges e JOIN refs r ON r.ref_id = e.ref_id WHERE e.target_file = ?1
+         UNION SELECT file_path FROM file_dependencies WHERE dep_file = ?1",
+    )?;
+    for row in statement.query_map([file], |row| row.get::<_, String>(0))? {
+        callers.insert(row?);
+    }
+    Ok(())
+}
+
+pub(super) fn record_projection_delta(
+    tx: &Transaction<'_>,
+    callers: &BTreeSet<String>,
+) -> Result<()> {
+    super::bump_projection_write_revision(tx)?;
+    let revision = projection_write_revision(tx)?.expect("just advanced revision");
+    let key = format!("projection_delta_{}", revision % DELTA_HISTORY);
+    let value = serde_json::to_string(&(revision, callers))
+        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+    if value.len() <= MAX_DELTA_BYTES {
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
+            params![key, value],
+        )?;
+    } else {
+        // Oversized batches need no retained history: a cold projection is safer
+        // than allowing per-root journal storage to grow with the corpus.
+        tx.execute("DELETE FROM meta WHERE k = ?1", [key])?;
+    }
+    Ok(())
+}
+
+fn projection_delta_since(
+    conn: &Connection,
+    previous: u64,
+    current: u64,
+) -> Result<Option<BTreeSet<String>>> {
+    if current < previous || current - previous > DELTA_HISTORY {
+        return Ok(None);
+    }
+    let mut callers = BTreeSet::new();
+    for revision in previous.saturating_add(1)..=current {
+        let value: Option<String> = conn
+            .query_row(
+                "SELECT v FROM meta WHERE k = ?1",
+                [format!("projection_delta_{}", revision % DELTA_HISTORY)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(value) = value else { return Ok(None) };
+        let Ok((stored, files)) = serde_json::from_str::<(u64, BTreeSet<String>)>(&value) else {
+            return Ok(None);
+        };
+        if stored != revision {
+            return Ok(None);
+        }
+        callers.extend(files);
+    }
+    Ok(Some(callers))
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROJECTION_WORK: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_projection_work() -> (usize, usize) {
+    PROJECTION_WORK.with(|work| work.replace((0, 0)))
+}
+
+fn record_outbound_rows(rows: usize) {
+    #[cfg(test)]
+    PROJECTION_WORK.with(|work| {
+        let (full, read) = work.get();
+        work.set((full, read + rows));
+    });
+    #[cfg(not(test))]
+    let _ = rows;
+}
+
+fn record_full_projection() {
+    #[cfg(test)]
+    PROJECTION_WORK.with(|work| {
+        let (full, read) = work.get();
+        work.set((full + 1, read));
+    });
 }
 
 fn project_root_from_backend_state(conn: &Connection) -> Result<PathBuf> {
@@ -139,10 +306,17 @@ fn stale_backend_file_count(conn: &Connection, project_root: &Path) -> Result<i6
 fn project_files_from_store(
     conn: &Connection,
     paths: &mut SnapshotPathResolver<'_>,
+    file: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
-    let mut statement = conn.prepare("SELECT path FROM files ORDER BY path")?;
+    let mut statement = conn.prepare(if file.is_some() {
+        "SELECT path FROM files WHERE path = ?1 ORDER BY path"
+    } else {
+        "SELECT path FROM files ORDER BY path"
+    })?;
     let files = statement
-        .query_map([], |row| row.get::<_, String>(0))?
+        .query_map(rusqlite::params_from_iter(file), |row| {
+            row.get::<_, String>(0)
+        })?
         .map(|path| path.map(|path| paths.resolve(&path)))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(files)
@@ -151,14 +325,20 @@ fn project_files_from_store(
 fn exported_symbols_from_store(
     conn: &Connection,
     paths: &mut SnapshotPathResolver<'_>,
+    file: Option<&str>,
 ) -> Result<Vec<CallgraphExport>> {
-    let mut statement = conn.prepare(
+    let filter = if file.is_some() {
+        " AND file_path = ?1"
+    } else {
+        ""
+    };
+    let mut statement = conn.prepare(&format!(
         "SELECT file_path, name, kind, start_line, exported, is_default_export
          FROM nodes
-         WHERE exported != 0 OR is_default_export != 0
+         WHERE (exported != 0 OR is_default_export != 0){filter}
          ORDER BY file_path, start_line, name, kind, id",
-    )?;
-    let rows = statement.query_map([], |row| {
+    ))?;
+    let rows = statement.query_map(rusqlite::params_from_iter(file), |row| {
         Ok(ExportRow {
             file_path: row.get(0)?,
             name: row.get(1)?,
@@ -196,15 +376,21 @@ fn exported_symbols_from_store(
 fn entry_point_symbols_from_store(
     conn: &Connection,
     paths: &mut SnapshotPathResolver<'_>,
+    file: Option<&str>,
 ) -> Result<BTreeMap<PathBuf, BTreeSet<String>>> {
-    let mut statement = conn.prepare(
+    let filter = if file.is_some() {
+        " AND n.file_path = ?1"
+    } else {
+        ""
+    };
+    let mut statement = conn.prepare(&format!(
         "SELECT n.file_path, n.name, n.scoped_name, n.kind, n.exported, f.lang
          FROM nodes n
          JOIN files f ON f.path = n.file_path
-         WHERE n.is_callgraph_entry_point != 0
+         WHERE n.is_callgraph_entry_point != 0{filter}
          ORDER BY n.file_path, n.start_line, n.name, n.kind, n.id",
-    )?;
-    let rows = statement.query_map([], |row| {
+    ))?;
+    let rows = statement.query_map(rusqlite::params_from_iter(file), |row| {
         Ok(EntryPointSymbolRow {
             file_path: row.get(0)?,
             name: row.get(1)?,
@@ -261,8 +447,28 @@ fn outbound_calls_from_store(
     conn: &Connection,
     paths: &mut SnapshotPathResolver<'_>,
 ) -> Result<Vec<CallgraphOutboundCall>> {
-    let mut statement = conn.prepare(OUTBOUND_CALLS_SQL)?;
-    let rows = statement.query_map([], |row| {
+    outbound_calls_query(conn, paths, None)
+}
+
+fn outbound_calls_for_file(
+    conn: &Connection,
+    paths: &mut SnapshotPathResolver<'_>,
+    file: &str,
+) -> Result<Vec<CallgraphOutboundCall>> {
+    outbound_calls_query(conn, paths, Some(file))
+}
+
+fn outbound_calls_query(
+    conn: &Connection,
+    paths: &mut SnapshotPathResolver<'_>,
+    file: Option<&str>,
+) -> Result<Vec<CallgraphOutboundCall>> {
+    let sql = match file {
+        Some(_) => format!("{OUTBOUND_CALLS_SQL} AND r.caller_file = ?1"),
+        None => OUTBOUND_CALLS_SQL.to_owned(),
+    };
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(file), |row| {
         Ok(OutboundRow {
             caller_file: row.get(0)?,
             caller_node: row.get(1)?,
@@ -280,6 +486,7 @@ fn outbound_calls_from_store(
         })
     })?;
     let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    record_outbound_rows(rows.len());
     // SQLite otherwise materializes this 300k+-row ordering in a temporary
     // B-tree. Sorting the already-required projection rows in memory preserves
     // its BINARY/NULL-first order without turning a read-only snapshot into

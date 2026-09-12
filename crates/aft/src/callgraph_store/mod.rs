@@ -489,8 +489,8 @@ mod write_amplification_tests {
         assert_eq!(stats.refreshed_own_files, 0);
         assert_eq!(
             after - before,
-            3,
-            "files, backend freshness, and the durable projection revision update"
+            2,
+            "only files and backend freshness update; graph-neutral edits retain the projection revision"
         );
 
         fs::write(&source, "\nexport function main() { return 1; }\n\n").unwrap();
@@ -504,7 +504,7 @@ mod write_amplification_tests {
     #[test]
     fn one_file_no_graph_delta_refresh_appends_at_most_four_wal_pages_per_changed_row() {
         const FUNCTION_COUNT: usize = 256;
-        const LOGICAL_ROWS_CHANGED: u64 = 3;
+        const LOGICAL_ROWS_CHANGED: u64 = 2;
         const MAX_WAL_PAGES_PER_CHANGED_ROW: u64 = 4;
 
         let temp = tempdir().unwrap();
@@ -690,9 +690,11 @@ thread_local! {
 
 mod dead_code_projection;
 pub use dead_code_projection::project_dead_code_snapshot;
-pub(crate) use dead_code_projection::project_dead_code_snapshot_with_revision;
+pub(crate) use dead_code_projection::{
+    project_dead_code_snapshot_incremental, project_dead_code_snapshot_with_revision,
+};
 #[cfg(test)]
-pub(crate) use dead_code_projection::set_projection_before_open_observer;
+pub(crate) use dead_code_projection::{set_projection_before_open_observer, take_projection_work};
 
 #[doc(hidden)]
 pub fn set_cold_build_swap_observer(observer: Option<Arc<ColdBuildSwapObserver>>) {
@@ -4276,6 +4278,16 @@ impl CallGraphStore {
             }
         }
 
+        let mut projection_callers = touched_callers.clone();
+        projection_callers.extend(deleted.iter().cloned());
+        for file in touched_callers.iter().chain(deleted.iter()) {
+            dead_code_projection::extend_projection_dependents(
+                &conn,
+                file,
+                &mut projection_callers,
+            )?;
+        }
+
         let tx = conn.transaction()?;
         for (rel_path, freshness) in fresh_metadata {
             update_file_fresh_metadata(
@@ -4297,13 +4309,13 @@ impl CallGraphStore {
             profile.row_deletes += started.elapsed();
         }
 
-        // Already-fresh inputs have no callers to resolve. Keep the durable
-        // projection identity when even backend freshness needed no write, so
-        // a duplicate watcher/tier-2 refresh can reuse the existing snapshot.
+        // Already-fresh inputs have no callers to resolve. Backend freshness
+        // writes do not change projection inputs, so only deletions invalidate
+        // the retained snapshot on this path.
         if caller_extracts.is_empty() {
             let wrote_rows = tx.total_changes() != total_changes_before;
-            if wrote_rows {
-                bump_projection_write_revision(&tx)?;
+            if !deleted.is_empty() {
+                dead_code_projection::record_projection_delta(&tx, &projection_callers)?;
             }
             let started = Instant::now();
             commit_incremental_if_current(tx)?;
@@ -4428,7 +4440,11 @@ impl CallGraphStore {
         insert_method_dispatch_edges(&tx, &self.project_root, Some(&own_refresh))?;
         profile.method_dispatch += started.elapsed();
 
-        bump_projection_write_revision(&tx)?;
+        // Freshness metadata is not an input to the projection. Only changed
+        // graph rows need a new revision and a corresponding caller delta.
+        if !own_refresh.is_empty() || !selected_ref_ids.is_empty() || !deleted.is_empty() {
+            dead_code_projection::record_projection_delta(&tx, &projection_callers)?;
+        }
         let started = Instant::now();
         commit_incremental_if_current(tx)?;
         self.record_commit(total_changes_before, &conn);

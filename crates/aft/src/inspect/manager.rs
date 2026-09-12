@@ -1138,6 +1138,18 @@ impl InspectManager {
             .map(|cached| Arc::clone(&cached.snapshot))
     }
 
+    fn previous_callgraph_projection(
+        &self,
+        identity: &CallgraphProjectionIdentity,
+    ) -> Option<(u64, Arc<CallgraphSnapshot>)> {
+        let projection = self.callgraph_projection.lock().ok()?;
+        let cached = projection.as_ref()?;
+        let mut expected = identity.clone();
+        expected.write_revision = cached.identity.write_revision;
+        (cached.identity == expected)
+            .then(|| (cached.identity.write_revision, Arc::clone(&cached.snapshot)))
+    }
+
     fn cache_callgraph_projection(
         &self,
         identity: CallgraphProjectionIdentity,
@@ -1145,6 +1157,12 @@ impl InspectManager {
     ) {
         let estimated_bytes = estimate_callgraph_snapshot_bytes(snapshot.as_ref());
         if let Ok(mut cached) = self.callgraph_projection.lock() {
+            // Retain at most one 256 MiB projection per root. Larger graphs can
+            // still be scanned, but do not become permanent resident caches.
+            if estimated_bytes > 256 * 1024 * 1024 {
+                *cached = None;
+                return;
+            }
             *cached = Some(CachedCallgraphProjection {
                 identity,
                 snapshot,
@@ -3353,29 +3371,36 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
             }
         }
 
-        let (write_revision, snapshot) = match project_dead_code_snapshot_with_revision(
-            projection_store.sqlite_path(),
-        ) {
-            Ok(projected) => projected,
-            Err(CallGraphStoreError::Unavailable(message)) => {
-                crate::slog_info!(
+        let previous = projection_cache
+            .zip(cache_identity.as_ref())
+            .and_then(|(cache, identity)| cache.previous_callgraph_projection(identity));
+        let (write_revision, snapshot) =
+            match crate::callgraph_store::project_dead_code_snapshot_incremental(
+                projection_store.sqlite_path(),
+                previous
+                    .as_ref()
+                    .map(|(revision, snapshot)| (*revision, snapshot.as_ref())),
+            ) {
+                Ok(projected) => projected,
+                Err(CallGraphStoreError::Unavailable(message)) => {
+                    crate::slog_info!(
                         "tier2 dead_code: callgraph store projection unavailable at {} ({}); trying fallback={}",
                         callgraph_dir.display(),
                         message,
                         index + 1 < callgraph_dirs.len()
                     );
-                continue;
-            }
-            Err(error) => {
-                crate::slog_warn!(
+                    continue;
+                }
+                Err(error) => {
+                    crate::slog_warn!(
                         "tier2 dead_code: callgraph store projection failed at {}: {}; trying fallback={}",
                         callgraph_dir.display(),
                         error,
                         index + 1 < callgraph_dirs.len()
                     );
-                continue;
-            }
-        };
+                    continue;
+                }
+            };
         let snapshot = Arc::new(snapshot);
         if let (Some(cache), Some(write_revision)) = (projection_cache, write_revision) {
             cache.cache_callgraph_projection(
@@ -6189,6 +6214,16 @@ export function bannerUnused() {}
     #[test]
     fn projection_cache_invalidates_on_in_place_refresh_for_readonly_scans() {
         let (_dir, root, inspect_dir, job) = published_projection_fixture();
+        let unrelated = root.join("src/unrelated.ts");
+        write_projection_cache_file(&unrelated, &"unrelated();\n".repeat(100));
+        let store = CallGraphStore::open_ready_no_rebuild(
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).unwrap(),
+            root.clone(),
+        )
+        .unwrap()
+        .unwrap();
+        store.refresh_files(&[unrelated]).unwrap();
+        drop(store);
         let manager = InspectManager::new();
         let (projections, _observer_reset) = count_projections();
         let target = root.join("src/target.ts");
@@ -6219,9 +6254,14 @@ export function bannerUnused() {}
         );
         drop(writer);
 
+        crate::callgraph_store::take_projection_work();
         let second = manager
             .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
             .expect("refreshed readonly projection");
+        let (full_projections, outbound_rows_read) = crate::callgraph_store::take_projection_work();
+        eprintln!("incremental_work full_projections={full_projections} outbound_rows_read={outbound_rows_read}");
+        assert_eq!(full_projections, 0);
+        assert_eq!(outbound_rows_read, 1);
         assert!(
             !first
                 .exported_symbols
@@ -6832,6 +6872,14 @@ mod dead_code_projection_tests {
     fn dead_code_projection_incremental_scenario_matrix_matches_cold_rebuild() {
         run_projection_scenario("rename", setup_projection_rename, edit_projection_rename);
         run_projection_scenario("delete", setup_projection_delete, edit_projection_delete);
+        run_projection_scenario("new-file", setup_projection_delete, |root| {
+            let path = root.join("new.ts");
+            write_file(
+                &path,
+                "import { foo } from './foo'; export function added() { foo(); }\n",
+            );
+            vec![path]
+        });
         run_projection_scenario(
             "barrel delete",
             setup_projection_barrel,
@@ -7034,12 +7082,31 @@ pub fn unrelated() -> u32 { 2 }
             .cold_build(&files_before)
             .expect("initial cold build");
 
+        let (revision, previous) =
+            project_dead_code_snapshot_with_revision(incremental_store.sqlite_path())
+                .expect("initial projection");
         let changed = edit(&root);
         incremental_store
             .refresh_files(&changed)
             .expect("refresh changed files");
-        let incremental = project_dead_code_snapshot(incremental_store.sqlite_path())
-            .expect("project incremental snapshot");
+        let (_, incremental) = crate::callgraph_store::project_dead_code_snapshot_incremental(
+            incremental_store.sqlite_path(),
+            Some((revision.unwrap(), &previous)),
+        )
+        .expect("project incremental snapshot");
+        let full =
+            project_dead_code_snapshot(incremental_store.sqlite_path()).expect("full projection");
+        let files = project_files(&root);
+        assert_eq!(
+            serde_json::to_vec(&dead_code_aggregate(
+                &root,
+                files.clone(),
+                incremental.clone()
+            ))
+            .unwrap(),
+            serde_json::to_vec(&dead_code_aggregate(&root, files, full)).unwrap(),
+            "{name}: incremental and full projection aggregates must be byte-identical",
+        );
 
         let cold_store = CallGraphStore::open(
             root.join(format!(".store-dead-code-projection-{name}-cold")),
@@ -7114,6 +7181,138 @@ pub fn unrelated() -> u32 { 2 }
             store_build_ms + proj_ms + scan_ms
         );
         let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    #[cfg(unix)]
+    fn projection_bench_cpu_ms() -> f64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+        // getrusage initializes the output only on success.
+        let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        assert_eq!(result, 0);
+        let usage = unsafe { usage.assume_init() };
+        (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64 * 1000.0
+            + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 / 1000.0
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "offline projection/rollup benchmark copies a production generation"]
+    fn profile_incremental_projection_on_store_copy() {
+        use rusqlite::{backup::Backup, Connection, OpenFlags};
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+        let source_dir = PathBuf::from(
+            std::env::var_os("AFT_CALLGRAPH_REFRESH_STORE")
+                .expect("set AFT_CALLGRAPH_REFRESH_STORE to the source root-key directory"),
+        );
+        let pointer = std::fs::read_dir(&source_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "current"))
+            .expect("source generation pointer");
+        let source_path = source_dir.join(std::fs::read_to_string(pointer).unwrap().trim());
+        let temp = tempfile::tempdir_in(root.join("target")).unwrap();
+        let store_dir = temp.path().join("store");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let key = crate::search_index::artifact_cache_key(&root);
+        let db = store_dir.join(format!("{key}.sqlite"));
+        {
+            let source =
+                Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+            let mut destination = Connection::open(&db).unwrap();
+            Backup::new(&source, &mut destination)
+                .unwrap()
+                .run_to_completion(256, Duration::from_millis(5), None)
+                .unwrap();
+            destination
+                .execute(
+                    "UPDATE backend_file_state SET workspace_root = ?1",
+                    [root.display().to_string()],
+                )
+                .unwrap();
+        }
+        let store = CallGraphStore::open(store_dir, root.clone()).unwrap();
+        // Only this temporary source and the SQLite backup are mutated. The
+        // production generation and all checkout source files remain untouched.
+        let changed = temp.path().join("probe.rs");
+        write_file(&changed, "pub fn projection_probe() {}\n");
+        store.refresh_files(std::slice::from_ref(&changed)).unwrap();
+        let (revision, previous) =
+            project_dead_code_snapshot_with_revision(store.sqlite_path()).unwrap();
+        write_file(&changed, "pub fn projection_probe() { projection_probe_target(); }\npub fn projection_probe_target() {}\n");
+        store.refresh_files(&[changed]).unwrap();
+        let cpu = projection_bench_cpu_ms();
+        let started = Instant::now();
+        let full = project_dead_code_snapshot(store.sqlite_path()).unwrap();
+        let full_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let full_cpu = projection_bench_cpu_ms() - cpu;
+        crate::callgraph_store::take_projection_work();
+        let cpu = projection_bench_cpu_ms();
+        let started = Instant::now();
+        let (_, incremental) = crate::callgraph_store::project_dead_code_snapshot_incremental(
+            store.sqlite_path(),
+            Some((revision.unwrap(), &previous)),
+        )
+        .unwrap();
+        let delta_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let delta_cpu = projection_bench_cpu_ms() - cpu;
+        let work = crate::callgraph_store::take_projection_work();
+        let mut job = InspectJob {
+            job_id: 87,
+            key: JobKey::for_project_category(InspectCategory::DeadCode),
+            category: InspectCategory::DeadCode,
+            scope_files: full.files.clone(),
+            project_root: root.clone(),
+            inspect_dir: temp.path().join("inspect"),
+            config: Arc::new(Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            }),
+            symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
+            inspect_writer: true,
+            callgraph_writer: false,
+            callgraph_snapshot: Some(Arc::new(full)),
+        };
+        let contributions = crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
+            .outcome
+            .unwrap()
+            .contributions;
+        let cpu = projection_bench_cpu_ms();
+        let started = Instant::now();
+        let full_aggregate = roll_up_dead_code_contributions(&job, &contributions, None);
+        let full_rollup_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let full_rollup_cpu = projection_bench_cpu_ms() - cpu;
+        job.callgraph_snapshot = Some(Arc::new(incremental));
+        let cpu = projection_bench_cpu_ms();
+        let started = Instant::now();
+        let delta_aggregate = roll_up_dead_code_contributions(&job, &contributions, None);
+        let delta_rollup_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let delta_rollup_cpu = projection_bench_cpu_ms() - cpu;
+        assert_eq!(
+            serde_json::to_vec(&full_aggregate).unwrap(),
+            serde_json::to_vec(&delta_aggregate).unwrap()
+        );
+        let manager = InspectManager::new();
+        manager.cache_callgraph_projection(
+            CallgraphProjectionIdentity {
+                project_root: root,
+                generation: None,
+                legacy_sqlite_path: Some(db),
+                write_revision: store.projection_write_revision().unwrap().unwrap(),
+            },
+            job.callgraph_snapshot.clone().unwrap(),
+        );
+        eprintln!("projection_bench rows={} before snapshot={full_ms:.3} cpu={full_cpu:.3} rollup={full_rollup_ms:.3} rollup_cpu={full_rollup_cpu:.3}; after snapshot={delta_ms:.3} cpu={delta_cpu:.3} rollup={delta_rollup_ms:.3} rollup_cpu={delta_rollup_cpu:.3}; full_projections={} outbound_rows_read={}", previous.outbound_calls.len(), work.0, work.1);
+        eprintln!(
+            "projection_bench callgraph_memory={:?}",
+            manager.callgraph_projection_estimated_memory()
+        );
     }
 
     fn store_projected_snapshot(root: &Path, store_name: &str) -> CallgraphSnapshot {
@@ -7430,6 +7629,7 @@ export function renamed() {}
     }
 
     fn setup_projection_delete(root: &Path) {
+        write_file(&root.join("other.ts"), "export function foo() {}\n");
         write_file(
             &root.join("main.ts"),
             r#"import { foo } from "./foo";
