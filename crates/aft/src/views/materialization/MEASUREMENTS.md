@@ -119,3 +119,31 @@ The final drill produced a better input pair than the older retained artifact: i
 Every-table parity passes on this real transition. Incremental work is 110,596 graph-row operations plus 36,923 dependency/surface-cache operations, versus 821,633 plus 344,787 cold; 296 unchanged consumers / 556 total files / 93,230 references are resolved. **The requested tens-of-MiB write target is not met on this larger real transition:** incremental physical writes are 361.77 MiB, though below 806.96 MiB cold. Wall time also did not improve in this offline sample. The successful 17-entry measurement must not be substituted for this larger case. Combined with the final drill, this is an explicit remaining acceptance gap, not a shipping recommendation.
 
 Retained databases: `target/view-diff-real-300-input/.tmpoSckwe/{base,cold,incremental}.sqlite`.
+
+## Release profiling prerequisite run (2026-09-12, base e2589c10)
+
+The previous worker's offline artifacts were unavailable in the new worktree. A fresh release binary (`cargo build --release -p agent-file-tools --bin aft`, passed) regenerated the input with `scripts/views-branch-drill.sh --mode both --binary "$PWD/target/release/aft" --storage "$PWD/target/branch-drill-baseline"`. No optimization was applied. The script restored opencode to `5716f8ba60e79ec60ec485b6e5291c0b0bc1f252` with a clean checkout. Generated reports were retained under `target/branch-drill-baseline.{json,md}` rather than changing the historical investigation reports.
+
+Generations 1 → 2 are **7,060 → 7,045 entries and 276 changed entries** across 300 Git paths. The membership-count difference of 15 is not the changed-entry count. Fingerprints:
+
+- Base: `c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1`
+- Next: `a632b1603f62b77a16c041435b34764810ec2919461ae14fba9c2a70b49fdace`
+
+The pair is copied to `target/view-diff-real-300-input/{base,next}.json`, beside the supplied offline `callgraph.sqlite`. Equality comparison of entries keyed by `rel_path`, including plane keys and metadata, confirms 276 changes. These fingerprints must not be classified as a 17-entry pair merely from membership counts.
+
+### Unmodified release drill baseline
+
+Observed `2026-09-12T22:16:10Z`. Views warm-up: 561,819 ms; legacy warm-up: 2,511 ms. Fresh storage did not reproduce the earlier zero-embedding forward legs. The generated report's static narrative claims zero embeddings, but the actual table below does not; only the table is evidence for this run.
+
+| switch | views publication ms | views puts | views embeds | views CPU s | views correct ms | legacy embeds | legacy CPU s | legacy correct ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HEAD → A | 39093 | 0 | 3 | 104.41 | 39093 | 3 | 30.89 | 27679 |
+| A → HEAD | 35377 | 0 | 0 | 56.23 | 35376 | 4 | 27.93 | 23747 |
+| HEAD → B | 38490 | 0 | 1 | 61.68 | 38794 | 3 | 29.73 | 25009 |
+| B → HEAD | 35554 | 0 | 0 | 56.77 | 35857 | 4 | 30.25 | 25513 |
+
+Views remains slower to correctness by 11,414 / 11,629 / 13,785 / 10,344 ms. This is an unmodified baseline, not a before/after optimization comparison or a shipping pass.
+
+### Blocked release benchmark
+
+`cargo test --release -p agent-file-tools --lib views::materialization::tests::bench_real_manifest_diff --no-run` fails before producing a benchmark executable: 17 E0425 errors in `gh_shim.rs` tests reference `DEV_MANIFEST_KEY_ID` / `DEV_MANIFEST_PUBLIC_KEY`, whose definitions are gated by `#[cfg(debug_assertions)]` at lines 2180–2183. The production release binary builds, but the release library test target does not. That file is outside the materialization/selected-join fence, and changing security-key compilation or enabling debug assertions was not used as a measurement workaround. Fix the release-test cfg mismatch separately, then run the release benchmark on the retained pair with sampling before selecting an optimization. No bucket attribution, optimized measurements, work-count mutation proofs, or parity/warnings acceptance is claimed by this prerequisite run.
