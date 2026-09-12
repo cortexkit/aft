@@ -238,28 +238,30 @@ fn entry_point_symbols_from_store(
     Ok(by_file)
 }
 
+const OUTBOUND_CALLS_SQL: &str = "SELECT r.caller_file,
+            r.caller_node,
+            n.name,
+            r.short_name,
+            r.full_ref,
+            r.status,
+            COALESCE(r.target_file, e.target_file),
+            COALESCE(tn.name, r.target_symbol, e.target_symbol),
+            r.line,
+            COALESCE(e.provenance, r.provenance),
+            r.byte_start,
+            r.byte_end,
+            r.ref_id
+     FROM refs r
+     LEFT JOIN nodes n ON n.id = r.caller_node
+     LEFT JOIN edges e ON e.ref_id = r.ref_id AND e.kind = r.kind
+     LEFT JOIN nodes tn ON tn.id = e.target_node
+     WHERE r.kind IN ('call', 'value_ref')";
+
 fn outbound_calls_from_store(
     conn: &Connection,
     paths: &mut SnapshotPathResolver<'_>,
 ) -> Result<Vec<CallgraphOutboundCall>> {
-    let mut statement = conn.prepare(
-        "SELECT r.caller_file,
-                r.caller_node,
-                n.name,
-                r.short_name,
-                r.full_ref,
-                r.status,
-                COALESCE(r.target_file, e.target_file),
-                COALESCE(tn.name, r.target_symbol, e.target_symbol),
-                r.line,
-                COALESCE(e.provenance, r.provenance)
-         FROM refs r
-         LEFT JOIN nodes n ON n.id = r.caller_node
-         LEFT JOIN edges e ON e.ref_id = r.ref_id AND e.kind = r.kind
-         LEFT JOIN nodes tn ON tn.id = e.target_node
-         WHERE r.kind IN ('call', 'value_ref')
-         ORDER BY r.caller_file, n.name, r.line, r.byte_start, r.byte_end, r.ref_id",
-    )?;
+    let mut statement = conn.prepare(OUTBOUND_CALLS_SQL)?;
     let rows = statement.query_map([], |row| {
         Ok(OutboundRow {
             caller_file: row.get(0)?,
@@ -272,13 +274,29 @@ fn outbound_calls_from_store(
             target_symbol: row.get(7)?,
             line: row.get::<_, i64>(8)? as u32,
             provenance: row.get(9)?,
+            byte_start: row.get(10)?,
+            byte_end: row.get(11)?,
+            ref_id: row.get(12)?,
         })
     })?;
+    let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    // SQLite otherwise materializes this 300k+-row ordering in a temporary
+    // B-tree. Sorting the already-required projection rows in memory preserves
+    // its BINARY/NULL-first order without turning a read-only snapshot into
+    // roughly 100 MB of physical temporary-file writes.
+    rows.sort_by(|left, right| {
+        left.caller_file
+            .cmp(&right.caller_file)
+            .then_with(|| left.caller_symbol.cmp(&right.caller_symbol))
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.byte_start.cmp(&right.byte_start))
+            .then_with(|| left.byte_end.cmp(&right.byte_end))
+            .then_with(|| left.ref_id.cmp(&right.ref_id))
+    });
 
-    let mut calls = Vec::new();
+    let mut calls = Vec::with_capacity(rows.len());
     let mut stale_caller_nodes = 0usize;
     for row in rows {
-        let row = row?;
         if row.provenance == PROVENANCE_VALUE_REF
             && !matches!(row.status.as_str(), "resolved" | "resolved_local")
         {
@@ -466,6 +484,9 @@ struct OutboundRow {
     target_symbol: Option<String>,
     line: u32,
     provenance: String,
+    byte_start: usize,
+    byte_end: usize,
+    ref_id: String,
 }
 
 #[cfg(test)]
@@ -594,6 +615,58 @@ impl OtherType {
             !type_match_calls[0].target.ends_with("OtherType::new"),
             "dead_code nodes use bare symbol names, not scoped method names: {:#?}",
             type_match_calls[0]
+        );
+    }
+
+    #[test]
+    fn outbound_projection_sorts_in_rust_without_a_sqlite_temp_btree() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path().join("project");
+        fs::create_dir_all(&root).expect("create project root");
+        let source = root.join("main.ts");
+        fs::write(
+            &source,
+            r#"topLevel();
+export function zed() { second(); first(); }
+export function alpha() { third(); }
+"#,
+        )
+        .expect("write ordering fixture");
+        let store = CallGraphStore::open(root.join(".store"), root).expect("open store");
+        store
+            .cold_build(std::slice::from_ref(&source))
+            .expect("cold build ordering fixture");
+
+        let conn = Connection::open(store.sqlite_path()).expect("open projection fixture");
+        let mut plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {OUTBOUND_CALLS_SQL}"))
+            .expect("prepare outbound query plan");
+        let details = plan
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("query outbound plan")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect outbound plan");
+        assert!(
+            details
+                .iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE")),
+            "outbound projection must not spill its ordering to disk: {details:?}"
+        );
+
+        let snapshot = project_dead_code_snapshot(store.sqlite_path()).expect("project snapshot");
+        let order = snapshot
+            .outbound_calls
+            .iter()
+            .map(|call| (call.caller_symbol.as_str(), call.target.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            vec![
+                (TOP_LEVEL_SYMBOL, "topLevel"),
+                ("alpha", "third"),
+                ("zed", "second"),
+                ("zed", "first"),
+            ]
         );
     }
 

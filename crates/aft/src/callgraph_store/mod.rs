@@ -501,6 +501,59 @@ mod write_amplification_tests {
         assert_eq!(shifted_stats.refreshed_own_files, 1);
     }
 
+    #[test]
+    fn one_file_no_graph_delta_refresh_appends_at_most_four_wal_pages_per_changed_row() {
+        const FUNCTION_COUNT: usize = 256;
+        const LOGICAL_ROWS_CHANGED: u64 = 3;
+        const MAX_WAL_PAGES_PER_CHANGED_ROW: u64 = 4;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("large.ts");
+        let dependency = root.join("dependency.ts");
+        fs::write(&dependency, "export function dependency() { return 1; }\n").unwrap();
+        let mut contents = String::from("import { dependency } from './dependency';\n");
+        for index in 0..FUNCTION_COUNT {
+            let next = (index + 1) % FUNCTION_COUNT;
+            contents.push_str(&format!(
+                "export function symbol{index}() {{ console.log(symbol{next}()); return dependency(); }}\n"
+            ));
+        }
+        fs::write(&source, &contents).unwrap();
+
+        let store = CallGraphStore::open(temp.path().join("store"), root).unwrap();
+        store.cold_build(&[source.clone(), dependency]).unwrap();
+        assert!(store.checkpoint_wal_truncate());
+        let wal_path = sqlite_file_set_path(store.sqlite_path(), "-wal");
+        assert_eq!(
+            fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0),
+            0
+        );
+
+        contents.push_str("// Graph-neutral watcher edit.\n");
+        fs::write(&source, contents).unwrap();
+        let changes_before = store.conn.lock().unwrap().total_changes();
+        let stats = store.refresh_files(std::slice::from_ref(&source)).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let changes_after = conn.total_changes();
+        let page_size: u64 = conn
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        drop(conn);
+
+        let wal_bytes = fs::metadata(&wal_path).unwrap().len();
+        let max_wal_frames = LOGICAL_ROWS_CHANGED * MAX_WAL_PAGES_PER_CHANGED_ROW;
+        let max_wal_bytes = 32 + max_wal_frames * (page_size + 24);
+        assert!(
+            wal_bytes <= max_wal_bytes,
+            "one-file graph-neutral refresh appended {wal_bytes} WAL bytes; bound is {max_wal_bytes} bytes ({max_wal_frames} pages for {LOGICAL_ROWS_CHANGED} changed rows)"
+        );
+        assert_eq!(stats.unchanged_extract_files, 1);
+        assert_eq!(stats.refreshed_own_files, 0);
+        assert_eq!(changes_after - changes_before, LOGICAL_ROWS_CHANGED);
+    }
+
     #[cfg(unix)]
     #[test]
     fn deleted_symlink_alias_refresh_removes_the_original_stale_row() {
@@ -9957,7 +10010,9 @@ fn build_dispatch_hints(
 ) -> Vec<DispatchHint> {
     let mut hints = Vec::new();
     let mut ordinal = 0usize;
-    for (caller_symbol, call_sites) in &data.calls_by_symbol {
+    let mut calls_by_symbol = data.calls_by_symbol.iter().collect::<Vec<_>>();
+    calls_by_symbol.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    for (caller_symbol, call_sites) in calls_by_symbol {
         let Some(caller_node) = node_by_scoped.get(caller_symbol) else {
             continue;
         };
@@ -13820,7 +13875,7 @@ fn stored_extract_matches(
                 resolved.target_node,
                 resolved.target_file,
                 resolved.target_symbol,
-                PROVENANCE_TREESITTER,
+                ref_provenance(raw),
             ])
             .to_string()
         })
@@ -13868,7 +13923,7 @@ fn stored_extract_matches(
                     edge.target_symbol,
                     edge.kind,
                     edge.line,
-                    PROVENANCE_TREESITTER,
+                    ref_provenance(&resolved.raw),
                 ])
                 .to_string()
             })
