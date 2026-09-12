@@ -299,3 +299,37 @@ fn added_and_removed_targets_relink_previously_unresolved_callers() {
         assert_eq!(snapshot(&db), snapshot(&cold));
     }
 }
+
+#[test]
+fn selected_join_seam_matches_existing_cold_join_and_retains_missing_candidates() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let reader = ManifestViewBlobReader { connection: &conn };
+    let old = join::JoinResult::from_manifest(&f.base, &reader).unwrap();
+    let cold = join::join_selected_manifest(&f.base, &reader, None, &BTreeMap::new()).unwrap();
+    assert_eq!(
+        old.canonical_serialization(),
+        cold.result.canonical_serialization()
+    );
+    assert!(
+        cold.bindings["caller.ts"]
+            .dependencies
+            .contains("target.tsx"),
+        "absent alternatives must be persisted"
+    );
+    let selected = BTreeSet::from([
+        "target.ts".to_string(),
+        "added.ts".to_string(),
+        "caller.ts".to_string(),
+    ]);
+    let next =
+        join::join_selected_manifest(&f.next, &reader, Some(&selected), &cold.bindings).unwrap();
+    let all = join::JoinResult::from_manifest(&f.next, &reader).unwrap();
+    assert_eq!(
+        next.result.rows,
+        all.rows
+            .into_iter()
+            .filter(|row| selected.contains(std::str::from_utf8(&row.caller_path).unwrap()))
+            .collect()
+    );
+}

@@ -980,6 +980,15 @@ impl ParseBlob {
         path: &str,
         facts: &FactPaths<'_>,
     ) -> Result<super::FileExtract, ManifestJoinError> {
+        self.bind_with_dependencies(path, facts, None)
+    }
+
+    fn bind_with_dependencies(
+        &self,
+        path: &str,
+        facts: &FactPaths<'_>,
+        cached: Option<&BTreeMap<u32, BTreeSet<String>>>,
+    ) -> Result<super::FileExtract, ManifestJoinError> {
         let data = self.file_data(path)?;
         let nodes = self
             .symbols
@@ -1010,22 +1019,25 @@ impl ParseBlob {
         let abs = facts.root.join(path);
         let mut raw_refs = Vec::new();
         for raw in &self.refs {
-            let dependencies = if raw.kind == BlobRefKind::Module {
-                super::rust_external_module_target(
-                    &abs,
-                    raw.path_override.as_deref(),
-                    raw.module_path.as_deref().unwrap_or_default(),
-                    facts,
-                )
-                .and_then(|p| facts.canonical(&p))
-                .map(|p| super::relative_path(facts.root, &p))
-                .into_iter()
-                .collect()
-            } else if let Some(module) = &raw.module_path {
-                super::module_dependencies(facts.root, &abs, module, facts)
-            } else {
-                BTreeSet::new()
-            };
+            let dependencies =
+                if let Some(dependencies) = cached.and_then(|cache| cache.get(&raw.ordinal)) {
+                    dependencies.clone()
+                } else if raw.kind == BlobRefKind::Module {
+                    super::rust_external_module_target(
+                        &abs,
+                        raw.path_override.as_deref(),
+                        raw.module_path.as_deref().unwrap_or_default(),
+                        facts,
+                    )
+                    .and_then(|p| facts.canonical(&p))
+                    .map(|p| super::relative_path(facts.root, &p))
+                    .into_iter()
+                    .collect()
+                } else if let Some(module) = &raw.module_path {
+                    super::module_dependencies(facts.root, &abs, module, facts)
+                } else {
+                    BTreeSet::new()
+                };
             let caller_symbol = raw
                 .caller_symbol
                 .as_ref()
@@ -1295,3 +1307,192 @@ fn manifest_payloads(
 #[cfg(test)]
 #[path = "../../tests/integration/join_manifest_test.rs"]
 mod manifest_integration_tests;
+
+/// Bound reference dependencies and resolver probes are generation-specific, unlike
+/// parse blobs. The owner must invalidate these whenever a probed path changes.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ViewBindingDependencies {
+    pub references: BTreeMap<u32, BTreeSet<String>>,
+    pub dependencies: BTreeSet<String>,
+}
+
+pub(crate) struct SelectedManifestJoin {
+    pub result: JoinResult,
+    pub bindings: BTreeMap<String, ViewBindingDependencies>,
+}
+
+/// Configuration files read by the manifest resolver's workspace/package and
+/// tsconfig lookup (callgraph.rs), and Rust crate lookup (callgraph_store).
+/// Directory enumeration serves workspace discovery, so new configuration files
+/// invalidate all bindings, including callers that never saw that directory.
+pub(crate) fn view_resolution_config(path: &[u8]) -> bool {
+    matches!(
+        path.rsplit(|byte| *byte == b'/').next(),
+        Some(b"package.json" | b"tsconfig.json" | b"pnpm-workspace.yaml" | b"Cargo.toml")
+    )
+}
+
+struct ViewBindingFacts<'a> {
+    inner: Rc<dyn ProjectFacts + 'a>,
+    probes: std::cell::RefCell<BTreeSet<String>>,
+}
+
+impl ViewBindingFacts<'_> {
+    fn record(&self, path: &[u8]) {
+        // Config changes invalidate every caller separately. Persist source probes,
+        // including misses, to catch a newly added module or an earlier candidate.
+        if !view_resolution_config(path) {
+            if let Ok(path) = std::str::from_utf8(path) {
+                self.probes.borrow_mut().insert(path.to_string());
+            }
+        }
+    }
+
+    fn take(&self) -> BTreeSet<String> {
+        std::mem::take(&mut *self.probes.borrow_mut())
+    }
+}
+
+impl ProjectFacts for ViewBindingFacts<'_> {
+    fn is_file(&self, rel: &[u8]) -> bool {
+        self.record(rel);
+        self.inner.is_file(rel)
+    }
+    fn is_dir(&self, rel: &[u8]) -> bool {
+        self.inner.is_dir(rel)
+    }
+    fn config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
+        self.record(rel);
+        self.inner.config_bytes(rel)
+    }
+    fn symlink_target(&self, rel: &[u8]) -> Option<&[u8]> {
+        self.inner.symlink_target(rel)
+    }
+    fn canonical(&self, rel: &[u8]) -> Option<Vec<u8>> {
+        self.inner.canonical(rel)
+    }
+    fn list_dir(&self, rel: &[u8]) -> Vec<super::facts::DirEntry> {
+        self.inner.list_dir(rel)
+    }
+}
+
+/// Resolve selected callers against the complete symbol index. Cached binding
+/// dependencies avoid resolving unchanged imports merely to rebuild that index.
+/// `selected=None` is the cold path; otherwise the owner supplies the transitive
+/// reverse-dependency closure and caches from the same base generation.
+pub(crate) fn join_selected_manifest(
+    manifest: &Manifest,
+    blobs: &impl ManifestBlobReader,
+    selected: Option<&BTreeSet<String>>,
+    cached: &BTreeMap<String, ViewBindingDependencies>,
+) -> Result<SelectedManifestJoin, ManifestJoinError> {
+    let loaded = manifest_payloads(manifest, blobs)?;
+    let reader = |key: &BlobKey| loaded.get(key).cloned();
+    let facts = Rc::new(ViewBindingFacts {
+        inner: Rc::new(ManifestFacts {
+            manifest,
+            blobs: &reader,
+        }),
+        probes: Default::default(),
+    });
+    let root = Path::new("/");
+    let paths = FactPaths {
+        root,
+        facts: facts.as_ref(),
+    };
+    let mut extracts = HashMap::new();
+    let mut files = HashMap::new();
+    let mut work = Vec::new();
+    let mut bindings = BTreeMap::new();
+    let mut unbound_non_utf8_paths = Vec::new();
+    for (path, entry) in manifest.entries() {
+        let ManifestEntry::Regular { planes, .. } = entry else {
+            continue;
+        };
+        let Some(key) = &planes.callgraph else {
+            continue;
+        };
+        let CallgraphBlob::Parse(blob) = CallgraphBlob::from_bytes(&loaded[key])? else {
+            continue;
+        };
+        let Ok(rel) = std::str::from_utf8(path.as_bytes()) else {
+            unbound_non_utf8_paths.push(path.as_bytes().to_vec());
+            continue;
+        };
+        let resolve = selected.is_none_or(|set| set.contains(rel));
+        let cache = (!resolve).then(|| cached.get(rel)).flatten();
+        facts.take();
+        let extract =
+            blob.bind_with_dependencies(rel, &paths, cache.map(|cache| &cache.references))?;
+        files.insert(
+            rel.to_string(),
+            super::DbFileIndex::from_extract(root, &extract, &paths),
+        );
+        let mut binding = cache.cloned().unwrap_or_default();
+        if cache.is_none() {
+            binding.references = blob
+                .refs
+                .iter()
+                .zip(&extract.raw_refs)
+                .map(|(raw, bound)| (raw.ordinal, bound.dependencies.clone()))
+                .collect();
+            binding.dependencies = binding.references.values().flatten().cloned().collect();
+            binding.dependencies.extend(facts.take());
+        }
+        bindings.insert(rel.to_string(), binding);
+        if resolve {
+            for (raw, bound) in blob.refs.iter().zip(&extract.raw_refs) {
+                work.push((
+                    CallerRefKey {
+                        caller_blob_key: key.clone(),
+                        ref_ordinal: raw.ordinal,
+                        caller_path: path.as_bytes().to_vec(),
+                    },
+                    (raw.kind, bound.clone()),
+                ));
+            }
+        }
+        extracts.insert(rel.to_string(), extract);
+    }
+    let caller_data = extracts
+        .iter()
+        .map(|(path, extract)| (path.clone(), &extract.data))
+        .collect();
+    let index = ManifestProjectIndex::from_parts(
+        root,
+        files,
+        caller_data,
+        super::WorkspaceCratePrefixCache::default(),
+        facts.clone(),
+    );
+    let mut result = JoinResult {
+        rows: BTreeSet::new(),
+        resolution_order: Vec::new(),
+        unbound_non_utf8_paths,
+    };
+    work.sort_by(|a, b| (&a.0, a.1 .0).cmp(&(&b.0, b.1 .0)));
+    for (key, (kind, raw)) in work {
+        facts.take();
+        let resolved = super::resolve_ref(raw, &index)
+            .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
+        let caller = std::str::from_utf8(&key.caller_path).expect("bound UTF-8 caller");
+        let binding = bindings.get_mut(caller).expect("bound caller dependencies");
+        binding.dependencies.extend(resolved.dependencies);
+        binding.dependencies.extend(facts.take());
+        result.rows.insert(DerivedRow {
+            caller_blob_key: key.caller_blob_key.clone(),
+            ref_ordinal: key.ref_ordinal,
+            caller_path: key.caller_path.clone(),
+            kind,
+            status: if resolved.target_file.is_some() {
+                ResolutionStatus::Resolved
+            } else {
+                ResolutionStatus::Unresolved
+            },
+            target_path: resolved.target_file.map(String::into_bytes),
+            target_symbol: resolved.target_symbol,
+        });
+        result.resolution_order.push(key);
+    }
+    Ok(SelectedManifestJoin { result, bindings })
+}
