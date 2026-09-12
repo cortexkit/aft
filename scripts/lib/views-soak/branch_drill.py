@@ -52,6 +52,10 @@ PUBLICATION_RE = re.compile(
     r"content-addressed view publication(?: after semantic refresh)? published=(?P<published>true|false) "
     r"blob_puts=(?P<puts>\d+) pending_paths=(?P<pending>\d+) root=(?P<root>.+)$"
 )
+PHASE_PUBLICATION_RE = re.compile(
+    r"index_event kind=view_publication plane=views root=(?P<root>.+?) "
+    r"outcome=(?P<outcome>\S+) candidates=\d+ blob_puts=(?P<puts>\d+)(?:\s|$)"
+)
 EMBED_RE = re.compile(
     r'semantic embedder refresh: root="(?P<root>[^"]+)" .*? files=(?P<files>\d+) '
     r'chunks=(?P<chunks>\d+) batches=(?P<batches>\d+)\b'
@@ -306,6 +310,7 @@ def file_log_since(path: Path, mark: int) -> str:
 def log_metrics(text: str, root: Path) -> tuple[int | None, int | None, int, int]:
     reuse_puts: int | None = None
     publication_puts: int | None = None
+    phase_puts: int | None = None
     embed_calls = 0
     embedded_files = 0
     root_texts = {str(root), str(root.resolve())}
@@ -320,11 +325,26 @@ def log_metrics(text: str, root: Path) -> tuple[int | None, int | None, int, int
             and publication.group("root") in root_texts
         ):
             publication_puts = int(publication.group("puts"))
+        phase = PHASE_PUBLICATION_RE.search(line)
+        if (
+            phase
+            and phase.group("outcome") in {"published", "no_op"}
+            and phase.group("root") in root_texts
+        ):
+            phase_puts = int(phase.group("puts"))
         embed = EMBED_RE.search(line)
         if embed and embed.group("root") in root_texts:
             embed_calls += int(embed.group("batches"))
             embedded_files += int(embed.group("files"))
-    return reuse_puts, publication_puts, embed_calls, embedded_files
+    # Prepared publication emits a root-owned phase profile, not the older
+    # summary line. Membership deltas are not blob writes (deleting 15 entries
+    # can still put zero blobs), so prefer the explicit phase counter.
+    return (
+        reuse_puts,
+        phase_puts if phase_puts is not None else publication_puts,
+        embed_calls,
+        embedded_files,
+    )
 
 
 def publication_outcome(

@@ -23,6 +23,18 @@ class ViewsBranchDrillProbeTest(unittest.TestCase):
         self.assertFalse(MODULE.probe_has_definition_and_reference_evidence(1))
         self.assertTrue(MODULE.probe_has_definition_and_reference_evidence(2))
 
+    def test_root_owned_phase_puts_overrides_membership_and_legacy_counters(self) -> None:
+        root = Path("/tmp/opencode root")
+        text = "\n".join([
+            f"index_event kind=view_publication plane=views root={root} outcome=pending candidates=7045 blob_puts=8 pending_paths=260",
+            f"index_event kind=view_publication plane=views root={root} outcome=published candidates=7045 blob_puts=0 pending_paths=0",
+            f"content-addressed view publication published=true blob_puts=15 pending_paths=0 root={root}",
+            f"index_event kind=view_publication plane=views root={root}-other outcome=published candidates=9000 blob_puts=99 pending_paths=0",
+        ])
+        _, puts, embeds, files = MODULE.log_metrics(text, root)
+        self.assertEqual(puts, 0)
+        self.assertEqual((embeds, files), (0, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
