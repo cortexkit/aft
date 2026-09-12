@@ -6147,7 +6147,10 @@ export function bannerUnused() {}
         let first = manager
             .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
             .expect("initial projection");
-        let target = root.join("src/main.ts");
+        // Snapshot paths are verbatim-stripped by the projection's normalizer;
+        // mirror it (as the other projection tests do) so the expectation
+        // matches on Windows, where the canonical root is verbatim.
+        let target = canonicalize_for_snapshot(&root.join("src/main.ts"));
         assert!(first.files.contains(&target));
         let graph_dir = callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).unwrap();
         let writer = CallGraphStore::open_ready_no_rebuild(graph_dir, root.clone())
