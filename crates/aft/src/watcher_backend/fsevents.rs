@@ -122,7 +122,6 @@ impl FsEventsStream {
         sender: mpsc::Sender<notify::Result<Event>>,
     ) -> notify::Result<Self> {
         let watched_paths = create_cf_path_array(std::slice::from_ref(&root.to_path_buf()))?;
-        let exclusion_paths = create_cf_path_array(exclusions)?;
         let context_info = Box::into_raw(Box::new(CallbackContext {
             sender: sender.clone(),
         }));
@@ -149,17 +148,32 @@ impl FsEventsStream {
         }
         if stream.is_null() {
             unsafe {
-                cf::CFRelease(exclusion_paths);
                 drop(Box::from_raw(context_info));
             }
             return Err(notify::Error::generic("FSEventStreamCreate returned null"));
         }
 
-        let exclusions_set =
-            unsafe { fs::FSEventStreamSetExclusionPaths(stream, exclusion_paths) != 0 };
-        unsafe {
-            cf::CFRelease(exclusion_paths);
-        }
+        let exclusions_set = if exclusions.is_empty() {
+            true
+        } else {
+            let exclusion_paths = match create_cf_path_array(exclusions) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    unsafe {
+                        fs::FSEventStreamInvalidate(stream);
+                        fs::FSEventStreamRelease(stream);
+                    }
+                    return Err(error);
+                }
+            };
+            let accepted =
+                unsafe { fs::FSEventStreamSetExclusionPaths(stream, exclusion_paths) != 0 };
+            unsafe {
+                cf::CFRelease(exclusion_paths);
+            }
+            accepted
+        };
+
         if !exclusions_set {
             unsafe {
                 fs::FSEventStreamInvalidate(stream);
@@ -421,13 +435,11 @@ mod tests {
     fn fsevents_drop_flags_preserve_typed_rescan_reason() {
         let path = Path::new("/tmp/root");
         let user = translate_event(
-            fs::kFSEventStreamEventFlagMustScanSubDirs
-                | fs::kFSEventStreamEventFlagUserDropped,
+            fs::kFSEventStreamEventFlagMustScanSubDirs | fs::kFSEventStreamEventFlagUserDropped,
             path,
         );
         let kernel = translate_event(
-            fs::kFSEventStreamEventFlagMustScanSubDirs
-                | fs::kFSEventStreamEventFlagKernelDropped,
+            fs::kFSEventStreamEventFlagMustScanSubDirs | fs::kFSEventStreamEventFlagKernelDropped,
             path,
         );
 
