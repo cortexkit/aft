@@ -1365,8 +1365,11 @@ impl ViewBindingFacts<'_> {
 
 impl ProjectFacts for ViewBindingFacts<'_> {
     fn is_file(&self, rel: &[u8]) -> bool {
-        self.record(rel);
-        self.inner.is_file(rel)
+        let is_file = self.inner.is_file(rel);
+        if is_file {
+            self.record(rel);
+        }
+        is_file
     }
     fn is_dir(&self, rel: &[u8]) -> bool {
         self.inner.is_dir(rel)
@@ -1381,8 +1384,17 @@ impl ProjectFacts for ViewBindingFacts<'_> {
     fn canonical(&self, rel: &[u8]) -> Option<Vec<u8>> {
         // FactPaths canonicalizes before testing existence, so misses must be
         // recorded here as well as in is_file (not only after canonicalization).
-        self.record(rel);
-        self.inner.canonical(rel)
+        let canonical = self.inner.canonical(rel);
+        // Existing directory probes are workspace-discovery implementation detail:
+        // memo hits may omit them. Configuration changes invalidate that discovery
+        // globally, while file probes and misses remain stable caller dependencies.
+        if canonical
+            .as_ref()
+            .is_none_or(|path| self.inner.is_file(path))
+        {
+            self.record(rel);
+        }
+        canonical
     }
     fn list_dir(&self, rel: &[u8]) -> Vec<super::facts::DirEntry> {
         self.inner.list_dir(rel)
