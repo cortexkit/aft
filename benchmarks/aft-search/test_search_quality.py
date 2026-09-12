@@ -65,6 +65,24 @@ class ManifestMechanismTests(unittest.TestCase):
         with self.assertRaisesRegex(InputFault, "manifest_relabel_reason_missing"):
             validate_manifest_relabels(old_manifest, new_manifest)
 
+    def test_corrected_phrase_rows_are_relabelled_with_reasons(self) -> None:
+        path = Path(__file__).with_name("real-query-manifest.json")
+        manifest = json.loads(path.read_text())
+        rows = {row["episode_id"]: row for row in manifest["rows"]}
+        expected = {
+            "followup-census:832": ("NDJSON=0", "dispatch=0"),
+            "followup-census:19696": ("cortexkit-store=0",),
+            "followup-census:7695": ("wiring=0",),
+        }
+        for episode_id, missing_tokens in expected.items():
+            with self.subTest(episode_id=episode_id):
+                row = rows[episode_id]
+                self.assertEqual(row["mechanism"], "not_a_search_failure")
+                reason = row["relabel_reason"]
+                self.assertIn("30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17", reason)
+                for missing_token in missing_tokens:
+                    self.assertIn(missing_token, reason)
+
 
 class ProfileSelectionTests(unittest.TestCase):
     def profile_for_schema(self, schema: dict) -> tuple[str, dict]:
