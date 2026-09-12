@@ -3,7 +3,8 @@
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "crates/aft/tests/integration/tool_call_parity_test.rs"
+    "harness-goldens",
+    "profile-grammar"
   ],
   "slices": [
     "reference-rebaseline-train-65"
