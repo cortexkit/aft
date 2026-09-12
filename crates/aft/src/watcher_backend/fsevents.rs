@@ -33,6 +33,10 @@ impl ProjectWatcher {
         matcher_generation: Arc<AtomicU64>,
     ) -> notify::Result<Self> {
         let root = std::fs::canonicalize(&root).unwrap_or(root);
+        // Same rule as the inotify backend: the exclusion set describes the
+        // matcher at this generation, so the generation is captured beside it
+        // rather than on the backend thread after spawn.
+        let observed_generation = matcher_generation.load(Ordering::Acquire);
         let exclusions = derive_excluded_subtrees(&root, &matcher, Some(FSEVENTS_EXCLUSION_LIMIT));
         super::log_exclusions(&root, &exclusions);
 
@@ -53,7 +57,7 @@ impl ProjectWatcher {
                 let mut stream = stream;
                 let _external_watcher = external_watcher;
                 let mut exclusions = exclusions;
-                let mut observed_generation = matcher_generation.load(Ordering::Acquire);
+                let mut observed_generation = observed_generation;
 
                 while !thread_shutdown.load(Ordering::Acquire) {
                     let generation = matcher_generation.load(Ordering::Acquire);

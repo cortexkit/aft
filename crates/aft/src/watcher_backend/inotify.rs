@@ -29,6 +29,11 @@ impl ProjectWatcher {
         matcher_generation: Arc<AtomicU64>,
     ) -> notify::Result<Self> {
         let root = std::fs::canonicalize(&root).unwrap_or(root);
+        // The watch set below describes the matcher at this generation. Capture
+        // it here, not on the backend thread: a bump between spawn and the
+        // thread's first instruction would otherwise be read as "already
+        // observed" and the rebuild it requires would never run.
+        let observed_generation = matcher_generation.load(Ordering::Acquire);
         let exclusions = derive_excluded_subtrees(&root, &matcher, None);
         super::log_exclusions(&root, &exclusions);
 
@@ -52,7 +57,7 @@ impl ProjectWatcher {
             .name("aft-inotify-backend".to_string())
             .spawn(move || {
                 let mut exclusions = exclusions;
-                let mut observed_generation = matcher_generation.load(Ordering::Acquire);
+                let mut observed_generation = observed_generation;
 
                 while !thread_shutdown.load(Ordering::Acquire) {
                     let generation = matcher_generation.load(Ordering::Acquire);
@@ -191,6 +196,10 @@ mod tests {
         assert_eq!(watcher.watched_directory_count(), 2);
     }
 
+    // The matcher bump here can land before the backend thread executes its
+    // first instruction (it did on a loaded Linux CI runner). The watch set
+    // must still be rebuilt, which is why `create` captures the generation
+    // alongside the initial walk instead of on the thread.
     #[test]
     fn inotify_rebuild_adjusts_existing_watches() {
         let root = tempfile::tempdir().unwrap();
