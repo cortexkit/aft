@@ -352,6 +352,27 @@ The old warm generation that seeded the fast A to HEAD row was swept, so its exa
 
 ### Dirty-since-durable blob stores
 
-Dirty state is tracked per shared blob-database path for the life of the process. First sight is conservatively dirty, every put marks the store dirty before its SQLite transaction begins, and a successful checkpoint plus fsync clears it. Publication and puts share a barrier through closure probing, so a manifest cannot observe an in-flight put after deciding that its store is clean. A clean store's durable contents are already its current contents, leaving the pointer CAS argument unchanged.
+Dirty state is tracked per shared blob-database path for the life of the process. First sight is conservatively dirty, every inserted payload marks the store dirty before releasing the put/publication barrier, and a successful checkpoint plus fsync clears it. Publication and puts share a barrier through closure probing, so a manifest cannot observe an in-flight put after deciding that its store is clean. A clean store's durable contents are already its current contents, leaving the pointer CAS argument unchanged.
 
-The mechanism red was `publication_cas_test::clean_blob_stores_skip_checkpoint_and_fsync_until_a_put_marks_one_dirty`: before the fix its clean publication observed `(3 checkpoints, 1 fsync event)` instead of `(0, 0)`. The observer now reports each blob-store checkpoint and fsync individually. The clean publication observes exactly zero of each, while one semantic put causes exactly one checkpoint and one fsync. Alias checkpoint/fsync, trigram fsync, and derived main/WAL fsync remain in the closure and are attributed separately.
+The mechanism red was `publication_cas_test::clean_blob_stores_skip_checkpoint_and_fsync_until_a_put_marks_one_dirty`: before the fix its clean publication observed `(3 checkpoints, 1 fsync event)` instead of `(0, 0)`. The observer now reports each blob-store checkpoint and fsync individually. The clean publication observes exactly zero of each, while one inserted semantic payload causes exactly one checkpoint and one fsync; an idempotent reused put leaves the already-durable store clean. Alias checkpoint/fsync, trigram fsync, and derived main/WAL fsync remain in the closure and are attributed separately.
+
+### Final fresh-storage branch drill
+
+The final binary was built after the inserted-versus-reused refinement and run detached without shortening the drill:
+
+`scripts/views-branch-drill.sh --mode both --binary target/release/aft --storage /tmp/aft-views-drill-77-proportional-final/on --baseline-storage /tmp/aft-views-drill-77-proportional-final/off --output-dir /tmp/aft-views-drill-77-proportional-final/out`
+
+Views-on warm-up was 603,619 ms and legacy warm-up was 690,649 ms. The report contains no defects, and every row reached the correct callgraph result.
+
+| switch | views publication ms | views CPU s | views correct ms | legacy CPU s | legacy correct ms | views - legacy correct |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| HEAD to A | 34,017 | 99.12 | 34,016 | 84.07 | 34,942 | -926 |
+| A to HEAD | 33,748 | 79.57 | 34,061 | 32.24 | 26,674 | +7,387 |
+| HEAD to B | 30,795 | 53.48 | 31,083 | 32.20 | 26,838 | +4,245 |
+| B to HEAD | 28,301 | 53.49 | 28,606 | 32.57 | 26,710 | +1,896 |
+
+The owner's rule remains: **views must beat legacy to correctness on every row, with views CPU not above legacy**. It is not met. Views wins correctness only on HEAD to A and exceeds legacy CPU by 15.05 / 47.33 / 21.28 / 20.92 seconds. The required full-resolution materializations remain the largest bucket at 17,816-21,846 ms per callgraph-plane publication.
+
+The four semantic-fill publications perform 30-54 ms of materialization and retain closure times of 2,922 / 2,673 / 2,509 / 2,503 ms. The dirty-store red proves that clean blob stores issue no checkpoint or fsync calls, so this residual is not evidence that the skip failed. The final manifest requires 8,891 blob-membership probes, and `SqliteClosure::contains_blob` currently opens a SQLite connection for every key. On copied final artifacts, reproducing that pattern took 6,789 ms; retaining two read connections reduced it to 1,755 ms. For comparison, fsyncing copied derived WAL/main, trigram, and alias artifacts measured 0.190 / 0.023 / 0.478 ms after they were already durable, while the drill's detached derived checkpoints completed in 8-25 ms. Those copied-file fsync numbers are lower bounds, but they rule out multi-second file size alone.
+
+The next closure bucket is therefore the manifest-wide per-key connection/query pattern, followed by separately timed derived, trigram, and alias syncs. The next overall acceptance bucket remains correctness-required full resolution when package resolution inputs change; optimizing it belongs in resolver-selection work, not this policy/closure change.

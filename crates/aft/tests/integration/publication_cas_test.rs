@@ -1,4 +1,4 @@
-use aft::blob_store::{BlobPlane, BlobStore, SemanticKey};
+use aft::blob_store::{BlobPlane, BlobStore, PutOutcome, SemanticKey};
 use aft::views::{
     ArtifactPlane, ClosureRequirements, Manifest, ManifestEntry, PublicationArtifacts,
     PublicationClosure, PublicationObserver, PublicationRequest, PublicationStep, PublishOutcome,
@@ -168,12 +168,15 @@ fn clean_blob_stores_skip_checkpoint_and_fsync_until_a_put_marks_one_dirty() {
     let store = ViewStore::open(directory.path(), "durability-view").unwrap();
     let manifest = manifest();
 
+    let initial = RecordedSteps::default();
     store
-        .publish(
+        .publish_with_observer(
             &request("generation-initial", None, &manifest, files_for_retry(&files)),
             &CompleteClosure,
+            Some(&initial),
         )
         .unwrap();
+    assert_eq!(observed_blob_durability_steps(&initial), (2, 2));
 
     let clean = RecordedSteps::default();
     store
@@ -199,13 +202,29 @@ fn clean_blob_stores_skip_checkpoint_and_fsync_until_a_put_marks_one_dirty() {
                 "generation-dirty",
                 Some("generation-clean"),
                 &manifest,
-                files,
+                files_for_retry(&files),
             ),
             &CompleteClosure,
             Some(&dirty),
         )
         .unwrap();
     assert_eq!(observed_blob_durability_steps(&dirty), (1, 1));
+
+    assert_eq!(semantic.put(&key, b"payload").unwrap().outcome, PutOutcome::Reused);
+    let reused = RecordedSteps::default();
+    store
+        .publish_with_observer(
+            &request(
+                "generation-reused",
+                Some("generation-dirty"),
+                &manifest,
+                files,
+            ),
+            &CompleteClosure,
+            Some(&reused),
+        )
+        .unwrap();
+    assert_eq!(observed_blob_durability_steps(&reused), (0, 0));
 }
 
 #[test]

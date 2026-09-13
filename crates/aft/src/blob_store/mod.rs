@@ -530,9 +530,6 @@ impl BlobStore {
     pub fn put(&mut self, full_key: &FullKey, payload: &[u8]) -> Result<PutReport, BlobStoreError> {
         self.ensure_key_plane(full_key)?;
         let _durability = publication_durability_barrier();
-        // Mark before SQLite begins so publication cannot observe a clean store
-        // while a commit that its manifest may reference is in flight.
-        mark_blob_database_dirty(&self.path);
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -564,6 +561,9 @@ impl BlobStore {
             ],
         )?;
         tx.commit()?;
+        if inserted == 1 {
+            mark_blob_database_dirty(&self.path);
+        }
         Ok(PutReport::new(if inserted == 1 {
             PutOutcome::Inserted
         } else {
@@ -622,12 +622,14 @@ impl BlobStore {
     pub fn quarantine(&mut self, full_key: &FullKey) -> Result<(), BlobStoreError> {
         self.ensure_key_plane(full_key)?;
         let _durability = publication_durability_barrier();
-        mark_blob_database_dirty(&self.path);
-        self.connection.execute(
+        let inserted = self.connection.execute(
             "INSERT INTO blob_quarantine (full_key) VALUES (?1)
              ON CONFLICT(full_key) DO NOTHING",
             params![full_key.as_bytes().as_slice()],
         )?;
+        if inserted == 1 {
+            mark_blob_database_dirty(&self.path);
+        }
         Ok(())
     }
 
