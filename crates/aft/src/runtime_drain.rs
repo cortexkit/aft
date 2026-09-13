@@ -28,6 +28,9 @@ pub struct DrainBatchOutcome {
 
 pub const WATCHER_PATH_DRAIN_BATCH_CAP: usize = 2_048;
 pub const WATCHER_DRAIN_SLICE_BUDGET: Duration = Duration::from_millis(250);
+// View assembly may waste one superseded build, but it must not inherit the
+// semantic embedder's human-edit debounce before publishing callgraph data.
+const VIEW_PUBLICATION_QUIET_WINDOW: Duration = Duration::from_secs(1);
 const WATCHER_DRAIN_UNIT_WARN_AFTER: Duration = Duration::from_secs(5);
 const WATCHER_DRAIN_UNIT_FINAL_AFTER: Duration = Duration::from_secs(30);
 pub const LSP_EVENT_DRAIN_BATCH_CAP: usize = 256;
@@ -2772,9 +2775,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             state.ignore_changed = false;
             if ctx.config().views.enabled {
                 state.view_publication_paths.clear();
-                state.view_publication_due = Some(
-                    Instant::now() + crate::commands::configure::semantic_refresh_quiet_window(),
-                );
+                state.view_publication_due = Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
             }
         }
         state.status_changed = false;
@@ -2792,10 +2793,8 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 state.ignore_changed = false;
                 if ctx.config().views.enabled {
                     state.view_publication_paths.clear();
-                    state.view_publication_due = Some(
-                        Instant::now()
-                            + crate::commands::configure::semantic_refresh_quiet_window(),
-                    );
+                    state.view_publication_due =
+                        Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
                 }
             }
         }
@@ -2823,10 +2822,8 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             } else {
                 if ctx.config().views.enabled {
                     state.view_publication_paths.extend(paths.iter().cloned());
-                    state.view_publication_due = Some(
-                        Instant::now()
-                            + crate::commands::configure::semantic_refresh_quiet_window(),
-                    );
+                    state.view_publication_due =
+                        Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
                 }
                 state.path_slice_count += 1;
                 state.scheduler_changed_path_count = if ignore_changed {
@@ -4690,6 +4687,37 @@ mod watcher_slice_tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         *ctx.watcher_rx().lock() = Some(rx);
         (ctx, tx)
+    }
+
+    #[test]
+    fn watcher_batch_schedules_view_publication_within_its_own_quiet_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let (ctx, tx) = context_with_watcher(temp.path());
+        ctx.update_config(|config| config.views.enabled = true);
+        tx.send(WatcherDispatchEvent::Paths(vec![temp
+            .path()
+            .join("changed.rs")]))
+            .unwrap();
+        let applied_at = Instant::now();
+
+        let outcome = drain_watcher_events_bounded(&ctx, 1);
+
+        assert_eq!(outcome.processed, 1);
+        let due = ctx
+            .watcher_drain_slice()
+            .lock()
+            .as_ref()
+            .and_then(|state| state.view_publication_due)
+            .expect("watcher batch should schedule view publication");
+        assert!(due > applied_at);
+        assert!(
+            due <= applied_at + VIEW_PUBLICATION_QUIET_WINDOW + Duration::from_millis(250),
+            "view publication due {due:?} exceeded its own quiet window from {applied_at:?}"
+        );
+        assert!(
+            due < applied_at + crate::commands::configure::semantic_refresh_quiet_window(),
+            "view publication inherited the semantic refresh quiet window"
+        );
     }
 
     fn set_watcher_unit_test_seam(delay: Duration, thresholds: Option<(Duration, Duration)>) {
