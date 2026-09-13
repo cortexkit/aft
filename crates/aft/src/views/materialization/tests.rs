@@ -575,7 +575,6 @@ fn changed_tsconfig_relinks_unchanged_importer_with_cold_parity() {
     assert_eq!(target, "two.ts");
 }
 
-#[cfg(target_os = "macos")]
 fn assert_snapshot_parity(
     expected: &BTreeMap<String, Vec<String>>,
     actual: &BTreeMap<String, Vec<String>>,
