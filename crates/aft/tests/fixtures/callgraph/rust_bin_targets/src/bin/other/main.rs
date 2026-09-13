@@ -1,5 +1,5 @@
 mod nested;
 
 fn main() {
-    nested::nested_target();
+    crate::nested::nested_target();
 }

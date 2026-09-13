@@ -2099,6 +2099,7 @@ enum ViewSurfaceQuery {
     Default(String),
     Contains(String),
     Crate(String),
+    CrateRoot(String),
     Inline(String, Vec<String>, String),
 }
 
@@ -2130,6 +2131,9 @@ impl ViewSurfaceQuery {
     fn dependencies(&self) -> Vec<String> {
         match self {
             Self::Crate(_) => vec![VIEW_CONFIG_MEMBERSHIP_DOMAIN.into()],
+            Self::CrateRoot(file) => {
+                vec![file.clone(), VIEW_CONFIG_MEMBERSHIP_DOMAIN.into()]
+            }
             Self::Parent(file) | Self::Inline(file, ..) => {
                 vec![file.clone(), VIEW_RUST_MODULE_DOMAIN.into()]
             }
@@ -2160,6 +2164,7 @@ impl ViewSurfaceQuery {
             Self::Default(file) => surface_value(&index.default_export(file)),
             Self::Contains(file) => surface_value(&index.contains_file(file)),
             Self::Crate(name) => surface_value(&index.crate_src_prefix(name)),
+            Self::CrateRoot(file) => surface_value(&index.rust_crate_root_file(file)),
             Self::Inline(file, segments, symbol) => {
                 surface_value(&index.inline_scoped_target(file, segments, symbol))
             }
@@ -2248,6 +2253,11 @@ impl<I: super::ResolverIndex> super::ResolverIndex for ViewSurfaceIndex<'_, I> {
     fn crate_src_prefix(&self, name: &str) -> Option<String> {
         let value = self.inner.crate_src_prefix(name);
         self.record(ViewSurfaceQuery::Crate(name.into()), &value);
+        value
+    }
+    fn rust_crate_root_file(&self, file: &str) -> Option<String> {
+        let value = self.inner.rust_crate_root_file(file);
+        self.record(ViewSurfaceQuery::CrateRoot(file.into()), &value);
         value
     }
     fn inline_scoped_target(

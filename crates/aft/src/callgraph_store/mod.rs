@@ -2371,6 +2371,7 @@ trait ResolverIndex {
     fn default_export(&self, file: &str) -> Option<String>;
     fn contains_file(&self, file: &str) -> bool;
     fn crate_src_prefix(&self, crate_name: &str) -> Option<String>;
+    fn rust_crate_root_file(&self, caller_file: &str) -> Option<String>;
     fn inline_scoped_target(
         &self,
         caller_file: &str,
@@ -2465,6 +2466,19 @@ impl ResolverIndex for ProjectIndex<'_> {
             })
             .get(crate_name)
             .cloned()
+    }
+
+    fn rust_crate_root_file(&self, caller_file: &str) -> Option<String> {
+        let paths = FactPaths {
+            root: &self.project_root,
+            facts: self.facts.as_ref(),
+        };
+        callgraph::rust_crate_root_file_for_caller(
+            &self.project_root,
+            &self.project_root.join(caller_file),
+            &paths,
+        )
+        .map(|path| relative_path(&self.project_root, &path))
     }
 
     fn inline_scoped_target(
@@ -2840,6 +2854,20 @@ impl ResolverIndex for DiskProjectIndex<'_> {
             })
             .get(crate_name)
             .cloned()
+    }
+
+    fn rust_crate_root_file(&self, caller_file: &str) -> Option<String> {
+        let disk = DiskFacts::new(self.project_root);
+        let paths = FactPaths {
+            root: self.project_root,
+            facts: &disk,
+        };
+        callgraph::rust_crate_root_file_for_caller(
+            self.project_root,
+            &self.project_root.join(caller_file),
+            &paths,
+        )
+        .map(|path| relative_path(self.project_root, &path))
     }
 
     fn inline_scoped_target(
@@ -9363,7 +9391,13 @@ fn rust_external_module_target(
     }
 
     let stem = declaring_file.file_stem().and_then(|stem| stem.to_str())?;
-    let module_dir = if matches!(stem, "lib" | "main" | "mod") {
+    let declaring_file = facts
+        .canonical(declaring_file)
+        .unwrap_or_else(|| declaring_file.to_path_buf());
+    let is_crate_root =
+        callgraph::rust_crate_root_file_for_caller(facts.root, &declaring_file, facts).as_ref()
+            == Some(&declaring_file);
+    let module_dir = if matches!(stem, "lib" | "main" | "mod") || is_crate_root {
         parent.to_path_buf()
     } else {
         parent.join(stem)
@@ -10504,8 +10538,13 @@ fn rust_resolve_segments_with_index<I: ResolverIndex>(
     caller_file: &str,
     segments: &[&str],
 ) -> Option<Vec<String>> {
-    let caller_segments = rust_registered_module_segments(index, caller_file)
-        .unwrap_or_else(|| rust_module_segments_for_rel(caller_file));
+    let caller_segments = if index.rust_crate_root_file(caller_file).as_deref() == Some(caller_file)
+    {
+        Vec::new()
+    } else {
+        rust_registered_module_segments(index, caller_file)
+            .unwrap_or_else(|| rust_module_segments_for_rel(caller_file))
+    };
     rust_resolve_segments_from(caller_segments, segments)
 }
 
@@ -10570,7 +10609,9 @@ fn rust_file_for_segments<I: ResolverIndex>(
     segments: &[String],
 ) -> Option<String> {
     let src_prefix = rust_src_prefix(caller_file);
-    if let Some(target) = rust_file_from_module_declarations(index, &src_prefix, segments) {
+    if let Some(target) =
+        rust_file_from_module_declarations(index, caller_file, &src_prefix, segments)
+    {
         return Some(target);
     }
     rust_file_for_src_prefix(index, &src_prefix, segments)
@@ -10578,15 +10619,18 @@ fn rust_file_for_segments<I: ResolverIndex>(
 
 fn rust_file_from_module_declarations<I: ResolverIndex>(
     index: &I,
+    caller_file: &str,
     src_prefix: &str,
     segments: &[String],
 ) -> Option<String> {
-    let mut current = [
-        format!("{src_prefix}/lib.rs"),
-        format!("{src_prefix}/main.rs"),
-    ]
-    .into_iter()
-    .find(|candidate| index.contains_file(candidate))?;
+    let mut current = index.rust_crate_root_file(caller_file).or_else(|| {
+        [
+            format!("{src_prefix}/lib.rs"),
+            format!("{src_prefix}/main.rs"),
+        ]
+        .into_iter()
+        .find(|candidate| index.contains_file(candidate))
+    })?;
     for segment in segments {
         current = index.module_target(&current, segment)?;
     }

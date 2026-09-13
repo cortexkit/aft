@@ -535,9 +535,10 @@ struct ResolvedSymbol {
 
 #[derive(Debug, Clone)]
 struct RustCrateInfo {
+    package_root: PathBuf,
     lib_name: String,
     lib_root: Option<PathBuf>,
-    main_root: Option<PathBuf>,
+    target_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -1975,7 +1976,7 @@ fn resolve_rust_module_path(caller_file: &Path, module_path: &str) -> Option<Pat
             if segments.len() == 1 {
                 return Some(canonicalize_path(caller_file));
             }
-            let mut target_segments = rust_module_segments_for_file(&base.src_dir, caller_file)?;
+            let mut target_segments = rust_module_segments_for_file(&base, caller_file)?;
             target_segments.extend(segments[1..].iter().cloned());
             resolve_rust_module_segments(&base, &target_segments)
         }
@@ -1983,7 +1984,7 @@ fn resolve_rust_module_path(caller_file: &Path, module_path: &str) -> Option<Pat
             let crate_root = find_rust_crate_root(caller_file)?;
             let crate_info = rust_crate_info(&crate_root)?;
             let base = rust_module_base_for_caller(&crate_info, caller_file)?;
-            let mut target_segments = rust_module_segments_for_file(&base.src_dir, caller_file)?;
+            let mut target_segments = rust_module_segments_for_file(&base, caller_file)?;
             target_segments.pop();
             target_segments.extend(segments[1..].iter().cloned());
             resolve_rust_module_segments(&base, &target_segments)
@@ -2215,13 +2216,18 @@ fn read_rust_crate_info(crate_root: &Path) -> Option<RustCrateInfo> {
         .unwrap_or_else(|| crate_root.join("src/lib.rs"));
     let lib_root = lib_root.is_file().then(|| canonicalize_path(&lib_root));
 
-    let main_root = crate_root.join("src/main.rs");
-    let main_root = main_root.is_file().then(|| canonicalize_path(&main_root));
-
     Some(RustCrateInfo {
+        package_root: canonicalize_path(crate_root),
         lib_name,
         lib_root,
-        main_root,
+        target_roots: rust_target_roots(
+            crate_root,
+            &cargo,
+            &FactPaths {
+                root: crate_root,
+                facts: &DiskFacts::new(crate_root),
+            },
+        ),
     })
 }
 
@@ -2230,25 +2236,152 @@ fn rust_manifest_value(path: &Path) -> Option<toml::Value> {
     toml::from_str(&source).ok()
 }
 
+fn rust_target_roots(
+    crate_root: &Path,
+    cargo: &toml::Value,
+    facts: &FactPaths<'_>,
+) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for (table, directory, auto_key) in [
+        ("bin", "src/bin", "autobins"),
+        ("example", "examples", "autoexamples"),
+        ("test", "tests", "autotests"),
+        ("bench", "benches", "autobenches"),
+    ] {
+        if let Some(targets) = cargo.get(table).and_then(toml::Value::as_array) {
+            for path in targets.iter().filter_map(|target| {
+                target
+                    .get("path")
+                    .and_then(toml::Value::as_str)
+                    .map(|path| crate_root.join(path))
+            }) {
+                if facts.is_file(&path) {
+                    roots.push(facts.canonical(&path).unwrap_or(path));
+                }
+            }
+        }
+        let enabled = cargo
+            .get("package")
+            .and_then(|package| package.get(auto_key))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true);
+        if !enabled {
+            continue;
+        }
+        let directory = crate_root.join(directory);
+        for entry in facts.list_dir(&directory) {
+            let path = directory.join(byte_path(&entry.name));
+            let root = match entry.kind {
+                EntryKind::Regular
+                    if path.extension().and_then(|ext| ext.to_str()) == Some("rs") =>
+                {
+                    Some(path)
+                }
+                EntryKind::Directory => Some(path.join("main.rs")),
+                _ => None,
+            };
+            if let Some(root) = root.filter(|root| facts.is_file(root)) {
+                roots.push(facts.canonical(&root).unwrap_or(root));
+            }
+        }
+    }
+    if cargo
+        .get("package")
+        .and_then(|package| package.get("autobins"))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true)
+    {
+        let main = crate_root.join("src/main.rs");
+        if facts.is_file(&main) {
+            roots.push(facts.canonical(&main).unwrap_or(main));
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+pub(crate) fn rust_crate_root_file_for_caller(
+    project_root: &Path,
+    caller_file: &Path,
+    facts: &FactPaths<'_>,
+) -> Option<PathBuf> {
+    let caller = facts
+        .canonical(caller_file)
+        .unwrap_or_else(|| caller_file.to_path_buf());
+    let mut current = caller.parent();
+    let crate_root = loop {
+        let dir = current?;
+        if facts.is_file(&dir.join("Cargo.toml")) {
+            break dir.to_path_buf();
+        }
+        if dir == project_root {
+            return None;
+        }
+        current = dir.parent();
+    };
+    let bytes = facts.attributed_bytes(&crate_root.join("Cargo.toml"))?;
+    let cargo: toml::Value = toml::from_str(std::str::from_utf8(&bytes).ok()?).ok()?;
+    let lib = cargo
+        .get("lib")
+        .and_then(|lib| lib.get("path"))
+        .and_then(toml::Value::as_str)
+        .map(|path| crate_root.join(path))
+        .unwrap_or_else(|| crate_root.join("src/lib.rs"));
+    let lib = facts
+        .is_file(&lib)
+        .then(|| facts.canonical(&lib).unwrap_or(lib));
+    if lib.as_ref() == Some(&caller) {
+        return lib;
+    }
+    let target = rust_target_roots(&crate_root, &cargo, facts)
+        .into_iter()
+        .filter(|root| {
+            let default_main = **root == crate_root.join("src/main.rs");
+            root.parent()
+                .is_some_and(|dir| caller == **root || (!default_main && caller.starts_with(dir)))
+        })
+        .max_by_key(|root| {
+            (
+                caller == *root,
+                root.parent()
+                    .map(|dir| dir.components().count())
+                    .unwrap_or(0),
+            )
+        });
+    if target.is_some() {
+        return target;
+    }
+    lib
+}
+
 fn rust_module_base_for_caller(
     crate_info: &RustCrateInfo,
     caller_file: &Path,
 ) -> Option<RustModuleBase> {
     let caller = canonicalize_path(caller_file);
-    if crate_info.main_root.as_ref() == Some(&caller) {
-        return rust_main_module_base(crate_info);
+    if crate_info.lib_root.as_ref() == Some(&caller) {
+        return rust_lib_module_base(crate_info);
     }
-    rust_lib_module_base(crate_info).or_else(|| rust_main_module_base(crate_info))
+    crate_info
+        .target_roots
+        .iter()
+        .filter_map(|root_file| {
+            let src_dir = root_file.parent()?;
+            let default_main = *root_file == crate_info.package_root.join("src/main.rs");
+            (caller == *root_file || (!default_main && caller.starts_with(src_dir))).then(|| {
+                RustModuleBase {
+                    src_dir: src_dir.to_path_buf(),
+                    root_file: root_file.clone(),
+                }
+            })
+        })
+        .max_by_key(|base| (caller == base.root_file, base.src_dir.components().count()))
+        .or_else(|| rust_lib_module_base(crate_info))
 }
 
 fn rust_lib_module_base(crate_info: &RustCrateInfo) -> Option<RustModuleBase> {
     let root_file = crate_info.lib_root.clone()?;
-    let src_dir = root_file.parent()?.to_path_buf();
-    Some(RustModuleBase { src_dir, root_file })
-}
-
-fn rust_main_module_base(crate_info: &RustCrateInfo) -> Option<RustModuleBase> {
-    let root_file = crate_info.main_root.clone()?;
     let src_dir = root_file.parent()?.to_path_buf();
     Some(RustModuleBase { src_dir, root_file })
 }
@@ -2274,9 +2407,12 @@ fn resolve_rust_module_segments(base: &RustModuleBase, segments: &[String]) -> O
     None
 }
 
-fn rust_module_segments_for_file(src_dir: &Path, file: &Path) -> Option<Vec<String>> {
-    let src_dir = canonicalize_path(src_dir);
+fn rust_module_segments_for_file(base: &RustModuleBase, file: &Path) -> Option<Vec<String>> {
+    let src_dir = canonicalize_path(&base.src_dir);
     let file = canonicalize_path(file);
+    if file == canonicalize_path(&base.root_file) {
+        return Some(Vec::new());
+    }
     let rel = file.strip_prefix(&src_dir).ok()?;
     let mut parts: Vec<String> = rel
         .components()
