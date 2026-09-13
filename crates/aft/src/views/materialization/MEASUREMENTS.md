@@ -223,3 +223,46 @@ Measured implementation: `f143185c`; observed `2026-09-13T01:12:24Z`. Command: `
 **Shipping criterion remains unmet.** Only HEAD → A beats legacy to correctness; views CPU is higher on every row. The offline 8.766 s result must not be substituted for the drill's 18–24 s derived phase. Legacy times also increased substantially versus the retained before table, so cross-run wall-time changes are not a controlled speedup claim. Within the final run, there is another ~23–27 s between switch initiation and the final publication event's own measured duration, including the earlier pending publication and semantic readiness work; that is outside this materialization-only change. Final published-event puts are zero, but earlier pending forward events put 269 / 13 blobs, and embeddings remain 3 / 1 on forward legs. The generated script's static zero-embedding narrative is not evidence.
 
 The next measured offline CPU/wall buckets are resolver/surface recording (~2.11 s) and ref/edge emission (~2.08 s). Resolution still runs once per reference. A cache keyed only by `(dependent, import binding)` would be unsound: namespace member accesses differ by `full_ref`/`short_name`, value refs apply callable-target checks, and Rust resolution consumes additional raw-reference context. A narrower JS/TS target lookup memo could preserve those inputs and replay both surface queries and dependency probes, but has not been implemented or claimed here. Independently, the dependency-basis set is reconstructed per reference in the existing selected loop; hoisting that immutable per-caller set is a lower-risk next experiment. These follow-ups and normalized binding storage need their own work guards and same-input measurements. No unmeasured second optimization was included to make this run appear to pass.
+
+## In-situ publication attribution and release drill (2026-09-13)
+
+The publication profile now reports the materializer's existing phase timers on the root-attributed `index_event kind=view_publication` line. It also distinguishes the `apply_manifest_diff` call from generation clone and publication-closure durability. The old `materialize_ms` field incorrectly repeated the whole `derived_ms` phase; it now measures only the materialization call. `derived_ms` remains the cancellation/health phase boundary and therefore includes clone, materialization, trigram creation and closure durability.
+
+A fresh-storage, pre-attribution-fix both-arm drill (`target/branch-drill-prefixed.{json,md}` and `.stderr.log`) had one pending and one published event per switch. Every pending event had `derived_ms=0`; only the published event materialized. Thus there are two publication attempts, but **not two materializations** for one switch. The pending attempt assembled HEAD and filled missing immutable blobs while semantic data was unavailable; the semantic-ready attempt adopted those blobs and performed the sole derived build.
+
+The final release drill reused that isolated storage so its warm-up measured the same already-built caches rather than repeating the 15-minute cold semantic build. Command: `scripts/views-branch-drill.sh --mode both --binary "$PWD/target/release/aft" --storage "$PWD/target/branch-drill-prefixed"`. Reports are retained as `target/branch-drill-final.{json,md}` and `.stderr.log`; the historical investigation reports were restored. The designated opencode checkout was restored clean at `5716f8ba60e79ec60ec485b6e5291c0b0bc1f252`.
+
+### Offline and daemon materialization phases
+
+All daemon rows below are the one published event for that switch. Times are milliseconds. Nested join rows are still subdivisions of `selected join`, not additional time. Small differences between the displayed phase sum and materialization call are connection setup/close, fingerprinting and integer truncation.
+
+| operation | load/select | delete rows | owned decode/insert | selected join | binding writes | ref/edge emission | commit | materialization call | closure durability | derived phase |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Offline persistent surfaces | 616 | 1,043 | 565 | 3,600 | 232 | 2,079 | 565 | **8,766** | not measured | not measured |
+| Daemon HEAD → A | 1,054 | 820 | 496 | 3,463 | 224 | 1,820 | 442 | **8,482** | 2,502 | 10,986 |
+| Daemon A → HEAD | 1,220 | 754 | 628 | 3,858 | 193 | 2,229 | 498 | **9,453** | 3,791 | 13,245 |
+| Daemon HEAD → B | 1,245 | 805 | 518 | 3,654 | 221 | 2,218 | 552 | **9,296** | 3,377 | 12,673 |
+| Daemon B → HEAD | 1,111 | 715 | 576 | 3,987 | 201 | 2,349 | 560 | **9,577** | 3,622 | 13,200 |
+
+| operation | join decode/index | join surface replay | join deferred caller decode | join resolve/record | join dependency union |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Offline persistent surfaces | 895 | 52 | 443 | 2,111 | 74 |
+| Daemon HEAD → A | 994 | 58 | 415 | 1,911 | 59 |
+| Daemon A → HEAD | 1,125 | 55 | 687 | 1,913 | 56 |
+| Daemon HEAD → B | 1,053 | 54 | 499 | 1,965 | 60 |
+| Daemon B → HEAD | 1,098 | 51 | 721 | 2,034 | 61 |
+
+The materialization itself is 8.482–9.577 s in situ, bracketing the 8.766 s offline result. No phase exhibits the former 2–3× inflation, and clonefile is 0 ms in every row. The apparent 18–24 s discrepancy came from treating the publication's broader derived phase as the materialization timer, plus run-to-run contention: the fresh-storage profiling run measured 12.819–14.539 s derived, while the final run measured 10.986–13.245 s. In the final run, 2.502–3.791 s is required publication-closure checkpoint/fsync and is absent from the offline benchmark. These numbers do not support clone warming, lower-priority deferral, or publication cancellation as a materialization optimization.
+
+### Publication count and final acceptance
+
+| switch | publication events | pending derived ms | published materializations | views CPU s | legacy CPU s | views correct ms | legacy correct ms | views minus legacy correct ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HEAD → A | 2 | 0 | **1** | 33.03 | 40.17 | 32,792 | 34,211 | -1,419 |
+| A → HEAD | 2 | 0 | **1** | 58.26 | 32.62 | 38,008 | 27,466 | +10,542 |
+| HEAD → B | 2 | 0 | **1** | 54.40 | 35.85 | 35,291 | 29,947 | +5,344 |
+| B → HEAD | 2 | 0 | **1** | 58.63 | 32.58 | 38,225 | 27,160 | +11,065 |
+
+Every correctness probe passed and the drill reported no defects. **The shipping criterion remains unmet:** views must beat legacy to correctness on all four rows with CPU not above legacy. Views wins correctness and CPU only on HEAD → A. It is 5.344–11.065 s slower on the other three rows and uses 18.55–26.05 more CPU-seconds there.
+
+The next wall bucket is outside the final publication event: correctness minus that event's own total is 19.551 / 22.117 / 20.414 / 22.418 s. That interval includes watcher application, semantic readiness, the pending assembly and other concurrent maintenance. Within the sole materialization, selected join (3.463–3.987 s) and ref/edge emission (1.820–2.349 s) remain the largest buckets. Optimizing either requires a separate guarded change; the present measurements do not justify changing publication orchestration or durability semantics.
