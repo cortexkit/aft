@@ -517,8 +517,9 @@ pub struct PublicationRequest<'a> {
 /// tests. Production callers do not need to retain the sequence.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PublicationStep {
-    /// The SQLite WAL checkpoint completed; fsync has not begun yet.
+    /// One blob database's SQLite WAL checkpoint completed; fsync has not begun.
     BlobWalCheckpointed,
+    /// One blob database's main file, WAL, and parent have been fsynced.
     BlobWalFsync,
     /// The derived database's committed WAL and main file have been fsynced
     /// without moving WAL pages into the main file.
@@ -705,20 +706,25 @@ impl ViewStore {
             ));
         }
 
+        let blob_durability_barrier = crate::blob_store::publication_durability_barrier();
         for path in &request.artifacts.blob_databases {
-            checkpoint_and_sync_database(path, observer)?;
+            if !crate::blob_store::blob_database_needs_durability(path) {
+                continue;
+            }
+            checkpoint_and_sync_database(path, observer, true)?;
+            crate::blob_store::mark_blob_database_durable(path);
         }
-        observe(observer, PublicationStep::BlobWalFsync);
 
         sync_database_wal_without_checkpoint(&request.artifacts.derived_database, observer)?;
         sync_file_and_parent(&request.artifacts.trigram_artifact)?;
         observe(observer, PublicationStep::DerivedAndTrigramDurable);
 
-        checkpoint_and_sync_database(&request.artifacts.alias_database, observer)?;
+        checkpoint_and_sync_database(&request.artifacts.alias_database, observer, false)?;
         observe(observer, PublicationStep::AliasRowsDurable);
 
         probe_publication_closure(request.manifest, &request.closure_requirements, closure)?;
         observe(observer, PublicationStep::ClosureProbed);
+        drop(blob_durability_barrier);
 
         write_manifest_once(&manifest_path, request.manifest)?;
         observe(observer, PublicationStep::ManifestFileWritten);
@@ -926,6 +932,7 @@ fn sync_database_wal_without_checkpoint(
 fn checkpoint_and_sync_database(
     path: &Path,
     observer: Option<&dyn PublicationObserver>,
+    observe_blob_database: bool,
 ) -> Result<()> {
     if !path.is_file() {
         return Err(ViewError::InvalidManifest(format!(
@@ -936,7 +943,9 @@ fn checkpoint_and_sync_database(
     let connection = Connection::open(path)?;
     configure_connection(&connection)?;
     connection.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
-    observe(observer, PublicationStep::BlobWalCheckpointed);
+    if observe_blob_database {
+        observe(observer, PublicationStep::BlobWalCheckpointed);
+    }
     drop(connection);
     sync_file(path)?;
     // SQLite deletes the WAL when the last connection to the database closes,
@@ -951,7 +960,11 @@ fn checkpoint_and_sync_database(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(ViewError::Io(error)),
     }
-    sync_parent(path)
+    sync_parent(path)?;
+    if observe_blob_database {
+        observe(observer, PublicationStep::BlobWalFsync);
+    }
+    Ok(())
 }
 
 fn checkpoint_pointer_after_cas(path: &Path) -> Result<()> {
@@ -1120,7 +1133,9 @@ mod tests {
             let handles: Vec<_> = (0..8)
                 .map(|_| {
                     let artifact = artifact.clone();
-                    std::thread::spawn(move || checkpoint_and_sync_database(&artifact, None))
+                    std::thread::spawn(move || {
+                        checkpoint_and_sync_database(&artifact, None, false)
+                    })
                 })
                 .collect();
             for handle in handles {

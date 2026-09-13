@@ -1,3 +1,4 @@
+use aft::blob_store::{BlobPlane, BlobStore, SemanticKey};
 use aft::views::{
     ArtifactPlane, ClosureRequirements, Manifest, ManifestEntry, PublicationArtifacts,
     PublicationClosure, PublicationObserver, PublicationRequest, PublicationStep, PublishOutcome,
@@ -98,7 +99,7 @@ struct BeforeTrigramSignal {
 impl PublicationObserver for BeforeTrigramSignal {
     fn reached(&self, step: PublicationStep) {
         if step == PublicationStep::BlobWalCheckpointed
-            && self.checkpoints.fetch_add(1, Ordering::SeqCst) == 2
+            && self.checkpoints.fetch_add(1, Ordering::SeqCst) == 1
         {
             let _ = self.reached.send(());
         }
@@ -120,6 +121,91 @@ fn request<'a>(
             referenced_aliases: BTreeSet::from(["proven-git-oid".to_string()]),
         },
     }
+}
+
+fn blob_store_artifacts(
+    root: &Path,
+    semantic: &BlobStore,
+    callgraph: &BlobStore,
+) -> PublicationArtifacts {
+    let derived = root.join("blob-derived.sqlite");
+    let aliases = root.join("blob-oid-alias.sqlite");
+    for path in [&derived, &aliases] {
+        sqlite(path);
+    }
+    let trigram = root.join("blob-trigram.bin");
+    fs::write(&trigram, "trigram state").unwrap();
+    PublicationArtifacts {
+        blob_databases: vec![semantic.path().to_path_buf(), callgraph.path().to_path_buf()],
+        derived_database: derived,
+        trigram_artifact: trigram,
+        alias_database: aliases,
+    }
+}
+
+fn observed_blob_durability_steps(recorded: &RecordedSteps) -> (usize, usize) {
+    let steps = recorded.0.lock().unwrap();
+    (
+        steps
+            .iter()
+            .filter(|step| **step == PublicationStep::BlobWalCheckpointed)
+            .count(),
+        steps
+            .iter()
+            .filter(|step| **step == PublicationStep::BlobWalFsync)
+            .count(),
+    )
+}
+
+#[test]
+fn clean_blob_stores_skip_checkpoint_and_fsync_until_a_put_marks_one_dirty() {
+    let directory = tempdir().unwrap();
+    let mut semantic =
+        BlobStore::open(directory.path(), "durability-family", BlobPlane::Semantic).unwrap();
+    let callgraph =
+        BlobStore::open(directory.path(), "durability-family", BlobPlane::Callgraph).unwrap();
+    let files = blob_store_artifacts(directory.path(), &semantic, &callgraph);
+    let store = ViewStore::open(directory.path(), "durability-view").unwrap();
+    let manifest = manifest();
+
+    store
+        .publish(
+            &request("generation-initial", None, &manifest, files_for_retry(&files)),
+            &CompleteClosure,
+        )
+        .unwrap();
+
+    let clean = RecordedSteps::default();
+    store
+        .publish_with_observer(
+            &request(
+                "generation-clean",
+                Some("generation-initial"),
+                &manifest,
+                files_for_retry(&files),
+            ),
+            &CompleteClosure,
+            Some(&clean),
+        )
+        .unwrap();
+    assert_eq!(observed_blob_durability_steps(&clean), (0, 0));
+
+    let key = SemanticKey::for_current(b"changed", b"src/main.rs", "model").full_key();
+    semantic.put(&key, b"payload").unwrap();
+    let dirty = RecordedSteps::default();
+    store
+        .publish_with_observer(
+            &request(
+                "generation-dirty",
+                Some("generation-clean"),
+                &manifest,
+                files,
+            ),
+            &CompleteClosure,
+            Some(&dirty),
+        )
+        .unwrap();
+    assert_eq!(observed_blob_durability_steps(&dirty), (1, 1));
 }
 
 #[test]
@@ -166,11 +252,11 @@ fn publication_makes_dependencies_durable_before_sqlite_pointer_visibility() {
         *recorded.0.lock().unwrap(),
         vec![
             PublicationStep::BlobWalCheckpointed,
+            PublicationStep::BlobWalFsync,
             PublicationStep::BlobWalCheckpointed,
             PublicationStep::BlobWalFsync,
             PublicationStep::DerivedWalFsynced,
             PublicationStep::DerivedAndTrigramDurable,
-            PublicationStep::BlobWalCheckpointed,
             PublicationStep::AliasRowsDurable,
             PublicationStep::ClosureProbed,
             PublicationStep::ManifestFileWritten,

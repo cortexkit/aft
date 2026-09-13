@@ -4,10 +4,12 @@
 //! caller supplies the family (`artifact_key`); this module maps it to the
 //! fixed on-disk layout and never derives a family from a checkout path.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, ErrorCode, OptionalExtension, TransactionBehavior};
@@ -19,6 +21,60 @@ pub const BUSY_TIMEOUT_MS: u64 = 5_000;
 /// SQLite's documented connection default.  The blob store reads this value
 /// after opening instead of overriding it so future SQLite defaults are caught.
 pub const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
+
+#[derive(Clone, Copy)]
+struct BlobDurabilityState {
+    dirty: bool,
+}
+
+static BLOB_DURABILITY: OnceLock<Mutex<HashMap<PathBuf, BlobDurabilityState>>> = OnceLock::new();
+static BLOB_DURABILITY_BARRIER: Mutex<()> = Mutex::new(());
+
+fn durability_states() -> &'static Mutex<HashMap<PathBuf, BlobDurabilityState>> {
+    BLOB_DURABILITY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_blob_database(path: &Path) {
+    durability_states()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(path.to_path_buf())
+        .or_insert(BlobDurabilityState { dirty: true });
+}
+
+fn mark_blob_database_dirty(path: &Path) {
+    durability_states()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(path.to_path_buf())
+        .and_modify(|state| state.dirty = true)
+        .or_insert(BlobDurabilityState { dirty: true });
+}
+
+pub(crate) fn blob_database_needs_durability(path: &Path) -> bool {
+    let mut states = durability_states()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    states
+        .entry(path.to_path_buf())
+        .or_insert(BlobDurabilityState { dirty: true })
+        .dirty
+}
+
+pub(crate) fn mark_blob_database_durable(path: &Path) {
+    durability_states()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(path.to_path_buf())
+        .and_modify(|state| state.dirty = false)
+        .or_insert(BlobDurabilityState { dirty: false });
+}
+
+pub(crate) fn publication_durability_barrier() -> MutexGuard<'static, ()> {
+    BLOB_DURABILITY_BARRIER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Payload encodings and the key producers that name them are pinned together.
 /// A payload format change must update the corresponding producer string in the
@@ -421,6 +477,7 @@ impl BlobStore {
         configure_connection(&connection)?;
         ensure_schema(&mut connection)?;
         let pragmas = read_and_assert_pragmas(&connection)?;
+        register_blob_database(&path);
         Ok(Self {
             artifact_key: artifact_key.to_owned(),
             plane,
@@ -472,6 +529,10 @@ impl BlobStore {
     /// bytes fail a later integrity check; callers must use a new producer key.
     pub fn put(&mut self, full_key: &FullKey, payload: &[u8]) -> Result<PutReport, BlobStoreError> {
         self.ensure_key_plane(full_key)?;
+        let _durability = publication_durability_barrier();
+        // Mark before SQLite begins so publication cannot observe a clean store
+        // while a commit that its manifest may reference is in flight.
+        mark_blob_database_dirty(&self.path);
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -560,6 +621,8 @@ impl BlobStore {
     /// table.  Subsequent puts report `quarantined` until a changed key is used.
     pub fn quarantine(&mut self, full_key: &FullKey) -> Result<(), BlobStoreError> {
         self.ensure_key_plane(full_key)?;
+        let _durability = publication_durability_barrier();
+        mark_blob_database_dirty(&self.path);
         self.connection.execute(
             "INSERT INTO blob_quarantine (full_key) VALUES (?1)
              ON CONFLICT(full_key) DO NOTHING",
