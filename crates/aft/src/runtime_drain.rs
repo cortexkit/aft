@@ -2060,18 +2060,11 @@ fn watcher_path_is_generated_for_callgraph(ctx: &AppContext, path: &Path) -> boo
         .is_some_and(|project_root| crate::inspect::is_generated_file(&project_root, path))
 }
 
-fn legacy_callgraph_refresh_enabled(ctx: &AppContext) -> bool {
-    !(ctx.config().views.enabled
-        && ctx
-            .view_runtime_snapshot()
-            .is_some_and(|view| view.generation.is_some() && view.manifest.is_some()))
-}
-
 pub fn refresh_callgraph_store_for_watcher(
     ctx: &AppContext,
     changed: &HashSet<std::path::PathBuf>,
 ) {
-    if !ctx.heavy_root_work_allowed() || !legacy_callgraph_refresh_enabled(ctx) {
+    if !ctx.heavy_root_work_allowed() {
         return;
     }
     let refresh_paths = changed
@@ -2336,7 +2329,7 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 &mut remaining,
                 started,
                 WATCHER_DRAIN_SLICE_BUDGET,
-                heavy_root_work_allowed && legacy_callgraph_refresh_enabled(ctx),
+                heavy_root_work_allowed,
                 |ctx, changed| {
                     let _ = ctx.enqueue_callgraph_store_refresh_for_generation(
                         changed.iter().cloned(),
@@ -4686,7 +4679,7 @@ mod tests {
 mod watcher_slice_tests {
     use super::*;
     use crate::config::Config;
-    use crate::context::{default_language_provider_factory, AppContext, ViewRuntimeSnapshot};
+    use crate::context::{default_language_provider_factory, AppContext};
 
     fn context_with_watcher(
         root: &Path,
@@ -4707,53 +4700,6 @@ mod watcher_slice_tests {
 
     fn clear_watcher_unit_test_seam() {
         set_watcher_unit_test_seam(Duration::ZERO, None);
-    }
-
-    #[test]
-    fn watcher_callgraph_work_routes_exclusively_by_current_view_generation() {
-        fn refresh_count(ctx: &AppContext, source: PathBuf) -> usize {
-            let mut paths = VecDeque::from([source]);
-            let mut remaining = paths.len();
-            let mut count = 0;
-            assert!(apply_callgraph_watcher_phase(
-                ctx,
-                &mut paths,
-                &mut remaining,
-                Instant::now(),
-                WATCHER_DRAIN_SLICE_BUDGET,
-                legacy_callgraph_refresh_enabled(ctx),
-                |_, _| count += 1,
-            ));
-            count
-        }
-
-        let views_off_root = tempfile::tempdir().unwrap();
-        let (views_off, _) = context_with_watcher(views_off_root.path());
-        assert_eq!(
-            refresh_count(&views_off, views_off_root.path().join("changed.rs")),
-            1
-        );
-
-        let views_on_root = tempfile::tempdir().unwrap();
-        let (views_on, _) = context_with_watcher(views_on_root.path());
-        views_on.update_config(|config| config.views.enabled = true);
-        views_on.install_view_runtime(
-            ViewRuntimeSnapshot {
-                query_pin: None,
-                storage: views_on_root.path().join("storage"),
-                family: "family".to_owned(),
-                scope: "scope".to_owned(),
-                view_dir: views_on_root.path().join("view"),
-                generation: Some("1-current".to_owned()),
-                manifest: Some(crate::views::Manifest::new([]).unwrap()),
-                pending_paths: BTreeSet::new(),
-            },
-            None,
-        );
-        assert_eq!(
-            refresh_count(&views_on, views_on_root.path().join("changed.rs")),
-            0
-        );
     }
 
     #[test]
