@@ -249,13 +249,11 @@ const BashFeaturesSchema = z.object({
   host_fallback: z.boolean().optional(),
   /**
    * Allow OpenCode subagents to use real background bash (`background: true`
-   * and auto-promotion). Default: false — subagents fall back to synchronous
-   * foreground polling because they can't survive turn-end to receive the
-   * wake-up reminder. When true, subagents get the same bg semantics as
-   * primary sessions and MUST explicitly wait for their bg tasks with
-   * `bash_status({ taskId, exit: true, ... })` before returning to parent.
-   * Setting this is essentially a contract with your subagent prompts that
-   * they know how to use bash_status's wait mode.
+   * and auto-promotion). Default: true. When false, subagent background
+   * requests are converted to synchronous foreground polling. Workers are
+   * multi-turn and can use `bash_watch` to wait for completion; one-shot
+   * subagents that do not wait can set this to false.
+   * `bash_status({ taskId, exit: true, ... })` remains available for explicit waits.
    */
   subagent_background: z.boolean().optional(),
   /**
@@ -846,7 +844,7 @@ export interface ResolvedBashConfig {
   background: boolean;
   /** Emergency local execution gate. Default false, including for `bash: true`. */
   host_fallback: boolean;
-  /** See BashFeaturesSchema.subagent_background. Default false. */
+  /** See BashFeaturesSchema.subagent_background. Default true. */
   subagent_background: boolean;
   /** Detach wait:true bash calls on user messages; `&detach` overrides and is stripped before delivery. */
   detach_on_user_message: boolean;
@@ -920,11 +918,10 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     (typeof top === "object" && top !== null ? top.long_running_reminder_interval_ms : undefined) ??
     legacy?.long_running_reminder_interval_ms;
 
-  // subagent_background defaults FALSE everywhere (object form, legacy form,
-  // surface default). It's an explicit opt-in even when bash: true. Top-level
-  // wins; only the object form can set it.
+  // subagent_background defaults true everywhere (object form, legacy form,
+  // surface default). Top-level wins; only the object form can set it.
   const topSubagentBg =
-    typeof top === "object" && top !== null ? top.subagent_background === true : false;
+    typeof top === "object" && top !== null ? top.subagent_background !== false : true;
   const topDetachOnUserMessage =
     typeof top === "object" && top !== null ? (top.detach_on_user_message ?? true) : true;
 
@@ -946,7 +943,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     compress: false,
     background: false,
     host_fallback: false,
-    subagent_background: false,
+    subagent_background: true,
     detach_on_user_message: true,
     long_running_reminder_enabled: reminderEnabled,
     long_running_reminder_interval_ms: reminderInterval,

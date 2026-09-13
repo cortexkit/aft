@@ -2066,7 +2066,7 @@ fn resolve_bash_config(
         .unwrap_or(false);
     let top_subagent_background = top_features
         .and_then(|features| features.subagent_background)
-        .unwrap_or(false);
+        .unwrap_or(true);
     let top_detach_on_user_message = top_features
         .and_then(|features| features.detach_on_user_message)
         .unwrap_or(true);
@@ -2086,7 +2086,7 @@ fn resolve_bash_config(
         compress: false,
         background: false,
         host_fallback: false,
-        subagent_background: false,
+        subagent_background: true,
         detach_on_user_message: true,
         long_running_reminder_enabled: reminder_enabled,
         long_running_reminder_interval_ms: reminder_interval,

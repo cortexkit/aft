@@ -101,7 +101,7 @@ export function bashToolDescription(
     ? " Output is compressed by default; pass compressed: false for raw output. Piped commands run verbatim and show the pipeline's output; for AFT's test/build summary, run the runner without | head, | tail, or | grep. Pipeline-failure notes cover single top-level pipelines only; multi-statement commands (`a; b | c; d`) are not instrumented, so masked failures inside them still need explicit exit-code checks."
     : "";
   const tasks = backgroundOn
-    ? ` Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting; ${userMessageDetachDescription(detachOnUserMessage)} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch handles only a short remaining wait (default 30s, max bash.watch_sync_max_ms, 120s by default); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: "screen" }) plus bash_write.`
+    ? ` Commands run in the foreground and return inline; wait: true blocks until a long command finishes instead of auto-promoting; ${userMessageDetachDescription(detachOnUserMessage)} Use it when you need the result before doing anything else; keep it off otherwise so auto-promote can remind you while you work. Use background: true yourself ONLY when you have other useful work to do while it runs; then bash_watch handles only a short remaining wait (default 30s, max bash.watch_sync_max_ms, 120s by default); for anything longer end the turn and let the completion reminder wake you, or use bash({wait:true}) when the result is needed before anything else — never background a command and immediately bash_watch it (that wastes a turn for what foreground returns in one), and never loop bash_status to wait. A \`nohup … &\` launch still holds the call if the child keeps stdout/stderr; redirect both or use background:true. pty: true runs interactive programs (REPLs, TUIs), implies background, and is driven with bash_status({ outputMode: "screen" }) plus bash_write.`
     : " Commands run in the foreground to completion; timeout is the hard kill cap (default 30 minutes).";
   return `Execute shell commands.${compression}${tasks}
 
@@ -310,15 +310,7 @@ export function createBashTool(
       const command = rawCommand;
       const cwd = (args.workdir as string | undefined) ?? context.directory;
 
-      // Detect whether the calling session is a subagent (has a non-empty
-      // parentID). AFT bash auto-promotes long foreground tasks to background
-      // (default ~8s, configurable via bash.foreground_wait_window_ms), but a
-      // subagent terminates after its single response and cannot survive
-      // backgrounding: any task_id we returned would be unreachable because
-      // the subagent has no chance to call bash_status. So for subagents we
-      // silently treat `background: true` as `false` and ask the server to
-      // keep the call inline until the command completes or reaches its
-      // hard-kill timeout.
+      // Detect whether the calling session is a subagent (has a non-empty parentID).
       const isSubagent = await resolveIsSubagent(ctx.client, context.sessionID, context.directory);
       const backgroundDisabled = !bashCfg.background;
       const requestedWait = coerceBoolean(args.wait);

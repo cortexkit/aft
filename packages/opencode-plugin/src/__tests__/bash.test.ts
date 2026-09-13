@@ -1655,14 +1655,13 @@ function createSubagentHarness(
 }
 
 describe("OpenCode bash adapter — subagent gating", () => {
-  test("subagent + background: true is silently converted to server block-to-completion", async () => {
+  test("subagent + background: true is honoured by default", async () => {
     _resetSubagentCacheForTest();
     const { calls, tool: bash } = createSubagentHarness(() => ({
       success: true,
-      status: "completed",
-      task_id: "bash-conv",
-      exit_code: 0,
-      output: "converted output",
+      status: "running",
+      task_id: "bash-bg",
+      output: "started",
       truncated: false,
     }));
     const result = bashText(
@@ -1671,35 +1670,50 @@ describe("OpenCode bash adapter — subagent gating", () => {
         createMockSdkContext({ sessionID: "ses_subagent_a" }),
       ),
     );
-    // Result should be the actual command output, NOT a JSON refusal envelope
-    // and NOT a "Background task started" launch line.
     expect(typeof result).toBe("string");
-    expect(result as string).toContain("converted output");
-    expect(result as string).not.toContain("Background task started");
-    expect(result as string).not.toContain('"success":false');
-    // The bridge MUST have been called with background=false (silent conversion).
+    expect(result as string).toContain("started");
+    expect(result as string).toContain("bash-bg");
     const bashCall = calls.find((c) => c.command === "bash");
     expect(bashCall).toBeDefined();
-    expect(bashCall?.params.background).toBe(false);
-    expect(bashCall?.params.notify_on_completion).toBe(false);
-    expect(bashCall?.params.block_to_completion).toBe(true);
-    // Subagents must not make client-side bash_status or bash_promote calls
-    // even if the caller asked for background:true. The server owns waiting for
-    // the command to reach a terminal state.
+    expect(bashCall?.params.background).toBe(true);
+    expect(bashCall?.params.notify_on_completion).toBe(true);
+    expect(bashCall?.params.block_to_completion).toBe(false);
     expect(calls.map((c) => c.command)).toEqual(["bash"]);
-    expect(calls.find((c) => c.command === "bash_promote")).toBeUndefined();
+  });
+
+  test("subagent + background: true is converted when explicitly disabled", async () => {
+    _resetSubagentCacheForTest();
+    const { calls, tool: bash } = createSubagentHarness(
+      () => ({ success: true, status: "completed", output: "converted output" }),
+      "ses_parent_xyz",
+      { bash: { subagent_background: false } } as PluginContext["config"],
+    );
+    const result = bashText(
+      await bash.execute(
+        { command: "sleep 30", background: true, timeout: 30_000 },
+        createMockSdkContext({ sessionID: "ses_subagent_disabled" }),
+      ),
+    );
+    expect(result as string).toContain("converted output");
+    expect(calls[0].params.background).toBe(false);
+    expect(calls[0].params.notify_on_completion).toBe(false);
+    expect(calls[0].params.block_to_completion).toBe(true);
   });
 
   test("subagent forced foreground does not ask the client to promote", async () => {
     _resetSubagentCacheForTest();
-    const { calls, tool: bash } = createSubagentHarness(() => ({
-      success: true,
-      status: "completed",
-      task_id: "bash-no-promote",
-      exit_code: 0,
-      output: "finished inline",
-      truncated: false,
-    }));
+    const { calls, tool: bash } = createSubagentHarness(
+      () => ({
+        success: true,
+        status: "completed",
+        task_id: "bash-no-promote",
+        exit_code: 0,
+        output: "finished inline",
+        truncated: false,
+      }),
+      "ses_parent_xyz",
+      { bash: { subagent_background: false } } as PluginContext["config"],
+    );
 
     const result = bashText(
       await bash.execute(
@@ -1716,14 +1730,18 @@ describe("OpenCode bash adapter — subagent gating", () => {
 
   test("subagent + foreground delegates inline waiting to the server", async () => {
     _resetSubagentCacheForTest();
-    const { calls, tool: bash } = createSubagentHarness(() => ({
-      success: true,
-      status: "completed",
-      task_id: "bash-sub",
-      exit_code: 0,
-      output: "ok",
-      truncated: false,
-    }));
+    const { calls, tool: bash } = createSubagentHarness(
+      () => ({
+        success: true,
+        status: "completed",
+        task_id: "bash-sub",
+        exit_code: 0,
+        output: "ok",
+        truncated: false,
+      }),
+      "ses_parent_xyz",
+      { bash: { subagent_background: false } } as PluginContext["config"],
+    );
     const result = bashText(
       await bash.execute(
         { command: "fast-test", timeout: 30_000 },
@@ -1740,14 +1758,18 @@ describe("OpenCode bash adapter — subagent gating", () => {
 
   test("subagent + foreground without explicit timeout sizes transport to the hard cap", async () => {
     _resetSubagentCacheForTest();
-    const { calls, tool: bash } = createSubagentHarness(() => ({
-      success: true,
-      status: "completed",
-      task_id: "bash-sub2",
-      exit_code: 0,
-      output: "ok",
-      truncated: false,
-    }));
+    const { calls, tool: bash } = createSubagentHarness(
+      () => ({
+        success: true,
+        status: "completed",
+        task_id: "bash-sub2",
+        exit_code: 0,
+        output: "ok",
+        truncated: false,
+      }),
+      "ses_parent_xyz",
+      { bash: { subagent_background: false } } as PluginContext["config"],
+    );
     bashText(
       await bash.execute(
         { command: "fast-test" }, // No user timeout, so bridge timeout is 30 minutes plus 10s margin.

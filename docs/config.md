@@ -299,9 +299,10 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     // Default false.
     "background": false,
 
-    // Allow subagents to run background bash. Default false — subagent
-    // `background: true` requests are otherwise converted to foreground.
-    "subagent_background": false,
+    // Allow subagents to run background bash. When false, `background: true`
+    // is converted to a foreground call that blocks up to the hard cap. Default
+    // true because workers are multi-turn and use bash_watch to wait.
+    "subagent_background": true,
 
     // How long a foreground bash call blocks before auto-promoting the task
     // to the background. Minimum 5000; lower values are clamped up. Default 8000.

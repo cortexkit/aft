@@ -277,6 +277,8 @@ export interface BashConfig {
   background?: boolean;
   /** Permit per-command host fallback after AFT transport failure. Default false. */
   host_fallback?: boolean;
+  /** Allow subagents to use background bash; when false, requests block to completion. Default true. */
+  subagent_background?: boolean;
   /** Detach wait:true bash calls on user messages; `&detach` overrides, is stripped before delivery, and a token-only message gets a minimal replacement. */
   detach_on_user_message?: boolean;
   long_running_reminder_enabled?: boolean;
@@ -409,6 +411,8 @@ export interface ResolvedBashConfig {
   background: boolean;
   /** Emergency local execution gate. Default false, including for `bash: true`. */
   host_fallback: boolean;
+  /** Allow subagents to use background bash; default true. */
+  subagent_background: boolean;
   /** Detach wait:true bash calls on user messages; `&detach` overrides, is stripped before delivery, and a token-only message gets a minimal replacement. */
   detach_on_user_message: boolean;
   long_running_reminder_enabled?: boolean;
@@ -498,6 +502,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
     compress: false,
     background: false,
     host_fallback: false,
+    subagent_background: true,
     detach_on_user_message: true,
     long_running_reminder_enabled: reminderEnabled,
     long_running_reminder_interval_ms: reminderInterval,
@@ -519,6 +524,7 @@ export function resolveBashConfig(config: AftConfig): ResolvedBashConfig {
       compress: top.compress ?? true,
       background: top.background ?? true,
       host_fallback: top.host_fallback ?? false,
+      subagent_background: top.subagent_background ?? true,
       detach_on_user_message: topDetachOnUserMessage,
     };
   }
@@ -711,6 +717,8 @@ const BashFeaturesSchema = z.object({
   compress: z.boolean().optional(),
   background: z.boolean().optional(),
   host_fallback: z.boolean().optional(),
+  /** When false, subagent background requests block up to the hard cap. Default true for multi-turn workers using bash_watch. */
+  subagent_background: z.boolean().optional(),
   detach_on_user_message: z.boolean().optional(),
   long_running_reminder_enabled: z.boolean().optional(),
   long_running_reminder_interval_ms: z.number().int().positive().optional(),
