@@ -981,12 +981,24 @@ fn insert_resolved_file(map: &mut Map<String, Value>, project_root: &Path, file_
     );
 }
 
-fn insert_read_file(map: &mut Map<String, Value>, project_root: &Path, file_path: &str) {
-    if file_path.starts_with("issue://") || file_path.starts_with("pr://") {
+/// A GitHub resource target (`issue://…`, `pr://…`) is a scheme the command
+/// handlers route themselves (`is_github_read_target`); resolving it against
+/// the project root would turn it into a nonexistent file path. Every tool
+/// that advertises the scheme (read, outline, zoom) must go through this.
+fn insert_file_or_github_target(
+    map: &mut Map<String, Value>,
+    project_root: &Path,
+    file_path: &str,
+) {
+    if is_github_resource_target(file_path) {
         map.insert("file".to_string(), Value::String(file_path.to_string()));
     } else {
         insert_resolved_file(map, project_root, file_path);
     }
+}
+
+fn is_github_resource_target(target: &str) -> bool {
+    target.starts_with("issue://") || target.starts_with("pr://")
 }
 
 pub fn subc_translate(
@@ -1343,7 +1355,7 @@ fn translate_read(args: Value, project_root: &Path) -> Result<Translated, Transl
         .ok_or_else(|| invalid_request("'path' is required"))?;
 
     let mut out = Map::new();
-    insert_read_file(&mut out, project_root, file_path);
+    insert_file_or_github_target(&mut out, project_root, file_path);
 
     let mut start_line = map_in.get("startLine").and_then(Value::as_u64);
     let mut end_line = map_in.get("endLine").and_then(Value::as_u64);
@@ -2131,7 +2143,11 @@ fn translate_outline(args: Value, project_root: &Path) -> Result<Translated, Tra
     }
 
     if let Some(url) = target.as_str() {
-        if !files_flag && (url.starts_with("http://") || url.starts_with("https://")) {
+        if !files_flag
+            && (url.starts_with("http://")
+                || url.starts_with("https://")
+                || is_github_resource_target(url))
+        {
             out.insert("file".to_string(), Value::String(url.to_string()));
             return Ok(Translated {
                 command: "outline".into(),
@@ -2250,12 +2266,8 @@ fn translate_zoom_targets(
                     "targets[{index}].symbol must be a non-empty string"
                 ))
             })?;
-        let resolved = resolve_path_from_project_root(project_root, file_path);
         let mut target_out = Map::new();
-        target_out.insert(
-            "file".to_string(),
-            Value::String(resolved.to_string_lossy().into_owned()),
-        );
+        insert_file_or_github_target(&mut target_out, project_root, file_path);
         target_out.insert("symbol".to_string(), Value::String(symbol.to_string()));
         target_out.insert(
             "target_label".to_string(),
@@ -2344,7 +2356,7 @@ fn translate_zoom(args: Value, project_root: &Path) -> Result<Translated, Transl
     if let Some(url) = url {
         out.insert("file".to_string(), Value::String(url.to_string()));
     } else if let Some(file_path) = file_path {
-        insert_resolved_file(&mut out, project_root, file_path);
+        insert_file_or_github_target(&mut out, project_root, file_path);
     }
 
     if let Some(symbols) = map_in.get("symbols") {
@@ -2499,6 +2511,54 @@ mod tests {
         let error = subc_translate_owned("read", canonically_different, project)
             .expect_err("different Unicode normalization");
         assert_eq!(error.code, "invalid_request");
+    }
+
+    #[test]
+    fn github_resource_targets_pass_through_read_outline_and_zoom_unresolved() {
+        // The command handlers route `issue://` and `pr://` themselves; a
+        // translate step that resolved them against the project root produced
+        // `/project/issue:/310` and a "file not found" from every tool but
+        // `read`. The scheme must survive translation in all three tools and
+        // in zoom's batched targets.
+        let project = Path::new("/project");
+        for tool in ["read", "outline"] {
+            let args = if tool == "read" {
+                serde_json::json!({ "path": "issue://310" })
+            } else {
+                serde_json::json!({ "target": "pr://302" })
+            };
+            let translated = subc_translate_owned(tool, args, project).expect(tool);
+            let file = translated.args["file"].as_str().expect("file");
+            assert!(
+                file.starts_with("issue://") || file.starts_with("pr://"),
+                "{tool}: GitHub target was resolved as a path: {file}"
+            );
+        }
+        let zoom = subc_translate_owned(
+            "zoom",
+            serde_json::json!({ "path": "pr://302", "symbols": "4" }),
+            project,
+        )
+        .expect("zoom path form");
+        assert_eq!(zoom.args["file"].as_str(), Some("pr://302"));
+        let batched = subc_translate_owned(
+            "zoom",
+            serde_json::json!({ "targets": [{ "path": "issue://310", "symbol": "1" }] }),
+            project,
+        )
+        .expect("zoom targets form");
+        assert_eq!(
+            batched.args["targets"][0]["file"].as_str(),
+            Some("issue://310")
+        );
+        // A plain relative path still resolves against the project root.
+        let plain = subc_translate_owned(
+            "outline",
+            serde_json::json!({ "target": "src/lib.rs" }),
+            project,
+        )
+        .expect("plain outline");
+        assert_eq!(plain.args["file"].as_str(), Some("/project/src/lib.rs"));
     }
 
     #[test]
