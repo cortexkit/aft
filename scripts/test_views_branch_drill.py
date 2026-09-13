@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -22,6 +23,16 @@ class ViewsBranchDrillProbeTest(unittest.TestCase):
         self.assertIsNone(re.search(query, "inactiveInformation"))
         self.assertFalse(MODULE.probe_has_definition_and_reference_evidence(1))
         self.assertTrue(MODULE.probe_has_definition_and_reference_evidence(2))
+
+    def test_fresh_storage_guard_rejects_reused_arm_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Path(directory) / "arm"
+            MODULE.assert_fresh_storage(storage, "arm storage")
+            storage.mkdir()
+            MODULE.assert_fresh_storage(storage, "arm storage")
+            (storage / "manifest.json").write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(MODULE.SoakError, "must be fresh and empty"):
+                MODULE.assert_fresh_storage(storage, "arm storage")
 
     def test_root_owned_phase_puts_overrides_membership_and_legacy_counters(self) -> None:
         root = Path("/tmp/opencode root")

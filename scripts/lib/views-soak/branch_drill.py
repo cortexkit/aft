@@ -79,6 +79,11 @@ IGNORED_SYMBOLS = {
 }
 
 
+def assert_fresh_storage(path: Path, label: str) -> None:
+    if path.exists() and any(path.iterdir()):
+        raise SoakError(f"{label} must be fresh and empty: {path}")
+
+
 def changed_file_count(root: Path, left: str, right: str) -> int:
     output = git_bytes(root, "diff", "--name-only", left, right, "--")
     return len([line for line in output.splitlines() if line])
@@ -589,10 +594,11 @@ def run_mode(
     scope: str,
     views_on: bool,
     baseline_storage: Path,
+    log_dir: Path,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if git_text(checkout, "rev-parse", "HEAD") != head:
         raise SoakError(f"{mode} did not start at HEAD")
-    cache_dir = Path.home() / ".cache" / "aft-views-soak" / scope
+    cache_dir = log_dir
     user_config = Path.home() / ".config" / "cortexkit" / "aft.jsonc"
     view_dir = storage / "views" / scope
     rows: list[dict[str, Any]] = []
@@ -791,6 +797,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="isolated storage for the standalone views-on subject",
     )
     parser.add_argument(
+        "--baseline-storage",
+        type=Path,
+        help="fresh isolated storage for the standalone views-off subject",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=RESULT_DIR,
+        help="directory for JSON, Markdown, and per-arm stderr logs",
+    )
+    parser.add_argument(
+        "--allow-reused-storage",
+        action="store_true",
+        help="permit non-empty arm storage (invalid for controlled acceptance runs)",
+    )
+    parser.add_argument(
         "--mode",
         choices=("both", "views-on", "views-off"),
         default="both",
@@ -806,6 +828,20 @@ def main(argv: list[str]) -> int:
         raise SoakError("the branch drill is restricted to the opencode soak root")
     binary = args.binary.expanduser().resolve()
     storage = args.storage.expanduser().resolve()
+    baseline_storage = (
+        args.baseline_storage.expanduser().resolve()
+        if args.baseline_storage is not None
+        else storage.with_name(f"{storage.name}-views-off")
+    )
+    output_dir = args.output_dir.expanduser().resolve()
+    if storage == baseline_storage:
+        raise SoakError("views-on and views-off storage must be distinct")
+    if not args.allow_reused_storage:
+        if args.mode in {"both", "views-on"}:
+            assert_fresh_storage(storage, "views-on storage")
+        if args.mode in {"both", "views-off"}:
+            assert_fresh_storage(baseline_storage, "views-off storage")
+    output_dir.mkdir(parents=True, exist_ok=True)
     if not binary.is_file() or not binary.stat().st_mode & 0o111:
         raise SoakError(f"placed AFT binary is missing or not executable: {binary}")
     config = read_jsonc(root / ".cortexkit" / "aft.jsonc")
@@ -826,7 +862,6 @@ def main(argv: list[str]) -> int:
         (branch[1], original_head, f"{branch[0]}→HEAD", branch[2]),
     ]
     baseline = ensure_owned_baseline(root, scope, original_head)
-    baseline_storage = Path.home() / ".cache/aft-views-soak" / scope / "baseline-storage"
     health_before = health_snapshot(binary)
     rows: list[dict[str, Any]] = []
     warmups: dict[str, Any] = {}
@@ -845,6 +880,7 @@ def main(argv: list[str]) -> int:
                 scope=scope,
                 views_on=True,
                 baseline_storage=baseline_storage,
+                log_dir=output_dir,
             )
             rows.extend(on_rows)
 
@@ -865,6 +901,7 @@ def main(argv: list[str]) -> int:
                 scope=scope,
                 views_on=False,
                 baseline_storage=baseline_storage,
+                log_dir=output_dir,
             )
             rows.extend(off_rows)
     finally:
@@ -944,13 +981,13 @@ def main(argv: list[str]) -> int:
         "defects": defects,
         "run1_artifact": previous_path.name if previous is not None else None,
     }
-    json_path = RESULT_DIR / (
+    json_path = output_dir / (
         "branch-drill.json" if args.mode == "both" else f"branch-drill-{args.mode}.json"
     )
     write_json(json_path, result)
     print(f"wrote {json_path}")
     if args.mode == "both":
-        markdown_path = RESULT_DIR / "branch-drill.md"
+        markdown_path = output_dir / "branch-drill.md"
         markdown_path.parent.mkdir(parents=True, exist_ok=True)
         markdown_path.write_text(
             render_table(rows, refs, defects, warmups, previous), encoding="utf-8"
