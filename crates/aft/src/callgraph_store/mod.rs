@@ -688,6 +688,7 @@ mod dead_code_projection;
 pub use dead_code_projection::project_dead_code_snapshot;
 pub(crate) use dead_code_projection::{
     project_dead_code_snapshot_incremental, project_dead_code_snapshot_with_revision,
+    ProjectionKind, ProjectionVerdict, MAX_DELTA_BYTES,
 };
 #[cfg(test)]
 pub(crate) use dead_code_projection::{set_projection_before_open_observer, take_projection_work};

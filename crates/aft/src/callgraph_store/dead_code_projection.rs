@@ -23,6 +23,38 @@ use super::{
     PROVENANCE_VALUE_REF, TOP_LEVEL_SYMBOL,
 };
 
+/// How a dead-code snapshot was produced: by splicing the previous snapshot
+/// with the caller delta journal, or by re-reading the whole store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectionKind {
+    Spliced,
+    Full,
+}
+
+/// Why a projection took the path it did, plus the journal/corpus counts that
+/// let an operator see the cost without re-deriving it from timings.
+///
+/// `reason` is `Some` only for `Full` projections; the reasons are `cold`
+/// (no previous snapshot or a legacy store without a durable revision),
+/// `journal_gap` (a missing/unparseable journal entry bridged the revisions),
+/// `journal_oversize` (a delta batch exceeded the journal byte bound), and
+/// `revision_unchanged_reuse` (the cached snapshot for the current revision
+/// was reused without touching the store). No `generation_changed` arm exists:
+/// the cache identity already pairs the cold-build generation with the durable
+/// revision, so a generation change surfaces as `cold` or a cache miss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProjectionVerdict {
+    pub kind: ProjectionKind,
+    pub reason: Option<&'static str>,
+    /// Bytes of journal entries read for a splice, or the journal byte bound
+    /// when the delta was dropped as oversize.
+    pub journal_bytes: u64,
+    /// Files re-projected from the delta (splice) or 0 for a full projection.
+    pub changed_files: usize,
+    /// Transitive dependents pulled in by the delta (splice) or 0 for full.
+    pub dependents: usize,
+}
+
 #[cfg(test)]
 pub(crate) fn set_projection_before_open_observer(
     observer: Option<std::sync::Arc<ProjectionBeforeOpenObserver>>,
@@ -51,12 +83,13 @@ pub(crate) fn project_dead_code_snapshot_with_revision(
     db_path: &Path,
 ) -> Result<(Option<u64>, CallgraphSnapshot)> {
     project_dead_code_snapshot_incremental(db_path, None)
+        .map(|(revision, snapshot, _)| (revision, snapshot))
 }
 
 pub(crate) fn project_dead_code_snapshot_incremental(
     db_path: &Path,
     previous: Option<(u64, &CallgraphSnapshot)>,
-) -> Result<(Option<u64>, CallgraphSnapshot)> {
+) -> Result<(Option<u64>, CallgraphSnapshot, ProjectionVerdict)> {
     if !db_path.is_file() {
         return Err(CallGraphStoreError::Unavailable(format!(
             "database does not exist: {}",
@@ -91,50 +124,77 @@ pub(crate) fn project_dead_code_snapshot_incremental(
             "callgraph has stale files pending refresh".to_string(),
         ));
     }
-    let changed = match (previous, write_revision) {
+    let delta = match (previous, write_revision) {
         (Some((revision, _)), Some(current)) => projection_delta_since(&tx, revision, current)?,
-        _ => None,
+        _ => DeltaRead::Cold,
     };
     let mut paths = SnapshotPathResolver::new(&project_root);
-    let (files, exported_symbols, outbound_calls, entry_point_symbols) =
-        if let (Some(changed), Some((_, previous))) = (changed, previous) {
-            let mut replacements = BTreeMap::new();
-            let mut file_replacements = BTreeMap::new();
-            let mut export_replacements = BTreeMap::new();
-            let mut roots = previous.entry_point_symbols.clone();
-            for file in &changed {
-                let path = paths.resolve(file);
-                file_replacements.insert(
-                    path.clone(),
-                    project_files_from_store(&tx, &mut paths, Some(file))?,
-                );
-                export_replacements.insert(
-                    path.clone(),
-                    exported_symbols_from_store(&tx, &mut paths, Some(file))?,
-                );
-                roots.remove(&path);
-                roots.extend(entry_point_symbols_from_store(&tx, &mut paths, Some(file))?);
-                replacements.insert(path, outbound_calls_for_file(&tx, &mut paths, file)?);
+    let (files, exported_symbols, outbound_calls, entry_point_symbols, verdict) =
+        match (delta, previous) {
+            (DeltaRead::Spliced { callers, journal_bytes }, Some((_, previous))) => {
+                let mut replacements = BTreeMap::new();
+                let mut file_replacements = BTreeMap::new();
+                let mut export_replacements = BTreeMap::new();
+                let mut roots = previous.entry_point_symbols.clone();
+                for file in &callers {
+                    let path = paths.resolve(file);
+                    file_replacements.insert(
+                        path.clone(),
+                        project_files_from_store(&tx, &mut paths, Some(file))?,
+                    );
+                    export_replacements.insert(
+                        path.clone(),
+                        exported_symbols_from_store(&tx, &mut paths, Some(file))?,
+                    );
+                    roots.remove(&path);
+                    roots.extend(entry_point_symbols_from_store(&tx, &mut paths, Some(file))?);
+                    replacements.insert(path, outbound_calls_for_file(&tx, &mut paths, file)?);
+                }
+                let calls = splice_files(&previous.outbound_calls, replacements, |call| {
+                    &call.caller_file
+                });
+                let verdict = ProjectionVerdict {
+                    kind: ProjectionKind::Spliced,
+                    reason: None,
+                    journal_bytes,
+                    changed_files: callers.len(),
+                    dependents: 0,
+                };
+                (
+                    splice_files(&previous.files, file_replacements, |path| path),
+                    splice_files(&previous.exported_symbols, export_replacements, |export| {
+                        &export.file
+                    }),
+                    calls,
+                    roots,
+                    verdict,
+                )
             }
-            let calls = splice_files(&previous.outbound_calls, replacements, |call| {
-                &call.caller_file
-            });
-            (
-                splice_files(&previous.files, file_replacements, |path| path),
-                splice_files(&previous.exported_symbols, export_replacements, |export| {
-                    &export.file
-                }),
-                calls,
-                roots,
-            )
-        } else {
-            record_full_projection();
-            (
-                project_files_from_store(&tx, &mut paths, None)?,
-                exported_symbols_from_store(&tx, &mut paths, None)?,
-                outbound_calls_from_store(&tx, &mut paths)?,
-                entry_point_symbols_from_store(&tx, &mut paths, None)?,
-            )
+            (delta, _) => {
+                record_full_projection();
+                let (reason, journal_bytes) = match delta {
+                    DeltaRead::Cold => ("cold", 0),
+                    DeltaRead::Gap => ("journal_gap", 0),
+                    DeltaRead::Oversize => ("journal_oversize", MAX_DELTA_BYTES as u64),
+                    DeltaRead::Spliced { .. } => {
+                        unreachable!("spliced delta handled in the arm above")
+                    }
+                };
+                let verdict = ProjectionVerdict {
+                    kind: ProjectionKind::Full,
+                    reason: Some(reason),
+                    journal_bytes,
+                    changed_files: 0,
+                    dependents: 0,
+                };
+                (
+                    project_files_from_store(&tx, &mut paths, None)?,
+                    exported_symbols_from_store(&tx, &mut paths, None)?,
+                    outbound_calls_from_store(&tx, &mut paths)?,
+                    entry_point_symbols_from_store(&tx, &mut paths, None)?,
+                    verdict,
+                )
+            }
         };
     let entry_points = entry_points_for_files(&project_root, &files);
     let snapshot = CallgraphSnapshot {
@@ -147,7 +207,7 @@ pub(crate) fn project_dead_code_snapshot_incremental(
     };
     tx.commit()?;
 
-    Ok((write_revision, snapshot))
+    Ok((write_revision, snapshot, verdict))
 }
 
 fn splice_files<T: Clone>(
@@ -173,7 +233,25 @@ fn splice_files<T: Clone>(
 // A bounded durable journal lets a reader bridge multiple watcher transactions.
 // Missing entries (including writes by older binaries) always force a cold read.
 const DELTA_HISTORY: u64 = 64;
-const MAX_DELTA_BYTES: usize = 256 * 1024;
+/// Journal byte bound per revision; a delta batch larger than this is dropped
+/// and the reader reports `journal_oversize` with this bound in the reason.
+pub(crate) const MAX_DELTA_BYTES: usize = 256 * 1024;
+
+/// The outcome of reading the caller-delta journal between two revisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeltaRead {
+    /// No previous snapshot or no durable revision: full projection.
+    Cold,
+    /// A journal entry was missing or unparseable: full projection.
+    Gap,
+    /// A delta batch exceeded the journal byte bound: full projection.
+    Oversize,
+    /// Every entry bridged cleanly: splice the previous snapshot.
+    Spliced {
+        callers: BTreeSet<String>,
+        journal_bytes: u64,
+    },
+}
 
 pub(super) fn extend_projection_dependents(
     conn: &Connection,
@@ -207,8 +285,13 @@ pub(super) fn record_projection_delta(
         )?;
     } else {
         // Oversized batches need no retained history: a cold projection is safer
-        // than allowing per-root journal storage to grow with the corpus.
-        tx.execute("DELETE FROM meta WHERE k = ?1", [key])?;
+        // than allowing per-root journal storage to grow with the corpus. Record
+        // an explicit marker so a later reader can distinguish an oversize drop
+        // from a genuine journal gap (e.g. a write by an older binary).
+        tx.execute(
+            "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
+            params![key, format!("oversize:{revision}")],
+        )?;
     }
     Ok(())
 }
@@ -217,11 +300,12 @@ fn projection_delta_since(
     conn: &Connection,
     previous: u64,
     current: u64,
-) -> Result<Option<BTreeSet<String>>> {
+) -> Result<DeltaRead> {
     if current < previous || current - previous > DELTA_HISTORY {
-        return Ok(None);
+        return Ok(DeltaRead::Gap);
     }
     let mut callers = BTreeSet::new();
+    let mut journal_bytes = 0u64;
     for revision in previous.saturating_add(1)..=current {
         let value: Option<String> = conn
             .query_row(
@@ -230,16 +314,26 @@ fn projection_delta_since(
                 |row| row.get(0),
             )
             .optional()?;
-        let Some(value) = value else { return Ok(None) };
+        let Some(value) = value else { return Ok(DeltaRead::Gap) };
+        if let Some(stored) = value.strip_prefix("oversize:") {
+            if stored == revision.to_string() {
+                return Ok(DeltaRead::Oversize);
+            }
+            return Ok(DeltaRead::Gap);
+        }
         let Ok((stored, files)) = serde_json::from_str::<(u64, BTreeSet<String>)>(&value) else {
-            return Ok(None);
+            return Ok(DeltaRead::Gap);
         };
         if stored != revision {
-            return Ok(None);
+            return Ok(DeltaRead::Gap);
         }
+        journal_bytes = journal_bytes.saturating_add(value.len() as u64);
         callers.extend(files);
     }
-    Ok(Some(callers))
+    Ok(DeltaRead::Spliced {
+        callers,
+        journal_bytes,
+    })
 }
 
 #[cfg(test)]

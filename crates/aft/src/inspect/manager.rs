@@ -27,7 +27,7 @@ use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph_store::project_dead_code_snapshot;
 use crate::callgraph_store::{
     project_dead_code_snapshot_with_revision, CallGraphStore, CallGraphStoreError,
-    ReadonlyCallGraphStore,
+    ProjectionKind, ProjectionVerdict, ReadonlyCallGraphStore, MAX_DELTA_BYTES,
 };
 use crate::cold_build_limiter;
 
@@ -1177,6 +1177,7 @@ impl InspectManager {
         }
     }
 
+    #[cfg(test)]
     fn build_tier2_callgraph_snapshot_with_refresh(
         &self,
         job: &InspectJob,
@@ -1184,6 +1185,25 @@ impl InspectManager {
         build_if_missing: bool,
         refresh_paths: &[PathBuf],
     ) -> Option<Arc<CallgraphSnapshot>> {
+        self.build_tier2_callgraph_snapshot_with_refresh_and_verdict(
+            job,
+            allow_cold_build,
+            build_if_missing,
+            refresh_paths,
+        )
+        .map(|(snapshot, _)| snapshot)
+    }
+
+    /// Build the dead-code snapshot and report how it was produced, so the
+    /// `perf tier2 phases` line can name the projection verdict instead of
+    /// leaving the operator to infer it from timings.
+    fn build_tier2_callgraph_snapshot_with_refresh_and_verdict(
+        &self,
+        job: &InspectJob,
+        allow_cold_build: bool,
+        build_if_missing: bool,
+        refresh_paths: &[PathBuf],
+    ) -> Option<(Arc<CallgraphSnapshot>, ProjectionVerdict)> {
         build_tier2_callgraph_snapshot_with_refresh_inner(
             job,
             allow_cold_build,
@@ -2132,12 +2152,17 @@ impl InspectManager {
                 && scan_job.callgraph_snapshot.is_none()
             {
                 let snapshot_started = Instant::now();
-                scan_job.callgraph_snapshot = self.build_tier2_callgraph_snapshot_with_refresh(
-                    &scan_job,
-                    options.allow_callgraph_cold_build,
-                    options.require_callgraph_snapshot,
-                    &callgraph_refresh_files,
-                );
+                if let Some((snapshot, verdict)) = self
+                    .build_tier2_callgraph_snapshot_with_refresh_and_verdict(
+                        &scan_job,
+                        options.allow_callgraph_cold_build,
+                        options.require_callgraph_snapshot,
+                        &callgraph_refresh_files,
+                    )
+                {
+                    scan_job.callgraph_snapshot = Some(snapshot);
+                    phases.projection = Some(verdict);
+                }
                 phases.snapshot += snapshot_started.elapsed();
             }
             aggregate_job.callgraph_snapshot = scan_job.callgraph_snapshot.clone();
@@ -2242,13 +2267,17 @@ impl InspectManager {
                     && rescan_job.callgraph_snapshot.is_none()
                 {
                     let snapshot_started = Instant::now();
-                    rescan_job.callgraph_snapshot = self
-                        .build_tier2_callgraph_snapshot_with_refresh(
+                    if let Some((snapshot, verdict)) = self
+                        .build_tier2_callgraph_snapshot_with_refresh_and_verdict(
                             &rescan_job,
                             options.allow_callgraph_cold_build,
                             options.require_callgraph_snapshot,
                             &callgraph_refresh_files,
-                        );
+                        )
+                    {
+                        rescan_job.callgraph_snapshot = Some(snapshot);
+                        phases.projection = Some(verdict);
+                    }
                     phases.snapshot += snapshot_started.elapsed();
                 }
                 let scan_started = Instant::now();
@@ -2310,12 +2339,17 @@ impl InspectManager {
             && aggregate_job.callgraph_snapshot.is_none()
         {
             let snapshot_started = Instant::now();
-            aggregate_job.callgraph_snapshot = self.build_tier2_callgraph_snapshot_with_refresh(
-                &aggregate_job,
-                options.allow_callgraph_cold_build,
-                options.require_callgraph_snapshot,
-                &callgraph_refresh_files,
-            );
+            if let Some((snapshot, verdict)) = self
+                .build_tier2_callgraph_snapshot_with_refresh_and_verdict(
+                    &aggregate_job,
+                    options.allow_callgraph_cold_build,
+                    options.require_callgraph_snapshot,
+                    &callgraph_refresh_files,
+                )
+            {
+                aggregate_job.callgraph_snapshot = Some(snapshot);
+                phases.projection = Some(verdict);
+            }
             phases.snapshot += snapshot_started.elapsed();
         }
         if options.require_callgraph_snapshot
@@ -2672,6 +2706,8 @@ struct Tier2PhaseTimings {
     /// Aggregate roll-up + store.
     rollup: Duration,
     scanned_files: usize,
+    /// How the dead-code snapshot was produced (dead_code only).
+    projection: Option<ProjectionVerdict>,
 }
 
 const TIER2_WORK_LOG_THRESHOLD: Duration = Duration::from_millis(50);
@@ -2698,8 +2734,12 @@ impl Tier2PhaseTimings {
             return;
         }
         let key = crate::search_index::artifact_cache_key(project_root);
+        let projection = self
+            .projection
+            .map(render_projection_suffix)
+            .unwrap_or_default();
         crate::slog_info!(
-            "perf tier2 phases category={} freshness={}ms snapshot={}ms scan={}ms({} files) db={}ms(lock={},txn={}) rollup={}ms root={} key={}",
+            "perf tier2 phases category={} freshness={}ms snapshot={}ms scan={}ms({} files) db={}ms(lock={},txn={}) rollup={}ms{} root={} key={}",
             category,
             self.freshness.as_millis(),
             self.snapshot.as_millis(),
@@ -2709,10 +2749,31 @@ impl Tier2PhaseTimings {
             self.db_lock.as_millis(),
             self.db_txn.as_millis(),
             self.rollup.as_millis(),
+            projection,
             crate::logging::normalize_index_root(project_root),
             key
         );
     }
+}
+
+/// Render the `projection=...` suffix of the `perf tier2 phases` line for one
+/// dead-code snapshot verdict. `reason` is omitted for spliced projections;
+/// the `journal_oversize` reason carries the journal byte bound so the operator
+/// sees the cap that forced the full projection.
+fn render_projection_suffix(verdict: ProjectionVerdict) -> String {
+    let kind = match verdict.kind {
+        ProjectionKind::Spliced => "spliced",
+        ProjectionKind::Full => "full",
+    };
+    let reason = match verdict.reason {
+        Some("journal_oversize") => format!(" reason=journal_oversize:{}", MAX_DELTA_BYTES),
+        Some(reason) => format!(" reason={reason}"),
+        None => String::new(),
+    };
+    format!(
+        " projection={kind}{reason} journal_bytes={} changed_files={} dependents={}",
+        verdict.journal_bytes, verdict.changed_files, verdict.dependents
+    )
 }
 
 fn scope_files(project_root: &Path, scope: &JobScope) -> Vec<PathBuf> {
@@ -2982,6 +3043,7 @@ fn build_tier2_callgraph_snapshot(
     allow_cold_build: bool,
 ) -> Option<Arc<CallgraphSnapshot>> {
     build_tier2_callgraph_snapshot_with_refresh_inner(job, allow_cold_build, false, &[], None)
+        .map(|(snapshot, _)| snapshot)
 }
 
 #[cfg(test)]
@@ -2997,6 +3059,7 @@ fn build_tier2_callgraph_snapshot_with_refresh(
         refresh_paths,
         None,
     )
+    .map(|(snapshot, _)| snapshot)
 }
 
 const BLOCKING_CALLGRAPH_STORE_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -3151,7 +3214,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
     build_if_missing: bool,
     refresh_paths: &[PathBuf],
     projection_cache: Option<&InspectManager>,
-) -> Option<Arc<CallgraphSnapshot>> {
+) -> Option<(Arc<CallgraphSnapshot>, ProjectionVerdict)> {
     let started = Instant::now();
     if !job.config.callgraph_store {
         crate::slog_info!(
@@ -3361,7 +3424,16 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
             // graph mutation. Equal identities therefore prove identical store
             // bytes for dead-code projection: this cache is exact, not heuristic.
             if let Some(snapshot) = cache.cached_callgraph_projection(identity) {
-                return Some(snapshot);
+                return Some((
+                    snapshot,
+                    ProjectionVerdict {
+                        kind: ProjectionKind::Full,
+                        reason: Some("revision_unchanged_reuse"),
+                        journal_bytes: 0,
+                        changed_files: 0,
+                        dependents: 0,
+                    },
+                ));
             }
         } else if cache_identity.is_none() {
             // Stores from older binaries lack a durable revision, so keeping an
@@ -3374,7 +3446,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
         let previous = projection_cache
             .zip(cache_identity.as_ref())
             .and_then(|(cache, identity)| cache.previous_callgraph_projection(identity));
-        let (write_revision, snapshot) =
+        let (write_revision, snapshot, verdict) =
             match crate::callgraph_store::project_dead_code_snapshot_incremental(
                 projection_store.sqlite_path(),
                 previous
@@ -3426,7 +3498,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
             started.elapsed().as_millis()
         );
 
-        return Some(snapshot);
+        return Some((snapshot, verdict));
     }
 
     crate::slog_info!(
@@ -7095,11 +7167,21 @@ pub fn unrelated() -> u32 { 2 }
         incremental_store
             .refresh_files(&changed)
             .expect("refresh changed files");
-        let (_, incremental) = crate::callgraph_store::project_dead_code_snapshot_incremental(
-            incremental_store.sqlite_path(),
-            Some((revision.unwrap(), &previous)),
-        )
-        .expect("project incremental snapshot");
+        let (_, incremental, verdict) =
+            crate::callgraph_store::project_dead_code_snapshot_incremental(
+                incremental_store.sqlite_path(),
+                Some((revision.unwrap(), &previous)),
+            )
+            .expect("project incremental snapshot");
+        assert_eq!(
+            verdict.reason, None,
+            "{name}: a spliced projection carries no full-projection reason"
+        );
+        assert_eq!(
+            verdict.kind,
+            ProjectionKind::Spliced,
+            "{name}: a clean journal bridge must splice the previous snapshot"
+        );
         let full =
             project_dead_code_snapshot(incremental_store.sqlite_path()).expect("full projection");
         let files = project_files(&root);
@@ -7261,7 +7343,7 @@ pub fn unrelated() -> u32 { 2 }
         crate::callgraph_store::take_projection_work();
         let cpu = projection_bench_cpu_ms();
         let started = Instant::now();
-        let (_, incremental) = crate::callgraph_store::project_dead_code_snapshot_incremental(
+        let (_, incremental, _) = crate::callgraph_store::project_dead_code_snapshot_incremental(
             store.sqlite_path(),
             Some((revision.unwrap(), &previous)),
         )
@@ -7770,6 +7852,119 @@ export function main() { foo(); }
         assert_eq!(
             remaining,
             vec![PathBuf::from("changed.ts"), PathBuf::from("oversized.ts")]
+        );
+    }
+
+    #[test]
+    fn perf_tier2_phases_line_renders_each_projection_verdict() {
+        let spliced = render_projection_suffix(ProjectionVerdict {
+            kind: ProjectionKind::Spliced,
+            reason: None,
+            journal_bytes: 4096,
+            changed_files: 3,
+            dependents: 2,
+        });
+        assert_eq!(
+            spliced,
+            " projection=spliced journal_bytes=4096 changed_files=3 dependents=2",
+            "a spliced verdict must omit the reason field"
+        );
+
+        let cold = render_projection_suffix(ProjectionVerdict {
+            kind: ProjectionKind::Full,
+            reason: Some("cold"),
+            journal_bytes: 0,
+            changed_files: 0,
+            dependents: 0,
+        });
+        assert_eq!(
+            cold,
+            " projection=full reason=cold journal_bytes=0 changed_files=0 dependents=0"
+        );
+
+        let gap = render_projection_suffix(ProjectionVerdict {
+            kind: ProjectionKind::Full,
+            reason: Some("journal_gap"),
+            journal_bytes: 0,
+            changed_files: 0,
+            dependents: 0,
+        });
+        assert_eq!(
+            gap,
+            " projection=full reason=journal_gap journal_bytes=0 changed_files=0 dependents=0"
+        );
+
+        let oversize = render_projection_suffix(ProjectionVerdict {
+            kind: ProjectionKind::Full,
+            reason: Some("journal_oversize"),
+            journal_bytes: 262144,
+            changed_files: 0,
+            dependents: 0,
+        });
+        assert_eq!(
+            oversize,
+            " projection=full reason=journal_oversize:262144 journal_bytes=262144 changed_files=0 dependents=0",
+            "the journal byte bound must be visible on the oversize line"
+        );
+
+        let reuse = render_projection_suffix(ProjectionVerdict {
+            kind: ProjectionKind::Full,
+            reason: Some("revision_unchanged_reuse"),
+            journal_bytes: 0,
+            changed_files: 0,
+            dependents: 0,
+        });
+        assert_eq!(
+            reuse,
+            " projection=full reason=revision_unchanged_reuse journal_bytes=0 changed_files=0 dependents=0"
+        );
+    }
+
+    #[test]
+    fn journal_oversize_delta_reports_full_oversize_verdict() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_projection_fixture(dir.path());
+        let root = canonical_root(dir.path());
+        let store = CallGraphStore::open(root.join(".store-oversize"), root.clone())
+            .expect("open store");
+        store
+            .cold_build(&project_files(&root))
+            .expect("cold build fixture");
+        let (revision, previous) =
+            project_dead_code_snapshot_with_revision(store.sqlite_path()).expect("initial projection");
+        let revision = revision.expect("new stores write a projection revision");
+
+        // Simulate an oversized delta batch by advancing the write revision and
+        // planting the oversize marker the writer leaves behind.
+        let conn = rusqlite::Connection::open(store.sqlite_path()).expect("open write conn");
+        conn.execute(
+            "INSERT INTO meta(k, v) VALUES('projection_write_revision', '1')
+             ON CONFLICT(k) DO UPDATE SET v = CAST(v AS INTEGER) + 1",
+            [],
+        )
+        .expect("advance write revision");
+        let next = revision + 1;
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
+            rusqlite::params![
+                format!("projection_delta_{}", next % 64),
+                format!("oversize:{next}")
+            ],
+        )
+        .expect("plant oversize marker");
+        drop(conn);
+
+        let (_, _, verdict) =
+            crate::callgraph_store::project_dead_code_snapshot_incremental(
+                store.sqlite_path(),
+                Some((revision, &previous)),
+            )
+            .expect("project with oversize marker");
+        assert_eq!(verdict.kind, ProjectionKind::Full);
+        assert_eq!(verdict.reason, Some("journal_oversize"));
+        assert_eq!(
+            verdict.journal_bytes, 262144,
+            "the oversize verdict must report the journal byte bound"
         );
     }
 }
