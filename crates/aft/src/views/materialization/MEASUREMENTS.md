@@ -301,3 +301,32 @@ Both attempts exercised all four views-on transitions, restored the designated c
 | B → HEAD | ~42,000 | unavailable | 27,160 | 32.58 |
 
 The owner's rule remains: **views must beat legacy to correctness on every row, with views CPU not above legacy**. This incomplete drill does not establish that rule. Its wall observations miss legacy by approximately 14.8 / 25.5 / 13.1 / 14.8 s, and CPU cannot be adjudicated. The next benchmark bucket is obtaining a clean, compatible warm manifest set (or allowing its one-time rebuild to finish outside the timed run), then rerunning the unchanged both-arm drill so the intended incremental callgraph-plane publication—not full-resolution recovery—is measured.
+
+## Policy costs landed: own 1 s publication window, deferred checkpoint (2026-09-13, f0750e15)
+
+Both-arm drill on fresh storage per arm, release binary at `f0750e15`, `scripts/views-branch-drill.sh --mode both --binary target/release/aft --storage /tmp/aft-views-drill-77/on --baseline-storage /tmp/aft-views-drill-77/off --output-dir /tmp/aft-views-drill-77/out` (detached, ~1 h; views-on warm-up 533 s, views-off 492 s, both cold semantic builds). No defects, every correctness probe passed, zero blob puts and zero embeds on both return legs. Raw record: `/tmp/aft-views-drill-77/out/branch-drill.{json,md}` and the two per-arm stderr logs.
+
+| switch | views publication ms | views CPU s | views correct ms | legacy CPU s | legacy correct ms | views − legacy correct |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| HEAD → A | 27,876 | 95.3 | 32,436 | 80.4 | 34,254 | −1,818 |
+| A → HEAD | 27,228 | 72.6 | 31,434 | 28.9 | 23,997 | +7,437 |
+| HEAD → B | 25,222 | 54.6 | 29,252 | 31.0 | 25,932 | +3,320 |
+| B → HEAD | 25,225 | 54.7 | 29,327 | 30.5 | 25,708 | +3,619 |
+
+**Shipping criterion still unmet** (views beats legacy to correctness on all four rows with CPU not above legacy): views wins one row and loses three by 3.3–7.4 s; views CPU is above legacy on every row.
+
+The published events' own attribution, callgraph-plane publication per switch (the semantic fill that follows each is 2.8–3.2 s total with a 26–31 ms materialization and a 2.5–3.0 s closure):
+
+| switch | manifest | derived | materialization call | load/select | delete rows | selected join | ref/edge emission | commit | closure |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| HEAD → A | 1,971 | 22,350 | 19,213 | 615 | 1,121 | 10,781 | 5,187 | 97 | 3,126 |
+| A → HEAD | 2,163 | 22,136 | 19,577 | 753 | 917 | 10,249 | 5,850 | 121 | 2,548 |
+| HEAD → B | 1,616 | 20,951 | 18,330 | 800 | 823 | 10,200 | 5,202 | 77 | 2,611 |
+| B → HEAD | 1,612 | 20,953 | 18,475 | 877 | 1,335 | 9,834 | 5,089 | 85 | 2,469 |
+
+Two findings this run adds, both unexplained and both the next work:
+
+1. **The incremental materialization measures 18.3–19.6 s here against 8.5–9.6 s in the previous in-situ run and 8.8 s offline, on the same transition and the same binary lineage.** Selected join 10 s vs 3.5 s, ref/edge emission 5.2 s vs 2 s — a uniform ~2.5–3× on the two SQLite-heavy phases, and the cold seed materialization (18.5 s) costs the same as the incremental. The only product changes between the two runs are this delivery's (`journal_mode=WAL` + `synchronous=FULL` + `wal_autocheckpoint=0` on the materialization connection, the keeper connection held open through the build, the deferred checkpoint) and fresh storage per arm. Bisect on the same input before touching the join.
+2. **The closure costs 2.5–3.1 s per publication with zero blob puts** (the semantic-fill publications, materialization 26 ms, closure 2.5–3.0 s), so it is a fixed cost: PASSIVE checkpoints and fsyncs of the two shared blob stores (the callgraph store is ~1.7 GB) plus alias/trigram fsyncs, paid twice per switch. It is no longer the derived checkpoint (that is deferred; `derived_clone_ms` is 4–11 ms). Proportional-to-change durability is the fix shape: a store with no puts since its last durable point needs neither checkpoint nor fsync.
+
+Critical path after this run: ~1 s window + ~2 s assembly + 18–19 s materialization + ~2.6 s closure ≈ 25 s publication, correctness at ~29–32 s; legacy at 24–26 s. With the materialization back at ~9 s and the fixed closure removed, the views path is ~13 s against legacy's ~24 s on this switch.
