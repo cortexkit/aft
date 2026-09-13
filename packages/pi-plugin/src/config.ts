@@ -156,7 +156,9 @@ export interface SemanticConfig {
   api_key_env?: string;
   timeout_ms?: number;
   query_timeout_ms?: number;
+  query_instruction?: string;
   max_batch_size?: number;
+  max_input_tokens?: number;
   max_files?: number;
 }
 
@@ -622,7 +624,9 @@ const SemanticConfigSchema = z.object({
   api_key_env: z.string().trim().min(1).optional(),
   timeout_ms: z.number().int().positive().optional(),
   query_timeout_ms: z.number().int().positive().optional(),
+  query_instruction: z.string().trim().min(1).optional(),
   max_batch_size: z.number().int().positive().optional(),
+  max_input_tokens: z.number().int().positive().optional(),
   max_files: z.number().int().positive().optional(),
 });
 

@@ -618,6 +618,18 @@ function buildSchema(): Record<string, unknown> {
             description:
               "Interactive query embedding deadline in milliseconds. Project-scoped configs cannot set this field; values are clamped to 500..15000.",
           },
+          query_instruction: {
+            type: "string",
+            default: "auto",
+            description:
+              'Query-only task instruction sent to the embedding backend: "auto" applies the model family\'s documented recipe (Qwen3-Embedding: the model-card retrieval task; fastembed and other families stay bare), "off" sends bare queries, any other value is used as literal task text. Never changes document vectors or the index fingerprint.',
+          },
+          max_input_tokens: {
+            type: "integer",
+            minimum: 1,
+            description:
+              "Whole-row input token budget for remote embedding backends. Absent keeps the MiniLM-era chunk caps. Fingerprinted: changing it rebuilds the semantic index.",
+          },
           max_batch_size: {
             type: "integer",
             minimum: 1,

@@ -4,7 +4,12 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 3_000;
-pub const DEFAULT_SEMANTIC_QUERY_INSTRUCTION: &str = "off";
+/// `auto`: on the production lane (Bionic / Qwen3-Embedding-0.6B) the model-card
+/// instruction on queries only left concept MRR and exact recall flat within noise,
+/// raised real-query MRR 0.182 -> 0.189, and cut the dense lane's no-vocabulary
+/// admission from 59% to 49% of top-10 rows (docs/investigations/query-instruction-ab-2026-09.md).
+/// Document vectors are untouched, so flipping this never rebuilds an index.
+pub const DEFAULT_SEMANTIC_QUERY_INSTRUCTION: &str = "auto";
 /// Verbatim retrieval task recommended by the Qwen3-Embedding model card:
 /// <https://huggingface.co/Qwen/Qwen3-Embedding-0.6B#usage-tips>
 pub const QWEN3_EMBEDDING_MODEL_CARD_RETRIEVAL_TASK: &str =

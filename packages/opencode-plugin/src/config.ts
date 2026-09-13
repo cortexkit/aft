@@ -133,8 +133,18 @@ const SemanticConfigSchema = z.object({
   timeout_ms: z.number().int().positive().optional(),
   /** Interactive query embedding deadline in milliseconds (clamped to 500..15000). */
   query_timeout_ms: z.number().int().positive().optional(),
+  /**
+   * Query-only task instruction: "auto" (model-family recipe), "off", or literal
+   * task text. Never changes document vectors or the index fingerprint.
+   */
+  query_instruction: z.string().trim().min(1).optional(),
   /** Maximum batch size used by the semantic pipeline. */
   max_batch_size: z.number().int().positive().optional(),
+  /**
+   * Whole-row input token budget for remote embedding backends; absent keeps the
+   * MiniLM-era chunk caps. Fingerprinted: changing it rebuilds the index.
+   */
+  max_input_tokens: z.number().int().positive().optional(),
   /** Maximum number of project files to semantically index (default 20000). */
   max_files: z.number().int().positive().optional(),
 });

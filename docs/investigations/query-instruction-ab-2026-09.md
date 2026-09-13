@@ -2,7 +2,7 @@
 
 ## Decision
 
-AFT now supports `semantic.query_instruction = "auto" | "off" | "<literal task>"`, but the shipped default is **`off`**. Both instructed arms slightly reduced concept-family MRR, so they did not meet the predeclared default-on criterion even though real-query MRR and the no-vocabulary diagnostic improved.
+AFT now supports `semantic.query_instruction = "auto" | "off" | "<literal task>"`. The worker landed the default as `off` because the predeclared rule asked for a concept-family improvement and the two instructed arms moved concept MRR by −0.003 and −0.001 on 87 queries. The owner ruled the shipped default **`auto`** on the whole table: those concept deltas are inside the noise floor, exact recall is 1.0 in every arm, real-query MRR rose from 0.182 to 0.189 (model-card) / 0.197 (code-search), and the dense lane's no-vocabulary admission fell from 59% to 49–50% of top-10 rows with a higher relevance rate inside the band — the same noise-admission signature Magic Context measured on the 8B model, at the magnitude a fused pipeline (whose exact and lexical lanes already carry keyword-shaped queries) leaves for the dense lane to gain. The recipe is the model's documented one, document vectors are untouched, and `"off"` restores the old behaviour with one config line.
 
 Explicit `auto` resolves case-insensitive Qwen3-Embedding model IDs to the model card's verbatim retrieval task:
 

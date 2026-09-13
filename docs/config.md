@@ -210,7 +210,7 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
   "semantic": {
     "backend": "fastembed",            // "fastembed" | "openai_compatible" | "ollama"
     "model": "all-MiniLM-L6-v2",       // model id understood by the backend
-    "query_instruction": "off",         // QUERY-only: "auto", "off" (default), or literal task text.
+    "query_instruction": "auto",        // QUERY-only: "auto" (default), "off", or literal task text.
                                          // Auto applies Qwen3-Embedding's model-card retrieval task;
                                          // fastembed and other model families remain bare. This does not
                                          // change document vectors or trigger an index rebuild.
