@@ -670,3 +670,27 @@ checks with `RUSTFLAGS='-D warnings'` passed. The sidekick service was unavailab
 (provider credential outage); the owner authorized direct inspection and comment
 self-review instead. The earlier AFT inspect request timed out; cargo checks are
 the authoritative diagnostics gate.
+
+## Fresh-storage drill, cold work gated (2026-09-13)
+
+The release binary was built from the `b7dd9b4f` product tree; the intervening harness commit changes only the fenced Python drill. The both-arm command used fresh `/tmp/aft-views-drill-cold-gated-297/{on,off}` storage and kept both standalone processes alive. Before launch, `uptime` reported a one-minute load average of **5.81**. The views-on cold-work gate cleared in **1,338,120 ms** and the legacy gate in **1,382,693 ms**. Neither process switched commits until both gates had completed the semantic seed and one full dead-code pass.
+
+The previous misleading `semantic_index.status=ready` value reported queryability of an installed resident/view index, not semantic-worker idleness. When a `SemanticIndex` is already installed, the status producer labels that index from `idx.status_label()` and does not attach `semantic_build_progress`; those progress fields are attached only in the no-index cold-building branch. Because the views-on subject was a fresh isolated standalone process, it could not have borrowed a legacy index from another process. The cold gate consequently checks the progress fields and root-owned semantic build lifecycle rather than treating `ready` as proof that the post-configure seed stopped.
+
+| switch | views correct ms | legacy correct ms | views CPU s | legacy CPU s | views contention | legacy contention | owner rule |
+| --- | ---: | ---: | ---: | ---: | --- | --- | --- |
+| HEAD → A | 43,109 | 55,581 | 81.10 | 101.59 | `build_progress=0; tier2_scheduled=1` | `build_progress=0; tier2_scheduled=1` | met |
+| A → HEAD | 34,180 | 48,088 | 50.24 | 58.21 | `build_progress=0; tier2_phases=dead_code,unused_exports,duplicates,cycles,complexity` | `build_progress=0; tier2_phases=dead_code,unused_exports,duplicates,cycles,complexity` | met |
+| HEAD → B | 28,253 | 26,469 | 42.18 | 30.36 | none | none | not met |
+| B → HEAD | 31,708 | 25,057 | 33.86 | 29.91 | none | none | not met |
+
+The contention interval is exactly switch initiation through the first correct search-and-callgraph observation. The completed pre-switch cold pass made each process idle at the gate; the first checkout then scheduled a new Tier-2 refresh in both arms, and its phases crossed the first two rows. No semantic or other index `build_progress` line crossed any measured window.
+
+The owner's rule is: **"views beats legacy to correctness on every row with CPU not above legacy"**.
+
+- **HEAD → A — met:** views was correct **12,472 ms sooner** and used **20.49 fewer CPU-seconds**.
+- **A → HEAD — met:** views was correct **13,908 ms sooner** and used **7.97 fewer CPU-seconds**.
+- **HEAD → B — not met:** views was correct **1,784 ms later** and used **11.82 more CPU-seconds**. With no reported contention, the named views bucket is publication work: the callgraph-plane publication spent **15,963 ms** in materialization, followed by a **2,636 ms** semantic-fill publication.
+- **B → HEAD — not met:** views was correct **6,651 ms later** and used **3.95 more CPU-seconds**. With no reported contention, the named views bucket is again publication work: **19,880 ms** in materialization, followed by a **2,591 ms** semantic-fill publication.
+
+The rule is therefore **not met overall**. All eight correctness probes converged, process PIDs remained stable, and the harness reported no correctness or publication defects. Raw JSON, Markdown, and both stderr logs remain under `/tmp/aft-views-drill-cold-gated-297/out`.
