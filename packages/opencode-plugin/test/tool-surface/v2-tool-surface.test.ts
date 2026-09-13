@@ -241,7 +241,9 @@ describe("OpenCode V2 tool surface", () => {
           executionContext,
         ),
       ),
-    ).rejects.toThrow("V2 permission requests require the host permission endpoint consumer");
+    ).rejects.toThrow(
+      'The "read" operation was refused because the OpenCode V2 host did not provide a permission request endpoint.',
+    );
     expect(executed).toBe(false);
   });
 
