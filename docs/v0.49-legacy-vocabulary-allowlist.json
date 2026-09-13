@@ -5342,6 +5342,39 @@
       "reason": "The spelling is retained only for raw-input compatibility or an internal bridge payload."
     },
     {
+      "path": "scripts/audit-v049-agent-surface.test.ts",
+      "line": 45,
+      "column": 32,
+      "token": "filePath",
+      "text": "\"const session = openSession(filePath);\",",
+      "location": "line 45, column 32",
+      "ordinal": 1,
+      "class": "audit-implementation",
+      "reason": "The audit or capture implementation names the vocabulary it checks."
+    },
+    {
+      "path": "scripts/audit-v049-agent-surface.test.ts",
+      "line": 46,
+      "column": 27,
+      "token": "toFile",
+      "text": "\"await persist(session, toFile);\",",
+      "location": "line 46, column 27",
+      "ordinal": 1,
+      "class": "audit-implementation",
+      "reason": "The audit or capture implementation names the vocabulary it checks."
+    },
+    {
+      "path": "scripts/audit-v049-agent-surface.test.ts",
+      "line": 68,
+      "column": 52,
+      "token": "filePath",
+      "text": "changedLines[1] = \"const session = openSession(filePath, { strict: true });\";",
+      "location": "line 68, column 52",
+      "ordinal": 1,
+      "class": "audit-implementation",
+      "reason": "The audit or capture implementation names the vocabulary it checks."
+    },
+    {
       "path": "scripts/audit-v049-agent-surface.ts",
       "line": 37,
       "column": 18,
