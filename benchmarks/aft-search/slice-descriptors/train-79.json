@@ -1,0 +1,15 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "issue-310-slow-embedding-backend",
+    "views-closure-batching",
+    "gh-resource-targets-in-outline-zoom-translate",
+    "allowlist-content-key"
+  ],
+  "note": "semantic_index.rs changes only the BUILD-time embedding request path (batch-scaled deadlines, halving on timeout, corpus-failure recovery set); the query embedding path (EmbeddingRequestPolicy::Query) and every ranking stage are untouched, so search rows are byte-identical to the reference (the predicate is the proof)."
+}
