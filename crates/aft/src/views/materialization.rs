@@ -80,6 +80,8 @@ pub(crate) fn apply_manifest_diff_profiled(
 }
 
 pub(crate) mod profile;
+#[cfg(test)]
+mod resolution_facts;
 
 const MATERIALIZATION_VERSION: &str = "4";
 

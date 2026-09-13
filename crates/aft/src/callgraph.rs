@@ -2640,7 +2640,7 @@ fn workspace_member_dirs(
     expand_workspace_patterns(workspace_root, &patterns, facts)
 }
 
-fn workspace_patterns(package_json: &Value) -> Vec<String> {
+pub(crate) fn workspace_patterns(package_json: &Value) -> Vec<String> {
     match package_json.get("workspaces") {
         Some(Value::Array(items)) => items
             .iter()
@@ -2670,7 +2670,11 @@ fn pnpm_workspace_patterns(workspace_root: &Path, facts: &FactPaths<'_>) -> Vec<
         return Vec::new();
     };
 
-    let Ok(source) = std::str::from_utf8(&bytes) else {
+    parse_pnpm_workspace_patterns(&bytes)
+}
+
+pub(crate) fn parse_pnpm_workspace_patterns(bytes: &[u8]) -> Vec<String> {
+    let Ok(source) = std::str::from_utf8(bytes) else {
         return Vec::new();
     };
     let mut patterns = Vec::new();

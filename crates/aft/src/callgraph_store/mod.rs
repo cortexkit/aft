@@ -10448,8 +10448,25 @@ fn rust_manifest_crate_names(manifest: &Path, facts: &FactPaths<'_>) -> Vec<Stri
     let Some(bytes) = facts.bytes(manifest) else {
         return Vec::new();
     };
-    let Ok(source) = std::str::from_utf8(&bytes) else {
-        return Vec::new();
+    let (package_name, lib_name) = rust_manifest_name_fields(&bytes);
+    let mut names = Vec::new();
+    if let Some(lib) = lib_name {
+        names.push(lib);
+    }
+    if let Some(package) = package_name {
+        let normalized = package.replace('-', "_");
+        if !names.contains(&normalized) {
+            names.push(normalized);
+        }
+    }
+    names
+}
+
+/// Preserve the manifest resolver's line-oriented extraction, including its
+/// first non-lib name and last lib name semantics; this is not a TOML parser.
+pub(crate) fn rust_manifest_name_fields(bytes: &[u8]) -> (Option<String>, Option<String>) {
+    let Ok(source) = std::str::from_utf8(bytes) else {
+        return (None, None);
     };
     let mut in_lib = false;
     let mut package_name = None;
@@ -10471,17 +10488,7 @@ fn rust_manifest_crate_names(manifest: &Path, facts: &FactPaths<'_>) -> Vec<Stri
             package_name = Some(value.to_string());
         }
     }
-    let mut names = Vec::new();
-    if let Some(lib) = lib_name {
-        names.push(lib);
-    }
-    if let Some(package) = package_name {
-        let normalized = package.replace('-', "_");
-        if !names.contains(&normalized) {
-            names.push(normalized);
-        }
-    }
-    names
+    (package_name, lib_name)
 }
 
 fn rust_resolve_segments_with_index<I: ResolverIndex>(
