@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 
 SOAK_SCOPE_BY_ROOT = {
@@ -632,6 +632,194 @@ def wait_indexes_ready(
             {"status": last_status, "callgraph_probe": public_response(last_callgraph)},
             sort_keys=True,
         )
+    )
+
+
+def _semantic_component(payload: Mapping[str, Any], root: Path) -> Mapping[str, Any] | None:
+    standalone = payload.get("semantic_index")
+    if isinstance(standalone, Mapping):
+        return standalone
+
+    metrics = payload.get("metrics")
+    roots = metrics.get("roots") if isinstance(metrics, Mapping) else None
+    root_texts = {str(root), str(root.resolve())}
+    if isinstance(roots, Sequence) and not isinstance(roots, (str, bytes)):
+        for candidate in roots:
+            if not isinstance(candidate, Mapping):
+                continue
+            if candidate.get("project_root") not in root_texts:
+                continue
+            semantic = candidate.get("semantic_index")
+            return semantic if isinstance(semantic, Mapping) else None
+    return None
+
+
+def _semantic_log_work(log_text: str, root: Path) -> str | None:
+    root_texts = {str(root), str(root.resolve())}
+    active: dict[str, str] = {}
+    queued_at = -1
+    terminal_at = -1
+    event_re = re.compile(
+        r"index_event kind=(?P<kind>\S+) plane=semantic build_id=(?P<build_id>\S+) "
+        r"root=(?P<root>.+?) key=\S+"
+    )
+    for position, line in enumerate(log_text.splitlines()):
+        if "request=semantic post-configure cold build" in line and "queued" in line:
+            queued_at = position
+        event = event_re.search(line)
+        if not event or event.group("root") not in root_texts:
+            continue
+        kind = event.group("kind")
+        build_id = event.group("build_id")
+        if kind == "build_started":
+            active[build_id] = f"semantic build {build_id} starting"
+        elif kind == "build_progress":
+            fields = {
+                key: value
+                for key, value in re.findall(
+                    r"\b(stage|completed|total|chunks_done|batch|total_batches)=([^\s]+)",
+                    line,
+                )
+            }
+            stage = fields.get("stage", "unknown")
+            chunks = fields.get("chunks_done", fields.get("completed", "?"))
+            total = fields.get("total", "?")
+            batches = ""
+            if "batch" in fields or "total_batches" in fields:
+                batches = f" batch={fields.get('batch', '?')}/{fields.get('total_batches', '?')}"
+            active[build_id] = (
+                f"semantic build {build_id} stage={stage} chunks={chunks}/{total}{batches}"
+            )
+        elif kind in {"build_ready", "build_failed", "build_superseded", "build_suspended"}:
+            active.pop(build_id, None)
+            terminal_at = position
+    if active:
+        return "; ".join(active[build_id] for build_id in sorted(active))
+    if queued_at > terminal_at:
+        return "semantic post-configure cold build queued"
+    return None
+
+
+def semantic_work_description(
+    payload: Mapping[str, Any], root: Path, log_text: str = ""
+) -> str | None:
+    """Name semantic work still running even when a resident index can serve queries."""
+    component = _semantic_component(payload, root)
+    if component is not None:
+        state = component.get("status", component.get("state"))
+        progress_present = any(
+            field in component
+            for field in ("embedded_chunks", "total_chunks", "current_batch", "total_batches")
+        )
+        if state in {"building", "loading"} or progress_present:
+            stage = component.get("stage", state or "unknown")
+            embedded = component.get("embedded_chunks", component.get("entries_done", "?"))
+            total = component.get("total_chunks", component.get("entries_total", "?"))
+            batch = component.get("current_batch", "?")
+            batches = component.get("total_batches", "?")
+            return f"semantic stage={stage} chunks={embedded}/{total} batch={batch}/{batches}"
+    return _semantic_log_work(log_text, root)
+
+
+def inspect_cache_has_dead_code(storage_root: Path) -> bool:
+    """Return true only when isolated storage records a completed dead-code full pass."""
+    inspect_root = storage_root / "inspect"
+    if not inspect_root.is_dir():
+        return False
+    for scope_dir in inspect_root.iterdir():
+        if not scope_dir.is_dir():
+            continue
+        scope = scope_dir.name
+        candidates: list[Path] = []
+        pointer = scope_dir / f"{scope}.current"
+        try:
+            generation = pointer.read_text(encoding="utf-8").strip()
+        except OSError:
+            generation = ""
+        if generation:
+            candidates.append(scope_dir / generation)
+        candidates.append(scope_dir / f"{scope}.sqlite")
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            try:
+                connection = sqlite3.connect(f"file:{candidate}?mode=ro", uri=True)
+                try:
+                    row = connection.execute(
+                        "SELECT last_full_run FROM tier2_meta "
+                        "WHERE category = 'dead_code' LIMIT 1"
+                    ).fetchone()
+                finally:
+                    connection.close()
+            except sqlite3.Error:
+                continue
+            if row is not None and isinstance(row[0], int):
+                return True
+    return False
+
+
+def _dead_code_phase_logged(log_text: str, root: Path) -> bool:
+    root_markers = {f"root={root}", f"root={root.resolve()}"}
+    return any(
+        "perf tier2 phases category=dead_code" in line
+        and any(marker in line for marker in root_markers)
+        for line in log_text.splitlines()
+    )
+
+
+def wait_cold_work_ready(
+    client: ToolClient,
+    *,
+    root: Path,
+    storage_root: Path,
+    log_reader: Callable[[], str],
+    timeout_s: float,
+) -> dict[str, Any]:
+    """Wait for the semantic seed and first dead-code pass, not merely query readiness."""
+    started = time.monotonic()
+    deadline = started + timeout_s
+    inspect_requested = False
+    last_status: dict[str, Any] = {}
+    last_semantic: str | None = "semantic state not observed"
+    last_tier2_ready = False
+    while time.monotonic() < deadline:
+        remaining = max(1.0, deadline - time.monotonic())
+        last_status = client.status(timeout_s=min(60.0, remaining))
+        log_text = log_reader()
+        last_semantic = semantic_work_description(last_status, root, log_text)
+        last_tier2_ready = _dead_code_phase_logged(
+            log_text, root
+        ) or inspect_cache_has_dead_code(storage_root)
+        if last_semantic is None and last_tier2_ready:
+            return {
+                "elapsed_ms": round((time.monotonic() - started) * 1000),
+                "status": last_status,
+                "semantic": "idle",
+                "tier2_dead_code": "complete",
+            }
+        if last_semantic is None and not inspect_requested:
+            response = client.tool(
+                "inspect", {"sections": "dead_code"}, timeout_s=remaining
+            )
+            inspect_requested = True
+            if response.get("success") is not True:
+                raise SoakError(
+                    "cold work readiness failed while requesting the tier-2 dead-code pass: "
+                    + json.dumps(public_response(response), sort_keys=True)
+                )
+            continue
+        time.sleep(0.5)
+
+    running = []
+    if last_semantic is not None:
+        running.append(last_semantic)
+    if not last_tier2_ready:
+        running.append("tier-2 dead_code cold pass incomplete")
+    raise SoakError(
+        "cold work readiness timed out; still running: "
+        + "; ".join(running)
+        + "; last_status="
+        + json.dumps(last_status, sort_keys=True)
     )
 
 

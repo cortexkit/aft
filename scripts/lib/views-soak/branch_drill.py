@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+from contextlib import ExitStack
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -36,6 +37,7 @@ from common import (
     sample_process,
     select_stable_symbols,
     utc_now,
+    wait_cold_work_ready,
     wait_indexes_ready,
     write_json,
     write_views_off_config,
@@ -352,6 +354,36 @@ def log_metrics(text: str, root: Path) -> tuple[int | None, int | None, int, int
     )
 
 
+def contention_metrics(text: str, root: Path) -> dict[str, Any]:
+    root_markers = {f"root={root}", f"root={root.resolve()}"}
+    build_progress_lines = 0
+    tier2_refresh_scheduled: list[str] = []
+    tier2_phase_lines: list[str] = []
+    tier2_categories: list[str] = []
+    for line in text.splitlines():
+        root_owned = any(marker in line for marker in root_markers)
+        if "index_event kind=build_progress" in line and root_owned:
+            build_progress_lines += 1
+        if "tier2 refresh scheduled" in line:
+            tier2_refresh_scheduled.append(line)
+        if "perf tier2 phases" in line and root_owned:
+            tier2_phase_lines.append(line)
+            category = re.search(r"\bcategory=([^\s]+)", line)
+            if category:
+                tier2_categories.append(category.group(1))
+    parts = [f"build_progress={build_progress_lines}"]
+    if tier2_refresh_scheduled:
+        parts.append(f"tier2_scheduled={len(tier2_refresh_scheduled)}")
+    if tier2_categories:
+        parts.append("tier2_phases=" + ",".join(tier2_categories))
+    return {
+        "build_progress_lines": build_progress_lines,
+        "tier2_refresh_scheduled_lines": tier2_refresh_scheduled,
+        "tier2_phase_lines": tier2_phase_lines,
+        "summary": "none" if parts == ["build_progress=0"] else "; ".join(parts),
+    }
+
+
 def publication_outcome(
     before_generation: str | None,
     after_generation: str | None,
@@ -420,6 +452,11 @@ def perform_switch(
         log_path = storage / "logs" / f"aft-{before_pid}.log"
         log_mark = file_log_mark(log_path)
 
+    def read_log_window() -> str:
+        if isinstance(client, NdjsonClient):
+            return client.log_since(log_mark)
+        return file_log_since(log_path, log_mark)
+
     started = time.monotonic()
     checkout_args = ["checkout", "--quiet", "--detach"]
     if not views_on:
@@ -438,6 +475,7 @@ def perform_switch(
     readiness_observations: list[dict[str, Any]] = []
     last_search: dict[str, Any] = {}
     last_callgraph: dict[str, Any] = {}
+    contention_log_text: str | None = None
     while time.monotonic() < deadline:
         remaining = max(1.0, deadline - time.monotonic())
         try:
@@ -476,9 +514,12 @@ def perform_switch(
         )
         if search_is_correct(last_search, probe.token) and callgraph_is_correct(last_callgraph):
             time_to_correct_ms = round((time.monotonic() - started) * 1000)
+            contention_log_text = read_log_window()
             break
         time.sleep(0.25)
 
+    if contention_log_text is None:
+        contention_log_text = read_log_window()
     if views_on and publication_ms is None:
         generation = current_generation(view_dir)
         if generation is not None and generation != before_generation:
@@ -569,6 +610,7 @@ def perform_switch(
         "readiness_ms": readiness_ms,
         "readiness_observations": readiness_observations,
         "index_events": index_events,
+        "contention": contention_metrics(contention_log_text, checkout),
         "readiness_error": readiness_error,
         "time_to_correct_ms": time_to_correct_ms,
         "correctness": "timeout" if timed_out else "correct",
@@ -578,10 +620,57 @@ def perform_switch(
     }
 
 
+def warm_mode(
+    *,
+    mode: str,
+    checkout: Path,
+    client: ToolClient,
+    storage: Path,
+    baseline_storage: Path,
+    views_on: bool,
+    standalone_pid: int,
+    warm_started: float,
+    ceiling_s: float,
+) -> dict[str, Any]:
+    stable = select_stable_symbols(client, checkout, count=1)
+    remaining = ceiling_s - (time.monotonic() - warm_started)
+    if remaining <= 0:
+        raise SoakError(f"{mode} exhausted its cold-work budget before index readiness")
+    ready = wait_indexes_ready(client, stable[0], timeout_s=remaining)
+    indexes_ready_ms = round((time.monotonic() - warm_started) * 1000)
+    remaining = ceiling_s - (time.monotonic() - warm_started)
+    if remaining <= 0:
+        raise SoakError(
+            f"{mode} cold-work readiness timed out; still running: "
+            "semantic state unknown; tier-2 dead_code cold pass incomplete"
+        )
+    if isinstance(client, NdjsonClient):
+        log_reader = lambda: client.log_since(0)
+    else:
+        log_path = storage / "logs" / f"aft-{standalone_pid}.log"
+        log_reader = lambda: file_log_since(log_path, 0)
+    cold = wait_cold_work_ready(
+        client,
+        root=checkout,
+        storage_root=storage if views_on else baseline_storage,
+        log_reader=log_reader,
+        timeout_s=remaining,
+    )
+    cold_work_ms = round((time.monotonic() - warm_started) * 1000)
+    return {
+        "ceiling_ms": round(ceiling_s * 1000),
+        "storage": str(storage if views_on else baseline_storage),
+        "subject": "standalone_views_on" if views_on else "standalone_owned_baseline",
+        "readiness_detail_ms": ready["elapsed_ms"],
+        "indexes_ready_ms": indexes_ready_ms,
+        "cold_gate_detail_ms": cold["elapsed_ms"],
+        "cold_work_ms": cold_work_ms,
+        "total_ms": cold_work_ms,
+        "measurement_pid": standalone_pid,
+    }
 
 
-
-def run_mode(
+def exercise_mode(
     *,
     mode: str,
     checkout: Path,
@@ -589,74 +678,45 @@ def run_mode(
     head: str,
     transitions: list[tuple[str, str, str, int]],
     probes: Mapping[tuple[str, str], SwitchProbe],
-    binary: Path,
-    storage: Path,
-    scope: str,
+    client: ToolClient,
     views_on: bool,
-    baseline_storage: Path,
-    log_dir: Path,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    view_dir: Path,
+    storage: Path,
+    standalone_pid: int,
+) -> list[dict[str, Any]]:
     if git_text(checkout, "rev-parse", "HEAD") != head:
         raise SoakError(f"{mode} did not start at HEAD")
-    cache_dir = log_dir
-    user_config = Path.home() / ".config" / "cortexkit" / "aft.jsonc"
-    view_dir = storage / "views" / scope
     rows: list[dict[str, Any]] = []
-    warm_started = time.monotonic()
     known_manifest_fingerprints: dict[str, str] = {}
     if views_on:
         initial_fingerprint = manifest_fingerprint(view_dir)
         if initial_fingerprint is not None:
             known_manifest_fingerprints[head] = initial_fingerprint
 
-    def exercise(client: ToolClient, standalone_pid: int | None) -> None:
-        stable = select_stable_symbols(client, checkout, count=1)
-        ready = wait_indexes_ready(client, stable[0], timeout_s=1200.0)
-        warmup["readiness_detail_ms"] = ready["elapsed_ms"]
-        warmup["total_ms"] = round((time.monotonic() - warm_started) * 1000)
-        warmup["measurement_pid"] = standalone_pid
-        for source, target, label, changed_files in transitions:
-            if git_text(checkout, "rev-parse", "HEAD") != source:
-                raise SoakError(f"{mode} sequence drift before {label}")
-            row = perform_switch(
-                    mode=mode,
-                    checkout=checkout,
-                    source_root=source_root,
-                    target_sha=target,
-                    changed_files=changed_files,
-                    label=label,
-                    probe=probes[(source, target)],
-                    client=client,
-                    views_on=views_on,
-                    view_dir=view_dir,
-                    storage=storage,
-                    expected_manifest_fingerprint=known_manifest_fingerprints.get(target),
-                    standalone_pid=standalone_pid,
-                )
-            rows.append(row)
-            if views_on and row["publication"] in {"published", "no_op"}:
-                fingerprint = row["manifest_fingerprint_after"]
-                if fingerprint is not None:
-                    known_manifest_fingerprints[target] = fingerprint
-
-    warmup: dict[str, Any] = {
-        "ceiling_ms": 1_200_000,
-        "storage": str(storage if views_on else baseline_storage),
-        "subject": "standalone_views_on" if views_on else "standalone_owned_baseline",
-    }
-    subject = "views-on" if views_on else "views-off"
-    stderr_path = cache_dir / f"branch-drill-{subject}.stderr.log"
-    subject_storage = storage if views_on else baseline_storage
-    with NdjsonClient(
-        binary,
-        checkout,
-        subject_storage,
-        stderr_path,
-        f"views-branch-{subject}-{int(time.time())}",
-    ) as client:
-        client.configure(user_config)
-        exercise(client, client.proc.pid)
-    return rows, warmup
+    for source, target, label, changed_files in transitions:
+        if git_text(checkout, "rev-parse", "HEAD") != source:
+            raise SoakError(f"{mode} sequence drift before {label}")
+        row = perform_switch(
+            mode=mode,
+            checkout=checkout,
+            source_root=source_root,
+            target_sha=target,
+            changed_files=changed_files,
+            label=label,
+            probe=probes[(source, target)],
+            client=client,
+            views_on=views_on,
+            view_dir=view_dir,
+            storage=storage,
+            expected_manifest_fingerprint=known_manifest_fingerprints.get(target),
+            standalone_pid=standalone_pid,
+        )
+        rows.append(row)
+        if views_on and row["publication"] in {"published", "no_op"}:
+            fingerprint = row["manifest_fingerprint_after"]
+            if fingerprint is not None:
+                known_manifest_fingerprints[target] = fingerprint
+    return rows
 
 
 def render_table(
@@ -678,19 +738,19 @@ def render_table(
         "The isolated views-on subject exercises content-addressed publication without restarting or mutating the live daemon. "
         f"Views-on used {views_on_embeds} embed batches across the four switches; the legacy arm used {views_off_embeds}.",
         "",
-        "## Run 3 — isolated views-on, warm owned baseline",
+        "## Cold-work-gated run",
         "",
         f"Observed at `{refs['observed_at']}` against `{refs['head'][:12]}`.",
         "",
         f"- A: first-parent commit `{refs['anchor']['sha'][:12]}` ({refs['anchor']['changed_files']} changed files)",
         f"- B: branch `{refs['branch']['ref']}` (`{refs['branch']['sha'][:12]}`, {refs['branch']['changed_files']} changed files)",
-        f"- Views-on subject: standalone AFT with isolated view storage; warm-up `{warmups['views-on']['total_ms']} ms`.",
-        f"- Views-off subject: standalone AFT on an independent baseline clone and isolated storage; warm-up `{warmups['views-off']['total_ms']} ms`.",
+        f"- Views-on subject: standalone AFT with isolated view storage; cold work gated in `{warmups['views-on']['cold_work_ms']} ms`.",
+        f"- Views-off subject: standalone AFT on an independent baseline clone and isolated storage; cold work gated in `{warmups['views-off']['cold_work_ms']} ms`.",
         "",
         "`cpu_s` and `rss_delta_mb` use the active standalone subject PID for each row. PID changes are recorded as defects rather than subtracting unrelated processes.",
         "",
-        "| switch | on publication_ms | on puts | on embeds | on cpu_s | on rss_delta_mb | on correct_ms | off publication_ms | off puts | off embeds | off cpu_s | off rss_delta_mb | off correct_ms |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| switch | on publication_ms | on puts | on embeds | on cpu_s | on rss_delta_mb | on correct_ms | on contention | off publication_ms | off puts | off embeds | off cpu_s | off rss_delta_mb | off correct_ms | off contention |",
+        "|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---|",
     ]
     for switch in switches:
         on = by_mode[("views-on", switch)]
@@ -703,16 +763,24 @@ def render_table(
             "—" if on["cpu_s"] is None else on["cpu_s"],
             "—" if on["rss_delta_mb"] is None else on["rss_delta_mb"],
             "timeout" if on["time_to_correct_ms"] is None else on["time_to_correct_ms"],
+            on["contention"]["summary"],
             "—" if off["publication_ms"] is None else off["publication_ms"],
             "—" if off["puts"] is None else off["puts"],
             off["embeds"],
             "—" if off["cpu_s"] is None else off["cpu_s"],
             "—" if off["rss_delta_mb"] is None else off["rss_delta_mb"],
             "timeout" if off["time_to_correct_ms"] is None else off["time_to_correct_ms"],
+            off["contention"]["summary"],
         )
         lines.append("| " + " | ".join(markdown_cell(value) for value in values) + " |")
     lines.extend(
         [
+            "",
+            "### Cold-work readiness",
+            "",
+            "Both standalone arm processes were started before either arm switched commits. Each arm first passed query readiness, then waited for semantic progress and root-owned semantic build events to settle and for one full dead-code Tier-2 pass. The first switch began only after both gates cleared.",
+            "",
+            "The earlier `semantic_index.status=ready` observation described an installed queryable resident/view index, not an idle semantic worker. In the status producer, an installed `SemanticIndex` is labeled from the resident index and the live `semantic_build_progress` fields are only attached to the no-index cold-building branch. Fresh isolated standalone storage rules out borrowing another process's legacy index. The gate therefore requires the progress/build lifecycle itself to be terminal rather than accepting the queryable status label.",
             "",
             "### Four mechanisms",
             "",
@@ -813,6 +881,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="permit non-empty arm storage (invalid for controlled acceptance runs)",
     )
     parser.add_argument(
+        "--cold-work-timeout-s",
+        type=float,
+        default=1800.0,
+        help="per-arm budget for indexes, semantic idle, and the first dead-code pass",
+    )
+    parser.add_argument(
         "--mode",
         choices=("both", "views-on", "views-off"),
         default="both",
@@ -867,43 +941,90 @@ def main(argv: list[str]) -> int:
     warmups: dict[str, Any] = {}
 
     try:
-        if args.mode in {"both", "views-on"}:
-            on_rows, warmups["views-on"] = run_mode(
-                mode="views-on",
-                checkout=root,
-                source_root=root,
-                head=original_head,
-                transitions=transitions,
-                probes=probes,
-                binary=binary,
-                storage=storage,
-                scope=scope,
-                views_on=True,
-                baseline_storage=baseline_storage,
-                log_dir=output_dir,
-            )
-            rows.extend(on_rows)
-
         if args.mode in {"both", "views-off"}:
             for target in {target for _, target, _, _ in transitions}:
                 git_text(baseline, "fetch", "--quiet", str(root), target)
             git_text(baseline, "checkout", "--quiet", "--detach", "--force", original_head)
             write_views_off_config(root, baseline)
-            off_rows, warmups["views-off"] = run_mode(
-                mode="views-off",
-                checkout=baseline,
-                source_root=root,
-                head=original_head,
-                transitions=transitions,
-                probes=probes,
-                binary=binary,
-                storage=storage,
-                scope=scope,
-                views_on=False,
-                baseline_storage=baseline_storage,
-                log_dir=output_dir,
+
+        subject_specs: list[dict[str, Any]] = []
+        if args.mode in {"both", "views-on"}:
+            subject_specs.append(
+                {
+                    "mode": "views-on",
+                    "checkout": root,
+                    "source_root": root,
+                    "subject_storage": storage,
+                    "views_on": True,
+                }
             )
-            rows.extend(off_rows)
+        if args.mode in {"both", "views-off"}:
+            subject_specs.append(
+                {
+                    "mode": "views-off",
+                    "checkout": baseline,
+                    "source_root": root,
+                    "subject_storage": baseline_storage,
+                    "views_on": False,
+                }
+            )
+
+        with ExitStack() as stack:
+            active_subjects: list[dict[str, Any]] = []
+            for spec in subject_specs:
+                mode = str(spec["mode"])
+                warm_started = time.monotonic()
+                client = stack.enter_context(
+                    NdjsonClient(
+                        binary,
+                        spec["checkout"],
+                        spec["subject_storage"],
+                        output_dir / f"branch-drill-{mode}.stderr.log",
+                        f"views-branch-{mode}-{int(time.time())}",
+                    )
+                )
+                active_subjects.append(
+                    {**spec, "client": client, "warm_started": warm_started}
+                )
+
+            user_config = Path.home() / ".config" / "cortexkit" / "aft.jsonc"
+            for subject in active_subjects:
+                subject["client"].configure(user_config)
+
+            # Keep both processes alive and finish every arm's cold gate before
+            # the first checkout mutation, so no arm warms during measured rows.
+            for subject in active_subjects:
+                client = subject["client"]
+                mode = str(subject["mode"])
+                warmups[mode] = warm_mode(
+                    mode=mode,
+                    checkout=subject["checkout"],
+                    client=client,
+                    storage=storage,
+                    baseline_storage=baseline_storage,
+                    views_on=bool(subject["views_on"]),
+                    standalone_pid=client.proc.pid,
+                    warm_started=float(subject["warm_started"]),
+                    ceiling_s=args.cold_work_timeout_s,
+                )
+
+            for subject in active_subjects:
+                client = subject["client"]
+                rows.extend(
+                    exercise_mode(
+                        mode=str(subject["mode"]),
+                        checkout=subject["checkout"],
+                        source_root=subject["source_root"],
+                        head=original_head,
+                        transitions=transitions,
+                        probes=probes,
+                        client=client,
+                        views_on=bool(subject["views_on"]),
+                        view_dir=storage / "views" / scope,
+                        storage=subject["subject_storage"],
+                        standalone_pid=client.proc.pid,
+                    )
+                )
     finally:
         current = git_text(root, "rev-parse", "HEAD", allowed=(0, 128))
         current_branch = git_text(
@@ -964,7 +1085,7 @@ def main(argv: list[str]) -> int:
     previous_path = RESULT_DIR / "branch-drill-run1-confounded.json"
     previous = json.loads(previous_path.read_text(encoding="utf-8")) if previous_path.is_file() else None
     result = {
-        "schema_version": 2,
+        "schema_version": 3,
         "observed_at": observed_at,
         "root": str(root),
         "baseline": str(baseline),
