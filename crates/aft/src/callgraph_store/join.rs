@@ -1317,6 +1317,14 @@ pub(crate) struct ViewBindingDependencies {
     // unique and stable within the immutable caller blob used to validate reuse.
     pub references: BTreeMap<u32, BTreeSet<String>>,
     pub dependencies: BTreeSet<String>,
+    #[serde(default)]
+    pub consulted_facts: BTreeSet<(String, String)>,
+    #[serde(default)]
+    pub unattributed: bool,
+    #[serde(default)]
+    binding_facts: ConfigConsultations,
+    #[serde(default)]
+    resolution_facts: ConfigConsultations,
     binding_probes: BTreeSet<String>,
     resolved_dependencies: BTreeSet<String>,
     surface_queries: Vec<(ViewSurfaceQuery, String)>,
@@ -1413,9 +1421,44 @@ pub(crate) fn view_resolution_config(path: &[u8]) -> bool {
 
 /// All memo tables are scoped to one immutable manifest join. Hits still record
 /// the caller's probes, so memoization cannot hide a future invalidation edge.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+struct ConfigConsultations {
+    facts: BTreeSet<(String, String)>,
+    reads: BTreeSet<String>,
+    unattributed: bool,
+}
+impl ConfigConsultations {
+    fn extend(&mut self, other: &Self) {
+        self.facts.extend(other.facts.iter().cloned());
+        self.reads.extend(other.reads.iter().cloned());
+        self.unattributed |= other.unattributed;
+    }
+    fn unattributed(&self) -> bool {
+        self.unattributed
+            || self
+                .reads
+                .iter()
+                .any(|path| !self.facts.iter().any(|(input, _)| input == path))
+    }
+}
+
+#[derive(Clone, Default)]
+struct ConsultationTrace {
+    config: ConfigConsultations,
+    probes: BTreeSet<String>,
+}
+type ConsultationMemoKey = (std::path::PathBuf, String, String);
+
 struct ViewBindingFacts<'a> {
     inner: Rc<dyn ProjectFacts + 'a>,
     probes: std::cell::RefCell<BTreeSet<String>>,
+    consultations: std::cell::RefCell<ConfigConsultations>,
+    memo_stack: std::cell::RefCell<Vec<(ConsultationMemoKey, ConsultationTrace)>>,
+    memo_traces: std::cell::RefCell<BTreeMap<ConsultationMemoKey, ConsultationTrace>>,
+    workspace_packages:
+        std::cell::RefCell<BTreeMap<(std::path::PathBuf, String), Option<std::path::PathBuf>>>,
+    workspace_members:
+        std::cell::RefCell<BTreeMap<std::path::PathBuf, Arc<Vec<std::path::PathBuf>>>>,
     canonical_cache: std::cell::RefCell<HashMap<Vec<u8>, Option<Vec<u8>>>>,
     file_cache: std::cell::RefCell<HashMap<Vec<u8>, bool>>,
     config_cache: std::cell::RefCell<HashMap<Vec<u8>, Option<Arc<[u8]>>>>,
@@ -1447,8 +1490,36 @@ impl ViewBindingFacts<'_> {
                         _ => parts.push(part),
                     }
                 }
-                self.probes.borrow_mut().insert(parts.join("/"));
+                let path = parts.join("/");
+                self.probes.borrow_mut().insert(path.clone());
+                for (_, trace) in self.memo_stack.borrow_mut().iter_mut() {
+                    trace.probes.insert(path.clone());
+                }
             }
+        }
+    }
+
+    fn take_config(&self) -> ConfigConsultations {
+        let mut result = std::mem::take(&mut *self.consultations.borrow_mut());
+        result.unattributed = result.unattributed();
+        result.reads.clear();
+        result
+    }
+
+    fn config_event(&self, path: &[u8], name: Option<&str>) {
+        let Ok(path) = std::str::from_utf8(path) else {
+            self.consultations.borrow_mut().unattributed = true;
+            return;
+        };
+        let mut event = ConfigConsultations::default();
+        if let Some(name) = name {
+            event.facts.insert((path.into(), name.into()));
+        } else {
+            event.reads.insert(path.into());
+        }
+        self.consultations.borrow_mut().extend(&event);
+        for (_, trace) in self.memo_stack.borrow_mut().iter_mut() {
+            trace.config.extend(&event);
         }
     }
 
@@ -1458,6 +1529,66 @@ impl ViewBindingFacts<'_> {
 }
 
 impl ProjectFacts for ViewBindingFacts<'_> {
+    fn records_config_facts(&self) -> bool {
+        true
+    }
+    fn config_fact(&self, rel: &[u8], name: &str) {
+        self.config_event(rel, Some(name));
+    }
+    fn memo_start(&self, path: &Path, kind: &str, name: &str) {
+        self.memo_stack.borrow_mut().push((
+            (path.into(), kind.into(), name.into()),
+            ConsultationTrace::default(),
+        ));
+    }
+    fn memo_finish(&self, path: &Path, kind: &str, name: &str) {
+        let (key, trace) = self
+            .memo_stack
+            .borrow_mut()
+            .pop()
+            .expect("balanced resolver memo recording");
+        debug_assert_eq!(key, (path.into(), kind.into(), name.into()));
+        self.memo_traces.borrow_mut().insert(key, trace);
+    }
+    fn memo_replay(&self, path: &Path, kind: &str, name: &str) {
+        let traces = self.memo_traces.borrow();
+        let Some(trace) = traces.get(&(path.into(), kind.into(), name.into())) else {
+            self.consultations.borrow_mut().unattributed = true;
+            return;
+        };
+        self.consultations.borrow_mut().extend(&trace.config);
+        self.probes
+            .borrow_mut()
+            .extend(trace.probes.iter().cloned());
+        for (_, parent) in self.memo_stack.borrow_mut().iter_mut() {
+            parent.config.extend(&trace.config);
+            parent.probes.extend(trace.probes.iter().cloned());
+        }
+    }
+    fn workspace_package(&self, root: &Path, name: &str) -> Option<Option<std::path::PathBuf>> {
+        self.workspace_packages
+            .borrow()
+            .get(&(root.into(), name.into()))
+            .cloned()
+    }
+    fn remember_workspace_package(
+        &self,
+        root: &Path,
+        name: &str,
+        value: Option<std::path::PathBuf>,
+    ) {
+        self.workspace_packages
+            .borrow_mut()
+            .insert((root.into(), name.into()), value);
+    }
+    fn workspace_members(&self, root: &Path) -> Option<Arc<Vec<std::path::PathBuf>>> {
+        self.workspace_members.borrow().get(root).cloned()
+    }
+    fn remember_workspace_members(&self, root: &Path, value: Arc<Vec<std::path::PathBuf>>) {
+        self.workspace_members
+            .borrow_mut()
+            .insert(root.into(), value);
+    }
     fn is_file(&self, rel: &[u8]) -> bool {
         let is_file = self.file_fact(rel);
         if is_file {
@@ -1469,6 +1600,7 @@ impl ProjectFacts for ViewBindingFacts<'_> {
         self.inner.is_dir(rel)
     }
     fn config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
+        self.config_event(rel, None);
         self.record(rel);
         if let Some(value) = self.config_cache.borrow().get(rel) {
             return value.clone();
@@ -1582,6 +1714,11 @@ fn join_manifest_with_surfaces(
             blobs: &reader,
         }),
         probes: Default::default(),
+        consultations: Default::default(),
+        memo_stack: Default::default(),
+        memo_traces: Default::default(),
+        workspace_packages: Default::default(),
+        workspace_members: Default::default(),
         canonical_cache: Default::default(),
         file_cache: Default::default(),
         config_cache: Default::default(),
@@ -1637,6 +1774,7 @@ fn join_manifest_with_surfaces(
         };
         decoded_caller_blobs += 1;
         facts.take();
+        facts.take_config();
         let extract =
             blob.bind_with_dependencies(rel, &paths, cache.map(|cache| &cache.references))?;
         let file_index = super::DbFileIndex::from_extract(root, &extract, &paths);
@@ -1658,6 +1796,7 @@ fn join_manifest_with_surfaces(
                 })
                 .collect();
             binding.binding_probes = facts.take();
+            binding.binding_facts = facts.take_config();
             binding.dependencies = binding.references.values().flatten().cloned().collect();
             binding
                 .dependencies
@@ -1715,6 +1854,7 @@ fn join_manifest_with_surfaces(
         if resolved_callers.contains(path) {
             binding.resolved_dependencies.clear();
             binding.surface_queries.clear();
+            binding.resolution_facts = ConfigConsultations::default();
         } else if let Some(old) = cached.get(path) {
             binding.resolved_dependencies = old.resolved_dependencies.clone();
             binding.surface_queries = old.surface_queries.clone();
@@ -1737,6 +1877,7 @@ fn join_manifest_with_surfaces(
         };
         decoded_caller_blobs += 1;
         facts.take();
+        facts.take_config();
         let extract =
             blob.bind_with_dependencies(caller, &paths, Some(&bindings[caller].references))?;
         for (raw, bound) in blob.refs.iter().zip(&extract.raw_refs) {
@@ -1774,10 +1915,12 @@ fn join_manifest_with_surfaces(
             continue;
         }
         facts.take();
+        facts.take_config();
         let resolved = super::resolve_ref(raw, &surface_index)
             .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
         let caller = std::str::from_utf8(&key.caller_path).expect("bound UTF-8 caller");
         let binding = bindings.get_mut(caller).expect("bound caller dependencies");
+        binding.resolution_facts.extend(&facts.take_config());
         queries
             .entry(caller.to_string())
             .or_default()
@@ -1812,6 +1955,14 @@ fn join_manifest_with_surfaces(
     }
     profile.finish("resolve_and_record");
     for (path, binding) in &mut bindings {
+        binding.consulted_facts = binding
+            .binding_facts
+            .facts
+            .union(&binding.resolution_facts.facts)
+            .cloned()
+            .collect();
+        binding.unattributed =
+            binding.binding_facts.unattributed() || binding.resolution_facts.unattributed();
         if let Some(queries) = queries.remove(path) {
             binding.surface_queries = queries.into_iter().collect();
         }

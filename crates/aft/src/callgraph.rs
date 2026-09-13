@@ -164,12 +164,15 @@ impl ModuleResolutionMemo {
         let key = (from_dir.to_path_buf(), module_path.to_string());
         if self.enabled {
             if let Some(cached) = self.module_paths.borrow().get(&key) {
+                facts.facts.memo_replay(from_dir, "module", module_path);
                 return cached.clone();
             }
         }
 
         self.note_module_computation(&key);
+        facts.facts.memo_start(from_dir, "module", module_path);
         let resolved = resolve_module_path_uncached(from_dir, module_path, Some(self), facts);
+        facts.facts.memo_finish(from_dir, "module", module_path);
         if self.enabled {
             let retained_weight = module_resolution_entry_weight(&key, resolved.as_deref());
             self.module_paths
@@ -2399,9 +2402,12 @@ fn resolve_tsconfig_path(
     facts: &FactPaths<'_>,
 ) -> Option<PathBuf> {
     let tsconfig_dir = find_tsconfig_dir(from_dir, facts)?;
-    let tsconfig = package_json_like_value(&tsconfig_dir.join("tsconfig.json"), memo, facts)?;
+    let tsconfig = package_json_like_value(&tsconfig_dir.join("tsconfig.json"), memo, facts);
+    facts.config_field(&tsconfig_dir, "tsconfig.json", "compilerOptions.paths");
+    let tsconfig = tsconfig?;
     let compiler_options = tsconfig.get("compilerOptions")?;
     let paths = compiler_options.get("paths")?.as_object()?;
+    facts.config_field(&tsconfig_dir, "tsconfig.json", "baseUrl");
     let base_url = compiler_options
         .get("baseUrl")
         .and_then(Value::as_str)
@@ -2517,6 +2523,7 @@ fn is_workspace_root(
     memo: Option<&ModuleResolutionMemo>,
     facts: &FactPaths<'_>,
 ) -> bool {
+    facts.config_field(dir, "package.json", "workspaces");
     package_json_value(dir, memo, facts)
         .map(|value| !workspace_patterns(&value).is_empty())
         .unwrap_or(false)
@@ -2580,27 +2587,50 @@ fn resolve_workspace_package(
     // at 70% each in that walk during one-file Tier-2 rescans across roots.
     if let Some(memo) = memo {
         if let Some(cached) = memo.workspace_package(&cache_key) {
+            facts
+                .facts
+                .memo_replay(&workspace_root, "package", package_name);
             return cached;
         }
     }
-    if let Ok(cache) = WORKSPACE_PACKAGE_CACHE.read() {
+    if facts.facts.records_config_facts() {
+        if let Some(cached) = facts.facts.workspace_package(&workspace_root, package_name) {
+            facts
+                .facts
+                .memo_replay(&workspace_root, "package", package_name);
+            return cached;
+        }
+    } else if let Ok(cache) = WORKSPACE_PACKAGE_CACHE.read() {
         if let Some(cached) = cache.get(&cache_key) {
             if let Some(memo) = memo {
                 memo.remember_workspace_package(cache_key, cached.clone());
             }
+            facts
+                .facts
+                .memo_replay(&workspace_root, "package", package_name);
             return cached.clone();
         }
     }
 
+    facts
+        .facts
+        .memo_start(&workspace_root, "package", package_name);
     let resolved = cached_workspace_member_dirs(&workspace_root, memo, facts)
         .iter()
         .find(|dir| package_json_name(dir, memo, facts).as_deref() == Some(package_name))
         .map(|dir| facts.canonical(dir).unwrap_or_else(|| dir.clone()));
 
+    facts
+        .facts
+        .memo_finish(&workspace_root, "package", package_name);
     if let Some(memo) = memo {
         memo.remember_workspace_package(cache_key.clone(), resolved.clone());
     }
-    if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
+    if facts.facts.records_config_facts() {
+        facts
+            .facts
+            .remember_workspace_package(&workspace_root, package_name, resolved.clone());
+    } else if let Ok(mut cache) = WORKSPACE_PACKAGE_CACHE.write() {
         cache.insert(cache_key, resolved.clone());
     }
 
@@ -2615,13 +2645,25 @@ fn cached_workspace_member_dirs(
     memo: Option<&ModuleResolutionMemo>,
     facts: &FactPaths<'_>,
 ) -> Arc<Vec<PathBuf>> {
-    if let Ok(cache) = WORKSPACE_MEMBER_DIRS_CACHE.read() {
+    if facts.facts.records_config_facts() {
+        if let Some(members) = facts.facts.workspace_members(workspace_root) {
+            facts.facts.memo_replay(workspace_root, "members", "");
+            return members;
+        }
+    } else if let Ok(cache) = WORKSPACE_MEMBER_DIRS_CACHE.read() {
         if let Some(members) = cache.get(workspace_root) {
+            facts.facts.memo_replay(workspace_root, "members", "");
             return Arc::clone(members);
         }
     }
+    facts.facts.memo_start(workspace_root, "members", "");
     let members = Arc::new(workspace_member_dirs(workspace_root, memo, facts));
-    if let Ok(mut cache) = WORKSPACE_MEMBER_DIRS_CACHE.write() {
+    facts.facts.memo_finish(workspace_root, "members", "");
+    if facts.facts.records_config_facts() {
+        facts
+            .facts
+            .remember_workspace_members(workspace_root, Arc::clone(&members));
+    } else if let Ok(mut cache) = WORKSPACE_MEMBER_DIRS_CACHE.write() {
         cache.insert(workspace_root.to_path_buf(), Arc::clone(&members));
     }
     members
@@ -2632,6 +2674,7 @@ fn workspace_member_dirs(
     memo: Option<&ModuleResolutionMemo>,
     facts: &FactPaths<'_>,
 ) -> Vec<PathBuf> {
+    facts.config_field(workspace_root, "package.json", "workspaces");
     let mut patterns = package_json_value(workspace_root, memo, facts)
         .map(|package_json| workspace_patterns(&package_json))
         .unwrap_or_default();
@@ -2666,6 +2709,7 @@ fn non_empty_workspace_pattern(value: &Value) -> Option<String> {
 }
 
 fn pnpm_workspace_patterns(workspace_root: &Path, facts: &FactPaths<'_>) -> Vec<String> {
+    facts.config_field(workspace_root, "pnpm-workspace.yaml", "packages");
     let Some(bytes) = facts.bytes(&workspace_root.join("pnpm-workspace.yaml")) else {
         return Vec::new();
     };
@@ -2811,6 +2855,7 @@ fn package_json_name(
     memo: Option<&ModuleResolutionMemo>,
     facts: &FactPaths<'_>,
 ) -> Option<String> {
+    facts.config_field(dir, "package.json", "name");
     package_json_value(dir, memo, facts)?
         .get("name")?
         .as_str()
@@ -2826,6 +2871,7 @@ fn resolve_package_entry(
     let package_json =
         package_json_value(package_root, memo, facts).unwrap_or_else(|| Arc::new(Value::Null));
 
+    facts.config_field(package_root, "package.json", "exports");
     if let Some(exports) = package_json.get("exports") {
         if let Some(target) = export_target_for_subpath(exports, subpath.as_deref()) {
             if let Some(path) = resolve_package_target(package_root, &target, facts) {
@@ -2836,6 +2882,7 @@ fn resolve_package_entry(
 
     if subpath.is_none() {
         for field in ["module", "main"] {
+            facts.config_field(package_root, "package.json", field);
             if let Some(target) = package_json.get(field).and_then(Value::as_str) {
                 if let Some(path) = resolve_package_target(package_root, target, facts) {
                     return Some(path);

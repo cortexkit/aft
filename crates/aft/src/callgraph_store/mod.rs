@@ -2446,16 +2446,22 @@ impl ResolverIndex for ProjectIndex<'_> {
     }
 
     fn crate_src_prefix(&self, crate_name: &str) -> Option<String> {
+        if self.workspace_crate_prefixes.0.get().is_some() {
+            self.facts.memo_replay(&self.project_root, "crates", "");
+        }
         self.workspace_crate_prefixes
             .0
             .get_or_init(|| {
-                build_workspace_crate_prefixes(
+                self.facts.memo_start(&self.project_root, "crates", "");
+                let prefixes = build_workspace_crate_prefixes(
                     &self.project_root,
                     &FactPaths {
                         root: &self.project_root,
                         facts: self.facts.as_ref(),
                     },
-                )
+                );
+                self.facts.memo_finish(&self.project_root, "crates", "");
+                prefixes
             })
             .get(crate_name)
             .cloned()
@@ -10445,6 +10451,8 @@ fn build_workspace_crate_prefixes(
 /// (`-` -> `_`) and any explicit `[lib] name`. Returns both so a crate is
 /// reachable by either spelling, matching the previous match semantics.
 fn rust_manifest_crate_names(manifest: &Path, facts: &FactPaths<'_>) -> Vec<String> {
+    facts.config_fact(manifest, "manifest.name");
+    facts.config_fact(manifest, "manifest.lib.name");
     let Some(bytes) = facts.bytes(manifest) else {
         return Vec::new();
     };

@@ -24,6 +24,22 @@ pub(crate) struct DirEntry {
 }
 
 pub(crate) trait ProjectFacts {
+    /// Only generation-owned view joins collect consultation provenance.
+    fn records_config_facts(&self) -> bool {
+        false
+    }
+    fn config_fact(&self, _rel: &[u8], _name: &str) {}
+    fn memo_start(&self, _path: &Path, _kind: &str, _name: &str) {}
+    fn memo_finish(&self, _path: &Path, _kind: &str, _name: &str) {}
+    fn memo_replay(&self, _path: &Path, _kind: &str, _name: &str) {}
+    fn workspace_package(&self, _root: &Path, _name: &str) -> Option<Option<PathBuf>> {
+        None
+    }
+    fn remember_workspace_package(&self, _root: &Path, _name: &str, _value: Option<PathBuf>) {}
+    fn workspace_members(&self, _root: &Path) -> Option<Arc<Vec<PathBuf>>> {
+        None
+    }
+    fn remember_workspace_members(&self, _root: &Path, _value: Arc<Vec<PathBuf>>) {}
     fn is_file(&self, rel: &[u8]) -> bool;
     fn is_dir(&self, rel: &[u8]) -> bool;
     fn config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>>;
@@ -183,6 +199,20 @@ pub(crate) struct FactPaths<'a> {
     pub facts: &'a dyn ProjectFacts,
 }
 impl FactPaths<'_> {
+    /// Test the recording capability before allocating relative path bytes, so
+    /// the disk resolver's default hooks do no work and allocate nothing.
+    pub fn config_fact(&self, path: &Path, name: &str) {
+        if self.facts.records_config_facts() {
+            if let Some(rel) = self.rel(path) {
+                self.facts.config_fact(&rel, name);
+            }
+        }
+    }
+    pub fn config_field(&self, dir: &Path, input: &str, name: &str) {
+        if self.facts.records_config_facts() {
+            self.config_fact(&dir.join(input), name);
+        }
+    }
     fn rel(&self, path: &Path) -> Option<Vec<u8>> {
         Some(path_bytes(path.strip_prefix(self.root).unwrap_or(path)))
     }

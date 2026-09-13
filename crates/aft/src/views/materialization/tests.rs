@@ -899,3 +899,6 @@ fn persistent_surfaces_rebuild_only_changed_entries_without_reading_pruned_calle
     materialize_manifest_view_database(&cold, &f.blobs, &next).unwrap();
     assert_snapshot_parity(&snapshot(&db), &snapshot(&cold));
 }
+
+#[path = "fact_tests.rs"]
+mod fact_tests;
