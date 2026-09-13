@@ -175,7 +175,8 @@ pub fn prepare_checkout(
         .unwrap_or_default();
     let rebuild_all = request.changed_paths.is_empty();
     let assembly_started = Instant::now();
-    let mut pending_paths = BTreeSet::new();
+    let mut blocking_paths = BTreeSet::new();
+    let mut semantic_pending_paths = BTreeSet::new();
     let mut candidates = Vec::with_capacity(head.len());
 
     for tracked in head {
@@ -238,26 +239,37 @@ pub fn prepare_checkout(
                     .as_deref()
                     .map(|language| {
                         let key = CallgraphKey::for_current(&source, language).full_key();
-                        let blob = if resolution_input {
-                            CallgraphBlob::config(source.clone(), CALLGRAPH_PRODUCER_VERSION)
+                        let key_hex = key.to_hex();
+                        let callgraph_is_current = previous_entries
+                            .get(&tracked.rel_path)
+                            .is_some_and(|entry| {
+                                manifest_entry_callgraph_key(entry) == Some(key_hex.as_str())
+                            });
+                        let payload = if callgraph_is_current {
+                            None
                         } else {
-                            CallgraphBlob::extract(
-                                std::str::from_utf8(&source).map_err(|error| {
+                            let blob = if resolution_input {
+                                CallgraphBlob::config(source.clone(), CALLGRAPH_PRODUCER_VERSION)
+                            } else {
+                                CallgraphBlob::extract(
+                                    std::str::from_utf8(&source).map_err(|error| {
+                                        ViewError::InvalidManifest(error.to_string())
+                                    })?,
+                                    language,
+                                    CALLGRAPH_PRODUCER_VERSION,
+                                )
+                                .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
+                            };
+                            Some(
+                                blob.to_bytes().map_err(|error| {
                                     ViewError::InvalidManifest(error.to_string())
                                 })?,
-                                language,
-                                CALLGRAPH_PRODUCER_VERSION,
                             )
-                            .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
                         };
-                        Ok::<_, ViewError>((
-                            key,
-                            blob.to_bytes()
-                                .map_err(|error| ViewError::InvalidManifest(error.to_string()))?,
-                        ))
+                        Ok::<_, ViewError>((key, payload))
                     })
                     .transpose()?
-                    .map_or((None, None), |(key, payload)| (Some(key), Some(payload)));
+                    .map_or((None, None), |(key, payload)| (Some(key), payload));
                 let callgraph_key = key.as_ref().map(FullKey::to_hex);
                 candidates.push(Candidate {
                     path: rel_path,
@@ -276,7 +288,7 @@ pub fn prepare_checkout(
                 });
             }
             GitMode::Other(_) => {
-                pending_paths.insert(tracked.rel_path);
+                blocking_paths.insert(tracked.rel_path);
             }
         }
     }
@@ -297,7 +309,7 @@ pub fn prepare_checkout(
                         )
             );
             if missing {
-                pending_paths.insert(candidate.path.as_bytes().to_vec());
+                semantic_pending_paths.insert(candidate.path.as_bytes().to_vec());
             }
         }
     }
@@ -356,34 +368,44 @@ pub fn prepare_checkout(
             .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
             .is_none()
         {
-            pending_paths.insert(candidate.path.as_bytes().to_vec());
+            blocking_paths.insert(candidate.path.as_bytes().to_vec());
         }
     }
 
     prepared.profile.blob_puts = blob_puts;
-    prepared.profile.pending_paths = pending_paths.len();
+    prepared.profile.pending_paths = blocking_paths.len() + semantic_pending_paths.len();
     let mut status = PathStatusStore::open(view.view_dir())
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-    if !pending_paths.is_empty() {
-        for path in &pending_paths {
-            status
-                .mark_pending(
-                    path,
-                    "shared blob unavailable",
-                    generation_number(&next_generation),
-                )
-                .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-        }
+    for path in blocking_paths.iter().chain(&semantic_pending_paths) {
+        status
+            .mark_pending(
+                path,
+                if blocking_paths.contains(path) {
+                    "shared callgraph blob unavailable"
+                } else {
+                    "shared semantic blob unavailable"
+                },
+                generation_number(&next_generation),
+            )
+            .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+    }
+    if !blocking_paths.is_empty() {
         prepared.profile.outcome = "pending";
         prepared.report.blob_puts = blob_puts;
-        prepared.report.pending_paths = pending_paths;
+        prepared.report.pending_paths = blocking_paths
+            .union(&semantic_pending_paths)
+            .cloned()
+            .collect();
         return Ok(prepared);
     }
     for candidate in &candidates {
-        status
-            .clear(candidate.path.as_bytes())
-            .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+        if !semantic_pending_paths.contains(candidate.path.as_bytes()) {
+            status
+                .clear(candidate.path.as_bytes())
+                .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+        }
     }
+    prepared.report.pending_paths = semantic_pending_paths;
 
     let manifest = Manifest::new(
         candidates
@@ -419,18 +441,25 @@ pub fn prepare_checkout(
     prepared.profile.derived_clone_ms = clone_started.elapsed().as_millis();
     let materialization_started = Instant::now();
     if let Some(base_manifest) = previous.as_ref().filter(|_| cloned_base) {
-        let (stats, timings) = super::materialization::apply_manifest_diff_profiled(
-            &derived,
-            base_manifest,
-            &manifest,
-            callgraph.path(),
-        )
-        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-        prepared.profile.materialization = timings;
-        log::info!(
-            "view manifest diff: generation={} stats={stats:?}",
-            next_generation
-        );
+        if manifest_callgraph_equivalent(base_manifest, &manifest) {
+            log::info!(
+                "view callgraph materialization reused unchanged plane: generation={}",
+                next_generation
+            );
+        } else {
+            let (stats, timings) = super::materialization::apply_manifest_diff_profiled(
+                &derived,
+                base_manifest,
+                &manifest,
+                callgraph.path(),
+            )
+            .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+            prepared.profile.materialization = timings;
+            log::info!(
+                "view manifest diff: generation={} stats={stats:?}",
+                next_generation
+            );
+        }
     } else {
         crate::callgraph_store::materialize_manifest_view_database(
             &derived,
@@ -478,7 +507,7 @@ pub fn prepare_checkout(
         generation: Some(next_generation),
         manifest: Some(manifest),
         blob_puts,
-        pending_paths,
+        pending_paths: prepared.report.pending_paths.clone(),
         published: false,
     };
     Ok(prepared)
@@ -638,6 +667,46 @@ mod tests {
              materialize_emit_refs_edges_ms=22 materialize_commit_ms=23"
         ));
         assert_eq!(line.matches("index_event kind=view_publication").count(), 1);
+    }
+}
+
+fn manifest_entry_callgraph_key(entry: &ManifestEntry) -> Option<&str> {
+    match entry {
+        ManifestEntry::Regular { planes, .. } => planes.callgraph.as_deref(),
+        ManifestEntry::Synthetic { planes, .. } => Some(&planes.callgraph),
+        ManifestEntry::Symlink { .. } | ManifestEntry::Gitlink { .. } => None,
+    }
+}
+
+fn manifest_callgraph_equivalent(left: &Manifest, right: &Manifest) -> bool {
+    let mut left = left.entries();
+    let mut right = right.entries();
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return true,
+            (Some((left_path, left_entry)), Some((right_path, right_entry)))
+                if left_path == right_path
+                    && match (left_entry, right_entry) {
+                        (
+                            ManifestEntry::Regular {
+                                mode: left_mode,
+                                planes: left_planes,
+                                resolution_input: left_resolution_input,
+                            },
+                            ManifestEntry::Regular {
+                                mode: right_mode,
+                                planes: right_planes,
+                                resolution_input: right_resolution_input,
+                            },
+                        ) => {
+                            left_mode == right_mode
+                                && left_resolution_input == right_resolution_input
+                                && left_planes.callgraph == right_planes.callgraph
+                        }
+                        _ => left_entry == right_entry,
+                    } => {}
+            _ => return false,
+        }
     }
 }
 

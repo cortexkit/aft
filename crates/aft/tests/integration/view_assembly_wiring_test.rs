@@ -5,6 +5,8 @@ use std::process::Command;
 
 use aft::blob_store::{BlobPlane, BlobStore, SemanticKey};
 use aft::views::assembly::{head_tree_fingerprint, publish_checkout, AssemblyRequest};
+use aft::views::{ManifestEntry, RelPath, ViewStore};
+use rusqlite::Connection;
 use tempfile::tempdir;
 
 fn git(root: &Path, args: &[&str]) {
@@ -281,7 +283,7 @@ fn republishing_an_unchanged_checkout_keeps_the_current_generation() {
 }
 
 #[test]
-fn changed_path_does_not_inherit_previous_semantic_blob() {
+fn semantic_plane_follows_an_immediately_published_callgraph_plane() {
     let project = tempdir().unwrap();
     let storage = tempdir().unwrap();
     git(project.path(), &["init", "--quiet"]);
@@ -291,6 +293,7 @@ fn changed_path_does_not_inherit_previous_semantic_blob() {
     commit(project.path(), "first");
 
     let family = "semantic-switch-family";
+    let scope = "semantic-view";
     let semantic_key =
         SemanticKey::for_current(first_source, &rel_path, "fixture-model").full_key();
     BlobStore::open(storage.path(), family, BlobPlane::Semantic)
@@ -301,7 +304,7 @@ fn changed_path_does_not_inherit_previous_semantic_blob() {
         storage.path(),
         project.path(),
         family,
-        "semantic-view",
+        scope,
         BTreeSet::new(),
         true,
     );
@@ -309,20 +312,64 @@ fn changed_path_does_not_inherit_previous_semantic_blob() {
     initial.semantic_keys = BTreeMap::from([(rel_path.clone(), semantic_key.to_hex())]);
     assert!(publish_checkout(&initial).unwrap().published);
 
-    fs::write(project.path().join("lib.rs"), "pub fn second() {}\n").unwrap();
+    let second_source = b"pub fn second() {}\npub fn caller() { second(); }\n";
+    fs::write(project.path().join("lib.rs"), second_source).unwrap();
     commit(project.path(), "second");
     let mut switched = request(
         storage.path(),
         project.path(),
         family,
-        "semantic-view",
+        scope,
         BTreeSet::from([rel_path.clone()]),
         true,
     );
     switched.require_semantic = true;
     let report = publish_checkout(&switched).unwrap();
-    assert!(!report.published);
-    assert_eq!(report.pending_paths, BTreeSet::from([rel_path]));
+    assert!(report.published);
+    assert_eq!(report.pending_paths, BTreeSet::from([rel_path.clone()]));
+    let manifest = report.manifest.unwrap();
+    let entry = manifest
+        .get(&RelPath::new(rel_path.clone()).unwrap())
+        .unwrap();
+    assert!(matches!(
+        entry,
+        ManifestEntry::Regular { planes, .. }
+            if planes.callgraph.is_some() && planes.semantic.is_none()
+    ));
+
+    let view = ViewStore::open(storage.path(), scope).unwrap();
+    let callgraph_generation = report.generation.unwrap();
+    let callgraph_db = view.derived_path(&callgraph_generation).unwrap();
+    let connection = Connection::open(&callgraph_db).unwrap();
+    let node_count: usize = connection
+        .query_row(
+            "SELECT COUNT(*) FROM nodes WHERE name = 'second'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        node_count, 1,
+        "the callgraph plane is queryable while semantic is pending"
+    );
+    connection
+        .execute_batch(
+            "CREATE TRIGGER forbid_callgraph_rewrite BEFORE DELETE ON nodes BEGIN SELECT RAISE(ABORT, 'callgraph plane was rewritten'); END;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let second_semantic_key =
+        SemanticKey::for_current(second_source, &rel_path, "fixture-model").full_key();
+    BlobStore::open(storage.path(), family, BlobPlane::Semantic)
+        .unwrap()
+        .put(&second_semantic_key, b"second-vector")
+        .unwrap();
+    switched.semantic_keys = BTreeMap::from([(rel_path, second_semantic_key.to_hex())]);
+    let semantic_report = publish_checkout(&switched).unwrap();
+    assert!(semantic_report.published);
+    assert!(semantic_report.pending_paths.is_empty());
+    assert_eq!(semantic_report.blob_puts, 0);
 }
 
 #[cfg(unix)]

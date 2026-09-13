@@ -6315,6 +6315,131 @@ mod tests {
     }
 
     #[test]
+    fn callgraph_view_publishes_while_semantic_refresh_batch_is_held() {
+        let _artifact_guard = artifact_owner_test_lock();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let server = CountingEmbeddingServer::start();
+        let project = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(project.path());
+        let canonical_root = project.path().canonicalize().unwrap();
+        let source = canonical_root.join("tracked.rs");
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                storage_dir: Some(storage.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let request = configure_semantic_views(&canonical_root, storage.path(), &server.base_url);
+        assert!(handle_configure_for_test(&request, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(
+            server.wait_for_non_probe_request_count(1, Duration::from_secs(5)),
+            "initial semantic build did not reach the embedding server"
+        );
+        server.release_response();
+        wait_for_semantic_build_ready(&ctx, Duration::from_secs(10));
+        ctx.publish_view_paths(BTreeSet::new(), true).unwrap();
+
+        let second_source =
+            "pub fn newly_visible() {}\npub fn invokes_new() { newly_visible(); }\n";
+        fs::write(&source, second_source).unwrap();
+        assert!(git_command(project.path())
+            .args(["add", "tracked.rs"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(git_command(project.path())
+            .args([
+                "-c",
+                "user.name=AFT Tests",
+                "-c",
+                "user.email=aft-tests@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "semantic refresh change",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        ctx.update_config(|config| config.callgraph_store = true);
+        let semantic_fingerprint = ctx
+            .semantic_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .unwrap()
+            .fingerprint()
+            .cloned()
+            .unwrap();
+        ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .unwrap()
+            .invalidate_files(std::slice::from_ref(&source));
+        let mut held_model =
+            crate::semantic_index::EmbeddingModel::from_config(&ctx.config().semantic)
+                .expect("held refresh embedding model");
+        let held_batch = std::thread::spawn(move || {
+            held_model.embed(vec!["watcher semantic refresh batch".to_owned()])
+        });
+        assert!(
+            server.wait_for_non_probe_request_count(2, Duration::from_secs(5)),
+            "watcher refresh did not reach its held embedding batch"
+        );
+
+        let callgraph_report = ctx
+            .publish_view_paths(BTreeSet::from([b"tracked.rs".to_vec()]), true)
+            .unwrap();
+        assert!(callgraph_report.published);
+        assert_eq!(
+            callgraph_report.pending_paths,
+            BTreeSet::from([b"tracked.rs".to_vec()])
+        );
+        match ctx.callgraph_store_for_ops() {
+            CallgraphStoreAccess::Ready(store) => {
+                assert_eq!(store.reader_kind(), "view");
+                assert!(crate::callgraph_store::CallGraphRead::node_for(
+                    &store,
+                    Path::new("tracked.rs"),
+                    "newly_visible",
+                )
+                .is_ok());
+            }
+            _ => panic!("callgraph plane was not readable while embedding was held"),
+        }
+
+        let callgraph_generation = callgraph_report.generation.unwrap();
+        server.release_response();
+        held_batch.join().unwrap().unwrap();
+        let mut replacement = SemanticIndex::build(
+            &canonical_root,
+            std::slice::from_ref(&source),
+            &mut |texts| Ok(texts.into_iter().map(|_| vec![1.0, 1.1, 1.2]).collect()),
+            64,
+        )
+        .unwrap();
+        replacement.set_fingerprint(semantic_fingerprint);
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(replacement);
+        let semantic_report = ctx
+            .publish_view_paths(BTreeSet::from([b"tracked.rs".to_vec()]), true)
+            .unwrap();
+        assert!(semantic_report.published);
+        assert!(semantic_report.pending_paths.is_empty());
+        assert_ne!(
+            semantic_report.generation.as_deref(),
+            Some(callgraph_generation.as_str())
+        );
+        assert_eq!(semantic_report.blob_puts, 0);
+    }
+
+    #[test]
     fn legacy_semantic_import_runs_once_and_records_its_outcome() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -6511,6 +6636,32 @@ mod tests {
                     "base_url": base_url,
                     "timeout_ms": 5_000,
                     "max_batch_size": max_batch_size,
+                    "max_files": 1_000
+                }
+            }))],
+        }))
+    }
+
+    fn configure_semantic_views(
+        root: &std::path::Path,
+        storage: &std::path::Path,
+        base_url: &str,
+    ) -> RawRequest {
+        configure_request_with_params(json!({
+            "project_root": root,
+            "harness": "opencode",
+            "storage_dir": storage,
+            "config": [user_tier(json!({
+                "views": { "enabled": true },
+                "search_index": false,
+                "semantic_search": true,
+                "callgraph_store": false,
+                "semantic": {
+                    "backend": "openai_compatible",
+                    "model": "counting-test-embedding",
+                    "base_url": base_url,
+                    "timeout_ms": 5_000,
+                    "max_batch_size": 64,
                     "max_files": 1_000
                 }
             }))],
@@ -9439,7 +9590,7 @@ mod tests {
             "config": [user_tier(json!({
                 "search_index": true,
                 "semantic_search": true,
-                "callgraph_store": true,
+                "callgraph_store": false,
                 "semantic": {
                     "backend": "openai_compatible",
                     "model": "counting-test-embedding",
