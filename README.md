@@ -67,7 +67,7 @@ AFT ships as a Rust binary with thin adapters for [OpenCode](https://opencode.ai
 npx @cortexkit/aft@latest setup
 ```
 
-Auto-detects which harnesses you have installed and configures each one. On the next session start, the `aft` binary downloads if needed and all tools come online. Target a specific harness with `--harness opencode` or `--harness pi`.
+Auto-detects which harnesses you have installed and configures each one. On the next session start, the `aft` binary downloads if needed and all tools come online. Target a specific harness with `--harness opencode`, `--harness pi`, or `--harness omp`.
 
 **What setup does to each host:**
 

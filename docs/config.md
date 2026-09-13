@@ -10,6 +10,8 @@ Both files are JSONC (comments allowed). One location serves every harness:
 
 For the removal order and harness-specific registration steps, see [Uninstall](../README.md#uninstall).
 
+OMP uses this same CortexKit user file; register its Pi-compatible plugin with `npx @cortexkit/aft@latest setup --harness omp`.
+
 `bash.watch_sync_max_ms` bounds synchronous `bash_watch` calls, which should only cover a short remaining wait on a task; it defaults to 120 seconds because longer synchronous waits keep the agent turn occupied. For longer commands, use `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. Values are clamped to 1000..=1800000 with a warning; set it to `1800000` in user or project config to restore the old 30-minute cap.
 
 Background-task completion and pattern-watch notices are delivered only to the session that started the task; other sessions bound to the same project may still inspect or stop the task by ID.
