@@ -1410,8 +1410,8 @@ impl ViewFileSurface {
 
 /// Configuration files read by the manifest resolver's workspace/package and
 /// tsconfig lookup (callgraph.rs), and Rust crate lookup (callgraph_store).
-/// Directory enumeration serves workspace discovery, so new configuration files
-/// invalidate all bindings, including callers that never saw that directory.
+/// Directory discovery uses a compact membership domain for these names. Their
+/// content changes invalidate only callers that consulted changed fields.
 pub(crate) fn view_resolution_config(path: &[u8]) -> bool {
     matches!(
         path.rsplit(|byte| *byte == b'/').next(),
@@ -1419,8 +1419,8 @@ pub(crate) fn view_resolution_config(path: &[u8]) -> bool {
     )
 }
 
-/// All memo tables are scoped to one immutable manifest join. Hits still record
-/// the caller's probes, so memoization cannot hide a future invalidation edge.
+/// Field identities are generation-owned. Raw-read paths are transient validation
+/// evidence, cleared after classifying a caller so memo-hit timing is not persisted.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 struct ConfigConsultations {
     facts: BTreeSet<(String, String)>,
@@ -1449,6 +1449,8 @@ struct ConsultationTrace {
 }
 type ConsultationMemoKey = (std::path::PathBuf, String, String);
 
+/// Memo answers and their provenance belong to one immutable manifest join.
+/// Replaying provenance on hits keeps missing candidates and facts attributable.
 struct ViewBindingFacts<'a> {
     inner: Rc<dyn ProjectFacts + 'a>,
     probes: std::cell::RefCell<BTreeSet<String>>,
@@ -1491,8 +1493,13 @@ impl<'a> ViewBindingFacts<'a> {
     }
 
     fn record(&self, path: &[u8]) {
-        // Content changes use consulted facts; presence changes still need the
-        // ordinary missing-path probes, including configuration candidates.
+        // Directory discovery may probe thousands of missing package manifests.
+        // One membership domain rechecks those bindings on config add/remove;
+        // individual config content changes use the field consultations instead.
+        if view_resolution_config(path) {
+            self.record(VIEW_CONFIG_MEMBERSHIP_DOMAIN.as_bytes());
+            return;
+        }
         if let Ok(path) = std::str::from_utf8(path) {
             let mut parts = Vec::new();
             for part in path.split('/') {
@@ -1649,9 +1656,9 @@ impl ProjectFacts for ViewBindingFacts<'_> {
                 .insert(rel.to_vec(), value.clone());
             value
         });
-        // Existing directory probes are workspace-discovery implementation detail:
-        // memo hits may omit them. Configuration changes invalidate that discovery
-        // globally, while file probes and misses remain stable caller dependencies.
+        // Existing directory probes are workspace-discovery implementation detail.
+        // Config add/remove rechecks that discovery through its membership domain;
+        // source-file probes and misses remain caller-specific dependencies.
         if canonical.as_ref().is_none_or(|path| self.file_fact(path)) {
             self.record(rel);
         }

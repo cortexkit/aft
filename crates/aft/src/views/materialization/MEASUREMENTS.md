@@ -519,3 +519,154 @@ The final batch code passes the views and durable publication/restart tests,
 `RUSTFLAGS='-D warnings'`. The callgraph_store suite (including join) passed on
 the retained-handle unit; no resolver code changed in the batch unit. Both
 retained-handle and final batch release binaries were built successfully.
+
+## Consulted resolution facts (2026-09-13)
+
+Materialization version **5** replaces the config-content full-resolution rule
+with per-field projections and recorded consultations. Package inputs project
+`name`, normalized workspace patterns, `exports`, `module`, and `main` (not
+`types`); tsconfig projects `compilerOptions.paths` and `baseUrl` and does not
+follow `extends`. The pnpm projection calls the resolver's extracted line parser.
+Rust's manifest reader and projection share the first-non-lib/last-lib name
+extractor. Its facts are `manifest.name` and `manifest.lib.name`; the disk TOML
+reader's package/lib names, lib path and workspace members have separate `disk.*`
+identities. Workspace membership does not constrain the manifest Rust crate map.
+
+Bindings persist consulted `(input path, field)` identities. Changed input blobs
+are decoded and projected once per side of the transition, never once per ref.
+Changed fact consumers rebind, then reference-binding equality and the existing
+consumer-specific resolver-index queries prune unchanged reference resolution.
+Config add/remove also rechecks a compact membership domain, so previously unseen
+workspace packages and nearer tsconfigs cannot escape invalidation. Ordinary
+source-file candidates, missing paths and Rust module-index dependencies remain.
+Raw `ProjectFacts::config_bytes` calls outside the instrumented readers mark the
+caller unattributed, including a raw read after a known read of the same input.
+Unknown projections or an unattributed caller on an input transition use the full
+fallback and log `views materialization: full resolution
+(reason=unattributed_reads count=N)`. The returned stats count unattributed
+callers. Old dependency versions take the cold path once.
+
+View workspace memo answers now belong to the immutable join. The old shared
+absolute `/` workspace cache could otherwise return manifest A's answer during a
+cold join of manifest B. Legacy disk globals and resolution decisions are
+unchanged. Both per-pass and workspace-cache returns replay consultation traces;
+legacy default hooks check no recording state and allocate no relative path or
+field strings. The callgraph suites and tool-call envelope parity pass.
+
+### Every-table matrix and work counts
+
+Each case compares every SQLite table with a newly materialized cold next view,
+including binding payloads, dependencies and metadata. The JS fixtures include
+both a second importer that hits the workspace memo and an independent named
+package importer (not only relative/local calls).
+
+| transition | unchanged callers resolved | total callers resolved | refs resolved | surfaces rebuilt | caller blobs decoded | full resolution | unattributed |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| package version only | 0 | 0 | 0 | 0 | 0 | false | 0 |
+| workspace member admitted by patterns | 2 | 2 | 4 | 3 | 3 | false | 0 |
+| one package exports changed | 2 | 2 | 4 | 2 | 2 | false | 0 |
+| tsconfig alias targets changed | 2 | 2 | 4 | 3 | 3 | false | 0 |
+| Cargo workspace member and crate added | 1 | 2 | 1 | 2 | 2 | false | 0 |
+| Rust mod file moved to directory form | 1 | 2 | 2 | 2 | 2 | false | 0 |
+
+Broad workspace/alias facts can require rebinding an independent named importer,
+but its unchanged binding and surface answers avoid reference resolution. The
+Cargo member fixture adds the actual crate manifest/source as well as the root
+member entry; changing only `[workspace].members` does not affect this manifest
+resolver. A separate member-name transition verifies that the memo-hit caller
+loses the old edge when its package name disappears. A subprocess cold-B oracle
+checks the shared-root memo-scope correction without inheriting any A cache.
+
+### Restored mutation controls
+
+All controls were staged from the live implementation, had a nonempty unstaged
+`git diff --stat` during mutation, and restored to an empty unstaged diff before
+continuing. No `NON-VACUITY BREAK` is retained in production.
+
+- Whole-file hashing: `version_only_package_edit_resolves_no_unchanged_callers`
+  **FAILED**, rebuilt surfaces `left: 3, right: 0`. Reference-resolution pruning
+  still avoided refs, so the test also asserts zero caller decode/binding work.
+  The earlier pure projection control
+  `package_version_and_types_are_not_resolution_facts` also failed when `name`
+  was replaced with the whole-file digest.
+- Dropped exports hook: `exports_change_resolves_only_package_importers`
+  **FAILED**, `table edges: missing=2 extra=2` (one.ts instead of two.ts).
+  `version_only_package_edit_resolves_no_unchanged_callers` remained green.
+- Dropped package memo-return hooks:
+  `workspace_member_name_change_invalidates_memo_hit_callers` **FAILED**,
+  `table edges: missing=0 extra=1`, the extra edge owned by **b.ts**.
+  The version-only control remained green. The direct recording test
+  `memo_hit_callers_retain_member_name_consultations` also reddened for b.ts,
+  with `disk_facts_disable_recording_hooks` still green.
+- Removed view memo scoping:
+  `cold_workspace_after_prior_manifest_matches_fresh_process` **FAILED**,
+  `table edges: missing=2 extra=2` (old packages/pkg instead of packages/new).
+  `disk_facts_disable_recording_hooks` stayed green.
+- Removed compact config-probe domain:
+  `workspace_discovery_uses_one_config_membership_dependency` **FAILED**,
+  `a.ts stored directory-wide config probes as individual dependency rows`.
+  `opaque_config_read_is_unattributed_even_after_a_known_field_read` stayed green.
+
+### Real offline 300-Git-path pair
+
+Offline source: an APFS clone of the retained, closed
+`/tmp/aft-views-drill-77-proportional-final/on` artifacts into this worktree.
+Generations **3 → 4**, A → HEAD, contain **7,045 → 7,060 entries and 285 changed
+entries**, including the same two package.json inputs. Their manifest identity
+suffixes are `a632b1603f62b77a16c041435b34764810ec2919461ae14fba9c2a70b49fdace`
+and `c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1`.
+This is the retained 300-Git-path transition with additional plane-state entries,
+not the older 17-entry pair and not a synthetic 300-file fixture.
+
+Command (release, private databases):
+
+```sh
+AFT_VIEW_DIFF_INPUT="$PWD/target/view-diff-real-300-input" AFT_VIEW_PROFILE=1 \
+  cargo test --release -p agent-file-tools --lib \
+  views::materialization::tests::bench_real_manifest_diff -- --ignored --exact --nocapture
+```
+
+| operation | wall s | CPU s | physical bytes | logical bytes | WAL bytes | resolved files | resolved refs | full resolution | unattributed |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| cold replacement | 20.428 | 18.255 | 460918784 | 940012652 | 455618472 | 4934 | 300219 | true | 0 |
+| fact-sensitive incremental | **7.490** | **5.871** | 153341952 | 323547718 | 151199912 | **576** | **95228** | **false** | **0** |
+
+Every-table parity passed. Incremental selected **296 unchanged dependents**,
+rebuilt 299 surfaces and decoded 585 caller blobs. The 576/95,228 counts differ
+from the historical 569/95,222 warm row because this retained pair has additional
+manifest entries; the earlier count must not be substituted for this measurement.
+The 7.490 s derived call is 10.84–12.09 s below the documented 18.33–19.58 s
+full-resolution drill rows; those are historical, differently loaded in-situ
+measurements, not a same-run policy comparison. The same-input cold control above
+is the direct work/timing comparison.
+
+| incremental phase | ms |
+| --- | ---: |
+| load bindings and select | 756 |
+| delete rows | 919 |
+| changed-owner decode/insert | 509 |
+| selected join | 3100 |
+| binding writes | 163 |
+| ref/edge emission | 1812 |
+| commit | 84 |
+
+Within selected join: bind/index 978 ms, surface replay 48 ms, deferred caller
+decode 361 ms, resolve/record 1627 ms, dependency union 60 ms. These are nested
+wall boundaries, not CPU attributions. The next within-materializer bucket is
+selected join (~3.1 s) and emission (~1.8 s); neither was optimized here.
+
+The first recording implementation expanded config-presence probes into ordinary
+rows: 2,670,644 config-path dependencies, 15.980 s incremental and 49.011 s cold.
+The compact membership-domain guard above eliminated that avoidable storage
+regression before acceptance. Raw logs remain in `target/fact-real-release.log`
+and `target/fact-real-release-compact.log`; the final measured databases are
+`target/view-diff-real-300-input/.tmpjQEAfp/{base,cold,incremental}.sqlite`.
+
+Verification before the drill: views 46 passed / 3 ignored; callgraph-filtered
+library suites (including store/join) 230 passed / 3 ignored; callgraph_store_test
+37 passed / 1 ignored; tool_call_parity_test 12 passed; durable_restart 2 passed /
+1 child ignored; publication_cas 3 passed. Host and x86_64-pc-windows-gnu library
+checks with `RUSTFLAGS='-D warnings'` passed. The sidekick service was unavailable
+(provider credential outage); the owner authorized direct inspection and comment
+self-review instead. The earlier AFT inspect request timed out; cargo checks are
+the authoritative diagnostics gate.

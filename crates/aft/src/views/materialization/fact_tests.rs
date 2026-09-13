@@ -374,3 +374,42 @@ fn cold_workspace_after_prior_manifest_matches_fresh_process() {
         &snapshot(&f.dir.path().join("after.sqlite")),
     );
 }
+
+#[test]
+fn workspace_member_name_change_invalidates_memo_hit_callers() {
+    let mut f = workspace_fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    config(
+        &conn,
+        &mut f.next,
+        "packages/pkg/package.json",
+        r#"{"name":"retired","exports":"./one.ts"}"#,
+    );
+    check_transition(&f, 2, 2);
+}
+
+#[test]
+fn workspace_discovery_uses_one_config_membership_dependency() {
+    let f = workspace_fixture();
+    let (base, _) = prepare(&f);
+    let bindings = load_bindings(&Connection::open(base).unwrap()).unwrap();
+    for caller in ["a.ts", "b.ts", "q.ts"] {
+        let binding = &bindings[caller];
+        assert!(binding
+            .dependencies
+            .contains(join::VIEW_CONFIG_MEMBERSHIP_DOMAIN));
+        assert!(
+            binding
+                .dependencies
+                .iter()
+                .all(|path| !join::view_resolution_config(path.as_bytes())),
+            "{caller} stored directory-wide config probes as individual dependency rows"
+        );
+    }
+    assert!(
+        !bindings["q.ts"]
+            .consulted_facts
+            .contains(&("packages/pkg/package.json".into(), "exports".into())),
+        "name discovery must not subscribe to unrelated entry points"
+    );
+}
