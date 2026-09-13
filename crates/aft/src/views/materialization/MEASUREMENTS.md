@@ -330,3 +330,28 @@ Two findings this run adds, both unexplained and both the next work:
 2. **The closure costs 2.5–3.1 s per publication with zero blob puts** (the semantic-fill publications, materialization 26 ms, closure 2.5–3.0 s), so it is a fixed cost: PASSIVE checkpoints and fsyncs of the two shared blob stores (the callgraph store is ~1.7 GB) plus alias/trigram fsyncs, paid twice per switch. It is no longer the derived checkpoint (that is deferred; `derived_clone_ms` is 4–11 ms). Proportional-to-change durability is the fix shape: a store with no puts since its last durable point needs neither checkpoint nor fsync.
 
 Critical path after this run: ~1 s window + ~2 s assembly + 18–19 s materialization + ~2.6 s closure ≈ 25 s publication, correctness at ~29–32 s; legacy at 24–26 s. With the materialization back at ~9 s and the fixed closure removed, the views path is ~13 s against legacy's ~24 s on this switch.
+
+## Proportional publication closure follow-up (2026-09-13)
+
+### Controlled policy bisect
+
+The retained fresh-storage HEAD/A manifests and callgraph store from `/tmp/aft-views-drill-77/on` were copied before use. The retained pair has the same `a632b160...` and `c3d6ca11...` fingerprints as the drill transition and 285 manifest-entry differences; this is larger than the drill's 276-entry source transition because the generated manifests include additional plane-state changes. `bench_real_manifest_diff` ran in release mode from a newly materialized base for each arm. Times are milliseconds except wall and CPU; WAL is the final byte count while the measurement keeper remains open.
+
+| arm | wall s | CPU s | WAL bytes | load/select | delete | owned decode/insert | selected join | binding writes | ref/edge emission | commit |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| policy as shipped | 18.184 | 16.151 | 148,736,152 | 570 | 958 | 533 | 10,543 | 223 | 5,083 | 99 |
+| default `wal_autocheckpoint` | 16.762 | 14.567 | 148,736,152 | 532 | 989 | 507 | 9,287 | 174 | 4,651 | 459 |
+| `synchronous=NORMAL` | 16.160 | 14.193 | 148,736,152 | 520 | 885 | 501 | 9,268 | 175 | 4,584 | 63 |
+| no keeper during build | 16.658 | 14.622 | 0 after close | 531 | 868 | 464 | 9,320 | 182 | 4,705 | 101 |
+
+The no-keeper zero does not mean zero generated frames: closing the last connection checkpointed and removed the WAL. The cold control remained 19.105-21.882 s in all four arms. No single policy arm restored the earlier 8.5-9.6 s result, so changing the materializer's durability policy would not close the measured gap.
+
+The retained logs identify the actual difference. The fast run's A to HEAD publication selected an incremental closure (`full_resolution=false`, 296 dependent files, 569 resolved files, 95,222 resolved references, and 273 rebuilt surfaces). The fresh run over the same Git direction performed required full resolution (`full_resolution=true`, 4,654 dependent files, 4,934 resolved files, 300,219 resolved references, and 4,934 rebuilt surfaces). Its manifests change both `package.json` and `packages/session-ui/package.json`, which are resolution inputs and intentionally force full resolution. A later run on the old warm store also became full-resolution and took 21.788 s, so neither retained surfaces nor page cache explains the fast number. A copied persisted base likewise took 16.373 s with full resolution.
+
+The old warm generation that seeded the fast A to HEAD row was swept, so its exact stale manifest entry cannot be recovered. The surviving work counters are sufficient to bound the finding: the 8-9 s and 18-19 s rows did not execute the same materialization work even though they followed the same Git checkout transition. The former is not a valid policy baseline, and no materialization-policy change is made here. Configuration-input invalidation remains correctness-required.
+
+### Dirty-since-durable blob stores
+
+Dirty state is tracked per shared blob-database path for the life of the process. First sight is conservatively dirty, every put marks the store dirty before its SQLite transaction begins, and a successful checkpoint plus fsync clears it. Publication and puts share a barrier through closure probing, so a manifest cannot observe an in-flight put after deciding that its store is clean. A clean store's durable contents are already its current contents, leaving the pointer CAS argument unchanged.
+
+The mechanism red was `publication_cas_test::clean_blob_stores_skip_checkpoint_and_fsync_until_a_put_marks_one_dirty`: before the fix its clean publication observed `(3 checkpoints, 1 fsync event)` instead of `(0, 0)`. The observer now reports each blob-store checkpoint and fsync individually. The clean publication observes exactly zero of each, while one semantic put causes exactly one checkpoint and one fsync. Alias checkpoint/fsync, trigram fsync, and derived main/WAL fsync remain in the closure and are attributed separately.
