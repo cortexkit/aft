@@ -1332,12 +1332,46 @@ pub(crate) struct ViewBindingDependencies {
     surface: Option<ViewFileSurface>,
 }
 
+/// Inputs that determine a reference's target, excluding call-site identity.
+/// Rust qualified imports are visible only after their declaration; the count
+/// of visible imports identifies that monotone prefix even across nested uses.
+#[derive(Hash, PartialEq, Eq)]
+struct ViewResolutionBinding {
+    caller: String,
+    kind: String,
+    full_ref: Option<String>,
+    short_name: Option<String>,
+    visible_rust_imports: usize,
+}
+
+impl ViewResolutionBinding {
+    fn new(raw: &super::RawRef, caller: &FileCallData) -> Self {
+        Self {
+            caller: raw.caller_file.clone(),
+            kind: raw.kind.clone(),
+            full_ref: raw.full_ref.clone(),
+            short_name: raw.short_name.clone(),
+            visible_rust_imports: if caller.lang == LangId::Rust {
+                caller
+                    .import_block
+                    .imports
+                    .iter()
+                    .filter(|import| import.byte_range.start <= raw.byte_start)
+                    .count()
+            } else {
+                0
+            },
+        }
+    }
+}
+
 pub(crate) struct SelectedManifestJoin {
     pub result: JoinResult,
     pub bindings: BTreeMap<String, ViewBindingDependencies>,
     pub resolved_callers: BTreeSet<String>,
     pub rebuilt_surface_entries: usize,
     pub decoded_caller_blobs: usize,
+    pub resolved_bindings: usize,
 }
 
 /// Compact, deterministic snapshot of one file's resolver index. It deliberately
@@ -1931,48 +1965,78 @@ fn join_manifest_with_surfaces(
         queries: Default::default(),
     };
     let mut queries = BTreeMap::<String, BTreeMap<ViewSurfaceQuery, String>>::new();
+    let bases: BTreeMap<_, BTreeSet<_>> = resolved_callers
+        .iter()
+        .map(|caller| {
+            let binding = &bindings[caller];
+            (
+                caller.clone(),
+                binding
+                    .references
+                    .values()
+                    .flatten()
+                    .chain(binding.binding_probes.iter())
+                    .cloned()
+                    .collect(),
+            )
+        })
+        .collect();
+    let mut resolutions = HashMap::<ViewResolutionBinding, (Option<String>, Option<String>)>::new();
     work.sort_by(|a, b| (&a.0, a.1 .0).cmp(&(&b.0, b.1 .0)));
     for (key, (kind, raw)) in work {
         let caller = std::str::from_utf8(&key.caller_path).expect("bound UTF-8 caller");
         if !resolved_callers.contains(caller) {
             continue;
         }
-        facts.take();
-        facts.take_config();
-        let resolved = super::resolve_ref(raw, &surface_index)
-            .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
-        let caller = std::str::from_utf8(&key.caller_path).expect("bound UTF-8 caller");
+        let memo_key = ViewResolutionBinding::new(&raw, &extracts[caller].data);
         let binding = bindings.get_mut(caller).expect("bound caller dependencies");
-        binding.resolution_facts.extend(&facts.take_config());
-        queries
-            .entry(caller.to_string())
-            .or_default()
-            .extend(surface_index.take());
-        let basis = binding
-            .references
-            .values()
-            .flatten()
-            .chain(binding.binding_probes.iter())
-            .collect::<BTreeSet<_>>();
+        let basis = &bases[caller];
+        // Dependencies belonging to a call site are not part of the memoized
+        // target. Preserve them even when another reference resolved its binding.
         binding.resolved_dependencies.extend(
-            resolved
-                .dependencies
-                .into_iter()
-                .chain(facts.take())
-                .filter(|dependency| !basis.contains(dependency)),
+            raw.dependencies
+                .iter()
+                .filter(|dependency| !basis.contains(*dependency))
+                .cloned(),
         );
+        let (target_file, target_symbol) = match resolutions.entry(memo_key) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                facts.take();
+                facts.take_config();
+                let resolved = super::resolve_ref(raw, &surface_index)
+                    .map_err(|error| ManifestJoinError::Parse(error.to_string()))?;
+                // The key includes the caller, so recording consultations once
+                // per binding preserves the caller-owned union on cache hits.
+                binding.resolution_facts.extend(&facts.take_config());
+                queries
+                    .entry(caller.to_string())
+                    .or_default()
+                    .extend(surface_index.take());
+                binding.resolved_dependencies.extend(
+                    resolved
+                        .dependencies
+                        .into_iter()
+                        .chain(facts.take())
+                        .filter(|dependency| !basis.contains(dependency)),
+                );
+                entry
+                    .insert((resolved.target_file, resolved.target_symbol))
+                    .clone()
+            }
+        };
         result.rows.insert(DerivedRow {
             caller_blob_key: key.caller_blob_key.clone(),
             ref_ordinal: key.ref_ordinal,
             caller_path: key.caller_path.clone(),
             kind,
-            status: if resolved.target_file.is_some() {
+            status: if target_file.is_some() {
                 ResolutionStatus::Resolved
             } else {
                 ResolutionStatus::Unresolved
             },
-            target_path: resolved.target_file.map(String::into_bytes),
-            target_symbol: resolved.target_symbol,
+            target_path: target_file.map(String::into_bytes),
+            target_symbol,
         });
         result.resolution_order.push(key);
     }
@@ -2014,6 +2078,7 @@ fn join_manifest_with_surfaces(
         resolved_callers,
         rebuilt_surface_entries,
         decoded_caller_blobs,
+        resolved_bindings: resolutions.len(),
     })
 }
 

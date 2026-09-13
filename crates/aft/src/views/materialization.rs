@@ -31,6 +31,7 @@ pub struct MaterializeStats {
     pub dependent_files: usize,
     pub resolved_files: usize,
     pub resolved_refs: usize,
+    pub resolved_bindings: usize,
     pub rebuilt_surface_entries: usize,
     pub decoded_caller_blobs: usize,
     pub full_resolution: bool,
@@ -434,6 +435,7 @@ fn materialize(
     stats.rebuilt_surface_entries = joined.rebuilt_surface_entries;
     stats.decoded_caller_blobs = joined.decoded_caller_blobs;
     stats.resolved_refs = joined.result.rows.len();
+    stats.resolved_bindings = joined.resolved_bindings;
     stats.resolved_files = joined.resolved_callers.len();
     stats.dependent_files = joined
         .resolved_callers
@@ -473,94 +475,111 @@ fn materialize(
         )?;
     }
     profile.finish("write_bindings");
-    for row in joined.result.rows {
-        let caller_path = String::from_utf8(row.caller_path.clone()).map_err(|_| {
-            CallGraphStoreError::Unavailable("non-UTF-8 manifest caller path".to_string())
-        })?;
-        ensure_manifest_path(
-            &caller_path,
-            manifest,
-            &blob_connection,
-            &mut loaded_paths,
-            &mut parsed,
-            &mut nodes,
-        )?;
-        if let Some(target) = row
-            .target_path
-            .as_ref()
-            .and_then(|path| std::str::from_utf8(path).ok())
-        {
-            ensure_manifest_path(
-                target,
-                manifest,
-                &blob_connection,
-                &mut loaded_paths,
-                &mut parsed,
-                &mut nodes,
-            )?;
-        }
-        let Some(parse) = parsed.get(&caller_path) else {
-            continue;
-        };
-        let Some(reference) = parse.get(&row.ref_ordinal) else {
-            continue;
-        };
-        let caller_node = reference
-            .caller_symbol
-            .as_ref()
-            .and_then(|symbol| nodes.get(&(caller_path.clone(), symbol.clone())))
-            .cloned();
-        let target_path = row
-            .target_path
-            .as_ref()
-            .and_then(|path| String::from_utf8(path.clone()).ok());
-        let target_symbol = row.target_symbol.clone();
-        let target_node = target_path
-            .as_ref()
-            .zip(target_symbol.as_ref())
-            .and_then(|(path, symbol)| nodes.get(&(path.clone(), symbol.clone())))
-            .cloned();
-        let ref_id = format!("view:{caller_path}:{}", row.ref_ordinal);
-        let relink = changed
-            .as_ref()
-            .is_some_and(|paths| !paths.contains(caller_path.as_bytes()));
-        let status = if row.status == join::ResolutionStatus::Resolved {
-            "resolved"
-        } else {
-            "unresolved"
-        };
-        if relink {
-            // Symbol IDs encode path, scoped name and ordinal. Even an unchanged
-            // caller must be re-linked when target ordinals or resolution change.
-            // Resolve against the complete new manifest: additions, reexports and
-            // configuration changes can affect callers with no previous target.
-            let same: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM refs WHERE ref_id = ?1 AND caller_node IS ?2
-                 AND status = ?3 AND target_node IS ?4 AND target_file IS ?5 AND target_symbol IS ?6)",
-                params![ref_id, caller_node, status, target_node, target_path, target_symbol],
-                |row| row.get(0),
-            )?;
-            if same {
-                continue;
-            }
-            stats.relinked_deleted +=
-                transaction.execute("DELETE FROM edges WHERE ref_id = ?1", [&ref_id])?;
-            stats.relinked_deleted +=
-                transaction.execute("DELETE FROM refs WHERE ref_id = ?1", [&ref_id])?;
-        }
-        let inserted = if relink {
-            &mut stats.relinked_inserted
-        } else {
-            &mut stats.inserted
-        };
-        *inserted += transaction.execute(
+    // Retain prepared statements across the fan-out. Preparing each statement
+    // again costs more than binding many of these small reference rows.
+    {
+        let mut same_ref = transaction.prepare("SELECT EXISTS(SELECT 1 FROM refs WHERE ref_id = ?1 AND caller_node IS ?2
+                 AND status = ?3 AND target_node IS ?4 AND target_file IS ?5 AND target_symbol IS ?6)")?;
+        let mut delete_edge = transaction.prepare("DELETE FROM edges WHERE ref_id = ?1")?;
+        let mut delete_ref = transaction.prepare("DELETE FROM refs WHERE ref_id = ?1")?;
+        let mut insert_ref = transaction.prepare(
             "INSERT OR REPLACE INTO refs
              (ref_id, caller_node, caller_file, kind, short_name, full_ref, module_path,
               import_kind, local_name, requested_name, namespace_alias, wildcard, line,
               byte_start, byte_end, status, target_node, target_file, target_symbol, provenance)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                      ?15, ?16, ?17, ?18, ?19, ?20)",
-            params![
+        )?;
+        let mut insert_edge = transaction.prepare(
+            "INSERT OR REPLACE INTO edges
+                     (edge_id, ref_id, source_node, target_node, target_file, target_symbol,
+                      kind, line, provenance)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'call', ?7, ?8)",
+        )?;
+        for row in joined.result.rows {
+            let caller_path = String::from_utf8(row.caller_path.clone()).map_err(|_| {
+                CallGraphStoreError::Unavailable("non-UTF-8 manifest caller path".to_string())
+            })?;
+            ensure_manifest_path(
+                &caller_path,
+                manifest,
+                &blob_connection,
+                &mut loaded_paths,
+                &mut parsed,
+                &mut nodes,
+            )?;
+            if let Some(target) = row
+                .target_path
+                .as_ref()
+                .and_then(|path| std::str::from_utf8(path).ok())
+            {
+                ensure_manifest_path(
+                    target,
+                    manifest,
+                    &blob_connection,
+                    &mut loaded_paths,
+                    &mut parsed,
+                    &mut nodes,
+                )?;
+            }
+            let Some(parse) = parsed.get(&caller_path) else {
+                continue;
+            };
+            let Some(reference) = parse.get(&row.ref_ordinal) else {
+                continue;
+            };
+            let caller_node = reference
+                .caller_symbol
+                .as_ref()
+                .and_then(|symbol| nodes.get(&(caller_path.clone(), symbol.clone())))
+                .cloned();
+            let target_path = row
+                .target_path
+                .as_ref()
+                .and_then(|path| String::from_utf8(path.clone()).ok());
+            let target_symbol = row.target_symbol.clone();
+            let target_node = target_path
+                .as_ref()
+                .zip(target_symbol.as_ref())
+                .and_then(|(path, symbol)| nodes.get(&(path.clone(), symbol.clone())))
+                .cloned();
+            let ref_id = format!("view:{caller_path}:{}", row.ref_ordinal);
+            let relink = changed
+                .as_ref()
+                .is_some_and(|paths| !paths.contains(caller_path.as_bytes()));
+            let status = if row.status == join::ResolutionStatus::Resolved {
+                "resolved"
+            } else {
+                "unresolved"
+            };
+            if relink {
+                // Symbol IDs encode path, scoped name and ordinal. Even an unchanged
+                // caller must be re-linked when target ordinals or resolution change.
+                // Resolve against the complete new manifest: additions, reexports and
+                // configuration changes can affect callers with no previous target.
+                let same: bool = same_ref.query_row(
+                    params![
+                        ref_id,
+                        caller_node,
+                        status,
+                        target_node,
+                        target_path,
+                        target_symbol
+                    ],
+                    |row| row.get(0),
+                )?;
+                if same {
+                    continue;
+                }
+                stats.relinked_deleted += delete_edge.execute([&ref_id])?;
+                stats.relinked_deleted += delete_ref.execute([&ref_id])?;
+            }
+            let inserted = if relink {
+                &mut stats.relinked_inserted
+            } else {
+                &mut stats.inserted
+            };
+            *inserted += insert_ref.execute(params![
                 ref_id,
                 caller_node,
                 caller_path,
@@ -585,18 +604,12 @@ fn materialize(
                 target_path,
                 target_symbol,
                 PROVENANCE_TREESITTER,
-            ],
-        )?;
-        if row.kind == join::BlobRefKind::Call {
-            if let (Some(source_node), Some(target_file), Some(target_symbol)) =
-                (caller_node, target_path, target_symbol)
-            {
-                *inserted += transaction.execute(
-                    "INSERT OR REPLACE INTO edges
-                     (edge_id, ref_id, source_node, target_node, target_file, target_symbol,
-                      kind, line, provenance)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'call', ?7, ?8)",
-                    params![
+            ])?;
+            if row.kind == join::BlobRefKind::Call {
+                if let (Some(source_node), Some(target_file), Some(target_symbol)) =
+                    (caller_node, target_path, target_symbol)
+                {
+                    *inserted += insert_edge.execute(params![
                         format!("edge:{ref_id}"),
                         ref_id,
                         source_node,
@@ -605,8 +618,8 @@ fn materialize(
                         target_symbol,
                         i64::from(reference.line),
                         PROVENANCE_TREESITTER,
-                    ],
-                )?;
+                    ])?;
+                }
             }
         }
     }

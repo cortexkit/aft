@@ -149,6 +149,7 @@ fn incremental_writes_only_owned_rows_and_relinks() {
             dependent_files: 1,
             resolved_files: 3,
             resolved_refs: 2,
+            resolved_bindings: 2,
             rebuilt_surface_entries: 2,
             decoded_caller_blobs: 3,
             full_resolution: false,
@@ -905,3 +906,50 @@ fn persistent_surfaces_rebuild_only_changed_entries_without_reading_pruned_calle
 
 #[path = "fact_tests.rs"]
 mod fact_tests;
+
+#[test]
+fn memoized_bindings_keep_callers_and_reference_kinds_distinct() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let source = "import { target } from './target'; export function caller() { target(); target(); return target; }";
+    let current = manifest(
+        &conn,
+        &[
+            ("a/caller.ts", source),
+            ("b/caller.ts", source),
+            ("a/target.ts", "export function target() {}"),
+            ("b/target.ts", "export function target() {}"),
+        ],
+    );
+    let reader = ManifestViewBlobReader { connection: &conn };
+    let reference = join::JoinResult::from_manifest(&current, &reader).unwrap();
+    let memoized = join::join_selected_manifest(&current, &reader, None, &BTreeMap::new()).unwrap();
+    assert_eq!(
+        reference.canonical_serialization(),
+        memoized.result.canonical_serialization()
+    );
+    assert!(memoized.resolved_bindings < memoized.result.resolution_order.len());
+    for prefix in ["a", "b"] {
+        assert!(memoized.result.rows.iter().any(|row| row.caller_path
+            == format!("{prefix}/caller.ts").as_bytes()
+            && row.target_path.as_deref() == Some(format!("{prefix}/target.ts").as_bytes())));
+    }
+}
+
+#[test]
+fn memoized_rust_bindings_keep_import_visibility() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let current = manifest(&conn, &[
+        ("src/lib.rs", "mod target; fn before() { alias::target(); } use crate::target as alias; fn after() { alias::target(); alias::target(); }"),
+        ("src/target.rs", "pub fn target() {}"),
+    ]);
+    let reader = ManifestViewBlobReader { connection: &conn };
+    let reference = join::JoinResult::from_manifest(&current, &reader).unwrap();
+    let memoized = join::join_selected_manifest(&current, &reader, None, &BTreeMap::new()).unwrap();
+    assert_eq!(
+        reference.canonical_serialization(),
+        memoized.result.canonical_serialization()
+    );
+    assert!(memoized.resolved_bindings < memoized.result.resolution_order.len());
+}
