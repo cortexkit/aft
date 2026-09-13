@@ -583,7 +583,7 @@ async function runOneScenario(options: {
       hostGeneration,
       binaryPath: config.nativeExecutable,
       mockBaseUrl: mock.url,
-      model: (scenario.model ?? "mock/mock-model").split("/").at(-1),
+      model: (scenario.model ?? "openai/mock-model").split("/").at(-1),
       projectConfig: scenario.project_config,
       providerConfig: hostGeneration === "v2" ? options.providerConfig : undefined,
     });
@@ -645,7 +645,7 @@ async function runOneScenario(options: {
     const host = await client.wait(
       typeof scenario.metadata?.host_timeout_ms === "number"
         ? scenario.metadata.host_timeout_ms
-        : 20_000,
+        : 45_000,
     );
     hostCompletedAt = Date.now();
     await emit({ kind: "host_exit", at: hostCompletedAt, output: host });

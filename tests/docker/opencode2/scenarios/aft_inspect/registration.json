@@ -151,7 +151,7 @@
         {
           "id": "inspect-abort-control",
           "after_turn": "call-tool",
-          "delay_ms": 1000,
+          "delay_ms": 500,
           "method": "POST",
           "path": "/api/session/{{session_id}}/abort",
           "expected_status": 0,

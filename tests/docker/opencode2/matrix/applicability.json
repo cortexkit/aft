@@ -46,7 +46,7 @@
         "T3": "expected_fail:https://github.com/anomalyco/opencode/issues/37164#tests/docker/opencode2/contract/probe/bash-t1-permission-refusal.txt",
         "T4": "expected_fail:https://github.com/anomalyco/opencode/issues/37164#tests/docker/opencode2/contract/probe/bash-t1-permission-refusal.txt",
         "T5": "expected_fail:https://github.com/anomalyco/opencode/issues/37164#tests/docker/opencode2/contract/probe/bash-t1-permission-refusal.txt",
-        "T6": "applicable",
+        "T6": "expected_fail:https://github.com/anomalyco/opencode/issues/37164#tests/docker/opencode2/contract/probe/bash-t1-permission-refusal.txt",
         "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/48340"
       }
     },
@@ -154,7 +154,7 @@
         "T3": "n/a:no-permission-operation",
         "T4": "n/a:no-abortable-operation",
         "T5": "n/a:no-background-capability",
-        "T6": "applicable",
+        "T6": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/48340"
       }
     },
@@ -166,7 +166,7 @@
         "T3": "n/a:no-permission-operation",
         "T4": "n/a:no-abortable-operation",
         "T5": "n/a:no-background-capability",
-        "T6": "applicable",
+        "T6": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/48340"
       }
     },
@@ -188,7 +188,7 @@
         "T1": "applicable",
         "T2": "applicable",
         "T3": "n/a:no-permission-operation",
-        "T4": "applicable",
+        "T4": "expected_fail:https://www.npmjs.com/package/@opencode/cli/v/2.0.3#abort-route-absent",
         "T5": "n/a:no-background-capability",
         "T6": "applicable",
         "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/48340"
@@ -262,7 +262,7 @@
         "T3": "n/a:no-permission-operation",
         "T4": "n/a:no-abortable-operation",
         "T5": "n/a:no-background-capability",
-        "T6": "applicable",
+        "T6": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/48340"
       }
     },

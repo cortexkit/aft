@@ -1,0 +1,35 @@
+OpenCode 2 GA shared-server host contract probe
+run_id: oc2-ga-inspect-t4
+checkout_sha: 80723fbe278b5034c7a02bb65cc671cce8d9d27c
+platform: linux/amd64 container (node:24-bookworm-slim)
+binary: @opencode/cli-linux-x64@2.0.3/bin/opencode
+isolation: HOME, TMPDIR, all four persistent XDG roots, and XDG_RUNTIME_DIR are private; OPENCODE_DB=opencode2.db; one foreground serve process only
+secret handling: the ephemeral server password is redacted
+
+$ opencode serve --hostname 127.0.0.1 --port <ephemeral>
+server listening on http://127.0.0.1:34941
+server password <redacted>
+[process remains running]
+
+$ OPENCODE_SERVER_PASSWORD=<captured> opencode api --server http://127.0.0.1:34941 GET /api/health
+{"healthy":true,"version":"2.0.3","pid":46}
+[exit 0]
+
+Ordered negative controls
+
+$ OPENCODE_SERVER_PASSWORD=WRONG opencode api --server http://127.0.0.1:34941 GET /api/health
+Error: Server at http://127.0.0.1:34941 did not provide a compatible V2 health response
+[cause: ClientError: UnsupportedContentType]
+[exit 1]
+
+$ env -u OPENCODE_SERVER_PASSWORD opencode api --server http://127.0.0.1:34941 GET /api/health
+Error: Server at http://127.0.0.1:34941 did not provide a compatible V2 health response
+[cause: ClientError: UnsupportedContentType]
+[exit 1]
+
+$ OPENCODE_SERVER_PASSWORD=<captured> opencode api --server http://127.0.0.1:1 GET /api/health
+Error: Could not reach server at http://127.0.0.1:1
+[cause: ClientError: Transport]
+[exit 1]
+
+Diff from beta-19234: command and password handoff are unchanged; the health body version changed from 0.0.0-beta-19234 to 2.0.3. Volatile stack frames were omitted.

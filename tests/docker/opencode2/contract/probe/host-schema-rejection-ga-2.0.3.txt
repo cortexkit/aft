@@ -1,0 +1,20 @@
+OpenCode 2 GA host schema-rejection probe
+run_id: oc2-ga-schema-20260913-03
+checkout_sha: 80723fbe278b5034c7a02bb65cc671cce8d9d27c
+platform: linux/amd64 container (node:24-bookworm-slim)
+binary: @opencode/cli-linux-x64@2.0.3/bin/opencode
+session_id: ses_f65020437ffe4QSTdVp8rVl9yM
+isolation: HOME, TMPDIR, all four persistent XDG roots, and XDG_RUNTIME_DIR are private; OPENCODE_DB=opencode2.db
+
+The deterministic OpenAI-compatible mock emitted:
+{"name":"read","arguments":"{}"}
+
+$ opencode run --standalone --print-logs --format json --model openai/mock-model --auto "Call read with the supplied arguments, then report the result."
+{"type":"tool_use","sessionID":"ses_f65020437ffe4QSTdVp8rVl9yM","part":{"type":"tool","id":"host-schema-rejection","tool":"read","state":{"status":"error","input":{},"error":"Invalid arguments for tool \"read\":\n- path: Invalid input: expected string, received undefined\n\nArguments provided:\n{}\n\nUpdate the arguments and call the tool again.","metadata":{"providerCall":{"executed":false},"providerResult":{"executed":false},"rawInput":"{}"}}}}
+{"type":"text","sessionID":"ses_f65020437ffe4QSTdVp8rVl9yM","part":{"type":"text","text":"Probe complete."}}
+[exit 0]
+
+Agent-visible tool message:
+{"error":{"type":"tool.execution","message":"Invalid arguments for tool \"read\":\n- path: Invalid input: expected string, received undefined\n\nArguments provided:\n{}\n\nUpdate the arguments and call the tool again."},"content":[]}
+
+Diff from beta-19234: missing path now reports Zod 4's "Invalid input: expected string, received undefined" and the host event adds providerCall/providerResult/rawInput metadata. Rejection still happens before AFT executes and is handed to the model as tool.execution.

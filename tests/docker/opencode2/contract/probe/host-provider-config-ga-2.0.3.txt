@@ -1,0 +1,30 @@
+OpenCode 2 GA native provider configuration probe
+run_id: oc2-ga-schema-20260913-03
+checkout_sha: 80723fbe278b5034c7a02bb65cc671cce8d9d27c
+platform: linux/amd64 container (node:24-bookworm-slim)
+binary: @opencode/cli-linux-x64@2.0.3/bin/opencode
+isolation: HOME, TMPDIR, all four persistent XDG roots, and XDG_RUNTIME_DIR are private; OPENCODE_DB=opencode2.db
+
+Exact provider block written to opencode.json:
+{
+  "providers": {
+    "openai": {
+      "name": "Deterministic aimock",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://127.0.0.1:<ephemeral>/v1",
+        "apiKey": "{env:OPENAI_API_KEY}"
+      },
+      "models": { "mock-model": { "name": "Mock Model" } }
+    }
+  }
+}
+
+$ OPENAI_API_KEY=sk-mock opencode run --standalone --print-logs --format json --model openai/mock-model --auto "Call read with the supplied arguments, then report the result."
+request user-agent: opencode/latest/2.0.3/cli
+request model: mock-model
+request path: /v1/chat/completions
+host event: {"type":"tool_use","part":{"tool":"read","state":{"status":"error","input":{}}}}
+[exit 0]
+
+Diff from beta-19234: provider package changed from @opencode-ai/ai/providers/openai-compatible to @opencode/ai/providers/openai-compatible. The providers/package/settings shape and openai/mock-model selector remain accepted.

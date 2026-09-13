@@ -1,6 +1,6 @@
 # OpenCode 2 Docker harness
 
-`../../run-opencode2-test.sh` is the local and CI entry point. It reads the V2 beta pin from the existing load-matrix source, builds the checkout binary and plugin tarball in Docker, verifies producer-backed executable provenance, validates all registrations, and runs the selected matrix.
+`../../run-opencode2-test.sh` is the local and CI entry point. It reads the pinned GA V2 version from the existing load-matrix source, builds the checkout binary and plugin tarball in Docker, verifies producer-backed executable provenance, validates all registrations, and runs the selected matrix.
 
 Tool slices add `registration.json`, `registration.ts`, or `*.scenario.json` below `../scenarios/<tool>/`. The loader discovers these files recursively; harness changes are not needed. Optional `*.extension.ts` files may implement `HarnessExtension` for slice-owned validation and lifecycle assertions. The JSON shapes are documented by `registration.schema.json` and `matrix.schema.json`.
 

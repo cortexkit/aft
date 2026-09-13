@@ -139,10 +139,13 @@ export async function createScenarioIsolation(options: {
   const providerConfig = options.providerConfig
     ? materializeProviderConfig(options.providerConfig, options.mockBaseUrl)
     : {
-        mock: {
-          api: "openai",
+        openai: {
+          package: "@opencode/ai/providers/openai-compatible",
           name: "deterministic aimock",
-          options: { baseURL: `${options.mockBaseUrl.replace(/\/$/, "")}/v1` },
+          settings: {
+            baseURL: `${options.mockBaseUrl.replace(/\/$/, "")}/v1`,
+            apiKey: "{env:OPENAI_API_KEY}",
+          },
           models: { [options.model ?? "mock-model"]: { name: "Deterministic mock" } },
         },
       };
@@ -155,14 +158,6 @@ export async function createScenarioIsolation(options: {
       {
         $schema: "https://opencode.ai/config.json",
         plugin: [pluginDirectoryUrl],
-        provider: {
-          mock: {
-            api: "openai",
-            name: "aimock",
-            options: { baseURL: `${options.mockBaseUrl}/v1` },
-            models: { "mock-model": { name: "Mock Model" } },
-          },
-        },
         providers: providerConfig,
       },
       null,
