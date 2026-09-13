@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "kind": "harness",
+  "fixtures": ["harness-goldens", "profile-grammar", "paging"],
+  "slices": [
+    "oc2-ga-reverify-2.0.3",
+    "views-drill-cold-gate",
+    "views-drill-host-load-column",
+    "oc2-runner-container-reap"
+  ],
+  "note": "No ranking-fence file changes: the OpenCode 2 GA pin move and harness, the views drill instrumentation, and the OC2 runner container reap."
+}
