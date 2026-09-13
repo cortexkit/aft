@@ -266,3 +266,38 @@ The materialization itself is 8.482–9.577 s in situ, bracketing the 8.766 s of
 Every correctness probe passed and the drill reported no defects. **The shipping criterion remains unmet:** views must beat legacy to correctness on all four rows with CPU not above legacy. Views wins correctness and CPU only on HEAD → A. It is 5.344–11.065 s slower on the other three rows and uses 18.55–26.05 more CPU-seconds there.
 
 The next wall bucket is outside the final publication event: correctness minus that event's own total is 19.551 / 22.117 / 20.414 / 22.418 s. That interval includes watcher application, semantic readiness, the pending assembly and other concurrent maintenance. Within the sole materialization, selected join (3.463–3.987 s) and ref/edge emission (1.820–2.349 s) remain the largest buckets. Optimizing either requires a separate guarded change; the present measurements do not justify changing publication orchestration or durability semantics.
+
+## Plane-ready publication investigation (2026-09-13)
+
+The retained baseline log is `~/.cache/aft-views-soak/0f3900af641f5248/branch-drill-views-on.stderr.log`; a copy was regenerated while testing the release binary. For the baseline forward HEAD → A switch its timestamped timeline was:
+
+| UTC | elapsed from watcher | event / attribution |
+| --- | ---: | --- |
+| 03:22:05 | 0 s | watcher applied the 300-path batch and invalidated the resident indexes |
+| 03:22:05–03:22:08 | 0–3 s | concurrent tier-2 refreshes ran; no legacy callgraph refresh completion was logged |
+| 03:22:05–03:22:20 | 0–15 s | semantic collection waited/scheduled and then collected 2,690 chunks from 260 files (`sched=6302ms`, collection 73 ms) |
+| 03:22:20–03:22:23 | 15–18 s | the semantic embedder completed 3 batches for 260 files |
+| 03:22:22–03:22:25 | 17–20 s | the first view attempt assembled HEAD, found 260 semantic keys pending, and ended `outcome=pending`, `derived_ms=0`, `total_ms=3053` |
+| 03:22:25–03:22:52 | 20–47 s | semantic readiness retriggered the view; the final publication spent 26,556 ms total, including 20,494 ms materialization and 3,834 ms closure durability |
+| 03:22:53 | 48 s | the first `callers(activeInfo)` probe succeeded |
+
+This confirms Fact A: the manifest was withheld solely because semantic keys were absent, even though its callgraph blobs were available. Publication now treats semantic misses as plane-local pending state: it publishes the callgraph-bearing manifest immediately, retains those paths for the semantic fill, and the fill advances the manifest fingerprint without rewriting callgraph rows. The guarded acceptance test holds an embedding request at the fake server and resolves the checkout's new callgraph symbol through the view while that request remains held.
+
+Fact B was **false in the same baseline log**. The views-on switch contained two `index_event kind=view_publication` lines (one pending and one published), zero `refreshed callgraph store ... for N watcher path(s)` lines, and its perf tick reported `callgraph_invalidations=0`. `CallGraphRead` selected `reader_kind=view` for the current pinned generation, but the hypothesized duplicate legacy incremental refresh did not occur. No legacy-refresh suppression is shipped from this investigation.
+
+### Release drill after the plane split
+
+The required command was attempted with both throwaway seeded storage and the known warm storage:
+
+`scripts/views-branch-drill.sh --mode both --binary "$PWD/target/release/aft" --storage <isolated-storage>`
+
+Both attempts exercised all four views-on transitions, restored the designated checkout to `5716f8ba60e79ec60ec485b6e5291c0b0bc1f252`, and then hit the command timeout before producing the combined JSON/Markdown table. Consequently process CPU deltas and a valid same-run legacy comparison are unavailable; the partial wall observations below are diagnostic only, not an acceptance claim. The warm store had inherited mismatched historical manifests, forcing full-resolution materialization (17.0–23.8 s) rather than the 8.5–9.6 s incremental path measured above.
+
+| switch | views correct ms (log timestamps) | views CPU s | prior legacy correct ms | prior legacy CPU s |
+| --- | ---: | ---: | ---: | ---: |
+| HEAD → A | ~49,000 | unavailable | 34,211 | 40.17 |
+| A → HEAD | ~53,000 | unavailable | 27,466 | 32.62 |
+| HEAD → B | ~43,000 | unavailable | 29,947 | 35.85 |
+| B → HEAD | ~42,000 | unavailable | 27,160 | 32.58 |
+
+The owner's rule remains: **views must beat legacy to correctness on every row, with views CPU not above legacy**. This incomplete drill does not establish that rule. Its wall observations miss legacy by approximately 14.8 / 25.5 / 13.1 / 14.8 s, and CPU cannot be adjudicated. The next benchmark bucket is obtaining a clean, compatible warm manifest set (or allowing its one-time rebuild to finish outside the timed run), then rerunning the unchanged both-arm drill so the intended incremental callgraph-plane publication—not full-resolution recovery—is measured.
