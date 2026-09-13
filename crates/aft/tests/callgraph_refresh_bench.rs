@@ -47,7 +47,12 @@ fn bench_refresh_files_on_store_copy() {
             std::env::var_os("AFT_CALLGRAPH_REFRESH_STORE").is_some(),
             "path-list mode requires a base store"
         );
-        read_transition_paths(Path::new(&path_list), store.project_root())
+        let paths = read_transition_paths(Path::new(&path_list), store.project_root());
+        eprintln!("transition_git_paths={}", paths.len());
+        paths
+            .into_iter()
+            .filter(|path| aft::parser::detect_language(path).is_some())
+            .collect()
     } else {
         let warmup = store
             .refresh_files(std::slice::from_ref(&changed_file))
