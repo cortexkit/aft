@@ -1,12 +1,19 @@
 //! Generation-owned derived artifacts. Unpublished files are protected by the
 //! assembly pin; published files by the pointer and query read markers.
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    time::Instant,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock, Weak,
+    },
+    time::{Duration, Instant},
 };
 
-use super::{Result, ViewStore};
+use rusqlite::Connection;
+
+use super::{Result, ViewError, ViewStore};
 
 impl ViewStore {
     pub fn derived_path(&self, generation: &str) -> Result<PathBuf> {
@@ -150,9 +157,139 @@ impl ViewStore {
     }
 }
 
-/// The source is a checkpointed immutable generation, never a live SQLite
-/// database. Copying its main file therefore cannot omit committed WAL pages.
+#[derive(Clone)]
+struct DeferredCheckpointJob {
+    path: PathBuf,
+    cancelled: Arc<AtomicBool>,
+}
+
+static DEFERRED_CHECKPOINTS: OnceLock<Mutex<HashMap<PathBuf, DeferredCheckpointJob>>> =
+    OnceLock::new();
+static CHECKPOINT_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
+const DEFERRED_CHECKPOINT_IDLE_DELAY: Duration = Duration::from_millis(250);
+
+fn checkpoint_lock(path: &Path) -> Arc<Mutex<()>> {
+    let mut locks = CHECKPOINT_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
+fn checkpoint_derived(path: &Path, connection: Option<&Connection>) -> Result<()> {
+    let lock = checkpoint_lock(path);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let owned;
+    let connection = if let Some(connection) = connection {
+        connection
+    } else {
+        owned = Connection::open(path)?;
+        &owned
+    };
+    connection.busy_timeout(Duration::from_secs(5))?;
+    connection.pragma_update(None, "synchronous", "FULL")?;
+    let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+        connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+    if busy != 0 {
+        return Err(ViewError::InvalidManifest(format!(
+            "derived WAL checkpoint remained busy: path={} log_frames={} checkpointed_frames={}",
+            path.display(),
+            log_frames,
+            checkpointed_frames
+        )));
+    }
+    super::sync_file(path)?;
+    super::sync_parent(path)?;
+    Ok(())
+}
+
+/// Run the generation-sized checkpoint after pointer publication. A later
+/// publication cancels a not-yet-started obsolete job; its clone has already
+/// forced the source checkpoint through [`clone_derived`].
+pub(super) fn schedule_derived_checkpoint(path: PathBuf, connection: Connection) {
+    let key = path.parent().unwrap_or(&path).to_path_buf();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let job = DeferredCheckpointJob {
+        path: path.clone(),
+        cancelled: Arc::clone(&cancelled),
+    };
+    if let Some(previous) = DEFERRED_CHECKPOINTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.clone(), job)
+    {
+        previous.cancelled.store(true, Ordering::Release);
+        log::debug!(
+            "view derived checkpoint superseded path={}",
+            previous.path.display()
+        );
+    }
+    let path_for_error = path.clone();
+    let key_for_error = key.clone();
+    let cancelled_for_error = Arc::clone(&cancelled);
+    let spawn = std::thread::Builder::new()
+        .name("aft-view-checkpoint".to_owned())
+        .spawn(move || {
+            std::thread::sleep(DEFERRED_CHECKPOINT_IDLE_DELAY);
+            let started = Instant::now();
+            if !cancelled.load(Ordering::Acquire) {
+                match checkpoint_derived(&path, Some(&connection)) {
+                    Ok(()) => log::info!(
+                        "view derived checkpoint completed ms={} path={}",
+                        started.elapsed().as_millis(),
+                        path.display()
+                    ),
+                    Err(error) => log::warn!(
+                        "view derived checkpoint deferred to next clone path={} error={}",
+                        path.display(),
+                        error
+                    ),
+                }
+            }
+            let mut jobs = DEFERRED_CHECKPOINTS
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if jobs
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(&current.cancelled, &cancelled))
+            {
+                jobs.remove(&key);
+            }
+        });
+    if let Err(error) = spawn {
+        let mut jobs = DEFERRED_CHECKPOINTS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if jobs
+            .get(&key_for_error)
+            .is_some_and(|current| Arc::ptr_eq(&current.cancelled, &cancelled_for_error))
+        {
+            jobs.remove(&key_for_error);
+        }
+        log::warn!(
+            "view derived checkpoint worker unavailable; next clone will checkpoint path={} error={}",
+            path_for_error.display(),
+            error
+        );
+    }
+}
+
+/// Checkpoint the source before copying its main file. This also recovers a
+/// commit-durable WAL left by a process that exited before detached maintenance.
 pub(super) fn clone_derived(source: &Path, destination: &Path) -> Result<()> {
+    checkpoint_derived(source, None)?;
     let started = Instant::now();
     let mechanism = if try_clone(source, destination) {
         if cfg!(target_os = "macos") {
@@ -173,6 +310,92 @@ pub(super) fn clone_derived(source: &Path, destination: &Path) -> Result<()> {
         destination.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deferred_checkpoint_runs_after_the_publication_path_returns() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.sqlite");
+        let connection = Connection::open(&source).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        connection
+            .pragma_update(None, "synchronous", "FULL")
+            .unwrap();
+        connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE state (value TEXT NOT NULL);\
+                 INSERT INTO state VALUES ('durable');",
+            )
+            .unwrap();
+        let wal = PathBuf::from(format!("{}-wal", source.display()));
+        assert!(fs::metadata(&wal).unwrap().len() > 0);
+
+        schedule_derived_checkpoint(source.clone(), connection);
+
+        assert!(
+            fs::metadata(&wal).is_ok_and(|metadata| metadata.len() > 0),
+            "checkpoint ran synchronously on the publication path"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs::metadata(&wal).is_ok_and(|metadata| metadata.len() > 0) {
+            assert!(
+                Instant::now() < deadline,
+                "detached derived checkpoint did not finish"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            Connection::open(&source)
+                .unwrap()
+                .query_row("SELECT value FROM state", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "durable"
+        );
+    }
+
+    #[test]
+    fn clone_checkpoints_committed_wal_before_copying_the_main_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.sqlite");
+        let destination = directory.path().join("destination.sqlite");
+        let connection = Connection::open(&source).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        connection
+            .pragma_update(None, "synchronous", "FULL")
+            .unwrap();
+        connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE state (value TEXT NOT NULL);\
+                 INSERT INTO state VALUES ('committed-in-wal');",
+            )
+            .unwrap();
+        let wal = PathBuf::from(format!("{}-wal", source.display()));
+        assert!(fs::metadata(&wal).unwrap().len() > 0);
+
+        clone_derived(&source, &destination).unwrap();
+
+        assert_eq!(
+            Connection::open(&destination)
+                .unwrap()
+                .query_row("SELECT value FROM state", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "committed-in-wal"
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]

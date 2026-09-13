@@ -100,10 +100,15 @@ fn durable_restart_child() {
     )
     .unwrap();
 
-    let artifacts = artifacts(&storage, semantic.path(), callgraph.path());
+    let (artifacts, derived_keeper) = artifacts(&storage, semantic.path(), callgraph.path(), "new");
     let manifest = manifest_for(&inputs);
     let store = ViewStore::open(&storage, VIEW).unwrap();
-    let closure = DiskClosure::new(&storage, semantic.path(), callgraph.path(), &artifacts);
+    let closure = DiskClosure::new(
+        semantic.path(),
+        callgraph.path(),
+        &artifacts,
+        Some(derived_keeper),
+    );
     let request = publication_request("new", Some("old"), &manifest, artifacts);
     store
         .publish_with_observer(&request, &closure, Some(&KillAtStep { step, ready }))
@@ -139,10 +144,10 @@ fn run_kill9_case(failpoint: Failpoint, seed: u64) {
     );
     if let Some(generation) = pointer {
         let closure = DiskClosure::new(
-            &storage,
             &storage.join("blobs").join(FAMILY).join("semantic.sqlite"),
             &storage.join("blobs").join(FAMILY).join("callgraph.sqlite"),
             &artifacts,
+            None,
         );
         let requirements = ClosureRequirements {
             referenced_aliases: BTreeSet::from([ALIAS.to_string()]),
@@ -154,6 +159,16 @@ fn run_kill9_case(failpoint: Failpoint, seed: u64) {
         )
         .unwrap();
     }
+
+    assert_eq!(
+        Connection::open(&artifacts.derived_database)
+            .unwrap()
+            .query_row("SELECT value FROM state", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "new",
+        "seed={seed} failpoint={} must recover the commit-durable derived WAL",
+        failpoint.name
+    );
 
     let durable = fs::read_to_string(storage.join("durable-keys.txt"))
         .unwrap()
@@ -275,10 +290,15 @@ fn seed_old_generation(root: &Path, storage: &Path) {
         semantic.put(&input.semantic, &input.payload).unwrap();
         callgraph.put(&input.callgraph, &input.payload).unwrap();
     }
-    let artifacts = artifacts(storage, semantic.path(), callgraph.path());
+    let (artifacts, derived_keeper) = artifacts(storage, semantic.path(), callgraph.path(), "old");
     let store = ViewStore::open(storage, VIEW).unwrap();
     let manifest = manifest_for(&inputs);
-    let closure = DiskClosure::new(storage, semantic.path(), callgraph.path(), &artifacts);
+    let closure = DiskClosure::new(
+        semantic.path(),
+        callgraph.path(),
+        &artifacts,
+        Some(derived_keeper),
+    );
     assert_eq!(
         store
             .publish(
@@ -307,15 +327,31 @@ fn manifest_for(inputs: &[Input]) -> Manifest {
     .unwrap()
 }
 
-fn artifacts(storage: &Path, semantic: &Path, callgraph: &Path) -> PublicationArtifacts {
+fn artifacts(
+    storage: &Path,
+    semantic: &Path,
+    callgraph: &Path,
+    value: &str,
+) -> (PublicationArtifacts, Connection) {
     let derived = storage.join("derived.sqlite");
     let aliases = storage.join("oid-alias.sqlite");
-    for path in [&derived, &aliases] {
-        let connection = Connection::open(path).unwrap();
-        connection
-            .execute_batch("CREATE TABLE IF NOT EXISTS state (value TEXT NOT NULL);")
-            .unwrap();
-    }
+    let derived_keeper = Connection::open(&derived).unwrap();
+    derived_keeper
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;\
+             PRAGMA synchronous=FULL;\
+             PRAGMA wal_autocheckpoint=0;\
+             CREATE TABLE IF NOT EXISTS state (value TEXT NOT NULL);\
+             DELETE FROM state;",
+        )
+        .unwrap();
+    derived_keeper
+        .execute("INSERT INTO state VALUES (?1)", params![value])
+        .unwrap();
+    let connection = Connection::open(&aliases).unwrap();
+    connection
+        .execute_batch("CREATE TABLE IF NOT EXISTS state (value TEXT NOT NULL);")
+        .unwrap();
     Connection::open(&aliases)
         .unwrap()
         .execute(
@@ -329,12 +365,15 @@ fn artifacts(storage: &Path, semantic: &Path, callgraph: &Path) -> PublicationAr
         .unwrap();
     let trigram = storage.join("trigram.bin");
     fs::write(&trigram, "ready").unwrap();
-    PublicationArtifacts {
-        blob_databases: vec![semantic.to_path_buf(), callgraph.to_path_buf()],
-        derived_database: derived,
-        trigram_artifact: trigram,
-        alias_database: aliases,
-    }
+    (
+        PublicationArtifacts {
+            blob_databases: vec![semantic.to_path_buf(), callgraph.to_path_buf()],
+            derived_database: derived,
+            trigram_artifact: trigram,
+            alias_database: aliases,
+        },
+        derived_keeper,
+    )
 }
 
 fn artifacts_for_existing(storage: &Path) -> PublicationArtifacts {
@@ -371,21 +410,22 @@ struct DiskClosure {
     callgraph_database: PathBuf,
     trigram: PathBuf,
     aliases: PathBuf,
+    _derived_keeper: Option<Connection>,
 }
 
 impl DiskClosure {
     fn new(
-        storage: &Path,
         semantic: &Path,
         callgraph: &Path,
         artifacts: &PublicationArtifacts,
+        derived_keeper: Option<Connection>,
     ) -> Self {
-        let _ = storage;
         Self {
             semantic_database: semantic.to_path_buf(),
             callgraph_database: callgraph.to_path_buf(),
             trigram: artifacts.trigram_artifact.clone(),
             aliases: artifacts.alias_database.clone(),
+            _derived_keeper: derived_keeper,
         }
     }
 }

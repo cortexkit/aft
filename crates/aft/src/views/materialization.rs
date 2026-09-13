@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -140,6 +141,7 @@ fn materialize(
     } else {
         Connection::open(database_path)?
     };
+    configure_materialization_connection(&connection)?;
     if base.is_none() {
         initialize_schema(&connection)?;
     }
@@ -610,6 +612,18 @@ const fn manifest_ref_kind(kind: join::BlobRefKind) -> &'static str {
         join::BlobRefKind::Reexport => "reexport",
         join::BlobRefKind::ExportAlias => "export_alias",
     }
+}
+
+fn configure_materialization_connection(connection: &Connection) -> Result<()> {
+    connection.busy_timeout(Duration::from_secs(5))?;
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    // Publication can expose the generation while its pages remain in the WAL,
+    // so the transaction commit itself must survive power loss.
+    connection.pragma_update(None, "synchronous", "FULL")?;
+    // A detached checkpoint moves these pages into the main file. Keeping the
+    // automatic threshold disabled makes that work observable and off-path.
+    connection.pragma_update(None, "wal_autocheckpoint", 0)?;
+    Ok(())
 }
 
 #[cfg(test)]

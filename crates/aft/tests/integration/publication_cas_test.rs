@@ -168,7 +168,7 @@ fn publication_makes_dependencies_durable_before_sqlite_pointer_visibility() {
             PublicationStep::BlobWalCheckpointed,
             PublicationStep::BlobWalCheckpointed,
             PublicationStep::BlobWalFsync,
-            PublicationStep::BlobWalCheckpointed,
+            PublicationStep::DerivedWalFsynced,
             PublicationStep::DerivedAndTrigramDurable,
             PublicationStep::BlobWalCheckpointed,
             PublicationStep::AliasRowsDurable,

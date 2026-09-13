@@ -73,6 +73,7 @@ pub struct PreparedAssembly {
     report: AssemblyReport,
     publication: Option<super::PreparedPublication>,
     files: Option<(ViewStore, String)>,
+    derived_checkpoint: Option<(PathBuf, Connection)>,
     pin: Option<AssemblyPin>,
     _base_pin: Option<crate::pins::QueryPin>,
     profile: PublicationProfile,
@@ -92,6 +93,9 @@ impl PreparedAssembly {
                 PublishOutcome::Published => {
                     self.report.published = true;
                     self.files = None;
+                    if let Some((path, connection)) = self.derived_checkpoint.take() {
+                        super::generation::schedule_derived_checkpoint(path, connection);
+                    }
                     self.profile.outcome = "published";
                 }
                 PublishOutcome::Conflict { current_generation } => {
@@ -337,6 +341,7 @@ pub fn prepare_checkout(
         },
         publication: None,
         files: Some((view.clone(), next_generation.clone())),
+        derived_checkpoint: None,
         pin: Some(pin),
         _base_pin: base_pin,
         profile,
@@ -439,6 +444,11 @@ pub fn prepare_checkout(
         }
     }
     prepared.profile.derived_clone_ms = clone_started.elapsed().as_millis();
+    // Keep one connection alive so SQLite does not checkpoint the committed WAL
+    // when the materializer closes its writer before pointer publication.
+    let derived_keeper = Connection::open(&derived)?;
+    derived_keeper.busy_timeout(std::time::Duration::from_secs(5))?;
+    prepared.derived_checkpoint = Some((derived.clone(), derived_keeper));
     let materialization_started = Instant::now();
     if let Some(base_manifest) = previous.as_ref().filter(|_| cloned_base) {
         let (stats, timings) = super::materialization::apply_manifest_diff_profiled(

@@ -490,7 +490,9 @@ pub fn probe_publication_closure(
 }
 
 /// Files whose committed state must be durable before a pointer can name a new
-/// generation. All SQLite paths are checkpointed with `PASSIVE` before fsync.
+/// generation. Shared SQLite stores are checkpointed before fsync; the derived
+/// generation keeps its commit-durable WAL until detached post-publication work
+/// checkpoints it for the next clone.
 #[derive(Clone, Debug)]
 pub struct PublicationArtifacts {
     pub blob_databases: Vec<PathBuf>,
@@ -518,6 +520,9 @@ pub enum PublicationStep {
     /// The SQLite WAL checkpoint completed; fsync has not begun yet.
     BlobWalCheckpointed,
     BlobWalFsync,
+    /// The derived database's committed WAL and main file have been fsynced
+    /// without moving WAL pages into the main file.
+    DerivedWalFsynced,
     DerivedAndTrigramDurable,
     AliasRowsDurable,
     ClosureProbed,
@@ -705,7 +710,7 @@ impl ViewStore {
         }
         observe(observer, PublicationStep::BlobWalFsync);
 
-        checkpoint_and_sync_database(&request.artifacts.derived_database, observer)?;
+        sync_database_wal_without_checkpoint(&request.artifacts.derived_database, observer)?;
         sync_file_and_parent(&request.artifacts.trigram_artifact)?;
         observe(observer, PublicationStep::DerivedAndTrigramDurable);
 
@@ -893,6 +898,28 @@ fn configure_connection(connection: &Connection) -> Result<()> {
     })?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
     connection.pragma_update(None, "foreign_keys", "OFF")?;
+    Ok(())
+}
+
+fn sync_database_wal_without_checkpoint(
+    path: &Path,
+    observer: Option<&dyn PublicationObserver>,
+) -> Result<()> {
+    if !path.is_file() {
+        return Err(ViewError::InvalidManifest(format!(
+            "durability input is not a SQLite file: {}",
+            path.display()
+        )));
+    }
+    sync_file(path)?;
+    let wal_path = PathBuf::from(format!("{}-wal", path.display()));
+    match open_file_for_sync(&wal_path) {
+        Ok(file) => file.sync_all()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ViewError::Io(error)),
+    }
+    sync_parent(path)?;
+    observe(observer, PublicationStep::DerivedWalFsynced);
     Ok(())
 }
 
