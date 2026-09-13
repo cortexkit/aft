@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "subagent-background-default",
+    "issue-309-omp-adapter"
+  ],
+  "note": "The only ranking-fence file touched is the subc tool-schema artifact, regenerated because the bash tool description gained one steering sentence about nohup launches; no search engine file changed and rows are byte-identical to the reference (the predicate is the proof)."
+}
