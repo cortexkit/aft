@@ -89,6 +89,41 @@ fn fingerprint(manifest: &crate::views::Manifest) -> Result<String> {
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
+fn manifest_callgraph_equivalent(
+    left: &crate::views::Manifest,
+    right: &crate::views::Manifest,
+) -> bool {
+    let mut left = left.entries();
+    let mut right = right.entries();
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return true,
+            (Some((left_path, left_entry)), Some((right_path, right_entry)))
+                if left_path == right_path
+                    && match (left_entry, right_entry) {
+                        (
+                            crate::views::ManifestEntry::Regular {
+                                mode: left_mode,
+                                planes: left_planes,
+                                resolution_input: left_resolution_input,
+                            },
+                            crate::views::ManifestEntry::Regular {
+                                mode: right_mode,
+                                planes: right_planes,
+                                resolution_input: right_resolution_input,
+                            },
+                        ) => {
+                            left_mode == right_mode
+                                && left_resolution_input == right_resolution_input
+                                && left_planes.callgraph == right_planes.callgraph
+                        }
+                        _ => left_entry == right_entry,
+                    } => {}
+            _ => return false,
+        }
+    }
+}
+
 fn materialize(
     database_path: &Path,
     callgraph_blob_database: &Path,
@@ -137,6 +172,15 @@ fn materialize(
             base = None;
         } else if base_manifest == manifest {
             profile.finish("load_bindings_select");
+            return Ok((MaterializeStats::default(), profile.into_timings()));
+        } else if manifest_callgraph_equivalent(base_manifest, manifest) {
+            profile.finish("load_bindings_select");
+            transaction.execute(
+                "INSERT OR REPLACE INTO meta(k, v) VALUES('view_manifest_fingerprint', ?1)",
+                [fingerprint(manifest)?],
+            )?;
+            transaction.commit()?;
+            profile.finish("commit");
             return Ok((MaterializeStats::default(), profile.into_timings()));
         }
     }

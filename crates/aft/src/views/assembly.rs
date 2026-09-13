@@ -441,25 +441,18 @@ pub fn prepare_checkout(
     prepared.profile.derived_clone_ms = clone_started.elapsed().as_millis();
     let materialization_started = Instant::now();
     if let Some(base_manifest) = previous.as_ref().filter(|_| cloned_base) {
-        if manifest_callgraph_equivalent(base_manifest, &manifest) {
-            log::info!(
-                "view callgraph materialization reused unchanged plane: generation={}",
-                next_generation
-            );
-        } else {
-            let (stats, timings) = super::materialization::apply_manifest_diff_profiled(
-                &derived,
-                base_manifest,
-                &manifest,
-                callgraph.path(),
-            )
-            .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-            prepared.profile.materialization = timings;
-            log::info!(
-                "view manifest diff: generation={} stats={stats:?}",
-                next_generation
-            );
-        }
+        let (stats, timings) = super::materialization::apply_manifest_diff_profiled(
+            &derived,
+            base_manifest,
+            &manifest,
+            callgraph.path(),
+        )
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+        prepared.profile.materialization = timings;
+        log::info!(
+            "view manifest diff: generation={} stats={stats:?}",
+            next_generation
+        );
     } else {
         crate::callgraph_store::materialize_manifest_view_database(
             &derived,
@@ -675,38 +668,6 @@ fn manifest_entry_callgraph_key(entry: &ManifestEntry) -> Option<&str> {
         ManifestEntry::Regular { planes, .. } => planes.callgraph.as_deref(),
         ManifestEntry::Synthetic { planes, .. } => Some(&planes.callgraph),
         ManifestEntry::Symlink { .. } | ManifestEntry::Gitlink { .. } => None,
-    }
-}
-
-fn manifest_callgraph_equivalent(left: &Manifest, right: &Manifest) -> bool {
-    let mut left = left.entries();
-    let mut right = right.entries();
-    loop {
-        match (left.next(), right.next()) {
-            (None, None) => return true,
-            (Some((left_path, left_entry)), Some((right_path, right_entry)))
-                if left_path == right_path
-                    && match (left_entry, right_entry) {
-                        (
-                            ManifestEntry::Regular {
-                                mode: left_mode,
-                                planes: left_planes,
-                                resolution_input: left_resolution_input,
-                            },
-                            ManifestEntry::Regular {
-                                mode: right_mode,
-                                planes: right_planes,
-                                resolution_input: right_resolution_input,
-                            },
-                        ) => {
-                            left_mode == right_mode
-                                && left_resolution_input == right_resolution_input
-                                && left_planes.callgraph == right_planes.callgraph
-                        }
-                        _ => left_entry == right_entry,
-                    } => {}
-            _ => return false,
-        }
     }
 }
 
