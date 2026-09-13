@@ -9590,7 +9590,7 @@ mod tests {
             "config": [user_tier(json!({
                 "search_index": true,
                 "semantic_search": true,
-                "callgraph_store": false,
+                "callgraph_store": true,
                 "semantic": {
                     "backend": "openai_compatible",
                     "model": "counting-test-embedding",
