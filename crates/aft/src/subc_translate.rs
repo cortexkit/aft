@@ -2558,11 +2558,14 @@ mod tests {
             project,
         )
         .expect("plain outline");
-        let expected = project.join("src").join("lib.rs");
+        // The resolver lexically normalizes the joined path, so on Windows the
+        // POSIX-spelled test root comes back with backslashes throughout; compare
+        // the normalized form, not a hand-joined one.
+        let expected = resolve_path_from_project_root(project, "src/lib.rs");
         assert_eq!(
             plain.args["file"].as_str(),
             Some(expected.to_string_lossy().as_ref()),
-            "plain paths resolve with the platform's separators"
+            "a plain relative target must still resolve against the project root"
         );
     }
 
