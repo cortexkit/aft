@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar"
+  ],
+  "slices": [
+    "release-profile-lib-tests",
+    "views-persistent-surfaces",
+    "tier2-projection-verdict"
+  ],
+  "note": "gh_shim/inspect/parser test cfgs, views materialization, callgraph_store join seam and dead-code projection; no ranking-fence file in the diff."
+}
