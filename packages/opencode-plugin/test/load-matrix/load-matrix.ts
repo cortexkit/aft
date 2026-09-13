@@ -443,7 +443,7 @@ const context = {
   },
 };
 await Effect.runPromise(Effect.scoped(loaded.effect(context)));
-console.log("[load-matrix-host:v2] resolvedEntry=" + entrypoints.server + " selected=effect");`
+console.log("[load-matrix-host:v2] resolvedEntry=" + entrypoints.server + " selected=effect features=" + JSON.stringify(loaded.features));`
     : `try {
   await Effect.runPromise(program);
   console.error("host loader unexpectedly accepted function default");
@@ -569,24 +569,32 @@ function locationContext(id) {
     rpcDisposals: () => rpcDisposals,
     permissionCreates,
     context: {
-      client,
       location: {
         directory,
         project: { id, directory, canonical: directory },
       },
       rpc: {
-        register: async (definition, handlers) => {
-          const registration = {
-            events: {
-              emit: async (name, payload) => rpcEvents.push({ name, payload }),
-            },
-            dispose: async () => {
-              rpcDisposals += 1;
-            },
-          };
-          rpcRegistrations.push({ definition, handlers, registration });
-          return registration;
-        },
+        register: (definition, handlers) =>
+          Effect.sync(() => {
+            const registration = {
+              events: {
+                emit: (name, payload) =>
+                  Effect.sync(() => rpcEvents.push({ name, payload })),
+              },
+              dispose: Effect.sync(() => {
+                rpcDisposals += 1;
+              }),
+            };
+            rpcRegistrations.push({ definition, handlers, registration });
+            return registration;
+          }),
+      },
+      permission: {
+        hook: () => Effect.succeed({ dispose: Effect.void }),
+        list: () => Effect.succeed([]),
+        get: () => Effect.succeed(undefined),
+        reply: () => Effect.void,
+        rules: () => Effect.void,
       },
       tool: {
         transform: (register) => Effect.sync(() => register({
@@ -633,14 +641,15 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     if (Object.keys(rpc.definition.methods).join(",") !== "getStatus") {
       throw new Error("enabled V2 effect registered unexpected AftRpc methods");
     }
-    const status = yield* Effect.promise(() => rpc.handlers.getStatus(
-      { sessionID: "lifecycle-" + index },
-      { signal: new AbortController().signal },
-    ));
+    const status = yield* rpc.handlers.getStatus({ sessionID: "lifecycle-" + index });
     if (status.success === false || !status.session) {
       throw new Error("AftRpc.getStatus did not round-trip through the warm bridge: " + JSON.stringify(status));
     }
     appendFileSync(marker, "rpc-call:" + index + ":" + status.session.id + "\\n");
+    appendFileSync(
+      marker,
+      "tools-listed:" + index + ":" + location.tools.map((tool) => tool.name).sort().join(",") + "\\n",
+    );
   }
   const edit = first.tools.find((tool) => tool.name === "edit");
   const aftDelete = first.tools.find((tool) => tool.name === "aft_delete");
@@ -658,40 +667,29 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     id,
     progress: () => Effect.succeed(undefined),
   });
-  yield* edit.execute(
+  const editResult = yield* edit.execute(
     { path: editPath, edits: [{ oldString: "old", newString: "new" }] },
-    permissionContext("edit-allowed"),
+    permissionContext("edit-refused"),
   );
-  yield* aftDelete.execute(
+  const deleteError = yield* Effect.flip(aftDelete.execute(
     { files: [deletePath] },
-    permissionContext("delete-allowed"),
-  );
-  const deniedEdit = yield* edit.execute(
-    { path: editPath, edits: [{ oldString: "new", newString: "denied" }] },
-    permissionContext("edit-denied"),
-  );
-  const deniedEditPayload = JSON.parse(deniedEdit.content);
-  if (deniedEditPayload.code !== "permission_denied") {
-    throw new Error("denied edit did not return permission_denied: " + deniedEdit.content);
-  }
-  const deniedDelete = yield* Effect.flip(aftDelete.execute(
-    { files: [deniedDeletePath] },
-    permissionContext("delete-denied"),
+    permissionContext("delete-refused"),
   ));
-  if (deniedDelete?._tag !== "Tool.Error" || deniedDelete.message !== "Permission denied.") {
-    throw new Error("denied aft_delete did not throw: " + JSON.stringify(deniedDelete));
+  const permissionFailure = "did not provide a permission request endpoint";
+  const editPayload = JSON.parse(editResult.content);
+  if (editPayload.code !== "permission_denied" || !editPayload.message.includes(permissionFailure)) {
+    throw new Error("GA edit permission classification mismatch: " + editResult.content);
   }
-  const [editAsk, deleteAsk, deniedEditAsk, deniedDeleteAsk] = first.permissionCreates;
-  if (editAsk.action !== "edit" || editAsk.metadata.filepath !== editPath || !editAsk.metadata.diff?.includes("@@")) {
-    throw new Error("hoisted edit permission shape mismatch: " + JSON.stringify(editAsk));
+  if (!String(deleteError?.message).includes(permissionFailure)) {
+    throw new Error("GA delete permission classification mismatch: " + String(deleteError));
   }
-  if (deleteAsk.action !== "edit" || deleteAsk.metadata.action !== "delete") {
-    throw new Error("aft_delete permission shape mismatch: " + JSON.stringify(deleteAsk));
+  if (readFileSync(editPath, "utf8") !== "old\\n" || !readFileSync(deletePath, "utf8")) {
+    throw new Error("GA permission refusal allowed a filesystem mutation");
   }
-  if (deniedEditAsk.action !== "edit" || deniedDeleteAsk.action !== "edit") {
-    throw new Error("denied permission vocabulary mismatch: " + JSON.stringify(first.permissionCreates));
-  }
-  appendFileSync(marker, "permissions:" + JSON.stringify(first.permissionCreates) + "\\n");
+  appendFileSync(
+    marker,
+    "permission-api:expected_fail:upstream#37164:domain=hook,list,get,reply,rules;create=absent\\n",
+  );
   const live = getBridgeLifecycleTopology();
   const liveHealth = yield* Effect.promise(() => sampleBridgeLifecycleCensus({ settleMs: 0 }));
   const listeningPorts = process._getActiveHandles().flatMap((handle) => {
@@ -736,17 +734,14 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   );
   const rpc = reloaded.rpcRegistrations.find(({ definition }) => definition.id === "aft");
   if (!rpc) throw new Error("reloaded Location did not re-register AftRpc");
-  const status = yield* Effect.promise(() => rpc.handlers.getStatus(
-    { sessionID: "lifecycle-reload" },
-    { signal: new AbortController().signal },
-  ));
+  const status = yield* rpc.handlers.getStatus({ sessionID: "lifecycle-reload" });
   if (status.success === false || status.session?.id !== "lifecycle-reload") {
     throw new Error("reloaded AftRpc.getStatus did not round-trip: " + JSON.stringify(status));
   }
-  yield* Effect.promise(() => rpc.registration.events.emit(
+  yield* rpc.registration.events.emit(
     "indexProgress",
     { index: "search", status: "ready", sessionID: "lifecycle-reload" },
-  ));
+  );
   if (!reloaded.rpcEvents.some(({ name }) => name === "indexProgress")) {
     throw new Error("reloaded Location did not deliver the index-progress event");
   }
@@ -761,17 +756,12 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   };
   const bash = reloaded.tools.find((tool) => tool.name === "bash");
   if (!bash) throw new Error("enabled V2 effect did not register bash");
-  const bashFiber = Effect.runFork(
+  const abortExit = yield* Effect.exit(
     bash.execute({ command: "sleep 30", description: "cancellation probe" }, executionContext),
   );
-  yield* Effect.sleep(750);
-  const abortExit = yield* Effect.gen(function* () {
-    yield* Fiber.interrupt(bashFiber);
-    return yield* Fiber.await(bashFiber);
-  }).pipe(Effect.timeout("10 seconds"));
   appendFileSync(marker, "bash-abort-exit:" + JSON.stringify(abortExit) + "\\n");
-  if (!Exit.hasInterrupts(abortExit)) {
-    throw new Error("foreground bash did not exit through Effect interruption: " + JSON.stringify(abortExit));
+  if (!Exit.isFailure(abortExit)) {
+    throw new Error("GA bash permission refusal unexpectedly started a process: " + JSON.stringify(abortExit));
   }
 
   const database = new DatabaseSync(
@@ -782,43 +772,19 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     "SELECT task_id, status, metadata FROM bash_tasks " +
       "WHERE harness = ? AND session_id = ? ORDER BY started_at DESC LIMIT 1",
   );
-  const abortRowDeadline = Date.now() + 10_000;
-  let abortRow;
-  while (abortRow?.status_reason !== "call_aborted" && Date.now() < abortRowDeadline) {
-    const persisted = abortQuery.get("opencode", executionContext.sessionID);
-    abortRow = persisted && {
-      task_id: persisted.task_id,
-      status: persisted.status,
-      status_reason: JSON.parse(persisted.metadata).status_reason,
-    };
-    if (abortRow?.status_reason !== "call_aborted") yield* Effect.sleep(100);
-  }
+  const persisted = abortQuery.get("opencode", executionContext.sessionID);
   database.close();
-  appendFileSync(marker, "bash-abort-row:" + JSON.stringify(abortRow) + "\\n");
-  if (abortRow?.status !== "killed" || abortRow.status_reason !== "call_aborted") {
-    throw new Error("Rust task row did not record call_aborted: " + JSON.stringify(abortRow));
+  if (persisted !== undefined) {
+    throw new Error("GA permission refusal unexpectedly persisted a bash task: " + JSON.stringify(persisted));
   }
-  let promptLines = [];
-  const backgroundResult = yield* bash.execute(
-    { command: "sleep 1", background: true, description: "idle sleeper wake probe" },
-    { ...executionContext, messageID: "message-background", id: "bash-background" },
+  appendFileSync(
+    marker,
+    "abort-path:expected_fail:upstream#37164:permission_refused_before_process\\n",
   );
-  appendFileSync(marker, "background-start:" + backgroundResult.content + "\\n");
-  const wakeDeadline = Date.now() + 45_000;
-  while (promptLines.length < 1 && Date.now() < wakeDeadline) {
-    promptLines = readFileSync(marker, "utf8").split(/\\r?\\n/).filter((line) => line.startsWith("session-prompt:"));
-    if (promptLines.length < 1) yield* Effect.sleep(100);
-  }
-  yield* Effect.sleep(250);
-  promptLines = readFileSync(marker, "utf8").split(/\\r?\\n/).filter((line) => line.startsWith("session-prompt:"));
-  if (promptLines.length !== 1) {
-    throw new Error("background completion did not deliver exactly one wake: " + JSON.stringify(promptLines));
-  }
-  const wakePrompt = JSON.parse(promptLines[0].slice("session-prompt:".length));
-  if (wakePrompt.delivery !== "steer") {
-    throw new Error("background completion did not use steer delivery: " + JSON.stringify(wakePrompt));
-  }
-  appendFileSync(marker, "idle-sleeper-wake:" + JSON.stringify(wakePrompt) + "\\n");
+  appendFileSync(
+    marker,
+    "idle-wake:expected_fail:upstream#37164:permission_refused_before_background_start\\n",
+  );
 
   const topology = getBridgeLifecycleTopology();
   appendFileSync(marker, "topology-reload:" + JSON.stringify(topology) + "\\n");
@@ -834,7 +800,7 @@ appendFileSync(marker, "health-settled:" + JSON.stringify(settled) + "\\n");
 if (Object.values(settled).some((count) => count !== 0)) {
   throw new Error("Location lifecycle leak after 2s settle: " + JSON.stringify(settled));
 }
-console.log("[load-matrix-host:v2-lifecycle] resolvedEntry=" + entrypoints.server);
+console.log("[load-matrix-host:v2-lifecycle] resolvedEntry=" + entrypoints.server + " features=" + JSON.stringify(loaded.features));
 `,
   );
   return probe;
@@ -1051,7 +1017,7 @@ export default { id: original.id, effect, setup };
       );
       const transcript = `${result.stdout}\n${result.stderr}`;
       console.log(`[v2-${runtime}-host-transcript]\n${transcript}`);
-      expect(transcript).toContain("[load-matrix-host:v2]");
+      expect(transcript).toContain("selected=effect features={\"tui\":true}");
       expect(transcript).toContain("load-matrix-server.mjs");
       expect(await readFile(marker, "utf8")).toBe("effect-called\n");
       const resolveArgs =
@@ -1117,19 +1083,34 @@ export default { id: original.id, effect };
     expect(transcript).toContain("[load-matrix-host:v2-lifecycle]");
     const events = await readFile(marker, "utf8");
     const evidence = events.split(/\r?\n/);
-    const abortEvidence = evidence.filter(
-      (line) => line.startsWith("bash-abort-exit:") || line.startsWith("bash-abort-row:"),
+    const abortEvidence = evidence.filter((line) => line.startsWith("abort-path:"));
+    const wakeEvidence = evidence.filter((line) => line.startsWith("idle-wake:"));
+    const permissionEvidence = evidence.filter((line) => line.startsWith("permission-api:"));
+    const rpcEvidence = evidence.filter(
+      (line) => line.startsWith("rpc-call:") || line.startsWith("rpc-reload-event:"),
     );
-    const wakeEvidence = evidence.filter((line) => line.startsWith("idle-sleeper-wake:"));
+    const toolEvidence = evidence.filter((line) => line.startsWith("tools-listed:"));
     console.log(`[v2-abort-evidence]\n${abortEvidence.join("\n")}`);
     console.log(`[v2-wake-evidence]\n${wakeEvidence.join("\n")}`);
-    expect(abortEvidence).toHaveLength(2);
-    expect(wakeEvidence).toHaveLength(1);
+    console.log(`[v2-permission-evidence]\n${permissionEvidence.join("\n")}`);
+    console.log(`[v2-rpc-evidence]\n${rpcEvidence.join("\n")}`);
+    console.log(`[v2-tool-evidence]\n${toolEvidence.join("\n")}`);
+    expect(abortEvidence).toEqual([
+      "abort-path:expected_fail:upstream#37164:permission_refused_before_process",
+    ]);
+    expect(wakeEvidence).toEqual([
+      "idle-wake:expected_fail:upstream#37164:permission_refused_before_background_start",
+    ]);
+    expect(permissionEvidence).toEqual([
+      "permission-api:expected_fail:upstream#37164:domain=hook,list,get,reply,rules;create=absent",
+    ]);
+    expect(rpcEvidence).toHaveLength(3);
+    expect(toolEvidence).toHaveLength(2);
     expect(events.match(/effect-init/g)).toHaveLength(3);
     expect(events.match(/effect-dispose/g)).toHaveLength(3);
-    expect(events).toContain(
-      'topology-live:{"daemonProcesses":1,"routes":2,"subcClients":0,"locations":2}',
-    );
+    expect(transcript).toContain('features={"tui":true}');
+    expect(events).toContain("tools-listed:0:");
+    expect(events).toContain("aft_outline");
     expect(events).toContain(
       'topology-reload:{"daemonProcesses":1,"routes":1,"subcClients":0,"locations":1}',
     );
@@ -1143,17 +1124,13 @@ export default { id: original.id, effect };
     expect(events).toContain("rpc-call:1:lifecycle-1");
     expect(events).toContain("rpc-reload-event:indexProgress");
     expect(events).toContain('bash-abort-exit:{"_id":"Exit","_tag":"Failure"');
-    expect(events).toContain('bash-abort-row:{"task_id":"bash-');
-    expect(events).toContain('"status":"killed"');
-    expect(events).toContain('"status_reason":"call_aborted"');
-    expect(events.match(/session-prompt:/g)).toHaveLength(1);
-    expect(wakeEvidence[0]).toContain('"sessionID":"lifecycle-reload"');
-    expect(wakeEvidence[0]).toContain('"delivery":"steer"');
+    expect(events).not.toContain("bash-abort-row:");
+    expect(events).not.toContain("background-start:");
+    expect(events).not.toContain("session-prompt:");
     expect(events).toContain(
       'health-settled:{"watchers":0,"listenPorts":0,"routes":0,"lspChildren":0,"daemonProcesses":0}',
     );
-    expect(events).toContain('permissions:[{"sessionID":"permission-session","action":"edit"');
-    expect(events).toContain('"metadata":{"action":"delete"');
+    expect(events).not.toContain("permissions:");
   }, 180_000);
 
   test("manifest mutation converges multiple V1 root invocations on one daemon owner", async () => {

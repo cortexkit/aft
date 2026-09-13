@@ -47,7 +47,7 @@ describe("OpenCode V2 shared behavioral cases", () => {
         releaseBridge: async () => {},
         // The behavioral cases are about tool execution; the host stub here
         // carries no rpc surface, so the RPC registration is injected inert.
-        registerRpc: async () => ({ dispose: async () => {} }),
+        registerRpc: () => Effect.succeed({ dispose: async () => {} }),
         buildToolMap: () => ({ [behavior.name]: behavior.definition }),
       };
 

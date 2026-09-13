@@ -94,9 +94,7 @@ export function makeServerEffect(overrides = {}) {
           await dependencies.releaseBridge(runtime.pool);
         }),
       );
-      const rpc = yield* Effect.promise(() =>
-        dependencies.registerRpc(context, location, runtime.pool),
-      );
+      const rpc = yield* dependencies.registerRpc(context, location, runtime.pool);
       yield* Effect.addFinalizer(() => Effect.promise(() => rpc.dispose()));
       yield* dependencies.registerTools(
         context,

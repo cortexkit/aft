@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
 import type { AftTransportPool } from "@cortexkit/aft-bridge";
+import { Effect } from 'effect';
 import { AftRpc } from "../../src/rpc/contract.js";
 import {
   type AftRpcContext,
@@ -13,7 +14,10 @@ import {
 } from "../../src/shared/rpc-notifications.js";
 
 type RpcEvent = { name: string; payload: Record<string, unknown> };
-type GetStatus = (input: { sessionID?: string }) => Promise<Record<string, unknown>>;
+type GetStatus = (
+  input: { sessionID?: string },
+  context?: { signal?: AbortSignal },
+) => Promise<Record<string, unknown>>;
 
 class StatusBridge {
   snapshot: Record<string, unknown> | null;
@@ -76,20 +80,25 @@ function hostHarness() {
   };
   const context: AftRpcContext = {
     rpc: {
-      async register(definition, handlers) {
-        expect(definition).toBe(AftRpc);
-        registrations += 1;
-        getStatus = handlers.getStatus;
-        return {
-          events: {
-            async emit(name, payload) {
-              for (const events of Object.values(clients)) events.push({ name, payload });
+      register(definition, handlers) {
+        return Effect.sync(() => {
+          expect(definition).toBe(AftRpc);
+          registrations += 1;
+          getStatus = (input, context) =>
+            Effect.runPromise(handlers.getStatus(input), { signal: context?.signal });
+          return {
+            events: {
+              emit(name, payload) {
+                return Effect.sync(() => {
+                  for (const events of Object.values(clients)) events.push({ name, payload });
+                });
+              },
             },
-          },
-          async dispose() {
-            disposals += 1;
-          },
-        };
+            dispose: Effect.sync(() => {
+              disposals += 1;
+            }),
+          };
+        });
       },
     },
   };
@@ -147,11 +156,9 @@ afterEach(() => __resetRpcNotificationsForTest());
 describe("registerAftRpc", () => {
   test("keeps cold status reads lazy and round-trips warm status", async () => {
     const coldHost = hostHarness();
-    const cold = await registerAftRpc(
-      coldHost.context,
-      { directory: "/work/project" },
-      poolHarness(null),
-    );
+    const cold = await Effect.runPromise(Effect.scoped(registerAftRpc(coldHost.context,
+    { directory: "/work/project" },
+    poolHarness(null),)));
     expect(await coldHost.getStatus()({ sessionID: "ses_cold" })).toMatchObject({
       success: true,
       cache_role: "not_initialized",
@@ -160,11 +167,9 @@ describe("registerAftRpc", () => {
 
     const bridge = new StatusBridge(statusSnapshot());
     const warmHost = hostHarness();
-    const warm = await registerAftRpc(
-      warmHost.context,
-      { directory: "/work/project" },
-      poolHarness(bridge),
-    );
+    const warm = await Effect.runPromise(Effect.scoped(registerAftRpc(warmHost.context,
+    { directory: "/work/project" },
+    poolHarness(bridge),)));
     expect(await warmHost.getStatus()({ sessionID: "ses_1" })).toMatchObject({
       success: true,
       session: { id: "ses_1" },
@@ -176,16 +181,11 @@ describe("registerAftRpc", () => {
   test("threads RPC cancellation into an uncached status request", async () => {
     const bridge = new StatusBridge(statusSnapshot("ses_other"));
     const host = hostHarness();
-    const registered = await registerAftRpc(
-      host.context,
-      { directory: "/work/project" },
-      poolHarness(bridge),
-    );
+    const registered = await Effect.runPromise(Effect.scoped(registerAftRpc(host.context,
+    { directory: "/work/project" },
+    poolHarness(bridge),)));
     const controller = new AbortController();
-    const handler = host.getStatus() as (
-      input: { sessionID?: string },
-      context: { signal: AbortSignal },
-    ) => Promise<Record<string, unknown>>;
+    const handler = host.getStatus();
 
     await handler({ sessionID: "ses_requested" }, { signal: controller.signal });
 
@@ -202,11 +202,9 @@ describe("registerAftRpc", () => {
   test("fans index progress to TUI, Desktop, and headless SDK clients", async () => {
     const bridge = new StatusBridge(null);
     const host = hostHarness();
-    const registered = await registerAftRpc(
-      host.context,
-      { directory: "/work/project" },
-      poolHarness(bridge),
-    );
+    const registered = await Effect.runPromise(Effect.scoped(registerAftRpc(host.context,
+    { directory: "/work/project" },
+    poolHarness(bridge),)));
 
     bridge.publish(statusSnapshot("ses_progress"));
     await host.getStatus()({ sessionID: "ses_progress" });
@@ -230,11 +228,9 @@ describe("registerAftRpc", () => {
 
   test("maps the private dialog notification onto the typed event without a socket", async () => {
     const host = hostHarness();
-    const registered = await registerAftRpc(
-      host.context,
-      { directory: "/work/project" },
-      poolHarness(null),
-    );
+    const registered = await Effect.runPromise(Effect.scoped(registerAftRpc(host.context,
+    { directory: "/work/project" },
+    poolHarness(null),)));
 
     pushNotification(
       "action",
@@ -251,19 +247,15 @@ describe("registerAftRpc", () => {
 
   test("re-registers after Location reload and disposes each supervisor registration", async () => {
     const host = hostHarness();
-    const first = await registerAftRpc(
-      host.context,
-      { directory: "/work/project" },
-      poolHarness(null),
-    );
+    const first = await Effect.runPromise(Effect.scoped(registerAftRpc(host.context,
+    { directory: "/work/project" },
+    poolHarness(null),)));
     await first.emitIndexProgress({ index: "search", status: "building", completed: 1 });
     await first.dispose();
 
-    const reloaded = await registerAftRpc(
-      host.context,
-      { directory: "/work/project" },
-      poolHarness(null),
-    );
+    const reloaded = await Effect.runPromise(Effect.scoped(registerAftRpc(host.context,
+    { directory: "/work/project" },
+    poolHarness(null),)));
     await reloaded.emitIndexProgress({ index: "search", status: "ready", completed: 12 });
     await reloaded.dispose();
 

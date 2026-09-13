@@ -1,4 +1,5 @@
 import type { AftProjectTransport, AftTransportPool } from "@cortexkit/aft-bridge";
+import { Effect, type Scope } from 'effect';
 
 import {
   type RpcNotification,
@@ -8,9 +9,12 @@ import {
 import { type AftIndexProgress, AftRpc, type AftRpcSession } from "./contract";
 
 type RpcRegistration = {
-  dispose(): Promise<void>;
+  dispose: Effect.Effect<void>;
   events: {
-    emit(name: keyof typeof AftRpc.events, payload: Record<string, unknown>): Promise<void>;
+    emit(
+      name: keyof typeof AftRpc.events,
+      payload: Record<string, unknown>,
+    ): Effect.Effect<void, unknown>;
   };
 };
 
@@ -19,12 +23,9 @@ export type AftRpcContext = {
     register(
       definition: typeof AftRpc,
       handlers: {
-        getStatus(
-          input: AftRpcSession,
-          context: { signal: AbortSignal },
-        ): Promise<Record<string, unknown>>;
+        getStatus(input: AftRpcSession): Effect.Effect<Record<string, unknown>, unknown>;
       },
-    ): Promise<RpcRegistration>;
+    ): Effect.Effect<RpcRegistration, unknown, Scope.Scope>;
   };
 };
 
@@ -124,118 +125,122 @@ function restoreOwnProperty(
   else Reflect.deleteProperty(target, key);
 }
 
-export async function registerAftRpc(
+export function registerAftRpc(
   context: AftRpcContext,
   location: AftRpcLocation,
   pool: AftTransportPool,
-): Promise<RegisteredAftRpc> {
-  const root = locationRoot(location);
-  const bridgeUnsubscribes = new Map<object, () => void>();
-  let disposed = false;
-  let registration!: RpcRegistration;
+): Effect.Effect<RegisteredAftRpc, unknown, Scope.Scope> {
+  return Effect.gen(function* () {
+    const root = locationRoot(location);
+    const bridgeUnsubscribes = new Map<object, () => void>();
+    let disposed = false;
+    let registration!: RpcRegistration;
 
-  const emit = async (
-    name: keyof typeof AftRpc.events,
-    payload: Record<string, unknown>,
-  ): Promise<void> => {
-    if (disposed) return;
-    await registration.events.emit(name, payload);
-  };
-
-  const publishStatus = (snapshot: Record<string, unknown>): void => {
-    const sessionID = sessionFromSnapshot(snapshot);
-    void emit("statusInvalidated", sessionID ? { sessionID } : {}).catch(() => {});
-    for (const event of indexProgressFromStatus(snapshot)) {
-      void emit("indexProgress", event).catch(() => {});
-    }
-  };
-
-  const observeBridge = (bridge: AftProjectTransport | null): void => {
-    if (!bridge || !isStatusSubscribable(bridge) || bridgeUnsubscribes.has(bridge)) return;
-    bridgeUnsubscribes.set(bridge, bridge.subscribeStatus(publishStatus));
-  };
-
-  const getStatus = async (
-    input: AftRpcSession,
-    rpcContext: { signal: AbortSignal },
-  ): Promise<Record<string, unknown>> => {
-    const sessionID = input.sessionID || "rpc";
-    const bridge = pool.getActiveBridgeForRoot(root);
-    if (!bridge) return placeholderStatus();
-    observeBridge(bridge);
-
-    const cached = bridge.getCachedStatus();
-    const cachedSessionID = cached ? sessionFromSnapshot(cached) : undefined;
-    if (cached && cachedSessionID === sessionID) {
-      return { success: true, ...cached };
-    }
-    const response = await bridge.send(
-      "status",
-      { session_id: sessionID },
-      { abortSignal: rpcContext.signal },
-    );
-    if (response.success !== false) bridge.cacheStatusSnapshot(response);
-    return response;
-  };
-
-  registration = await context.rpc.register(AftRpc, { getStatus });
-
-  const ownGetBridge = Object.getOwnPropertyDescriptor(pool, "getBridge");
-  const ownToolCall = Object.getOwnPropertyDescriptor(pool, "toolCall");
-  const getBridge = pool.getBridge;
-  const toolCall = pool.toolCall;
-  Object.defineProperty(pool, "getBridge", {
-    configurable: true,
-    writable: true,
-    value(projectRoot: string) {
-      const bridge = getBridge.call(pool, projectRoot);
-      observeBridge(bridge);
-      return bridge;
-    },
-  });
-  Object.defineProperty(pool, "toolCall", {
-    configurable: true,
-    writable: true,
-    async value(...args: Parameters<AftTransportPool["toolCall"]>) {
-      try {
-        return await toolCall.apply(pool, args);
-      } finally {
-        observeBridge(pool.getActiveBridgeForRoot(args[0]));
-      }
-    },
-  });
-  observeBridge(pool.getActiveBridgeForRoot(root));
-
-  const removeNotificationSink = registerNotificationSink({
-    send(notification: RpcNotification) {
-      if (notification.type !== "action") return;
-      if (notification.payload.action !== "show-status-dialog") return;
-      const sessionID = notification.sessionId ?? nonEmptyString(notification.payload.sessionId);
-      void emit("showStatusDialog", sessionID ? { sessionID } : {}).catch(() => {});
-    },
-  });
-  const removeStatusChangeSink = registerStatusChangeSink({
-    send(event) {
-      void emit("statusInvalidated", event.sessionId ? { sessionID: event.sessionId } : {}).catch(
-        () => {},
-      );
-    },
-  });
-
-  return {
-    emitStatusInvalidated: (payload = {}) => emit("statusInvalidated", payload),
-    emitShowStatusDialog: (payload = {}) => emit("showStatusDialog", payload),
-    emitIndexProgress: (payload) => emit("indexProgress", payload),
-    async dispose() {
+    const emit = async (
+      name: keyof typeof AftRpc.events,
+      payload: Record<string, unknown>,
+    ): Promise<void> => {
       if (disposed) return;
-      disposed = true;
-      removeNotificationSink();
-      removeStatusChangeSink();
-      for (const unsubscribe of bridgeUnsubscribes.values()) unsubscribe();
-      bridgeUnsubscribes.clear();
-      restoreOwnProperty(pool, "getBridge", ownGetBridge);
-      restoreOwnProperty(pool, "toolCall", ownToolCall);
-      await registration.dispose();
-    },
-  };
+      await Effect.runPromise(registration.events.emit(name, payload));
+    };
+
+    const publishStatus = (snapshot: Record<string, unknown>): void => {
+      const sessionID = sessionFromSnapshot(snapshot);
+      void emit("statusInvalidated", sessionID ? { sessionID } : {}).catch(() => {});
+      for (const event of indexProgressFromStatus(snapshot)) {
+        void emit("indexProgress", event).catch(() => {});
+      }
+    };
+
+    const observeBridge = (bridge: AftProjectTransport | null): void => {
+      if (!bridge || !isStatusSubscribable(bridge) || bridgeUnsubscribes.has(bridge)) return;
+      bridgeUnsubscribes.set(bridge, bridge.subscribeStatus(publishStatus));
+    };
+
+    const getStatus = (input: AftRpcSession): Effect.Effect<Record<string, unknown>, unknown> =>
+      Effect.suspend(() => {
+        const sessionID = input.sessionID || "rpc";
+        const bridge = pool.getActiveBridgeForRoot(root);
+        if (!bridge) return Effect.succeed(placeholderStatus());
+        observeBridge(bridge);
+
+        const cached = bridge.getCachedStatus();
+        const cachedSessionID = cached ? sessionFromSnapshot(cached) : undefined;
+        if (cached && cachedSessionID === sessionID) {
+          return Effect.succeed({ success: true, ...cached });
+        }
+        return Effect.tryPromise({
+          try: (signal) =>
+            bridge.send("status", { session_id: sessionID }, { abortSignal: signal }),
+          catch: (error) => error,
+        }).pipe(
+          Effect.tap((response) =>
+            Effect.sync(() => {
+              if (response.success !== false) bridge.cacheStatusSnapshot(response);
+            }),
+          ),
+        );
+      });
+
+    registration = yield* context.rpc.register(AftRpc, { getStatus });
+
+    const ownGetBridge = Object.getOwnPropertyDescriptor(pool, "getBridge");
+    const ownToolCall = Object.getOwnPropertyDescriptor(pool, "toolCall");
+    const getBridge = pool.getBridge;
+    const toolCall = pool.toolCall;
+    Object.defineProperty(pool, "getBridge", {
+      configurable: true,
+      writable: true,
+      value(projectRoot: string) {
+        const bridge = getBridge.call(pool, projectRoot);
+        observeBridge(bridge);
+        return bridge;
+      },
+    });
+    Object.defineProperty(pool, "toolCall", {
+      configurable: true,
+      writable: true,
+      async value(...args: Parameters<AftTransportPool["toolCall"]>) {
+        try {
+          return await toolCall.apply(pool, args);
+        } finally {
+          observeBridge(pool.getActiveBridgeForRoot(args[0]));
+        }
+      },
+    });
+    observeBridge(pool.getActiveBridgeForRoot(root));
+
+    const removeNotificationSink = registerNotificationSink({
+      send(notification: RpcNotification) {
+        if (notification.type !== "action") return;
+        if (notification.payload.action !== "show-status-dialog") return;
+        const sessionID = notification.sessionId ?? nonEmptyString(notification.payload.sessionId);
+        void emit("showStatusDialog", sessionID ? { sessionID } : {}).catch(() => {});
+      },
+    });
+    const removeStatusChangeSink = registerStatusChangeSink({
+      send(event) {
+        void emit("statusInvalidated", event.sessionId ? { sessionID: event.sessionId } : {}).catch(
+          () => {},
+        );
+      },
+    });
+
+    return {
+      emitStatusInvalidated: (payload = {}) => emit("statusInvalidated", payload),
+      emitShowStatusDialog: (payload = {}) => emit("showStatusDialog", payload),
+      emitIndexProgress: (payload) => emit("indexProgress", payload),
+      async dispose() {
+        if (disposed) return;
+        disposed = true;
+        removeNotificationSink();
+        removeStatusChangeSink();
+        for (const unsubscribe of bridgeUnsubscribes.values()) unsubscribe();
+        bridgeUnsubscribes.clear();
+        restoreOwnProperty(pool, "getBridge", ownGetBridge);
+        restoreOwnProperty(pool, "toolCall", ownToolCall);
+        await Effect.runPromise(registration.dispose);
+      },
+    };
+  });
 }
