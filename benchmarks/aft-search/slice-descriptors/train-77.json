@@ -1,0 +1,15 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "views-in-situ-attribution",
+    "views-per-plane-publication",
+    "views-policy-costs",
+    "semantic-query-instruction"
+  ],
+  "note": "semantic_index.rs gains the query-only instruction, resolved by model family; the gate's fixture embedding model is not a Qwen3 family, so the instruction is absent on this lane and rows are byte-identical to the reference (the predicate is the proof). The production-lane effect is measured in docs/investigations/query-instruction-ab-2026-09.md."
+}
