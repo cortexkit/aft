@@ -8,6 +8,9 @@
 //! must contain the next revision: warmup and forced staleness are skipped so
 //! they cannot consume the transition before measurement. Without store/root
 //! variables the harness builds a synthetic store with a large fixture.
+//! `AFT_CALLGRAPH_REFRESH_COUNT_ROWS=1` installs audit triggers in the private
+//! copy for a separate work-count pass. Its timings and WAL include the audit
+//! overhead and must not be used as the timing baseline.
 
 use aft::callgraph_store::{project_dead_code_snapshot, CallGraphStore, RefreshFilesProfile};
 use rusqlite::{backup::Backup, params, Connection, OpenFlags};
@@ -61,6 +64,10 @@ fn bench_refresh_files_on_store_copy() {
     sync_sqlite_file_set(store.sqlite_path());
     let page_size = sqlite_page_size(store.sqlite_path());
     let wal_path = sqlite_sidecar(store.sqlite_path(), "-wal");
+    let count_rows = std::env::var_os("AFT_CALLGRAPH_REFRESH_COUNT_ROWS").is_some();
+    if count_rows {
+        install_row_audit(store.sqlite_path());
+    }
     let refresh_usage_before = process_write_usage();
     let refresh_cpu_before = process_cpu_us();
     let refresh_started = Instant::now();
@@ -110,6 +117,9 @@ fn bench_refresh_files_on_store_copy() {
             "wal_pages object={object} pages={pages} mb={:.3}",
             mib(pages.saturating_mul(page_size))
         );
+    }
+    if count_rows {
+        report_row_audit(store.sqlite_path(), store.project_root(), &changed_files);
     }
     report_dominant_phase(&profile);
     measure_snapshot_read(store.sqlite_path());
@@ -676,4 +686,79 @@ fn transition_paths_reject_parent_escape() {
     let list = temp.path().join("paths.txt");
     fs::write(&list, "../outside.ts\n").unwrap();
     read_transition_paths(&list, temp.path());
+}
+
+fn install_row_audit(db: &Path) {
+    let conn = Connection::open(db).expect("open private store for row audit");
+    let tables = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    conn.execute_batch("CREATE TABLE bench_row_audit (object TEXT, operation TEXT, caller TEXT, rows INTEGER, PRIMARY KEY(object, operation, caller))").unwrap();
+    for (index, table) in tables.iter().enumerate() {
+        let identifier = table.replace('"', "\"\"");
+        let literal = table.replace('\'', "''");
+        for operation in ["INSERT", "UPDATE", "DELETE"] {
+            let caller = if table == "refs" {
+                if operation == "DELETE" {
+                    "OLD.caller_file"
+                } else {
+                    "NEW.caller_file"
+                }
+            } else {
+                "''"
+            };
+            conn.execute_batch(&format!("CREATE TRIGGER bench_audit_{index}_{operation} AFTER {operation} ON \"{identifier}\" BEGIN INSERT INTO bench_row_audit VALUES ('{literal}', '{operation}', {caller}, 1) ON CONFLICT(object, operation, caller) DO UPDATE SET rows=rows+1; END;")).unwrap();
+        }
+    }
+}
+
+fn report_row_audit(db: &Path, root: &Path, changed: &[PathBuf]) {
+    let conn = Connection::open(db).unwrap();
+    let mut statement = conn.prepare("SELECT object, operation, sum(rows) FROM bench_row_audit GROUP BY object, operation ORDER BY object, operation").unwrap();
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
+        })
+        .unwrap();
+    for row in rows {
+        let (object, operation, rows) = row.unwrap();
+        eprintln!("audit_rows object={object} operation={operation} rows={rows}");
+    }
+    let callers = conn.prepare("SELECT DISTINCT caller FROM bench_row_audit WHERE object='refs' AND operation='INSERT'").unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+    let importers = callers
+        .iter()
+        .filter(|caller| !changed.contains(&root.join(caller)))
+        .count();
+    eprintln!(
+        "audit_ref_callers={} audit_unchanged_importers={importers} timing_includes_audit=true",
+        callers.len()
+    );
+}
+
+#[test]
+fn row_audit_counts_insert_update_delete_and_reference_callers() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("audit.sqlite");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE refs (ref_id TEXT PRIMARY KEY, caller_file TEXT); CREATE TABLE files (path TEXT PRIMARY KEY);").unwrap();
+    install_row_audit(&db);
+    conn.execute_batch("INSERT INTO refs VALUES ('a', 'caller.ts'), ('b', 'caller.ts'); UPDATE refs SET caller_file='other.ts' WHERE ref_id='b'; DELETE FROM refs WHERE ref_id='a'; INSERT INTO files VALUES ('caller.ts');").unwrap();
+    let rows: Vec<(String, String, String, u64)> = conn.prepare("SELECT object, operation, caller, rows FROM bench_row_audit ORDER BY object, operation, caller").unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("files".into(), "INSERT".into(), "".into(), 1),
+            ("refs".into(), "DELETE".into(), "caller.ts".into(), 1),
+            ("refs".into(), "INSERT".into(), "caller.ts".into(), 2),
+            ("refs".into(), "UPDATE".into(), "other.ts".into(), 1)
+        ]
+    );
 }
