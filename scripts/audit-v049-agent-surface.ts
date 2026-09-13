@@ -61,9 +61,26 @@ interface AllowlistEntry {
    * import, a reordered block) fail the audit, which is churn with no signal —
    * a test file cannot be an agent-visible surface, so where the mention sits
    * inside it tells a reviewer nothing.
+   *
+   * Present for line-level entries but informational only: `line`, `column`,
+   * and `location` are refreshed on every regen and never compared. Identity
+   * is (`path`, `token`, `text`, `ordinal`) instead, so inserting a line above
+   * an allowlisted occurrence does not move its pin.
    */
   line?: number;
   column?: number;
+  /**
+   * Whitespace-collapsed whole-line text (see normalizeOccurrenceText).
+   * Absent for file-level entries and for allowlists written before the
+   * content-keyed re-keying.
+   */
+  text?: string;
+  /**
+   * 1-based ordinal of this occurrence among identical (`text`, `token`)
+   * occurrences in the same file, so two identical lines are two entries.
+   * Absent wherever `text` is absent.
+   */
+  ordinal?: number;
   token: string;
   class: string;
   reason: string;
@@ -165,6 +182,63 @@ function textFile(path: string): boolean {
   return !bytes.subarray(0, 4096).includes(0);
 }
 
+/**
+ * Collapse a whole source line to its allowlist identity text: trim the ends
+ * and fold every internal whitespace run to one space. Re-indenting a line or
+ * re-wrapping its spacing therefore keeps the pin; changing any other
+ * character breaks it, which is exactly the "genuinely new or changed line"
+ * the allowlist exists to catch.
+ */
+export function normalizeOccurrenceText(line: string): string {
+  return line.trim().replace(/\s+/g, " ");
+}
+
+interface ScannedOccurrence {
+  path: string;
+  line: number;
+  column: number;
+  token: string;
+  text: string;
+  ordinal: number;
+  location: string;
+}
+
+/**
+ * Scan one file's lines for legacy-vocabulary occurrences in file order and
+ * assign each its 1-based ordinal among identical (`text`, `token`)
+ * occurrences in that file. Two identical lines holding the same token are
+ * two entries (ordinals 1, 2); so are two mentions of one token on a single
+ * line. Pure and git-free so the offline test can exercise the keying.
+ */
+export function scanLinesForOccurrences(path: string, lines: string[]): ScannedOccurrence[] {
+  const raw: Array<Omit<ScannedOccurrence, "ordinal">> = [];
+  for (const [lineIndex, line] of lines.entries()) {
+    for (const token of LEGACY) {
+      let start = 0;
+      while (true) {
+        const column = line.indexOf(token, start);
+        if (column < 0) break;
+        raw.push({
+          path,
+          line: lineIndex + 1,
+          column: column + 1,
+          token,
+          text: normalizeOccurrenceText(line),
+          location: `line ${lineIndex + 1}, column ${column + 1}`,
+        });
+        start = column + token.length;
+      }
+    }
+  }
+  const seen = new Map<string, number>();
+  return raw.map((occurrence) => {
+    const counter = `${occurrence.path}\0${occurrence.text}\0${occurrence.token}`;
+    const ordinal = (seen.get(counter) ?? 0) + 1;
+    seen.set(counter, ordinal);
+    return { ...occurrence, ordinal };
+  });
+}
+
 function occurrenceEntries(): AllowlistEntry[] {
   const entries: AllowlistEntry[] = [];
   for (const path of trackedFiles()) {
@@ -179,23 +253,13 @@ function occurrenceEntries(): AllowlistEntry[] {
       continue;
     }
     const lines = readFileSync(join(ROOT, path), "utf8").split("\n");
-    for (const [lineIndex, line] of lines.entries()) {
-      for (const token of LEGACY) {
-        let start = 0;
-        while (true) {
-          const column = line.indexOf(token, start);
-          if (column < 0) break;
-          entries.push({
-            path,
-            location: `line ${lineIndex + 1}, column ${column + 1}`,
-            line: lineIndex + 1,
-            column: column + 1,
-            token,
-            ...classifyOccurrence(path, line),
-          });
-          start = column + token.length;
-        }
-      }
+    for (const occurrence of scanLinesForOccurrences(path, lines)) {
+      const { path: occurrencePath, ...rest } = occurrence;
+      entries.push({
+        path: occurrencePath,
+        ...rest,
+        ...classifyOccurrence(occurrencePath, lines[occurrence.line - 1]),
+      });
     }
   }
   return collapseFileLevelEntries(entries);
@@ -218,7 +282,7 @@ function collapseFileLevelEntries(entries: AllowlistEntry[]): AllowlistEntry[] {
     const key = `${entry.path}::${entry.token}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    const { line: _line, column: _column, ...rest } = entry;
+    const { line: _line, column: _column, text: _text, ordinal: _ordinal, ...rest } = entry;
     collapsed.push({ ...rest, location: "file-level" });
   }
   return collapsed;
@@ -315,14 +379,37 @@ function loadAllowlist(): Allowlist {
   return JSON.parse(readFileSync(join(ROOT, ALLOWLIST_PATH), "utf8")) as Allowlist;
 }
 
-function occurrenceKey(entry: Pick<AllowlistEntry, "path" | "line" | "column" | "token">): string {
+/**
+ * The pre-rekey pin: `path:line:column:token`. Any edit above an
+ * allowlisted occurrence shifted it. Kept only so the offline test can show
+ * the old scheme going red where the content key stays green.
+ */
+export function legacyOccurrenceKey(entry: Pick<AllowlistEntry, "path" | "line" | "column" | "token">): string {
   if (entry.line === undefined) return `${entry.path}::${entry.token}`;
   return `${entry.path}:${entry.line}:${entry.column}:${entry.token}`;
 }
 
-function auditSourceOccurrences(allowlist: Allowlist): void {
-  const expected = occurrenceEntries();
-  const checked = new Map(allowlist.entries.map((entry) => [occurrenceKey(entry), entry]));
+/**
+ * The content pin: file plus normalized whole-line text plus the ordinal
+ * among identical lines in that file (and the token, so one line naming both
+ * retired spellings is two entries). `line`/`column` are never compared —
+ * they ride along as informational fields only. File-level fixture entries
+ * carry no line and stay pinned by path and token alone.
+ */
+export function occurrenceKey(entry: Pick<AllowlistEntry, "path" | "line" | "column" | "token" | "text" | "ordinal">): string {
+  if (entry.line === undefined) return `${entry.path}::${entry.token}`;
+  if (entry.text === undefined || entry.ordinal === undefined) return legacyOccurrenceKey(entry);
+  return `${entry.path}::${entry.token}::#${entry.ordinal}::"${entry.text}"`;
+}
+
+/**
+ * Pure stale/new classification over content keys, git-free for the offline
+ * test. An expected occurrence whose key is allowlisted passes whatever its
+ * line is; one that is not is "not allowlisted" (a genuinely new or changed
+ * line); an allowlist entry no expected occurrence matches is "stale".
+ */
+export function classifyOccurrenceDrift(expected: AllowlistEntry[], allowlisted: AllowlistEntry[]): string[] {
+  const checked = new Map(allowlisted.map((entry) => [occurrenceKey(entry), entry]));
   const failures: string[] = [];
   for (const occurrence of expected) {
     const entry = checked.get(occurrenceKey(occurrence));
@@ -337,11 +424,17 @@ function auditSourceOccurrences(allowlist: Allowlist): void {
       failures.push(`${occurrenceKey(occurrence)} remains on a prohibited agent-visible surface`);
     }
   }
-  for (const entry of allowlist.entries) {
-    if (!expected.some((occurrence) => occurrenceKey(occurrence) === occurrenceKey(entry))) {
+  const live = new Set(expected.map((occurrence) => occurrenceKey(occurrence)));
+  for (const entry of allowlisted) {
+    if (!live.has(occurrenceKey(entry))) {
       failures.push(`${occurrenceKey(entry)} is stale in the allowlist`);
     }
   }
+  return failures;
+}
+
+function auditSourceOccurrences(allowlist: Allowlist): void {
+  const failures = classifyOccurrenceDrift(occurrenceEntries(), allowlist.entries);
   if (failures.length > 0) throw new Error(`legacy vocabulary audit failed:\n${failures.join("\n")}`);
 }
 
@@ -623,4 +716,8 @@ function main(): void {
   console.log(`v0.49 agent surface audit passed (${commit})`);
 }
 
-main();
+// Importable by the offline test without running the audit: only execute
+// when bun runs this file directly.
+if (import.meta.main) {
+  main();
+}
