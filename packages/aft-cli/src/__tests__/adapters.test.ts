@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { getAdapter, getAllAdapters } from "../adapters/index.js";
+import { OmpAdapter } from "../adapters/omp.js";
 import { OpenCodeAdapter } from "../adapters/opencode.js";
 import { PiAdapter } from "../adapters/pi.js";
 import { getSelfVersion } from "../lib/self-version.js";
@@ -24,7 +25,7 @@ describe("registry", () => {
   test("getAllAdapters returns known adapters", () => {
     const all = getAllAdapters();
     const kinds = all.map((a) => a.kind).sort();
-    expect(kinds).toEqual(["opencode", "pi"]);
+    expect(kinds).toEqual(["omp", "opencode", "pi"]);
   });
 
   test("getAdapter('opencode') returns OpenCodeAdapter", () => {
@@ -37,6 +38,12 @@ describe("registry", () => {
     const adapter = getAdapter("pi");
     expect(adapter.kind).toBe("pi");
     expect(adapter.displayName).toBe("Pi");
+  });
+
+  test("getAdapter('omp') returns OmpAdapter", () => {
+    const adapter = getAdapter("omp");
+    expect(adapter).toBeInstanceOf(OmpAdapter);
+    expect(adapter.displayName).toBe("Oh My Pi (OMP)");
   });
 });
 
