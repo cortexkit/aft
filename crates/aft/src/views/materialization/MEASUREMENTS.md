@@ -694,3 +694,188 @@ The owner's rule is: **"views beats legacy to correctness on every row with CPU 
 - **B → HEAD — not met:** views was correct **6,651 ms later** and used **3.95 more CPU-seconds**. With no reported contention, the named views bucket is again publication work: **19,880 ms** in materialization, followed by a **2,591 ms** semantic-fill publication.
 
 The rule is therefore **not met overall**. All eight correctness probes converged, process PIDs remained stable, and the harness reported no correctness or publication defects. Raw JSON, Markdown, and both stderr logs remain under `/tmp/aft-views-drill-cold-gated-297/out`.
+
+## Per-binding resolution (2026-09-13)
+
+### Same-work baseline and reconstruction
+
+No retained `target/view-diff-real-300-input` survived the target-directory sweep.
+The input was regenerated with the unmodified `57830e306` product tree (includes
+`c0c8e8022`), not a synthetic replacement. The owner cancelled the separately
+armed idle baseline; this worktree exclusively launched the reconstruction after
+an idle gate observed load **2.985**, empty `docker ps`, and no `branch_drill.py`.
+The release executable was built before the run. Both arms used fresh storage:
+
+```sh
+cargo build --release -p agent-file-tools --bin aft
+# First require: uptime 1-minute load < 3; docker ps empty;
+# pgrep -f branch_drill.py finds no other drill.
+git -C ~/Work/OSS/opencode rev-parse HEAD
+nohup scripts/views-branch-drill.sh --mode both \
+  --binary "$PWD/target/release/aft" \
+  --storage "$PWD/target/branch-drill-baseline/on" \
+  --baseline-storage "$PWD/target/branch-drill-baseline/off" \
+  --output-dir "$PWD/target/branch-drill-baseline/out" \
+  > target/branch-drill-baseline.log 2>&1 &
+# Wait for completion before copying databases or touching the soak checkout.
+git -C ~/Work/OSS/opencode rev-parse HEAD
+mkdir -p target/view-diff-real-300-input target/legacy-next-project
+cp target/branch-drill-baseline/on/views/0f3900af641f5248/manifest-1-*-c3d6ca11eca18e25d2e58e52629921215cdea1d4f23ce9278941c1a13faa95d1.json \
+  target/view-diff-real-300-input/base.json
+cp target/branch-drill-baseline/on/views/0f3900af641f5248/manifest-2-*-a632b1603f62b77a16c041435b34764810ec2919461ae14fba9c2a70b49fdace.json \
+  target/view-diff-real-300-input/next.json
+# Quiescent blob database, with no outstanding callgraph WAL after process exit.
+cp target/branch-drill-baseline/on/blobs/aa69d52ef2dcad4d/callgraph.sqlite \
+  target/view-diff-real-300-input/callgraph.sqlite
+git -C ~/Work/OSS/opencode archive a085bf62a459 | tar -x -C target/legacy-next-project
+git -C ~/Work/OSS/opencode diff --name-only \
+  5716f8ba60e79ec60ec485b6e5291c0b0bc1f252 a085bf62a459 \
+  > target/view-diff-real-300-input/changed-paths.txt
+```
+
+Original and restored opencode HEAD were both
+`5716f8ba60e79ec60ec485b6e5291c0b0bc1f252`. The graph fingerprints match the
+historical pair above. Full manifests have **7,060 → 7,045 entries, 285 changed
+entries**, across **300 Git paths**. Do not silently substitute the historical
+276-change count: semantic-plane membership varies during the publications.
+This retained pair resolves **93,236 rows / 563 files**, not the previous
+95,228 / 576 row. The before and after below use these exact same JSON files and
+immutable blobs. The legacy input is an archive of the *same target Git commit*,
+against a copy of the completed views-off arm's HEAD store.
+
+The existing benchmark is `crates/aft/tests/callgraph_refresh_bench.rs`, not a
+`benches/` target. It now accepts a newline-delimited path list, including removed
+files, and excludes paths without a parser (283 of 300 paths reach refresh).
+In transition mode it **does not warm up or force hashes stale**. It re-roots
+only the copied backend identity before opening; otherwise root repair
+cold-builds the next revision before timing, falsely reporting a 0.303-second
+"refresh". That contaminated exploratory run was discarded. The regression
+`transition_copy_does_not_refresh_next_revision_during_open` verifies the old
+content hash survives open and only the timed refresh changes it. Neutralizing
+the re-root UPDATE with `WHERE 0 /* NON-VACUITY BREAK */` fails that test alone
+(3 other tests pass); the scratch edit was restored before commit.
+
+```sh
+AFT_VIEW_DIFF_INPUT="$PWD/target/view-diff-real-300-input" AFT_VIEW_PROFILE=1 \
+  cargo test --release -p agent-file-tools --lib \
+  views::materialization::tests::bench_real_manifest_diff \
+  -- --ignored --exact --nocapture
+AFT_CALLGRAPH_REFRESH_STORE="$PWD/target/branch-drill-baseline/off/callgraph/aa69d52ef2dcad4d" \
+AFT_CALLGRAPH_REFRESH_ROOT="$PWD/target/legacy-next-project" \
+AFT_CALLGRAPH_REFRESH_PATHS="$PWD/target/view-diff-real-300-input/changed-paths.txt" \
+  cargo test --release -p agent-file-tools --test callgraph_refresh_bench \
+  bench_refresh_files_on_store_copy -- --ignored --exact --nocapture
+# Repeat only the legacy command with AFT_CALLGRAPH_REFRESH_COUNT_ROWS=1
+# for the separate private-copy audit pass. Never use its timing/WAL as baseline.
+```
+
+Both harnesses link the same release product implementation. Copying/preparation
+is excluded from timing. Legacy audit triggers count actual INSERT/UPDATE/DELETE
+operations separately from the uninstrumented timing pass; views uses its
+existing row-operation counters. "Reference rows" does not count extra resolver
+probes used by legacy's stored-extract equality checks.
+
+| same transition, offline | wall s | CPU s | owned extraction/decode | unchanged callers resolved | reference rows | graph row operations | all counted row operations | WAL bytes |
+| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| legacy incremental refresh | 44.928 | 40.484 | 269 changed extracts (245 rewritten, 24 graph-equal) | 527 (audit) | 123,570 inserted (audit) | 320,972 (audit) | 386,402 (audit) | 240,146,592 |
+| views before | 7.403 | 5.768 | 286 surfaces rebuilt; 572 caller blobs decoded | 296 | 93,236 resolved | 110,834 | 148,196 | 148,546,632 |
+| views after | **5.739** | **4.268** | **unchanged** | **296** | **93,236** | **110,834** | **148,196** | **148,546,632** |
+
+Legacy selected 110,896 dependent ref IDs in the timing pass and 110,904 in the
+separate audit pass (an eight-ID variation); audit inserts cover 766 callers.
+Its phase table was parse 5,963 ms, dependency selection 21,050, dependent parse
+11,261, index load 1,534, ref resolution 2,661, own-row deletes/inserts 733/335,
+method dispatch 167, commit 684. This is not views doing the same work slower:
+legacy re-extracts more importers, emits more refs, and spends substantially more
+on dependent selection. The 44.928-second offline result is **not** a substitute
+for the end-to-end drill's legacy correctness latency.
+
+Raw logs: `target/per-binding-before-{views,legacy}.log`,
+`target/per-binding-legacy-audit.log`, `target/per-binding-after-views.log`.
+Baseline/optimized every-table databases:
+`target/view-diff-real-300-input/{.tmpNGhmzS,.tmpBsO6La}/incremental.sqlite`.
+
+### Binding and emission result
+
+The target memo key contains caller path, reference kind, full and short names,
+and the Rust visible-import prefix. It is not merely an import module path:
+namespace members, local calls, unresolved names and value references have
+separate resolution semantics. On the real incremental pair there are
+**39,456 distinct target bindings for 93,236 rows** (2.36x, not an order of
+magnitude). Cold resolution uses 140,510 bindings for 298,227 rows. A call site's
+own dependency candidates are always retained; surface/config consultations are
+unioned once into the same caller's persisted binding record. The dependency
+basis is now built once per caller instead of constructing the same set on every
+reference. The legacy resolver itself is unchanged.
+
+Emission already used one immediate transaction and retained the secondary
+indexes; it nevertheless prepared SELECT/DELETE/INSERT SQL for each reference.
+Five statements now live across the fan-out, with no schema/index or transaction
+change. The emission phase includes unchanged-ref checks and lazy caller/target
+decode, not only inserted rows. Its throughput is **51,128 → 66,683 examined
+reference rows/s**. Actual ref/edge insertion operations are 50,535 (54,172 total
+inserts less 267 owned files and 3,370 owned nodes), giving **27,712 → 36,143
+ref/edge insert operations/s** over that whole phase. No index-write reduction is
+claimed; WAL bytes and every-table rows are unchanged.
+
+| incremental phase | historical 7.490 s row, ms | same-pair before, ms | after, ms |
+| --- | ---: | ---: | ---: |
+| load bindings/select | 756 | 654 | 701 |
+| delete rows | 919 | 1,047 | 965 |
+| owner decode/insert | 509 | 481 | 457 |
+| selected join | 3,100 | 3,018 | 1,845 |
+| ↳ bind/index | 978 | 942 | 936 |
+| ↳ surface replay | 48 | 48 | 47 |
+| ↳ deferred caller decode | 361 | 366 | 384 |
+| ↳ resolve/record (includes dependency basis) | 1,627 | 1,589 | **400** |
+| ↳ dependency union | 60 | 53 | 55 |
+| binding writes | 163 | 140 | 142 |
+| ref/edge emission | 1,812 | 1,823 | **1,398** |
+| commit | 84 | 92 | 93 |
+
+Same-pair wall improves **22.5%**, CPU **26.0%**; cold replacement improves
+20.862/18.361 wall/CPU seconds to 17.150/15.029. This measures an improvement,
+not an irreducible floor: selection/load, owner work and emission still dominate.
+
+Every value in every derived table was compared between the pre-change and
+optimized real incremental databases, including metadata, dependency caches and
+empty side tables. All match. Seven fact-transition snapshots (the requested six
+plus workspace-member rename) are byte-equal before/after, using temporary test
+instrumentation to save the existing sorted snapshot representation; no snapshot
+knob was added to the product or tests. Files are under
+`target/per-binding-fact-{before,after}`. The final materialization suite passes
+32 tests / 2 ignored; the callgraph-store-filtered suite passes 135 / 3 ignored;
+release library check and release binary build pass. AFT inspect timed out twice;
+Cargo is the authoritative gate. Sidekick's cold reader was unavailable; comment
+lint reported no unclear comments.
+
+Scratch caller-key red:
+
+```text
+// NON-VACUITY BREAK: replace caller: raw.caller_file.clone() with String::new()
+test views::materialization::tests::memoized_rust_bindings_keep_import_visibility ... ok
+test views::materialization::tests::memoized_bindings_keep_callers_and_reference_kinds_distinct ... FAILED
+assertion `left == right` failed (canonical reference rows differ)
+test result: FAILED. 1 passed; 1 failed
+```
+
+The staged live tree had an empty unstaged diff, the mutation showed one
+insertion/one deletion in `join.rs`, and restore returned the unstaged diff to
+empty. The restored full materialization suite is green. No mutation remains.
+
+### Before drill (unmodified product)
+
+Reconstruction completed at `2026-09-13T19:30:52Z`; cold gates were 1,181,480 ms
+(views) and 1,215,250 ms (legacy). The launch idle gate did not guarantee idle row
+windows: reported host load ranged 6.41–7.82. All eight search/callgraph probes
+converged and the shared checkout was restored. However, the harness reported
+**return-leg manifest mismatches on both HEAD returns** and three embeddings on
+the first return, already on unmodified main. These are retained as baseline
+caveats, not hidden by a successful shell exit or by the graph-only parity above.
+
+| switch | views correct ms | legacy correct ms | views CPU s | legacy CPU s | latency/CPU rule |
+| --- | ---: | ---: | ---: | ---: | --- |
+| HEAD → A | 19,524 | 62,256 | 51.10 | 123.93 | met |
+| A → HEAD | 15,389 | 36,634 | 39.53 | 70.43 | met; manifest caveat |
+| HEAD → B | 27,201 | 29,146 | 69.23 | 38.36 | **not met: CPU** |
+| B → HEAD | 15,429 | 27,027 | 28.35 | 30.99 | met; manifest caveat |
