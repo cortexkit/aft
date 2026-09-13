@@ -197,6 +197,7 @@ export async function createScenarioIsolation(options: {
     XDG_RUNTIME_DIR: paths.runtime,
     TMPDIR: paths.temp,
     OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
+    OPENCODE_DB: "opencode2.db",
     OPENAI_API_KEY: "sk-opencode2-harness",
     AFT_E2E_PLUGIN_LOG: pluginLog,
     AFT_E2E_ISOLATION_ROOT: root,
@@ -243,6 +244,9 @@ export function assertScenarioIsolation(env: NodeJS.ProcessEnv, root: string): v
   }
   if (env.OPENCODE_DISABLE_DEFAULT_PLUGINS !== "true") {
     fail("scenario_invalid", "OPENCODE_DISABLE_DEFAULT_PLUGINS must be true", {}, true);
+  }
+  if (env.OPENCODE_DB !== "opencode2.db") {
+    fail("scenario_invalid", "OPENCODE_DB must be opencode2.db", {}, true);
   }
 }
 

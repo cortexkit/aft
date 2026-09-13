@@ -14,48 +14,6 @@ interface AcceptanceRow {
   testPattern: string;
 }
 
-const reliedOnContractLines = [
-  {
-    name: "permission endpoint",
-    citation: "packages/server/src/handlers/permission.ts",
-  },
-  {
-    name: "Effect entry precedence",
-    citation: "packages/core/src/plugin/module.ts:14-27,115",
-  },
-  {
-    name: "typed RPC",
-    citation: "packages/core/src/rpc.ts:99-103",
-  },
-  {
-    name: "interruption ordering",
-    citation: "packages/core/src/session/runner/step.ts:140-142",
-  },
-  {
-    name: "built-in replacement",
-    citation: "packages/core/src/tool.ts:181-202",
-  },
-  {
-    name: "path header keys",
-    citation: "session-ui/src/tools/tool-renderer.tsx:362",
-  },
-  {
-    name: "path header keys (TUI)",
-    citation: "tui/src/mini/tool.ts:412",
-  },
-  {
-    name: "inert effect dep",
-    citation: "declared effect dependency inert on V1 server loader",
-  },
-  {
-    name: "sessionID-scoped permission.create",
-    citation: "route path sessionID selects owning Permission.Service",
-  },
-  {
-    name: "dev/beta cadence",
-    citation: "coherent rolling release cadence",
-  },
-];
 
 const acceptanceMatrix: AcceptanceRow[] = [
   {
@@ -146,34 +104,43 @@ const acceptanceMatrix: AcceptanceRow[] = [
   {
     sliceId: "S9",
     claim:
-      "Beta pin bump to 0.0.0-beta-19234 verified against OC delta audit record pm_7725ea5f with zero deltas",
+      "GA pin move to @opencode/*@2.0.3 is verified against unpacked package contracts while retaining the beta audit",
     governingSource:
-      "constraints §Coexistence testing; rulings R1, R13, R18; OC record pm_7ceb3a96 §4, pm_7725ea5f",
+      "constraints §Coexistence testing; GA delta audit oc2-ga-2.0.3; prior OC record pm_7725ea5f",
     testFile: "matrix/acceptance-matrix.test.ts",
-    testPattern: "pm_7725ea5f",
+    testPattern: "oc2-ga-2.0.3",
   },
 ];
 
 describe("OpenCode V2 delta audit evidence", () => {
-  const auditFile = join(testDir, "delta-audit-beta-19234.md");
+  const betaAuditFile = join(testDir, "delta-audit-beta-19234.md");
+  const gaAuditFile = join(testDir, "delta-audit-ga-2.0.3.md");
 
-  test("evidence file exists on disk", () => {
-    expect(existsSync(auditFile)).toBe(true);
-  });
-
-  test("evidence records pinned build id 0.0.0-beta-19234 and OC record pm_7725ea5f", () => {
-    const content = readFileSync(auditFile, "utf8");
+  test("beta evidence remains on disk", () => {
+    expect(existsSync(betaAuditFile)).toBe(true);
+    const content = readFileSync(betaAuditFile, "utf8");
     expect(content).toContain("0.0.0-beta-19234");
     expect(content).toContain("pm_7725ea5f");
-    expect(content).toContain("2026-09-07");
     expect(content).toContain("ZERO delta");
   });
 
-  test("evidence lists every relied-on contract line and citation", () => {
-    const content = readFileSync(auditFile, "utf8");
-    for (const item of reliedOnContractLines) {
-      expect(content).toContain(item.citation);
+  test("GA evidence records the exact 2.0.3 pin and source-derived record", () => {
+    expect(existsSync(gaAuditFile)).toBe(true);
+    const content = readFileSync(gaAuditFile, "utf8");
+    expect(content).toContain("@opencode/*@2.0.3");
+    expect(content).toContain("oc2-ga-2.0.3");
+    expect(content).toContain("2026-09-12T23:46:23.757Z");
+    expect(content).toContain("expected_fail:upstream#37164");
+  });
+
+  test("GA evidence diffs all nine relied-on contract lines with dist citations", () => {
+    const content = readFileSync(gaAuditFile, "utf8");
+    for (let line = 1; line <= 9; line += 1) {
+      expect(content).toContain(`${line}. **`);
     }
+    expect(content).toContain("dist/chunks/mime-771dt0vh.js");
+    expect(content).toContain("dist/effect/plugin.d.ts");
+    expect(content).toContain("dist/host.js");
   });
 });
 

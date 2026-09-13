@@ -13,7 +13,7 @@ describe("powershell OpenCode 2 Linux applicability", () => {
       platform: "linux",
       scenarios,
       matrix: {},
-      pinned_host_version: "0.0.0-beta-19234",
+      pinned_host_version: "2.0.3",
     });
   });
 });

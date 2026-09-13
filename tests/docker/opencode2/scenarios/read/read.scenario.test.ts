@@ -22,7 +22,7 @@ describe("read OpenCode 2 scenarios", () => {
       platform: "linux",
       scenarios,
       matrix: {},
-      pinned_host_version: "0.0.0-beta-19234",
+      pinned_host_version: "2.0.3",
     });
   });
 });

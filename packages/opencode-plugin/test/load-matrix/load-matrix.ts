@@ -23,7 +23,7 @@ import {
 const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const repoRoot = join(pluginRoot, "../..");
 const packageName = "@cortexkit/aft-opencode";
-const v2Version = "0.0.0-beta-19234";
+const v2Version = "2.0.3";
 const v2CoreVersion = v2Version;
 const allowLiveOperatorWrites = process.env.AFT_LOAD_MATRIX_ALLOW_LIVE_OPERATOR === "1";
 const suiteTempParent = join(pluginRoot, "tmp");
@@ -45,7 +45,7 @@ function assertNodeVersion(): void {
   const major = Number.parseInt(version.replace(/^v/, "").split(".")[0], 10);
   if (Number.isNaN(major) || major < 24) {
     throw new Error(
-      `OpenCode V2 load matrix requires Node >= 24 for '@opencode-ai/core' await using support (found ${version}).`,
+      `OpenCode V2 load matrix requires Node >= 24 for '@opencode/core' await using support (found ${version}).`,
     );
   }
 }
@@ -209,6 +209,7 @@ async function withOperatorCanary<T>(label: string, operation: () => T | Promise
 
 async function installHost(
   name: string,
+  pluginPackage: "@opencode-ai/plugin" | "@opencode/plugin",
   pluginVersion: string,
   dependencies: Record<string, string>,
 ): Promise<{ root: string; output: string }> {
@@ -222,7 +223,7 @@ async function installHost(
         type: "module",
         dependencies: {
           [packageName]: `file:${tarball}`,
-          "@opencode-ai/plugin": pluginVersion,
+          [pluginPackage]: pluginVersion,
           ...dependencies,
         },
       },
@@ -252,10 +253,12 @@ async function installHost(
 
 async function ensureHostInstalls(): Promise<HostInstalls> {
   hostInstalls ??= (async () => {
-    const v1 = await installHost("host-v1", modernV1, { "opencode-ai": modernV1 });
-    const v2 = await installHost("host-v2", v2Version, {
-      "@opencode-ai/cli": v2Version,
-      "@opencode-ai/core": v2CoreVersion,
+    const v1 = await installHost("host-v1", "@opencode-ai/plugin", modernV1, {
+      "opencode-ai": modernV1,
+    });
+    const v2 = await installHost("host-v2", "@opencode/plugin", v2Version, {
+      "@opencode/cli": v2Version,
+      "@opencode/core": v2CoreVersion,
     });
     const peerWarning = /ERESOLVE|overrid(?:e|ing).*peer|peer dependency|peer dep missing/i;
     expect(v1.output).not.toMatch(peerWarning);
@@ -301,6 +304,7 @@ async function makeIsolation(label: string): Promise<HostIsolation> {
     NODE_ENV: "test",
     AFT_LOG_STDERR: "1",
     OPENCODE_DISABLE_DEFAULT_PLUGINS: "true",
+    OPENCODE_DB: "opencode2.db",
   };
   delete env.OPENCODE_CONFIG;
   delete env.OPENCODE_CONFIG_CONTENT;
@@ -402,10 +406,10 @@ async function writeV2CoreProbe(hostRoot: string, mode: "load" | "reject"): Prom
     probe,
     `
 import { Effect } from "effect";
-import { PluginModule } from "@opencode-ai/core/plugin/module";
-import { Watcher } from "@opencode-ai/core/filesystem/watcher";
-import { Host } from "@opencode-ai/plugin/host";
-import { Npm } from "@opencode-ai/util/npm";
+import { PluginModule } from "@opencode/core/plugin/module";
+import { Watcher } from "@opencode/core/filesystem/watcher";
+import { Host } from "@opencode/plugin/host";
+import { Npm } from "@opencode/util/npm";
 
 const packageRoot = process.argv[2];
 const installed = {
@@ -463,10 +467,10 @@ import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Effect, Exit, Fiber } from "effect";
-import { PluginModule } from "@opencode-ai/core/plugin/module";
-import { Watcher } from "@opencode-ai/core/filesystem/watcher";
-import { Host } from "@opencode-ai/plugin/host";
-import { Npm } from "@opencode-ai/util/npm";
+import { PluginModule } from "@opencode/core/plugin/module";
+import { Watcher } from "@opencode/core/filesystem/watcher";
+import { Host } from "@opencode/plugin/host";
+import { Npm } from "@opencode/util/npm";
 import {
   getBridgeLifecycleTopology,
   sampleBridgeLifecycleCensus,
@@ -883,10 +887,11 @@ describe("packed module shapes", () => {
 
   test("packed manifest retains discovery and all public subpaths", async () => {
     const manifest = JSON.parse(await readFile(join(packedRoot, "package.json"), "utf8"));
-    expect(manifest["oc-plugin"]).toEqual(["server", "tui"]);
+    expect(manifest["oc-plugin"]).toBeUndefined();
     expect(Object.keys(manifest.exports).sort()).toEqual([".", "./server", "./tui"]);
     expect(manifest.dependencies.effect).toBe("4.0.0-rc.112");
     expect(manifest.peerDependencies["@opencode-ai/plugin"]).toBe(">=0.0.0-beta-0");
+    expect(manifest.peerDependencies["@opencode/plugin"]).toBe("2.0.3");
   });
 
   test("operator canary detects same-size byte changes", async () => {
@@ -913,14 +918,14 @@ describe("packed module shapes", () => {
 });
 
 describe("real host load matrix", () => {
-  test("packed installs have no peer warning under modern V1 and the beta host", async () => {
+  test("packed installs have no peer warning under modern V1 and the GA host", async () => {
     const installs = await ensureHostInstalls();
     expect(installs.v1Output).not.toContain("ERESOLVE");
     expect(installs.v2Output).not.toContain("ERESOLVE");
     expect(existsSync(v1Binary(installs.v1))).toBe(true);
     expect(
       existsSync(
-        join(installs.v2, "node_modules", "@opencode-ai", "core", "dist", "plugin", "module.js"),
+        join(installs.v2, "node_modules", "@opencode", "core", "dist", "plugin", "module.js"),
       ),
     ).toBe(true);
   }, 240_000);

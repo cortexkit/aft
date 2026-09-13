@@ -1,7 +1,7 @@
 /** @jsxImportSource @opentui/solid */
 // @ts-nocheck
 
-import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode-ai/plugin/tui";
+import type { TuiPlugin, TuiPluginApi, TuiThemeCurrent } from "@opencode/plugin/tui";
 import { createMemo, createSignal, onCleanup } from "solid-js";
 
 import { version as packageVersion } from "../../package.json";

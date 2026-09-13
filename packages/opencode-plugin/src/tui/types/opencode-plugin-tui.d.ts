@@ -1,7 +1,8 @@
-// Type declarations for @opencode-ai/plugin/tui
-// These types are not yet exported by the installed @opencode-ai/plugin package
+// Compatibility declarations for the GA @opencode/plugin/tui entrypoint.
+// AFT's shared TUI still consumes the legacy callback surface while its V2 setup
+// export uses the GA setup context directly.
 
-declare module "@opencode-ai/plugin/tui" {
+declare module "@opencode/plugin/tui" {
   import type {
     createOpencodeClient as createOpencodeClientV2,
     Event as TuiEvent,

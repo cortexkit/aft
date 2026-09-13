@@ -56,6 +56,7 @@
   "devDependencies": {
     "@opencode-ai/plugin": "^1.17.11",
     "@opencode-ai/sdk": "^1.17.11",
+    "@opencode/plugin": "2.0.3",
     "@types/node": "^22.0.0",
     "typescript": "^5.8.0"
   },
@@ -73,11 +74,8 @@
       "import": "./src/entry/tui.mjs"
     }
   },
-  "oc-plugin": [
-    "server",
-    "tui"
-  ],
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=0.0.0-beta-0"
+    "@opencode-ai/plugin": ">=0.0.0-beta-0",
+    "@opencode/plugin": "2.0.3"
   }
 }

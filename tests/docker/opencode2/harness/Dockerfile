@@ -46,8 +46,8 @@ RUN test -n "$OPENCODE2_VERSION" && test -n "$OPENCODE1_VERSION" && \
     curl -fsSL https://bun.sh/install | bash && \
     npm install --prefix /opt/opencode --no-audit --no-fund \
       "@copilotkit/aimock@1.24.0" \
-      "@opencode-ai/cli@$OPENCODE2_VERSION" \
-      "@opencode-ai/cli-linux-x64@$OPENCODE2_VERSION" && \
+      "@opencode/cli@$OPENCODE2_VERSION" \
+      "@opencode/cli-linux-x64@$OPENCODE2_VERSION" && \
     npm install --prefix /opt/opencode1 --no-audit --no-fund "opencode-ai@$OPENCODE1_VERSION"
 ENV PATH="/root/.bun/bin:/opt/aft/bin:$PATH"
 ENV NODE_PATH="/opt/opencode/node_modules"
@@ -60,6 +60,6 @@ ENV AFT_BINARY_PATH=/opt/aft/bin/aft
 ENV AFT_E2E_NATIVE_BINARY_PATH=/opt/aft/bin/aft.real
 ENV AFT_OPENCODE2_PLUGIN_TARBALL=/opt/aft/packages/aft-opencode.tgz
 ENV AFT_OPENCODE2_PLUGIN_DIRECTORY=/opt/aft/plugin/node_modules/@cortexkit/aft-opencode
-ENV OPENCODE2_BIN=/opt/opencode/node_modules/@opencode-ai/cli-linux-x64/bin/opencode2
+ENV OPENCODE2_BIN=/opt/opencode/node_modules/@opencode/cli-linux-x64/bin/opencode
 ENV OPENCODE1_BIN=/opt/opencode1/node_modules/.bin/opencode
 ENTRYPOINT ["bun", "tests/docker/opencode2/harness/driver.ts"]

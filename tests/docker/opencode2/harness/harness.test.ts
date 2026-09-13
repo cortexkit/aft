@@ -196,6 +196,7 @@ describe("scenario isolation and liveness", () => {
       expect(isolated.env[key]?.startsWith(isolated.root)).toBe(true);
     }
     expect(isolated.env.OPENCODE_DISABLE_DEFAULT_PLUGINS).toBe("true");
+    expect(isolated.env.OPENCODE_DB).toBe("opencode2.db");
     expect(isolated.env.AFT_BINARY_PATH).toBe("/native/aft");
     const aftConfig = JSON.parse(
       await readFile(join(isolated.project, ".cortexkit", "aft.jsonc"), "utf8"),

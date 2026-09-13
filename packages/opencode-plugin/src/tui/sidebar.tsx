@@ -7,7 +7,7 @@
 // current without polling.
 
 import { canonicalizeProjectRoot } from "@cortexkit/aft-bridge";
-import type { TuiPluginApi, TuiSlotPlugin, TuiThemeCurrent } from "@opencode-ai/plugin/tui";
+import type { TuiPluginApi, TuiSlotPlugin, TuiThemeCurrent } from "@opencode/plugin/tui";
 import { createEffect, createMemo, createSignal, on, onCleanup } from "solid-js";
 import { AftRpcClient } from "../shared/rpc-client";
 import {

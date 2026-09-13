@@ -15,6 +15,6 @@ export async function readPinnedHostVersion(repoRoot: string): Promise<string> {
   const text = await readFile(source, "utf8");
   const match = text.match(/const\s+v2Version\s*=\s*["']([^"']+)["']/);
   if (!match?.[1])
-    fail("contract_uncaptured", "pinned OpenCode 2 beta source is missing", { source }, true);
+    fail("contract_uncaptured", "pinned OpenCode 2 GA source is missing", { source }, true);
   return match[1];
 }
