@@ -1320,12 +1320,84 @@ pub(crate) struct ViewBindingDependencies {
     binding_probes: BTreeSet<String>,
     resolved_dependencies: BTreeSet<String>,
     surface_queries: Vec<(ViewSurfaceQuery, String)>,
+    #[serde(default)]
+    surface: Option<ViewFileSurface>,
 }
 
 pub(crate) struct SelectedManifestJoin {
     pub result: JoinResult,
     pub bindings: BTreeMap<String, ViewBindingDependencies>,
     pub resolved_callers: BTreeSet<String>,
+    pub rebuilt_surface_entries: usize,
+    pub decoded_caller_blobs: usize,
+}
+
+/// Compact, deterministic snapshot of one file's resolver index. It deliberately
+/// excludes source, AST nodes, and call sites: only callers actually resolved need
+/// those payloads. Membership probes invalidate module/reexport targets along with
+/// bindings; source changes invalidate the snapshot through the manifest diff.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ViewFileSurface {
+    language: String,
+    exports: BTreeSet<String>,
+    default_export: Option<String>,
+    export_aliases: BTreeMap<String, String>,
+    node_by_scoped: BTreeMap<String, String>,
+    node_by_bare: BTreeMap<String, String>,
+    node_kind_by_id: BTreeMap<String, String>,
+    module_targets: BTreeMap<String, Option<String>>,
+    declared_module_targets: BTreeMap<String, Option<String>>,
+    reexports: Vec<(Option<String>, BTreeMap<String, String>, bool)>,
+}
+
+impl ViewFileSurface {
+    fn capture(language: &str, index: &super::DbFileIndex) -> Self {
+        Self {
+            language: language.into(),
+            exports: index.exports.iter().cloned().collect(),
+            default_export: index.default_export.clone(),
+            export_aliases: index.export_aliases.clone().into_iter().collect(),
+            node_by_scoped: index.node_by_scoped.clone().into_iter().collect(),
+            node_by_bare: index.node_by_bare.clone().into_iter().collect(),
+            node_kind_by_id: index.node_kind_by_id.clone().into_iter().collect(),
+            module_targets: index.module_targets.clone().into_iter().collect(),
+            declared_module_targets: index.declared_module_targets.clone().into_iter().collect(),
+            reexports: index
+                .reexports
+                .iter()
+                .map(|r| {
+                    (
+                        r.target_file.clone(),
+                        r.named.clone().into_iter().collect(),
+                        r.wildcard,
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn restore(&self) -> super::DbFileIndex {
+        super::DbFileIndex {
+            lang: language_id(&self.language),
+            exports: self.exports.iter().cloned().collect(),
+            default_export: self.default_export.clone(),
+            export_aliases: self.export_aliases.clone().into_iter().collect(),
+            node_by_scoped: self.node_by_scoped.clone().into_iter().collect(),
+            node_by_bare: self.node_by_bare.clone().into_iter().collect(),
+            node_kind_by_id: self.node_kind_by_id.clone().into_iter().collect(),
+            module_targets: self.module_targets.clone().into_iter().collect(),
+            declared_module_targets: self.declared_module_targets.clone().into_iter().collect(),
+            reexports: self
+                .reexports
+                .iter()
+                .map(|(target_file, named, wildcard)| super::ReexportIndex {
+                    target_file: target_file.clone(),
+                    named: named.clone().into_iter().collect(),
+                    wildcard: *wildcard,
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Configuration files read by the manifest resolver's workspace/package and
@@ -1482,8 +1554,28 @@ fn join_manifest_with_surfaces(
     cached: &BTreeMap<String, ViewBindingDependencies>,
     reuse: Option<(&BTreeSet<String>, &BTreeSet<String>)>,
 ) -> Result<SelectedManifestJoin, ManifestJoinError> {
-    let loaded = manifest_payloads(manifest, blobs)?;
-    let reader = |key: &BlobKey| loaded.get(key).cloned();
+    let mut profile = crate::views::materialization::profile::PhaseTimer::new("join");
+    let loaded = std::cell::RefCell::new(BTreeMap::<BlobKey, Arc<[u8]>>::new());
+    let load = |key: &BlobKey| -> Result<Arc<[u8]>, ManifestJoinError> {
+        if let Some(bytes) = loaded.borrow().get(key) {
+            return Ok(bytes.clone());
+        }
+        let bytes: Arc<[u8]> = blobs
+            .read_callgraph_blob(key)?
+            .ok_or_else(|| ManifestJoinError::MissingBlob(key.clone()))?
+            .into();
+        loaded.borrow_mut().insert(key.clone(), bytes.clone());
+        Ok(bytes)
+    };
+    let read_error = std::cell::RefCell::new(None);
+    let reader = |key: &BlobKey| match load(key) {
+        Ok(bytes) => Some(bytes),
+        Err(error) => {
+            *read_error.borrow_mut() = Some(error);
+            None
+        }
+    };
+    profile.finish("load_payloads");
     let facts = Rc::new(ViewBindingFacts {
         inner: Rc::new(ManifestFacts {
             manifest,
@@ -1505,6 +1597,8 @@ fn join_manifest_with_surfaces(
     let mut work = Vec::new();
     let mut bindings = BTreeMap::new();
     let mut unbound_non_utf8_paths = Vec::new();
+    let mut rebuilt_surface_entries = 0;
+    let mut decoded_caller_blobs = 0;
     for (path, entry) in manifest.entries() {
         let ManifestEntry::Regular { planes, .. } = entry else {
             continue;
@@ -1512,11 +1606,13 @@ fn join_manifest_with_surfaces(
         let Some(key) = &planes.callgraph else {
             continue;
         };
-        let CallgraphBlob::Parse(blob) = CallgraphBlob::from_bytes(&loaded[key])? else {
-            continue;
-        };
         let Ok(rel) = std::str::from_utf8(path.as_bytes()) else {
-            unbound_non_utf8_paths.push(path.as_bytes().to_vec());
+            if matches!(
+                CallgraphBlob::from_bytes(&load(key)?)?,
+                CallgraphBlob::Parse(_)
+            ) {
+                unbound_non_utf8_paths.push(path.as_bytes().to_vec());
+            }
             continue;
         };
         let resolve = selected.is_none_or(|set| set.contains(rel));
@@ -1529,14 +1625,25 @@ fn join_manifest_with_surfaces(
                 !resolve
             }
         });
+        if let Some((cache, surface)) =
+            cache.and_then(|cache| cache.surface.as_ref().map(|surface| (cache, surface)))
+        {
+            files.insert(rel.to_string(), surface.restore());
+            bindings.insert(rel.to_string(), cache.clone());
+            continue;
+        }
+        let CallgraphBlob::Parse(blob) = CallgraphBlob::from_bytes(&load(key)?)? else {
+            continue;
+        };
+        decoded_caller_blobs += 1;
         facts.take();
         let extract =
             blob.bind_with_dependencies(rel, &paths, cache.map(|cache| &cache.references))?;
-        files.insert(
-            rel.to_string(),
-            super::DbFileIndex::from_extract(root, &extract, &paths),
-        );
+        let file_index = super::DbFileIndex::from_extract(root, &extract, &paths);
+        rebuilt_surface_entries += 1;
         let mut binding = cache.cloned().unwrap_or_default();
+        binding.surface = Some(ViewFileSurface::capture(&blob.language, &file_index));
+        files.insert(rel.to_string(), file_index);
         if cache.is_none() {
             binding.references = blob
                 .refs
@@ -1571,14 +1678,11 @@ fn join_manifest_with_surfaces(
         }
         extracts.insert(rel.to_string(), extract);
     }
-    let caller_data = extracts
-        .iter()
-        .map(|(path, extract)| (path.clone(), &extract.data))
-        .collect();
+    profile.finish("decode_bind_index_entries");
     let index = ManifestProjectIndex::from_parts(
         root,
         files,
-        caller_data,
+        HashMap::new(),
         super::WorkspaceCratePrefixCache::default(),
         facts.clone(),
     );
@@ -1616,6 +1720,48 @@ fn join_manifest_with_surfaces(
             binding.surface_queries = old.surface_queries.clone();
         }
     }
+    profile.finish("index_and_surface_replay");
+    // Surface replay needs no call sites. Decode an unchanged caller only after
+    // replay proves that its reference results may change.
+    for caller in &resolved_callers {
+        if extracts.contains_key(caller) {
+            continue;
+        }
+        let path = RelPath::new(caller.as_bytes().to_vec()).expect("bound manifest path");
+        let Some(ManifestEntry::Regular { planes, .. }) = manifest.get(&path) else {
+            continue;
+        };
+        let key = planes.callgraph.as_ref().expect("bound caller key");
+        let CallgraphBlob::Parse(blob) = CallgraphBlob::from_bytes(&load(key)?)? else {
+            continue;
+        };
+        decoded_caller_blobs += 1;
+        facts.take();
+        let extract =
+            blob.bind_with_dependencies(caller, &paths, Some(&bindings[caller].references))?;
+        for (raw, bound) in blob.refs.iter().zip(&extract.raw_refs) {
+            work.push((
+                CallerRefKey {
+                    caller_blob_key: key.clone(),
+                    ref_ordinal: raw.ordinal,
+                    caller_path: caller.as_bytes().to_vec(),
+                },
+                (raw.kind, bound.clone()),
+            ));
+        }
+        extracts.insert(caller.clone(), extract);
+    }
+    let index = ManifestProjectIndex::from_parts(
+        root,
+        index.files,
+        extracts
+            .iter()
+            .map(|(path, extract)| (path.clone(), &extract.data))
+            .collect(),
+        super::WorkspaceCratePrefixCache::default(),
+        facts.clone(),
+    );
+    profile.finish("decode_resolved_callers");
     let surface_index = ViewSurfaceIndex {
         inner: &index,
         queries: Default::default(),
@@ -1664,6 +1810,7 @@ fn join_manifest_with_surfaces(
         });
         result.resolution_order.push(key);
     }
+    profile.finish("resolve_and_record");
     for (path, binding) in &mut bindings {
         if let Some(queries) = queries.remove(path) {
             binding.surface_queries = queries.into_iter().collect();
@@ -1683,10 +1830,16 @@ fn join_manifest_with_surfaces(
             )
             .collect();
     }
+    profile.finish("dependency_union");
+    if let Some(error) = read_error.borrow_mut().take() {
+        return Err(error);
+    }
     Ok(SelectedManifestJoin {
         result,
         bindings,
         resolved_callers,
+        rebuilt_surface_entries,
+        decoded_caller_blobs,
     })
 }
 

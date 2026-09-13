@@ -147,3 +147,57 @@ Views remains slower to correctness by 11,414 / 11,629 / 13,785 / 10,344 ms. Thi
 ### Blocked release benchmark
 
 `cargo test --release -p agent-file-tools --lib views::materialization::tests::bench_real_manifest_diff --no-run` fails before producing a benchmark executable: 17 E0425 errors in `gh_shim.rs` tests reference `DEV_MANIFEST_KEY_ID` / `DEV_MANIFEST_PUBLIC_KEY`, whose definitions are gated by `#[cfg(debug_assertions)]` at lines 2180–2183. The production release binary builds, but the release library test target does not. That file is outside the materialization/selected-join fence, and changing security-key compilation or enabling debug assertions was not used as a measurement workaround. Fix the release-test cfg mismatch separately, then run the release benchmark on the retained pair with sampling before selecting an optimization. No bucket attribution, optimized measurements, work-count mutation proofs, or parity/warnings acceptance is claimed by this prerequisite run.
+
+## Release profile and persistent file surfaces (resumed)
+
+The release-test prerequisite was supplied as `57be7181d` and cherry-picked without modifying its test-cfg changes. The original drill table above is retained verbatim. After the task's original `target/` artifacts were reclaimed, a second unmodified both-arm drill regenerated the same two fingerprints and **276** changed entries; its reports are `target/branch-drill-recovered.{json,md}`. The offline input now uses a SQLite backup of that isolated drill's blob database, not live storage.
+
+### Release attribution before the optimization
+
+`cargo test --release -p agent-file-tools --lib views::materialization::tests::bench_real_manifest_diff --no-run` passed. The resulting test executable was run with the real input while `/usr/bin/sample <pid> 180 10 -file target/real-release-before.sample.txt` sampled its lifetime (the benchmark exited after 90.25 s). Every-table parity passed. This sample includes base preparation, cold replacement, incremental replacement and snapshot comparison: its aggregated stack counts must not be labeled incremental-only CPU. The stacks show manifest blob reads through SQLite `pread`, decoding/binding in the selected join, resolver work, SQLite B-tree writes, and checkpoint I/O. A subsequent same-input run with `AFT_VIEW_PROFILE=1` supplies **wall-time phase boundaries**, not inferred CPU times, below. SQLite index maintenance is included with the corresponding writes; commit includes synchronization and checkpoint work and is not a pure fsync counter.
+
+| incremental phase | before ms | persistent surfaces ms |
+| --- | ---: | ---: |
+| Binding-cache load and dependency selection | 811.948 | 616.234 |
+| SQLite owned deletions, including indexes | 1688.395 | 1043.251 |
+| Changed-owner blob decode and node/file inserts | 798.042 | 565.182 |
+| Eager whole-manifest blob fetch | 3339.224 | 0.000 |
+| Blob decode, binding and file symbol-index construction/restoration | 4756.353 | 895.065 |
+| Global index setup and consumer-surface replay | 60.083 | 52.130 |
+| Deferred decode/bind of consumers that failed surface replay | included above | 443.226 |
+| Reference resolution and surface/dependency recording | 2016.768 | 2111.027 |
+| Dependency union | 60.367 | 74.248 |
+| Entire selected join, including allocations/drop overhead | 10289.146 | 3600.256 |
+| SQLite binding-cache writes | 192.922 | 232.496 |
+| Ref/edge emission, relink comparisons, lazy blob decode and indexes | 2163.370 | 2079.154 |
+| Metadata and transaction commit | 630.292 | 565.245 |
+| Entire materialization, including connection-close overhead | **16646** | **8766** |
+
+Nested join rows are subdivisions, not additional time to add to the entire selected join. Decode and symbol reconstruction are grouped where they share the same loop; these numbers do not pretend to distinguish their individual CPU costs. The largest actionable combined bucket was reading/decoding/binding all manifest payloads to reconstruct file indexes (~8.1 s), not the global `ProjectIndex::from_parts` setup (~60 ms including surface replay).
+
+### Mechanism and work proof
+
+Materialization version **4** persists a deterministic compact per-file resolver surface in `view_bindings`, alongside the existing generation-owned binding dependencies. It stores symbol/export/module/reexport lookup data but no source, AST or call sites. Unchanged entries restore their surface without opening their blob; changed entries or membership-invalidated bindings rebuild it. Existing configuration invalidation still forces a cold join. Consumer surface replay runs before decoding unchanged callers: only consumers actually selected for re-resolution decode/bind their call sites. No process-global cache, checkout read, or publication/orchestration change is involved. The existing `JoinResult` implementation is unchanged.
+
+On the real pair only **260 current changed parse entries rebuild surfaces**, versus 4,921 cold. Only **556 caller blobs decode**, corresponding to the 260 changed files and 296 consumers whose results may change. Reference work remains 93,230; this optimization does not claim per-binding resolver deduplication. Removed files and non-parse entries explain the difference between 260 rebuilt surfaces and 276 changed manifest entries.
+
+`persistent_surfaces_rebuild_only_changed_entries_without_reading_pruned_callers` reopens persisted bindings, counts actual immutable-blob reads, and checks cold parity. Disabling surface reuse with a restored `NON-VACUITY BREAK` makes that test alone fail (`rebuilt_surface_entries`: 2 rather than 1); the existing unrelated-export parity test remains green under the same mutation. The established graph/dependency row counts remain unchanged; its expected stats only gained the two new work counters. Debug/release materialization suites, callgraph-store suites, selected-join parity, and host plus Windows GNU library checks with `RUSTFLAGS='-D warnings'` pass.
+
+### Same-input release offline measurements
+
+| implementation | physical bytes | logical bytes | WAL bytes | wall seconds | CPU seconds |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Baseline cold, sampled run | 849338368 | 1333890296 | 422963352 | 31.613 | 28.604 |
+| Baseline incremental, sampled run | 378933248 | 479782414 | 143635592 | 21.626 | 18.913 |
+| Baseline cold, phase-timed run | 849338368 | 1335094520 | 422963352 | 30.184 | 27.142 |
+| Baseline incremental, phase-timed run | 378933248 | 475145742 | 143635592 | 16.646 | 14.466 |
+| Persistent surfaces cold | 880517120 | 1363766296 | 436979592 | 23.916 | 21.375 |
+| Persistent surfaces incremental | 383717376 | 484611958 | 145806832 | **8.766** | **6.951** |
+
+All three runs pass every-table parity against their own cold materialization. Shared-machine and page-cache variation affects timings (including cold, whose work count is unchanged), so the work counters are the mechanism evidence. The optimized offline derived phase is 1.234 s below the 10 s target; the physical-write target remains unmet and slightly regresses from 361.38 to 365.94 MiB.
+
+### WAL attribution, not a speculative index removal
+
+The benchmark maps **every WAL frame** through the final database's `dbstat` page ownership, preserving repeated page writes. This is final-owner attribution: pages reused mid-transaction can have had another owner. Missing `dbstat` fails the benchmark rather than silently printing an empty map. The largest baseline incremental object is **view_bindings: 46,090,440 bytes**, rising to 48,261,680 with persisted surfaces; `refs` is 18,366,960. The five refs secondary indexes together are 30,731,080 bytes: caller-file 6,044,040; caller-node/kind 8,610,800; kind/caller-file 6,888,640; short-name 5,479,600; target-file 3,708,000. Ref primary-key index: 6,600,240. Edge secondary indexes total 11,568,960. No individual secondary index dominates: removing a shared graph index is not justified by this profile. Binding payload churn and collective ref/edge row/index churn remain the physical-write problem; a separate normalized binding/surface persistence layout is a better next write-amplification experiment than dropping one shared query index.
+
+Raw logs: `target/real-release-before.log`, `target/real-release-before-profile.log`, `target/real-release-surface.log`, and `target/surface-mutation.log`. The measured databases remain under `target/view-diff-real-300-input/`.

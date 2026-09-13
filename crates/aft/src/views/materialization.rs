@@ -30,6 +30,8 @@ pub struct MaterializeStats {
     pub dependent_files: usize,
     pub resolved_files: usize,
     pub resolved_refs: usize,
+    pub rebuilt_surface_entries: usize,
+    pub decoded_caller_blobs: usize,
     pub full_resolution: bool,
 }
 
@@ -61,7 +63,9 @@ pub fn apply_manifest_diff(
     )
 }
 
-const MATERIALIZATION_VERSION: &str = "3";
+pub(crate) mod profile;
+
+const MATERIALIZATION_VERSION: &str = "4";
 
 fn fingerprint(manifest: &crate::views::Manifest) -> Result<String> {
     let bytes = manifest
@@ -76,6 +80,11 @@ fn materialize(
     manifest: &crate::views::Manifest,
     mut base: Option<&crate::views::Manifest>,
 ) -> Result<MaterializeStats> {
+    let mut profile = profile::PhaseTimer::new(if base.is_some() {
+        "incremental"
+    } else {
+        "cold"
+    });
     let mut connection = if base.is_some() {
         Connection::open_with_flags(database_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?
     } else {
@@ -138,6 +147,7 @@ fn materialize(
         full_resolution: selected.is_none(),
         ..MaterializeStats::default()
     };
+    profile.finish("load_bindings_select");
     if let Some(changed) = &changed {
         for path in changed {
             let Ok(path) = std::str::from_utf8(path) else {
@@ -167,6 +177,7 @@ fn materialize(
             stats.dependency_deleted += transaction.execute(&format!("DELETE FROM {table}"), [])?;
         }
     }
+    profile.finish("delete_rows");
     let blob_connection = Connection::open(callgraph_blob_database)?;
     let mut parsed = BTreeMap::new();
     let mut nodes = HashMap::new();
@@ -273,6 +284,7 @@ fn materialize(
         }
     }
 
+    profile.finish("owned_blob_decode_and_insert");
     let reader = ManifestViewBlobReader {
         connection: &blob_connection,
     };
@@ -301,6 +313,9 @@ fn materialize(
         &membership_changed,
     )
     .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+    profile.finish("selected_join");
+    stats.rebuilt_surface_entries = joined.rebuilt_surface_entries;
+    stats.decoded_caller_blobs = joined.decoded_caller_blobs;
     stats.resolved_refs = joined.result.rows.len();
     stats.resolved_files = joined.resolved_callers.len();
     stats.dependent_files = joined
@@ -340,6 +355,7 @@ fn materialize(
             params![path, payload],
         )?;
     }
+    profile.finish("write_bindings");
     for row in joined.result.rows {
         let caller_path = String::from_utf8(row.caller_path.clone()).map_err(|_| {
             CallGraphStoreError::Unavailable("non-UTF-8 manifest caller path".to_string())
@@ -477,6 +493,7 @@ fn materialize(
             }
         }
     }
+    profile.finish("emit_refs_edges");
     set_meta_ready(&transaction, true)?;
     transaction.execute(
         "INSERT OR REPLACE INTO meta(k, v) VALUES('view_manifest_fingerprint', ?1)",
@@ -487,6 +504,7 @@ fn materialize(
         [MATERIALIZATION_VERSION],
     )?;
     transaction.commit()?;
+    profile.finish("commit");
     Ok(stats)
 }
 

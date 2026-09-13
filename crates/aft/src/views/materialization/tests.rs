@@ -149,6 +149,8 @@ fn incremental_writes_only_owned_rows_and_relinks() {
             dependent_files: 1,
             resolved_files: 3,
             resolved_refs: 2,
+            rebuilt_surface_entries: 2,
+            decoded_caller_blobs: 3,
             full_resolution: false,
         }
     );
@@ -287,6 +289,7 @@ fn bench_real_manifest_diff() {
             .unwrap()
             .len();
         println!("incremental={incremental} wall_s={elapsed:.3} cpu_s={:.3} physical_bytes={} logical_bytes={} wal_bytes={wal} stats={stats:?}", after.2-before.2, after.0-before.0, after.1-before.1);
+        report_wal_pages(&db);
         outputs.push(snapshot(&db));
     }
     assert_snapshot_parity(&outputs[0], &outputs[1]);
@@ -784,4 +787,116 @@ fn colliding_structural_ordinals_keep_distinct_bindings_and_first_reference_rows
         )
         .unwrap();
     assert_eq!(module, first_module);
+}
+
+#[cfg(target_os = "macos")]
+fn report_wal_pages(db: &std::path::Path) {
+    let connection = Connection::open(db).unwrap();
+    let page_size: usize = connection
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .unwrap();
+    let mut statement = connection
+        .prepare("SELECT pageno, name FROM dbstat")
+        .unwrap();
+    let owners = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<BTreeMap<_, _>>>()
+        .unwrap();
+    let bytes = std::fs::read(format!("{}-wal", db.display())).unwrap();
+    let mut frames = BTreeMap::<String, usize>::new();
+    for frame in bytes[32..].chunks_exact(page_size + 24) {
+        let page = u32::from_be_bytes(frame[..4].try_into().unwrap());
+        *frames
+            .entry(
+                owners
+                    .get(&page)
+                    .cloned()
+                    .unwrap_or_else(|| "<freelist-or-unmapped>".into()),
+            )
+            .or_default() += 1;
+    }
+    // Ownership is the final dbstat mapping; reused pages may have had another
+    // owner earlier in the transaction. Count every frame, not distinct pages.
+    println!(
+        "wal_frame_bytes_by_final_owner={:?}",
+        frames
+            .into_iter()
+            .map(|(name, frames)| (name, frames * (page_size + 24)))
+            .collect::<BTreeMap<_, _>>()
+    );
+}
+
+#[test]
+fn persistent_surfaces_rebuild_only_changed_entries_without_reading_pruned_callers() {
+    let f = fixture();
+    let connection = Connection::open(&f.blobs).unwrap();
+    let caller = "import { target } from './target'; export function caller() { return target(); }";
+    let base = manifest(
+        &connection,
+        &[
+            ("caller.ts", caller),
+            (
+                "target.ts",
+                "const anchor = 0; export function target() { return 1; }",
+            ),
+        ],
+    );
+    let next = manifest(
+        &connection,
+        &[
+            ("caller.ts", caller),
+            (
+                "target.ts",
+                "const anchor = 0; export function target() { return 1; } export function unrelated() {}",
+            ),
+        ],
+    );
+    let db = f.dir.path().join("persistent-surface.sqlite");
+    materialize_manifest_view_database(&db, &f.blobs, &base).unwrap();
+    let cache = load_bindings(&Connection::open(&db).unwrap()).unwrap();
+    struct CountingReader<'a> {
+        inner: ManifestViewBlobReader<'a>,
+        reads: std::cell::RefCell<Vec<String>>,
+    }
+    impl join::ManifestBlobReader for CountingReader<'_> {
+        fn read_callgraph_blob(
+            &self,
+            key: &str,
+        ) -> std::result::Result<Option<Vec<u8>>, join::ManifestJoinError> {
+            self.reads.borrow_mut().push(key.into());
+            self.inner.read_callgraph_blob(key)
+        }
+    }
+    let reader = CountingReader {
+        inner: ManifestViewBlobReader {
+            connection: &connection,
+        },
+        reads: Default::default(),
+    };
+    let selected = BTreeSet::from(["caller.ts".into(), "target.ts".into()]);
+    let changed = BTreeSet::from(["target.ts".into()]);
+    let joined = join::join_selected_manifest_reusing_surfaces(
+        &next,
+        &reader,
+        Some(&selected),
+        &cache,
+        &changed,
+        &BTreeSet::new(),
+    )
+    .unwrap();
+    assert_eq!(joined.rebuilt_surface_entries, 1);
+    assert_eq!(joined.decoded_caller_blobs, 1);
+    assert_eq!(
+        reader.reads.borrow().len(),
+        1,
+        "only the changed target's immutable blob may be read"
+    );
+    assert_eq!(joined.resolved_callers, changed);
+    let cold = f.dir.path().join("persistent-surface-cold.sqlite");
+    apply_manifest_diff(&db, &base, &next, &f.blobs).unwrap();
+    materialize_manifest_view_database(&cold, &f.blobs, &next).unwrap();
+    assert_snapshot_parity(&snapshot(&db), &snapshot(&cold));
 }
