@@ -1,7 +1,7 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
-import { readConfigTiers } from "@cortexkit/aft-bridge";
+import { readConfigTiers, resolveCortexKitProjectConfigPath } from "@cortexkit/aft-bridge";
 
 import type { HarnessAdapter } from "../adapters/types.js";
 import type { AftRequest, sendAftRequest } from "../lib/aft-bridge.js";
@@ -269,14 +269,12 @@ function buildConfigureParams(adapter: HarnessAdapter, projectRoot: string): Aft
   // are stripped by the resolver, same as the plugins). lsp_paths_extra is
   // process-state (the install cache dirs) and stays a flat param.
   const userConfigPath = adapter.detectConfigPaths().aftConfig;
-  // Every harness reads the project tier from the shared CortexKit location
-  // (`<root>/.cortexkit/aft.jsonc`), the same path the plugins resolve; the
-  // per-harness `.pi` / `.opencode` directories are the pre-unification layout
-  // and would make this probe read a file the plugin never loads.
-  const dir = ".cortexkit";
-  const projectJsonc = join(projectRoot, dir, "aft.jsonc");
-  const projectJson = join(projectRoot, dir, "aft.json");
-  const projectConfigPath = existsSync(projectJsonc) ? projectJsonc : projectJson;
+  // The project tier is the file the plugins load: the shared CortexKit
+  // location for every harness. The per-harness `.pi/aft.json` and
+  // `.opencode/aft.json` files are the pre-unification layout that the plugins
+  // migrate away from on first load, so probing them here would report a
+  // config the running plugin no longer reads.
+  const projectConfigPath = resolveCortexKitProjectConfigPath(projectRoot);
   return {
     id: "doctor-lsp-configure",
     command: "configure",

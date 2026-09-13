@@ -62,11 +62,13 @@ describe("doctor lsp project root detection", () => {
     const userConfig = tempRoot("aft-lsp-user-config-");
     const srcDir = join(project, "src", "pkg");
     mkdirSync(srcDir, { recursive: true });
-    mkdirSync(join(project, ".opencode"), { recursive: true });
+    mkdirSync(join(project, ".cortexkit"), { recursive: true });
     writeFileSync(join(project, "package.json"), JSON.stringify({ name: "sample" }));
     writeFileSync(join(srcDir, "main.py"), "print('hello')\n");
+    // The project tier lives where the plugins read it; a legacy
+    // `.opencode/aft.json` would be migrated by the plugin, never probed here.
     writeFileSync(
-      join(project, ".opencode", "aft.json"),
+      join(project, ".cortexkit", "aft.jsonc"),
       JSON.stringify({ lsp: { python: "ty", disabled: ["lua"] } }),
     );
     process.chdir(outside);
@@ -107,7 +109,7 @@ describe("doctor lsp project root detection", () => {
     expect(Array.isArray(tiers)).toBe(true);
     const projectTier = tiers?.find((t) => t.tier === "project");
     expect(projectTier).toBeDefined();
-    expect(projectTier?.source).toBe(join(project, ".opencode", "aft.json"));
+    expect(projectTier?.source).toBe(join(project, ".cortexkit", "aft.jsonc"));
     expect(JSON.parse(projectTier?.doc ?? "{}")).toEqual({
       lsp: { python: "ty", disabled: ["lua"] },
     });
