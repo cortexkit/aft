@@ -8824,14 +8824,34 @@ public class Greeter {
             .expect_err("closed listener must refuse the request");
 
         assert!(embedding_failure_is_transient(&error), "error: {error}");
-        assert!(
-            error.contains("embedding backend unreachable (connection refused or connect failure)"),
-            "error: {error}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_millis(500),
-            "connection refusal should not wait through a retry ladder"
-        );
+        // Unix answers a closed loopback port with RST, so the request fails at
+        // connect. Windows Filtering Platform stealth mode drops the SYN instead,
+        // so the same probe is a connect timeout at the base floor - which the
+        // one-item rule already reads as down. Either arm is one deadline at most
+        // and never the same-batch retry ladder.
+        if cfg!(windows) {
+            assert!(
+                error.contains(
+                    "embedding backend unreachable (connection refused or connect failure)"
+                ) || error.contains("single-item request timed out at 500 ms: treating as down"),
+                "error: {error}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(500 * 2),
+                "a dropped SYN must be judged within one base deadline, not a ladder"
+            );
+        } else {
+            assert!(
+                error.contains(
+                    "embedding backend unreachable (connection refused or connect failure)"
+                ),
+                "error: {error}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "connection refusal should not wait through a retry ladder"
+            );
+        }
     }
 
     #[test]

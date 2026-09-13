@@ -2558,7 +2558,12 @@ mod tests {
             project,
         )
         .expect("plain outline");
-        assert_eq!(plain.args["file"].as_str(), Some("/project/src/lib.rs"));
+        let expected = project.join("src").join("lib.rs");
+        assert_eq!(
+            plain.args["file"].as_str(),
+            Some(expected.to_string_lossy().as_ref()),
+            "plain paths resolve with the platform's separators"
+        );
     }
 
     #[test]
