@@ -155,8 +155,23 @@ fn open_production_store_copy(
     sqlite_backup(&source_db, &copied_db);
 
     if transition {
+        // The archive deliberately has next-revision bytes. Re-root only the
+        // copied backend identity before open so root repair cannot cold-build
+        // those bytes and silently consume the transition before timing it.
+        Connection::open(&copied_db)
+            .unwrap()
+            .execute(
+                "UPDATE backend_file_state SET workspace_root = ?1",
+                [project_root.to_string_lossy().as_ref()],
+            )
+            .unwrap();
         let store =
             CallGraphStore::open(copied_store, project_root).expect("open copied base store");
+        assert_eq!(
+            store.sqlite_path(),
+            copied_db,
+            "opening the base must not publish a cold replacement"
+        );
         return (store, PathBuf::new());
     }
     let rel_path = requested_file.unwrap_or_else(|| select_fixture_file(&copied_db));
@@ -766,4 +781,42 @@ fn row_audit_counts_insert_update_delete_and_reference_callers() {
             ("refs".into(), "UPDATE".into(), "other.ts".into(), 1)
         ]
     );
+}
+
+#[test]
+fn transition_copy_does_not_refresh_next_revision_during_open() {
+    let source = tempfile::tempdir().unwrap();
+    let root = source.path().join("project");
+    fs::create_dir(&root).unwrap();
+    let file = root.join("caller.ts");
+    fs::write(&file, "export function before() {}\n").unwrap();
+    let store_dir = source.path().join("store");
+    let store = CallGraphStore::open(store_dir.clone(), root).unwrap();
+    store.cold_build(&[file]).unwrap();
+    let file_hash = |db: &Path| {
+        Connection::open(db)
+            .unwrap()
+            .query_row(
+                "SELECT content_hash FROM files WHERE path='caller.ts'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap()
+    };
+    let before_hash = file_hash(store.sqlite_path());
+    fs::write(
+        store_dir.join("bench.current"),
+        store.sqlite_path().file_name().unwrap().to_str().unwrap(),
+    )
+    .unwrap();
+    let next = source.path().join("next");
+    fs::create_dir(&next).unwrap();
+    let file = next.join("caller.ts");
+    fs::write(&file, "export function after() {}\n").unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let (copied, _) = open_production_store_copy(&temp, &store_dir, next, None, true);
+    assert_eq!(file_hash(copied.sqlite_path()), before_hash);
+    let stats = copied.refresh_files(&[file]).unwrap();
+    assert_eq!(stats.refreshed_own_files, 1);
+    assert_ne!(file_hash(copied.sqlite_path()), before_hash);
 }
