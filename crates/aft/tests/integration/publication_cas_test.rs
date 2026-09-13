@@ -136,7 +136,10 @@ fn blob_store_artifacts(
     let trigram = root.join("blob-trigram.bin");
     fs::write(&trigram, "trigram state").unwrap();
     PublicationArtifacts {
-        blob_databases: vec![semantic.path().to_path_buf(), callgraph.path().to_path_buf()],
+        blob_databases: vec![
+            semantic.path().to_path_buf(),
+            callgraph.path().to_path_buf(),
+        ],
         derived_database: derived,
         trigram_artifact: trigram,
         alias_database: aliases,
@@ -171,7 +174,12 @@ fn clean_blob_stores_skip_checkpoint_and_fsync_until_a_put_marks_one_dirty() {
     let initial = RecordedSteps::default();
     store
         .publish_with_observer(
-            &request("generation-initial", None, &manifest, files_for_retry(&files)),
+            &request(
+                "generation-initial",
+                None,
+                &manifest,
+                files_for_retry(&files),
+            ),
             &CompleteClosure,
             Some(&initial),
         )
@@ -210,7 +218,10 @@ fn clean_blob_stores_skip_checkpoint_and_fsync_until_a_put_marks_one_dirty() {
         .unwrap();
     assert_eq!(observed_blob_durability_steps(&dirty), (1, 1));
 
-    assert_eq!(semantic.put(&key, b"payload").unwrap().outcome, PutOutcome::Reused);
+    assert_eq!(
+        semantic.put(&key, b"payload").unwrap().outcome,
+        PutOutcome::Reused
+    );
     let reused = RecordedSteps::default();
     store
         .publish_with_observer(
@@ -392,9 +403,14 @@ fn publication_retries_sync_open_while_reader_holds_the_target() {
         )
     });
 
-    reached_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("publisher must reach the final artifact before the target is released");
+    // A Disconnected here means the publisher returned before the signal; its
+    // own error is the diagnosis, so surface it instead of the channel's.
+    if let Err(error) = reached_rx.recv_timeout(Duration::from_secs(10)) {
+        let publisher_result = publisher.join().unwrap();
+        panic!(
+            "publisher must reach the final artifact before the target is released: {error:?}; publisher returned {publisher_result:?}"
+        );
+    }
     // Keep the no-share handle open long enough for the publisher to enter its
     // bounded open retry; the injected unit regression proves that retry arm.
     thread::sleep(Duration::from_millis(100));

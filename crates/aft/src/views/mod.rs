@@ -1133,9 +1133,7 @@ mod tests {
             let handles: Vec<_> = (0..8)
                 .map(|_| {
                     let artifact = artifact.clone();
-                    std::thread::spawn(move || {
-                        checkpoint_and_sync_database(&artifact, None, false)
-                    })
+                    std::thread::spawn(move || checkpoint_and_sync_database(&artifact, None, false))
                 })
                 .collect();
             for handle in handles {
