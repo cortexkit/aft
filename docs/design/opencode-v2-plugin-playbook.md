@@ -1,0 +1,81 @@
+# OpenCode 2 plugin porting playbook
+
+**Version target.** Port against the exact GA family `@opencode/*@2.0.3`: the CLI exposes both `opencode` and `opencode2` and pins every platform binary to `2.0.3` (`packages/opencode-plugin/node_modules/@opencode/cli/package.json:1-37`); plugin dependencies are likewise exact (`packages/opencode-plugin/node_modules/@opencode/plugin/package.json:42-53`). AFT's checked-in dependency is still the historical beta, `@opencode-ai/plugin@0.0.0-beta-19234` (`packages/opencode-plugin/package.json:63-69`), so its old-scope imports are **pending re-verification** in parallel work. Do not infer the GA contract from that dependency.
+
+This is an implementation playbook for Magic Context and Alfonso. The campaign drafts only locate decisions; every assertion below points to landed AFT code, captured host evidence, or unpacked package source.
+
+## 1. What OpenCode 2 is to a plugin
+
+V1 is the `opencode-ai` 1.x package and `opencode` executable; GA V2 is the `@opencode/cli` package plus exact platform packages, with both executable names (`packages/aft-cli/src/setup/host-generation.ts:219-255`; `packages/opencode-plugin/node_modules/@opencode/cli/package.json:1-37`). Setup/doctor therefore search for both binaries, inspect nearby package identity, and reject an ambiguous two-generation install rather than writing config (`packages/aft-cli/src/adapters/opencode.ts:70-73`; `packages/aft-cli/src/setup/host-generation.ts:219-269`; `packages/aft-cli/src/doctor/opencode.ts:181-184`).
+
+GA discovers exports, not an `oc-plugin` field. `Host.resolve` tries `<package>/server`, then the root export, and separately `<package>/tui` and `<package>/rpc` through the exports map (`packages/opencode-plugin/node_modules/@opencode/plugin/dist/host.js:4-32`). The loader accepts default `{id,effect}` or `{id,setup}`; unknown keys are ignored and `"effect" in value` chooses the native Effect path (`packages/opencode-plugin/node_modules/@opencode/core/dist/chunks/mime-771dt0vh.js:54-65,72-101`). The `oc-plugin: ["server","tui"]` field in AFT is beta history, not a GA API (`packages/opencode-plugin/package.json:8-11`); the GA plugin manifest has no such field (`packages/opencode-plugin/node_modules/@opencode/plugin/package.json:1-41`).
+
+AFT keeps the V1 function as the root default and publishes distinct server/TUI subpaths (`packages/opencode-plugin/package.json:12-39`; `packages/opencode-plugin/src/index.ts:1343-1345`; `packages/opencode-plugin/src/entry/server.mjs:1-10`; `packages/opencode-plugin/src/entry/tui.mjs:1-11`). The landed beta server definition is `{id,server,effect}` and the TUI definition is `{id,tui,setup}` (`packages/opencode-plugin/src/entry/server.mjs:1-10`; `packages/opencode-plugin/src/tui/index.tsx:802-808`); GA selects `effect` and ignores extras, while the TUI still needs GA re-verification. One package/version can therefore serve both hosts, but which host loaded it is known by **which export entry ran**, not by probing the process. AFT records `root-default`, `export-server-v1`, or an Effect server load path for doctor (`packages/aft-cli/src/doctor/opencode.ts:9-16,136-160`).
+
+## 2. Hook-by-hook port map
+
+Each row gives **what changed / what we did / pointer**. GA domains come from `Context` (`packages/opencode-plugin/node_modules/@opencode/plugin/dist/effect/plugin.d.ts:24-55`).
+
+| V1 surface | GA V2 status/equivalent | What AFT did | Pointer |
+|---|---|---|---|
+| `experimental.chat.messages.transform` | Renamed/reframed as `context.session.hook("context", ...)`; it edits `SessionContext.messages`, system and tools. | Our landed beta server does not consume this hook; port consumers to the GA session domain, not the old hook name. | `packages/opencode-plugin/node_modules/@opencode/plugin/dist/effect/session.d.ts:20-35,94-106`; `packages/opencode-plugin/src/index.ts:1142-1153` |
+| `chat.message` | Replaced by `context.session.hook("prompt", ...)`; payload has IDs, mutable prompt, metadata and inbox delivery. | Existing V1 callback remains in the root function; wakes use the V2 session API directly. | `packages/opencode-plugin/node_modules/@opencode/plugin/dist/effect/session.d.ts:13-19,94-106`; `packages/opencode-plugin/src/index.ts:1203-1230` |
+| `tool.execute.before` | Renamed to `context.tool.hook("execute.before", ...)`. It may mutate input and fail with `Tool.Error`. | AFT instead registers direct tools with host input schemas and execution adapters. | `packages/opencode-plugin/node_modules/@opencode/plugin/dist/effect/tool.d.ts:20-51`; `packages/opencode-plugin/src/entry/server-runtime.mjs:95-133` |
+| `tool.execute.after` | Renamed to `context.tool.hook("execute.after", ...)`; receives completed result or error. | No AFT after-hook was needed; direct tool results are projected into V2 content/metadata. | `packages/opencode-plugin/node_modules/@opencode/plugin/dist/effect/tool.d.ts:29-51`; `packages/opencode-plugin/src/tools/definitions/v2.ts:87-109` |
+| `event` | Replaced by `context.event.subscribe` (no catch-all return object). | Server registration owns subscriptions/resources inside the Effect scope. | `packages/opencode-plugin/node_modules/@opencode/plugin/dist/effect/event.d.ts:1-3`; `packages/opencode-plugin/src/entry/server-runtime.mjs:95-133` |
+| `command.execute.before` | Gone. Commands are definitions installed through `context.command.transform`; each has `execute({sessionID,prompt,delivery})`. | Port interception into a command definition or session prompt hook; AFT does not emulate the old hook. | `packages/opencode-plugin/node_modules/@opencode/plugin/dist/effect/command.d.ts:7-23` |
+| `config` | No GA config hook/domain. | AFT loads its own config at location boot; host-facing additions use domains/transforms. | `packages/opencode-plugin/node_modules/@opencode/plugin/dist/effect/plugin.d.ts:24-50`; `packages/opencode-plugin/src/entry/server-runtime.mjs:56-68,95-133` |
+| TUI export | Separate package `./tui` export; GA discovery resolves only that subpath. | AFT publishes a TUI loader and returns `{id,tui,setup}`; this old-scope implementation is pending GA re-verification. | `packages/opencode-plugin/node_modules/@opencode/plugin/dist/host.js:29-32`; `packages/opencode-plugin/src/entry/tui.mjs:1-11`; `packages/opencode-plugin/src/tui/index.tsx:8-19` |
+| SDK `session.prompt` | GA `context.session.prompt`; no separate plugin client is required. | Send steering prompts through the host session domain. | `packages/opencode-plugin/node_modules/@opencode/plugin/dist/effect/session.d.ts:105-106`; `packages/opencode-plugin/src/wakes/session-delivery.ts:20-35,49-91` |
+| SDK `session.promptAsync` | The beta SDK required calling the method with its receiver (`this._client`); GA replaces the client method with session-domain `prompt`. | `callPromptAsync` preserves the beta receiver; V2 wake delivery uses steer prompts or `synthetic(..., resume:false)` records. | `packages/opencode-plugin/src/wakes/session-delivery.ts:20-35,49-91`; `packages/opencode-plugin/node_modules/@opencode/plugin/dist/effect/session.d.ts:105-106` |
+
+**Permission exception.** The pinned beta had no usable permission-request API; our real-host finding records the attempted reply endpoint and fail-closed handling (`tests/docker/opencode2/harness/driver.ts:131-163`; `tests/docker/opencode2/contract/probe/bash-t1-permission-refusal.txt:1-29`). This was tracked upstream as #37164. Do not reproduce beta endpoint guesses. GA now exposes `context.permission`; use that domain and verify its semantics (`packages/opencode-plugin/node_modules/@opencode/plugin/dist/effect/plugin.d.ts:37-43`; `packages/opencode-plugin/node_modules/@opencode/plugin/dist/effect/permission.d.ts:1-24`).
+
+## 3. SDK/client message and part JSON
+
+AFT's wake boundary serializes only host-supported prompt parts: text becomes `{type:"text",text}`, synthetic wake history becomes `{role:"assistant",content:[{type:"text",text}],resume:false}`, and a busy session gets a steer delivery instead (`packages/opencode-plugin/src/wakes/session-delivery.ts:38-91`).
+
+Between the pinned beta and GA, `SessionContext` changed from separate mutable `generation` plus `providerOptions` fields to a shared request with `system`, `messages`, and one `options` bag; GA also added compaction/generate/title hook payloads (`packages/opencode-plugin/node_modules/@opencode-ai/plugin/dist/effect/session.d.ts:19-32,75-85`; `packages/opencode-plugin/node_modules/@opencode/plugin/dist/effect/session.d.ts:20-56,94-106`). Prompt remains `PromptInput.Prompt`, and both versions expose `prompt` and `synthetic` on `SessionDomain` at those same pointers. Nothing AFT serializes requires a text-part JSON change: its consumed subset remains `{type,text}`; the host owns richer message JSON. Keep serialization narrow instead of copying generated message objects.
+
+## 4. Storage and `opencode.db`
+
+The beta incident was real: boot applied the post-V1 migration tranche (the generated list contains the late migrations at positions 40-47) and introduced/rebuilt `kv`, `instruction_*`, `session_pending`, `session_v2` and `session_message` side tables (`packages/opencode-plugin/node_modules/@opencode-ai/core/dist/chunks/worktree-nnad2ash.js:116-187`; `packages/opencode-plugin/node_modules/@opencode-ai/core/dist/chunks/worktree-sdp7kfr6.js:34-147`). A KV latch records migration phase/cursor/completion, and legacy V1 sessions/messages/parts are copied into V2 rows (`packages/opencode-plugin/node_modules/@opencode-ai/core/dist/database/v1-migration.bun.js:410-444,456-520`).
+
+The primary file is `$XDG_DATA_HOME/opencode/opencode.db` (default `~/.local/share/opencode/opencode.db`), not `opencode-local.db` or `opencode-dev.db`; AFT's operator-state canary names that exact file and the package computes the data root from XDG (`packages/aft-cli/src/setup/host-generation.ts:151-155`; `packages/opencode-plugin/node_modules/@opencode-ai/util/dist/global-roots.js:3-16`; `packages/opencode-plugin/node_modules/@opencode-ai/util/dist/global.js:11-24`). The beta can additionally import an earlier V2 `opencode-next.db`; it is not the active DB (`packages/opencode-plugin/node_modules/@opencode-ai/core/dist/database/v1-migration.bun.js:524-535`).
+
+For read-only consumers: assume additive/rebuilt tables, side tables, and a one-time V1-to-V2 copy; discover columns/tables, tolerate both generations, open read-only, and never trigger host boot against an operator DB. Our incident workaround set `OPENCODE_DB=opencode2.db` during isolation; the permanent rule is stronger—set four XDG roots and a throwaway HOME so even code that ignores that override cannot touch live state (`packages/aft-cli/src/setup/host-generation.ts:158-210`; `.github/workflows/beta-pin-gate.yml:54-66`).
+
+## 5. Run both hosts side by side
+
+Use one explicit shared server:
+
+```sh
+opencode2 serve --hostname 127.0.0.1 --port N --print-logs
+OPENCODE_SERVER_PASSWORD="$password" opencode2 run --server "http://127.0.0.1:N" --format json --model openai/mock-model "..."
+OPENCODE_SERVER_PASSWORD="$password" opencode2 api --server "http://127.0.0.1:N" METHOD /api/...
+```
+
+The captured contract says `run` and `api` receive the endpoint through `--server` and password via environment (`tests/docker/opencode2/contract/host-cli-contract.json:1-44`); the harness extracts the `server listening on ...` and `server password ...` handoff lines (`tests/docker/opencode2/harness/host.ts:92-127`). `run --standalone` starts its own host and is deliberately a different, single-process trajectory—not shared-server attachment (`tests/docker/opencode2/harness/host.ts:155-193`).
+
+For every host process set `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME`, `XDG_CACHE_HOME`, plus a throwaway `HOME`; the isolation builder creates all five roots and clears inherited OpenCode controls (`tests/docker/opencode2/harness/isolation.ts:52-83,172-215`). In the beta harness, install the tarball but configure a wrapper **directory path**; the host loads its server entry from the directory (`tests/docker/opencode2/harness/isolation.ts:104-159`). Do not configure the `.tgz`/`file://` tarball itself as the beta plugin entry.
+
+Linux runs in `node:24-bookworm-slim`, because the host/package path uses Node 24 syntax such as `await using` (`tests/docker/opencode2/harness/Dockerfile:1-18`; `packages/opencode-plugin/test/load-matrix/load-matrix.ts:31-49`). The CI job is `e2e-opencode2-linux` (`.github/workflows/_e2e-suite.yml:93-118`). Its deterministic provider is `openai/mock-model` with OpenAI-compatible `baseURL`; the old V1 `mock` provider is rejected as `provider.no-route` (`tests/docker/opencode2/contract/host-provider-config.json:1-55`; `tests/docker/opencode2/contract/probe/host-provider-config.txt:8-35`).
+
+## 6. Gotchas
+
+- **`path` / `filePath`:** V2 headers and schemas use canonical `path`; translate to `filePath` only at AFT's V1 read/write/edit execution seam (`packages/opencode-plugin/src/tools/definitions/v2.ts:64-77`; `packages/opencode-plugin/src/tools/definitions/v2.ts:108-115`).
+- **Version lookup:** `dist/entry/server.js` is deeper than `dist/index.js`; a fixed relative manifest read yielded `0.0.0` and fetched the wrong binary, so walk to the manifest bearing the package name (`packages/opencode-plugin/src/plugin-version.ts:5-29`).
+- **Errors:** rejected V2 execution must throw a real `Error`; plain `Tool.Error` objects stringify as `[object Object]` (`packages/opencode-plugin/src/tools/definitions/v2.ts:50-62`).
+- **Codemode:** direct tools must set `{codemode:false}` or the host may project them away (`packages/opencode-plugin/src/tools/definitions/v2.ts:57-67`; `packages/opencode-plugin/test/entry/server-effect.test.ts:107-123`).
+- **Exact scopes/pins:** use `@opencode/*@2.0.3`, never `@opencode-ai/plugin` for V2 and never a range; the GA package graph itself is exact (`packages/opencode-plugin/node_modules/@opencode/plugin/package.json:42-53`). Clear stale install caches before judging a pin; setup reports the configured cache/version (`packages/aft-cli/src/adapters/opencode.ts:328-356,371-429`).
+- **OpenTUI/Solid:** do not make the runtime packages required peer externals; V1's bundled host can resolve inside `$bunfs`. AFT precompiles JSX while virtualizing imports to the host's single runtime (`packages/opencode-plugin/scripts/build-tui.ts:9-18,118-145`; `packages/opencode-plugin/test/load-matrix/load-matrix.ts:1029-1060`).
+- **Bootstrap:** set `OPENCODE_DISABLE_DEFAULT_PLUGINS=true` in isolated CI to prevent default-plugin install stalls (`tests/docker/opencode2/contract/probe/host-schema-rejection.txt:4-7`).
+- **Typed RPC:** define methods/events once and register them through `context.rpc.register`; retain and dispose the scoped registration (`packages/opencode-plugin/node_modules/@opencode/plugin/dist/effect/rpc.d.ts:6-18`; `packages/opencode-plugin/src/rpc/register.ts:127-143,181-182,225-240`).
+- **Cancellation:** forward Effect interruption into the `AbortSignal` used by shared execution so bridge/native work does not outlive the call (`packages/opencode-plugin/src/cancellation/effect-abort.ts:8-42`; `packages/opencode-plugin/src/tools/bash/executor.ts:6-25`).
+- **Scope lifetime:** acquire bridge/RPC resources in the plugin Effect and release them with scoped finalizers; do not rely on process exit (`packages/opencode-plugin/src/entry/server-runtime.mjs:79-108`).
+
+## 7. Source and verification
+
+The historical beta source is installed at `packages/opencode-plugin/node_modules/@opencode-ai/*`; there is no separate `~/Work/OSS` checkout. For GA review, unpack exact npm tarballs under `packages/opencode-plugin/node_modules/@opencode/*`; verify identity/version before reading (`packages/opencode-plugin/node_modules/@opencode/plugin/package.json:1-5`; `packages/opencode-plugin/node_modules/@opencode/core/package.json:1-16`).
+
+**Verify your port:** run `bun test ./packages/opencode-plugin/test/matrix/acceptance-matrix.test.ts ./packages/opencode-plugin/test/load-matrix/load-matrix.ts` under isolated HOME plus all four XDG roots; green means both real loaders accepted the published entries and the acceptance surface passed, not merely that a mocked import worked (`.github/workflows/beta-pin-gate.yml:54-66`).
