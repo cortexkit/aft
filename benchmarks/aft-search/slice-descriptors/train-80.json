@@ -1,7 +1,12 @@
 {
   "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
   "kind": "harness",
-  "fixtures": ["harness-goldens", "profile-grammar", "paging"],
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
   "slices": [
     "oc2-ga-reverify-2.0.3",
     "views-drill-cold-gate",
