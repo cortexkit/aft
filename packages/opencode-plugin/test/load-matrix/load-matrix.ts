@@ -646,6 +646,13 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       throw new Error("AftRpc.getStatus did not round-trip through the warm bridge: " + JSON.stringify(status));
     }
     appendFileSync(marker, "rpc-call:" + index + ":" + status.session.id + "\\n");
+    if (entrypoints.rpc !== undefined || loaded.features.rpc !== undefined) {
+      throw new Error("AFT unexpectedly advertised a ./rpc entrypoint");
+    }
+    appendFileSync(
+      marker,
+      "rpc-route:context.rpc.register;features.rpc=false;export.rpc=absent\\n",
+    );
     appendFileSync(
       marker,
       "tools-listed:" + index + ":" + location.tools.map((tool) => tool.name).sort().join(",") + "\\n",
@@ -1087,7 +1094,10 @@ export default { id: original.id, effect };
     const wakeEvidence = evidence.filter((line) => line.startsWith("idle-wake:"));
     const permissionEvidence = evidence.filter((line) => line.startsWith("permission-api:"));
     const rpcEvidence = evidence.filter(
-      (line) => line.startsWith("rpc-call:") || line.startsWith("rpc-reload-event:"),
+      (line) =>
+        line.startsWith("rpc-call:") ||
+        line.startsWith("rpc-reload-event:") ||
+        line.startsWith("rpc-route:"),
     );
     const toolEvidence = evidence.filter((line) => line.startsWith("tools-listed:"));
     console.log(`[v2-abort-evidence]\n${abortEvidence.join("\n")}`);
@@ -1104,7 +1114,11 @@ export default { id: original.id, effect };
     expect(permissionEvidence).toEqual([
       "permission-api:expected_fail:upstream#37164:domain=hook,list,get,reply,rules;create=absent",
     ]);
-    expect(rpcEvidence).toHaveLength(3);
+    expect(rpcEvidence.filter((line) => line.startsWith("rpc-call:"))).toHaveLength(2);
+    expect(rpcEvidence).toContain(
+      "rpc-route:context.rpc.register;features.rpc=false;export.rpc=absent",
+    );
+    expect(rpcEvidence).toContain("rpc-reload-event:indexProgress");
     expect(toolEvidence).toHaveLength(2);
     expect(events.match(/effect-init/g)).toHaveLength(3);
     expect(events.match(/effect-dispose/g)).toHaveLength(3);
