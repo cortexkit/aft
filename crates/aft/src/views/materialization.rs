@@ -34,6 +34,7 @@ pub struct MaterializeStats {
     pub rebuilt_surface_entries: usize,
     pub decoded_caller_blobs: usize,
     pub full_resolution: bool,
+    pub unattributed_callers: usize,
 }
 
 impl MaterializeStats {
@@ -80,10 +81,9 @@ pub(crate) fn apply_manifest_diff_profiled(
 }
 
 pub(crate) mod profile;
-#[cfg(test)]
 mod resolution_facts;
 
-const MATERIALIZATION_VERSION: &str = "4";
+const MATERIALIZATION_VERSION: &str = "5";
 
 fn fingerprint(manifest: &crate::views::Manifest) -> Result<String> {
     let bytes = manifest
@@ -201,14 +201,55 @@ fn materialize(
     } else {
         BTreeMap::new()
     };
+    let blob_connection = Connection::open(callgraph_blob_database)?;
+    let mut fact_invalidated = BTreeSet::new();
+    let mut fallback_count = 0;
     let selected = match (&changed, base) {
         (Some(changed), Some(base)) if !requires_full_resolution(base, manifest, changed) => {
-            Some(dependent_closure(&transaction, changed)?)
+            let diff = resolution_facts::diff_inputs(base, manifest, changed, &blob_connection)?;
+            for (caller, binding) in &cached {
+                if !binding.consulted_facts.is_disjoint(&diff.changed) {
+                    fact_invalidated.insert(caller.clone());
+                }
+                if diff.inputs_changed && binding.unattributed {
+                    fallback_count += 1;
+                }
+            }
+            if diff.unknown != 0 || fallback_count != 0 {
+                fallback_count += diff.unknown;
+                log::warn!("views materialization: full resolution (reason=unattributed_reads count={fallback_count})");
+                None
+            } else {
+                // Configuration bytes are invalidated by their consulted fields.
+                // Presence changes still seed ordinary missing-path dependencies.
+                let mut seeds = changed
+                    .iter()
+                    .filter(|path| {
+                        !join::view_resolution_config(path) || {
+                            let rel =
+                                crate::views::RelPath::new((*path).clone()).expect("manifest path");
+                            base.get(&rel).is_some() != manifest.get(&rel).is_some()
+                        }
+                    })
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                seeds.extend(fact_invalidated.iter().map(|path| path.as_bytes().to_vec()));
+                if changed.iter().any(|path| {
+                    join::view_resolution_config(path) && {
+                        let rel = crate::views::RelPath::new(path.clone()).expect("manifest path");
+                        base.get(&rel).is_some() != manifest.get(&rel).is_some()
+                    }
+                }) {
+                    seeds.insert(join::VIEW_CONFIG_MEMBERSHIP_DOMAIN.as_bytes().to_vec());
+                }
+                Some(dependent_closure(&transaction, &seeds)?)
+            }
         }
         _ => None,
     };
     let mut stats = MaterializeStats {
         full_resolution: selected.is_none(),
+        unattributed_callers: fallback_count,
         ..MaterializeStats::default()
     };
     profile.finish("load_bindings_select");
@@ -242,7 +283,6 @@ fn materialize(
         }
     }
     profile.finish("delete_rows");
-    let blob_connection = Connection::open(callgraph_blob_database)?;
     let mut parsed = BTreeMap::new();
     let mut nodes = HashMap::new();
     let mut loaded_paths = BTreeSet::new();
@@ -358,7 +398,7 @@ fn materialize(
             .filter_map(|path| String::from_utf8(path.clone()).ok())
             .collect()
     });
-    let membership_changed = base.map_or_else(BTreeSet::new, |base| {
+    let mut membership_changed = base.map_or_else(BTreeSet::new, |base| {
         base.entries()
             .chain(manifest.entries())
             .filter(|(path, _)| {
@@ -368,6 +408,12 @@ fn materialize(
             .filter_map(|(path, _)| String::from_utf8(path.as_bytes().to_vec()).ok())
             .collect()
     });
+    if membership_changed
+        .iter()
+        .any(|path| join::view_resolution_config(path.as_bytes()))
+    {
+        membership_changed.insert(join::VIEW_CONFIG_MEMBERSHIP_DOMAIN.into());
+    }
     let joined = join::join_selected_manifest_reusing_surfaces(
         manifest,
         &reader,
@@ -375,9 +421,16 @@ fn materialize(
         &cached,
         &changed_strings,
         &membership_changed,
+        &fact_invalidated,
     )
     .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
     profile.finish("selected_join");
+    stats.unattributed_callers = joined
+        .bindings
+        .values()
+        .filter(|binding| binding.unattributed)
+        .count()
+        .max(stats.unattributed_callers);
     stats.rebuilt_surface_entries = joined.rebuilt_surface_entries;
     stats.decoded_caller_blobs = joined.decoded_caller_blobs;
     stats.resolved_refs = joined.result.rows.len();
@@ -681,22 +734,17 @@ fn requires_full_resolution(
     changed: &BTreeSet<Vec<u8>>,
 ) -> bool {
     changed.iter().any(|path| {
-        join::view_resolution_config(path)
-            || base
-                .entries()
-                .chain(next.entries())
-                .any(|(candidate, entry)| {
-                    candidate.as_bytes() == path
-                        && matches!(
-                            entry,
-                            crate::views::ManifestEntry::Regular {
-                                resolution_input: true,
-                                ..
-                            } | crate::views::ManifestEntry::Synthetic { .. }
-                                | crate::views::ManifestEntry::Symlink { .. }
-                                | crate::views::ManifestEntry::Gitlink { .. }
-                        )
-                })
+        base.entries()
+            .chain(next.entries())
+            .any(|(candidate, entry)| {
+                candidate.as_bytes() == path
+                    && matches!(
+                        entry,
+                        crate::views::ManifestEntry::Synthetic { .. }
+                            | crate::views::ManifestEntry::Symlink { .. }
+                            | crate::views::ManifestEntry::Gitlink { .. }
+                    )
+            })
     })
 }
 

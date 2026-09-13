@@ -1465,7 +1465,22 @@ struct ViewBindingFacts<'a> {
     directory_cache: std::cell::RefCell<HashMap<Vec<u8>, Vec<super::facts::DirEntry>>>,
 }
 
-impl ViewBindingFacts<'_> {
+impl<'a> ViewBindingFacts<'a> {
+    fn new(inner: Rc<dyn ProjectFacts + 'a>) -> Self {
+        Self {
+            inner,
+            probes: Default::default(),
+            consultations: Default::default(),
+            memo_stack: Default::default(),
+            memo_traces: Default::default(),
+            workspace_packages: Default::default(),
+            workspace_members: Default::default(),
+            canonical_cache: Default::default(),
+            file_cache: Default::default(),
+            config_cache: Default::default(),
+            directory_cache: Default::default(),
+        }
+    }
     fn file_fact(&self, rel: &[u8]) -> bool {
         if let Some(value) = self.file_cache.borrow().get(rel) {
             return *value;
@@ -1476,25 +1491,23 @@ impl ViewBindingFacts<'_> {
     }
 
     fn record(&self, path: &[u8]) {
-        // Config changes invalidate every caller separately. Persist source probes,
-        // including misses, to catch a newly added module or an earlier candidate.
-        if !view_resolution_config(path) {
-            if let Ok(path) = std::str::from_utf8(path) {
-                let mut parts = Vec::new();
-                for part in path.split('/') {
-                    match part {
-                        "" | "." => {}
-                        ".." => {
-                            parts.pop();
-                        }
-                        _ => parts.push(part),
+        // Content changes use consulted facts; presence changes still need the
+        // ordinary missing-path probes, including configuration candidates.
+        if let Ok(path) = std::str::from_utf8(path) {
+            let mut parts = Vec::new();
+            for part in path.split('/') {
+                match part {
+                    "" | "." => {}
+                    ".." => {
+                        parts.pop();
                     }
+                    _ => parts.push(part),
                 }
-                let path = parts.join("/");
-                self.probes.borrow_mut().insert(path.clone());
-                for (_, trace) in self.memo_stack.borrow_mut().iter_mut() {
-                    trace.probes.insert(path.clone());
-                }
+            }
+            let path = parts.join("/");
+            self.probes.borrow_mut().insert(path.clone());
+            for (_, trace) in self.memo_stack.borrow_mut().iter_mut() {
+                trace.probes.insert(path.clone());
             }
         }
     }
@@ -1533,6 +1546,10 @@ impl ProjectFacts for ViewBindingFacts<'_> {
         true
     }
     fn config_fact(&self, rel: &[u8], name: &str) {
+        self.record(rel);
+        if matches!(name, "workspaces" | "packages") {
+            self.record(VIEW_CONFIG_MEMBERSHIP_DOMAIN.as_bytes());
+        }
         self.config_event(rel, Some(name));
     }
     fn memo_start(&self, path: &Path, kind: &str, name: &str) {
@@ -1600,6 +1617,13 @@ impl ProjectFacts for ViewBindingFacts<'_> {
         self.inner.is_dir(rel)
     }
     fn config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
+        self.consultations.borrow_mut().unattributed = true;
+        for (_, trace) in self.memo_stack.borrow_mut().iter_mut() {
+            trace.config.unattributed = true;
+        }
+        self.attributed_config_bytes(rel)
+    }
+    fn attributed_config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
         self.config_event(rel, None);
         self.record(rel);
         if let Some(value) = self.config_cache.borrow().get(rel) {
@@ -1669,13 +1693,14 @@ pub(crate) fn join_selected_manifest_reusing_surfaces(
     cached: &BTreeMap<String, ViewBindingDependencies>,
     changed: &BTreeSet<String>,
     membership_changed: &BTreeSet<String>,
+    fact_invalidated: &BTreeSet<String>,
 ) -> Result<SelectedManifestJoin, ManifestJoinError> {
     join_manifest_with_surfaces(
         manifest,
         blobs,
         selected,
         cached,
-        Some((changed, membership_changed)),
+        Some((changed, membership_changed, fact_invalidated)),
     )
 }
 
@@ -1684,7 +1709,7 @@ fn join_manifest_with_surfaces(
     blobs: &impl ManifestBlobReader,
     selected: Option<&BTreeSet<String>>,
     cached: &BTreeMap<String, ViewBindingDependencies>,
-    reuse: Option<(&BTreeSet<String>, &BTreeSet<String>)>,
+    reuse: Option<(&BTreeSet<String>, &BTreeSet<String>, &BTreeSet<String>)>,
 ) -> Result<SelectedManifestJoin, ManifestJoinError> {
     let mut profile = crate::views::materialization::profile::PhaseTimer::new("join");
     let loaded = std::cell::RefCell::new(BTreeMap::<BlobKey, Arc<[u8]>>::new());
@@ -1708,22 +1733,10 @@ fn join_manifest_with_surfaces(
         }
     };
     profile.finish("load_payloads");
-    let facts = Rc::new(ViewBindingFacts {
-        inner: Rc::new(ManifestFacts {
-            manifest,
-            blobs: &reader,
-        }),
-        probes: Default::default(),
-        consultations: Default::default(),
-        memo_stack: Default::default(),
-        memo_traces: Default::default(),
-        workspace_packages: Default::default(),
-        workspace_members: Default::default(),
-        canonical_cache: Default::default(),
-        file_cache: Default::default(),
-        config_cache: Default::default(),
-        directory_cache: Default::default(),
-    });
+    let facts = Rc::new(ViewBindingFacts::new(Rc::new(ManifestFacts {
+        manifest,
+        blobs: &reader,
+    })));
     let root = Path::new("/");
     let paths = FactPaths {
         root,
@@ -1754,9 +1767,10 @@ fn join_manifest_with_surfaces(
         };
         let resolve = selected.is_none_or(|set| set.contains(rel));
         let cache = cached.get(rel).filter(|cache| {
-            if let Some((changed, membership)) = reuse {
+            if let Some((changed, membership, fact_invalidated)) = reuse {
                 selected.is_some()
                     && !changed.contains(rel)
+                    && !fact_invalidated.contains(rel)
                     && cache.dependencies.is_disjoint(membership)
             } else {
                 !resolve
@@ -1836,16 +1850,18 @@ fn join_manifest_with_surfaces(
             if selected.is_some_and(|set| !set.contains(*path)) {
                 return false;
             }
-            let Some((changed, _)) = reuse else {
+            let Some((changed, _, _)) = reuse else {
                 return true;
             };
             if selected.is_none() || changed.contains(*path) {
                 return true;
             }
             cached.get(*path).is_none_or(|old| {
-                old.surface_queries
-                    .iter()
-                    .any(|(query, expected)| query.answer(&index) != *expected)
+                old.references != bindings[*path].references
+                    || old
+                        .surface_queries
+                        .iter()
+                        .any(|(query, expected)| query.answer(&index) != *expected)
             })
         })
         .cloned()
@@ -2035,12 +2051,13 @@ fn reexport_surface(value: &[super::ReexportIndex]) -> String {
     )
 }
 
+pub(crate) const VIEW_CONFIG_MEMBERSHIP_DOMAIN: &str = "\0view:config-membership";
 pub(crate) const VIEW_RUST_MODULE_DOMAIN: &str = "\0view:rust-module-index";
 
 impl ViewSurfaceQuery {
     fn dependencies(&self) -> Vec<String> {
         match self {
-            Self::Crate(_) => Vec::new(),
+            Self::Crate(_) => vec![VIEW_CONFIG_MEMBERSHIP_DOMAIN.into()],
             Self::Parent(file) | Self::Inline(file, ..) => {
                 vec![file.clone(), VIEW_RUST_MODULE_DOMAIN.into()]
             }
@@ -2173,5 +2190,44 @@ impl<I: super::ResolverIndex> super::ResolverIndex for ViewSurfaceIndex<'_, I> {
             &value,
         );
         value
+    }
+}
+
+#[cfg(test)]
+mod consultation_tests {
+    use super::*;
+
+    #[test]
+    fn opaque_config_read_is_unattributed_even_after_a_known_field_read() {
+        let manifest = Manifest::new([(
+            RelPath::new(b"package.json".to_vec()).unwrap(),
+            ManifestEntry::Regular {
+                mode: 0o100644,
+                planes: crate::views::RegularPlanes {
+                    callgraph: Some("config".into()),
+                    semantic: None,
+                },
+                resolution_input: true,
+            },
+        )])
+        .unwrap();
+        let bytes: Arc<[u8]> = CallgraphBlob::config(b"{}".to_vec(), "fixture")
+            .to_bytes()
+            .unwrap()
+            .into();
+        let reader = |_: &BlobKey| Some(bytes.clone());
+        let facts = ViewBindingFacts::new(Rc::new(ManifestFacts {
+            manifest: &manifest,
+            blobs: &reader,
+        }));
+        facts.config_fact(b"package.json", "name");
+        assert!(facts.attributed_config_bytes(b"package.json").is_some());
+        assert!(!facts.consultations.borrow().unattributed());
+        facts.memo_start(Path::new("/"), "test", "");
+        assert!(facts.config_bytes(b"package.json").is_some());
+        facts.memo_finish(Path::new("/"), "test", "");
+        assert!(facts.take_config().unattributed());
+        facts.memo_replay(Path::new("/"), "test", "");
+        assert!(facts.take_config().unattributed());
     }
 }

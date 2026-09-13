@@ -191,7 +191,7 @@ impl ModuleResolutionMemo {
 
         self.note_json_probe(path);
         let parsed = facts
-            .bytes(path)
+            .attributed_bytes(path)
             .and_then(|source| serde_json::from_slice(&source).ok())
             .map(Arc::new);
         if self.enabled {
@@ -2710,7 +2710,7 @@ fn non_empty_workspace_pattern(value: &Value) -> Option<String> {
 
 fn pnpm_workspace_patterns(workspace_root: &Path, facts: &FactPaths<'_>) -> Vec<String> {
     facts.config_field(workspace_root, "pnpm-workspace.yaml", "packages");
-    let Some(bytes) = facts.bytes(&workspace_root.join("pnpm-workspace.yaml")) else {
+    let Some(bytes) = facts.attributed_bytes(&workspace_root.join("pnpm-workspace.yaml")) else {
         return Vec::new();
     };
 
@@ -2846,7 +2846,7 @@ fn package_json_like_value(
     if let Some(memo) = memo {
         return memo.json_value(path, facts);
     }
-    let json = facts.bytes(path)?;
+    let json = facts.attributed_bytes(path)?;
     serde_json::from_slice(&json).ok().map(Arc::new)
 }
 

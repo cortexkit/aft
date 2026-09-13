@@ -10453,7 +10453,7 @@ fn build_workspace_crate_prefixes(
 fn rust_manifest_crate_names(manifest: &Path, facts: &FactPaths<'_>) -> Vec<String> {
     facts.config_fact(manifest, "manifest.name");
     facts.config_fact(manifest, "manifest.lib.name");
-    let Some(bytes) = facts.bytes(manifest) else {
+    let Some(bytes) = facts.attributed_bytes(manifest) else {
         return Vec::new();
     };
     let (package_name, lib_name) = rust_manifest_name_fields(&bytes);

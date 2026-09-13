@@ -43,6 +43,9 @@ pub(crate) trait ProjectFacts {
     fn is_file(&self, rel: &[u8]) -> bool;
     fn is_dir(&self, rel: &[u8]) -> bool;
     fn config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>>;
+    fn attributed_config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
+        self.config_bytes(rel)
+    }
     fn symlink_target(&self, rel: &[u8]) -> Option<&[u8]>;
     fn canonical(&self, rel: &[u8]) -> Option<Vec<u8>>;
     fn canonical_path(&self, root: &Path, rel: &[u8]) -> Option<PathBuf> {
@@ -226,8 +229,9 @@ impl FactPaths<'_> {
             .and_then(|rel| self.facts.canonical(&rel))
             .is_some_and(|rel| self.facts.is_dir(&rel))
     }
-    pub fn bytes(&self, path: &Path) -> Option<Arc<[u8]>> {
-        self.facts.config_bytes(&self.rel(path)?)
+    /// Opaque reads remain distinguishable from the field-instrumented readers.
+    pub fn attributed_bytes(&self, path: &Path) -> Option<Arc<[u8]>> {
+        self.facts.attributed_config_bytes(&self.rel(path)?)
     }
     pub fn canonical(&self, path: &Path) -> Option<PathBuf> {
         self.facts.canonical_path(self.root, &self.rel(path)?)

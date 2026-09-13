@@ -152,6 +152,7 @@ fn incremental_writes_only_owned_rows_and_relinks() {
             rebuilt_surface_entries: 2,
             decoded_caller_blobs: 3,
             full_resolution: false,
+            unattributed_callers: 0,
         }
     );
     assert_eq!(stats.graph_rows_written(), 13);
@@ -567,7 +568,8 @@ fn changed_tsconfig_relinks_unchanged_importer_with_cold_parity() {
     let stats = apply_manifest_diff(&db, &base, &next, &f.blobs).unwrap();
     materialize_manifest_view_database(&cold, &f.blobs, &next).unwrap();
     assert_eq!(snapshot(&db), snapshot(&cold));
-    assert!(stats.full_resolution);
+    assert!(!stats.full_resolution);
+    assert_eq!(stats.dependent_files, 1);
     let target: String = Connection::open(&db)
         .unwrap()
         .query_row("SELECT target_file FROM edges", [], |row| row.get(0))
@@ -883,6 +885,7 @@ fn persistent_surfaces_rebuild_only_changed_entries_without_reading_pruned_calle
         Some(&selected),
         &cache,
         &changed,
+        &BTreeSet::new(),
         &BTreeSet::new(),
     )
     .unwrap();
