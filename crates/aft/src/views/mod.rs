@@ -459,6 +459,17 @@ pub struct ClosureRequirements {
 /// Presence checks used by durable restart and manifest-membership validation.
 pub trait PublicationClosure {
     fn contains_blob(&self, plane: ArtifactPlane, full_key: &str) -> Result<bool>;
+    fn probe_blobs(&self, keys: &[(ArtifactPlane, &str)]) -> Result<()> {
+        for &(plane, key) in keys {
+            if !self.contains_blob(plane, key)? {
+                return Err(ViewError::MissingBlob {
+                    plane,
+                    key: key.to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
     fn trigram_is_present(&self) -> Result<bool>;
     fn contains_alias(&self, git_oid: &str) -> Result<bool>;
 }
@@ -470,14 +481,7 @@ pub fn probe_publication_closure(
     requirements: &ClosureRequirements,
     closure: &impl PublicationClosure,
 ) -> Result<()> {
-    for (plane, key) in manifest.plane_keys() {
-        if !closure.contains_blob(plane, key)? {
-            return Err(ViewError::MissingBlob {
-                plane,
-                key: key.to_owned(),
-            });
-        }
-    }
+    closure.probe_blobs(&manifest.plane_keys().collect::<Vec<_>>())?;
     if !closure.trigram_is_present()? {
         return Err(ViewError::MissingTrigram);
     }

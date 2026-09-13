@@ -376,3 +376,146 @@ The owner's rule remains: **views must beat legacy to correctness on every row, 
 The four semantic-fill publications perform 30-54 ms of materialization and retain closure times of 2,922 / 2,673 / 2,509 / 2,503 ms. The dirty-store red proves that clean blob stores issue no checkpoint or fsync calls, so this residual is not evidence that the skip failed. The final manifest requires 8,891 blob-membership probes, and `SqliteClosure::contains_blob` currently opens a SQLite connection for every key. On copied final artifacts, reproducing that pattern took 6,789 ms; retaining two read connections reduced it to 1,755 ms. For comparison, fsyncing copied derived WAL/main, trigram, and alias artifacts measured 0.190 / 0.023 / 0.478 ms after they were already durable, while the drill's detached derived checkpoints completed in 8-25 ms. Those copied-file fsync numbers are lower bounds, but they rule out multi-second file size alone.
 
 The next closure bucket is therefore the manifest-wide per-key connection/query pattern, followed by separately timed derived, trigram, and alias syncs. The next overall acceptance bucket remains correctness-required full resolution when package resolution inputs change; optimizing it belongs in resolver-selection work, not this policy/closure change.
+
+## Closure connection and batching follow-up (2026-09-13)
+
+This follow-up changes the closure probe only. Resolution-input invalidation is
+unchanged: configuration transitions still require full resolution. There is no
+new six-case fact-invalidation parity matrix, fact-invalidation work red, or
+`full_resolution=false` real-pair claim in this follow-up.
+
+### Resolver reads that still need fact attribution
+
+The manifest path uses `module_dependencies` at
+`callgraph_store/mod.rs:14095-14118`, not a second resolution algorithm. The
+following locations describe the reads in this revision (paths relative to
+`crates/aft/src`):
+
+| Read | Existing location | Important constraint for recording |
+| --- | --- | --- |
+| TS alias targets and base directory | `callgraph.rs:2395-2431` | Reads `compilerOptions.paths` and `baseUrl` from the nearest tsconfig; does not follow `extends`. |
+| Ancestor package identity | `callgraph.rs:2481-2498`, `2805-2814` | Reads `name`; a scan for one name must not subscribe to every other package's entry points. |
+| Workspace-root discovery | `callgraph.rs:2500-2524`, `2643-2666` | Reads package workspaces (array or `packages` object) and pnpm package patterns. |
+| Name-to-package-directory lookup | `callgraph.rs:2563-2608`, `2610-2641` | Per-pass and process-wide memo returns bypass member traversal, so recording must also cover those returns. |
+| pnpm workspace patterns | `callgraph.rs:2668-2701` | Uses a line-oriented parser for `packages:` entries, not a general YAML parser. |
+| Package entry point | `callgraph.rs:2816-2844`, `2846-2930` | Reads `exports`, then `module`/`main` for root imports; `types` is not consumed here. |
+| Rust manifest crate names | `callgraph_store/mod.rs:10444-10485` | Uses line-oriented `name` extraction and `[lib]` state, not TOML semantic parsing; replacing it with a TOML projection would change which facts are represented. |
+| Rust crate map | `callgraph_store/mod.rs:10402-10442` | Walks project directories excluding target/node_modules/.git; does not restrict this map to workspace members. |
+| Rust source candidates | `callgraph_store/mod.rs:14120-14154`, `callgraph.rs:210-234`, `join.rs:666-711` | Candidate misses and declared module paths remain ordinary file dependencies. |
+
+The older disk-oriented Rust resolver also reads package name, lib name/path,
+and workspace members at `callgraph.rs:2196-2223` and `2346-2365`. These are not
+interchangeable with the manifest crate-name parser. Neither resolver's decisions
+were changed here. The `ProjectFacts::config_bytes` seam returns opaque bytes;
+field consultations and memo-hit replay still need recording at the actual
+reads before the conservative full-resolution bound can be removed safely.
+
+### Closure mechanism and offline comparison
+
+`SqliteClosure` now lazily retains a `TrackedConnection` per blob plane, scoped
+to the closure object. Its batch override sorts and deduplicates keys per plane
+and queries at most 500 placeholders per statement. Missing keys still fail the
+closure, with the first missing key reported in manifest order. Other
+`PublicationClosure` implementations retain their single-key behavior through a
+default method. The normal `contains_blob` path shares the same retained handles.
+
+`bench_closure_probe_strategies` reads the actual copied manifest and checks
+membership of every one of its 8,891 plane keys, rather than substituting a
+store-wide row count. The fixture is the final generation from
+`/tmp/aft-views-drill-77-proportional-final/on`; the semantic database was copied
+with SQLite backup and the checkpointed callgraph database with an APFS clone.
+The final debug benchmark (after the drill and release build completed) reported:
+
+| strategy | elapsed ms |
+| --- | ---: |
+| open and query once per key | 8,577 |
+| two retained handles, cached point statements | 2,135 |
+| retained handles, sorted batches (production probe) | 1,931 |
+
+The batch strategy was retained. These are offline debug timings, not a release
+or in-situ speedup claim. Run with absolute paths in `AFT_CLOSURE_MANIFEST`,
+`AFT_CLOSURE_SEMANTIC`, `AFT_CLOSURE_CALLGRAPH`, and `AFT_CLOSURE_TRIGRAM`:
+
+`cargo test -p agent-file-tools --lib bench_closure_probe_strategies -- --ignored --nocapture`
+
+### Mutation evidence
+
+All mutations were staged from the live implementation before mutation, produced
+a nonempty unstaged diff, and were restored to an empty unstaged diff before
+subsequent work. No mutation was committed.
+
+The initial retained-point-query implementation, with connection retention
+neutralized, produced:
+
+```text
+test closure_probe_opens_at_most_one_connection_per_plane ... FAILED
+assertion `left == right` failed
+  left: 64
+ right: 2
+test closure_probe_rejects_absent_key_after_successful_probes ... ok
+test malformed_key_does_not_open_a_plane ... ok
+```
+
+The final batch fixture uses 600 distinct keys per plane, crossing the batch
+boundary. Clearing the retained connection map at each batch produced:
+
+```text
+test closure_probe_opens_at_most_one_connection_per_plane ... FAILED
+assertion `left == right` failed
+  left: 4
+ right: 2
+test closure_probe_rejects_absent_key_after_successful_probes ... ok
+test malformed_key_does_not_open_a_plane ... ok
+```
+
+Neutralizing the final batch membership rejection produced:
+
+```text
+test closure_probe_rejects_absent_key_after_successful_probes ... FAILED
+assertion failed: matches!(probe_publication_closure(&missing,
+  &ClosureRequirements::default(), &closure),
+  Err(ViewError::MissingBlob { plane: ArtifactPlane::Semantic,
+  key: actual }) if actual == key)
+test closure_probe_opens_at_most_one_connection_per_plane ... ok
+test malformed_key_does_not_open_a_plane ... ok
+```
+
+These tests live under `views::assembly::closure_connection_tests`. Cumulative
+opens and live connections are measured at the `TrackedConnection` lifecycle
+seam using a test-only per-thread mirror; they are not inferred from timing.
+
+### Retained-point-query drill, not final-batch acceptance
+
+The unshortened both-arm fresh-storage drill ran against commit `64ef79d4`
+(the retained-point-query implementation, **before batching**):
+
+`scripts/views-branch-drill.sh --mode both --binary target/release/aft --storage /tmp/aft-views-drill-closure-291/on --baseline-storage /tmp/aft-views-drill-closure-291/off --output-dir /tmp/aft-views-drill-closure-291/out`
+
+It ran through nohup as a background task. Both arms completed, with no reported
+correctness defects. Views warm-up was 896,925 ms; legacy warm-up was 613,930 ms.
+Local builds and offline probing overlapped this run, so the following raw
+measurements are **not a controlled final performance acceptance run**.
+
+| switch | views publication ms | views CPU s | views correct ms | legacy CPU s | legacy correct ms | views minus legacy correct ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| HEAD to A | 57,565 | 114.61 | 57,565 | 85.71 | 36,110 | +21,455 |
+| A to HEAD | 45,532 | 76.90 | 46,073 | 44.09 | 41,444 | +4,629 |
+| HEAD to B | 44,954 | 79.59 | 45,346 | 34.45 | 29,615 | +15,731 |
+| B to HEAD | 32,854 | 35.88 | 32,854 | 35.70 | 31,498 | +1,356 |
+
+Semantic-fill closure_ms was 3,123 / 4,420 / 2,977 / 2,471, versus the earlier
+per-key-open drill's 2,922 / 2,673 / 2,509 / 2,503. No in-situ closure speedup can
+be claimed from these differently loaded runs. A fresh drill of the final
+batched binary is still required.
+
+The owner's rule remains: **views beats legacy to correctness on every row,
+with CPU not above legacy**. The raw retained-point-query run misses correctness
+by the amounts above and CPU by 28.90 / 32.81 / 45.14 / 0.18 seconds. The next
+major bucket remains fact-sensitive resolution-input invalidation; materializer
+resolution policy is deliberately unchanged by this closure optimization.
+
+The final batch code passes the views and durable publication/restart tests,
+`tool_call_parity_test`, and host plus x86_64-pc-windows-gnu `cargo check` with
+`RUSTFLAGS='-D warnings'`. The callgraph_store suite (including join) passed on
+the retained-handle unit; no resolver code changed in the batch unit. Both
+retained-handle and final batch release binaries were built successfully.

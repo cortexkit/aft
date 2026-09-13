@@ -748,6 +748,63 @@ impl PublicationClosure for SqliteClosure {
         Ok(present)
     }
 
+    fn probe_blobs(&self, keys: &[(ArtifactPlane, &str)]) -> Result<()> {
+        let mut present = BTreeSet::new();
+        for (plane_id, plane) in [ArtifactPlane::Semantic, ArtifactPlane::Callgraph]
+            .into_iter()
+            .enumerate()
+        {
+            let wanted = keys
+                .iter()
+                .filter(|(p, _)| *p == plane)
+                .map(|(_, key)| *key)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            for chunk in wanted.chunks(500) {
+                // Sorted key batches follow the blob index rather than manifest
+                // path order. Keep the tracked plane handle across all batches.
+                let Some(first_valid) = chunk.iter().find(|key| decode_hex(key).is_some()) else {
+                    continue;
+                };
+                self.contains_blob(plane, first_valid)?;
+                let connections = self.connections.borrow();
+                let Some(connection) = connections.get(&(plane == ArtifactPlane::Semantic)) else {
+                    continue;
+                };
+                let decoded = chunk
+                    .iter()
+                    .filter_map(|key| decode_hex(key))
+                    .collect::<Vec<_>>();
+                if decoded.is_empty() {
+                    continue;
+                }
+                let sql = format!(
+                    "SELECT full_key FROM blob_payloads WHERE full_key IN ({})",
+                    vec!["?"; decoded.len()].join(",")
+                );
+                let mut statement = connection.prepare_cached(&sql)?;
+                for key in statement.query_map(rusqlite::params_from_iter(&decoded), |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })? {
+                    present.insert((plane_id, key?));
+                }
+            }
+        }
+        // Return the first missing key in manifest order, even though membership
+        // reads are grouped by plane and sorted for index locality.
+        for &(plane, key) in keys {
+            let plane_id = usize::from(plane == ArtifactPlane::Callgraph);
+            if decode_hex(key).is_none_or(|key| !present.contains(&(plane_id, key))) {
+                return Err(ViewError::MissingBlob {
+                    plane,
+                    key: key.to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn trigram_is_present(&self) -> Result<bool> {
         Ok(self.trigram.is_file())
     }
