@@ -408,6 +408,7 @@ pub fn prepare_checkout(
     prepared.profile.enter(2, phase)?;
     let derived = view.derived_path(&next_generation)?;
     let mut cloned_base = false;
+    let clone_started = Instant::now();
     if let Some(base) = current_generation.as_deref() {
         let base_path = view.derived_path(base)?;
         if base_path.is_file() {
@@ -415,14 +416,17 @@ pub fn prepare_checkout(
             cloned_base = true;
         }
     }
+    prepared.profile.derived_clone_ms = clone_started.elapsed().as_millis();
+    let materialization_started = Instant::now();
     if let Some(base_manifest) = previous.as_ref().filter(|_| cloned_base) {
-        let stats = super::materialization::apply_manifest_diff(
+        let (stats, timings) = super::materialization::apply_manifest_diff_profiled(
             &derived,
             base_manifest,
             &manifest,
             callgraph.path(),
         )
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+        prepared.profile.materialization = timings;
         log::info!(
             "view manifest diff: generation={} stats={stats:?}",
             next_generation
@@ -435,6 +439,7 @@ pub fn prepare_checkout(
         )
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
     }
+    prepared.profile.materialization_call_ms = materialization_started.elapsed().as_millis();
     let trigram = view.trigram_path(&next_generation)?;
     fs::write(&trigram, [])?;
     let artifacts = PublicationArtifacts {
@@ -451,6 +456,7 @@ pub fn prepare_checkout(
         callgraph: callgraph.path().to_path_buf(),
         trigram,
     };
+    let closure_started = Instant::now();
     let publication = view.prepare_with_observer(
         &PublicationRequest {
             generation: &next_generation,
@@ -462,6 +468,7 @@ pub fn prepare_checkout(
         &closure,
         None,
     )?;
+    prepared.profile.closure_ms = closure_started.elapsed().as_millis();
     prepared.profile.derived_bytes = fs::metadata(&derived)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
@@ -495,6 +502,10 @@ struct PublicationProfile {
     started: Instant,
     total_ms: u128,
     derived_bytes: u64,
+    derived_clone_ms: u128,
+    materialization_call_ms: u128,
+    closure_ms: u128,
+    materialization: super::materialization::profile::PhaseTimings,
 }
 
 impl PublicationProfile {
@@ -515,6 +526,10 @@ impl PublicationProfile {
             started: now,
             total_ms: 0,
             derived_bytes: 0,
+            derived_clone_ms: 0,
+            materialization_call_ms: 0,
+            closure_ms: 0,
+            materialization: super::materialization::profile::PhaseTimings::default(),
         }
     }
 
@@ -555,12 +570,28 @@ fn publication_profile_line(profile: &PublicationProfile) -> String {
     // pointer transaction is a subset of the cas phase, which also includes
     // waiting to acquire the actor barrier.
     format!(
-        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} pointer_ms={} total_ms={} derived_bytes={}",
+        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} derived_clone_ms={} materialization_call_ms={} closure_ms={} materialize_load_bindings_select_ms={} materialize_delete_rows_ms={} materialize_owned_blob_decode_insert_ms={} materialize_join_load_payloads_ms={} materialize_join_decode_bind_index_entries_ms={} materialize_join_index_surface_replay_ms={} materialize_join_decode_resolved_callers_ms={} materialize_join_resolve_record_ms={} materialize_join_dependency_union_ms={} materialize_selected_join_ms={} materialize_write_bindings_ms={} materialize_emit_refs_edges_ms={} materialize_commit_ms={} pointer_ms={} total_ms={} derived_bytes={}",
         profile.root.display(), profile.outcome, profile.candidates, profile.blob_puts,
         profile.pending_paths, profile.phase_ms[0], profile.phase_ms[1],
         profile.phase_ms[2], profile.phase_ms[3], profile.head_ms, profile.assembly_ms,
-        profile.phase_ms[1], profile.phase_ms[2], profile.pointer_ms,
-        profile.total_ms, profile.derived_bytes,
+        profile.phase_ms[1], profile.materialization_call_ms,
+        profile.derived_clone_ms,
+        profile.materialization_call_ms,
+        profile.closure_ms,
+        profile.materialization.load_bindings_select_ms,
+        profile.materialization.delete_rows_ms,
+        profile.materialization.owned_blob_decode_and_insert_ms,
+        profile.materialization.join_load_payloads_ms,
+        profile.materialization.join_decode_bind_index_entries_ms,
+        profile.materialization.join_index_and_surface_replay_ms,
+        profile.materialization.join_decode_resolved_callers_ms,
+        profile.materialization.join_resolve_and_record_ms,
+        profile.materialization.join_dependency_union_ms,
+        profile.materialization.selected_join_ms,
+        profile.materialization.write_bindings_ms,
+        profile.materialization.emit_refs_edges_ms,
+        profile.materialization.commit_ms,
+        profile.pointer_ms, profile.total_ms, profile.derived_bytes,
     )
 }
 
@@ -573,9 +604,39 @@ mod tests {
         let mut profile = PublicationProfile::new(Path::new("/checkout"));
         profile.outcome = "published";
         profile.phase_ms = [5, 6, 7, 8];
+        profile.derived_clone_ms = 9;
+        profile.materialization_call_ms = 10;
+        profile.closure_ms = 11;
+        profile.materialization = crate::views::materialization::profile::PhaseTimings {
+            load_bindings_select_ms: 11,
+            delete_rows_ms: 12,
+            owned_blob_decode_and_insert_ms: 13,
+            join_load_payloads_ms: 14,
+            join_decode_bind_index_entries_ms: 15,
+            join_index_and_surface_replay_ms: 16,
+            join_decode_resolved_callers_ms: 17,
+            join_resolve_and_record_ms: 18,
+            join_dependency_union_ms: 19,
+            selected_join_ms: 20,
+            write_bindings_ms: 21,
+            emit_refs_edges_ms: 22,
+            commit_ms: 23,
+        };
         let line = publication_profile_line(&profile);
         assert!(line.contains("plane=views root=/checkout outcome=published"));
         assert!(line.contains("manifest_ms=5 blobs_ms=6 derived_ms=7 cas_ms=8"));
+        assert!(line.contains("derived_clone_ms=9 materialization_call_ms=10 closure_ms=11"));
+        assert!(line.contains("blob_ms=6 materialize_ms=10"));
+        assert!(line.contains(
+            "materialize_load_bindings_select_ms=11 materialize_delete_rows_ms=12 \
+             materialize_owned_blob_decode_insert_ms=13 materialize_join_load_payloads_ms=14 \
+             materialize_join_decode_bind_index_entries_ms=15 \
+             materialize_join_index_surface_replay_ms=16 \
+             materialize_join_decode_resolved_callers_ms=17 \
+             materialize_join_resolve_record_ms=18 materialize_join_dependency_union_ms=19 \
+             materialize_selected_join_ms=20 materialize_write_bindings_ms=21 \
+             materialize_emit_refs_edges_ms=22 materialize_commit_ms=23"
+        ));
         assert_eq!(line.matches("index_event kind=view_publication").count(), 1);
     }
 }

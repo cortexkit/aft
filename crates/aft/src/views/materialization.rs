@@ -55,6 +55,21 @@ pub fn apply_manifest_diff(
     new_manifest: &crate::views::Manifest,
     callgraph_blob_database: &Path,
 ) -> Result<MaterializeStats> {
+    apply_manifest_diff_profiled(
+        database_path,
+        base_manifest,
+        new_manifest,
+        callgraph_blob_database,
+    )
+    .map(|(stats, _)| stats)
+}
+
+pub(crate) fn apply_manifest_diff_profiled(
+    database_path: &Path,
+    base_manifest: &crate::views::Manifest,
+    new_manifest: &crate::views::Manifest,
+    callgraph_blob_database: &Path,
+) -> Result<(MaterializeStats, profile::PhaseTimings)> {
     materialize(
         database_path,
         callgraph_blob_database,
@@ -79,7 +94,7 @@ fn materialize(
     callgraph_blob_database: &Path,
     manifest: &crate::views::Manifest,
     mut base: Option<&crate::views::Manifest>,
-) -> Result<MaterializeStats> {
+) -> Result<(MaterializeStats, profile::PhaseTimings)> {
     let mut profile = profile::PhaseTimer::new(if base.is_some() {
         "incremental"
     } else {
@@ -121,7 +136,8 @@ fn materialize(
         } else if version.as_deref() != Some(MATERIALIZATION_VERSION) {
             base = None;
         } else if base_manifest == manifest {
-            return Ok(MaterializeStats::default());
+            profile.finish("load_bindings_select");
+            return Ok((MaterializeStats::default(), profile.into_timings()));
         }
     }
     transaction.execute_batch("CREATE TABLE IF NOT EXISTS view_bindings (file_path TEXT PRIMARY KEY, payload TEXT NOT NULL)")?;
@@ -505,7 +521,7 @@ fn materialize(
     )?;
     transaction.commit()?;
     profile.finish("commit");
-    Ok(stats)
+    Ok((stats, profile.into_timings()))
 }
 
 struct ManifestViewBlobReader<'a> {
