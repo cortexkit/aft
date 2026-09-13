@@ -2,8 +2,12 @@
 //!
 //! Run against a copy of a production store:
 //! `AFT_CALLGRAPH_REFRESH_STORE=/path/to/<root-key> AFT_CALLGRAPH_REFRESH_ROOT=/path/to/project cargo test -p agent-file-tools --test callgraph_refresh_bench -- --ignored --nocapture`
-//! Set `AFT_CALLGRAPH_REFRESH_FILE` to choose a project-relative file. Without
-//! these variables the harness builds a synthetic store with a large fixture.
+//! Set `AFT_CALLGRAPH_REFRESH_FILE` to choose a project-relative file, or
+//! `AFT_CALLGRAPH_REFRESH_PATHS` to a newline-delimited list for a real transition.
+//! In path-list mode the copied store must represent the base and the project
+//! must contain the next revision: warmup and forced staleness are skipped so
+//! they cannot consume the transition before measurement. Without store/root
+//! variables the harness builds a synthetic store with a large fixture.
 
 use aft::callgraph_store::{project_dead_code_snapshot, CallGraphStore, RefreshFilesProfile};
 use rusqlite::{backup::Backup, params, Connection, OpenFlags};
@@ -17,6 +21,7 @@ use tempfile::TempDir;
 #[ignore = "offline benchmark copies or builds a large callgraph store"]
 fn bench_refresh_files_on_store_copy() {
     let temp = tempfile::tempdir().expect("benchmark temp dir");
+    let path_list = std::env::var_os("AFT_CALLGRAPH_REFRESH_PATHS");
     let (store, changed_file) = match (
         std::env::var_os("AFT_CALLGRAPH_REFRESH_STORE"),
         std::env::var_os("AFT_CALLGRAPH_REFRESH_ROOT"),
@@ -26,6 +31,7 @@ fn bench_refresh_files_on_store_copy() {
             Path::new(&source_store),
             PathBuf::from(project_root),
             std::env::var_os("AFT_CALLGRAPH_REFRESH_FILE").map(PathBuf::from),
+            path_list.is_some(),
         ),
         (None, None) => build_synthetic_store(&temp),
         _ => panic!(
@@ -33,14 +39,23 @@ fn bench_refresh_files_on_store_copy() {
         ),
     };
 
-    let warmup = store
-        .refresh_files(std::slice::from_ref(&changed_file))
-        .expect("normalize copied rows with the measured binary");
-    eprintln!("measurement_warmup stats={warmup:?}");
-    force_stale(store.sqlite_path(), store.project_root(), &changed_file);
-
+    let changed_files = if let Some(path_list) = path_list {
+        assert!(
+            std::env::var_os("AFT_CALLGRAPH_REFRESH_STORE").is_some(),
+            "path-list mode requires a base store"
+        );
+        read_transition_paths(Path::new(&path_list), store.project_root())
+    } else {
+        let warmup = store
+            .refresh_files(std::slice::from_ref(&changed_file))
+            .expect("normalize copied rows with the measured binary");
+        eprintln!("measurement_warmup stats={warmup:?}");
+        force_stale(store.sqlite_path(), store.project_root(), &changed_file);
+        report_refresh_row_counts(store.sqlite_path(), store.project_root(), &changed_file);
+        vec![changed_file]
+    };
+    eprintln!("refresh_requested_paths={}", changed_files.len());
     report_query_plans(store.sqlite_path());
-    report_refresh_row_counts(store.sqlite_path(), store.project_root(), &changed_file);
     let initial_checkpoint = wal_checkpoint(store.sqlite_path(), "TRUNCATE");
     assert_eq!(initial_checkpoint.busy, 0, "clear WAL before measurement");
     sync_sqlite_file_set(store.sqlite_path());
@@ -50,8 +65,8 @@ fn bench_refresh_files_on_store_copy() {
     let refresh_cpu_before = process_cpu_us();
     let refresh_started = Instant::now();
     let (stats, profile) = store
-        .refresh_files_profiled(std::slice::from_ref(&changed_file))
-        .expect("profile one-file refresh");
+        .refresh_files_profiled(&changed_files)
+        .expect("profile incremental refresh");
     let refresh_elapsed = refresh_started.elapsed();
     let refresh_cpu_us = process_cpu_us().saturating_sub(refresh_cpu_before);
     let refresh_usage = process_write_usage().delta(refresh_usage_before);
@@ -105,6 +120,7 @@ fn open_production_store_copy(
     source_store: &Path,
     project_root: PathBuf,
     requested_file: Option<PathBuf>,
+    transition: bool,
 ) -> (CallGraphStore, PathBuf) {
     let pointer = fs::read_dir(source_store)
         .expect("read source store directory")
@@ -123,6 +139,11 @@ fn open_production_store_copy(
     let copied_db = copied_store.join(format!("{project_key}.sqlite"));
     sqlite_backup(&source_db, &copied_db);
 
+    if transition {
+        let store =
+            CallGraphStore::open(copied_store, project_root).expect("open copied base store");
+        return (store, PathBuf::new());
+    }
     let rel_path = requested_file.unwrap_or_else(|| select_fixture_file(&copied_db));
     let changed_file = if rel_path.is_absolute() {
         rel_path
@@ -612,4 +633,47 @@ fn output_blocks() -> u64 {
 #[cfg(not(unix))]
 fn output_blocks() -> u64 {
     0
+}
+
+fn read_transition_paths(list: &Path, root: &Path) -> Vec<PathBuf> {
+    let text = fs::read_to_string(list).expect("read transition path list");
+    let paths: std::collections::BTreeSet<_> = text
+        .lines()
+        .map(|line| {
+            let path = Path::new(line);
+            assert!(
+                !line.is_empty()
+                    && path
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_))),
+                "transition paths must be non-empty project-relative paths"
+            );
+            root.join(path)
+        })
+        .collect();
+    assert!(!paths.is_empty(), "transition path list must not be empty");
+    paths.into_iter().collect()
+}
+
+#[test]
+fn transition_paths_include_removed_files_and_deduplicate() {
+    let temp = tempfile::tempdir().unwrap();
+    let list = temp.path().join("paths.txt");
+    fs::write(&list, "src/removed.ts\nsrc/added.ts\nsrc/removed.ts\n").unwrap();
+    assert_eq!(
+        read_transition_paths(&list, temp.path()),
+        vec![
+            temp.path().join("src/added.ts"),
+            temp.path().join("src/removed.ts")
+        ]
+    );
+}
+
+#[test]
+#[should_panic(expected = "project-relative paths")]
+fn transition_paths_reject_parent_escape() {
+    let temp = tempfile::tempdir().unwrap();
+    let list = temp.path().join("paths.txt");
+    fs::write(&list, "../outside.ts\n").unwrap();
+    read_transition_paths(&list, temp.path());
 }
