@@ -36,6 +36,7 @@ docker build \
 
 run_args=(
   --rm
+  --name "aft-opencode2-$RUN_ID"
   --platform linux/amd64
   --volume "$ARTIFACT_ROOT:/artifacts"
   --env "AFT_CHECKOUT_SHA=$GIT_SHA"
@@ -60,4 +61,9 @@ if [[ -n "${AFT_BINARY_PATH:-}" ]]; then
 fi
 
 printf 'Running OpenCode 2 matrix; forensics: %s/%s\n' "$ARTIFACT_ROOT" "$RUN_ID"
+# `docker run` in the foreground does not forward the signal that kills this
+# script (a caller's outer time cap, ctrl-c): the container keeps running its
+# host processes for hours and loads the box. Name it and remove it on exit.
+cleanup() { docker rm -f "aft-opencode2-$RUN_ID" >/dev/null 2>&1 || true; }
+trap cleanup EXIT INT TERM
 docker run "${run_args[@]}" "$IMAGE" "$@"
