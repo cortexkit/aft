@@ -6,7 +6,7 @@
 
 The cold writer remains available through its old callgraph-store re-export. The materializer shares the existing graph schema, rather than duplicating it. Edges are owned by their `ref_id` through `refs.caller_file`; node IDs encode path, scoped name and AST ordinal, not SQLite rowids. Changed target ordinals therefore require incoming reference/edge relinking.
 
-Derived metadata version **3** includes `view_manifest_fingerprint` and `view_materialization_version`. A mismatched fingerprint is refused. An older materialization version, or a legacy clone with neither diff metadata key, takes the cold path, preventing use of a database without binding dependencies. `view_bindings` is file-owned, and the existing `file_dependencies(file_path, dep_file)` table stores reverse-queryable dependency rows. Other legacy side tables are not populated by either view materialization path.
+Derived metadata version **4** includes `view_manifest_fingerprint` and `view_materialization_version`. A mismatched fingerprint is refused. An older materialization version, or a legacy clone with neither diff metadata key, takes the cold path, preventing use of a database without binding dependencies. `view_bindings` is file-owned, and the existing `file_dependencies(file_path, dep_file)` table stores reverse-queryable dependency rows. Other legacy side tables are not populated by either view materialization path.
 
 ## Selection and remaining corpus work
 
@@ -16,7 +16,7 @@ Binding work and reference work are separate. Unchanged callers reuse bindings u
 
 The resolver reads `package.json`, `tsconfig.json`, `pnpm-workspace.yaml` and `Cargo.toml` through its manifest facts. Changes to those names, explicitly marked resolution inputs, synthetic entries or symlink/gitlink identity force full resolution. Existing directory probes are excluded from persisted caller dependencies: workspace-discovery memo hits omit those incidental probes, and configuration changes invalidate discovery globally. File probes and misses are retained. Rust's absent declared-module candidates need recording **before** `FactPaths`' canonicalization can reject them.
 
-The join still reconstructs the complete manifest's symbol index. Manifest facts are memoized for the duration of that immutable join, with dependency probes recorded on hits as well as misses. Row emission no longer decodes every unchanged blob a second time: it loads only changed owners and the callers/targets needed by actual emitted references. The optimization bounds expensive binding/resolution work, not every CPU instruction, to changed files and affected consumers. There is no separate semantic-plane materialization in this function.
+The join restores compact persisted per-file symbol surfaces and rebuilds only changed or membership-invalidated entries. Manifest facts and lazily loaded immutable payloads are memoized for the duration of that join, with dependency probes recorded on hits as well as misses. Unchanged callers decode only after their consumed surface queries change. Row emission loads only changed owners and the callers/targets needed by actual emitted references. Restoring compact lookup maps and loading binding caches still scales with the manifest; expensive source/AST decode, binding and resolution do not. There is no separate semantic-plane materialization in this function. Historical version 3 measurements below predate persisted file surfaces.
 
 ## Measurements (Darwin, debug builds)
 
@@ -201,3 +201,25 @@ All three runs pass every-table parity against their own cold materialization. S
 The benchmark maps **every WAL frame** through the final database's `dbstat` page ownership, preserving repeated page writes. This is final-owner attribution: pages reused mid-transaction can have had another owner. Missing `dbstat` fails the benchmark rather than silently printing an empty map. The largest baseline incremental object is **view_bindings: 46,090,440 bytes**, rising to 48,261,680 with persisted surfaces; `refs` is 18,366,960. The five refs secondary indexes together are 30,731,080 bytes: caller-file 6,044,040; caller-node/kind 8,610,800; kind/caller-file 6,888,640; short-name 5,479,600; target-file 3,708,000. Ref primary-key index: 6,600,240. Edge secondary indexes total 11,568,960. No individual secondary index dominates: removing a shared graph index is not justified by this profile. Binding payload churn and collective ref/edge row/index churn remain the physical-write problem; a separate normalized binding/surface persistence layout is a better next write-amplification experiment than dropping one shared query index.
 
 Raw logs: `target/real-release-before.log`, `target/real-release-before-profile.log`, `target/real-release-surface.log`, and `target/surface-mutation.log`. The measured databases remain under `target/view-diff-real-300-input/`.
+
+### Final release drill after persistent surfaces
+
+Measured implementation: `f143185c`; observed `2026-09-13T01:12:24Z`. Command: `scripts/views-branch-drill.sh --mode both --binary "$PWD/target/release/aft" --storage "$PWD/target/branch-drill-surface"`, after a fresh release binary build. Views warm-up: 956,554 ms; legacy warm-up: 5,418 ms. The designated checkout was restored clean to `5716f8ba60e79ec60ec485b6e5291c0b0bc1f252`. Reports were copied to `target/branch-drill-surface.{json,md}` and historical investigation files restored.
+
+| switch | on publication_ms | on puts | on embeds | on cpu_s | on rss_delta_mb | on correct_ms | off publication_ms | off puts | off embeds | off cpu_s | off rss_delta_mb | off correct_ms |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| HEAD→a085bf62a459 | 53980 | 0 | 3 | 137.86 | 754.453 | 53980 | — | — | 3 | 65.72 | 2686.703 | 59809 |
+| a085bf62a459→HEAD | 48569 | 0 | 0 | 69.9 | -130.719 | 48875 | — | — | 4 | 46.63 | -543.312 | 44762 |
+| HEAD→refs/remotes/upstream/v2-timeouts | 43846 | 0 | 1 | 70.0 | -443.75 | 44216 | — | — | 3 | 48.14 | 2.391 | 44020 |
+| refs/remotes/upstream/v2-timeouts→HEAD | 46048 | 0 | 0 | 72.51 | -416.438 | 46047 | — | — | 4 | 44.67 | 41.078 | 38002 |
+
+| switch | derived ms | over 10,000 ms target | final publication event total ms | views correct_ms minus legacy correct_ms |
+| --- | ---: | ---: | ---: | ---: |
+| HEAD → A | 23539 | 13539 | 26703 | -5829 |
+| A → HEAD | 20245 | 10245 | 23696 | +4113 |
+| HEAD → B | 18042 | 8042 | 21061 | +196 |
+| B → HEAD | 19521 | 9521 | 22779 | +8045 |
+
+**Shipping criterion remains unmet.** Only HEAD → A beats legacy to correctness; views CPU is higher on every row. The offline 8.766 s result must not be substituted for the drill's 18–24 s derived phase. Legacy times also increased substantially versus the retained before table, so cross-run wall-time changes are not a controlled speedup claim. Within the final run, there is another ~23–27 s between switch initiation and the final publication event's own measured duration, including the earlier pending publication and semantic readiness work; that is outside this materialization-only change. Final published-event puts are zero, but earlier pending forward events put 269 / 13 blobs, and embeddings remain 3 / 1 on forward legs. The generated script's static zero-embedding narrative is not evidence.
+
+The next measured offline CPU/wall buckets are resolver/surface recording (~2.11 s) and ref/edge emission (~2.08 s). Resolution still runs once per reference. A cache keyed only by `(dependent, import binding)` would be unsound: namespace member accesses differ by `full_ref`/`short_name`, value refs apply callable-target checks, and Rust resolution consumes additional raw-reference context. A narrower JS/TS target lookup memo could preserve those inputs and replay both surface queries and dependency probes, but has not been implemented or claimed here. Independently, the dependency-basis set is reconstructed per reference in the existing selected loop; hoisting that immutable per-caller set is a lower-risk next experiment. These follow-ups and normalized binding storage need their own work guards and same-input measurements. No unmeasured second optimization was included to make this run appear to pass.
