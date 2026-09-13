@@ -897,6 +897,11 @@ export function buildDoctorFixPlan(
         kind: "plugin",
         message: `Will run \`pi install ${adapter.pluginEntryWithVersion}\` to register ${adapter.displayName}`,
       });
+    } else if (adapter.kind === "omp") {
+      items.push({
+        kind: "plugin",
+        message: `Will ask OMP to install or enable ${adapter.pluginPackageName}`,
+      });
     } else {
       items.push({
         kind: "plugin",
@@ -1318,6 +1323,7 @@ async function maybeFixPlugin(adapter: HarnessAdapter): Promise<void> {
 function describeAdapterInstallHint(kind: string): string {
   if (kind === "opencode") return "https://opencode.ai/docs/install";
   if (kind === "pi") return "https://github.com/badlogic/pi-mono";
+  if (kind === "omp") return "https://omp.sh";
   return "(unknown harness)";
 }
 

@@ -1,6 +1,6 @@
 /**
  * HarnessAdapter — abstracts what the unified AFT CLI needs to know about a
- * specific agent harness (OpenCode, Pi, and future entries).
+ * specific agent harness (OpenCode, Pi, OMP, and future entries).
  *
  * Each adapter covers:
  *   1. *Detection* — is the harness installed? is AFT registered with it?
@@ -12,7 +12,7 @@
  * structures; async work lives in the command layer.
  */
 
-export type HarnessKind = "opencode" | "pi";
+export type HarnessKind = "opencode" | "pi" | "omp";
 
 export interface HarnessConfigPaths {
   /** Primary config dir (e.g. `~/.config/opencode`, `~/.pi/agent`). */

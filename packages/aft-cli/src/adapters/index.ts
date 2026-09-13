@@ -1,11 +1,12 @@
+import { OmpAdapter } from "./omp.js";
 import { OpenCodeAdapter } from "./opencode.js";
 import { PiAdapter } from "./pi.js";
 import type { HarnessAdapter, HarnessKind } from "./types.js";
 
 export type { HarnessAdapter, HarnessKind } from "./types.js";
-export { OpenCodeAdapter, PiAdapter };
+export { OmpAdapter, OpenCodeAdapter, PiAdapter };
 
-const ALL: HarnessAdapter[] = [new OpenCodeAdapter(), new PiAdapter()];
+const ALL: HarnessAdapter[] = [new OpenCodeAdapter(), new PiAdapter(), new OmpAdapter()];
 
 export function getAllAdapters(): HarnessAdapter[] {
   return ALL;

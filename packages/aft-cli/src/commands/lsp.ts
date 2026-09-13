@@ -107,7 +107,7 @@ export function findProjectRootForFile(
 }
 
 export function printLspDoctorHelp(): void {
-  console.log(`Usage: ${CLI} doctor lsp <file> [--harness opencode|pi]`);
+  console.log(`Usage: ${CLI} doctor lsp <file> [--harness opencode|pi|omp]`);
   console.log("");
   console.log("Inspect what AFT's LSP layer would do for a file.");
 }
@@ -269,7 +269,7 @@ function buildConfigureParams(adapter: HarnessAdapter, projectRoot: string): Aft
   // are stripped by the resolver, same as the plugins). lsp_paths_extra is
   // process-state (the install cache dirs) and stays a flat param.
   const userConfigPath = adapter.detectConfigPaths().aftConfig;
-  const dir = adapter.kind === "pi" ? ".pi" : ".opencode";
+  const dir = adapter.kind === "pi" ? ".pi" : adapter.kind === "omp" ? ".cortexkit" : ".opencode";
   const projectJsonc = join(projectRoot, dir, "aft.jsonc");
   const projectJson = join(projectRoot, dir, "aft.json");
   const projectConfigPath = existsSync(projectJsonc) ? projectJsonc : projectJson;

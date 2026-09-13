@@ -118,10 +118,11 @@ function printNextSteps(adapter: HarnessAdapter): void {
     );
     return;
   }
-  if (adapter.kind === "pi") {
+  if (adapter.kind === "pi" || adapter.kind === "omp") {
+    const host = adapter.kind === "omp" ? "OMP" : "Pi";
     note(
       [
-        "Restart your Pi session so the extension registers.",
+        `Restart your ${host} session so the extension registers.`,
         `Verify with: \`${CLI} doctor\`.`,
       ].join("\n"),
       "Next steps",

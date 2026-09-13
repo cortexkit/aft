@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import type { HarnessAdapter } from "../adapters/types.js";
+import { getOmpSessionsRoot } from "./omp-paths.js";
 
 export interface RecentSession {
   id: string;
@@ -27,6 +28,7 @@ export function listRecentSessions(adapter: HarnessAdapter): RecentSession[] {
   try {
     if (adapter.kind === "opencode") return listRecentOpenCodeSessions();
     if (adapter.kind === "pi") return listRecentPiSessions();
+    if (adapter.kind === "omp") return listPiSessionsFromDir(getOmpSessionsRoot());
     return [];
   } catch {
     return [];

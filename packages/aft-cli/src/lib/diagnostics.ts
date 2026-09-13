@@ -341,7 +341,7 @@ function compareLooseSemver(a: string, b: string): number {
 }
 
 function pluginPackageNameForHarness(kind: string): string {
-  if (kind === "pi") return "@cortexkit/aft-pi";
+  if (kind === "pi" || kind === "omp") return "@cortexkit/aft-pi";
   return "@cortexkit/aft-opencode";
 }
 

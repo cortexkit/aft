@@ -6,13 +6,13 @@ function parseHarnessFlag(argv: string[]): HarnessKind | null {
   const idx = argv.indexOf("--harness");
   if (idx === -1 || idx === argv.length - 1) return null;
   const value = argv[idx + 1];
-  if (value === "opencode" || value === "pi") return value;
+  if (value === "opencode" || value === "pi" || value === "omp") return value;
   return null;
 }
 
 /**
  * Resolve which adapter(s) to act on.
- *   - `--harness opencode|pi` → single adapter (hard override)
+ *   - `--harness opencode|pi|omp` → single adapter (hard override)
  *   - otherwise: installed hosts, with interactive prompts when ambiguous
  *     - 0 installed → prompt user to pick (give install hints)
  *     - 1 installed → use it silently
@@ -34,7 +34,7 @@ export async function resolveAdaptersForCommand(
   if (installed.length === 0) {
     // None installed — still let the user pick one so setup can give them
     // install instructions for that harness.
-    log.warn("No supported harness was detected on PATH (opencode, pi).");
+    log.warn("No supported harness was detected on PATH (opencode, pi, omp).");
     const pick = await selectOne("Which harness do you want to configure?", [
       {
         label: "OpenCode",
@@ -44,6 +44,11 @@ export async function resolveAdaptersForCommand(
       {
         label: "Pi",
         value: "pi" as HarnessKind,
+        hint: "@cortexkit/aft-pi",
+      },
+      {
+        label: "Oh My Pi (OMP)",
+        value: "omp" as HarnessKind,
         hint: "@cortexkit/aft-pi",
       },
     ]);

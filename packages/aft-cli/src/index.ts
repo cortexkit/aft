@@ -34,6 +34,7 @@ function printHelp(): void {
   console.log("  Harness selection:");
   console.log("    --harness opencode    Target OpenCode only");
   console.log("    --harness pi          Target Pi only");
+  console.log("    --harness omp         Target OMP (oh-my-pi) only");
   console.log("    (default: auto-detect, prompt if multiple detected)");
   console.log("");
   console.log("  Usage:");
