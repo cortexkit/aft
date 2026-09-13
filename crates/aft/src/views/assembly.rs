@@ -487,6 +487,7 @@ pub fn prepare_checkout(
         semantic: semantic.path().to_path_buf(),
         callgraph: callgraph.path().to_path_buf(),
         trigram,
+        connections: Default::default(),
     };
     let closure_started = Instant::now();
     let publication = view.prepare_with_observer(
@@ -717,6 +718,9 @@ struct SqliteClosure {
     semantic: PathBuf,
     callgraph: PathBuf,
     trigram: PathBuf,
+    // Lazy handles preserve probes of empty planes and malformed keys without
+    // opening their databases. Valid keys share a handle for this closure only.
+    connections: std::cell::RefCell<BTreeMap<bool, crate::db::lifecycle::TrackedConnection>>,
 }
 
 impl PublicationClosure for SqliteClosure {
@@ -728,14 +732,20 @@ impl PublicationClosure for SqliteClosure {
             ArtifactPlane::Semantic => &self.semantic,
             ArtifactPlane::Callgraph => &self.callgraph,
         };
-        Ok(Connection::open(path)?
-            .query_row(
-                "SELECT 1 FROM blob_payloads WHERE full_key = ?1",
-                [key],
-                |_| Ok(()),
-            )
+        let mut connections = self.connections.borrow_mut();
+        let semantic = plane == ArtifactPlane::Semantic;
+        if let std::collections::btree_map::Entry::Vacant(entry) = connections.entry(semantic) {
+            entry.insert(crate::db::lifecycle::TrackedConnection::open(
+                path,
+                crate::db::lifecycle::SqliteStore::BlobStore,
+            )?);
+        }
+        let present = connections[&semantic]
+            .prepare_cached("SELECT 1 FROM blob_payloads WHERE full_key = ?1")?
+            .query_row([key], |_| Ok(()))
             .optional()?
-            .is_some())
+            .is_some();
+        Ok(present)
     }
 
     fn trigram_is_present(&self) -> Result<bool> {
@@ -781,3 +791,7 @@ fn read_symlink_bytes(path: &Path) -> Result<Vec<u8>> {
         Ok(target.to_string_lossy().as_bytes().to_vec())
     }
 }
+
+#[cfg(test)]
+#[path = "closure_connection_tests.rs"]
+mod closure_connection_tests;

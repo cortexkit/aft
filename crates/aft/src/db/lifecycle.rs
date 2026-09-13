@@ -96,20 +96,28 @@ fn register_close(store: SqliteStore) {
 /// connections concurrently, so a test cannot assert a delta against it. This
 /// mirror only ever sees the calling thread's own opens and closes.
 #[cfg(test)]
-mod thread_counts {
+pub(crate) mod thread_counts {
     use super::SqliteStore;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
 
     thread_local! {
         static COUNTS: RefCell<BTreeMap<SqliteStore, i64>> = RefCell::new(BTreeMap::new());
+        static OPENS: RefCell<BTreeMap<SqliteStore, u64>> = RefCell::new(BTreeMap::new());
     }
 
     pub(super) fn record(store: SqliteStore, delta: i64) {
         COUNTS.with(|counts| *counts.borrow_mut().entry(store).or_default() += delta);
+        if delta > 0 {
+            OPENS.with(|counts| *counts.borrow_mut().entry(store).or_default() += 1);
+        }
     }
 
-    pub(super) fn open_on_this_thread(store: SqliteStore) -> i64 {
+    pub(crate) fn total_opens_on_this_thread(store: SqliteStore) -> u64 {
+        OPENS.with(|counts| counts.borrow().get(&store).copied().unwrap_or(0))
+    }
+
+    pub(crate) fn open_on_this_thread(store: SqliteStore) -> i64 {
         COUNTS.with(|counts| counts.borrow().get(&store).copied().unwrap_or(0))
     }
 }
