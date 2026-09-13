@@ -29,6 +29,9 @@ use super::{
 pub(crate) enum ProjectionKind {
     Spliced,
     Full,
+    /// The cached snapshot for the current revision was handed back without
+    /// touching the store: no projection work at all.
+    Reused,
 }
 
 /// Why a projection took the path it did, plus the journal/corpus counts that
@@ -37,11 +40,14 @@ pub(crate) enum ProjectionKind {
 /// `reason` is `Some` only for `Full` projections; the reasons are `cold`
 /// (no previous snapshot or a legacy store without a durable revision),
 /// `journal_gap` (a missing/unparseable journal entry bridged the revisions),
-/// `journal_oversize` (a delta batch exceeded the journal byte bound), and
-/// `revision_unchanged_reuse` (the cached snapshot for the current revision
-/// was reused without touching the store). No `generation_changed` arm exists:
-/// the cache identity already pairs the cold-build generation with the durable
-/// revision, so a generation change surfaces as `cold` or a cache miss.
+/// and `journal_oversize` (a delta batch exceeded the journal byte bound).
+/// No `generation_changed` arm exists: the cache identity already pairs the
+/// cold-build generation with the durable revision, so a generation change
+/// surfaces as `cold` or a cache miss.
+///
+/// The journal records each write's callers already extended with their
+/// dependents, so `changed_files` counts every file re-projected by a splice;
+/// the caller/dependent split is not recoverable at read time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProjectionVerdict {
     pub kind: ProjectionKind,
@@ -51,8 +57,6 @@ pub(crate) struct ProjectionVerdict {
     pub journal_bytes: u64,
     /// Files re-projected from the delta (splice) or 0 for a full projection.
     pub changed_files: usize,
-    /// Transitive dependents pulled in by the delta (splice) or 0 for full.
-    pub dependents: usize,
 }
 
 #[cfg(test)]
@@ -131,7 +135,13 @@ pub(crate) fn project_dead_code_snapshot_incremental(
     let mut paths = SnapshotPathResolver::new(&project_root);
     let (files, exported_symbols, outbound_calls, entry_point_symbols, verdict) =
         match (delta, previous) {
-            (DeltaRead::Spliced { callers, journal_bytes }, Some((_, previous))) => {
+            (
+                DeltaRead::Spliced {
+                    callers,
+                    journal_bytes,
+                },
+                Some((_, previous)),
+            ) => {
                 let mut replacements = BTreeMap::new();
                 let mut file_replacements = BTreeMap::new();
                 let mut export_replacements = BTreeMap::new();
@@ -158,7 +168,6 @@ pub(crate) fn project_dead_code_snapshot_incremental(
                     reason: None,
                     journal_bytes,
                     changed_files: callers.len(),
-                    dependents: 0,
                 };
                 (
                     splice_files(&previous.files, file_replacements, |path| path),
@@ -185,7 +194,6 @@ pub(crate) fn project_dead_code_snapshot_incremental(
                     reason: Some(reason),
                     journal_bytes,
                     changed_files: 0,
-                    dependents: 0,
                 };
                 (
                     project_files_from_store(&tx, &mut paths, None)?,
@@ -296,11 +304,7 @@ pub(super) fn record_projection_delta(
     Ok(())
 }
 
-fn projection_delta_since(
-    conn: &Connection,
-    previous: u64,
-    current: u64,
-) -> Result<DeltaRead> {
+fn projection_delta_since(conn: &Connection, previous: u64, current: u64) -> Result<DeltaRead> {
     if current < previous || current - previous > DELTA_HISTORY {
         return Ok(DeltaRead::Gap);
     }
@@ -314,7 +318,9 @@ fn projection_delta_since(
                 |row| row.get(0),
             )
             .optional()?;
-        let Some(value) = value else { return Ok(DeltaRead::Gap) };
+        let Some(value) = value else {
+            return Ok(DeltaRead::Gap);
+        };
         if let Some(stored) = value.strip_prefix("oversize:") {
             if stored == revision.to_string() {
                 return Ok(DeltaRead::Oversize);

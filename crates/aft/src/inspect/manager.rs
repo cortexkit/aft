@@ -26,8 +26,8 @@ use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 #[cfg(test)]
 use crate::callgraph_store::project_dead_code_snapshot;
 use crate::callgraph_store::{
-    project_dead_code_snapshot_with_revision, CallGraphStore, CallGraphStoreError,
-    ProjectionKind, ProjectionVerdict, ReadonlyCallGraphStore, MAX_DELTA_BYTES,
+    project_dead_code_snapshot_with_revision, CallGraphStore, CallGraphStoreError, ProjectionKind,
+    ProjectionVerdict, ReadonlyCallGraphStore, MAX_DELTA_BYTES,
 };
 use crate::cold_build_limiter;
 
@@ -2757,13 +2757,15 @@ impl Tier2PhaseTimings {
 }
 
 /// Render the `projection=...` suffix of the `perf tier2 phases` line for one
-/// dead-code snapshot verdict. `reason` is omitted for spliced projections;
+/// dead-code snapshot verdict. `reason` is omitted for spliced and reused
+/// projections;
 /// the `journal_oversize` reason carries the journal byte bound so the operator
 /// sees the cap that forced the full projection.
 fn render_projection_suffix(verdict: ProjectionVerdict) -> String {
     let kind = match verdict.kind {
         ProjectionKind::Spliced => "spliced",
         ProjectionKind::Full => "full",
+        ProjectionKind::Reused => "reused",
     };
     let reason = match verdict.reason {
         Some("journal_oversize") => format!(" reason=journal_oversize:{}", MAX_DELTA_BYTES),
@@ -2771,8 +2773,8 @@ fn render_projection_suffix(verdict: ProjectionVerdict) -> String {
         None => String::new(),
     };
     format!(
-        " projection={kind}{reason} journal_bytes={} changed_files={} dependents={}",
-        verdict.journal_bytes, verdict.changed_files, verdict.dependents
+        " projection={kind}{reason} journal_bytes={} changed_files={}",
+        verdict.journal_bytes, verdict.changed_files
     )
 }
 
@@ -3427,11 +3429,10 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
                 return Some((
                     snapshot,
                     ProjectionVerdict {
-                        kind: ProjectionKind::Full,
-                        reason: Some("revision_unchanged_reuse"),
+                        kind: ProjectionKind::Reused,
+                        reason: None,
                         journal_bytes: 0,
                         changed_files: 0,
-                        dependents: 0,
                     },
                 ));
             }
@@ -7862,11 +7863,9 @@ export function main() { foo(); }
             reason: None,
             journal_bytes: 4096,
             changed_files: 3,
-            dependents: 2,
         });
         assert_eq!(
-            spliced,
-            " projection=spliced journal_bytes=4096 changed_files=3 dependents=2",
+            spliced, " projection=spliced journal_bytes=4096 changed_files=3",
             "a spliced verdict must omit the reason field"
         );
 
@@ -7875,11 +7874,10 @@ export function main() { foo(); }
             reason: Some("cold"),
             journal_bytes: 0,
             changed_files: 0,
-            dependents: 0,
         });
         assert_eq!(
             cold,
-            " projection=full reason=cold journal_bytes=0 changed_files=0 dependents=0"
+            " projection=full reason=cold journal_bytes=0 changed_files=0"
         );
 
         let gap = render_projection_suffix(ProjectionVerdict {
@@ -7887,11 +7885,10 @@ export function main() { foo(); }
             reason: Some("journal_gap"),
             journal_bytes: 0,
             changed_files: 0,
-            dependents: 0,
         });
         assert_eq!(
             gap,
-            " projection=full reason=journal_gap journal_bytes=0 changed_files=0 dependents=0"
+            " projection=full reason=journal_gap journal_bytes=0 changed_files=0"
         );
 
         let oversize = render_projection_suffix(ProjectionVerdict {
@@ -7899,24 +7896,22 @@ export function main() { foo(); }
             reason: Some("journal_oversize"),
             journal_bytes: 262144,
             changed_files: 0,
-            dependents: 0,
         });
         assert_eq!(
             oversize,
-            " projection=full reason=journal_oversize:262144 journal_bytes=262144 changed_files=0 dependents=0",
+            " projection=full reason=journal_oversize:262144 journal_bytes=262144 changed_files=0",
             "the journal byte bound must be visible on the oversize line"
         );
 
-        let reuse = render_projection_suffix(ProjectionVerdict {
-            kind: ProjectionKind::Full,
-            reason: Some("revision_unchanged_reuse"),
+        let reused = render_projection_suffix(ProjectionVerdict {
+            kind: ProjectionKind::Reused,
+            reason: None,
             journal_bytes: 0,
             changed_files: 0,
-            dependents: 0,
         });
         assert_eq!(
-            reuse,
-            " projection=full reason=revision_unchanged_reuse journal_bytes=0 changed_files=0 dependents=0"
+            reused, " projection=reused journal_bytes=0 changed_files=0",
+            "a cache hit is not a full projection and must not read as one"
         );
     }
 
@@ -7925,13 +7920,13 @@ export function main() { foo(); }
         let dir = tempfile::tempdir().expect("tempdir");
         write_projection_fixture(dir.path());
         let root = canonical_root(dir.path());
-        let store = CallGraphStore::open(root.join(".store-oversize"), root.clone())
-            .expect("open store");
+        let store =
+            CallGraphStore::open(root.join(".store-oversize"), root.clone()).expect("open store");
         store
             .cold_build(&project_files(&root))
             .expect("cold build fixture");
-        let (revision, previous) =
-            project_dead_code_snapshot_with_revision(store.sqlite_path()).expect("initial projection");
+        let (revision, previous) = project_dead_code_snapshot_with_revision(store.sqlite_path())
+            .expect("initial projection");
         let revision = revision.expect("new stores write a projection revision");
 
         // Simulate an oversized delta batch by advancing the write revision and
@@ -7954,12 +7949,11 @@ export function main() { foo(); }
         .expect("plant oversize marker");
         drop(conn);
 
-        let (_, _, verdict) =
-            crate::callgraph_store::project_dead_code_snapshot_incremental(
-                store.sqlite_path(),
-                Some((revision, &previous)),
-            )
-            .expect("project with oversize marker");
+        let (_, _, verdict) = crate::callgraph_store::project_dead_code_snapshot_incremental(
+            store.sqlite_path(),
+            Some((revision, &previous)),
+        )
+        .expect("project with oversize marker");
         assert_eq!(verdict.kind, ProjectionKind::Full);
         assert_eq!(verdict.reason, Some("journal_oversize"));
         assert_eq!(
