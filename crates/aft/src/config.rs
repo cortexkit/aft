@@ -4,6 +4,13 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 3_000;
+pub const DEFAULT_SEMANTIC_QUERY_INSTRUCTION: &str = "off";
+/// Verbatim retrieval task recommended by the Qwen3-Embedding model card:
+/// <https://huggingface.co/Qwen/Qwen3-Embedding-0.6B#usage-tips>
+pub const QWEN3_EMBEDDING_MODEL_CARD_RETRIEVAL_TASK: &str =
+    "Given a web search query, retrieve relevant passages that answer the query";
+pub const QWEN3_EMBEDDING_CODE_SEARCH_TASK: &str =
+    "Given a code search query, retrieve relevant source code, symbols, and documentation";
 pub(crate) const MIN_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 500;
 pub(crate) const MAX_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 15_000;
 pub(crate) const DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 120_000;
@@ -188,6 +195,10 @@ pub struct SemanticBackendConfig {
     /// this budget never controls background index builds.
     #[serde(default = "default_semantic_query_timeout_ms")]
     pub query_timeout_ms: u64,
+    /// Query-only task instruction. `auto` selects a model-family recipe, `off`
+    /// sends bare queries, and any other value is used as literal task text.
+    #[serde(default = "default_semantic_query_instruction")]
+    pub query_instruction: String,
     pub max_batch_size: usize,
     /// Optional whole-row input budget for remote embedding backends. When absent,
     /// chunk construction retains the legacy MiniLM-era limits.
@@ -220,6 +231,26 @@ pub struct UserServerDef {
     pub disabled: bool,
 }
 
+fn default_semantic_query_instruction() -> String {
+    DEFAULT_SEMANTIC_QUERY_INSTRUCTION.to_string()
+}
+
+impl SemanticBackendConfig {
+    pub fn resolved_query_instruction(&self) -> Option<&str> {
+        if self.backend == SemanticBackend::Fastembed {
+            return None;
+        }
+        match self.query_instruction.as_str() {
+            "off" => None,
+            "auto" if self.model.to_ascii_lowercase().contains("qwen3-embedding") => {
+                Some(QWEN3_EMBEDDING_MODEL_CARD_RETRIEVAL_TASK)
+            }
+            "auto" => None,
+            literal => Some(literal),
+        }
+    }
+}
+
 impl Default for SemanticBackendConfig {
     fn default() -> Self {
         Self {
@@ -231,6 +262,7 @@ impl Default for SemanticBackendConfig {
             // semantic_search requests when callers do not set an explicit timeout.
             timeout_ms: 25_000,
             query_timeout_ms: DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
+            query_instruction: default_semantic_query_instruction(),
             max_batch_size: 64,
             max_input_tokens: None,
             max_files: 20_000,
@@ -732,6 +764,32 @@ mod tests {
             ..Config::default()
         };
         assert!(!unhoisted.read_slot_survives());
+    }
+
+    #[test]
+    fn semantic_query_instruction_resolves_by_backend_model_and_override() {
+        let mut config = SemanticBackendConfig::default();
+        config.model = "QWEN/Qwen3-Embedding-0.6B".to_string();
+        config.query_instruction = "auto".to_string();
+        assert_eq!(config.resolved_query_instruction(), None);
+
+        config.backend = SemanticBackend::OpenAiCompatible;
+        assert_eq!(
+            config.resolved_query_instruction(),
+            Some(QWEN3_EMBEDDING_MODEL_CARD_RETRIEVAL_TASK)
+        );
+
+        config.model = "text-embedding-3-small".to_string();
+        assert_eq!(config.resolved_query_instruction(), None);
+
+        config.query_instruction = "custom code retrieval task".to_string();
+        assert_eq!(
+            config.resolved_query_instruction(),
+            Some("custom code retrieval task")
+        );
+
+        config.query_instruction = "off".to_string();
+        assert_eq!(config.resolved_query_instruction(), None);
     }
 
     #[test]

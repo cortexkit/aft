@@ -470,6 +470,9 @@ pub struct SemanticEmbeddingModel {
     query_embedding_cache_order: VecDeque<String>,
     query_embedding_cache_hits: u64,
     query_embedding_cache_misses: u64,
+    query_instruction: Option<String>,
+    query_instruction_logged: bool,
+    query_instruction_root: Option<PathBuf>,
 }
 
 pub type EmbeddingModel = SemanticEmbeddingModel;
@@ -1027,6 +1030,13 @@ fn configured_embedding_timeout_ms(config: &SemanticBackendConfig) -> u64 {
     }
 }
 
+fn query_embedding_text(query: &str, instruction: Option<&str>) -> String {
+    match instruction {
+        Some(task) => format!("Instruct: {task}\nQuery: {query}"),
+        None => query.to_string(),
+    }
+}
+
 impl SemanticEmbeddingModel {
     pub fn from_config(config: &SemanticBackendConfig) -> Result<Self, String> {
         Self::from_config_with_timeout_ms(config, configured_embedding_timeout_ms(config))
@@ -1118,6 +1128,9 @@ impl SemanticEmbeddingModel {
             query_embedding_cache_order: VecDeque::new(),
             query_embedding_cache_hits: 0,
             query_embedding_cache_misses: 0,
+            query_instruction: config.resolved_query_instruction().map(str::to_string),
+            query_instruction_logged: false,
+            query_instruction_root: config.route_project_root.clone(),
         })
     }
 
@@ -1207,13 +1220,32 @@ impl SemanticEmbeddingModel {
         query: &str,
         budget: QueryBudget,
     ) -> Result<Vec<f32>, String> {
-        self.embed_texts(
-            vec![query.to_string()],
-            EmbeddingRequestPolicy::Query(budget),
-        )?
-        .into_iter()
-        .next()
-        .ok_or_else(|| "embedding model returned no query vector".to_string())
+        if !self.query_instruction_logged {
+            let root = self
+                .query_instruction_root
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<unscoped>".to_string());
+            match self.query_instruction.as_deref() {
+                Some(instruction) => slog_info!(
+                    "semantic query instruction for root {} model {}: {:?}",
+                    root,
+                    self.model,
+                    instruction
+                ),
+                None => slog_info!(
+                    "semantic query instruction for root {} model {}: none",
+                    root,
+                    self.model
+                ),
+            }
+            self.query_instruction_logged = true;
+        }
+        let query_text = query_embedding_text(query, self.query_instruction.as_deref());
+        self.embed_texts(vec![query_text], EmbeddingRequestPolicy::Query(budget))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "embedding model returned no query vector".to_string())
     }
 
     pub fn query_embedding_cache_stats(&self) -> (u64, u64, usize) {
@@ -6109,6 +6141,68 @@ mod tests {
         (format!("http://{addr}"), requests, handle)
     }
 
+    fn start_recording_embedding_server(
+        expected_requests: usize,
+    ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind recording server");
+        let addr = listener.local_addr().expect("recording server addr");
+        let inputs = Arc::new(Mutex::new(Vec::new()));
+        let inputs_for_thread = Arc::clone(&inputs);
+        let handle = thread::spawn(move || {
+            for _ in 0..expected_requests {
+                let (mut stream, _) = listener.accept().expect("accept recording request");
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut header_end = None;
+                let mut content_length = 0usize;
+                loop {
+                    let count = stream.read(&mut chunk).expect("read recording request");
+                    if count == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..count]);
+                    if header_end.is_none() {
+                        if let Some(position) =
+                            buf.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            header_end = Some(position + 4);
+                            for line in String::from_utf8_lossy(&buf[..position + 4]).lines() {
+                                if line.to_ascii_lowercase().starts_with("content-length:") {
+                                    content_length = line
+                                        .split_once(':')
+                                        .map(|(_, value)| value.trim().parse().unwrap_or(0))
+                                        .unwrap_or(0);
+                                }
+                            }
+                        }
+                    }
+                    if header_end.is_some_and(|end| buf.len() >= end + content_length) {
+                        break;
+                    }
+                }
+                let body_start = header_end.expect("recording request headers");
+                let body: serde_json::Value =
+                    serde_json::from_slice(&buf[body_start..body_start + content_length])
+                        .expect("recording request JSON");
+                let input = body["input"][0]
+                    .as_str()
+                    .expect("single string embedding input")
+                    .to_string();
+                inputs_for_thread.lock().unwrap().push(input);
+                let response_body = r#"{"data":[{"embedding":[0.1,0.2,0.3],"index":0}]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write recording response");
+            }
+        });
+        (format!("http://{addr}"), inputs, handle)
+    }
+
     fn start_mock_http_server<F>(handler: F) -> (String, thread::JoinHandle<()>)
     where
         F: Fn(String, String, String) -> String + Send + 'static,
@@ -8072,6 +8166,73 @@ public class Greeter {
 
         assert!(message.starts_with("ONNX Runtime not found. Install via:"));
         assert!(message.contains("Original error:"));
+    }
+
+    #[test]
+    fn qwen_query_request_uses_documented_instruction_shape() {
+        assert_eq!(
+            query_embedding_text(
+                "where is authentication handled",
+                Some(crate::config::QWEN3_EMBEDDING_MODEL_CARD_RETRIEVAL_TASK),
+            ),
+            "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: where is authentication handled"
+        );
+        assert_eq!(
+            query_embedding_text("where is authentication handled", None),
+            "where is authentication handled"
+        );
+    }
+
+    #[test]
+    fn query_instruction_does_not_change_index_fingerprint() {
+        let mut config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "text-embedding-qwen3-embedding-0.6b".to_string(),
+            base_url: Some("http://127.0.0.1:1234/v1".to_string()),
+            ..SemanticBackendConfig::default()
+        };
+        let automatic = SemanticIndexFingerprint::for_config_dimension(&config, 1024);
+        config.query_instruction = "off".to_string();
+        let off = SemanticIndexFingerprint::for_config_dimension(&config, 1024);
+        config.query_instruction = crate::config::QWEN3_EMBEDDING_CODE_SEARCH_TASK.to_string();
+        let literal = SemanticIndexFingerprint::for_config_dimension(&config, 1024);
+
+        assert_eq!(automatic.as_string(), off.as_string());
+        assert_eq!(off.as_string(), literal.as_string());
+        assert!(automatic.matches(&off));
+        assert!(off.matches(&literal));
+    }
+
+    #[test]
+    fn query_embedding_cache_keys_the_text_sent_to_the_server() {
+        let (base_url, inputs, handle) = start_recording_embedding_server(2);
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "text-embedding-qwen3-embedding-0.6b".to_string(),
+            base_url: Some(base_url),
+            query_instruction: crate::config::QWEN3_EMBEDDING_CODE_SEARCH_TASK.to_string(),
+            ..SemanticBackendConfig::default()
+        };
+        let budget = QueryBudget::from_config(&config);
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+
+        model.embed_query_cached("cache probe", budget).unwrap();
+        model.query_instruction = None;
+        model.embed_query_cached("cache probe", budget).unwrap();
+        model.embed_query_cached("cache probe", budget).unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(model.query_embedding_cache_stats(), (1, 2, 2));
+        assert_eq!(
+            *inputs.lock().unwrap(),
+            vec![
+                format!(
+                    "Instruct: {}\nQuery: cache probe",
+                    crate::config::QWEN3_EMBEDDING_CODE_SEARCH_TASK
+                ),
+                "cache probe".to_string(),
+            ]
+        );
     }
 
     #[test]

@@ -199,8 +199,9 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
   // Voyage, vLLM, LM Studio, etc.), and "ollama" (self-hosted at /api/embeddings).
   //
   // USER-only fields: "backend", "base_url", "api_key_env" (project config cannot
-  // inject these — strict-allowlist trust boundary). Project config can still tune
-  // "model", "timeout_ms", "max_batch_size", "max_files", "max_input_tokens".
+  // inject these — strict-allowlist trust boundary). Project config can tune
+  // "model", "query_instruction", "timeout_ms", "max_batch_size", "max_files",
+  // and "max_input_tokens".
   //
   // Switching "backend", "model", or "base_url" deletes the persisted index and
   // rebuilds from scratch on next session start (necessary because dimensions and
@@ -209,6 +210,10 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
   "semantic": {
     "backend": "fastembed",            // "fastembed" | "openai_compatible" | "ollama"
     "model": "all-MiniLM-L6-v2",       // model id understood by the backend
+    "query_instruction": "off",         // QUERY-only: "auto", "off" (default), or literal task text.
+                                         // Auto applies Qwen3-Embedding's model-card retrieval task;
+                                         // fastembed and other model families remain bare. This does not
+                                         // change document vectors or trigger an index rebuild.
     // "base_url": "https://api.openai.com/v1",   // required for openai_compatible / ollama
     // "api_key_env": "OPENAI_API_KEY",            // env var name (not the key itself)
     "timeout_ms": 25000,                // per-request timeout for INDEX BUILDS, kept under bridge limit

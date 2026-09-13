@@ -284,6 +284,8 @@ pub struct RawSemantic {
     pub timeout_ms: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
     pub query_timeout_ms: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
+    pub query_instruction: Option<String>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
     pub max_batch_size: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_usize")]
@@ -300,6 +302,7 @@ impl RawSemantic {
             && self.api_key_env.is_none()
             && self.timeout_ms.is_none()
             && self.query_timeout_ms.is_none()
+            && self.query_instruction.is_none()
             && self.max_batch_size.is_none()
             && self.max_input_tokens.is_none()
             && self.max_files.is_none()
@@ -1160,6 +1163,7 @@ fn merge_semantic_config(
         api_key_env: None,
         timeout_ms: None,
         query_timeout_ms: None,
+        query_instruction: None,
         max_batch_size: None,
         max_input_tokens: None,
         max_files: None,
@@ -1171,6 +1175,9 @@ fn merge_semantic_config(
         }
         if project.timeout_ms.is_some() {
             semantic.timeout_ms = project.timeout_ms;
+        }
+        if project.query_instruction.is_some() {
+            semantic.query_instruction = project.query_instruction;
         }
         if project.max_batch_size.is_some() {
             semantic.max_batch_size = project.max_batch_size;
@@ -1705,6 +1712,9 @@ fn resolve_semantic_config(
     }
     if let Some(value) = raw.timeout_ms {
         semantic.timeout_ms = value.min(MAX_SEMANTIC_TIMEOUT_MS);
+    }
+    if let Some(value) = &raw.query_instruction {
+        semantic.query_instruction = value.clone();
     }
     if let Some(value) = raw.query_timeout_ms {
         semantic.query_timeout_ms =
@@ -2872,6 +2882,29 @@ mod tests {
             }"#,
         )]);
         assert_eq!(with_model.config.semantic.model, "configured-model");
+    }
+
+    #[test]
+    fn semantic_query_instruction_resolves_at_user_and_project_tiers() {
+        let result = resolve_config(&[
+            tier(
+                "user",
+                r#"{"semantic":{"query_instruction":"user retrieval task"}}"#,
+            ),
+            tier(
+                "project",
+                r#"{"semantic":{"query_instruction":"project retrieval task"}}"#,
+            ),
+        ]);
+
+        assert_eq!(
+            result.config.semantic.query_instruction,
+            "project retrieval task"
+        );
+        assert_eq!(
+            resolve_config(&[]).config.semantic.query_instruction,
+            crate::config::DEFAULT_SEMANTIC_QUERY_INSTRUCTION
+        );
     }
 
     #[test]
