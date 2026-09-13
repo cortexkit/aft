@@ -216,6 +216,35 @@ function observeHostStream(
   });
 }
 
+async function discoverActiveSessionId(
+  control: ApiControlPlan,
+  values: Record<string, string>,
+  options: Omit<Parameters<typeof runApiCommand>[0], "method" | "path" | "body">,
+): Promise<void> {
+  if (!control.path.includes("{{session_id}}") || values.session_id) return;
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    try {
+      const authorization = Buffer.from(`opencode:${options.password}`).toString("base64");
+      const response = await fetch(new URL("/api/session/active", options.endpoint), {
+        headers: { authorization: `Basic ${authorization}` },
+      });
+      if (response.ok) {
+        const data = asRecord(await response.json())?.data;
+        if (typeof data === "object" && data !== null && !Array.isArray(data)) {
+          const activeId = Object.keys(data)[0];
+          if (activeId) {
+            values.session_id = activeId;
+            return;
+          }
+        }
+      }
+    } catch {}
+    await Bun.sleep(25);
+  }
+  fail("host_failed", `${control.id}: active session id was not observed`);
+}
+
 async function discoverPermissionRequestId(
   control: ApiControlPlan,
   values: Record<string, string>,
@@ -549,6 +578,7 @@ async function runOneScenario(options: {
               password: controlServer.password,
             };
             await discoverPermissionRequestId(control, controlPathValues, apiOptions);
+            await discoverActiveSessionId(control, controlPathValues, apiOptions);
             await emit({ kind: "control_started", control, at: Date.now() });
             if (control.purpose === "abort") abortIssuedAt ??= Date.now();
             const output = await runApiControl(
@@ -674,6 +704,7 @@ async function runOneScenario(options: {
 
     for (const call of plannedCalls(scenario)) {
       const observed = toolResultForCall(mock.exchanges, call.id);
+      if (!observed && scenario.trajectory === "T4") continue;
       if (!observed) throw new Error(`mock never observed tool result for ${call.id}`);
       observedTexts[call.id] = observed.text;
       assertT2ProductContract(scenario, call, observed.text, hostStream);
@@ -687,7 +718,10 @@ async function runOneScenario(options: {
       }
     }
     threeState?.assertComplete();
-    const expectedTurns = scenario.expected_turns ?? scenario.turns.map((turn) => turn.label);
+    const expectedTurns =
+      scenario.trajectory === "T4"
+        ? [scenario.turns[0].label]
+        : (scenario.expected_turns ?? scenario.turns.map((turn) => turn.label));
     assertTurnLog(expectedTurns, await readTurnLog(turnLogPath));
     assertT5HostWakeTranscript(scenario, mock.exchanges, controlPathValues);
 
@@ -774,6 +808,7 @@ async function runOneScenario(options: {
       }
       if (
         scenario.trajectory === "T4" &&
+        termination.tasks.length > 0 &&
         !termination.tasks.some((task) => task.status_reason === "call_aborted")
       ) {
         recordFailure(

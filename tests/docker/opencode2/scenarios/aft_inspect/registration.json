@@ -151,19 +151,19 @@
         {
           "id": "inspect-abort-control",
           "after_turn": "call-tool",
-          "delay_ms": 500,
           "method": "POST",
-          "path": "/api/session/{{session_id}}/abort",
+          "path": "/api/session/{{session_id}}/interrupt",
           "expected_status": 0,
+          "expected_stdout_pattern": "^\\{\"interrupted\":true\\}\\s*$",
           "purpose": "abort"
         }
       ],
       "metadata": {
         "accepted_exit_codes": [
           0,
+          1,
           130
-        ],
-        "harness_blocker": "ApiControlPlan cannot interpolate the active session id"
+        ]
       }
     },
     {

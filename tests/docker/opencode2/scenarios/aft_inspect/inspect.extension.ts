@@ -13,11 +13,18 @@ async function validate(context: HarnessValidationContext): Promise<void> {
     if (call.disk_effects === undefined && call.non_mutating_evidence === undefined) throw new Error(scenario.id + ":" + call.id + " lacks a disk classification");
   }
   const matrix = JSON.parse(await readFile(join(here, "matrix.json"), "utf8"));
-  if (JSON.stringify(matrix.rows?.[0]?.trajectories) !== JSON.stringify({"T1":"applicable","T2":"applicable","T3":"n/a:no-permission-operation","T4":"expected_fail:https://www.npmjs.com/package/@opencode/cli/v/2.0.3#abort-route-absent","T5":"n/a:no-background-capability","T6":"applicable","T7":"expected_fail:https://github.com/anomalyco/opencode/issues/48340"})) throw new Error("inspect" + " applicability mismatch");
+  if (JSON.stringify(matrix.rows?.[0]?.trajectories) !== JSON.stringify({"T1":"applicable","T2":"applicable","T3":"n/a:no-permission-operation","T4":"applicable","T5":"n/a:no-background-capability","T6":"applicable","T7":"expected_fail:https://github.com/anomalyco/opencode/issues/48340"})) throw new Error("inspect" + " applicability mismatch");
   const controls = JSON.parse(await readFile(join(here, "mutation-controls.json"), "utf8"));
   if (!Array.isArray(controls.controls) || controls.controls.length < 3) throw new Error("inspect" + " mutation controls missing");
 }
 async function beforeScenario(context: ScenarioLifecycleContext): Promise<void> {
+  if (context.scenario.id === "inspect/T4/abort") {
+    const lines = Array.from(
+      { length: 10_000 },
+      (_, index) => `// TODO: cancellation fixture work item ${index}`,
+    );
+    await writeFile(join(context.project_root, "abort-load.ts"), `${lines.join("\n")}\n`);
+  }
   if (!context.scenario.id.endsWith("_config_deny")) return;
   const path = join(dirname(context.project_root), "xdg-config", "opencode", "opencode.json");
   const config = JSON.parse(await readFile(path, "utf8"));

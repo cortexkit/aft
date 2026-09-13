@@ -280,10 +280,15 @@ export async function runApiControl(
   }
   const visible = `${result.stdout}\n${result.stderr}`;
   if (plan.expected_stdout_pattern && !new RegExp(plan.expected_stdout_pattern).test(visible)) {
-    fail("host_failed", `control ${plan.id} did not match expected output`, {
-      control: plan,
-      output: result,
-    });
+    const detail = visible.trim();
+    fail(
+      "host_failed",
+      `control ${plan.id} did not match expected output${detail ? `: ${detail}` : ""}`,
+      {
+        control: plan,
+        output: result,
+      },
+    );
   }
   if (plan.forbidden_stdout_pattern && new RegExp(plan.forbidden_stdout_pattern).test(visible)) {
     fail("host_failed", `control ${plan.id} matched forbidden output`, {
