@@ -129,7 +129,10 @@ const SemanticConfigSchema = z.object({
   base_url: z.string().trim().min(1).optional(),
   /** Environment variable that contains the API key used by external backends. */
   api_key_env: z.string().trim().min(1).optional(),
-  /** Background build request timeout in milliseconds. */
+  /**
+   * Background embedding request floor in milliseconds. HTTP batch deadlines
+   * scale above it from the successful per-item latency EMA.
+   */
   timeout_ms: z.number().int().positive().optional(),
   /** Interactive query embedding deadline in milliseconds (clamped to 500..15000). */
   query_timeout_ms: z.number().int().positive().optional(),

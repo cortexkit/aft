@@ -1282,6 +1282,9 @@ pub enum SemanticRefreshEvent {
         error: String,
     },
     CorpusFailed {
+        /// Files already selected by the corpus walk and still needing refresh.
+        /// Recovery re-extracts this cheap file set instead of walking the corpus again.
+        paths: Vec<PathBuf>,
         error: String,
     },
 }
@@ -6548,7 +6551,11 @@ impl AppContext {
         self.semantic_refresh_circuit.open.load(Ordering::SeqCst)
     }
 
-    pub fn record_semantic_refresh_transient_failure(&self, trip_threshold: usize) -> bool {
+    pub fn record_semantic_refresh_transient_failure(
+        &self,
+        trip_threshold: usize,
+        reason: &str,
+    ) -> bool {
         let failures = self
             .semantic_refresh_circuit
             .consecutive_transient_failures
@@ -6561,13 +6568,14 @@ impl AppContext {
                 .swap(true, Ordering::SeqCst)
         {
             crate::slog_warn!(
-                "embedding backend appears down; suspending active retries, will resume on next change or successful probe"
+                "embedding backend appears down: {}; suspending active retries, will resume on next change or successful probe",
+                reason,
             );
         }
         self.semantic_refresh_circuit_is_open()
     }
 
-    pub fn trip_semantic_refresh_circuit(&self, trip_threshold: usize) {
+    pub fn trip_semantic_refresh_circuit(&self, trip_threshold: usize, reason: &str) {
         self.semantic_refresh_circuit
             .consecutive_transient_failures
             .store(trip_threshold, Ordering::SeqCst);
@@ -6577,7 +6585,8 @@ impl AppContext {
             .swap(true, Ordering::SeqCst)
         {
             crate::slog_warn!(
-                "embedding backend appears down; suspending active retries, will resume on next change or successful probe"
+                "embedding backend appears down: {}; suspending active retries, will resume on next change or successful probe",
+                reason,
             );
         }
     }

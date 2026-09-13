@@ -3790,7 +3790,7 @@ mod watcher_filter_tests {
     }
 
     #[test]
-    fn transient_corpus_refresh_failure_retries_without_another_watcher_event() {
+    fn transient_corpus_failure_probe_resumes_exact_files_without_recollecting_corpus() {
         let tmp = TempDir::new().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
 
@@ -3799,6 +3799,7 @@ mod watcher_filter_tests {
             let (request_rx, event_tx) = install_semantic_refresh_channels(&ctx);
             event_tx
                 .send(SemanticRefreshEvent::CorpusFailed {
+                    paths: vec![root.join("slow.rs")],
                     error: transient_embedding_error(),
                 })
                 .unwrap();
@@ -3812,8 +3813,14 @@ mod watcher_filter_tests {
 
             assert!(matches!(
                 request_rx.recv_timeout(std::time::Duration::from_secs(1)),
-                Ok(SemanticRefreshRequest::Corpus)
+                Ok(SemanticRefreshRequest::Files { paths }) if paths == vec![root.join("slow.rs")]
             ));
+            assert!(
+                request_rx
+                    .recv_timeout(std::time::Duration::from_millis(50))
+                    .is_err(),
+                "recovery must send exactly one file-set refresh and never queue Corpus"
+            );
         });
     }
 
@@ -3825,7 +3832,7 @@ mod watcher_filter_tests {
         let ctx_b = make_ctx_with_root(root_b.path());
 
         for _ in 0..BREAKER_TRIP_THRESHOLD {
-            record_semantic_refresh_transient_failure(&ctx_a);
+            record_semantic_refresh_transient_failure(&ctx_a, &transient_embedding_error());
         }
 
         assert!(semantic_refresh_circuit_is_open(&ctx_a));
@@ -3964,6 +3971,7 @@ mod watcher_filter_tests {
 
         event_tx
             .send(SemanticRefreshEvent::CorpusFailed {
+                paths: vec![file.clone()],
                 error: format!(
                     "{}backend unavailable",
                     aft::semantic_index::TRANSIENT_EMBEDDING_MARKER

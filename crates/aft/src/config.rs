@@ -195,6 +195,9 @@ pub struct SemanticBackendConfig {
     pub model: String,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
+    /// Per-request floor for background index builds. HTTP batches scale this
+    /// deadline from a successful per-item latency EMA; interactive queries use
+    /// `query_timeout_ms` instead.
     pub timeout_ms: u64,
     /// Deadline for one interactive query embedding request. Unlike `timeout_ms`,
     /// this budget never controls background index builds.
@@ -263,8 +266,9 @@ impl Default for SemanticBackendConfig {
             model: DEFAULT_SEMANTIC_MODEL.to_string(),
             base_url: None,
             api_key_env: None,
-            // Keep the default below the plugin bridge timeout to avoid bridge-killed
-            // semantic_search requests when callers do not set an explicit timeout.
+            // Background HTTP batches treat this as a per-request floor and
+            // scale it with measured per-item latency. Query requests have their
+            // own short deadline below.
             timeout_ms: 25_000,
             query_timeout_ms: DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
             query_instruction: default_semantic_query_instruction(),

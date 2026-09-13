@@ -1182,8 +1182,9 @@ pub fn semantic_refresh_circuit_is_open(ctx: &AppContext) -> bool {
     ctx.semantic_refresh_circuit_is_open()
 }
 
-pub fn record_semantic_refresh_transient_failure(ctx: &AppContext) -> bool {
-    ctx.record_semantic_refresh_transient_failure(BREAKER_TRIP_THRESHOLD)
+pub fn record_semantic_refresh_transient_failure(ctx: &AppContext, error: &str) -> bool {
+    let reason = aft::semantic_index::strip_transient_embedding_marker(error);
+    ctx.record_semantic_refresh_transient_failure(BREAKER_TRIP_THRESHOLD, &reason)
 }
 
 fn reset_semantic_refresh_transient_failure_count(ctx: &AppContext) {
@@ -1472,7 +1473,7 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
             }
             SemanticRefreshEvent::Failed { paths, error } => {
                 if aft::semantic_index::embedding_failure_is_transient(&error) {
-                    if record_semantic_refresh_transient_failure(ctx) {
+                    if record_semantic_refresh_transient_failure(ctx, &error) {
                         ctx.add_pending_semantic_index_paths(paths);
                         schedule_breaker_probe = true;
                     } else if !schedule_semantic_refresh_retry(ctx, paths.clone(), &error) {
@@ -1498,7 +1499,7 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                     }
                 }
             }
-            SemanticRefreshEvent::CorpusFailed { error } => {
+            SemanticRefreshEvent::CorpusFailed { paths, error } => {
                 // A transient backend blip during a corpus refresh must NOT
                 // destroy the working index — the prior index is still valid and
                 // serving. Keep it Ready and let the next watcher/ignore change
@@ -1514,8 +1515,12 @@ pub fn drain_semantic_refresh_events(ctx: &AppContext) {
                         .read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .is_some();
-                    ctx.mark_pending_semantic_corpus_refresh();
-                    ctx.trip_semantic_refresh_circuit(BREAKER_TRIP_THRESHOLD);
+                    // The corpus worker already paid for the project walk and
+                    // identified the exact changed/new/deleted file set. Retain
+                    // only those paths so the probe re-extracts them through the
+                    // file refresh lane instead of collecting the corpus again.
+                    ctx.add_pending_semantic_index_paths(paths);
+                    ctx.trip_semantic_refresh_circuit(BREAKER_TRIP_THRESHOLD, &clean);
                     schedule_breaker_probe = true;
                     if has_index {
                         aft::slog_warn!(

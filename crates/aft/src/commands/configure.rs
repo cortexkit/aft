@@ -860,7 +860,10 @@ fn spawn_semantic_refresh_worker(
                                 max_files
                             );
                             if event_tx
-                                .send(SemanticRefreshEvent::CorpusFailed { error })
+                                .send(SemanticRefreshEvent::CorpusFailed {
+                                    paths: Vec::new(),
+                                    error,
+                                })
                                 .is_err()
                             {
                                 break;
@@ -875,7 +878,10 @@ fn spawn_semantic_refresh_worker(
                             "too many files (>{}) for semantic indexing (max {})",
                             max_files, max_files
                         );
-                        let _ = event_tx.send(SemanticRefreshEvent::CorpusFailed { error });
+                        let _ = event_tx.send(SemanticRefreshEvent::CorpusFailed {
+                            paths: Vec::new(),
+                            error,
+                        });
                         continue;
                     }
                     if event_tx
@@ -922,6 +928,7 @@ fn spawn_semantic_refresh_worker(
                             )
                         })
                     };
+                    let mut recovery_paths = Vec::new();
                     let refresh_result = index.refresh_stale_files_with_strategy_and_blob_reuse(
                         &project_root,
                         &current_files,
@@ -930,6 +937,7 @@ fn spawn_semantic_refresh_worker(
                         &mut progress,
                         VerifyStrategy::Strict,
                         &mut reuse_blob,
+                        Some(&mut recovery_paths),
                     );
                     if embed_batches > 0 {
                         let files = refresh_result
@@ -973,7 +981,10 @@ fn spawn_semantic_refresh_worker(
                         Err(error) => {
                             slog_warn!("semantic corpus refresh failed: {}", error);
                             if event_tx
-                                .send(SemanticRefreshEvent::CorpusFailed { error })
+                                .send(SemanticRefreshEvent::CorpusFailed {
+                                    paths: recovery_paths,
+                                    error,
+                                })
                                 .is_err()
                             {
                                 break;
@@ -4315,6 +4326,7 @@ fn schedule_artifact_loads(
                                     &mut progress,
                                     verify_strategy,
                                     &mut reuse_blob,
+                                    None,
                                 );
                             if embed_batches > 0 {
                                 let files = refresh_result

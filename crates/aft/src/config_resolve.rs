@@ -280,6 +280,8 @@ pub struct RawSemantic {
     pub base_url: Option<String>,
     #[serde(default, deserialize_with = "deserialize_opt_trimmed_non_empty_string")]
     pub api_key_env: Option<String>,
+    /// Background embedding request floor in milliseconds. HTTP batch deadlines
+    /// scale above it using measured per-item latency.
     #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
     pub timeout_ms: Option<u64>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]

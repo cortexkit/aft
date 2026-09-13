@@ -137,6 +137,12 @@ const QUERY_EMBEDDING_CACHE_CAP: usize = 1_000;
 const FALLBACK_BACKEND: &str = "none";
 const EMBEDDING_REQUEST_MAX_ATTEMPTS: usize = 3;
 const EMBEDDING_REQUEST_BACKOFF_MS: [u64; 2] = [500, 1_000];
+const BUILD_EMBEDDING_TIMEOUT_MARKER_PREFIX: &str = "[build-timeout:";
+const BUILD_EMBEDDING_TIMEOUT_MARKER_SUFFIX: &str = "]";
+const BUILD_PER_ITEM_EMA_ALPHA: f64 = 0.25;
+const BUILD_PER_ITEM_SAFETY_FACTOR: f64 = 2.0;
+const BUILD_INITIAL_BATCH_DIVISOR: u64 = 16;
+const BUILD_BATCH_GROWTH_SUCCESSES: usize = 2;
 static SEMANTIC_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 
 /// Test-only probe counter for the managed-ONNX resolver (see
@@ -171,23 +177,29 @@ impl QueryBudget {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct BuildRequestBudget {
+    batch_size: usize,
+    deadline_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum EmbeddingRequestPolicy {
-    Build,
+    Build(BuildRequestBudget),
     Query(QueryBudget),
 }
 
 impl EmbeddingRequestPolicy {
     fn max_attempts(self) -> usize {
         match self {
-            Self::Build => EMBEDDING_REQUEST_MAX_ATTEMPTS,
+            Self::Build(_) => EMBEDDING_REQUEST_MAX_ATTEMPTS,
             Self::Query(_) => 1,
         }
     }
 
-    fn request_timeout(self) -> Option<Duration> {
+    fn request_timeout(self) -> Duration {
         match self {
-            Self::Build => None,
-            Self::Query(budget) => Some(Duration::from_millis(budget.timeout_ms)),
+            Self::Build(budget) => Duration::from_millis(budget.deadline_ms),
+            Self::Query(budget) => Duration::from_millis(budget.timeout_ms),
         }
     }
 }
@@ -464,6 +476,9 @@ pub struct SemanticEmbeddingModel {
     base_url: Option<String>,
     timeout_ms: u64,
     max_batch_size: usize,
+    adaptive_build_batch_size: usize,
+    successful_build_batches_at_size: usize,
+    per_item_ema_ms: Option<f64>,
     dimension: Option<usize>,
     engine: SemanticEmbeddingEngine,
     query_embedding_cache: HashMap<String, Vec<f32>>,
@@ -807,6 +822,33 @@ pub fn strip_transient_embedding_marker(error: &str) -> String {
     error.replace(TRANSIENT_EMBEDDING_MARKER, "")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BuildTimeoutDetails {
+    batch_size: usize,
+    deadline_ms: u64,
+    attempts: usize,
+}
+
+fn build_embedding_timeout_marker(details: BuildTimeoutDetails) -> String {
+    format!(
+        "{BUILD_EMBEDDING_TIMEOUT_MARKER_PREFIX}{}:{}:{}{BUILD_EMBEDDING_TIMEOUT_MARKER_SUFFIX}",
+        details.batch_size, details.deadline_ms, details.attempts
+    )
+}
+
+fn build_embedding_timeout_details(error: &str) -> Option<BuildTimeoutDetails> {
+    let start = error.find(BUILD_EMBEDDING_TIMEOUT_MARKER_PREFIX)?
+        + BUILD_EMBEDDING_TIMEOUT_MARKER_PREFIX.len();
+    let end = error[start..].find(BUILD_EMBEDDING_TIMEOUT_MARKER_SUFFIX)? + start;
+    let mut fields = error[start..end].split(':');
+    let details = BuildTimeoutDetails {
+        batch_size: fields.next()?.parse().ok()?,
+        deadline_ms: fields.next()?.parse().ok()?,
+        attempts: fields.next()?.parse().ok()?,
+    };
+    fields.next().is_none().then_some(details)
+}
+
 /// Stable machine marker prefixed onto a *query* embedding error string when
 /// the failure was a request timeout — i.e. reqwest's `is_timeout()` fired
 /// while running under a `Query(budget)` policy. The marker carries the budget
@@ -929,24 +971,41 @@ where
     let max_attempts = policy.max_attempts();
     for attempt_index in 0..max_attempts {
         let last_attempt = attempt_index + 1 == max_attempts;
-        let mut request = make_request();
-        if let Some(timeout) = policy.request_timeout() {
-            request = request.timeout(timeout);
-        }
+        let request = make_request().timeout(policy.request_timeout());
 
         let exchange = match policy {
-            EmbeddingRequestPolicy::Build => execute_embedding_exchange(request),
+            EmbeddingRequestPolicy::Build(_) => execute_embedding_exchange(request),
             EmbeddingRequestPolicy::Query(_) => execute_query_embedding_exchange(request)?,
         };
         let (status, raw) = match exchange {
             EmbeddingExchange::SendFailed(error) => {
+                if let EmbeddingRequestPolicy::Build(budget) = policy {
+                    if error.is_timeout() {
+                        let details = BuildTimeoutDetails {
+                            batch_size: budget.batch_size,
+                            deadline_ms: budget.deadline_ms,
+                            attempts: attempt_index + 1,
+                        };
+                        return Err(format!(
+                            "{TRANSIENT_EMBEDDING_MARKER}{}{} request timed out: {}",
+                            build_embedding_timeout_marker(details),
+                            backend_label,
+                            render_error_source_chain(&error),
+                        ));
+                    }
+                }
+                // A refused connection is already conclusive unreachable evidence;
+                // retrying the same socket target only delays the circuit breaker.
+                if error.is_connect() && embedding_send_error_is_transient(&error) {
+                    return Err(format!(
+                        "{TRANSIENT_EMBEDDING_MARKER}embedding backend unreachable (connection refused or connect failure): {}",
+                        render_error_source_chain(&error),
+                    ));
+                }
                 if !last_attempt && is_retryable_embedding_error(&error) {
                     sleep_before_embedding_retry(attempt_index);
                     continue;
                 }
-                // Connect/timeout failures mean the backend is unreachable or
-                // cold-loading — mark transient so the build layer rides it out
-                // and self-heals instead of parking the index in `Failed`.
                 let marker = if embedding_send_error_is_transient(&error) {
                     TRANSIENT_EMBEDDING_MARKER
                 } else {
@@ -971,6 +1030,21 @@ where
                 status: _,
                 body: Err(error),
             } => {
+                if let EmbeddingRequestPolicy::Build(budget) = policy {
+                    if error.is_timeout() {
+                        let details = BuildTimeoutDetails {
+                            batch_size: budget.batch_size,
+                            deadline_ms: budget.deadline_ms,
+                            attempts: attempt_index + 1,
+                        };
+                        return Err(format!(
+                            "{TRANSIENT_EMBEDDING_MARKER}{}{} response timed out: {}",
+                            build_embedding_timeout_marker(details),
+                            backend_label,
+                            render_error_source_chain(&error),
+                        ));
+                    }
+                }
                 if !last_attempt && embedding_response_read_error_is_transient(&error) {
                     sleep_before_embedding_retry(attempt_index);
                     continue;
@@ -1122,6 +1196,9 @@ impl SemanticEmbeddingModel {
             base_url: config.base_url.clone(),
             timeout_ms,
             max_batch_size,
+            adaptive_build_batch_size: max_batch_size,
+            successful_build_batches_at_size: 0,
+            per_item_ema_ms: None,
             dimension: None,
             engine,
             query_embedding_cache: HashMap::new(),
@@ -1169,42 +1246,151 @@ impl SemanticEmbeddingModel {
         Ok(fingerprint)
     }
 
+    fn uses_http_embedding_backend(&self) -> bool {
+        matches!(
+            &self.engine,
+            SemanticEmbeddingEngine::OpenAiCompatible { .. }
+                | SemanticEmbeddingEngine::Ollama { .. }
+        )
+    }
+
+    fn build_request_deadline_ms(&self, batch_size: usize) -> u64 {
+        let batch_size = batch_size.max(1);
+        match self.per_item_ema_ms {
+            Some(per_item_ms) => {
+                let scaled =
+                    (per_item_ms * batch_size as f64 * BUILD_PER_ITEM_SAFETY_FACTOR).ceil();
+                let scaled = if scaled.is_finite() {
+                    scaled.min(u64::MAX as f64) as u64
+                } else {
+                    u64::MAX
+                };
+                self.timeout_ms.max(scaled)
+            }
+            None => self.timeout_ms.max(
+                self.timeout_ms
+                    .saturating_mul(batch_size as u64)
+                    .div_ceil(BUILD_INITIAL_BATCH_DIVISOR),
+            ),
+        }
+    }
+
+    fn build_request_budget(&self, batch_size: usize) -> BuildRequestBudget {
+        BuildRequestBudget {
+            batch_size,
+            deadline_ms: self.build_request_deadline_ms(batch_size),
+        }
+    }
+
+    fn note_successful_build_batch(&mut self, batch_size: usize, elapsed: Duration) {
+        let measured_per_item_ms = elapsed.as_secs_f64() * 1_000.0 / batch_size.max(1) as f64;
+        self.per_item_ema_ms = Some(match self.per_item_ema_ms {
+            Some(previous) => {
+                previous * (1.0 - BUILD_PER_ITEM_EMA_ALPHA)
+                    + measured_per_item_ms * BUILD_PER_ITEM_EMA_ALPHA
+            }
+            None => measured_per_item_ms,
+        });
+
+        if batch_size != self.adaptive_build_batch_size {
+            return;
+        }
+        self.successful_build_batches_at_size =
+            self.successful_build_batches_at_size.saturating_add(1);
+        if self.successful_build_batches_at_size < BUILD_BATCH_GROWTH_SUCCESSES
+            || self.adaptive_build_batch_size >= self.max_batch_size
+        {
+            return;
+        }
+
+        let old_size = self.adaptive_build_batch_size;
+        self.adaptive_build_batch_size = old_size.saturating_mul(2).min(self.max_batch_size);
+        self.successful_build_batches_at_size = 0;
+        slog_info!(
+            "semantic embed batch size {} -> {} after successful batches (per_item_ms={:.0})",
+            old_size,
+            self.adaptive_build_batch_size,
+            self.per_item_ema_ms.unwrap_or(measured_per_item_ms),
+        );
+    }
+
+    fn embed_build_http_adaptive(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
+        let mut vectors = Vec::with_capacity(texts.len());
+        let mut cursor = 0usize;
+
+        while cursor < texts.len() {
+            let batch_size = self
+                .adaptive_build_batch_size
+                .max(1)
+                .min(texts.len() - cursor);
+            let budget = self.build_request_budget(batch_size);
+            let batch = texts[cursor..cursor + batch_size].to_vec();
+            let started = Instant::now();
+            match self.embed_texts(batch, EmbeddingRequestPolicy::Build(budget)) {
+                Ok(mut batch_vectors) => {
+                    self.note_successful_build_batch(batch_size, started.elapsed());
+                    vectors.append(&mut batch_vectors);
+                    cursor += batch_size;
+                }
+                Err(error) => {
+                    let Some(timeout) = build_embedding_timeout_details(&error) else {
+                        return Err(error);
+                    };
+                    if timeout.batch_size == 1 {
+                        return Err(format!(
+                            "{TRANSIENT_EMBEDDING_MARKER}single-item request timed out at {} ms: treating as down ({} attempt(s))",
+                            self.timeout_ms, timeout.attempts,
+                        ));
+                    }
+
+                    let new_size = timeout.batch_size.div_ceil(2).max(1);
+                    self.adaptive_build_batch_size = new_size;
+                    self.successful_build_batches_at_size = 0;
+                    let per_item_ms = self
+                        .per_item_ema_ms
+                        .unwrap_or(self.timeout_ms as f64 / BUILD_INITIAL_BATCH_DIVISOR as f64);
+                    slog_info!(
+                        "semantic embed batch size {} -> {} after timeout (per_item_ms={:.0}, deadline_ms={})",
+                        timeout.batch_size,
+                        new_size,
+                        per_item_ms,
+                        timeout.deadline_ms,
+                    );
+                }
+            }
+        }
+
+        Ok(vectors)
+    }
+
     pub fn dimension(&mut self) -> Result<usize, String> {
         if let Some(dimension) = self.dimension {
             return Ok(dimension);
         }
 
-        let dimension = match &mut self.engine {
-            SemanticEmbeddingEngine::Local(model) => {
-                let vectors = model.embed(&["semantic index fingerprint probe".to_string()])?;
-                vectors
-                    .first()
-                    .map(|v| v.len())
-                    .ok_or_else(|| "embedding backend returned no vectors".to_string())?
+        let dimension = if self.uses_http_embedding_backend() {
+            let vectors = self.embed(vec!["semantic index fingerprint probe".to_string()])?;
+            vectors
+                .first()
+                .map(|v| v.len())
+                .ok_or_else(|| "embedding backend returned no vectors".to_string())?
+        } else {
+            match &mut self.engine {
+                SemanticEmbeddingEngine::Local(model) => {
+                    let vectors = model.embed(&["semantic index fingerprint probe".to_string()])?;
+                    vectors
+                        .first()
+                        .map(|v| v.len())
+                        .ok_or_else(|| "embedding backend returned no vectors".to_string())?
+                }
+                SemanticEmbeddingEngine::Synapse(client) => client
+                    .probe_dimension(Duration::from_millis(self.timeout_ms))
+                    .map_err(|error| error.to_string())?,
+                SemanticEmbeddingEngine::OpenAiCompatible { .. }
+                | SemanticEmbeddingEngine::Ollama { .. } => {
+                    unreachable!("HTTP backends are handled above")
+                }
             }
-            SemanticEmbeddingEngine::OpenAiCompatible { .. } => {
-                let vectors = self.embed_texts(
-                    vec!["semantic index fingerprint probe".to_string()],
-                    EmbeddingRequestPolicy::Build,
-                )?;
-                vectors
-                    .first()
-                    .map(|v| v.len())
-                    .ok_or_else(|| "embedding backend returned no vectors".to_string())?
-            }
-            SemanticEmbeddingEngine::Ollama { .. } => {
-                let vectors = self.embed_texts(
-                    vec!["semantic index fingerprint probe".to_string()],
-                    EmbeddingRequestPolicy::Build,
-                )?;
-                vectors
-                    .first()
-                    .map(|v| v.len())
-                    .ok_or_else(|| "embedding backend returned no vectors".to_string())?
-            }
-            SemanticEmbeddingEngine::Synapse(client) => client
-                .probe_dimension(Duration::from_millis(self.timeout_ms))
-                .map_err(|error| error.to_string())?,
         };
 
         self.dimension = Some(dimension);
@@ -1212,7 +1398,12 @@ impl SemanticEmbeddingModel {
     }
 
     pub fn embed(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
-        self.embed_texts(texts, EmbeddingRequestPolicy::Build)
+        if self.uses_http_embedding_backend() {
+            self.embed_build_http_adaptive(texts)
+        } else {
+            let budget = self.build_request_budget(texts.len());
+            self.embed_texts(texts, EmbeddingRequestPolicy::Build(budget))
+        }
     }
 
     pub fn embed_query_cached(
@@ -1262,7 +1453,7 @@ impl SemanticEmbeddingModel {
         policy: EmbeddingRequestPolicy,
     ) -> Result<Vec<Vec<f32>>, String> {
         let query_cache_key = match policy {
-            EmbeddingRequestPolicy::Build => None,
+            EmbeddingRequestPolicy::Build(_) => None,
             EmbeddingRequestPolicy::Query(_) => texts.first().cloned(),
         };
         let cached_vectors = query_cache_key.as_ref().and_then(|query| {
@@ -1434,7 +1625,7 @@ impl SemanticEmbeddingModel {
             }
             SemanticEmbeddingEngine::Synapse(client) => {
                 let vectors = match policy {
-                    EmbeddingRequestPolicy::Build => client
+                    EmbeddingRequestPolicy::Build(_) => client
                         .embed_batch(&texts)
                         .map_err(|error| error.to_string())?,
                     EmbeddingRequestPolicy::Query(budget) => {
@@ -3255,6 +3446,7 @@ impl SemanticIndex {
             progress,
             verify_strategy,
             &mut |_| None,
+            None,
         )
     }
 
@@ -3267,6 +3459,7 @@ impl SemanticIndex {
         progress: &mut P,
         verify_strategy: cache_freshness::VerifyStrategy,
         reuse_blob: &mut R,
+        mut recovery_paths: Option<&mut Vec<PathBuf>>,
     ) -> Result<RefreshSummary, String>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
@@ -3392,6 +3585,13 @@ impl SemanticIndex {
         let mut to_embed: Vec<PathBuf> = Vec::with_capacity(changed.len() + added.len());
         to_embed.extend(changed.iter().cloned());
         to_embed.extend(added.iter().cloned());
+        if let Some(paths) = recovery_paths.as_mut() {
+            paths.clear();
+            paths.extend(deleted.iter().cloned());
+            paths.extend(to_embed.iter().cloned());
+            paths.sort();
+            paths.dedup();
+        }
 
         if to_embed.is_empty() {
             // Only deletions happened.
@@ -5637,8 +5837,9 @@ mod tests {
     use crate::config::{SemanticBackend, SemanticBackendConfig};
     use crate::parser::FileParser;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::process::Command;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
     use std::thread;
     use tempfile::NamedTempFile;
 
@@ -6141,6 +6342,180 @@ mod tests {
         (format!("http://{addr}"), requests, handle)
     }
 
+    struct ProgrammableEmbeddingServer {
+        base_url: String,
+        per_item_delay_ms: Arc<AtomicU64>,
+        never_answer: Arc<AtomicBool>,
+        requests: Arc<Mutex<Vec<usize>>>,
+        completed: Arc<Mutex<Vec<usize>>>,
+        shutdown: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ProgrammableEmbeddingServer {
+        fn start(per_item_delay: Duration) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind programmable server");
+            listener
+                .set_nonblocking(true)
+                .expect("set programmable server nonblocking");
+            let addr = listener.local_addr().expect("programmable server addr");
+            let per_item_delay_ms = Arc::new(AtomicU64::new(
+                per_item_delay.as_millis().min(u128::from(u64::MAX)) as u64,
+            ));
+            let never_answer = Arc::new(AtomicBool::new(false));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let completed = Arc::new(Mutex::new(Vec::new()));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let thread_delay = Arc::clone(&per_item_delay_ms);
+            let thread_never = Arc::clone(&never_answer);
+            let thread_requests = Arc::clone(&requests);
+            let thread_completed = Arc::clone(&completed);
+            let thread_shutdown = Arc::clone(&shutdown);
+            let handle = thread::spawn(move || {
+                let mut handlers = Vec::new();
+                while !thread_shutdown.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let delay = Arc::clone(&thread_delay);
+                            let never = Arc::clone(&thread_never);
+                            let requests = Arc::clone(&thread_requests);
+                            let completed = Arc::clone(&thread_completed);
+                            let shutdown = Arc::clone(&thread_shutdown);
+                            handlers.push(thread::spawn(move || {
+                                handle_programmable_embedding_request(
+                                    stream, delay, never, requests, completed, shutdown,
+                                );
+                            }));
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("accept programmable embedding request: {error}"),
+                    }
+                }
+                for handler in handlers {
+                    handler.join().expect("programmable embedding handler");
+                }
+            });
+
+            Self {
+                base_url: format!("http://{addr}"),
+                per_item_delay_ms,
+                never_answer,
+                requests,
+                completed,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+
+        fn set_per_item_delay(&self, delay: Duration) {
+            self.per_item_delay_ms.store(
+                delay.as_millis().min(u128::from(u64::MAX)) as u64,
+                Ordering::SeqCst,
+            );
+        }
+
+        fn set_never_answer(&self, never_answer: bool) {
+            self.never_answer.store(never_answer, Ordering::SeqCst);
+        }
+
+        fn request_sizes(&self) -> Vec<usize> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        fn completed_sizes(&self) -> Vec<usize> {
+            self.completed.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for ProgrammableEmbeddingServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                handle.join().expect("programmable embedding server");
+            }
+        }
+    }
+
+    fn handle_programmable_embedding_request(
+        mut stream: TcpStream,
+        per_item_delay_ms: Arc<AtomicU64>,
+        never_answer: Arc<AtomicBool>,
+        requests: Arc<Mutex<Vec<usize>>>,
+        completed: Arc<Mutex<Vec<usize>>>,
+        shutdown: Arc<AtomicBool>,
+    ) {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let mut header_end = None;
+        let mut content_length = 0usize;
+        loop {
+            let count = match stream.read(&mut chunk) {
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(error) => panic!("read programmable request: {error}"),
+            };
+            if count == 0 {
+                return;
+            }
+            buf.extend_from_slice(&chunk[..count]);
+            if header_end.is_none() {
+                if let Some(position) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+                    header_end = Some(position + 4);
+                    for line in String::from_utf8_lossy(&buf[..position + 4]).lines() {
+                        if line.to_ascii_lowercase().starts_with("content-length:") {
+                            content_length = line
+                                .split_once(':')
+                                .and_then(|(_, value)| value.trim().parse().ok())
+                                .unwrap_or(0);
+                        }
+                    }
+                }
+            }
+            if header_end.is_some_and(|end| buf.len() >= end + content_length) {
+                break;
+            }
+        }
+        let body_start = header_end.expect("programmable request headers");
+        let body: serde_json::Value =
+            serde_json::from_slice(&buf[body_start..body_start + content_length])
+                .expect("programmable request JSON");
+        let input_count = body["input"]
+            .as_array()
+            .expect("embedding input array")
+            .len();
+        requests.lock().unwrap().push(input_count);
+
+        if never_answer.load(Ordering::SeqCst) {
+            while !shutdown.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(2));
+            }
+            return;
+        }
+
+        thread::sleep(Duration::from_millis(
+            per_item_delay_ms
+                .load(Ordering::SeqCst)
+                .saturating_mul(input_count as u64),
+        ));
+        let data = (0..input_count)
+            .map(|index| serde_json::json!({"embedding": [0.1, 0.2, 0.3], "index": index}))
+            .collect::<Vec<_>>();
+        let response_body = serde_json::json!({"data": data}).to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body,
+        );
+        if stream.write_all(response.as_bytes()).is_ok() {
+            completed.lock().unwrap().push(input_count);
+        }
+    }
+
     fn start_recording_embedding_server(
         expected_requests: usize,
     ) -> (String, Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
@@ -6327,7 +6702,10 @@ Connection: close
         let error = send_embedding_request(
             || client.post(&url).body("{}"),
             "test backend",
-            EmbeddingRequestPolicy::Build,
+            EmbeddingRequestPolicy::Build(BuildRequestBudget {
+                batch_size: 1,
+                deadline_ms: 250,
+            }),
         )
         .expect_err("truncated body should fail");
 
@@ -6819,6 +7197,50 @@ Connection: close
 
         assert!(!cache_dir.join("semantic.bin").exists());
         assert!(!cache_dir.exists());
+    }
+
+    #[test]
+    fn corpus_refresh_failure_reports_exact_file_set_for_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let changed = root.join("changed.rs");
+        let deleted = root.join("deleted.rs");
+        let unchanged = root.join("unchanged.rs");
+        write_rust_file(&changed, "changed_before");
+        write_rust_file(&deleted, "deleted");
+        write_rust_file(&unchanged, "unchanged");
+        let mut index = build_test_index(
+            &root,
+            &[changed.clone(), deleted.clone(), unchanged.clone()],
+        );
+
+        write_rust_file(&changed, "changed_after_with_a_longer_name");
+        force_stale(&mut index, &changed);
+        std::fs::remove_file(&deleted).unwrap();
+        let added = root.join("added.rs");
+        write_rust_file(&added, "added");
+        let current_files = vec![changed.clone(), unchanged, added.clone()];
+        let mut recovery_paths = Vec::new();
+        let mut embed = |_texts: Vec<String>| -> Result<Vec<Vec<f32>>, String> {
+            Err(format!("{TRANSIENT_EMBEDDING_MARKER}backend timeout"))
+        };
+        let mut progress = |_done: usize, _total: usize| {};
+
+        let result = index.refresh_stale_files_with_strategy_and_blob_reuse(
+            &root,
+            &current_files,
+            &mut embed,
+            64,
+            &mut progress,
+            cache_freshness::VerifyStrategy::Strict,
+            &mut |_| None,
+            Some(&mut recovery_paths),
+        );
+
+        assert!(result.is_err());
+        let mut expected = vec![added, changed, deleted];
+        expected.sort();
+        assert_eq!(recovery_paths, expected);
     }
 
     #[test]
@@ -8278,9 +8700,9 @@ public class Greeter {
     }
 
     #[test]
-    fn background_build_embedding_keeps_retry_ladder() {
+    fn single_item_build_timeout_is_dead_evidence_without_same_batch_retry() {
         let (base_url, requests, handle) =
-            start_slow_embedding_server(EMBEDDING_REQUEST_MAX_ATTEMPTS, Duration::from_millis(300));
+            start_slow_embedding_server(1, Duration::from_millis(300));
         let config = SemanticBackendConfig {
             backend: SemanticBackend::OpenAiCompatible,
             model: "test-embedding".to_string(),
@@ -8296,15 +8718,138 @@ public class Greeter {
 
         let error = model
             .embed(vec!["slow build batch".to_string()])
-            .expect_err("all slow build attempts should time out");
+            .expect_err("a single item exceeding the base deadline is dead evidence");
         handle.join().expect("slow embedding server");
 
         assert!(embedding_failure_is_transient(&error), "error: {error}");
+        assert!(
+            error.contains("single-item request timed out at 100 ms: treating as down"),
+            "error: {error}"
+        );
         assert_eq!(
             requests.load(Ordering::SeqCst),
-            EMBEDDING_REQUEST_MAX_ATTEMPTS,
-            "background builds must retain the existing retry ladder"
+            1,
+            "a timeout must shrink or terminate rather than retrying the same batch"
         );
+    }
+
+    fn programmable_http_config(server: &ProgrammableEmbeddingServer) -> SemanticBackendConfig {
+        SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "test-embedding".to_string(),
+            base_url: Some(server.base_url.clone()),
+            api_key_env: None,
+            timeout_ms: 40,
+            query_timeout_ms: DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
+            max_batch_size: 64,
+            max_files: 20_000,
+            ..Default::default()
+        }
+    }
+
+    fn embedding_inputs(count: usize) -> Vec<String> {
+        (0..count).map(|index| format!("chunk {index}")).collect()
+    }
+
+    #[test]
+    fn slow_backend_converges_without_being_marked_down() {
+        // This is the reporter's 2 s/item, 25 s floor ratio scaled down 250x so
+        // the test exercises real HTTP deadlines without taking minutes.
+        let server = ProgrammableEmbeddingServer::start(Duration::from_millis(8));
+        let config = programmable_http_config(&server);
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+
+        for _ in 0..3 {
+            assert_eq!(model.embed(embedding_inputs(64)).unwrap().len(), 64);
+        }
+
+        assert_eq!(model.adaptive_build_batch_size, config.max_batch_size);
+        assert!(
+            server.completed_sizes().contains(&64),
+            "EMA-scaled deadlines must eventually let a recovered 64-item batch finish; requests={:?}, completed={:?}",
+            server.request_sizes(),
+            server.completed_sizes(),
+        );
+    }
+
+    #[test]
+    fn never_answering_backend_is_declared_down_within_eleven_base_deadlines() {
+        let server = ProgrammableEmbeddingServer::start(Duration::ZERO);
+        server.set_never_answer(true);
+        let config = programmable_http_config(&server);
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let started = Instant::now();
+
+        let error = model
+            .embed(embedding_inputs(64))
+            .expect_err("a backend that never answers must reach the singleton dead check");
+        let elapsed = started.elapsed();
+
+        assert!(
+            error.contains("single-item request timed out at 40 ms: treating as down"),
+            "error: {error}"
+        );
+        assert_eq!(server.request_sizes(), vec![64, 32, 16, 8, 4, 2, 1]);
+        let protocol_bound = Duration::from_millis(config.timeout_ms * 11);
+        assert!(
+            elapsed <= protocol_bound + Duration::from_secs(1),
+            "never-answer ladder exceeded 11 base deadlines plus scheduler allowance: elapsed={elapsed:?}, protocol_bound={protocol_bound:?}"
+        );
+    }
+
+    #[test]
+    fn refused_connection_is_an_immediate_honest_transient_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve refused port");
+        let addr = listener.local_addr().expect("refused port address");
+        drop(listener);
+        let config = SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "test-embedding".to_string(),
+            base_url: Some(format!("http://{addr}")),
+            api_key_env: None,
+            timeout_ms: 500,
+            max_batch_size: 64,
+            ..Default::default()
+        };
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let started = Instant::now();
+
+        let error = model
+            .embed(vec!["connection probe".to_string()])
+            .expect_err("closed listener must refuse the request");
+
+        assert!(embedding_failure_is_transient(&error), "error: {error}");
+        assert!(
+            error.contains("embedding backend unreachable (connection refused or connect failure)"),
+            "error: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "connection refusal should not wait through a retry ladder"
+        );
+    }
+
+    #[test]
+    fn aimd_grows_back_to_configured_max_after_backend_speeds_up() {
+        let server = ProgrammableEmbeddingServer::start(Duration::from_millis(10));
+        let config = programmable_http_config(&server);
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+
+        assert_eq!(model.embed(embedding_inputs(64)).unwrap().len(), 64);
+        assert!(
+            model.adaptive_build_batch_size < config.max_batch_size,
+            "the initial slowdown should reduce the active batch size"
+        );
+
+        server.set_per_item_delay(Duration::from_millis(1));
+        for _ in 0..4 {
+            assert_eq!(model.embed(embedding_inputs(64)).unwrap().len(), 64);
+            if model.adaptive_build_batch_size == config.max_batch_size {
+                break;
+            }
+        }
+
+        assert_eq!(model.adaptive_build_batch_size, config.max_batch_size);
     }
 
     #[test]

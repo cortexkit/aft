@@ -154,6 +154,10 @@ export interface SemanticConfig {
   model?: string;
   base_url?: string;
   api_key_env?: string;
+  /**
+   * Background embedding request floor in milliseconds. HTTP batch deadlines
+   * scale above it from the successful per-item latency EMA.
+   */
   timeout_ms?: number;
   query_timeout_ms?: number;
   query_instruction?: string;

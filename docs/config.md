@@ -218,11 +218,20 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
                                          // change document vectors or trigger an index rebuild.
     // "base_url": "https://api.openai.com/v1",   // required for openai_compatible / ollama
     // "api_key_env": "OPENAI_API_KEY",            // env var name (not the key itself)
-    "timeout_ms": 25000,                // per-request timeout for INDEX BUILDS, kept under bridge limit
+    "timeout_ms": 25000,                // INDEX BUILD request floor. HTTP batch deadlines scale with
+                                         // batch size and a successful wall-time-per-item EMA (25% new,
+                                         // 75% prior) with 2x safety. Before the first success, the
+                                         // deadline is max(timeout_ms, timeout_ms * batch_size / 16).
+                                         // A timed-out batch halves immediately; only a one-item timeout
+                                         // at this base floor is treated as backend-down evidence.
     "query_timeout_ms": 3000,           // per-request timeout for interactive QUERY embeds (500-15000).
                                         // Raise for slow providers; on timeout, search degrades to
                                         // lexical for that query instead of failing.
-    "max_batch_size": 64,               // embeddings batched in groups of this size
+    "max_batch_size": 64,               // maximum adaptive build batch size. Timeout halves the active
+                                         // size; two successes at that size allow doubling toward this max.
+                                         // With the default max 64 and no successful latency sample, a
+                                         // never-answering backend reaches the one-item verdict within 11
+                                         // timeout_ms floors (275 s), plus scheduler overhead.
     "max_files": 20000,                 // max files indexed (default 20000); raise for remote backends
     // "max_input_tokens": 512          // advanced: per-row token budget for remote backends; widens the
                                         // symbol-body slice each chunk embeds (default keeps the 512-safe
