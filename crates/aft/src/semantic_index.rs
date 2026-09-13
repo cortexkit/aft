@@ -8739,7 +8739,11 @@ public class Greeter {
             model: "test-embedding".to_string(),
             base_url: Some(server.base_url.clone()),
             api_key_env: None,
-            timeout_ms: 40,
+            // The floor leaves a single item on a loaded CI runner (HTTP setup
+            // plus scheduling is tens of ms there) far below the base deadline:
+            // a one-item timeout is the "down" verdict, and this suite must
+            // reach it only from the never-answer arm, never from contention.
+            timeout_ms: 300,
             query_timeout_ms: DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
             max_batch_size: 64,
             max_files: 20_000,
@@ -8753,9 +8757,10 @@ public class Greeter {
 
     #[test]
     fn slow_backend_converges_without_being_marked_down() {
-        // This is the reporter's 2 s/item, 25 s floor ratio scaled down 250x so
-        // the test exercises real HTTP deadlines without taking minutes.
-        let server = ProgrammableEmbeddingServer::start(Duration::from_millis(8));
+        // The reporter's shape (2 s/item against a 25 s floor) scaled so the
+        // test exercises real HTTP deadlines in seconds, not minutes: a 64-item
+        // batch cannot fit the initial deadline, a 4-item batch can.
+        let server = ProgrammableEmbeddingServer::start(Duration::from_millis(50));
         let config = programmable_http_config(&server);
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
 
@@ -8786,7 +8791,7 @@ public class Greeter {
         let elapsed = started.elapsed();
 
         assert!(
-            error.contains("single-item request timed out at 40 ms: treating as down"),
+            error.contains("single-item request timed out at 300 ms: treating as down"),
             "error: {error}"
         );
         assert_eq!(server.request_sizes(), vec![64, 32, 16, 8, 4, 2, 1]);
@@ -8831,7 +8836,7 @@ public class Greeter {
 
     #[test]
     fn aimd_grows_back_to_configured_max_after_backend_speeds_up() {
-        let server = ProgrammableEmbeddingServer::start(Duration::from_millis(10));
+        let server = ProgrammableEmbeddingServer::start(Duration::from_millis(60));
         let config = programmable_http_config(&server);
         let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
 
@@ -8841,7 +8846,7 @@ public class Greeter {
             "the initial slowdown should reduce the active batch size"
         );
 
-        server.set_per_item_delay(Duration::from_millis(1));
+        server.set_per_item_delay(Duration::from_millis(2));
         for _ in 0..4 {
             assert_eq!(model.embed(embedding_inputs(64)).unwrap().len(), 64);
             if model.adaptive_build_batch_size == config.max_batch_size {
