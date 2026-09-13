@@ -14,7 +14,6 @@ interface AcceptanceRow {
   testPattern: string;
 }
 
-
 const acceptanceMatrix: AcceptanceRow[] = [
   {
     sliceId: "S1",

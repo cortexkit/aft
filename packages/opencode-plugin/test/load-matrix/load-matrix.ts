@@ -1024,7 +1024,7 @@ export default { id: original.id, effect, setup };
       );
       const transcript = `${result.stdout}\n${result.stderr}`;
       console.log(`[v2-${runtime}-host-transcript]\n${transcript}`);
-      expect(transcript).toContain("selected=effect features={\"tui\":true}");
+      expect(transcript).toContain('selected=effect features={"tui":true}');
       expect(transcript).toContain("load-matrix-server.mjs");
       expect(await readFile(marker, "utf8")).toBe("effect-called\n");
       const resolveArgs =

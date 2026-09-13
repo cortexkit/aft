@@ -1,5 +1,5 @@
 import type { AftProjectTransport, AftTransportPool } from "@cortexkit/aft-bridge";
-import { Effect, type Scope } from 'effect';
+import { Effect, type Scope } from "effect";
 
 import {
   type RpcNotification,
