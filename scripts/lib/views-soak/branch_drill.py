@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -458,6 +459,11 @@ def perform_switch(
         return file_log_since(log_path, log_mark)
 
     started = time.monotonic()
+    # The in-process contention column cannot see other processes on the box
+    # (a concurrent Docker matrix doubled one run's materialization time while
+    # every in-process signal read idle); the host load brackets each row so a
+    # loaded machine is visible in the table rather than read as a regression.
+    load_at_start = round(os.getloadavg()[0], 2)
     checkout_args = ["checkout", "--quiet", "--detach"]
     if not views_on:
         checkout_args.append("--force")
@@ -611,6 +617,7 @@ def perform_switch(
         "readiness_observations": readiness_observations,
         "index_events": index_events,
         "contention": contention_metrics(contention_log_text, checkout),
+        "host_load_1m": {"start": load_at_start, "end": round(os.getloadavg()[0], 2)},
         "readiness_error": readiness_error,
         "time_to_correct_ms": time_to_correct_ms,
         "correctness": "timeout" if timed_out else "correct",
@@ -749,8 +756,8 @@ def render_table(
         "",
         "`cpu_s` and `rss_delta_mb` use the active standalone subject PID for each row. PID changes are recorded as defects rather than subtracting unrelated processes.",
         "",
-        "| switch | on publication_ms | on puts | on embeds | on cpu_s | on rss_delta_mb | on correct_ms | on contention | off publication_ms | off puts | off embeds | off cpu_s | off rss_delta_mb | off correct_ms | off contention |",
-        "|---|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---|",
+        "| switch | on publication_ms | on puts | on embeds | on cpu_s | on rss_delta_mb | on correct_ms | on contention | on load | off publication_ms | off puts | off embeds | off cpu_s | off rss_delta_mb | off correct_ms | off contention | off load |",
+        "|---|---:|---:|---:|---:|---:|---:|---|---|---:|---:|---:|---:|---:|---:|---|---|",
     ]
     for switch in switches:
         on = by_mode[("views-on", switch)]
@@ -764,6 +771,7 @@ def render_table(
             "—" if on["rss_delta_mb"] is None else on["rss_delta_mb"],
             "timeout" if on["time_to_correct_ms"] is None else on["time_to_correct_ms"],
             on["contention"]["summary"],
+            f"{on['host_load_1m']['start']}→{on['host_load_1m']['end']}",
             "—" if off["publication_ms"] is None else off["publication_ms"],
             "—" if off["puts"] is None else off["puts"],
             off["embeds"],
@@ -771,6 +779,7 @@ def render_table(
             "—" if off["rss_delta_mb"] is None else off["rss_delta_mb"],
             "timeout" if off["time_to_correct_ms"] is None else off["time_to_correct_ms"],
             off["contention"]["summary"],
+            f"{off['host_load_1m']['start']}→{off['host_load_1m']['end']}",
         )
         lines.append("| " + " | ".join(markdown_cell(value) for value in values) + " |")
     lines.extend(
