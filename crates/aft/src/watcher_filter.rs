@@ -673,20 +673,24 @@ impl WatcherFilterThread {
     fn overflow_prefixes(&self) -> Vec<crate::context::WatcherOverflowPrefix> {
         let mut counts = BTreeMap::<String, u64>::new();
         for (path, _) in &self.recent_paths {
+            // Root-relative, first two components, joined with `/` on every
+            // platform: the prefix is rendered in the overflow log line (one
+            // grammar for the fleet's log readers) and persisted for slot
+            // ranking, and `Path::new` on Windows reads `/` back as a
+            // separator when the prefix is turned into an exclusion path.
             let prefix = path
                 .components()
                 .filter_map(|component| match component {
-                    Component::Normal(name) => Some(name),
+                    Component::Normal(name) => Some(name.to_string_lossy()),
                     _ => None,
                 })
                 .take(2)
-                .collect::<PathBuf>();
-            if prefix.as_os_str().is_empty() {
+                .collect::<Vec<_>>()
+                .join("/");
+            if prefix.is_empty() {
                 continue;
             }
-            *counts
-                .entry(prefix.to_string_lossy().into_owned())
-                .or_default() += 1;
+            *counts.entry(prefix).or_default() += 1;
         }
         let mut prefixes = counts
             .into_iter()
