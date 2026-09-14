@@ -97,6 +97,9 @@ export interface BashCompletedFrame {
   compressed_tokens?: number;
   tokens_skipped?: boolean;
   status_reason?: string;
+  live_descendants?: Array<{ pid: number; comm: string; argv0: string }> | null;
+  live_descendants_omitted?: number;
+  live_descendants_summary?: string;
   session_id?: string;
 }
 
@@ -161,4 +164,7 @@ export interface BgCompletion {
   compressed_tokens?: number;
   tokens_skipped?: boolean;
   status_reason?: string;
+  live_descendants?: Array<{ pid: number; comm: string; argv0: string }> | null;
+  live_descendants_omitted?: number;
+  live_descendants_summary?: string;
 }

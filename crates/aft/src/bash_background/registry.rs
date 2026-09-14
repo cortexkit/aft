@@ -51,7 +51,9 @@ use super::persistence::{
 use super::process::terminate_pgid;
 #[cfg(windows)]
 use super::process::terminate_pid;
-use super::process::{is_process_alive, is_recorded_process_alive};
+use super::process::{
+    is_process_alive, is_recorded_process_alive, live_process_group_members, LiveDescendant,
+};
 use super::pty_process::spawn_pty_for_command;
 use super::pty_runtime::PtyRuntime;
 use super::watches::{
@@ -108,6 +110,15 @@ pub struct BgCompletion {
     pub tokens_skipped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_reason: Option<String>,
+    pub live_descendants: Option<Vec<LiveDescendant>>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub live_descendants_omitted: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_descendants_summary: Option<String>,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 fn is_false(v: &bool) -> bool {
@@ -139,6 +150,11 @@ pub struct BgTaskSnapshot {
     pub sandbox_native: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub sandbox_unavailable: bool,
+    pub live_descendants: Option<Vec<LiveDescendant>>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub live_descendants_omitted: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_descendants_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -326,6 +342,9 @@ pub(crate) struct BgTaskState {
     /// but never observed exit via this process's `try_wait()`), so those
     /// continue to fall through to the `is_process_alive` probe path.
     pub(crate) child_exit_observed: bool,
+    /// Prevent duplicate completion delivery while the post-exit process-group
+    /// sample is waiting for its grace period.
+    pub(crate) descendant_sampling_started: bool,
     pub(crate) buffer: BgBuffer,
     terminal_output_cache: Option<TerminalOutputCache>,
     /// PTY-only: set for timeout kill intent before signaling the child.
@@ -808,6 +827,83 @@ impl BgTaskRegistry {
     }
 
     fn post_terminal_transition(&self, task: &Arc<BgTask>, emit_frame: bool) -> Result<(), String> {
+        let should_sample = {
+            let mut state = task
+                .state
+                .lock()
+                .map_err(|_| "background task lock poisoned".to_string())?;
+            if !state.metadata.status.is_terminal() {
+                return Ok(());
+            }
+            if state.metadata.mode != BgMode::Pipes || state.descendant_sampling_started {
+                false
+            } else {
+                state.descendant_sampling_started = true;
+                true
+            }
+        };
+
+        self.inner.terminal_transition.notify_waiters();
+        if !should_sample {
+            return self.finish_terminal_transition(task, emit_frame);
+        }
+
+        let registry = self.clone();
+        let task = Arc::clone(task);
+        std::thread::Builder::new()
+            .name(format!("aft-bg-descendants-{}", task.task_id))
+            .spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                let first = registry.sample_task_process_group(&task);
+                if first
+                    .as_ref()
+                    .is_some_and(|(members, omitted)| !members.is_empty() || *omitted > 0)
+                {
+                    // A second sample at two seconds avoids reporting wrapper-owned
+                    // children that are already shutting down during the short grace.
+                    std::thread::sleep(Duration::from_millis(1_700));
+                    let _ = registry.sample_task_process_group(&task);
+                }
+                if let Err(error) = registry.finish_terminal_transition(&task, emit_frame) {
+                    crate::slog_warn!(
+                        "failed to finish background task {} after descendant sampling: {error}",
+                        task.task_id
+                    );
+                }
+            })
+            .map_err(|error| format!("failed to start descendant sampler: {error}"))?;
+        Ok(())
+    }
+
+    fn sample_task_process_group(
+        &self,
+        task: &Arc<BgTask>,
+    ) -> Option<(Vec<LiveDescendant>, usize)> {
+        let pgid = task
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.metadata.pgid)?;
+        let sample = live_process_group_members(pgid);
+        if let Ok(mut state) = task.state.lock() {
+            state.metadata.live_descendants = sample.as_ref().map(|(members, _)| members.clone());
+            state.metadata.live_descendants_omitted =
+                sample.as_ref().map(|(_, omitted)| *omitted).unwrap_or(0);
+            if let Err(error) = self.persist_task(&task.paths, &state.metadata) {
+                crate::slog_warn!(
+                    "failed to persist live descendants for {}: {error}",
+                    task.task_id
+                );
+            }
+        }
+        sample
+    }
+
+    fn finish_terminal_transition(
+        &self,
+        task: &Arc<BgTask>,
+        emit_frame: bool,
+    ) -> Result<(), String> {
         let (metadata, buffer) = {
             let state = task
                 .state
@@ -827,7 +923,6 @@ impl BgTaskRegistry {
             emit_frame,
             cache.as_ref(),
         );
-        self.inner.terminal_transition.notify_waiters();
         Ok(())
     }
 
@@ -1565,6 +1660,7 @@ impl BgTaskRegistry {
                 io_handles: Some(io_handles),
                 detached: false,
                 child_exit_observed: false,
+                descendant_sampling_started: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pipes),
                 terminal_output_cache: None,
                 pending_terminal_override: None,
@@ -1757,6 +1853,7 @@ impl BgTaskRegistry {
                 io_handles: Some(io_handles),
                 detached: false,
                 child_exit_observed: false,
+                descendant_sampling_started: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pty),
                 terminal_output_cache: None,
                 pending_terminal_override: None,
@@ -1905,6 +2002,7 @@ impl BgTaskRegistry {
                 io_handles: Some(io_handles),
                 detached: false,
                 child_exit_observed: false,
+                descendant_sampling_started: false,
                 buffer: BgBuffer::registered(&paths, BgMode::Pipes),
                 terminal_output_cache: None,
                 pending_terminal_override: None,
@@ -3768,6 +3866,9 @@ impl BgTaskRegistry {
             compressed_tokens: None,
             tokens_skipped: false,
             status_reason: snapshot.info.status_reason,
+            live_descendants: snapshot.live_descendants,
+            live_descendants_omitted: snapshot.live_descendants_omitted,
+            live_descendants_summary: snapshot.live_descendants_summary,
         })
     }
 
@@ -3961,6 +4062,7 @@ impl BgTaskRegistry {
                 // `is_process_alive(child_pid)` probe rather than declaring
                 // failure based on stale evidence.
                 child_exit_observed: false,
+                descendant_sampling_started: false,
                 buffer: BgBuffer::registered(&paths, mode.clone()),
                 terminal_output_cache: None,
                 pending_terminal_override: None,
@@ -4534,6 +4636,9 @@ impl BgTaskRegistry {
             compressed_tokens: token_counts.compressed_tokens,
             tokens_skipped: token_counts.tokens_skipped,
             status_reason: metadata.status_reason.clone(),
+            live_descendants: metadata.live_descendants.clone(),
+            live_descendants_omitted: metadata.live_descendants_omitted,
+            live_descendants_summary: live_descendants_summary(metadata),
         };
 
         // Record the compression event BEFORE the push-frame dedupe. Event
@@ -4901,6 +5006,9 @@ impl BgTaskRegistry {
         );
         frame.bash_output_list_envelope = completion.bash_output_list_envelope;
         frame.status_reason = completion.status_reason;
+        frame.live_descendants = completion.live_descendants;
+        frame.live_descendants_omitted = completion.live_descendants_omitted;
+        frame.live_descendants_summary = completion.live_descendants_summary;
         sender(PushFrame::BashCompleted(frame));
     }
 
@@ -5821,6 +5929,50 @@ impl CompletionTokenCounts {
     }
 }
 
+fn live_descendants_summary(metadata: &PersistedTask) -> Option<String> {
+    let Some(members) = metadata.live_descendants.as_deref() else {
+        #[cfg(windows)]
+        return (metadata.mode == BgMode::Pipes).then(|| {
+            "live descendant check n/a on Windows (background tasks do not use a Job Object)"
+                .to_string()
+        });
+        #[cfg(not(windows))]
+        return None;
+    };
+    let total = members.len() + metadata.live_descendants_omitted;
+    if total == 0 {
+        return None;
+    }
+
+    let mut counts = BTreeMap::<&str, usize>::new();
+    for member in members {
+        *counts.entry(member.comm.as_str()).or_default() += 1;
+    }
+    let mut processes = counts
+        .into_iter()
+        .map(|(comm, count)| {
+            if count == 1 {
+                comm.to_string()
+            } else {
+                format!("{comm} ×{count}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if metadata.live_descendants_omitted > 0 {
+        processes.push_str(&format!(" +{} more", metadata.live_descendants_omitted));
+    }
+    let workload = ["vitest", "jest", "cargo test"]
+        .into_iter()
+        .find(|name| metadata.command.contains(name))
+        .map(|name| format!(" ({name})"))
+        .unwrap_or_default();
+    Some(format!(
+        "{total} live descendants still running: {processes}{workload} — they keep the task's process group; bash_kill({}) stops them",
+        metadata.task_id
+    ))
+}
+
 fn completion_status_text(status: &BgTaskStatus, exit_code: Option<i32>) -> String {
     match status {
         BgTaskStatus::TimedOut => "timed out".to_string(),
@@ -5974,6 +6126,7 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
             .finished_at
             .map(|finished_at| finished_at.saturating_sub(metadata.started_at))
     });
+    let live_descendants_summary = live_descendants_summary(&metadata);
     BgTaskSnapshot {
         info: BgTaskInfo {
             task_id: metadata.task_id,
@@ -5998,6 +6151,9 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
         scanner_report: metadata.scanner_report,
         sandbox_native: metadata.sandbox_native,
         sandbox_unavailable: false,
+        live_descendants: metadata.live_descendants.clone(),
+        live_descendants_omitted: metadata.live_descendants_omitted,
+        live_descendants_summary,
     }
 }
 
@@ -6064,6 +6220,9 @@ impl BgTask {
                 && open_task_artifact(&self.paths, TaskArtifact::SandboxUnavailable)
                     .and_then(|mut file| file.read_all())
                     .is_ok_and(|bytes| bytes == b"sandbox_unavailable"),
+            live_descendants: metadata.live_descendants.clone(),
+            live_descendants_omitted: metadata.live_descendants_omitted,
+            live_descendants_summary: live_descendants_summary(metadata),
         }
     }
 
@@ -6606,6 +6765,9 @@ mod tests {
                 compressed_tokens: None,
                 tokens_skipped: false,
                 status_reason: None,
+                live_descendants: Some(Vec::new()),
+                live_descendants_omitted: 0,
+                live_descendants_summary: None,
             });
         let estimate = registry.estimated_memory();
         assert!(estimate.estimated_bytes.unwrap() > 0);

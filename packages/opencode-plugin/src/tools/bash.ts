@@ -571,6 +571,9 @@ async function formatBashStatusText(
   const dur =
     typeof data.duration_ms === "number" ? ` ${Math.round(data.duration_ms / 1000)}s` : "";
   let text = `Task ${taskId}: ${status}${exit}${dur}`;
+  if (typeof data.live_descendants_summary === "string") {
+    text += ` · ${data.live_descendants_summary}`;
+  }
   if (data.mode === "pty") {
     // PTY output is rendered from the raw terminal spill file; never feed it
     // through the piped-output compression/line renderer.

@@ -481,6 +481,9 @@ mod tests {
             scanner_report: Vec::new(),
             sandbox_native: false,
             sandbox_unavailable: false,
+            live_descendants: Some(Vec::new()),
+            live_descendants_omitted: 0,
+            live_descendants_summary: None,
         }
     }
 

@@ -28,6 +28,9 @@ export interface BgCompletion {
   compressed_tokens?: number;
   tokens_skipped?: boolean;
   status_reason?: string;
+  live_descendants?: Array<{ pid: number; comm: string; argv0: string }> | null;
+  live_descendants_omitted?: number;
+  live_descendants_summary?: string;
   mode?: "pipes" | "pty" | string;
   output_path?: string;
 }
@@ -1349,7 +1352,10 @@ function formatCompletion(completion: BgCompletion): string {
   const duration = formatDuration(completion);
   const header = `- task ${completion.task_id} (${status}${duration ? `, ${duration}` : ""})`;
   const previewBlock = formatOutputPreview(completion);
-  return previewBlock ? `${header}\n${previewBlock}` : header;
+  const descendantWarning = completion.live_descendants_summary
+    ? `    ${completion.live_descendants_summary}`
+    : "";
+  return [header, previewBlock, descendantWarning].filter(Boolean).join("\n");
 }
 
 function formatOutputPreview(completion: BgCompletion): string {

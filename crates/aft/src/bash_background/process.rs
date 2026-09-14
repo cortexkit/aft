@@ -1,5 +1,7 @@
 #[cfg(unix)]
 use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 /// Shared process-termination helpers for both foreground bash and background
 /// bash tasks. Extracted to avoid duplication between `commands/bash.rs` and
 /// `bash_background/registry.rs`.
@@ -16,6 +18,168 @@ use std::time::Duration;
 use std::time::Instant;
 
 pub const TERMINATE_GRACE: Duration = Duration::from_secs(2);
+pub const LIVE_DESCENDANT_CAP: usize = 16;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LiveDescendant {
+    pub pid: u32,
+    pub comm: String,
+    pub argv0: String,
+}
+
+/// Enumerate surviving members of a task's process group. `None` means the
+/// platform has no process-group enumeration support for these tasks today.
+pub fn live_process_group_members(pgid: i32) -> Option<(Vec<LiveDescendant>, usize)> {
+    #[cfg(target_os = "linux")]
+    let mut members = linux_process_group_members(pgid);
+    #[cfg(target_os = "macos")]
+    let mut members = macos_process_group_members(pgid);
+    #[cfg(windows)]
+    {
+        let _ = pgid;
+        return None;
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    {
+        let _ = pgid;
+        return None;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        members.sort_by_key(|member| member.pid);
+        let omitted = members.len().saturating_sub(LIVE_DESCENDANT_CAP);
+        members.truncate(LIVE_DESCENDANT_CAP);
+        Some((members, omitted))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_group_members(pgid: i32) -> Vec<LiveDescendant> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| linux_process_member(pid, pgid))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_member(pid: u32, expected_pgid: i32) -> Option<LiveDescendant> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let open = stat.find('(')?;
+    let close = stat.rfind(") ")?;
+    let comm = stat.get(open + 1..close)?.to_string();
+    let mut fields = stat.get(close + 2..)?.split_whitespace();
+    let state = fields.next()?;
+    let _ppid = fields.next()?;
+    let pgrp = fields.next()?.parse::<i32>().ok()?;
+    if pgrp != expected_pgid || state == "Z" {
+        return None;
+    }
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+    let argv0 = cmdline
+        .split(|byte| *byte == 0)
+        .next()
+        .filter(|value| !value.is_empty())
+        .map(|value| String::from_utf8_lossy(value).into_owned())
+        .unwrap_or_else(|| comm.clone());
+    Some(LiveDescendant { pid, comm, argv0 })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_group_members(pgid: i32) -> Vec<LiveDescendant> {
+    use std::ffi::{c_char, c_int, c_void};
+
+    #[link(name = "proc")]
+    extern "C" {
+        fn proc_listpgrppids(pgrpid: u32, buffer: *mut c_void, buffersize: c_int) -> c_int;
+        fn proc_name(pid: c_int, buffer: *mut c_void, buffersize: u32) -> c_int;
+    }
+
+    if pgid <= 0 {
+        return Vec::new();
+    }
+    let mut pids = vec![0_u32; 16_384];
+    let count = unsafe {
+        proc_listpgrppids(
+            pgid as u32,
+            pids.as_mut_ptr().cast(),
+            i32::try_from(pids.len() * std::mem::size_of::<u32>()).unwrap_or(i32::MAX),
+        )
+    };
+    if count <= 0 {
+        return Vec::new();
+    }
+    pids.truncate(count as usize);
+    pids.into_iter()
+        .filter(|pid| *pid != 0)
+        .filter_map(|pid| {
+            let mut name = [0 as c_char; 1024];
+            let name_len =
+                unsafe { proc_name(pid as c_int, name.as_mut_ptr().cast(), name.len() as u32) };
+            if name_len <= 0 {
+                return None;
+            }
+            let comm = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            let argv0 = macos_argv0(pid).unwrap_or_else(|| comm.clone());
+            Some(LiveDescendant { pid, comm, argv0 })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_argv0(pid: u32) -> Option<String> {
+    const CTL_KERN: libc::c_int = 1;
+    const KERN_PROCARGS2: libc::c_int = 49;
+    let mut mib = [CTL_KERN, KERN_PROCARGS2, i32::try_from(pid).ok()?];
+    let mut size = 0_usize;
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || size <= std::mem::size_of::<libc::c_int>()
+    {
+        return None;
+    }
+    let mut bytes = vec![0_u8; size];
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as u32,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    bytes.truncate(size);
+    let mut cursor = std::mem::size_of::<libc::c_int>();
+    cursor += bytes.get(cursor..)?.iter().position(|byte| *byte == 0)?;
+    while bytes.get(cursor).is_some_and(|byte| *byte == 0) {
+        cursor += 1;
+    }
+    let end = cursor
+        + bytes
+            .get(cursor..)?
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len().saturating_sub(cursor));
+    (end > cursor).then(|| String::from_utf8_lossy(&bytes[cursor..end]).into_owned())
+}
 
 /// The Unix payload wrapper runs the user's command in the same shell that
 /// owns the pipeline. Bash exposes per-segment statuses as `PIPESTATUS`, while

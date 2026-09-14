@@ -311,9 +311,12 @@ fn early_exit_pipeline_reports_live_descendants_while_tail_reports_none() {
     frame_pids.sort_unstable();
     row_pids.sort_unstable();
     expected_pids_sorted.sort_unstable();
-    assert_eq!(frame_pids, expected_pids_sorted, "completion frame: {frame:?}");
+    assert_eq!(
+        frame_pids, expected_pids_sorted,
+        "completion frame: {frame:?}"
+    );
     assert_eq!(row_pids, expected_pids_sorted, "task row: {completed:?}");
-    assert_eq!(frame["live_descendants_omitted"], 0);
+    assert_eq!(frame["live_descendants_omitted"].as_u64().unwrap_or(0), 0);
     assert!(
         frame["live_descendants_summary"]
             .as_str()

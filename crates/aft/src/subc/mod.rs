@@ -7053,6 +7053,9 @@ pub(crate) mod test_support {
             compressed_tokens: None,
             tokens_skipped: false,
             status_reason: None,
+            live_descendants: Some(Vec::new()),
+            live_descendants_omitted: 0,
+            live_descendants_summary: None,
         })
     }
 

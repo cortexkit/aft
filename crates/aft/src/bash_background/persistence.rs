@@ -23,6 +23,7 @@ use crate::backup::hash_session;
 use crate::bash_permissions::PermissionAsk;
 use crate::db::bash_tasks::BashTaskRow;
 
+use super::process::LiveDescendant;
 use super::BgTaskStatus;
 
 pub const SCHEMA_VERSION: u32 = 6;
@@ -503,6 +504,12 @@ pub struct PersistedTask {
     pub exit_code: Option<i32>,
     pub child_pid: Option<u32>,
     pub pgid: Option<i32>,
+    /// `Some` records a completed Unix sample, including an empty group. `None`
+    /// means sampling is unavailable (Windows and unsupported Unix targets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_descendants: Option<Vec<LiveDescendant>>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub live_descendants_omitted: usize,
     pub completion_delivered: bool,
     #[serde(default = "default_notify_on_completion")]
     pub notify_on_completion: bool,
@@ -527,6 +534,10 @@ fn default_notify_on_completion() -> bool {
 
 fn default_compressed() -> bool {
     true
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -564,6 +575,8 @@ impl PersistedTask {
             exit_code: None,
             child_pid: None,
             pgid: None,
+            live_descendants: None,
+            live_descendants_omitted: 0,
             completion_delivered: !notify_on_completion,
             notify_on_completion,
             compressed,
@@ -678,6 +691,8 @@ impl From<BashTaskRow> for PersistedTask {
             exit_code: row.exit_code,
             child_pid: row.pid.and_then(|value| u32::try_from(value).ok()),
             pgid: row.pgid.and_then(|value| i32::try_from(value).ok()),
+            live_descendants: None,
+            live_descendants_omitted: 0,
             completion_delivered: row.completion_delivered,
             notify_on_completion: !row.completion_delivered,
             compressed: row.compressed,

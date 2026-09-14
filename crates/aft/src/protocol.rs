@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::bash_background::process::LiveDescendant;
 use crate::bash_background::BgTaskStatus;
 use crate::list_envelope::ListEnvelope;
 
@@ -76,6 +77,15 @@ pub struct BashCompletedFrame {
     pub tokens_skipped: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_reason: Option<String>,
+    pub live_descendants: Option<Vec<LiveDescendant>>,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub live_descendants_omitted: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_descendants_summary: Option<String>,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -337,6 +347,9 @@ impl BashCompletedFrame {
             compressed_tokens,
             tokens_skipped,
             status_reason: None,
+            live_descendants: None,
+            live_descendants_omitted: 0,
+            live_descendants_summary: None,
         }
     }
 }

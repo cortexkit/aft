@@ -283,6 +283,9 @@ interface BashStatusDetails {
   pty_cols?: number;
   pty_screen?: string;
   pty_raw?: string;
+  live_descendants?: Array<{ pid: number; comm: string; argv0: string }> | null;
+  live_descendants_omitted?: number;
+  live_descendants_summary?: string;
   waited?: BashStatusWaited;
 }
 
@@ -1376,6 +1379,9 @@ async function formatBashStatus(
   const dur =
     typeof details.duration_ms === "number" ? ` ${Math.round(details.duration_ms / 1000)}s` : "";
   let text = `Task ${taskId}: ${details.status}${exit}${dur}`;
+  if (details.live_descendants_summary) {
+    text += ` · ${details.live_descendants_summary}`;
+  }
   if (details.waited)
     text += `
 ${formatWaitSummary(details.waited, details)}`;
