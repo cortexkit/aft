@@ -71,6 +71,7 @@ const QUARANTINE_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 const TOKENIZE_CAP_BYTES_PER_STREAM: usize = 128 * 1024;
 pub const ROOT_RECLAIMED_REASON: &str = "root_reclaimed";
+#[cfg(target_os = "linux")]
 pub(crate) const LINUX_SCOPE_ENV: &str = "AFT_INTERNAL_LINUX_SCOPE";
 
 #[derive(Debug, Clone, Serialize)]
@@ -848,32 +849,45 @@ impl BgTaskRegistry {
             }
         };
 
-        self.inner.terminal_transition.notify_waiters();
-        if !should_sample {
-            return self.finish_terminal_transition(task, emit_frame);
+        // The wrapper shell waits for every pipeline member before it exits, so
+        // at the terminal transition the only survivors in the task's process
+        // group are reparented grandchildren (pool workers a SIGPIPE'd producer
+        // never reaped). Sample once, immediately: the common case is an empty
+        // group, and that case must not pay any delay because every foreground
+        // `bash` reply and `wait:true` result passes through here.
+        let survivors_at_exit = should_sample
+            && self
+                .sample_task_process_group(task)
+                .is_some_and(|(members, omitted)| !members.is_empty() || omitted > 0);
+        if !survivors_at_exit {
+            let result = self.finish_terminal_transition(task, emit_frame);
+            self.inner.terminal_transition.notify_waiters();
+            return result;
         }
 
+        // Survivors exist. Give them a short grace before the frame names them
+        // (a grandchild that exits on its own within 300 ms is not the class
+        // being reported), then a longer settle for the row bash_status shows.
         let registry = self.clone();
         let task = Arc::clone(task);
         std::thread::Builder::new()
             .name(format!("aft-bg-descendants-{}", task.task_id))
             .spawn(move || {
                 std::thread::sleep(Duration::from_millis(300));
-                let first = registry.sample_task_process_group(&task);
-                if first
-                    .as_ref()
-                    .is_some_and(|(members, omitted)| !members.is_empty() || *omitted > 0)
-                {
-                    // A second sample at two seconds avoids reporting wrapper-owned
-                    // children that are already shutting down during the short grace.
-                    std::thread::sleep(Duration::from_millis(1_700));
-                    let _ = registry.sample_task_process_group(&task);
-                }
+                let settled = registry.sample_task_process_group(&task);
                 if let Err(error) = registry.finish_terminal_transition(&task, emit_frame) {
                     crate::slog_warn!(
                         "failed to finish background task {} after descendant sampling: {error}",
                         task.task_id
                     );
+                }
+                registry.inner.terminal_transition.notify_waiters();
+                if settled
+                    .as_ref()
+                    .is_some_and(|(members, omitted)| !members.is_empty() || *omitted > 0)
+                {
+                    std::thread::sleep(Duration::from_millis(1_700));
+                    let _ = registry.sample_task_process_group(&task);
                 }
             })
             .map_err(|error| format!("failed to start descendant sampler: {error}"))?;
@@ -1534,8 +1548,10 @@ impl BgTaskRegistry {
     ) -> Result<String, String> {
         self.start_watchdog();
 
-        let linux_scope =
-            cfg!(target_os = "linux") && env.remove(LINUX_SCOPE_ENV).as_deref() == Some("1");
+        #[cfg(target_os = "linux")]
+        let linux_scope = env.remove(LINUX_SCOPE_ENV).as_deref() == Some("1");
+        #[cfg(not(target_os = "linux"))]
+        let linux_scope = false;
 
         let running = self.running_count();
         if running >= max_running {
@@ -4334,7 +4350,9 @@ impl BgTaskRegistry {
             .task_for_session(task_id, session_id)
             .ok_or_else(|| format!("background task not found: {task_id}"))?;
         let mut terminalized = false;
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut kill_signaled = false;
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut kill_reached = 0;
 
         {
@@ -6538,7 +6556,7 @@ fn spawn_detached_child(
     env: &HashMap<String, String>,
     io_handles: &mut TaskIoHandles,
     capture_pipeline_status: bool,
-    linux_scope: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] linux_scope: bool,
 ) -> Result<std::process::Child, String> {
     #[cfg(windows)]
     let _ = capture_pipeline_status;
