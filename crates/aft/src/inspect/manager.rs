@@ -68,6 +68,10 @@ struct CachedCallgraphProjection {
     identity: CallgraphProjectionIdentity,
     snapshot: Arc<CallgraphSnapshot>,
     estimated_bytes: u64,
+    rollup: Option<(
+        CallgraphProjectionIdentity,
+        Arc<super::scanners::dead_code::DeadCodeRollupState>,
+    )>,
 }
 
 #[derive(Debug, Clone)]
@@ -1157,17 +1161,46 @@ impl InspectManager {
     ) {
         let estimated_bytes = estimate_callgraph_snapshot_bytes(snapshot.as_ref());
         if let Ok(mut cached) = self.callgraph_projection.lock() {
+            let rollup = cached.take().and_then(|cached| cached.rollup);
             // Retain at most one 256 MiB projection per root. Larger graphs can
             // still be scanned, but do not become permanent resident caches.
             if estimated_bytes > 256 * 1024 * 1024 {
-                *cached = None;
                 return;
             }
             *cached = Some(CachedCallgraphProjection {
                 identity,
                 snapshot,
                 estimated_bytes,
+                rollup,
             });
+        }
+    }
+
+    fn previous_dead_code_rollup_state(
+        &self,
+        project_root: &Path,
+    ) -> Option<Arc<super::scanners::dead_code::DeadCodeRollupState>> {
+        let cached = self.callgraph_projection.lock().ok()?;
+        let cached = cached.as_ref()?;
+        let (identity, state) = cached.rollup.as_ref()?;
+        (identity.project_root == project_root
+            && identity.generation == cached.identity.generation
+            && identity.legacy_sqlite_path == cached.identity.legacy_sqlite_path)
+            .then(|| Arc::clone(state))
+    }
+
+    fn cache_dead_code_rollup_state(
+        &self,
+        project_root: &Path,
+        state: super::scanners::dead_code::DeadCodeRollupState,
+    ) {
+        if let Ok(mut cached) = self.callgraph_projection.lock() {
+            if let Some(cached) = cached
+                .as_mut()
+                .filter(|cached| cached.identity.project_root == project_root)
+            {
+                cached.rollup = Some((cached.identity.clone(), Arc::new(state)));
+            }
         }
     }
 
@@ -2373,7 +2406,47 @@ impl InspectManager {
         }
         let rollup_started = Instant::now();
         let contributions = load_contributions(cache, &aggregate_job)?;
-        let aggregate = roll_up_tier2_contributions(&aggregate_job, &contributions);
+        let aggregate = if aggregate_job.category == InspectCategory::DeadCode {
+            let Some(snapshot) = aggregate_job.callgraph_snapshot.as_deref() else {
+                return Err("dead-code rollup lost its required callgraph snapshot".to_string());
+            };
+            let public_api_files =
+                super::scanners::dead_code::collect_public_api_files(&job.project_root);
+            let roles = super::entry_points::resolve_project_roles(&job.project_root);
+            let changed_files = scan_files
+                .iter()
+                .filter_map(|path| path.strip_prefix(&job.project_root).ok())
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+                .collect::<BTreeSet<_>>();
+            let allow_incremental = phases
+                .projection
+                .is_some_and(|verdict| verdict.kind != ProjectionKind::Full);
+            let previous = allow_incremental
+                .then(|| self.previous_dead_code_rollup_state(&job.project_root))
+                .flatten();
+            let (aggregate, state, mut verdict) =
+                super::scanners::dead_code::aggregate_dead_code_contributions_incremental(
+                    &job.project_root,
+                    snapshot,
+                    &contributions,
+                    &public_api_files,
+                    &roles,
+                    Some(MAX_DRILL_DOWN_ITEMS),
+                    previous.as_deref(),
+                    &changed_files,
+                );
+            if verdict.kind == super::scanners::dead_code::RollupKind::Full {
+                verdict.reason = phases
+                    .projection
+                    .and_then(|projection| projection.reason)
+                    .or(Some("cold"));
+            }
+            phases.rollup_verdict = Some(verdict);
+            self.cache_dead_code_rollup_state(&job.project_root, state);
+            aggregate
+        } else {
+            roll_up_tier2_contributions(&aggregate_job, &contributions)
+        };
         cache
             .store_tier2_aggregate(job.key.clone(), &contribution_set_hash, aggregate.clone())
             .map_err(|error| error.to_string())?;
@@ -2708,6 +2781,9 @@ struct Tier2PhaseTimings {
     scanned_files: usize,
     /// How the dead-code snapshot was produced (dead_code only).
     projection: Option<ProjectionVerdict>,
+    /// Whether dead-code reachability traversed the complete graph or only the
+    /// affected frontier.
+    rollup_verdict: Option<super::scanners::dead_code::RollupVerdict>,
 }
 
 const TIER2_WORK_LOG_THRESHOLD: Duration = Duration::from_millis(50);
@@ -2738,8 +2814,12 @@ impl Tier2PhaseTimings {
             .projection
             .map(render_projection_suffix)
             .unwrap_or_default();
+        let rollup = self
+            .rollup_verdict
+            .map(render_rollup_suffix)
+            .unwrap_or_default();
         crate::slog_info!(
-            "perf tier2 phases category={} freshness={}ms snapshot={}ms scan={}ms({} files) db={}ms(lock={},txn={}) rollup={}ms{} root={} key={}",
+            "perf tier2 phases category={} freshness={}ms snapshot={}ms scan={}ms({} files) db={}ms(lock={},txn={}) rollup_ms={}{}{} root={} key={}",
             category,
             self.freshness.as_millis(),
             self.snapshot.as_millis(),
@@ -2749,6 +2829,7 @@ impl Tier2PhaseTimings {
             self.db_lock.as_millis(),
             self.db_txn.as_millis(),
             self.rollup.as_millis(),
+            rollup,
             projection,
             crate::logging::normalize_index_root(project_root),
             key
@@ -2759,6 +2840,18 @@ impl Tier2PhaseTimings {
 /// Render the `projection=...` suffix of the `perf tier2 phases` line for one
 /// dead-code snapshot verdict. `reason` is omitted for spliced and reused
 /// projections.
+fn render_rollup_suffix(verdict: super::scanners::dead_code::RollupVerdict) -> String {
+    let kind = match verdict.kind {
+        super::scanners::dead_code::RollupKind::Incremental => "incremental",
+        super::scanners::dead_code::RollupKind::Full => "full",
+    };
+    let reason = verdict
+        .reason
+        .map(|reason| format!(" reason={reason}"))
+        .unwrap_or_default();
+    format!(" rollup={kind}{reason}")
+}
+
 fn render_projection_suffix(verdict: ProjectionVerdict) -> String {
     let kind = match verdict.kind {
         ProjectionKind::Spliced => "spliced",
@@ -7855,6 +7948,21 @@ export function main() { foo(); }
 
     #[test]
     fn perf_tier2_phases_line_renders_each_projection_verdict() {
+        assert_eq!(
+            render_rollup_suffix(crate::inspect::scanners::dead_code::RollupVerdict {
+                kind: crate::inspect::scanners::dead_code::RollupKind::Incremental,
+                reason: None,
+            }),
+            " rollup=incremental"
+        );
+        assert_eq!(
+            render_rollup_suffix(crate::inspect::scanners::dead_code::RollupVerdict {
+                kind: crate::inspect::scanners::dead_code::RollupKind::Full,
+                reason: Some("journal_gap"),
+            }),
+            " rollup=full reason=journal_gap"
+        );
+
         let spliced = render_projection_suffix(ProjectionVerdict {
             kind: ProjectionKind::Spliced,
             reason: None,

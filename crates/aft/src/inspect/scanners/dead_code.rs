@@ -41,6 +41,34 @@ type ExportNode = (String, String);
 type OutboundCallsByCallerFile<'a> = BTreeMap<PathBuf, Vec<&'a CallgraphOutboundCall>>;
 type MethodNamesByLanguage = BTreeMap<String, BTreeSet<String>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RollupKind {
+    Incremental,
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RollupVerdict {
+    pub kind: RollupKind,
+    pub reason: Option<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct DeadCodeRollupState {
+    all: ReachabilityState,
+    production: ReachabilityState,
+}
+
+#[derive(Debug, Clone)]
+struct ReachabilityState {
+    edges: BTreeMap<ExportNode, BTreeSet<ExportNode>>,
+    imported_by_file: BTreeMap<String, BTreeSet<ExportNode>>,
+    namespace_by_file: BTreeMap<String, BTreeSet<ExportNode>>,
+    roots: BTreeSet<ExportNode>,
+    dispatch_roots: BTreeSet<ExportNode>,
+    reachable: BTreeSet<ExportNode>,
+}
+
 #[derive(Debug, Default)]
 struct ImportedExportLiveness {
     root_exports: Vec<ImportedExportContribution>,
@@ -574,17 +602,73 @@ pub(crate) fn aggregate_dead_code_contributions_with_snapshot(
     roles: &crate::inspect::entry_points::ProjectRoles,
     drill_down_limit: Option<usize>,
 ) -> serde_json::Value {
+    aggregate_dead_code_contributions_incremental(
+        project_root,
+        snapshot,
+        contributions,
+        public_api_files,
+        roles,
+        drill_down_limit,
+        None,
+        &BTreeSet::new(),
+    )
+    .0
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn aggregate_dead_code_contributions_incremental(
+    project_root: &Path,
+    snapshot: &CallgraphSnapshot,
+    contributions: &[FileContribution],
+    public_api_files: &BTreeSet<String>,
+    roles: &crate::inspect::entry_points::ProjectRoles,
+    drill_down_limit: Option<usize>,
+    previous: Option<&DeadCodeRollupState>,
+    changed_files: &BTreeSet<String>,
+) -> (serde_json::Value, DeadCodeRollupState, RollupVerdict) {
     let parsed = parse_dead_code_contributions(contributions);
     let materialized =
         materialize_dead_code_contributions(project_root, snapshot, parsed, public_api_files);
-    aggregate_materialized_dead_code_contributions(
+    let all_edges = edges_by_source(&materialized, false);
+    let production_edges = edges_by_source(&materialized, true);
+    let dispatched_method_names = collect_dispatched_method_names_by_language(&materialized);
+    let (all, all_incremental) = build_reachability_state(
+        &materialized,
+        all_edges,
+        &dispatched_method_names,
+        previous.map(|state| &state.all),
+        changed_files,
+    );
+    let (production, production_incremental) = build_reachability_state(
+        &materialized,
+        production_edges,
+        &dispatched_method_names,
+        previous.map(|state| &state.production),
+        changed_files,
+    );
+    let verdict = if all_incremental && production_incremental {
+        RollupVerdict {
+            kind: RollupKind::Incremental,
+            reason: None,
+        }
+    } else {
+        RollupVerdict {
+            kind: RollupKind::Full,
+            reason: Some("cold"),
+        }
+    };
+    let aggregate = aggregate_materialized_dead_code_contributions(
         project_root,
         &materialized,
         public_api_files,
         roles,
         drill_down_limit,
         contributions.len(),
-    )
+        &all.reachable,
+        &production.reachable,
+        &dispatched_method_names,
+    );
+    (aggregate, DeadCodeRollupState { all, production }, verdict)
 }
 
 fn parse_dead_code_contributions(contributions: &[FileContribution]) -> Vec<DeadCodeContribution> {
@@ -855,16 +939,10 @@ fn aggregate_materialized_dead_code_contributions(
     roles: &crate::inspect::entry_points::ProjectRoles,
     drill_down_limit: Option<usize>,
     scanned_files: usize,
+    reachable: &BTreeSet<ExportNode>,
+    production_reachable: &BTreeSet<ExportNode>,
+    dispatched_method_names: &MethodNamesByLanguage,
 ) -> serde_json::Value {
-    let all_edges_by_source = edges_by_source(parsed, false);
-    let production_edges_by_source = edges_by_source(parsed, true);
-    let dispatched_method_names = collect_dispatched_method_names_by_language(parsed);
-    let reachable = reachable_exports(parsed, &all_edges_by_source, &dispatched_method_names);
-    let production_reachable = reachable_exports(
-        parsed,
-        &production_edges_by_source,
-        &dispatched_method_names,
-    );
     let test_only_callers = test_only_callers_by_target(parsed);
     let referenced_type_names = collect_referenced_type_names(parsed);
 
@@ -1223,82 +1301,280 @@ fn collect_referenced_type_names(contributions: &[DeadCodeContribution]) -> BTre
         .collect()
 }
 
-fn reachable_exports(
+fn build_reachability_state(
     contributions: &[DeadCodeContribution],
-    edges_by_source: &BTreeMap<ExportNode, BTreeSet<ExportNode>>,
+    edges: BTreeMap<ExportNode, BTreeSet<ExportNode>>,
     dispatched_method_names: &MethodNamesByLanguage,
-) -> BTreeSet<ExportNode> {
-    let imported_exports_by_file = imported_exports_by_file(contributions);
-    let namespace_imports_by_file = namespace_imported_exports_by_file(contributions);
+    previous: Option<&ReachabilityState>,
+    changed_files: &BTreeSet<String>,
+) -> (ReachabilityState, bool) {
+    let mut current = reachability_inputs(contributions, edges, dispatched_method_names);
+    let Some(previous) = previous else {
+        current.reachable = traverse_reachable(
+            &current,
+            BTreeSet::new(),
+            current.roots.iter().chain(&current.dispatch_roots).cloned(),
+        );
+        return (current, false);
+    };
+
+    current.reachable = incremental_reachable(previous, &current, changed_files);
+    (current, true)
+}
+
+fn reachability_inputs(
+    contributions: &[DeadCodeContribution],
+    edges: BTreeMap<ExportNode, BTreeSet<ExportNode>>,
+    dispatched_method_names: &MethodNamesByLanguage,
+) -> ReachabilityState {
+    let mut roots = BTreeSet::new();
+    for contribution in contributions {
+        roots.extend(
+            contribution
+                .liveness_roots
+                .iter()
+                .map(|root| (contribution.file.clone(), root.clone())),
+        );
+        roots.extend(
+            contribution
+                .exports
+                .iter()
+                .filter(|export| export.is_entry_point)
+                .map(|export| (contribution.file.clone(), export.symbol.clone())),
+        );
+    }
+
     let dispatch_live_source_names_by_file =
         dispatch_live_source_names_by_file(contributions, dispatched_method_names);
-    let mut expanded_file_imports = BTreeSet::new();
-    let mut reachable = BTreeSet::new();
-    let mut queue = VecDeque::new();
+    let dispatch_roots = edges
+        .keys()
+        .filter(|source| {
+            dispatch_live_source_names_by_file
+                .get(&source.0)
+                .is_some_and(|names| names.contains(symbol_liveness_name(&source.1)))
+        })
+        .cloned()
+        .collect();
 
-    for contribution in contributions {
-        for root in &contribution.liveness_roots {
-            queue.push_back((contribution.file.clone(), root.clone()));
-        }
-        for export in &contribution.exports {
-            if export.is_entry_point {
-                queue.push_back((contribution.file.clone(), export.symbol.clone()));
-            }
-        }
+    ReachabilityState {
+        edges,
+        imported_by_file: imported_exports_by_file(contributions),
+        namespace_by_file: namespace_imported_exports_by_file(contributions),
+        roots,
+        dispatch_roots,
+        reachable: BTreeSet::new(),
+    }
+}
+
+fn incremental_reachable(
+    previous: &ReachabilityState,
+    current: &ReachabilityState,
+    changed_files: &BTreeSet<String>,
+) -> BTreeSet<ExportNode> {
+    if changed_files.is_empty()
+        && previous.edges == current.edges
+        && previous.imported_by_file == current.imported_by_file
+        && previous.namespace_by_file == current.namespace_by_file
+        && previous.roots == current.roots
+        && previous.dispatch_roots == current.dispatch_roots
+    {
+        return previous.reachable.clone();
     }
 
-    // Methods reached only via receiver or interface dispatch often have no
-    // precise call edge because the concrete receiver type is unknown. They are
-    // rescued from the dead list by method name, but that alone would not let
-    // liveness flow through the method body. Go uses the method-only gate below;
-    // other languages keep their existing name-based behavior.
-    for source in edges_by_source.keys() {
-        if dispatch_live_source_names_by_file
-            .get(&source.0)
-            .is_some_and(|method_names| method_names.contains(symbol_liveness_name(&source.1)))
+    let mut frontier = BTreeSet::new();
+    for source in previous.edges.keys().chain(current.edges.keys()) {
+        if changed_files.contains(&source.0)
+            || previous.edges.get(source) != current.edges.get(source)
         {
-            queue.push_back(source.clone());
+            frontier.insert(source.clone());
+            frontier.extend(previous.edges.get(source).into_iter().flatten().cloned());
+            frontier.extend(current.edges.get(source).into_iter().flatten().cloned());
+        }
+    }
+    frontier.extend(previous.roots.symmetric_difference(&current.roots).cloned());
+    frontier.extend(
+        previous
+            .dispatch_roots
+            .symmetric_difference(&current.dispatch_roots)
+            .cloned(),
+    );
+    let import_files = previous
+        .imported_by_file
+        .keys()
+        .chain(current.imported_by_file.keys())
+        .chain(previous.namespace_by_file.keys())
+        .chain(current.namespace_by_file.keys())
+        .collect::<BTreeSet<_>>();
+    for file in import_files {
+        if previous.imported_by_file.get(file) != current.imported_by_file.get(file) {
+            frontier.extend(
+                previous
+                    .imported_by_file
+                    .get(file)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
+            frontier.extend(
+                current
+                    .imported_by_file
+                    .get(file)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
+        }
+        if previous.namespace_by_file.get(file) != current.namespace_by_file.get(file) {
+            frontier.extend(
+                previous
+                    .namespace_by_file
+                    .get(file)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
+            frontier.extend(
+                current
+                    .namespace_by_file
+                    .get(file)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
         }
     }
 
-    while let Some(node) = queue.pop_front() {
-        if !reachable.insert(node.clone()) {
-            continue;
-        }
-        if expanded_file_imports.insert(node.0.clone()) {
-            // Static imports are file-level liveness edges: an imported export
-            // should keep the target live only when the importer file itself is
-            // reachable. This prevents dead consumers from making their imports
-            // look live while still covering references the call graph cannot
-            // see (type-only imports, JSX/value usage, barrel consumers, etc.).
-            if let Some(targets) = imported_exports_by_file.get(&node.0) {
-                for target in targets {
-                    if !reachable.contains(target) {
-                        queue.push_back(target.clone());
-                    }
-                }
-            }
+    // A removed edge can orphan its complete downstream component, including a
+    // cycle. Invalidate that old component before seeding it again from roots or
+    // unaffected live inbound edges in the new graph.
+    expand_frontier(previous, &mut frontier);
+    expand_frontier(current, &mut frontier);
 
-            // Namespace imports remain conservative file-level edges: once the
-            // importer file is reached, every export of the imported module is
-            // considered live because member access is not tracked here.
-            if let Some(targets) = namespace_imports_by_file.get(&node.0) {
-                for target in targets {
-                    if !reachable.contains(target) {
-                        queue.push_back(target.clone());
-                    }
+    let mut retained = previous
+        .reachable
+        .difference(&frontier)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut seeds = current
+        .roots
+        .iter()
+        .chain(&current.dispatch_roots)
+        .filter(|node| frontier.contains(*node))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for (source, targets) in &current.edges {
+        if retained.contains(source) {
+            seeds.extend(
+                targets
+                    .iter()
+                    .filter(|target| frontier.contains(*target))
+                    .cloned(),
+            );
+        }
+    }
+    let retained_files = retained
+        .iter()
+        .map(|node| node.0.as_str())
+        .collect::<BTreeSet<_>>();
+    for file in retained_files {
+        seeds.extend(
+            current
+                .imported_by_file
+                .get(file)
+                .into_iter()
+                .chain(current.namespace_by_file.get(file))
+                .flatten()
+                .filter(|target| frontier.contains(*target))
+                .cloned(),
+        );
+    }
+
+    retained = traverse_reachable_in_frontier(current, retained, seeds, &frontier);
+    retained
+}
+
+fn expand_frontier(state: &ReachabilityState, frontier: &mut BTreeSet<ExportNode>) {
+    let mut queue = frontier.iter().cloned().collect::<VecDeque<_>>();
+    let mut expanded_files = BTreeSet::new();
+    while let Some(node) = queue.pop_front() {
+        if expanded_files.insert(node.0.clone()) {
+            for target in state
+                .imported_by_file
+                .get(&node.0)
+                .into_iter()
+                .chain(state.namespace_by_file.get(&node.0))
+                .flatten()
+            {
+                if frontier.insert(target.clone()) {
+                    queue.push_back(target.clone());
                 }
             }
         }
-        if let Some(targets) = edges_by_source.get(&node) {
+        if let Some(targets) = state.edges.get(&node) {
             for target in targets {
-                if !reachable.contains(target) {
+                if frontier.insert(target.clone()) {
                     queue.push_back(target.clone());
                 }
             }
         }
     }
+}
 
+fn traverse_reachable(
+    state: &ReachabilityState,
+    reachable: BTreeSet<ExportNode>,
+    seeds: impl IntoIterator<Item = ExportNode>,
+) -> BTreeSet<ExportNode> {
+    traverse_reachable_inner(state, reachable, seeds, None)
+}
+
+fn traverse_reachable_in_frontier(
+    state: &ReachabilityState,
+    reachable: BTreeSet<ExportNode>,
+    seeds: impl IntoIterator<Item = ExportNode>,
+    frontier: &BTreeSet<ExportNode>,
+) -> BTreeSet<ExportNode> {
+    traverse_reachable_inner(state, reachable, seeds, Some(frontier))
+}
+
+fn traverse_reachable_inner(
+    state: &ReachabilityState,
+    mut reachable: BTreeSet<ExportNode>,
+    seeds: impl IntoIterator<Item = ExportNode>,
+    frontier: Option<&BTreeSet<ExportNode>>,
+) -> BTreeSet<ExportNode> {
+    let mut queue = seeds.into_iter().collect::<VecDeque<_>>();
+    let mut expanded_file_imports = reachable
+        .iter()
+        .map(|node| node.0.clone())
+        .collect::<BTreeSet<_>>();
+    while let Some(node) = queue.pop_front() {
+        if frontier.is_some_and(|nodes| !nodes.contains(&node)) || !reachable.insert(node.clone()) {
+            continue;
+        }
+        if expanded_file_imports.insert(node.0.clone()) {
+            queue.extend(
+                state
+                    .imported_by_file
+                    .get(&node.0)
+                    .into_iter()
+                    .chain(state.namespace_by_file.get(&node.0))
+                    .flatten()
+                    .filter(|target| !reachable.contains(*target))
+                    .cloned(),
+            );
+        }
+        queue.extend(
+            state
+                .edges
+                .get(&node)
+                .into_iter()
+                .flatten()
+                .filter(|target| !reachable.contains(*target))
+                .cloned(),
+        );
+    }
     reachable
 }
 
@@ -3543,6 +3819,126 @@ struct ParsedTarget {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn reachability_fixture(edges: &[(&str, &str)], roots: &[&str]) -> ReachabilityState {
+        let mut by_source = BTreeMap::<ExportNode, BTreeSet<ExportNode>>::new();
+        for (source, target) in edges {
+            by_source
+                .entry(("graph.ts".to_string(), (*source).to_string()))
+                .or_default()
+                .insert(("graph.ts".to_string(), (*target).to_string()));
+        }
+        let mut roots = roots
+            .iter()
+            .map(|root| ("graph.ts".to_string(), (*root).to_string()))
+            .collect::<BTreeSet<_>>();
+        roots.insert(("stable.ts".to_string(), "stable_root".to_string()));
+        let mut state = ReachabilityState {
+            edges: by_source,
+            imported_by_file: BTreeMap::new(),
+            namespace_by_file: BTreeMap::new(),
+            roots,
+            dispatch_roots: BTreeSet::new(),
+            reachable: BTreeSet::new(),
+        };
+        state.reachable = traverse_reachable(&state, BTreeSet::new(), state.roots.iter().cloned());
+        state
+    }
+
+    fn assert_incremental_reachability_parity(
+        previous: &ReachabilityState,
+        mut current: ReachabilityState,
+    ) -> ReachabilityState {
+        let full = current.reachable.clone();
+        current.reachable = incremental_reachable(
+            previous,
+            &current,
+            &["graph.ts".to_string()].into_iter().collect(),
+        );
+        assert_eq!(current.reachable, full);
+        current
+    }
+
+    #[test]
+    fn incremental_reachability_matches_full_across_cycle_diamond_and_orphan_edits() {
+        let initial = reachability_fixture(
+            &[
+                ("root", "a"),
+                ("a", "b"),
+                ("a", "c"),
+                ("b", "d"),
+                ("c", "d"),
+                ("d", "e"),
+                ("e", "d"),
+                ("a", "orphan"),
+                ("x", "y"),
+            ],
+            &["root"],
+        );
+        let removed_only_path = assert_incremental_reachability_parity(
+            &initial,
+            reachability_fixture(
+                &[
+                    ("root", "a"),
+                    ("a", "b"),
+                    ("a", "c"),
+                    ("b", "d"),
+                    ("c", "d"),
+                    ("d", "e"),
+                    ("e", "d"),
+                    ("x", "y"),
+                ],
+                &["root"],
+            ),
+        );
+        assert!(!removed_only_path
+            .reachable
+            .contains(&("graph.ts".to_string(), "orphan".to_string())));
+
+        let newly_reached = assert_incremental_reachability_parity(
+            &removed_only_path,
+            reachability_fixture(
+                &[
+                    ("root", "a"),
+                    ("a", "b"),
+                    ("a", "c"),
+                    ("b", "d"),
+                    ("c", "d"),
+                    ("d", "e"),
+                    ("e", "d"),
+                    ("c", "orphan"),
+                    ("x", "z"),
+                ],
+                &["root"],
+            ),
+        );
+        assert!(newly_reached
+            .reachable
+            .contains(&("graph.ts".to_string(), "orphan".to_string())));
+
+        let root_removed = assert_incremental_reachability_parity(
+            &newly_reached,
+            reachability_fixture(
+                &[
+                    ("a", "b"),
+                    ("a", "c"),
+                    ("b", "d"),
+                    ("c", "d"),
+                    ("d", "e"),
+                    ("e", "d"),
+                    ("c", "orphan"),
+                    ("x", "z"),
+                ],
+                &[],
+            ),
+        );
+        assert_eq!(
+            root_removed.reachable,
+            [("stable.ts".to_string(), "stable_root".to_string())]
+                .into_iter()
+                .collect()
+        );
+    }
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, RwLock};
 
