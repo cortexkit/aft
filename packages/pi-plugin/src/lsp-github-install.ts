@@ -688,26 +688,62 @@ export function validateExtraction(stagingRoot: string): void {
  *   4. Atomic rename: `staging → destDir`. Any prior `destDir` is removed first.
  *   5. Always cleanup staging on any failure.
  */
-export function precheckArchiveContents(archivePath: string, archiveType: string): void {
+type ZipListingMode = "platform" | "tar";
+
+function assertArchiveEntryPath(entry: string): void {
+  const normalized = entry.replaceAll("\\", "/");
+  if (
+    normalized.startsWith("/") ||
+    /^[A-Za-z]:\//.test(normalized) ||
+    normalized.split("/").includes("..")
+  ) {
+    throw new Error(`archive entry escapes archive root: ${entry}`);
+  }
+}
+
+function precheckWithTar(archivePath: string, command: string): number {
   let totalBytes = 0;
-  if (archiveType === "zip") {
+  const verbose = execFileSync(command, ["-tvf", archivePath], { encoding: "utf8" });
+  for (const line of verbose.split("\n")) {
+    // Both bsdtar and GNU tar render hardlinks with a leading `h` type marker.
+    // Reject them before extraction because the extracted inode cannot reveal
+    // the archive link target during the post-extraction containment walk.
+    if (line.startsWith("h")) {
+      throw new Error(`archive contains hardlink entry: ${line.trim()}`);
+    }
+    const parts = line.trim().split(/\s+/);
+    if (parts.length >= 6) {
+      const numeric = parts
+        .map((part) => Number.parseInt(part, 10))
+        .filter((value) => Number.isFinite(value) && value >= 0);
+      if (numeric.length > 0) totalBytes += Math.max(...numeric);
+    }
+  }
+
+  const names = execFileSync(command, ["-tf", archivePath], { encoding: "utf8" });
+  for (const entry of names.split("\n")) {
+    if (entry.length > 0) assertArchiveEntryPath(entry);
+  }
+  return totalBytes;
+}
+
+export function precheckArchiveContents(
+  archivePath: string,
+  archiveType: string,
+  zipListingMode: ZipListingMode = "platform",
+): void {
+  let totalBytes = 0;
+  if (archiveType === "zip" && zipListingMode === "platform" && process.platform !== "win32") {
     const out = execFileSync("unzip", ["-l", archivePath], { encoding: "utf8" });
     const match = out.match(/^\s*(\d+)\s+\d+\s+files?\s*$/m);
     if (match) totalBytes = Number.parseInt(match[1] ?? "0", 10);
-  } else {
-    const out = execFileSync("tar", ["-tvf", archivePath], { encoding: "utf8" });
-    for (const line of out.split("\n")) {
-      if (line.startsWith("h")) {
-        throw new Error(`archive contains hardlink entry: ${line.trim()}`);
-      }
-      const parts = line.trim().split(/\s+/);
-      if (parts.length >= 6) {
-        const numeric = parts
-          .map((part) => Number.parseInt(part, 10))
-          .filter((value) => Number.isFinite(value) && value >= 0);
-        if (numeric.length > 0) totalBytes += Math.max(...numeric);
-      }
+    const names = execFileSync("unzip", ["-Z1", archivePath], { encoding: "utf8" });
+    for (const entry of names.split("\n")) {
+      if (entry.length > 0) assertArchiveEntryPath(entry);
     }
+  } else {
+    const command = process.platform === "win32" ? "tar.exe" : "tar";
+    totalBytes = precheckWithTar(archivePath, command);
   }
   if (totalBytes > MAX_EXTRACT_BYTES) {
     throw new Error(`archive uncompressed size ${totalBytes} exceeds ${MAX_EXTRACT_BYTES}`);
