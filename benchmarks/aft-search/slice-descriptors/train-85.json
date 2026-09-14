@@ -1,0 +1,11 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens", "profile-grammar", "paging"],
+  "slices": [
+    "issue-312-aft-db-migration-race",
+    "e2e-suite-check-context-pr-head-sha"
+  ],
+  "note": "No ranking-fence file changes: aft.db migration planning/idempotency/self-heal, the standing-roots log suppression, and a workflow step fix."
+}
