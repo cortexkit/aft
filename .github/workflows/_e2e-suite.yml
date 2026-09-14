@@ -225,12 +225,15 @@ jobs:
       - name: Capture emitted check context and run identity
         env:
           GH_TOKEN: ${{ github.token }}
+          # On pull_request events GITHUB_SHA is the synthetic merge commit; the
+          # check runs are attached to the PR head, so list that sha instead.
+          OBSERVED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           run_root="$AFT_E2E_ARTIFACT_ROOT/$AFT_E2E_RUN_ID"
           mkdir -p "$run_root"
           current=""
           for attempt in 1 2 3 4 5 6; do
-            if checks=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs"); then
+            if checks=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${OBSERVED_SHA}/check-runs"); then
               current=$(jq -c \
                 --arg run_id "$GITHUB_RUN_ID" \
                 --arg job "OpenCode 2 (Linux Docker)" \
@@ -250,7 +253,7 @@ jobs:
           jq -n \
             --arg context "$(jq -r .name <<<"$current")" \
             --argjson observed_run_id "$(jq -r .id <<<"$current")" \
-            --arg observed_sha "$GITHUB_SHA" \
+            --arg observed_sha "$OBSERVED_SHA" \
             '{context: $context, observed_run_id: $observed_run_id, observed_sha: $observed_sha}' \
             > "$run_root/required-check-observation.json"
           cat "$run_root/required-check-observation.json"
