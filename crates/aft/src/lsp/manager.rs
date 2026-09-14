@@ -394,6 +394,9 @@ pub struct LspManager {
     next_post_edit_waiter_id: u64,
     /// Optional binary path overrides used by integration tests.
     binary_overrides: HashMap<ServerKind, PathBuf>,
+    /// Last plugin-pushed LSP search paths. `None` keeps direct `LspManager`
+    /// users compatible with the paths supplied on their `Config` argument.
+    pushed_search_paths: Option<Vec<PathBuf>>,
     /// Extra env vars merged into every spawned LSP child. Used in tests to
     /// drive the fake server's behavioral variants (`AFT_FAKE_LSP_PULL=1`,
     /// `AFT_FAKE_LSP_WORKSPACE=1`, etc.). Production code does not set this.
@@ -439,6 +442,7 @@ impl LspManager {
             post_edit_waiters: HashMap::new(),
             next_post_edit_waiter_id: 0,
             binary_overrides: HashMap::new(),
+            pushed_search_paths: None,
             extra_env: HashMap::new(),
             failed_spawns: HashMap::new(),
             watched_file_skip_logged: HashSet::new(),
@@ -508,6 +512,18 @@ impl LspManager {
     /// For testing: override the binary for a server kind.
     pub fn override_binary(&mut self, kind: ServerKind, binary_path: PathBuf) {
         self.binary_overrides.insert(kind, binary_path);
+    }
+
+    /// Replace the plugin-managed binary search paths used by future lazy starts.
+    /// Existing servers stay live; failed starts are forgotten when the paths
+    /// change so a newly installed binary is retried without restarting AFT.
+    pub fn set_search_paths(&mut self, paths: Vec<PathBuf>) -> bool {
+        if self.pushed_search_paths.as_ref() == Some(&paths) {
+            return false;
+        }
+        self.pushed_search_paths = Some(paths);
+        self.clear_failed_spawns();
+        true
     }
 
     /// Resolve every configured server applicable to a root without starting it.
@@ -2945,7 +2961,15 @@ impl LspManager {
             )));
         }
 
-        resolve_server_binary(def, Some(root), config).ok_or_else(|| {
+        let mut pushed_config;
+        let resolution_config = if let Some(paths) = self.pushed_search_paths.as_ref() {
+            pushed_config = config.clone();
+            pushed_config.lsp_paths_extra.clone_from(paths);
+            &pushed_config
+        } else {
+            config
+        };
+        resolve_server_binary(def, Some(root), resolution_config).ok_or_else(|| {
             let searched = if matches!(def.kind, ServerKind::Python | ServerKind::Ty) {
                 "the workspace virtualenv, node_modules/.bin, lsp_paths_extra, or PATH"
             } else {
@@ -3503,6 +3527,49 @@ mod diagnostic_capacity_tests {
         manager.insert_failed_spawn_for_test();
         assert_eq!(manager.clear_failed_spawns(), 1);
         assert_eq!(manager.clear_failed_spawns(), 0);
+    }
+
+    #[test]
+    fn pushed_search_paths_make_new_binary_visible_to_stale_config() {
+        let root = tempfile::tempdir().unwrap();
+        let bin_dir = tempfile::tempdir().unwrap();
+        let binary_name = "aft-test-pushed-lsp";
+        let binary = bin_dir.path().join(binary_name);
+        fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let config = Config {
+            project_root: Some(root.path().to_path_buf()),
+            lsp_servers: vec![crate::config::UserServerDef {
+                id: "pushed-search-path-test".to_string(),
+                extensions: vec!["pushedpath".to_string()],
+                binary: binary_name.to_string(),
+                args: Vec::new(),
+                root_markers: Vec::new(),
+                env: Default::default(),
+                initialization_options: None,
+                disabled: false,
+            }],
+            ..Config::default()
+        };
+        let file = root.path().join("sample.pushedpath");
+        fs::write(&file, "test\n").unwrap();
+        let definition = crate::lsp::registry::servers_for_file(&file, &config)
+            .into_iter()
+            .find(|definition| definition.kind.id_str() == "pushed-search-path-test")
+            .unwrap();
+        let mut manager = LspManager::new();
+
+        assert!(manager.resolve_binary(&definition, root.path(), &config).is_err());
+        assert!(manager.set_search_paths(vec![bin_dir.path().to_path_buf()]));
+        assert_eq!(
+            manager.resolve_binary(&definition, root.path(), &config).unwrap(),
+            binary
+        );
     }
 
     #[test]

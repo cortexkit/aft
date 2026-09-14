@@ -1313,6 +1313,46 @@ fn should_clear_failed_spawns(
         || previous.lsp_inflight_installs != next.lsp_inflight_installs
 }
 
+fn configs_equal_including_runtime_only_fields(previous: &Config, next: &Config) -> bool {
+    let serialized_equal = match (
+        serde_json::to_value(previous),
+        serde_json::to_value(next),
+    ) {
+        (Ok(previous), Ok(next)) => previous == next,
+        _ => false,
+    };
+    serialized_equal
+        && previous.foreground_wait_window_ms == next.foreground_wait_window_ms
+        && previous.diagnostics_on_edit == next.diagnostics_on_edit
+        && previous.semantic.subc_connection_file == next.semantic.subc_connection_file
+        && previous.semantic.route_project_root == next.semantic.route_project_root
+        && previous.semantic.route_harness == next.semantic.route_harness
+}
+
+/// The plugin owns these three process-state fields: binary search directories,
+/// auto-installable binary names, and installs currently in flight. None changes
+/// project artifacts, watcher inputs, or the active server registry.
+fn only_lsp_process_state_changed(previous: &Config, next: &Config) -> bool {
+    let changed = previous.lsp_paths_extra != next.lsp_paths_extra
+        || previous.lsp_auto_install_binaries != next.lsp_auto_install_binaries
+        || previous.lsp_inflight_installs != next.lsp_inflight_installs;
+    if !changed {
+        return false;
+    }
+
+    let mut without_lsp_process_state = next.clone();
+    without_lsp_process_state
+        .lsp_paths_extra
+        .clone_from(&previous.lsp_paths_extra);
+    without_lsp_process_state
+        .lsp_auto_install_binaries
+        .clone_from(&previous.lsp_auto_install_binaries);
+    without_lsp_process_state
+        .lsp_inflight_installs
+        .clone_from(&previous.lsp_inflight_installs);
+    configs_equal_including_runtime_only_fields(previous, &without_lsp_process_state)
+}
+
 #[cfg(test)]
 fn reset_workspace_manifest_fingerprint_scans_for_test() {
     WORKSPACE_MANIFEST_FINGERPRINT_SCANS.with(|count| count.set(0));
@@ -2437,24 +2477,9 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             format!("configure: project_root is not a directory: {}", root),
         );
     }
-    ctx.begin_configure_ack_phase("canonicalize");
-    let canonical_cache_root =
-        std::fs::canonicalize(&root_path).unwrap_or_else(|_| root_path.clone());
-    debug_assert!(canonical_cache_root.is_absolute());
-    ctx.begin_configure_ack_phase("worktree_probe");
-    if let Some(cancelled) = configure_cancelled(&req.id) {
-        return cancelled;
-    }
-    let (is_worktree_bridge, git_common_dir) = detect_worktree_bridge(ctx, &canonical_cache_root);
-    if let Some(cancelled) = configure_cancelled(&req.id) {
-        return cancelled;
-    }
-
     let previous_config = ctx.config();
     let previous_project_root = previous_config.project_root.clone();
     let previous_canonical_cache_root = ctx.canonical_cache_root_opt();
-    let project_root_changed =
-        previous_canonical_cache_root.as_deref() != Some(canonical_cache_root.as_path());
     wait_on_configure_semantic_snapshot_gate_for_test(&req.id);
     let mut next_config = previous_config.as_ref().clone();
     next_config.project_root = Some(root_path.clone());
@@ -2487,8 +2512,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             Some(&harness),
             &mut next_config,
         );
-    next_config.semantic.route_project_root = Some(canonical_cache_root.clone());
-    next_config.semantic.route_harness = Some(harness.wire_label());
     let config_dropped_keys = config_diagnostics.dropped;
     let mut configure_warnings = config_diagnostics
         .warnings
@@ -2587,20 +2610,6 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     let resolved_storage_dir =
         crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
     next_config.storage_dir = Some(resolved_storage_dir);
-    let child_storage_root =
-        crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
-    if let Err(error) = crate::agent_child_env::maintain(&next_config, &child_storage_root) {
-        return Response::error(&req.id, "child_environment_unavailable", error);
-    }
-    // Resolve the plugin-managed ONNX Runtime before the semantic build worker
-    // thread spawns below. This sets the process-global ORT_DYLIB_PATH once at
-    // startup so pre_validate_onnx_runtime finds the runtime the plugin already
-    // downloaded (issue #128). Idempotent: once ORT_DYLIB_PATH is set (by us or
-    // by an explicit user override) it short-circuits. Must run here, not lazily
-    // from the worker thread, because env mutation races ort's own dlopen.
-    if let Some(storage_dir) = next_config.storage_dir.as_deref() {
-        crate::semantic_index::resolve_managed_onnx_runtime(storage_dir);
-    }
     if let Some(raw) = params.get("max_background_bash_tasks") {
         let parsed = raw.as_u64().filter(|v| *v >= 1);
         match parsed.and_then(|v| usize::try_from(v).ok()) {
@@ -2616,6 +2625,99 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 );
             }
         }
+    }
+
+    // The common plugin auto-install update repeats the configured root spelling.
+    // That spelling and the stored canonical root form a proven alias pair, so the
+    // live-session check avoids another filesystem canonicalization entirely.
+    let active_canonical_root = previous_canonical_cache_root.as_ref().filter(|canonical_root| {
+        ctx.configure_generation() > 0
+            && ctx.harness_opt().as_ref() == Some(&harness)
+            && (previous_project_root.as_deref() == Some(root_path.as_path())
+                || canonical_root.as_path() == root_path)
+            && ctx.has_configure_session_binding(canonical_root, req.session())
+    });
+    if let Some(canonical_root) = active_canonical_root {
+        next_config.semantic.route_project_root = Some(canonical_root.clone());
+        next_config.semantic.route_harness = Some(harness.wire_label());
+        if only_lsp_process_state_changed(&previous_config, &next_config) {
+            if let Some(token) = crate::executor::current_job_cancellation() {
+                if !token.try_seal_committed() {
+                    return Response::error(
+                        &req.id,
+                        "request_cancelled",
+                        "configure cancelled: the requesting route was torn down or its bind deadline expired",
+                    );
+                }
+            }
+            let path_count = next_config.lsp_paths_extra.len();
+            {
+                let mut lsp = ctx.lsp();
+                lsp.set_search_paths(next_config.lsp_paths_extra.clone());
+                lsp.clear_failed_spawns();
+            }
+            ctx.set_config(next_config.clone());
+            ctx.begin_configure_ack_phase("ack_ready");
+            slog_info!(
+                "configure: lsp paths updated in place ({} dirs), no reconfigure",
+                path_count
+            );
+            let artifact_owner_status = ctx.artifact_owner_status();
+            let search_index_cache_reused = next_config.search_index
+                && ctx
+                    .search_index()
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some();
+            return Response::success(
+                &req.id,
+                json!({
+                    "project_root": root_path.display().to_string(),
+                    "warnings": configure_warnings,
+                    "warnings_pending": false,
+                    "search_index_cache_reused": search_index_cache_reused,
+                    "artifact_owner": artifact_owner_status
+                        .as_ref()
+                        .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null)),
+                    "config_dropped_keys": config_dropped_keys
+                        .iter()
+                        .map(|d| json!({ "key": d.key, "tier": d.tier, "reason": d.reason }))
+                        .collect::<Vec<_>>(),
+                }),
+            );
+        }
+    }
+
+    ctx.begin_configure_ack_phase("canonicalize");
+    let canonical_cache_root =
+        std::fs::canonicalize(&root_path).unwrap_or_else(|_| root_path.clone());
+    debug_assert!(canonical_cache_root.is_absolute());
+    let project_root_changed =
+        previous_canonical_cache_root.as_deref() != Some(canonical_cache_root.as_path());
+    next_config.semantic.route_project_root = Some(canonical_cache_root.clone());
+    next_config.semantic.route_harness = Some(harness.wire_label());
+    ctx.begin_configure_ack_phase("worktree_probe");
+    if let Some(cancelled) = configure_cancelled(&req.id) {
+        return cancelled;
+    }
+    let (is_worktree_bridge, git_common_dir) = detect_worktree_bridge(ctx, &canonical_cache_root);
+    if let Some(cancelled) = configure_cancelled(&req.id) {
+        return cancelled;
+    }
+
+    let child_storage_root =
+        crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+    if let Err(error) = crate::agent_child_env::maintain(&next_config, &child_storage_root) {
+        return Response::error(&req.id, "child_environment_unavailable", error);
+    }
+    // Resolve the plugin-managed ONNX Runtime before the semantic build worker
+    // thread spawns below. This sets the process-global ORT_DYLIB_PATH once at
+    // startup so pre_validate_onnx_runtime finds the runtime the plugin already
+    // downloaded (issue #128). Idempotent: once ORT_DYLIB_PATH is set (by us or
+    // by an explicit user override) it short-circuits. Must run here, not lazily
+    // from the worker thread, because env mutation races ort's own dlopen.
+    if let Some(storage_dir) = next_config.storage_dir.as_deref() {
+        crate::semantic_index::resolve_managed_onnx_runtime(storage_dir);
     }
 
     // Detect "this is not really a project root" scenarios before any walks
@@ -2948,6 +3050,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     if semantic_fingerprint_config_changed(&previous_config.semantic, &next_config.semantic) {
         ctx.advance_semantic_fingerprint_generation();
     }
+    ctx.lsp()
+        .set_search_paths(next_config.lsp_paths_extra.clone());
     ctx.set_config(next_config.clone());
     register_hashline_for_configure(
         ctx,
@@ -5733,7 +5837,8 @@ mod tests {
         configure_artifact_load_attempts_for_test, configure_artifact_load_cancellations_for_test,
         configure_artifact_post_gate_reached_for_test, configure_deferred_delay_reached_for_test,
         external_ignore_watch_paths, handle_configure, install_project_watcher_with,
-        parse_lsp_paths_extra, release_callgraph_start_waiters_for_generation_change,
+        only_lsp_process_state_changed, parse_lsp_paths_extra,
+        release_callgraph_start_waiters_for_generation_change,
         reset_configure_artifact_load_attempts_for_test,
         reset_configure_artifact_load_cancellations_for_test,
         reset_configure_deferred_delay_reached_for_test, semantic_build_retry_backoff,
@@ -11160,6 +11265,233 @@ mod tests {
 
         assert!(should_clear_failed_spawns(&previous, &next, true));
         assert!(!should_clear_failed_spawns(&previous, &previous, true));
+    }
+
+    #[test]
+    fn only_plugin_lsp_process_state_is_fast_path_eligible() {
+        let previous = Config::default();
+        for mutate in [
+            |config: &mut Config| config.lsp_paths_extra.push(PathBuf::from("/cache/lsp")),
+            |config: &mut Config| {
+                config
+                    .lsp_auto_install_binaries
+                    .insert("test-lsp".to_string());
+            },
+            |config: &mut Config| {
+                config.lsp_inflight_installs.insert("test-lsp".to_string());
+            },
+        ] {
+            let mut next = previous.clone();
+            mutate(&mut next);
+            assert!(only_lsp_process_state_changed(&previous, &next));
+        }
+
+        let mut semantic = previous.clone();
+        semantic.semantic.max_files += 1;
+        semantic.lsp_paths_extra.push(PathBuf::from("/cache/lsp"));
+        assert!(!only_lsp_process_state_changed(&previous, &semantic));
+
+        let mut sandbox = previous.clone();
+        sandbox.sandbox.enabled = true;
+        sandbox.lsp_paths_extra.push(PathBuf::from("/cache/lsp"));
+        assert!(!only_lsp_process_state_changed(&previous, &sandbox));
+    }
+
+    #[test]
+    fn lsp_paths_only_reconfigure_skips_git_and_artifact_work_under_50_ms() {
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let lsp_bin = tempfile::tempdir().unwrap();
+        init_git_fixture(root.path());
+        let ctx = test_context();
+        let base_params = json!({
+            "project_root": root.path(),
+            "harness": "opencode",
+            "storage_dir": storage.path(),
+            "config": [user_tier(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false
+            }))]
+        });
+        let initial = configure_request_with_session(base_params.clone(), "session-a");
+        assert!(handle_configure_for_test(&initial, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+
+        let generation = ctx.configure_generation();
+        let worktree_probes = ctx.worktree_bridge_probe_spawns_for_test();
+        let artifact_key_derivations = ctx.artifact_cache_key_derivation_count_for_test();
+        let artifact_loads = super::configure_artifact_load_attempts_for_root_for_test(root.path());
+        ctx.force_worktree_bridge_reprobe_for_test(true);
+        let mut lsp_params = base_params;
+        lsp_params["lsp_paths_extra"] = json!([lsp_bin.path()]);
+        lsp_params["lsp_inflight_installs"] = json!(["aft-test-lsp"]);
+        let update = configure_request_with_session(lsp_params, "session-a");
+
+        let started = Instant::now();
+        let response = handle_configure_for_test(&update, &ctx);
+        let elapsed = started.elapsed();
+        ctx.force_worktree_bridge_reprobe_for_test(false);
+
+        assert!(response.success, "LSP path update failed: {response:?}");
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "LSP path update took {elapsed:?}"
+        );
+        assert_eq!(ctx.configure_generation(), generation);
+        assert_eq!(ctx.worktree_bridge_probe_spawns_for_test(), worktree_probes);
+        assert_eq!(
+            ctx.artifact_cache_key_derivation_count_for_test(),
+            artifact_key_derivations
+        );
+        assert_eq!(
+            super::configure_artifact_load_attempts_for_root_for_test(root.path()),
+            artifact_loads
+        );
+        assert_eq!(ctx.configure_maintenance_job_count_for_test(), 0);
+    }
+
+    #[test]
+    fn lsp_paths_only_reconfigure_makes_new_binary_lazy_start_discoverable() {
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let lsp_bin = tempfile::tempdir().unwrap();
+        let binary_name = "aft-test-configure-pushed-lsp";
+        let source = root.path().join("sample.pushedpath");
+        std::fs::write(&source, "test\n").unwrap();
+        std::fs::write(root.path().join("custom-root.json"), "{}\n").unwrap();
+        init_git_fixture(root.path());
+        let ctx = test_context();
+        let base_params = json!({
+            "project_root": root.path(),
+            "harness": "opencode",
+            "storage_dir": storage.path(),
+            "config": [user_tier(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false,
+                "lsp": {"servers": {"pushed-path": {
+                    "extensions": ["pushedpath"],
+                    "binary": binary_name,
+                    "args": [],
+                    "root_markers": ["custom-root.json"],
+                    "disabled": false
+                }}}
+            }))]
+        });
+        let initial = configure_request_with_session(base_params.clone(), "session-a");
+        assert!(handle_configure_for_test(&initial, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert!(!ctx
+            .lsp()
+            .navigation_requires_deferred_execution(&source, ctx.config().as_ref()));
+
+        let binary = lsp_bin.path().join(binary_name);
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let generation = ctx.configure_generation();
+        let mut lsp_params = base_params;
+        lsp_params["lsp_paths_extra"] = json!([lsp_bin.path()]);
+        let update = configure_request_with_session(lsp_params, "session-a");
+        assert!(handle_configure_for_test(&update, &ctx).success);
+
+        assert_eq!(ctx.configure_generation(), generation);
+        assert!(ctx
+            .lsp()
+            .navigation_requires_deferred_execution(&source, ctx.config().as_ref()));
+    }
+
+    #[test]
+    fn project_semantic_and_sandbox_reconfigures_still_take_full_path() {
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+
+        let assert_full_path = |label: &str, changed_doc: Value| {
+            let root = tempfile::tempdir().unwrap();
+            let storage = tempfile::tempdir().unwrap();
+            init_git_fixture(root.path());
+            let ctx = test_context();
+            let base = json!({
+                "project_root": root.path(),
+                "harness": "opencode",
+                "storage_dir": storage.path(),
+                "config": [user_tier(json!({
+                    "search_index": false,
+                    "semantic_search": false,
+                    "callgraph_store": false
+                }))]
+            });
+            let initial = configure_request_with_session(base.clone(), "session-a");
+            assert!(handle_configure_for_test(&initial, &ctx).success);
+            super::drain_deferred_configure_maintenance(&ctx);
+            let worktree_probes = ctx.worktree_bridge_probe_spawns_for_test();
+            ctx.force_worktree_bridge_reprobe_for_test(true);
+
+            let mut changed = base;
+            changed["config"] = json!([user_tier(changed_doc)]);
+            let update = configure_request_with_session(changed, "session-a");
+            assert!(handle_configure_for_test(&update, &ctx).success);
+            ctx.force_worktree_bridge_reprobe_for_test(false);
+            assert!(
+                ctx.worktree_bridge_probe_spawns_for_test() > worktree_probes,
+                "{label} change should run the full configure path"
+            );
+        };
+
+        assert_full_path("semantic", json!({
+            "search_index": false,
+            "semantic_search": false,
+            "callgraph_store": false,
+            "semantic": {
+                "backend": "openai_compatible",
+                "model": "reconfigure-test-model",
+                "base_url": "http://127.0.0.1:9",
+                "timeout_ms": 1000,
+                "max_batch_size": 8,
+                "max_files": 1234
+            }
+        }));
+        assert_full_path("sandbox", json!({
+            "search_index": false,
+            "semantic_search": false,
+            "callgraph_store": false,
+            "sandbox": {"enabled": true}
+        }));
+
+        let root_a = tempfile::tempdir().unwrap();
+        let root_b = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(root_a.path());
+        init_git_fixture(root_b.path());
+        let ctx = test_context();
+        let params_for = |root: &Path| json!({
+            "project_root": root,
+            "harness": "opencode",
+            "storage_dir": storage.path(),
+            "config": [user_tier(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false
+            }))]
+        });
+        let initial = configure_request_with_session(params_for(root_a.path()), "session-a");
+        assert!(handle_configure_for_test(&initial, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+        let generation = ctx.configure_generation();
+        let changed = configure_request_with_session(params_for(root_b.path()), "session-a");
+        assert!(handle_configure_for_test(&changed, &ctx).success);
+        assert!(ctx.configure_generation() > generation);
     }
 
     /// Manual bind-path benchmark with a 5,120-source-file, 64-package repository.

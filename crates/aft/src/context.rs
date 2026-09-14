@@ -2598,6 +2598,7 @@ impl AppContext {
             .unwrap_or_else(|| Arc::new(std::sync::RwLock::new(SymbolCache::new())));
         let mut lsp_manager = LspManager::new();
         lsp_manager.set_child_registry(app.lsp_child_registry());
+        lsp_manager.set_search_paths(config.lsp_paths_extra.clone());
         // Apply the configured diagnostic LRU cap (default 5000, 0 = unbounded)
         // so the documented `lsp.diagnostic_cache_size` knob takes effect.
         lsp_manager.set_diagnostic_capacity(config.diagnostic_cache_size);
