@@ -300,7 +300,11 @@ maybeDescribe("e2e semantic search tool", () => {
 
     if (!output.includes(expectedFile) && lastError) throw lastError;
     expect(output).toContain(expectedFile);
-    expect(output).toContain("lexical match");
+    // Semantic search is off, so the hit must carry non-semantic evidence. Which
+    // kind depends on how far the borrowed trigram index has loaded when the
+    // poll first sees the file: the bounded walk renders "lexical match", the
+    // engine's phrase lane renders "[exact]" once the index is ready.
+    expect(output).toMatch(/lexical match|\[exact\]/);
   }, 40_000);
 });
 
