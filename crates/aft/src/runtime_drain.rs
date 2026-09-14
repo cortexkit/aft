@@ -71,6 +71,59 @@ static WATCHER_PHASE_COMMIT_GATE: std::sync::OnceLock<Mutex<Option<WatcherPhaseC
     std::sync::OnceLock::new();
 
 #[cfg(test)]
+struct WatcherRescanGate {
+    context_id: usize,
+    reached_tx: crossbeam_channel::Sender<()>,
+    release_rx: crossbeam_channel::Receiver<()>,
+}
+
+#[cfg(test)]
+static WATCHER_RESCAN_GATE: OnceLock<Mutex<Option<WatcherRescanGate>>> = OnceLock::new();
+
+#[cfg(test)]
+fn install_watcher_rescan_gate_for_test(
+    ctx: &AppContext,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
+    let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+    let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+    *WATCHER_RESCAN_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("watcher rescan gate mutex poisoned") = Some(WatcherRescanGate {
+        context_id: ctx as *const AppContext as usize,
+        reached_tx,
+        release_rx,
+    });
+    (reached_rx, release_tx)
+}
+
+#[cfg(test)]
+fn wait_on_watcher_rescan_gate_for_test(ctx: &AppContext) {
+    let mut slot = WATCHER_RESCAN_GATE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("watcher rescan gate mutex poisoned");
+    if !slot
+        .as_ref()
+        .is_some_and(|gate| gate.context_id == ctx as *const AppContext as usize)
+    {
+        return;
+    }
+    let gate = slot.take();
+    drop(slot);
+    if let Some(gate) = gate {
+        let _ = gate.reached_tx.send(());
+        let _ = gate.release_rx.recv_timeout(Duration::from_secs(12));
+    }
+}
+
+#[cfg(not(test))]
+fn wait_on_watcher_rescan_gate_for_test(_ctx: &AppContext) {}
+
+#[cfg(test)]
 fn install_watcher_phase_commit_gate_for_test(
     target: PathBuf,
 ) -> (
@@ -2737,25 +2790,34 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             .or_else(|| ctx.config().project_root.clone())
             .unwrap_or_else(|| PathBuf::from("<unconfigured>"));
         let watcher_counters = ctx.watcher_counters();
-        let interval = watcher_counters.begin_rescan(state.rescan_reason);
-        if ctx.heavy_root_work_allowed() {
-            ctx.rebuild_gitignore();
-        } else {
-            ctx.clear_gitignore();
+        watcher_counters.start_rescan();
+        let mut rescan_reason = state.rescan_reason;
+        loop {
+            let interval = watcher_counters.begin_rescan(rescan_reason);
+            wait_on_watcher_rescan_gate_for_test(ctx);
+            if ctx.heavy_root_work_allowed() {
+                ctx.rebuild_gitignore();
+            } else {
+                ctx.clear_gitignore();
+            }
+            let rss_before = watcher_rescan_rss_bytes();
+            let rescan_started = Instant::now();
+            state.status_changed |= refresh_project_after_watcher_rescan(ctx);
+            let cost_ms = rescan_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            let rss_delta_bytes = watcher_rescan_rss_delta(rss_before, watcher_rescan_rss_bytes());
+            watcher_counters.finish_rescan(cost_ms, rss_delta_bytes);
+            crate::logging::log_watcher_rescan(
+                &root,
+                rescan_reason,
+                cost_ms,
+                rss_delta_bytes,
+                interval.raw_events,
+            );
+            let Some(next_reason) = watcher_counters.finish_rescan_walk() else {
+                break;
+            };
+            rescan_reason = next_reason;
         }
-        let rss_before = watcher_rescan_rss_bytes();
-        let rescan_started = Instant::now();
-        state.status_changed |= refresh_project_after_watcher_rescan(ctx);
-        let cost_ms = rescan_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        let rss_delta_bytes = watcher_rescan_rss_delta(rss_before, watcher_rescan_rss_bytes());
-        watcher_counters.finish_rescan(cost_ms, rss_delta_bytes);
-        crate::logging::log_watcher_rescan(
-            &root,
-            state.rescan_reason,
-            cost_ms,
-            rss_delta_bytes,
-            interval.raw_events,
-        );
         state.scheduler_changed_path_count =
             aft::inspect::tier2_scheduler::TIER2_REFRESH_STORM_PATH_THRESHOLD + 1;
         if state.status_changed {
@@ -4935,6 +4997,121 @@ mod watcher_slice_tests {
             "expected 4-8 path-budgeted slices, got {slices}"
         );
         assert_eq!(ctx.pending_tier2_paths().len(), path_count);
+    }
+
+    #[test]
+    fn watcher_overflows_during_rescan_coalesce_one_followup_without_filter_stall() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let ctx = Arc::new(AppContext::new(
+            default_language_provider_factory(),
+            Config::default(),
+        ));
+        ctx.update_config(|config| config.project_root = Some(root.clone()));
+        ctx.set_canonical_cache_root(root.clone());
+        let counters = ctx.watcher_counters();
+        let matcher = Arc::new(std::sync::RwLock::new(None));
+        let matcher_generation = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (dispatch_tx, dispatch_rx) = crossbeam_channel::bounded(8);
+        *ctx.watcher_rx().lock() = Some(dispatch_rx);
+        let (raw_sender_tx, raw_sender_rx) = crossbeam_channel::bounded(1);
+        let filter_shutdown = Arc::clone(&shutdown);
+        let filter_root = root.clone();
+        let filter = std::thread::spawn(move || {
+            crate::watcher_filter::run_watcher_thread(
+                crate::watcher_filter::WatcherFilterConfig::new(filter_root, None),
+                Vec::new(),
+                matcher,
+                matcher_generation,
+                dispatch_tx,
+                filter_shutdown,
+                move |_root, _extra, raw_tx| {
+                    raw_sender_tx.send(raw_tx).unwrap();
+                    Ok::<(), std::io::Error>(())
+                },
+            );
+        });
+        let raw_tx = raw_sender_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let overflow =
+            || notify::Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan);
+        raw_tx.send(Ok(overflow())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while (counters.snapshot().overflows_total != 1
+            || ctx
+                .watcher_rx()
+                .lock()
+                .as_ref()
+                .is_none_or(crossbeam_channel::Receiver::is_empty))
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(counters.snapshot().overflows_total, 1);
+        assert!(ctx
+            .watcher_rx()
+            .lock()
+            .as_ref()
+            .is_some_and(|receiver| !receiver.is_empty()));
+        let _ = crate::watcher_filter::take_watcher_overflow_logs_for_test();
+
+        let (rescan_reached, release_rescan) = install_watcher_rescan_gate_for_test(&ctx);
+        let drain_ctx = Arc::clone(&ctx);
+        let drain = std::thread::spawn(move || drain_watcher_events(&drain_ctx));
+        rescan_reached
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first rescan did not reach the test gate");
+
+        raw_tx.send(Ok(overflow())).unwrap();
+        raw_tx.send(Ok(overflow())).unwrap();
+        let callback_deadline = Instant::now() + Duration::from_millis(50);
+        let mut overflow_lines = Vec::new();
+        while overflow_lines
+            .iter()
+            .filter(|line: &&String| {
+                line.contains(&format!("root={}", root.display()))
+                    && line.contains("rescan_in_progress=true")
+            })
+            .count()
+            != 2
+            && Instant::now() < callback_deadline
+        {
+            overflow_lines.extend(crate::watcher_filter::take_watcher_overflow_logs_for_test());
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            overflow_lines
+                .iter()
+                .filter(|line| {
+                    line.contains(&format!("root={}", root.display()))
+                        && line.contains("rescan_in_progress=true")
+                })
+                .count(),
+            2,
+            "the filter must finish attributing drops without waiting for the rescan: {overflow_lines:?}"
+        );
+        assert_eq!(counters.snapshot().overflows_total, 3);
+        assert!(ctx
+            .watcher_rx()
+            .lock()
+            .as_ref()
+            .is_some_and(crossbeam_channel::Receiver::is_empty));
+        release_rescan.send(()).unwrap();
+        drain.join().unwrap();
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.overflows_during_rescan, 2);
+        assert_eq!(snapshot.rescans_unknown_total, 2);
+        assert!(!counters.rescan_in_progress());
+        assert!(ctx
+            .watcher_rx()
+            .lock()
+            .as_ref()
+            .is_some_and(crossbeam_channel::Receiver::is_empty));
+
+        shutdown.store(true, Ordering::SeqCst);
+        drop(raw_tx);
+        filter.join().unwrap();
     }
 
     #[test]

@@ -515,10 +515,12 @@ impl WatcherFilterThread {
                     self.config.counters.note_raw_event();
                     if event.need_rescan() {
                         let reason = RescanReason::from_event_info(event.info());
-                        self.log_overflow(reason);
+                        let during_rescan = self.log_overflow(reason);
                         self.raw_paths.clear();
                         self.flush_deadline = None;
-                        if !self.send_dispatch(WatcherDispatchEvent::RescanRequired(reason)) {
+                        if !during_rescan
+                            && !self.send_dispatch(WatcherDispatchEvent::RescanRequired(reason))
+                        {
                             return;
                         }
                         continue;
@@ -587,7 +589,9 @@ impl WatcherFilterThread {
             if prefix.as_os_str().is_empty() {
                 continue;
             }
-            *counts.entry(prefix.to_string_lossy().into_owned()).or_default() += 1;
+            *counts
+                .entry(prefix.to_string_lossy().into_owned())
+                .or_default() += 1;
         }
         let mut prefixes = counts
             .into_iter()
@@ -603,9 +607,9 @@ impl WatcherFilterThread {
         prefixes
     }
 
-    fn log_overflow(&self, reason: RescanReason) {
+    fn log_overflow(&self, reason: RescanReason) -> bool {
         let prefixes = self.overflow_prefixes();
-        let during_rescan = self.config.counters.note_overflow(prefixes.clone());
+        let during_rescan = self.config.counters.note_overflow(reason, prefixes.clone());
         let backend = self.config.counters.backend_exclusions();
         let exclusions = backend
             .paths
@@ -649,6 +653,7 @@ impl WatcherFilterThread {
             during_rescan
         );
         emit_watcher_overflow_log(line);
+        during_rescan
     }
 
     fn push_raw_paths(&mut self, paths: Vec<PathBuf>) -> bool {
@@ -781,7 +786,7 @@ fn emit_watcher_overflow_log(line: String) {
 static WATCHER_OVERFLOW_LOGS_FOR_TEST: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
 #[cfg(test)]
-fn take_watcher_overflow_logs_for_test() -> Vec<String> {
+pub(crate) fn take_watcher_overflow_logs_for_test() -> Vec<String> {
     std::mem::take(
         &mut *WATCHER_OVERFLOW_LOGS_FOR_TEST
             .get_or_init(|| Mutex::new(Vec::new()))

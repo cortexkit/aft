@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, BufWriter};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock, TryLockError, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -703,6 +703,13 @@ pub(crate) struct WatcherCountersSnapshot {
     pub(crate) last_rescan_rss_delta_bytes: Option<i64>,
 }
 
+// After recording a drop's prefix summary, the filter changes RUNNING to RERUN
+// using only these atomics. The project tree walk does not access the prefix
+// lock or these atomics, so another drop can be recorded while that walk runs.
+const WATCHER_RESCAN_IDLE: u8 = 0;
+const WATCHER_RESCAN_RUNNING: u8 = 1;
+const WATCHER_RESCAN_RERUN: u8 = 2;
+
 #[derive(Debug, Default)]
 pub(crate) struct WatcherCounters {
     raw_events_total: AtomicU64,
@@ -717,7 +724,8 @@ pub(crate) struct WatcherCounters {
     overflows_during_rescan: AtomicU64,
     last_overflow_prefixes: RwLock<Vec<WatcherOverflowPrefix>>,
     backend_exclusions: RwLock<WatcherBackendExclusions>,
-    rescan_in_progress: AtomicBool,
+    rescan_state: AtomicU8,
+    rescan_again_reason: AtomicU8,
     rescans_kernel_dropped_total: AtomicU64,
     rescans_user_dropped_total: AtomicU64,
     rescans_unknown_total: AtomicU64,
@@ -762,18 +770,95 @@ impl WatcherCounters {
             .fetch_add(count, Ordering::Relaxed);
     }
 
-    pub(crate) fn note_overflow(&self, prefixes: Vec<WatcherOverflowPrefix>) -> bool {
+    pub(crate) fn note_overflow(
+        &self,
+        reason: crate::watcher_filter::RescanReason,
+        prefixes: Vec<WatcherOverflowPrefix>,
+    ) -> bool {
         self.overflows_total.fetch_add(1, Ordering::Relaxed);
-        let during_rescan = self.rescan_in_progress.load(Ordering::Acquire);
-        if during_rescan {
-            self.overflows_during_rescan
-                .fetch_add(1, Ordering::Relaxed);
-        }
         *self
             .last_overflow_prefixes
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = prefixes;
-        during_rescan
+
+        let reason = match reason {
+            crate::watcher_filter::RescanReason::KernelDropped => 1,
+            crate::watcher_filter::RescanReason::UserDropped => 2,
+            crate::watcher_filter::RescanReason::Unknown => 3,
+        };
+        loop {
+            let state = self.rescan_state.load(Ordering::Acquire);
+            if state == WATCHER_RESCAN_IDLE {
+                return false;
+            }
+            self.rescan_again_reason.store(reason, Ordering::Release);
+            if self
+                .rescan_state
+                .compare_exchange(
+                    state,
+                    WATCHER_RESCAN_RERUN,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                self.overflows_during_rescan.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+    }
+
+    pub(crate) fn start_rescan(&self) {
+        let _ = self.rescan_state.compare_exchange(
+            WATCHER_RESCAN_IDLE,
+            WATCHER_RESCAN_RUNNING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    pub(crate) fn finish_rescan_walk(&self) -> Option<crate::watcher_filter::RescanReason> {
+        loop {
+            match self.rescan_state.load(Ordering::Acquire) {
+                WATCHER_RESCAN_RERUN => {
+                    if self
+                        .rescan_state
+                        .compare_exchange(
+                            WATCHER_RESCAN_RERUN,
+                            WATCHER_RESCAN_RUNNING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return Some(match self.rescan_again_reason.load(Ordering::Acquire) {
+                            1 => crate::watcher_filter::RescanReason::KernelDropped,
+                            2 => crate::watcher_filter::RescanReason::UserDropped,
+                            _ => crate::watcher_filter::RescanReason::Unknown,
+                        });
+                    }
+                }
+                WATCHER_RESCAN_RUNNING => {
+                    if self
+                        .rescan_state
+                        .compare_exchange(
+                            WATCHER_RESCAN_RUNNING,
+                            WATCHER_RESCAN_IDLE,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    pub(crate) fn rescan_in_progress(&self) -> bool {
+        self.rescan_state.load(Ordering::Acquire) != WATCHER_RESCAN_IDLE
     }
 
     pub(crate) fn set_backend_exclusions(&self, matcher_generation: u64, paths: Vec<PathBuf>) {

@@ -2283,10 +2283,13 @@ mod tests {
         watcher.note_invalidating_event();
         watcher.note_paths_after_gitignore(7);
         watcher.note_paths_dispatched(6);
-        watcher.note_overflow(vec![crate::context::WatcherOverflowPrefix {
-            prefix: "packages/opencode-plugin".to_string(),
-            count: 23,
-        }]);
+        watcher.note_overflow(
+            crate::watcher_filter::RescanReason::UserDropped,
+            vec![crate::context::WatcherOverflowPrefix {
+                prefix: "packages/opencode-plugin".to_string(),
+                count: 23,
+            }],
+        );
         assert_eq!(
             watcher
                 .begin_rescan(crate::watcher_filter::RescanReason::UserDropped)
