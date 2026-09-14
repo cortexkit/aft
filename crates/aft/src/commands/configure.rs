@@ -11442,7 +11442,7 @@ mod tests {
     }
 
     #[test]
-    fn lsp_paths_only_reconfigure_skips_git_and_artifact_work_under_50_ms() {
+    fn lsp_paths_only_reconfigure_skips_git_and_artifact_work() {
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
@@ -11475,16 +11475,13 @@ mod tests {
         lsp_params["lsp_inflight_installs"] = json!(["aft-test-lsp"]);
         let update = configure_request_with_session(lsp_params, "session-a");
 
-        let started = Instant::now();
         let response = handle_configure_for_test(&update, &ctx);
-        let elapsed = started.elapsed();
         ctx.force_worktree_bridge_reprobe_for_test(false);
 
         assert!(response.success, "LSP path update failed: {response:?}");
-        assert!(
-            elapsed < Duration::from_millis(50),
-            "LSP path update took {elapsed:?}"
-        );
+        // The proof that the fast path was taken is the counters below (no
+        // probe spawned, no key derived, no artifact loaded, no maintenance
+        // enqueued), not a wall-clock bound a loaded CI runner can miss.
         assert_eq!(ctx.configure_generation(), generation);
         assert_eq!(ctx.worktree_bridge_probe_spawns_for_test(), worktree_probes);
         assert_eq!(
