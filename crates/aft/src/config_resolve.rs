@@ -387,6 +387,7 @@ pub struct RawBashFeatures {
     pub foreground_wait_window_ms: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_positive_u64")]
     pub watch_sync_max_ms: Option<u64>,
+    pub linux_scope: Option<bool>,
     pub powershell_tool: Option<bool>,
 }
 
@@ -1052,7 +1053,7 @@ fn merge_project_config(base: &mut RawAftConfig, project: RawAftConfig) {
     base.semantic = merge_semantic_config(base.semantic.clone(), project.semantic);
     base.lsp = merge_lsp_config(base.lsp.clone(), project.lsp);
     base.experimental = merge_experimental_config(base.experimental.clone(), project.experimental);
-    base.bash = merge_bash_config(base.bash.clone(), project.bash);
+    base.bash = merge_bash_config(base.bash.clone(), project_safe_bash(project.bash));
     base.inspect = merge_inspect_config(base.inspect.clone(), project.inspect);
     base.idle = merge_idle_config(base.idle.clone(), project.idle);
     base.worktree = merge_worktree_config(base.worktree.clone(), project.worktree);
@@ -1254,6 +1255,16 @@ fn merge_experimental_bash(
     bash.has_any_value().then_some(bash)
 }
 
+fn project_safe_bash(project: Option<RawBash>) -> Option<RawBash> {
+    project.map(|bash| match bash {
+        RawBash::Bool(enabled) => RawBash::Bool(enabled),
+        RawBash::Features(mut features) => {
+            features.linux_scope = None;
+            RawBash::Features(features)
+        }
+    })
+}
+
 fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> Option<RawBash> {
     match (base, override_bash) {
         (None, None) => None,
@@ -1285,6 +1296,7 @@ fn merge_bash_config(base: Option<RawBash>, override_bash: Option<RawBash>) -> O
                 watch_sync_max_ms: override_features
                     .watch_sync_max_ms
                     .or(base.watch_sync_max_ms),
+                linux_scope: override_features.linux_scope.or(base.linux_scope),
                 powershell_tool: override_features.powershell_tool.or(base.powershell_tool),
             }))
         }
@@ -1304,6 +1316,7 @@ fn expand_bash_for_merge(value: &RawBash) -> RawBashFeatures {
             long_running_reminder_interval_ms: None,
             foreground_wait_window_ms: None,
             watch_sync_max_ms: None,
+            linux_scope: None,
             powershell_tool: None,
         },
         RawBash::Features(features) => features.clone(),
@@ -1454,6 +1467,11 @@ fn record_project_drops(raw: &RawAftConfig, tier: &str, dropped: &mut Vec<Droppe
         if sandbox.write_allow.is_some() {
             push_drop(dropped, "sandbox.write_allow", tier, USER_ONLY_REASON);
         }
+    }
+    if raw.bash.as_ref().is_some_and(
+        |bash| matches!(bash, RawBash::Features(features) if features.linux_scope.is_some()),
+    ) {
+        push_drop(dropped, "bash.linux_scope", tier, USER_ONLY_REASON);
     }
     if raw
         .disabled_tools
@@ -2016,6 +2034,7 @@ struct ResolvedBashConfig {
     long_running_reminder_interval_ms: Option<u64>,
     foreground_wait_window_ms: u64,
     watch_sync_max_ms: u64,
+    linux_scope: bool,
     powershell_tool: bool,
 }
 
@@ -2028,6 +2047,7 @@ fn resolve_bash_fields(raw: &RawAftConfig, config: &mut Config, warnings: &mut V
     config.bash.host_fallback = bash.host_fallback;
     config.bash.detach_on_user_message = bash.detach_on_user_message;
     config.bash.watch_sync_max_ms = bash.watch_sync_max_ms;
+    config.bash.linux_scope = bash.linux_scope;
     config.bash.powershell_tool = bash.powershell_tool;
     config.experimental_bash_rewrite = bash.rewrite;
     config.experimental_bash_compress = bash.compress;
@@ -2075,6 +2095,9 @@ fn resolve_bash_config(
     let raw_foreground_wait = top_features.and_then(|features| features.foreground_wait_window_ms);
     let raw_watch_sync_max = top_features.and_then(|features| features.watch_sync_max_ms);
     let watch_sync_max_ms = resolve_clamped_bash_watch_sync_max_ms(raw_watch_sync_max, warnings);
+    let top_linux_scope = top_features
+        .and_then(|features| features.linux_scope)
+        .unwrap_or(false);
     let top_powershell_tool = top_features
         .and_then(|features| features.powershell_tool)
         .unwrap_or(false);
@@ -2094,6 +2117,7 @@ fn resolve_bash_config(
         long_running_reminder_interval_ms: reminder_interval,
         foreground_wait_window_ms,
         watch_sync_max_ms,
+        linux_scope: top_linux_scope,
         powershell_tool: false,
     };
 
@@ -3292,6 +3316,18 @@ mod tests {
             .disabled_tools
             .iter()
             .any(|tool| tool == "aft_search"));
+    }
+
+    #[test]
+    fn bash_linux_scope_is_user_only_and_defaults_off() {
+        assert!(!resolve_config(&[]).config.bash.linux_scope);
+
+        let result = resolve_config(&[
+            tier("user", r#"{ "bash": { "linux_scope": true } }"#),
+            tier("project", r#"{ "bash": { "linux_scope": false } }"#),
+        ]);
+        assert!(result.config.bash.linux_scope);
+        assert!(drop_keys(&result).contains(&"bash.linux_scope".to_string()));
     }
 
     #[test]

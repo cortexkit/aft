@@ -180,6 +180,10 @@ pub fn spawn(
     {
         return Response::error(request_id, "child_environment_unavailable", error);
     }
+    #[cfg(target_os = "linux")]
+    if !pty && config.bash.linux_scope {
+        env.insert(registry::LINUX_SCOPE_ENV.to_string(), "1".to_string());
+    }
     let task_kind = if pty {
         SandboxTaskKind::BashPty
     } else if require_background_flag {

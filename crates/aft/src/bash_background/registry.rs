@@ -71,6 +71,7 @@ const QUARANTINE_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 const TOKENIZE_CAP_BYTES_PER_STREAM: usize = 128 * 1024;
 pub const ROOT_RECLAIMED_REASON: &str = "root_reclaimed";
+pub(crate) const LINUX_SCOPE_ENV: &str = "AFT_INTERNAL_LINUX_SCOPE";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BgCompletion {
@@ -1523,7 +1524,7 @@ impl BgTaskRegistry {
         shell_path: PathBuf,
         session_id: String,
         workdir: PathBuf,
-        env: HashMap<String, String>,
+        mut env: HashMap<String, String>,
         timeout: Option<Duration>,
         storage_dir: PathBuf,
         max_running: usize,
@@ -1532,6 +1533,9 @@ impl BgTaskRegistry {
         project_root: Option<PathBuf>,
     ) -> Result<String, String> {
         self.start_watchdog();
+
+        let linux_scope =
+            cfg!(target_os = "linux") && env.remove(LINUX_SCOPE_ENV).as_deref() == Some("1");
 
         let running = self.running_count();
         if running >= max_running {
@@ -1649,6 +1653,7 @@ impl BgTaskRegistry {
             &env,
             &mut io_handles,
             capture_pipeline_status,
+            linux_scope,
         ) {
             Ok(child) => child,
             Err(error) => {
@@ -1988,6 +1993,7 @@ impl BgTaskRegistry {
             &workdir,
             &env,
             &mut io_handles,
+            false,
             false,
         ) {
             Ok(child) => child,
@@ -6532,6 +6538,7 @@ fn spawn_detached_child(
     env: &HashMap<String, String>,
     io_handles: &mut TaskIoHandles,
     capture_pipeline_status: bool,
+    linux_scope: bool,
 ) -> Result<std::process::Child, String> {
     #[cfg(windows)]
     let _ = capture_pipeline_status;
@@ -6568,7 +6575,8 @@ fn spawn_detached_child(
         } else {
             String::new()
         };
-        let args = vec![
+        let base_executable = PathBuf::from("/bin/sh");
+        let base_args = vec![
             OsString::from("-c"),
             payload.wrapper_text.clone(),
             OsString::from("aft-payload-wrapper"),
@@ -6578,9 +6586,32 @@ fn spawn_detached_child(
             OsString::from(pipeline_status_fd),
             OsString::from(pipeline_shell),
         ];
+        #[cfg(target_os = "linux")]
+        let (executable, args) = if linux_scope {
+            if spawn_plan.is_native_launcher() {
+                crate::slog_info!(
+                    "bash.linux_scope requested but native sandbox launch cannot reach the user manager; spawning without a systemd scope"
+                );
+                (base_executable, base_args)
+            } else if let Some(launcher) = super::process::select_systemd_scope_launcher() {
+                super::process::systemd_scope_argv(&launcher, &base_executable, &base_args)
+            } else {
+                crate::slog_info!(
+                    "bash.linux_scope requested but systemd-run or the user manager is unavailable; spawning without a systemd scope"
+                );
+                (base_executable, base_args)
+            }
+        } else {
+            (base_executable, base_args)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (executable, args) = {
+            let _ = linux_scope;
+            (base_executable, base_args)
+        };
         let (mut child_command, profile_handle) = crate::sandbox_spawn::detached_command_for_plan(
             spawn_plan,
-            std::ffi::OsStr::new("/bin/sh"),
+            executable.as_os_str(),
             &args,
             &paths.json,
             crate::sandbox_spawn::CHILD_EXIT_FD,

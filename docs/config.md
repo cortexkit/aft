@@ -14,6 +14,8 @@ OMP uses this same CortexKit user file; register its Pi-compatible plugin with `
 
 `bash.watch_sync_max_ms` bounds synchronous `bash_watch` calls, which should only cover a short remaining wait on a task; it defaults to 120 seconds because longer synchronous waits keep the agent turn occupied. For longer commands, use `bash({background:true})` and let the completion reminder wake you, or use `bash({wait:true})` when the result is needed before anything else. Values are clamped to 1000..=1800000 with a warning; set it to `1800000` in user or project config to restore the old 30-minute cap.
 
+On Linux, user config may set `bash.linux_scope: true` to launch non-PTY tool shells through `systemd-run --user --scope --collect --quiet`. The default is `false`. AFT uses the scope only when `systemd-run` exists and the user manager is reachable; otherwise it falls back to the normal process-group-isolated spawn and writes one informational log line. Native-sandbox launches also use the normal spawn because their launcher cannot contact the user manager. Project config cannot enable or disable this host-level containment option.
+
 Background-task completion and pattern-watch notices are delivered only to the session that started the task; other sessions bound to the same project may still inspect or stop the task by ID.
 
 Older installs used per-harness paths (`~/.config/opencode/aft.jsonc`, `~/.pi/agent/aft.jsonc`,
@@ -333,7 +335,11 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
     // values outside 1000..=1800000 are clamped with a warning. Sync waits are
     // intended for a short remaining wait; to restore the old 30-minute cap,
     // set this to 1800000 in the user or project config.
-    "watch_sync_max_ms": 120000
+    "watch_sync_max_ms": 120000,
+
+    // Linux-only and user-tier only. Put non-PTY tool shells in transient
+    // systemd user scopes when the user manager is reachable. Default false.
+    "linux_scope": false
   },
 
   // aft_inspect codebase-health scanner (recommended/all tiers).

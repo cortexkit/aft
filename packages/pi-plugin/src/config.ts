@@ -294,6 +294,8 @@ export interface BashConfig {
   foreground_wait_window_ms?: number;
   /** Maximum synchronous bash_watch wait; values outside 1000..1800000 are clamped. Default 120000. */
   watch_sync_max_ms?: number;
+  /** Linux-only user-tier opt-in for transient systemd user scopes. Default false. */
+  linux_scope?: boolean;
   /** Manual fallback for Pi versions that do not expose enabled default tools. */
   powershell_tool?: boolean;
 }
@@ -729,6 +731,8 @@ const BashFeaturesSchema = z.object({
   foreground_wait_window_ms: z.number().int().positive().optional(),
   /** Maximum synchronous bash_watch wait in milliseconds; clamped to 1000..1800000. Default 120000. */
   watch_sync_max_ms: z.number().int().positive().optional(),
+  /** Linux-only user-tier opt-in for transient systemd user scopes. Default false. */
+  linux_scope: z.boolean().optional(),
   // Pi mirrors the host's optional PowerShell default tool when its API can
   // report that state. This project-safe fallback is used only on older hosts.
   powershell_tool: z.boolean().optional(),

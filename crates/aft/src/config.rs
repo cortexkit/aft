@@ -489,6 +489,8 @@ pub struct BashConfig {
     /// Rust accepts this for cross-language config parity but never acts on it.
     #[serde(default = "default_bash_watch_sync_max_ms")]
     pub watch_sync_max_ms: u64,
+    /// Put Linux tool shells in transient user scopes when systemd is available.
+    pub linux_scope: bool,
     /// Pi-only fallback gate for its optional PowerShell default tool. The Rust
     /// executor accepts this solely to keep shared config parsing in parity.
     pub powershell_tool: bool,
@@ -500,6 +502,7 @@ impl Default for BashConfig {
             host_fallback: false,
             detach_on_user_message: default_bash_detach_on_user_message(),
             watch_sync_max_ms: default_bash_watch_sync_max_ms(),
+            linux_scope: false,
             powershell_tool: false,
         }
     }

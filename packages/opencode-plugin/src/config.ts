@@ -274,6 +274,8 @@ const BashFeaturesSchema = z.object({
   foreground_wait_window_ms: z.number().int().positive().optional(),
   /** Maximum synchronous bash_watch wait in milliseconds; clamped to 1000..1800000. Default 120000. */
   watch_sync_max_ms: z.number().int().positive().optional(),
+  /** Linux-only user-tier opt-in for transient systemd user scopes. Default false. */
+  linux_scope: z.boolean().optional(),
   // Pi-only registration fallback. OpenCode accepts this shared config key but
   // never registers a PowerShell tool.
   powershell_tool: z.boolean().optional(),

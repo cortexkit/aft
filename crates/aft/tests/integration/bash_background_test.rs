@@ -242,11 +242,23 @@ fn orphaning_pipeline_command(pid_file: &Path, consumer: &str) -> String {
 #[cfg(unix)]
 fn pids_from_file(path: &Path) -> Vec<i32> {
     wait_for_file(path);
-    std::fs::read_to_string(path)
-        .unwrap()
-        .lines()
-        .map(|line| line.parse::<i32>().unwrap())
-        .collect()
+    let started = Instant::now();
+    loop {
+        let pids = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| line.parse::<i32>().unwrap())
+            .collect::<Vec<_>>();
+        if pids.len() == 3 {
+            return pids;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "timed out waiting for all worker pids in {}: {pids:?}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[cfg(unix)]

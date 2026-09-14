@@ -332,6 +332,11 @@
               "default": 120000,
               "description": "Maximum synchronous bash_watch wait in milliseconds. Defaults to 120 seconds for short remaining waits; set to 1800000 to restore the old 30-minute cap."
             },
+            "linux_scope": {
+              "type": "boolean",
+              "default": false,
+              "description": "Linux-only, user-tier opt-in. Run tool shells in transient systemd user scopes when systemd-run and the user manager are available; otherwise fall back to the normal spawn."
+            },
             "long_running_reminder_enabled": {
               "type": "boolean",
               "default": true,
@@ -1037,6 +1042,11 @@
                     "maximum": 1800000,
                     "default": 120000,
                     "description": "Maximum synchronous bash_watch wait in milliseconds. Defaults to 120 seconds for short remaining waits; set to 1800000 to restore the old 30-minute cap."
+                  },
+                  "linux_scope": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Linux-only, user-tier opt-in. Run tool shells in transient systemd user scopes when systemd-run and the user manager are available; otherwise fall back to the normal spawn."
                   },
                   "long_running_reminder_enabled": {
                     "type": "boolean",

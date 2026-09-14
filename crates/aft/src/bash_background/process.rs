@@ -1,5 +1,9 @@
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
 #[cfg(unix)]
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 /// Shared process-termination helpers for both foreground bash and background
@@ -52,6 +56,46 @@ pub fn live_process_group_members(pgid: i32) -> Option<(Vec<LiveDescendant>, usi
         members.truncate(LIVE_DESCENDANT_CAP);
         Some((members, omitted))
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn systemd_scope_argv(
+    systemd_run: &Path,
+    executable: &Path,
+    args: &[OsString],
+) -> (PathBuf, Vec<OsString>) {
+    let mut wrapped = ["--user", "--scope", "--collect", "--quiet"]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+    wrapped.push(executable.as_os_str().to_os_string());
+    wrapped.extend_from_slice(args);
+    (systemd_run.to_path_buf(), wrapped)
+}
+
+#[cfg(target_os = "linux")]
+fn select_systemd_scope_launcher_with(
+    find: impl FnOnce() -> Option<PathBuf>,
+    probe: impl FnOnce(&Path) -> bool,
+) -> Option<PathBuf> {
+    let launcher = find()?;
+    probe(&launcher).then_some(launcher)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn select_systemd_scope_launcher() -> Option<PathBuf> {
+    select_systemd_scope_launcher_with(
+        || which::which("systemd-run").ok(),
+        |launcher| {
+            std::process::Command::new(launcher)
+                .args(["--user", "--scope", "--collect", "--quiet", "/bin/true"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        },
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -338,6 +382,48 @@ pub fn is_process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_scope_argv_wraps_the_tool_shell() {
+        let args = vec![OsString::from("-c"), OsString::from("printf ready")];
+        let (program, wrapped) = systemd_scope_argv(
+            Path::new("/usr/bin/systemd-run"),
+            Path::new("/bin/sh"),
+            &args,
+        );
+        assert_eq!(program, PathBuf::from("/usr/bin/systemd-run"));
+        assert_eq!(
+            wrapped,
+            vec![
+                "--user",
+                "--scope",
+                "--collect",
+                "--quiet",
+                "/bin/sh",
+                "-c",
+                "printf ready",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_scope_falls_back_when_user_manager_is_unreachable() {
+        let probes = std::cell::Cell::new(0);
+        let selected = select_systemd_scope_launcher_with(
+            || Some(PathBuf::from("/usr/bin/systemd-run")),
+            |_| {
+                probes.set(probes.get() + 1);
+                false
+            },
+        );
+        assert_eq!(selected, None);
+        assert_eq!(probes.get(), 1);
+    }
 
     #[test]
     fn is_process_alive_returns_true_for_self() {
