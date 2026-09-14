@@ -423,13 +423,11 @@ fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError>
         });
     }
     if db_version >= version {
-        return tx
-            .commit()
-            .map_err(|error| OpenError::MigrationFailed {
-                from: planned_from,
-                to: version,
-                error,
-            });
+        return tx.commit().map_err(|error| OpenError::MigrationFailed {
+            from: planned_from,
+            to: version,
+            error,
+        });
     }
 
     let from = db_version;
@@ -459,9 +457,7 @@ fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError>
         error,
     })?;
     if already_applied && from == 9 && version == 10 {
-        log::warn!(
-            "aft.db: schema 9 with v10 objects present; recorded 10 (issue #312 recovery)"
-        );
+        log::warn!("aft.db: schema 9 with v10 objects present; recorded 10 (issue #312 recovery)");
     }
     Ok(())
 }

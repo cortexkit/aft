@@ -215,10 +215,15 @@ fn stale_planned_migrations_cannot_regress_the_schema_or_wedge_open() {
     let observed_version = schema_version(&observed);
     let observed_objects = v10_objects(&observed);
     drop(observed);
-    let fresh_open = aft::db::open(&database).map(|_| ()).map_err(|error| error.to_string());
+    let fresh_open = aft::db::open(&database)
+        .map(|_| ())
+        .map_err(|error| error.to_string());
 
     if let Err(stale_error) = stale_result {
-        assert_eq!(observed_version, 9, "stale V9 must expose the reported regression");
+        assert_eq!(
+            observed_version, 9,
+            "stale V9 must expose the reported regression"
+        );
         assert_eq!(
             observed_objects,
             vec![
@@ -228,7 +233,8 @@ fn stale_planned_migrations_cannot_regress_the_schema_or_wedge_open() {
             ],
             "the failed stale V10 must leave every V10 object present"
         );
-        let fresh_error = fresh_open.expect_err("the reported wedged database must refuse a fresh open");
+        let fresh_error =
+            fresh_open.expect_err("the reported wedged database must refuse a fresh open");
         panic!(
             "stale migration plan wedged aft.db: stale opener: {stale_error}; fresh opener: {fresh_error}"
         );
@@ -288,7 +294,10 @@ fn eight_concurrent_v8_openers_converge_on_the_fresh_v10_schema() {
         .iter()
         .filter_map(|outcome| outcome.as_ref().err())
         .collect::<Vec<_>>();
-    assert!(failures.is_empty(), "concurrent migration failures: {failures:?}");
+    assert!(
+        failures.is_empty(),
+        "concurrent migration failures: {failures:?}"
+    );
 
     let migrated = Connection::open(&database).expect("open concurrently migrated database");
     assert_eq!(schema_version(&migrated), aft::db::CURRENT_SCHEMA_VERSION);

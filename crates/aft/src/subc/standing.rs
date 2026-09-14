@@ -172,10 +172,7 @@ impl StandingActor {
             Ok(report) => report,
             Err(error) => {
                 let error = error.to_string();
-                let action = self
-                    .reconciliation_failures
-                    .lock()
-                    .record_failure(&error);
+                let action = self.reconciliation_failures.lock().record_failure(&error);
                 match action {
                     ReconciliationLogAction::WarnFirst => {
                         log::warn!("standing roots reconciliation refused: {error}");
