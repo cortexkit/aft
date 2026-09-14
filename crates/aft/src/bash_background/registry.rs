@@ -9348,6 +9348,20 @@ mod tests {
             .post_terminal_transition(&comp_handle, true)
             .unwrap();
 
+        // The completion task was marked terminal while its child is still
+        // running, so the descendant sampler finds a survivor and the frame is
+        // emitted after its grace period rather than inline.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let emitted = frames.lock().unwrap().iter().any(|frame| {
+                matches!(frame, PushFrame::BashCompleted(f) if f.task_id == task_comp)
+            });
+            if emitted || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
         let captured = frames.lock().unwrap();
         let pattern_matches = captured
             .iter()
