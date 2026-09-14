@@ -491,6 +491,8 @@ pub struct PersistedTask {
     /// need to parse the command again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pipeline_segments: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_status_unavailable: Option<String>,
     #[serde(default)]
     pub mode: BgMode,
     pub workdir: PathBuf,
@@ -564,6 +566,7 @@ impl PersistedTask {
             session_id,
             command,
             pipeline_segments: Vec::new(),
+            pipeline_status_unavailable: None,
             mode: BgMode::Pipes,
             workdir,
             project_root,
@@ -680,6 +683,7 @@ impl From<BashTaskRow> for PersistedTask {
             session_id: row.session_id,
             command: row.command,
             pipeline_segments: Vec::new(),
+            pipeline_status_unavailable: None,
             mode: BgMode::Pipes,
             workdir: PathBuf::from(row.cwd),
             project_root: None,

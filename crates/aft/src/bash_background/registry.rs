@@ -1596,9 +1596,10 @@ impl BgTaskRegistry {
         #[cfg(unix)]
         let capture_pipeline_status = {
             let pipeline = single_top_level_pipeline(command);
+            let has_pipeline = pipeline.is_some();
             let capture = !shell.is_powershell()
-                && should_capture_pipeline_status(&spawn_plan, pipeline.is_some(), &shell_path);
-            if capture {
+                && should_capture_pipeline_status(&spawn_plan, has_pipeline, &shell_path);
+            if !shell.is_powershell() {
                 metadata.pipeline_segments = pipeline
                     .as_ref()
                     .map(|pipeline| {
@@ -1609,6 +1610,18 @@ impl BgTaskRegistry {
                             .collect()
                     })
                     .unwrap_or_default();
+                if has_pipeline && !capture {
+                    metadata.pipeline_status_unavailable =
+                        Some(if spawn_plan.is_native_launcher() {
+                            "native sandbox launcher".to_string()
+                        } else {
+                            shell_path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("unknown shell")
+                                .to_string()
+                        });
+                }
             }
             capture
         };
@@ -5304,8 +5317,22 @@ fn append_pipeline_warning(
     if metadata.pipeline_segments.len() < 2 {
         return;
     }
-    let Ok(mut status_file) = open_task_artifact(paths, TaskArtifact::PipelineStatus) else {
-        return;
+    let mut status_file = match open_task_artifact(paths, TaskArtifact::PipelineStatus) {
+        Ok(file) => file,
+        Err(_) => {
+            let Some(shell) = metadata.pipeline_status_unavailable.as_deref() else {
+                return;
+            };
+            let footer = format!(
+                "note: pipeline status unavailable under {shell}; an upstream failure may be masked by the final segment's exit code."
+            );
+            if cache.output_preview.trim().is_empty() {
+                cache.output_preview = footer;
+            } else {
+                cache.output_preview = format!("{}\n{footer}", cache.output_preview.trim_end());
+            }
+            return;
+        }
     };
     let Ok(status_bytes) = status_file.read_all() else {
         return;
