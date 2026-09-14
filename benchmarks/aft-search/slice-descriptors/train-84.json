@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "oc2-playbook-ga-facts",
+    "embed-send-error-unexpected-message-classifier",
+    "load-matrix-subc-skip"
+  ],
+  "note": "semantic_index.rs changes only the send-error transience classifier (a hyper UnexpectedMessage phrase); no query or ranking path is touched, so search rows are byte-identical to the reference (the predicate is the proof)."
+}
