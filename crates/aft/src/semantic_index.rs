@@ -14,11 +14,11 @@ use crate::local_embed::LocalEmbedder;
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::error::Error;
 use std::fmt::Display;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -127,6 +127,13 @@ const SEMANTIC_INDEX_VERSION_V5: u8 = 5;
 const SEMANTIC_INDEX_VERSION_V6: u8 = 6;
 /// V7 adds qualified symbol names for ranking metadata without changing embeddings.
 const SEMANTIC_INDEX_VERSION_V7: u8 = 7;
+/// A V6/V7 base snapshot may be followed by these checksummed delta frames.
+/// The base stays independently readable, so an incomplete final frame can be discarded.
+const SEMANTIC_SEGMENT_MAGIC: &[u8; 8] = b"AFTSEG01";
+const SEMANTIC_SEGMENT_VERSION: u8 = 1;
+const SEMANTIC_SEGMENT_FRAME_HEADER_BYTES: usize = 8 + 8 + 32;
+const SEMANTIC_COMPACT_SEGMENT_LIMIT: usize = 64;
+const SEMANTIC_COMPACT_BYTE_RATIO_DENOMINATOR: u64 = 4;
 const DEFAULT_OPENAI_EMBEDDING_PATH: &str = "/embeddings";
 const DEFAULT_OLLAMA_EMBEDDING_PATH: &str = "/api/embed";
 // Build/refresh embedding requests keep a larger budget because they run on
@@ -2564,6 +2571,132 @@ fn relativize_semantic_map<T>(
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SemanticArtifactIdentity {
+    bytes: u64,
+    modified_nanos: Option<u128>,
+}
+
+#[derive(Debug)]
+struct LoadedSemanticArtifact {
+    index: SemanticIndex,
+    base_bytes: usize,
+    valid_bytes: usize,
+    segment_count: usize,
+    segment_bytes: usize,
+    torn_tail: bool,
+}
+
+fn semantic_artifact_identity(path: &Path) -> Option<SemanticArtifactIdentity> {
+    let metadata = path.metadata().ok()?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos());
+    Some(SemanticArtifactIdentity {
+        bytes: metadata.len(),
+        modified_nanos,
+    })
+}
+
+fn acquire_semantic_persistence_lock(dir: &Path) -> io::Result<fs_lock::LockGuard> {
+    fs_lock::try_acquire(&dir.join("semantic.persist.lock"), Duration::from_secs(2)).map_err(
+        |error| match error {
+            fs_lock::AcquireError::Timeout => {
+                io::Error::other("timed out acquiring semantic persistence lock")
+            }
+            fs_lock::AcquireError::Io(error) => error,
+        },
+    )
+}
+
+fn semantic_entry_cmp(left: &&EmbeddingEntry, right: &&EmbeddingEntry) -> std::cmp::Ordering {
+    let left = *left;
+    let right = *right;
+    left.chunk
+        .file
+        .cmp(&right.chunk.file)
+        .then_with(|| left.chunk.name.cmp(&right.chunk.name))
+        .then_with(|| left.chunk.qualified_name.cmp(&right.chunk.qualified_name))
+        .then_with(|| {
+            symbol_kind_to_u8(&left.chunk.kind).cmp(&symbol_kind_to_u8(&right.chunk.kind))
+        })
+        .then_with(|| left.chunk.start_line.cmp(&right.chunk.start_line))
+        .then_with(|| left.chunk.end_line.cmp(&right.chunk.end_line))
+        .then_with(|| left.chunk.exported.cmp(&right.chunk.exported))
+        .then_with(|| left.chunk.snippet.cmp(&right.chunk.snippet))
+        .then_with(|| left.chunk.embed_text.cmp(&right.chunk.embed_text))
+        .then_with(|| {
+            left.vector
+                .iter()
+                .map(|value| value.to_bits())
+                .cmp(right.vector.iter().map(|value| value.to_bits()))
+        })
+}
+
+fn semantic_entry_persistence_eq(left: &EmbeddingEntry, right: &EmbeddingEntry) -> bool {
+    left.chunk.file == right.chunk.file
+        && left.chunk.name == right.chunk.name
+        && left.chunk.qualified_name == right.chunk.qualified_name
+        && left.chunk.kind == right.chunk.kind
+        && left.chunk.start_line == right.chunk.start_line
+        && left.chunk.end_line == right.chunk.end_line
+        && left.chunk.exported == right.chunk.exported
+        && left.chunk.snippet == right.chunk.snippet
+        && left.chunk.embed_text == right.chunk.embed_text
+        && left.vector.len() == right.vector.len()
+        && left
+            .vector
+            .iter()
+            .zip(&right.vector)
+            .all(|(left, right)| left.to_bits() == right.to_bits())
+}
+
+fn semantic_file_persistence_eq(left: &SemanticIndex, right: &SemanticIndex, path: &Path) -> bool {
+    if left.file_mtimes.get(path) != right.file_mtimes.get(path)
+        || left.file_sizes.get(path) != right.file_sizes.get(path)
+        || left.file_hashes.get(path) != right.file_hashes.get(path)
+    {
+        return false;
+    }
+
+    let mut left_entries = left
+        .entries
+        .iter()
+        .filter(|entry| entry.chunk.file == path)
+        .collect::<Vec<_>>();
+    let mut right_entries = right
+        .entries
+        .iter()
+        .filter(|entry| entry.chunk.file == path)
+        .collect::<Vec<_>>();
+    left_entries.sort_by(semantic_entry_cmp);
+    right_entries.sort_by(semantic_entry_cmp);
+    left_entries.len() == right_entries.len()
+        && left_entries
+            .iter()
+            .zip(right_entries)
+            .all(|(left, right)| semantic_entry_persistence_eq(left, right))
+}
+
+fn semantic_changed_paths(previous: &SemanticIndex, current: &SemanticIndex) -> BTreeSet<PathBuf> {
+    let mut paths = BTreeSet::new();
+    paths.extend(previous.file_mtimes.keys().cloned());
+    paths.extend(current.file_mtimes.keys().cloned());
+    paths.extend(
+        previous
+            .entries
+            .iter()
+            .map(|entry| entry.chunk.file.clone()),
+    );
+    paths.extend(current.entries.iter().map(|entry| entry.chunk.file.clone()));
+    paths
+        .into_iter()
+        .filter(|path| !semantic_file_persistence_eq(previous, current, path))
+        .collect()
+}
+
 impl SemanticIndex {
     fn from_shared_base(project_root: PathBuf, shared_base: Arc<SharedSemanticBase>) -> Self {
         debug_assert!(project_root.is_absolute());
@@ -4248,25 +4381,12 @@ impl SemanticIndex {
         self.fingerprint = Some(fingerprint);
     }
 
-    /// Write the semantic index to disk using atomic temp+rename pattern.
-    /// Empty indexes are persisted too so a completed rebuild cannot leave an
-    /// older non-empty snapshot visible to the next process.
-    pub fn write_to_disk(&self, storage_dir: &Path, project_key: &str) -> bool {
-        if self.shared_base.is_some() {
-            let mut private = self.clone();
-            private.materialize_shared_base();
-            return private.write_to_disk(storage_dir, project_key);
-        }
-        let dir = storage_dir.join("semantic").join(project_key);
-        let data_path = dir.join("semantic.bin");
-        let access = crate::root_cache::ArtifactAccess::for_root(&self.project_root);
-        if !access.allows_write(project_key, &data_path) {
-            return false;
-        }
-        if let Err(e) = fs::create_dir_all(&dir) {
-            slog_warn!("failed to create semantic cache dir: {}", e);
-            return false;
-        }
+    fn write_full_snapshot_at(
+        &self,
+        dir: &Path,
+        data_path: &Path,
+        pause_before_swap: bool,
+    ) -> io::Result<usize> {
         let tmp_path = dir.join(format!(
             "semantic.bin.tmp.{}.{}",
             std::process::id(),
@@ -4285,26 +4405,558 @@ impl SemanticIndex {
         })();
         let bytes_written = match write_result {
             Ok(bytes_written) => bytes_written,
-            Err(e) => {
-                slog_warn!("failed to write semantic index: {}", e);
+            Err(error) => {
                 let _ = fs::remove_file(&tmp_path);
+                return Err(error);
+            }
+        };
+
+        #[cfg(debug_assertions)]
+        if pause_before_swap {
+            if let Some(ready) = env::var_os("AFT_TEST_SEMANTIC_COMPACTION_READY") {
+                let ready = PathBuf::from(ready);
+                fs::write(&ready, b"ready")?;
+                let release = ready.with_extension("release");
+                let started = Instant::now();
+                while !release.is_file() {
+                    if started.elapsed() >= Duration::from_secs(30) {
+                        let _ = fs::remove_file(&tmp_path);
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "timed out waiting at semantic compaction swap test seam",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = pause_before_swap;
+
+        if let Err(error) = crate::fs_lock::rename_over(&tmp_path, data_path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(error);
+        }
+        crate::fs_lock::sync_parent(data_path);
+        Ok(bytes_written)
+    }
+
+    fn persistence_identity_matches(&self, previous: &Self) -> bool {
+        self.dimension == previous.dimension
+            && self
+                .fingerprint
+                .as_ref()
+                .map(SemanticIndexFingerprint::as_string)
+                == previous
+                    .fingerprint
+                    .as_ref()
+                    .map(SemanticIndexFingerprint::as_string)
+    }
+
+    fn delta_for_paths(&self, paths: &BTreeSet<PathBuf>) -> Self {
+        Self {
+            entries: self
+                .entries
+                .iter()
+                .filter(|entry| paths.contains(&entry.chunk.file))
+                .cloned()
+                .collect(),
+            file_mtimes: self
+                .file_mtimes
+                .iter()
+                .filter(|(path, _)| paths.contains(*path))
+                .map(|(path, value)| (path.clone(), *value))
+                .collect(),
+            file_sizes: self
+                .file_sizes
+                .iter()
+                .filter(|(path, _)| paths.contains(*path))
+                .map(|(path, value)| (path.clone(), *value))
+                .collect(),
+            any_missing_sizes: false,
+            file_hashes: self
+                .file_hashes
+                .iter()
+                .filter(|(path, _)| paths.contains(*path))
+                .map(|(path, value)| (path.clone(), *value))
+                .collect(),
+            dimension: self.dimension,
+            fingerprint: self.fingerprint.clone(),
+            project_root: self.project_root.clone(),
+            deferred_files: HashSet::new(),
+            shared_base: None,
+            #[cfg(test)]
+            removal_retain_passes: 0,
+        }
+    }
+
+    fn build_segment_frame(
+        &self,
+        sequence: u64,
+        changed_paths: &BTreeSet<PathBuf>,
+    ) -> Result<Vec<u8>, String> {
+        let fingerprint = self
+            .fingerprint
+            .as_ref()
+            .map(SemanticIndexFingerprint::as_string)
+            .unwrap_or_default();
+        let mut payload = Vec::new();
+        payload.push(SEMANTIC_SEGMENT_VERSION);
+        payload.extend_from_slice(&sequence.to_le_bytes());
+        payload.extend_from_slice(&(fingerprint.len() as u32).to_le_bytes());
+        payload.extend_from_slice(fingerprint.as_bytes());
+        payload.extend_from_slice(&(self.dimension as u32).to_le_bytes());
+        payload.extend_from_slice(&(changed_paths.len() as u32).to_le_bytes());
+        for path in changed_paths {
+            let relative = cache_relative_path(&self.project_root, path).ok_or_else(|| {
+                format!(
+                    "semantic segment tombstone escapes project root: {}",
+                    path.display()
+                )
+            })?;
+            let relative = relative.to_string_lossy();
+            payload.extend_from_slice(&(relative.len() as u32).to_le_bytes());
+            payload.extend_from_slice(relative.as_bytes());
+        }
+
+        let delta_bytes = self.delta_for_paths(changed_paths).to_bytes();
+        payload.extend_from_slice(&(delta_bytes.len() as u64).to_le_bytes());
+        payload.extend_from_slice(&delta_bytes);
+
+        let checksum = blake3::hash(&payload);
+        let mut frame = Vec::with_capacity(SEMANTIC_SEGMENT_FRAME_HEADER_BYTES + payload.len());
+        frame.extend_from_slice(SEMANTIC_SEGMENT_MAGIC);
+        frame.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        frame.extend_from_slice(checksum.as_bytes());
+        frame.extend_from_slice(&payload);
+        Ok(frame)
+    }
+
+    fn append_segment_frame(data_path: &Path, frame: &[u8]) -> io::Result<()> {
+        let mut file = OpenOptions::new().append(true).open(data_path)?;
+
+        #[cfg(debug_assertions)]
+        if let Some(ready) = env::var_os("AFT_TEST_SEMANTIC_SEGMENT_TEAR_READY") {
+            let cut = (frame.len() / 2).max(SEMANTIC_SEGMENT_FRAME_HEADER_BYTES);
+            file.write_all(&frame[..cut])?;
+            file.sync_all()?;
+            fs::write(ready, b"ready")?;
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+
+        file.write_all(frame)?;
+        file.sync_all()
+    }
+
+    fn compact_path_if_unchanged(
+        dir: &Path,
+        data_path: &Path,
+        project_root: &Path,
+        expected: SemanticArtifactIdentity,
+    ) -> bool {
+        let Ok(_lock) = acquire_semantic_persistence_lock(dir) else {
+            return false;
+        };
+        if semantic_artifact_identity(data_path) != Some(expected) {
+            return false;
+        }
+        let loaded = match Self::load_artifact_path(data_path, project_root) {
+            Ok(loaded) if !loaded.torn_tail && loaded.valid_bytes as u64 == expected.bytes => {
+                loaded
+            }
+            Ok(_) => return false,
+            Err(error) => {
+                slog_warn!("failed to load semantic index for compaction: {}", error);
                 return false;
             }
         };
-        if let Err(e) = crate::fs_lock::rename_over(&tmp_path, &data_path) {
-            slog_warn!("failed to rename semantic index: {}", e);
-            let _ = fs::remove_file(&tmp_path);
-            return false;
+        match loaded.index.write_full_snapshot_at(dir, data_path, true) {
+            Ok(bytes_written) => {
+                slog_info!(
+                    "semantic index compacted: {} entries, {:.1} KB",
+                    loaded.index.entries.len(),
+                    bytes_written as f64 / 1024.0
+                );
+                true
+            }
+            Err(error) => {
+                slog_warn!("failed to compact semantic index: {}", error);
+                false
+            }
         }
-        slog_info!(
-            "semantic index persisted: {} entries, {:.1} KB",
-            self.entries.len(),
-            bytes_written as f64 / 1024.0
-        );
-        true
     }
 
-    /// Read the semantic index from disk
+    fn schedule_compaction_if_needed(
+        &self,
+        dir: &Path,
+        data_path: &Path,
+        loaded: &LoadedSemanticArtifact,
+        appended_bytes: usize,
+    ) {
+        let segment_count = loaded.segment_count.saturating_add(1);
+        let segment_bytes = loaded.segment_bytes.saturating_add(appended_bytes);
+        let byte_bound_crossed = (segment_bytes as u64)
+            > (loaded.base_bytes as u64 / SEMANTIC_COMPACT_BYTE_RATIO_DENOMINATOR);
+        if segment_count <= SEMANTIC_COMPACT_SEGMENT_LIMIT && !byte_bound_crossed {
+            return;
+        }
+        let Some(expected) = semantic_artifact_identity(data_path) else {
+            return;
+        };
+        let project_root = self.project_root.clone();
+        let dir = dir.to_path_buf();
+        let data_path = data_path.to_path_buf();
+        let _ = std::thread::Builder::new()
+            .name("semantic-index-compaction".to_string())
+            .spawn(move || {
+                Self::compact_path_if_unchanged(&dir, &data_path, &project_root, expected);
+            });
+    }
+
+    /// Write a cold base snapshot or append one checksummed file-replacement segment.
+    /// A final partial segment is ignored (and truncated by an owning reader/writer),
+    /// so SIGKILL during append leaves every previously committed refresh loadable.
+    pub fn write_to_disk(&self, storage_dir: &Path, project_key: &str) -> bool {
+        if self.shared_base.is_some() {
+            let mut private = self.clone();
+            private.materialize_shared_base();
+            return private.write_to_disk(storage_dir, project_key);
+        }
+        let dir = storage_dir.join("semantic").join(project_key);
+        let data_path = dir.join("semantic.bin");
+        let access = crate::root_cache::ArtifactAccess::for_root(&self.project_root);
+        if !access.allows_write(project_key, &data_path) {
+            return false;
+        }
+        if let Err(error) = fs::create_dir_all(&dir) {
+            slog_warn!("failed to create semantic cache dir: {}", error);
+            return false;
+        }
+        let _persistence_lock = match acquire_semantic_persistence_lock(&dir) {
+            Ok(lock) => lock,
+            Err(error) => {
+                slog_warn!("failed to acquire semantic persistence lock: {}", error);
+                return false;
+            }
+        };
+
+        if data_path.is_file() {
+            match Self::load_artifact_path(&data_path, &self.project_root) {
+                Ok(loaded) if self.persistence_identity_matches(&loaded.index) => {
+                    if loaded.torn_tail {
+                        match OpenOptions::new()
+                            .write(true)
+                            .open(&data_path)
+                            .and_then(|file| {
+                                file.set_len(loaded.valid_bytes as u64)?;
+                                file.sync_all()
+                            }) {
+                            Ok(()) => {}
+                            Err(error) => {
+                                slog_warn!("failed to truncate torn semantic segment: {}", error);
+                                return false;
+                            }
+                        }
+                    }
+                    let changed_paths = semantic_changed_paths(&loaded.index, self);
+                    if changed_paths.is_empty() {
+                        return true;
+                    }
+                    let frame = match self.build_segment_frame(
+                        loaded.segment_count.saturating_add(1) as u64,
+                        &changed_paths,
+                    ) {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            slog_warn!("failed to encode semantic delta: {}", error);
+                            return false;
+                        }
+                    };
+                    if let Err(error) = Self::append_segment_frame(&data_path, &frame) {
+                        slog_warn!("failed to append semantic delta: {}", error);
+                        return false;
+                    }
+                    slog_info!(
+                        "semantic index delta persisted: {} files, {:.1} KB",
+                        changed_paths.len(),
+                        frame.len() as f64 / 1024.0
+                    );
+                    self.schedule_compaction_if_needed(&dir, &data_path, &loaded, frame.len());
+                    return true;
+                }
+                Ok(_) => {
+                    // Backend/model/dimension/template identity changed. Replacing the
+                    // base atomically invalidates every segment from the old identity.
+                }
+                Err(error) => {
+                    slog_warn!(
+                        "semantic index delta baseline unavailable ({}); replacing base snapshot",
+                        error
+                    );
+                }
+            }
+        }
+
+        match self.write_full_snapshot_at(&dir, &data_path, false) {
+            Ok(bytes_written) => {
+                slog_info!(
+                    "semantic index persisted: {} entries, {:.1} KB",
+                    self.entries.len(),
+                    bytes_written as f64 / 1024.0
+                );
+                true
+            }
+            Err(error) => {
+                slog_warn!("failed to write semantic index: {}", error);
+                false
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn compact_to_disk_for_test(&self, storage_dir: &Path, project_key: &str) -> bool {
+        let dir = storage_dir.join("semantic").join(project_key);
+        let data_path = dir.join("semantic.bin");
+        let Some(expected) = semantic_artifact_identity(&data_path) else {
+            return false;
+        };
+        Self::compact_path_if_unchanged(&dir, &data_path, &self.project_root, expected)
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn persistence_stats_for_test(
+        storage_dir: &Path,
+        project_key: &str,
+        project_root: &Path,
+    ) -> Option<(usize, usize, usize)> {
+        let data_path = storage_dir
+            .join("semantic")
+            .join(project_key)
+            .join("semantic.bin");
+        let loaded = Self::load_artifact_path(&data_path, project_root).ok()?;
+        Some((
+            loaded.base_bytes,
+            loaded.segment_count,
+            loaded.segment_bytes,
+        ))
+    }
+
+    fn decode_segment_payload(
+        payload: &[u8],
+        expected_sequence: u64,
+        current_canonical_root: &Path,
+        base_fingerprint: Option<&SemanticIndexFingerprint>,
+        base_dimension: usize,
+    ) -> Result<(BTreeSet<PathBuf>, Self), String> {
+        let mut reader = CountingReader::with_bytes_read(Cursor::new(payload), 0);
+        let segment_version = read_u8_stream(&mut reader, "semantic segment is empty")?;
+        if segment_version != SEMANTIC_SEGMENT_VERSION {
+            return Err(format!(
+                "unsupported semantic segment version: {segment_version}"
+            ));
+        }
+        let sequence = read_u64_stream(&mut reader)?;
+        if sequence != expected_sequence {
+            return Err(format!(
+                "semantic segment order mismatch: expected {expected_sequence}, found {sequence}"
+            ));
+        }
+        let fingerprint_len = read_u32_stream(&mut reader)? as usize;
+        if reader.bytes_read().saturating_add(fingerprint_len) > payload.len() {
+            return Err("unexpected end of semantic segment fingerprint".to_string());
+        }
+        let mut fingerprint = vec![0_u8; fingerprint_len];
+        read_exact_stream(
+            &mut reader,
+            &mut fingerprint,
+            "unexpected end of semantic segment fingerprint",
+        )?;
+        let fingerprint = String::from_utf8(fingerprint)
+            .map_err(|error| format!("invalid semantic segment fingerprint: {error}"))?;
+        let expected_fingerprint = base_fingerprint
+            .map(SemanticIndexFingerprint::as_string)
+            .unwrap_or_default();
+        if fingerprint != expected_fingerprint {
+            return Err("semantic segment fingerprint does not match base snapshot".to_string());
+        }
+
+        let dimension = read_u32_stream(&mut reader)? as usize;
+        if dimension != base_dimension {
+            return Err(format!(
+                "semantic segment dimension mismatch: base={base_dimension}, segment={dimension}"
+            ));
+        }
+        let tombstone_count = read_u32_stream(&mut reader)? as usize;
+        if tombstone_count > MAX_ENTRIES {
+            return Err(format!(
+                "too many semantic segment tombstones: {tombstone_count}"
+            ));
+        }
+        let mut tombstones = BTreeSet::new();
+        for _ in 0..tombstone_count {
+            let relative = PathBuf::from(read_string_stream(&mut reader, Some(payload.len()))?);
+            let path = cached_path_under_root(current_canonical_root, &relative)
+                .ok_or_else(|| "semantic segment tombstone escapes project root".to_string())?;
+            if !tombstones.insert(path) {
+                return Err("semantic segment contains a duplicate tombstone".to_string());
+            }
+        }
+
+        let delta_len = usize::try_from(read_u64_stream(&mut reader)?)
+            .map_err(|_| "semantic segment delta is too large".to_string())?;
+        if reader.bytes_read().saturating_add(delta_len) != payload.len() {
+            return Err("semantic segment delta length does not match payload".to_string());
+        }
+        let mut delta_bytes = vec![0_u8; delta_len];
+        read_exact_stream(
+            &mut reader,
+            &mut delta_bytes,
+            "unexpected end of semantic segment delta",
+        )?;
+        let delta = Self::from_bytes(&delta_bytes, current_canonical_root)?;
+        if delta.dimension != base_dimension
+            || delta
+                .fingerprint
+                .as_ref()
+                .map(SemanticIndexFingerprint::as_string)
+                != base_fingerprint.map(SemanticIndexFingerprint::as_string)
+        {
+            return Err("semantic segment replacement snapshot identity mismatch".to_string());
+        }
+
+        let replacement_paths = delta
+            .file_mtimes
+            .keys()
+            .chain(delta.file_sizes.keys())
+            .chain(delta.file_hashes.keys())
+            .cloned()
+            .chain(delta.entries.iter().map(|entry| entry.chunk.file.clone()))
+            .collect::<BTreeSet<_>>();
+        if !replacement_paths.is_subset(&tombstones) {
+            return Err(
+                "semantic segment replacement contains a file without a tombstone".to_string(),
+            );
+        }
+        Ok((tombstones, delta))
+    }
+
+    fn apply_segment_log<R: Read>(
+        reader: &mut R,
+        mut index: Self,
+        total_len: usize,
+        base_bytes: usize,
+    ) -> Result<LoadedSemanticArtifact, String> {
+        let mut valid_bytes = base_bytes;
+        let mut segment_count = 0usize;
+        let mut torn_tail = false;
+
+        while valid_bytes < total_len {
+            let remaining = total_len.saturating_sub(valid_bytes);
+            if remaining < SEMANTIC_SEGMENT_FRAME_HEADER_BYTES {
+                torn_tail = true;
+                break;
+            }
+            let mut header = [0_u8; SEMANTIC_SEGMENT_FRAME_HEADER_BYTES];
+            if reader.read_exact(&mut header).is_err() {
+                torn_tail = true;
+                break;
+            }
+            if &header[..SEMANTIC_SEGMENT_MAGIC.len()] != SEMANTIC_SEGMENT_MAGIC {
+                torn_tail = true;
+                break;
+            }
+            let payload_len = usize::try_from(u64::from_le_bytes(
+                header[8..16]
+                    .try_into()
+                    .expect("semantic segment length field"),
+            ))
+            .map_err(|_| "semantic segment length exceeds this platform".to_string())?;
+            let frame_len = SEMANTIC_SEGMENT_FRAME_HEADER_BYTES
+                .checked_add(payload_len)
+                .ok_or_else(|| "semantic segment frame length overflow".to_string())?;
+            if frame_len > remaining {
+                torn_tail = true;
+                break;
+            }
+            let mut payload = vec![0_u8; payload_len];
+            if reader.read_exact(&mut payload).is_err() {
+                torn_tail = true;
+                break;
+            }
+            let expected_checksum = &header[16..SEMANTIC_SEGMENT_FRAME_HEADER_BYTES];
+            if blake3::hash(&payload).as_bytes() != expected_checksum {
+                torn_tail = true;
+                break;
+            }
+
+            let expected_sequence = segment_count.saturating_add(1) as u64;
+            let (tombstones, delta) = Self::decode_segment_payload(
+                &payload,
+                expected_sequence,
+                &index.project_root,
+                index.fingerprint.as_ref(),
+                index.dimension,
+            )?;
+            let tombstones = tombstones.into_iter().collect::<Vec<_>>();
+            index.remove_indexed_files(&tombstones);
+            index.entries.extend(delta.entries);
+            index.file_mtimes.extend(delta.file_mtimes);
+            index.file_sizes.extend(delta.file_sizes);
+            index.file_hashes.extend(delta.file_hashes);
+            index.any_missing_sizes = index
+                .file_mtimes
+                .keys()
+                .any(|path| !index.file_sizes.contains_key(path));
+
+            valid_bytes = valid_bytes.saturating_add(frame_len);
+            segment_count = segment_count.saturating_add(1);
+        }
+
+        Ok(LoadedSemanticArtifact {
+            index,
+            base_bytes,
+            valid_bytes,
+            segment_count,
+            segment_bytes: valid_bytes.saturating_sub(base_bytes),
+            torn_tail,
+        })
+    }
+
+    fn load_artifact_path(
+        data_path: &Path,
+        current_canonical_root: &Path,
+    ) -> Result<LoadedSemanticArtifact, String> {
+        let file = fs::File::open(data_path).map_err(|error| error.to_string())?;
+        let file_len =
+            usize::try_from(file.metadata().map_err(|error| error.to_string())?.len())
+                .map_err(|_| "semantic artifact is too large for this platform".to_string())?;
+        if file_len < HEADER_BYTES_V1 {
+            return Err(format!("data too short: {file_len} bytes"));
+        }
+        let mut reader = BufReader::new(file);
+        let mut version_buf = [0_u8; 1];
+        reader
+            .read_exact(&mut version_buf)
+            .map_err(|error| error.to_string())?;
+        let version = version_buf[0];
+        if version != SEMANTIC_INDEX_VERSION_V6 && version != SEMANTIC_INDEX_VERSION_V7 {
+            return Err(format!("unsupported on-disk semantic version: {version}"));
+        }
+        let (index, base_bytes) = Self::from_reader_after_version(
+            &mut reader,
+            version,
+            current_canonical_root,
+            Some(file_len),
+            1,
+        )?;
+        Self::apply_segment_log(&mut reader, index, file_len, base_bytes)
+    }
+
+    /// Read the semantic base snapshot and apply every committed delta in sequence.
     pub fn read_from_disk(
         storage_dir: &Path,
         project_key: &str,
@@ -4317,8 +4969,7 @@ impl SemanticIndex {
             .join("semantic")
             .join(project_key)
             .join("semantic.bin");
-        let file = fs::File::open(&data_path).ok()?;
-        let file_len = usize::try_from(file.metadata().ok()?.len()).ok()?;
+        let file_len = usize::try_from(data_path.metadata().ok()?.len()).ok()?;
         if file_len < HEADER_BYTES_V1 {
             slog_warn!(
                 "corrupt semantic index (too small: {} bytes), removing",
@@ -4329,45 +4980,61 @@ impl SemanticIndex {
             }
             return None;
         }
-
-        let mut reader = BufReader::new(file);
-        let mut version_buf = [0u8; 1];
-        reader.read_exact(&mut version_buf).ok()?;
+        let mut version_buf = [0_u8; 1];
+        fs::File::open(&data_path)
+            .ok()?
+            .read_exact(&mut version_buf)
+            .ok()?;
         let version = version_buf[0];
         if version != SEMANTIC_INDEX_VERSION_V6 && version != SEMANTIC_INDEX_VERSION_V7 {
             slog_info!(
-            "cached semantic index version {} is not compatible with {}, rebuilding without deleting the shared artifact",
-            version,
-            SEMANTIC_INDEX_VERSION_V7
-        );
+                "cached semantic index version {} is not compatible with {}, rebuilding without deleting the shared artifact",
+                version,
+                SEMANTIC_INDEX_VERSION_V7
+            );
             return None;
         }
-        match Self::from_reader_after_version(
-            reader,
-            version,
-            current_canonical_root,
-            Some(file_len),
-            1,
-        ) {
-            Ok(index) => {
+
+        match Self::load_artifact_path(&data_path, current_canonical_root) {
+            Ok(loaded) => {
                 if let Some(expected) = expected_fingerprint {
-                    let matches = index
+                    let matches = loaded
+                        .index
                         .fingerprint()
                         .map(|fingerprint| fingerprint.matches_expected(expected))
                         .unwrap_or(false);
                     if !matches {
-                        log_fingerprint_mismatch(index.fingerprint(), expected);
+                        log_fingerprint_mismatch(loaded.index.fingerprint(), expected);
                         return None;
                     }
                 }
+                if loaded.torn_tail {
+                    slog_warn!(
+                        "ignoring torn semantic segment tail after {} committed bytes",
+                        loaded.valid_bytes
+                    );
+                    if !is_worktree_bridge {
+                        let truncate_result = OpenOptions::new()
+                            .write(true)
+                            .open(&data_path)
+                            .and_then(|file| {
+                                file.set_len(loaded.valid_bytes as u64)?;
+                                file.sync_all()
+                            });
+                        if let Err(error) = truncate_result {
+                            slog_warn!("failed to truncate torn semantic segment: {}", error);
+                        }
+                    }
+                }
                 slog_info!(
-                    "loaded semantic index from disk: {} entries",
-                    index.entries.len()
+                    "loaded semantic index from disk: {} entries ({} delta segments)",
+                    loaded.index.entries.len(),
+                    loaded.segment_count
                 );
-                Some(index)
+                Some(loaded.index)
             }
-            Err(e) => {
-                slog_warn!("corrupt semantic index, rebuilding: {}", e);
+            Err(error) => {
+                slog_warn!("corrupt semantic index, rebuilding: {}", error);
                 if !is_worktree_bridge {
                     let _ = fs::remove_file(&data_path);
                 }
@@ -4544,16 +5211,30 @@ impl SemanticIndex {
             }
         });
         let fp_bytes_ref = fingerprint.as_deref().map(str::as_bytes).unwrap_or(&[]);
-        let file_mtime_count = self
+        let mut file_metadata = self
             .file_mtimes
             .iter()
-            .filter(|(path, _)| cache_relative_path(&self.project_root, path).is_some())
-            .count();
-        let entry_count = self
+            .filter_map(|(path, mtime)| {
+                cache_relative_path(&self.project_root, path)
+                    .map(|relative| (relative, path, mtime))
+            })
+            .collect::<Vec<_>>();
+        file_metadata.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut persisted_entries = self
             .entries
             .iter()
-            .filter(|entry| cache_relative_path(&self.project_root, &entry.chunk.file).is_some())
-            .count();
+            .filter_map(|entry| {
+                cache_relative_path(&self.project_root, &entry.chunk.file)
+                    .map(|relative| (relative, entry))
+            })
+            .collect::<Vec<_>>();
+        persisted_entries.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| semantic_entry_cmp(&left.1, &right.1))
+        });
+        let file_mtime_count = file_metadata.len();
+        let entry_count = persisted_entries.len();
 
         // Header: version(1) + dimension(4) + entry_count(4) + fingerprint_len(4) + fingerprint
         //
@@ -4595,10 +5276,7 @@ impl SemanticIndex {
             &(file_mtime_count as u32).to_le_bytes(),
             &mut bytes_written,
         )?;
-        for (path, mtime) in &self.file_mtimes {
-            let Some(relative) = cache_relative_path(&self.project_root, path) else {
-                continue;
-            };
+        for (relative, path, mtime) in file_metadata {
             let relative = relative.to_string_lossy();
             let path_bytes = relative.as_bytes();
             write_counted(
@@ -4630,11 +5308,9 @@ impl SemanticIndex {
             write_counted(writer, hash.as_bytes(), &mut bytes_written)?;
         }
 
-        // Entries: each is metadata + vector
-        for entry in &self.entries {
-            let Some(relative) = cache_relative_path(&self.project_root, &entry.chunk.file) else {
-                continue;
-            };
+        // Entries: each is metadata + vector. Canonical ordering lets parity
+        // compare structure directly even when HashMap insertion order differs.
+        for (relative, entry) in persisted_entries {
             let c = &entry.chunk;
 
             // File path
@@ -4708,20 +5384,23 @@ impl SemanticIndex {
         Ok(bytes_written)
     }
 
-    /// Deserialize the index from bytes
+    /// Deserialize a base snapshot and any committed delta segments.
     pub fn from_bytes(data: &[u8], current_canonical_root: &Path) -> Result<Self, String> {
         debug_assert!(current_canonical_root.is_absolute());
         if data.len() < HEADER_BYTES_V1 {
             return Err("data too short".to_string());
         }
 
-        Self::from_reader_after_version(
-            Cursor::new(&data[1..]),
+        let mut reader = Cursor::new(&data[1..]);
+        let (index, base_bytes) = Self::from_reader_after_version(
+            &mut reader,
             data[0],
             current_canonical_root,
             Some(data.len()),
             1,
-        )
+        )?;
+        Self::apply_segment_log(&mut reader, index, data.len(), base_bytes)
+            .map(|loaded| loaded.index)
     }
 
     fn from_reader_after_version<R: Read>(
@@ -4730,7 +5409,7 @@ impl SemanticIndex {
         current_canonical_root: &Path,
         total_len: Option<usize>,
         bytes_read: usize,
-    ) -> Result<Self, String> {
+    ) -> Result<(Self, usize), String> {
         debug_assert!(current_canonical_root.is_absolute());
         let mut reader = CountingReader::with_bytes_read(reader, bytes_read);
 
@@ -4978,20 +5657,24 @@ impl SemanticIndex {
         let any_missing_sizes = file_mtimes
             .keys()
             .any(|path| !file_sizes.contains_key(path));
-        Ok(Self {
-            entries,
-            file_mtimes,
-            file_sizes,
-            any_missing_sizes,
-            file_hashes,
-            dimension,
-            fingerprint,
-            project_root: current_canonical_root.to_path_buf(),
-            deferred_files: HashSet::new(),
-            shared_base: None,
-            #[cfg(test)]
-            removal_retain_passes: 0,
-        })
+        let bytes_read = reader.bytes_read();
+        Ok((
+            Self {
+                entries,
+                file_mtimes,
+                file_sizes,
+                any_missing_sizes,
+                file_hashes,
+                dimension,
+                fingerprint,
+                project_root: current_canonical_root.to_path_buf(),
+                deferred_files: HashSet::new(),
+                shared_base: None,
+                #[cfg(test)]
+                removal_retain_passes: 0,
+            },
+            bytes_read,
+        ))
     }
 }
 

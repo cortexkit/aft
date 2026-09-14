@@ -3,6 +3,12 @@ use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "macos")]
 use std::collections::HashSet;
+#[cfg(unix)]
+use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::thread;
+#[cfg(unix)]
+use std::time::Duration;
 #[cfg(target_os = "macos")]
 use std::time::Instant;
 
@@ -72,8 +78,13 @@ fn darwin_write_usage() -> (u64, u64) {
         )
     };
     assert_eq!(result, 0, "Darwin write accounting is required");
-    let counter =
-        |field: usize| u64::from_ne_bytes(buffer[16 + field * 8..16 + (field + 1) * 8].try_into().unwrap());
+    let counter = |field: usize| {
+        u64::from_ne_bytes(
+            buffer[16 + field * 8..16 + (field + 1) * 8]
+                .try_into()
+                .unwrap(),
+        )
+    };
     (counter(17), counter(27))
 }
 
@@ -105,19 +116,17 @@ fn bench_semantic_refresh_persistence_writes() {
             .sync_all()
             .expect("sync copied artifact");
 
-        let mut index = SemanticIndex::read_from_disk(
-            &storage,
-            "measured",
-            &root,
-            false,
-            None,
-        )
-        .expect("load copied semantic artifact");
+        let mut index = SemanticIndex::read_from_disk(&storage, "measured", &root, false, None)
+            .expect("load copied semantic artifact");
         let dimension = index.dimension();
         let mut selected = Vec::with_capacity(changed_files);
         let mut seen = HashSet::new();
         for result in index.search(&vec![0.0; dimension], index.len()) {
-            if result.file.extension().and_then(|extension| extension.to_str()) == Some("rs")
+            if result
+                .file
+                .extension()
+                .and_then(|extension| extension.to_str())
+                == Some("rs")
                 && seen.insert(result.file.clone())
             {
                 selected.push(result.file);
@@ -126,7 +135,11 @@ fn bench_semantic_refresh_persistence_writes() {
                 }
             }
         }
-        assert_eq!(selected.len(), changed_files, "copied artifact needs enough Rust files");
+        assert_eq!(
+            selected.len(),
+            changed_files,
+            "copied artifact needs enough Rust files"
+        );
         for (ordinal, path) in selected.iter().enumerate() {
             fs::create_dir_all(path.parent().expect("selected file parent"))
                 .expect("create selected file parent");
@@ -137,23 +150,11 @@ fn bench_semantic_refresh_persistence_writes() {
             .expect("write changed source");
         }
         let mut embed = |texts: Vec<String>| {
-            Ok::<Vec<Vec<f32>>, String>(
-                texts
-                    .into_iter()
-                    .map(|_| vec![1.0; dimension])
-                    .collect(),
-            )
+            Ok::<Vec<Vec<f32>>, String>(texts.into_iter().map(|_| vec![1.0; dimension]).collect())
         };
         let mut progress = |_done: usize, _total: usize| {};
         let update = index
-            .refresh_invalidated_files(
-                &root,
-                &selected,
-                &mut embed,
-                64,
-                usize::MAX,
-                &mut progress,
-            )
+            .refresh_invalidated_files(&root, &selected, &mut embed, 64, usize::MAX, &mut progress)
             .expect("refresh selected files");
         assert_eq!(
             update.summary.changed, changed_files,
@@ -171,7 +172,472 @@ fn bench_semantic_refresh_persistence_writes() {
             after.1.saturating_sub(before.1),
             fs::metadata(&data_path).expect("measure artifact").len(),
         );
+
+        if changed_files == 100 {
+            let before = darwin_write_usage();
+            let started = Instant::now();
+            assert!(index.compact_to_disk_for_test(&storage, "measured"));
+            let after = darwin_write_usage();
+            eprintln!(
+                "semantic-delta-compaction elapsed_ms={} physical_bytes={} logical_bytes={} artifact_bytes={}",
+                started.elapsed().as_millis(),
+                after.0.saturating_sub(before.0),
+                after.1.saturating_sub(before.1),
+                fs::metadata(&data_path).expect("measure compacted artifact").len(),
+            );
+        }
     }
+}
+
+const DELTA_PROJECT_KEY: &str = "delta-project";
+
+fn delta_fingerprint() -> SemanticIndexFingerprint {
+    SemanticIndexFingerprint {
+        backend: "test".to_string(),
+        model: "deterministic".to_string(),
+        base_url: "none".to_string(),
+        dimension: 4,
+        chunking_version: 7,
+        ..Default::default()
+    }
+}
+
+fn write_delta_fixture(path: &Path, ordinal: usize, version: usize) {
+    fs::create_dir_all(path.parent().expect("delta fixture parent"))
+        .expect("create delta fixture parent");
+    fs::write(
+        path,
+        format!(
+            "pub fn symbol_{ordinal}_v{version}() -> usize {{\n    {}\n}}\n",
+            ordinal + version
+        ),
+    )
+    .expect("write delta fixture");
+}
+
+fn delta_vector(text: &str) -> Vec<f32> {
+    let hash = blake3::hash(text.as_bytes());
+    hash.as_bytes()[..4]
+        .iter()
+        .map(|byte| (*byte as f32 + 1.0) / 256.0)
+        .collect()
+}
+
+fn build_delta_index(root: &Path, files: &[PathBuf]) -> SemanticIndex {
+    let existing = files
+        .iter()
+        .filter(|path| path.is_file())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut embed = |texts: Vec<String>| {
+        Ok::<Vec<Vec<f32>>, String>(texts.iter().map(|text| delta_vector(text)).collect())
+    };
+    let mut index = SemanticIndex::build(root, &existing, &mut embed, 64)
+        .expect("build deterministic semantic index");
+    index.set_fingerprint(delta_fingerprint());
+    index
+}
+
+fn refresh_delta_paths(index: &mut SemanticIndex, root: &Path, paths: &[PathBuf]) {
+    let mut embed = |texts: Vec<String>| {
+        Ok::<Vec<Vec<f32>>, String>(texts.iter().map(|text| delta_vector(text)).collect())
+    };
+    let mut progress = |_done: usize, _total: usize| {};
+    index
+        .refresh_invalidated_files(root, paths, &mut embed, 64, usize::MAX, &mut progress)
+        .expect("refresh deterministic semantic paths");
+}
+
+fn load_delta_index(storage: &Path, root: &Path) -> SemanticIndex {
+    SemanticIndex::read_from_disk(
+        storage,
+        DELTA_PROJECT_KEY,
+        root,
+        false,
+        Some(&delta_fingerprint().as_string()),
+    )
+    .expect("load semantic base plus segments")
+}
+
+fn assert_delta_structural_parity(
+    storage: &Path,
+    root: &Path,
+    files: &[PathBuf],
+    expected_live: &SemanticIndex,
+) {
+    let loaded = load_delta_index(storage, root);
+    let whole_rewrite = build_delta_index(root, files);
+    assert_eq!(
+        loaded.to_bytes(),
+        expected_live.to_bytes(),
+        "base plus ordered segments must equal the live refreshed index"
+    );
+    assert_eq!(
+        loaded.to_bytes(),
+        whole_rewrite.to_bytes(),
+        "base plus ordered segments must equal a whole-rewrite snapshot"
+    );
+}
+
+fn seed_delta_fixture(root: &Path, count: usize) -> Vec<PathBuf> {
+    (0..count)
+        .map(|ordinal| {
+            let path = root.join(format!("src/file_{ordinal:03}.rs"));
+            write_delta_fixture(&path, ordinal, 0);
+            path
+        })
+        .collect()
+}
+
+#[test]
+fn semantic_delta_sequence_matches_whole_rewrite_after_every_step() {
+    let project = tempfile::tempdir().expect("create delta project");
+    let storage = tempfile::tempdir().expect("create delta storage");
+    let files = seed_delta_fixture(project.path(), 130);
+    let mut live = build_delta_index(project.path(), &files);
+
+    assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+    assert_delta_structural_parity(storage.path(), project.path(), &files, &live);
+
+    write_delta_fixture(&files[0], 0, 1);
+    refresh_delta_paths(&mut live, project.path(), &files[..1]);
+    assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+    assert_delta_structural_parity(storage.path(), project.path(), &files, &live);
+
+    for (ordinal, path) in files[1..11].iter().enumerate() {
+        write_delta_fixture(path, ordinal + 1, 1);
+    }
+    refresh_delta_paths(&mut live, project.path(), &files[1..11]);
+    assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+    assert_delta_structural_parity(storage.path(), project.path(), &files, &live);
+
+    for path in &files[11..14] {
+        fs::remove_file(path).expect("delete indexed delta fixture");
+    }
+    refresh_delta_paths(&mut live, project.path(), &files[11..14]);
+    assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+    assert_delta_structural_parity(storage.path(), project.path(), &files, &live);
+
+    for (ordinal, path) in files[20..120].iter().enumerate() {
+        write_delta_fixture(path, ordinal + 20, 2);
+    }
+    refresh_delta_paths(&mut live, project.path(), &files[20..120]);
+    assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+    assert_delta_structural_parity(storage.path(), project.path(), &files, &live);
+
+    assert!(live.compact_to_disk_for_test(storage.path(), DELTA_PROJECT_KEY));
+    assert_eq!(
+        SemanticIndex::persistence_stats_for_test(
+            storage.path(),
+            DELTA_PROJECT_KEY,
+            project.path()
+        ),
+        Some((live.to_bytes().len(), 0, 0)),
+        "compaction should fold all segments into one canonical base"
+    );
+    assert_delta_structural_parity(storage.path(), project.path(), &files, &live);
+}
+
+#[test]
+fn semantic_segment_tombstone_masks_deleted_file() {
+    let project = tempfile::tempdir().expect("create tombstone project");
+    let storage = tempfile::tempdir().expect("create tombstone storage");
+    let files = seed_delta_fixture(project.path(), 20);
+    let deleted = files[3].clone();
+    let mut live = build_delta_index(project.path(), &files);
+    assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+
+    fs::remove_file(&deleted).expect("delete semantic fixture");
+    refresh_delta_paths(&mut live, project.path(), std::slice::from_ref(&deleted));
+    assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+
+    let loaded = load_delta_index(storage.path(), project.path());
+    let results = loaded.search(&[1.0, 0.0, 0.0, 0.0], loaded.len());
+    assert!(
+        results.iter().all(|result| result.file != deleted),
+        "a deleted file's base chunks must stay masked by its segment tombstone"
+    );
+    assert_eq!(loaded.to_bytes(), live.to_bytes());
+}
+
+#[test]
+fn semantic_segments_apply_in_refresh_order() {
+    let project = tempfile::tempdir().expect("create ordered segment project");
+    let storage = tempfile::tempdir().expect("create ordered segment storage");
+    let files = seed_delta_fixture(project.path(), 20);
+    let changed = files[0].clone();
+    let mut live = build_delta_index(project.path(), &files);
+    assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+
+    for version in 1..=2 {
+        write_delta_fixture(&changed, 0, version);
+        refresh_delta_paths(&mut live, project.path(), std::slice::from_ref(&changed));
+        assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+    }
+
+    assert_eq!(
+        SemanticIndex::persistence_stats_for_test(
+            storage.path(),
+            DELTA_PROJECT_KEY,
+            project.path()
+        )
+        .map(|(_, segments, _)| segments),
+        Some(2)
+    );
+    let loaded = load_delta_index(storage.path(), project.path());
+    let names = loaded
+        .search(&[1.0, 0.0, 0.0, 0.0], loaded.len())
+        .into_iter()
+        .filter(|result| result.file.file_name() == changed.file_name())
+        .map(|result| result.name)
+        .collect::<Vec<_>>();
+    assert!(
+        names.iter().any(|name| name == "symbol_0_v2"),
+        "latest segment should win for the changed file: {names:?}"
+    );
+    assert!(!names.iter().any(|name| name == "symbol_0_v1"));
+    assert_eq!(loaded.to_bytes(), live.to_bytes());
+}
+
+#[test]
+fn semantic_compaction_folds_superseded_chunks_once() {
+    let project = tempfile::tempdir().expect("create compaction project");
+    let storage = tempfile::tempdir().expect("create compaction storage");
+    let files = seed_delta_fixture(project.path(), 20);
+    let changed = files[0].clone();
+    let mut live = build_delta_index(project.path(), &files);
+    assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+
+    for version in 1..=2 {
+        write_delta_fixture(&changed, 0, version);
+        refresh_delta_paths(&mut live, project.path(), std::slice::from_ref(&changed));
+        assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+    }
+    let compacted = live.compact_to_disk_for_test(storage.path(), DELTA_PROJECT_KEY);
+    let stats = SemanticIndex::persistence_stats_for_test(
+        storage.path(),
+        DELTA_PROJECT_KEY,
+        project.path(),
+    );
+    assert!(
+        compacted || stats.map(|(_, segments, _)| segments) == Some(0),
+        "explicit compaction should win unless off-path compaction already did: {stats:?}"
+    );
+
+    let loaded = load_delta_index(storage.path(), project.path());
+    let names = loaded
+        .search(&[1.0, 0.0, 0.0, 0.0], loaded.len())
+        .into_iter()
+        .filter(|result| result.file.file_name() == changed.file_name())
+        .map(|result| result.name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names.iter().filter(|name| *name == "symbol_0_v2").count(),
+        1,
+        "compaction must not duplicate the latest chunk identity"
+    );
+    assert!(!names.iter().any(|name| name == "symbol_0_v0"));
+    assert!(!names.iter().any(|name| name == "symbol_0_v1"));
+    assert_eq!(loaded.to_bytes(), live.to_bytes());
+}
+
+#[test]
+fn semantic_compaction_starts_after_sixty_four_segments() {
+    let project = tempfile::tempdir().expect("create bounded compaction project");
+    let storage = tempfile::tempdir().expect("create bounded compaction storage");
+    let files = seed_delta_fixture(project.path(), 1_000);
+    let changed = files[0].clone();
+    let mut live = build_delta_index(project.path(), &files);
+    assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+
+    for version in 1..=64 {
+        write_delta_fixture(&changed, 0, version);
+        refresh_delta_paths(&mut live, project.path(), std::slice::from_ref(&changed));
+        assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+    }
+    assert_eq!(
+        SemanticIndex::persistence_stats_for_test(
+            storage.path(),
+            DELTA_PROJECT_KEY,
+            project.path()
+        )
+        .map(|(_, segments, _)| segments),
+        Some(64),
+        "the segment-count bound is exclusive"
+    );
+
+    write_delta_fixture(&changed, 0, 65);
+    refresh_delta_paths(&mut live, project.path(), std::slice::from_ref(&changed));
+    assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+    let started = std::time::Instant::now();
+    loop {
+        let segment_count = SemanticIndex::persistence_stats_for_test(
+            storage.path(),
+            DELTA_PROJECT_KEY,
+            project.path(),
+        )
+        .map(|(_, segments, _)| segments);
+        if segment_count == Some(0) {
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "off-path compaction did not fold the 65th segment: {segment_count:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        load_delta_index(storage.path(), project.path()).to_bytes(),
+        live.to_bytes()
+    );
+}
+
+#[cfg(unix)]
+const SEGMENT_TEAR_CHILD_TEST: &str = "semantic_disk_test::semantic_segment_sigkill_child";
+#[cfg(unix)]
+const COMPACTION_SWAP_CHILD_TEST: &str = "semantic_disk_test::semantic_compaction_swap_child";
+
+#[cfg(unix)]
+fn wait_for_test_seam(child: &mut std::process::Child, ready: &Path) {
+    let started = std::time::Instant::now();
+    while !ready.is_file() {
+        if let Some(status) = child.try_wait().expect("poll semantic child") {
+            panic!("semantic persistence child exited before test seam: {status}");
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "timed out waiting for semantic persistence child seam"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore]
+fn semantic_segment_sigkill_child() {
+    let root = PathBuf::from(std::env::var_os("AFT_TEST_SEMANTIC_ROOT").expect("child root"));
+    let storage =
+        PathBuf::from(std::env::var_os("AFT_TEST_SEMANTIC_STORAGE").expect("child storage"));
+    let changed =
+        PathBuf::from(std::env::var_os("AFT_TEST_SEMANTIC_CHANGED").expect("changed path"));
+    let mut index = load_delta_index(&storage, &root);
+    write_delta_fixture(&changed, 0, 1);
+    refresh_delta_paths(&mut index, &root, std::slice::from_ref(&changed));
+    assert!(index.write_to_disk(&storage, DELTA_PROJECT_KEY));
+}
+
+#[cfg(unix)]
+#[test]
+fn semantic_segment_sigkill_preserves_previous_state_and_retry_recovers() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let project = tempfile::tempdir().expect("create SIGKILL project");
+    let storage = tempfile::tempdir().expect("create SIGKILL storage");
+    let files = seed_delta_fixture(project.path(), 20);
+    let changed = files[0].clone();
+    let mut original = build_delta_index(project.path(), &files);
+    assert!(original.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+    let ready = storage.path().join("segment-tear.ready");
+
+    let mut child = Command::new(std::env::current_exe().expect("semantic test executable"))
+        .args([
+            "--exact",
+            SEGMENT_TEAR_CHILD_TEST,
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("AFT_TEST_SEMANTIC_ROOT", project.path())
+        .env("AFT_TEST_SEMANTIC_STORAGE", storage.path())
+        .env("AFT_TEST_SEMANTIC_CHANGED", &changed)
+        .env("AFT_TEST_SEMANTIC_SEGMENT_TEAR_READY", &ready)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn semantic tear child");
+    wait_for_test_seam(&mut child, &ready);
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
+    let status = child.wait().expect("reap semantic tear child");
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+
+    let after_kill = load_delta_index(storage.path(), project.path());
+    assert_eq!(
+        after_kill.to_bytes(),
+        original.to_bytes(),
+        "a torn final segment must expose the previous committed state"
+    );
+
+    write_delta_fixture(&changed, 0, 1);
+    refresh_delta_paths(
+        &mut original,
+        project.path(),
+        std::slice::from_ref(&changed),
+    );
+    assert!(original.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+    assert_eq!(
+        load_delta_index(storage.path(), project.path()).to_bytes(),
+        original.to_bytes(),
+        "the next writer must truncate the torn tail before appending its retry"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore]
+fn semantic_compaction_swap_child() {
+    let root = PathBuf::from(std::env::var_os("AFT_TEST_SEMANTIC_ROOT").expect("child root"));
+    let storage =
+        PathBuf::from(std::env::var_os("AFT_TEST_SEMANTIC_STORAGE").expect("child storage"));
+    let index = load_delta_index(&storage, &root);
+    assert!(index.compact_to_disk_for_test(&storage, DELTA_PROJECT_KEY));
+}
+
+#[cfg(unix)]
+#[test]
+fn semantic_reader_open_during_compaction_sees_complete_generation() {
+    let project = tempfile::tempdir().expect("create reader project");
+    let storage = tempfile::tempdir().expect("create reader storage");
+    let files = seed_delta_fixture(project.path(), 20);
+    let changed = files[0].clone();
+    let mut live = build_delta_index(project.path(), &files);
+    assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+    write_delta_fixture(&changed, 0, 1);
+    refresh_delta_paths(&mut live, project.path(), std::slice::from_ref(&changed));
+    assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+    let expected = live.to_bytes();
+
+    let ready = storage.path().join("compaction-swap.ready");
+    let release = ready.with_extension("release");
+    let mut child = Command::new(std::env::current_exe().expect("semantic test executable"))
+        .args([
+            "--exact",
+            COMPACTION_SWAP_CHILD_TEST,
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("AFT_TEST_SEMANTIC_ROOT", project.path())
+        .env("AFT_TEST_SEMANTIC_STORAGE", storage.path())
+        .env("AFT_TEST_SEMANTIC_COMPACTION_READY", &ready)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn semantic compaction child");
+    wait_for_test_seam(&mut child, &ready);
+
+    let during = SemanticIndex::read_from_disk(
+        storage.path(),
+        DELTA_PROJECT_KEY,
+        project.path(),
+        true,
+        Some(&delta_fingerprint().as_string()),
+    )
+    .expect("borrowed reader opens old complete inode during compaction");
+    assert_eq!(during.to_bytes(), expected);
+
+    fs::write(&release, b"release").expect("release compaction swap");
+    assert!(child.wait().expect("wait for compaction child").success());
+    let after = load_delta_index(storage.path(), project.path());
+    assert_eq!(after.to_bytes(), expected);
 }
 
 fn build_v1_index_bytes(file: &Path) -> Vec<u8> {
