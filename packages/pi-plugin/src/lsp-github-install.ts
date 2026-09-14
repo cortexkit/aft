@@ -95,6 +95,15 @@ function ghExtractDir(spec: GithubServerSpec): string {
 }
 
 const INSTALLED_META_FILE = ".aft-installed";
+const INSTALL_FAILED_FILE = ".aft-install-failed.json";
+const INSTALL_FAILURE_BACKOFF_MS = 6 * 60 * 60 * 1000;
+
+interface GithubInstallFailureMarker {
+  release: string;
+  sha256: string;
+  error: string;
+  at: string;
+}
 
 interface GithubInstalledMeta {
   version: string;
@@ -102,6 +111,69 @@ interface GithubInstalledMeta {
   sha256?: string;
   binarySha256?: string;
   archiveSha256?: string;
+}
+
+function installFailureMarkerPath(spec: GithubServerSpec): string {
+  return join(ghPackageDir(spec), INSTALL_FAILED_FILE);
+}
+
+function readInstallFailureMarker(spec: GithubServerSpec): GithubInstallFailureMarker | null {
+  try {
+    const marker = JSON.parse(
+      readFileSync(installFailureMarkerPath(spec), "utf8"),
+    ) as Partial<GithubInstallFailureMarker>;
+    if (
+      typeof marker.release !== "string" ||
+      typeof marker.sha256 !== "string" ||
+      typeof marker.error !== "string" ||
+      typeof marker.at !== "string" ||
+      !Number.isFinite(Date.parse(marker.at))
+    ) {
+      return null;
+    }
+    return marker as GithubInstallFailureMarker;
+  } catch {
+    return null;
+  }
+}
+
+function writeInstallFailureMarker(
+  spec: GithubServerSpec,
+  release: string,
+  sha256: string,
+  installError: string,
+): void {
+  const path = installFailureMarkerPath(spec);
+  const markerError = installError.replace(/\s+/g, " ").trim();
+  const tempPath = `${path}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(
+      tempPath,
+      `${JSON.stringify({ release, sha256, error: markerError, at: new Date().toISOString() })}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+    renameSync(tempPath, path);
+  } catch (err) {
+    try {
+      rmSync(tempPath, { force: true });
+    } catch {}
+    warn(`[lsp] could not write install failure marker ${path}: ${err}`);
+  }
+}
+
+function clearInstallFailureMarker(spec: GithubServerSpec): void {
+  try {
+    rmSync(installFailureMarkerPath(spec), { force: true });
+  } catch {}
+}
+
+function sameRelease(left: string, right: string): boolean {
+  return stripTagV(left) === stripTagV(right);
+}
+
+function isFreshInstallFailure(marker: GithubInstallFailureMarker): boolean {
+  return Math.abs(Date.now() - Date.parse(marker.at)) < INSTALL_FAILURE_BACKOFF_MS;
 }
 
 /** Final binary path under our cache. */
@@ -893,12 +965,13 @@ function runPlatformExtractor(archivePath: string, destDir: string, archiveType:
 
 /* ─────────────────────────── install pipeline ─────────────────────────── */
 
+type GithubDownloadResult =
+  | { ok: true; archiveSha256: string; binarySha256: string }
+  | { ok: false; sha256: string; error: string };
+
 /**
  * Run the download + extract + binary-place flow for a single server.
- * Returns archive and final-binary SHA-256 hashes on success, or null on any failure.
- *
- * The caller persists the hash in `.aft-installed` for TOFU
- * verification on subsequent installs of the same tag.
+ * Returns hashes on success or a durable-marker payload on failure.
  */
 async function downloadAndInstall(
   spec: GithubServerSpec,
@@ -908,20 +981,20 @@ async function downloadAndInstall(
   arch: Arch,
   fetchImpl: typeof fetch,
   signal?: AbortSignal,
-): Promise<{ archiveSha256: string; binarySha256: string } | null> {
+): Promise<GithubDownloadResult> {
   const version = stripTagV(tag);
   const expected = spec.resolveAsset(platform, arch, version);
   if (!expected) {
-    warn(`[lsp] ${spec.id}: unsupported platform/arch combo ${platform}/${arch}`);
-    return null;
+    const message = `unsupported platform/arch combo ${platform}/${arch}`;
+    warn(`[lsp] ${spec.id}: ${message}`);
+    return { ok: false, sha256: "", error: message };
   }
 
-  const matchingAsset = assets.find((a) => a.name === expected.name);
+  const matchingAsset = assets.find((asset) => asset.name === expected.name);
   if (!matchingAsset) {
-    warn(
-      `[lsp] ${spec.id}: asset ${expected.name} not found in release ${tag} (${assets.length} assets available)`,
-    );
-    return null;
+    const message = `asset ${expected.name} not found in release ${tag} (${assets.length} assets available)`;
+    warn(`[lsp] ${spec.id}: ${message}`);
+    return { ok: false, sha256: "", error: message };
   }
 
   const pkgDir = ghPackageDir(spec);
@@ -932,57 +1005,65 @@ async function downloadAndInstall(
   try {
     await downloadFile(matchingAsset.url, archivePath, fetchImpl, matchingAsset.size, signal);
   } catch (err) {
+    const message = `download failed: ${err instanceof Error ? err.message : String(err)}`;
     error(`[lsp] download ${spec.id} failed: ${err}`);
-    return null;
+    return { ok: false, sha256: "", error: message };
   }
 
-  // SHA-256 always-log + TOFU verification.
   let archiveSha256: string;
   try {
     archiveSha256 = await sha256OfFile(archivePath);
   } catch (err) {
+    const message = `hash failed: ${err instanceof Error ? err.message : String(err)}`;
     error(`[lsp] hash ${spec.id} failed: ${err}`);
     try {
       unlinkSync(archivePath);
     } catch {}
-    return null;
+    return { ok: false, sha256: "", error: message };
   }
   log(`[lsp] ${spec.id} ${tag} sha256=${archiveSha256}`);
 
   const previousMeta = readGithubInstalledMetaIn(ghPackageDir(spec));
   const previousArchiveSha256 =
     previousMeta?.archiveSha256 ?? (previousMeta?.binarySha256 ? undefined : previousMeta?.sha256);
-  if (previousMeta && previousMeta.version === tag && previousArchiveSha256) {
-    if (previousArchiveSha256 !== archiveSha256) {
-      error(
-        `[lsp] ${spec.id} ${tag}: TOFU sha256 mismatch — refusing install. ` +
-          `Previously installed archive sha256=${previousArchiveSha256}, downloaded sha256=${archiveSha256}. ` +
-          `This means the published release for tag ${tag} changed. Investigate before proceeding.`,
-      );
-      try {
-        unlinkSync(archivePath);
-      } catch {}
-      return null;
-    }
+  if (
+    previousMeta &&
+    previousMeta.version === tag &&
+    previousArchiveSha256 &&
+    previousArchiveSha256 !== archiveSha256
+  ) {
+    const message =
+      `TOFU sha256 mismatch: previously installed archive sha256=${previousArchiveSha256}, ` +
+      `downloaded sha256=${archiveSha256}`;
+    error(
+      `[lsp] ${spec.id} ${tag}: ${message}. ` +
+        `This means the published release for tag ${tag} changed. Investigate before proceeding.`,
+    );
+    try {
+      unlinkSync(archivePath);
+    } catch {}
+    return { ok: false, sha256: archiveSha256, error: message };
   }
 
   try {
     extractArchiveSafely(archivePath, extractDir, expected.archive);
   } catch (err) {
+    const message = `extract failed: ${err instanceof Error ? err.message : String(err)}`;
     error(`[lsp] extract ${spec.id} failed: ${err}`);
-    return null;
+    return { ok: false, sha256: archiveSha256, error: message };
   } finally {
     try {
       unlinkSync(archivePath);
     } catch {
-      // ignore — leftover archive isn't critical
+      // A leftover archive does not make the validated extraction unsafe.
     }
   }
 
   const innerBinaryPath = join(extractDir, spec.binaryPathInArchive(platform, arch, version));
   if (!existsSync(innerBinaryPath)) {
-    error(`[lsp] ${spec.id}: extracted binary not found at ${innerBinaryPath}`);
-    return null;
+    const message = `extracted binary not found at ${innerBinaryPath}`;
+    error(`[lsp] ${spec.id}: ${message}`);
+    return { ok: false, sha256: archiveSha256, error: message };
   }
 
   const targetBinary = ghBinaryPath(spec, platform);
@@ -990,19 +1071,25 @@ async function downloadAndInstall(
   try {
     copyFileSync(innerBinaryPath, targetBinary);
     if (platform !== "win32") {
-      // chmod +x.
       const { chmodSync } = await import("node:fs");
       chmodSync(targetBinary, 0o755);
     }
   } catch (err) {
-    error(`[lsp] ${spec.id}: failed to place binary at ${targetBinary}: ${err}`);
-    return null;
+    const message = `failed to place binary at ${targetBinary}: ${err instanceof Error ? err.message : String(err)}`;
+    error(`[lsp] ${spec.id}: ${message}`);
+    return { ok: false, sha256: archiveSha256, error: message };
   }
 
-  log(`[lsp] installed ${spec.id} ${tag} at ${targetBinary}`);
-  const binarySha256 = await sha256OfFile(targetBinary);
-  log(`[lsp] ${spec.id} ${tag} binary_sha256=${binarySha256}`);
-  return { archiveSha256, binarySha256 };
+  try {
+    const binarySha256 = await sha256OfFile(targetBinary);
+    log(`[lsp] installed ${spec.id} ${tag} at ${targetBinary}`);
+    log(`[lsp] ${spec.id} ${tag} binary_sha256=${binarySha256}`);
+    return { ok: true, archiveSha256, binarySha256 };
+  } catch (err) {
+    const message = `failed to hash installed binary: ${err instanceof Error ? err.message : String(err)}`;
+    error(`[lsp] ${spec.id}: ${message}`);
+    return { ok: false, sha256: archiveSha256, error: message };
+  }
 }
 
 /* ─────────────────────────── per-server flow ─────────────────────────── */
@@ -1015,12 +1102,23 @@ async function ensureGithubInstalled(
   arch: Arch,
   signal?: AbortSignal,
 ): Promise<{ started: boolean; reason?: string }> {
-  // Hold the install lock through the FULL download+extract+install
-  // cycle, not just the start decision. Two parallel sessions racing into
-  // the same package would otherwise both pass the "already installed" check,
-  // both claim the lock, both release it before downloading, and corrupt
-  // the cache by extracting concurrent archives over each other.
   const outcome = await withInstallLock(spec.githubRepo, async () => {
+    const failureMarker = readInstallFailureMarker(spec);
+    const pinnedRelease = config.versions[spec.githubRepo];
+    if (failureMarker) {
+      if (
+        isFreshInstallFailure(failureMarker) &&
+        (!pinnedRelease || sameRelease(failureMarker.release, pinnedRelease))
+      ) {
+        warn(
+          `[lsp] skipping ${spec.id}: recent install failure marker ${installFailureMarkerPath(spec)} ` +
+            `for ${failureMarker.release}: ${failureMarker.error}`,
+        );
+        return { started: false, reason: "recent install failure marker" };
+      }
+      clearInstallFailureMarker(spec);
+    }
+
     const { tag, assets, blockedByGrace, reason } = await resolveTargetTag(
       spec,
       config,
@@ -1045,11 +1143,10 @@ async function ensureGithubInstalled(
       return { started: false, reason: fallbackReason };
     }
 
-    // Skip-if-installed must compare the installed tag
-    // against the resolved target so pin changes take effect.
     if (isGithubInstalled(spec, platform)) {
       const installedMeta = readInstalledMetaIn(ghPackageDir(spec));
       if (installedMeta && installedMeta.version === tag) {
+        clearInstallFailureMarker(spec);
         return { started: false, reason: "already installed" };
       }
       if (installedMeta) {
@@ -1059,9 +1156,7 @@ async function ensureGithubInstalled(
       }
     }
 
-    // Hold the lock through the entire download+extract. Errors are logged
-    // but we still return `started: true` so the caller counts the attempt.
-    const hashes = await downloadAndInstall(
+    const installResult = await downloadAndInstall(
       spec,
       tag,
       assets,
@@ -1069,14 +1164,23 @@ async function ensureGithubInstalled(
       arch,
       fetchImpl,
       signal,
-    ).catch((err) => {
+    ).catch((err): GithubDownloadResult => {
+      const message = `install crashed: ${err instanceof Error ? err.message : String(err)}`;
       error(`[lsp] github install ${spec.id} crashed: ${err}`);
-      return null;
+      return { ok: false, sha256: "", error: message };
     });
-    if (!hashes) {
+    if (!installResult.ok) {
+      writeInstallFailureMarker(spec, tag, installResult.sha256, installResult.error);
       return { started: true, reason: "install failed (see plugin log)" };
     }
-    writeGithubInstalledMetaIn(ghPackageDir(spec), tag, hashes.binarySha256, hashes.archiveSha256);
+
+    clearInstallFailureMarker(spec);
+    writeGithubInstalledMetaIn(
+      ghPackageDir(spec),
+      tag,
+      installResult.binarySha256,
+      installResult.archiveSha256,
+    );
     return { started: true };
   });
 

@@ -11,12 +11,13 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { getAftLspBinariesDir } from "../../../aft-bridge/src/cache-paths.js";
 import {
+  detectHostPlatform,
   discoverRelevantGithubServers,
   ghBinaryPath,
   isGithubInstalled,
@@ -269,6 +270,75 @@ describe("runGithubAutoInstall", () => {
     const clangdSkip = result.skipped.find((s) => s.id === "clangd");
     expect(clangdSkip).toBeDefined();
     expect(clangdSkip?.reason).toContain("grace window");
+  });
+
+  test("a failed extract suppresses every fetch on the second pass", async () => {
+    const clangd = findGithubServerById("clangd");
+    const host = detectHostPlatform();
+    if (!clangd || !host) return;
+    const release = "99.0.0";
+    let selectedRelease = release;
+    if (!clangd.resolveAsset(host.platform, host.arch, release)) return;
+
+    let fetchCalls = 0;
+    const fakeFetch = (async (input: string | URL | Request) => {
+      fetchCalls += 1;
+      const url = String(input);
+      if (url.includes("/releases/tags/")) {
+        const selectedAsset = clangd.resolveAsset(host.platform, host.arch, selectedRelease);
+        if (!selectedAsset) throw new Error("fixture release is unsupported");
+        return new Response(
+          JSON.stringify({
+            tag_name: selectedRelease,
+            assets: [
+              {
+                name: selectedAsset.name,
+                browser_download_url: `https://github.com/clangd/clangd/releases/download/${selectedRelease}/${selectedAsset.name}`,
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response("not an archive", { status: 200 });
+    }) as typeof fetch;
+    const config = {
+      autoInstall: true,
+      graceDays: 7,
+      versions: { [clangd.githubRepo]: release },
+      disabled: new Set<string>(),
+    };
+
+    const first = runGithubAutoInstall(new Set([clangd.id]), config, fakeFetch);
+    await first.installsComplete;
+    expect(fetchCalls).toBe(2);
+
+    const second = runGithubAutoInstall(new Set([clangd.id]), config, fakeFetch);
+    await second.installsComplete;
+
+    expect(fetchCalls).toBe(2);
+    const marker = JSON.parse(
+      readFileSync(join(getAftLspBinariesDir(), clangd.id, ".aft-install-failed.json"), "utf8"),
+    );
+    expect(marker).toMatchObject({
+      release,
+      sha256: expect.any(String),
+      error: expect.any(String),
+    });
+    expect(Number.isFinite(Date.parse(marker.at))).toBe(true);
+
+    selectedRelease = "100.0.0";
+    const newerRelease = runGithubAutoInstall(
+      new Set([clangd.id]),
+      { ...config, versions: { [clangd.githubRepo]: selectedRelease } },
+      fakeFetch,
+    );
+    await newerRelease.installsComplete;
+    expect(fetchCalls).toBe(4);
+    const refreshedMarker = JSON.parse(
+      readFileSync(join(getAftLspBinariesDir(), clangd.id, ".aft-install-failed.json"), "utf8"),
+    );
+    expect(refreshedMarker.release).toBe(selectedRelease);
   });
 
   test("registry probe failure → skip with probe-failed reason and no install", async () => {
