@@ -325,7 +325,9 @@ fn semantic_delta_sequence_matches_whole_rewrite_after_every_step() {
     assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
     assert_delta_structural_parity(storage.path(), project.path(), &files, &live);
 
-    assert!(live.compact_to_disk_for_test(storage.path(), DELTA_PROJECT_KEY));
+    // Crossing the byte bound may already have scheduled the same fold. The
+    // synchronous request either performs it or observes that completed swap.
+    let _ = live.compact_to_disk_for_test(storage.path(), DELTA_PROJECT_KEY);
     assert_eq!(
         SemanticIndex::persistence_stats_for_test(
             storage.path(),
