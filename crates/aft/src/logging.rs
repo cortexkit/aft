@@ -1029,7 +1029,7 @@ fn sweep_logs(
             .is_some_and(|age| age >= max_age);
         let alive = *live_pids
             .entry(pid)
-            .or_insert_with(|| is_process_alive(pid));
+            .or_insert_with(|| is_process_alive(pid) && !pid_started_after_last_write(pid, modified));
         process_logs.push(ProcessLogFile {
             path: entry.path(),
             modified,
@@ -1071,6 +1071,27 @@ fn sweep_logs(
     }
 
     Ok(summary)
+}
+
+/// Slack for clock and filesystem timestamp granularity when comparing a
+/// process start time against a log file's last write.
+const PID_REUSE_TOLERANCE_MS: u64 = 2_000;
+
+/// The PID number outlives the process that wrote the log. After a reboot the
+/// kernel hands low numbers to system daemons, so a liveness check by number
+/// alone pinned sixteen-day-old files under the age reap and the budget
+/// backstop alike. The real owner started before it wrote the file, so a start
+/// time later than the file's last write proves the number was recycled.
+/// Platforms without a start-time source keep the number-only verdict.
+fn pid_started_after_last_write(pid: u32, modified: Option<SystemTime>) -> bool {
+    let Some(modified_ms) = modified
+        .and_then(|modified| modified.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|since_epoch| since_epoch.as_millis() as u64)
+    else {
+        return false;
+    };
+    crate::root_cache::process_start_time_ms(pid)
+        .is_some_and(|started_ms| started_ms > modified_ms.saturating_add(PID_REUSE_TOLERANCE_MS))
 }
 
 fn remove_sweep_candidate(path: &Path) -> bool {
@@ -1631,6 +1652,42 @@ mod tests {
         assert!(own.exists());
         assert!(live_rotated.exists());
         assert!(plugin.exists());
+    }
+
+    /// A live process's own start time always precedes its writes, so its file
+    /// with a current mtime stays; the same live number on a file last written
+    /// before that process started is a recycled PID and is reaped.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn recycled_pid_log_is_reaped_while_the_live_owner_is_kept() {
+        let temp = TempDir::new().unwrap();
+        let live_pid = unsafe { libc::getppid() } as u32;
+        assert!(is_process_alive(live_pid));
+        let recycled = temp.path().join(format!("aft-{live_pid}.log"));
+        fs::write(&recycled, "written long before this process existed").unwrap();
+        set_file_mtime(&recycled, FileTime::from_unix_time(1, 0)).unwrap();
+
+        let summary = sweep_logs(
+            temp.path(),
+            SystemTime::now(),
+            DEAD_PROCESS_LOG_MAX_AGE,
+            u64::MAX,
+        )
+        .unwrap();
+        assert_eq!(summary.removed_files, 1);
+        assert!(!recycled.exists());
+
+        let owned = temp.path().join(format!("aft-{live_pid}.log"));
+        fs::write(&owned, "written by the live owner").unwrap();
+        let summary = sweep_logs(
+            temp.path(),
+            SystemTime::now() + DEAD_PROCESS_LOG_MAX_AGE * 2,
+            DEAD_PROCESS_LOG_MAX_AGE,
+            0,
+        )
+        .unwrap();
+        assert_eq!(summary.removed_files, 0);
+        assert!(owned.exists());
     }
 
     #[test]
