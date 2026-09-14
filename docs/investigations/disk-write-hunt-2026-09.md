@@ -212,3 +212,32 @@ Verification after restoration:
 - `cargo test -p agent-file-tools --test integration tool_call_parity_test`: 12 passed.
 - Native and `--target x86_64-pc-windows-gnu` `cargo check -p agent-file-tools --all-targets` with `RUSTFLAGS='-D warnings'`: both passed.
 - Full integration was not rerun for this narrow read change; its unchanged callgraph-worktree failures and isolated LSP deadline rerun are documented above. No failing baseline test was rewritten.
+
+## Semantic base + delta persistence
+
+Measured 2026-09-14 with `bench_semantic_refresh_persistence_writes` on a copied production artifact (`semantic/90ff783f3f4c5cf2/semantic.bin`, 154,982,730 bytes). The probe copied that copy again for each row, re-rooted it to a temporary project, replaced exactly N indexed Rust files with deterministic fixtures, refreshed those files through `refresh_invalidated_files`, and sampled the real `write_to_disk` call with the hunt's Darwin `proc_pid_rusage(RUSAGE_INFO_V4)` attribution. It never opened a live artifact. Each N row is independent; replacing production files with smaller fixtures makes the resulting whole snapshot size differ by N, so the before rows are not expected to be byte-identical.
+
+Before (whole-snapshot writer at `edc5f58b9` plus the committed measurement probe):
+
+| Changed files | Physical bytes / MiB | Logical bytes / MiB | Resulting artifact bytes / MiB |
+| ---: | ---: | ---: | ---: |
+| 1 | 154,931,200 / 147.754 | 159,801,344 / 152.398 | 154,928,321 / 147.751 |
+| 10 | 153,686,016 / 146.566 | 160,931,837 / 153.477 | 153,684,255 / 146.565 |
+| 100 | 145,813,504 / 139.059 | 151,113,724 / 144.113 | 145,813,162 / 139.058 |
+
+After (same copied input and refresh procedure, base + delta writer):
+
+| Changed files | Physical bytes / MiB | Logical bytes / MiB | Resulting base + log bytes / MiB |
+| ---: | ---: | ---: | ---: |
+| 1 | **28,672 / 0.027** | 237,568 / 0.227 | 154,987,951 / 147.808 |
+| 10 | **77,824 / 0.074** | 438,272 / 0.418 | 155,028,325 / 147.847 |
+| 100 | **466,944 / 0.445** | 765,952 / 0.730 | 155,433,968 / 148.233 |
+| Forced compaction after the 100-file row | 145,817,600 / 139.063 | 156,974,932 / 149.703 | 145,813,162 / 139.058 |
+
+`semantic.bin` now starts with the unchanged V6/V7 base snapshot and appends one segment per persisted refresh. A segment contains ordered file-id tombstones followed by the complete replacement metadata, chunks, and vectors for those file ids. Each frame is `magic + u64 payload length + BLAKE3 checksum + payload`. Readers apply checksum-valid frames in sequence. A partial or checksum-invalid final frame is treated as a torn tail, leaving the preceding base + frames loadable; an owning reader or the next writer truncates it to the last valid boundary, while borrowed/read-only openers do not mutate it. This length-prefix/checksum design avoids rewriting the 145–155 MiB base merely to publish a small refresh.
+
+Compaction is scheduled after publication on a background thread when **segment bytes exceed 25% of base bytes or the count exceeds 64 segments**. The byte bound caps replay and temporary log space for unusually broad refreshes; the count bound caps replay for long runs of tiny watcher batches. For this 154,982,730-byte base the byte threshold is 38,745,682 bytes. The measured 100-file frame was about 451 KiB, so the count bound would fire first after the 65th comparable refresh; tiny one-file edits also compact no less often than every 65 persisted refreshes. Compaction intentionally pays one whole-snapshot write (measured above) outside the refresh path rather than paying it for every refresh.
+
+Append and compaction share an inter-process persistence lock. The compactor reloads the committed base + segments after taking that lock and compares the scheduled file identity before replacing anything, so a stale background job cannot erase a later append. It writes and fsyncs `semantic.bin.tmp.*`, then atomically renames it over `semantic.bin` and syncs the parent directory. A reader that opened before the rename remains on the complete old inode; one that opens afterward receives the complete compacted inode. The same `read_from_disk_borrow_tolerant` path used by `readonly_artifacts.rs` hashes and loads the base plus segments, and never truncates a torn tail.
+
+Structural regression coverage compares canonical serialized state (file table, chunks, vector bits, and fingerprint) with a fresh whole rebuild after cold build, 1-file refresh, 10-file refresh, three deletions, 100-file refresh, and compaction. Separate guards cover tombstone masking, ordered supersession, one-copy compaction, the 64-segment bound, SIGKILL during a partial frame, and a second process opening while compaction is paused immediately before the atomic swap.
