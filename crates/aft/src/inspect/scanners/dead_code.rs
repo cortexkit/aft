@@ -1,6 +1,7 @@
 use std::collections::{hash_map::Entry, BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Instant, UNIX_EPOCH};
 
 use rayon::prelude::*;
@@ -55,8 +56,40 @@ pub(crate) struct RollupVerdict {
 
 #[derive(Debug, Clone)]
 pub(crate) struct DeadCodeRollupState {
-    all: ReachabilityState,
-    production: ReachabilityState,
+    all: Arc<ReachabilityState>,
+    production: Arc<ReachabilityState>,
+    materialized: Arc<Vec<DeadCodeContribution>>,
+    contribution_hashes: BTreeMap<String, String>,
+    callgraph_hashes: BTreeMap<String, String>,
+    public_api_files: BTreeSet<String>,
+    roles_fingerprint: String,
+    fragments: BTreeMap<String, DeadCodeFileFragment>,
+    aggregate: Value,
+    drill_down_limit: Option<usize>,
+    cache_key: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DeadCodeFileFragment {
+    contribution_hash: String,
+    reachable_exports: BTreeSet<String>,
+    production_reachable_exports: BTreeSet<String>,
+    public_api: bool,
+    roles_fingerprint: String,
+    headline_items: Vec<Value>,
+    generated_items: Vec<Value>,
+    test_only_items: Vec<Value>,
+    uncertain_items: Vec<Value>,
+    by_language: BTreeMap<String, usize>,
+}
+
+impl DeadCodeFileFragment {
+    fn rendered_items(&self) -> usize {
+        self.headline_items.len()
+            + self.generated_items.len()
+            + self.test_only_items.len()
+            + self.uncertain_items.len()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -610,6 +643,7 @@ pub(crate) fn aggregate_dead_code_contributions_with_snapshot(
         roles,
         drill_down_limit,
         None,
+        None,
         &BTreeSet::new(),
     )
     .0
@@ -623,27 +657,113 @@ pub(crate) fn aggregate_dead_code_contributions_incremental(
     public_api_files: &BTreeSet<String>,
     roles: &crate::inspect::entry_points::ProjectRoles,
     drill_down_limit: Option<usize>,
+    cache_key: Option<&str>,
     previous: Option<&DeadCodeRollupState>,
     changed_files: &BTreeSet<String>,
 ) -> (serde_json::Value, DeadCodeRollupState, RollupVerdict) {
+    let contribution_hashes = contribution_hashes(
+        previous.map(|state| &state.contribution_hashes),
+        contributions,
+        changed_files,
+    );
+    let callgraph_hashes = callgraph_hashes(
+        project_root,
+        snapshot,
+        previous.map(|state| &state.callgraph_hashes),
+        changed_files,
+    );
+    let roles_fingerprint = format!("{roles:?}");
+    let changed_graph_files = previous
+        .map(|state| changed_map_keys(&state.callgraph_hashes, &callgraph_hashes))
+        .unwrap_or_default();
+    if let Some(previous) = previous {
+        let contribution_files = contribution_hashes.keys().cloned().collect::<BTreeSet<_>>();
+        let _retained_rendered_items = previous
+            .fragments
+            .values()
+            .map(DeadCodeFileFragment::rendered_items)
+            .sum::<usize>();
+        let fragments_match = previous.fragments.iter().all(|(file, fragment)| {
+            contribution_hashes.get(file) == Some(&fragment.contribution_hash)
+                && fragment.public_api == public_api_files.contains(file)
+                && fragment.roles_fingerprint == roles_fingerprint
+                && fragment.reachable_exports
+                    == reachable_symbols_for_file(&previous.all.reachable, file)
+                && fragment.production_reachable_exports
+                    == reachable_symbols_for_file(&previous.production.reachable, file)
+        });
+        if previous.contribution_hashes == contribution_hashes
+            && previous.public_api_files == *public_api_files
+            && previous.roles_fingerprint == roles_fingerprint
+            && previous.drill_down_limit == drill_down_limit
+            && previous.cache_key.as_deref() == cache_key
+            && previous.materialized.len() <= contribution_hashes.len()
+            && fragments_match
+            && changed_files
+                .iter()
+                .all(|file| !rollup_semantics_file(file))
+            && changed_graph_files.is_disjoint(&contribution_files)
+        {
+            let mut state = previous.clone();
+            state.callgraph_hashes = callgraph_hashes;
+            return (
+                state.aggregate.clone(),
+                state,
+                RollupVerdict {
+                    kind: RollupKind::Incremental,
+                    reason: None,
+                },
+            );
+        }
+    }
+
     let parsed = parse_dead_code_contributions(contributions);
-    let materialized =
-        materialize_dead_code_contributions(project_root, snapshot, parsed, public_api_files);
-    let all_edges = edges_by_source(&materialized, false);
-    let production_edges = edges_by_source(&materialized, true);
-    let dispatched_method_names = collect_dispatched_method_names_by_language(&materialized);
+    let mut affected_files = changed_files
+        .union(&changed_graph_files)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if previous.is_none()
+        || previous.is_some_and(|state| {
+            state.public_api_files != *public_api_files
+                || state.roles_fingerprint != roles_fingerprint
+        })
+        || affected_files
+            .iter()
+            .any(|file| rollup_semantics_file(file))
+        || changed_export_surface(previous, &parsed, &affected_files)
+        || parsed.iter().any(|contribution| {
+            affected_files.contains(&contribution.file) && contribution.oxc_facts.is_some()
+        })
+    {
+        affected_files = parsed
+            .iter()
+            .map(|contribution| contribution.file.clone())
+            .collect();
+    }
+    let materialized = Arc::new(materialize_dead_code_contributions(
+        project_root,
+        snapshot,
+        parsed,
+        public_api_files,
+        previous.map(|state| state.materialized.as_slice()),
+        &affected_files,
+    ));
+    let all_edges = edges_by_source(materialized.as_ref(), false);
+    let production_edges = edges_by_source(materialized.as_ref(), true);
+    let dispatched_method_names =
+        collect_dispatched_method_names_by_language(materialized.as_ref());
     let (all, all_incremental) = build_reachability_state(
-        &materialized,
+        materialized.as_ref(),
         all_edges,
         &dispatched_method_names,
-        previous.map(|state| &state.all),
+        previous.map(|state| state.all.as_ref()),
         changed_files,
     );
     let (production, production_incremental) = build_reachability_state(
-        &materialized,
+        materialized.as_ref(),
         production_edges,
         &dispatched_method_names,
-        previous.map(|state| &state.production),
+        previous.map(|state| state.production.as_ref()),
         changed_files,
     );
     let verdict = if all_incremental && production_incremental {
@@ -657,18 +777,401 @@ pub(crate) fn aggregate_dead_code_contributions_incremental(
             reason: Some("cold"),
         }
     };
-    let aggregate = aggregate_materialized_dead_code_contributions(
+    if let Some(previous) = previous {
+        affected_files.extend(
+            all.reachable
+                .symmetric_difference(&previous.all.reachable)
+                .map(|node| node.0.clone()),
+        );
+        affected_files.extend(
+            production
+                .reachable
+                .symmetric_difference(&previous.production.reachable)
+                .map(|node| node.0.clone()),
+        );
+    }
+    let all = Arc::new(all);
+    let production = Arc::new(production);
+    let mut fragments = previous
+        .map(|state| state.fragments.clone())
+        .unwrap_or_default();
+    fragments.retain(|file, _| contribution_hashes.contains_key(file));
+    let rendered = materialized
+        .iter()
+        .filter(|contribution| previous.is_none() || affected_files.contains(&contribution.file))
+        .cloned()
+        .collect::<Vec<_>>();
+    let rendered_aggregate = aggregate_materialized_dead_code_contributions(
         project_root,
-        &materialized,
+        materialized.as_ref(),
+        &rendered,
         public_api_files,
         roles,
-        drill_down_limit,
-        contributions.len(),
+        None,
+        rendered.len(),
         &all.reachable,
         &production.reachable,
         &dispatched_method_names,
     );
-    (aggregate, DeadCodeRollupState { all, production }, verdict)
+    fragments.extend(fragments_from_aggregate(
+        &rendered,
+        &contribution_hashes,
+        public_api_files,
+        &roles_fingerprint,
+        &all.reachable,
+        &production.reachable,
+        &rendered_aggregate,
+    ));
+    let aggregate = fold_dead_code_fragments(
+        &fragments,
+        materialized.as_ref(),
+        roles,
+        drill_down_limit,
+        contributions.len(),
+    );
+    (
+        aggregate.clone(),
+        DeadCodeRollupState {
+            all,
+            production,
+            materialized,
+            contribution_hashes,
+            callgraph_hashes,
+            public_api_files: public_api_files.clone(),
+            roles_fingerprint,
+            fragments,
+            aggregate,
+            drill_down_limit,
+            cache_key: cache_key.map(str::to_owned),
+        },
+        verdict,
+    )
+}
+
+fn rollup_semantics_file(file: &str) -> bool {
+    let name = Path::new(file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(file);
+    name == "package.json"
+        || name == "Cargo.toml"
+        || (name.starts_with("tsconfig") && name.ends_with(".json"))
+        || (name.starts_with("jsconfig") && name.ends_with(".json"))
+        || name.ends_with(".config.js")
+        || name.ends_with(".config.ts")
+}
+
+fn changed_export_surface(
+    previous: Option<&DeadCodeRollupState>,
+    parsed: &[DeadCodeContribution],
+    affected_files: &BTreeSet<String>,
+) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    let old = previous
+        .materialized
+        .iter()
+        .filter(|contribution| affected_files.contains(&contribution.file))
+        .map(|contribution| {
+            (
+                contribution.file.as_str(),
+                contribution
+                    .exports
+                    .iter()
+                    .map(|export| export.symbol.as_str())
+                    .collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let new = parsed
+        .iter()
+        .filter(|contribution| affected_files.contains(&contribution.file))
+        .map(|contribution| {
+            (
+                contribution.file.as_str(),
+                contribution
+                    .exports
+                    .iter()
+                    .map(|export| export.symbol.as_str())
+                    .collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    old != new
+}
+
+fn contribution_hashes(
+    previous: Option<&BTreeMap<String, String>>,
+    contributions: &[FileContribution],
+    changed_files: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    if let Some(previous) = previous {
+        let mut hashes = previous.clone();
+        for file in changed_files {
+            hashes.remove(file);
+        }
+        for contribution in contributions {
+            let file = contribution
+                .contribution
+                .get("file")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| contribution.file_path.to_string_lossy().replace('\\', "/"));
+            if changed_files.contains(&file) {
+                let bytes = serde_json::to_vec(&contribution.contribution).unwrap_or_default();
+                hashes.insert(file, blake3::hash(&bytes).to_hex().to_string());
+            }
+        }
+        return hashes;
+    }
+
+    contributions
+        .iter()
+        .map(|contribution| {
+            let file = contribution
+                .contribution
+                .get("file")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| contribution.file_path.to_string_lossy().replace('\\', "/"));
+            let bytes = serde_json::to_vec(&contribution.contribution).unwrap_or_default();
+            (file, blake3::hash(&bytes).to_hex().to_string())
+        })
+        .collect()
+}
+
+fn callgraph_hashes(
+    project_root: &Path,
+    snapshot: &CallgraphSnapshot,
+    previous: Option<&BTreeMap<String, String>>,
+    changed_files: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
+    let mut hashes = previous.cloned().unwrap_or_default();
+    let files = if previous.is_some() {
+        for file in changed_files {
+            hashes.remove(file);
+        }
+        changed_files.clone()
+    } else {
+        snapshot
+            .outbound_calls
+            .iter()
+            .map(|call| relative_path(project_root, &call.caller_file))
+            .collect()
+    };
+    let absolute_files = files
+        .iter()
+        .map(|file| (project_root.join(file), file))
+        .collect::<BTreeMap<_, _>>();
+    let mut hashers = BTreeMap::<String, blake3::Hasher>::new();
+    for call in &snapshot.outbound_calls {
+        let Some(file) = absolute_files.get(&call.caller_file) else {
+            continue;
+        };
+        let hasher = hashers.entry((*file).clone()).or_default();
+        hasher.update(call.caller_symbol.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(call.target.as_bytes());
+        hasher.update(&call.line.to_le_bytes());
+        hasher.update(call.provenance.as_bytes());
+    }
+    hashes.extend(
+        hashers
+            .into_iter()
+            .map(|(file, hasher)| (file, hasher.finalize().to_hex().to_string())),
+    );
+    hashes
+}
+
+fn changed_map_keys(
+    previous: &BTreeMap<String, String>,
+    current: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    previous
+        .keys()
+        .chain(current.keys())
+        .filter(|key| previous.get(*key) != current.get(*key))
+        .cloned()
+        .collect()
+}
+
+fn reachable_symbols_for_file(reachable: &BTreeSet<ExportNode>, file: &str) -> BTreeSet<String> {
+    reachable
+        .iter()
+        .filter(|node| node.0 == file)
+        .map(|node| node.1.clone())
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fragments_from_aggregate(
+    materialized: &[DeadCodeContribution],
+    contribution_hashes: &BTreeMap<String, String>,
+    public_api_files: &BTreeSet<String>,
+    roles_fingerprint: &str,
+    reachable: &BTreeSet<ExportNode>,
+    production_reachable: &BTreeSet<ExportNode>,
+    aggregate: &Value,
+) -> BTreeMap<String, DeadCodeFileFragment> {
+    let items_for_file = |key: &str, file: &str| {
+        aggregate[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| item["file"].as_str() == Some(file))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    materialized
+        .iter()
+        .map(|contribution| {
+            let file = contribution.file.clone();
+            (
+                file.clone(),
+                DeadCodeFileFragment {
+                    contribution_hash: contribution_hashes.get(&file).cloned().unwrap_or_default(),
+                    reachable_exports: reachable_symbols_for_file(reachable, &file),
+                    production_reachable_exports: reachable_symbols_for_file(
+                        production_reachable,
+                        &file,
+                    ),
+                    public_api: public_api_files.contains(&file),
+                    roles_fingerprint: roles_fingerprint.to_string(),
+                    headline_items: items_for_file("items", &file)
+                        .into_iter()
+                        .filter(|item| item.get("generated").is_none())
+                        .collect(),
+                    generated_items: items_for_file("generated_items", &file),
+                    test_only_items: items_for_file("test_only_items", &file),
+                    uncertain_items: items_for_file("uncertain_items", &file),
+                    by_language: [(
+                        language_for_file(&file).to_string(),
+                        aggregate["items"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter(|item| {
+                                item["file"].as_str() == Some(file.as_str())
+                                    && item.get("generated").is_none()
+                            })
+                            .count(),
+                    )]
+                    .into_iter()
+                    .filter(|(_, count)| *count > 0)
+                    .collect(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn fold_dead_code_fragments(
+    fragments: &BTreeMap<String, DeadCodeFileFragment>,
+    materialized: &[DeadCodeContribution],
+    roles: &crate::inspect::entry_points::ProjectRoles,
+    drill_down_limit: Option<usize>,
+    scanned_files: usize,
+) -> Value {
+    let count = fragments
+        .values()
+        .map(|fragment| fragment.headline_items.len())
+        .sum::<usize>();
+    let generated_count = fragments
+        .values()
+        .map(|fragment| fragment.generated_items.len())
+        .sum::<usize>();
+    let test_only_count = fragments
+        .values()
+        .map(|fragment| fragment.test_only_items.len())
+        .sum::<usize>();
+    let uncertain_count = fragments
+        .values()
+        .map(|fragment| fragment.uncertain_items.len())
+        .sum::<usize>();
+    let mut by_language = BTreeMap::<String, usize>::new();
+    for fragment in fragments.values() {
+        for (language, value) in &fragment.by_language {
+            *by_language.entry(language.clone()).or_default() += value;
+        }
+    }
+    let headline_items = crate::inspect::entry_points::rank_and_truncate_items(
+        fragments
+            .values()
+            .flat_map(|fragment| fragment.headline_items.iter().cloned())
+            .collect(),
+        roles,
+        drill_down_limit,
+    );
+    let generated_items = crate::inspect::entry_points::rank_and_truncate_items(
+        fragments
+            .values()
+            .flat_map(|fragment| fragment.generated_items.iter().cloned())
+            .collect(),
+        roles,
+        drill_down_limit,
+    );
+    let test_only_items = crate::inspect::entry_points::rank_and_truncate_items(
+        fragments
+            .values()
+            .flat_map(|fragment| fragment.test_only_items.iter().cloned())
+            .collect(),
+        roles,
+        drill_down_limit,
+    );
+    let mut uncertain_items = fragments
+        .values()
+        .flat_map(|fragment| fragment.uncertain_items.iter().cloned())
+        .collect::<Vec<_>>();
+    if let Some(limit) = drill_down_limit {
+        uncertain_items.truncate(limit);
+    }
+    let top = crate::inspect::entry_points::top_preview_symbols(&headline_items);
+    let mut dead_items = headline_items;
+    dead_items.extend(generated_items.iter().cloned());
+    if let Some(limit) = drill_down_limit {
+        dead_items.truncate(limit);
+    }
+    let generated_top = generated_items
+        .iter()
+        .take(crate::inspect::entry_points::TOP_PREVIEW_ITEMS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let test_only_top = test_only_items
+        .iter()
+        .take(crate::inspect::entry_points::TOP_PREVIEW_ITEMS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let (parse_errors, skipped_files, languages_skipped) = dead_code_honesty_fields(materialized);
+    let mut aggregate = json!({
+        "count": count,
+        "generated_count": generated_count,
+        "total_count": count + test_only_count + generated_count,
+        "items": dead_items,
+        "top": top,
+        "generated_items": generated_items,
+        "generated_top": generated_top,
+        "test_only_count": test_only_count,
+        "test_only_items": test_only_items,
+        "test_only_top": test_only_top,
+        "by_language": by_language,
+        "drill_down_capped": drill_down_limit.is_some_and(|limit| count + generated_count > limit),
+        "generated_drill_down_capped": drill_down_limit.is_some_and(|limit| generated_count > limit),
+        "test_only_drill_down_capped": drill_down_limit.is_some_and(|limit| test_only_count > limit),
+        "uncertain_count": uncertain_count,
+        "uncertain_items": uncertain_items,
+        "languages_skipped": languages_skipped,
+        "callgraph_available": true,
+        "scanned_files": scanned_files,
+        "complete": parse_errors.is_empty() && skipped_files.is_empty(),
+    });
+    if !parse_errors.is_empty() {
+        aggregate["parse_errors"] = Value::Array(parse_errors);
+    }
+    if !skipped_files.is_empty() {
+        aggregate["skipped_files"] = Value::Array(skipped_files);
+    }
+    aggregate
 }
 
 fn parse_dead_code_contributions(contributions: &[FileContribution]) -> Vec<DeadCodeContribution> {
@@ -685,6 +1188,8 @@ fn materialize_dead_code_contributions(
     snapshot: &CallgraphSnapshot,
     parsed: Vec<DeadCodeContribution>,
     public_api_files: &BTreeSet<String>,
+    previous: Option<&[DeadCodeContribution]>,
+    affected_files: &BTreeSet<String>,
 ) -> Vec<DeadCodeContribution> {
     let liveness_root_files = snapshot
         .entry_points
@@ -706,11 +1211,26 @@ fn materialize_dead_code_contributions(
         exported_symbol_indexes_from_contributions(project_root, snapshot, &parsed);
     let outbound_calls_by_caller_file =
         group_outbound_calls_by_caller_file(project_root, &snapshot.outbound_calls);
-    let oxc_by_file = oxc_verdicts_by_file(project_root, snapshot, &parsed, public_api_files);
+    let full_materialization = previous.is_none() || affected_files.len() >= parsed.len();
+    let oxc_by_file = if full_materialization {
+        oxc_verdicts_by_file(project_root, snapshot, &parsed, public_api_files)
+    } else {
+        BTreeMap::new()
+    };
+    let previous_by_file = previous
+        .into_iter()
+        .flatten()
+        .map(|contribution| (contribution.file.as_str(), contribution))
+        .collect::<BTreeMap<_, _>>();
 
     parsed
         .into_iter()
         .map(|mut contribution| {
+            if !affected_files.contains(&contribution.file) {
+                if let Some(previous) = previous_by_file.get(contribution.file.as_str()) {
+                    return (*previous).clone();
+                }
+            }
             let _facts_format_version = contribution.facts_format_version;
             let absolute_file = project_root.join(&contribution.file);
             let normalized_file = normalize_absolute(project_root, &absolute_file);
@@ -934,6 +1454,7 @@ fn sort_dedup_internal_calls(internal_calls: &mut Vec<InternalCall>) {
 
 fn aggregate_materialized_dead_code_contributions(
     project_root: &Path,
+    facts: &[DeadCodeContribution],
     parsed: &[DeadCodeContribution],
     public_api_files: &BTreeSet<String>,
     roles: &crate::inspect::entry_points::ProjectRoles,
@@ -943,8 +1464,8 @@ fn aggregate_materialized_dead_code_contributions(
     production_reachable: &BTreeSet<ExportNode>,
     dispatched_method_names: &MethodNamesByLanguage,
 ) -> serde_json::Value {
-    let test_only_callers = test_only_callers_by_target(parsed);
-    let referenced_type_names = collect_referenced_type_names(parsed);
+    let test_only_callers = test_only_callers_by_target(facts);
+    let referenced_type_names = collect_referenced_type_names(facts);
 
     let mut by_language: BTreeMap<String, usize> = BTreeMap::new();
     let mut count = 0usize;
@@ -3857,6 +4378,109 @@ mod tests {
         );
         assert_eq!(current.reachable, full);
         current
+    }
+
+    #[test]
+    fn incremental_aggregate_matches_full_for_reachability_flip_and_contribution_change() {
+        let (_temp, root, files) = fixture_project(&[
+            ("main.rs", "pub fn main() { target(); }\n"),
+            ("target.rs", "pub fn target() {}\n"),
+        ]);
+        let live_snapshot = snapshot_with_entry_points(
+            files.clone(),
+            vec![
+                export(&root, "main.rs", "main", "function"),
+                export(&root, "target.rs", "target", "function"),
+            ],
+            vec![outbound(&root, "main.rs", "main", "target.rs::target")],
+            [root.join("main.rs")].into_iter().collect(),
+        );
+        let scan_job = job(&root, files.clone(), live_snapshot.clone());
+        let contributions = run_dead_code_scan(&scan_job)
+            .outcome
+            .expect("initial scan")
+            .contributions;
+        let public = BTreeSet::new();
+        let roles = crate::inspect::entry_points::ProjectRoles::default();
+        let (live, state, _) = aggregate_dead_code_contributions_incremental(
+            &root,
+            &live_snapshot,
+            &contributions,
+            &public,
+            &roles,
+            None,
+            Some("sequence"),
+            None,
+            &BTreeSet::new(),
+        );
+
+        let orphaned_snapshot = snapshot_with_entry_points(
+            files,
+            vec![
+                export(&root, "main.rs", "main", "function"),
+                export(&root, "target.rs", "target", "function"),
+            ],
+            Vec::new(),
+            [root.join("main.rs")].into_iter().collect(),
+        );
+        let changed = ["main.rs".to_string()].into_iter().collect();
+        let (incremental, state, _) = aggregate_dead_code_contributions_incremental(
+            &root,
+            &orphaned_snapshot,
+            &contributions,
+            &public,
+            &roles,
+            None,
+            Some("sequence"),
+            Some(&state),
+            &changed,
+        );
+        let (full, _, _) = aggregate_dead_code_contributions_incremental(
+            &root,
+            &orphaned_snapshot,
+            &contributions,
+            &public,
+            &roles,
+            None,
+            Some("sequence"),
+            None,
+            &BTreeSet::new(),
+        );
+        assert_eq!(incremental, full);
+        assert_ne!(incremental, live);
+        assert!(aggregate_has_item(&incremental, "target.rs", "target"));
+
+        let mut changed_contributions = contributions.clone();
+        let target = changed_contributions
+            .iter_mut()
+            .find(|contribution| contribution.contribution["file"] == "target.rs")
+            .expect("target contribution");
+        target.contribution["exports"][0]["line"] = json!(99);
+        let changed = ["target.rs".to_string()].into_iter().collect();
+        let (incremental, _, _) = aggregate_dead_code_contributions_incremental(
+            &root,
+            &orphaned_snapshot,
+            &changed_contributions,
+            &public,
+            &roles,
+            None,
+            Some("sequence"),
+            Some(&state),
+            &changed,
+        );
+        let (full, _, _) = aggregate_dead_code_contributions_incremental(
+            &root,
+            &orphaned_snapshot,
+            &changed_contributions,
+            &public,
+            &roles,
+            None,
+            Some("sequence"),
+            None,
+            &BTreeSet::new(),
+        );
+        assert_eq!(incremental, full);
+        assert_eq!(incremental["items"][0]["line"], json!(99));
     }
 
     #[test]

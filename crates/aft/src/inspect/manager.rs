@@ -2558,11 +2558,12 @@ impl InspectManager {
             let public_api_files =
                 super::scanners::dead_code::collect_public_api_files(&job.project_root);
             let roles = super::entry_points::resolve_project_roles(&job.project_root);
-            let changed_files = scan_files
+            let mut changed_files = scan_files
                 .iter()
                 .filter_map(|path| path.strip_prefix(&job.project_root).ok())
                 .map(|path| path.to_string_lossy().replace('\\', "/"))
                 .collect::<BTreeSet<_>>();
+            changed_files.extend(force_relative.iter().cloned());
             let allow_incremental = phases
                 .projection
                 .is_some_and(|verdict| verdict.kind != ProjectionKind::Full);
@@ -2577,6 +2578,7 @@ impl InspectManager {
                     &public_api_files,
                     &roles,
                     Some(MAX_DRILL_DOWN_ITEMS),
+                    Some(&contribution_set_hash),
                     previous.as_deref(),
                     &changed_files,
                 );
@@ -7633,12 +7635,22 @@ pub fn unrelated() -> u32 { 2 }
                 &public_api_files,
                 &roles,
                 None,
+                Some("store-copy-benchmark"),
                 None,
                 &BTreeSet::new(),
             );
         let full_rollup_ms = started.elapsed().as_secs_f64() * 1000.0;
         let full_rollup_cpu = projection_bench_cpu_ms() - cpu;
         job.callgraph_snapshot = Some(Arc::new(incremental));
+        let changed_relative = changed
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<BTreeSet<_>>();
         let cpu = projection_bench_cpu_ms();
         let started = Instant::now();
         let (delta_aggregate, _, rollup_verdict) =
@@ -7649,8 +7661,9 @@ pub fn unrelated() -> u32 { 2 }
                 &public_api_files,
                 &roles,
                 None,
+                Some("store-copy-benchmark"),
                 Some(&rollup_state),
-                &BTreeSet::new(),
+                &changed_relative,
             );
         let delta_rollup_ms = started.elapsed().as_secs_f64() * 1000.0;
         let delta_rollup_cpu = projection_bench_cpu_ms() - cpu;
