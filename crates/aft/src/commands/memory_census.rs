@@ -27,11 +27,13 @@ pub fn render_memory_census(
         let semantic = detail.semantic.estimated_bytes.unwrap_or(0);
         let symbols = detail.symbols.estimated_bytes.unwrap_or(0);
         let callgraph = detail.callgraph.estimated_bytes.unwrap_or(0);
+        let callgraph_projection = detail.callgraph_projection.estimated_bytes.unwrap_or(0);
         let inspect = detail.inspect.estimated_bytes.unwrap_or(0);
         let planes_total = search
             .saturating_add(semantic)
             .saturating_add(symbols)
             .saturating_add(callgraph)
+            .saturating_add(callgraph_projection)
             .saturating_add(inspect);
         let mut row = json!({
             "root": root,
@@ -46,6 +48,7 @@ pub fn render_memory_census(
                 "semantic": semantic,
                 "symbols": symbols,
                 "callgraph": callgraph,
+                "callgraph_projection": callgraph_projection,
                 "inspect": inspect,
             },
             "attributed_bytes": planes_total,
@@ -66,6 +69,7 @@ pub fn render_memory_census(
     }
 
     let process = &snapshot.process;
+    let dead_code_snapshots = crate::inspect::InspectManager::dead_code_snapshot_census();
     let slack = process.allocator.retained_slack_bytes.unwrap_or(0);
     // Unattributed = what the process holds beyond the per-root attribution.
     // phys_footprint already excludes MADV_FREE allocator slack (that is why it
@@ -99,6 +103,11 @@ pub fn render_memory_census(
             "unattributed_bytes": unattributed_bytes,
             "last_relief_at_ms": crate::memory::last_allocator_relief_at_ms(),
             "last_relief_freed_bytes": crate::memory::last_allocator_relief_freed_bytes(),
+            "dead_code_snapshots": {
+                "roots": dead_code_snapshots.roots,
+                "bytes": dead_code_snapshots.bytes,
+                "drops": dead_code_snapshots.drops,
+            },
         }
     })
 }
@@ -186,6 +195,33 @@ mod tests {
     fn bound_roots_have_no_eviction_horizon() {
         assert_eq!(evictable_in_ms(1, 1_000, 100), None);
         assert_eq!(evictable_in_ms(0, 1_000, 100), Some(900));
+    }
+
+    #[test]
+    fn census_reports_projection_plane_and_fleet_line() {
+        let zero = MemoryEstimate::estimated(0);
+        let root = RootMemorySnapshot::new(
+            zero.clone(),
+            zero.clone(),
+            zero.clone(),
+            zero.clone(),
+            MemoryEstimate::estimated(41),
+            zero.clone(),
+            zero.clone(),
+            zero.clone(),
+            zero,
+        );
+        let mut roots = BTreeMap::new();
+        roots.insert("/repo".to_string(), root);
+        let value = render_memory_census(&MemorySnapshot::new("ready", roots), None);
+        assert_eq!(
+            value["roots"]["/repo"]["planes"]["callgraph_projection"],
+            json!(41)
+        );
+        assert_eq!(value["roots"]["/repo"]["attributed_bytes"], json!(41));
+        assert!(value["process"]["dead_code_snapshots"]["roots"].is_number());
+        assert!(value["process"]["dead_code_snapshots"]["bytes"].is_number());
+        assert!(value["process"]["dead_code_snapshots"]["drops"].is_number());
     }
 
     #[test]

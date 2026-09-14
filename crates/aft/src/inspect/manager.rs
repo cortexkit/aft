@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{after, bounded, select_biased, Receiver, Sender};
@@ -72,6 +72,118 @@ struct CachedCallgraphProjection {
         CallgraphProjectionIdentity,
         Arc<super::scanners::dead_code::DeadCodeRollupState>,
     )>,
+}
+
+// Projection snapshots are useful only as whole-root splice bases. Bound their
+// aggregate residency rather than multiplying a per-root cap by every manager.
+const DEAD_CODE_SNAPSHOT_FLEET_BUDGET: u64 = 1024 * 1024 * 1024;
+
+type ProjectionSlot = Mutex<Option<CachedCallgraphProjection>>;
+
+struct ProjectionFleetEntry {
+    slot: Weak<ProjectionSlot>,
+    bytes: u64,
+    touched: u64,
+}
+
+#[derive(Default)]
+struct ProjectionFleet {
+    entries: HashMap<PathBuf, ProjectionFleetEntry>,
+    bytes: u64,
+    drops: u64,
+    clock: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeadCodeSnapshotCensus {
+    pub roots: usize,
+    pub bytes: u64,
+    pub drops: u64,
+}
+
+impl ProjectionFleet {
+    fn admit(&mut self, root: PathBuf, slot: Weak<ProjectionSlot>, bytes: u64, budget: u64) {
+        self.clock = self.clock.saturating_add(1);
+        if let Some(previous) = self.entries.remove(&root) {
+            self.bytes = self.bytes.saturating_sub(previous.bytes);
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.entries.insert(
+            root,
+            ProjectionFleetEntry {
+                slot,
+                bytes,
+                touched: self.clock,
+            },
+        );
+
+        while self.bytes > budget {
+            let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.touched)
+                .map(|(root, _)| root.clone())
+            else {
+                break;
+            };
+            let Some(entry) = self.entries.remove(&oldest) else {
+                continue;
+            };
+            self.bytes = self.bytes.saturating_sub(entry.bytes);
+            if let Some(slot) = entry.slot.upgrade() {
+                if let Ok(mut cached) = slot.lock() {
+                    cached.take();
+                }
+            }
+            self.drops = self.drops.saturating_add(1);
+        }
+    }
+
+    fn touch(&mut self, root: &Path) {
+        if let Some(entry) = self.entries.get_mut(root) {
+            self.clock = self.clock.saturating_add(1);
+            entry.touched = self.clock;
+        }
+    }
+
+    fn forget(&mut self, root: &Path) {
+        if let Some(entry) = self.entries.remove(root) {
+            self.bytes = self.bytes.saturating_sub(entry.bytes);
+        }
+    }
+
+    fn census(&mut self) -> DeadCodeSnapshotCensus {
+        let stale = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.slot.upgrade().is_none())
+            .map(|(root, _)| root.clone())
+            .collect::<Vec<_>>();
+        for root in stale {
+            self.forget(&root);
+        }
+        DeadCodeSnapshotCensus {
+            roots: self.entries.len(),
+            bytes: self.bytes,
+            drops: self.drops,
+        }
+    }
+}
+
+fn projection_fleet() -> &'static Mutex<ProjectionFleet> {
+    static FLEET: OnceLock<Mutex<ProjectionFleet>> = OnceLock::new();
+    FLEET.get_or_init(|| Mutex::new(ProjectionFleet::default()))
+}
+
+pub(crate) fn dead_code_snapshot_census() -> DeadCodeSnapshotCensus {
+    projection_fleet()
+        .lock()
+        .map(|mut fleet| fleet.census())
+        .unwrap_or(DeadCodeSnapshotCensus {
+            roots: 0,
+            bytes: 0,
+            drops: 0,
+        })
 }
 
 #[derive(Debug, Clone)]
@@ -352,7 +464,7 @@ pub struct InspectManager {
     caches: Mutex<HashMap<InspectCacheIdentity, Arc<InspectCache>>>,
     /// One root-scoped dead-code graph projection. It is cleared with the
     /// manager's other idle artifacts rather than on a separate timer.
-    callgraph_projection: Mutex<Option<CachedCallgraphProjection>>,
+    callgraph_projection: Arc<ProjectionSlot>,
     oxc_facts_cache: Mutex<OxcFactsCache>,
     soft_deadline: Duration,
     next_job_id: AtomicU64,
@@ -431,7 +543,7 @@ impl InspectManager {
             in_flight: Mutex::new(HashMap::new()),
             in_flight_changed: Condvar::new(),
             caches: Mutex::new(HashMap::new()),
-            callgraph_projection: Mutex::new(None),
+            callgraph_projection: Arc::new(Mutex::new(None)),
             oxc_facts_cache: Mutex::new(OxcFactsCache::new()),
             soft_deadline,
             next_job_id: AtomicU64::new(1),
@@ -1112,6 +1224,10 @@ impl InspectManager {
             .gap("oxc_fact_bytes")
     }
 
+    pub(crate) fn dead_code_snapshot_census() -> DeadCodeSnapshotCensus {
+        dead_code_snapshot_census()
+    }
+
     /// Estimate the resident full-graph projection used by dead-code scans.
     /// The slot belongs to this root's manager and is dropped on idle eviction.
     pub fn callgraph_projection_estimated_memory(&self) -> crate::memory::MemoryEstimate {
@@ -1135,23 +1251,35 @@ impl InspectManager {
         &self,
         identity: &CallgraphProjectionIdentity,
     ) -> Option<Arc<CallgraphSnapshot>> {
-        let projection = self.callgraph_projection.lock().ok()?;
-        projection
-            .as_ref()
-            .filter(|cached| cached.identity == *identity)
-            .map(|cached| Arc::clone(&cached.snapshot))
+        let snapshot = {
+            let projection = self.callgraph_projection.lock().ok()?;
+            projection
+                .as_ref()
+                .filter(|cached| cached.identity == *identity)
+                .map(|cached| Arc::clone(&cached.snapshot))
+        }?;
+        if let Ok(mut fleet) = projection_fleet().lock() {
+            fleet.touch(&identity.project_root);
+        }
+        Some(snapshot)
     }
 
     fn previous_callgraph_projection(
         &self,
         identity: &CallgraphProjectionIdentity,
     ) -> Option<(u64, Arc<CallgraphSnapshot>)> {
-        let projection = self.callgraph_projection.lock().ok()?;
-        let cached = projection.as_ref()?;
-        let mut expected = identity.clone();
-        expected.write_revision = cached.identity.write_revision;
-        (cached.identity == expected)
-            .then(|| (cached.identity.write_revision, Arc::clone(&cached.snapshot)))
+        let previous = {
+            let projection = self.callgraph_projection.lock().ok()?;
+            let cached = projection.as_ref()?;
+            let mut expected = identity.clone();
+            expected.write_revision = cached.identity.write_revision;
+            (cached.identity == expected)
+                .then(|| (cached.identity.write_revision, Arc::clone(&cached.snapshot)))
+        }?;
+        if let Ok(mut fleet) = projection_fleet().lock() {
+            fleet.touch(&identity.project_root);
+        }
+        Some(previous)
     }
 
     fn cache_callgraph_projection(
@@ -1160,19 +1288,25 @@ impl InspectManager {
         snapshot: Arc<CallgraphSnapshot>,
     ) {
         let estimated_bytes = estimate_callgraph_snapshot_bytes(snapshot.as_ref());
+        let root = identity.project_root.clone();
         if let Ok(mut cached) = self.callgraph_projection.lock() {
             let rollup = cached.take().and_then(|cached| cached.rollup);
-            // Retain at most one 256 MiB projection per root. Larger graphs can
-            // still be scanned, but do not become permanent resident caches.
-            if estimated_bytes > 256 * 1024 * 1024 {
-                return;
-            }
             *cached = Some(CachedCallgraphProjection {
                 identity,
                 snapshot,
                 estimated_bytes,
                 rollup,
             });
+        } else {
+            return;
+        }
+        if let Ok(mut fleet) = projection_fleet().lock() {
+            fleet.admit(
+                root,
+                Arc::downgrade(&self.callgraph_projection),
+                estimated_bytes,
+                DEAD_CODE_SNAPSHOT_FLEET_BUDGET,
+            );
         }
     }
 
@@ -1205,8 +1339,16 @@ impl InspectManager {
     }
 
     fn clear_callgraph_projection(&self) {
-        if let Ok(mut cached) = self.callgraph_projection.lock() {
-            cached.take();
+        let root = self
+            .callgraph_projection
+            .lock()
+            .ok()
+            .and_then(|mut cached| cached.take())
+            .map(|cached| cached.identity.project_root);
+        if let Some(root) = root {
+            if let Ok(mut fleet) = projection_fleet().lock() {
+                fleet.forget(&root);
+            }
         }
     }
 
@@ -7943,6 +8085,66 @@ export function main() { foo(); }
         assert_eq!(
             remaining,
             vec![PathBuf::from("changed.ts"), PathBuf::from("oversized.ts")]
+        );
+    }
+
+    #[test]
+    fn fleet_budget_drops_oldest_whole_root_snapshot() {
+        fn slot(root: &str) -> Arc<ProjectionSlot> {
+            Arc::new(Mutex::new(Some(CachedCallgraphProjection {
+                identity: CallgraphProjectionIdentity {
+                    project_root: PathBuf::from(root),
+                    generation: Some("generation".to_string()),
+                    legacy_sqlite_path: None,
+                    write_revision: 1,
+                },
+                snapshot: Arc::new(CallgraphSnapshot {
+                    generated_at: None,
+                    files: Vec::new(),
+                    exported_symbols: Vec::new(),
+                    outbound_calls: Vec::new(),
+                    entry_points: BTreeSet::new(),
+                    entry_point_symbols: BTreeMap::new(),
+                }),
+                estimated_bytes: 600 * 1024 * 1024,
+                rollup: None,
+            })))
+        }
+
+        let first = slot("/first");
+        let second = slot("/second");
+        let third = slot("/third");
+        let mut fleet = ProjectionFleet::default();
+        fleet.admit(
+            PathBuf::from("/first"),
+            Arc::downgrade(&first),
+            400 * 1024 * 1024,
+            DEAD_CODE_SNAPSHOT_FLEET_BUDGET,
+        );
+        fleet.admit(
+            PathBuf::from("/second"),
+            Arc::downgrade(&second),
+            400 * 1024 * 1024,
+            DEAD_CODE_SNAPSHOT_FLEET_BUDGET,
+        );
+        fleet.touch(Path::new("/first"));
+        fleet.admit(
+            PathBuf::from("/third"),
+            Arc::downgrade(&third),
+            400 * 1024 * 1024,
+            DEAD_CODE_SNAPSHOT_FLEET_BUDGET,
+        );
+
+        assert!(first.lock().unwrap().is_some());
+        assert!(second.lock().unwrap().is_none());
+        assert!(third.lock().unwrap().is_some());
+        assert_eq!(
+            fleet.census(),
+            DeadCodeSnapshotCensus {
+                roots: 2,
+                bytes: 800 * 1024 * 1024,
+                drops: 1,
+            }
         );
     }
 
