@@ -2388,6 +2388,24 @@ pub(crate) fn hashline_downgrade_warning() -> Value {
     )
 }
 
+fn slow_configure_prefix_line(total: Duration, phases: &str) -> String {
+    format!(
+        "configure prefix slow: total={}ms {phases}",
+        total.as_millis()
+    )
+}
+
+fn log_slow_configure_prefix(ctx: &AppContext, started_at: Instant) {
+    const SLOW_PREFIX: Duration = Duration::from_secs(1);
+    let total = started_at.elapsed();
+    if total >= SLOW_PREFIX {
+        slog_info!(
+            "{}",
+            slow_configure_prefix_line(total, &ctx.configure_ack_phase_snapshot())
+        );
+    }
+}
+
 fn register_hashline_for_configure(
     ctx: &AppContext,
     root: &Path,
@@ -2427,6 +2445,7 @@ fn register_hashline_for_configure(
 /// Stderr log: `[aft] project root set: <path>`
 /// Stderr log: `[aft] watcher started: <path>`
 pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
+    let prefix_started_at = Instant::now();
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
@@ -2718,6 +2737,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 );
             }
             ctx.begin_configure_ack_phase("ack_ready");
+            log_slow_configure_prefix(ctx, prefix_started_at);
             let artifact_owner_status = ctx.artifact_owner_status();
             let search_index_cache_reused = next_config.search_index
                 && ctx
@@ -2760,6 +2780,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
             }
             ctx.set_config(next_config.clone());
             ctx.begin_configure_ack_phase("ack_ready");
+            log_slow_configure_prefix(ctx, prefix_started_at);
             slog_info!(
                 "configure: lsp paths updated in place ({} dirs), no reconfigure",
                 path_count
@@ -2974,6 +2995,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
         }
 
         ctx.begin_configure_ack_phase("ack_ready");
+        log_slow_configure_prefix(ctx, prefix_started_at);
         let artifact_owner_status = ctx.artifact_owner_status();
         let search_index_cache_reused = next_config.search_index
             && ctx
@@ -3503,6 +3525,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // configured. Missing-binary warnings are sent later in a `configure_warnings`
     // push frame.
     ctx.begin_configure_ack_phase("ack_ready");
+    log_slow_configure_prefix(ctx, prefix_started_at);
     let response = Response::success(
         &req.id,
         json!({
@@ -5950,9 +5973,9 @@ mod tests {
         reset_configure_artifact_load_cancellations_for_test,
         reset_configure_deferred_delay_reached_for_test, semantic_build_retry_backoff,
         set_configure_artifact_post_gate_delay_for_test, should_clear_failed_spawns,
-        should_wait_for_callgraph_start, validate_storage_dir, wait_for_semantic_artifact_start,
-        ConfigureMaintenanceStage, INDEX_ORDER_GRACE_MS, INDEX_ORDER_TEST_LOCK,
-        INDEX_ORDER_TIMEOUT_LOGS, WATCHER_GENERATION,
+        should_wait_for_callgraph_start, slow_configure_prefix_line, validate_storage_dir,
+        wait_for_semantic_artifact_start, ConfigureMaintenanceStage, INDEX_ORDER_GRACE_MS,
+        INDEX_ORDER_TEST_LOCK, INDEX_ORDER_TIMEOUT_LOGS, WATCHER_GENERATION,
     };
     use crate::cache_freshness::{self, VerifyArtifact, WarmVerifyPlan};
     use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
@@ -11624,6 +11647,15 @@ mod tests {
     }
 
     #[test]
+    fn slow_prefix_log_line_names_recorded_sync_phases() {
+        let phases = "config_resolve=4ms,canonicalize=1ms,worktree_probe=12ms,cache_key_resolve=8ms,artifact_owner_claim=2ms,storage_capability_probe=1ms,state_commit=3ms,index_loading_state=5ms,maintenance_enqueue=1ms,ack_ready=0ms";
+        assert_eq!(
+            slow_configure_prefix_line(Duration::from_millis(1_234), phases),
+            format!("configure prefix slow: total=1234ms {phases}")
+        );
+    }
+
+    #[test]
     fn new_session_attach_skips_root_probes_and_keeps_watcher_thread() {
         let _watcher_guard = watcher_test_mutex()
             .lock()
@@ -11773,6 +11805,60 @@ mod tests {
         );
         assert_eq!(ctx.watcher_registry_count(), 1);
         ctx.stop_watcher_runtime();
+    }
+
+    #[test]
+    #[ignore = "manual configure slow-prefix candidate measurement"]
+    fn configure_slow_prefix_candidates_measurement() {
+        const PARTITIONS: usize = 40;
+        const BYTES_PER_PARTITION: u64 = 50 * 1024 * 1024;
+        const RUNS: usize = 21;
+
+        fn median(samples: &mut [Duration]) -> Duration {
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        }
+
+        let storage = tempfile::tempdir().unwrap();
+        let callgraph = storage.path().join("opencode/callgraph");
+        std::fs::create_dir_all(&callgraph).unwrap();
+        for partition in 0..PARTITIONS {
+            let key = format!("{partition:016x}");
+            let dir = callgraph.join(key);
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = std::fs::File::create(dir.join("payload.sqlite")).unwrap();
+            file.set_len(BYTES_PER_PARTITION).unwrap();
+        }
+        let non_git_root = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(non_git_root.path()).unwrap();
+
+        let mut inventory = Vec::with_capacity(RUNS);
+        let mut cache_key = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let started = Instant::now();
+            let entries = crate::legacy_partitions::inventory_legacy_partitions(storage.path())
+                .expect("inventory fixture");
+            inventory.push(started.elapsed());
+            assert_eq!(entries.len(), PARTITIONS);
+
+            let started = Instant::now();
+            let key = crate::search_index::artifact_cache_key_with_memo(
+                &canonical,
+                non_git_root.path(),
+                storage.path(),
+                None,
+            )
+            .expect("non-git path identity");
+            cache_key.push(started.elapsed());
+            std::hint::black_box(key);
+        }
+
+        eprintln!(
+            "configure slow-prefix candidates: partitions={PARTITIONS} sparse_bytes={} runs={RUNS} legacy_inventory_median_us={} non_git_cache_key_median_us={} legacy_inventory_prefix_reachable=false",
+            PARTITIONS as u64 * BYTES_PER_PARTITION,
+            median(&mut inventory).as_micros(),
+            median(&mut cache_key).as_micros(),
+        );
     }
 
     /// Manual bind-path benchmark with a 5,120-source-file, 64-package repository.

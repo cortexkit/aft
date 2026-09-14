@@ -3972,7 +3972,7 @@ impl AppContext {
     pub(crate) fn begin_configure_ack_phase(&self, phase: &'static str) {
         let now = Instant::now();
         let mut timing = self.configure_phase_timing.lock();
-        if phase == "canonicalize" {
+        if phase == "config_resolve" {
             timing.completed.clear();
         } else if timing.phase != "idle" && timing.phase != "ack_ready" {
             let previous = timing.phase;
