@@ -243,23 +243,15 @@ const PROJECTION_DELTA_SPILL_TABLE: &str = "projection_delta_spill";
 
 /// Keep ordinary deltas in `meta`, but scale that inline allowance with the
 /// corpus so a large repository's normal watcher batches do not become
-/// exceptional. Two percent of the projected strings is enough for roughly one
-/// changed caller in fifty; larger batches spill rather than forcing a full
-/// projection, so this is an inline-storage choice rather than a correctness cap.
+/// exceptional. Two percent of the SQLite corpus footprint is an O(1) proxy for
+/// retained projection size and covers roughly one changed caller in fifty;
+/// larger batches spill, so this is an inline-storage choice, not a correctness
+/// cap.
 fn inline_delta_bytes(conn: &Connection) -> Result<usize> {
-    let projected_bytes: i64 = conn.query_row(
-        "SELECT
-             COALESCE((SELECT SUM(length(path)) FROM files), 0) +
-             COALESCE((SELECT SUM(length(file_path) + length(name)) FROM nodes), 0) +
-             COALESCE((SELECT SUM(length(caller_file) + length(COALESCE(full_ref, ''))) FROM refs), 0)",
-        [],
-        |row| row.get(0),
-    )?;
-    let proportional = usize::try_from(projected_bytes.max(0))
-        .unwrap_or(usize::MAX)
-        .saturating_mul(2)
-        / 100;
-    Ok(MIN_INLINE_DELTA_BYTES.max(proportional))
+    let page_count: u64 = conn.pragma_query_value(None, "page_count", |row| row.get(0))?;
+    let page_size: u64 = conn.pragma_query_value(None, "page_size", |row| row.get(0))?;
+    let proportional = page_count.saturating_mul(page_size).saturating_mul(2) / 100;
+    Ok(MIN_INLINE_DELTA_BYTES.max(usize::try_from(proportional).unwrap_or(usize::MAX)))
 }
 
 /// The outcome of reading the caller-delta journal between two revisions.
