@@ -384,10 +384,21 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, OpenError> {
         "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL PRIMARY KEY);",
     )?;
 
-    // Every candidate step re-reads the version after acquiring SQLite's write
-    // lock. A concurrent opener can finish first, but its committed version then
-    // causes this opener to skip rather than replaying an obsolete plan.
-    for version in 1..=CURRENT_SCHEMA_VERSION {
+    let db_version = current_schema_version(conn)?;
+    if db_version == CURRENT_SCHEMA_VERSION {
+        return Ok(db_version);
+    }
+    if db_version > CURRENT_SCHEMA_VERSION {
+        return Err(OpenError::DowngradeRefused {
+            db_version,
+            supported: CURRENT_SCHEMA_VERSION,
+        });
+    }
+
+    // The bare read above keeps current-schema opens read-only. A lagging opener
+    // may still have observed a stale version, so every planned step re-reads it
+    // after acquiring SQLite's write lock and skips work another opener committed.
+    for version in (db_version + 1)..=CURRENT_SCHEMA_VERSION {
         apply_migration(conn, version)?;
     }
 

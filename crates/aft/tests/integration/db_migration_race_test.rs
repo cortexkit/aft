@@ -1,5 +1,6 @@
 use std::cell::Cell;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, LazyLock, Mutex};
 use std::thread;
 
@@ -104,6 +105,7 @@ DELETE FROM schema_version;
 INSERT INTO schema_version (version) VALUES (9);
 "#;
 
+static MIGRATION_WRITE_TRANSACTIONS: AtomicUsize = AtomicUsize::new(0);
 static STALE_PLAN_BARRIER: LazyLock<Mutex<Option<Arc<Barrier>>>> =
     LazyLock::new(|| Mutex::new(None));
 static CONCURRENT_PLAN_BARRIER: LazyLock<Mutex<Option<Arc<Barrier>>>> =
@@ -112,6 +114,12 @@ static CONCURRENT_PLAN_BARRIER: LazyLock<Mutex<Option<Arc<Barrier>>>> =
 thread_local! {
     static STALE_PLAN_PAUSED: Cell<bool> = const { Cell::new(false) };
     static CONCURRENT_PLAN_PAUSED: Cell<bool> = const { Cell::new(false) };
+}
+
+fn count_migration_write_transactions(sql: &str) {
+    if sql.starts_with("BEGIN IMMEDIATE") {
+        MIGRATION_WRITE_TRANSACTIONS.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 fn pause_stale_plan_before_first_write(sql: &str) {
@@ -187,6 +195,34 @@ fn schema_sql(conn: &Connection) -> Vec<Option<String>> {
         .expect("query schema")
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("collect schema")
+}
+
+#[test]
+fn migration_fast_path_avoids_writes_and_v8_runs_only_two_steps() {
+    let current_storage = tempfile::tempdir().expect("current temporary storage");
+    let current_database = current_storage.path().join("aft.db");
+    drop(aft::db::open(&current_database).expect("create current database"));
+    let mut current = Connection::open(&current_database).expect("open current connection");
+    aft::db::apply_pragmas(&current).expect("apply current connection pragmas");
+    MIGRATION_WRITE_TRANSACTIONS.store(0, Ordering::SeqCst);
+    current.trace(Some(count_migration_write_transactions));
+
+    aft::db::run_migrations(&mut current).expect("open current schema");
+
+    assert_eq!(MIGRATION_WRITE_TRANSACTIONS.load(Ordering::SeqCst), 0);
+    current.trace(None);
+
+    let v8_storage = tempfile::tempdir().expect("v8 temporary storage");
+    let v8_database = v8_storage.path().join("aft.db");
+    create_v8_database(&v8_database);
+    let mut v8 = Connection::open(&v8_database).expect("open v8 connection");
+    aft::db::apply_pragmas(&v8).expect("apply v8 connection pragmas");
+    MIGRATION_WRITE_TRANSACTIONS.store(0, Ordering::SeqCst);
+    v8.trace(Some(count_migration_write_transactions));
+
+    aft::db::run_migrations(&mut v8).expect("migrate v8 schema");
+
+    assert_eq!(MIGRATION_WRITE_TRANSACTIONS.load(Ordering::SeqCst), 2);
 }
 
 #[test]
