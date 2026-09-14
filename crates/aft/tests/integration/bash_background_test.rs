@@ -231,6 +231,43 @@ fn wait_for_file(path: &Path) {
     }
 }
 
+#[cfg(unix)]
+fn orphaning_pipeline_command(pid_file: &Path, consumer: &str) -> String {
+    format!(
+        "bash -c 'for i in 1 2 3; do (exec -a \"fakeworker-$i\" sleep 25) & echo $! >> {}; done; i=1; while [ $i -le 200000 ]; do echo \"line $i\"; i=$((i + 1)); done' | {consumer}",
+        shell_quote_path(pid_file),
+    )
+}
+
+#[cfg(unix)]
+fn pids_from_file(path: &Path) -> Vec<i32> {
+    wait_for_file(path);
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| line.parse::<i32>().unwrap())
+        .collect()
+}
+
+#[cfg(unix)]
+fn live_descendant_pids(value: &Value) -> Vec<i32> {
+    value["live_descendants"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing live_descendants array: {value:?}"))
+        .iter()
+        .map(|descendant| descendant["pid"].as_i64().unwrap() as i32)
+        .collect()
+}
+
+#[cfg(unix)]
+fn kill_pids(pids: &[i32]) {
+    for pid in pids {
+        unsafe {
+            libc::kill(*pid, libc::SIGKILL);
+        }
+    }
+}
+
 fn hold_until_release_command(marker: &Path, release: &Path) -> String {
     format!(
         "printf ready > {}; polls=0; while [ ! -f {} ] && [ \"$polls\" -lt 6000 ]; do sleep 0.05; polls=$((polls + 1)); done; if [ ! -f {} ]; then printf 'gate-timeout\\n'; fi",
@@ -251,6 +288,147 @@ fn cross_platform_hold_until_release_command(marker: &Path, release: &Path) -> S
     } else {
         hold_until_release_command(marker, release)
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn early_exit_pipeline_reports_live_descendants_while_tail_reports_none() {
+    let mut aft = AftProcess::spawn();
+    let dir = configure_background(&mut aft);
+
+    let head_pid_file = dir.path().join("head-workers.txt");
+    let head_task = spawn_bg(
+        &mut aft,
+        "head-live-descendants",
+        &orphaning_pipeline_command(&head_pid_file, "head -5"),
+    );
+    let expected_pids = pids_from_file(&head_pid_file);
+    let frame = wait_for_bash_completed_frame(&mut aft, &head_task);
+    let completed = status(&mut aft, &head_task);
+    let mut frame_pids = live_descendant_pids(&frame);
+    let mut row_pids = live_descendant_pids(&completed);
+    let mut expected_pids_sorted = expected_pids.clone();
+    frame_pids.sort_unstable();
+    row_pids.sort_unstable();
+    expected_pids_sorted.sort_unstable();
+    assert_eq!(frame_pids, expected_pids_sorted, "completion frame: {frame:?}");
+    assert_eq!(row_pids, expected_pids_sorted, "task row: {completed:?}");
+    assert_eq!(frame["live_descendants_omitted"], 0);
+    assert!(
+        frame["live_descendants_summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("3 live descendants still running"),
+        "completion frame must render an honest descendant warning: {frame:?}"
+    );
+    kill_pids(&expected_pids);
+
+    let tail_pid_file = dir.path().join("tail-workers.txt");
+    let tail_task = spawn_bg(
+        &mut aft,
+        "tail-no-live-descendants",
+        &orphaning_pipeline_command(&tail_pid_file, "tail -5"),
+    );
+    let tail_workers = pids_from_file(&tail_pid_file);
+    let tail_frame = wait_for_bash_completed_frame(&mut aft, &tail_task);
+    let tail_completed = status(&mut aft, &tail_task);
+    assert_eq!(tail_frame["live_descendants"], json!([]), "{tail_frame:?}");
+    assert_eq!(
+        tail_completed["live_descendants"],
+        json!([]),
+        "{tail_completed:?}"
+    );
+    assert!(
+        tail_frame.get("live_descendants_summary").is_none(),
+        "zero descendants must render no warning: {tail_frame:?}"
+    );
+    assert!(tail_workers.iter().all(|pid| !process_exists(*pid)));
+
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_kill_reaches_descendants_after_task_completed() {
+    let mut aft = AftProcess::spawn();
+    let dir = configure_background(&mut aft);
+    let pid_file = dir.path().join("kill-workers.txt");
+    let task_id = spawn_bg(
+        &mut aft,
+        "kill-completed-descendants",
+        &orphaning_pipeline_command(&pid_file, "head -5"),
+    );
+    let worker_pids = pids_from_file(&pid_file);
+    let _frame = wait_for_bash_completed_frame(&mut aft, &task_id);
+
+    let killed = aft.send(
+        &json!({
+            "id": "kill-completed-descendants-request",
+            "command": "bash_kill",
+            "params": { "task_id": task_id }
+        })
+        .to_string(),
+    );
+    assert_eq!(killed["success"], true, "kill failed: {killed:?}");
+    assert_eq!(killed["kill_signaled"], true, "{killed:?}");
+    assert_eq!(killed["kill_reached"], 3, "{killed:?}");
+    assert_eq!(killed["live_descendants"], json!([]), "{killed:?}");
+    assert!(
+        worker_pids.iter().all(|pid| wait_until_process_exits(*pid)),
+        "completed-task bash_kill left workers alive: {worker_pids:?}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn pipeline_warning_reports_reporter_exact_upstream_failure() {
+    let mut aft = AftProcess::spawn();
+    let _dir = configure_background(&mut aft);
+
+    let task_id = spawn_bg(
+        &mut aft,
+        "pipeline-reporter-exact-arm",
+        "sh -c 'sleep 6; exit 3' | cat",
+    );
+    let frame = wait_for_bash_completed_frame(&mut aft, &task_id);
+    let completed = status(&mut aft, &task_id);
+    for observed in [&frame, &completed] {
+        assert_eq!(observed["exit_code"], 0, "{observed:?}");
+        assert!(
+            observed["output_preview"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("note: `sh` (segment 1 of 2) exited 3"),
+            "reporter's exact arm must name the masked segment: {observed:?}"
+        );
+    }
+
+    assert!(aft.shutdown().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn pipeline_warning_explains_when_posix_shell_cannot_report_segment_statuses() {
+    let mut aft = AftProcess::spawn_with_env(&[("BASH", std::ffi::OsStr::new("/bin/sh"))]);
+    let _dir = configure_background(&mut aft);
+
+    let task_id = spawn_bg(
+        &mut aft,
+        "pipeline-status-unavailable",
+        "sh -c 'sleep 1; exit 3' | cat",
+    );
+    let frame = wait_for_bash_completed_frame(&mut aft, &task_id);
+    assert!(
+        frame["output_preview"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pipeline status unavailable under sh"),
+        "unsupported shells must not silently omit masked-pipeline diagnostics: {frame:?}"
+    );
+
+    assert!(aft.shutdown().success());
 }
 
 #[cfg(unix)]
