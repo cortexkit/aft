@@ -2087,6 +2087,13 @@ fn git_entry_signature(project_root: &Path) -> GitEntrySignature {
     }
 }
 
+struct WatcherRuntimeIdentity {
+    root: PathBuf,
+    gitignore_generation: u64,
+    #[cfg(test)]
+    thread_id: Option<std::thread::ThreadId>,
+}
+
 /// Shared application context threaded through all command handlers.
 ///
 /// Holds the language provider, backup/checkpoint stores, and configuration.
@@ -2223,6 +2230,7 @@ pub struct AppContext {
     watcher_rx: parking_lot::Mutex<Option<crossbeam_channel::Receiver<WatcherDispatchEvent>>>,
     watcher_drain_slice: parking_lot::Mutex<Option<WatcherDrainSliceState>>,
     watcher_thread: parking_lot::Mutex<Option<WatcherThreadHandle>>,
+    watcher_runtime_identity: parking_lot::Mutex<Option<WatcherRuntimeIdentity>>,
     watcher_counters: RwLock<Arc<WatcherCounters>>,
     lsp_manager: parking_lot::Mutex<LspManager>,
     configure_generation: Arc<AtomicU64>,
@@ -2690,6 +2698,7 @@ impl AppContext {
             watcher_rx: parking_lot::Mutex::new(None),
             watcher_drain_slice: parking_lot::Mutex::new(None),
             watcher_thread: parking_lot::Mutex::new(None),
+            watcher_runtime_identity: parking_lot::Mutex::new(None),
             watcher_counters: RwLock::new(watcher_counters),
             lsp_manager: parking_lot::Mutex::new(lsp_manager),
             configure_generation: Arc::new(AtomicU64::new(0)),
@@ -6918,14 +6927,66 @@ impl AppContext {
         rx: crossbeam_channel::Receiver<WatcherDispatchEvent>,
         runtime: WatcherThreadHandle,
     ) {
+        self.install_watcher_runtime_inner(rx, runtime, None);
+    }
+
+    pub(crate) fn install_watcher_runtime_with_thread_id(
+        &self,
+        rx: crossbeam_channel::Receiver<WatcherDispatchEvent>,
+        runtime: WatcherThreadHandle,
+        thread_id: std::thread::ThreadId,
+    ) {
+        self.install_watcher_runtime_inner(rx, runtime, Some(thread_id));
+    }
+
+    fn install_watcher_runtime_inner(
+        &self,
+        rx: crossbeam_channel::Receiver<WatcherDispatchEvent>,
+        runtime: WatcherThreadHandle,
+        _thread_id: Option<std::thread::ThreadId>,
+    ) {
+        let root = self.watcher_root_path();
+        let gitignore_generation = self.gitignore_generation.load(Ordering::SeqCst);
         let _runtime_guard = self.watcher_runtime_lock.lock();
         let replaced = self.watcher_thread.lock().replace(runtime);
         self.app.watcher_started();
         if let Some(runtime) = replaced {
-            Self::spawn_watcher_shutdown(Arc::clone(&self.app), self.watcher_root_path(), runtime);
+            Self::spawn_watcher_shutdown(Arc::clone(&self.app), root.clone(), runtime);
         }
         *self.watcher_rx.lock() = Some(rx);
         *self.watcher_drain_slice.lock() = None;
+        *self.watcher_runtime_identity.lock() = Some(WatcherRuntimeIdentity {
+            root,
+            gitignore_generation,
+            #[cfg(test)]
+            thread_id: _thread_id,
+        });
+    }
+
+    pub(crate) fn watcher_runtime_matches(&self, root: &Path, gitignore_generation: u64) -> bool {
+        let _runtime_guard = self.watcher_runtime_lock.lock();
+        let thread_live = self
+            .watcher_thread
+            .lock()
+            .as_ref()
+            .is_some_and(|runtime| !runtime.is_finished());
+        thread_live
+            && self.watcher_rx.lock().is_some()
+            && self
+                .watcher_runtime_identity
+                .lock()
+                .as_ref()
+                .is_some_and(|identity| {
+                    identity.root == root && identity.gitignore_generation == gitignore_generation
+                })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn watcher_runtime_thread_id_for_test(&self) -> Option<std::thread::ThreadId> {
+        self.watcher_runtime_identity
+            .lock()
+            .as_ref()
+            .and_then(|identity| identity.thread_id)
     }
 
     fn watcher_root_path(&self) -> PathBuf {
@@ -6967,6 +7028,7 @@ impl AppContext {
         *self.watcher_rx.lock() = None;
         *self.watcher_drain_slice.lock() = None;
         *self.watcher.lock() = None;
+        self.watcher_runtime_identity.lock().take();
         runtime
     }
 
@@ -7003,6 +7065,7 @@ impl AppContext {
             *self.watcher_rx.lock() = None;
             *self.watcher_drain_slice.lock() = None;
             *self.watcher.lock() = None;
+            self.watcher_runtime_identity.lock().take();
             runtime
         };
         if let Some(runtime) = runtime {

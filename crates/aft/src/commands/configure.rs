@@ -587,7 +587,12 @@ fn start_project_watcher_with<W, E, F>(
         })
         .expect("spawn watcher filter thread");
 
-    ctx.install_watcher_runtime(dispatch_rx, WatcherThreadHandle::new(shutdown, join));
+    let watcher_thread_id = join.thread().id();
+    ctx.install_watcher_runtime_with_thread_id(
+        dispatch_rx,
+        WatcherThreadHandle::new(shutdown, join),
+        watcher_thread_id,
+    );
 
     if sync_start {
         match start_rx.recv_timeout(Duration::from_secs(5)) {
@@ -1314,9 +1319,16 @@ fn should_clear_failed_spawns(
 }
 
 fn configs_equal_including_runtime_only_fields(previous: &Config, next: &Config) -> bool {
+    if previous.disabled_lsp != next.disabled_lsp {
+        return false;
+    }
+    let mut normalized_next = next.clone();
+    normalized_next
+        .disabled_lsp
+        .clone_from(&previous.disabled_lsp);
     let serialized_equal = match (
         serde_json::to_value(previous),
-        serde_json::to_value(next),
+        serde_json::to_value(&normalized_next),
     ) {
         (Ok(previous), Ok(next)) => previous == next,
         _ => false,
@@ -2630,13 +2642,15 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     // The common plugin auto-install update repeats the configured root spelling.
     // That spelling and the stored canonical root form a proven alias pair, so the
     // live-session check avoids another filesystem canonicalization entirely.
-    let active_canonical_root = previous_canonical_cache_root.as_ref().filter(|canonical_root| {
-        ctx.configure_generation() > 0
-            && ctx.harness_opt().as_ref() == Some(&harness)
-            && (previous_project_root.as_deref() == Some(root_path.as_path())
-                || canonical_root.as_path() == root_path)
-            && ctx.has_configure_session_binding(canonical_root, req.session())
-    });
+    let active_canonical_root = previous_canonical_cache_root
+        .as_ref()
+        .filter(|canonical_root| {
+            ctx.configure_generation() > 0
+                && ctx.harness_opt().as_ref() == Some(&harness)
+                && (previous_project_root.as_deref() == Some(root_path.as_path())
+                    || canonical_root.as_path() == root_path)
+                && ctx.has_configure_session_binding(canonical_root, req.session())
+        });
     if let Some(canonical_root) = active_canonical_root {
         next_config.semantic.route_project_root = Some(canonical_root.clone());
         next_config.semantic.route_harness = Some(harness.wire_label());
@@ -2704,6 +2718,8 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(cancelled) = configure_cancelled(&req.id) {
         return cancelled;
     }
+    let watcher_topology_changed =
+        ctx.is_worktree_bridge() != is_worktree_bridge || ctx.git_common_dir() != git_common_dir;
 
     let child_storage_root =
         crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
@@ -3305,7 +3321,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     let refresh_project_runtime =
-        !equivalent_warm_config || project_root_changed || effective_configure_changed;
+        project_root_changed || watcher_topology_changed || !ctx.watcher_runtime_active();
     let sync_bash_compress_flag = !equivalent_warm_config
         || previous_config.experimental_bash_compress != next_config.experimental_bash_compress;
     let clear_failed_spawns =
@@ -5428,35 +5444,38 @@ fn run_configure_maintenance_unit(
         }
         ConfigureMaintenanceStage::Watcher => {
             if job.refresh_project_runtime {
-                if ctx
-                    .run_if_subc_bound_generation(job.generation, || ())
-                    .is_none()
-                {
-                    if ctx.subc_unbound_quiesced() {
-                        return ConfigureMaintenanceUnitResult::CancelAll;
-                    }
-                    forget_configure_job_binding(ctx, job);
-                    return ConfigureMaintenanceUnitResult::Complete;
-                }
-
-                // Joining a prior FSEvents thread can block in the OS. Do that
-                // outside lifecycle admission, then reacquire admission only for
-                // the atomic watcher start. An unbind or superseding configure that
-                // wins during the join prevents the replacement from being started.
-                ctx.stop_watcher_runtime();
-                if ctx
-                    .run_if_subc_bound_generation(job.generation, || {
-                        if !job.home_match {
-                            start_project_watcher(ctx, &job.canonical_cache_root);
+                let gitignore_generation = ctx.gitignore_generation().load(Ordering::SeqCst);
+                if !ctx.watcher_runtime_matches(&job.canonical_cache_root, gitignore_generation) {
+                    if ctx
+                        .run_if_subc_bound_generation(job.generation, || ())
+                        .is_none()
+                    {
+                        if ctx.subc_unbound_quiesced() {
+                            return ConfigureMaintenanceUnitResult::CancelAll;
                         }
-                    })
-                    .is_none()
-                {
-                    if ctx.subc_unbound_quiesced() {
-                        return ConfigureMaintenanceUnitResult::CancelAll;
+                        forget_configure_job_binding(ctx, job);
+                        return ConfigureMaintenanceUnitResult::Complete;
                     }
-                    forget_configure_job_binding(ctx, job);
-                    return ConfigureMaintenanceUnitResult::Complete;
+
+                    // Joining a prior FSEvents thread can block in the OS. Do that
+                    // outside lifecycle admission, then reacquire admission only for
+                    // the atomic watcher start. An unbind or superseding configure that
+                    // wins during the join prevents the replacement from being started.
+                    ctx.stop_watcher_runtime();
+                    if ctx
+                        .run_if_subc_bound_generation(job.generation, || {
+                            if !job.home_match {
+                                start_project_watcher(ctx, &job.canonical_cache_root);
+                            }
+                        })
+                        .is_none()
+                    {
+                        if ctx.subc_unbound_quiesced() {
+                            return ConfigureMaintenanceUnitResult::CancelAll;
+                        }
+                        forget_configure_job_binding(ctx, job);
+                        return ConfigureMaintenanceUnitResult::Complete;
+                    }
                 }
             }
             continuation.stage = ConfigureMaintenanceStage::ViewLoad;
@@ -5845,7 +5864,7 @@ mod tests {
         set_configure_artifact_post_gate_delay_for_test, should_clear_failed_spawns,
         should_wait_for_callgraph_start, validate_storage_dir, wait_for_semantic_artifact_start,
         ConfigureMaintenanceStage, INDEX_ORDER_GRACE_MS, INDEX_ORDER_TEST_LOCK,
-        INDEX_ORDER_TIMEOUT_LOGS,
+        INDEX_ORDER_TIMEOUT_LOGS, WATCHER_GENERATION,
     };
     use crate::cache_freshness::{self, VerifyArtifact, WarmVerifyPlan};
     use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
@@ -11295,6 +11314,20 @@ mod tests {
         sandbox.sandbox.enabled = true;
         sandbox.lsp_paths_extra.push(PathBuf::from("/cache/lsp"));
         assert!(!only_lsp_process_state_changed(&previous, &sandbox));
+
+        let mut previous_with_disabled = previous;
+        previous_with_disabled.disabled_lsp = ["pyright", "typescript"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut paths_with_disabled = previous_with_disabled.clone();
+        paths_with_disabled
+            .lsp_paths_extra
+            .push(PathBuf::from("/cache/lsp"));
+        assert!(only_lsp_process_state_changed(
+            &previous_with_disabled,
+            &paths_with_disabled
+        ));
     }
 
     #[test]
@@ -11449,25 +11482,31 @@ mod tests {
             );
         };
 
-        assert_full_path("semantic", json!({
-            "search_index": false,
-            "semantic_search": false,
-            "callgraph_store": false,
-            "semantic": {
-                "backend": "openai_compatible",
-                "model": "reconfigure-test-model",
-                "base_url": "http://127.0.0.1:9",
-                "timeout_ms": 1000,
-                "max_batch_size": 8,
-                "max_files": 1234
-            }
-        }));
-        assert_full_path("sandbox", json!({
-            "search_index": false,
-            "semantic_search": false,
-            "callgraph_store": false,
-            "sandbox": {"enabled": true}
-        }));
+        assert_full_path(
+            "semantic",
+            json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false,
+                "semantic": {
+                    "backend": "openai_compatible",
+                    "model": "reconfigure-test-model",
+                    "base_url": "http://127.0.0.1:9",
+                    "timeout_ms": 1000,
+                    "max_batch_size": 8,
+                    "max_files": 1234
+                }
+            }),
+        );
+        assert_full_path(
+            "sandbox",
+            json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false,
+                "sandbox": {"enabled": true}
+            }),
+        );
 
         let root_a = tempfile::tempdir().unwrap();
         let root_b = tempfile::tempdir().unwrap();
@@ -11475,8 +11514,43 @@ mod tests {
         init_git_fixture(root_a.path());
         init_git_fixture(root_b.path());
         let ctx = test_context();
-        let params_for = |root: &Path| json!({
-            "project_root": root,
+        let params_for = |root: &Path| {
+            json!({
+                "project_root": root,
+                "harness": "opencode",
+                "storage_dir": storage.path(),
+                "config": [user_tier(json!({
+                    "search_index": false,
+                    "semantic_search": false,
+                    "callgraph_store": false
+                }))]
+            })
+        };
+        let initial = configure_request_with_session(params_for(root_a.path()), "session-a");
+        assert!(handle_configure_for_test(&initial, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+        let generation = ctx.configure_generation();
+        let changed = configure_request_with_session(params_for(root_b.path()), "session-a");
+        assert!(handle_configure_for_test(&changed, &ctx).success);
+        assert!(ctx.configure_generation() > generation);
+    }
+
+    #[test]
+    fn same_root_reconfigure_keeps_watcher_runtime_when_matcher_is_unchanged() {
+        let _watcher_guard = watcher_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _enable_watcher = EnvVarGuard::remove("AFT_TEST_DISABLE_FILE_WATCHER");
+        let _sync_watcher = EnvVarGuard::set("AFT_TEST_SYNC_FILE_WATCHER_START", "1");
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        init_git_fixture(root.path());
+        let ctx = test_context();
+        let watcher_starts_before = WATCHER_GENERATION.load(Ordering::SeqCst);
+        let base = json!({
+            "project_root": root.path(),
             "harness": "opencode",
             "storage_dir": storage.path(),
             "config": [user_tier(json!({
@@ -11485,13 +11559,68 @@ mod tests {
                 "callgraph_store": false
             }))]
         });
-        let initial = configure_request_with_session(params_for(root_a.path()), "session-a");
+        let initial = configure_request_with_session(base.clone(), "session-a");
         assert!(handle_configure_for_test(&initial, &ctx).success);
+        ctx.mark_subc_bound();
         super::drain_deferred_configure_maintenance(&ctx);
-        let generation = ctx.configure_generation();
-        let changed = configure_request_with_session(params_for(root_b.path()), "session-a");
-        assert!(handle_configure_for_test(&changed, &ctx).success);
-        assert!(ctx.configure_generation() > generation);
+        assert!(ctx.watcher_runtime_active());
+        let runtime_generation = WATCHER_GENERATION.load(Ordering::SeqCst);
+        assert_eq!(runtime_generation, watcher_starts_before.wrapping_add(1));
+        let runtime_thread_id = ctx.watcher_runtime_thread_id_for_test().unwrap();
+        let matcher_generation = ctx.gitignore_generation().load(Ordering::SeqCst);
+
+        let identical = configure_request_with_session(base.clone(), "session-a");
+        assert!(handle_configure_for_test(&identical, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert_eq!(
+            ctx.watcher_runtime_thread_id_for_test(),
+            Some(runtime_thread_id),
+            "identical configure replaced the watcher thread"
+        );
+        assert_eq!(
+            WATCHER_GENERATION.load(Ordering::SeqCst),
+            runtime_generation
+        );
+        assert_eq!(
+            ctx.gitignore_generation().load(Ordering::SeqCst),
+            matcher_generation
+        );
+
+        let mut changed = base;
+        changed["config"] = json!([user_tier(json!({
+            "search_index": false,
+            "semantic_search": false,
+            "callgraph_store": false,
+            "semantic": {
+                "backend": "openai_compatible",
+                "model": "watcher-reconfigure-test",
+                "base_url": "http://127.0.0.1:9",
+                "timeout_ms": 1000,
+                "max_batch_size": 8,
+                "max_files": 1234
+            }
+        }))]);
+        let reconfigure = configure_request_with_session(changed, "session-a");
+        assert!(handle_configure_for_test(&reconfigure, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+
+        assert_eq!(
+            WATCHER_GENERATION.load(Ordering::SeqCst),
+            runtime_generation,
+            "same-root reconfigure replaced the watcher runtime"
+        );
+        assert_eq!(
+            ctx.watcher_runtime_thread_id_for_test(),
+            Some(runtime_thread_id),
+            "same-root reconfigure replaced the watcher thread"
+        );
+        assert_eq!(
+            ctx.gitignore_generation().load(Ordering::SeqCst),
+            matcher_generation,
+            "same-root reconfigure rebuilt an unchanged matcher"
+        );
+        assert_eq!(ctx.watcher_registry_count(), 1);
+        ctx.stop_watcher_runtime();
     }
 
     /// Manual bind-path benchmark with a 5,120-source-file, 64-package repository.

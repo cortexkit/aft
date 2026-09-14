@@ -3564,10 +3564,14 @@ mod diagnostic_capacity_tests {
             .unwrap();
         let mut manager = LspManager::new();
 
-        assert!(manager.resolve_binary(&definition, root.path(), &config).is_err());
+        assert!(manager
+            .resolve_binary(&definition, root.path(), &config)
+            .is_err());
         assert!(manager.set_search_paths(vec![bin_dir.path().to_path_buf()]));
         assert_eq!(
-            manager.resolve_binary(&definition, root.path(), &config).unwrap(),
+            manager
+                .resolve_binary(&definition, root.path(), &config)
+                .unwrap(),
             binary
         );
     }
