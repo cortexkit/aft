@@ -489,6 +489,20 @@ mod tests {
             )
             .unwrap();
         }
+        thread::sleep(Duration::from_millis(500));
+        let excluded_raw_events = rx.try_iter().collect::<Vec<_>>();
+        for event in &excluded_raw_events {
+            if let Err(error) = event {
+                panic!("watcher error during excluded flood: {error}");
+            }
+        }
+        eprintln!("excluded build raw events: {}", excluded_raw_events.len());
+        assert_eq!(
+            excluded_raw_events.len(),
+            0,
+            "the excluded target build must not reach the raw channel"
+        );
+
         let expected = (0..3)
             .map(|index| canonical_root.join("src").join(format!("kept-{index}")))
             .collect::<BTreeSet<_>>();

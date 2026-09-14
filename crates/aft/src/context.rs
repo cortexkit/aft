@@ -858,6 +858,7 @@ impl WatcherCounters {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn rescan_in_progress(&self) -> bool {
         self.rescan_state.load(Ordering::Acquire) != WATCHER_RESCAN_IDLE
     }
