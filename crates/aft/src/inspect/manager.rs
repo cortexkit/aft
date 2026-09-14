@@ -3542,6 +3542,13 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
             &self,
             project_root: &Path,
         ) -> Result<Option<CallgraphProjectionIdentity>, CallGraphStoreError> {
+            let stale_files = match self {
+                Self::ReadOnly(store) => store.stale_files()?,
+                Self::Writable(store) => store.stale_files()?,
+            };
+            if !stale_files.is_empty() {
+                return Ok(None);
+            }
             let write_revision = match self {
                 Self::ReadOnly(store) => store.projection_write_revision()?,
                 Self::Writable(store) => store.projection_write_revision()?,
@@ -6402,6 +6409,32 @@ export function bannerUnused() {}
         assert!(
             memory.estimated_bytes.unwrap_or_default() > 0,
             "a populated projection must report an estimated residency"
+        );
+    }
+
+    #[test]
+    fn stale_store_never_reuses_an_equal_revision_projection() {
+        let (_dir, root, inspect_dir, job) = published_projection_fixture();
+        let manager = InspectManager::new();
+        manager
+            .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
+            .expect("initial projection");
+        let writer = CallGraphStore::open_ready_no_rebuild(
+            callgraph_store_dir_from_inspect_dir(&inspect_dir, &root).expect("callgraph dir"),
+            root.clone(),
+        )
+        .expect("open writer")
+        .expect("ready writer");
+        writer
+            .mark_files_stale(&[root.join("src/target.ts")])
+            .expect("mark target stale");
+        drop(writer);
+
+        assert!(
+            manager
+                .build_tier2_callgraph_snapshot_with_refresh(&job, false, false, &[])
+                .is_none(),
+            "a stale marker must block a cache hit even though it does not advance the graph revision"
         );
     }
 

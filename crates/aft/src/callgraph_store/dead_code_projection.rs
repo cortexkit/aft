@@ -320,6 +320,8 @@ pub(super) fn record_projection_delta(
             params![key, format!("spill:{revision}")],
         )?;
     }
+    #[cfg(test)]
+    super::note_projection_journal_append_for_test();
     // Ring entries older than the bridgeable revision range cannot be read.
     // Prune their side payloads in the same transaction as the new marker.
     if table_exists(tx, PROJECTION_DELTA_SPILL_TABLE)? {

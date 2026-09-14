@@ -96,6 +96,42 @@ type ColdBuildSliceObserver = dyn Fn(&'static str, usize, usize) + Send + Sync +
 #[cfg(test)]
 type ColdBuildExtractObserver = dyn Fn(&[PathBuf]) + Send + Sync + 'static;
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProjectionMutationCounts {
+    pub revision_bumps: usize,
+    pub journal_appends: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROJECTION_MUTATION_COUNTS: std::cell::Cell<ProjectionMutationCounts> =
+        const { std::cell::Cell::new(ProjectionMutationCounts { revision_bumps: 0, journal_appends: 0 }) };
+}
+
+#[cfg(test)]
+fn note_projection_revision_bump_for_test() {
+    PROJECTION_MUTATION_COUNTS.with(|counts| {
+        let mut current = counts.get();
+        current.revision_bumps += 1;
+        counts.set(current);
+    });
+}
+
+#[cfg(test)]
+pub(super) fn note_projection_journal_append_for_test() {
+    PROJECTION_MUTATION_COUNTS.with(|counts| {
+        let mut current = counts.get();
+        current.journal_appends += 1;
+        counts.set(current);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn take_projection_mutation_counts_for_test() -> ProjectionMutationCounts {
+    PROJECTION_MUTATION_COUNTS.with(|counts| counts.replace(ProjectionMutationCounts::default()))
+}
+
 static COLD_BUILD_PHASE_OBSERVER: OnceLock<Mutex<Option<Arc<ColdBuildPhaseObserver>>>> =
     OnceLock::new();
 
@@ -495,6 +531,61 @@ mod write_amplification_tests {
             .unwrap();
         assert_eq!(shifted_stats.unchanged_extract_files, 0);
         assert_eq!(shifted_stats.refreshed_own_files, 1);
+    }
+
+    #[test]
+    fn revision_bumps_always_have_journal_entries_and_graph_neutral_saves_have_neither() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("main.ts");
+        fs::write(&source, "export function before() { return 1; }\n").unwrap();
+        let store = CallGraphStore::open(temp.path().join("store"), root).unwrap();
+        store.cold_build(std::slice::from_ref(&source)).unwrap();
+        let (baseline_revision, mut snapshot) =
+            dead_code_projection::project_dead_code_snapshot_with_revision(store.sqlite_path())
+                .unwrap();
+        let mut revision = baseline_revision.unwrap();
+        take_projection_mutation_counts_for_test();
+
+        for contents in [
+            "export function middle() { return 2; }\n",
+            "export function after() { return 3; }\n",
+        ] {
+            fs::write(&source, contents).unwrap();
+            store
+                .mark_files_stale(std::slice::from_ref(&source))
+                .unwrap();
+            store.refresh_files(std::slice::from_ref(&source)).unwrap();
+
+            let counts = take_projection_mutation_counts_for_test();
+            assert_eq!(
+                counts.revision_bumps, counts.journal_appends,
+                "every revision advance in an edit-save sequence must append its caller delta"
+            );
+            assert_eq!(counts.revision_bumps, 1);
+            let (next_revision, next_snapshot, verdict) =
+                dead_code_projection::project_dead_code_snapshot_incremental(
+                    store.sqlite_path(),
+                    Some((revision, &snapshot)),
+                )
+                .unwrap();
+            assert_eq!(verdict.kind, dead_code_projection::ProjectionKind::Spliced);
+            revision = next_revision.unwrap();
+            snapshot = next_snapshot;
+        }
+
+        fs::write(&source, "export function after() { return 3; }\n").unwrap();
+        store
+            .mark_files_stale(std::slice::from_ref(&source))
+            .unwrap();
+        store.refresh_files(std::slice::from_ref(&source)).unwrap();
+        assert_eq!(
+            take_projection_mutation_counts_for_test(),
+            ProjectionMutationCounts::default(),
+            "a graph-neutral save must neither advance the revision nor append a delta"
+        );
+        assert_eq!(store.projection_write_revision().unwrap(), Some(revision));
     }
 
     #[test]
@@ -4525,7 +4616,9 @@ impl CallGraphStore {
             )?;
             marked.push(rel_path);
         }
-        bump_projection_write_revision(&tx)?;
+        // A stale marker blocks projection until refresh but does not mutate graph
+        // rows. Only a refresh that changes graph rows advances the revision and
+        // writes the matching changed-file journal entry.
         tx.commit()?;
         self.record_commit(total_changes_before, &conn);
         marked.sort();
@@ -7505,6 +7598,8 @@ fn bump_projection_write_revision(tx: &Transaction<'_>) -> Result<()> {
          ON CONFLICT(k) DO UPDATE SET v = CAST(v AS INTEGER) + 1",
         [],
     )?;
+    #[cfg(test)]
+    note_projection_revision_bump_for_test();
     Ok(())
 }
 
