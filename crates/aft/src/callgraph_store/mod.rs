@@ -2353,6 +2353,7 @@ struct ProjectIndex<'a> {
     /// Cold/direct refreshes use a private cache so each refresh builds and uses
     /// its own workspace mapping.
     workspace_crate_prefixes: WorkspaceCratePrefixCache,
+    rust_crate_roots: callgraph::RustCrateRootMemo,
 }
 
 /// Resolution reads symbols and exports through one interface. Incremental
@@ -2477,6 +2478,7 @@ impl ResolverIndex for ProjectIndex<'_> {
             &self.project_root,
             &self.project_root.join(caller_file),
             &paths,
+            &self.rust_crate_roots,
         )
         .map(|path| relative_path(&self.project_root, &path))
     }
@@ -2862,12 +2864,13 @@ impl ResolverIndex for DiskProjectIndex<'_> {
             root: self.project_root,
             facts: &disk,
         };
-        callgraph::rust_crate_root_file_for_caller(
-            self.project_root,
-            &self.project_root.join(caller_file),
-            &paths,
-        )
-        .map(|path| relative_path(self.project_root, &path))
+        self.module_resolution_memo
+            .rust_crate_root_file(
+                self.project_root,
+                &self.project_root.join(caller_file),
+                &paths,
+            )
+            .map(|path| relative_path(self.project_root, &path))
     }
 
     fn inline_scoped_target(
@@ -9394,9 +9397,14 @@ fn rust_external_module_target(
     let declaring_file = facts
         .canonical(declaring_file)
         .unwrap_or_else(|| declaring_file.to_path_buf());
-    let is_crate_root =
-        callgraph::rust_crate_root_file_for_caller(facts.root, &declaring_file, facts).as_ref()
-            == Some(&declaring_file);
+    let is_crate_root = callgraph::rust_crate_root_file_for_caller(
+        facts.root,
+        &declaring_file,
+        facts,
+        &callgraph::RustCrateRootMemo::default(),
+    )
+    .as_ref()
+        == Some(&declaring_file);
     let module_dir = if matches!(stem, "lib" | "main" | "mod") || is_crate_root {
         parent.to_path_buf()
     } else {
@@ -10722,6 +10730,7 @@ impl<'a> ProjectIndex<'a> {
             files,
             caller_data,
             workspace_crate_prefixes,
+            rust_crate_roots: callgraph::RustCrateRootMemo::default(),
         }
     }
 
@@ -18698,6 +18707,7 @@ mod reexport_resolution_tests {
             files: files.into_iter().collect(),
             caller_data: HashMap::new(),
             workspace_crate_prefixes: WorkspaceCratePrefixCache::default(),
+            rust_crate_roots: callgraph::RustCrateRootMemo::default(),
         }
     }
 

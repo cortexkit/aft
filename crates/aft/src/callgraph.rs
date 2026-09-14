@@ -65,6 +65,18 @@ type ModuleResolutionKey = (PathBuf, String);
 type WorkspacePackageKey = (PathBuf, String);
 type RustDeclaredModuleMap = HashMap<String, Option<String>>;
 
+#[derive(Clone, Debug)]
+struct RustCrateTargets {
+    lib_root: Option<PathBuf>,
+    target_roots: Vec<PathBuf>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct RustCrateRootMemo {
+    caller_roots: std::rc::Rc<RefCell<HashMap<PathBuf, Option<PathBuf>>>>,
+    crate_targets: std::rc::Rc<RefCell<HashMap<PathBuf, Option<RustCrateTargets>>>>,
+}
+
 struct BoundedMemo<K, V> {
     entries: HashMap<K, V>,
     retained_weight: usize,
@@ -112,6 +124,7 @@ pub(crate) struct ModuleResolutionMemo {
     json_values: RefCell<BoundedMemo<PathBuf, Option<Arc<Value>>>>,
     workspace_packages: RefCell<BoundedMemo<WorkspacePackageKey, Option<PathBuf>>>,
     rust_declared_modules: RefCell<BoundedMemo<String, Arc<RustDeclaredModuleMap>>>,
+    rust_crate_roots: RustCrateRootMemo,
     #[cfg(test)]
     collect_metrics: bool,
     #[cfg(test)]
@@ -142,6 +155,7 @@ impl Default for ModuleResolutionMemo {
                 RUST_DECLARED_MODULE_MEMO_MAX_ENTRIES,
                 RUST_DECLARED_MODULE_MEMO_MAX_RETAINED_BYTES,
             )),
+            rust_crate_roots: RustCrateRootMemo::default(),
             #[cfg(test)]
             collect_metrics: false,
             #[cfg(test)]
@@ -208,6 +222,16 @@ impl ModuleResolutionMemo {
             );
         }
         parsed
+    }
+
+    pub(crate) fn rust_crate_root_file(
+        &self,
+        project_root: &Path,
+        caller_file: &Path,
+        facts: &FactPaths<'_>,
+    ) -> Option<PathBuf> {
+        self.rust_crate_roots
+            .root_file(project_root, caller_file, facts)
     }
 
     pub(crate) fn rust_declared_module_target(
@@ -2301,25 +2325,88 @@ fn rust_target_roots(
     roots
 }
 
-pub(crate) fn rust_crate_root_file_for_caller(
-    project_root: &Path,
-    caller_file: &Path,
-    facts: &FactPaths<'_>,
-) -> Option<PathBuf> {
-    let caller = facts
-        .canonical(caller_file)
-        .unwrap_or_else(|| caller_file.to_path_buf());
-    let mut current = caller.parent();
-    let crate_root = loop {
-        let dir = current?;
-        if facts.is_file(&dir.join("Cargo.toml")) {
-            break dir.to_path_buf();
+impl RustCrateRootMemo {
+    pub(crate) fn root_file(
+        &self,
+        project_root: &Path,
+        caller_file: &Path,
+        facts: &FactPaths<'_>,
+    ) -> Option<PathBuf> {
+        let caller = facts
+            .canonical(caller_file)
+            .unwrap_or_else(|| caller_file.to_path_buf());
+        if let Some(cached) = self.caller_roots.borrow().get(&caller).cloned() {
+            facts.facts.memo_replay(&caller, "rust-crate-root", "");
+            return cached;
         }
-        if dir == project_root {
-            return None;
+
+        facts.facts.memo_start(&caller, "rust-crate-root", "");
+        let resolved = self.resolve_root_file(project_root, &caller, facts);
+        facts.facts.memo_finish(&caller, "rust-crate-root", "");
+        self.caller_roots
+            .borrow_mut()
+            .insert(caller, resolved.clone());
+        resolved
+    }
+
+    fn resolve_root_file(
+        &self,
+        project_root: &Path,
+        caller: &Path,
+        facts: &FactPaths<'_>,
+    ) -> Option<PathBuf> {
+        let mut current = caller.parent();
+        let crate_root = loop {
+            let dir = current?;
+            if facts.is_file(&dir.join("Cargo.toml")) {
+                break dir.to_path_buf();
+            }
+            if dir == project_root {
+                return None;
+            }
+            current = dir.parent();
+        };
+        let cached_targets = { self.crate_targets.borrow().get(&crate_root).cloned() };
+        let targets = if let Some(cached) = cached_targets {
+            facts
+                .facts
+                .memo_replay(&crate_root, "rust-target-roots", "");
+            cached
+        } else {
+            facts.facts.memo_start(&crate_root, "rust-target-roots", "");
+            let resolved = read_rust_crate_targets(&crate_root, facts);
+            facts
+                .facts
+                .memo_finish(&crate_root, "rust-target-roots", "");
+            self.crate_targets
+                .borrow_mut()
+                .insert(crate_root.clone(), resolved.clone());
+            resolved
+        }?;
+        if targets.lib_root.as_ref() == Some(&caller.to_path_buf()) {
+            return targets.lib_root;
         }
-        current = dir.parent();
-    };
+        targets
+            .target_roots
+            .into_iter()
+            .filter(|root| {
+                let default_main = *root == crate_root.join("src/main.rs");
+                root.parent()
+                    .is_some_and(|dir| caller == root || (!default_main && caller.starts_with(dir)))
+            })
+            .max_by_key(|root| {
+                (
+                    caller == root,
+                    root.parent()
+                        .map(|dir| dir.components().count())
+                        .unwrap_or(0),
+                )
+            })
+            .or(targets.lib_root)
+    }
+}
+
+fn read_rust_crate_targets(crate_root: &Path, facts: &FactPaths<'_>) -> Option<RustCrateTargets> {
     let bytes = facts.attributed_bytes(&crate_root.join("Cargo.toml"))?;
     let cargo: toml::Value = toml::from_str(std::str::from_utf8(&bytes).ok()?).ok()?;
     let lib = cargo
@@ -2328,31 +2415,22 @@ pub(crate) fn rust_crate_root_file_for_caller(
         .and_then(toml::Value::as_str)
         .map(|path| crate_root.join(path))
         .unwrap_or_else(|| crate_root.join("src/lib.rs"));
-    let lib = facts
+    let lib_root = facts
         .is_file(&lib)
         .then(|| facts.canonical(&lib).unwrap_or(lib));
-    if lib.as_ref() == Some(&caller) {
-        return lib;
-    }
-    let target = rust_target_roots(&crate_root, &cargo, facts)
-        .into_iter()
-        .filter(|root| {
-            let default_main = **root == crate_root.join("src/main.rs");
-            root.parent()
-                .is_some_and(|dir| caller == **root || (!default_main && caller.starts_with(dir)))
-        })
-        .max_by_key(|root| {
-            (
-                caller == *root,
-                root.parent()
-                    .map(|dir| dir.components().count())
-                    .unwrap_or(0),
-            )
-        });
-    if target.is_some() {
-        return target;
-    }
-    lib
+    Some(RustCrateTargets {
+        lib_root,
+        target_roots: rust_target_roots(crate_root, &cargo, facts),
+    })
+}
+
+pub(crate) fn rust_crate_root_file_for_caller(
+    project_root: &Path,
+    caller_file: &Path,
+    facts: &FactPaths<'_>,
+    memo: &RustCrateRootMemo,
+) -> Option<PathBuf> {
+    memo.root_file(project_root, caller_file, facts)
 }
 
 fn rust_module_base_for_caller(
@@ -3450,8 +3528,99 @@ pub fn walk_project_files(root: &Path) -> impl Iterator<Item = PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::callgraph_store::facts::{DirEntry, ProjectFacts};
+    use std::cell::Cell;
     use std::fs;
     use tempfile::TempDir;
+
+    struct CountingFacts {
+        inner: DiskFacts,
+        cargo_reads: Cell<usize>,
+        bin_listings: Cell<usize>,
+    }
+
+    impl CountingFacts {
+        fn new(root: &Path) -> Self {
+            Self {
+                inner: DiskFacts::new(root),
+                cargo_reads: Cell::new(0),
+                bin_listings: Cell::new(0),
+            }
+        }
+    }
+
+    impl ProjectFacts for CountingFacts {
+        fn is_file(&self, rel: &[u8]) -> bool {
+            self.inner.is_file(rel)
+        }
+
+        fn is_dir(&self, rel: &[u8]) -> bool {
+            self.inner.is_dir(rel)
+        }
+
+        fn config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
+            self.inner.config_bytes(rel)
+        }
+
+        fn attributed_config_bytes(&self, rel: &[u8]) -> Option<Arc<[u8]>> {
+            if rel == b"Cargo.toml" {
+                self.cargo_reads.set(self.cargo_reads.get() + 1);
+            }
+            self.inner.attributed_config_bytes(rel)
+        }
+
+        fn symlink_target(&self, rel: &[u8]) -> Option<&[u8]> {
+            self.inner.symlink_target(rel)
+        }
+
+        fn canonical(&self, rel: &[u8]) -> Option<Vec<u8>> {
+            self.inner.canonical(rel)
+        }
+
+        fn list_dir(&self, rel: &[u8]) -> Vec<DirEntry> {
+            if rel == b"src/bin" {
+                self.bin_listings.set(self.bin_listings.get() + 1);
+            }
+            self.inner.list_dir(rel)
+        }
+    }
+
+    #[test]
+    fn rust_crate_root_memo_bounds_one_thousand_per_reference_lookups() {
+        let temp = TempDir::new().unwrap();
+        let root = canonicalize_path(temp.path());
+        let root = root.as_path();
+        fs::create_dir_all(root.join("src/bin/support")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"memo-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/bin/tool.rs"), "mod support;\n").unwrap();
+        let callers = [
+            root.join("src/bin/support/admin_client.rs"),
+            root.join("src/bin/support/route_client.rs"),
+        ];
+        for caller in &callers {
+            fs::write(caller, "pub fn caller() {}\n").unwrap();
+        }
+
+        let counting = CountingFacts::new(root);
+        let paths = FactPaths {
+            root,
+            facts: &counting,
+        };
+        let memo = RustCrateRootMemo::default();
+        for index in 0..1_000 {
+            assert_eq!(
+                memo.root_file(root, &callers[index % callers.len()], &paths),
+                Some(canonicalize_path(&root.join("src/bin/tool.rs")))
+            );
+        }
+
+        assert_eq!(counting.cargo_reads.get(), 1);
+        assert_eq!(counting.bin_listings.get(), 1);
+    }
 
     fn collect_calls_by_symbol_reference(
         source: &str,
