@@ -1098,3 +1098,49 @@ fn callback_target() {}
         );
     }
 }
+
+#[cfg(test)]
+#[test]
+fn oversized_projection_delta_is_retained_in_spill_table() {
+    let mut conn = Connection::open_in_memory().expect("open fixture database");
+    conn.execute_batch(
+        "CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+         CREATE TABLE files (path TEXT);
+         CREATE TABLE nodes (file_path TEXT, name TEXT);
+         CREATE TABLE refs (caller_file TEXT, callee TEXT);",
+    )
+    .expect("create projection journal fixture");
+    let callers = (0..171)
+        .map(|index| format!("src/{index:03}-{}.ts", "x".repeat(1_600)))
+        .collect::<BTreeSet<_>>();
+    let serialized = serde_json::to_string(&(1u64, &callers)).expect("serialize caller batch");
+    assert!(serialized.len() > MIN_INLINE_DELTA_BYTES);
+
+    let tx = conn.transaction().expect("start journal transaction");
+    record_projection_delta(&tx, &callers).expect("record spill-backed delta");
+    tx.commit().expect("commit spill-backed delta");
+
+    let marker: String = conn
+        .query_row(
+            "SELECT v FROM meta WHERE k = 'projection_delta_1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read spill marker");
+    assert_eq!(marker, "spill:1");
+    let payload: String = conn
+        .query_row(
+            "SELECT payload FROM projection_delta_spill WHERE revision = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read spilled payload");
+    assert_eq!(payload, serialized);
+    assert_eq!(
+        projection_delta_since(&conn, 0, 1).unwrap(),
+        DeltaRead::Spliced {
+            callers,
+            journal_bytes: payload.len() as u64,
+        }
+    );
+}
