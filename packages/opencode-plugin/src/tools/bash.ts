@@ -533,7 +533,7 @@ export function createBashKillTool(ctx: PluginContext): ToolDefinition {
         throw new Error((data.message as string | undefined) ?? "bash_kill failed");
       }
       if (data.kill_signaled === true) {
-        return `Task ${args.taskId}: kill_signaled`;
+        return `Task ${args.taskId}: kill_signaled · reached ${String(data.kill_reached ?? 0)} live descendants`;
       }
       return `Task ${args.taskId}: ${String(data.status ?? "killed")}`;
     },

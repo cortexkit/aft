@@ -297,6 +297,8 @@ interface BashWriteDetails {
 interface BashKillDetails {
   success: boolean;
   status: string;
+  kill_signaled?: boolean;
+  kill_reached?: number;
 }
 
 interface BashWatchDetails extends Record<string, unknown> {}
@@ -967,9 +969,12 @@ export function createBashKillTool(ctx: PluginContext) {
       if (data.success === false) {
         throw new Error((data.message as string | undefined) ?? "bash_kill failed");
       }
-      const details = data as unknown as BashKillDetails & { kill_signaled?: boolean };
+      const details = data as unknown as BashKillDetails;
       if (details.kill_signaled === true) {
-        return bashKillResult(`Task ${params.task_id}: kill_signaled`, details);
+        return bashKillResult(
+          `Task ${params.task_id}: kill_signaled · reached ${details.kill_reached ?? 0} live descendants`,
+          details,
+        );
       }
       return bashKillResult(`Task ${params.task_id}: ${details.status}`, details);
     },

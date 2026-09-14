@@ -155,6 +155,10 @@ pub struct BgTaskSnapshot {
     pub live_descendants_omitted: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub live_descendants_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub kill_signaled: bool,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub kill_reached: usize,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -4311,6 +4315,8 @@ impl BgTaskRegistry {
             .task_for_session(task_id, session_id)
             .ok_or_else(|| format!("background task not found: {task_id}"))?;
         let mut terminalized = false;
+        let mut kill_signaled = false;
+        let mut kill_reached = 0;
 
         {
             let mut state = task
@@ -4319,6 +4325,31 @@ impl BgTaskRegistry {
                 .map_err(|_| "background task lock poisoned".to_string())?;
             if state.metadata.status.is_terminal() {
                 state.pending_terminal_override = None;
+                #[cfg(unix)]
+                let live_count = state
+                    .metadata
+                    .live_descendants
+                    .as_ref()
+                    .map(Vec::len)
+                    .unwrap_or(0)
+                    + state.metadata.live_descendants_omitted;
+                #[cfg(unix)]
+                if live_count > 0 {
+                    if let Some(pgid) = state.metadata.pgid {
+                        kill_signaled = true;
+                        kill_reached = live_count;
+                        terminate_pgid(pgid, None);
+                        let sample = live_process_group_members(pgid);
+                        state.metadata.live_descendants =
+                            sample.as_ref().map(|(members, _)| members.clone());
+                        state.metadata.live_descendants_omitted =
+                            sample.as_ref().map(|(_, omitted)| *omitted).unwrap_or(0);
+                        self.persist_task(&task.paths, &state.metadata)
+                            .map_err(|error| {
+                                format!("failed to persist post-kill descendant sample: {error}")
+                            })?;
+                    }
+                }
             } else if let Ok(Some(marker)) = read_exit_marker(&task.paths) {
                 state.metadata =
                     terminal_metadata_from_marker(state.metadata.clone(), marker, reason.clone());
@@ -4465,7 +4496,10 @@ impl BgTaskRegistry {
         if terminalized {
             self.post_terminal_transition(&task, true)?;
         }
-        Ok(self.snapshot_with_terminal_cache(&task, RUNNING_OUTPUT_PREVIEW_BYTES))
+        let mut snapshot = self.snapshot_with_terminal_cache(&task, RUNNING_OUTPUT_PREVIEW_BYTES);
+        snapshot.kill_signaled = kill_signaled;
+        snapshot.kill_reached = kill_reached;
+        Ok(snapshot)
     }
 
     fn finalize_from_marker(
@@ -6154,6 +6188,8 @@ fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTask
         live_descendants: metadata.live_descendants.clone(),
         live_descendants_omitted: metadata.live_descendants_omitted,
         live_descendants_summary,
+        kill_signaled: false,
+        kill_reached: 0,
     }
 }
 
@@ -6223,6 +6259,8 @@ impl BgTask {
             live_descendants: metadata.live_descendants.clone(),
             live_descendants_omitted: metadata.live_descendants_omitted,
             live_descendants_summary: live_descendants_summary(metadata),
+            kill_signaled: false,
+            kill_reached: 0,
         }
     }
 
