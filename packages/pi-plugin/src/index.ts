@@ -197,7 +197,7 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.55.1";
+const ANNOUNCEMENT_VERSION = "0.56.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
   "Callgraph stays consistent under load: edits arriving mid-rebuild can no longer be silently lost from navigation results.",
   "aft_zoom handles real-world .jsonc: files with comment banners above the opening brace now resolve, and not-found errors point at the segment that actually failed (thanks @iceteaSA).",
