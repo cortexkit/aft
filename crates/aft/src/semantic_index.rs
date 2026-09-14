@@ -736,8 +736,11 @@ fn embedding_send_error_is_transient(error: &reqwest::Error) -> bool {
     // connection, just later in the exchange. reqwest surfaces it as a plain
     // send error. Classify from the io source chain where one exists; hyper
     // errors like IncompleteMessage ("connection closed before message
-    // completed") carry no io source, so fall back to known phrases in the
-    // chain's rendered messages.
+    // completed") and UnexpectedMessage ("received unexpected message from
+    // connection" — the peer wrote a partial reply and closed while the
+    // request was still being sent, observed on Windows CI where the socket
+    // closes with unread request bytes) carry no io source, so fall back to
+    // known phrases in the chain's rendered messages.
     let mut source = std::error::Error::source(error);
     while let Some(inner) = source {
         if let Some(io) = inner.downcast_ref::<std::io::Error>() {
@@ -757,6 +760,7 @@ fn embedding_send_error_is_transient(error: &reqwest::Error) -> bool {
             || rendered.contains("connection closed")
             || rendered.contains("broken pipe")
             || rendered.contains("unexpected end of file")
+            || rendered.contains("unexpected message from connection")
         {
             return true;
         }
@@ -7846,12 +7850,13 @@ Connection: close
             "body read failures should be transient-marked: {error}"
         );
         // The mock closes the socket after writing a truncated body. Whether
-        // the client observes that as a body-read EOF or as a send-stage
-        // connection reset is an OS-level race (Windows sends RST when the
-        // socket closes with unread request bytes, and under load the mock's
-        // single read can return early). Both shapes are the backend dying
-        // mid-exchange and both must carry the transient marker; the message
-        // prefix differs by stage.
+        // the client observes that as a body-read EOF, as a send-stage
+        // connection reset, or as hyper's UnexpectedMessage (the partial reply
+        // arrived while the request was still being written) is an OS-level
+        // race (Windows sends RST when the socket closes with unread request
+        // bytes, and under load the mock's single read can return early). All
+        // shapes are the backend dying mid-exchange and all must carry the
+        // transient marker; the message prefix differs by stage.
         assert!(
             error.contains("response read failed") || error.contains("request failed"),
             "unexpected error shape: {error}"

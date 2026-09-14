@@ -1148,6 +1148,21 @@ export default { id: original.id, effect };
   }, 180_000);
 
   test("manifest mutation converges multiple V1 root invocations on one daemon owner", async () => {
+    // This is the one row that needs a real subconscious daemon. The sibling
+    // subc lanes skip their whole describe when the core binary is absent
+    // (it lives in a private repository and is never on a CI runner); this
+    // row records the same skip as a canary entry so the label roll-call
+    // below still proves every row ran or named why it did not.
+    const preparedProbe = await prepareSubcLane();
+    if (preparedProbe.skipReason) {
+      hostCanaries.push({
+        label: "v1-root-mutation",
+        before: `skipped: ${preparedProbe.skipReason}`,
+        after: `skipped: ${preparedProbe.skipReason}`,
+      });
+      console.log(`[load-matrix] v1-root-mutation skipped: ${preparedProbe.skipReason}`);
+      return;
+    }
     const { v1 } = await ensureHostInstalls();
     const isolation = await makeIsolation("v1-root-mutation");
     const oldTmp = process.env.TMPDIR;
@@ -1286,6 +1301,12 @@ export default entry;
       "v2-function-negative",
     ]);
     for (const canary of hostCanaries) {
+      if (typeof canary.before === "string") {
+        // A skipped row records its reason in place of snapshots; there is
+        // no operator state to compare for it.
+        expect(canary.after).toEqual(canary.before);
+        continue;
+      }
       if (allowLiveOperatorWrites) {
         const before = canary.before as { db: PathSnapshot; logs: PathSnapshot };
         const after = canary.after as { db: PathSnapshot; logs: PathSnapshot };
