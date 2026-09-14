@@ -38,9 +38,8 @@ pub(crate) enum ProjectionKind {
 /// let an operator see the cost without re-deriving it from timings.
 ///
 /// `reason` is `Some` only for `Full` projections; the reasons are `cold`
-/// (no previous snapshot or a legacy store without a durable revision),
-/// `journal_gap` (a missing/unparseable journal entry bridged the revisions),
-/// and `journal_oversize` (a delta batch exceeded the journal byte bound).
+/// (no previous snapshot or a legacy store without a durable revision) and
+/// `journal_gap` (a missing or unparseable journal entry bridged the revisions).
 /// No `generation_changed` arm exists: the cache identity already pairs the
 /// cold-build generation with the durable revision, so a generation change
 /// surfaces as `cold` or a cache miss.
@@ -52,8 +51,7 @@ pub(crate) enum ProjectionKind {
 pub(crate) struct ProjectionVerdict {
     pub kind: ProjectionKind,
     pub reason: Option<&'static str>,
-    /// Bytes of journal entries read for a splice, or the journal byte bound
-    /// when the delta was dropped as oversize.
+    /// Bytes of inline or spill-backed journal entries read for a splice.
     pub journal_bytes: u64,
     /// Files re-projected from the delta (splice) or 0 for a full projection.
     pub changed_files: usize,
@@ -184,7 +182,6 @@ pub(crate) fn project_dead_code_snapshot_incremental(
                 let (reason, journal_bytes) = match delta {
                     DeltaRead::Cold => ("cold", 0),
                     DeltaRead::Gap => ("journal_gap", 0),
-                    DeltaRead::Oversize => ("journal_oversize", MAX_DELTA_BYTES as u64),
                     DeltaRead::Spliced { .. } => {
                         unreachable!("spliced delta handled in the arm above")
                     }
@@ -241,9 +238,29 @@ fn splice_files<T: Clone>(
 // A bounded durable journal lets a reader bridge multiple watcher transactions.
 // Missing entries (including writes by older binaries) always force a cold read.
 const DELTA_HISTORY: u64 = 64;
-/// Journal byte bound per revision; a delta batch larger than this is dropped
-/// and the reader reports `journal_oversize` with this bound in the reason.
-pub(crate) const MAX_DELTA_BYTES: usize = 256 * 1024;
+const MIN_INLINE_DELTA_BYTES: usize = 256 * 1024;
+const PROJECTION_DELTA_SPILL_TABLE: &str = "projection_delta_spill";
+
+/// Keep ordinary deltas in `meta`, but scale that inline allowance with the
+/// corpus so a large repository's normal watcher batches do not become
+/// exceptional. Two percent of the projected strings is enough for roughly one
+/// changed caller in fifty; larger batches spill rather than forcing a full
+/// projection, so this is an inline-storage choice rather than a correctness cap.
+fn inline_delta_bytes(conn: &Connection) -> Result<usize> {
+    let projected_bytes: i64 = conn.query_row(
+        "SELECT
+             COALESCE((SELECT SUM(length(path)) FROM files), 0) +
+             COALESCE((SELECT SUM(length(file_path) + length(name)) FROM nodes), 0) +
+             COALESCE((SELECT SUM(length(caller_file) + length(callee)) FROM refs), 0)",
+        [],
+        |row| row.get(0),
+    )?;
+    let proportional = usize::try_from(projected_bytes.max(0))
+        .unwrap_or(usize::MAX)
+        .saturating_mul(2)
+        / 100;
+    Ok(MIN_INLINE_DELTA_BYTES.max(proportional))
+}
 
 /// The outcome of reading the caller-delta journal between two revisions.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,8 +269,6 @@ enum DeltaRead {
     Cold,
     /// A journal entry was missing or unparseable: full projection.
     Gap,
-    /// A delta batch exceeded the journal byte bound: full projection.
-    Oversize,
     /// Every entry bridged cleanly: splice the previous snapshot.
     Spliced {
         callers: BTreeSet<String>,
@@ -286,19 +301,36 @@ pub(super) fn record_projection_delta(
     let key = format!("projection_delta_{}", revision % DELTA_HISTORY);
     let value = serde_json::to_string(&(revision, callers))
         .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
-    if value.len() <= MAX_DELTA_BYTES {
+    if value.len() <= inline_delta_bytes(tx)? {
         tx.execute(
             "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
             params![key, value],
         )?;
     } else {
-        // Oversized batches need no retained history: a cold projection is safer
-        // than allowing per-root journal storage to grow with the corpus. Record
-        // an explicit marker so a later reader can distinguish an oversize drop
-        // from a genuine journal gap (e.g. a write by an older binary).
+        tx.execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS {PROJECTION_DELTA_SPILL_TABLE} (
+                 revision INTEGER PRIMARY KEY,
+                 payload TEXT NOT NULL
+             )"
+        ))?;
+        tx.execute(
+            &format!(
+                "INSERT OR REPLACE INTO {PROJECTION_DELTA_SPILL_TABLE}(revision, payload)
+                 VALUES(?1, ?2)"
+            ),
+            params![revision, value],
+        )?;
         tx.execute(
             "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
-            params![key, format!("oversize:{revision}")],
+            params![key, format!("spill:{revision}")],
+        )?;
+    }
+    // Ring entries older than the bridgeable revision range cannot be read.
+    // Prune their side payloads in the same transaction as the new marker.
+    if table_exists(tx, PROJECTION_DELTA_SPILL_TABLE)? {
+        tx.execute(
+            &format!("DELETE FROM {PROJECTION_DELTA_SPILL_TABLE} WHERE revision <= ?1"),
+            [revision.saturating_sub(DELTA_HISTORY)],
         )?;
     }
     Ok(())
@@ -321,12 +353,30 @@ fn projection_delta_since(conn: &Connection, previous: u64, current: u64) -> Res
         let Some(value) = value else {
             return Ok(DeltaRead::Gap);
         };
-        if let Some(stored) = value.strip_prefix("oversize:") {
-            if stored == revision.to_string() {
-                return Ok(DeltaRead::Oversize);
+        let value = if let Some(stored) = value.strip_prefix("spill:") {
+            if stored != revision.to_string() || !table_exists(conn, PROJECTION_DELTA_SPILL_TABLE)?
+            {
+                return Ok(DeltaRead::Gap);
             }
+            let spilled: Option<String> = conn
+                .query_row(
+                    &format!(
+                        "SELECT payload FROM {PROJECTION_DELTA_SPILL_TABLE} WHERE revision = ?1"
+                    ),
+                    [revision],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(spilled) = spilled else {
+                return Ok(DeltaRead::Gap);
+            };
+            spilled
+        } else if value.starts_with("oversize:") {
+            // Older writers dropped these bytes, so this is now an honest gap.
             return Ok(DeltaRead::Gap);
-        }
+        } else {
+            value
+        };
         let Ok((stored, files)) = serde_json::from_str::<(u64, BTreeSet<String>)>(&value) else {
             return Ok(DeltaRead::Gap);
         };
@@ -340,6 +390,17 @@ fn projection_delta_since(conn: &Connection, previous: u64, current: u64) -> Res
         callers,
         journal_bytes,
     })
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 #[cfg(test)]

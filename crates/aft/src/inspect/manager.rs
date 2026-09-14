@@ -27,7 +27,7 @@ use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph_store::project_dead_code_snapshot;
 use crate::callgraph_store::{
     project_dead_code_snapshot_with_revision, CallGraphStore, CallGraphStoreError, ProjectionKind,
-    ProjectionVerdict, ReadonlyCallGraphStore, MAX_DELTA_BYTES,
+    ProjectionVerdict, ReadonlyCallGraphStore,
 };
 use crate::cold_build_limiter;
 
@@ -2758,20 +2758,17 @@ impl Tier2PhaseTimings {
 
 /// Render the `projection=...` suffix of the `perf tier2 phases` line for one
 /// dead-code snapshot verdict. `reason` is omitted for spliced and reused
-/// projections;
-/// the `journal_oversize` reason carries the journal byte bound so the operator
-/// sees the cap that forced the full projection.
+/// projections.
 fn render_projection_suffix(verdict: ProjectionVerdict) -> String {
     let kind = match verdict.kind {
         ProjectionKind::Spliced => "spliced",
         ProjectionKind::Full => "full",
         ProjectionKind::Reused => "reused",
     };
-    let reason = match verdict.reason {
-        Some("journal_oversize") => format!(" reason=journal_oversize:{}", MAX_DELTA_BYTES),
-        Some(reason) => format!(" reason={reason}"),
-        None => String::new(),
-    };
+    let reason = verdict
+        .reason
+        .map(|reason| format!(" reason={reason}"))
+        .unwrap_or_default();
     format!(
         " projection={kind}{reason} journal_bytes={} changed_files={}",
         verdict.journal_bytes, verdict.changed_files
@@ -7891,18 +7888,6 @@ export function main() { foo(); }
             " projection=full reason=journal_gap journal_bytes=0 changed_files=0"
         );
 
-        let oversize = render_projection_suffix(ProjectionVerdict {
-            kind: ProjectionKind::Full,
-            reason: Some("journal_oversize"),
-            journal_bytes: 262144,
-            changed_files: 0,
-        });
-        assert_eq!(
-            oversize,
-            " projection=full reason=journal_oversize:262144 journal_bytes=262144 changed_files=0",
-            "the journal byte bound must be visible on the oversize line"
-        );
-
         let reused = render_projection_suffix(ProjectionVerdict {
             kind: ProjectionKind::Reused,
             reason: None,
@@ -7916,21 +7901,28 @@ export function main() { foo(); }
     }
 
     #[test]
-    fn journal_oversize_delta_reports_full_oversize_verdict() {
+    fn spill_backed_171_file_delta_splices_where_old_bound_was_full() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_projection_fixture(dir.path());
         let root = canonical_root(dir.path());
         let store =
-            CallGraphStore::open(root.join(".store-oversize"), root.clone()).expect("open store");
+            CallGraphStore::open(root.join(".store-spill"), root.clone()).expect("open store");
         store
             .cold_build(&project_files(&root))
             .expect("cold build fixture");
         let (revision, previous) = project_dead_code_snapshot_with_revision(store.sqlite_path())
             .expect("initial projection");
         let revision = revision.expect("new stores write a projection revision");
+        let next = revision + 1;
+        let callers = (0..171)
+            .map(|index| format!("src/{index:03}-{}.ts", "x".repeat(1_600)))
+            .collect::<BTreeSet<_>>();
+        let payload = serde_json::to_string(&(next, &callers)).expect("serialize caller batch");
+        assert!(
+            payload.len() > 256 * 1024,
+            "fixture must exceed the former absolute journal bound"
+        );
 
-        // Simulate an oversized delta batch by advancing the write revision and
-        // planting the oversize marker the writer leaves behind.
         let conn = rusqlite::Connection::open(store.sqlite_path()).expect("open write conn");
         conn.execute(
             "INSERT INTO meta(k, v) VALUES('projection_write_revision', '1')
@@ -7938,27 +7930,59 @@ export function main() { foo(); }
             [],
         )
         .expect("advance write revision");
-        let next = revision + 1;
+        let journal_key = format!("projection_delta_{}", next % 64);
         conn.execute(
             "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
-            rusqlite::params![
-                format!("projection_delta_{}", next % 64),
-                format!("oversize:{next}")
-            ],
+            rusqlite::params![journal_key, format!("oversize:{next}")],
         )
-        .expect("plant oversize marker");
+        .expect("plant legacy oversize marker");
+
+        let (_, _, old_verdict) = crate::callgraph_store::project_dead_code_snapshot_incremental(
+            store.sqlite_path(),
+            Some((revision, &previous)),
+        )
+        .expect("project legacy oversize marker");
+        assert_eq!(old_verdict.kind, ProjectionKind::Full);
+        assert_eq!(old_verdict.reason, Some("journal_gap"));
+        assert_eq!(
+            render_projection_suffix(old_verdict),
+            " projection=full reason=journal_gap journal_bytes=0 changed_files=0"
+        );
+
+        conn.execute_batch(
+            "CREATE TABLE projection_delta_spill (
+                 revision INTEGER PRIMARY KEY,
+                 payload TEXT NOT NULL
+             )",
+        )
+        .expect("create spill table");
+        conn.execute(
+            "INSERT INTO projection_delta_spill(revision, payload) VALUES(?1, ?2)",
+            rusqlite::params![next, payload],
+        )
+        .expect("store spill payload");
+        conn.execute(
+            "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
+            rusqlite::params![journal_key, format!("spill:{next}")],
+        )
+        .expect("replace legacy marker with spill marker");
         drop(conn);
 
         let (_, _, verdict) = crate::callgraph_store::project_dead_code_snapshot_incremental(
             store.sqlite_path(),
             Some((revision, &previous)),
         )
-        .expect("project with oversize marker");
-        assert_eq!(verdict.kind, ProjectionKind::Full);
-        assert_eq!(verdict.reason, Some("journal_oversize"));
+        .expect("project spill-backed delta");
+        assert_eq!(verdict.kind, ProjectionKind::Spliced);
+        assert_eq!(verdict.reason, None);
+        assert_eq!(verdict.changed_files, 171);
+        assert_eq!(verdict.journal_bytes, payload.len() as u64);
         assert_eq!(
-            verdict.journal_bytes, 262144,
-            "the oversize verdict must report the journal byte bound"
+            render_projection_suffix(verdict),
+            format!(
+                " projection=spliced journal_bytes={} changed_files=171",
+                payload.len()
+            )
         );
     }
 }
