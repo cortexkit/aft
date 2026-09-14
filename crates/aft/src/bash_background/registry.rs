@@ -4453,9 +4453,29 @@ impl BgTaskRegistry {
                         state.detached = true;
 
                         if let Some(handles) = state.io_handles.as_mut() {
-                            handles.write(TaskArtifact::Exit, b"killed").map_err(|e| {
-                                format!("failed to write retained kill marker: {e}")
-                            })?;
+                            match handles.write(TaskArtifact::Exit, b"killed") {
+                                Ok(()) => {}
+                                Err(error)
+                                    if error.kind() == std::io::ErrorKind::Interrupted
+                                        && error.to_string().contains(
+                                            super::persistence::ARTIFACT_CONCURRENTLY_REPLACED,
+                                        ) =>
+                                {
+                                    // The child's own temp+rename exit write landed
+                                    // between wait() and this write, leaving the
+                                    // retained handle at zero links (Windows). The
+                                    // replacement is the child's real exit marker;
+                                    // re-open by path and keep whichever is there.
+                                    write_kill_marker_if_absent(&task.paths).map_err(|e| {
+                                        format!("failed to write kill marker after replace: {e}")
+                                    })?;
+                                }
+                                Err(error) => {
+                                    return Err(format!(
+                                        "failed to write retained kill marker: {error}"
+                                    ));
+                                }
+                            }
                         } else {
                             write_kill_marker_if_absent(&task.paths)
                                 .map_err(|e| format!("failed to write kill marker: {e}"))?;
