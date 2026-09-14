@@ -879,3 +879,41 @@ caveats, not hidden by a successful shell exit or by the graph-only parity above
 | A → HEAD | 15,389 | 36,634 | 39.53 | 70.43 | met; manifest caveat |
 | HEAD → B | 27,201 | 29,146 | 69.23 | 38.36 | **not met: CPU** |
 | B → HEAD | 15,429 | 27,027 | 28.35 | 30.99 | met; manifest caveat |
+
+### After drill — pending at owner handoff
+
+**drill: not run - box shared (load 3.98, two foreign containers) at delivery**.
+This refers to the optimized after-drill; the unmodified reconstruction/before
+run above did complete. The final idle gate waited a full hour without passing.
+Containers `8265fb983c3c` (`mc-investigate-890`) and `8ae3f6f2657e` belonged to
+another seat and were left untouched. The owner explicitly directed delivery of
+the verified offline changes rather than further waiting, and will run/append
+the both-arm drill at the next idle window.
+
+Consequently **the owner's shipping rule is not established for this change**:
+"views beats legacy to correctness on every row with CPU not above legacy".
+Offline views is strictly cheaper on this retained transition, but that does
+not establish four-row end-to-end correctness latency or CPU. No optimized
+drill table is fabricated or inferred from the offline timings.
+
+From a clean checkout containing the optimizer, with no competing drill,
+load < 3 and empty `docker ps`, use fresh storage (do not reuse either baseline
+arm):
+
+```sh
+cargo build --release -p agent-file-tools --bin aft
+git -C ~/Work/OSS/opencode rev-parse HEAD
+nohup scripts/views-branch-drill.sh --mode both \
+  --binary "$PWD/target/release/aft" \
+  --storage "$PWD/target/branch-drill-per-binding/on" \
+  --baseline-storage "$PWD/target/branch-drill-per-binding/off" \
+  --output-dir "$PWD/target/branch-drill-per-binding/out" \
+  > target/branch-drill-per-binding.log 2>&1 &
+# Wait for completion, then verify the original HEAD is restored.
+git -C ~/Work/OSS/opencode rev-parse HEAD
+```
+
+Append the four-row latency/CPU table and evaluate the rule separately for each
+row, retaining host-load/phase contention and any publication defects. The
+before report to compare is `target/branch-drill-baseline/out/branch-drill.md`;
+its data table and caveats are also preserved above if target artifacts are swept.
