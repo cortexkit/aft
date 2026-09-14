@@ -19,7 +19,7 @@ use std::env;
 use std::error::Error;
 use std::fmt::Display;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
+use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -134,6 +134,8 @@ const SEMANTIC_SEGMENT_VERSION: u8 = 1;
 const SEMANTIC_SEGMENT_FRAME_HEADER_BYTES: usize = 8 + 8 + 32;
 const SEMANTIC_COMPACT_SEGMENT_LIMIT: usize = 64;
 const SEMANTIC_COMPACT_BYTE_RATIO_DENOMINATOR: u64 = 4;
+const SEMANTIC_PERSIST_LOCK_MIN_WAIT: Duration = Duration::from_secs(5);
+const SEMANTIC_PERSIST_LOCK_BYTES_PER_SECOND: u64 = 32 * 1024 * 1024;
 const DEFAULT_OPENAI_EMBEDDING_PATH: &str = "/embeddings";
 const DEFAULT_OLLAMA_EMBEDDING_PATH: &str = "/api/embed";
 // Build/refresh embedding requests keep a larger budget because they run on
@@ -2232,6 +2234,8 @@ struct SharedSemanticBase {
     dimension: usize,
     fingerprint: Option<SemanticIndexFingerprint>,
     deferred_files: HashSet<PathBuf>,
+    dirty_paths: Arc<Mutex<Option<BTreeSet<PathBuf>>>>,
+    persistence: Arc<Mutex<Option<SemanticPersistenceState>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -2396,6 +2400,11 @@ pub struct SemanticIndex {
     project_root: PathBuf,
     deferred_files: HashSet<PathBuf>,
     shared_base: Option<Arc<SharedSemanticBase>>,
+    /// Paths whose complete persisted rows must replace prior rows. `None` is
+    /// reserved for indexes created by callers that cannot report mutations.
+    dirty_paths: Arc<Mutex<Option<BTreeSet<PathBuf>>>>,
+    persistence: Arc<Mutex<Option<SemanticPersistenceState>>>,
+    last_append_read_bytes: Arc<AtomicUsize>,
     #[cfg(test)]
     removal_retain_passes: usize,
 }
@@ -2577,6 +2586,26 @@ struct SemanticArtifactIdentity {
     modified_nanos: Option<u128>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SemanticPersistenceState {
+    identity: SemanticArtifactIdentity,
+    base_bytes: usize,
+    segment_count: usize,
+    segment_bytes: usize,
+    valid_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SemanticArtifactLayout {
+    identity: SemanticArtifactIdentity,
+    base_bytes: usize,
+    valid_bytes: usize,
+    segment_count: usize,
+    segment_bytes: usize,
+    torn_tail: bool,
+    bytes_read: usize,
+}
+
 #[derive(Debug)]
 struct LoadedSemanticArtifact {
     index: SemanticIndex,
@@ -2600,15 +2629,27 @@ fn semantic_artifact_identity(path: &Path) -> Option<SemanticArtifactIdentity> {
     })
 }
 
-fn acquire_semantic_persistence_lock(dir: &Path) -> io::Result<fs_lock::LockGuard> {
-    fs_lock::try_acquire(&dir.join("semantic.persist.lock"), Duration::from_secs(2)).map_err(
-        |error| match error {
-            fs_lock::AcquireError::Timeout => {
-                io::Error::other("timed out acquiring semantic persistence lock")
-            }
-            fs_lock::AcquireError::Io(error) => error,
-        },
+fn semantic_persistence_lock_wait(artifact_bytes: u64) -> Duration {
+    let proportional_seconds = artifact_bytes
+        .div_ceil(SEMANTIC_PERSIST_LOCK_BYTES_PER_SECOND)
+        .saturating_add(2);
+    SEMANTIC_PERSIST_LOCK_MIN_WAIT.max(Duration::from_secs(proportional_seconds))
+}
+
+fn acquire_semantic_persistence_lock(
+    dir: &Path,
+    artifact_bytes: u64,
+) -> io::Result<fs_lock::LockGuard> {
+    fs_lock::try_acquire(
+        &dir.join("semantic.persist.lock"),
+        semantic_persistence_lock_wait(artifact_bytes),
     )
+    .map_err(|error| match error {
+        fs_lock::AcquireError::Timeout => {
+            io::Error::other("timed out acquiring semantic persistence lock")
+        }
+        fs_lock::AcquireError::Io(error) => error,
+    })
 }
 
 fn semantic_entry_cmp(left: &&EmbeddingEntry, right: &&EmbeddingEntry) -> std::cmp::Ordering {
@@ -2714,6 +2755,9 @@ impl SemanticIndex {
             fingerprint: shared_base.fingerprint.clone(),
             project_root,
             deferred_files: HashSet::new(),
+            dirty_paths: Arc::clone(&shared_base.dirty_paths),
+            persistence: Arc::clone(&shared_base.persistence),
+            last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
             shared_base: Some(shared_base),
             #[cfg(test)]
             removal_retain_passes: 0,
@@ -2779,6 +2823,24 @@ impl SemanticIndex {
             .into_iter()
             .map(|path| cache_relative_path(&self.project_root, &path))
             .collect::<Option<HashSet<_>>>()?;
+        let dirty_paths = match self
+            .dirty_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            Some(paths) => Some(
+                paths
+                    .iter()
+                    .map(|path| cache_relative_path(&self.project_root, path))
+                    .collect::<Option<BTreeSet<_>>>()?,
+            ),
+            None => None,
+        };
+        let persistence = *self
+            .persistence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Some(SharedSemanticBase {
             entries: self.entries,
             file_mtimes: relativize_semantic_map(&self.project_root, self.file_mtimes)?,
@@ -2788,6 +2850,8 @@ impl SemanticIndex {
             dimension: self.dimension,
             fingerprint: self.fingerprint,
             deferred_files,
+            dirty_paths: Arc::new(Mutex::new(dirty_paths)),
+            persistence: Arc::new(Mutex::new(persistence)),
         })
     }
 
@@ -2827,6 +2891,27 @@ impl SemanticIndex {
             .iter()
             .map(|path| self.project_root.join(path))
             .collect();
+        *self
+            .dirty_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = base
+            .dirty_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|paths| {
+                paths
+                    .iter()
+                    .map(|path| self.project_root.join(path))
+                    .collect()
+            });
+        *self
+            .persistence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = *base
+            .persistence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
 
     pub fn new(project_root: PathBuf, dimension: usize) -> Self {
@@ -2842,6 +2927,9 @@ impl SemanticIndex {
             project_root,
             deferred_files: HashSet::new(),
             shared_base: None,
+            dirty_paths: Arc::new(Mutex::new(None)),
+            persistence: Arc::new(Mutex::new(None)),
+            last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             removal_retain_passes: 0,
         }
@@ -3271,6 +3359,9 @@ impl SemanticIndex {
                 fingerprint: None,
                 project_root: project_root.to_path_buf(),
                 deferred_files: HashSet::new(),
+                dirty_paths: Arc::new(Mutex::new(None)),
+                persistence: Arc::new(Mutex::new(None)),
+                last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
                 shared_base: None,
                 #[cfg(test)]
                 removal_retain_passes: 0,
@@ -3389,6 +3480,9 @@ impl SemanticIndex {
             project_root: project_root.to_path_buf(),
             deferred_files: HashSet::new(),
             shared_base: None,
+            dirty_paths: Arc::new(Mutex::new(None)),
+            persistence: Arc::new(Mutex::new(None)),
+            last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             removal_retain_passes: 0,
         })
@@ -3793,6 +3887,7 @@ impl SemanticIndex {
                 self.file_sizes.insert(file.clone(), metadata.size);
                 self.file_hashes.insert(file.clone(), metadata.content_hash);
             }
+            self.extend_dirty_paths(successful_files.iter().cloned());
             return Ok(RefreshSummary {
                 changed: changed_count,
                 added: added_count,
@@ -3836,6 +3931,7 @@ impl SemanticIndex {
         if let Some(dim) = observed_dimension {
             self.dimension = dim;
         }
+        self.extend_dirty_paths(successful_files.iter().cloned());
 
         Ok(RefreshSummary {
             changed: changed
@@ -4125,6 +4221,52 @@ impl SemanticIndex {
         }
     }
 
+    fn dirty_paths_snapshot(&self) -> Option<BTreeSet<PathBuf>> {
+        self.dirty_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn set_dirty_paths(&self, paths: Option<BTreeSet<PathBuf>>) {
+        *self
+            .dirty_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = paths;
+    }
+
+    fn persistence_snapshot(&self) -> Option<SemanticPersistenceState> {
+        *self
+            .persistence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_persistence(&self, state: Option<SemanticPersistenceState>) {
+        *self
+            .persistence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = state;
+    }
+
+    fn extend_dirty_paths(&self, paths: impl IntoIterator<Item = PathBuf>) {
+        if let Some(dirty_paths) = self
+            .dirty_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            dirty_paths.extend(paths);
+        }
+    }
+
+    fn mark_all_dirty(&self) {
+        let mut paths = BTreeSet::new();
+        paths.extend(self.file_mtimes.keys().cloned());
+        paths.extend(self.entries.iter().map(|entry| entry.chunk.file.clone()));
+        self.set_dirty_paths(Some(paths));
+    }
+
     fn remove_indexed_file_keys(
         &mut self,
         entry_files: &HashSet<PathBuf>,
@@ -4141,6 +4283,7 @@ impl SemanticIndex {
             self.file_sizes.remove(path);
             self.file_hashes.remove(path);
         }
+        self.extend_dirty_paths(metadata_files.iter().cloned());
     }
 
     fn remove_indexed_files(&mut self, files: &[PathBuf]) {
@@ -4385,6 +4528,122 @@ impl SemanticIndex {
         self.fingerprint = Some(fingerprint);
     }
 
+    fn scan_artifact_for_append(
+        data_path: &Path,
+        expected: SemanticPersistenceState,
+        expected_fingerprint: &str,
+        expected_dimension: usize,
+    ) -> Result<SemanticArtifactLayout, String> {
+        let mut file = fs::File::open(data_path).map_err(|error| error.to_string())?;
+        let identity = semantic_artifact_identity(data_path)
+            .ok_or_else(|| "semantic artifact identity unavailable".to_string())?;
+        if identity != expected.identity {
+            return Err("semantic artifact changed since it was loaded".to_string());
+        }
+        let file_len = usize::try_from(identity.bytes)
+            .map_err(|_| "semantic artifact is too large for this platform".to_string())?;
+        if expected.base_bytes < HEADER_BYTES_V2 || expected.base_bytes > file_len {
+            return Err("persisted semantic base boundary is invalid".to_string());
+        }
+
+        let mut fixed = [0_u8; HEADER_BYTES_V2];
+        file.read_exact(&mut fixed)
+            .map_err(|error| error.to_string())?;
+        if fixed[0] != SEMANTIC_INDEX_VERSION_V6 && fixed[0] != SEMANTIC_INDEX_VERSION_V7 {
+            return Err(format!(
+                "unsupported on-disk semantic version: {}",
+                fixed[0]
+            ));
+        }
+        let dimension = u32::from_le_bytes(fixed[1..5].try_into().unwrap()) as usize;
+        if dimension != expected_dimension {
+            return Err("semantic artifact dimension changed".to_string());
+        }
+        let fingerprint_len = u32::from_le_bytes(fixed[9..13].try_into().unwrap()) as usize;
+        if fingerprint_len > 64 * 1024 {
+            return Err("semantic artifact fingerprint is oversized".to_string());
+        }
+        let mut fingerprint = vec![0_u8; fingerprint_len];
+        file.read_exact(&mut fingerprint)
+            .map_err(|error| error.to_string())?;
+        if fingerprint != expected_fingerprint.as_bytes() {
+            return Err("semantic artifact fingerprint changed".to_string());
+        }
+
+        file.seek(SeekFrom::Start(expected.base_bytes as u64))
+            .map_err(|error| error.to_string())?;
+        let mut valid_bytes = expected.base_bytes;
+        let mut segment_count = 0usize;
+        let mut torn_tail = false;
+        let mut bytes_read = HEADER_BYTES_V2.saturating_add(fingerprint_len);
+        while valid_bytes < file_len {
+            let remaining = file_len.saturating_sub(valid_bytes);
+            if remaining < SEMANTIC_SEGMENT_FRAME_HEADER_BYTES {
+                torn_tail = true;
+                break;
+            }
+            let mut header = [0_u8; SEMANTIC_SEGMENT_FRAME_HEADER_BYTES];
+            file.read_exact(&mut header)
+                .map_err(|error| error.to_string())?;
+            bytes_read = bytes_read.saturating_add(header.len());
+            if &header[..8] != SEMANTIC_SEGMENT_MAGIC {
+                torn_tail = true;
+                break;
+            }
+            let payload_len =
+                usize::try_from(u64::from_le_bytes(header[8..16].try_into().unwrap()))
+                    .map_err(|_| "semantic segment length exceeds this platform".to_string())?;
+            let frame_len = SEMANTIC_SEGMENT_FRAME_HEADER_BYTES
+                .checked_add(payload_len)
+                .ok_or_else(|| "semantic segment frame length overflow".to_string())?;
+            if frame_len > remaining {
+                torn_tail = true;
+                break;
+            }
+            let frame_end = valid_bytes.saturating_add(frame_len);
+            if frame_end == file_len {
+                let mut payload = vec![0_u8; payload_len];
+                file.read_exact(&mut payload)
+                    .map_err(|error| error.to_string())?;
+                bytes_read = bytes_read.saturating_add(payload_len);
+                if blake3::hash(&payload).as_bytes()
+                    != &header[16..SEMANTIC_SEGMENT_FRAME_HEADER_BYTES]
+                {
+                    torn_tail = true;
+                    break;
+                }
+            } else {
+                file.seek(SeekFrom::Current(payload_len as i64))
+                    .map_err(|error| error.to_string())?;
+            }
+            valid_bytes = frame_end;
+            segment_count = segment_count.saturating_add(1);
+        }
+
+        Ok(SemanticArtifactLayout {
+            identity,
+            base_bytes: expected.base_bytes,
+            valid_bytes,
+            segment_count,
+            segment_bytes: valid_bytes.saturating_sub(expected.base_bytes),
+            torn_tail,
+            bytes_read,
+        })
+    }
+
+    fn persistence_state_from_loaded(
+        data_path: &Path,
+        loaded: &LoadedSemanticArtifact,
+    ) -> Option<SemanticPersistenceState> {
+        Some(SemanticPersistenceState {
+            identity: semantic_artifact_identity(data_path)?,
+            base_bytes: loaded.base_bytes,
+            segment_count: loaded.segment_count,
+            segment_bytes: loaded.segment_bytes,
+            valid_bytes: loaded.valid_bytes,
+        })
+    }
+
     fn write_full_snapshot_at(
         &self,
         dir: &Path,
@@ -4489,6 +4748,9 @@ impl SemanticIndex {
             project_root: self.project_root.clone(),
             deferred_files: HashSet::new(),
             shared_base: None,
+            dirty_paths: Arc::new(Mutex::new(None)),
+            persistence: Arc::new(Mutex::new(None)),
+            last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             removal_retain_passes: 0,
         }
@@ -4560,7 +4822,7 @@ impl SemanticIndex {
         project_root: &Path,
         expected: SemanticArtifactIdentity,
     ) -> bool {
-        let Ok(_lock) = acquire_semantic_persistence_lock(dir) else {
+        let Ok(_lock) = acquire_semantic_persistence_lock(dir, expected.bytes) else {
             return false;
         };
         if semantic_artifact_identity(data_path) != Some(expected) {
@@ -4576,12 +4838,23 @@ impl SemanticIndex {
                 return false;
             }
         };
+        slog_info!(
+            "semantic index compaction started: root=\"{}\" segments={} segment_bytes={}",
+            project_root.display(),
+            loaded.segment_count,
+            loaded.segment_bytes
+        );
+        let started = Instant::now();
         match loaded.index.write_full_snapshot_at(dir, data_path, true) {
             Ok(bytes_written) => {
                 slog_info!(
-                    "semantic index compacted: {} entries, {:.1} KB",
+                    "semantic index compaction finished: root=\"{}\" segments={} segment_bytes={} entries={} bytes={} elapsed_ms={}",
+                    project_root.display(),
+                    loaded.segment_count,
+                    loaded.segment_bytes,
                     loaded.index.entries.len(),
-                    bytes_written as f64 / 1024.0
+                    bytes_written,
+                    started.elapsed().as_millis()
                 );
                 true
             }
@@ -4596,19 +4869,25 @@ impl SemanticIndex {
         &self,
         dir: &Path,
         data_path: &Path,
-        loaded: &LoadedSemanticArtifact,
+        layout: &SemanticArtifactLayout,
         appended_bytes: usize,
     ) {
-        let segment_count = loaded.segment_count.saturating_add(1);
-        let segment_bytes = loaded.segment_bytes.saturating_add(appended_bytes);
+        let segment_count = layout.segment_count.saturating_add(1);
+        let segment_bytes = layout.segment_bytes.saturating_add(appended_bytes);
         let byte_bound_crossed = (segment_bytes as u64)
-            > (loaded.base_bytes as u64 / SEMANTIC_COMPACT_BYTE_RATIO_DENOMINATOR);
+            > (layout.base_bytes as u64 / SEMANTIC_COMPACT_BYTE_RATIO_DENOMINATOR);
         if segment_count <= SEMANTIC_COMPACT_SEGMENT_LIMIT && !byte_bound_crossed {
             return;
         }
         let Some(expected) = semantic_artifact_identity(data_path) else {
             return;
         };
+        slog_info!(
+            "semantic index compaction scheduled: root=\"{}\" segments={} segment_bytes={}",
+            self.project_root.display(),
+            segment_count,
+            segment_bytes
+        );
         let project_root = self.project_root.clone();
         let dir = dir.to_path_buf();
         let data_path = data_path.to_path_buf();
@@ -4638,7 +4917,10 @@ impl SemanticIndex {
             slog_warn!("failed to create semantic cache dir: {}", error);
             return false;
         }
-        let _persistence_lock = match acquire_semantic_persistence_lock(&dir) {
+        let artifact_bytes = semantic_artifact_identity(&data_path)
+            .map(|identity| identity.bytes)
+            .unwrap_or_default();
+        let _persistence_lock = match acquire_semantic_persistence_lock(&dir, artifact_bytes) {
             Ok(lock) => lock,
             Err(error) => {
                 slog_warn!("failed to acquire semantic persistence lock: {}", error);
@@ -4647,64 +4929,193 @@ impl SemanticIndex {
         };
 
         if data_path.is_file() {
-            match Self::load_artifact_path(&data_path, &self.project_root) {
-                Ok(loaded) if self.persistence_identity_matches(&loaded.index) => {
-                    if loaded.torn_tail {
-                        match OpenOptions::new()
-                            .write(true)
-                            .open(&data_path)
-                            .and_then(|file| {
-                                file.set_len(loaded.valid_bytes as u64)?;
-                                file.sync_all()
-                            }) {
-                            Ok(()) => {}
-                            Err(error) => {
-                                slog_warn!("failed to truncate torn semantic segment: {}", error);
-                                return false;
-                            }
-                        }
+            let fingerprint = self
+                .fingerprint
+                .as_ref()
+                .map(SemanticIndexFingerprint::as_string)
+                .unwrap_or_default();
+            let mut structural_baseline = None;
+            let layout = self.persistence_snapshot().and_then(|persistence| {
+                match Self::scan_artifact_for_append(
+                    &data_path,
+                    persistence,
+                    &fingerprint,
+                    self.dimension,
+                ) {
+                    Ok(layout) => Some(layout),
+                    Err(error) => {
+                        slog_info!(
+                            "semantic delta metadata unavailable ({}); using structural fallback",
+                            error
+                        );
+                        None
                     }
-                    let changed_paths = semantic_changed_paths(&loaded.index, self);
-                    if changed_paths.is_empty() {
-                        return true;
+                }
+            });
+            let (layout, changed_paths) = if let (Some(layout), Some(dirty_paths)) =
+                (layout, self.dirty_paths_snapshot())
+            {
+                (layout, dirty_paths.clone())
+            } else {
+                match Self::load_artifact_path(&data_path, &self.project_root) {
+                    Ok(loaded) if self.persistence_identity_matches(&loaded.index) => {
+                        let changed_paths = semantic_changed_paths(&loaded.index, self);
+                        let identity = match semantic_artifact_identity(&data_path) {
+                            Some(identity) => identity,
+                            None => return false,
+                        };
+                        let layout = SemanticArtifactLayout {
+                            identity,
+                            base_bytes: loaded.base_bytes,
+                            valid_bytes: loaded.valid_bytes,
+                            segment_count: loaded.segment_count,
+                            segment_bytes: loaded.segment_bytes,
+                            torn_tail: loaded.torn_tail,
+                            bytes_read: identity.bytes as usize,
+                        };
+                        structural_baseline = Some(loaded.index);
+                        (layout, changed_paths)
                     }
-                    let frame = match self.build_segment_frame(
-                        loaded.segment_count.saturating_add(1) as u64,
-                        &changed_paths,
-                    ) {
-                        Ok(frame) => frame,
-                        Err(error) => {
-                            slog_warn!("failed to encode semantic delta: {}", error);
-                            return false;
-                        }
-                    };
-                    if let Err(error) = Self::append_segment_frame(&data_path, &frame) {
-                        slog_warn!("failed to append semantic delta: {}", error);
+                    Ok(_) => {
+                        self.set_persistence(None);
+                        self.mark_all_dirty();
+                        return self
+                            .write_full_snapshot_at(&dir, &data_path, false)
+                            .is_ok_and(|bytes_written| {
+                                let Some(identity) = semantic_artifact_identity(&data_path) else {
+                                    return false;
+                                };
+                                self.set_persistence(Some(SemanticPersistenceState {
+                                    identity,
+                                    base_bytes: bytes_written,
+                                    segment_count: 0,
+                                    segment_bytes: 0,
+                                    valid_bytes: bytes_written,
+                                }));
+                                self.set_dirty_paths(Some(BTreeSet::new()));
+                                slog_info!(
+                                    "semantic index persisted: {} entries, {:.1} KB",
+                                    self.entries.len(),
+                                    bytes_written as f64 / 1024.0
+                                );
+                                true
+                            });
+                    }
+                    Err(error) => {
+                        slog_warn!(
+                            "semantic index delta baseline unavailable ({}); replacing base snapshot",
+                            error
+                        );
+                        self.set_persistence(None);
+                        self.mark_all_dirty();
+                        return self
+                            .write_full_snapshot_at(&dir, &data_path, false)
+                            .is_ok_and(|bytes_written| {
+                                let Some(identity) = semantic_artifact_identity(&data_path) else {
+                                    return false;
+                                };
+                                self.set_persistence(Some(SemanticPersistenceState {
+                                    identity,
+                                    base_bytes: bytes_written,
+                                    segment_count: 0,
+                                    segment_bytes: 0,
+                                    valid_bytes: bytes_written,
+                                }));
+                                self.set_dirty_paths(Some(BTreeSet::new()));
+                                true
+                            });
+                    }
+                }
+            };
+
+            self.last_append_read_bytes
+                .store(layout.bytes_read, Ordering::Relaxed);
+            if layout.torn_tail {
+                match OpenOptions::new()
+                    .write(true)
+                    .open(&data_path)
+                    .and_then(|file| {
+                        file.set_len(layout.valid_bytes as u64)?;
+                        file.sync_all()
+                    }) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        slog_warn!("failed to truncate torn semantic segment: {}", error);
                         return false;
                     }
-                    slog_info!(
-                        "semantic index delta persisted: {} files, {:.1} KB",
-                        changed_paths.len(),
-                        frame.len() as f64 / 1024.0
-                    );
-                    self.schedule_compaction_if_needed(&dir, &data_path, &loaded, frame.len());
-                    return true;
-                }
-                Ok(_) => {
-                    // Backend/model/dimension/template identity changed. Replacing the
-                    // base atomically invalidates every segment from the old identity.
-                }
-                Err(error) => {
-                    slog_warn!(
-                        "semantic index delta baseline unavailable ({}); replacing base snapshot",
-                        error
-                    );
                 }
             }
+            if changed_paths.is_empty() {
+                self.set_dirty_paths(Some(BTreeSet::new()));
+                self.set_persistence(Some(SemanticPersistenceState {
+                    identity: layout.identity,
+                    base_bytes: layout.base_bytes,
+                    segment_count: layout.segment_count,
+                    segment_bytes: layout.segment_bytes,
+                    valid_bytes: layout.valid_bytes,
+                }));
+                return true;
+            }
+            let frame = match self.build_segment_frame(
+                layout.segment_count.saturating_add(1) as u64,
+                &changed_paths,
+            ) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    slog_warn!("failed to encode semantic delta: {}", error);
+                    return false;
+                }
+            };
+            #[cfg(debug_assertions)]
+            if let Some(previous) = structural_baseline.as_ref() {
+                let structural_paths = semantic_changed_paths(previous, self);
+                debug_assert_eq!(
+                    frame,
+                    self.build_segment_frame(
+                        layout.segment_count.saturating_add(1) as u64,
+                        &structural_paths
+                    )
+                    .expect("structural semantic segment")
+                );
+            }
+            if let Err(error) = Self::append_segment_frame(&data_path, &frame) {
+                slog_warn!("failed to append semantic delta: {}", error);
+                return false;
+            }
+            let Some(identity) = semantic_artifact_identity(&data_path) else {
+                return false;
+            };
+            self.set_persistence(Some(SemanticPersistenceState {
+                identity,
+                base_bytes: layout.base_bytes,
+                segment_count: layout.segment_count.saturating_add(1),
+                segment_bytes: layout.segment_bytes.saturating_add(frame.len()),
+                valid_bytes: layout.valid_bytes.saturating_add(frame.len()),
+            }));
+            self.set_dirty_paths(Some(BTreeSet::new()));
+            slog_info!(
+                "semantic index delta persisted: {} files, {:.1} KB, artifact_read_bytes={}",
+                changed_paths.len(),
+                frame.len() as f64 / 1024.0,
+                layout.bytes_read
+            );
+            self.schedule_compaction_if_needed(&dir, &data_path, &layout, frame.len());
+            return true;
         }
 
         match self.write_full_snapshot_at(&dir, &data_path, false) {
             Ok(bytes_written) => {
+                let Some(identity) = semantic_artifact_identity(&data_path) else {
+                    return false;
+                };
+                self.set_persistence(Some(SemanticPersistenceState {
+                    identity,
+                    base_bytes: bytes_written,
+                    segment_count: 0,
+                    segment_bytes: 0,
+                    valid_bytes: bytes_written,
+                }));
+                self.set_dirty_paths(Some(BTreeSet::new()));
                 slog_info!(
                     "semantic index persisted: {} entries, {:.1} KB",
                     self.entries.len(),
@@ -4719,7 +5130,51 @@ impl SemanticIndex {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn segment_frames_for_test(
+        &self,
+        previous: &Self,
+        sequence: u64,
+    ) -> Option<(Vec<u8>, Vec<u8>)> {
+        let dirty_paths = self.dirty_paths_snapshot()?;
+        let structural_paths = semantic_changed_paths(previous, self);
+        Some((
+            self.build_segment_frame(sequence, &dirty_paths).ok()?,
+            self.build_segment_frame(sequence, &structural_paths).ok()?,
+        ))
+    }
+
+    #[doc(hidden)]
+    pub fn extend_dirty_paths_for_test(&self, paths: impl IntoIterator<Item = PathBuf>) {
+        self.extend_dirty_paths(paths);
+    }
+
+    #[doc(hidden)]
+    pub fn last_append_read_bytes_for_test(&self) -> usize {
+        self.last_append_read_bytes.load(Ordering::Relaxed)
+    }
+
+    #[doc(hidden)]
+    pub fn append_scan_bytes_for_test(
+        &self,
+        storage_dir: &Path,
+        project_key: &str,
+    ) -> Option<usize> {
+        let data_path = storage_dir
+            .join("semantic")
+            .join(project_key)
+            .join("semantic.bin");
+        let persistence = self.persistence_snapshot()?;
+        let fingerprint = self
+            .fingerprint
+            .as_ref()
+            .map(SemanticIndexFingerprint::as_string)
+            .unwrap_or_default();
+        Self::scan_artifact_for_append(&data_path, persistence, &fingerprint, self.dimension)
+            .ok()
+            .map(|layout| layout.bytes_read)
+    }
+
     #[doc(hidden)]
     pub fn compact_to_disk_for_test(&self, storage_dir: &Path, project_key: &str) -> bool {
         let dir = storage_dir.join("semantic").join(project_key);
@@ -4957,7 +5412,12 @@ impl SemanticIndex {
             Some(file_len),
             1,
         )?;
-        Self::apply_segment_log(&mut reader, index, file_len, base_bytes)
+        let loaded = Self::apply_segment_log(&mut reader, index, file_len, base_bytes)?;
+        loaded.index.set_dirty_paths(Some(BTreeSet::new()));
+        loaded
+            .index
+            .set_persistence(Self::persistence_state_from_loaded(data_path, &loaded));
+        Ok(loaded)
     }
 
     /// Read the semantic base snapshot and apply every committed delta in sequence.
@@ -5674,6 +6134,9 @@ impl SemanticIndex {
                 project_root: current_canonical_root.to_path_buf(),
                 deferred_files: HashSet::new(),
                 shared_base: None,
+                dirty_paths: Arc::new(Mutex::new(None)),
+                persistence: Arc::new(Mutex::new(None)),
+                last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
                 #[cfg(test)]
                 removal_retain_passes: 0,
             },

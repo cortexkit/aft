@@ -166,11 +166,12 @@ fn bench_semantic_refresh_persistence_writes() {
         assert!(index.write_to_disk(&storage, "measured"));
         let after = darwin_write_usage();
         eprintln!(
-            "semantic-delta-measure changed_files={changed_files} elapsed_ms={} physical_bytes={} logical_bytes={} artifact_bytes={}",
+            "semantic-delta-measure changed_files={changed_files} elapsed_ms={} physical_bytes={} logical_bytes={} artifact_bytes={} artifact_read_bytes={}",
             started.elapsed().as_millis(),
             after.0.saturating_sub(before.0),
             after.1.saturating_sub(before.1),
             fs::metadata(&data_path).expect("measure artifact").len(),
+            index.last_append_read_bytes_for_test(),
         );
 
         if changed_files == 100 {
@@ -259,6 +260,20 @@ fn load_delta_index(storage: &Path, root: &Path) -> SemanticIndex {
     .expect("load semantic base plus segments")
 }
 
+fn assert_dirty_frame_matches_structural_diff(
+    previous: &SemanticIndex,
+    current: &SemanticIndex,
+    sequence: u64,
+) {
+    let (dirty, structural) = current
+        .segment_frames_for_test(previous, sequence)
+        .expect("build dirty and structural semantic frames");
+    assert_eq!(
+        dirty, structural,
+        "dirty-path segment must be byte-equal to structural-diff segment"
+    );
+}
+
 fn assert_delta_structural_parity(
     storage: &Path,
     root: &Path,
@@ -299,29 +314,37 @@ fn semantic_delta_sequence_matches_whole_rewrite_after_every_step() {
     assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
     assert_delta_structural_parity(storage.path(), project.path(), &files, &live);
 
+    let previous = load_delta_index(storage.path(), project.path());
     write_delta_fixture(&files[0], 0, 1);
     refresh_delta_paths(&mut live, project.path(), &files[..1]);
+    assert_dirty_frame_matches_structural_diff(&previous, &live, 1);
     assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
     assert_delta_structural_parity(storage.path(), project.path(), &files, &live);
 
+    let previous = load_delta_index(storage.path(), project.path());
     for (ordinal, path) in files[1..11].iter().enumerate() {
         write_delta_fixture(path, ordinal + 1, 1);
     }
     refresh_delta_paths(&mut live, project.path(), &files[1..11]);
+    assert_dirty_frame_matches_structural_diff(&previous, &live, 2);
     assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
     assert_delta_structural_parity(storage.path(), project.path(), &files, &live);
 
+    let previous = load_delta_index(storage.path(), project.path());
     for path in &files[11..14] {
         fs::remove_file(path).expect("delete indexed delta fixture");
     }
     refresh_delta_paths(&mut live, project.path(), &files[11..14]);
+    assert_dirty_frame_matches_structural_diff(&previous, &live, 3);
     assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
     assert_delta_structural_parity(storage.path(), project.path(), &files, &live);
 
+    let previous = load_delta_index(storage.path(), project.path());
     for (ordinal, path) in files[20..120].iter().enumerate() {
         write_delta_fixture(path, ordinal + 20, 2);
     }
     refresh_delta_paths(&mut live, project.path(), &files[20..120]);
+    assert_dirty_frame_matches_structural_diff(&previous, &live, 4);
     assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
     assert_delta_structural_parity(storage.path(), project.path(), &files, &live);
 
@@ -338,6 +361,29 @@ fn semantic_delta_sequence_matches_whole_rewrite_after_every_step() {
         "compaction should fold all segments into one canonical base"
     );
     assert_delta_structural_parity(storage.path(), project.path(), &files, &live);
+}
+
+#[test]
+fn semantic_dirty_frame_matches_structural_diff_exactly() {
+    let project = tempfile::tempdir().expect("create dirty parity project");
+    let storage = tempfile::tempdir().expect("create dirty parity storage");
+    let files = seed_delta_fixture(project.path(), 20);
+    let mut live = build_delta_index(project.path(), &files);
+    assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+    let previous = load_delta_index(storage.path(), project.path());
+
+    write_delta_fixture(&files[0], 0, 1);
+    refresh_delta_paths(&mut live, project.path(), &files[..1]);
+    assert_dirty_frame_matches_structural_diff(&previous, &live, 1);
+
+    live.extend_dirty_paths_for_test([files[1].clone()]);
+    let (dirty, structural) = live
+        .segment_frames_for_test(&previous, 1)
+        .expect("build frames with extra dirty path");
+    assert_ne!(
+        dirty, structural,
+        "marking an unchanged path dirty must change the encoded frame"
+    );
 }
 
 #[test]
@@ -672,6 +718,62 @@ fn semantic_reader_open_during_compaction_sees_complete_generation() {
     assert!(child.wait().expect("wait for compaction child").success());
     let after = load_delta_index(storage.path(), project.path());
     assert_eq!(after.to_bytes(), expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn semantic_append_waits_for_paused_compaction_and_lands() {
+    let project = tempfile::tempdir().expect("create contention project");
+    let storage = tempfile::tempdir().expect("create contention storage");
+    let files = seed_delta_fixture(project.path(), 20);
+    let first = files[0].clone();
+    let second = files[1].clone();
+    let mut live = build_delta_index(project.path(), &files);
+    assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+    write_delta_fixture(&first, 0, 1);
+    refresh_delta_paths(&mut live, project.path(), std::slice::from_ref(&first));
+    assert!(live.write_to_disk(storage.path(), DELTA_PROJECT_KEY));
+
+    let ready = storage.path().join("compaction-contention.ready");
+    let release = ready.with_extension("release");
+    let mut child = Command::new(std::env::current_exe().expect("semantic test executable"))
+        .args([
+            "--exact",
+            COMPACTION_SWAP_CHILD_TEST,
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("AFT_TEST_SEMANTIC_ROOT", project.path())
+        .env("AFT_TEST_SEMANTIC_STORAGE", storage.path())
+        .env("AFT_TEST_SEMANTIC_COMPACTION_READY", &ready)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn paused semantic compaction");
+    wait_for_test_seam(&mut child, &ready);
+
+    write_delta_fixture(&second, 1, 1);
+    refresh_delta_paths(&mut live, project.path(), std::slice::from_ref(&second));
+    let append_index = live.clone();
+    let append_storage = storage.path().to_path_buf();
+    let append =
+        thread::spawn(move || append_index.write_to_disk(&append_storage, DELTA_PROJECT_KEY));
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        !append.is_finished(),
+        "append should wait behind compaction's lock"
+    );
+    fs::write(&release, b"release").expect("release semantic compaction");
+    assert!(child
+        .wait()
+        .expect("wait for semantic compaction")
+        .success());
+    assert!(append.join().expect("join semantic append"));
+    assert_eq!(
+        load_delta_index(storage.path(), project.path()).to_bytes(),
+        live.to_bytes(),
+        "the waiting append must land after compaction swaps its base"
+    );
 }
 
 fn build_v1_index_bytes(file: &Path) -> Vec<u8> {
