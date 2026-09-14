@@ -877,6 +877,9 @@ impl WatcherCounters {
             .clone()
     }
 
+    // Only the FSEvents and inotify backends take an exclusion list; the
+    // Windows backend has no exclusion API, so nothing calls this there.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn set_backend_exclusions(&self, matcher_generation: u64, paths: Vec<PathBuf>) {
         *self
             .backend_exclusions

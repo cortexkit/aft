@@ -4992,17 +4992,17 @@ mod watcher_slice_tests {
             if !outcome.has_more {
                 break;
             }
-            assert!(slices < 8, "single dispatch event did not converge");
+            // Convergence guard only: the 250 ms time budget can end a slice
+            // after a handful of paths on a loaded box, so the slice count is
+            // bounded by the mechanism (every slice makes progress), not by a
+            // number that depends on the host's speed.
+            assert!(slices <= path_count, "single dispatch event did not converge");
         }
 
         assert_eq!(processed, path_count);
-        // At least ceil(1024/256) slices from the path budget; the 250ms time
-        // budget may end a slice early under parallel test load, so an exact
-        // slice count would be load-sensitive.
-        assert!(
-            (4..=8).contains(&slices),
-            "expected 4-8 path-budgeted slices, got {slices}"
-        );
+        // At least ceil(1024/256) slices from the path budget; the time budget
+        // may only add slices, never remove them.
+        assert!(slices >= 4, "expected at least 4 path-budgeted slices, got {slices}");
         assert_eq!(ctx.pending_tier2_paths().len(), path_count);
     }
 
@@ -5159,13 +5159,13 @@ mod watcher_slice_tests {
         assert!(snapshot.last_rescan_cost_ms.is_some());
         // Other tests on this thread pool emit index_event lines too; the
         // capture is process-wide, so select this test's line by content —
-        // kind and this test's own root, since sibling tests also rescan.
-        let root = std::fs::canonicalize(temp.path()).unwrap();
-        let root_marker = format!("root={}", root.display());
+        // kind and this test's own root (matched by the temp dir's unique
+        // name, since the line may spell the root canonically or not).
+        let root_name = temp.path().file_name().unwrap().to_string_lossy().into_owned();
         let rescan_lines = lines
             .iter()
             .filter(|line| {
-                line.contains("kind=watcher_rescan plane=watcher") && line.contains(&root_marker)
+                line.contains("kind=watcher_rescan plane=watcher") && line.contains(&root_name)
             })
             .collect::<Vec<_>>();
         assert_eq!(rescan_lines.len(), 1, "lines: {lines:?}");
