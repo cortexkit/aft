@@ -2891,10 +2891,7 @@ impl SemanticIndex {
             .iter()
             .map(|path| self.project_root.join(path))
             .collect();
-        *self
-            .dirty_paths
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = base
+        let dirty_paths = base
             .dirty_paths
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2905,13 +2902,12 @@ impl SemanticIndex {
                     .map(|path| self.project_root.join(path))
                     .collect()
             });
-        *self
-            .persistence
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = *base
+        let persistence = *base
             .persistence
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.set_dirty_paths(dirty_paths);
+        self.set_persistence(persistence);
     }
 
     pub fn new(project_root: PathBuf, dimension: usize) -> Self {
