@@ -5158,10 +5158,15 @@ mod watcher_slice_tests {
         assert!(snapshot.last_rescan_at_ms.is_some());
         assert!(snapshot.last_rescan_cost_ms.is_some());
         // Other tests on this thread pool emit index_event lines too; the
-        // capture is process-wide, so select this test's line by content.
+        // capture is process-wide, so select this test's line by content —
+        // kind and this test's own root, since sibling tests also rescan.
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let root_marker = format!("root={}", root.display());
         let rescan_lines = lines
             .iter()
-            .filter(|line| line.contains("kind=watcher_rescan plane=watcher"))
+            .filter(|line| {
+                line.contains("kind=watcher_rescan plane=watcher") && line.contains(&root_marker)
+            })
             .collect::<Vec<_>>();
         assert_eq!(rescan_lines.len(), 1, "lines: {lines:?}");
         assert!(rescan_lines[0].contains("reason=kernel_dropped"));
