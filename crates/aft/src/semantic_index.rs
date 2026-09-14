@@ -2788,18 +2788,7 @@ impl SemanticIndex {
             ));
         }
 
-        let paths_are_shareable = self
-            .entries
-            .iter()
-            .all(|entry| cache_relative_path(&self.project_root, &entry.chunk.file).is_some())
-            && self
-                .file_mtimes
-                .keys()
-                .chain(self.file_sizes.keys())
-                .chain(self.file_hashes.keys())
-                .chain(self.deferred_files.iter())
-                .all(|path| cache_relative_path(&self.project_root, path).is_some());
-        if !paths_are_shareable {
+        if !self.paths_are_shareable() {
             return None;
         }
 
@@ -2809,48 +2798,108 @@ impl SemanticIndex {
         let owner_root = self.project_root.clone();
         let placeholder = Self::new(owner_root.clone(), self.dimension());
         let private = std::mem::replace(self, placeholder);
-        let base = Arc::new(
-            private
-                .into_shared_base()
-                .expect("shareable semantic paths were validated before freezing"),
-        );
+        let base = match private.into_shared_base() {
+            Ok(base) => Arc::new(base),
+            Err(private) => {
+                // Unreachable after the shareability check (this index is held
+                // exclusively, so no path can appear between the check and the
+                // move), but a private index is never worth a process: restore
+                // it and decline to share.
+                crate::slog_warn!(
+                    "semantic index for {} could not be frozen into a shared base; keeping it private",
+                    owner_root.display()
+                );
+                *self = private;
+                return None;
+            }
+        };
         *self = Self::from_shared_base(owner_root, Arc::clone(&base));
         Some(Self::from_shared_base(project_root.to_path_buf(), base))
     }
 
-    fn into_shared_base(mut self) -> Option<SharedSemanticBase> {
-        for entry in &mut self.entries {
-            entry.chunk.file = cache_relative_path(&self.project_root, &entry.chunk.file)?;
-        }
-        let deferred_files = self
-            .deferred_files
-            .into_iter()
-            .map(|path| cache_relative_path(&self.project_root, &path))
-            .collect::<Option<HashSet<_>>>()?;
-        let dirty_paths = match self
-            .dirty_paths
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
-            Some(paths) => Some(
-                paths
-                    .iter()
-                    .map(|path| cache_relative_path(&self.project_root, path))
-                    .collect::<Option<BTreeSet<_>>>()?,
-            ),
-            None => None,
+    /// Every path this index carries must be expressible relative to its own
+    /// root before the index can be frozen into a base shared across roots.
+    /// The dirty-path set belongs here too: it is persisted with the base, and
+    /// a delta path outside the root once turned the freeze into a panic.
+    fn paths_are_shareable(&self) -> bool {
+        let shareable = |path: &Path| cache_relative_path(&self.project_root, path).is_some();
+        self.entries
+            .iter()
+            .all(|entry| shareable(&entry.chunk.file))
+            && self
+                .file_mtimes
+                .keys()
+                .chain(self.file_sizes.keys())
+                .chain(self.file_hashes.keys())
+                .chain(self.deferred_files.iter())
+                .all(|path| shareable(path))
+            && self
+                .dirty_paths
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_none_or(|paths| paths.iter().all(|path| shareable(path)))
+    }
+
+    fn into_shared_base(mut self) -> Result<SharedSemanticBase, Self> {
+        // Relativize every path before moving anything, so a path outside the
+        // root hands the index back intact instead of leaving a half-moved
+        // one behind. Only the path strings are copied here; the vectors move.
+        let root = self.project_root.clone();
+        let relative = |path: &Path| cache_relative_path(&root, path);
+        let Some(entry_files) = self
+            .entries
+            .iter()
+            .map(|entry| relative(&entry.chunk.file))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Err(self);
         };
+        let Some(deferred_files) = self
+            .deferred_files
+            .iter()
+            .map(|path| relative(path))
+            .collect::<Option<HashSet<_>>>()
+        else {
+            return Err(self);
+        };
+        let dirty_paths = {
+            let guard = self
+                .dirty_paths
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match guard.as_ref() {
+                Some(paths) => paths
+                    .iter()
+                    .map(|path| relative(path))
+                    .collect::<Option<BTreeSet<_>>>()
+                    .map(Some),
+                None => Some(None),
+            }
+        };
+        let Some(dirty_paths) = dirty_paths else {
+            return Err(self);
+        };
+        let (Some(file_mtimes), Some(file_sizes), Some(file_hashes)) = (
+            relativize_semantic_map(&root, self.file_mtimes.clone()),
+            relativize_semantic_map(&root, self.file_sizes.clone()),
+            relativize_semantic_map(&root, self.file_hashes.clone()),
+        ) else {
+            return Err(self);
+        };
+        for (entry, file) in self.entries.iter_mut().zip(entry_files) {
+            entry.chunk.file = file;
+        }
         let persistence = *self
             .persistence
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Some(SharedSemanticBase {
+        Ok(SharedSemanticBase {
             entries: self.entries,
-            file_mtimes: relativize_semantic_map(&self.project_root, self.file_mtimes)?,
-            file_sizes: relativize_semantic_map(&self.project_root, self.file_sizes)?,
+            file_mtimes,
+            file_sizes,
             any_missing_sizes: self.any_missing_sizes,
-            file_hashes: relativize_semantic_map(&self.project_root, self.file_hashes)?,
+            file_hashes,
             dimension: self.dimension,
             fingerprint: self.fingerprint,
             deferred_files,
@@ -5599,7 +5648,7 @@ impl SemanticIndex {
             true,
             Some(&key.fingerprint),
         )?;
-        let Some(base) = private.clone().into_shared_base() else {
+        let Ok(base) = private.clone().into_shared_base() else {
             slog_warn!(
                 "semantic shared-base paths could not be normalized for key {}; loading a private borrowed copy",
                 project_key
@@ -9358,6 +9407,61 @@ public class Greeter {
     }
 
     #[test]
+    fn freezing_declines_instead_of_panicking_when_a_dirty_path_is_outside_the_root() {
+        // A delta path outside the root once turned the freeze into a panic:
+        // the shareability check covered entries, metadata maps and deferred
+        // files but not the dirty-path set, and the move then hit an expect.
+        // Under the daemon that panic is a fatal actor exit (exit 4 three
+        // times on 2026-09-14).
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp
+            .path()
+            .join("owner")
+            .canonicalize()
+            .unwrap_or_else(|_| {
+                fs::create_dir_all(temp.path().join("owner")).unwrap();
+                temp.path().join("owner").canonicalize().unwrap()
+            });
+        let borrower = temp.path().join("borrower");
+        fs::create_dir_all(&borrower).unwrap();
+        let mut index = SemanticIndex::new(project_root.clone(), 2);
+        let file = project_root.join("file_0.rs");
+        fs::write(&file, "fn symbol_0() {}\n").unwrap();
+        add_invalidation_fixture_entry(&mut index, file, 0);
+        let config = SemanticBackendConfig::default();
+        index.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(&config, 2));
+        // A fresh index carries no delta set (None means "structural diff");
+        // seed one the way a refresh does so the stray path is really carried.
+        index.set_dirty_paths(Some(BTreeSet::from([temp
+            .path()
+            .join("elsewhere")
+            .join("stray.rs")])));
+        let entries_before = index.entries.len();
+
+        let adopted = index.adopt_frozen_base_for_root(&borrower, &config);
+
+        assert!(adopted.is_none(), "an unshareable index must stay private");
+        assert!(index.shared_base.is_none());
+        assert_eq!(
+            index.entries.len(),
+            entries_before,
+            "the private index survives intact"
+        );
+
+        // The same index with an in-root dirty path freezes normally.
+        let mut shareable = SemanticIndex::new(project_root.clone(), 2);
+        let file = project_root.join("file_1.rs");
+        fs::write(&file, "fn symbol_1() {}\n").unwrap();
+        add_invalidation_fixture_entry(&mut shareable, file.clone(), 1);
+        shareable.set_fingerprint(SemanticIndexFingerprint::for_config_dimension(&config, 2));
+        shareable.set_dirty_paths(Some(BTreeSet::from([file])));
+        assert!(shareable
+            .adopt_frozen_base_for_root(&borrower, &config)
+            .is_some());
+        assert!(shareable.shared_base.is_some());
+    }
+
+    #[test]
     fn batch_invalidation_matches_sequential_calls_with_one_retain_pass() {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path().canonicalize().unwrap();
@@ -9372,7 +9476,7 @@ public class Greeter {
             .collect::<Vec<_>>();
         let invalidated = vec![files[1].clone(), files[3].clone(), files[6].clone()];
 
-        let shared = Arc::new(source.into_shared_base().unwrap());
+        let shared = Arc::new(source.into_shared_base().ok().unwrap());
         let mut shared_batched =
             SemanticIndex::from_shared_base(project_root.clone(), Arc::clone(&shared));
         shared_batched.invalidate_files(&invalidated);
