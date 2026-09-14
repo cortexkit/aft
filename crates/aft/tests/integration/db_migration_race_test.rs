@@ -52,6 +52,58 @@ DELETE FROM schema_version;
 INSERT INTO schema_version (version) VALUES (8);
 "#;
 
+const REPLAY_V9_AND_RECORD_9: &str = r#"
+DROP INDEX IF EXISTS idx_bash_pattern_watches_session;
+DROP INDEX IF EXISTS idx_bash_pattern_watches_task;
+ALTER TABLE bash_pattern_watches RENAME TO bash_pattern_watches_without_task_fk;
+CREATE TABLE bash_pattern_watches (
+  harness        TEXT NOT NULL,
+  session_id     TEXT NOT NULL,
+  task_id        TEXT NOT NULL,
+  watch_id       TEXT NOT NULL,
+  pattern_kind   TEXT NOT NULL,
+  pattern        TEXT NOT NULL,
+  once           INTEGER NOT NULL DEFAULT 1,
+  created_at     INTEGER NOT NULL,
+  stdout_offset  INTEGER NOT NULL DEFAULT 0,
+  stderr_offset  INTEGER NOT NULL DEFAULT 0,
+  pty_offset     INTEGER NOT NULL DEFAULT 0,
+  scanning       INTEGER NOT NULL DEFAULT 1,
+  pending_match  INTEGER NOT NULL DEFAULT 0,
+  match_text     TEXT,
+  match_offset   INTEGER,
+  match_context  TEXT,
+  PRIMARY KEY (harness, session_id, task_id, watch_id),
+  FOREIGN KEY (harness, session_id, task_id)
+    REFERENCES bash_tasks (harness, session_id, task_id) ON DELETE CASCADE
+);
+INSERT INTO bash_pattern_watches (
+  harness, session_id, task_id, watch_id, pattern_kind, pattern, once,
+  created_at, stdout_offset, stderr_offset, pty_offset, scanning,
+  pending_match, match_text, match_offset, match_context
+)
+SELECT
+  watch.harness, watch.session_id, watch.task_id, watch.watch_id,
+  watch.pattern_kind, watch.pattern, watch.once, watch.created_at,
+  watch.stdout_offset, watch.stderr_offset, watch.pty_offset, watch.scanning,
+  watch.pending_match, watch.match_text, watch.match_offset, watch.match_context
+FROM bash_pattern_watches_without_task_fk AS watch
+WHERE EXISTS (
+  SELECT 1
+  FROM bash_tasks AS task
+  WHERE task.harness = watch.harness
+    AND task.session_id = watch.session_id
+    AND task.task_id = watch.task_id
+);
+DROP TABLE bash_pattern_watches_without_task_fk;
+CREATE INDEX idx_bash_pattern_watches_session
+  ON bash_pattern_watches (harness, session_id);
+CREATE INDEX idx_bash_pattern_watches_task
+  ON bash_pattern_watches (harness, session_id, task_id);
+DELETE FROM schema_version;
+INSERT INTO schema_version (version) VALUES (9);
+"#;
+
 static STALE_PLAN_BARRIER: LazyLock<Mutex<Option<Arc<Barrier>>>> =
     LazyLock::new(|| Mutex::new(None));
 static CONCURRENT_PLAN_BARRIER: LazyLock<Mutex<Option<Arc<Barrier>>>> =
@@ -184,6 +236,23 @@ fn stale_planned_migrations_cannot_regress_the_schema_or_wedge_open() {
 
     assert_eq!(observed_version, aft::db::CURRENT_SCHEMA_VERSION);
     assert!(fresh_open.is_ok(), "fresh open must succeed after the race");
+}
+
+#[test]
+fn open_repairs_reported_version_nine_wedge_with_v10_objects_intact() {
+    let storage = tempfile::tempdir().expect("temporary storage");
+    let database = storage.path().join("aft.db");
+    let conn = aft::db::open(&database).expect("create v10 database");
+    conn.execute_batch(REPLAY_V9_AND_RECORD_9)
+        .expect("reproduce stale V9 commit after V10");
+    assert_eq!(schema_version(&conn), 9);
+    assert_eq!(v10_objects(&conn).len(), 3);
+    drop(conn);
+
+    let repaired = aft::db::open(&database).expect("self-heal reported wedge");
+
+    assert_eq!(schema_version(&repaired), aft::db::CURRENT_SCHEMA_VERSION);
+    assert_eq!(v10_objects(&repaired).len(), 3);
 }
 
 #[test]

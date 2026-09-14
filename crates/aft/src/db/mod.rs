@@ -433,7 +433,18 @@ fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError>
     }
 
     let from = db_version;
-    let result = apply_migration_statements(&tx, version).and_then(|()| {
+    let already_applied =
+        migration_already_applied(&tx, version).map_err(|error| OpenError::MigrationFailed {
+            from,
+            to: version,
+            error,
+        })?;
+    let result = if already_applied {
+        Ok(())
+    } else {
+        apply_migration_statements(&tx, version)
+    }
+    .and_then(|()| {
         tx.execute("DELETE FROM schema_version", [])?;
         tx.execute(
             "INSERT OR REPLACE INTO schema_version (version) VALUES (?1)",
@@ -446,7 +457,30 @@ fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError>
         from,
         to: version,
         error,
-    })
+    })?;
+    if already_applied && from == 9 && version == 10 {
+        log::warn!(
+            "aft.db: schema 9 with v10 objects present; recorded 10 (issue #312 recovery)"
+        );
+    }
+    Ok(())
+}
+
+fn migration_already_applied(conn: &Connection, version: u32) -> rusqlite::Result<bool> {
+    match version {
+        10 => conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE (type = 'table' AND name IN (
+                   'compression_event_rollups',
+                   'compression_retention_cursor'
+                 )) OR (type = 'index' AND name = 'idx_compression_created')",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .map(|object_count| object_count == 3),
+        _ => Ok(false),
+    }
 }
 
 fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Result<()> {
@@ -606,6 +640,21 @@ mod tests {
         let conn = open(&dir.path().join("aft.db")).unwrap();
 
         assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migration_v10_probe_recognizes_the_reported_version_nine_wedge() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        run_migrations(&mut conn).unwrap();
+        conn.execute_batch(MIGRATION_V9).unwrap();
+        conn.execute_batch(
+            "DELETE FROM schema_version;
+             INSERT INTO schema_version (version) VALUES (9);",
+        )
+        .unwrap();
+
+        assert_eq!(schema_version(&conn), 9);
+        assert!(migration_already_applied(&conn, 10).unwrap());
     }
 
     #[test]
