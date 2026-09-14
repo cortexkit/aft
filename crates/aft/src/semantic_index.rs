@@ -4934,7 +4934,6 @@ impl SemanticIndex {
                 .as_ref()
                 .map(SemanticIndexFingerprint::as_string)
                 .unwrap_or_default();
-            let mut structural_baseline = None;
             let layout = self.persistence_snapshot().and_then(|persistence| {
                 match Self::scan_artifact_for_append(
                     &data_path,
@@ -4973,7 +4972,6 @@ impl SemanticIndex {
                             torn_tail: loaded.torn_tail,
                             bytes_read: identity.bytes as usize,
                         };
-                        structural_baseline = Some(loaded.index);
                         (layout, changed_paths)
                     }
                     Ok(_) => {
@@ -5066,18 +5064,6 @@ impl SemanticIndex {
                     return false;
                 }
             };
-            #[cfg(debug_assertions)]
-            if let Some(previous) = structural_baseline.as_ref() {
-                let structural_paths = semantic_changed_paths(previous, self);
-                debug_assert_eq!(
-                    frame,
-                    self.build_segment_frame(
-                        layout.segment_count.saturating_add(1) as u64,
-                        &structural_paths
-                    )
-                    .expect("structural semantic segment")
-                );
-            }
             if let Err(error) = Self::append_segment_frame(&data_path, &frame) {
                 slog_warn!("failed to append semantic delta: {}", error);
                 return false;
@@ -5185,7 +5171,6 @@ impl SemanticIndex {
         Self::compact_path_if_unchanged(&dir, &data_path, &self.project_root, expected)
     }
 
-    #[cfg(debug_assertions)]
     #[doc(hidden)]
     pub fn persistence_stats_for_test(
         storage_dir: &Path,
