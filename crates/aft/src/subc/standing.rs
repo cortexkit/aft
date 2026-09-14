@@ -24,11 +24,57 @@ pub(super) const STANDING_MAINTENANCE_INTERVAL: std::time::Duration = super::DRA
 static LAST_STANDING_VERIFY_STRATEGY: std::sync::atomic::AtomicU8 =
     std::sync::atomic::AtomicU8::new(0);
 
+#[derive(Debug, PartialEq, Eq)]
+enum ReconciliationLogAction {
+    WarnFirst,
+    WarnChanged {
+        previous_error: String,
+        suppressed_repeats: u64,
+    },
+    Suppress,
+}
+
+#[derive(Default)]
+struct ReconciliationFailureLog {
+    last_error: Option<String>,
+    suppressed_repeats: u64,
+}
+
+impl ReconciliationFailureLog {
+    fn record_failure(&mut self, error: &str) -> ReconciliationLogAction {
+        match self.last_error.take() {
+            None => {
+                self.last_error = Some(error.to_string());
+                ReconciliationLogAction::WarnFirst
+            }
+            Some(previous_error) if previous_error == error => {
+                self.last_error = Some(previous_error);
+                self.suppressed_repeats = self.suppressed_repeats.saturating_add(1);
+                ReconciliationLogAction::Suppress
+            }
+            Some(previous_error) => {
+                self.last_error = Some(error.to_string());
+                ReconciliationLogAction::WarnChanged {
+                    previous_error,
+                    suppressed_repeats: std::mem::take(&mut self.suppressed_repeats),
+                }
+            }
+        }
+    }
+
+    fn record_success(&mut self) -> Option<(String, u64)> {
+        self.last_error
+            .take()
+            .map(|error| (error, std::mem::take(&mut self.suppressed_repeats)))
+    }
+}
+
 pub(super) struct StandingActor {
     app: Arc<App>,
     executor: Arc<Executor>,
     roots: StandingRoots,
     observed_config: Mutex<Config>,
+    reconciliation_failures: Mutex<ReconciliationFailureLog>,
     /// Root ids registered solely to host unbound standing work. Session actors
     /// are never removed by this owner.
     owned_actors: Mutex<HashMap<String, (ProjectRootId, bool)>>,
@@ -41,6 +87,7 @@ impl StandingActor {
             executor,
             roots: StandingRoots::default(),
             observed_config: Mutex::new(Config::default()),
+            reconciliation_failures: Mutex::new(ReconciliationFailureLog::default()),
             owned_actors: Mutex::new(HashMap::new()),
         }
     }
@@ -124,10 +171,33 @@ impl StandingActor {
         let report = match self.roots.reconcile(&snapshot) {
             Ok(report) => report,
             Err(error) => {
-                log::warn!("standing roots reconciliation refused: {error}");
+                let error = error.to_string();
+                let action = self
+                    .reconciliation_failures
+                    .lock()
+                    .record_failure(&error);
+                match action {
+                    ReconciliationLogAction::WarnFirst => {
+                        log::warn!("standing roots reconciliation refused: {error}");
+                    }
+                    ReconciliationLogAction::WarnChanged {
+                        previous_error,
+                        suppressed_repeats,
+                    } => log::warn!(
+                        "standing roots reconciliation refused: {error} ({suppressed_repeats} repeats of previous error suppressed: {previous_error})"
+                    ),
+                    ReconciliationLogAction::Suppress => {}
+                }
                 return;
             }
         };
+        if let Some((previous_error, suppressed_repeats)) =
+            self.reconciliation_failures.lock().record_success()
+        {
+            log::info!(
+                "standing roots reconciliation recovered after suppressing {suppressed_repeats} repeated refusal(s): {previous_error}"
+            );
+        }
 
         self.retire_removed_actors(&report.removed);
         self.resume_entries_without_bound_session(&report.active_entries);
@@ -434,6 +504,40 @@ fn root_fingerprint(root: &std::path::Path) -> Option<(u64, Option<u128>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconciliation_failure_logging_tracks_error_state_changes_and_recovery() {
+        let mut failures = ReconciliationFailureLog::default();
+
+        assert_eq!(
+            failures.record_failure("schema mismatch"),
+            ReconciliationLogAction::WarnFirst
+        );
+        assert_eq!(
+            failures.record_failure("schema mismatch"),
+            ReconciliationLogAction::Suppress
+        );
+        assert_eq!(
+            failures.record_failure("schema mismatch"),
+            ReconciliationLogAction::Suppress
+        );
+        assert_eq!(
+            failures.record_failure("database locked"),
+            ReconciliationLogAction::WarnChanged {
+                previous_error: "schema mismatch".to_string(),
+                suppressed_repeats: 2,
+            }
+        );
+        assert_eq!(
+            failures.record_failure("database locked"),
+            ReconciliationLogAction::Suppress
+        );
+        assert_eq!(
+            failures.record_success(),
+            Some(("database locked".to_string(), 1))
+        );
+        assert_eq!(failures.record_success(), None);
+    }
 
     #[test]
     fn standing_interval_uses_the_existing_subc_maintenance_cadence() {
