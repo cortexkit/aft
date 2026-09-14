@@ -907,18 +907,24 @@ fn contribution_hashes(
     changed_files: &BTreeSet<String>,
 ) -> BTreeMap<String, String> {
     if let Some(previous) = previous {
+        // A contribution that is no longer present must lose its hash (and with
+        // it its retained fragment) even when the caller's changed-file set did
+        // not name it: a forced deletion arrives spelled by the manager
+        // (backslashes on Windows) while these keys use the contribution's own
+        // `file` field, so membership in `changed_files` cannot be the only
+        // thing that removes a stale key.
+        let current_files = contributions
+            .iter()
+            .map(contribution_file_key)
+            .collect::<BTreeSet<_>>();
         let mut hashes = previous.clone();
+        hashes.retain(|file, _| current_files.contains(file));
         for file in changed_files {
             hashes.remove(file);
         }
         for contribution in contributions {
-            let file = contribution
-                .contribution
-                .get("file")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| contribution.file_path.to_string_lossy().replace('\\', "/"));
-            if changed_files.contains(&file) {
+            let file = contribution_file_key(contribution);
+            if changed_files.contains(&file) || !hashes.contains_key(&file) {
                 let bytes = serde_json::to_vec(&contribution.contribution).unwrap_or_default();
                 hashes.insert(file, blake3::hash(&bytes).to_hex().to_string());
             }
@@ -929,16 +935,20 @@ fn contribution_hashes(
     contributions
         .iter()
         .map(|contribution| {
-            let file = contribution
-                .contribution
-                .get("file")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| contribution.file_path.to_string_lossy().replace('\\', "/"));
+            let file = contribution_file_key(contribution);
             let bytes = serde_json::to_vec(&contribution.contribution).unwrap_or_default();
             (file, blake3::hash(&bytes).to_hex().to_string())
         })
         .collect()
+}
+
+fn contribution_file_key(contribution: &FileContribution) -> String {
+    contribution
+        .contribution
+        .get("file")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| contribution.file_path.to_string_lossy().replace('\\', "/"))
 }
 
 fn callgraph_hashes(
@@ -4378,6 +4388,76 @@ mod tests {
         );
         assert_eq!(current.reachable, full);
         current
+    }
+
+    #[test]
+    fn vanished_contribution_drops_its_fragment_without_a_changed_file_entry() {
+        // A deleted file's contribution disappears from the set the rollup is
+        // given, but the host may spell the deletion differently from the
+        // contribution key (Windows backslashes) or not name it at all; the
+        // fragment must go regardless.
+        let (_temp, root, files) = fixture_project(&[
+            ("main.rs", "pub fn main() {}\n"),
+            ("dead.rs", "pub fn planted_dead() {}\n"),
+        ]);
+        let snapshot = snapshot_with_entry_points(
+            files.clone(),
+            vec![
+                export(&root, "main.rs", "main", "function"),
+                export(&root, "dead.rs", "planted_dead", "function"),
+            ],
+            Vec::new(),
+            [root.join("main.rs")].into_iter().collect(),
+        );
+        let scan_job = job(&root, files.clone(), snapshot.clone());
+        let contributions = run_dead_code_scan(&scan_job)
+            .outcome
+            .expect("initial scan")
+            .contributions;
+        let public = BTreeSet::new();
+        let roles = crate::inspect::entry_points::ProjectRoles::default();
+        let (initial, state, _) = aggregate_dead_code_contributions_incremental(
+            &root,
+            &snapshot,
+            &contributions,
+            &public,
+            &roles,
+            None,
+            Some("vanish"),
+            None,
+            &BTreeSet::new(),
+        );
+        assert!(aggregate_has_item(&initial, "dead.rs", "planted_dead"));
+
+        let remaining = contributions
+            .iter()
+            .filter(|contribution| contribution.contribution["file"] != "dead.rs")
+            .cloned()
+            .collect::<Vec<_>>();
+        let (incremental, _, _) = aggregate_dead_code_contributions_incremental(
+            &root,
+            &snapshot,
+            &remaining,
+            &public,
+            &roles,
+            None,
+            Some("vanish"),
+            Some(&state),
+            &["dead\\.rs".to_string()].into_iter().collect(),
+        );
+        let (full, _, _) = aggregate_dead_code_contributions_incremental(
+            &root,
+            &snapshot,
+            &remaining,
+            &public,
+            &roles,
+            None,
+            Some("vanish"),
+            None,
+            &BTreeSet::new(),
+        );
+        assert_eq!(incremental, full);
+        assert!(!aggregate_has_item(&incremental, "dead.rs", "planted_dead"));
     }
 
     #[test]

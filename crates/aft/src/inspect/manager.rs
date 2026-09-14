@@ -2563,7 +2563,13 @@ impl InspectManager {
                 .filter_map(|path| path.strip_prefix(&job.project_root).ok())
                 .map(|path| path.to_string_lossy().replace('\\', "/"))
                 .collect::<BTreeSet<_>>();
-            changed_files.extend(force_relative.iter().cloned());
+            // Forced paths are spelled by the host (backslashes on Windows);
+            // the rollup keys files by the contribution's own slash form.
+            changed_files.extend(
+                force_relative
+                    .iter()
+                    .map(|relative| relative.replace('\\', "/")),
+            );
             let allow_incremental = phases
                 .projection
                 .is_some_and(|verdict| verdict.kind != ProjectionKind::Full);
