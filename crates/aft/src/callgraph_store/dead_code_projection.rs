@@ -2,7 +2,7 @@ use crate::db::{SqliteStore, TrackedConnection};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Transaction};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(test)]
 pub(crate) type ProjectionBeforeOpenObserver = dyn Fn(&Path) + Send + Sync + 'static;
@@ -38,8 +38,9 @@ pub(crate) enum ProjectionKind {
 /// let an operator see the cost without re-deriving it from timings.
 ///
 /// `reason` is `Some` only for `Full` projections; the reasons are `cold`
-/// (no previous snapshot or a legacy store without a durable revision) and
-/// `journal_gap` (a missing or unparseable journal entry bridged the revisions).
+/// (no previous snapshot or a legacy store without a durable revision),
+/// `journal_gap` (a missing or unparseable journal entry bridged the revisions),
+/// and `splice_costlier` (the retained root timings predict a full pass is cheaper).
 /// No `generation_changed` arm exists: the cache identity already pairs the
 /// cold-build generation with the durable revision, so a generation change
 /// surfaces as `cold` or a cache miss.
@@ -53,8 +54,51 @@ pub(crate) struct ProjectionVerdict {
     pub reason: Option<&'static str>,
     /// Bytes of inline or spill-backed journal entries read for a splice.
     pub journal_bytes: u64,
-    /// Files re-projected from the delta (splice) or 0 for a full projection.
+    /// Files in the journal delta, including a delta rejected as costlier than full.
     pub changed_files: usize,
+}
+
+/// Root-local running costs used to avoid a splice whose fold is predicted to
+/// cost more than rebuilding the complete projection and reachability result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProjectionCostEstimates {
+    full_ns: u64,
+    splice_ns_per_file: u64,
+}
+
+impl ProjectionCostEstimates {
+    pub(crate) fn splice_is_costlier(self, changed_files: usize) -> bool {
+        self.full_ns > 0
+            && self.splice_ns_per_file > 0
+            && self
+                .splice_ns_per_file
+                .saturating_mul(u64::try_from(changed_files).unwrap_or(u64::MAX))
+                >= self.full_ns
+    }
+
+    pub(crate) fn observe(&mut self, verdict: ProjectionVerdict, elapsed: Duration) {
+        let elapsed_ns = elapsed.as_nanos().min(u128::from(u64::MAX)) as u64;
+        match verdict.kind {
+            ProjectionKind::Full => update_running_estimate(&mut self.full_ns, elapsed_ns),
+            ProjectionKind::Spliced if verdict.changed_files > 0 => {
+                let per_file = elapsed_ns / verdict.changed_files as u64;
+                update_running_estimate(&mut self.splice_ns_per_file, per_file.max(1));
+            }
+            ProjectionKind::Spliced | ProjectionKind::Reused => {}
+        }
+    }
+}
+
+fn update_running_estimate(estimate: &mut u64, observed: u64) {
+    *estimate = if *estimate == 0 {
+        observed.max(1)
+    } else {
+        estimate
+            .saturating_mul(3)
+            .saturating_add(observed)
+            .saturating_add(2)
+            / 4
+    };
 }
 
 #[cfg(test)]
@@ -84,14 +128,32 @@ pub fn project_dead_code_snapshot(db_path: &Path) -> Result<CallgraphSnapshot> {
 pub(crate) fn project_dead_code_snapshot_with_revision(
     db_path: &Path,
 ) -> Result<(Option<u64>, CallgraphSnapshot)> {
-    project_dead_code_snapshot_incremental(db_path, None)
-        .map(|(revision, snapshot, _)| (revision, snapshot))
+    project_dead_code_snapshot_incremental_with_costs(
+        db_path,
+        None,
+        ProjectionCostEstimates::default(),
+    )
+    .map(|(revision, snapshot, _, _)| (revision, snapshot))
 }
 
+#[cfg(test)]
 pub(crate) fn project_dead_code_snapshot_incremental(
     db_path: &Path,
     previous: Option<(u64, &CallgraphSnapshot)>,
 ) -> Result<(Option<u64>, CallgraphSnapshot, ProjectionVerdict)> {
+    project_dead_code_snapshot_incremental_with_costs(
+        db_path,
+        previous,
+        ProjectionCostEstimates::default(),
+    )
+    .map(|(revision, snapshot, verdict, _)| (revision, snapshot, verdict))
+}
+
+pub(crate) fn project_dead_code_snapshot_incremental_with_costs(
+    db_path: &Path,
+    previous: Option<(u64, &CallgraphSnapshot)>,
+    costs: ProjectionCostEstimates,
+) -> Result<(Option<u64>, CallgraphSnapshot, ProjectionVerdict, Duration)> {
     if !db_path.is_file() {
         return Err(CallGraphStoreError::Unavailable(format!(
             "database does not exist: {}",
@@ -130,6 +192,7 @@ pub(crate) fn project_dead_code_snapshot_incremental(
         (Some((revision, _)), Some(current)) => projection_delta_since(&tx, revision, current)?,
         _ => DeltaRead::Cold,
     };
+    let projection_started = Instant::now();
     let mut paths = SnapshotPathResolver::new(&project_root);
     let (files, exported_symbols, outbound_calls, entry_point_symbols, verdict) =
         match (delta, previous) {
@@ -139,7 +202,7 @@ pub(crate) fn project_dead_code_snapshot_incremental(
                     journal_bytes,
                 },
                 Some((_, previous)),
-            ) => {
+            ) if !costs.splice_is_costlier(callers.len()) => {
                 let mut replacements = BTreeMap::new();
                 let mut file_replacements = BTreeMap::new();
                 let mut export_replacements = BTreeMap::new();
@@ -179,18 +242,19 @@ pub(crate) fn project_dead_code_snapshot_incremental(
             }
             (delta, _) => {
                 record_full_projection();
-                let (reason, journal_bytes) = match delta {
-                    DeltaRead::Cold => ("cold", 0),
-                    DeltaRead::Gap => ("journal_gap", 0),
-                    DeltaRead::Spliced { .. } => {
-                        unreachable!("spliced delta handled in the arm above")
-                    }
+                let (reason, journal_bytes, changed_files) = match delta {
+                    DeltaRead::Cold => ("cold", 0, 0),
+                    DeltaRead::Gap => ("journal_gap", 0, 0),
+                    DeltaRead::Spliced {
+                        callers,
+                        journal_bytes,
+                    } => ("splice_costlier", journal_bytes, callers.len()),
                 };
                 let verdict = ProjectionVerdict {
                     kind: ProjectionKind::Full,
                     reason: Some(reason),
                     journal_bytes,
-                    changed_files: 0,
+                    changed_files,
                 };
                 (
                     project_files_from_store(&tx, &mut paths, None)?,
@@ -210,9 +274,10 @@ pub(crate) fn project_dead_code_snapshot_incremental(
         entry_points,
         entry_point_symbols,
     };
+    let projection_elapsed = projection_started.elapsed();
     tx.commit()?;
 
-    Ok((write_revision, snapshot, verdict))
+    Ok((write_revision, snapshot, verdict, projection_elapsed))
 }
 
 fn splice_files<T: Clone>(
@@ -1078,6 +1143,84 @@ fn callback_target() {}
         assert_call_with_provenance(&snapshot, "callback_target", PROVENANCE_VALUE_REF);
         assert_call_with_provenance(&snapshot, "typed_edge", PROVENANCE_TYPE_MATCH);
         assert_call_with_provenance(&snapshot, "named_edge", PROVENANCE_NAME_MATCH);
+    }
+
+    #[test]
+    fn projection_cost_estimates_retain_running_full_and_per_file_costs() {
+        let mut costs = ProjectionCostEstimates::default();
+        costs.observe(
+            ProjectionVerdict {
+                kind: ProjectionKind::Full,
+                reason: Some("cold"),
+                journal_bytes: 0,
+                changed_files: 0,
+            },
+            Duration::from_nanos(100),
+        );
+        costs.observe(
+            ProjectionVerdict {
+                kind: ProjectionKind::Spliced,
+                reason: None,
+                journal_bytes: 20,
+                changed_files: 4,
+            },
+            Duration::from_nanos(80),
+        );
+
+        assert_eq!(costs.full_ns, 100);
+        assert_eq!(costs.splice_ns_per_file, 20);
+        assert!(!costs.splice_is_costlier(4));
+        assert!(costs.splice_is_costlier(5));
+
+        costs.observe(
+            ProjectionVerdict {
+                kind: ProjectionKind::Full,
+                reason: Some("splice_costlier"),
+                journal_bytes: 30,
+                changed_files: 5,
+            },
+            Duration::from_nanos(60),
+        );
+        assert_eq!(costs.full_ns, 90);
+    }
+
+    #[test]
+    fn delta_above_measured_crossover_chooses_full_with_splice_costlier() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let root = temp_dir.path().join("project");
+        fs::create_dir_all(&root).expect("create project root");
+        let first = root.join("first.ts");
+        let second = root.join("second.ts");
+        fs::write(&first, "export function first() {}\n").expect("write first source");
+        fs::write(&second, "export function second() {}\n").expect("write second source");
+        let store = CallGraphStore::open(root.join(".store"), root).expect("open store");
+        store
+            .cold_build(&[first, second])
+            .expect("cold build crossover fixture");
+        let (revision, previous) = project_dead_code_snapshot_with_revision(store.sqlite_path())
+            .expect("project baseline");
+        let callers = BTreeSet::from(["first.ts".to_string(), "second.ts".to_string()]);
+        {
+            let mut conn = store.conn.lock().expect("store lock");
+            let tx = conn.transaction().expect("delta transaction");
+            record_projection_delta(&tx, &callers).expect("record caller delta");
+            tx.commit().expect("commit caller delta");
+        }
+        let costs = ProjectionCostEstimates {
+            full_ns: 100,
+            splice_ns_per_file: 60,
+        };
+
+        let (_, _, verdict, _) = project_dead_code_snapshot_incremental_with_costs(
+            store.sqlite_path(),
+            Some((revision.expect("baseline revision"), &previous)),
+            costs,
+        )
+        .expect("cost-aware projection");
+
+        assert_eq!(verdict.kind, ProjectionKind::Full);
+        assert_eq!(verdict.reason, Some("splice_costlier"));
+        assert_eq!(verdict.changed_files, 2);
     }
 
     fn assert_call_with_provenance(

@@ -26,7 +26,8 @@ use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 #[cfg(test)]
 use crate::callgraph_store::project_dead_code_snapshot;
 use crate::callgraph_store::{
-    project_dead_code_snapshot_with_revision, CallGraphStore, CallGraphStoreError, ProjectionKind,
+    project_dead_code_snapshot_incremental_with_costs, project_dead_code_snapshot_with_revision,
+    CallGraphStore, CallGraphStoreError, ProjectionCostEstimates, ProjectionKind,
     ProjectionVerdict, ReadonlyCallGraphStore, MAX_DELTA_BYTES,
 };
 use crate::cold_build_limiter;
@@ -68,6 +69,7 @@ struct CachedCallgraphProjection {
     identity: CallgraphProjectionIdentity,
     snapshot: Arc<CallgraphSnapshot>,
     estimated_bytes: u64,
+    costs: ProjectionCostEstimates,
     rollup: Option<(
         CallgraphProjectionIdentity,
         Arc<super::scanners::dead_code::DeadCodeRollupState>,
@@ -1282,6 +1284,38 @@ impl InspectManager {
         Some(previous)
     }
 
+    fn callgraph_projection_costs(
+        &self,
+        identity: &CallgraphProjectionIdentity,
+    ) -> ProjectionCostEstimates {
+        self.callgraph_projection
+            .lock()
+            .ok()
+            .and_then(|projection| {
+                projection
+                    .as_ref()
+                    .filter(|cached| cached.identity.project_root == identity.project_root)
+                    .map(|cached| cached.costs)
+            })
+            .unwrap_or_default()
+    }
+
+    fn observe_callgraph_projection_cost(
+        &self,
+        project_root: &Path,
+        verdict: ProjectionVerdict,
+        elapsed: Duration,
+    ) {
+        if let Ok(mut projection) = self.callgraph_projection.lock() {
+            if let Some(cached) = projection
+                .as_mut()
+                .filter(|cached| cached.identity.project_root == project_root)
+            {
+                cached.costs.observe(verdict, elapsed);
+            }
+        }
+    }
+
     fn cache_callgraph_projection(
         &self,
         identity: CallgraphProjectionIdentity,
@@ -1290,11 +1324,18 @@ impl InspectManager {
         let estimated_bytes = estimate_callgraph_snapshot_bytes(snapshot.as_ref());
         let root = identity.project_root.clone();
         if let Ok(mut cached) = self.callgraph_projection.lock() {
-            let rollup = cached.take().and_then(|cached| cached.rollup);
+            let previous = cached.take();
+            let costs = previous
+                .as_ref()
+                .filter(|cached| cached.identity.project_root == root)
+                .map(|cached| cached.costs)
+                .unwrap_or_default();
+            let rollup = previous.and_then(|cached| cached.rollup);
             *cached = Some(CachedCallgraphProjection {
                 identity,
                 snapshot,
                 estimated_bytes,
+                costs,
                 rollup,
             });
         } else {
@@ -1366,7 +1407,7 @@ impl InspectManager {
             build_if_missing,
             refresh_paths,
         )
-        .map(|(snapshot, _)| snapshot)
+        .map(|(snapshot, _, _)| snapshot)
     }
 
     /// Build the dead-code snapshot and report how it was produced, so the
@@ -1378,7 +1419,7 @@ impl InspectManager {
         allow_cold_build: bool,
         build_if_missing: bool,
         refresh_paths: &[PathBuf],
-    ) -> Option<(Arc<CallgraphSnapshot>, ProjectionVerdict)> {
+    ) -> Option<(Arc<CallgraphSnapshot>, ProjectionVerdict, Duration)> {
         build_tier2_callgraph_snapshot_with_refresh_inner(
             job,
             allow_cold_build,
@@ -2327,7 +2368,7 @@ impl InspectManager {
                 && scan_job.callgraph_snapshot.is_none()
             {
                 let snapshot_started = Instant::now();
-                if let Some((snapshot, verdict)) = self
+                if let Some((snapshot, verdict, projection_cost)) = self
                     .build_tier2_callgraph_snapshot_with_refresh_and_verdict(
                         &scan_job,
                         options.allow_callgraph_cold_build,
@@ -2337,6 +2378,7 @@ impl InspectManager {
                 {
                     scan_job.callgraph_snapshot = Some(snapshot);
                     phases.projection = Some(verdict);
+                    phases.projection_cost += projection_cost;
                 }
                 phases.snapshot += snapshot_started.elapsed();
             }
@@ -2442,7 +2484,7 @@ impl InspectManager {
                     && rescan_job.callgraph_snapshot.is_none()
                 {
                     let snapshot_started = Instant::now();
-                    if let Some((snapshot, verdict)) = self
+                    if let Some((snapshot, verdict, projection_cost)) = self
                         .build_tier2_callgraph_snapshot_with_refresh_and_verdict(
                             &rescan_job,
                             options.allow_callgraph_cold_build,
@@ -2452,6 +2494,7 @@ impl InspectManager {
                     {
                         rescan_job.callgraph_snapshot = Some(snapshot);
                         phases.projection = Some(verdict);
+                        phases.projection_cost += projection_cost;
                     }
                     phases.snapshot += snapshot_started.elapsed();
                 }
@@ -2514,7 +2557,7 @@ impl InspectManager {
             && aggregate_job.callgraph_snapshot.is_none()
         {
             let snapshot_started = Instant::now();
-            if let Some((snapshot, verdict)) = self
+            if let Some((snapshot, verdict, projection_cost)) = self
                 .build_tier2_callgraph_snapshot_with_refresh_and_verdict(
                     &aggregate_job,
                     options.allow_callgraph_cold_build,
@@ -2524,6 +2567,7 @@ impl InspectManager {
             {
                 aggregate_job.callgraph_snapshot = Some(snapshot);
                 phases.projection = Some(verdict);
+                phases.projection_cost += projection_cost;
             }
             phases.snapshot += snapshot_started.elapsed();
         }
@@ -2604,6 +2648,13 @@ impl InspectManager {
             .store_tier2_aggregate(job.key.clone(), &contribution_set_hash, aggregate.clone())
             .map_err(|error| error.to_string())?;
         phases.rollup = rollup_started.elapsed();
+        if let Some(verdict) = phases.projection {
+            self.observe_callgraph_projection_cost(
+                &job.project_root,
+                verdict,
+                phases.projection_cost + phases.rollup,
+            );
+        }
         phases.log(job.category, &job.project_root);
 
         Ok(InspectScanSuccess {
@@ -2919,8 +2970,10 @@ fn validate_tier2_read_category(category: InspectCategory) -> Result<(), JobOutc
 struct Tier2PhaseTimings {
     /// Freshness verification of cached contributions (file stat + hash reads).
     freshness: Duration,
-    /// Callgraph store snapshot projection (dead_code only).
+    /// Callgraph refresh, store open, and snapshot projection (dead_code only).
     snapshot: Duration,
+    /// The projection operation alone, excluding store refresh and open work.
+    projection_cost: Duration,
     /// Scanner compute over files needing (re)scan.
     scan: Duration,
     /// SQLite contribution upserts/deletes, including connection lock wait.
@@ -3289,7 +3342,7 @@ fn build_tier2_callgraph_snapshot(
     allow_cold_build: bool,
 ) -> Option<Arc<CallgraphSnapshot>> {
     build_tier2_callgraph_snapshot_with_refresh_inner(job, allow_cold_build, false, &[], None)
-        .map(|(snapshot, _)| snapshot)
+        .map(|(snapshot, _, _)| snapshot)
 }
 
 #[cfg(test)]
@@ -3305,7 +3358,7 @@ fn build_tier2_callgraph_snapshot_with_refresh(
         refresh_paths,
         None,
     )
-    .map(|(snapshot, _)| snapshot)
+    .map(|(snapshot, _, _)| snapshot)
 }
 
 const BLOCKING_CALLGRAPH_STORE_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -3460,7 +3513,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
     build_if_missing: bool,
     refresh_paths: &[PathBuf],
     projection_cache: Option<&InspectManager>,
-) -> Option<(Arc<CallgraphSnapshot>, ProjectionVerdict)> {
+) -> Option<(Arc<CallgraphSnapshot>, ProjectionVerdict, Duration)> {
     let started = Instant::now();
     if !job.config.callgraph_store {
         crate::slog_info!(
@@ -3685,6 +3738,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
                         journal_bytes: 0,
                         changed_files: 0,
                     },
+                    Duration::ZERO,
                 ));
             }
         } else if cache_identity.is_none() {
@@ -3698,12 +3752,17 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
         let previous = projection_cache
             .zip(cache_identity.as_ref())
             .and_then(|(cache, identity)| cache.previous_callgraph_projection(identity));
-        let (write_revision, snapshot, verdict) =
-            match crate::callgraph_store::project_dead_code_snapshot_incremental(
+        let costs = projection_cache
+            .zip(cache_identity.as_ref())
+            .map(|(cache, identity)| cache.callgraph_projection_costs(identity))
+            .unwrap_or_default();
+        let (write_revision, snapshot, verdict, projection_cost) =
+            match project_dead_code_snapshot_incremental_with_costs(
                 projection_store.sqlite_path(),
                 previous
                     .as_ref()
                     .map(|(revision, snapshot)| (*revision, snapshot.as_ref())),
+                costs,
             ) {
                 Ok(projected) => projected,
                 Err(CallGraphStoreError::Unavailable(message)) => {
@@ -3750,7 +3809,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
             started.elapsed().as_millis()
         );
 
-        return Some((snapshot, verdict));
+        return Some((snapshot, verdict, projection_cost));
     }
 
     crate::slog_info!(
@@ -7565,13 +7624,22 @@ pub fn unrelated() -> u32 { 2 }
     #[ignore = "offline projection/rollup benchmark copies a production generation"]
     fn profile_incremental_projection_on_store_copy() {
         use rusqlite::{backup::Backup, Connection, OpenFlags};
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
             .parent()
             .unwrap()
             .canonicalize()
             .unwrap();
+        let root = std::env::var_os("AFT_PROJECTION_BENCH_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| workspace_root.clone())
+            .canonicalize()
+            .unwrap();
+        assert!(
+            root == workspace_root || root.starts_with(workspace_root.join("target")),
+            "benchmark roots must be this checkout or a disposable copy below target"
+        );
         let source_dir = PathBuf::from(
             std::env::var_os("AFT_CALLGRAPH_REFRESH_STORE")
                 .expect("set AFT_CALLGRAPH_REFRESH_STORE to the source root-key directory"),
@@ -7583,7 +7651,7 @@ pub fn unrelated() -> u32 { 2 }
             .find(|path| path.extension().is_some_and(|ext| ext == "current"))
             .expect("source generation pointer");
         let source_path = source_dir.join(std::fs::read_to_string(pointer).unwrap().trim());
-        let temp = tempfile::tempdir_in(root.join("target")).unwrap();
+        let temp = tempfile::tempdir_in(workspace_root.join("target")).unwrap();
         let store_dir = temp.path().join("store");
         std::fs::create_dir_all(&store_dir).unwrap();
         let key = crate::search_index::artifact_cache_key(&root);
@@ -7604,44 +7672,116 @@ pub fn unrelated() -> u32 { 2 }
                 .unwrap();
         }
         let store = CallGraphStore::open(store_dir, root.clone()).unwrap();
-        // Only these temporary sources and the SQLite backup are mutated. The
-        // production generation and all checkout source files remain untouched.
+        // Only disposable checkout sources and the SQLite backup may be mutated.
+        // The source generation is always opened read-only.
         let changed_count = std::env::var("AFT_PROJECTION_BENCH_CHANGED_FILES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(1);
-        let changed = (0..changed_count)
-            .map(|index| temp.path().join(format!("probe-{index}.rs")))
-            .collect::<Vec<_>>();
-        for path in &changed {
-            write_file(path, "pub fn projection_probe() {}\n");
+        let changed_paths = std::env::var_os("AFT_PROJECTION_BENCH_CHANGED_PATHS");
+        let changed = if let Some(changed_paths) = changed_paths.as_ref() {
+            std::fs::read_to_string(changed_paths)
+                .unwrap()
+                .lines()
+                .filter(|line| !line.is_empty())
+                .take(changed_count)
+                .map(|relative| root.join(relative))
+                .collect::<Vec<_>>()
+        } else {
+            (0..changed_count)
+                .map(|index| temp.path().join(format!("probe-{index}.rs")))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            changed.len(),
+            changed_count,
+            "changed-path corpus is too small"
+        );
+        if changed_paths.is_none() {
+            for path in &changed {
+                write_file(path, "pub fn projection_probe() {}\n");
+            }
+            store.refresh_files(&changed).unwrap();
         }
-        store.refresh_files(&changed).unwrap();
         let (revision, previous) =
             project_dead_code_snapshot_with_revision(store.sqlite_path()).unwrap();
-        for path in &changed {
-            write_file(
-                path,
-                "pub fn projection_probe() { projection_probe_target(); }\npub fn projection_probe_target() {}\n",
-            );
+        if std::env::var_os("AFT_PROJECTION_BENCH_JOURNAL_ONLY").is_some() {
+            let next = revision.unwrap() + 1;
+            let callers = changed
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(&root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                })
+                .collect::<BTreeSet<_>>();
+            let payload = serde_json::to_string(&(next, callers)).unwrap();
+            let conn = rusqlite::Connection::open(store.sqlite_path()).unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(k, v) VALUES('projection_write_revision', ?1)",
+                [next.to_string()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
+                rusqlite::params![format!("projection_delta_{}", next % 64), payload],
+            )
+            .unwrap();
+        } else {
+            if changed_paths.is_none() {
+                for path in &changed {
+                    write_file(
+                        path,
+                        "pub fn projection_probe() { projection_probe_target(); }\npub fn projection_probe_target() {}\n",
+                    );
+                }
+            }
+            store.refresh_files(&changed).unwrap();
         }
-        store.refresh_files(&changed).unwrap();
         let cpu = projection_bench_cpu_ms();
         let started = Instant::now();
         let full = project_dead_code_snapshot(store.sqlite_path()).unwrap();
-        let full_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let full_elapsed = started.elapsed();
+        let full_ms = full_elapsed.as_secs_f64() * 1000.0;
         let full_cpu = projection_bench_cpu_ms() - cpu;
         crate::callgraph_store::take_projection_work();
         let cpu = projection_bench_cpu_ms();
         let started = Instant::now();
-        let (_, incremental, _) = crate::callgraph_store::project_dead_code_snapshot_incremental(
-            store.sqlite_path(),
-            Some((revision.unwrap(), &previous)),
-        )
-        .unwrap();
-        let delta_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let (_, incremental, verdict) =
+            crate::callgraph_store::project_dead_code_snapshot_incremental(
+                store.sqlite_path(),
+                Some((revision.unwrap(), &previous)),
+            )
+            .unwrap();
+        let delta_elapsed = started.elapsed();
+        let delta_ms = delta_elapsed.as_secs_f64() * 1000.0;
         let delta_cpu = projection_bench_cpu_ms() - cpu;
         let work = crate::callgraph_store::take_projection_work();
+        if std::env::var_os("AFT_PROJECTION_BENCH_PROJECTION_ONLY").is_some() {
+            let mut costs = ProjectionCostEstimates::default();
+            costs.observe(
+                ProjectionVerdict {
+                    kind: ProjectionKind::Full,
+                    reason: Some("cold"),
+                    journal_bytes: 0,
+                    changed_files: 0,
+                },
+                full_elapsed,
+            );
+            costs.observe(verdict, delta_elapsed);
+            let (_, _, predicted, _) = project_dead_code_snapshot_incremental_with_costs(
+                store.sqlite_path(),
+                Some((revision.unwrap(), &previous)),
+                costs,
+            )
+            .unwrap();
+            eprintln!(
+                "projection_crossover changed_files={} full_ms={full_ms:.3} full_cpu_ms={full_cpu:.3} splice_ms={delta_ms:.3} splice_cpu_ms={delta_cpu:.3} measured={:?} predicted={:?} predicted_reason={:?} outbound_rows_read={}",
+                verdict.changed_files, verdict.kind, predicted.kind, predicted.reason, work.1
+            );
+            return;
+        }
         let mut job = InspectJob {
             job_id: 87,
             key: JobKey::for_project_category(InspectCategory::DeadCode),
@@ -8184,6 +8324,57 @@ export function main() { foo(); }
     }
 
     #[test]
+    fn cached_projection_retains_root_cost_estimates_across_revisions() {
+        let manager = InspectManager::new();
+        let root = PathBuf::from("/cost-root");
+        let identity = CallgraphProjectionIdentity {
+            project_root: root.clone(),
+            generation: Some("generation".to_string()),
+            legacy_sqlite_path: None,
+            write_revision: 1,
+        };
+        let snapshot = Arc::new(CallgraphSnapshot {
+            generated_at: None,
+            files: Vec::new(),
+            exported_symbols: Vec::new(),
+            outbound_calls: Vec::new(),
+            entry_points: BTreeSet::new(),
+            entry_point_symbols: BTreeMap::new(),
+        });
+        manager.cache_callgraph_projection(identity.clone(), Arc::clone(&snapshot));
+        manager.observe_callgraph_projection_cost(
+            &root,
+            ProjectionVerdict {
+                kind: ProjectionKind::Full,
+                reason: Some("cold"),
+                journal_bytes: 0,
+                changed_files: 0,
+            },
+            Duration::from_nanos(100),
+        );
+        manager.observe_callgraph_projection_cost(
+            &root,
+            ProjectionVerdict {
+                kind: ProjectionKind::Spliced,
+                reason: None,
+                journal_bytes: 20,
+                changed_files: 4,
+            },
+            Duration::from_nanos(120),
+        );
+        let mut next_identity = identity;
+        next_identity.write_revision = 2;
+        manager.cache_callgraph_projection(next_identity.clone(), snapshot);
+
+        assert!(
+            manager
+                .callgraph_projection_costs(&next_identity)
+                .splice_is_costlier(4),
+            "cost estimates must survive replacing a root snapshot at a new revision"
+        );
+    }
+
+    #[test]
     fn fleet_budget_drops_oldest_whole_root_snapshot() {
         fn slot(root: &str) -> Arc<ProjectionSlot> {
             Arc::new(Mutex::new(Some(CachedCallgraphProjection {
@@ -8202,6 +8393,7 @@ export function main() { foo(); }
                     entry_point_symbols: BTreeMap::new(),
                 }),
                 estimated_bytes: 600 * 1024 * 1024,
+                costs: ProjectionCostEstimates::default(),
                 rollup: None,
             })))
         }
@@ -8291,6 +8483,17 @@ export function main() { foo(); }
         assert_eq!(
             gap,
             " projection=full reason=journal_gap journal_bytes=0 changed_files=0"
+        );
+
+        let costlier = render_projection_suffix(ProjectionVerdict {
+            kind: ProjectionKind::Full,
+            reason: Some("splice_costlier"),
+            journal_bytes: 261_465,
+            changed_files: 1_486,
+        });
+        assert_eq!(
+            costlier,
+            " projection=full reason=splice_costlier journal_bytes=261465 changed_files=1486"
         );
 
         let reused = render_projection_suffix(ProjectionVerdict {
