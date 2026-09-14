@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens", "profile-grammar", "paging"],
+  "slices": [
+    "issue-314-windows-lsp-install-storm",
+    "issue-311-live-descendants",
+    "e2e-borrowed-sibling-exact-evidence"
+  ],
+  "note": "No ranking-fence file changes: plugin LSP install path, bash background descendants/pipeline footer/linux scope, and an e2e assertion."
+}
