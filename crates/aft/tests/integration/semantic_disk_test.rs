@@ -560,6 +560,38 @@ fn semantic_segment_sigkill_preserves_previous_state_and_retry_recovers() {
     let status = child.wait().expect("reap semantic tear child");
     assert_eq!(status.signal(), Some(libc::SIGKILL));
 
+    let torn_bytes = fs::metadata(
+        storage
+            .path()
+            .join("semantic")
+            .join(DELTA_PROJECT_KEY)
+            .join("semantic.bin"),
+    )
+    .expect("stat torn semantic artifact")
+    .len();
+    let borrowed_after_kill = SemanticIndex::read_from_disk(
+        storage.path(),
+        DELTA_PROJECT_KEY,
+        project.path(),
+        true,
+        Some(&delta_fingerprint().as_string()),
+    )
+    .expect("borrowed reader should retain the last complete segment boundary");
+    assert_eq!(borrowed_after_kill.to_bytes(), original.to_bytes());
+    assert_eq!(
+        fs::metadata(
+            storage
+                .path()
+                .join("semantic")
+                .join(DELTA_PROJECT_KEY)
+                .join("semantic.bin")
+        )
+        .expect("restat torn semantic artifact")
+        .len(),
+        torn_bytes,
+        "a borrowed reader must not truncate its owner's torn tail"
+    );
+
     let after_kill = load_delta_index(storage.path(), project.path());
     assert_eq!(
         after_kill.to_bytes(),
