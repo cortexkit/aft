@@ -9373,9 +9373,9 @@ mod tests {
         // emitted after its grace period rather than inline.
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let emitted = frames.lock().unwrap().iter().any(|frame| {
-                matches!(frame, PushFrame::BashCompleted(f) if f.task_id == task_comp)
-            });
+            let emitted = frames.lock().unwrap().iter().any(
+                |frame| matches!(frame, PushFrame::BashCompleted(f) if f.task_id == task_comp),
+            );
             if emitted || Instant::now() >= deadline {
                 break;
             }

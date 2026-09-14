@@ -4996,13 +4996,19 @@ mod watcher_slice_tests {
             // after a handful of paths on a loaded box, so the slice count is
             // bounded by the mechanism (every slice makes progress), not by a
             // number that depends on the host's speed.
-            assert!(slices <= path_count, "single dispatch event did not converge");
+            assert!(
+                slices <= path_count,
+                "single dispatch event did not converge"
+            );
         }
 
         assert_eq!(processed, path_count);
         // At least ceil(1024/256) slices from the path budget; the time budget
         // may only add slices, never remove them.
-        assert!(slices >= 4, "expected at least 4 path-budgeted slices, got {slices}");
+        assert!(
+            slices >= 4,
+            "expected at least 4 path-budgeted slices, got {slices}"
+        );
         assert_eq!(ctx.pending_tier2_paths().len(), path_count);
     }
 
@@ -5161,7 +5167,12 @@ mod watcher_slice_tests {
         // capture is process-wide, so select this test's line by content —
         // kind and this test's own root (matched by the temp dir's unique
         // name, since the line may spell the root canonically or not).
-        let root_name = temp.path().file_name().unwrap().to_string_lossy().into_owned();
+        let root_name = temp
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let rescan_lines = lines
             .iter()
             .filter(|line| {

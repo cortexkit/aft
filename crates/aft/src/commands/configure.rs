@@ -1365,6 +1365,56 @@ fn only_lsp_process_state_changed(previous: &Config, next: &Config) -> bool {
     configs_equal_including_runtime_only_fields(previous, &without_lsp_process_state)
 }
 
+/// The equivalent-configure and attach fast paths skip every probe and load the
+/// full path would run, so they are admissible only while nothing the full path
+/// would re-establish has been lost: the worktree topology memo still holds
+/// under the root's current `.git` marker (a stat, no git spawn), and each
+/// configured artifact plane is resident or already loading, and the watcher is
+/// live. An idle-evicted plane, a loader cleared by an unbind, a stopped
+/// watcher, or a changed `.git` marker takes the full path, which is what
+/// schedules the reload, re-verifies, or re-probes topology.
+fn fast_path_admissible(ctx: &AppContext, canonical_root: &Path, config: &Config) -> bool {
+    if ctx.subc_unbound_quiesced() {
+        return false;
+    }
+    if ctx.cached_worktree_bridge(canonical_root).is_none() {
+        return false;
+    }
+    // The full path re-reads the workspace manifest fingerprint because a bind
+    // may follow a window nobody observed; while the watcher is live every
+    // manifest edit reaches the callgraph through it, so the scan is redundant
+    // only then. A root whose watcher is down takes the full path.
+    if !ctx.watcher_runtime_active() {
+        return false;
+    }
+    let search_ready = !config.search_index
+        || ctx
+            .search_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        || ctx
+            .search_index_rx()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+    let semantic_ready = !config.semantic_search
+        || ctx
+            .semantic_index()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        || ctx.semantic_index_rx().lock().is_some();
+    let callgraph_ready = !config.callgraph_store
+        || ctx
+            .callgraph_store()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        || ctx.callgraph_store_rx().lock().is_some();
+    search_ready && semantic_ready && callgraph_ready
+}
+
 #[cfg(test)]
 fn reset_workspace_manifest_fingerprint_scans_for_test() {
     WORKSPACE_MANIFEST_FINGERPRINT_SCANS.with(|count| count.set(0));
@@ -2668,6 +2718,7 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 && ctx.harness_opt().as_ref() == Some(&harness)
                 && (previous_project_root.as_deref() == Some(root_path.as_path())
                     || canonical_root.as_path() == root_path)
+                && fast_path_admissible(ctx, canonical_root, &next_config)
         });
     if let Some(canonical_root) = active_canonical_root {
         next_config.semantic.route_project_root = Some(canonical_root.clone());
@@ -11443,9 +11494,15 @@ mod tests {
 
     #[test]
     fn lsp_paths_only_reconfigure_skips_git_and_artifact_work() {
+        let _watcher_guard = watcher_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _env_guard = home_env_mutex();
         let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _disable_watcher = EnvVarGuard::set("AFT_TEST_DISABLE_FILE_WATCHER", "1");
+        // The fast path requires a live watcher (it is what makes skipping the
+        // manifest fingerprint scan safe), so this test runs with one.
+        let _enable_watcher = EnvVarGuard::remove("AFT_TEST_DISABLE_FILE_WATCHER");
+        let _sync_watcher = EnvVarGuard::set("AFT_TEST_SYNC_FILE_WATCHER_START", "1");
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let lsp_bin = tempfile::tempdir().unwrap();
@@ -11463,20 +11520,23 @@ mod tests {
         });
         let initial = configure_request_with_session(base_params.clone(), "session-a");
         assert!(handle_configure_for_test(&initial, &ctx).success);
+        ctx.mark_subc_bound();
         super::drain_deferred_configure_maintenance(&ctx);
+        assert!(ctx.watcher_runtime_active());
 
         let generation = ctx.configure_generation();
         let worktree_probes = ctx.worktree_bridge_probe_spawns_for_test();
         let artifact_key_derivations = ctx.artifact_cache_key_derivation_count_for_test();
         let artifact_loads = super::configure_artifact_load_attempts_for_root_for_test(root.path());
-        ctx.force_worktree_bridge_reprobe_for_test(true);
+        // No forced reprobe: the fast path is admissible only on a topology memo
+        // hit under the unchanged `.git` marker, and that hit is the proof the
+        // probe was skipped rather than a seam pretending it never ran.
         let mut lsp_params = base_params;
         lsp_params["lsp_paths_extra"] = json!([lsp_bin.path()]);
         lsp_params["lsp_inflight_installs"] = json!(["aft-test-lsp"]);
         let update = configure_request_with_session(lsp_params, "session-a");
 
         let response = handle_configure_for_test(&update, &ctx);
-        ctx.force_worktree_bridge_reprobe_for_test(false);
 
         assert!(response.success, "LSP path update failed: {response:?}");
         // The proof that the fast path was taken is the counters below (no
@@ -11493,6 +11553,7 @@ mod tests {
             artifact_loads
         );
         assert_eq!(ctx.configure_maintenance_job_count_for_test(), 0);
+        ctx.stop_watcher_runtime();
     }
 
     #[test]
@@ -11686,11 +11747,9 @@ mod tests {
         let watcher_thread = ctx.watcher_runtime_thread_id_for_test().unwrap();
         let watcher_generation = WATCHER_GENERATION.load(Ordering::SeqCst);
         let worktree_probes = ctx.worktree_bridge_probe_spawns_for_test();
-        ctx.force_worktree_bridge_reprobe_for_test(true);
 
         let second = configure_request_with_session(params, "session-b");
         assert!(handle_configure_for_test(&second, &ctx).success);
-        ctx.force_worktree_bridge_reprobe_for_test(false);
 
         assert_eq!(ctx.worktree_bridge_probe_spawns_for_test(), worktree_probes);
         assert_eq!(
