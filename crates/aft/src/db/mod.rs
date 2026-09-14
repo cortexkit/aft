@@ -21,7 +21,7 @@ pub mod state;
 pub const CURRENT_SCHEMA_VERSION: u32 = 10;
 
 const MIGRATION_V10: &str = r#"
-CREATE TABLE compression_event_rollups (
+CREATE TABLE IF NOT EXISTS compression_event_rollups (
   harness TEXT NOT NULL,
   project_key TEXT NOT NULL,
   session_is_null INTEGER NOT NULL,
@@ -31,8 +31,8 @@ CREATE TABLE compression_event_rollups (
   compressed_tokens INTEGER NOT NULL,
   PRIMARY KEY (harness, project_key, session_is_null, session_id)
 );
-CREATE INDEX idx_compression_created ON compression_events(created_at, id);
-CREATE TABLE compression_retention_cursor (
+CREATE INDEX IF NOT EXISTS idx_compression_created ON compression_events(created_at, id);
+CREATE TABLE IF NOT EXISTS compression_retention_cursor (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   created_at INTEGER NOT NULL,
   event_id INTEGER NOT NULL
@@ -231,7 +231,9 @@ CREATE INDEX idx_bash_tasks_non_terminal_pid
 "#;
 
 // Watches cannot outlive their task. Rebuilding also drops legacy orphan rows,
-// which cannot satisfy the new composite foreign key.
+// which cannot satisfy the new composite foreign key. This rebuild is safely
+// re-runnable: its rename frees the table name, and its index drops free the
+// index names before each unguarded CREATE.
 const MIGRATION_V9: &str = r#"
 DROP INDEX IF EXISTS idx_bash_pattern_watches_session;
 DROP INDEX IF EXISTS idx_bash_pattern_watches_task;
@@ -431,20 +433,7 @@ fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError>
     }
 
     let from = db_version;
-    let result = match version {
-        1 => tx.execute_batch(MIGRATION_V1),
-        2 => tx.execute_batch(MIGRATION_V2),
-        3 => tx.execute_batch(MIGRATION_V3),
-        4 => apply_migration_v4(&tx),
-        5 => tx.execute_batch(MIGRATION_V5),
-        6 => tx.execute_batch(MIGRATION_V6),
-        7 => tx.execute_batch(MIGRATION_V7),
-        8 => tx.execute_batch(MIGRATION_V8),
-        9 => tx.execute_batch(MIGRATION_V9),
-        10 => tx.execute_batch(MIGRATION_V10),
-        _ => Ok(()),
-    }
-    .and_then(|()| {
+    let result = apply_migration_statements(&tx, version).and_then(|()| {
         tx.execute("DELETE FROM schema_version", [])?;
         tx.execute(
             "INSERT OR REPLACE INTO schema_version (version) VALUES (?1)",
@@ -458,6 +447,22 @@ fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError>
         to: version,
         error,
     })
+}
+
+fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Result<()> {
+    match version {
+        1 => conn.execute_batch(MIGRATION_V1),
+        2 => conn.execute_batch(MIGRATION_V2),
+        3 => conn.execute_batch(MIGRATION_V3),
+        4 => apply_migration_v4(conn),
+        5 => conn.execute_batch(MIGRATION_V5),
+        6 => conn.execute_batch(MIGRATION_V6),
+        7 => conn.execute_batch(MIGRATION_V7),
+        8 => conn.execute_batch(MIGRATION_V8),
+        9 => conn.execute_batch(MIGRATION_V9),
+        10 => conn.execute_batch(MIGRATION_V10),
+        _ => Ok(()),
+    }
 }
 
 fn apply_migration_v4(conn: &Connection) -> rusqlite::Result<()> {
@@ -601,6 +606,20 @@ mod tests {
         let conn = open(&dir.path().join("aft.db")).unwrap();
 
         assert_eq!(schema_version(&conn), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn every_migration_is_safe_to_apply_twice() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        for version in 1..=CURRENT_SCHEMA_VERSION {
+            apply_migration_statements(&conn, version).unwrap_or_else(|error| {
+                panic!("migration V{version} failed on its first application: {error}")
+            });
+            apply_migration_statements(&conn, version).unwrap_or_else(|error| {
+                panic!("migration V{version} failed when applied a second time: {error}")
+            });
+        }
     }
 
     #[test]
