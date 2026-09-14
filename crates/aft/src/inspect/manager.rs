@@ -27,7 +27,7 @@ use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph_store::project_dead_code_snapshot;
 use crate::callgraph_store::{
     project_dead_code_snapshot_with_revision, CallGraphStore, CallGraphStoreError, ProjectionKind,
-    ProjectionVerdict, ReadonlyCallGraphStore,
+    ProjectionVerdict, ReadonlyCallGraphStore, MAX_DELTA_BYTES,
 };
 use crate::cold_build_limiter;
 
@@ -3003,10 +3003,11 @@ fn render_projection_suffix(verdict: ProjectionVerdict) -> String {
         ProjectionKind::Full => "full",
         ProjectionKind::Reused => "reused",
     };
-    let reason = verdict
-        .reason
-        .map(|reason| format!(" reason={reason}"))
-        .unwrap_or_default();
+    let reason = match verdict.reason {
+        Some("journal_oversize") => format!(" reason=journal_oversize:{MAX_DELTA_BYTES}"),
+        Some(reason) => format!(" reason={reason}"),
+        None => String::new(),
+    };
     format!(
         " projection={kind}{reason} journal_bytes={} changed_files={}",
         verdict.journal_bytes, verdict.changed_files
@@ -8271,7 +8272,7 @@ export function main() { foo(); }
             .collect::<BTreeSet<_>>();
         let payload = serde_json::to_string(&(next, &callers)).expect("serialize caller batch");
         assert!(
-            payload.len() > 256 * 1024,
+            payload.len() > MAX_DELTA_BYTES,
             "fixture must exceed the former absolute journal bound"
         );
 

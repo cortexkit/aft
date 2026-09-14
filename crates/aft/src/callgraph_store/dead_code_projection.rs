@@ -238,7 +238,10 @@ fn splice_files<T: Clone>(
 // A bounded durable journal lets a reader bridge multiple watcher transactions.
 // Missing entries (including writes by older binaries) always force a cold read.
 const DELTA_HISTORY: u64 = 64;
-const MIN_INLINE_DELTA_BYTES: usize = 256 * 1024;
+/// Historical public floor retained for call sites that render journal limits.
+/// The effective inline limit is corpus-proportional and may be larger.
+pub(crate) const MAX_DELTA_BYTES: usize = 256 * 1024;
+const MIN_INLINE_DELTA_BYTES: usize = MAX_DELTA_BYTES;
 const PROJECTION_DELTA_SPILL_TABLE: &str = "projection_delta_spill";
 
 /// Keep ordinary deltas in `meta`, but scale that inline allowance with the
