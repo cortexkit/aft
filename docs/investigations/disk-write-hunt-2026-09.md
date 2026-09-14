@@ -229,10 +229,10 @@ After (same copied input and refresh procedure, base + delta writer):
 
 | Changed files | Physical bytes / MiB | Logical bytes / MiB | Resulting base + log bytes / MiB |
 | ---: | ---: | ---: | ---: |
-| 1 | **28,672 / 0.027** | 237,568 / 0.227 | 154,987,951 / 147.808 |
-| 10 | **77,824 / 0.074** | 438,272 / 0.418 | 155,028,325 / 147.847 |
-| 100 | **466,944 / 0.445** | 765,952 / 0.730 | 155,433,968 / 148.233 |
-| Forced compaction after the 100-file row | 145,817,600 / 139.063 | 156,974,932 / 149.703 | 145,813,162 / 139.058 |
+| 1 | **20,480 / 0.020** | 114,688 / 0.109 | 154,987,951 / 147.808 |
+| 10 | **69,632 / 0.066** | 212,992 / 0.203 | 155,028,325 / 147.847 |
+| 100 | **462,848 / 0.441** | 598,016 / 0.570 | 155,433,968 / 148.233 |
+| Forced compaction after the 100-file row | 145,817,600 / 139.063 | 146,718,548 / 139.922 | 145,813,162 / 139.058 |
 
 `semantic.bin` now starts with the unchanged V6/V7 base snapshot and appends one segment per persisted refresh. A segment contains ordered file-id tombstones followed by the complete replacement metadata, chunks, and vectors for those file ids. Each frame is `magic + u64 payload length + BLAKE3 checksum + payload`. Readers apply checksum-valid frames in sequence. A partial or checksum-invalid final frame is treated as a torn tail, leaving the preceding base + frames loadable; an owning reader or the next writer truncates it to the last valid boundary, while borrowed/read-only openers do not mutate it. This length-prefix/checksum design avoids rewriting the 145–155 MiB base merely to publish a small refresh.
 

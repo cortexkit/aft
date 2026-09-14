@@ -2653,47 +2653,51 @@ fn semantic_entry_persistence_eq(left: &EmbeddingEntry, right: &EmbeddingEntry) 
             .all(|(left, right)| left.to_bits() == right.to_bits())
 }
 
-fn semantic_file_persistence_eq(left: &SemanticIndex, right: &SemanticIndex, path: &Path) -> bool {
-    if left.file_mtimes.get(path) != right.file_mtimes.get(path)
-        || left.file_sizes.get(path) != right.file_sizes.get(path)
-        || left.file_hashes.get(path) != right.file_hashes.get(path)
-    {
-        return false;
+fn semantic_entries_by_file(index: &SemanticIndex) -> HashMap<&Path, Vec<&EmbeddingEntry>> {
+    let mut by_file: HashMap<&Path, Vec<&EmbeddingEntry>> = HashMap::new();
+    for entry in &index.entries {
+        by_file
+            .entry(entry.chunk.file.as_path())
+            .or_default()
+            .push(entry);
     }
-
-    let mut left_entries = left
-        .entries
-        .iter()
-        .filter(|entry| entry.chunk.file == path)
-        .collect::<Vec<_>>();
-    let mut right_entries = right
-        .entries
-        .iter()
-        .filter(|entry| entry.chunk.file == path)
-        .collect::<Vec<_>>();
-    left_entries.sort_by(semantic_entry_cmp);
-    right_entries.sort_by(semantic_entry_cmp);
-    left_entries.len() == right_entries.len()
-        && left_entries
-            .iter()
-            .zip(right_entries)
-            .all(|(left, right)| semantic_entry_persistence_eq(left, right))
+    for entries in by_file.values_mut() {
+        entries.sort_by(semantic_entry_cmp);
+    }
+    by_file
 }
 
 fn semantic_changed_paths(previous: &SemanticIndex, current: &SemanticIndex) -> BTreeSet<PathBuf> {
+    let previous_entries = semantic_entries_by_file(previous);
+    let current_entries = semantic_entries_by_file(current);
     let mut paths = BTreeSet::new();
     paths.extend(previous.file_mtimes.keys().cloned());
     paths.extend(current.file_mtimes.keys().cloned());
-    paths.extend(
-        previous
-            .entries
-            .iter()
-            .map(|entry| entry.chunk.file.clone()),
-    );
-    paths.extend(current.entries.iter().map(|entry| entry.chunk.file.clone()));
+    paths.extend(previous_entries.keys().map(|path| (*path).to_path_buf()));
+    paths.extend(current_entries.keys().map(|path| (*path).to_path_buf()));
     paths
         .into_iter()
-        .filter(|path| !semantic_file_persistence_eq(previous, current, path))
+        .filter(|path| {
+            if previous.file_mtimes.get(path) != current.file_mtimes.get(path)
+                || previous.file_sizes.get(path) != current.file_sizes.get(path)
+                || previous.file_hashes.get(path) != current.file_hashes.get(path)
+            {
+                return true;
+            }
+            let previous = previous_entries
+                .get(path.as_path())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let current = current_entries
+                .get(path.as_path())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            previous.len() != current.len()
+                || !previous
+                    .iter()
+                    .zip(current)
+                    .all(|(previous, current)| semantic_entry_persistence_eq(previous, current))
+        })
         .collect()
 }
 
