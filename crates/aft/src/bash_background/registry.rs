@@ -1538,7 +1538,7 @@ impl BgTaskRegistry {
         shell_path: PathBuf,
         session_id: String,
         workdir: PathBuf,
-        mut env: HashMap<String, String>,
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))] mut env: HashMap<String, String>,
         timeout: Option<Duration>,
         storage_dir: PathBuf,
         max_running: usize,
