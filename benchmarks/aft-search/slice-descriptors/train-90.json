@@ -1,8 +1,9 @@
 {
   "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
-  "fixtures": ["harness-goldens", "profile-grammar", "paging"],
-  "parity_fixture": "crates/aft/tests/integration/tool_call_parity_fixtures",
-  "slices": ["semantic-shared-base-freeze-no-panic"],
-  "note": "semantic_index.rs is in the ranking fence; the change is the shared-base freeze path (borrow binds), not embedding or ranking: rows byte-equal to the reference."
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": ["semantic-shared-base-freeze-no-panic"]
 }
