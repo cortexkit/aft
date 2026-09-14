@@ -1,9 +1,11 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, RwLock};
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -22,6 +24,8 @@ const EXCLUSION_FILE_COUNT_CAP: usize = 50_000;
 const ROOT_DELETED_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const GITIGNORE_REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DISPATCH_SEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const WATCHER_ATTRIBUTION_RING_CAPACITY: usize = 512;
+const WATCHER_OVERFLOW_PREFIX_LIMIT: usize = 5;
 
 #[derive(Debug, Clone)]
 pub struct WatcherFilterConfig {
@@ -464,6 +468,7 @@ struct WatcherFilterThread {
     dispatch_tx: Sender<WatcherDispatchEvent>,
     shutdown: Arc<AtomicBool>,
     raw_paths: BTreeSet<PathBuf>,
+    recent_paths: VecDeque<(PathBuf, Instant)>,
     flush_deadline: Option<Instant>,
 }
 
@@ -482,6 +487,7 @@ impl WatcherFilterThread {
             dispatch_tx,
             shutdown,
             raw_paths: BTreeSet::new(),
+            recent_paths: VecDeque::with_capacity(WATCHER_ATTRIBUTION_RING_CAPACITY),
             flush_deadline: None,
         }
     }
@@ -509,6 +515,7 @@ impl WatcherFilterThread {
                     self.config.counters.note_raw_event();
                     if event.need_rescan() {
                         let reason = RescanReason::from_event_info(event.info());
+                        self.log_overflow(reason);
                         self.raw_paths.clear();
                         self.flush_deadline = None;
                         if !self.send_dispatch(WatcherDispatchEvent::RescanRequired(reason)) {
@@ -516,6 +523,7 @@ impl WatcherFilterThread {
                         }
                         continue;
                     }
+                    self.record_recent_paths(&event.paths);
                     if watcher_event_invalidates(&event.kind) {
                         self.config.counters.note_invalidating_event();
                         if !self.push_raw_paths(event.paths) {
@@ -546,6 +554,101 @@ impl WatcherFilterThread {
 
     fn project_root_was_deleted(&self) -> bool {
         !self.config.project_root.exists()
+    }
+
+    fn record_recent_paths(&mut self, paths: &[PathBuf]) {
+        let arrived_at = Instant::now();
+        for path in paths {
+            let relative = path
+                .strip_prefix(&self.config.project_root)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|_| {
+                    PathBuf::from("<external>")
+                        .join(path.file_name().unwrap_or_else(|| path.as_os_str()))
+                });
+            if self.recent_paths.len() == WATCHER_ATTRIBUTION_RING_CAPACITY {
+                self.recent_paths.pop_front();
+            }
+            self.recent_paths.push_back((relative, arrived_at));
+        }
+    }
+
+    fn overflow_prefixes(&self) -> Vec<crate::context::WatcherOverflowPrefix> {
+        let mut counts = BTreeMap::<String, u64>::new();
+        for (path, _) in &self.recent_paths {
+            let prefix = path
+                .components()
+                .filter_map(|component| match component {
+                    Component::Normal(name) => Some(name),
+                    _ => None,
+                })
+                .take(2)
+                .collect::<PathBuf>();
+            if prefix.as_os_str().is_empty() {
+                continue;
+            }
+            *counts.entry(prefix.to_string_lossy().into_owned()).or_default() += 1;
+        }
+        let mut prefixes = counts
+            .into_iter()
+            .map(|(prefix, count)| crate::context::WatcherOverflowPrefix { prefix, count })
+            .collect::<Vec<_>>();
+        prefixes.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.prefix.cmp(&right.prefix))
+        });
+        prefixes.truncate(WATCHER_OVERFLOW_PREFIX_LIMIT);
+        prefixes
+    }
+
+    fn log_overflow(&self, reason: RescanReason) {
+        let prefixes = self.overflow_prefixes();
+        let during_rescan = self.config.counters.note_overflow(prefixes.clone());
+        let backend = self.config.counters.backend_exclusions();
+        let exclusions = backend
+            .paths
+            .iter()
+            .map(|path| {
+                path.strip_prefix(&self.config.project_root)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let prefixes = prefixes
+            .iter()
+            .map(|prefix| format!("{}:{}", prefix.prefix, prefix.count))
+            .collect::<Vec<_>>()
+            .join(",");
+        let span_ms = self
+            .recent_paths
+            .front()
+            .zip(self.recent_paths.back())
+            .map(|((_, first), (_, last))| {
+                last.saturating_duration_since(*first)
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64
+            })
+            .unwrap_or(0);
+        let queue_depth = backend
+            .queue_depth
+            .map(|depth| depth.to_string())
+            .unwrap_or_else(|| "unavailable".to_string());
+        let line = format!(
+            "watcher overflow: reason={} root={} exclusions=[{}] matcher_generation={} top_prefixes=[{}] ring_span_ms={} queue_depth={} rescan_in_progress={}",
+            reason.as_str(),
+            self.config.project_root.display(),
+            exclusions,
+            backend.matcher_generation,
+            prefixes,
+            span_ms,
+            queue_depth,
+            during_rescan
+        );
+        emit_watcher_overflow_log(line);
     }
 
     fn push_raw_paths(&mut self, paths: Vec<PathBuf>) -> bool {
@@ -662,6 +765,29 @@ impl WatcherFilterThread {
             }
         }
     }
+}
+
+fn emit_watcher_overflow_log(line: String) {
+    crate::slog_warn!("{line}");
+    #[cfg(test)]
+    WATCHER_OVERFLOW_LOGS_FOR_TEST
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(line);
+}
+
+#[cfg(test)]
+static WATCHER_OVERFLOW_LOGS_FOR_TEST: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+#[cfg(test)]
+fn take_watcher_overflow_logs_for_test() -> Vec<String> {
+    std::mem::take(
+        &mut *WATCHER_OVERFLOW_LOGS_FOR_TEST
+            .get_or_init(|| Mutex::new(Vec::new()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }
 
 #[cfg(test)]
@@ -840,6 +966,83 @@ mod tests {
         shutdown.store(true, Ordering::SeqCst);
         drop(raw_tx);
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn overflow_log_attributes_excluded_and_nonexcluded_burst_prefixes() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let target = root.join("target/cache");
+        let source = root.join("src/generated");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        let matcher = shared_matcher(&root);
+        let generation = Arc::new(AtomicU64::new(7));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (dispatch_tx, dispatch_rx) = crossbeam_channel::bounded(1);
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let config = WatcherFilterConfig::new(root.clone(), None);
+        config.counters.set_backend_exclusions(
+            7,
+            (0..FSEVENTS_EXCLUSION_LIMIT)
+                .map(|index| root.join(format!("excluded-{index}")))
+                .collect(),
+        );
+        let counters = Arc::clone(&config.counters);
+        let mut filter = WatcherFilterThread::new(
+            config,
+            matcher,
+            generation,
+            dispatch_tx,
+            Arc::clone(&shutdown),
+        );
+        let handle = thread::spawn(move || filter.run(raw_rx));
+
+        for index in 0..20 {
+            raw_tx
+                .send(Ok(notify::Event::new(EventKind::Create(CreateKind::File))
+                    .add_path(target.join(format!("artifact-{index}")))))
+                .unwrap();
+        }
+        for index in 0..7 {
+            raw_tx
+                .send(Ok(notify::Event::new(EventKind::Create(CreateKind::File))
+                    .add_path(source.join(format!("source-{index}.rs")))))
+                .unwrap();
+        }
+        raw_tx
+            .send(Ok(
+                notify::Event::new(EventKind::Other).set_flag(Flag::Rescan)
+            ))
+            .unwrap();
+        assert_eq!(
+            dispatch_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WatcherDispatchEvent::RescanRequired(RescanReason::Unknown)
+        );
+
+        shutdown.store(true, Ordering::SeqCst);
+        drop(raw_tx);
+        handle.join().unwrap();
+
+        let lines = take_watcher_overflow_logs_for_test();
+        let line = lines
+            .iter()
+            .find(|line| line.contains(&format!("root={}", root.display())))
+            .unwrap_or_else(|| panic!("missing overflow line for {}: {lines:?}", root.display()));
+        assert!(line.contains("matcher_generation=7"), "line: {line}");
+        assert!(line.contains("target/cache:20"), "line: {line}");
+        assert!(line.contains("src/generated:7"), "line: {line}");
+        assert!(line.contains("queue_depth=unavailable"), "line: {line}");
+        assert!(line.contains("rescan_in_progress=false"), "line: {line}");
+        for index in 0..FSEVENTS_EXCLUSION_LIMIT {
+            assert!(line.contains(&format!("excluded-{index}")), "line: {line}");
+        }
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.overflows_total, 1);
+        assert_eq!(snapshot.overflows_during_rescan, 0);
+        assert_eq!(snapshot.last_overflow_prefixes[0].prefix, "target/cache");
+        assert_eq!(snapshot.last_overflow_prefixes[0].count, 20);
     }
 
     #[test]

@@ -40,6 +40,8 @@ impl ProjectWatcher {
         let (backend_tx, backend_rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(backend_tx)?;
         let mut watched_directories = collect_watch_directories(&root, &matcher);
+        let counters = crate::context::watcher_counters_for_root(&root);
+        counters.set_backend_exclusions(observed_generation, exclusions.clone());
         for directory in &watched_directories {
             watcher.watch(directory, RecursiveMode::NonRecursive)?;
         }
@@ -80,6 +82,10 @@ impl ProjectWatcher {
 
                         let replacement_exclusions =
                             derive_excluded_subtrees(&root, &matcher, None);
+                        counters.set_backend_exclusions(
+                            observed_generation,
+                            replacement_exclusions.clone(),
+                        );
                         if replacement_exclusions != exclusions {
                             super::log_exclusions(&root, &replacement_exclusions);
                             exclusions = replacement_exclusions;

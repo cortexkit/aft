@@ -2283,6 +2283,10 @@ mod tests {
         watcher.note_invalidating_event();
         watcher.note_paths_after_gitignore(7);
         watcher.note_paths_dispatched(6);
+        watcher.note_overflow(vec![crate::context::WatcherOverflowPrefix {
+            prefix: "packages/opencode-plugin".to_string(),
+            count: 23,
+        }]);
         assert_eq!(
             watcher
                 .begin_rescan(crate::watcher_filter::RescanReason::UserDropped)
@@ -2310,6 +2314,16 @@ mod tests {
         assert_eq!(watcher["invalidating_events_total"].as_u64(), Some(1));
         assert_eq!(watcher["paths_after_gitignore_total"].as_u64(), Some(7));
         assert_eq!(watcher["paths_dispatched_total"].as_u64(), Some(6));
+        assert_eq!(watcher["overflows_total"].as_u64(), Some(1));
+        assert_eq!(watcher["overflows_during_rescan"].as_u64(), Some(0));
+        assert_eq!(
+            watcher["last_overflow_prefixes"][0]["prefix"].as_str(),
+            Some("packages/opencode-plugin")
+        );
+        assert_eq!(
+            watcher["last_overflow_prefixes"][0]["count"].as_u64(),
+            Some(23)
+        );
         assert_eq!(watcher["rescans_kernel_dropped_total"].as_u64(), Some(0));
         assert_eq!(watcher["rescans_user_dropped_total"].as_u64(), Some(1));
         assert_eq!(watcher["rescans_unknown_total"].as_u64(), Some(0));

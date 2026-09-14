@@ -660,6 +660,29 @@ pub(crate) enum WatcherDrainPhase {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub(crate) struct WatcherOverflowPrefix {
+    pub(crate) prefix: String,
+    pub(crate) count: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct WatcherBackendExclusions {
+    pub(crate) matcher_generation: u64,
+    pub(crate) paths: Vec<PathBuf>,
+    pub(crate) queue_depth: Option<usize>,
+}
+
+impl Default for WatcherBackendExclusions {
+    fn default() -> Self {
+        Self {
+            matcher_generation: 0,
+            paths: Vec::new(),
+            queue_depth: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub(crate) struct WatcherCountersSnapshot {
     pub(crate) raw_events_total: u64,
     pub(crate) raw_events_since_last_rescan: u64,
@@ -669,6 +692,9 @@ pub(crate) struct WatcherCountersSnapshot {
     pub(crate) paths_after_gitignore_since_last_rescan: u64,
     pub(crate) paths_dispatched_total: u64,
     pub(crate) paths_dispatched_since_last_rescan: u64,
+    pub(crate) overflows_total: u64,
+    pub(crate) overflows_during_rescan: u64,
+    pub(crate) last_overflow_prefixes: Vec<WatcherOverflowPrefix>,
     pub(crate) rescans_kernel_dropped_total: u64,
     pub(crate) rescans_user_dropped_total: u64,
     pub(crate) rescans_unknown_total: u64,
@@ -687,6 +713,11 @@ pub(crate) struct WatcherCounters {
     paths_after_gitignore_since_last_rescan: AtomicU64,
     paths_dispatched_total: AtomicU64,
     paths_dispatched_since_last_rescan: AtomicU64,
+    overflows_total: AtomicU64,
+    overflows_during_rescan: AtomicU64,
+    last_overflow_prefixes: RwLock<Vec<WatcherOverflowPrefix>>,
+    backend_exclusions: RwLock<WatcherBackendExclusions>,
+    rescan_in_progress: AtomicBool,
     rescans_kernel_dropped_total: AtomicU64,
     rescans_user_dropped_total: AtomicU64,
     rescans_unknown_total: AtomicU64,
@@ -729,6 +760,38 @@ impl WatcherCounters {
             .fetch_add(count, Ordering::Relaxed);
         self.paths_dispatched_since_last_rescan
             .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_overflow(&self, prefixes: Vec<WatcherOverflowPrefix>) -> bool {
+        self.overflows_total.fetch_add(1, Ordering::Relaxed);
+        let during_rescan = self.rescan_in_progress.load(Ordering::Acquire);
+        if during_rescan {
+            self.overflows_during_rescan
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        *self
+            .last_overflow_prefixes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = prefixes;
+        during_rescan
+    }
+
+    pub(crate) fn set_backend_exclusions(&self, matcher_generation: u64, paths: Vec<PathBuf>) {
+        *self
+            .backend_exclusions
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = WatcherBackendExclusions {
+            matcher_generation,
+            paths,
+            queue_depth: None,
+        };
+    }
+
+    pub(crate) fn backend_exclusions(&self) -> WatcherBackendExclusions {
+        self.backend_exclusions
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn begin_rescan(
@@ -790,6 +853,13 @@ impl WatcherCounters {
             paths_dispatched_since_last_rescan: self
                 .paths_dispatched_since_last_rescan
                 .load(Ordering::Relaxed),
+            overflows_total: self.overflows_total.load(Ordering::Relaxed),
+            overflows_during_rescan: self.overflows_during_rescan.load(Ordering::Relaxed),
+            last_overflow_prefixes: self
+                .last_overflow_prefixes
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
             rescans_kernel_dropped_total: self.rescans_kernel_dropped_total.load(Ordering::Relaxed),
             rescans_user_dropped_total: self.rescans_user_dropped_total.load(Ordering::Relaxed),
             rescans_unknown_total: self.rescans_unknown_total.load(Ordering::Relaxed),

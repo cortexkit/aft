@@ -2738,11 +2738,6 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
             .unwrap_or_else(|| PathBuf::from("<unconfigured>"));
         let watcher_counters = ctx.watcher_counters();
         let interval = watcher_counters.begin_rescan(state.rescan_reason);
-        aft::slog_warn!(
-            "watcher overflow: forcing project rescan reason={} root={}",
-            state.rescan_reason.as_str(),
-            root.display()
-        );
         if ctx.heavy_root_work_allowed() {
             ctx.rebuild_gitignore();
         } else {

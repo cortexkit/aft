@@ -42,6 +42,8 @@ impl ProjectWatcher {
 
         let (backend_tx, backend_rx) = mpsc::channel();
         let stream = FsEventsStream::start(&root, &exclusions, backend_tx.clone())?;
+        let counters = crate::context::watcher_counters_for_root(&root);
+        counters.set_backend_exclusions(observed_generation, exclusions.clone());
         let mut external_watcher = notify::recommended_watcher(backend_tx)?;
         for path in extra_watch_paths {
             if path.exists() {
@@ -72,6 +74,10 @@ impl ProjectWatcher {
                             Ok(replacement) => {
                                 stream = replacement;
                                 observed_generation = generation;
+                                counters.set_backend_exclusions(
+                                    observed_generation,
+                                    replacement_exclusions.clone(),
+                                );
                                 if replacement_exclusions != exclusions {
                                     super::log_exclusions(&root, &replacement_exclusions);
                                     exclusions = replacement_exclusions;
