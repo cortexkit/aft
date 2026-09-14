@@ -382,19 +382,14 @@ pub fn run_migrations(conn: &mut Connection) -> Result<u32, OpenError> {
         "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL PRIMARY KEY);",
     )?;
 
-    let db_version = current_schema_version(conn)?;
-    if db_version > CURRENT_SCHEMA_VERSION {
-        return Err(OpenError::DowngradeRefused {
-            db_version,
-            supported: CURRENT_SCHEMA_VERSION,
-        });
-    }
-
-    for version in (db_version + 1)..=CURRENT_SCHEMA_VERSION {
+    // Every candidate step re-reads the version after acquiring SQLite's write
+    // lock. A concurrent opener can finish first, but its committed version then
+    // causes this opener to skip rather than replaying an obsolete plan.
+    for version in 1..=CURRENT_SCHEMA_VERSION {
         apply_migration(conn, version)?;
     }
 
-    Ok(current_schema_version(conn)?)
+    Ok(CURRENT_SCHEMA_VERSION)
 }
 
 fn current_schema_version(conn: &Connection) -> Result<u32, rusqlite::Error> {
@@ -406,15 +401,36 @@ fn current_schema_version(conn: &Connection) -> Result<u32, rusqlite::Error> {
 }
 
 fn apply_migration(conn: &mut Connection, version: u32) -> Result<(), OpenError> {
-    let from = version - 1;
+    let planned_from = version - 1;
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| OpenError::MigrationFailed {
-            from,
+            from: planned_from,
             to: version,
             error,
         })?;
+    let db_version = current_schema_version(&tx).map_err(|error| OpenError::MigrationFailed {
+        from: planned_from,
+        to: version,
+        error,
+    })?;
+    if db_version > CURRENT_SCHEMA_VERSION {
+        return Err(OpenError::DowngradeRefused {
+            db_version,
+            supported: CURRENT_SCHEMA_VERSION,
+        });
+    }
+    if db_version >= version {
+        return tx
+            .commit()
+            .map_err(|error| OpenError::MigrationFailed {
+                from: planned_from,
+                to: version,
+                error,
+            });
+    }
 
+    let from = db_version;
     let result = match version {
         1 => tx.execute_batch(MIGRATION_V1),
         2 => tx.execute_batch(MIGRATION_V2),

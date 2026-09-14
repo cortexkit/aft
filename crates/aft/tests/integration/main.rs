@@ -38,6 +38,7 @@ mod config_parity_test;
 mod configure_test;
 mod conflicts_discovery_test;
 mod cuda_test;
+mod db_migration_race_test;
 mod db_read_fallback_test;
 // The durable-restart matrix SIGKILLs a child publisher at each failpoint; the
 // kill primitive and the parked-child protocol are POSIX-only.
