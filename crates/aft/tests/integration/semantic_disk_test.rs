@@ -1,6 +1,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "macos")]
+use std::collections::HashSet;
+#[cfg(target_os = "macos")]
+use std::time::Instant;
+
 use aft::cache_freshness::{self, FreshnessVerdict};
 use aft::semantic_index::{SemanticIndex, SemanticIndexFingerprint};
 
@@ -46,6 +51,127 @@ fn build_test_index(project_root: &Path) -> (SemanticIndex, PathBuf) {
 fn push_string(buf: &mut Vec<u8>, value: &str) {
     buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
     buf.extend_from_slice(value.as_bytes());
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_write_usage() -> (u64, u64) {
+    unsafe extern "C" {
+        fn proc_pid_rusage(
+            pid: libc::c_int,
+            flavor: libc::c_int,
+            buffer: *mut libc::c_void,
+        ) -> libc::c_int;
+    }
+
+    let mut buffer = [0_u8; 512];
+    let result = unsafe {
+        proc_pid_rusage(
+            std::process::id() as libc::c_int,
+            4,
+            buffer.as_mut_ptr().cast(),
+        )
+    };
+    assert_eq!(result, 0, "Darwin write accounting is required");
+    let counter =
+        |field: usize| u64::from_ne_bytes(buffer[16 + field * 8..16 + (field + 1) * 8].try_into().unwrap());
+    (counter(17), counter(27))
+}
+
+/// Offline probe for the semantic persistence before/after tables in the disk-write hunt.
+/// The input must be a copied production semantic.bin; the probe never opens its live source.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "offline probe copies a large production semantic artifact"]
+fn bench_semantic_refresh_persistence_writes() {
+    let input = PathBuf::from(
+        std::env::var_os("AFT_SEMANTIC_DELTA_INPUT")
+            .expect("set AFT_SEMANTIC_DELTA_INPUT to a copied semantic.bin"),
+    );
+    let artifact = fs::read(&input).expect("read copied semantic artifact");
+
+    for changed_files in [1_usize, 10, 100] {
+        let temp = tempfile::tempdir_in(input.parent().expect("artifact parent"))
+            .expect("create measurement directory beside copied artifact");
+        let root = temp.path().join("project");
+        fs::create_dir(&root).expect("create rerooted project");
+        let root = root.canonicalize().expect("canonicalize rerooted project");
+        let storage = temp.path().join("storage");
+        let semantic_dir = storage.join("semantic").join("measured");
+        fs::create_dir_all(&semantic_dir).expect("create copied artifact directory");
+        let data_path = semantic_dir.join("semantic.bin");
+        fs::write(&data_path, &artifact).expect("copy semantic artifact");
+        fs::File::open(&data_path)
+            .expect("open copied artifact")
+            .sync_all()
+            .expect("sync copied artifact");
+
+        let mut index = SemanticIndex::read_from_disk(
+            &storage,
+            "measured",
+            &root,
+            false,
+            None,
+        )
+        .expect("load copied semantic artifact");
+        let dimension = index.dimension();
+        let mut selected = Vec::with_capacity(changed_files);
+        let mut seen = HashSet::new();
+        for result in index.search(&vec![0.0; dimension], index.len()) {
+            if result.file.extension().and_then(|extension| extension.to_str()) == Some("rs")
+                && seen.insert(result.file.clone())
+            {
+                selected.push(result.file);
+                if selected.len() == changed_files {
+                    break;
+                }
+            }
+        }
+        assert_eq!(selected.len(), changed_files, "copied artifact needs enough Rust files");
+        for (ordinal, path) in selected.iter().enumerate() {
+            fs::create_dir_all(path.parent().expect("selected file parent"))
+                .expect("create selected file parent");
+            fs::write(
+                path,
+                format!("pub fn measured_refresh_{ordinal}() -> usize {{ {ordinal} }}\n"),
+            )
+            .expect("write changed source");
+        }
+        let mut embed = |texts: Vec<String>| {
+            Ok::<Vec<Vec<f32>>, String>(
+                texts
+                    .into_iter()
+                    .map(|_| vec![1.0; dimension])
+                    .collect(),
+            )
+        };
+        let mut progress = |_done: usize, _total: usize| {};
+        let update = index
+            .refresh_invalidated_files(
+                &root,
+                &selected,
+                &mut embed,
+                64,
+                usize::MAX,
+                &mut progress,
+            )
+            .expect("refresh selected files");
+        assert_eq!(
+            update.summary.changed, changed_files,
+            "every selected production-artifact file should be replaced"
+        );
+
+        let before = darwin_write_usage();
+        let started = Instant::now();
+        assert!(index.write_to_disk(&storage, "measured"));
+        let after = darwin_write_usage();
+        eprintln!(
+            "semantic-delta-measure changed_files={changed_files} elapsed_ms={} physical_bytes={} logical_bytes={} artifact_bytes={}",
+            started.elapsed().as_millis(),
+            after.0.saturating_sub(before.0),
+            after.1.saturating_sub(before.1),
+            fs::metadata(&data_path).expect("measure artifact").len(),
+        );
+    }
 }
 
 fn build_v1_index_bytes(file: &Path) -> Vec<u8> {
