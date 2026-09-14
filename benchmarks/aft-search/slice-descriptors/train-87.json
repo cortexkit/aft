@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens", "profile-grammar", "paging"],
+  "slices": [
+    "tier2-verdict-findings",
+    "watcher-user-dropped-attribution",
+    "watcher-test-flake-fixes"
+  ],
+  "note": "No ranking-fence file changes: tier-2 projection verdict, watcher overflow attribution/coalescing/slot ranking, and two test fixes."
+}
