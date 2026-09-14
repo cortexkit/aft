@@ -2548,10 +2548,13 @@ impl InspectManager {
         }
         let rollup_started = Instant::now();
         let contributions = load_contributions(cache, &aggregate_job)?;
-        let aggregate = if aggregate_job.category == InspectCategory::DeadCode {
-            let Some(snapshot) = aggregate_job.callgraph_snapshot.as_deref() else {
-                return Err("dead-code rollup lost its required callgraph snapshot".to_string());
-            };
+        let aggregate = if aggregate_job.category == InspectCategory::DeadCode
+            && aggregate_job.callgraph_snapshot.is_some()
+        {
+            let snapshot = aggregate_job
+                .callgraph_snapshot
+                .as_deref()
+                .expect("checked dead-code snapshot");
             let public_api_files =
                 super::scanners::dead_code::collect_public_api_files(&job.project_root);
             let roles = super::entry_points::resolve_project_roles(&job.project_root);

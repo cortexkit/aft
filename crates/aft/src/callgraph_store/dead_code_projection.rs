@@ -251,7 +251,7 @@ fn inline_delta_bytes(conn: &Connection) -> Result<usize> {
         "SELECT
              COALESCE((SELECT SUM(length(path)) FROM files), 0) +
              COALESCE((SELECT SUM(length(file_path) + length(name)) FROM nodes), 0) +
-             COALESCE((SELECT SUM(length(caller_file) + length(callee)) FROM refs), 0)",
+             COALESCE((SELECT SUM(length(caller_file) + length(COALESCE(full_ref, ''))) FROM refs), 0)",
         [],
         |row| row.get(0),
     )?;
@@ -1107,7 +1107,7 @@ fn oversized_projection_delta_is_retained_in_spill_table() {
         "CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
          CREATE TABLE files (path TEXT);
          CREATE TABLE nodes (file_path TEXT, name TEXT);
-         CREATE TABLE refs (caller_file TEXT, callee TEXT);",
+         CREATE TABLE refs (caller_file TEXT, full_ref TEXT);",
     )
     .expect("create projection journal fixture");
     let callers = (0..171)
