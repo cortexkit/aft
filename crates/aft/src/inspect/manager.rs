@@ -7562,15 +7562,28 @@ pub fn unrelated() -> u32 { 2 }
                 .unwrap();
         }
         let store = CallGraphStore::open(store_dir, root.clone()).unwrap();
-        // Only this temporary source and the SQLite backup are mutated. The
+        // Only these temporary sources and the SQLite backup are mutated. The
         // production generation and all checkout source files remain untouched.
-        let changed = temp.path().join("probe.rs");
-        write_file(&changed, "pub fn projection_probe() {}\n");
-        store.refresh_files(std::slice::from_ref(&changed)).unwrap();
+        let changed_count = std::env::var("AFT_PROJECTION_BENCH_CHANGED_FILES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1);
+        let changed = (0..changed_count)
+            .map(|index| temp.path().join(format!("probe-{index}.rs")))
+            .collect::<Vec<_>>();
+        for path in &changed {
+            write_file(path, "pub fn projection_probe() {}\n");
+        }
+        store.refresh_files(&changed).unwrap();
         let (revision, previous) =
             project_dead_code_snapshot_with_revision(store.sqlite_path()).unwrap();
-        write_file(&changed, "pub fn projection_probe() { projection_probe_target(); }\npub fn projection_probe_target() {}\n");
-        store.refresh_files(&[changed]).unwrap();
+        for path in &changed {
+            write_file(
+                path,
+                "pub fn projection_probe() { projection_probe_target(); }\npub fn projection_probe_target() {}\n",
+            );
+        }
+        store.refresh_files(&changed).unwrap();
         let cpu = projection_bench_cpu_ms();
         let started = Instant::now();
         let full = project_dead_code_snapshot(store.sqlite_path()).unwrap();
@@ -7607,17 +7620,43 @@ pub fn unrelated() -> u32 { 2 }
             .outcome
             .unwrap()
             .contributions;
+        let public_api_files = crate::inspect::scanners::dead_code::collect_public_api_files(&root);
+        let roles = crate::inspect::entry_points::resolve_project_roles(&root);
         let cpu = projection_bench_cpu_ms();
         let started = Instant::now();
-        let full_aggregate = roll_up_dead_code_contributions(&job, &contributions, None);
+        let (full_aggregate, rollup_state, _) =
+            crate::inspect::scanners::dead_code::aggregate_dead_code_contributions_incremental(
+                &root,
+                job.callgraph_snapshot.as_deref().unwrap(),
+                &contributions,
+                &public_api_files,
+                &roles,
+                None,
+                None,
+                &BTreeSet::new(),
+            );
         let full_rollup_ms = started.elapsed().as_secs_f64() * 1000.0;
         let full_rollup_cpu = projection_bench_cpu_ms() - cpu;
         job.callgraph_snapshot = Some(Arc::new(incremental));
         let cpu = projection_bench_cpu_ms();
         let started = Instant::now();
-        let delta_aggregate = roll_up_dead_code_contributions(&job, &contributions, None);
+        let (delta_aggregate, _, rollup_verdict) =
+            crate::inspect::scanners::dead_code::aggregate_dead_code_contributions_incremental(
+                &root,
+                job.callgraph_snapshot.as_deref().unwrap(),
+                &contributions,
+                &public_api_files,
+                &roles,
+                None,
+                Some(&rollup_state),
+                &BTreeSet::new(),
+            );
         let delta_rollup_ms = started.elapsed().as_secs_f64() * 1000.0;
         let delta_rollup_cpu = projection_bench_cpu_ms() - cpu;
+        assert_eq!(
+            rollup_verdict.kind,
+            crate::inspect::scanners::dead_code::RollupKind::Incremental
+        );
         assert_eq!(
             serde_json::to_vec(&full_aggregate).unwrap(),
             serde_json::to_vec(&delta_aggregate).unwrap()
@@ -7632,7 +7671,7 @@ pub fn unrelated() -> u32 { 2 }
             },
             job.callgraph_snapshot.clone().unwrap(),
         );
-        eprintln!("projection_bench rows={} before snapshot={full_ms:.3} cpu={full_cpu:.3} rollup={full_rollup_ms:.3} rollup_cpu={full_rollup_cpu:.3}; after snapshot={delta_ms:.3} cpu={delta_cpu:.3} rollup={delta_rollup_ms:.3} rollup_cpu={delta_rollup_cpu:.3}; full_projections={} outbound_rows_read={}", previous.outbound_calls.len(), work.0, work.1);
+        eprintln!("projection_bench changed_files={changed_count} rows={} before snapshot={full_ms:.3} cpu={full_cpu:.3} rollup={full_rollup_ms:.3} rollup_cpu={full_rollup_cpu:.3}; after snapshot={delta_ms:.3} cpu={delta_cpu:.3} rollup={delta_rollup_ms:.3} rollup_cpu={delta_rollup_cpu:.3}; full_projections={} outbound_rows_read={}", previous.outbound_calls.len(), work.0, work.1);
         eprintln!(
             "projection_bench callgraph_memory={:?}",
             manager.callgraph_projection_estimated_memory()
