@@ -412,9 +412,9 @@ function buildSchema(): Record<string, unknown> {
               },
               subagent_background: {
                 type: "boolean",
-                default: false,
+                default: true,
                 description:
-                  "Allow subagents to run background bash. Default false — subagent `background: true` requests are otherwise converted to foreground so the subagent turn does not end early.",
+                  "Allow subagents to run background bash. Default true because workers are multi-turn and wait with bash_watch; when false, subagent `background: true` requests are converted to foreground calls that block up to the hard cap.",
               },
               detach_on_user_message: {
                 type: "boolean",
@@ -429,6 +429,12 @@ function buildSchema(): Record<string, unknown> {
                 default: 120000,
                 description:
                   "Maximum synchronous bash_watch wait in milliseconds. Defaults to 120 seconds for short remaining waits; set to 1800000 to restore the old 30-minute cap.",
+              },
+              linux_scope: {
+                type: "boolean",
+                default: false,
+                description:
+                  "Linux-only, user-tier opt-in. Run tool shells in transient systemd user scopes when systemd-run and the user manager are available; otherwise fall back to the normal spawn.",
               },
               long_running_reminder_enabled: {
                 type: "boolean",

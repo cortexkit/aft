@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "v0.56.0-release"
+  ],
+  "note": "Version bump plus the config schema generator catching up with bash.linux_scope and the subagent_background default; no ranking-fence file changes."
+}
