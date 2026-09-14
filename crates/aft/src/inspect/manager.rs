@@ -2254,6 +2254,13 @@ impl InspectManager {
         options: &Tier2ReuseOptions,
     ) -> Result<InspectScanSuccess, String> {
         let mut phases = Tier2PhaseTimings::default();
+        phases.projection_skip_reason = Some(if job.category != InspectCategory::DeadCode {
+            "not_required"
+        } else if job.callgraph_snapshot.is_some() {
+            "provided_snapshot"
+        } else {
+            "aggregate_reused"
+        });
         let phase_started = Instant::now();
         let cached_records = load_contribution_freshness(cache, job.category)?;
         let current_by_relative = current_project_files(&job.project_root, &job.scope_files);
@@ -2368,17 +2375,18 @@ impl InspectManager {
                 && scan_job.callgraph_snapshot.is_none()
             {
                 let snapshot_started = Instant::now();
-                if let Some((snapshot, verdict, projection_cost)) = self
-                    .build_tier2_callgraph_snapshot_with_refresh_and_verdict(
-                        &scan_job,
-                        options.allow_callgraph_cold_build,
-                        options.require_callgraph_snapshot,
-                        &callgraph_refresh_files,
-                    )
-                {
-                    scan_job.callgraph_snapshot = Some(snapshot);
-                    phases.projection = Some(verdict);
-                    phases.projection_cost += projection_cost;
+                match self.build_tier2_callgraph_snapshot_with_refresh_and_verdict(
+                    &scan_job,
+                    options.allow_callgraph_cold_build,
+                    options.require_callgraph_snapshot,
+                    &callgraph_refresh_files,
+                ) {
+                    Some((snapshot, verdict, projection_cost)) => {
+                        scan_job.callgraph_snapshot = Some(snapshot);
+                        phases.projection = Some(verdict);
+                        phases.projection_cost += projection_cost;
+                    }
+                    None => phases.projection_skip_reason = Some("no_callgraph"),
                 }
                 phases.snapshot += snapshot_started.elapsed();
             }
@@ -2484,17 +2492,18 @@ impl InspectManager {
                     && rescan_job.callgraph_snapshot.is_none()
                 {
                     let snapshot_started = Instant::now();
-                    if let Some((snapshot, verdict, projection_cost)) = self
-                        .build_tier2_callgraph_snapshot_with_refresh_and_verdict(
-                            &rescan_job,
-                            options.allow_callgraph_cold_build,
-                            options.require_callgraph_snapshot,
-                            &callgraph_refresh_files,
-                        )
-                    {
-                        rescan_job.callgraph_snapshot = Some(snapshot);
-                        phases.projection = Some(verdict);
-                        phases.projection_cost += projection_cost;
+                    match self.build_tier2_callgraph_snapshot_with_refresh_and_verdict(
+                        &rescan_job,
+                        options.allow_callgraph_cold_build,
+                        options.require_callgraph_snapshot,
+                        &callgraph_refresh_files,
+                    ) {
+                        Some((snapshot, verdict, projection_cost)) => {
+                            rescan_job.callgraph_snapshot = Some(snapshot);
+                            phases.projection = Some(verdict);
+                            phases.projection_cost += projection_cost;
+                        }
+                        None => phases.projection_skip_reason = Some("no_callgraph"),
                     }
                     phases.snapshot += snapshot_started.elapsed();
                 }
@@ -2557,17 +2566,18 @@ impl InspectManager {
             && aggregate_job.callgraph_snapshot.is_none()
         {
             let snapshot_started = Instant::now();
-            if let Some((snapshot, verdict, projection_cost)) = self
-                .build_tier2_callgraph_snapshot_with_refresh_and_verdict(
-                    &aggregate_job,
-                    options.allow_callgraph_cold_build,
-                    options.require_callgraph_snapshot,
-                    &callgraph_refresh_files,
-                )
-            {
-                aggregate_job.callgraph_snapshot = Some(snapshot);
-                phases.projection = Some(verdict);
-                phases.projection_cost += projection_cost;
+            match self.build_tier2_callgraph_snapshot_with_refresh_and_verdict(
+                &aggregate_job,
+                options.allow_callgraph_cold_build,
+                options.require_callgraph_snapshot,
+                &callgraph_refresh_files,
+            ) {
+                Some((snapshot, verdict, projection_cost)) => {
+                    aggregate_job.callgraph_snapshot = Some(snapshot);
+                    phases.projection = Some(verdict);
+                    phases.projection_cost += projection_cost;
+                }
+                None => phases.projection_skip_reason = Some("no_callgraph"),
             }
             phases.snapshot += snapshot_started.elapsed();
         }
@@ -2987,6 +2997,8 @@ struct Tier2PhaseTimings {
     scanned_files: usize,
     /// How the dead-code snapshot was produced (dead_code only).
     projection: Option<ProjectionVerdict>,
+    /// Why a path completed without running the callgraph projection.
+    projection_skip_reason: Option<&'static str>,
     /// Whether dead-code reachability traversed the complete graph or only the
     /// affected frontier.
     rollup_verdict: Option<super::scanners::dead_code::RollupVerdict>,
@@ -3016,15 +3028,24 @@ impl Tier2PhaseTimings {
             return;
         }
         let key = crate::search_index::artifact_cache_key(project_root);
+        crate::slog_info!("{}", self.render(category, project_root, &key));
+    }
+
+    fn render(&self, category: InspectCategory, project_root: &Path, key: &str) -> String {
         let projection = self
             .projection
             .map(render_projection_suffix)
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                render_no_projection_suffix(
+                    self.projection_skip_reason
+                        .unwrap_or_else(|| default_projection_skip_reason(category)),
+                )
+            });
         let rollup = self
             .rollup_verdict
             .map(render_rollup_suffix)
             .unwrap_or_default();
-        crate::slog_info!(
+        format!(
             "perf tier2 phases category={} freshness={}ms snapshot={}ms scan={}ms({} files) db={}ms(lock={},txn={}) rollup_ms={}{}{} root={} key={}",
             category,
             self.freshness.as_millis(),
@@ -3039,8 +3060,24 @@ impl Tier2PhaseTimings {
             projection,
             crate::logging::normalize_index_root(project_root),
             key
-        );
+        )
     }
+}
+
+fn default_projection_skip_reason(category: InspectCategory) -> &'static str {
+    if category == InspectCategory::DeadCode {
+        "no_callgraph"
+    } else {
+        "not_required"
+    }
+}
+
+/// Projection fields in a `perf tier2 phases` line use this grammar:
+/// `projection=<spliced|full|reused|none> reason=<cold|journal_gap|splice_costlier|no_callgraph|aggregate_reused|provided_snapshot|not_required> journal_bytes=<bytes> changed_files=<count>`.
+/// Successful splice/reuse verdicts omit `reason`; every `none` verdict names why
+/// no callgraph projection ran.
+fn render_no_projection_suffix(reason: &'static str) -> String {
+    format!(" projection=none reason={reason} journal_bytes=0 changed_files=0")
 }
 
 /// Render the `projection=...` suffix of the `perf tier2 phases` line for one
@@ -8433,6 +8470,30 @@ export function main() { foo(); }
                 drops: 1,
             }
         );
+    }
+
+    #[test]
+    fn every_tier2_phases_line_path_renders_projection_key() {
+        for (category, reason) in [
+            (InspectCategory::DeadCode, "no_callgraph"),
+            (InspectCategory::DeadCode, "aggregate_reused"),
+            (InspectCategory::DeadCode, "provided_snapshot"),
+            (InspectCategory::UnusedExports, "not_required"),
+            (InspectCategory::Duplicates, "not_required"),
+            (InspectCategory::Cycles, "not_required"),
+            (InspectCategory::Complexity, "not_required"),
+        ] {
+            let phases = Tier2PhaseTimings {
+                projection_skip_reason: Some(reason),
+                ..Tier2PhaseTimings::default()
+            };
+            let line = phases.render(category, Path::new("/root"), "test-key");
+            assert!(
+                line.contains(&format!(" projection=none reason={reason} ")),
+                "{category} phases line omitted its projection verdict: {line}"
+            );
+            assert!(line.contains(" journal_bytes=0 changed_files=0 "));
+        }
     }
 
     #[test]
