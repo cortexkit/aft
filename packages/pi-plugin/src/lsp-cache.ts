@@ -21,6 +21,8 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -328,6 +330,132 @@ export async function withInstallLock<T>(
     return await task(lease);
   } finally {
     lease.release();
+  }
+}
+
+const AUTO_INSTALL_STAMP_FILE = "last-lsp-autoinstall.json";
+const AUTO_INSTALL_WINDOW_MS = 60 * 1000;
+const AUTO_INSTALL_LOCK_STALE_MS = 30 * 60 * 1000;
+
+export interface AutoInstallPassLease {
+  release(): void;
+}
+
+interface AutoInstallLockOwner {
+  pid: number;
+  startedMs: number;
+  token: string;
+}
+
+function autoInstallStampPath(): string {
+  return join(aftCacheBase(), AUTO_INSTALL_STAMP_FILE);
+}
+
+function hasRecentAutoInstallStamp(path: string): boolean {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as { lastRunMs?: unknown };
+    return (
+      typeof parsed.lastRunMs === "number" &&
+      Number.isFinite(parsed.lastRunMs) &&
+      Math.abs(Date.now() - parsed.lastRunMs) < AUTO_INSTALL_WINDOW_MS
+    );
+  } catch {
+    return false;
+  }
+}
+
+function readAutoInstallLockOwner(path: string): AutoInstallLockOwner | null {
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<AutoInstallLockOwner>;
+    if (
+      typeof parsed.pid !== "number" ||
+      typeof parsed.startedMs !== "number" ||
+      typeof parsed.token !== "string"
+    ) {
+      return null;
+    }
+    return parsed as AutoInstallLockOwner;
+  } catch {
+    return null;
+  }
+}
+
+function autoInstallLockIsStale(path: string): boolean {
+  const owner = readAutoInstallLockOwner(path);
+  let age = Number.POSITIVE_INFINITY;
+  try {
+    age = Math.abs(Date.now() - statSync(path).mtimeMs);
+  } catch {
+    return true;
+  }
+  if (age >= AUTO_INSTALL_LOCK_STALE_MS) return true;
+  if (process.platform === "win32" || !owner) return false;
+  return !isProcessAlive(owner.pid);
+}
+
+/** Claim the machine-wide 60-second startup auto-install slot. */
+export function claimLspAutoInstallPass(): AutoInstallPassLease | null {
+  const stampPath = autoInstallStampPath();
+  const lock = `${stampPath}.lock`;
+  mkdirSync(aftCacheBase(), { recursive: true });
+  if (hasRecentAutoInstallStamp(stampPath)) return null;
+
+  const owner: AutoInstallLockOwner = {
+    pid: process.pid,
+    startedMs: Date.now(),
+    token: randomUUID(),
+  };
+  const tryClaim = (): boolean => {
+    try {
+      const fd = openSync(lock, "wx");
+      try {
+        writeFileSync(fd, JSON.stringify(owner));
+      } finally {
+        closeSync(fd);
+      }
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw err;
+    }
+  };
+
+  let claimed = false;
+  try {
+    claimed = tryClaim();
+    if (!claimed && autoInstallLockIsStale(lock)) {
+      rmSync(lock, { force: true });
+      claimed = tryClaim();
+    }
+    if (!claimed) return null;
+
+    const release = () => {
+      const current = readAutoInstallLockOwner(lock);
+      if (current?.pid === owner.pid && current.token === owner.token) {
+        rmSync(lock, { force: true });
+      }
+    };
+    if (hasRecentAutoInstallStamp(stampPath)) {
+      release();
+      return null;
+    }
+
+    const tempPath = `${stampPath}.tmp-${process.pid}-${owner.token}`;
+    writeFileSync(tempPath, `${JSON.stringify({ lastRunMs: Date.now() })}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    renameSync(tempPath, stampPath);
+    return { release };
+  } catch (err) {
+    if (claimed) {
+      const current = readAutoInstallLockOwner(lock);
+      if (current?.pid === owner.pid && current.token === owner.token) {
+        rmSync(lock, { force: true });
+      }
+    }
+    warn(`[lsp] could not coordinate auto-install pass: ${err}`);
+    return null;
   }
 }
 

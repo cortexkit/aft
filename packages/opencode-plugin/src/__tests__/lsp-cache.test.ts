@@ -11,11 +11,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { acquireEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import { getAftCacheRoot, getAftLspPackagesDir } from "../../../aft-bridge/src/cache-paths.js";
 import {
   acquireInstallLock,
   aftCacheBase,
+  claimLspAutoInstallPass,
   isInstalled,
   lspBinaryPath,
   lspBinDir,
@@ -194,6 +196,44 @@ describe("install lock", () => {
     // Cleanup.
     unlinkSync(lockFile);
   });
+});
+
+describe("auto-install pass slot", () => {
+  test("two plugin instances get exactly one auto-install pass in one process", () => {
+    const first = claimLspAutoInstallPass();
+    const second = claimLspAutoInstallPass();
+    expect([first, second].filter(Boolean)).toHaveLength(1);
+    first?.release();
+    second?.release();
+  });
+
+  test("two node processes racing one cache get exactly one auto-install pass", async () => {
+    const bundleDir = join(tempCache, "bundle");
+    mkdirSync(bundleDir, { recursive: true });
+    const build = await Bun.build({
+      entrypoints: [fileURLToPath(new URL("../lsp-cache.ts", import.meta.url))],
+      outdir: bundleDir,
+      naming: "lsp-cache.mjs",
+      target: "node",
+      format: "esm",
+    });
+    expect(build.success).toBe(true);
+
+    const bundlePath = join(bundleDir, "lsp-cache.mjs");
+    const resultPath = join(tempCache, "race-results.txt");
+    const helperPath = fileURLToPath(
+      new URL("./fixtures/lsp-autoinstall-race-helper.mjs", import.meta.url),
+    );
+    const env = { ...process.env, AFT_CACHE_DIR: join(tempCache, "shared-race-cache") };
+    const children = [
+      Bun.spawn(["node", helperPath, bundlePath, resultPath], { env }),
+      Bun.spawn(["node", helperPath, bundlePath, resultPath], { env }),
+    ];
+    expect(await Promise.all(children.map((child) => child.exited))).toEqual([0, 0]);
+
+    const outcomes = readFileSync(resultPath, "utf8").trim().split("\n").sort();
+    expect(outcomes).toEqual(["skipped", "winner"]);
+  }, 15_000);
 });
 
 describe("version-check record", () => {

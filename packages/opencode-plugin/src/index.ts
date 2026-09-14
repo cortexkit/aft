@@ -53,6 +53,7 @@ import {
   pushLspPathsAfterAutoInstall,
   runAutoInstall,
 } from "./lsp-auto-install.js";
+import { type AutoInstallPassLease, claimLspAutoInstallPass } from "./lsp-cache.js";
 import {
   abortInFlightGithubInstalls,
   discoverRelevantGithubServers,
@@ -396,11 +397,18 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
   // The whole step is best-effort: if both probes fail, `cachedBinDirs` is
   // still populated from `isInstalled()` checks, so previously-installed
   // binaries continue to work.
+  let lspAutoInstallPassLease: AutoInstallPassLease | null = null;
   try {
     const lspAutoInstall = aftConfig.lsp?.auto_install ?? true;
     const lspGraceDays = aftConfig.lsp?.grace_days ?? 7;
     const lspVersions = aftConfig.lsp?.versions ?? {};
     const lspDisabled = new Set(aftConfig.lsp?.disabled ?? []);
+    lspAutoInstallPassLease = lspAutoInstall ? claimLspAutoInstallPass() : null;
+    const skippedByRecentAutoInstall = lspAutoInstall && lspAutoInstallPassLease === null;
+    if (skippedByRecentAutoInstall) {
+      log("[lsp] skipping auto-install (another instance ran one recently)");
+    }
+    const runSharedAutoInstall = lspAutoInstall && !skippedByRecentAutoInstall;
     // When `lsp.auto_install: false`, leave the list empty so the Rust-side
     // `detect_missing_lsp_binaries` loop in configure.rs skips its built-in
     // server walk entirely. Without this gate, users who opted out of
@@ -412,7 +420,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       : [];
 
     const npmResult = runAutoInstall(input.directory, {
-      autoInstall: lspAutoInstall,
+      autoInstall: runSharedAutoInstall,
       graceDays: lspGraceDays,
       versions: lspVersions,
       disabled: lspDisabled,
@@ -422,7 +430,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     // binaries are heavier (10-100 MB).
     const relevantGithub = discoverRelevantGithubServers(input.directory);
     const ghResult = runGithubAutoInstall(relevantGithub, {
-      autoInstall: lspAutoInstall,
+      autoInstall: runSharedAutoInstall,
       graceDays: lspGraceDays,
       versions: lspVersions,
       disabled: lspDisabled,
@@ -460,7 +468,7 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
     // Fire-and-forget; never block plugin startup.
     const installCompletion = Promise.all([npmResult.installsComplete, ghResult.installsComplete])
       .then(() => {
-        if (installsWereStarted) {
+        if (installsWereStarted || skippedByRecentAutoInstall) {
           const updatedPaths = [
             ...new Set([...npmResult.getCachedBinDirs(), ...ghResult.getCachedBinDirs()]),
           ];
@@ -502,9 +510,17 @@ async function initializePluginForDirectory(input: Parameters<Plugin>[0]) {
       .catch((err) => {
         warn(`[lsp] install-summary aggregation failed: ${err}`);
         return null;
+      })
+      .finally(() => {
+        lspAutoInstallPassLease?.release();
+        lspAutoInstallPassLease = null;
       });
-    if (installsWereStarted) lspInstallCompletion = installCompletion;
+    if (installsWereStarted || skippedByRecentAutoInstall) {
+      lspInstallCompletion = installCompletion;
+    }
   } catch (err) {
+    lspAutoInstallPassLease?.release();
+    lspAutoInstallPassLease = null;
     // Auto-install failures must never block plugin startup.
     warn(`[lsp] auto-install setup failed: ${err instanceof Error ? err.message : String(err)}`);
   }

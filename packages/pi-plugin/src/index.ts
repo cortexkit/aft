@@ -72,6 +72,7 @@ import {
   pushLspPathsAfterAutoInstall,
   runAutoInstall,
 } from "./lsp-auto-install.js";
+import { type AutoInstallPassLease, claimLspAutoInstallPass } from "./lsp-cache.js";
 import {
   abortInFlightGithubInstalls,
   discoverRelevantGithubServers,
@@ -462,11 +463,18 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   // dirs to Rust as `lsp_paths_extra`, kick off background installs for
   // anything missing. The 7-day grace defends against newly-published
   // malicious versions. Best-effort — failures never block plugin startup.
+  let lspAutoInstallPassLease: AutoInstallPassLease | null = null;
   try {
     const lspAutoInstall = config.lsp?.auto_install ?? true;
     const lspGraceDays = config.lsp?.grace_days ?? 7;
     const lspVersions = config.lsp?.versions ?? {};
     const lspDisabled = new Set(config.lsp?.disabled ?? []);
+    lspAutoInstallPassLease = lspAutoInstall ? claimLspAutoInstallPass() : null;
+    const skippedByRecentAutoInstall = lspAutoInstall && lspAutoInstallPassLease === null;
+    if (skippedByRecentAutoInstall) {
+      log("[lsp] skipping auto-install (another instance ran one recently)");
+    }
+    const runSharedAutoInstall = lspAutoInstall && !skippedByRecentAutoInstall;
     // When `lsp.auto_install: false`, leave the list empty so the Rust-side
     // `detect_missing_lsp_binaries` loop in configure.rs skips its built-in
     // server walk entirely. Without this gate, users who opted out of
@@ -477,14 +485,14 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       : [];
 
     const npmResult = runAutoInstall(projectRoot, {
-      autoInstall: lspAutoInstall,
+      autoInstall: runSharedAutoInstall,
       graceDays: lspGraceDays,
       versions: lspVersions,
       disabled: lspDisabled,
     });
     const relevantGithub = discoverRelevantGithubServers(projectRoot);
     const ghResult = runGithubAutoInstall(relevantGithub, {
-      autoInstall: lspAutoInstall,
+      autoInstall: runSharedAutoInstall,
       graceDays: lspGraceDays,
       versions: lspVersions,
       disabled: lspDisabled,
@@ -516,7 +524,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     // stay out of the warning summary.
     const installCompletion = Promise.all([npmResult.installsComplete, ghResult.installsComplete])
       .then(() => {
-        if (installsWereStarted) {
+        if (installsWereStarted || skippedByRecentAutoInstall) {
           const updatedPaths = [
             ...new Set([...npmResult.getCachedBinDirs(), ...ghResult.getCachedBinDirs()]),
           ];
@@ -552,9 +560,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
       .catch((err) => {
         warn(`[lsp] install-summary aggregation failed: ${err}`);
         return null;
+      })
+      .finally(() => {
+        lspAutoInstallPassLease?.release();
+        lspAutoInstallPassLease = null;
       });
-    if (installsWereStarted) lspInstallCompletion = installCompletion;
+    if (installsWereStarted || skippedByRecentAutoInstall) {
+      lspInstallCompletion = installCompletion;
+    }
   } catch (err) {
+    lspAutoInstallPassLease?.release();
+    lspAutoInstallPassLease = null;
     warn(`[lsp] auto-install setup failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
