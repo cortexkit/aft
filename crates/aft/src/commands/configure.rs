@@ -543,6 +543,10 @@ fn start_project_watcher_with<W, E, F>(
     let thread_shutdown = Arc::clone(&shutdown);
 
     let root_path = root_path.to_path_buf();
+    let watcher_counters = crate::context::watcher_counters_for_root(&root_path);
+    let app = ctx.app();
+    let db = app.db();
+    watcher_filter::load_watcher_observations(&root_path, &watcher_counters, db.as_ref());
     let filter_config = WatcherFilterConfig::new(root_path.clone(), ctx.git_common_dir());
     let shared_gitignore = ctx.shared_gitignore();
     let gitignore_generation = ctx.gitignore_generation();

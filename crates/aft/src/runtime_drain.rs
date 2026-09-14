@@ -2795,6 +2795,13 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         loop {
             let interval = watcher_counters.begin_rescan(rescan_reason);
             wait_on_watcher_rescan_gate_for_test(ctx);
+            let app = ctx.app();
+            let db = app.db();
+            crate::watcher_filter::persist_watcher_observations(
+                &root,
+                &watcher_counters,
+                db.as_ref(),
+            );
             if ctx.heavy_root_work_allowed() {
                 ctx.rebuild_gitignore();
             } else {

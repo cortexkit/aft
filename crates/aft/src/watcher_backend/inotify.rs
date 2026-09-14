@@ -10,6 +10,7 @@ use notify::{Event, EventKind, RecursiveMode, Watcher};
 
 use crate::watcher_filter::{
     derive_excluded_subtrees, watcher_path_is_ignored_by_matcher, SharedGitignore,
+    WATCHER_EXCLUSION_LIMIT,
 };
 
 const BACKEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -34,12 +35,12 @@ impl ProjectWatcher {
         // thread's first instruction would otherwise be read as "already
         // observed" and the rebuild it requires would never run.
         let observed_generation = matcher_generation.load(Ordering::Acquire);
-        let exclusions = derive_excluded_subtrees(&root, &matcher, None);
+        let exclusions = derive_excluded_subtrees(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
         super::log_exclusions(&root, &exclusions);
 
         let (backend_tx, backend_rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(backend_tx)?;
-        let mut watched_directories = collect_watch_directories(&root, &matcher);
+        let mut watched_directories = collect_watch_directories(&root, &matcher, &exclusions);
         let counters = crate::context::watcher_counters_for_root(&root);
         counters.set_backend_exclusions(observed_generation, exclusions.clone());
         for directory in &watched_directories {
@@ -64,7 +65,13 @@ impl ProjectWatcher {
                 while !thread_shutdown.load(Ordering::Acquire) {
                     let generation = matcher_generation.load(Ordering::Acquire);
                     if generation != observed_generation {
-                        let desired = collect_watch_directories(&root, &matcher);
+                        let replacement_exclusions = derive_excluded_subtrees(
+                            &root,
+                            &matcher,
+                            Some(WATCHER_EXCLUSION_LIMIT),
+                        );
+                        let desired =
+                            collect_watch_directories(&root, &matcher, &replacement_exclusions);
                         for directory in watched_directories.difference(&desired) {
                             let _ = watcher.unwatch(directory);
                         }
@@ -80,8 +87,6 @@ impl ProjectWatcher {
                         thread_count.store(watched_directories.len(), Ordering::Release);
                         observed_generation = generation;
 
-                        let replacement_exclusions =
-                            derive_excluded_subtrees(&root, &matcher, None);
                         counters.set_backend_exclusions(
                             observed_generation,
                             replacement_exclusions.clone(),
@@ -96,7 +101,9 @@ impl ProjectWatcher {
                         Ok(Ok(event)) => {
                             if matches!(event.kind, EventKind::Create(CreateKind::Folder)) {
                                 for path in &event.paths {
-                                    for directory in collect_watch_directories(path, &matcher) {
+                                    for directory in
+                                        collect_watch_directories(path, &matcher, &exclusions)
+                                    {
                                         if watched_directories.insert(directory.clone()) {
                                             if let Err(error) = watcher
                                                 .watch(&directory, RecursiveMode::NonRecursive)
@@ -149,13 +156,21 @@ impl Drop for ProjectWatcher {
     }
 }
 
-fn collect_watch_directories(root: &Path, matcher: &SharedGitignore) -> BTreeSet<PathBuf> {
+fn collect_watch_directories(
+    root: &Path,
+    matcher: &SharedGitignore,
+    exclusions: &[PathBuf],
+) -> BTreeSet<PathBuf> {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut directories = BTreeSet::new();
     let mut stack = vec![root];
 
     while let Some(directory) = stack.pop() {
-        if watcher_path_is_ignored_by_matcher(matcher, &directory) {
+        if exclusions
+            .iter()
+            .any(|excluded| directory.starts_with(excluded))
+            || watcher_path_is_ignored_by_matcher(matcher, &directory)
+        {
             continue;
         }
         if !directory.is_dir() {

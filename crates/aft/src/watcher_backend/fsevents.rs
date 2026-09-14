@@ -14,7 +14,7 @@ use notify::event::{
 };
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
-use crate::watcher_filter::{derive_excluded_subtrees, SharedGitignore, FSEVENTS_EXCLUSION_LIMIT};
+use crate::watcher_filter::{derive_excluded_subtrees, SharedGitignore, WATCHER_EXCLUSION_LIMIT};
 
 const FSEVENTS_LATENCY_SECONDS: f64 = 0.03;
 const BACKEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -37,7 +37,7 @@ impl ProjectWatcher {
         // matcher at this generation, so the generation is captured beside it
         // rather than on the backend thread after spawn.
         let observed_generation = matcher_generation.load(Ordering::Acquire);
-        let exclusions = derive_excluded_subtrees(&root, &matcher, Some(FSEVENTS_EXCLUSION_LIMIT));
+        let exclusions = derive_excluded_subtrees(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
         super::log_exclusions(&root, &exclusions);
 
         let (backend_tx, backend_rx) = mpsc::channel();
@@ -67,7 +67,7 @@ impl ProjectWatcher {
                         let replacement_exclusions = derive_excluded_subtrees(
                             &root,
                             &matcher,
-                            Some(FSEVENTS_EXCLUSION_LIMIT),
+                            Some(WATCHER_EXCLUSION_LIMIT),
                         );
                         match FsEventsStream::start(&root, &replacement_exclusions, stream.sender())
                         {

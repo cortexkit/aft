@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, RwLock};
 #[cfg(test)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -17,15 +17,14 @@ pub type SharedGitignore = Arc<RwLock<Option<Arc<Gitignore>>>>;
 pub const WATCHER_FLUSH_WINDOW: Duration = Duration::from_millis(250);
 pub const WATCHER_MAX_BATCH_PATHS: usize = 1024;
 pub const WATCHER_DISPATCH_CHANNEL_CAPACITY: usize = 1024;
-#[cfg(any(target_os = "macos", test))]
-pub(crate) const FSEVENTS_EXCLUSION_LIMIT: usize = 8;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-const EXCLUSION_FILE_COUNT_CAP: usize = 50_000;
+pub(crate) const WATCHER_EXCLUSION_LIMIT: usize = 8;
 const ROOT_DELETED_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const GITIGNORE_REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DISPATCH_SEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const WATCHER_ATTRIBUTION_RING_CAPACITY: usize = 512;
 const WATCHER_OVERFLOW_PREFIX_LIMIT: usize = 5;
+const WATCHER_OBSERVED_EXCLUSION_LIMIT: usize = 32;
 
 #[derive(Debug, Clone)]
 pub struct WatcherFilterConfig {
@@ -280,20 +279,31 @@ fn watcher_path_is_ignored(matcher: Option<&Gitignore>, path: &Path) -> bool {
 
 /// Find ignored directory boundaries that an OS watcher can omit entirely.
 ///
-/// The traversal counts files while it discovers each boundary, so ordering
-/// exclusions does not require a second walk. Counting stops at 50,000 files
-/// per excluded subtree because larger values are equivalent for prioritising
-/// high-churn directories and should not delay watcher startup.
+/// `.git` always owns the first slot. A prefix observed in the event ring before
+/// an overflow outranks fixed fallbacks; otherwise common build/install outputs
+/// are preferred in the order documented by `FIXED_EXCLUSION_PRIORITY`.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) fn derive_excluded_subtrees(
     root: &Path,
     matcher: &SharedGitignore,
     max_paths: Option<usize>,
 ) -> Vec<PathBuf> {
+    const FIXED_EXCLUSION_PRIORITY: [&str; 8] = [
+        "target",
+        "node_modules",
+        "dist",
+        "build",
+        ".next",
+        "tmp",
+        ".bench",
+        "coverage",
+    ];
+
     #[derive(Debug)]
     struct Candidate {
         path: PathBuf,
-        file_count: usize,
+        observed_count: Option<u64>,
+        fixed_priority: usize,
         is_git: bool,
     }
 
@@ -302,44 +312,45 @@ pub(crate) fn derive_excluded_subtrees(
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    let observed = crate::context::watcher_counters_for_root(&root)
+        .observed_exclusion_prefixes()
+        .into_iter()
+        .map(|prefix| (PathBuf::from(prefix.prefix), prefix.count))
+        .collect::<BTreeMap<_, _>>();
     let root_git = root.join(".git");
     let mut candidates = Vec::<Candidate>::new();
-    let mut stack = vec![(root, None::<usize>)];
+    let mut stack = vec![root.clone()];
 
-    while let Some((directory, owner)) = stack.pop() {
-        if owner.is_some_and(|index| candidates[index].file_count >= EXCLUSION_FILE_COUNT_CAP) {
-            continue;
-        }
+    while let Some(directory) = stack.pop() {
         let Ok(entries) = fs::read_dir(&directory) else {
             continue;
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
+            if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
                 continue;
-            };
-            if file_type.is_dir() {
-                if let Some(index) = owner {
-                    stack.push((path, Some(index)));
-                    continue;
-                }
-                let is_git = path == root_git;
-                if is_git || watcher_path_is_ignored(matcher.as_deref(), &path) {
-                    let index = candidates.len();
-                    candidates.push(Candidate {
-                        path: path.clone(),
-                        file_count: 0,
-                        is_git,
-                    });
-                    stack.push((path, Some(index)));
-                } else {
-                    stack.push((path, None));
-                }
-            } else if let Some(index) = owner {
-                candidates[index].file_count = candidates[index]
-                    .file_count
-                    .saturating_add(1)
-                    .min(EXCLUSION_FILE_COUNT_CAP);
+            }
+            let is_git = path == root_git;
+            if is_git || watcher_path_is_ignored(matcher.as_deref(), &path) {
+                let relative = path.strip_prefix(&root).unwrap_or(&path);
+                let fixed_priority = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| {
+                        FIXED_EXCLUSION_PRIORITY
+                            .iter()
+                            .position(|priority| name == *priority)
+                    })
+                    .unwrap_or(FIXED_EXCLUSION_PRIORITY.len());
+                let observed_count = observed.get(relative).copied();
+                candidates.push(Candidate {
+                    path,
+                    observed_count,
+                    fixed_priority,
+                    is_git,
+                });
+            } else {
+                stack.push(path);
             }
         }
     }
@@ -348,7 +359,19 @@ pub(crate) fn derive_excluded_subtrees(
         right
             .is_git
             .cmp(&left.is_git)
-            .then_with(|| right.file_count.cmp(&left.file_count))
+            .then_with(|| {
+                right
+                    .observed_count
+                    .is_some()
+                    .cmp(&left.observed_count.is_some())
+            })
+            .then_with(|| {
+                right
+                    .observed_count
+                    .unwrap_or_default()
+                    .cmp(&left.observed_count.unwrap_or_default())
+            })
+            .then_with(|| left.fixed_priority.cmp(&right.fixed_priority))
             .then_with(|| left.path.cmp(&right.path))
     });
     let mut paths = candidates
@@ -359,6 +382,78 @@ pub(crate) fn derive_excluded_subtrees(
         paths.truncate(max_paths);
     }
     paths
+}
+
+const WATCHER_OBSERVATION_STATE_PREFIX: &str = "watcher.observed_exclusion_prefixes";
+
+fn watcher_observation_state_key(root: &Path) -> String {
+    format!(
+        "{WATCHER_OBSERVATION_STATE_PREFIX}:{}",
+        crate::path_identity::project_scope_key(root)
+    )
+}
+
+fn valid_observed_exclusion_prefix(prefix: &crate::context::WatcherOverflowPrefix) -> bool {
+    prefix.count > 0
+        && !prefix.prefix.is_empty()
+        && Path::new(&prefix.prefix)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+pub(crate) fn load_watcher_observations(
+    root: &Path,
+    counters: &crate::context::WatcherCounters,
+    db: Option<&Arc<Mutex<crate::db::TrackedConnection>>>,
+) {
+    let Some(db) = db else {
+        return;
+    };
+    let conn = db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Ok(Some(raw)) =
+        crate::db::state::get_host_state(&conn, &watcher_observation_state_key(root))
+    else {
+        return;
+    };
+    let Ok(mut prefixes) = serde_json::from_str::<Vec<crate::context::WatcherOverflowPrefix>>(&raw)
+    else {
+        return;
+    };
+    prefixes.retain(valid_observed_exclusion_prefix);
+    prefixes.truncate(WATCHER_OBSERVED_EXCLUSION_LIMIT);
+    counters.set_observed_exclusion_prefixes(prefixes);
+}
+
+pub(crate) fn persist_watcher_observations(
+    root: &Path,
+    counters: &crate::context::WatcherCounters,
+    db: Option<&Arc<Mutex<crate::db::TrackedConnection>>>,
+) {
+    let Some(db) = db else {
+        return;
+    };
+    let prefixes = counters.observed_exclusion_prefixes();
+    let Ok(value) = serde_json::to_string(&prefixes) else {
+        return;
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    let conn = db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Err(error) = crate::db::state::set_host_state(
+        &conn,
+        &watcher_observation_state_key(root),
+        &value,
+        now_ms,
+    ) {
+        crate::slog_warn!(
+            "failed to persist watcher overflow prefixes for {}: {}",
+            root.display(),
+            error
+        );
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -607,8 +702,50 @@ impl WatcherFilterThread {
         prefixes
     }
 
+    fn observed_exclusion_prefixes(&self) -> Vec<crate::context::WatcherOverflowPrefix> {
+        let matcher = self
+            .matcher
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let root_git = self.config.project_root.join(".git");
+        let mut counts = BTreeMap::<String, u64>::new();
+        for (path, _) in &self.recent_paths {
+            let mut relative = PathBuf::new();
+            let mut absolute = self.config.project_root.clone();
+            for component in path.components() {
+                let Component::Normal(name) = component else {
+                    continue;
+                };
+                relative.push(name);
+                absolute.push(name);
+                if absolute == root_git || watcher_path_is_ignored(matcher.as_deref(), &absolute) {
+                    *counts
+                        .entry(relative.to_string_lossy().into_owned())
+                        .or_default() += 1;
+                    break;
+                }
+            }
+        }
+        let mut prefixes = counts
+            .into_iter()
+            .map(|(prefix, count)| crate::context::WatcherOverflowPrefix { prefix, count })
+            .collect::<Vec<_>>();
+        prefixes.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.prefix.cmp(&right.prefix))
+        });
+        prefixes.truncate(WATCHER_OBSERVED_EXCLUSION_LIMIT);
+        prefixes
+    }
+
     fn log_overflow(&self, reason: RescanReason) -> bool {
         let prefixes = self.overflow_prefixes();
+        self.config
+            .counters
+            .set_observed_exclusion_prefixes(self.observed_exclusion_prefixes());
         let during_rescan = self.config.counters.note_overflow(reason, prefixes.clone());
         let backend = self.config.counters.backend_exclusions();
         let exclusions = backend
@@ -820,25 +957,164 @@ mod tests {
     }
 
     #[test]
-    fn exclusion_derivation_orders_caps_and_skips_missing_directories() {
+    fn overflow_volume_promotes_deep_ignored_prefix_into_next_exclusion_set() {
         let root = TempDir::new().unwrap();
         std::fs::create_dir(root.path().join(".git")).unwrap();
-        let names = (0..10)
-            .map(|index| format!("ignored-{index:02}"))
-            .collect::<Vec<_>>();
-        for (index, name) in names.iter().enumerate() {
-            let directory = root.path().join(name);
-            std::fs::create_dir(&directory).unwrap();
-            for file_index in 0..=index {
-                std::fs::write(directory.join(format!("file-{file_index}")), "x").unwrap();
-            }
+        let fallback = [
+            "target",
+            "node_modules",
+            "dist",
+            "build",
+            ".next",
+            "tmp",
+            ".bench",
+            "coverage",
+            "aaa",
+            "bbb",
+        ];
+        for directory in fallback {
+            std::fs::create_dir_all(root.path().join(directory)).unwrap();
+        }
+        let hot = root.path().join("packages/opencode-plugin/tmp");
+        std::fs::create_dir_all(&hot).unwrap();
+        std::fs::write(
+            root.path().join(".gitignore"),
+            format!(
+                "{}packages/*/tmp/\n",
+                fallback
+                    .iter()
+                    .map(|directory| format!("{directory}/\n"))
+                    .collect::<String>()
+            ),
+        )
+        .unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let hot = std::fs::canonicalize(hot).unwrap();
+        let matcher = shared_matcher(&canonical_root);
+        let generation = Arc::new(AtomicU64::new(4));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (dispatch_tx, dispatch_rx) = crossbeam_channel::bounded(1);
+        let (raw_tx, raw_rx) = mpsc::channel();
+        let config = WatcherFilterConfig::new(canonical_root.clone(), None);
+        let mut filter = WatcherFilterThread::new(
+            config,
+            Arc::clone(&matcher),
+            generation,
+            dispatch_tx,
+            Arc::clone(&shutdown),
+        );
+        let handle = thread::spawn(move || filter.run(raw_rx));
+
+        for index in 0..64 {
+            raw_tx
+                .send(Ok(notify::Event::new(EventKind::Create(CreateKind::File))
+                    .add_path(hot.join(format!("host-install-{index}")))))
+                .unwrap();
+        }
+        raw_tx
+            .send(Ok(
+                notify::Event::new(EventKind::Other).set_flag(Flag::Rescan)
+            ))
+            .unwrap();
+        assert_eq!(
+            dispatch_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            WatcherDispatchEvent::RescanRequired(RescanReason::Unknown)
+        );
+        shutdown.store(true, Ordering::SeqCst);
+        drop(raw_tx);
+        handle.join().unwrap();
+
+        let exclusions =
+            derive_excluded_subtrees(&canonical_root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        assert_eq!(exclusions[0], canonical_root.join(".git"));
+        assert_eq!(exclusions[1], hot);
+    }
+
+    #[test]
+    fn observed_exclusion_ranking_survives_state_database_reload() {
+        let root = TempDir::new().unwrap();
+        let storage = TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        let hot = root.path().join("packages/opencode-plugin/tmp");
+        std::fs::create_dir_all(&hot).unwrap();
+        let fallback = [
+            "target",
+            "node_modules",
+            "dist",
+            "build",
+            ".next",
+            "tmp",
+            ".bench",
+            "coverage",
+        ];
+        for directory in fallback {
+            std::fs::create_dir(root.path().join(directory)).unwrap();
         }
         std::fs::write(
             root.path().join(".gitignore"),
             format!(
-                "{}missing/\n",
-                names
+                "{}packages/*/tmp/\n",
+                fallback
                     .iter()
+                    .map(|directory| format!("{directory}/\n"))
+                    .collect::<String>()
+            ),
+        )
+        .unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let hot = std::fs::canonicalize(hot).unwrap();
+        let matcher = shared_matcher(&canonical_root);
+        let counters = crate::context::watcher_counters_for_root(&canonical_root);
+        let db = Arc::new(Mutex::new(
+            crate::db::open(&storage.path().join("aft.db")).unwrap(),
+        ));
+        counters.set_observed_exclusion_prefixes(vec![crate::context::WatcherOverflowPrefix {
+            prefix: "packages/opencode-plugin/tmp".to_string(),
+            count: 37,
+        }]);
+        persist_watcher_observations(&canonical_root, &counters, Some(&db));
+        counters.set_observed_exclusion_prefixes(Vec::new());
+
+        load_watcher_observations(&canonical_root, &counters, Some(&db));
+
+        assert_eq!(
+            counters.observed_exclusion_prefixes(),
+            vec![crate::context::WatcherOverflowPrefix {
+                prefix: "packages/opencode-plugin/tmp".to_string(),
+                count: 37,
+            }]
+        );
+        let exclusions =
+            derive_excluded_subtrees(&canonical_root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        assert_eq!(exclusions[0], canonical_root.join(".git"));
+        assert_eq!(exclusions[1], hot);
+    }
+
+    #[test]
+    fn exclusion_derivation_uses_fixed_priority_caps_and_skips_missing_directories() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        let priorities = [
+            "target",
+            "node_modules",
+            "dist",
+            "build",
+            ".next",
+            "tmp",
+            ".bench",
+            "coverage",
+        ];
+        for name in priorities {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+        }
+        std::fs::create_dir(root.path().join("other-generated")).unwrap();
+        std::fs::write(
+            root.path().join(".gitignore"),
+            format!(
+                "{}other-generated/\nmissing/\n",
+                priorities
+                    .iter()
+                    .rev()
                     .map(|name| format!("{name}/\n"))
                     .collect::<String>()
             ),
@@ -847,22 +1123,24 @@ mod tests {
         let matcher = shared_matcher(root.path());
 
         let exclusions =
-            derive_excluded_subtrees(root.path(), &matcher, Some(FSEVENTS_EXCLUSION_LIMIT));
+            derive_excluded_subtrees(root.path(), &matcher, Some(WATCHER_EXCLUSION_LIMIT));
 
-        assert_eq!(exclusions.len(), FSEVENTS_EXCLUSION_LIMIT);
+        assert_eq!(exclusions.len(), WATCHER_EXCLUSION_LIMIT);
         assert_eq!(
             exclusions[0],
             std::fs::canonicalize(root.path().join(".git")).unwrap()
         );
         assert_eq!(
             exclusions[1..],
-            names[3..]
+            priorities[..WATCHER_EXCLUSION_LIMIT - 1]
                 .iter()
-                .rev()
                 .map(|name| std::fs::canonicalize(root.path().join(name)).unwrap())
                 .collect::<Vec<_>>()
         );
         assert!(!exclusions.iter().any(|path| path.ends_with("missing")));
+        assert!(!exclusions
+            .iter()
+            .any(|path| path.ends_with("other-generated")));
     }
 
     #[test]
@@ -990,7 +1268,7 @@ mod tests {
         let config = WatcherFilterConfig::new(root.clone(), None);
         config.counters.set_backend_exclusions(
             7,
-            (0..FSEVENTS_EXCLUSION_LIMIT)
+            (0..WATCHER_EXCLUSION_LIMIT)
                 .map(|index| root.join(format!("excluded-{index}")))
                 .collect(),
         );
@@ -1040,7 +1318,7 @@ mod tests {
         assert!(line.contains("src/generated:7"), "line: {line}");
         assert!(line.contains("queue_depth=unavailable"), "line: {line}");
         assert!(line.contains("rescan_in_progress=false"), "line: {line}");
-        for index in 0..FSEVENTS_EXCLUSION_LIMIT {
+        for index in 0..WATCHER_EXCLUSION_LIMIT {
             assert!(line.contains(&format!("excluded-{index}")), "line: {line}");
         }
         let snapshot = counters.snapshot();

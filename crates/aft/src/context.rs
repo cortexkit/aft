@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::db::TrackedConnection;
 use lsp_types::FileChangeType;
 use notify::RecommendedWatcher;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::alert_state::{
     AcceptedObservationBatch, AcceptedObservationResult, AlertDeltaState, ObservationError,
@@ -659,7 +659,7 @@ pub(crate) enum WatcherDrainPhase {
     },
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct WatcherOverflowPrefix {
     pub(crate) prefix: String,
     pub(crate) count: u64,
@@ -723,6 +723,7 @@ pub(crate) struct WatcherCounters {
     overflows_total: AtomicU64,
     overflows_during_rescan: AtomicU64,
     last_overflow_prefixes: RwLock<Vec<WatcherOverflowPrefix>>,
+    observed_exclusion_prefixes: RwLock<Vec<WatcherOverflowPrefix>>,
     backend_exclusions: RwLock<WatcherBackendExclusions>,
     rescan_state: AtomicU8,
     rescan_again_reason: AtomicU8,
@@ -859,6 +860,20 @@ impl WatcherCounters {
 
     pub(crate) fn rescan_in_progress(&self) -> bool {
         self.rescan_state.load(Ordering::Acquire) != WATCHER_RESCAN_IDLE
+    }
+
+    pub(crate) fn set_observed_exclusion_prefixes(&self, prefixes: Vec<WatcherOverflowPrefix>) {
+        *self
+            .observed_exclusion_prefixes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = prefixes;
+    }
+
+    pub(crate) fn observed_exclusion_prefixes(&self) -> Vec<WatcherOverflowPrefix> {
+        self.observed_exclusion_prefixes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub(crate) fn set_backend_exclusions(&self, matcher_generation: u64, paths: Vec<PathBuf>) {
