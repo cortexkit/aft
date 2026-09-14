@@ -2649,12 +2649,100 @@ pub fn handle_configure(req: &RawRequest, ctx: &AppContext) -> Response {
                 && ctx.harness_opt().as_ref() == Some(&harness)
                 && (previous_project_root.as_deref() == Some(root_path.as_path())
                     || canonical_root.as_path() == root_path)
-                && ctx.has_configure_session_binding(canonical_root, req.session())
         });
     if let Some(canonical_root) = active_canonical_root {
         next_config.semantic.route_project_root = Some(canonical_root.clone());
         next_config.semantic.route_harness = Some(harness.wire_label());
-        if only_lsp_process_state_changed(&previous_config, &next_config) {
+        let session_already_bound =
+            ctx.has_configure_session_binding(canonical_root, req.session());
+        if configs_equal_including_runtime_only_fields(&previous_config, &next_config) {
+            if !session_already_bound && !ctx.configure_maintenance_has_capacity() {
+                return configure_maintenance_backpressure(&req.id);
+            }
+            if let Some(token) = crate::executor::current_job_cancellation() {
+                if !token.try_seal_committed() {
+                    return Response::error(
+                        &req.id,
+                        "request_cancelled",
+                        "configure cancelled: the requesting route was torn down or its bind deadline expired",
+                    );
+                }
+            }
+            register_hashline_for_configure(
+                ctx,
+                canonical_root,
+                req.session(),
+                next_config.hashline_enabled,
+                next_config.read_slot_survives(),
+                edit_slot_survives,
+                &mut configure_warnings,
+            );
+            if !session_already_bound {
+                let first_session_bind = ctx.note_configure_session_binding(
+                    canonical_root.clone(),
+                    req.session().to_string(),
+                );
+                debug_assert!(first_session_bind);
+                let storage_root =
+                    crate::bash_background::storage_dir(next_config.storage_dir.as_deref());
+                let enqueue_result = ctx.enqueue_configure_maintenance(ConfigureMaintenanceJob {
+                    generation: ctx.configure_generation(),
+                    root_path: root_path.clone(),
+                    canonical_cache_root: canonical_root.clone(),
+                    harness: harness.clone(),
+                    storage_root: storage_root.clone(),
+                    harness_dir: storage_root.join(harness.storage_segment()),
+                    session_id: req.session().to_string(),
+                    home_match: ctx.is_home_root(),
+                    format_tool_cache_clear_needed: false,
+                    run_bash_replay: true,
+                    refresh_project_runtime: false,
+                    sync_bash_compress_flag: false,
+                    reset_filter_registry: false,
+                    clear_failed_spawns: false,
+                    warm_callgraph_store: false,
+                    supersede_search_artifact_persistence: false,
+                    supersede_callgraph_artifact_persistence: false,
+                    supersede_semantic_artifact_persistence: false,
+                    search_artifact_load_start: None,
+                    semantic_artifact_load_start: None,
+                });
+                if enqueue_result.is_err() {
+                    ctx.forget_configure_session_binding(canonical_root, req.session());
+                    return configure_maintenance_backpressure(&req.id);
+                }
+                slog_debug!(
+                    "equivalent configure registered session {} for generation {}",
+                    req.session(),
+                    ctx.configure_generation()
+                );
+            }
+            ctx.begin_configure_ack_phase("ack_ready");
+            let artifact_owner_status = ctx.artifact_owner_status();
+            let search_index_cache_reused = next_config.search_index
+                && ctx
+                    .search_index()
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some();
+            return Response::success(
+                &req.id,
+                json!({
+                    "project_root": root_path.display().to_string(),
+                    "warnings": configure_warnings,
+                    "warnings_pending": false,
+                    "search_index_cache_reused": search_index_cache_reused,
+                    "artifact_owner": artifact_owner_status
+                        .as_ref()
+                        .map(|status| serde_json::to_value(status).unwrap_or(serde_json::Value::Null)),
+                    "config_dropped_keys": config_dropped_keys
+                        .iter()
+                        .map(|d| json!({ "key": d.key, "tier": d.tier, "reason": d.reason }))
+                        .collect::<Vec<_>>(),
+                }),
+            );
+        }
+        if session_already_bound && only_lsp_process_state_changed(&previous_config, &next_config) {
             if let Some(token) = crate::executor::current_job_cancellation() {
                 if !token.try_seal_committed() {
                     return Response::error(
@@ -11533,6 +11621,70 @@ mod tests {
         let changed = configure_request_with_session(params_for(root_b.path()), "session-a");
         assert!(handle_configure_for_test(&changed, &ctx).success);
         assert!(ctx.configure_generation() > generation);
+    }
+
+    #[test]
+    fn new_session_attach_skips_root_probes_and_keeps_watcher_thread() {
+        let _watcher_guard = watcher_test_mutex()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_guard = home_env_mutex();
+        let _git_env = crate::test_env::hermetic_git_env_guard();
+        let _enable_watcher = EnvVarGuard::remove("AFT_TEST_DISABLE_FILE_WATCHER");
+        let _sync_watcher = EnvVarGuard::set("AFT_TEST_SYNC_FILE_WATCHER_START", "1");
+        super::reset_configure_replay_session_calls_for_test();
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let source = root.path().join("session-b.txt");
+        std::fs::write(&source, "session b can read\n").unwrap();
+        init_git_fixture(root.path());
+        let ctx = test_context();
+        let params = json!({
+            "project_root": root.path(),
+            "harness": "opencode",
+            "storage_dir": storage.path(),
+            "config": [user_tier(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": false
+            }))]
+        });
+        let first = configure_request_with_session(params.clone(), "session-a");
+        assert!(handle_configure_for_test(&first, &ctx).success);
+        ctx.mark_subc_bound();
+        super::drain_deferred_configure_maintenance(&ctx);
+        let canonical_root = ctx.canonical_cache_root();
+        let watcher_thread = ctx.watcher_runtime_thread_id_for_test().unwrap();
+        let watcher_generation = WATCHER_GENERATION.load(Ordering::SeqCst);
+        let worktree_probes = ctx.worktree_bridge_probe_spawns_for_test();
+        ctx.force_worktree_bridge_reprobe_for_test(true);
+
+        let second = configure_request_with_session(params, "session-b");
+        assert!(handle_configure_for_test(&second, &ctx).success);
+        ctx.force_worktree_bridge_reprobe_for_test(false);
+
+        assert_eq!(ctx.worktree_bridge_probe_spawns_for_test(), worktree_probes);
+        assert_eq!(
+            WATCHER_GENERATION.load(Ordering::SeqCst),
+            watcher_generation
+        );
+        assert_eq!(
+            ctx.watcher_runtime_thread_id_for_test(),
+            Some(watcher_thread)
+        );
+        assert!(ctx.has_configure_session_binding(&canonical_root, "session-b"));
+        let read = RawRequest {
+            id: "session-b-read".to_string(),
+            command: "read".to_string(),
+            lsp_hints: None,
+            session_id: Some("session-b".to_string()),
+            params: json!({"file": source}),
+        };
+        assert!(crate::commands::read::handle_read(&read, &ctx).success);
+        super::drain_deferred_configure_maintenance(&ctx);
+        assert_eq!(super::configure_replay_session_calls_for_test(), 2);
+        assert_eq!(ctx.watcher_registry_count(), 1);
+        ctx.stop_watcher_runtime();
     }
 
     #[test]
