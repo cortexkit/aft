@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "repeat-breaker-wording"
+  ],
+  "note": "Repeat breaker steer wording only (response_finalize.rs). No ranking-fence files."
+}
