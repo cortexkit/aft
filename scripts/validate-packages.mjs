@@ -147,12 +147,21 @@ if (core) {
     );
   }
 
+  // Both OpenCode generations resolve `<pkg>/tui` through the exports map.
+  // The entry under src/entry/ wraps the precompiled TUI in the V2 loader's
+  // {id, tui, setup} shape and re-exports the V1 fields, so one path serves
+  // both hosts. It must be published alongside the tree it wraps.
   const tuiExportImport = core.exports?.["./tui"]?.import;
-  if (tuiExportImport !== "./src/tui/entry.mjs") {
+  if (tuiExportImport !== "./src/entry/tui.mjs") {
     fail(
       label,
-      `exports['./tui'].import must be './src/tui/entry.mjs', got '${tuiExportImport ?? "undefined"}'`,
+      `exports['./tui'].import must be './src/entry/tui.mjs', got '${tuiExportImport ?? "undefined"}'`,
     );
+  }
+  for (const dir of ["src/entry", "src/tui"]) {
+    if (!coreFiles.includes(dir)) {
+      fail(label, `files must include '${dir}' so the ./tui export resolves in the published package`);
+    }
   }
 
   if (core.version) platformVersions.push({ name: label, version: core.version });

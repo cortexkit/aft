@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "validate-packages-tui-export"
+  ],
+  "note": "Package validator follows the ./tui export to src/entry/tui.mjs and runs at train time; scripts and workflow only, no product source."
+}

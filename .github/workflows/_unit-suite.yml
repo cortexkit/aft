@@ -151,6 +151,13 @@ jobs:
       - name: Design gate unit tests
         run: bun run test:design-gate
 
+      # The publish job refuses a package.json shape this validator rejects,
+      # and a shape change lands on main days before anyone tags. Running it
+      # here means a train cannot land a shape the release would later refuse
+      # (v0.56.0's first publish died on a stale ./tui export pin).
+      - name: Validate npm package shapes
+        run: node scripts/validate-packages.mjs
+
       - name: Build aft-bridge dist (workspace consumers depend on it)
         run: bun run --cwd packages/aft-bridge build
 
