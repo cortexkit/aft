@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "gh-shim-repository-shape",
+    "release-notes-0561"
+  ],
+  "note": "gh-shim vector pin asserts repository shape (#278 follow-up); v0.56.1 release notes. No ranking-fence files."
+}
