@@ -113,6 +113,45 @@ fn prepare(f: &Fixture) -> (std::path::PathBuf, std::path::PathBuf) {
 }
 
 #[test]
+fn manifest_blob_reader_decodes_each_payload_once() {
+    let f = fixture();
+    let connection = Connection::open(&f.blobs).unwrap();
+    let key = f
+        .base
+        .entries()
+        .find_map(|(_, entry)| match entry {
+            ManifestEntry::Regular { planes, .. } => planes.callgraph.as_deref(),
+            _ => None,
+        })
+        .unwrap();
+    let reader = ManifestViewBlobReader::new(&connection);
+
+    let first = reader.read_decoded(key).unwrap().unwrap();
+    let second = reader.read_decoded(key).unwrap().unwrap();
+
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(reader.decoded.borrow().len(), 1);
+}
+
+#[test]
+fn selected_binding_load_skips_changed_payloads_and_matches_cold() {
+    let f = fixture();
+    let (_, incremental) = prepare(&f);
+    Connection::open(&incremental)
+        .unwrap()
+        .execute(
+            "UPDATE view_bindings SET payload = '{' WHERE file_path = 'target.ts'",
+            [],
+        )
+        .unwrap();
+
+    apply_manifest_diff(&incremental, &f.base, &f.next, &f.blobs).unwrap();
+    let cold = f.dir.path().join("selected-binding-cold.sqlite");
+    materialize_manifest_view_database(&cold, &f.blobs, &f.next).unwrap();
+    assert_snapshot_parity(&snapshot(&incremental), &snapshot(&cold));
+}
+
+#[test]
 fn incremental_rows_match_cold_with_cross_file_relink() {
     let f = fixture();
     let (base, copy) = prepare(&f);
@@ -147,6 +186,8 @@ fn incremental_writes_only_owned_rows_and_relinks() {
             relinked_inserted: 2,
             dependency_deleted: 3,
             dependency_inserted: 3,
+            surface_deleted: 2,
+            surface_inserted: 2,
             dependent_files: 1,
             resolved_files: 3,
             resolved_refs: 2,
@@ -158,7 +199,7 @@ fn incremental_writes_only_owned_rows_and_relinks() {
         }
     );
     assert_eq!(stats.graph_rows_written(), 13);
-    assert_eq!(stats.rows_written(), 19);
+    assert_eq!(stats.rows_written(), 23);
     assert_eq!(stats.dependent_files, 1);
     assert_eq!(stats.resolved_files, 3);
     assert!(!stats.full_resolution);
@@ -212,12 +253,16 @@ fn incremental_delete_rows_are_bounded_by_changed_manifest_paths() {
     let changed_files = 3;
 
     println!(
-        "bounded deletion: changed_files={changed_files} paths_touched={} graph_rows_deleted={} dependency_rows_deleted={}",
-        stats.delete_paths_touched, stats.deleted, stats.dependency_deleted
+        "bounded deletion: changed_files={changed_files} paths_touched={} graph_rows_deleted={} dependency_rows_deleted={} surface_rows_deleted={}",
+        stats.delete_paths_touched,
+        stats.deleted,
+        stats.dependency_deleted,
+        stats.surface_deleted
     );
     assert_eq!(stats.delete_paths_touched, changed_files);
     assert_eq!(stats.deleted, changed_files * 5);
     assert_eq!(stats.dependency_deleted, changed_files * 2);
+    assert_eq!(stats.surface_deleted, changed_files);
 }
 
 #[test]
@@ -384,7 +429,7 @@ fn added_and_removed_targets_relink_previously_unresolved_callers() {
 fn selected_join_seam_matches_existing_cold_join_and_retains_missing_candidates() {
     let f = fixture();
     let conn = Connection::open(&f.blobs).unwrap();
-    let reader = ManifestViewBlobReader { connection: &conn };
+    let reader = ManifestViewBlobReader::new(&conn);
     let old = join::JoinResult::from_manifest(&f.base, &reader).unwrap();
     let cold = join::join_selected_manifest(&f.base, &reader, None, &BTreeMap::new()).unwrap();
     assert_eq!(
@@ -674,7 +719,7 @@ fn binding_dependencies_exclude_existing_workspace_directory_probes() {
             ("dir/index.ts", "export function target() {}"),
         ],
     );
-    let reader = ManifestViewBlobReader { connection: &conn };
+    let reader = ManifestViewBlobReader::new(&conn);
     let cold = join::join_selected_manifest(&manifest, &reader, None, &BTreeMap::new()).unwrap();
     assert!(!cold.bindings["caller.ts"].dependencies.contains("dir"));
     assert!(cold.bindings["caller.ts"]
@@ -822,7 +867,7 @@ fn colliding_structural_ordinals_keep_distinct_bindings_and_first_reference_rows
         (path.clone(), entry)
     }))
     .unwrap();
-    let reader = ManifestViewBlobReader { connection: &conn };
+    let reader = ManifestViewBlobReader::new(&conn);
     let cold = join::join_selected_manifest(&manifest, &reader, None, &BTreeMap::new()).unwrap();
     let selected = BTreeSet::from(["caller.ts".to_string()]);
     let cached =
@@ -930,9 +975,7 @@ fn persistent_surfaces_rebuild_only_changed_entries_without_reading_pruned_calle
         }
     }
     let reader = CountingReader {
-        inner: ManifestViewBlobReader {
-            connection: &connection,
-        },
+        inner: ManifestViewBlobReader::new(&connection),
         reads: Default::default(),
     };
     let selected = BTreeSet::from(["caller.ts".into(), "target.ts".into()]);
@@ -978,13 +1021,14 @@ fn memoized_bindings_keep_callers_and_reference_kinds_distinct() {
             ("b/target.ts", "export function target() {}"),
         ],
     );
-    let reader = ManifestViewBlobReader { connection: &conn };
+    let reader = ManifestViewBlobReader::new(&conn);
     let reference = join::JoinResult::from_manifest(&current, &reader).unwrap();
     let memoized = join::join_selected_manifest(&current, &reader, None, &BTreeMap::new()).unwrap();
     assert_eq!(
         reference.canonical_serialization(),
         memoized.result.canonical_serialization()
     );
+    assert_eq!(memoized.resolved_bindings, 4);
     assert!(memoized.resolved_bindings < memoized.result.resolution_order.len());
     for prefix in ["a", "b"] {
         assert!(memoized.result.rows.iter().any(|row| row.caller_path
@@ -1001,7 +1045,7 @@ fn memoized_rust_bindings_keep_import_visibility() {
         ("src/lib.rs", "mod target; fn before() { alias::target(); } use crate::target as alias; fn after() { alias::target(); alias::target(); }"),
         ("src/target.rs", "pub fn target() {}"),
     ]);
-    let reader = ManifestViewBlobReader { connection: &conn };
+    let reader = ManifestViewBlobReader::new(&conn);
     let reference = join::JoinResult::from_manifest(&current, &reader).unwrap();
     let memoized = join::join_selected_manifest(&current, &reader, None, &BTreeMap::new()).unwrap();
     assert_eq!(

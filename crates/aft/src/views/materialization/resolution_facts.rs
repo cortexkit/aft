@@ -85,7 +85,7 @@ pub(super) fn diff_inputs(
 ) -> crate::callgraph_store::Result<InputDiff> {
     use crate::callgraph_store::join::{CallgraphBlob, ManifestBlobReader};
     use crate::views::{ManifestEntry, RelPath};
-    let reader = super::ManifestViewBlobReader { connection };
+    let reader = super::ManifestViewBlobReader::new(connection);
     let mut result = InputDiff::default();
     for path in changed {
         let rel = RelPath::new(path.clone()).expect("manifest path");

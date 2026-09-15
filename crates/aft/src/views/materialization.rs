@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -29,6 +31,8 @@ pub struct MaterializeStats {
     pub relinked_inserted: usize,
     pub dependency_deleted: usize,
     pub dependency_inserted: usize,
+    pub surface_deleted: usize,
+    pub surface_inserted: usize,
     pub dependent_files: usize,
     pub resolved_files: usize,
     pub resolved_refs: usize,
@@ -45,7 +49,11 @@ impl MaterializeStats {
     }
 
     pub fn rows_written(&self) -> usize {
-        self.graph_rows_written() + self.dependency_deleted + self.dependency_inserted
+        self.graph_rows_written()
+            + self.dependency_deleted
+            + self.dependency_inserted
+            + self.surface_deleted
+            + self.surface_inserted
     }
 }
 
@@ -85,7 +93,7 @@ pub(crate) fn apply_manifest_diff_profiled(
 pub(crate) mod profile;
 mod resolution_facts;
 
-const MATERIALIZATION_VERSION: &str = "5";
+const MATERIALIZATION_VERSION: &str = "6";
 
 fn fingerprint(manifest: &crate::views::Manifest) -> Result<String> {
     let bytes = manifest
@@ -190,7 +198,16 @@ fn materialize(
             return Ok((MaterializeStats::default(), profile.into_timings()));
         }
     }
-    transaction.execute_batch("CREATE TABLE IF NOT EXISTS view_bindings (file_path TEXT PRIMARY KEY, payload TEXT NOT NULL)")?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS view_bindings (
+             file_path TEXT PRIMARY KEY,
+             payload TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS view_file_surfaces (
+             file_path TEXT PRIMARY KEY,
+             payload TEXT NOT NULL
+         )",
+    )?;
     let changed = base.map(|base| {
         base.entries()
             .chain(manifest.entries())
@@ -198,24 +215,25 @@ fn materialize(
             .map(|(path, _)| path.as_bytes().to_vec())
             .collect::<BTreeSet<_>>()
     });
-    let cached = if base.is_some() {
-        load_bindings(&transaction)?
-    } else {
-        BTreeMap::new()
-    };
     let blob_connection = Connection::open(callgraph_blob_database)?;
+    let reader = ManifestViewBlobReader::new(&blob_connection);
+    let mut cached_for_invalidation = None;
     let mut fact_invalidated = BTreeSet::new();
     let mut fallback_count = 0;
     let selected = match (&changed, base) {
         (Some(changed), Some(base)) if !requires_full_resolution(base, manifest, changed) => {
             let diff = resolution_facts::diff_inputs(base, manifest, changed, &blob_connection)?;
-            for (caller, binding) in &cached {
-                if !binding.consulted_facts.is_disjoint(&diff.changed) {
-                    fact_invalidated.insert(caller.clone());
+            if diff.unknown == 0 && (!diff.changed.is_empty() || diff.inputs_changed) {
+                let cached = load_bindings(&transaction)?;
+                for (caller, binding) in &cached {
+                    if !binding.consulted_facts.is_disjoint(&diff.changed) {
+                        fact_invalidated.insert(caller.clone());
+                    }
+                    if diff.inputs_changed && binding.unattributed {
+                        fallback_count += 1;
+                    }
                 }
-                if diff.inputs_changed && binding.unattributed {
-                    fallback_count += 1;
-                }
+                cached_for_invalidation = Some(cached);
             }
             if diff.unknown != 0 || fallback_count != 0 {
                 fallback_count += diff.unknown;
@@ -249,6 +267,19 @@ fn materialize(
         }
         _ => None,
     };
+    let cached = if base.is_none() {
+        BTreeMap::new()
+    } else if let Some(cached) = cached_for_invalidation {
+        cached
+    } else if let Some(selected) = &selected {
+        load_bindings_for_selection(
+            &transaction,
+            selected,
+            changed.as_ref().expect("incremental selection has a diff"),
+        )?
+    } else {
+        load_bindings(&transaction)?
+    };
     let mut stats = MaterializeStats {
         full_resolution: selected.is_none(),
         unattributed_callers: fallback_count,
@@ -262,7 +293,8 @@ fn materialize(
              ) WITHOUT ROWID",
         )?;
         {
-            let mut insert = transaction.prepare("INSERT INTO changed_view_paths(path) VALUES(?1)")?;
+            let mut insert =
+                transaction.prepare("INSERT INTO changed_view_paths(path) VALUES(?1)")?;
             for path in changed {
                 let Ok(path) = std::str::from_utf8(path) else {
                     // Non-UTF-8 entries cannot have rows in the cold materialization.
@@ -302,6 +334,10 @@ fn materialize(
             "DELETE FROM view_bindings WHERE file_path IN (SELECT path FROM changed_view_paths)",
             [],
         )?;
+        stats.surface_deleted += transaction.execute(
+            "DELETE FROM view_file_surfaces WHERE file_path IN (SELECT path FROM changed_view_paths)",
+            [],
+        )?;
     } else {
         for table in ["edges", "refs", "nodes", "files"] {
             stats.deleted += transaction.execute(&format!("DELETE FROM {table}"), [])?;
@@ -311,10 +347,11 @@ fn materialize(
         for table in ["file_dependencies", "view_bindings"] {
             stats.dependency_deleted += transaction.execute(&format!("DELETE FROM {table}"), [])?;
         }
+        stats.surface_deleted += transaction.execute("DELETE FROM view_file_surfaces", [])?;
     }
     profile.finish("delete_rows");
     let mut parsed = BTreeMap::new();
-    let mut nodes = HashMap::new();
+    let mut nodes = HashMap::<String, HashMap<String, String>>::new();
     let mut loaded_paths = BTreeSet::new();
     for (path, entry) in manifest.entries() {
         if changed
@@ -334,21 +371,12 @@ fn materialize(
         let Some(key) = planes.callgraph.as_deref() else {
             continue;
         };
-        let key_bytes = decode_manifest_full_key(key).ok_or_else(|| {
-            CallGraphStoreError::Unavailable(format!("invalid manifest callgraph key {key}"))
-        })?;
-        let payload = blob_connection
-            .query_row(
-                "SELECT payload FROM blob_payloads WHERE full_key = ?1",
-                [key_bytes],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?
+        let blob = reader
+            .read_decoded(key)
+            .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?
             .ok_or_else(|| {
                 CallGraphStoreError::Unavailable(format!("missing manifest callgraph blob {key}"))
             })?;
-        let blob = join::CallgraphBlob::from_bytes(&payload)
-            .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
         let Some(parse) = blob.parse() else {
             continue;
         };
@@ -368,6 +396,7 @@ fn materialize(
                 params![path, key, parse.language],
             )?;
         }
+        let file_nodes = nodes.entry(path.clone()).or_default();
         for symbol in &parse.symbols {
             let id = format!("view:{path}:{}:{}", symbol.scoped_name, symbol.ordinal);
             if write_owned {
@@ -395,33 +424,15 @@ fn materialize(
                     ],
                 )?;
             }
-            nodes.insert((path.clone(), symbol.scoped_name.clone()), id.clone());
-            nodes
-                .entry((path.clone(), symbol.name.clone()))
-                .or_insert(id);
+            file_nodes.insert(symbol.scoped_name.clone(), id.clone());
+            file_nodes.entry(symbol.name.clone()).or_insert(id);
         }
         if !resolution_input {
-            parsed.insert(
-                path,
-                parse
-                    .refs
-                    .iter()
-                    .fold(BTreeMap::new(), |mut by_ordinal, reference| {
-                        // Match the cold writer's original first-reference lookup
-                        // when structural references share an AST ordinal.
-                        by_ordinal
-                            .entry(reference.ordinal)
-                            .or_insert_with(|| reference.clone());
-                        by_ordinal
-                    }),
-            );
+            parsed.insert(path, EmissionParse::new(blob));
         }
     }
 
     profile.finish("owned_blob_decode_and_insert");
-    let reader = ManifestViewBlobReader {
-        connection: &blob_connection,
-    };
     let changed_strings = changed.as_ref().map_or_else(BTreeSet::new, |paths| {
         paths
             .iter()
@@ -472,6 +483,17 @@ fn materialize(
         .filter(|path| !changed_strings.contains(*path) && changed.is_some())
         .count();
     for (path, binding) in &joined.bindings {
+        if joined.rebuilt_surface_paths.contains(path) {
+            if let Some(payload) = binding
+                .surface_json()
+                .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?
+            {
+                stats.surface_inserted += transaction.execute(
+                    "INSERT OR REPLACE INTO view_file_surfaces(file_path, payload) VALUES(?1, ?2)",
+                    params![path, payload],
+                )?;
+            }
+        }
         let old = cached.get(path).filter(|_| {
             changed
                 .as_ref()
@@ -507,12 +529,16 @@ fn materialize(
     // Retain prepared statements across the fan-out. Preparing each statement
     // again costs more than binding many of these small reference rows.
     {
+        transaction.execute_batch(
+            "CREATE TEMP TABLE pending_view_refs AS SELECT * FROM refs WHERE 0;
+             CREATE TEMP TABLE pending_view_edges AS SELECT * FROM edges WHERE 0",
+        )?;
         let mut same_ref = transaction.prepare("SELECT EXISTS(SELECT 1 FROM refs WHERE ref_id = ?1 AND caller_node IS ?2
                  AND status = ?3 AND target_node IS ?4 AND target_file IS ?5 AND target_symbol IS ?6)")?;
         let mut delete_edge = transaction.prepare("DELETE FROM edges WHERE ref_id = ?1")?;
         let mut delete_ref = transaction.prepare("DELETE FROM refs WHERE ref_id = ?1")?;
         let mut insert_ref = transaction.prepare(
-            "INSERT OR REPLACE INTO refs
+            "INSERT INTO pending_view_refs
              (ref_id, caller_node, caller_file, kind, short_name, full_ref, module_path,
               import_kind, local_name, requested_name, namespace_alias, wildcard, line,
               byte_start, byte_end, status, target_node, target_file, target_symbol, provenance)
@@ -520,32 +546,31 @@ fn materialize(
                      ?15, ?16, ?17, ?18, ?19, ?20)",
         )?;
         let mut insert_edge = transaction.prepare(
-            "INSERT OR REPLACE INTO edges
+            "INSERT INTO pending_view_edges
                      (edge_id, ref_id, source_node, target_node, target_file, target_symbol,
                       kind, line, provenance)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'call', ?7, ?8)",
         )?;
         for row in joined.result.rows {
-            let caller_path = String::from_utf8(row.caller_path.clone()).map_err(|_| {
+            let caller_path = String::from_utf8(row.caller_path).map_err(|_| {
                 CallGraphStoreError::Unavailable("non-UTF-8 manifest caller path".to_string())
             })?;
             ensure_manifest_path(
                 &caller_path,
                 manifest,
-                &blob_connection,
+                &reader,
                 &mut loaded_paths,
                 &mut parsed,
                 &mut nodes,
             )?;
-            if let Some(target) = row
+            let target_path = row
                 .target_path
-                .as_ref()
-                .and_then(|path| std::str::from_utf8(path).ok())
-            {
+                .and_then(|path| String::from_utf8(path).ok());
+            if let Some(target) = target_path.as_deref() {
                 ensure_manifest_path(
                     target,
                     manifest,
-                    &blob_connection,
+                    &reader,
                     &mut loaded_paths,
                     &mut parsed,
                     &mut nodes,
@@ -554,23 +579,19 @@ fn materialize(
             let Some(parse) = parsed.get(&caller_path) else {
                 continue;
             };
-            let Some(reference) = parse.get(&row.ref_ordinal) else {
+            let Some(reference) = parse.reference(row.ref_ordinal) else {
                 continue;
             };
             let caller_node = reference
                 .caller_symbol
                 .as_ref()
-                .and_then(|symbol| nodes.get(&(caller_path.clone(), symbol.clone())))
+                .and_then(|symbol| nodes.get(&caller_path)?.get(symbol))
                 .cloned();
-            let target_path = row
-                .target_path
-                .as_ref()
-                .and_then(|path| String::from_utf8(path.clone()).ok());
-            let target_symbol = row.target_symbol.clone();
+            let target_symbol = row.target_symbol;
             let target_node = target_path
                 .as_ref()
                 .zip(target_symbol.as_ref())
-                .and_then(|(path, symbol)| nodes.get(&(path.clone(), symbol.clone())))
+                .and_then(|(path, symbol)| nodes.get(path)?.get(symbol))
                 .cloned();
             let ref_id = format!("view:{caller_path}:{}", row.ref_ordinal);
             let relink = changed
@@ -651,6 +672,14 @@ fn materialize(
                 }
             }
         }
+        transaction.execute(
+            "INSERT OR REPLACE INTO refs SELECT * FROM pending_view_refs ORDER BY rowid",
+            [],
+        )?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO edges SELECT * FROM pending_view_edges ORDER BY rowid",
+            [],
+        )?;
     }
     profile.finish("emit_refs_edges");
     set_meta_ready(&transaction, true)?;
@@ -669,10 +698,18 @@ fn materialize(
 
 struct ManifestViewBlobReader<'a> {
     connection: &'a Connection,
+    decoded: RefCell<HashMap<String, Arc<join::CallgraphBlob>>>,
 }
 
-impl join::ManifestBlobReader for ManifestViewBlobReader<'_> {
-    fn read_callgraph_blob(
+impl<'a> ManifestViewBlobReader<'a> {
+    fn new(connection: &'a Connection) -> Self {
+        Self {
+            connection,
+            decoded: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn read_payload(
         &self,
         full_key: &str,
     ) -> std::result::Result<Option<Vec<u8>>, join::ManifestJoinError> {
@@ -687,6 +724,39 @@ impl join::ManifestBlobReader for ManifestViewBlobReader<'_> {
             )
             .optional()
             .map_err(|error| join::ManifestJoinError::InvalidBlob(error.to_string()))
+    }
+
+    fn read_decoded(
+        &self,
+        full_key: &str,
+    ) -> std::result::Result<Option<Arc<join::CallgraphBlob>>, join::ManifestJoinError> {
+        if let Some(blob) = self.decoded.borrow().get(full_key) {
+            return Ok(Some(blob.clone()));
+        }
+        let Some(payload) = self.read_payload(full_key)? else {
+            return Ok(None);
+        };
+        let blob = Arc::new(join::CallgraphBlob::from_bytes(&payload)?);
+        self.decoded
+            .borrow_mut()
+            .insert(full_key.to_string(), blob.clone());
+        Ok(Some(blob))
+    }
+}
+
+impl join::ManifestBlobReader for ManifestViewBlobReader<'_> {
+    fn read_callgraph_blob(
+        &self,
+        full_key: &str,
+    ) -> std::result::Result<Option<Vec<u8>>, join::ManifestJoinError> {
+        self.read_payload(full_key)
+    }
+
+    fn read_callgraph_blob_decoded(
+        &self,
+        full_key: &str,
+    ) -> std::result::Result<Option<Arc<join::CallgraphBlob>>, join::ManifestJoinError> {
+        self.read_decoded(full_key)
     }
 }
 
@@ -720,6 +790,11 @@ fn configure_materialization_connection(connection: &Connection) -> Result<()> {
     // A detached checkpoint moves these pages into the main file. Keeping the
     // automatic threshold disabled makes that work observable and off-path.
     connection.pragma_update(None, "wal_autocheckpoint", 0)?;
+    // The derived database has several secondary indexes. A publication-sized
+    // page cache avoids rereading their upper levels while deleting and emitting
+    // a bounded diff; temporary path/row sets never need durable spill files.
+    connection.pragma_update(None, "cache_size", -65_536)?;
+    connection.pragma_update(None, "temp_store", "MEMORY")?;
     Ok(())
 }
 
@@ -733,41 +808,124 @@ fn load_bindings(
     let rows = statement.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
+    let mut bindings = rows
+        .map(|row| {
+            let (path, payload) = row?;
+            let binding: join::ViewBindingDependencies = serde_json::from_str(&payload)
+                .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+            Ok((path, binding))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    for (path, surface) in load_surfaces(connection)? {
+        if let Some(binding) = bindings.get_mut(&path) {
+            binding.copy_surface_from(&surface);
+        }
+    }
+    Ok(bindings)
+}
+
+fn load_surfaces(
+    connection: &Connection,
+) -> Result<BTreeMap<String, join::ViewBindingDependencies>> {
+    let mut statement = connection.prepare("SELECT file_path, payload FROM view_file_surfaces")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
     rows.map(|row| {
-        let (path, payload) = row?;
-        let binding = serde_json::from_str(&payload)
+        let (path, surface) = row?;
+        let binding = join::ViewBindingDependencies::from_surface_json(&surface)
             .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
         Ok((path, binding))
     })
     .collect()
 }
 
+fn load_bindings_for_selection(
+    connection: &Connection,
+    selected: &BTreeSet<String>,
+    changed: &BTreeSet<Vec<u8>>,
+) -> Result<BTreeMap<String, join::ViewBindingDependencies>> {
+    connection.execute_batch(
+        "CREATE TEMP TABLE selected_view_paths (
+             path TEXT PRIMARY KEY
+         ) WITHOUT ROWID",
+    )?;
+    {
+        let mut insert = connection.prepare("INSERT INTO selected_view_paths(path) VALUES(?1)")?;
+        for path in selected {
+            if !changed.contains(path.as_bytes()) {
+                insert.execute([path])?;
+            }
+        }
+    }
+
+    let mut bindings = load_surfaces(connection)?;
+    for path in changed {
+        if let Ok(path) = std::str::from_utf8(path) {
+            bindings.remove(path);
+        }
+    }
+    {
+        let mut statement = connection.prepare(
+            "SELECT bindings.file_path, bindings.payload
+             FROM selected_view_paths
+             CROSS JOIN view_bindings AS bindings INDEXED BY sqlite_autoindex_view_bindings_1
+                 ON bindings.file_path = selected_view_paths.path",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (path, payload) = row?;
+            let mut binding: join::ViewBindingDependencies = serde_json::from_str(&payload)
+                .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+            if let Some(surface) = bindings.get(&path) {
+                binding.copy_surface_from(surface);
+            }
+            bindings.insert(path, binding);
+        }
+    }
+    Ok(bindings)
+}
+
 fn dependent_closure(
     connection: &Connection,
     changed: &BTreeSet<Vec<u8>>,
 ) -> Result<BTreeSet<String>> {
-    let mut selected = changed
-        .iter()
-        .filter_map(|path| String::from_utf8(path.clone()).ok())
-        .collect::<BTreeSet<_>>();
-    if !changed.is_empty() {
-        // Rust inline-module and parent queries can inspect the crate-wide index.
-        // Recheck that domain even for non-.rs paths: explicit module paths may
-        // name other extensions, and membership changes can expose new modules.
-        selected.insert(join::VIEW_RUST_MODULE_DOMAIN.to_string());
-    }
-    let mut pending = selected.iter().cloned().collect::<Vec<_>>();
-    let mut dependents =
-        connection.prepare("SELECT file_path FROM file_dependencies WHERE dep_file = ?1")?;
-    while let Some(path) = pending.pop() {
-        for caller in dependents.query_map([path], |row| row.get::<_, String>(0))? {
-            let caller = caller?;
-            if selected.insert(caller.clone()) {
-                pending.push(caller);
+    connection.execute_batch(
+        "CREATE TEMP TABLE dependency_seed_paths (
+             path TEXT PRIMARY KEY
+         ) WITHOUT ROWID",
+    )?;
+    {
+        let mut insert =
+            connection.prepare("INSERT OR IGNORE INTO dependency_seed_paths(path) VALUES(?1)")?;
+        for path in changed {
+            if let Ok(path) = std::str::from_utf8(path) {
+                insert.execute([path])?;
             }
         }
+        if !changed.is_empty() {
+            // Rust inline-module and parent queries can inspect the crate-wide index.
+            // Recheck that domain even for non-.rs paths: explicit module paths may
+            // name other extensions, and membership changes can expose new modules.
+            insert.execute([join::VIEW_RUST_MODULE_DOMAIN])?;
+        }
     }
-    Ok(selected)
+    let mut statement = connection.prepare(
+        "WITH RECURSIVE selected(path) AS (
+             SELECT path FROM dependency_seed_paths
+             UNION
+             SELECT dependencies.file_path
+             FROM selected
+             JOIN file_dependencies AS dependencies INDEXED BY idx_file_dependencies_dep_file
+                 ON dependencies.dep_file = selected.path
+         )
+         SELECT path FROM selected",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    rows.collect::<std::result::Result<BTreeSet<_>, _>>()
+        .map_err(Into::into)
 }
 
 fn requires_full_resolution(
@@ -790,16 +948,47 @@ fn requires_full_resolution(
     })
 }
 
+struct EmissionParse {
+    blob: Arc<join::CallgraphBlob>,
+    refs_by_ordinal: HashMap<u32, usize>,
+}
+
+impl EmissionParse {
+    fn new(blob: Arc<join::CallgraphBlob>) -> Self {
+        let refs_by_ordinal = blob
+            .parse()
+            .into_iter()
+            .flat_map(|parse| parse.refs.iter().enumerate())
+            .fold(HashMap::new(), |mut by_ordinal, (position, reference)| {
+                // Match the cold writer's original first-reference lookup when
+                // structural references share an AST ordinal.
+                by_ordinal.entry(reference.ordinal).or_insert(position);
+                by_ordinal
+            });
+        Self {
+            blob,
+            refs_by_ordinal,
+        }
+    }
+
+    fn reference(&self, ordinal: u32) -> Option<&join::BlobRef> {
+        self.blob
+            .parse()?
+            .refs
+            .get(*self.refs_by_ordinal.get(&ordinal)?)
+    }
+}
+
 /// Unchanged blobs are decoded for row emission only when a selected reference
 /// actually needs their caller data or target IDs. The join builds its own index;
 /// decoding every blob again here would erase much of the incremental saving.
 fn ensure_manifest_path(
     path: &str,
     manifest: &crate::views::Manifest,
-    blobs: &Connection,
+    blobs: &ManifestViewBlobReader<'_>,
     loaded: &mut BTreeSet<String>,
-    parsed: &mut BTreeMap<String, BTreeMap<u32, join::BlobRef>>,
-    nodes: &mut HashMap<(String, String), String>,
+    parsed: &mut BTreeMap<String, EmissionParse>,
+    nodes: &mut HashMap<String, HashMap<String, String>>,
 ) -> Result<()> {
     if !loaded.insert(path.to_string()) {
         return Ok(());
@@ -818,44 +1007,23 @@ fn ensure_manifest_path(
     let Some(key) = &planes.callgraph else {
         return Ok(());
     };
-    let key_bytes = decode_manifest_full_key(key).ok_or_else(|| {
-        CallGraphStoreError::Unavailable(format!("invalid manifest callgraph key {key}"))
-    })?;
-    let payload = blobs
-        .query_row(
-            "SELECT payload FROM blob_payloads WHERE full_key=?1",
-            [key_bytes],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .optional()?
+    let blob = blobs
+        .read_decoded(key)
+        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?
         .ok_or_else(|| {
             CallGraphStoreError::Unavailable(format!("missing manifest callgraph blob {key}"))
         })?;
-    let blob = join::CallgraphBlob::from_bytes(&payload)
-        .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
     let Some(parse) = blob.parse() else {
         return Ok(());
     };
+    let file_nodes = nodes.entry(path.to_string()).or_default();
     for symbol in &parse.symbols {
         let id = format!("view:{path}:{}:{}", symbol.scoped_name, symbol.ordinal);
-        nodes.insert((path.to_string(), symbol.scoped_name.clone()), id.clone());
-        nodes
-            .entry((path.to_string(), symbol.name.clone()))
-            .or_insert(id);
+        file_nodes.insert(symbol.scoped_name.clone(), id.clone());
+        file_nodes.entry(symbol.name.clone()).or_insert(id);
     }
     if !resolution_input {
-        parsed.insert(
-            path.to_string(),
-            parse
-                .refs
-                .iter()
-                .fold(BTreeMap::new(), |mut by_ordinal, reference| {
-                    by_ordinal
-                        .entry(reference.ordinal)
-                        .or_insert_with(|| reference.clone());
-                    by_ordinal
-                }),
-        );
+        parsed.insert(path.to_string(), EmissionParse::new(blob));
     }
     Ok(())
 }
