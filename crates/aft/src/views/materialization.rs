@@ -529,16 +529,12 @@ fn materialize(
     // Retain prepared statements across the fan-out. Preparing each statement
     // again costs more than binding many of these small reference rows.
     {
-        transaction.execute_batch(
-            "CREATE TEMP TABLE pending_view_refs AS SELECT * FROM refs WHERE 0;
-             CREATE TEMP TABLE pending_view_edges AS SELECT * FROM edges WHERE 0",
-        )?;
         let mut same_ref = transaction.prepare("SELECT EXISTS(SELECT 1 FROM refs WHERE ref_id = ?1 AND caller_node IS ?2
                  AND status = ?3 AND target_node IS ?4 AND target_file IS ?5 AND target_symbol IS ?6)")?;
         let mut delete_edge = transaction.prepare("DELETE FROM edges WHERE ref_id = ?1")?;
         let mut delete_ref = transaction.prepare("DELETE FROM refs WHERE ref_id = ?1")?;
         let mut insert_ref = transaction.prepare(
-            "INSERT INTO pending_view_refs
+            "INSERT OR REPLACE INTO refs
              (ref_id, caller_node, caller_file, kind, short_name, full_ref, module_path,
               import_kind, local_name, requested_name, namespace_alias, wildcard, line,
               byte_start, byte_end, status, target_node, target_file, target_symbol, provenance)
@@ -546,7 +542,7 @@ fn materialize(
                      ?15, ?16, ?17, ?18, ?19, ?20)",
         )?;
         let mut insert_edge = transaction.prepare(
-            "INSERT INTO pending_view_edges
+            "INSERT OR REPLACE INTO edges
                      (edge_id, ref_id, source_node, target_node, target_file, target_symbol,
                       kind, line, provenance)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'call', ?7, ?8)",
@@ -672,14 +668,6 @@ fn materialize(
                 }
             }
         }
-        transaction.execute(
-            "INSERT OR REPLACE INTO refs SELECT * FROM pending_view_refs ORDER BY rowid",
-            [],
-        )?;
-        transaction.execute(
-            "INSERT OR REPLACE INTO edges SELECT * FROM pending_view_edges ORDER BY rowid",
-            [],
-        )?;
     }
     profile.finish("emit_refs_edges");
     set_meta_ready(&transaction, true)?;
@@ -793,7 +781,8 @@ fn configure_materialization_connection(connection: &Connection) -> Result<()> {
     // The derived database has several secondary indexes. A publication-sized
     // page cache avoids rereading their upper levels while deleting and emitting
     // a bounded diff; temporary path/row sets never need durable spill files.
-    connection.pragma_update(None, "cache_size", -65_536)?;
+    connection.pragma_update(None, "cache_size", -262_144)?;
+    connection.pragma_update(None, "mmap_size", 268_435_456)?;
     connection.pragma_update(None, "temp_store", "MEMORY")?;
     Ok(())
 }
