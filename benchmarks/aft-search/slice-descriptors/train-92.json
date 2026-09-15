@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "log-sweep-pid-reuse",
+    "release-sh-train-push"
+  ],
+  "note": "Log retention sweep treats a recycled pid as dead; release.sh lands the release commit through train-push. No ranking-fence files."
+}
