@@ -87,8 +87,20 @@ echo "  ─────────────────────"
 echo ""
 
 push_release() {
-  echo "→ Pushing to origin..."
-  git push origin "$BRANCH"
+  # main is branch-protected: a direct push of an unchecked sha is refused with
+  # GH006 even for admins, so the release commit lands the same way every train
+  # does (CI on all platforms, then a fast-forward of main), and the tag goes
+  # up only once its sha is on origin/main.
+  echo "→ Landing the release commit through train-push (CI-gated main)..."
+  local release_sha
+  release_sha=$(git rev-parse HEAD)
+  scripts/train-push.sh "release-${VERSION}"
+  git fetch --quiet origin main
+  if ! git merge-base --is-ancestor "$release_sha" origin/main; then
+    echo "Error: release commit $release_sha is not on origin/main after train-push; not pushing the tag"
+    exit 1
+  fi
+  echo "→ Pushing tag $TAG..."
   git push origin "$TAG"
   echo ""
 
