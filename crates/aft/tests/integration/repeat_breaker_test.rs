@@ -208,6 +208,24 @@ fn repeat_breaker_ndjson_real_binary_uses_shared_transport_fixture() {
             .to_string();
         assert!(!text.is_empty(), "empty tool response text: {response:?}");
         texts.push(text);
+        // The plugin drains background completions after every agent tool call
+        // under the same session. The first live probe never fired because that
+        // plumbing call sat between every pair of agent calls and reset the run.
+        let drain = aft.send_with_timeout(
+            &serde_json::to_string(&json!({
+                "id": format!("repeat-ndjson-drain-{index}"),
+                "command": "tool_call",
+                "session_id": SESSION,
+                "name": "bash_drain_completions",
+                "arguments": { "session_id": SESSION },
+            }))
+            .expect("serialize drain request"),
+            Duration::from_secs(5),
+        );
+        assert!(
+            drain["success"].as_bool().unwrap_or(false),
+            "drain between agent calls must succeed: {drain:?}"
+        );
         if index < 2 {
             std::thread::sleep(Duration::from_secs(16));
         }

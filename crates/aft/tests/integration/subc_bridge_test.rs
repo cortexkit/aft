@@ -3625,6 +3625,17 @@ async fn drive_repeat_breaker_daemon(input: FakeDaemonInput) {
         assert_eq!(frame.header.corr, corr);
         assert!(!tool_result_is_error(&frame));
         texts.push(tool_result_text(&frame));
+        // The plugin drains completions after every agent tool call on the
+        // same route; the breaker must not count that plumbing as a call.
+        let _drain = call_tool_response(
+            &mut stream,
+            1,
+            corr + 50,
+            "bash_drain_completions",
+            json!({}),
+            "repeat breaker drain between agent calls",
+        )
+        .await;
         if index < 2 {
             tokio::time::sleep(Duration::from_secs(16)).await;
         }

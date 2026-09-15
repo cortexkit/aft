@@ -467,15 +467,23 @@ pub fn run_tool_call(
         .session_id
         .as_deref()
         .unwrap_or(crate::protocol::DEFAULT_SESSION_ID);
+    // Plumbing calls are the plugin's, not the model's: after every agent tool
+    // call the plugin drains completions (`bash_drain_completions`) under the
+    // same session, so counting them would reset the run on every agent call
+    // and the breaker could never see two agent calls in a row. The first live
+    // probe found exactly that: five identical bash calls over 78 s, no steer.
     // Hash the rendered tool text before status bars, alerts, and trailers are attached. Those
     // decorations carry moving counts, so hashing afterward would make identical results appear
     // different forever and silently prevent the breaker from firing.
     let output_hash = crate::response_finalize::repeat_breaker::output_hash(&result.text);
-    if let Some(intervention) =
+    let intervention = if crate::subc::is_subc_native_plumbing_tool(bare_name) {
+        None
+    } else {
         app_ctx
             .repeat_breaker()
             .observe(session_id, bare_name, semantic_key, output_hash)
-    {
+    };
+    if let Some(intervention) = intervention {
         crate::response_finalize::append_repeat_breaker_reminder(
             &mut result.text,
             session_id,

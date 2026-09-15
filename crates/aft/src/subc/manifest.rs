@@ -78,7 +78,7 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
 /// - `hashline_preflight`: parse-only, zero-mutation permission preflight for
 ///   the session's enabled hashline edit surface; it returns affected paths
 ///   before the plugin requests edit permission.
-pub(super) fn is_subc_native_plumbing_tool(name: &str) -> bool {
+pub(crate) fn is_subc_native_plumbing_tool(name: &str) -> bool {
     matches!(
         name,
         "bash_abort_inflight"

@@ -157,9 +157,10 @@ use self::health::{
     DeferredBashWaitGuard, DispatchPathMetrics, HealthRollupCache, HealthRollupWorker,
     ReapBlockerCensus, ResponseTaskGuard,
 };
+pub(crate) use self::manifest::is_subc_native_plumbing_tool;
 use self::manifest::{
     build_manifest, command_lane, control_flags, control_ops, is_bash_family_tool,
-    is_subc_agent_core_tool, is_subc_native_plumbing_tool,
+    is_subc_agent_core_tool,
 };
 pub use self::wire::SubcError;
 
