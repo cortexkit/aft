@@ -1,0 +1,16 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "stale-row-deleted-file",
+    "views-drill-terminal-publication",
+    "search-topk-telemetry"
+  ],
+  "note": "Callgraph refresh resolves stale rows for proven-absent paths; resident stale health counts; drill waits for terminal publication; read-only telemetry script. No ranking-fence files."
+}
