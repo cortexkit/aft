@@ -16,13 +16,21 @@ pub fn append_repeat_breaker_reminder(
     let count = intervention.count;
     let span_seconds = intervention.span.as_secs();
     let ordinal = ordinal(count);
+    // Two wording rules from the fleet review. The detector measured only that
+    // the command and its output are unchanged, so the text says that and not
+    // that the world is static (a CI run can move from queued to running with
+    // identical `gh run view` output). And a worker that backgrounded a gate
+    // and polls it in bounded watch windows produces exactly this signature
+    // while doing the right thing, so the instruction names the correct next
+    // action (let the watch return) rather than a prohibition it would have to
+    // decide to disobey.
     let instruction = if repeat_breaker::escalation_starts_at(count) {
-        "The turn must end now with no further tool call. If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn; do not call this again."
+        "The turn must end now with no further tool call. If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn. If you are already watching, let the watch return before calling again."
     } else {
-        "If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn; do not call this again."
+        "If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn. If you are already watching, let the watch return before calling again."
     };
     let reminder = format!(
-        "<system-reminder>\nThis is the {ordinal} identical call (same command, same output) in {span_seconds}s. Nothing is changing. {instruction}\n</system-reminder>"
+        "<system-reminder>\nThis is the {ordinal} identical call (same command, same output) in {span_seconds}s. This call is not returning anything new. {instruction}\n</system-reminder>"
     );
     if text.is_empty() {
         *text = reminder;
