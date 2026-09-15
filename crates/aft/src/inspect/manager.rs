@@ -7835,10 +7835,40 @@ pub fn unrelated() -> u32 { 2 }
             callgraph_writer: false,
             callgraph_snapshot: Some(Arc::new(full)),
         };
-        let contributions = crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
-            .outcome
-            .unwrap()
-            .contributions;
+        let contribution_load_started = Instant::now();
+        let copied_inspect = std::env::var_os("AFT_PROJECTION_BENCH_INSPECT_STORE");
+        let contributions = if let Some(source_path) = copied_inspect.as_ref() {
+            let project_key = crate::path_identity::project_scope_key(&root);
+            let project_inspect_dir = job.inspect_dir.join(&project_key);
+            std::fs::create_dir_all(&project_inspect_dir).unwrap();
+            let inspect_db = project_inspect_dir.join(format!("{project_key}.sqlite"));
+            {
+                let source =
+                    Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                        .unwrap();
+                let mut destination = Connection::open(&inspect_db).unwrap();
+                Backup::new(&source, &mut destination)
+                    .unwrap()
+                    .run_to_completion(256, Duration::from_millis(5), None)
+                    .unwrap();
+                for table in ["tier2_contributions", "tier2_aggregates", "tier2_meta"] {
+                    destination
+                        .execute(
+                            &format!("UPDATE {table} SET project_key = ?1"),
+                            [&project_key],
+                        )
+                        .unwrap();
+                }
+            }
+            let cache = InspectCache::open(job.inspect_dir.clone(), root.clone()).unwrap();
+            load_contributions(&cache, &job).unwrap()
+        } else {
+            crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
+                .outcome
+                .unwrap()
+                .contributions
+        };
+        let contribution_load_ms = contribution_load_started.elapsed().as_secs_f64() * 1000.0;
         let public_api_files = crate::inspect::scanners::dead_code::collect_public_api_files(&root);
         let roles = crate::inspect::entry_points::resolve_project_roles(&root);
         let cpu = projection_bench_cpu_ms();
@@ -7901,7 +7931,7 @@ pub fn unrelated() -> u32 { 2 }
             },
             job.callgraph_snapshot.clone().unwrap(),
         );
-        eprintln!("projection_bench changed_files={changed_count} rows={} before snapshot={full_ms:.3} cpu={full_cpu:.3} rollup={full_rollup_ms:.3} rollup_cpu={full_rollup_cpu:.3}; after snapshot={delta_ms:.3} cpu={delta_cpu:.3} rollup={delta_rollup_ms:.3} rollup_cpu={delta_rollup_cpu:.3}; full_projections={} outbound_rows_read={}", previous.outbound_calls.len(), work.0, work.1);
+        eprintln!("projection_bench changed_files={changed_count} rows={} contributions={} contribution_source={} contribution_load_ms={contribution_load_ms:.3}; before snapshot={full_ms:.3} cpu={full_cpu:.3} rollup={full_rollup_ms:.3} rollup_cpu={full_rollup_cpu:.3}; after snapshot={delta_ms:.3} cpu={delta_cpu:.3} rollup={delta_rollup_ms:.3} rollup_cpu={delta_rollup_cpu:.3}; full_projections={} outbound_rows_read={}", previous.outbound_calls.len(), contributions.len(), if copied_inspect.is_some() { "inspect_copy" } else { "source_scan" }, work.0, work.1);
         eprintln!(
             "projection_bench callgraph_memory={:?}",
             manager.callgraph_projection_estimated_memory()
