@@ -160,7 +160,10 @@ if (core) {
   }
   for (const dir of ["src/entry", "src/tui"]) {
     if (!coreFiles.includes(dir)) {
-      fail(label, `files must include '${dir}' so the ./tui export resolves in the published package`);
+      fail(
+        label,
+        `files must include '${dir}' so the ./tui export resolves in the published package`,
+      );
     }
   }
 
