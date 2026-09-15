@@ -57,7 +57,8 @@ PUBLICATION_RE = re.compile(
 )
 PHASE_PUBLICATION_RE = re.compile(
     r"index_event kind=view_publication plane=views root=(?P<root>.+?) "
-    r"outcome=(?P<outcome>\S+) candidates=\d+ blob_puts=(?P<puts>\d+)(?:\s|$)"
+    r"outcome=(?P<outcome>\S+) candidates=\d+ blob_puts=(?P<puts>\d+) "
+    r"pending_paths=(?P<pending>\d+)(?:\s|$)"
 )
 EMBED_RE = re.compile(
     r'semantic embedder refresh: root="(?P<root>[^"]+)" .*? files=(?P<files>\d+) '
@@ -355,6 +356,17 @@ def log_metrics(text: str, root: Path) -> tuple[int | None, int | None, int, int
     )
 
 
+def publication_is_complete(text: str, root: Path) -> bool:
+    """Return whether the latest root-owned publication has no pending paths."""
+    root_texts = {str(root), str(root.resolve())}
+    latest_pending: int | None = None
+    for line in text.splitlines():
+        phase = PHASE_PUBLICATION_RE.search(line)
+        if phase and phase.group("root") in root_texts:
+            latest_pending = int(phase.group("pending"))
+    return latest_pending == 0
+
+
 def contention_metrics(text: str, root: Path) -> dict[str, Any]:
     root_markers = {f"root={root}", f"root={root.resolve()}"}
     build_progress_lines = 0
@@ -518,10 +530,16 @@ def perform_switch(
             "callgraph",
             {"op": "callers", "path": probe.path, "symbol": probe.symbol},
         )
-        if search_is_correct(last_search, probe.token) and callgraph_is_correct(last_callgraph):
+        answers_correct = search_is_correct(
+            last_search, probe.token
+        ) and callgraph_is_correct(last_callgraph)
+        if answers_correct and time_to_correct_ms is None:
             time_to_correct_ms = round((time.monotonic() - started) * 1000)
-            contention_log_text = read_log_window()
-            break
+        if answers_correct:
+            current_log_text = read_log_window()
+            if not views_on or publication_is_complete(current_log_text, checkout):
+                contention_log_text = current_log_text
+                break
         time.sleep(0.25)
 
     if contention_log_text is None:

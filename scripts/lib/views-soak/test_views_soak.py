@@ -12,6 +12,7 @@ from pathlib import Path
 from branch_drill import (
     delta_metrics,
     log_metrics,
+    publication_is_complete,
     publication_outcome,
     search_is_correct,
     search_query_for_token,
@@ -110,6 +111,22 @@ class BranchDrillTests(unittest.TestCase):
             ]
         )
         self.assertEqual(log_metrics(text, root), (2, 2, 2, 3))
+
+    def test_correct_probe_waits_for_terminal_view_publication(self) -> None:
+        root = Path("/tmp/opencode")
+        partial = (
+            "index_event kind=view_publication plane=views root=/tmp/opencode "
+            "outcome=published candidates=7060 blob_puts=0 pending_paths=272"
+        )
+        complete = (
+            "index_event kind=view_publication plane=views root=/tmp/opencode "
+            "outcome=published candidates=7060 blob_puts=0 pending_paths=0"
+        )
+        other_root = complete.replace("/tmp/opencode", "/tmp/other")
+
+        self.assertFalse(publication_is_complete(partial, root))
+        self.assertFalse(publication_is_complete(f"{partial}\n{other_root}", root))
+        self.assertTrue(publication_is_complete(f"{partial}\n{complete}", root))
 
     def test_publication_expectation_distinguishes_noop_from_missing_publish(self) -> None:
         self.assertEqual(
