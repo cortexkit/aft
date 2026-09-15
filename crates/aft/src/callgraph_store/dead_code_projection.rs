@@ -58,8 +58,8 @@ pub(crate) struct ProjectionVerdict {
     pub changed_files: usize,
 }
 
-/// Root-local running costs used to avoid a splice whose fold is predicted to
-/// cost more than rebuilding the complete projection and reachability result.
+/// Root-local running projection costs used to avoid a splice whose snapshot
+/// fold is predicted to cost more than re-reading the complete store.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ProjectionCostEstimates {
     full_ns: u64,

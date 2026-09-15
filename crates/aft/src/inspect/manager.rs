@@ -2662,7 +2662,7 @@ impl InspectManager {
             self.observe_callgraph_projection_cost(
                 &job.project_root,
                 verdict,
-                phases.projection_cost + phases.rollup,
+                projection_estimator_duration(&phases),
             );
         }
         phases.log(job.category, &job.project_root);
@@ -3006,6 +3006,13 @@ struct Tier2PhaseTimings {
 
 const TIER2_WORK_LOG_THRESHOLD: Duration = Duration::from_millis(50);
 
+fn projection_estimator_duration(phases: &Tier2PhaseTimings) -> Duration {
+    // Projection journal files are the denominator used by the cost model.
+    // Refresh and rollup have different work sets, so folding either into this
+    // sample makes a cheap splice look expensive for unrelated work.
+    phases.projection_cost
+}
+
 impl Tier2PhaseTimings {
     fn add_db_timings(&mut self, timings: InspectDbTimings) {
         self.db_lock += timings.lock_wait;
@@ -3046,10 +3053,11 @@ impl Tier2PhaseTimings {
             .map(render_rollup_suffix)
             .unwrap_or_default();
         format!(
-            "perf tier2 phases category={} freshness={}ms snapshot={}ms scan={}ms({} files) db={}ms(lock={},txn={}) rollup_ms={}{}{} root={} key={}",
+            "perf tier2 phases category={} freshness={}ms snapshot={}ms projection_ms={} scan={}ms({} files) db={}ms(lock={},txn={}) rollup_ms={}{}{} root={} key={}",
             category,
             self.freshness.as_millis(),
             self.snapshot.as_millis(),
+            self.projection_cost.as_millis(),
             self.scan.as_millis(),
             self.scanned_files,
             self.db.as_millis(),
@@ -7742,6 +7750,7 @@ pub fn unrelated() -> u32 { 2 }
         }
         let (revision, previous) =
             project_dead_code_snapshot_with_revision(store.sqlite_path()).unwrap();
+        let mut refresh_ms = 0.0;
         if std::env::var_os("AFT_PROJECTION_BENCH_JOURNAL_ONLY").is_some() {
             let next = revision.unwrap() + 1;
             let callers = changed
@@ -7774,8 +7783,27 @@ pub fn unrelated() -> u32 { 2 }
                     );
                 }
             }
+            let refresh_started = Instant::now();
             store.refresh_files(&changed).unwrap();
+            refresh_ms = refresh_started.elapsed().as_secs_f64() * 1000.0;
+            if let Some(journal_paths) = std::env::var_os("AFT_PROJECTION_BENCH_JOURNAL_PATHS") {
+                let current = store.projection_write_revision().unwrap().unwrap();
+                let callers = std::fs::read_to_string(journal_paths)
+                    .unwrap()
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>();
+                let payload = serde_json::to_string(&(current, callers)).unwrap();
+                let conn = rusqlite::Connection::open(store.sqlite_path()).unwrap();
+                conn.execute(
+                    "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)",
+                    rusqlite::params![format!("projection_delta_{}", current % 64), payload],
+                )
+                .unwrap();
+            }
         }
+        let snapshot_replay_ms = refresh_ms;
         let cpu = projection_bench_cpu_ms();
         let started = Instant::now();
         let full = project_dead_code_snapshot(store.sqlite_path()).unwrap();
@@ -7814,8 +7842,8 @@ pub fn unrelated() -> u32 { 2 }
             )
             .unwrap();
             eprintln!(
-                "projection_crossover changed_files={} full_ms={full_ms:.3} full_cpu_ms={full_cpu:.3} splice_ms={delta_ms:.3} splice_cpu_ms={delta_cpu:.3} measured={:?} predicted={:?} predicted_reason={:?} outbound_rows_read={}",
-                verdict.changed_files, verdict.kind, predicted.kind, predicted.reason, work.1
+                "projection_crossover changed_files={} refresh_ms={refresh_ms:.3} snapshot_replay_ms={:.3} full_ms={full_ms:.3} full_cpu_ms={full_cpu:.3} splice_ms={delta_ms:.3} splice_cpu_ms={delta_cpu:.3} measured={:?} predicted={:?} predicted_reason={:?} outbound_rows_read={}",
+                verdict.changed_files, snapshot_replay_ms + delta_ms, verdict.kind, predicted.kind, predicted.reason, work.1
             );
             return;
         }
@@ -7931,7 +7959,7 @@ pub fn unrelated() -> u32 { 2 }
             },
             job.callgraph_snapshot.clone().unwrap(),
         );
-        eprintln!("projection_bench changed_files={changed_count} rows={} contributions={} contribution_source={} contribution_load_ms={contribution_load_ms:.3}; before snapshot={full_ms:.3} cpu={full_cpu:.3} rollup={full_rollup_ms:.3} rollup_cpu={full_rollup_cpu:.3}; after snapshot={delta_ms:.3} cpu={delta_cpu:.3} rollup={delta_rollup_ms:.3} rollup_cpu={delta_rollup_cpu:.3}; full_projections={} outbound_rows_read={}", previous.outbound_calls.len(), contributions.len(), if copied_inspect.is_some() { "inspect_copy" } else { "source_scan" }, work.0, work.1);
+        eprintln!("projection_bench changed_files={changed_count} rows={} contributions={} contribution_source={} contribution_load_ms={contribution_load_ms:.3}; refresh_ms={refresh_ms:.3} snapshot_replay_ms={:.3}; before snapshot={full_ms:.3} cpu={full_cpu:.3} rollup={full_rollup_ms:.3} rollup_cpu={full_rollup_cpu:.3}; after snapshot={delta_ms:.3} cpu={delta_cpu:.3} rollup={delta_rollup_ms:.3} rollup_cpu={delta_rollup_cpu:.3}; full_projections={} outbound_rows_read={}", previous.outbound_calls.len(), contributions.len(), if copied_inspect.is_some() { "inspect_copy" } else { "source_scan" }, snapshot_replay_ms + delta_ms, work.0, work.1);
         eprintln!(
             "projection_bench callgraph_memory={:?}",
             manager.callgraph_projection_estimated_memory()
@@ -8499,6 +8527,98 @@ export function main() { foo(); }
                 bytes: 800 * 1024 * 1024,
                 drops: 1,
             }
+        );
+    }
+
+    #[test]
+    fn projection_estimator_and_verdict_report_only_projection_work() {
+        let phases = Tier2PhaseTimings {
+            snapshot: Duration::from_millis(2_620),
+            projection_cost: Duration::from_millis(187),
+            rollup: Duration::from_millis(3_186),
+            rollup_verdict: Some(crate::inspect::scanners::dead_code::RollupVerdict {
+                kind: crate::inspect::scanners::dead_code::RollupKind::Incremental,
+                reason: None,
+            }),
+            projection: Some(ProjectionVerdict {
+                kind: ProjectionKind::Spliced,
+                reason: None,
+                journal_bytes: 2_397,
+                changed_files: 46,
+            }),
+            ..Tier2PhaseTimings::default()
+        };
+
+        assert_eq!(
+            projection_estimator_duration(&phases),
+            Duration::from_millis(187)
+        );
+        let line = phases.render(InspectCategory::DeadCode, Path::new("/root"), "test-key");
+        assert!(line.contains("snapshot=2620ms projection_ms=187"));
+        assert!(line.contains("rollup_ms=3186 rollup="));
+        assert!(line.contains("projection=spliced journal_bytes=2397 changed_files=46"));
+    }
+
+    #[test]
+    fn rollup_cost_cannot_poison_projection_crossover() {
+        let manager = InspectManager::new();
+        let root = PathBuf::from("/projection-only-cost-root");
+        let identity = CallgraphProjectionIdentity {
+            project_root: root.clone(),
+            generation: Some("generation".to_string()),
+            legacy_sqlite_path: None,
+            write_revision: 1,
+        };
+        manager.cache_callgraph_projection(
+            identity.clone(),
+            Arc::new(CallgraphSnapshot {
+                generated_at: None,
+                files: Vec::new(),
+                exported_symbols: Vec::new(),
+                outbound_calls: Vec::new(),
+                entry_points: BTreeSet::new(),
+                entry_point_symbols: BTreeMap::new(),
+            }),
+        );
+        for (verdict, projection_ms, rollup_ms) in [
+            (
+                ProjectionVerdict {
+                    kind: ProjectionKind::Full,
+                    reason: Some("cold"),
+                    journal_bytes: 0,
+                    changed_files: 0,
+                },
+                100,
+                1_000,
+            ),
+            (
+                ProjectionVerdict {
+                    kind: ProjectionKind::Spliced,
+                    reason: None,
+                    journal_bytes: 200,
+                    changed_files: 4,
+                },
+                40,
+                2_000,
+            ),
+        ] {
+            let phases = Tier2PhaseTimings {
+                projection_cost: Duration::from_millis(projection_ms),
+                rollup: Duration::from_millis(rollup_ms),
+                ..Tier2PhaseTimings::default()
+            };
+            manager.observe_callgraph_projection_cost(
+                &root,
+                verdict,
+                projection_estimator_duration(&phases),
+            );
+        }
+
+        assert!(
+            !manager
+                .callgraph_projection_costs(&identity)
+                .splice_is_costlier(5),
+            "rollup work must not force a full snapshot projection"
         );
     }
 
