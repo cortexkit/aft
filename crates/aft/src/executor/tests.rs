@@ -1762,7 +1762,7 @@ fn mutating_job_admits_while_callgraph_refresh_worker_is_writing() {
     let _refresh_guard = crate::callgraph_store::REFRESH_WORKER_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(1));
+    let _ = flush_callgraph_store_refreshes_with_budget(Duration::from_secs(30));
     let root_dir = tempfile::Builder::new()
         .prefix("aft-executor-callgraph-offload-")
         .tempdir()
@@ -1838,8 +1838,12 @@ fn mutating_job_admits_while_callgraph_refresh_worker_is_writing() {
         .recv_timeout(Duration::from_secs(10))
         .expect("interactive writer should admit while store worker is mid-write");
     assert!(recv_async(mutating, "interactive edit completion").success);
+    // The flush releases the held write and waits for the worker to finish it;
+    // that is a liveness check, not a latency one. Every other flush site in
+    // the refresh_worker tests uses 30 s, and a 1 s bound failed on a Windows
+    // runner whose whole libtest pass took 575 s.
     assert!(flush_callgraph_store_refreshes_with_budget(
-        Duration::from_secs(1)
+        Duration::from_secs(30)
     ));
     clear_callgraph_refresh_worker_test_seam(root_dir.path());
 }
