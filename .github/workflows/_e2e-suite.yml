@@ -351,7 +351,11 @@ jobs:
   e2e-windows:
     name: E2E (Windows native)
     runs-on: windows-2022
-    timeout-minutes: 30
+    # The 30-minute budget is the suite's. When release.yml folds the
+    # publishable release-profile build into this job (the other platform
+    # build jobs carry no cap at all), the build alone is 21.7 min cold and
+    # 9.6 min warm on v0.56.0, so the job gets the build class's headroom.
+    timeout-minutes: ${{ inputs.publish_release_artifacts && 60 || 30 }}
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
@@ -443,7 +447,12 @@ jobs:
   e2e-macos:
     name: E2E (macOS native)
     runs-on: macos-26
-    timeout-minutes: 30
+    # The 30-minute budget is the suite's. When release.yml folds the
+    # publishable release-profile build into this job, the fat-LTO link of
+    # the workspace crate runs single-threaded for 16 min on a normal runner
+    # and past 30 on a slow one (v0.56.0's retag timed out in exactly that
+    # step with a full cache hit), so the job gets the build class's headroom.
+    timeout-minutes: ${{ inputs.publish_release_artifacts && 60 || 30 }}
     env:
       SCCACHE_GHA_ENABLED: "true"
       RUSTC_WRAPPER: sccache
