@@ -969,6 +969,11 @@ fn rename_if_present(from: &Path, to: &Path) -> io::Result<()> {
 struct SweepSummary {
     removed_files: usize,
     bytes_freed: u64,
+    /// Files whose PID number is live but belongs to a process started after
+    /// the file's last write. Reported separately so a sweep that removes
+    /// nothing can be read from the log as "nothing was dead" versus "the
+    /// recycled-PID verdict never fired".
+    recycled_pids: usize,
 }
 
 struct ProcessLogFile {
@@ -982,9 +987,10 @@ struct ProcessLogFile {
 
 fn log_sweep_summary(summary: SweepSummary) {
     crate::slog_info!(
-        "log retention sweep: removed_files={} bytes_freed={}",
+        "log retention sweep: removed_files={} bytes_freed={} recycled_pids={}",
         summary.removed_files,
-        summary.bytes_freed
+        summary.bytes_freed,
+        summary.recycled_pids
     );
 }
 
@@ -999,6 +1005,7 @@ fn sweep_logs(
     let mut total_bytes = 0_u64;
     let mut process_logs = Vec::new();
     let mut live_pids = BTreeMap::new();
+    let mut recycled_count = 0_usize;
     let own_pid = std::process::id();
 
     for entry in fs::read_dir(dir)? {
@@ -1028,7 +1035,14 @@ fn sweep_logs(
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age >= max_age);
         let alive = *live_pids.entry(pid).or_insert_with(|| {
-            is_process_alive(pid) && !pid_started_after_last_write(pid, modified)
+            if !is_process_alive(pid) {
+                return false;
+            }
+            let recycled = pid_started_after_last_write(pid, modified);
+            if recycled {
+                recycled_count += 1;
+            }
+            !recycled
         });
         process_logs.push(ProcessLogFile {
             path: entry.path(),
@@ -1040,7 +1054,10 @@ fn sweep_logs(
         });
     }
 
-    let mut summary = SweepSummary::default();
+    let mut summary = SweepSummary {
+        recycled_pids: recycled_count,
+        ..SweepSummary::default()
+    };
     for file in &mut process_logs {
         if file.dead && file.old_enough && remove_sweep_candidate(&file.path) {
             file.removed = true;
@@ -1675,6 +1692,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(summary.removed_files, 1);
+        assert_eq!(summary.recycled_pids, 1);
         assert!(!recycled.exists());
 
         let owned = temp.path().join(format!("aft-{live_pid}.log"));
@@ -1688,6 +1706,36 @@ mod tests {
         .unwrap();
         assert_eq!(summary.removed_files, 0);
         assert!(owned.exists());
+    }
+
+    /// After a reboot the kernel hands low numbers to system daemons owned by
+    /// other users. PID 1 is always such a process, and the first cut of the
+    /// recycled-PID check could not read its start time on macOS, so the file
+    /// stayed pinned as if the daemon had written it. The verdict must not
+    /// depend on the new owner's uid.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn recycled_pid_now_owned_by_another_user_is_reaped() {
+        let temp = TempDir::new().unwrap();
+        assert!(is_process_alive(1));
+        assert!(
+            crate::root_cache::process_start_time_ms(1).is_some(),
+            "pid 1's start time must be readable from an unprivileged process"
+        );
+        let recycled = temp.path().join("aft-1.log");
+        fs::write(&recycled, "written before the current pid 1 booted").unwrap();
+        set_file_mtime(&recycled, FileTime::from_unix_time(1, 0)).unwrap();
+
+        let summary = sweep_logs(
+            temp.path(),
+            SystemTime::now(),
+            DEAD_PROCESS_LOG_MAX_AGE,
+            u64::MAX,
+        )
+        .unwrap();
+        assert_eq!(summary.removed_files, 1);
+        assert_eq!(summary.recycled_pids, 1);
+        assert!(!recycled.exists());
     }
 
     #[test]
