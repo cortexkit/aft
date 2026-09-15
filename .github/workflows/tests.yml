@@ -91,6 +91,17 @@ jobs:
   # same test coverage, minutes less link time per lane. Tag releases run
   # _e2e-suite.yml with the default `release` profile, so the shipped
   # fat-LTO binary shape is still e2e-tested before publishing.
+  #
+  # Pushes to main build the `release` profile instead. Actions cache scopes
+  # let a tag run read only its own ref and the default branch, and trains
+  # land on train/* refs, so main was the only place a release-profile cache
+  # could come from and it never held one: every tag run started cold. On
+  # v0.56.0 the Windows native build took 21.7 min cold and 9.6 min warm
+  # inside a 30-minute job; macOS gains only its ~1 min of deps because its
+  # cost is the fat-LTO link of the workspace crate, which no cache holds.
+  # A main run starts after main is already fast-forwarded, so it is off
+  # every critical path and can pay the release-profile build that keeps
+  # this cache warm for the next tag.
   # ---------------------------------------------------------------------------
   e2e:
     name: E2E
@@ -102,7 +113,7 @@ jobs:
       actions: read
       checks: read
     with:
-      cargo_profile: stage
+      cargo_profile: ${{ github.ref == 'refs/heads/main' && 'release' || 'stage' }}
 
   search-quality-binary:
     name: Search quality binary (Linux x64)
