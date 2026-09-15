@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "issue-316-operator-canary"
+  ],
+  "note": "CLI operator canary hashes through a bounded window and watches WAL sidecars (#316). No ranking-fence files."
+}
