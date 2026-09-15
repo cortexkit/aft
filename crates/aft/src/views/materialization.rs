@@ -22,6 +22,7 @@ pub fn materialize_manifest_view_database(
 /// Resolution counters describe work performed, not SQLite writes.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct MaterializeStats {
+    pub delete_paths_touched: usize,
     pub deleted: usize,
     pub inserted: usize,
     pub relinked_deleted: usize,
@@ -255,24 +256,52 @@ fn materialize(
     };
     profile.finish("load_bindings_select");
     if let Some(changed) = &changed {
-        for path in changed {
-            let Ok(path) = std::str::from_utf8(path) else {
-                // Non-UTF-8 entries cannot have rows in the cold materialization.
-                continue;
-            };
-            // Edges are owned through their ref_id, not their target. Delete them
-            // before the refs so that cross-file incoming edges remain available.
-            stats.deleted += transaction.execute("DELETE FROM edges WHERE ref_id IN (SELECT ref_id FROM refs WHERE caller_file = ?1)", [path])?;
-            stats.deleted +=
-                transaction.execute("DELETE FROM refs WHERE caller_file = ?1", [path])?;
-            stats.deleted +=
-                transaction.execute("DELETE FROM nodes WHERE file_path = ?1", [path])?;
-            stats.deleted += transaction.execute("DELETE FROM files WHERE path = ?1", [path])?;
-            stats.dependency_deleted += transaction
-                .execute("DELETE FROM file_dependencies WHERE file_path = ?1", [path])?;
-            stats.dependency_deleted +=
-                transaction.execute("DELETE FROM view_bindings WHERE file_path = ?1", [path])?;
+        transaction.execute_batch(
+            "CREATE TEMP TABLE changed_view_paths (
+                 path TEXT PRIMARY KEY
+             ) WITHOUT ROWID",
+        )?;
+        {
+            let mut insert = transaction.prepare("INSERT INTO changed_view_paths(path) VALUES(?1)")?;
+            for path in changed {
+                let Ok(path) = std::str::from_utf8(path) else {
+                    // Non-UTF-8 entries cannot have rows in the cold materialization.
+                    continue;
+                };
+                stats.delete_paths_touched += insert.execute([path])?;
+            }
         }
+        // Edges are owned through their ref_id, not their target. Delete them
+        // before refs so cross-file incoming edges remain available. Starting
+        // every lookup from the bounded path table keeps deletion on the diff.
+        stats.deleted += transaction.execute(
+            "DELETE FROM edges WHERE ref_id IN (
+                 SELECT refs.ref_id FROM changed_view_paths
+                 CROSS JOIN refs INDEXED BY idx_refs_caller_file
+                     ON refs.caller_file = changed_view_paths.path
+             )",
+            [],
+        )?;
+        stats.deleted += transaction.execute(
+            "DELETE FROM refs WHERE caller_file IN (SELECT path FROM changed_view_paths)",
+            [],
+        )?;
+        stats.deleted += transaction.execute(
+            "DELETE FROM nodes WHERE file_path IN (SELECT path FROM changed_view_paths)",
+            [],
+        )?;
+        stats.deleted += transaction.execute(
+            "DELETE FROM files WHERE path IN (SELECT path FROM changed_view_paths)",
+            [],
+        )?;
+        stats.dependency_deleted += transaction.execute(
+            "DELETE FROM file_dependencies WHERE file_path IN (SELECT path FROM changed_view_paths)",
+            [],
+        )?;
+        stats.dependency_deleted += transaction.execute(
+            "DELETE FROM view_bindings WHERE file_path IN (SELECT path FROM changed_view_paths)",
+            [],
+        )?;
     } else {
         for table in ["edges", "refs", "nodes", "files"] {
             stats.deleted += transaction.execute(&format!("DELETE FROM {table}"), [])?;

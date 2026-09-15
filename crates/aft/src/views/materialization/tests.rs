@@ -140,6 +140,7 @@ fn incremental_writes_only_owned_rows_and_relinks() {
     assert_eq!(
         stats,
         MaterializeStats {
+            delete_paths_touched: 3,
             deleted: 4,
             inserted: 5,
             relinked_deleted: 2,
@@ -161,6 +162,62 @@ fn incremental_writes_only_owned_rows_and_relinks() {
     assert_eq!(stats.dependent_files, 1);
     assert_eq!(stats.resolved_files, 3);
     assert!(!stats.full_resolution);
+}
+
+#[test]
+fn incremental_delete_rows_are_bounded_by_changed_manifest_paths() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let files = (0..32)
+        .map(|i| {
+            (
+                format!("file_{i}.ts"),
+                format!(
+                    "export function value_{i}() {{ return 1; }} export function caller_{i}() {{ return value_{i}(); }}"
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let next_files = files
+        .iter()
+        .enumerate()
+        .map(|(i, (path, source))| {
+            (
+                path.clone(),
+                if i < 3 {
+                    format!("\n{source}")
+                } else {
+                    source.clone()
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let base = manifest(
+        &conn,
+        &files
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let next = manifest(
+        &conn,
+        &next_files
+            .iter()
+            .map(|(path, source)| (path.as_str(), source.as_str()))
+            .collect::<Vec<_>>(),
+    );
+    let database = f.dir.path().join("bounded-delete.sqlite");
+    materialize_manifest_view_database(&database, &f.blobs, &base).unwrap();
+    let stats = apply_manifest_diff(&database, &base, &next, &f.blobs).unwrap();
+    let changed_files = 3;
+
+    println!(
+        "bounded deletion: changed_files={changed_files} paths_touched={} graph_rows_deleted={} dependency_rows_deleted={}",
+        stats.delete_paths_touched, stats.deleted, stats.dependency_deleted
+    );
+    assert_eq!(stats.delete_paths_touched, changed_files);
+    assert_eq!(stats.deleted, changed_files * 5);
+    assert_eq!(stats.dependency_deleted, changed_files * 2);
 }
 
 #[test]
