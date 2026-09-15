@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "repeat-breaker",
+    "logging-fmt"
+  ],
+  "note": "Repeated-identical-call breaker at the tool finalize seam (run_tool_call, response_finalize, context) plus a rustfmt reflow in logging.rs. No ranking-fence files."
+}
