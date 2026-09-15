@@ -1,10 +1,57 @@
 #[path = "alert_render.rs"]
 pub mod alert_render;
+#[path = "repeat_breaker.rs"]
+pub mod repeat_breaker;
 
 use std::path::Path;
 
 use crate::context::AppContext;
 use crate::protocol::Response;
+
+pub fn append_repeat_breaker_reminder(
+    text: &mut String,
+    session_id: &str,
+    intervention: &repeat_breaker::RepeatIntervention,
+) {
+    let count = intervention.count;
+    let span_seconds = intervention.span.as_secs();
+    let ordinal = ordinal(count);
+    let instruction = if repeat_breaker::escalation_starts_at(count) {
+        "The turn must end now with no further tool call. If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn; do not call this again."
+    } else {
+        "If you are waiting on a task or CI run, use a background task with a watch (or the background handle you already hold) and end the turn; do not call this again."
+    };
+    let reminder = format!(
+        "<system-reminder>\nThis is the {ordinal} identical call (same command, same output) in {span_seconds}s. Nothing is changing. {instruction}\n</system-reminder>"
+    );
+    if text.is_empty() {
+        *text = reminder;
+    } else {
+        text.push_str("\n\n");
+        text.push_str(&reminder);
+    }
+    log::info!(
+        "repeat_breaker fired session={} tool={} count={} span_ms={}",
+        session_id,
+        intervention.tool,
+        count,
+        intervention.span.as_millis()
+    );
+}
+
+fn ordinal(count: u64) -> String {
+    let suffix = if (11..=13).contains(&(count % 100)) {
+        "th"
+    } else {
+        match count % 10 {
+            1 => "st",
+            2 => "nd",
+            3 => "rd",
+            _ => "th",
+        }
+    };
+    format!("{count}{suffix}")
+}
 
 /// Finalize a direct protocol response that has no dispatch-root provenance. Agent-visible
 /// finalization must use [`finalize_response_for_dispatch_root`] so alert delivery never infers

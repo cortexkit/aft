@@ -2805,6 +2805,17 @@ fn subc_bridge_bash_wait_true_waits_for_terminal() {
 }
 
 #[test]
+fn subc_bridge_repeat_breaker_uses_shared_transport_fixture() {
+    run_subc_bridge_test_with_env(
+        "subc_bridge_repeat_breaker_uses_shared_transport_fixture",
+        Duration::from_secs(90),
+        || vec![set_test_foreground_wait_ms(100)],
+        drive_repeat_breaker_daemon,
+        |_, _, _| {},
+    );
+}
+
+#[test]
 fn subc_bridge_bash_abort_inflight_kills_foreground_and_settles_deferred_response() {
     run_subc_bridge_test_with_env(
         "subc_bridge_bash_abort_inflight_kills_foreground_and_settles_deferred_response",
@@ -3585,6 +3596,41 @@ async fn drive_bash_wait_true_daemon(input: FakeDaemonInput) {
     // terminal output; scheduler duration is not part of the contract.
     assert!(text.contains("wait-late"), "unexpected bash text: {text:?}");
     assert!(!text.contains("promoted to background"));
+    send_connection_goodbye(&mut stream).await;
+}
+
+async fn drive_repeat_breaker_daemon(input: FakeDaemonInput) {
+    let FakeDaemonSession {
+        mut stream, root1, ..
+    } = open_fake_daemon_session(input).await;
+    std::fs::write(root1.join("stable.repeat-fixture"), "stable")
+        .expect("write subc repeat fixture");
+    bind_route1(&mut stream, &root1).await;
+    let mut texts = Vec::new();
+
+    for (index, description) in super::repeat_breaker_test::DESCRIPTIONS
+        .into_iter()
+        .enumerate()
+    {
+        let corr = 800 + index as u64;
+        send_tool_call(
+            &mut stream,
+            1,
+            corr,
+            "glob",
+            super::repeat_breaker_test::transport_fixture_arguments(&root1, description),
+        )
+        .await;
+        let frame = read_frame_timeout(&mut stream, "repeat breaker glob response").await;
+        assert_eq!(frame.header.corr, corr);
+        assert!(!tool_result_is_error(&frame));
+        texts.push(tool_result_text(&frame));
+        if index < 2 {
+            tokio::time::sleep(Duration::from_secs(16)).await;
+        }
+    }
+
+    super::repeat_breaker_test::assert_transport_repeat_sequence(&texts);
     send_connection_goodbye(&mut stream).await;
 }
 

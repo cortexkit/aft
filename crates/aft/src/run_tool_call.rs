@@ -410,7 +410,8 @@ pub fn run_tool_call(
     finalizer: Option<&FinalizeFn<'_>>,
     mut phase_trace: Option<&mut PhaseTrace>,
 ) -> ToolCallOutcome {
-    let prepared = match prepare_tool_call(
+    let semantic_key = crate::response_finalize::repeat_breaker::semantic_key(bare_name, &args);
+    let mut result = match prepare_tool_call(
         bare_name,
         args,
         format_context,
@@ -418,49 +419,70 @@ pub fn run_tool_call(
         app_ctx,
         phase_trace.as_deref_mut(),
     ) {
-        Ok(prepared) => prepared,
-        Err(result) => return ToolCallOutcome::Unary(result),
+        Err(result) => result,
+        Ok(prepared) => {
+            let skipped_before = app_ctx.backup().lock().latest_skipped_order(
+                ctx.session_id
+                    .as_deref()
+                    .unwrap_or(crate::protocol::DEFAULT_SESSION_ID),
+            );
+            let mut response = if prepared.request.command == "inspect" {
+                crate::commands::inspect::handle_inspect_tool_call(&prepared.request, app_ctx)
+            } else {
+                dispatch(prepared.request, app_ctx)
+            };
+            if response.success && response.data.get("backup_skipped_reason").is_none() {
+                let session = ctx
+                    .session_id
+                    .as_deref()
+                    .unwrap_or(crate::protocol::DEFAULT_SESSION_ID);
+                if let Some(reason) = app_ctx
+                    .backup()
+                    .lock()
+                    .skipped_reason_after(session, skipped_before)
+                {
+                    if let Some(object) = response.data.as_object_mut() {
+                        object.insert(
+                            "backup_skipped_reason".to_string(),
+                            Value::String(reason.as_str().to_string()),
+                        );
+                    }
+                }
+            }
+            if let Some(trace) = phase_trace.as_mut() {
+                trace.mark_execute_done();
+            }
+            finish_tool_call_response(
+                bare_name,
+                format_context,
+                response,
+                prepared.surface_downgraded,
+                finalizer,
+                phase_trace,
+            )
+        }
     };
 
-    let skipped_before = app_ctx.backup().lock().latest_skipped_order(
-        ctx.session_id
-            .as_deref()
-            .unwrap_or(crate::protocol::DEFAULT_SESSION_ID),
-    );
-    let mut response = if prepared.request.command == "inspect" {
-        crate::commands::inspect::handle_inspect_tool_call(&prepared.request, app_ctx)
-    } else {
-        dispatch(prepared.request, app_ctx)
-    };
-    if response.success && response.data.get("backup_skipped_reason").is_none() {
-        let session = ctx
-            .session_id
-            .as_deref()
-            .unwrap_or(crate::protocol::DEFAULT_SESSION_ID);
-        if let Some(reason) = app_ctx
-            .backup()
-            .lock()
-            .skipped_reason_after(session, skipped_before)
-        {
-            if let Some(object) = response.data.as_object_mut() {
-                object.insert(
-                    "backup_skipped_reason".to_string(),
-                    Value::String(reason.as_str().to_string()),
-                );
-            }
-        }
+    let session_id = ctx
+        .session_id
+        .as_deref()
+        .unwrap_or(crate::protocol::DEFAULT_SESSION_ID);
+    // Hash the rendered tool text before status bars, alerts, and trailers are attached. Those
+    // decorations carry moving counts, so hashing afterward would make identical results appear
+    // different forever and silently prevent the breaker from firing.
+    let output_hash = crate::response_finalize::repeat_breaker::output_hash(&result.text);
+    if let Some(intervention) =
+        app_ctx
+            .repeat_breaker()
+            .observe(session_id, bare_name, semantic_key, output_hash)
+    {
+        crate::response_finalize::append_repeat_breaker_reminder(
+            &mut result.text,
+            session_id,
+            &intervention,
+        );
     }
-    if let Some(trace) = phase_trace.as_mut() {
-        trace.mark_execute_done();
-    }
-    let result = finish_tool_call_response(
-        bare_name,
-        format_context,
-        response,
-        prepared.surface_downgraded,
-        finalizer,
-        phase_trace,
-    );
+
     ToolCallOutcome::Unary(result)
 }
 

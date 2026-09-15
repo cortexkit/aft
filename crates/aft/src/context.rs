@@ -2282,6 +2282,7 @@ pub struct AppContext {
     /// Authoritative diagnostics observations are retained per session and
     /// producer. Only explicit observation sources may mutate this state.
     alert_state: parking_lot::Mutex<AlertDeltaState>,
+    repeat_breaker: crate::response_finalize::repeat_breaker::RepeatBreaker,
     compression_aggregates: Arc<crate::db::compression_events::CompressionAggregateCache>,
     bash_background: BgTaskRegistry,
     #[cfg(unix)]
@@ -2727,6 +2728,7 @@ impl AppContext {
             status_bar_last_emitted: LegacyStatusBarEmission::default(),
             status_bar_cached: RwLock::new(StatusBarCache::default()),
             alert_state: parking_lot::Mutex::new(AlertDeltaState::default()),
+            repeat_breaker: crate::response_finalize::repeat_breaker::RepeatBreaker::default(),
             compression_aggregates,
             bash_background,
             #[cfg(unix)]
@@ -3489,6 +3491,7 @@ impl AppContext {
     pub(crate) fn mark_subc_unbound(&self) {
         self.subc_lifecycle
             .mark_unbound(self.configure_generation.as_ref());
+        self.repeat_breaker.clear();
     }
 
     #[doc(hidden)]
@@ -3581,6 +3584,11 @@ impl AppContext {
         self.configured_session_roots
             .lock()
             .remove(&(root.to_path_buf(), session_id.to_string()));
+        self.repeat_breaker.clear_session(session_id);
+    }
+
+    pub fn repeat_breaker(&self) -> &crate::response_finalize::repeat_breaker::RepeatBreaker {
+        &self.repeat_breaker
     }
 
     /// Cheap emptiness probes for the maintenance scheduler: a drain kind with

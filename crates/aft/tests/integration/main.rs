@@ -115,6 +115,7 @@ mod query_shape_test;
 mod r_test;
 mod refresh_watcher_path_status_test;
 mod rename_delete_migration_test;
+mod repeat_breaker_test;
 mod root_keyed_adversarial_test;
 mod safety_test;
 mod sandbox_native_test;
