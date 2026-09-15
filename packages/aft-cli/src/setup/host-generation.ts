@@ -2,14 +2,18 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   accessSync,
+  closeSync,
   constants,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
   realpathSync,
   rmSync,
+  type Stats,
   statSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -130,27 +134,88 @@ function packageVersion(metadata: PackageMetadata | null): string | null {
     : null;
 }
 
+/**
+ * Largest file whose full bytes are hashed. Beyond this the canary hashes the
+ * head and tail plus size and mtime: a live `opencode.db` is routinely several
+ * gigabytes (issue #316 reported 54 GiB, still 4 GiB after pruning), and
+ * reading one whole costs more than the probe it guards — under Node it is not
+ * possible at all past 2 GiB, which is how the crash reached users.
+ */
+const FULL_CONTENT_HASH_MAX_BYTES = 64 * 1024 * 1024;
+/** Head and tail window hashed for a file over the full-content limit. */
+const PARTIAL_CONTENT_WINDOW_BYTES = 1024 * 1024;
+
+/**
+ * Hash a file's bytes while holding at most one window in memory. Whole small
+ * files are read window by window; a large file contributes its first and last
+ * window, which is where SQLite's header page and newly appended pages live, so
+ * a write during the probe still moves the digest.
+ */
+function hashFileBytes(hash: ReturnType<typeof createHash>, path: string, size: number): void {
+  const buffer = Buffer.allocUnsafe(Math.min(Math.max(size, 1), PARTIAL_CONTENT_WINDOW_BYTES));
+  const descriptor = openSync(path, "r");
+  try {
+    if (size <= FULL_CONTENT_HASH_MAX_BYTES) {
+      let position = 0;
+      while (position < size) {
+        const read = readSync(descriptor, buffer, 0, buffer.length, position);
+        if (read <= 0) break;
+        hash.update(buffer.subarray(0, read));
+        position += read;
+      }
+      return;
+    }
+    hash.update("partial\0");
+    const head = readSync(descriptor, buffer, 0, buffer.length, 0);
+    hash.update(buffer.subarray(0, Math.max(head, 0)));
+    const tailStart = Math.max(size - PARTIAL_CONTENT_WINDOW_BYTES, 0);
+    const tail = readSync(descriptor, buffer, 0, buffer.length, tailStart);
+    hash.update(buffer.subarray(0, Math.max(tail, 0)));
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
 function snapshotTree(path: string): string {
   if (!existsSync(path)) return "missing";
   const hash = createHash("sha256");
   const visit = (current: string, relativePath: string): void => {
-    const info = statSync(current);
-    hash.update(`${relativePath}\0${info.mode}\0${info.size}\0`);
+    let info: Stats;
+    try {
+      info = statSync(current);
+    } catch (error) {
+      // An entry that becomes unreadable between the two snapshots is itself a
+      // change, so the failure is hashed rather than skipped.
+      hash.update(`${relativePath}\0unreadable\0${(error as NodeJS.ErrnoException).code}\0`);
+      return;
+    }
+    hash.update(`${relativePath}\0${info.mode}\0${info.size}\0${info.mtimeMs}\0`);
     if (info.isDirectory()) {
       for (const entry of readdirSync(current).sort()) {
         visit(join(current, entry), join(relativePath, entry));
       }
       return;
     }
-    hash.update(readFileSync(current));
+    if (!info.isFile()) return;
+    try {
+      hashFileBytes(hash, current, info.size);
+    } catch (error) {
+      hash.update(`unreadable\0${(error as NodeJS.ErrnoException).code}\0`);
+    }
   };
   visit(path, ".");
   return hash.digest("hex");
 }
 
 function snapshotOperatorState(operatorHome: string): string {
+  const database = join(operatorHome, ".local", "share", "opencode", "opencode.db");
   return JSON.stringify({
-    database: snapshotTree(join(operatorHome, ".local", "share", "opencode", "opencode.db")),
+    database: snapshotTree(database),
+    // In WAL mode a write lands in the sidecar files first, so a canary that
+    // watched only the main database could miss the very write it exists to
+    // catch.
+    databaseWal: snapshotTree(`${database}-wal`),
+    databaseShm: snapshotTree(`${database}-shm`),
     logs: snapshotTree(join(operatorHome, ".local", "share", "opencode", "log")),
   });
 }
