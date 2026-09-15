@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "repeat-breaker-skip-plumbing"
+  ],
+  "note": "Repeat breaker ignores native bash_* plumbing calls (run_tool_call.rs, subc/manifest.rs visibility). No ranking-fence files."
+}
