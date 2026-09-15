@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "log-sweep-cross-uid-start-time"
+  ],
+  "note": "Process start time via kern.proc.pid on macOS; recycled_pids counter on the sweep summary. No ranking-fence files."
+}
