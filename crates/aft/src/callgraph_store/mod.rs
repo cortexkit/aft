@@ -5207,6 +5207,17 @@ impl ReadonlyCallGraphStore {
         self.inner.stale_path_census()
     }
 
+    /// Read stale-path health from this resident connection without opening a
+    /// second SQLite handle or waiting behind an active store operation.
+    pub fn try_stale_path_census(&self) -> Result<Option<StalePathCensus>> {
+        let conn = match self.inner.conn.try_lock() {
+            Ok(conn) => conn,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
+        stale_path_census(&conn, &self.inner.project_root).map(Some)
+    }
+
     pub(crate) fn projection_generation(&self) -> Option<&str> {
         self.inner.projection_generation()
     }

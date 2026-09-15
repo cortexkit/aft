@@ -1104,6 +1104,11 @@ fn build_health_diagnostic_rollup(
         fully_ready: bool,
         attributed_bytes: u64,
         repair_entries_60s: Option<u64>,
+        // This field deliberately covers only already-open resident stores. A
+        // standing report is necessary because stale rows block projection by
+        // making dead-code findings disappear rather than raising an error.
+        resident_callgraph_stale_backend_rows:
+            Option<crate::callgraph_store::StalePathCensus>,
         watcher: Option<crate::context::WatcherCountersSnapshot>,
         standing: Option<StandingHealthEntry>,
     }
@@ -1171,6 +1176,15 @@ fn build_health_diagnostic_rollup(
                 .map(|(count, _window_start)| count)
                 .filter(|count| *count > 0)
         });
+        let resident_callgraph_stale_backend_rows = ctx
+            .callgraph_store()
+            .try_read()
+            .ok()
+            .and_then(|store| {
+                store
+                    .as_ref()
+                    .and_then(|store| store.try_stale_path_census().ok().flatten())
+            });
         let health_summary = ctx.try_health_summary();
         let busy = health_summary.is_busy();
         let fully_ready = health_summary.is_fully_ready();
@@ -1181,6 +1195,7 @@ fn build_health_diagnostic_rollup(
             fully_ready,
             attributed_bytes,
             repair_entries_60s,
+            resident_callgraph_stale_backend_rows,
             watcher: Some(ctx.watcher_counters().snapshot()),
             standing,
         });
@@ -1200,6 +1215,7 @@ fn build_health_diagnostic_rollup(
             fully_ready: false,
             attributed_bytes: 0,
             repair_entries_60s: None,
+            resident_callgraph_stale_backend_rows: None,
             watcher: None,
             standing: Some(standing),
         });
@@ -1235,8 +1251,24 @@ fn build_health_diagnostic_rollup(
             snapshot.callgraph_repair_entries_60s = candidate.repair_entries_60s;
             let root_label = snapshot.project_root.clone();
             let mut value = standing_root_health_value(snapshot, candidate.standing.as_ref());
-            if let (Some(object), Some(watcher)) = (value.as_object_mut(), candidate.watcher) {
-                object.insert("watcher".to_string(), json!(watcher));
+            if let Some(object) = value.as_object_mut() {
+                if let Some(census) = candidate.resident_callgraph_stale_backend_rows {
+                    object.insert(
+                        "resident_callgraph_stale_backend_rows".to_string(),
+                        json!(census.stale),
+                    );
+                    object.insert(
+                        "resident_callgraph_absent_stale_backend_rows".to_string(),
+                        json!(census.absent),
+                    );
+                    object.insert(
+                        "resident_callgraph_unreadable_stale_backend_rows".to_string(),
+                        json!(census.unreadable),
+                    );
+                }
+                if let Some(watcher) = candidate.watcher {
+                    object.insert("watcher".to_string(), json!(watcher));
+                }
             }
             (root_label, value)
         })
@@ -1423,6 +1455,133 @@ mod tests {
             );
             std::thread::yield_now();
         }
+    }
+
+    fn install_resident_stale_callgraph(
+        ctx: &Arc<AppContext>,
+        root: &ProjectRootId,
+        file_name: &str,
+        remove_file: bool,
+    ) {
+        let project_root = root.as_path().to_path_buf();
+        let file = project_root.join(file_name);
+        std::fs::create_dir_all(file.parent().expect("fixture file parent")).unwrap();
+        std::fs::write(&file, "export function staleFixture() {}\n").unwrap();
+        let store_dir = project_root.join(".callgraph-health-test");
+        let writer = crate::callgraph_store::CallGraphStore::open(
+            store_dir.clone(),
+            project_root.clone(),
+        )
+        .unwrap();
+        writer.cold_build(std::slice::from_ref(&file)).unwrap();
+        writer.mark_files_stale(std::slice::from_ref(&file)).unwrap();
+        if remove_file {
+            std::fs::remove_file(&file).unwrap();
+        }
+        drop(writer);
+        let reader = crate::callgraph_store::CallGraphStore::open_readonly(
+            store_dir,
+            project_root,
+        )
+        .unwrap()
+        .expect("ready resident callgraph store");
+        *ctx.callgraph_store()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(reader));
+    }
+
+    #[test]
+    fn health_reports_resident_stale_backend_rows_with_absent_paths_distinguished() {
+        let executor = Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 1,
+            read_cap: 1,
+            actor_cap: 2,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        });
+        let (_absent_dir, absent_root) = test_root("health-stale-absent");
+        let absent_ctx = test_ctx();
+        install_resident_stale_callgraph(&absent_ctx, &absent_root, "absent.ts", true);
+        assert!(executor.register_actor(absent_root.clone(), absent_ctx));
+        let (_existing_dir, existing_root) = test_root("health-stale-existing");
+        let existing_ctx = test_ctx();
+        install_resident_stale_callgraph(&existing_ctx, &existing_root, "existing.ts", false);
+        assert!(executor.register_actor(existing_root.clone(), existing_ctx));
+
+        let report = test_health_report(
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &App::default_shared(),
+        );
+        let metrics = report.metrics.expect("health metrics");
+        let roots = metrics["roots"].as_array().expect("per-root health rows");
+        let row_for = |root: &ProjectRootId| {
+            roots
+                .iter()
+                .find(|row| row["project_root"] == root.as_path().display().to_string())
+                .expect("root health row")
+        };
+        let absent = row_for(&absent_root);
+        assert_eq!(absent["resident_callgraph_stale_backend_rows"], 1);
+        assert_eq!(
+            absent["resident_callgraph_absent_stale_backend_rows"],
+            1
+        );
+        assert_eq!(
+            absent["resident_callgraph_unreadable_stale_backend_rows"],
+            0
+        );
+        let existing = row_for(&existing_root);
+        assert_eq!(existing["resident_callgraph_stale_backend_rows"], 1);
+        assert_eq!(
+            existing["resident_callgraph_absent_stale_backend_rows"],
+            0
+        );
+        assert_eq!(
+            existing["resident_callgraph_unreadable_stale_backend_rows"],
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn health_counts_unreadable_resident_stale_backend_paths_separately() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let executor = Executor::with_config(crate::executor::ExecutorConfig {
+            pool_size: 1,
+            read_cap: 1,
+            actor_cap: 1,
+            heavy_permits: 1,
+            drr_quantum: 1,
+        });
+        let (_dir, root) = test_root("health-stale-unreadable");
+        let ctx = test_ctx();
+        install_resident_stale_callgraph(&ctx, &root, "guarded/unreadable.ts", false);
+        assert!(executor.register_actor(root.clone(), ctx));
+        let guarded = root.as_path().join("guarded");
+        let original_mode = std::fs::metadata(&guarded).unwrap().permissions().mode();
+        std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(0)).unwrap();
+
+        let report = test_health_report(
+            &executor,
+            &HashMap::new(),
+            &DispatchPathMetrics::new(),
+            &App::default_shared(),
+        );
+
+        std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(original_mode)).unwrap();
+        let metrics = report.metrics.expect("health metrics");
+        assert_eq!(metrics["roots"][0]["resident_callgraph_stale_backend_rows"], 1);
+        assert_eq!(
+            metrics["roots"][0]["resident_callgraph_absent_stale_backend_rows"],
+            0
+        );
+        assert_eq!(
+            metrics["roots"][0]["resident_callgraph_unreadable_stale_backend_rows"],
+            1
+        );
     }
 
     fn cached_reply_median(
