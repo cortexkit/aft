@@ -2112,6 +2112,13 @@ pub struct IncrementalStats {
     pub unchanged_extract_files: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StalePathCensus {
+    pub stale: usize,
+    pub absent: usize,
+    pub unreadable: usize,
+}
+
 /// Phase timings for the copy-based incremental refresh benchmark.
 #[doc(hidden)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -4292,6 +4299,29 @@ impl CallGraphStore {
         let mut changed_extracts: HashMap<String, FileExtract> = HashMap::new();
         let mut fresh_metadata = BTreeMap::new();
 
+        // Watchers cannot be the only source of deletions: a root can be
+        // unbound, idle, or restarted while a delete occurs, so that event is
+        // never delivered. Every refresh therefore resolves stale rows that a
+        // strict stat proves are now absent, even when this batch is empty or
+        // none of its paths are adopted.
+        for rel_path in stale_backend_file_paths(&conn, &self.project_root, true)? {
+            if stale_path_status(&self.project_root, &rel_path) != StalePathStatus::Absent {
+                continue;
+            }
+            if deleted.insert(rel_path.clone()) && load_file_row(&conn, &rel_path)?.is_some() {
+                surface_changed.insert(rel_path.clone());
+                let started = Instant::now();
+                let dependent_refs =
+                    ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
+                profile.dependency_selection += started.elapsed();
+                record_dependent_refs(
+                    &mut selected_ref_ids,
+                    &mut selected_refs_by_caller,
+                    dependent_refs,
+                );
+            }
+        }
+
         for input in changed_files {
             let (abs_path, rel_path) = match normalize_project_file_path(&self.project_root, input)
             {
@@ -4632,17 +4662,13 @@ impl CallGraphStore {
     pub fn stale_files(&self) -> Result<Vec<String>> {
         self.refresh_read_marker()?;
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT file_path FROM backend_file_state
-             WHERE backend = ?1 AND workspace_root = ?2 AND status = 'stale'
-             ORDER BY file_path",
-        )?;
-        let rows = stmt.query_map(
-            params![BACKEND_TREESITTER, self.project_root.display().to_string()],
-            |row| row.get::<_, String>(0),
-        )?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into)
+        stale_backend_file_paths(&conn, &self.project_root, true)
+    }
+
+    pub fn stale_path_census(&self) -> Result<StalePathCensus> {
+        self.refresh_read_marker()?;
+        let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        stale_path_census(&conn, &self.project_root)
     }
 
     pub fn backend_status_for_file(&self, file: &Path) -> Result<Option<String>> {
@@ -5175,6 +5201,10 @@ impl ReadonlyCallGraphStore {
 
     pub fn stale_files(&self) -> Result<Vec<String>> {
         self.inner.stale_files()
+    }
+
+    pub fn stale_path_census(&self) -> Result<StalePathCensus> {
+        self.inner.stale_path_census()
     }
 
     pub(crate) fn projection_generation(&self) -> Option<&str> {
@@ -13612,6 +13642,62 @@ fn mark_backend_state(
         ],
     )?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StalePathStatus {
+    Present,
+    Absent,
+    Unreadable,
+}
+
+fn stale_backend_file_paths(
+    conn: &Connection,
+    project_root: &Path,
+    distinct: bool,
+) -> Result<Vec<String>> {
+    let distinct = if distinct { "DISTINCT " } else { "" };
+    let sql = format!(
+        "SELECT {distinct}file_path FROM backend_file_state
+         WHERE backend = ?1 AND workspace_root = ?2 AND status = 'stale'
+         ORDER BY file_path"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(
+        params![BACKEND_TREESITTER, project_root.display().to_string()],
+        |row| row.get::<_, String>(0),
+    )?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(Into::into)
+}
+
+fn stale_path_census(conn: &Connection, project_root: &Path) -> Result<StalePathCensus> {
+    let mut census = StalePathCensus::default();
+    for rel_path in stale_backend_file_paths(conn, project_root, false)? {
+        census.stale += 1;
+        match stale_path_status(project_root, &rel_path) {
+            StalePathStatus::Present => {}
+            StalePathStatus::Absent => census.absent += 1,
+            StalePathStatus::Unreadable => census.unreadable += 1,
+        }
+    }
+    Ok(census)
+}
+
+fn stale_path_status(project_root: &Path, rel_path: &str) -> StalePathStatus {
+    let requested = project_root.join(rel_path);
+    let Ok((path, normalized_rel_path)) = normalize_project_file_path(project_root, &requested)
+    else {
+        return StalePathStatus::Unreadable;
+    };
+    if normalized_rel_path != rel_path.replace('\\', "/") {
+        return StalePathStatus::Unreadable;
+    }
+    match std::fs::metadata(path) {
+        Ok(_) => StalePathStatus::Present,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => StalePathStatus::Absent,
+        Err(_) => StalePathStatus::Unreadable,
+    }
 }
 
 fn clear_backend_state_for_file(
