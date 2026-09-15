@@ -1027,9 +1027,9 @@ fn sweep_logs(
         let old_enough = modified
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age >= max_age);
-        let alive = *live_pids
-            .entry(pid)
-            .or_insert_with(|| is_process_alive(pid) && !pid_started_after_last_write(pid, modified));
+        let alive = *live_pids.entry(pid).or_insert_with(|| {
+            is_process_alive(pid) && !pid_started_after_last_write(pid, modified)
+        });
         process_logs.push(ProcessLogFile {
             path: entry.path(),
             modified,
