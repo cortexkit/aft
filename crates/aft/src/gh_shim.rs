@@ -5406,7 +5406,20 @@ mod tests {
             .remove("agent_id");
         let mut actual = wire;
         // The repository field is derived from the checkout's git origin, so it
-        // is checkout-derived and intentionally different in a fork.
+        // is checkout-derived and intentionally different in a fork. Its shape
+        // still belongs to the pinned contract, so assert the shape here rather
+        // than letting the copy below accept a missing or malformed value
+        // (issue #278 asked for exactly this: presence and format, not value).
+        let actual_repository = actual["repository"]
+            .as_str()
+            .expect("wire request must carry a repository string");
+        let (owner, name) = actual_repository
+            .split_once('/')
+            .expect("repository must be owner/name");
+        assert!(
+            !owner.is_empty() && !name.is_empty() && !name.contains('/'),
+            "repository must be a single owner/name pair: {actual_repository}"
+        );
         expected["repository"] = actual["repository"].clone();
         actual["metadata"]
             .as_object_mut()
