@@ -14,6 +14,7 @@ use crate::local_embed::LocalEmbedder;
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::error::Error;
@@ -78,7 +79,8 @@ fn finish_semantic_index_build(
                 )
                 .field("elapsed_ms", scope.elapsed_ms())
                 .field("files", index.file_mtimes.len())
-                .field("chunks", index.entries.len()),
+                .field("chunks", index.entries.len())
+                .field("skipped_rows", index.skipped_rows),
             );
             failure_guard.disarm();
         }
@@ -148,11 +150,47 @@ const EMBEDDING_REQUEST_MAX_ATTEMPTS: usize = 3;
 const EMBEDDING_REQUEST_BACKOFF_MS: [u64; 2] = [500, 1_000];
 const BUILD_EMBEDDING_TIMEOUT_MARKER_PREFIX: &str = "[build-timeout:";
 const BUILD_EMBEDDING_TIMEOUT_MARKER_SUFFIX: &str = "]";
+const ROW_TOO_LONG_MARKER_PREFIX: &str = "[row-too-long:";
+const ROW_TOO_LONG_MARKER_SUFFIX: &str = "]";
+const MAX_ROW_SHRINK_ATTEMPTS: usize = 4;
+const ROW_SHRINK_RATIO_MARGIN: f64 = 0.9;
 const BUILD_PER_ITEM_EMA_ALPHA: f64 = 0.25;
 const BUILD_PER_ITEM_SAFETY_FACTOR: f64 = 2.0;
 const BUILD_INITIAL_BATCH_DIVISOR: u64 = 16;
 const BUILD_BATCH_GROWTH_SUCCESSES: usize = 2;
 static SEMANTIC_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
+
+#[derive(Debug, Clone)]
+struct BuildEmbeddingRowMetadata {
+    embedded_text: String,
+    skipped_reason: Option<String>,
+}
+
+struct AdaptiveBuildRow {
+    metadata: BuildEmbeddingRowMetadata,
+    vector: Option<Vec<f32>>,
+}
+
+thread_local! {
+    /// `EmbeddingModel::embed` keeps its long-standing vector-only API. The
+    /// semantic builder consumes this same-thread metadata immediately after
+    /// each HTTP build call so it can persist shrunk text and omit skipped rows.
+    static LAST_HTTP_BUILD_METADATA: RefCell<Option<Vec<BuildEmbeddingRowMetadata>>> = const {
+        RefCell::new(None)
+    };
+}
+
+fn clear_http_build_metadata() {
+    LAST_HTTP_BUILD_METADATA.with(|slot| slot.borrow_mut().take());
+}
+
+fn set_http_build_metadata(metadata: Vec<BuildEmbeddingRowMetadata>) {
+    LAST_HTTP_BUILD_METADATA.with(|slot| *slot.borrow_mut() = Some(metadata));
+}
+
+fn take_http_build_metadata() -> Option<Vec<BuildEmbeddingRowMetadata>> {
+    LAST_HTTP_BUILD_METADATA.with(|slot| slot.borrow_mut().take())
+}
 
 /// Test-only probe counter for the managed-ONNX resolver (see
 /// `find_managed_onnx_runtime`). Counts storage-tree reads so a negative-control
@@ -710,6 +748,104 @@ fn embedding_response_body_is_transient(status: reqwest::StatusCode, raw: &str) 
         || normalized.contains(r#""message":"model is currently loading""#)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowTooLongDetails {
+    limit_tokens: Option<usize>,
+    actual_tokens: Option<usize>,
+}
+
+fn json_token_count(value: &serde_json::Value, keys: &[&str]) -> Option<usize> {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (key, value) in fields {
+                if keys.iter().any(|candidate| key.eq_ignore_ascii_case(candidate)) {
+                    if let Some(count) = value.as_u64().and_then(|count| usize::try_from(count).ok())
+                    {
+                        return Some(count);
+                    }
+                }
+            }
+            fields
+                .values()
+                .find_map(|value| json_token_count(value, keys))
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(|value| json_token_count(value, keys)),
+        _ => None,
+    }
+}
+
+fn number_after_phrase(value: &str, phrases: &[&str]) -> Option<usize> {
+    phrases.iter().find_map(|phrase| {
+        let rest = value.split_once(phrase)?.1.trim_start();
+        let digits = rest.chars().take_while(char::is_ascii_digit).collect::<String>();
+        (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+    })
+}
+
+/// Classify only known context-window rejections. Generic 4xx responses remain
+/// permanent errors so authentication and model configuration failures abort.
+fn embedding_response_row_too_long(
+    status: reqwest::StatusCode,
+    raw: &str,
+) -> Option<RowTooLongDetails> {
+    if !status.is_client_error() {
+        return None;
+    }
+
+    let lower = raw.to_ascii_lowercase();
+    let known_overflow = lower.contains("exceed_context_size_error")
+        || lower.contains("input is too large to process")
+        || lower.contains("maximum context length is")
+        || lower.contains("this model's maximum context length")
+        || lower.contains("input length exceeds");
+    if !known_overflow {
+        return None;
+    }
+
+    let parsed = serde_json::from_str::<serde_json::Value>(raw).ok();
+    let limit_tokens = parsed
+        .as_ref()
+        .and_then(|value| json_token_count(value, &["n_ctx", "max_context_length"]))
+        .or_else(|| {
+            number_after_phrase(
+                &lower,
+                &[
+                    "maximum context length is ",
+                    "this model's maximum context length is ",
+                    "n_ctx=",
+                    "n_ctx: ",
+                ],
+            )
+        });
+    let actual_tokens = parsed
+        .as_ref()
+        .and_then(|value| {
+            json_token_count(
+                value,
+                &["n_prompt_tokens", "input_tokens", "prompt_tokens"],
+            )
+        })
+        .or_else(|| {
+            number_after_phrase(
+                &lower,
+                &[
+                    "resulted in ",
+                    "you requested ",
+                    "requested ",
+                    "n_prompt_tokens=",
+                    "n_prompt_tokens: ",
+                ],
+            )
+        });
+
+    Some(RowTooLongDetails {
+        limit_tokens,
+        actual_tokens,
+    })
+}
+
 fn is_retryable_embedding_error(error: &reqwest::Error) -> bool {
     // Retryable == transient-at-send-stage: a backend that refused, timed
     // out, or died mid-exchange deserves the same in-request retry ladder.
@@ -860,6 +996,69 @@ fn build_embedding_timeout_details(error: &str) -> Option<BuildTimeoutDetails> {
         attempts: fields.next()?.parse().ok()?,
     };
     fields.next().is_none().then_some(details)
+}
+
+fn row_too_long_marker(details: RowTooLongDetails) -> String {
+    format!(
+        "{ROW_TOO_LONG_MARKER_PREFIX}{}:{}{ROW_TOO_LONG_MARKER_SUFFIX}",
+        details.limit_tokens.unwrap_or(0),
+        details.actual_tokens.unwrap_or(0),
+    )
+}
+
+fn row_too_long_details(error: &str) -> Option<RowTooLongDetails> {
+    let start = error.find(ROW_TOO_LONG_MARKER_PREFIX)? + ROW_TOO_LONG_MARKER_PREFIX.len();
+    let end = error[start..].find(ROW_TOO_LONG_MARKER_SUFFIX)? + start;
+    let mut fields = error[start..end].split(':');
+    let limit_tokens = fields.next()?.parse::<usize>().ok()?;
+    let actual_tokens = fields.next()?.parse::<usize>().ok()?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(RowTooLongDetails {
+        limit_tokens: (limit_tokens > 0).then_some(limit_tokens),
+        actual_tokens: (actual_tokens > 0).then_some(actual_tokens),
+    })
+}
+
+fn strip_row_too_long_marker(error: &str) -> String {
+    let Some(details) = row_too_long_details(error) else {
+        return error.to_string();
+    };
+    error.replace(&row_too_long_marker(details), "")
+}
+
+/// Remove only body text; the identifying name/file/kind/signature prefix is
+/// retained so a shortened embedding remains attributable to its source row.
+fn shrink_embed_text(text: &str, details: RowTooLongDetails) -> Option<String> {
+    let body_marker = " body:";
+    let body_start = text.find(body_marker)?;
+    let header = &text[..body_start];
+    let body = &text[body_start + body_marker.len()..];
+    if body.is_empty() {
+        return None;
+    }
+
+    let ratio_target = details
+        .limit_tokens
+        .zip(details.actual_tokens)
+        .filter(|(_, actual)| *actual > 0)
+        .map(|(limit, actual)| {
+            (body.len() as f64 * limit as f64 / actual as f64 * ROW_SHRINK_RATIO_MARGIN) as usize
+        });
+    let target_bytes = ratio_target
+        .unwrap_or_else(|| body.len() / 2)
+        .min(body.len().saturating_sub(1));
+    if target_bytes == 0 {
+        return Some(header.to_string());
+    }
+
+    let shortened_body = &body[..body.floor_char_boundary(target_bytes)];
+    if shortened_body.is_empty() {
+        Some(header.to_string())
+    } else {
+        Some(format!("{header}{body_marker}{shortened_body}"))
+    }
 }
 
 /// Stable machine marker prefixed onto a *query* embedding error string when
@@ -1079,6 +1278,16 @@ where
 
         if status.is_success() {
             return Ok(raw);
+        }
+
+        if let Some(details) = embedding_response_row_too_long(status, &raw) {
+            return Err(format!(
+                "{}{} request failed (HTTP {}): {}",
+                row_too_long_marker(details),
+                backend_label,
+                status,
+                raw,
+            ));
         }
 
         // A 4xx whose body says the model is loading/unloaded is transient on
@@ -1327,8 +1536,94 @@ impl SemanticEmbeddingModel {
         );
     }
 
+    fn embed_http_batch_overflow_resilient(
+        &mut self,
+        texts: Vec<String>,
+    ) -> Result<Vec<AdaptiveBuildRow>, String> {
+        let budget = self.build_request_budget(texts.len());
+        match self.embed_texts(
+            texts.clone(),
+            EmbeddingRequestPolicy::Build(budget),
+        ) {
+            Ok(vectors) => {
+                validate_embedding_batch(&vectors, texts.len(), "embedding backend")?;
+                Ok(texts
+                    .into_iter()
+                    .zip(vectors)
+                    .map(|(embedded_text, vector)| AdaptiveBuildRow {
+                        metadata: BuildEmbeddingRowMetadata {
+                            embedded_text,
+                            skipped_reason: None,
+                        },
+                        vector: Some(vector),
+                    })
+                    .collect())
+            }
+            Err(error) => {
+                let Some(details) = row_too_long_details(&error) else {
+                    return Err(error);
+                };
+
+                if texts.len() > 1 {
+                    let right = texts.len().div_ceil(2);
+                    let mut left_rows = self
+                        .embed_http_batch_overflow_resilient(texts[..right].to_vec())?;
+                    let mut right_rows = self
+                        .embed_http_batch_overflow_resilient(texts[right..].to_vec())?;
+                    left_rows.append(&mut right_rows);
+                    return Ok(left_rows);
+                }
+
+                let mut embedded_text = texts
+                    .into_iter()
+                    .next()
+                    .expect("overflow response had at least one input");
+                let mut latest_details = details;
+                let mut latest_error = error;
+                for _ in 0..MAX_ROW_SHRINK_ATTEMPTS {
+                    let Some(shortened) = shrink_embed_text(&embedded_text, latest_details) else {
+                        break;
+                    };
+                    embedded_text = shortened;
+                    let budget = self.build_request_budget(1);
+                    match self.embed_texts(
+                        vec![embedded_text.clone()],
+                        EmbeddingRequestPolicy::Build(budget),
+                    ) {
+                        Ok(mut vectors) => {
+                            validate_embedding_batch(&vectors, 1, "embedding backend")?;
+                            return Ok(vec![AdaptiveBuildRow {
+                                metadata: BuildEmbeddingRowMetadata {
+                                    embedded_text,
+                                    skipped_reason: None,
+                                },
+                                vector: Some(vectors.remove(0)),
+                            }]);
+                        }
+                        Err(error) => {
+                            let Some(details) = row_too_long_details(&error) else {
+                                return Err(error);
+                            };
+                            latest_details = details;
+                            latest_error = error;
+                        }
+                    }
+                }
+
+                Ok(vec![AdaptiveBuildRow {
+                    metadata: BuildEmbeddingRowMetadata {
+                        embedded_text,
+                        skipped_reason: Some(strip_row_too_long_marker(&latest_error)),
+                    },
+                    vector: None,
+                }])
+            }
+        }
+    }
+
     fn embed_build_http_adaptive(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, String> {
-        let mut vectors = Vec::with_capacity(texts.len());
+        clear_http_build_metadata();
+        let mut rows = Vec::with_capacity(texts.len());
         let mut cursor = 0usize;
 
         while cursor < texts.len() {
@@ -1336,13 +1631,12 @@ impl SemanticEmbeddingModel {
                 .adaptive_build_batch_size
                 .max(1)
                 .min(texts.len() - cursor);
-            let budget = self.build_request_budget(batch_size);
             let batch = texts[cursor..cursor + batch_size].to_vec();
             let started = Instant::now();
-            match self.embed_texts(batch, EmbeddingRequestPolicy::Build(budget)) {
-                Ok(mut batch_vectors) => {
+            match self.embed_http_batch_overflow_resilient(batch) {
+                Ok(mut batch_rows) => {
                     self.note_successful_build_batch(batch_size, started.elapsed());
-                    vectors.append(&mut batch_vectors);
+                    rows.append(&mut batch_rows);
                     cursor += batch_size;
                 }
                 Err(error) => {
@@ -1373,6 +1667,13 @@ impl SemanticEmbeddingModel {
             }
         }
 
+        let mut metadata = Vec::with_capacity(rows.len());
+        let mut vectors = Vec::with_capacity(rows.len());
+        for row in rows {
+            metadata.push(row.metadata);
+            vectors.push(row.vector.unwrap_or_default());
+        }
+        set_http_build_metadata(metadata);
         Ok(vectors)
     }
 
@@ -2228,6 +2529,101 @@ impl EmbeddingEntry {
     }
 }
 
+enum BuildEmbeddingRow {
+    Embedded {
+        embedded_text: String,
+        vector: Vec<f32>,
+    },
+    Skipped {
+        embedded_text: String,
+        reason: String,
+    },
+}
+
+fn execute_build_embedding_batch<F>(
+    texts: Vec<String>,
+    embed_fn: &mut F,
+) -> Result<Vec<BuildEmbeddingRow>, String>
+where
+    F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+{
+    clear_http_build_metadata();
+    let requested_texts = texts.clone();
+    let vectors = embed_fn(texts)?;
+    let metadata = take_http_build_metadata();
+
+    if vectors.len() != requested_texts.len() {
+        return Err(format!(
+            "embedding backend returned {} vectors for {} inputs",
+            vectors.len(),
+            requested_texts.len()
+        ));
+    }
+    if metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.len() != requested_texts.len())
+    {
+        return Err("embedding backend returned mismatched row metadata".to_string());
+    }
+
+    let metadata = metadata.unwrap_or_else(|| {
+        requested_texts
+            .into_iter()
+            .map(|embedded_text| BuildEmbeddingRowMetadata {
+                embedded_text,
+                skipped_reason: None,
+            })
+            .collect()
+    });
+    let mut expected_dimension = None;
+    let mut rows = Vec::with_capacity(vectors.len());
+    for (metadata, vector) in metadata.into_iter().zip(vectors) {
+        if let Some(reason) = metadata.skipped_reason {
+            if !vector.is_empty() {
+                return Err("skipped embedding row unexpectedly returned a vector".to_string());
+            }
+            rows.push(BuildEmbeddingRow::Skipped {
+                embedded_text: metadata.embedded_text,
+                reason,
+            });
+            continue;
+        }
+
+        validate_embedding_dimension(vector.len())
+            .map_err(|error| format!("embedding backend returned {error}"))?;
+        match expected_dimension {
+            None => expected_dimension = Some(vector.len()),
+            Some(expected) if expected != vector.len() => {
+                return Err(format!(
+                    "embedding backend returned inconsistent embedding dimensions: expected {expected}, got {}",
+                    vector.len()
+                ));
+            }
+            _ => {}
+        }
+        rows.push(BuildEmbeddingRow::Embedded {
+            embedded_text: metadata.embedded_text,
+            vector,
+        });
+    }
+
+    Ok(rows)
+}
+
+fn format_skipped_row_warning(
+    chunk: &SemanticChunk,
+    embedded_text: &str,
+    reason: &str,
+) -> String {
+    format!(
+        "semantic embed skipped row: file={} symbol={} chars={} reason={}",
+        chunk.file.display(),
+        chunk.name,
+        embedded_text.chars().count(),
+        reason,
+    )
+}
+
 #[derive(Debug)]
 struct SharedSemanticBase {
     entries: Vec<EmbeddingEntry>,
@@ -2238,6 +2634,7 @@ struct SharedSemanticBase {
     dimension: usize,
     fingerprint: Option<SemanticIndexFingerprint>,
     deferred_files: HashSet<PathBuf>,
+    skipped_rows: usize,
     dirty_paths: Arc<Mutex<Option<BTreeSet<PathBuf>>>>,
     persistence: Arc<Mutex<Option<SemanticPersistenceState>>>,
 }
@@ -2409,6 +2806,8 @@ pub struct SemanticIndex {
     dirty_paths: Arc<Mutex<Option<BTreeSet<PathBuf>>>>,
     persistence: Arc<Mutex<Option<SemanticPersistenceState>>>,
     last_append_read_bytes: Arc<AtomicUsize>,
+    /// Rows rejected by the backend even after bounded body shrinking.
+    skipped_rows: usize,
     #[cfg(test)]
     removal_retain_passes: usize,
 }
@@ -2762,6 +3161,7 @@ impl SemanticIndex {
             dirty_paths: Arc::clone(&shared_base.dirty_paths),
             persistence: Arc::clone(&shared_base.persistence),
             last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
+            skipped_rows: shared_base.skipped_rows,
             shared_base: Some(shared_base),
             #[cfg(test)]
             removal_retain_passes: 0,
@@ -2903,6 +3303,7 @@ impl SemanticIndex {
             dimension: self.dimension,
             fingerprint: self.fingerprint,
             deferred_files,
+            skipped_rows: self.skipped_rows,
             dirty_paths: Arc::new(Mutex::new(dirty_paths)),
             persistence: Arc::new(Mutex::new(persistence)),
         })
@@ -2939,6 +3340,7 @@ impl SemanticIndex {
             .collect();
         self.dimension = base.dimension;
         self.fingerprint = base.fingerprint.clone();
+        self.skipped_rows = base.skipped_rows;
         self.deferred_files = base
             .deferred_files
             .iter()
@@ -2979,9 +3381,15 @@ impl SemanticIndex {
             dirty_paths: Arc::new(Mutex::new(None)),
             persistence: Arc::new(Mutex::new(None)),
             last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
+            skipped_rows: 0,
             #[cfg(test)]
             removal_retain_passes: 0,
         }
+    }
+
+    /// Number of rows omitted because the backend still rejected their header floor.
+    pub fn skipped_rows(&self) -> usize {
+        self.skipped_rows
     }
 
     /// Number of embedded symbol entries.
@@ -3296,7 +3704,7 @@ impl SemanticIndex {
             .map(|candidate| candidate.vector.clone())
     }
 
-    fn entries_for_chunks_with_reuse<F, P>(
+        fn entries_for_chunks_with_reuse<F, P>(
         chunks: Vec<SemanticChunk>,
         reuse_map: &ChunkReuseMap,
         embed_fn: &mut F,
@@ -3304,7 +3712,7 @@ impl SemanticIndex {
         initial_observed_dimension: Option<usize>,
         refresh_label: &str,
         progress: &mut P,
-    ) -> Result<(Vec<EmbeddingEntry>, Option<usize>), String>
+    ) -> Result<(Vec<EmbeddingEntry>, Option<usize>, usize), String>
     where
         F: FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
         P: FnMut(usize, usize),
@@ -3330,6 +3738,7 @@ impl SemanticIndex {
 
         let batch_size = max_batch_size.max(1);
         let mut observed_dimension = initial_observed_dimension;
+        let mut skipped_rows = 0usize;
 
         for batch_start in (0..misses.len()).step_by(batch_size) {
             let batch_end = (batch_start + batch_size).min(misses.len());
@@ -3338,40 +3747,47 @@ impl SemanticIndex {
                 .map(|(_, chunk)| chunk.embed_text.clone())
                 .collect();
 
-            let vectors = embed_fn(batch_texts)?;
-            validate_embedding_batch(&vectors, batch_end - batch_start, "embedding backend")?;
-
-            if let Some(dim) = vectors.first().map(|vector| vector.len()) {
-                match observed_dimension {
-                    None => observed_dimension = Some(dim),
-                    Some(expected) if dim != expected => {
-                        return Err(format!(
-                            "embedding dimension changed during {refresh_label}: \
-                             cached index uses {expected}, new vectors use {dim}"
-                        ));
+            let rows = execute_build_embedding_batch(batch_texts, embed_fn)?;
+            for (i, row) in rows.into_iter().enumerate() {
+                let (chunk_index, mut chunk) = misses[batch_start + i].clone();
+                match row {
+                    BuildEmbeddingRow::Embedded {
+                        embedded_text,
+                        vector,
+                    } => {
+                        match observed_dimension {
+                            None => observed_dimension = Some(vector.len()),
+                            Some(expected) if vector.len() != expected => {
+                                return Err(format!(
+                                    "embedding dimension changed during {refresh_label}: cached index uses {expected}, new vectors use {}",
+                                    vector.len()
+                                ));
+                            }
+                            _ => {}
+                        }
+                        chunk.embed_text = embedded_text;
+                        entries_by_chunk[chunk_index] = Some(EmbeddingEntry::new(chunk, vector));
                     }
-                    _ => {}
+                    BuildEmbeddingRow::Skipped {
+                        embedded_text,
+                        reason,
+                    } => {
+                        slog_warn!("{}", format_skipped_row_warning(&chunk, &embedded_text, &reason));
+                        skipped_rows = skipped_rows.saturating_add(1);
+                    }
                 }
-            }
-
-            for (i, vector) in vectors.into_iter().enumerate() {
-                let (chunk_index, chunk) = misses[batch_start + i].clone();
-                entries_by_chunk[chunk_index] = Some(EmbeddingEntry::new(chunk, vector));
             }
 
             completed += batch_end - batch_start;
             progress(completed, total_chunks);
         }
 
-        let entries = entries_by_chunk
-            .into_iter()
-            .map(|entry| entry.expect("semantic refresh accounted for every chunk"))
-            .collect();
+        let entries = entries_by_chunk.into_iter().flatten().collect();
 
-        Ok((entries, observed_dimension))
+        Ok((entries, observed_dimension, skipped_rows))
     }
 
-    fn build_from_chunks<F, P, C>(
+        fn build_from_chunks<F, P, C>(
         project_root: &Path,
         chunks: Vec<SemanticChunk>,
         file_metadata: HashMap<PathBuf, IndexedFileMetadata>,
@@ -3408,18 +3824,20 @@ impl SemanticIndex {
                 fingerprint: None,
                 project_root: project_root.to_path_buf(),
                 deferred_files: HashSet::new(),
+                shared_base: None,
                 dirty_paths: Arc::new(Mutex::new(None)),
                 persistence: Arc::new(Mutex::new(None)),
                 last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
-                shared_base: None,
+                skipped_rows: 0,
                 #[cfg(test)]
                 removal_retain_passes: 0,
             });
         }
 
-        // Embed in batches
         let mut entries: Vec<EmbeddingEntry> = Vec::with_capacity(chunks.len());
         let mut expected_dimension: Option<usize> = None;
+        let mut skipped_rows = 0usize;
+        let mut completed_rows = 0usize;
         let batch_size = max_batch_size.max(1);
         let embed_started = std::time::Instant::now();
         let batch_count = total_chunks.div_ceil(batch_size);
@@ -3437,32 +3855,43 @@ impl SemanticIndex {
             let batch_end = (batch_start + batch_size).min(chunks.len());
             let batch_texts: Vec<String> = chunks[batch_start..batch_end]
                 .iter()
-                .map(|c| c.embed_text.clone())
+                .map(|chunk| chunk.embed_text.clone())
                 .collect();
 
-            let vectors = embed_fn(batch_texts)?;
-            validate_embedding_batch(&vectors, batch_end - batch_start, "embedding backend")?;
-
-            // Track consistent dimension across all batches
-            if let Some(dim) = vectors.first().map(|v| v.len()) {
-                match expected_dimension {
-                    None => expected_dimension = Some(dim),
-                    Some(expected) if dim != expected => {
-                        return Err(format!(
-                            "embedding dimension changed across batches: expected {expected}, got {dim}"
-                        ));
+            let rows = execute_build_embedding_batch(batch_texts, embed_fn)?;
+            for (i, row) in rows.into_iter().enumerate() {
+                let mut chunk = chunks[batch_start + i].clone();
+                match row {
+                    BuildEmbeddingRow::Embedded {
+                        embedded_text,
+                        vector,
+                    } => {
+                        match expected_dimension {
+                            None => expected_dimension = Some(vector.len()),
+                            Some(expected) if vector.len() != expected => {
+                                return Err(format!(
+                                    "embedding dimension changed across batches: expected {expected}, got {}",
+                                    vector.len()
+                                ));
+                            }
+                            _ => {}
+                        }
+                        chunk.embed_text = embedded_text;
+                        entries.push(EmbeddingEntry::new(chunk, vector));
                     }
-                    _ => {}
+                    BuildEmbeddingRow::Skipped {
+                        embedded_text,
+                        reason,
+                    } => {
+                        slog_warn!("{}", format_skipped_row_warning(&chunk, &embedded_text, &reason));
+                        skipped_rows = skipped_rows.saturating_add(1);
+                    }
                 }
             }
 
-            for (i, vector) in vectors.into_iter().enumerate() {
-                let chunk_idx = batch_start + i;
-                entries.push(EmbeddingEntry::new(chunks[chunk_idx].clone(), vector));
-            }
-
+            completed_rows += batch_end - batch_start;
             if let Some(callback) = progress.as_mut() {
-                callback(entries.len(), total_chunks);
+                callback(completed_rows, total_chunks);
             }
             if let Some(scope) = crate::logging::current_index_build() {
                 if scope.plane == crate::logging::IndexPlane::Semantic {
@@ -3474,8 +3903,8 @@ impl SemanticIndex {
                         .field("stage", "embed")
                         .field("batch", batch_index + 1)
                         .field("total_batches", batch_count)
-                        .field("chunks_done", entries.len())
-                        .field("completed", entries.len())
+                        .field("chunks_done", completed_rows)
+                        .field("completed", completed_rows)
                         .field("total", total_chunks)
                         .field("elapsed_ms", scope.elapsed_ms()),
                     );
@@ -3486,7 +3915,7 @@ impl SemanticIndex {
                     "semantic embed progress: batch {}/{} ({} / {} chunks)",
                     batch_index + 1,
                     batch_count,
-                    entries.len(),
+                    completed_rows,
                     total_chunks
                 );
             }
@@ -3497,16 +3926,17 @@ impl SemanticIndex {
             .checked_div(embed_ms)
             .unwrap_or(0) as u64;
         slog_info!(
-            "semantic embed: {} chunks in {} batches, {} ms ({} chunks/s)",
+            "semantic embed: {} chunks in {} batches, {} ms ({} chunks/s), skipped_rows={}",
             total_chunks,
             batch_count,
             embed_ms,
-            rate
+            rate,
+            skipped_rows,
         );
 
         let dimension = entries
             .first()
-            .map(|e| e.vector.len())
+            .map(|entry| entry.vector.len())
             .unwrap_or(DEFAULT_DIMENSION);
 
         Ok(Self {
@@ -3532,6 +3962,7 @@ impl SemanticIndex {
             dirty_paths: Arc::new(Mutex::new(None)),
             persistence: Arc::new(Mutex::new(None)),
             last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
+            skipped_rows,
             #[cfg(test)]
             removal_retain_passes: 0,
         })
@@ -3952,15 +4383,17 @@ impl SemanticIndex {
         } else {
             Some(self.dimension)
         };
-        let (new_entries, observed_dimension) = Self::entries_for_chunks_with_reuse(
-            chunks,
-            &reuse_map,
-            embed_fn,
-            max_batch_size,
-            existing_dimension,
-            "incremental refresh",
-            progress,
-        )?;
+        let (new_entries, observed_dimension, skipped_rows) =
+            Self::entries_for_chunks_with_reuse(
+                chunks,
+                &reuse_map,
+                embed_fn,
+                max_batch_size,
+                existing_dimension,
+                "incremental refresh",
+                progress,
+            )?;
+        self.skipped_rows = self.skipped_rows.saturating_add(skipped_rows);
 
         let successful_files: HashSet<PathBuf> = fresh_metadata.keys().cloned().collect();
         for file in &successful_files {
@@ -4205,15 +4638,17 @@ impl SemanticIndex {
         } else {
             Some(self.dimension)
         };
-        let (new_entries, observed_dimension) = Self::entries_for_chunks_with_reuse(
-            chunks,
-            &reuse_map,
-            embed_fn,
-            max_batch_size,
-            initial_observed_dimension,
-            "invalidated-file refresh",
-            progress,
-        )?;
+        let (new_entries, observed_dimension, skipped_rows) =
+            Self::entries_for_chunks_with_reuse(
+                chunks,
+                &reuse_map,
+                embed_fn,
+                max_batch_size,
+                initial_observed_dimension,
+                "invalidated-file refresh",
+                progress,
+            )?;
+        self.skipped_rows = self.skipped_rows.saturating_add(skipped_rows);
 
         let added_entries = new_entries.clone();
         self.entries.extend(new_entries);
@@ -4800,6 +5235,7 @@ impl SemanticIndex {
             dirty_paths: Arc::new(Mutex::new(None)),
             persistence: Arc::new(Mutex::new(None)),
             last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
+            skipped_rows: self.skipped_rows,
             #[cfg(test)]
             removal_retain_passes: 0,
         }
@@ -6171,6 +6607,7 @@ impl SemanticIndex {
                 dirty_paths: Arc::new(Mutex::new(None)),
                 persistence: Arc::new(Mutex::new(None)),
                 last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
+                skipped_rows: 0,
                 #[cfg(test)]
                 removal_retain_passes: 0,
             },
