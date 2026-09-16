@@ -90,20 +90,35 @@ fn views_tier2_pending_plane_never_falls_back_to_legacy() {
 #[test]
 fn views_tier2_and_legacy_dead_code_verdicts_match() {
     let (_project, _storage, mut job, request) = view_projection_fixture();
-    crate::views::assembly::publish_checkout(&request).unwrap();
-    let view = build_tier2_callgraph_snapshot_with_refresh(&job, true, &job.scope_files).unwrap();
-    Arc::make_mut(&mut job.config).views.enabled = false;
-    let legacy = build_tier2_callgraph_snapshot_with_refresh(&job, true, &job.scope_files).unwrap();
-    job.callgraph_snapshot = Some(legacy);
-    let contributions = crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
-        .outcome
-        .unwrap()
-        .contributions;
-    assert!(!contributions.is_empty());
-    let legacy_verdict = roll_up_dead_code_contributions(&job, &contributions, None);
-    job.callgraph_snapshot = Some(view);
-    let view_verdict = roll_up_dead_code_contributions(&job, &contributions, None);
-    assert_eq!(view_verdict, legacy_verdict);
+    for source in [
+        "export function used() {}\nexport function dead() {}\n",
+        "export function used() { dead(); }\nexport function dead() {}\n",
+        "export function used() {}\nexport function dead() {}\n",
+        "export function used() { alternate(); }\nexport function alternate() {}\n",
+        "export function used() {}\nexport function dead() {}\n",
+    ] {
+        write_projection_cache_file(&job.project_root.join("target.ts"), source);
+        crate::views::assembly::publish_checkout(&request).unwrap();
+        Arc::make_mut(&mut job.config).views.enabled = true;
+        let view =
+            build_tier2_callgraph_snapshot_with_refresh(&job, true, &job.scope_files).unwrap();
+        Arc::make_mut(&mut job.config).views.enabled = false;
+        let legacy =
+            build_tier2_callgraph_snapshot_with_refresh(&job, true, &job.scope_files).unwrap();
+        job.callgraph_snapshot = Some(legacy);
+        let contributions = crate::inspect::scanners::dead_code::run_dead_code_scan(&job)
+            .outcome
+            .unwrap()
+            .contributions;
+        assert!(!contributions.is_empty());
+        let legacy_verdict = roll_up_dead_code_contributions(&job, &contributions, None);
+        job.callgraph_snapshot = Some(view);
+        let view_verdict = roll_up_dead_code_contributions(&job, &contributions, None);
+        assert_eq!(
+            view_verdict, legacy_verdict,
+            "same contribution set after source transition: {source}"
+        );
+    }
 }
 
 #[test]
@@ -203,4 +218,58 @@ fn views_projection_adapter_refuses_legacy_reader() {
         .unwrap();
     let error = crate::callgraph_store::project_dead_code_snapshot_from_view(&legacy).unwrap_err();
     assert!(error.to_string().contains("requires a view reader"));
+}
+
+#[test]
+#[ignore = "manual read latency benchmark requires AFT_HUNT_ROOT and AFT_HUNT_STORAGE for completed drill artifacts"]
+fn views_profile_navigation_reads_on_drill_artifacts() {
+    let root = PathBuf::from(std::env::var_os("AFT_HUNT_ROOT").expect("AFT_HUNT_ROOT"));
+    let storage = PathBuf::from(std::env::var_os("AFT_HUNT_STORAGE").expect("AFT_HUNT_STORAGE"));
+    let family = crate::search_index::artifact_cache_key(&root);
+    let view =
+        crate::views::ViewStore::open(&storage, &crate::path_identity::project_scope_key(&root))
+            .unwrap();
+    let generation = view.current_generation().unwrap().unwrap();
+    let pin = Some(Arc::new(
+        crate::pins::QueryPin::acquire(view.view_dir(), &generation).unwrap(),
+    ));
+    let legacy =
+        CallGraphStore::open_readonly(storage.join("callgraph").join(&family), root.clone())
+            .unwrap()
+            .unwrap();
+    let path = Path::new("packages/app/src/settings/timeline-detail.tsx");
+    let symbol = "TimelineDetailControl";
+    let mut rows = Vec::new();
+    for use_view in [false, true] {
+        let mut opens = Duration::ZERO;
+        let mut callers = Duration::ZERO;
+        let mut impact = Duration::ZERO;
+        let mut caller_count = 0;
+        let mut impact_count = 0;
+        for _ in 0..10 {
+            let start = Instant::now();
+            let selected = use_view.then(|| {
+                crate::views::read::open_published_callgraph(
+                    root.clone(),
+                    family.clone(),
+                    view.view_dir().to_path_buf(),
+                    &generation,
+                    pin.clone(),
+                )
+                .unwrap()
+            });
+            opens += start.elapsed();
+            let reader = selected.as_ref().unwrap_or(&legacy);
+            let start = Instant::now();
+            caller_count = reader.callers_of(path, symbol, 3).unwrap().callers.len();
+            callers += start.elapsed();
+            let start = Instant::now();
+            impact_count = reader.impact_of(path, symbol, 3).unwrap().callers.len();
+            impact += start.elapsed();
+        }
+        assert!(caller_count > 0 && impact_count > 0);
+        eprintln!("navigation_read source={} queries=10 open_us={} callers_us={} impact_us={} callers={} impacted={}", if use_view { "view_reopened" } else { "legacy_retained" }, opens.as_micros()/10, callers.as_micros()/10, impact.as_micros()/10, caller_count, impact_count);
+        rows.push((caller_count, impact_count));
+    }
+    assert_eq!(rows[0], rows[1]);
 }
