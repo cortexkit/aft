@@ -136,6 +136,7 @@ pub fn prepare_checkout(
     request: &AssemblyRequest,
     phase: &mut impl FnMut(&str) -> Result<()>,
 ) -> Result<PreparedAssembly> {
+    let mut timing = super::profile::PublicationTiming::new(&request.project_root);
     let mut profile = PublicationProfile::new(&request.project_root);
     profile.enter(0, phase)?;
     let view = ViewStore::open(&request.storage, &request.scope)?;
@@ -149,10 +150,12 @@ pub fn prepare_checkout(
         .as_deref()
         .map(|generation| view.load_manifest(generation))
         .transpose()?;
+    timing.phase("previous_manifest");
     let head_started = Instant::now();
     let head = head_tree_entries(&request.project_root)
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
     profile.head_ms = head_started.elapsed().as_millis();
+    timing.phase("head_tree");
     let mut callgraph = BlobStore::open(
         &request.storage,
         request.family.clone(),
@@ -168,6 +171,7 @@ pub fn prepare_checkout(
     let mut aliases = AliasStore::open(&request.storage, &request.family)
         .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
 
+    timing.phase("store_opens");
     let previous_entries = previous
         .as_ref()
         .map(|manifest| {
@@ -252,23 +256,13 @@ pub fn prepare_checkout(
                         let payload = if callgraph_is_current {
                             None
                         } else {
-                            let blob = if resolution_input {
-                                CallgraphBlob::config(source.clone(), CALLGRAPH_PRODUCER_VERSION)
-                            } else {
-                                CallgraphBlob::extract(
-                                    std::str::from_utf8(&source).map_err(|error| {
-                                        ViewError::InvalidManifest(error.to_string())
-                                    })?,
-                                    language,
-                                    CALLGRAPH_PRODUCER_VERSION,
-                                )
-                                .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
-                            };
-                            Some(
-                                blob.to_bytes().map_err(|error| {
-                                    ViewError::InvalidManifest(error.to_string())
-                                })?,
-                            )
+                            missing_callgraph_payload(
+                                &callgraph,
+                                &key,
+                                &source,
+                                language,
+                                resolution_input,
+                            )?
                         };
                         Ok::<_, ViewError>((key, payload))
                     })
@@ -297,6 +291,7 @@ pub fn prepare_checkout(
         }
     }
 
+    timing.phase("candidate_assembly");
     profile.candidates = candidates.len();
     profile.assembly_ms = assembly_started.elapsed().as_millis();
 
@@ -347,6 +342,7 @@ pub fn prepare_checkout(
         profile,
     };
     prepared.profile.enter(1, phase)?;
+    timing.phase("assembly_pin");
     let mut blob_puts = 0;
     for candidate in &candidates {
         let (Some(key), Some(payload)) = (&candidate.key, &candidate.payload) else {
@@ -377,6 +373,7 @@ pub fn prepare_checkout(
         }
     }
 
+    timing.phase("blob_and_alias_puts");
     prepared.profile.blob_puts = blob_puts;
     prepared.profile.pending_paths = blocking_paths.len() + semantic_pending_paths.len();
     let mut status = PathStatusStore::open(view.view_dir())
@@ -410,6 +407,7 @@ pub fn prepare_checkout(
                 .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
         }
     }
+    timing.phase("path_status");
     prepared.report.pending_paths = semantic_pending_paths;
 
     let manifest = Manifest::new(
@@ -852,6 +850,83 @@ impl PublicationClosure for SqliteClosure {
 
     fn contains_alias(&self, _git_oid: &str) -> Result<bool> {
         Ok(true)
+    }
+}
+
+fn missing_callgraph_payload(
+    store: &BlobStore,
+    key: &FullKey,
+    source: &[u8],
+    language: &str,
+    resolution_input: bool,
+) -> Result<Option<Vec<u8>>> {
+    // A branch return can name content absent from the previous manifest but
+    // already stored by an earlier generation. Validate that payload before
+    // paying for extraction, serialization, and an immutable no-op put.
+    if store
+        .get(key)
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
+        .is_some()
+    {
+        return Ok(None);
+    }
+    let blob = if resolution_input {
+        CallgraphBlob::config(source.to_vec(), CALLGRAPH_PRODUCER_VERSION)
+    } else {
+        CallgraphBlob::extract(
+            std::str::from_utf8(source)
+                .map_err(|error| ViewError::InvalidManifest(error.to_string()))?,
+            language,
+            CALLGRAPH_PRODUCER_VERSION,
+        )
+        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?
+    };
+    Ok(Some(blob.to_bytes().map_err(|error| {
+        ViewError::InvalidManifest(error.to_string())
+    })?))
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::*;
+
+    #[test]
+    fn views_corrupt_cached_payload_is_not_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = BlobStore::open(dir.path(), "corrupt", BlobPlane::Callgraph).unwrap();
+        let source = b"export function target() {}";
+        let key = CallgraphKey::for_current(source, "typescript").full_key();
+        let payload = missing_callgraph_payload(&store, &key, source, "typescript", false)
+            .unwrap()
+            .unwrap();
+        store.put(&key, &payload).unwrap();
+        Connection::open(store.path())
+            .unwrap()
+            .execute("UPDATE blob_payloads SET payload_digest = zeroblob(32)", [])
+            .unwrap();
+        assert!(
+            missing_callgraph_payload(&store, &key, source, "typescript", false)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn views_cached_callgraph_payload_does_not_extract_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = BlobStore::open(dir.path(), "reuse", BlobPlane::Callgraph).unwrap();
+        let source = b"export function target() {}";
+        let key = CallgraphKey::for_current(source, "typescript").full_key();
+        let payload = missing_callgraph_payload(&store, &key, source, "typescript", false)
+            .unwrap()
+            .unwrap();
+        store.put(&key, &payload).unwrap();
+        assert!(
+            missing_callgraph_payload(&store, &key, source, "typescript", false)
+                .unwrap()
+                .is_none(),
+            "cached content must not be extracted or put again"
+        );
     }
 }
 
