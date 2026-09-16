@@ -871,7 +871,7 @@ pub fn resolve_uninitialized_task_layout(
     let session = Arc::new(PinnedDir::open(session_dir)?);
     let directory = session.open_dir_at(OsStr::new(task_id));
     let flat_name = OsString::from(format!("{task_id}.json"));
-    let flat = session.open_file(&flat_name, false);
+    let flat = open_metadata_through_replacement(&session, &flat_name);
     let has_directory = match &directory {
         Ok(_) => true,
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
@@ -1081,6 +1081,42 @@ fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// How many times an open of a task's metadata re-tries a concurrent
+/// replacement before giving up. An attempt only loses if another rename lands
+/// in the microseconds between this open and its link-count check, so a handful
+/// of attempts outlasts even a writer republishing metadata in a loop.
+const METADATA_OPEN_ATTEMPTS: u32 = 8;
+
+/// Open a task's metadata file by name, tolerating a concurrent atomic replace.
+///
+/// Metadata is republished by writing a temporary file and renaming it over the
+/// old name (see `randomized_atomic_replace`), so a reader that opened the
+/// previous file a moment earlier finds it at zero links and is told the
+/// artifact was concurrently replaced (see the link-count semantics on
+/// `validate_regular_handle`). The name already points at the replacement by
+/// then, so re-opening it succeeds; the race is a single rename, not a
+/// sustained condition.
+///
+/// This matters because callers use the layout resolver to decide whether a
+/// task on disk is intact. Reporting a routine metadata write as a resolution
+/// failure makes a healthy task look like a damaged layout, and callers that
+/// quarantine damaged layouts — most destructively the persisted-task GC —
+/// would then rename a live task's whole bundle away just because its metadata
+/// was being written at that moment.
+fn open_metadata_through_replacement(dir: &PinnedDir, name: &OsStr) -> io::Result<File> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        match dir.open_file(name, false) {
+            Err(error)
+                if attempts < METADATA_OPEN_ATTEMPTS
+                    && error.kind() == io::ErrorKind::Interrupted
+                    && error.to_string().contains(ARTIFACT_CONCURRENTLY_REPLACED) => {}
+            other => return other,
+        }
+    }
+}
+
 pub fn read_task(path: &Path) -> io::Result<PersistedTask> {
     let mut file = open_validated_path(path, false)?;
     read_task_file(&mut file)
@@ -1091,7 +1127,7 @@ pub fn read_task_at(task: &ResolvedTask) -> io::Result<PersistedTask> {
         TaskLayout::Directory => OsString::from(METADATA_FILE),
         TaskLayout::Flat => OsString::from(format!("{}.json", task.paths.task_id)),
     };
-    let mut file = task.dirs.control.open_file(&name, false)?;
+    let mut file = open_metadata_through_replacement(&task.dirs.control, &name)?;
     let metadata = read_task_file(&mut file)?;
     if metadata.task_id != task.paths.task_id {
         return Err(io::Error::new(

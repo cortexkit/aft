@@ -1252,6 +1252,75 @@ fn cleanup_finished_retains_undelivered_terminals() {
         .is_some());
 }
 
+/// Task metadata is republished by writing a temporary file and renaming it
+/// over the old name. A reader that opened the previous file microseconds
+/// earlier finds it at zero links and is told the artifact was concurrently
+/// replaced. That is a routine write landing, not a damaged layout, so the
+/// layout resolver must not report it as a failure to resolve: the persisted
+/// sweep quarantines every layout it cannot resolve, which would rename a
+/// healthy task's whole bundle away while its own metadata was being written.
+///
+/// The window is one rename wide, so the test drives both sides in a loop and
+/// asserts the bundle is still there afterwards. It can therefore miss the race
+/// on a very slow machine, but it can never fail on code that handles it.
+#[test]
+fn gc_persisted_keeps_a_task_whose_metadata_is_being_rewritten() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let task_id = "bash-0000000000000119";
+    // Running and undelivered: the sweep's delete path cannot apply to this
+    // task at all, so anything that removes it came from the quarantine path.
+    let paths = fake_task(
+        storage.path(),
+        project.path(),
+        SESSION,
+        task_id,
+        BgTaskStatus::Running,
+        false,
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_stop = Arc::clone(&stop);
+    let json_path = paths.json.clone();
+    let project_path = project.path().to_path_buf();
+    // Stands in for replay rewriting a recovered task's metadata.
+    let writer = std::thread::spawn(move || {
+        let mut metadata = PersistedTask::starting(
+            task_id.to_string(),
+            SESSION.to_string(),
+            "true".to_string(),
+            project_path.clone(),
+            Some(project_path),
+            None,
+            true,
+            true,
+        );
+        metadata.status = BgTaskStatus::Running;
+        while !writer_stop.load(Ordering::SeqCst) {
+            write_task(&json_path, &metadata).unwrap();
+        }
+    });
+
+    let registry = registry();
+    let mut swept = 0;
+    while swept < 4_000 && paths.json.exists() {
+        registry.maybe_gc_persisted(storage.path()).unwrap();
+        swept += 1;
+    }
+    stop.store(true, Ordering::SeqCst);
+    writer.join().unwrap();
+
+    let quarantine = storage.path().join("bash-tasks-quarantine");
+    assert!(
+        !quarantine.exists(),
+        "sweep {swept} quarantined a task while its metadata was being rewritten"
+    );
+    assert!(
+        paths.json.exists(),
+        "sweep {swept} removed a task while its metadata was being rewritten"
+    );
+}
+
 #[test]
 fn replay_session_recovers_killing_state() {
     let project = tempfile::tempdir().unwrap();
