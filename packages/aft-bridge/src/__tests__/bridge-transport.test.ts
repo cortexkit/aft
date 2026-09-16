@@ -625,19 +625,16 @@ process.stdin.on("data", (chunk) => {
       expect(siblingMessage).toContain("triggering_request_id=3");
       expect(siblingMessage).toContain('triggering_tool="aft_inspect"');
       expect(siblingMessage).toContain("bridge_generation=1");
-      expect(siblingMessage).toContain(
-        'aborted_siblings=[{"request_id":"4","tool":"read"}]',
-      );
+      expect(siblingMessage).toContain('aborted_siblings=[{"request_id":"4","tool":"read"}]');
 
       const killLog = logs.find(
-        ({ level, message }) => level === "error" && message.includes("Bridge killed after timeout"),
+        ({ level, message }) =>
+          level === "error" && message.includes("Bridge killed after timeout"),
       );
       expect(killLog?.message).toContain("triggering_request_id=3");
       expect(killLog?.message).toContain('triggering_tool="aft_inspect"');
       expect(killLog?.message).toContain("bridge_generation=1");
-      expect(killLog?.message).toContain(
-        'aborted_siblings=[{"request_id":"4","tool":"read"}]',
-      );
+      expect(killLog?.message).toContain('aborted_siblings=[{"request_id":"4","tool":"read"}]');
       expect(killLog?.meta).toEqual({ sessionId: "timeout-session" });
       expect(bridge.isAlive()).toBe(false);
       expect(testBridge.configured).toBe(false);
