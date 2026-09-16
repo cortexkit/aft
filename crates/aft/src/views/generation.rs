@@ -262,7 +262,7 @@ fn checkpoint_derived(path: &Path, connection: Option<&Connection>) -> Result<()
 /// Run the generation-sized checkpoint after pointer publication. A later
 /// publication cancels a not-yet-started obsolete job; its clone has already
 /// forced the source checkpoint through [`clone_derived`].
-pub(super) fn schedule_derived_checkpoint(path: PathBuf, connection: Connection) {
+pub(super) fn schedule_derived_checkpoint(path: PathBuf, connection: Connection, root: PathBuf) {
     let key = path.parent().unwrap_or(&path).to_path_buf();
     let cancelled = Arc::new(AtomicBool::new(false));
     let job = DeferredCheckpointJob {
@@ -289,7 +289,9 @@ pub(super) fn schedule_derived_checkpoint(path: PathBuf, connection: Connection)
         .spawn(move || {
             std::thread::sleep(DEFERRED_CHECKPOINT_IDLE_DELAY);
             let started = Instant::now();
-            if !cancelled.load(Ordering::Acquire) {
+            let mut io = super::io::Window::new();
+            let skipped = cancelled.load(Ordering::Acquire);
+            if !skipped {
                 match checkpoint_derived(&path, Some(&connection)) {
                     Ok(()) => log::info!(
                         "view derived checkpoint completed ms={} path={}",
@@ -303,6 +305,19 @@ pub(super) fn schedule_derived_checkpoint(path: PathBuf, connection: Connection)
                     ),
                 }
             }
+            // Include the keeper close: it may checkpoint even a superseded job.
+            drop(connection);
+            crate::slog_info!(
+                "index_event kind=view_checkpoint root={} generation={} skipped={} {}",
+                root.display(),
+                path.file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown")
+                    .strip_prefix("derived-")
+                    .unwrap_or("unknown"),
+                skipped,
+                io.finish()
+            );
             let mut jobs = DEFERRED_CHECKPOINTS
                 .get_or_init(|| Mutex::new(HashMap::new()))
                 .lock()
@@ -386,7 +401,11 @@ mod tests {
         let wal = PathBuf::from(format!("{}-wal", source.display()));
         assert!(fs::metadata(&wal).unwrap().len() > 0);
 
-        schedule_derived_checkpoint(source.clone(), connection);
+        schedule_derived_checkpoint(
+            source.clone(),
+            connection,
+            source.parent().unwrap().to_path_buf(),
+        );
 
         assert!(
             fs::metadata(&wal).is_ok_and(|metadata| metadata.len() > 0),

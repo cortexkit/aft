@@ -3515,24 +3515,26 @@ fn refresh_writable_dead_code_store(
     callgraph_dir: &Path,
     refresh_paths: &[PathBuf],
 ) {
+    let mut io = crate::views::io::Window::new();
     #[cfg(test)]
     LEGACY_VIEW_REFRESHES.with(|count| count.set(count.get() + 1));
     match store.refresh_files(refresh_paths) {
         Ok(stats) => {
             crate::slog_info!(
-                "tier2 dead_code: refreshed callgraph store at {} for {} watcher path(s): changed={} deleted={} refreshed_own={}",
+                "tier2 dead_code: refreshed callgraph store at {} for {} watcher path(s): changed={} deleted={} refreshed_own={} root={} {}",
                 callgraph_dir.display(),
                 refresh_paths.len(),
                 stats.changed_files.len(),
                 stats.deleted_files.len(),
-                stats.refreshed_own_files
+                stats.refreshed_own_files,
+                store.project_root().display(), io.finish()
             );
         }
         Err(error) => {
             crate::slog_warn!(
-                "tier2 dead_code: failed to refresh callgraph store at {} before projection: {}",
+                "tier2 dead_code: failed to refresh callgraph store at {} before projection: {} root={} {}",
                 callgraph_dir.display(),
-                error
+                error, store.project_root().display(), io.finish()
             );
             if let Err(mark_error) = store.mark_files_stale(refresh_paths) {
                 crate::slog_warn!(

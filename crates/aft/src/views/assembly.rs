@@ -94,7 +94,12 @@ impl PreparedAssembly {
                     self.report.published = true;
                     self.files = None;
                     if let Some((path, connection)) = self.derived_checkpoint.take() {
-                        super::generation::schedule_derived_checkpoint(path, connection);
+                        self.profile.finish();
+                        super::generation::schedule_derived_checkpoint(
+                            path,
+                            connection,
+                            self.profile.root.clone(),
+                        );
                     }
                     self.profile.outcome = "published";
                 }
@@ -318,6 +323,7 @@ pub fn prepare_checkout(
         .filter_map(|candidate| candidate.key.clone())
         .collect::<Vec<_>>();
     let next_generation = next_generation(current_generation.as_deref(), &request.desired_head);
+    profile.generation = next_generation.clone();
     let pin = AssemblyPin::create(
         view.view_dir(),
         request.family.clone(),
@@ -415,6 +421,16 @@ pub fn prepare_checkout(
             .into_iter()
             .map(|candidate| (candidate.path, candidate.entry)),
     )?;
+    prepared.profile.semantic_fill = previous.as_ref().is_some_and(|base| {
+        base.entries
+            .iter()
+            .map(|(path, entry)| (path, manifest_entry_callgraph_key(entry)))
+            .eq(manifest
+                .entries
+                .iter()
+                .map(|(path, entry)| (path, manifest_entry_callgraph_key(entry))))
+            && base != &manifest
+    });
     // A publication that reproduces the current manifest byte for byte is a
     // no-op: callers fire on triggers that often leave HEAD untouched (a
     // semantic refresh completing, a watcher batch of ignored edits), and each
@@ -443,6 +459,7 @@ pub fn prepare_checkout(
             current_generation.as_deref().expect("reused base"),
         )?;
     }
+    prepared.profile.io.enter(super::io::Phase::Clone);
     let derived = view.derived_path(&next_generation)?;
     let mut cloned_base = false;
     if !reused_derived {
@@ -467,6 +484,7 @@ pub fn prepare_checkout(
             row.get::<_, i64>(0)
         })?;
         prepared.derived_checkpoint = Some((derived.clone(), derived_keeper));
+        prepared.profile.io.enter(super::io::Phase::Materialize);
         let materialization_started = Instant::now();
         let derived_manifest = current_generation
             .as_deref()
@@ -499,6 +517,7 @@ pub fn prepare_checkout(
         }
         prepared.profile.materialization_call_ms = materialization_started.elapsed().as_millis();
     }
+    prepared.profile.io.enter(super::io::Phase::DerivedOther);
     let trigram = view.trigram_path(&next_generation)?;
     fs::write(&trigram, [])?;
     let artifacts = PublicationArtifacts {
@@ -520,6 +539,7 @@ pub fn prepare_checkout(
         trigram,
         connections: Default::default(),
     };
+    prepared.profile.io.enter(super::io::Phase::Closure);
     let closure_started = Instant::now();
     let publication = view.prepare_with_reused_derived(
         &PublicationRequest {
@@ -557,6 +577,11 @@ pub fn prepare_checkout(
 /// prepared generation leaves the actor barrier (including failed attempts).
 struct PublicationProfile {
     root: PathBuf,
+    io: super::io::PublicationIo,
+    overlap: super::io::Overlap,
+    concurrent_publications: u64,
+    semantic_fill: bool,
+    generation: String,
     outcome: &'static str,
     candidates: usize,
     blob_puts: usize,
@@ -581,6 +606,11 @@ impl PublicationProfile {
         let now = Instant::now();
         Self {
             root: root.to_owned(),
+            io: super::io::PublicationIo::new(),
+            overlap: super::io::Overlap::new(true),
+            concurrent_publications: 0,
+            semantic_fill: false,
+            generation: "none".into(),
             outcome: "cancelled_or_failed",
             candidates: 0,
             blob_puts: 0,
@@ -603,6 +633,14 @@ impl PublicationProfile {
 
     fn enter(&mut self, phase: usize, callback: &mut impl FnMut(&str) -> Result<()>) -> Result<()> {
         self.checkpoint();
+        self.io.enter(
+            [
+                super::io::Phase::Manifest,
+                super::io::Phase::Blobs,
+                super::io::Phase::DerivedOther,
+                super::io::Phase::Cas,
+            ][phase],
+        );
         self.active_phase = Some(phase);
         self.phase_started = Instant::now();
         callback(["manifest", "blobs", "derived", "cas"][phase])
@@ -615,6 +653,11 @@ impl PublicationProfile {
     }
 
     fn finish(&mut self) {
+        if self.active_phase.is_none() {
+            return;
+        }
+        self.io.finish();
+        self.concurrent_publications = self.overlap.finish();
         self.checkpoint();
         self.total_ms = self.started.elapsed().as_millis();
     }
@@ -638,7 +681,7 @@ fn publication_profile_line(profile: &PublicationProfile) -> String {
     // pointer transaction is a subset of the cas phase, which also includes
     // waiting to acquire the actor barrier.
     format!(
-        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} derived_clone_ms={} materialization_call_ms={} closure_ms={} materialize_load_bindings_select_ms={} materialize_delete_rows_ms={} materialize_owned_blob_decode_insert_ms={} materialize_join_load_payloads_ms={} materialize_join_decode_bind_index_entries_ms={} materialize_join_index_surface_replay_ms={} materialize_join_decode_resolved_callers_ms={} materialize_join_resolve_record_ms={} materialize_join_dependency_union_ms={} materialize_selected_join_ms={} materialize_write_bindings_ms={} materialize_emit_refs_edges_ms={} materialize_commit_ms={} materialize_cleanup_memory_ms={} materialize_cleanup_connections_ms={} pointer_ms={} total_ms={} derived_bytes={}",
+        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} derived_clone_ms={} materialization_call_ms={} closure_ms={} materialize_load_bindings_select_ms={} materialize_delete_rows_ms={} materialize_owned_blob_decode_insert_ms={} materialize_join_load_payloads_ms={} materialize_join_decode_bind_index_entries_ms={} materialize_join_index_surface_replay_ms={} materialize_join_decode_resolved_callers_ms={} materialize_join_resolve_record_ms={} materialize_join_dependency_union_ms={} materialize_selected_join_ms={} materialize_write_bindings_ms={} materialize_emit_refs_edges_ms={} materialize_commit_ms={} materialize_cleanup_memory_ms={} materialize_cleanup_connections_ms={} pointer_ms={} total_ms={} derived_bytes={} semantic_fill={} generation={} concurrent_publications={} {}",
         profile.root.display(), profile.outcome, profile.candidates, profile.blob_puts,
         profile.pending_paths, profile.phase_ms[0], profile.phase_ms[1],
         profile.phase_ms[2], profile.phase_ms[3], profile.head_ms, profile.assembly_ms,
@@ -662,6 +705,7 @@ fn publication_profile_line(profile: &PublicationProfile) -> String {
         profile.materialization.cleanup_memory_ms,
         profile.materialization.cleanup_connections_ms,
         profile.pointer_ms, profile.total_ms, profile.derived_bytes,
+        profile.semantic_fill, profile.generation, profile.concurrent_publications, profile.io.fields(),
     )
 }
 
@@ -710,6 +754,11 @@ mod tests {
              materialize_emit_refs_edges_ms=22 materialize_commit_ms=23 \
              materialize_cleanup_memory_ms=24 materialize_cleanup_connections_ms=25"
         ));
+        assert!(line.contains("io_scope=process io_available="));
+        assert!(line.contains("manifest_physical_bytes_written="));
+        assert!(line.contains("closure_logical_bytes_written="));
+        assert!(line.contains("total_bytes_read="));
+        assert!(line.contains("semantic_fill=false generation=none concurrent_publications=0"));
         assert_eq!(line.matches("index_event kind=view_publication").count(), 1);
     }
 }

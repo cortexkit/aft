@@ -4282,6 +4282,7 @@ impl CallGraphStore {
         changed_files: &[PathBuf],
         workspace_crate_prefixes: WorkspaceCratePrefixCache,
     ) -> Result<(IncrementalStats, RefreshFilesProfile)> {
+        let _io = crate::views::io::Window::event("legacy_callgraph_refresh", &self.project_root);
         let total_started = Instant::now();
         let mut profile = RefreshFilesProfile::default();
         self.verify_writer_lease()?;
