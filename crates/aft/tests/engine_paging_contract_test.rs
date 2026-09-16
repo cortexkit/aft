@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use serde_json::json;
 
-use aft::commands::semantic_search::{blocks, evidence_descriptor, paging, plan_table, scoring};
+use aft::commands::semantic_search::{
+    blocks, evidence_descriptor, paging, plan_table, scoring, SEMANTIC_ENUMERATION_LIMIT,
+};
 
 use blocks::{BlockBuilder, CanonicalLane, CanonicalListKey, LaneCandidate};
 use evidence_descriptor::EvidenceDescriptor;
@@ -137,6 +139,59 @@ fn numbered_candidates(count: usize) -> Vec<LaneCandidate> {
             )
         })
         .collect()
+}
+
+fn serialized_deep_stream(search: &BlockBuilder, page_size: usize) -> Vec<u8> {
+    let mut stream = Vec::new();
+    for offset in (0..400).step_by(page_size) {
+        let page = serve_public_page(search, request(offset, page_size)).expect("deep page");
+        stream.extend(page.reply.page_stability_units());
+    }
+    assert_eq!(stream.len(), 400, "fixture must cover the frozen depth");
+    serde_json::to_vec(&stream).expect("serialize stability stream")
+}
+
+#[test]
+fn deep_paging_stream_is_page_size_independent_of_public_cap() {
+    const TEST_ONLY_PAGE_SIZE_100: usize = 100;
+
+    let semantic = (0..SEMANTIC_ENUMERATION_LIMIT)
+        .map(|position| {
+            candidate(
+                format!("semantic-{position:04}.rs"),
+                1.0 - position as f32 / 10_000.0,
+                false,
+            )
+        })
+        .collect();
+    let lexical = (0..400)
+        .map(|position| {
+            candidate(
+                format!("lexical-{position:04}.rs"),
+                0.9 - position as f32 / 10_000.0,
+                false,
+            )
+        })
+        .collect();
+    let search = BlockBuilder::new(
+        key("page-size-independent-admission", false),
+        policy(),
+        vec![
+            CanonicalLane::new(SearchLaneKind::Semantic, semantic).expect("semantic lane"),
+            CanonicalLane::new(SearchLaneKind::Lexical, lexical).expect("lexical lane"),
+        ],
+    )
+    .expect("deep paging builder");
+
+    let streams = [10, 25, 50, TEST_ONLY_PAGE_SIZE_100]
+        .map(|page_size| serialized_deep_stream(&search, page_size));
+    assert!(streams.windows(2).all(|pair| pair[0] == pair[1]));
+    assert!(
+        streams[0]
+            .windows(b"semantic-0099.rs".len())
+            .any(|window| window == b"semantic-0099.rs"),
+        "semantic admission must not shrink with the public page cap"
+    );
 }
 
 #[test]

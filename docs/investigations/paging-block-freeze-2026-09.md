@@ -76,4 +76,14 @@ This also explains both invariance observations. After the cap, sizes 10, 25, an
 
 Keep `SEARCH_MAX_TOP_K = 50` for public validation, but introduce a distinct fixed semantic enumeration limit of 100 for both normal and external semantic-index searches. A regression must concatenate one synthetic corpus to depth 400 at page sizes 10, 25, 50, and a test-only 100, compare serialized stability streams byte-for-byte, and prove that a semantic candidate beyond public rank 50 remains admitted. The 100-page path belongs only to the engine test; no public schema or translator limit changes.
 
+The red-first control was:
+
+```text
+running 1 test
+test deep_paging_stream_is_page_size_independent_of_public_cap ... FAILED
+thread 'deep_paging_stream_is_page_size_independent_of_public_cap' panicked:
+semantic admission must not shrink with the public page cap
+test result: FAILED. 0 passed; 1 failed
+```
+
 After the fix, the full 43-row eight-page head replay must be compared with the old four-page reference. `ranked_paths`, metrics, and the common portion of `page_zero_ranked_paths` should be unchanged. A size-50 page-zero list is expected to be the first 50 entries of the old size-100 page-zero list, not byte-equal in length.

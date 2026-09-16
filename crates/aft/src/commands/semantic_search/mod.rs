@@ -126,7 +126,9 @@ use crate::semantic_index::{
 use crate::symbols::{Range, Symbol, SymbolKind};
 
 const DEFAULT_TOP_K: usize = 10;
-const MAX_TOP_K: usize = crate::subc_translate::SEARCH_MAX_TOP_K as usize;
+/// Semantic candidate admission is ranking policy, not a public response-size limit.
+/// Keeping it fixed prevents page-cap changes from rewriting the fused list.
+pub const SEMANTIC_ENUMERATION_LIMIT: usize = 100;
 const DEGRADED_GREP_FILE_LIMIT: usize = 1_000;
 const DEGRADED_GREP_RESULT_LIMIT: usize = 100;
 const DEGRADED_GREP_WALK_BUDGET: Duration = Duration::from_secs(10);
@@ -1480,7 +1482,7 @@ fn handle_external_semantic_or_hybrid_search(
                     |query_vector| {
                         let mut results = semantic_index.search_filtered(
                             &query_vector,
-                            MAX_TOP_K.saturating_add(1),
+                            SEMANTIC_ENUMERATION_LIMIT.saturating_add(1),
                             |file| {
                                 path_allowed_by_include_tests(
                                     file,
@@ -1490,9 +1492,9 @@ fn handle_external_semantic_or_hybrid_search(
                             },
                         );
                         results.retain(|result| result.file.is_file());
-                        semantic_more_available = results.len() > MAX_TOP_K;
+                        semantic_more_available = results.len() > SEMANTIC_ENUMERATION_LIMIT;
                         if semantic_more_available {
-                            results.truncate(MAX_TOP_K);
+                            results.truncate(SEMANTIC_ENUMERATION_LIMIT);
                         }
                         rerank_semantic_candidates(&mut results, &shape, &params.query);
                         results
@@ -3074,7 +3076,7 @@ fn handle_semantic_or_hybrid_search(
 
     // Candidate enumeration is fixed across page sizes so every requested
     // interval is cut from the same ranked tuple.
-    let semantic_limit = MAX_TOP_K;
+    let semantic_limit = SEMANTIC_ENUMERATION_LIMIT;
     let semantic_fetch_limit = semantic_limit.saturating_add(1);
     let mut semantic_results = if let Some(view) = pinned_semantic_view.as_ref() {
         match view_semantic_search(
