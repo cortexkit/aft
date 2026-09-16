@@ -126,7 +126,7 @@ use crate::semantic_index::{
 use crate::symbols::{Range, Symbol, SymbolKind};
 
 const DEFAULT_TOP_K: usize = 10;
-const MAX_TOP_K: usize = 100;
+const MAX_TOP_K: usize = crate::subc_translate::SEARCH_MAX_TOP_K as usize;
 const DEGRADED_GREP_FILE_LIMIT: usize = 1_000;
 const DEGRADED_GREP_RESULT_LIMIT: usize = 100;
 const DEGRADED_GREP_WALK_BUDGET: Duration = Duration::from_secs(10);

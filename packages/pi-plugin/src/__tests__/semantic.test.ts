@@ -40,11 +40,11 @@ function directBackend(
       text: "invalid_request: offset must be an integer between 0 and 100000",
     };
   }
-  if (typeof topK !== "number" || !Number.isInteger(topK) || topK < 1 || topK > 100) {
+  if (typeof topK !== "number" || !Number.isInteger(topK) || topK < 1 || topK > 50) {
     return {
       success: false,
       code: "invalid_request",
-      text: "invalid_request: topK must be an integer between 1 and 100",
+      text: "invalid_request: topK must be an integer between 1 and 50",
     };
   }
   const page = DIRECT_RESULTS.slice(offset, offset + topK);
@@ -326,13 +326,13 @@ describe("aft_search adapter", () => {
     const schema = tool.parameters;
 
     expect(schemaAccepts(schema, { query: "auth", topK: 1 })).toBe(true);
-    expect(schemaAccepts(schema, { query: "auth", topK: 100 })).toBe(true);
+    expect(schemaAccepts(schema, { query: "auth", topK: 50 })).toBe(true);
     expect(schemaAccepts(schema, { query: "auth", offset: 0 })).toBe(true);
     expect(schemaAccepts(schema, { query: "auth", offset: 100000 })).toBe(true);
     expect(schemaAccepts(schema, { query: "auth" })).toBe(true);
     expect(schemaAccepts(schema, { query: "auth", hint: "literal" })).toBe(true);
     expect(schemaAccepts(schema, { query: "auth", topK: 0 })).toBe(false);
-    expect(schemaAccepts(schema, { query: "auth", topK: 101 })).toBe(false);
+    expect(schemaAccepts(schema, { query: "auth", topK: 51 })).toBe(false);
     expect(schemaAccepts(schema, { query: "auth", topK: 1.5 })).toBe(false);
     expect(schemaAccepts(schema, { query: "auth", topK: "10" })).toBe(false);
     expect(schemaAccepts(schema, { query: "auth", offset: -1 })).toBe(false);
@@ -342,7 +342,7 @@ describe("aft_search adapter", () => {
 
     const properties = (schema as { properties: Record<string, Record<string, unknown>> })
       .properties;
-    expect(properties.topK).toMatchObject({ type: "integer", minimum: 1, maximum: 100 });
+    expect(properties.topK).toMatchObject({ type: "integer", minimum: 1, maximum: 50 });
     expect(properties.offset).toMatchObject({ type: "integer", minimum: 0, maximum: 100000 });
     expect(properties.path.description).toContain("different Git project");
     expect(properties.path.description).toContain("not a subdirectory filter");

@@ -82,11 +82,11 @@ function directBackend(
       text: "invalid_request: offset must be an integer between 0 and 100000",
     };
   }
-  if (typeof topK !== "number" || !Number.isInteger(topK) || topK < 1 || topK > 100) {
+  if (typeof topK !== "number" || !Number.isInteger(topK) || topK < 1 || topK > 50) {
     return {
       success: false,
       code: "invalid_request",
-      text: "invalid_request: topK must be an integer between 1 and 100",
+      text: "invalid_request: topK must be an integer between 1 and 50",
     };
   }
   const page = DIRECT_RESULTS.slice(offset, offset + topK);
@@ -362,9 +362,10 @@ describe("semanticTools", () => {
       expect(args.offset.safeParse(value).success).toBe(false);
     }
     expect(args.topK.safeParse(1).success).toBe(true);
-    expect(args.topK.safeParse(100).success).toBe(true);
+    expect(args.topK.safeParse(50).success).toBe(true);
     expect(args.topK.safeParse(0).success).toBe(false);
-    expect(args.topK.safeParse(300).success).toBe(false);
+    expect(args.topK.safeParse(51).success).toBe(false);
+    expect(args.topK.safeParse(100).success).toBe(false);
     expect(args.path.safeParse(projectRoot).success).toBe(true);
     expect(tools.aft_search.description.split("Use `offset`").length - 1).toBe(1);
 
@@ -378,8 +379,8 @@ describe("semanticTools", () => {
     await expect(tools.aft_search.execute({ query: "q", offset: 100001 }, sdkCtx)).rejects.toThrow(
       "offset must be between 0 and 100000",
     );
-    await expect(tools.aft_search.execute({ query: "q", topK: 300 }, sdkCtx)).rejects.toThrow(
-      "topK must be between 1 and 100",
+    await expect(tools.aft_search.execute({ query: "q", topK: 100 }, sdkCtx)).rejects.toThrow(
+      "topK must be between 1 and 50",
     );
   });
 

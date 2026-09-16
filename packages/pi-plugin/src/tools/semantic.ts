@@ -119,9 +119,9 @@ const SearchParams = Type.Object(
     topK: Type.Optional(
       Type.Integer({
         minimum: 1,
-        maximum: 100,
+        maximum: 50,
         default: 10,
-        description: "Maximum number of results (default: 10, max: 100)",
+        description: "Maximum number of results (default: 10, max: 50)",
       }),
     ),
     offset: Type.Optional(

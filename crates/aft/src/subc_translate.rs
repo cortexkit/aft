@@ -26,6 +26,15 @@ pub struct TranslateError {
     pub message: String,
 }
 
+/// Largest `topK` an agent may request from `aft_search`. Seven days of local
+/// telemetry (7,935 calls, 2026-09) showed rows past rank 50 reaching the
+/// session's next three tool calls in about 1% of searches, while topK:100
+/// replies cost roughly four times a default one and were 31% of all search
+/// output tokens. The deep tail stays reachable through `offset`, which is the
+/// cheap shape for "the next ten" rather than re-running retrieval.
+pub const SEARCH_MAX_TOP_K: i64 = 50;
+pub const SEARCH_TOP_K_BOUNDS_MESSAGE: &str = "topK must be between 1 and 50";
+
 fn invalid_request(message: impl Into<String>) -> TranslateError {
     TranslateError {
         code: "invalid_request",
@@ -2044,16 +2053,16 @@ fn translate_search(args: Value) -> Result<Translated, TranslateError> {
 
     let mut out = Map::new();
     out.insert("query".to_string(), Value::String(query.to_string()));
-    let top_k_value =
-        coerce_optional_int_result(map_in.get("topK"), "topK", 0, 100).map_err(|error| {
-            if error.message.starts_with("topK must be between") {
-                invalid_request("topK must be between 1 and 100")
-            } else {
-                error
-            }
-        })?;
+    let top_k_value = coerce_optional_int_result(map_in.get("topK"), "topK", 0, SEARCH_MAX_TOP_K)
+        .map_err(|error| {
+        if error.message.starts_with("topK must be between") {
+            invalid_request(SEARCH_TOP_K_BOUNDS_MESSAGE)
+        } else {
+            error
+        }
+    })?;
     let top_k = match top_k_value {
-        Some(0) => return Err(invalid_request("topK must be between 1 and 100")),
+        Some(0) => return Err(invalid_request(SEARCH_TOP_K_BOUNDS_MESSAGE)),
         Some(value) => value,
         None => 10,
     };
@@ -3460,7 +3469,7 @@ mod tests {
 
     #[test]
     fn search_top_k_outside_public_bounds_is_invalid_request() {
-        for top_k in [serde_json::json!(0), serde_json::json!(101)] {
+        for top_k in [serde_json::json!(0), serde_json::json!(51)] {
             let error = subc_translate_owned(
                 "search",
                 serde_json::json!({"query": "ranked results", "topK": top_k}),

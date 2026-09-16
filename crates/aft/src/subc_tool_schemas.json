@@ -342,10 +342,10 @@
         "type": "string"
       },
       "topK": {
-        "description": "Number of results (default: 10, max: 100)",
+        "description": "Number of results (default: 10, max: 50)",
         "type": "integer",
         "minimum": 1,
-        "maximum": 100
+        "maximum": 50
       },
       "offset": {
         "description": "Zero-based result offset (default: 0, max: 100000).",

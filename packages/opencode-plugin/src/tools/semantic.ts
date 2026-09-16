@@ -122,7 +122,7 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
             "Concept, regex, literal text, filename, or capability to find. Examples: 'fuzzy match with whitespace tolerance', '^export', 'Cargo.lock'.",
           ),
       ),
-      topK: arg(optionalInt(1, 100).describe("Number of results (default: 10, max: 100)")),
+      topK: arg(optionalInt(1, 50).describe("Number of results (default: 10, max: 50)")),
       offset: arg(
         optionalInt(0, 100000).describe("Zero-based result offset (default: 0, max: 100000)."),
       ),
@@ -162,7 +162,7 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
       if (denied) return permissionDeniedResponse(denied);
 
       const rawArgs: Record<string, unknown> = { query };
-      const topK = coerceOptionalInt(args.topK, "topK", 1, 100);
+      const topK = coerceOptionalInt(args.topK, "topK", 1, 50);
       const offset = coerceOptionalInt(args.offset, "offset", 0, 100000);
       const includeTests = typeof args.includeTests === "boolean" ? args.includeTests : undefined;
       if (topK !== undefined) rawArgs.topK = topK;
