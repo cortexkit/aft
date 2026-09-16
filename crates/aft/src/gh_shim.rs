@@ -429,10 +429,7 @@ where
                 }
                 delegate_to_upstream(args)
             } else {
-                refuse(
-                    RefusalCode::AdminTier,
-                    "this action requires GH_SHIM_BYPASS=operator",
-                )
+                refuse(RefusalCode::AdminTier, &admin_refusal_text(&tuple))
             }
         }
         Classification::Governed { tuple, canonical } => {
@@ -461,6 +458,19 @@ where
             "destructive GitHub operations are not available through the shim",
         ),
     }
+}
+
+/// Refusal text for an administration-tier verb reached without the operator
+/// bypass.
+///
+/// It names the verb and describes the tier rather than the mechanism. The
+/// bypass is the sanctioned, audited way to run these verbs, so the text must
+/// not read as a prohibition or as a bare instruction to set an environment
+/// variable: what actually changes is whose identity the call runs under.
+fn admin_refusal_text(tuple: &str) -> String {
+    format!(
+        "`{tuple}` is administration-tier — it runs under the operator's identity, not the bot's. Re-run with GH_SHIM_BYPASS=operator; the shim records an operator-attributed audit line."
+    )
 }
 
 /// Refusal text for an undeclared invocation.
@@ -7293,6 +7303,22 @@ mod tests {
             Classification::Governed { ref tuple, .. }
                 if tuple == "api:PATCH:/repos/*/*/issues/comments/*"
         ));
+    }
+
+    #[test]
+    fn admin_tier_refusal_names_the_verb_and_the_sanctioned_operator_path() {
+        // The bypass is the audited way to run an administration-tier verb, so
+        // the text describes whose identity the call runs under instead of
+        // reading as a prohibition or a bare instruction to set a variable.
+        assert_eq!(
+            admin_refusal_text("pr merge"),
+            "`pr merge` is administration-tier — it runs under the operator's identity, not the bot's. Re-run with GH_SHIM_BYPASS=operator; the shim records an operator-attributed audit line."
+        );
+        assert_eq!(RefusalCode::AdminTier.as_str(), "gh_shim_admin_tier");
+        assert_eq!(
+            refuse(RefusalCode::AdminTier, &admin_refusal_text("pr merge")),
+            REFUSAL_EXIT_STATUS
+        );
     }
 
     #[test]

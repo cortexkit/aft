@@ -346,6 +346,12 @@ fn unclassified_refusal(verb: &str, manifest_version: u64) -> String {
     )
 }
 
+fn admin_refusal(verb: &str) -> String {
+    format!(
+        "gh-shim: gh_shim_admin_tier: `{verb}` is administration-tier — it runs under the operator's identity, not the bot's. Re-run with GH_SHIM_BYPASS=operator; the shim records an operator-attributed audit line.\n"
+    )
+}
+
 fn shim_status(
     project: &Path,
     config_home: &Path,
@@ -837,8 +843,9 @@ fn gh_shim_v9_admin_tuples_differ_from_raw_delete_and_keep_get_mechanical() {
     write_fresh_r3_cache_for_manifest(&state_home, now, 9);
     write_user_config(&config_home, &connection_file, None);
 
-    let expected_admin_refusal =
-        "gh-shim: gh_shim_admin_tier: this action requires GH_SHIM_BYPASS=operator\n";
+    // `run delete` is the admin verb this test compares against the raw API
+    // delete below; the loop derives each verb's own text per iteration.
+    let expected_admin_refusal = admin_refusal("run delete");
     for args in [
         &["repo", "edit", "cortexkit/insula", "--visibility", "public"][..],
         &[
@@ -865,7 +872,7 @@ fn gh_shim_v9_admin_tuples_differ_from_raw_delete_and_keep_get_mechanical() {
         assert!(output.stdout.is_empty());
         assert_eq!(
             String::from_utf8_lossy(&output.stderr),
-            expected_admin_refusal
+            admin_refusal(&format!("{} {}", args[0], args[1]))
         );
     }
 
@@ -973,7 +980,7 @@ fn gh_shim_operator_bypass_does_not_lift_unclassified_refusal_and_keeps_admin_me
     assert!(admin.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&admin.stderr),
-        "gh-shim: gh_shim_admin_tier: this action requires GH_SHIM_BYPASS=operator\n"
+        admin_refusal("repo edit")
     );
     assert!(!recorder.exists());
 }
@@ -994,8 +1001,7 @@ fn gh_shim_v10_workflow_run_admin_tuple_differs_from_raw_dispatch_and_is_version
     write_fresh_v10_manifest(&v10_state, now, 10);
     write_fresh_r3_cache_for_manifest(&v10_state, now, 10);
 
-    let expected_admin_refusal =
-        "gh-shim: gh_shim_admin_tier: this action requires GH_SHIM_BYPASS=operator\n";
+    let expected_admin_refusal = admin_refusal("workflow run");
     let workflow_run = ["workflow", "run", "ci.yml", "--ref", "main"];
     let admin = shim_command(
         &workflow_run,
@@ -1255,8 +1261,7 @@ fn gh_shim_v10_run_rerun_is_operator_bypassed_reads_passthrough_and_cancel_is_re
     write_fresh_r3_cache_for_manifest(&state_home, now, 10);
     write_user_config(&config_home, &connection_file, None);
 
-    let expected_admin_refusal =
-        "gh-shim: gh_shim_admin_tier: this action requires GH_SHIM_BYPASS=operator\n";
+    let expected_admin_refusal = admin_refusal("run rerun");
     let rerun_without_bypass = shim_command(
         &["run", "rerun", "123", "--failed"],
         &project,
@@ -1751,8 +1756,6 @@ fn gh_shim_v11_thread_state_verbs_stay_admin_and_v12_refuses_reason_and_delete_b
     let v11_recorder = temp.path().join("v11-upstream-invocations.txt");
     write_fresh_v11_manifest(&v11_state, now);
     write_fresh_r3_cache_for_manifest(&v11_state, now, 11);
-    let expected_admin_refusal =
-        "gh-shim: gh_shim_admin_tier: this action requires GH_SHIM_BYPASS=operator\n";
     for args in [
         &["issue", "close", "42"][..],
         &["issue", "reopen", "42"][..],
@@ -1774,7 +1777,7 @@ fn gh_shim_v11_thread_state_verbs_stay_admin_and_v12_refuses_reason_and_delete_b
         assert!(output.stdout.is_empty());
         assert_eq!(
             String::from_utf8_lossy(&output.stderr),
-            expected_admin_refusal
+            admin_refusal(&format!("{} {}", args[0], args[1]))
         );
     }
     assert!(
