@@ -18,6 +18,8 @@ pub(crate) struct PhaseTimings {
     pub(crate) write_bindings_ms: u128,
     pub(crate) emit_refs_edges_ms: u128,
     pub(crate) commit_ms: u128,
+    pub(crate) cleanup_memory_ms: u128,
+    pub(crate) cleanup_connections_ms: u128,
 }
 
 thread_local! {
@@ -76,6 +78,8 @@ impl PhaseTimer {
                 (_, "write_bindings") => timings.write_bindings_ms = elapsed_ms,
                 (_, "emit_refs_edges") => timings.emit_refs_edges_ms = elapsed_ms,
                 (_, "commit") => timings.commit_ms = elapsed_ms,
+                (_, "cleanup_memory") => timings.cleanup_memory_ms = elapsed_ms,
+                (_, "cleanup_connections") => timings.cleanup_connections_ms = elapsed_ms,
                 _ => {}
             }
         });

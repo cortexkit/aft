@@ -633,7 +633,7 @@ fn publication_profile_line(profile: &PublicationProfile) -> String {
     // pointer transaction is a subset of the cas phase, which also includes
     // waiting to acquire the actor barrier.
     format!(
-        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} derived_clone_ms={} materialization_call_ms={} closure_ms={} materialize_load_bindings_select_ms={} materialize_delete_rows_ms={} materialize_owned_blob_decode_insert_ms={} materialize_join_load_payloads_ms={} materialize_join_decode_bind_index_entries_ms={} materialize_join_index_surface_replay_ms={} materialize_join_decode_resolved_callers_ms={} materialize_join_resolve_record_ms={} materialize_join_dependency_union_ms={} materialize_selected_join_ms={} materialize_write_bindings_ms={} materialize_emit_refs_edges_ms={} materialize_commit_ms={} pointer_ms={} total_ms={} derived_bytes={}",
+        "index_event kind=view_publication plane=views root={} outcome={} candidates={} blob_puts={} pending_paths={} manifest_ms={} blobs_ms={} derived_ms={} cas_ms={} head_ms={} assembly_ms={} blob_ms={} materialize_ms={} derived_clone_ms={} materialization_call_ms={} closure_ms={} materialize_load_bindings_select_ms={} materialize_delete_rows_ms={} materialize_owned_blob_decode_insert_ms={} materialize_join_load_payloads_ms={} materialize_join_decode_bind_index_entries_ms={} materialize_join_index_surface_replay_ms={} materialize_join_decode_resolved_callers_ms={} materialize_join_resolve_record_ms={} materialize_join_dependency_union_ms={} materialize_selected_join_ms={} materialize_write_bindings_ms={} materialize_emit_refs_edges_ms={} materialize_commit_ms={} materialize_cleanup_memory_ms={} materialize_cleanup_connections_ms={} pointer_ms={} total_ms={} derived_bytes={}",
         profile.root.display(), profile.outcome, profile.candidates, profile.blob_puts,
         profile.pending_paths, profile.phase_ms[0], profile.phase_ms[1],
         profile.phase_ms[2], profile.phase_ms[3], profile.head_ms, profile.assembly_ms,
@@ -654,6 +654,8 @@ fn publication_profile_line(profile: &PublicationProfile) -> String {
         profile.materialization.write_bindings_ms,
         profile.materialization.emit_refs_edges_ms,
         profile.materialization.commit_ms,
+        profile.materialization.cleanup_memory_ms,
+        profile.materialization.cleanup_connections_ms,
         profile.pointer_ms, profile.total_ms, profile.derived_bytes,
     )
 }
@@ -684,6 +686,8 @@ mod tests {
             write_bindings_ms: 21,
             emit_refs_edges_ms: 22,
             commit_ms: 23,
+            cleanup_memory_ms: 24,
+            cleanup_connections_ms: 25,
         };
         let line = publication_profile_line(&profile);
         assert!(line.contains("plane=views root=/checkout outcome=published"));
@@ -698,7 +702,8 @@ mod tests {
              materialize_join_decode_resolved_callers_ms=17 \
              materialize_join_resolve_record_ms=18 materialize_join_dependency_union_ms=19 \
              materialize_selected_join_ms=20 materialize_write_bindings_ms=21 \
-             materialize_emit_refs_edges_ms=22 materialize_commit_ms=23"
+             materialize_emit_refs_edges_ms=22 materialize_commit_ms=23 \
+             materialize_cleanup_memory_ms=24 materialize_cleanup_connections_ms=25"
         ));
         assert_eq!(line.matches("index_event kind=view_publication").count(), 1);
     }

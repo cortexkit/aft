@@ -726,6 +726,13 @@ fn materialize(
     )?;
     transaction.commit()?;
     profile.finish("commit");
+    // Include destruction in the bracket: freeing decoded blobs and closing
+    // SQLite handles happens before the caller observes materialization complete.
+    drop((reader, parsed, nodes, cached));
+    drop(joined.bindings);
+    profile.finish("cleanup_memory");
+    drop((blob_connection, connection));
+    profile.finish("cleanup_connections");
     Ok((stats, profile.into_timings()))
 }
 
