@@ -81,3 +81,52 @@ fn semantic_fill_has_no_derived_writes_or_checkpoint_and_reader_uses_owner() {
     .unwrap();
     assert_eq!(reader.sqlite_path(), owner_path);
 }
+
+#[test]
+fn prepared_callgraph_retains_committed_wal_before_pointer_publication() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    fs::write(project.path().join("lib.rs"), "pub fn retained() {}\n").unwrap();
+    for args in [
+        vec!["init", "--quiet"],
+        vec!["add", "."],
+        vec![
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "base",
+        ],
+    ] {
+        assert!(std::process::Command::new("git")
+            .current_dir(project.path())
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let request = AssemblyRequest {
+        storage: storage.path().to_path_buf(),
+        project_root: project.path().to_path_buf(),
+        family: "wal-family".into(),
+        scope: "wal-scope".into(),
+        desired_head: "head".into(),
+        changed_paths: BTreeSet::new(),
+        semantic_keys: Default::default(),
+        require_semantic: false,
+        allow_blob_put: true,
+    };
+    let prepared = prepare_checkout(&request, &mut |_| Ok(())).unwrap();
+    let (path, _) = prepared
+        .derived_checkpoint
+        .as_ref()
+        .expect("graph checkpoint keeper");
+    let wal = PathBuf::from(format!("{}-wal", path.display()));
+    assert!(
+        fs::metadata(&wal).is_ok_and(|metadata| metadata.len() > 32),
+        "committed graph WAL was checkpointed on writer close before pointer publication"
+    );
+}

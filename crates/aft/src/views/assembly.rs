@@ -461,6 +461,13 @@ pub fn prepare_checkout(
         // when the materializer closes its writer before pointer publication.
         let derived_keeper = Connection::open(&derived)?;
         derived_keeper.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Opening a handle or setting journal_mode alone does not attach its
+        // pager to the WAL. Read the schema so closing the materializer is not
+        // the last WAL connection and cannot checkpoint before publication.
+        derived_keeper.pragma_update(None, "journal_mode", "WAL")?;
+        derived_keeper.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
         prepared.derived_checkpoint = Some((derived.clone(), derived_keeper));
         let materialization_started = Instant::now();
         let derived_manifest = current_generation
