@@ -92,6 +92,9 @@ CREATE TABLE IF NOT EXISTS blob_payloads (
     payload_schema INTEGER NOT NULL,
     created_at_ms INTEGER NOT NULL DEFAULT 0
 ) WITHOUT ROWID;
+-- WITHOUT ROWID stores payload bytes in the primary-key tree. Membership probes
+-- need a separate, narrow tree to avoid reading payload overflow pages.
+CREATE INDEX IF NOT EXISTS blob_membership ON blob_payloads(full_key);
 CREATE TABLE IF NOT EXISTS blob_quarantine (
     full_key BLOB NOT NULL PRIMARY KEY CHECK(length(full_key) = 32)
 ) WITHOUT ROWID;

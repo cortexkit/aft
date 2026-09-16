@@ -13,7 +13,7 @@ fn fixture() -> (tempfile::TempDir, SqliteClosure, Manifest) {
     fs::write(&closure.trigram, []).unwrap();
     for path in [&closure.semantic, &closure.callgraph] {
         let conn = Connection::open(path).unwrap();
-        conn.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB)")
+        conn.execute_batch("CREATE TABLE blob_payloads(full_key BLOB PRIMARY KEY, payload BLOB); CREATE INDEX blob_membership ON blob_payloads(full_key)")
             .unwrap();
         for key in 0..600u16 {
             conn.execute(
@@ -145,5 +145,20 @@ fn bench_closure_probe_strategies() {
         "closure_strategy keys={} per_key_ms={per_key_ms} retained_ms={retained_ms} batch_ms={}",
         keys.len(),
         started.elapsed().as_millis()
+    );
+}
+
+#[test]
+fn closure_membership_queries_use_payload_free_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = BlobStore::open(dir.path(), "membership", BlobPlane::Callgraph).unwrap();
+    let conn = Connection::open(store.path()).unwrap();
+    let sql = format!("EXPLAIN QUERY PLAN {}", membership_query(2));
+    let plan: String = conn
+        .query_row(&sql, [vec![0u8; 32], vec![1u8; 32]], |row| row.get(3))
+        .unwrap();
+    assert!(
+        plan.contains("COVERING INDEX blob_membership"),
+        "membership must not walk payload-bearing WITHOUT ROWID pages: {plan}"
     );
 }

@@ -783,7 +783,9 @@ impl PublicationClosure for SqliteClosure {
             )?);
         }
         let present = connections[&semantic]
-            .prepare_cached("SELECT 1 FROM blob_payloads WHERE full_key = ?1")?
+            .prepare_cached(
+                "SELECT 1 FROM blob_payloads INDEXED BY blob_membership WHERE full_key = ?1",
+            )?
             .query_row([key], |_| Ok(()))
             .optional()?
             .is_some();
@@ -821,10 +823,7 @@ impl PublicationClosure for SqliteClosure {
                 if decoded.is_empty() {
                     continue;
                 }
-                let sql = format!(
-                    "SELECT full_key FROM blob_payloads WHERE full_key IN ({})",
-                    vec!["?"; decoded.len()].join(",")
-                );
+                let sql = membership_query(decoded.len());
                 let mut statement = connection.prepare_cached(&sql)?;
                 for key in statement.query_map(rusqlite::params_from_iter(&decoded), |row| {
                     row.get::<_, Vec<u8>>(0)
@@ -854,6 +853,13 @@ impl PublicationClosure for SqliteClosure {
     fn contains_alias(&self, _git_oid: &str) -> Result<bool> {
         Ok(true)
     }
+}
+
+fn membership_query(count: usize) -> String {
+    format!(
+        "SELECT full_key FROM blob_payloads INDEXED BY blob_membership WHERE full_key IN ({})",
+        vec!["?"; count].join(",")
+    )
 }
 
 fn decode_hex(value: &str) -> Option<Vec<u8>> {
