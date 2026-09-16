@@ -778,10 +778,21 @@ fn configure_materialization_connection(connection: &Connection) -> Result<()> {
     // A detached checkpoint moves these pages into the main file. Keeping the
     // automatic threshold disabled makes that work observable and off-path.
     connection.pragma_update(None, "wal_autocheckpoint", 0)?;
-    // The derived database has several secondary indexes. A publication-sized
-    // page cache avoids rereading their upper levels while deleting and emitting
-    // a bounded diff; temporary path/row sets never need durable spill files.
-    connection.pragma_update(None, "cache_size", -262_144)?;
+    // Real-300 release replay, two runs per setting (mean incremental wall / process
+    // peak RSS): SQLite default 4.245 s / 3,327 MiB; 64 MiB 4.370 s / 3,358
+    // MiB; 256 MiB 4.145 s / 3,571 MiB. The 64 MiB cap is 5.4% slower than
+    // 256 MiB while bounding per-root publication cache growth.
+    #[cfg(not(test))]
+    let cache_kib = Some(65_536_i64);
+    #[cfg(test)]
+    let cache_kib = match std::env::var("AFT_VIEW_BENCH_CACHE_KIB").as_deref() {
+        Ok("default") => None,
+        Ok(value) => Some(value.parse::<i64>().expect("benchmark cache KiB")),
+        Err(_) => Some(65_536_i64),
+    };
+    if let Some(cache_kib) = cache_kib {
+        connection.pragma_update(None, "cache_size", -cache_kib)?;
+    }
     connection.pragma_update(None, "mmap_size", 268_435_456)?;
     connection.pragma_update(None, "temp_store", "MEMORY")?;
     Ok(())

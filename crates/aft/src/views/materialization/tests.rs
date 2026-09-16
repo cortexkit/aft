@@ -1054,3 +1054,39 @@ fn memoized_rust_bindings_keep_import_visibility() {
     );
     assert!(memoized.resolved_bindings < memoized.result.resolution_order.len());
 }
+
+#[test]
+fn memoized_bindings_keep_call_and_value_ref_results_distinct() {
+    let f = fixture();
+    let conn = Connection::open(&f.blobs).unwrap();
+    let current = manifest(
+        &conn,
+        &[(
+            "caller.rs",
+            "struct Foo; fn caller(value: Foo) { Foo(); let _constructor = Foo; let _ = value; }",
+        )],
+    );
+    let reader = ManifestViewBlobReader::new(&conn);
+    let reference = join::JoinResult::from_manifest(&current, &reader).unwrap();
+    let memoized = join::join_selected_manifest(&current, &reader, None, &BTreeMap::new()).unwrap();
+
+    assert_eq!(
+        reference.canonical_serialization(),
+        memoized.result.canonical_serialization()
+    );
+    let foo_rows = memoized
+        .result
+        .rows
+        .iter()
+        .filter(|row| {
+            row.target_symbol.as_deref() == Some("Foo")
+                || row.status == join::ResolutionStatus::Unresolved
+        })
+        .collect::<Vec<_>>();
+    assert!(foo_rows.iter().any(|row| {
+        row.kind == join::BlobRefKind::Call && row.status == join::ResolutionStatus::Resolved
+    }));
+    assert!(foo_rows.iter().any(|row| {
+        row.kind == join::BlobRefKind::ValueRef && row.status == join::ResolutionStatus::Unresolved
+    }));
+}
