@@ -11,6 +11,7 @@ import {
   loadAftConfig,
   resolveBridgePoolTransportOptions,
 } from "../config.js";
+import { debug, log } from "../logger.js";
 import { resolvePluginVersion } from "../plugin-version.js";
 import { registerAftRpc } from "../rpc/register.js";
 import { hoistedV2ToolConsumers } from "../tools/hoisted/v2.js";
@@ -83,6 +84,16 @@ export function makeServerEffect(overrides = {}) {
     // The V2 host already resolved the Location before invoking the plugin. Capture
     // it now so every registration and transport route belongs to that exact scope.
     const location = context.location;
+    // A V1 host's bundled core loader can decode {id, effect} and call this
+    // function with a PluginHost context that has no location. Throws inside the
+    // boot body are discarded by Effect.ignoreCause, so skip when that
+    // capability is missing rather than relying on the throw.
+    if (typeof location?.directory !== "string") {
+      debug("V2 effect skipped: host context has no location");
+      return Effect.void;
+    }
+
+    log("AFT V2 runtime starting");
 
     return Effect.gen(function* () {
       const runtime = yield* Effect.promise(() => bootLocation(context, location, dependencies));

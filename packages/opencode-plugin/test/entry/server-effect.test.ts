@@ -219,4 +219,17 @@ describe("V2 server effect", () => {
 
     expect(events).toEqual(["location:/work/disabled", "config:/work/disabled"]);
   });
+
+  test("returns a no-op when the host context has no location", async () => {
+    const events: string[] = [];
+    const effect = makeServerEffect(testDependencies(events));
+
+    await Effect.runPromise(Effect.scoped(effect({})));
+    await Effect.runPromise(Effect.scoped(effect({ location: undefined })));
+    await Effect.runPromise(
+      Effect.scoped(effect({ location: { directory: 1 } })),
+    );
+
+    expect(events).toEqual([]);
+  });
 });
