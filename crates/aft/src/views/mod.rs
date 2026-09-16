@@ -10,6 +10,7 @@ use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 pub mod assembly;
 mod generation;
+mod profile;
 pub mod materialization;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -736,7 +737,9 @@ impl ViewStore {
             ));
         }
 
+        let mut timing = profile::PublicationTiming::new(&self.view_dir);
         let blob_durability_barrier = crate::blob_store::publication_durability_barrier();
+        timing.phase("closure_lock");
         for path in &request.artifacts.blob_databases {
             if !crate::blob_store::blob_database_needs_durability(path) {
                 continue;
@@ -745,16 +748,23 @@ impl ViewStore {
             crate::blob_store::mark_blob_database_durable(path);
         }
 
+        timing.phase("blob_durability");
+        // A semantic-only fill reuses the pinned base's derived database, which
+        // is already durable; syncing it again would be the closure cost the fill
+        // exists to avoid.
         if reused.is_none() {
             sync_database_wal_without_checkpoint(&request.artifacts.derived_database, observer)?;
         }
+        timing.phase("derived_durability");
         sync_file_and_parent(&request.artifacts.trigram_artifact)?;
         observe(observer, PublicationStep::DerivedAndTrigramDurable);
+        timing.phase("trigram_durability");
 
         if reused.is_none() {
             checkpoint_and_sync_database(&request.artifacts.alias_database, observer, false)?;
         }
         observe(observer, PublicationStep::AliasRowsDurable);
+        timing.phase("alias_durability");
 
         if let Some(previous) = reused {
             // The pinned base already proved closure for immutable shared blobs.
@@ -779,16 +789,19 @@ impl ViewStore {
         }
         observe(observer, PublicationStep::ClosureProbed);
         drop(blob_durability_barrier);
+        timing.phase("closure_probe");
 
         write_manifest_once(&manifest_path, request.manifest)?;
         observe(observer, PublicationStep::ManifestFileWritten);
         sync_directory(&self.view_dir)?;
         observe(observer, PublicationStep::ManifestParentFsynced);
+        timing.phase("manifest_durability");
 
         let pointer = self.open_pointer_connection()?;
         pointer.pragma_update(None, "synchronous", "FULL")?;
         pointer.busy_timeout(Duration::from_millis(20))?;
         sync_directory(&self.view_dir)?;
+        timing.phase("pointer_prepare");
         Ok(PreparedPublication {
             pointer,
             store: self.clone(),
