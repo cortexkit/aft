@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from search_quality_lib import (
-    EVIDENCE_SHA, GateResult, InputFault, STRATA, atomic_write_pair, blake3,
+    EVIDENCE_SHA, PAGE_SIZE, GateResult, InputFault, STRATA, atomic_write_pair, blake3,
     aggregate_real_query, canonical_json, choose_stop, derive_slice_class, estimator, identity_delta,
     included_manifest_ids, invariance_requests, profile_requests, real_query_behavior_diff,
     row_metrics, sample_plan, sha256_bytes, sha256_file, total_gate,
@@ -130,7 +130,7 @@ def sidecar_bytes(manifest_path: Path, reference_bytes: bytes) -> bytes:
 
 def synthetic_documents() -> tuple[dict[str,Any],dict[str,Any],dict[str,Any]]:
     manifest={"schema":"manifest","rows":[{"episode_id":"followup-census:1","include_tests":False,"include_tests_source":"default","mechanism":"topk_cut"}]}
-    row={"episode_id":"followup-census:1","request":{"includeTests":False,"topK":100},"requests":[{"includeTests":False,"topK":100}],"request_count":1,"include_tests_source":"default","pages_fetched":1,"collapse_stop_reason":"exhausted","retrieval_depth":1,"ranked_paths":["opened.rs"]}
+    row={"episode_id":"followup-census:1","request":{"includeTests":False,"topK":PAGE_SIZE},"requests":[{"includeTests":False,"topK":PAGE_SIZE}],"request_count":1,"include_tests_source":"default","pages_fetched":1,"collapse_stop_reason":"exhausted","retrieval_depth":1,"ranked_paths":["opened.rs"]}
     metrics={"mrr_at_10":0.5,"hit_at_1":0.5,"hit_at_5":0.8}
     reference={"schema":"aft-search-score-v1","model_id":"fixture","profile":"single_page","capability":{"schema_path":"fixture.json","schema_sha256":"0"*64,"offset_declared":False},"families":{"exact_recall":dict(metrics),"concept_recall":dict(metrics),"real_query":dict(metrics)},"fixture_groups":{"exact_recall":{"g":dict(metrics)},"concept_recall":{"g":dict(metrics)}},"shapes":{"identifier":dict(metrics)},"mechanisms":{"topk_cut":dict(metrics)},"fixture_results":{"harness-goldens":True,"paging":True},"rows":[dict(row)]}
     score=copy.deepcopy(reference); score["rows"]=[dict(row)]
@@ -143,8 +143,8 @@ def self_test() -> None:
     assert row_metrics([f"p/{i}" for i in range(11)]+["label"],"label")["mrr_at_10"]==0
     assert choose_stop(page_cap=True,exhausted=True,ten_files=True)=="page_cap"
     assert choose_stop(page_cap=False,exhausted=True,ten_files=True)=="exhausted"
-    assert profile_requests("single_page",False)==[{"topK":100}]
-    assert [len(plan) for plan in invariance_requests()]==[10,4,1]
+    assert profile_requests("single_page",False)==[{"topK":PAGE_SIZE}]
+    assert [len(plan) for plan in invariance_requests()]==[10,4,2]
     try: profile_requests("paged",False); raise AssertionError("paged without offset passed")
     except InputFault: pass
     population=[]

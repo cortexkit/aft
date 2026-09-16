@@ -21,11 +21,13 @@ from typing import Any, Iterator, Mapping, Optional, Sequence
 from embedding_fixture_server import Server
 from search_quality_lib import (
     EVIDENCE_SHA,
+    INVARIANCE_DEPTH,
     InputFault,
     aggregate_real_query,
     canonical_json,
     choose_stop,
     collapse_paths,
+    invariance_requests,
     mean_metrics,
     profile_requests,
     row_metrics,
@@ -292,18 +294,14 @@ def _run_requests(client: Any, requests: Sequence[JsonObject], project_root: Pat
 
 
 def _invariance(client: Any, row: Mapping[str, Any], project_root: Path) -> tuple[list[list[JsonObject]], list[str]]:
-    plans = (
-        [{"topK": 10, "offset": offset} for offset in range(0, 100, 10)],
-        [{"topK": 25, "offset": offset} for offset in (0, 25, 50, 75)],
-        [{"topK": 100, "offset": 0}],
-    )
+    plans = invariance_requests()
     sent: list[list[JsonObject]] = []
     collapsed: list[list[str]] = []
     for plan in plans:
         requests = [_request(item, row) for item in plan]
         _, results = _run_requests(client, requests, project_root)
         sent.append(requests)
-        collapsed.append(collapse_paths(results[:100]))
+        collapsed.append(collapse_paths(results[:INVARIANCE_DEPTH]))
     if not collapsed[0] == collapsed[1] == collapsed[2]:
         raise InputFault(f"page_invariance_failed:{row['episode_id']}")
     return sent, collapsed[0]
@@ -342,7 +340,7 @@ def score_manifest_rows(
         invariance_sent: list[list[JsonObject]] = []
         if profile == "paged":
             invariance_sent, invariant_paths = _invariance(client, row, project_root)
-            if invariant_paths != collapse_paths(results[:100]):
+            if invariant_paths != collapse_paths(results[:INVARIANCE_DEPTH]):
                 raise InputFault(f"page_invariance_failed:{row['episode_id']}:scoring")
         metrics = row_metrics(ranked_paths, str(row["opened_file"]))
         scored.append(

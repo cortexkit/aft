@@ -16,6 +16,7 @@ from search_quality import (
     synthetic_documents,
 )
 from search_quality_lib import (
+    PAGE_SIZE,
     InputFault,
     TOOL_CALL_PARITY_FIXTURE_SOURCE,
     included_manifest_ids,
@@ -158,10 +159,10 @@ class PageZeroProjectionTests(unittest.TestCase):
                     "pinned_shape": "mixed",
                     "mechanism": "other",
                     "census_stratum": "short",
-                    "request": {"topK": 100, "offset": 0},
+                    "request": {"topK": PAGE_SIZE, "offset": 0},
                     "requests": [
-                        {"topK": 100, "offset": 0},
-                        {"topK": 100, "offset": 100},
+                        {"topK": PAGE_SIZE, "offset": 0},
+                        {"topK": PAGE_SIZE, "offset": PAGE_SIZE},
                     ],
                     "ranked_paths": ["src/opened.py", "src/later.py"],
                     "page_zero_ranked_paths": ["src/opened.py"],

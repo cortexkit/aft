@@ -30,7 +30,7 @@ from run_exact_recall import (
     validate_corpus,
 )
 from run_real_query import load_capability, load_inputs, materialized_bundle, score_manifest_rows
-from search_quality_lib import aggregate_real_query
+from search_quality_lib import PAGE_SIZE, aggregate_real_query
 from setup_corpus import parse_corpus_toml
 
 HERE = Path(__file__).resolve().parent
@@ -435,7 +435,7 @@ def real_query_family(args: argparse.Namespace, arm: Arm) -> tuple[JsonObject, J
                     rank = None
                 row.update({
                     "query_key": f"real:{row['episode_id']}", "query": source["query"], "expected": opened_file,
-                    "top_k": 100, "rank": rank,
+                    "top_k": PAGE_SIZE, "rank": rank,
                     "dense_diagnostic": dense_probe(
                         args, arm, source["query"], [opened_file]
                     ),
@@ -448,7 +448,7 @@ def real_query_family(args: argparse.Namespace, arm: Arm) -> tuple[JsonObject, J
     aggregate = aggregate_real_query(rows)["family"]
     family = {
         "manifest_sha256": body_cap.sha256_file(manifest_path), "query_count": len(rows),
-        "profile": REAL_QUERY_PROFILE, "top_k": 100,
+        "profile": REAL_QUERY_PROFILE, "top_k": PAGE_SIZE,
         "mrr_at_10": round(float(aggregate["mrr_at_10"]), 6), "hit_at_1": round(float(aggregate["hit_at_1"]), 6),
         "hit_at_5": round(float(aggregate["hit_at_5"]), 6),
         "no_vocabulary_band": aggregate_dense([row["dense_diagnostic"] for row in rows]), "rows": rows,

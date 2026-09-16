@@ -34,7 +34,7 @@ from run_real_query import (
     materialized_bundle,
     score_manifest_rows,
 )
-from search_quality_lib import aggregate_real_query
+from search_quality_lib import PAGE_SIZE, aggregate_real_query
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
@@ -444,7 +444,7 @@ def real_query_family(args: argparse.Namespace, arm: Arm) -> tuple[JsonObject, J
                 "query_key": f"real:{row['episode_id']}",
                 "query": source["query"],
                 "expected": opened_file,
-                "top_k": 100,
+                "top_k": PAGE_SIZE,
                 "rank": rank,
             }
         )
@@ -453,7 +453,7 @@ def real_query_family(args: argparse.Namespace, arm: Arm) -> tuple[JsonObject, J
         "manifest_sha256": sha256_file(manifest_path),
         "query_count": len(rows),
         "profile": REAL_QUERY_PROFILE,
-        "top_k": 100,
+        "top_k": PAGE_SIZE,
         "mrr_at_10": round(float(aggregate["mrr_at_10"]), 6),
         "hit_at_1": round(float(aggregate["hit_at_1"]), 6),
         "hit_at_5": round(float(aggregate["hit_at_5"]), 6),

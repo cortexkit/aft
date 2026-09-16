@@ -24,6 +24,9 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 EVIDENCE_SHA = "30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17"
+PAGE_SIZE = 50
+D_0 = 400
+INVARIANCE_DEPTH = 100
 STRATA = ("identifier", "code_literal", "short", "nl", "log_excerpt")
 STRATUM_COUNTS = {"identifier": 2015, "code_literal": 1718, "short": 799, "nl": 1820, "log_excerpt": 117}
 STRATUM_SHARES = {"identifier": 0.3115, "code_literal": 0.2656, "short": 0.1235, "nl": 0.2813, "log_excerpt": 0.0181}
@@ -367,19 +370,25 @@ def choose_stop(*, page_cap: bool, exhausted: bool, ten_files: bool) -> str:
 
 def profile_requests(profile: str, offset_declared: bool) -> list[dict[str, int]]:
     if profile == "single_page":
-        return [{"topK": 100}]
+        return [{"topK": PAGE_SIZE}]
     if profile == "paged":
         if not offset_declared:
             raise InputFault("illegal_profile:offset_not_declared")
-        return [{"topK": 100, "offset": offset} for offset in (0, 100, 200, 300)]
+        return [
+            {"topK": PAGE_SIZE, "offset": offset}
+            for offset in range(0, D_0, PAGE_SIZE)
+        ]
     raise InputFault(f"illegal_profile:{profile}")
 
 
 def invariance_requests() -> tuple[list[dict[str, int]], ...]:
     return (
-        [{"topK": 10, "offset": offset} for offset in range(0, 100, 10)],
-        [{"topK": 25, "offset": offset} for offset in (0, 25, 50, 75)],
-        [{"topK": 100, "offset": 0}],
+        [{"topK": 10, "offset": offset} for offset in range(0, INVARIANCE_DEPTH, 10)],
+        [{"topK": 25, "offset": offset} for offset in range(0, INVARIANCE_DEPTH, 25)],
+        [
+            {"topK": PAGE_SIZE, "offset": offset}
+            for offset in range(0, INVARIANCE_DEPTH, PAGE_SIZE)
+        ],
     )
 
 
@@ -406,11 +415,17 @@ def validate_profile_score(score: Mapping[str, Any]) -> None:
             raise InputFault(f"request_bound_violation:{row.get('episode_id')}:request_recorder")
         invariance = row.get("invariance_requests", [])
         if profile == "single_page":
-            if len(requests) != 1 or requests[0].get("topK") != 100 or "offset" in requests[0] or invariance:
+            if len(requests) != 1 or requests[0].get("topK") != PAGE_SIZE or "offset" in requests[0] or invariance:
                 raise InputFault(f"request_bound_violation:{row.get('episode_id')}:single_page")
         else:
             offsets = [request.get("offset") for request in requests]
-            if not offset_declared or len(requests) != 4 or offsets != [0, 100, 200, 300] or any(request.get("topK") != 100 for request in requests):
+            expected_offsets = list(range(0, D_0, PAGE_SIZE))
+            if (
+                not offset_declared
+                or len(requests) != len(expected_offsets)
+                or offsets != expected_offsets
+                or any(request.get("topK") != PAGE_SIZE for request in requests)
+            ):
                 raise InputFault(f"request_bound_violation:{row.get('episode_id')}:paged")
             expected_invariance = invariance_requests()
             if not isinstance(invariance, list) or len(invariance) != 3:

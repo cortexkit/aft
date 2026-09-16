@@ -28,7 +28,7 @@ The CI mode exception is narrow: only a complete diff containing the manifest an
 
 `embedding_fixture_server.py` binds loopback only and serves exact keys from checked-in packs. Corpus keys are `(pinned SHA, SHA-256 chunk content, template version)` and query keys are `(SHA-256 query text, template version)`. Unknown keys return `vector_missing`; zero vectors are never substituted. `record_vectors.py` is a separate authoring command requiring an explicit endpoint and is not selected by CI.
 
-`single_page` makes one `topK:100` request with no offset. `paged` requires an explicit schema declaration and a successful 0/100 probe, then permits offsets 0/100/200/300. The 10/4/1 invariance plans are legal public requests. Stop precedence is `page_cap` before `exhausted` before `ten_files`; `depth_cap` is rejected.
+`single_page` makes one request at the product's maximum `topK` with no offset. `paged` requires an explicit schema declaration and a successful page-zero/page-one probe, then uses enough maximum-size pages to cover the frozen 400-result scoring depth. The invariance plans retrieve the same 100 rows with page sizes 10, 25, and the product maximum. The harness keeps that maximum in `PAGE_SIZE`, guarded against `aft_search.topK.maximum` in the checked-in tool-schema artifact, so a future product-cap change fails the harness test by name. Stop precedence is `page_cap` before `exhausted` before `ten_files`; `depth_cap` is rejected.
 
 ## Re-measure assumptions
 

@@ -89,12 +89,15 @@ scripts/telemetry/cost-gate.sh --search-quality --mode record-reference --dry-ru
 The real-query replay extracts the checked-in pinned-tree bundle, starts the
 loopback-only embedding fixture server with empty temporary caches, and calls the
 public `search` tool through standalone AFT's `tool_call` NDJSON command. The
-`single_page` profile sends one explicit `topK: 100` request per row without an
-offset. The `paged` profile requires a declared, working offset, sends four
-100-result scoring pages, and separately executes the 10/4/1 page-size
-invariance plans. Every request forwards the row's recorded `includeTests`
-value. When the pinned product's semantic chunk format intentionally changes,
-refresh the checked-in
+`single_page` profile sends one request at the product's maximum `topK` without
+an offset. The `paged` profile requires a declared, working offset, sends enough
+maximum-size pages to cover the frozen 400-result scoring depth, and separately
+executes page-size invariance plans that retrieve the same 100 rows. The harness
+sets that maximum once as `PAGE_SIZE`; a test compares it with the checked-in
+`aft_search.topK.maximum` schema so a later product-cap change fails by name
+instead of turning every replay row into an invalid request. Every request
+forwards the row's recorded `includeTests` value. When the pinned product's
+semantic chunk format intentionally changes, refresh the checked-in
 allowlist in an authoring environment with
 `python3 benchmarks/aft-search/capture_real_query_vectors.py --allow-vector-authoring`;
 normal gate execution never derives a vector on a miss.
@@ -105,7 +108,7 @@ Run the independently named cases with, for example:
 cd benchmarks/aft-search
 python3 -m unittest -v test_run_real_query.RealQueryRunnerTests.test_runner_is_byte_deterministic_on_the_same_tree
 python3 -m unittest -v test_run_real_query.RealQueryRunnerTests.test_single_page_request_grammar_rejects_an_offset
-python3 -m unittest -v test_run_real_query.RealQueryRunnerTests.test_paged_profile_executes_four_scoring_and_10_4_1_invariance_requests
+python3 -m unittest -v test_run_real_query.RealQueryRunnerTests.test_paged_profile_covers_frozen_depth_and_runs_invariance_requests
 python3 -m unittest -v test_run_real_query.RealQueryRunnerTests.test_stop_token_precedence_is_page_cap_then_exhausted_then_ten_files
 python3 -m unittest -v test_run_real_query.RealQueryRunnerTests.test_missing_exact_recall_corpus_names_provision_command
 python3 -m unittest -v test_run_real_query.RealQueryRunnerTests.test_recorded_include_tests_changes_ranked_paths

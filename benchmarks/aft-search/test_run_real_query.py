@@ -10,7 +10,16 @@ from typing import Any, Mapping
 
 from run_exact_recall import CorpusMissing, validate_corpus
 from run_real_query import assemble_score, score_manifest_rows
-from search_quality_lib import InputFault, canonical_json, choose_stop, validate_profile_score
+from search_quality_lib import (
+    D_0,
+    INVARIANCE_DEPTH,
+    PAGE_SIZE,
+    InputFault,
+    canonical_json,
+    choose_stop,
+    invariance_requests,
+    validate_profile_score,
+)
 from setup_corpus import parse_corpus_toml
 
 
@@ -47,7 +56,7 @@ class CrossBoundaryDuplicateClient(FakeClient):
         offset = int(request.get("offset", 0))
         top_k = int(request["topK"])
         paths = [f"src/file{index:03}.py" for index in range(self.total)]
-        paths[99] = paths[0]
+        paths[PAGE_SIZE - 1] = paths[0]
         selected = paths[offset : offset + top_k]
         return {
             "success": True,
@@ -124,13 +133,38 @@ class RealQueryRunnerTests(unittest.TestCase):
         capability = {"schema_path": "fixture.json", "schema_sha256": "0" * 64, "offset_declared": False}
         client = FakeClient()
         rows = score_manifest_rows(manifest(), "single_page", capability, client, Path("."))
-        self.assertEqual(client.calls, [{"query": "recorded test visibility", "topK": 100, "includeTests": True}])
+        self.assertEqual(
+            client.calls,
+            [
+                {
+                    "query": "recorded test visibility",
+                    "topK": PAGE_SIZE,
+                    "includeTests": True,
+                }
+            ],
+        )
         score = {"profile": "single_page", "capability": capability, "rows": copy.deepcopy(rows)}
         score["rows"][0]["requests"][0]["offset"] = 0
         with self.assertRaisesRegex(InputFault, "request_bound_violation.*single_page"):
             validate_profile_score(score)
 
-    def test_paged_profile_executes_four_scoring_and_10_4_1_invariance_requests(self) -> None:
+    def test_page_size_matches_product_search_schema_maximum(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        schema_path = root / "crates/aft/src/subc_tool_schemas.json"
+        maximum = json.loads(schema_path.read_text())["search"]["properties"]["topK"]["maximum"]
+        self.assertEqual(
+            PAGE_SIZE,
+            maximum,
+            f"{schema_path.relative_to(root)} search.topK.maximum: {maximum}",
+        )
+
+    def test_invariance_plans_never_exceed_page_size(self) -> None:
+        for plan_index, plan in enumerate(invariance_requests()):
+            for request_index, request in enumerate(plan):
+                with self.subTest(plan=plan_index, request=request_index):
+                    self.assertLessEqual(request["topK"], PAGE_SIZE)
+
+    def test_paged_profile_covers_frozen_depth_and_runs_invariance_requests(self) -> None:
         capability = {
             "schema_path": "fixture.json",
             "schema_sha256": "0" * 64,
@@ -139,9 +173,16 @@ class RealQueryRunnerTests(unittest.TestCase):
         }
         client = FakeClient(total=500)
         rows = score_manifest_rows(manifest(), "paged", capability, client, Path("."))
-        self.assertEqual(rows[0]["pages_fetched"], 4)
-        self.assertEqual([len(plan) for plan in rows[0]["invariance_requests"]], [10, 4, 1])
-        self.assertEqual(rows[0]["request_count"], 19)
+        expected_invariance_lengths = [10, 4, 2]
+        self.assertEqual(rows[0]["pages_fetched"], D_0 // PAGE_SIZE)
+        self.assertEqual(
+            [len(plan) for plan in rows[0]["invariance_requests"]],
+            expected_invariance_lengths,
+        )
+        self.assertEqual(
+            rows[0]["request_count"],
+            D_0 // PAGE_SIZE + sum(expected_invariance_lengths),
+        )
         self.assertTrue(capability["probe_pages_differ"])
         validate_profile_score({"profile": "paged", "capability": capability, "rows": rows})
 
@@ -156,9 +197,12 @@ class RealQueryRunnerTests(unittest.TestCase):
             manifest(), "paged", capability, CrossBoundaryDuplicateClient(), Path(".")
         )
         page_zero = rows[0]["page_zero_ranked_paths"]
-        self.assertEqual(len(page_zero), 99)
-        self.assertEqual(page_zero, [f"src/file{index:03}.py" for index in range(99)])
-        self.assertNotIn("src/file099.py", page_zero)
+        self.assertEqual(len(page_zero), PAGE_SIZE - 1)
+        self.assertEqual(
+            page_zero,
+            [f"src/file{index:03}.py" for index in range(PAGE_SIZE - 1)],
+        )
+        self.assertNotIn(f"src/file{PAGE_SIZE - 1:03}.py", page_zero)
 
     def test_stop_token_precedence_is_page_cap_then_exhausted_then_ten_files(self) -> None:
         self.assertEqual(choose_stop(page_cap=True, exhausted=True, ten_files=True), "page_cap")
