@@ -102,7 +102,7 @@ fn fingerprint(manifest: &crate::views::Manifest) -> Result<String> {
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
-fn manifest_callgraph_equivalent(
+pub(super) fn manifest_callgraph_equivalent(
     left: &crate::views::Manifest,
     right: &crate::views::Manifest,
 ) -> bool {

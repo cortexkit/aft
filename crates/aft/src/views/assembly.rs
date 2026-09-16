@@ -433,52 +433,78 @@ pub fn prepare_checkout(
         return Ok(prepared);
     }
     prepared.profile.enter(2, phase)?;
+    let reused_derived = previous
+        .as_ref()
+        .is_some_and(|base| super::materialization::manifest_callgraph_equivalent(base, &manifest))
+        && current_generation
+            .as_deref()
+            .is_some_and(|base| view.derived_path(base).is_ok_and(|path| path.is_file()));
+    if reused_derived {
+        view.reuse_derived(
+            &next_generation,
+            current_generation.as_deref().expect("reused base"),
+        )?;
+    }
     let derived = view.derived_path(&next_generation)?;
     let mut cloned_base = false;
-    let clone_started = Instant::now();
-    if let Some(base) = current_generation.as_deref() {
-        let base_path = view.derived_path(base)?;
-        if base_path.is_file() {
-            super::generation::clone_derived(&base_path, &derived)?;
-            cloned_base = true;
+    if !reused_derived {
+        let clone_started = Instant::now();
+        if let Some(base) = current_generation.as_deref() {
+            let base_path = view.derived_path(base)?;
+            if base_path.is_file() {
+                super::generation::clone_derived(&base_path, &derived)?;
+                cloned_base = true;
+            }
         }
+        prepared.profile.derived_clone_ms = clone_started.elapsed().as_millis();
+        // Keep one connection alive so SQLite does not checkpoint the committed WAL
+        // when the materializer closes its writer before pointer publication.
+        let derived_keeper = Connection::open(&derived)?;
+        derived_keeper.busy_timeout(std::time::Duration::from_secs(5))?;
+        prepared.derived_checkpoint = Some((derived.clone(), derived_keeper));
+        let materialization_started = Instant::now();
+        let derived_manifest = current_generation
+            .as_deref()
+            .filter(|_| cloned_base)
+            .map(|base| {
+                view.derived_owner(base)
+                    .and_then(|owner| view.load_manifest(&owner))
+            })
+            .transpose()?;
+        if let Some(base_manifest) = derived_manifest.as_ref() {
+            let (stats, timings) = super::materialization::apply_manifest_diff_profiled(
+                &derived,
+                base_manifest,
+                &manifest,
+                callgraph.path(),
+            )
+            .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+            prepared.profile.materialization = timings;
+            log::info!(
+                "view manifest diff: generation={} stats={stats:?}",
+                next_generation
+            );
+        } else {
+            crate::callgraph_store::materialize_manifest_view_database(
+                &derived,
+                callgraph.path(),
+                &manifest,
+            )
+            .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
+        }
+        prepared.profile.materialization_call_ms = materialization_started.elapsed().as_millis();
     }
-    prepared.profile.derived_clone_ms = clone_started.elapsed().as_millis();
-    // Keep one connection alive so SQLite does not checkpoint the committed WAL
-    // when the materializer closes its writer before pointer publication.
-    let derived_keeper = Connection::open(&derived)?;
-    derived_keeper.busy_timeout(std::time::Duration::from_secs(5))?;
-    prepared.derived_checkpoint = Some((derived.clone(), derived_keeper));
-    let materialization_started = Instant::now();
-    if let Some(base_manifest) = previous.as_ref().filter(|_| cloned_base) {
-        let (stats, timings) = super::materialization::apply_manifest_diff_profiled(
-            &derived,
-            base_manifest,
-            &manifest,
-            callgraph.path(),
-        )
-        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-        prepared.profile.materialization = timings;
-        log::info!(
-            "view manifest diff: generation={} stats={stats:?}",
-            next_generation
-        );
-    } else {
-        crate::callgraph_store::materialize_manifest_view_database(
-            &derived,
-            callgraph.path(),
-            &manifest,
-        )
-        .map_err(|error| ViewError::InvalidManifest(error.to_string()))?;
-    }
-    prepared.profile.materialization_call_ms = materialization_started.elapsed().as_millis();
     let trigram = view.trigram_path(&next_generation)?;
     fs::write(&trigram, [])?;
     let artifacts = PublicationArtifacts {
-        blob_databases: vec![
-            semantic.path().to_path_buf(),
-            callgraph.path().to_path_buf(),
-        ],
+        blob_databases: if reused_derived {
+            vec![semantic.path().to_path_buf()]
+        } else {
+            vec![
+                semantic.path().to_path_buf(),
+                callgraph.path().to_path_buf(),
+            ]
+        },
         derived_database: derived.clone(),
         trigram_artifact: trigram.clone(),
         alias_database: aliases.path().to_path_buf(),
@@ -490,7 +516,7 @@ pub fn prepare_checkout(
         connections: Default::default(),
     };
     let closure_started = Instant::now();
-    let publication = view.prepare_with_observer(
+    let publication = view.prepare_with_reused_derived(
         &PublicationRequest {
             generation: &next_generation,
             base_generation: current_generation.as_deref(),
@@ -499,7 +525,11 @@ pub fn prepare_checkout(
             closure_requirements: ClosureRequirements::default(),
         },
         &closure,
-        None,
+        if reused_derived {
+            previous.as_ref()
+        } else {
+            None
+        },
     )?;
     prepared.profile.closure_ms = closure_started.elapsed().as_millis();
     prepared.profile.derived_bytes = fs::metadata(&derived)
@@ -852,3 +882,7 @@ fn read_symlink_bytes(path: &Path) -> Result<Vec<u8>> {
 #[cfg(test)]
 #[path = "closure_connection_tests.rs"]
 mod closure_connection_tests;
+
+#[cfg(test)]
+#[path = "semantic_fill_tests.rs"]
+mod semantic_fill_tests;

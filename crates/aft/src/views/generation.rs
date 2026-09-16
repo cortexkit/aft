@@ -17,8 +17,39 @@ use super::{Result, ViewError, ViewStore};
 
 impl ViewStore {
     pub fn derived_path(&self, generation: &str) -> Result<PathBuf> {
+        let owner = self.derived_owner(generation)?;
+        Ok(self.view_dir().join(format!("derived-{owner}.sqlite")))
+    }
+
+    pub(super) fn derived_owner(&self, generation: &str) -> Result<String> {
         super::validate_generation(generation)?;
-        Ok(self.view_dir().join(format!("derived-{generation}.sqlite")))
+        match fs::read_to_string(self.view_dir().join(format!("derived-{generation}.ref"))) {
+            Ok(owner) => {
+                super::validate_generation(&owner)?;
+                Ok(owner)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(generation.to_owned()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(super) fn reuse_derived(&self, generation: &str, base: &str) -> Result<()> {
+        super::validate_generation(generation)?;
+        // Serialize new ownership references with sweeping across processes. The
+        // caller keeps the base pin until this durable reference is visible.
+        let mut pointer = self.open_pointer_connection()?;
+        let _ownership =
+            pointer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let owner = self.derived_owner(base)?;
+        let path = self.view_dir().join(format!("derived-{generation}.ref"));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        use std::io::Write as _;
+        file.write_all(owner.as_bytes())?;
+        file.sync_all()?;
+        super::sync_parent(&path)
     }
 
     pub fn trigram_path(&self, generation: &str) -> Result<PathBuf> {
@@ -62,12 +93,25 @@ impl ViewStore {
     /// Remove generation files only after checking both durable publication and
     /// liveness. A dead assembler can leave a derived file before any manifest.
     pub fn sweep_generations(&self) -> Result<usize> {
+        // A publisher cannot add a reference after the ownership snapshot and
+        // release its base pin before the sweep checks that pin.
+        let mut pointer = self.open_pointer_connection()?;
+        let _ownership =
+            pointer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let current = self.current_generation()?;
         let mut generations = std::collections::BTreeSet::new();
+        let mut derived_owners = std::collections::BTreeSet::new();
         for entry in fs::read_dir(self.view_dir())? {
             let entry = entry?;
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
+            if let Some(generation) = name
+                .strip_prefix("derived-")
+                .and_then(|s| s.strip_suffix(".ref"))
+            {
+                generations.insert(generation.to_owned());
+                derived_owners.insert(self.derived_owner(generation)?);
+            }
             let generation = name
                 .strip_prefix("derived-")
                 .and_then(|s| s.strip_suffix(".sqlite"))
@@ -89,7 +133,9 @@ impl ViewStore {
         }
         let mut removed = 0;
         for generation in generations {
-            if current.as_deref() == Some(&generation) {
+            // Even an obsolete reference protects its owner until the next sweep.
+            // This keeps shared files alive without depending on directory order.
+            if current.as_deref() == Some(&generation) || derived_owners.contains(&generation) {
                 continue;
             }
             let (metadata_path, keys_path) = crate::pins::pin_paths(self.view_dir(), &generation);
@@ -141,7 +187,8 @@ impl ViewStore {
             }
         }
         for path in [
-            self.derived_path(generation),
+            Ok(self.view_dir().join(format!("derived-{generation}.sqlite"))),
+            Ok(self.view_dir().join(format!("derived-{generation}.ref"))),
             self.trigram_path(generation),
             self.manifest_path(generation),
         ]
@@ -436,4 +483,39 @@ fn try_clone(source: &Path, destination: &Path) -> bool {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn try_clone(_source: &Path, _destination: &Path) -> bool {
     false
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+
+    #[test]
+    fn ownership_reference_waits_for_sweep_pointer_lock() {
+        let storage = tempfile::tempdir().unwrap();
+        let view = ViewStore::open(storage.path(), "ownership-test").unwrap();
+        let mut pointer = view.open_pointer_connection().unwrap();
+        let ownership = pointer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx.send(view.reuse_derived("fill", "base")).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            matches!(
+                done_rx.recv_timeout(Duration::from_millis(200)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "ownership reference escaped the sweep lock"
+        );
+        drop(ownership);
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        worker.join().unwrap();
+    }
 }

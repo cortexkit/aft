@@ -5142,7 +5142,8 @@ impl ReadonlyCallGraphStore {
         generation: &str,
         pin: Option<Arc<crate::pins::QueryPin>>,
     ) -> Result<Self> {
-        let generation_path = view_dir.join(format!("derived-{generation}.sqlite"));
+        let generation_path = crate::views::resolve_derived_path(&view_dir, generation)
+            .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
         // Older publications used one checkout-wide database. Keep them readable
         // until the first generation-owned publication replaces their handle.
         let sqlite_path = if generation_path.is_file() {

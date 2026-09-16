@@ -26,6 +26,13 @@ const POINTER_DATABASE: &str = "pointer.sqlite";
 const POINTER_BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 const FILE_OPEN_RETRY_TIMEOUT: Duration = Duration::from_millis(5_000);
 
+pub(crate) fn resolve_derived_path(view_dir: &Path, generation: &str) -> Result<PathBuf> {
+    ViewStore {
+        view_dir: view_dir.to_path_buf(),
+    }
+    .derived_path(generation)
+}
+
 /// Errors raised while constructing, verifying, or publishing a view.
 #[derive(Debug)]
 pub enum ViewError {
@@ -697,6 +704,25 @@ impl ViewStore {
         closure: &impl PublicationClosure,
         observer: Option<&dyn PublicationObserver>,
     ) -> Result<PreparedPublication> {
+        self.prepare_inner(request, closure, observer, None)
+    }
+
+    pub(super) fn prepare_with_reused_derived(
+        &self,
+        request: &PublicationRequest<'_>,
+        closure: &impl PublicationClosure,
+        previous: Option<&Manifest>,
+    ) -> Result<PreparedPublication> {
+        self.prepare_inner(request, closure, None, previous)
+    }
+
+    fn prepare_inner(
+        &self,
+        request: &PublicationRequest<'_>,
+        closure: &impl PublicationClosure,
+        observer: Option<&dyn PublicationObserver>,
+        reused: Option<&Manifest>,
+    ) -> Result<PreparedPublication> {
         validate_generation(request.generation)?;
         if request.manifest.path_identity_version != PATH_IDENTITY_VERSION {
             return Err(ViewError::InvalidManifest(
@@ -719,14 +745,38 @@ impl ViewStore {
             crate::blob_store::mark_blob_database_durable(path);
         }
 
-        sync_database_wal_without_checkpoint(&request.artifacts.derived_database, observer)?;
+        if reused.is_none() {
+            sync_database_wal_without_checkpoint(&request.artifacts.derived_database, observer)?;
+        }
         sync_file_and_parent(&request.artifacts.trigram_artifact)?;
         observe(observer, PublicationStep::DerivedAndTrigramDurable);
 
-        checkpoint_and_sync_database(&request.artifacts.alias_database, observer, false)?;
+        if reused.is_none() {
+            checkpoint_and_sync_database(&request.artifacts.alias_database, observer, false)?;
+        }
         observe(observer, PublicationStep::AliasRowsDurable);
 
-        probe_publication_closure(request.manifest, &request.closure_requirements, closure)?;
+        if let Some(previous) = reused {
+            // The pinned base already proved closure for immutable shared blobs.
+            // A semantic-only fill must validate just the newly referenced keys.
+            let old_keys = previous
+                .plane_keys()
+                .map(|(plane, key)| (plane == ArtifactPlane::Semantic, key))
+                .collect::<BTreeSet<_>>();
+            let new_keys = request
+                .manifest
+                .plane_keys()
+                .filter(|(plane, key)| {
+                    !old_keys.contains(&(*plane == ArtifactPlane::Semantic, *key))
+                })
+                .collect::<Vec<_>>();
+            closure.probe_blobs(&new_keys)?;
+            if !closure.trigram_is_present()? {
+                return Err(ViewError::MissingTrigram);
+            }
+        } else {
+            probe_publication_closure(request.manifest, &request.closure_requirements, closure)?;
+        }
         observe(observer, PublicationStep::ClosureProbed);
         drop(blob_durability_barrier);
 

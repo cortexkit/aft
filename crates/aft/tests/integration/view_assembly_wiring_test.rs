@@ -370,6 +370,36 @@ fn semantic_plane_follows_an_immediately_published_callgraph_plane() {
     assert!(semantic_report.published);
     assert!(semantic_report.pending_paths.is_empty());
     assert_eq!(semantic_report.blob_puts, 0);
+    let fill_generation = semantic_report.generation.unwrap();
+    assert_eq!(
+        view.derived_path(&fill_generation).unwrap(),
+        callgraph_db,
+        "semantic fill must reuse the durable callgraph database, not clone or checkpoint it"
+    );
+    view.sweep_generations().unwrap();
+    assert!(
+        callgraph_db.is_file(),
+        "the fill pins its shared derived owner"
+    );
+    Connection::open(&callgraph_db)
+        .unwrap()
+        .execute_batch("DROP TRIGGER forbid_callgraph_rewrite")
+        .unwrap();
+    fs::write(project.path().join("lib.rs"), "pub fn third() {}\n").unwrap();
+    commit(project.path(), "third");
+    let next = publish_checkout(&request(
+        storage.path(),
+        project.path(),
+        family,
+        scope,
+        BTreeSet::from([b"lib.rs".to_vec()]),
+        true,
+    ))
+    .unwrap();
+    assert!(
+        next.published,
+        "a graph edit after a fill must accept the reused base"
+    );
 }
 
 #[cfg(unix)]
