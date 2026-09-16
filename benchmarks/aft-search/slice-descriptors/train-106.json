@@ -1,14 +1,16 @@
 {
-  "slice_class": "engine_unwired",
+  "slice_class": "non_ranking",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "crates/aft/tests/integration/tool_call_parity_test.rs"
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
   ],
   "slices": [
     "gh-shim-v14-classifier",
     "views-drill-legacy-attribution",
     "playbook-core-loader-notes"
   ],
-  "note": "gh-shim v14 classifier rows + refusal texts; views drill legacy-arm attribution; playbook. No search fence file touched."
+  "note": "No ranking-fence file changes: gh-shim v14 classifier rows + refusal texts; views drill legacy-arm attribution; playbook."
 }
