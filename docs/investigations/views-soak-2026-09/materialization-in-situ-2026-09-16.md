@@ -174,3 +174,156 @@ obtain the exact 69-fixture parity command from the owner. A change to the drill
 cold-readiness contract or runtime scheduling is outside this slice's product
 changes. Review this delivery as a coherent **partial semantic-fill improvement**,
 not a completed performance-target result.
+
+## Continued investigation and final capture (22:29Z)
+
+The earlier blocked attempt is historical; the drill now completes without
+skipping cold readiness. The parent authorized two script fixes:
+
+1. `branch_drill.py::log_metrics` previously overwrote `phase_puts` on every
+   publication. A zero-put semantic fill erased the graph publication's 269/13
+   puts. It now sums root-owned published/no-op phase events within the switch
+   window, without double-counting legacy summary lines. Red-first test:
+   `test_phase_puts_accumulate_across_graph_and_semantic_publications`, `0 != 282`.
+2. The overall cold budget was already 1800 seconds. The failure was the engine's
+   independent 120-second inspect-request deadline. `common.py::wait_cold_work_ready`
+   now retries **only** `inspect_request_timeout` inside the original overall
+   budget, still requiring completed dead-code evidence. Other errors remain
+   fatal. Retry count and elapsed timestamps are retained in warmup JSON.
+   Red-first test: `test_cold_gate_retries_only_inspect_timeout_and_requires_completion`.
+   Both script mutations were restored and followed immediately by all six tests
+   passing. The final real run needed zero retries and completed cold readiness
+   in 582.555 s with explicit `--cold-work-timeout-s 1800`.
+
+### The missing materialization tail was a real keeper bug
+
+`materialization.rs` originally stopped its phase collector immediately after
+transaction commit. Its caller measured the complete return, including cleanup.
+New `cleanup_memory` and `cleanup_connections` phases exposed the difference.
+On the 22:01Z in-situ B legs, memory destruction took 79/85 ms but connection
+close took **578/722 ms**. This was not resolver work.
+
+The assembly's keeper was only `Connection::open` plus `busy_timeout`. That does
+not attach a SQLite pager to the WAL. Even adding `journal_mode=WAL` was
+insufficient on a fresh database. The materializer was therefore closing the last
+actual WAL connection and implicitly checkpointing before publication. The
+offline benchmark, in contrast, executes WAL pragmas/checkpoint on its keeper.
+This is a concrete offline/in-situ lifecycle mismatch, not just a warmer memo.
+
+`assembly.rs` now reads `sqlite_schema` on the WAL-mode keeper before running
+materialization. Red-first
+`views::assembly::semantic_fill_tests::prepared_callgraph_retains_committed_wal_before_pointer_publication`
+failed with `committed graph WAL was checkpointed on writer close before pointer
+publication`. Removing only the schema read with `NON-VACUITY BREAK` fails that
+same test while the semantic-fill test stays green. After restoring from the
+staged live state, both tests pass. Final B-leg connection-close time is **2/1 ms**.
+Durability is preserved: FULL transaction commit and pre-publication WAL fsync
+remain in place; the existing post-publication checkpoint remains scheduled.
+
+### Same-pair offline control: quantify, do not blame load generically
+
+The copied baseline generation 6→7 pair is exactly the HEAD→B publication pair:
+7060→7045 entries, 283 manifest changes for the 298-file checkout transition.
+A SQLite backup of the stopped baseline arm's blob database supplies its payloads.
+No live SQLite file was used as a benchmark writer.
+
+`bench_real_manifest_diff` now samples load at the timed call, not before cargo
+compilation, and compares original per-reference SQL against caller-batched reads
+in the same process. The old implementation is available only in test builds.
+The new `emission_lookup_queries` counter first measured the current per-ref
+behavior; the cross-file parity fixture failed its caller-count bound (2 queries,
+1 dependent caller). The implementation now loads existing reference states once
+per dependent caller. The fixture's complete database snapshot still equals cold
+materialization. Its exact-row-count test changed only the newly introduced
+lookup count from 2 to 1, not any graph/dependency write expectation.
+
+| same-pair sample | load 1m at measured call | old wall / CPU s | batched wall / CPU s |
+|---|---|---:|---:|
+| paired control, before final drill | 7.89→7.45 | 4.440 / 3.347 | 4.445 / 3.315 |
+| immediately following 21:36Z drill | 5.96→5.72→5.90 | 4.406 / 3.283 | 4.946 / 3.695 |
+| final code, after 22:29Z drill and test compilation | 2.76→2.70→2.56 | 4.107 / 3.054 | 3.909 / 3.034 |
+
+Each pair matches cold rows exactly. Lookup SQL executions drop **57051→323**;
+this is a work-bound improvement, not a large or consistently demonstrated wall
+win. The last sample's delete / selected join / emission phases were
+731 / 1273 / 816 ms. The first uninstrumented-load offline attempt took 15.344 s
+wall / 7.894 CPU s; host load was 42.86 before compilation and 59.84 afterward,
+so it cannot be assigned an exact at-call load and is not a controlled comparison.
+
+The previous 3.78-second offline number is reproduced in shape by the 3.909 s
+low-load result. At load near 6, offline was 4.4–4.9 s, versus in-situ
+materialization 6.065/7.926 s before the keeper fix. The measured implicit close
+checkpoint explains a real part of the mismatch; the final in-situ call also
+runs concurrently with other root work whereas the offline replay does not.
+These observations **do not prove that all remaining variation is host load**.
+They do disprove a required full surface rebuild on every switch: the replay
+rebuilt 284 of 4921 surfaces, selected 588 callers, and resolved 96259 refs / 40848
+bindings. Index/surface replay itself remains only tens of milliseconds.
+
+### Final four rows, against supplied card-103 table
+
+Final product commit: `939797122`. Fresh arm storage and raw output:
+`.bg-shell/materialization-keeper/{storage,output}`. Same HEAD/A/B identities as
+baseline. The wrapper held `~/Work/OSS/opencode.aft-drill.lock` until the existing
+drill restored the subject; the lock was released normally. All probes are
+correct, `defects=[]`, and both return legs have zero puts and zero embeds.
+No sibling byte-accounting changes have been integrated into this branch;
+**in-situ per-phase bytes remain pending**, rather than duplicated here.
+
+| switch | supplied views correct s | final correct s | supplied views CPU s | final CPU s | final load start→end | puts | embeds |
+|---|---:|---:|---:|---:|---|---:|---:|
+| HEAD→A | 15.6 | 12.836 | — | 54.00 | 5.31→5.63 | 269 | 3 |
+| A→HEAD | — | 10.661 | — | 42.71 | 5.63→6.28 | 0 | 0 |
+| HEAD→B | 22.2 | 13.564 | 49.2 | 49.00 | 6.28→6.60 | 13 | 1 |
+| B→HEAD | 24.1 | 14.298 | 56.2 | 41.95 | 6.60→6.70 | 0 | 0 |
+
+These lower-load rows are not a causal before/after estimate. Against the supplied
+legacy rows, HEAD→B beats 33 s wall but not 38.2 CPU s; B→HEAD is still slower than
+12 s wall but below the approximate fair 45 CPU s. Updated fairness-slice legacy
+numbers have not been supplied to this branch. The 66.7 CPU-s embed-inclusive
+shape is not substituted for a non-embedding B row.
+
+| publication | derived total ms | clone ms | materialization call ms | closure ms | memory cleanup ms | connection cleanup ms |
+|---|---:|---:|---:|---:|---:|---:|
+| HEAD→A graph | 7319 | 15 | 5542 | 1760 | 82 | 2 |
+| HEAD→A fill | 47 | 0 | 0 | 40 | 0 | 0 |
+| A→HEAD graph | 6011 | 8 | 4663 | 1338 | 80 | 1 |
+| A→HEAD fill | 60 | 0 | 0 | 48 | 0 | 0 |
+| HEAD→B graph | 7603 | 9 | 5715 | 1876 | 88 | 2 |
+| HEAD→B fill | 59 | 0 | 0 | 51 | 0 | 0 |
+| B→HEAD graph | 8102 | 12 | 5552 | 2536 | 82 | 1 |
+| B→HEAD fill | 47 | 0 | 0 | 41 | 0 | 0 |
+
+`derived total` is inclusive. The target **is met for semantic fills** (47–60 ms
+inclusive, zero materialization and no graph checkpoint). The graph-plane ≤5000 ms
+target **is not met**, either inclusively or for both B materialization calls.
+Remaining HEAD→B/B→HEAD phases are selection 579/562, deletion 807/833, owned
+insert/decode 605/599, selected join 1999/1783, binding writes 181/207, emission
+1284/1393, commit 161/84, memory cleanup 88/82 ms; graph closure adds 1876/2536 ms.
+The remaining work is real row/index mutation, selected payload decode/resolution,
+and durable graph closure—not the eliminated empty-fill rewrite or implicit
+last-connection checkpoint. This delivery does not establish that no deeper
+within-fence optimization is possible, and must not be stamped as full performance
+acceptance. It provides a measured bucket answer and two proven lifecycle fixes.
+
+### Final gates and restore evidence
+
+- `cargo test -p agent-file-tools --lib -- views:: executor::view_publication::tests callgraph_store::join::`:
+  66 passed, 3 opt-in benchmarks ignored (69 discovered tests, **not** a claim
+  that this is the separately named 69-fixture parity gate).
+- The selected publication/CAS/migration/schema/pins/staging/assembly integration
+  command above: 44 passed on final product code.
+- `cargo test -p agent-file-tools --test watcher_integration branch_switch`:
+  2 passed on final code (126.84 s), including the return-leg embedding/put checks.
+- Both compiler deny-warnings targets and release build passed on final code.
+- Final offline paired replay passed full cold-row parity.
+- Six Python drill tests passed after each script mutation restore.
+- Caller-read-bound mutation failed only
+  `incremental_rows_match_cold_with_cross_file_relink`, then that exact test passed
+  after restore. Keeper mutation failed only
+  `prepared_callgraph_retains_committed_wal_before_pointer_publication`, with the
+  semantic-fill test green; both passed immediately after restore. Every mutation
+  used the staged live state and recorded nonempty then empty working diff stats.
+- Final AFT inspection completed its wait but reported unavailable Rust LSP
+  diagnostics (broken pipe); compiler checks, not that incomplete report, are the
+  authoritative diagnostic result.
