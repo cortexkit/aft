@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "issue-318-row-too-long",
+    "issue-317-standalone-deferral",
+    "views-materialization-cost"
+  ],
+  "note": "semantic_index.rs: build-time overflow recovery (bisect/shrink/skip); in-budget rows byte-identical. Standalone tool_call deferral + kill attribution. Views materialization bounded deletion. No ranking effect."
+}
