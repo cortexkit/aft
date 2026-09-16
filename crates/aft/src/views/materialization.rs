@@ -37,6 +37,7 @@ pub struct MaterializeStats {
     pub resolved_files: usize,
     pub resolved_refs: usize,
     pub resolved_bindings: usize,
+    pub emission_lookup_queries: usize,
     pub rebuilt_surface_entries: usize,
     pub decoded_caller_blobs: usize,
     pub full_resolution: bool,
@@ -529,8 +530,15 @@ fn materialize(
     // Retain prepared statements across the fan-out. Preparing each statement
     // again costs more than binding many of these small reference rows.
     {
-        let mut same_ref = transaction.prepare("SELECT EXISTS(SELECT 1 FROM refs WHERE ref_id = ?1 AND caller_node IS ?2
-                 AND status = ?3 AND target_node IS ?4 AND target_file IS ?5 AND target_symbol IS ?6)")?;
+        type ExistingRef = (
+            Option<String>,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let mut existing = HashMap::<String, HashMap<String, ExistingRef>>::new();
+        let mut load_refs = transaction.prepare("SELECT ref_id, caller_node, status, target_node, target_file, target_symbol FROM refs WHERE caller_file = ?1")?;
         let mut delete_edge = transaction.prepare("DELETE FROM edges WHERE ref_id = ?1")?;
         let mut delete_ref = transaction.prepare("DELETE FROM refs WHERE ref_id = ?1")?;
         let mut insert_ref = transaction.prepare(
@@ -547,6 +555,8 @@ fn materialize(
                       kind, line, provenance)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'call', ?7, ?8)",
         )?;
+        #[cfg(test)]
+        let mut control_lookup = transaction.prepare("SELECT EXISTS(SELECT 1 FROM refs WHERE ref_id=?1 AND caller_node IS ?2 AND status=?3 AND target_node IS ?4 AND target_file IS ?5 AND target_symbol IS ?6)")?;
         for row in joined.result.rows {
             let caller_path = String::from_utf8(row.caller_path).map_err(|_| {
                 CallGraphStoreError::Unavailable("non-UTF-8 manifest caller path".to_string())
@@ -603,17 +613,52 @@ fn materialize(
                 // caller must be re-linked when target ordinals or resolution change.
                 // Resolve against the complete new manifest: additions, reexports and
                 // configuration changes can affect callers with no previous target.
-                let same: bool = same_ref.query_row(
-                    params![
-                        ref_id,
-                        caller_node,
-                        status,
-                        target_node,
-                        target_path,
-                        target_symbol
-                    ],
-                    |row| row.get(0),
-                )?;
+                #[cfg(test)]
+                let control_same = if tests::PER_REFERENCE_LOOKUP.with(|enabled| enabled.get()) {
+                    stats.emission_lookup_queries += 1;
+                    Some(control_lookup.query_row(
+                        params![
+                            ref_id,
+                            caller_node,
+                            status,
+                            target_node,
+                            target_path,
+                            target_symbol
+                        ],
+                        |row| row.get::<_, bool>(0),
+                    )?)
+                } else {
+                    None
+                };
+                #[cfg(not(test))]
+                let control_same: Option<bool> = None;
+                if control_same.is_none() && !existing.contains_key(&caller_path) {
+                    stats.emission_lookup_queries += 1;
+                    let rows = load_refs
+                        .query_map([&caller_path], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                (
+                                    row.get(1)?,
+                                    row.get(2)?,
+                                    row.get(3)?,
+                                    row.get(4)?,
+                                    row.get(5)?,
+                                ),
+                            ))
+                        })?
+                        .collect::<std::result::Result<HashMap<String, ExistingRef>, _>>()?;
+                    existing.insert(caller_path.clone(), rows);
+                }
+                let same = control_same.unwrap_or_else(|| {
+                    existing[&caller_path].get(&ref_id).is_some_and(|old| {
+                        old.0 == caller_node
+                            && old.1 == status
+                            && old.2 == target_node
+                            && old.3 == target_path
+                            && old.4 == target_symbol
+                    })
+                });
                 if same {
                     continue;
                 }

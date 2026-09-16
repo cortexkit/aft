@@ -3,6 +3,11 @@ use crate::views::{Manifest, ManifestEntry, RegularPlanes, RelPath};
 use rusqlite::types::Value;
 use tempfile::TempDir;
 
+thread_local! {
+    // Offline paired measurements keep the old SQL lookup as an in-process control.
+    pub(super) static PER_REFERENCE_LOOKUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 struct Fixture {
     dir: TempDir,
     blobs: std::path::PathBuf,
@@ -167,6 +172,11 @@ fn incremental_rows_match_cold_with_cross_file_relink() {
         stats.relinked_inserted > 0,
         "fixture must exercise incoming edges"
     );
+    assert!(stats.emission_lookup_queries > 0);
+    assert!(
+        stats.emission_lookup_queries <= stats.dependent_files,
+        "existing refs must be loaded once per dependent caller, not once per reference: {stats:?}"
+    );
     assert_eq!(snapshot(&base), before, "published base remains readable");
 }
 
@@ -192,6 +202,7 @@ fn incremental_writes_only_owned_rows_and_relinks() {
             resolved_files: 3,
             resolved_refs: 2,
             resolved_bindings: 2,
+            emission_lookup_queries: 1,
             rebuilt_surface_entries: 2,
             decoded_caller_blobs: 3,
             full_resolution: false,
@@ -373,8 +384,11 @@ fn bench_real_manifest_diff() {
     let original = temp.join("base.sqlite");
     materialize_manifest_view_database(&original, &blobs, &base).unwrap();
     let mut outputs = Vec::new();
-    for incremental in [false, true] {
-        let db = temp.join(if incremental {
+    for (incremental, per_reference) in [(false, false), (true, true), (true, false)] {
+        PER_REFERENCE_LOOKUP.with(|enabled| enabled.set(per_reference));
+        let db = temp.join(if per_reference {
+            "per-reference.sqlite"
+        } else if incremental {
             "incremental.sqlite"
         } else {
             "cold.sqlite"
@@ -385,18 +399,29 @@ fn bench_real_manifest_diff() {
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE)")
             .unwrap();
         let before = usage();
+        let mut load_before = [0.0; 3];
+        // Sample host load at the measured call, not before compilation.
+        unsafe {
+            libc::getloadavg(load_before.as_mut_ptr(), 3);
+        }
         let start = std::time::Instant::now();
         let stats = materialize(&db, &blobs, &next, incremental.then_some(&base)).unwrap();
         let elapsed = start.elapsed().as_secs_f64();
         let after = usage();
+        let mut load_after = [0.0; 3];
+        unsafe {
+            libc::getloadavg(load_after.as_mut_ptr(), 3);
+        }
+        println!("load_before={load_before:?} load_after={load_after:?}");
         let wal = std::fs::metadata(format!("{}-wal", db.display()))
             .unwrap()
             .len();
-        println!("incremental={incremental} wall_s={elapsed:.3} cpu_s={:.3} physical_bytes={} logical_bytes={} wal_bytes={wal} stats={stats:?}", after.2-before.2, after.0-before.0, after.1-before.1);
+        println!("per_reference={per_reference} incremental={incremental} wall_s={elapsed:.3} cpu_s={:.3} physical_bytes={} logical_bytes={} wal_bytes={wal} stats={stats:?}", after.2-before.2, after.0-before.0, after.1-before.1);
         report_wal_pages(&db);
         outputs.push(snapshot(&db));
     }
     assert_snapshot_parity(&outputs[0], &outputs[1]);
+    assert_snapshot_parity(&outputs[0], &outputs[2]);
 }
 
 #[test]
