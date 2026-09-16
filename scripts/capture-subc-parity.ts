@@ -547,7 +547,7 @@ const TRANSLATE_CASES: TranslateCase[] = [
   { name: "search_default", tool_name: "search", agent_args: { query: "value" } },
   { name: "search_include_tests", tool_name: "search", agent_args: { query: "fixtures", topK: 7, includeTests: true } },
   { name: "search_whitespace_error", tool_name: "search", agent_args: { query: "   " } },
-  { name: "search_invalid_topk", tool_name: "search", expected_error: "topK must be between 1 and 100", agent_args: { query: "value", topK: -1 } },
+  { name: "search_invalid_topk", tool_name: "search", expected_error: "topK must be between 1 and 50", agent_args: { query: "value", topK: -1 } },
   { name: "inspect_scope_topk", tool_name: "inspect", agent_args: { sections: ["diagnostics"], scope: ["src", "docs"], topK: 5 } },
   { name: "inspect_invalid_topk", tool_name: "inspect", expected_error: "topK must be an integer between 1 and 100", agent_args: { topK: 1.5 } },
   { name: "outline_url", tool_name: "outline", agent_args: { target: "https://example.com/doc" } },
