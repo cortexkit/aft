@@ -2091,22 +2091,22 @@
     },
     {
       "path": "docs/design/opencode-v2-plugin-playbook.md",
-      "line": 70,
+      "line": 71,
       "column": 15,
       "token": "filePath",
       "text": "- **`path` / `filePath`:** V2 headers and schemas use canonical `path`; translate to `filePath` only at AFT's V1 read/write/edit execution seam (`packages/opencode-plugin/src/tools/definitions/v2.ts:64-77`; `packages/opencode-plugin/src/tools/definitions/v2.ts:108-115`).",
-      "location": "line 70, column 15",
+      "location": "line 71, column 15",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
       "path": "docs/design/opencode-v2-plugin-playbook.md",
-      "line": 70,
+      "line": 71,
       "column": 87,
       "token": "filePath",
       "text": "- **`path` / `filePath`:** V2 headers and schemas use canonical `path`; translate to `filePath` only at AFT's V1 read/write/edit execution seam (`packages/opencode-plugin/src/tools/definitions/v2.ts:64-77`; `packages/opencode-plugin/src/tools/definitions/v2.ts:108-115`).",
-      "location": "line 70, column 87",
+      "location": "line 71, column 87",
       "ordinal": 2,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
