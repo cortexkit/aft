@@ -555,7 +555,7 @@ process.stdin.on("data", (chunk) => {
     }
   });
 
-  test("repeated silent timeouts escalate to bridge kill and abort siblings", async () => {
+  test("repeated silent timeouts attribute the bridge kill and aborted siblings", async () => {
     const script = writeExecutable(
       "silent-hang.js",
       `#!/usr/bin/env node
@@ -575,26 +575,42 @@ process.stdin.on("data", (chunk) => {
 });
 `,
     );
-    const bridge = new BinaryBridge(script, workDir, { timeoutMs: 1_000, maxRestarts: 0 });
+    const logs: Array<{ level: string; message: string; meta?: LogMeta }> = [];
+    const logger: Logger = {
+      log: (message, meta) => logs.push({ level: "info", message, meta }),
+      warn: (message, meta) => logs.push({ level: "warn", message, meta }),
+      error: (message, meta) => logs.push({ level: "error", message, meta }),
+    };
+    const bridge = new BinaryBridge(script, workDir, {
+      timeoutMs: 1_000,
+      maxRestarts: 0,
+      logger,
+    });
     const testBridge = bridge as unknown as { configured: boolean };
 
     try {
       await bridge.send("configure", { project_root: workDir }, { timeoutMs: 5_000 });
 
-      const first = await bridge.send("first", {}, { timeoutMs: 20 }).then(
-        () => "resolved",
-        (err) => String(err instanceof Error ? err.message : err),
-      );
+      const first = await bridge
+        .toolCall("timeout-session", "first-timeout", {}, { timeoutMs: 20 })
+        .then(
+          () => "resolved",
+          (err) => String(err instanceof Error ? err.message : err),
+        );
       expect(first).toContain("bridge kept warm");
 
-      const secondResult = bridge.send("second", {}, { timeoutMs: 20 }).then(
-        () => "resolved",
-        (err) => String(err instanceof Error ? err.message : err),
-      );
-      const siblingResult = bridge.send("sibling", {}, { timeoutMs: 1_000 }).then<unknown>(
-        () => "resolved",
-        (err) => err,
-      );
+      const secondResult = bridge
+        .toolCall("timeout-session", "aft_inspect", {}, { timeoutMs: 20 })
+        .then(
+          () => "resolved",
+          (err) => String(err instanceof Error ? err.message : err),
+        );
+      const siblingResult = bridge
+        .toolCall("sibling-session", "read", {}, { timeoutMs: 1_000 })
+        .then<unknown>(
+          () => "resolved",
+          (err) => err,
+        );
 
       const [second, sibling] = (await Promise.race([
         Promise.all([secondResult, siblingResult]),
@@ -605,6 +621,24 @@ process.stdin.on("data", (chunk) => {
 
       expect(second).toMatch(/timed out|aborted/);
       expect(sibling).toBeInstanceOf(BridgeTransportUnknownOutcomeError);
+      const siblingMessage = String(sibling instanceof Error ? sibling.message : sibling);
+      expect(siblingMessage).toContain("triggering_request_id=3");
+      expect(siblingMessage).toContain('triggering_tool="aft_inspect"');
+      expect(siblingMessage).toContain("bridge_generation=1");
+      expect(siblingMessage).toContain(
+        'aborted_siblings=[{"request_id":"4","tool":"read"}]',
+      );
+
+      const killLog = logs.find(
+        ({ level, message }) => level === "error" && message.includes("Bridge killed after timeout"),
+      );
+      expect(killLog?.message).toContain("triggering_request_id=3");
+      expect(killLog?.message).toContain('triggering_tool="aft_inspect"');
+      expect(killLog?.message).toContain("bridge_generation=1");
+      expect(killLog?.message).toContain(
+        'aborted_siblings=[{"request_id":"4","tool":"read"}]',
+      );
+      expect(killLog?.meta).toEqual({ sessionId: "timeout-session" });
       expect(bridge.isAlive()).toBe(false);
       expect(testBridge.configured).toBe(false);
     } finally {

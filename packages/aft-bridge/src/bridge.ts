@@ -165,6 +165,8 @@ interface PendingRequest {
   onProgress?: (chunk: { kind: "stdout" | "stderr"; text: string }) => void;
   onSettled?: () => void;
   command: string;
+  tool: string;
+  generation: number;
 }
 
 /** Single configure-time warning produced by the Rust side. */
@@ -415,6 +417,7 @@ export class BinaryBridge implements AftProjectTransport {
   private pending = new Map<string, PendingRequest>();
   private outstandingBackgroundTaskIds = new Set<string>();
   private nextId = 1;
+  private processGeneration = 0;
   private stdoutBuffer = "";
   private stdoutReadOffset = 0;
   private stderrBuffer = "";
@@ -910,6 +913,8 @@ export class BinaryBridge implements AftProjectTransport {
       }
 
       const id = String(this.nextId++);
+      const tool =
+        command === "tool_call" && typeof params.name === "string" ? params.name : command;
       // Wire format: when params contains a key that collides with the protocol
       // envelope (`command`/`method`), nest params under a `params` key so the
       // outer dispatch dispatches on `command: "<bridge command>"` rather than
@@ -998,7 +1003,14 @@ export class BinaryBridge implements AftProjectTransport {
               `${this.errorPrefix} Request "${command}" (id=${id}) timed out after ${effectiveTimeoutMs}ms`,
             ),
           );
-          this.handleTimeout(requestSessionId);
+          this.handleTimeout(
+            {
+              requestId: id,
+              tool: entry.tool,
+              generation: entry.generation,
+            },
+            requestSessionId,
+          );
         }, effectiveTimeoutMs);
 
         const entry: PendingRequest = {
@@ -1007,6 +1019,8 @@ export class BinaryBridge implements AftProjectTransport {
           timer,
           onProgress: options?.onProgress,
           command,
+          tool,
+          generation: this.processGeneration,
         };
         this.pending.set(id, entry);
 
@@ -1438,6 +1452,7 @@ export class BinaryBridge implements AftProjectTransport {
     });
 
     this.process = child;
+    this.processGeneration += 1;
     this.spawnedBinaryFingerprint = readBinaryFingerprint(this.binaryPath);
     this.lastBinaryFingerprintCheckAt = Date.now();
     this.stdoutBuffer = "";
@@ -1631,15 +1646,28 @@ export class BinaryBridge implements AftProjectTransport {
     }
   }
 
-  private handleTimeout(triggeringSessionId?: string): void {
+  private handleTimeout(
+    trigger: { requestId: string; tool: string; generation: number },
+    triggeringSessionId?: string,
+  ): void {
     this.consecutiveRequestTimeouts = 0;
     this.spawnedBinaryFingerprint = null;
+    const abortedSiblings = Array.from(this.pending, ([requestId, entry]) => ({
+      request_id: requestId,
+      tool: entry.tool,
+    }));
+    const attribution =
+      `triggering_request_id=${trigger.requestId} ` +
+      `triggering_tool=${JSON.stringify(trigger.tool)} ` +
+      `bridge_generation=${trigger.generation} ` +
+      `aborted_siblings=${JSON.stringify(abortedSiblings)}`;
     // A timed-out request means the child is about to be SIGKILLed. Reject all
     // sibling in-flight requests now instead of leaving them parked until their
-    // own independent timers fire.
+    // own independent timers fire. Keep the full kill attribution on every
+    // sibling error because the trigger's timeout is otherwise invisible there.
     this.rejectAllPending(
       new BridgeTransportUnknownOutcomeError(
-        `${this.errorPrefix} bridge killed during sibling timeout — request aborted`,
+        `${this.errorPrefix} bridge killed during sibling timeout — request aborted; ${attribution}`,
       ),
     );
     // Forget outstanding background task ids: their removal hooks died with
@@ -1663,18 +1691,12 @@ export class BinaryBridge implements AftProjectTransport {
     const tail = this.formatStderrTail();
     this.stderrTail = [];
     const killedMsg = tail
-      ? `Bridge killed after timeout.${tail}`
-      : `Bridge killed after timeout (see ${this.getLogFilePathVia()})`;
-    if (tail) {
-      if (triggeringSessionId) {
-        this.sessionErrorVia(triggeringSessionId, killedMsg);
-      } else {
-        this.errorVia(killedMsg);
-      }
-    } else if (triggeringSessionId) {
-      this.sessionWarnVia(triggeringSessionId, killedMsg);
+      ? `Bridge killed after timeout; ${attribution}.${tail}`
+      : `Bridge killed after timeout; ${attribution} (see ${this.getLogFilePathVia()})`;
+    if (triggeringSessionId) {
+      this.sessionErrorVia(triggeringSessionId, killedMsg);
     } else {
-      this.warnVia(killedMsg);
+      this.errorVia(killedMsg);
     }
   }
 
