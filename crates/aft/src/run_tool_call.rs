@@ -302,9 +302,15 @@ pub(crate) fn prepare_tool_call(
             binding_guard.as_ref(),
         ),
     };
-    let (command, translated_args) = if crate::subc_translate::supports_tool(bare_name) {
+    let translated_bare_name = match bare_name {
+        // The public tool is registered as `aft_inspect`, while hoisted plugin
+        // callers normally send the translator's bare `inspect` spelling.
+        "aft_inspect" => "inspect",
+        _ => bare_name,
+    };
+    let (command, translated_args) = if crate::subc_translate::supports_tool(translated_bare_name) {
         match crate::subc_translate::subc_translate_owned_with_context(
-            bare_name,
+            translated_bare_name,
             sanitized_args,
             ctx.project_root.as_path(),
             translate_context,

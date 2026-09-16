@@ -1053,25 +1053,44 @@ fn attach_command_for_request(req: &RawRequest) -> String {
     }
 }
 
-fn is_semantic_search_request(req: &RawRequest) -> bool {
-    req.command == "semantic_search"
-        || (req.command == "tool_call"
-            && req.params.get("name").and_then(|value| value.as_str()) == Some("search"))
+fn tool_call_name(req: &RawRequest) -> Option<&str> {
+    (req.command == "tool_call")
+        .then(|| req.params.get("name").and_then(serde_json::Value::as_str))
+        .flatten()
 }
 
-fn cancelled_semantic_search_response(request_id: &str) -> Response {
+fn deferred_tool_call_name(req: &RawRequest) -> Option<&str> {
+    let name = tool_call_name(req)?;
+    let bare_name = name.strip_prefix("aft_").unwrap_or(name);
+    (matches!(
+        bare_name,
+        "search" | "inspect" | "read" | "bash" | "powershell"
+    ) || aft::commands::lsp_navigation::is_lsp_navigation_command(bare_name))
+    .then_some(name)
+}
+
+fn is_semantic_search_request(req: &RawRequest) -> bool {
+    req.command == "semantic_search" || tool_call_name(req).is_some_and(|name| name == "search")
+}
+
+fn cancelled_deferred_response(request_id: &str, command: &str) -> Response {
     Response::error(
         request_id,
         "request_cancelled",
-        "Search request cancelled because its route closed.",
+        format!("{command} request cancelled because its route closed."),
     )
 }
 
-fn handle_semantic_search_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOutcome {
+fn cancelled_semantic_search_response(request_id: &str) -> Response {
+    cancelled_deferred_response(request_id, "Search")
+}
+
+fn handle_dispatch_deferred(req: RawRequest, ctx: Arc<AppContext>) -> DispatchOutcome {
     let request_id = req.id.clone();
     let shutdown_request_id = request_id.clone();
     let session_id = req.session().to_string();
     let attach_command = attach_command_for_request(&req);
+    let shutdown_command = attach_command.clone();
     let cancellation = aft::executor::JobCancellation::new();
     let worker_cancellation = cancellation.clone();
     let worker_session_id = req.session_id.clone();
@@ -1093,12 +1112,12 @@ fn handle_semantic_search_deferred(req: RawRequest, ctx: Arc<AppContext>) -> Dis
             Err(mpsc::TryRecvError::Disconnected) => Some(Response::error(
                 &disconnected_request_id,
                 "internal_error",
-                "semantic search worker disconnected before producing a response",
+                "deferred request worker disconnected before producing a response",
             )),
         }),
         cancellation: Some(cancellation),
         on_shutdown: Some(Box::new(move |_| {
-            cancelled_semantic_search_response(&shutdown_request_id)
+            cancelled_deferred_response(&shutdown_request_id, &shutdown_command)
         })),
     })
 }
@@ -1135,8 +1154,8 @@ fn handle_cancel_request(req: &RawRequest, pending: &mut PendingResponses) -> Re
 
 fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
     aft::commands::tool_call::register_dispatch(dispatch);
-    if is_semantic_search_request(&req) {
-        return handle_semantic_search_deferred(req, Arc::clone(ctx));
+    if is_semantic_search_request(&req) || deferred_tool_call_name(&req).is_some() {
+        return handle_dispatch_deferred(req, Arc::clone(ctx));
     }
     if req.command == "inspect" {
         return aft::commands::inspect::handle_inspect_deferred(&req, Arc::clone(ctx));
@@ -1863,8 +1882,9 @@ mod pending_response_tests {
 #[cfg(test)]
 mod deferred_semantic_search_tests {
     use super::{
-        attach_command_for_request, dispatch, dispatch_outcome, handle_cancel_request,
-        wait_for_semantic_index_before_search, write_ready_pending_to_writer,
+        attach_command_for_request, deferred_tool_call_name, dispatch, dispatch_outcome,
+        handle_cancel_request, wait_for_semantic_index_before_search,
+        write_ready_pending_to_writer,
     };
     use aft::config::{Config, SemanticBackend, SemanticBackendConfig};
     use aft::context::{AppContext, SemanticIndexStatus};
@@ -2135,6 +2155,39 @@ mod deferred_semantic_search_tests {
     }
 
     #[test]
+    fn every_bare_deferred_route_has_a_deferred_tool_call_wrapper() {
+        for name in [
+            "search",
+            "inspect",
+            "read",
+            "bash",
+            "powershell",
+            "lsp_hover",
+            "lsp_goto_definition",
+            "lsp_find_references",
+            "lsp_prepare_rename",
+        ] {
+            let req = request(
+                "deferred-route-audit",
+                "tool_call",
+                serde_json::json!({"name": name, "arguments": {}}),
+            );
+            assert_eq!(
+                deferred_tool_call_name(&req),
+                Some(name),
+                "bare deferred route {name} must defer its tool_call wrapper"
+            );
+        }
+
+        let prefixed = request(
+            "prefixed-inspect-route",
+            "tool_call",
+            serde_json::json!({"name": "aft_inspect", "arguments": {}}),
+        );
+        assert_eq!(deferred_tool_call_name(&prefixed), Some("aft_inspect"));
+    }
+
+    #[test]
     fn deferred_tool_call_search_preserves_inline_response_bytes() {
         let root = tempfile::tempdir().expect("create search project");
         std::fs::write(
@@ -2191,6 +2244,67 @@ mod deferred_semantic_search_tests {
             assert!(
                 Instant::now() < deadline,
                 "timed out waiting for deferred parity response"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert_eq!(deferred_bytes, inline_bytes);
+    }
+
+    #[test]
+    fn deferred_tool_call_inspect_preserves_inline_response_bytes() {
+        let root = tempfile::tempdir().expect("create inspect project");
+        std::fs::write(root.path().join("fixture.rs"), "fn inspect_parity() {}\n")
+            .expect("write parity fixture");
+        let make_ctx = || {
+            Arc::new(AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                Config {
+                    project_root: Some(root.path().to_path_buf()),
+                    ..Config::default()
+                },
+            ))
+        };
+        let make_request = || {
+            request(
+                "parity-inspect",
+                "tool_call",
+                serde_json::json!({
+                    "name": "aft_inspect",
+                    "arguments": {"sections": ["todos"], "scope": "fixture.rs"}
+                }),
+            )
+        };
+
+        aft::commands::tool_call::register_dispatch(dispatch);
+        let inline_ctx = make_ctx();
+        let inline_request = make_request();
+        let inline_attach = attach_command_for_request(&inline_request);
+        let mut inline_response = dispatch(inline_request, &inline_ctx);
+        finalize_response(
+            &mut inline_response,
+            &inline_ctx,
+            "standalone-inspect-test",
+            &inline_attach,
+        );
+        let mut inline_bytes = Vec::new();
+        super::write_response_to_writer(&mut inline_bytes, &inline_response)
+            .expect("serialize inline response");
+
+        let deferred_ctx = make_ctx();
+        let mut pending = register_deferred(dispatch_outcome(make_request(), &deferred_ctx));
+        let mut deferred_bytes = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if write_ready_pending_to_writer(&deferred_ctx, &mut pending, &mut deferred_bytes)
+                .expect("serialize deferred response")
+                == 1
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for deferred inspect parity response"
             );
             thread::sleep(Duration::from_millis(5));
         }

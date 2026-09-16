@@ -364,6 +364,141 @@ fn start_embedding_server() -> (
 }
 
 #[test]
+fn standalone_tool_call_read_finishes_before_slow_inspect() {
+    let temp_dir = tempfile::tempdir().expect("create standalone inspect fixture");
+    let project = temp_dir.path().join("project");
+    let src = project.join("src");
+    let storage = temp_dir.path().join("storage");
+    fs::create_dir_all(&src).expect("create project source directory");
+    fs::write(src.join("main.rs"), "fn main() {}\n").expect("write fixture source");
+    for file_index in 0..2_000 {
+        let mut source = String::with_capacity(1_500);
+        for function_index in 0..20 {
+            source.push_str(&format!(
+                "pub fn fixture_{file_index}_{function_index}(value: usize) -> usize {{ value + {function_index} }}\n"
+            ));
+        }
+        fs::write(src.join(format!("fixture_{file_index}.rs")), source)
+            .expect("write inspect tier-2 fixture");
+    }
+
+    let mut aft = AftProcess::spawn();
+    let configure = aft.send(
+        &serde_json::to_string(&json!({
+            "id": "configure-inspect-liveness",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.display().to_string(),
+            "storage_dir": storage.display().to_string(),
+            "config": user_config(json!({
+                "search_index": false,
+                "semantic_search": false,
+                "callgraph_store": true,
+                "inspect": {"diagnostics_timeout_ms": 15000}
+            }))
+        }))
+        .expect("serialize configure request"),
+    );
+    assert_eq!(
+        configure["success"], true,
+        "configure failed: {configure:#}"
+    );
+
+    let callgraph = aft.send_with_timeout(
+        &serde_json::to_string(&json!({
+            "id": "warm-inspect-callgraph",
+            "command": "callers",
+            "file": src.join("main.rs").display().to_string(),
+            "symbol": "main"
+        }))
+        .expect("serialize callgraph warmup"),
+        Duration::from_secs(30),
+    );
+    assert_eq!(
+        callgraph["success"], true,
+        "callgraph warmup failed: {callgraph:#}"
+    );
+
+    aft.send_silent(
+        &serde_json::to_string(&json!({
+            "id": "slow-tool-call-inspect",
+            "command": "tool_call",
+            "name": "aft_inspect",
+            "arguments": {"sections": ["diagnostics"]}
+        }))
+        .expect("serialize inspect tool call"),
+    );
+    let read_sent = Instant::now();
+    aft.send_silent(
+        &serde_json::to_string(&json!({
+            "id": "sibling-tool-call-read",
+            "command": "tool_call",
+            "name": "read",
+            "arguments": {"path": "src/main.rs"}
+        }))
+        .expect("serialize read tool call"),
+    );
+
+    let liveness = Duration::from_secs(3);
+    let read_deadline = read_sent + liveness;
+    let read = loop {
+        let remaining = read_deadline.saturating_duration_since(Instant::now());
+        assert!(
+            remaining > Duration::ZERO,
+            "read did not finish within the liveness bound while inspect was pending"
+        );
+        let Some(frame) = aft.try_read_next_timeout(remaining.min(Duration::from_millis(100)))
+        else {
+            continue;
+        };
+        assert_ne!(
+            frame["id"], "slow-tool-call-inspect",
+            "inspect answered before the sibling read: {frame:#}"
+        );
+        if frame["id"] == "sibling-tool-call-read" {
+            break frame;
+        }
+    };
+    assert_eq!(read["success"], true, "read failed: {read:#}");
+    assert!(
+        read_sent.elapsed() < liveness,
+        "read exceeded the standalone liveness bound"
+    );
+
+    let cancel = aft.send_with_timeout(
+        &serde_json::to_string(&json!({
+            "id": "cancel-slow-inspect",
+            "command": "cancel_request",
+            "params": {"id": "slow-tool-call-inspect"}
+        }))
+        .expect("serialize inspect cancellation"),
+        Duration::from_secs(3),
+    );
+    assert_eq!(cancel["success"], true, "cancel failed: {cancel:#}");
+    assert_eq!(
+        cancel["cancelled"], true,
+        "cancel missed inspect: {cancel:#}"
+    );
+
+    let (inspect, inspect_finished) =
+        read_response(&mut aft, "slow-tool-call-inspect", Duration::from_secs(15));
+    assert!(
+        inspect_finished > read_sent,
+        "inspect must finish after read"
+    );
+    assert_eq!(
+        inspect["success"], false,
+        "inspect was not cancelled: {inspect:#}"
+    );
+    assert_eq!(
+        inspect["inspect_terminal"], "interrupted",
+        "inspect: {inspect:#}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn standalone_ndjson_status_and_cancel_proceed_while_search_is_pending() {
     let project = tempfile::tempdir().expect("create standalone project");
     let storage = tempfile::tempdir().expect("create standalone storage");
