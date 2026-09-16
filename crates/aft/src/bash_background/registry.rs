@@ -257,6 +257,51 @@ impl RecoveryContext {
     }
 }
 
+/// How much replay recovery a session task directory has seen.
+///
+/// `in_flight` answers "is a recovery running right now"; `finished` makes a
+/// recovery that started and ended inside someone else's observation window
+/// visible, which a flag alone cannot do. Comparing a snapshot against the
+/// current value therefore answers "did any recovery of this session touch it
+/// since I looked", which is what a destructive sweep needs to know.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SessionRecovery {
+    in_flight: usize,
+    finished: u64,
+}
+
+/// Marks a session's task directory as under replay recovery for as long as it
+/// lives. Replay holds one per session it restores; the persisted GC skips a
+/// session whose recovery is in flight and abandons any action on a session a
+/// recovery touched while it was deciding.
+#[doc(hidden)]
+pub struct SessionRecoveryGuard {
+    registry: BgTaskRegistry,
+    key: Option<String>,
+}
+
+impl Drop for SessionRecoveryGuard {
+    fn drop(&mut self) {
+        let Some(key) = self.key.take() else {
+            return;
+        };
+        let mut recoveries = self
+            .registry
+            .inner
+            .session_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(recovery) = recoveries.get_mut(&key) else {
+            return;
+        };
+        recovery.in_flight = recovery.in_flight.saturating_sub(1);
+        recovery.finished = recovery.finished.wrapping_add(1);
+        // The entry outlives the recovery on purpose: a sweep that snapshotted
+        // this session before the recovery started must still be able to see
+        // that one ran, and a removed entry would read as "never touched".
+    }
+}
+
 #[derive(Clone)]
 pub struct BgTaskRegistry {
     pub(crate) inner: Arc<RegistryInner>,
@@ -286,6 +331,11 @@ pub(crate) struct RegistryInner {
     /// integration suite pin that the GC stays off the configure/replay thread
     /// (the replay caller is the standalone request loop).
     persisted_gc_thread: Mutex<Option<String>>,
+    /// Replay-recovery activity per session task directory, keyed by the
+    /// directory's name. Written by `SessionRecoveryGuard`, read by the
+    /// persisted GC so a sweep never judges a session that replay is in the
+    /// middle of restoring.
+    session_recovery: Mutex<HashMap<String, SessionRecovery>>,
     /// Output compression callback. Set by `AppContext` after construction.
     /// Takes (command, raw_output, exit_code) and returns compressed text. Called from
     /// the watchdog thread when a task reaches a terminal state and from
@@ -389,6 +439,7 @@ impl BgTaskRegistry {
                 #[cfg(test)]
                 persisted_gc_runs: AtomicU64::new(0),
                 persisted_gc_thread: Mutex::new(None),
+                session_recovery: Mutex::new(HashMap::new()),
                 compressor: Mutex::new(None),
                 db_pool: RwLock::new(None),
                 db_harness: RwLock::new(None),
@@ -2102,6 +2153,49 @@ impl BgTaskRegistry {
         self.replay_session_inner(storage_dir, session_id, None)
     }
 
+    /// Mark `session_id`'s task directory as under replay recovery until the
+    /// returned guard is dropped.
+    ///
+    /// Recovery rewrites the metadata of every task it restores, so for that
+    /// window the directory's contents are mid-flight rather than settled. The
+    /// persisted GC consults this before it deletes or quarantines anything, so
+    /// a sweep cannot destroy a task the recovery just put back.
+    #[doc(hidden)]
+    pub fn begin_session_recovery(
+        &self,
+        storage_dir: &Path,
+        session_id: &str,
+    ) -> SessionRecoveryGuard {
+        let key = session_recovery_key(storage_dir, session_id);
+        if let Some(key) = key.as_ref() {
+            self.inner
+                .session_recovery
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(key.clone())
+                .or_default()
+                .in_flight += 1;
+        }
+        SessionRecoveryGuard {
+            registry: self.clone(),
+            key,
+        }
+    }
+
+    /// Recovery activity recorded for a session task directory, by its name.
+    fn session_recovery_state(&self, session_dir: &Path) -> SessionRecovery {
+        let Some(key) = session_dir.file_name().and_then(|name| name.to_str()) else {
+            return SessionRecovery::default();
+        };
+        self.inner
+            .session_recovery
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(key)
+            .copied()
+            .unwrap_or_default()
+    }
+
     /// Thread name recorded by the last `maybe_gc_persisted` run, if any.
     /// Recorded as the run exits, so `Some` also means that run has finished.
     #[doc(hidden)]
@@ -2299,6 +2393,11 @@ impl BgTaskRegistry {
         session_id: &str,
         project_root: Option<&Path>,
     ) -> Result<(), String> {
+        // Held for the whole call: from here on this session's task directory is
+        // being rewritten, and the persisted GC below sweeps the same storage
+        // root from another thread. Tasks belonging to other sessions are
+        // guarded as they are recovered, once the replay set is known.
+        let mut recovering = vec![self.begin_session_recovery(storage_dir, session_id)];
         // Standalone NDJSON: every session for a project replays through the same
         // bridge, so replay unions this session into live delivery routes.
         // Only subc route synchronization (subc/mod.rs:2120) replaces the whole set.
@@ -2314,7 +2413,9 @@ impl BgTaskRegistry {
             // past the plugin's 5 s request timeout under load. Replay itself
             // needs only this project's rows, so the GC runs detached; a row it
             // would have deleted is at worst rehydrated as terminal and reaped
-            // by the watchdog.
+            // by the watchdog. Detaching it means it walks the same directories
+            // this replay is rewriting, so the recovery guard above is what
+            // keeps the two apart.
             let registry = self.clone();
             let storage_dir = storage_dir.to_path_buf();
             let spawned = std::thread::Builder::new()
@@ -2367,6 +2468,16 @@ impl BgTaskRegistry {
                 self.replay_session_from_disk(storage_dir, session_id)?
             }
         };
+
+        // A project-scoped replay restores tasks from sessions other than the
+        // one being bound, so guard those directories too before the loop
+        // touches them.
+        let mut guarded = HashSet::from([session_id.to_string()]);
+        for metadata in &tasks {
+            if guarded.insert(metadata.session_id.clone()) {
+                recovering.push(self.begin_session_recovery(storage_dir, &metadata.session_id));
+            }
+        }
 
         for mut metadata in tasks {
             if project_root.is_none() && metadata.session_id != session_id {
@@ -2560,6 +2671,9 @@ impl BgTaskRegistry {
             }
         }
 
+        // Every recovery write for this replay has landed; release the
+        // directories so the sweep can judge them as settled storage.
+        drop(recovering);
         Ok(())
     }
 
@@ -3281,6 +3395,27 @@ impl BgTaskRegistry {
                 if !session_dir.is_dir() {
                     continue;
                 }
+                // Replay recovery rewrites the metadata of every task it
+                // restores, so while it runs this directory's contents are
+                // mid-flight rather than abandoned. Judging a task from a
+                // half-written session is how a sweep ends up destroying a row
+                // the recovery just put back, so skip the session entirely and
+                // leave it to a later sweep.
+                let recovery_before = self.session_recovery_state(&session_dir);
+                if recovery_before.in_flight > 0 {
+                    log::debug!(
+                        "skipping background task session {} during GC: replay recovery in flight",
+                        session_dir.display()
+                    );
+                    continue;
+                }
+                // Nothing below holds the session still, so every destructive
+                // step re-reads this: a recovery that starts and finishes while
+                // the sweep is making up its mind about a task leaves the
+                // sweep's evidence stale, and stale evidence must not destroy.
+                let undisturbed = |registry: &Self| {
+                    registry.session_recovery_state(&session_dir) == recovery_before
+                };
                 let (task_ids, invalid_entries) = match discover_task_ids(&session_dir) {
                     Ok(discovery) => discovery,
                     Err(error) => {
@@ -3292,6 +3427,9 @@ impl BgTaskRegistry {
                     }
                 };
                 for entry in invalid_entries {
+                    if !undisturbed(self) {
+                        break;
+                    }
                     let _ = quarantine_invalid_entry(storage_dir, &session_dir, &entry);
                 }
                 for task_id in task_ids {
@@ -3319,6 +3457,9 @@ impl BgTaskRegistry {
                                 );
                                 continue;
                             }
+                            if !undisturbed(self) {
+                                continue;
+                            }
                             crate::slog_warn!(
                                 "quarantining unresolved background task {task_id}: {error}"
                             );
@@ -3339,6 +3480,9 @@ impl BgTaskRegistry {
                                 );
                                 continue;
                             }
+                            if !undisturbed(self) {
+                                continue;
+                            }
                             crate::slog_warn!(
                                 "quarantining corrupt background task metadata {task_id}: {error}"
                             );
@@ -3356,6 +3500,9 @@ impl BgTaskRegistry {
                         crate::slog_warn!(
                             "refusing to delete terminal background task bundle {task_id}: recorded process is still alive"
                         );
+                        continue;
+                    }
+                    if !undisturbed(self) {
                         continue;
                     }
                     match delete_task_bundle(&resolved.paths) {
@@ -6098,6 +6245,15 @@ impl Default for BgTaskRegistry {
     fn default() -> Self {
         Self::new(Arc::new(Mutex::new(None)))
     }
+}
+
+/// Key for a session's recovery state: the name of its task directory, which
+/// is what the persisted GC has in hand while walking the storage root.
+fn session_recovery_key(storage_dir: &Path, session_id: &str) -> Option<String> {
+    session_tasks_dir(storage_dir, session_id)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
 }
 
 fn modified_within(path: &Path, grace: Duration) -> bool {

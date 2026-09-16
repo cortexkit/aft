@@ -1321,6 +1321,53 @@ fn gc_persisted_keeps_a_task_whose_metadata_is_being_rewritten() {
     );
 }
 
+/// Replay and the persisted sweep both walk the same session task directory,
+/// and replay's recovery rewrites the metadata of every task it restores. A
+/// sweep that reads that directory mid-recovery judges tasks by what it caught
+/// in flight, so it can delete or quarantine a bundle the recovery just put
+/// back. The two must be ordered: while a session is being recovered the sweep
+/// leaves it alone and picks it up afterwards.
+///
+/// The recovery gate is held by this test rather than timed, so the sweep runs
+/// at an exactly chosen point on either side of it.
+#[test]
+fn gc_persisted_defers_a_session_under_replay_recovery() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let paths = fake_task(
+        storage.path(),
+        project.path(),
+        SESSION,
+        "bash-0000000000000120",
+        BgTaskStatus::Completed,
+        true,
+    );
+    // Delivered, terminal and past the grace period: a bundle the sweep is
+    // entitled to delete the moment no recovery is in flight.
+    set_mtime(&paths.json, Duration::from_secs(25 * 60 * 60));
+    let registry = registry();
+
+    {
+        let _recovery = registry.begin_session_recovery(storage.path(), SESSION);
+        assert_eq!(
+            registry.maybe_gc_persisted(storage.path()).unwrap(),
+            0,
+            "sweep collected a session while replay was recovering it"
+        );
+        assert!(
+            paths.json.exists(),
+            "sweep removed a task from a session replay was recovering"
+        );
+    }
+
+    assert_eq!(
+        registry.maybe_gc_persisted(storage.path()).unwrap(),
+        1,
+        "sweep must collect the bundle once the recovery is done"
+    );
+    assert!(!paths.json.exists());
+}
+
 #[test]
 fn replay_session_recovers_killing_state() {
     let project = tempfile::tempdir().unwrap();
