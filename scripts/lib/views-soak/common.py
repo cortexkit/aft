@@ -779,6 +779,7 @@ def wait_cold_work_ready(
     started = time.monotonic()
     deadline = started + timeout_s
     inspect_requested = False
+    inspect_timeout_retries: list[int] = []
     last_status: dict[str, Any] = {}
     last_semantic: str | None = "semantic state not observed"
     last_tier2_ready = False
@@ -796,6 +797,8 @@ def wait_cold_work_ready(
                 "status": last_status,
                 "semantic": "idle",
                 "tier2_dead_code": "complete",
+                "inspect_timeout_retry_count": len(inspect_timeout_retries),
+                "inspect_timeout_retry_elapsed_ms": inspect_timeout_retries,
             }
         if last_semantic is None and not inspect_requested:
             response = client.tool(
@@ -803,6 +806,11 @@ def wait_cold_work_ready(
             )
             inspect_requested = True
             if response.get("success") is not True:
+                if "inspect_request_timeout" in str(response.get("text", "")):
+                    inspect_timeout_retries.append(round((time.monotonic() - started) * 1000))
+                    inspect_requested = False
+                    time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+                    continue
                 raise SoakError(
                     "cold work readiness failed while requesting the tier-2 dead-code pass: "
                     + json.dumps(public_response(response), sort_keys=True)
@@ -818,6 +826,8 @@ def wait_cold_work_ready(
     raise SoakError(
         "cold work readiness timed out; still running: "
         + "; ".join(running)
+        + "; inspect_timeout_retry_elapsed_ms="
+        + json.dumps(inspect_timeout_retries)
         + "; last_status="
         + json.dumps(last_status, sort_keys=True)
     )

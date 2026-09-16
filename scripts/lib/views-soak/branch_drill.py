@@ -351,14 +351,15 @@ def log_metrics(text: str, root: Path) -> tuple[int | None, int | None, int, int
             and phase.group("outcome") in {"published", "no_op"}
             and phase.group("root") in root_texts
         ):
-            phase_puts = int(phase.group("puts"))
+            phase_puts = (phase_puts or 0) + int(phase.group("puts"))
         embed = EMBED_RE.search(line)
         if embed and embed.group("root") in root_texts:
             embed_calls += int(embed.group("batches"))
             embedded_files += int(embed.group("files"))
     # Prepared publication emits a root-owned phase profile, not the older
     # summary line. Membership deltas are not blob writes (deleting 15 entries
-    # can still put zero blobs), so prefer the explicit phase counter.
+    # can still put zero blobs), so prefer explicit phase counters, summed across
+    # the graph publication and subsequent semantic fills in this switch window.
     return (
         reuse_puts,
         phase_puts if phase_puts is not None else publication_puts,
@@ -798,6 +799,8 @@ def warm_mode(
         "readiness_detail_ms": ready["elapsed_ms"],
         "indexes_ready_ms": indexes_ready_ms,
         "cold_gate_detail_ms": cold["elapsed_ms"],
+        "inspect_timeout_retry_count": cold["inspect_timeout_retry_count"],
+        "inspect_timeout_retry_elapsed_ms": cold["inspect_timeout_retry_elapsed_ms"],
         "cold_work_ms": cold_work_ms,
         "total_ms": cold_work_ms,
         "measurement_pid": standalone_pid,
