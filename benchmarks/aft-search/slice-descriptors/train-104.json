@@ -1,0 +1,10 @@
+{
+  "slice_class": "ranking",
+  "kind": "paging",
+  "targeted_mechanism": "none",
+  "fixtures": [
+    "engine_paging_contract_test::deep_paging_stream_is_page_size_independent_of_public_cap",
+    "real-query-paged-43"
+  ],
+  "slices": ["semantic-admission-block-freeze"]
+}
