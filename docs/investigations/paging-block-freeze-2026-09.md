@@ -87,3 +87,17 @@ test result: FAILED. 0 passed; 1 failed
 ```
 
 After the fix, the full 43-row eight-page head replay must be compared with the old four-page reference. `ranked_paths`, metrics, and the common portion of `page_zero_ranked_paths` should be unchanged. A size-50 page-zero list is expected to be the first 50 entries of the old size-100 page-zero list, not byte-equal in length.
+
+## Post-fix 43-row proof and rebaseline
+
+The fixed release binary (`9f2ffe3e482e5ecca1aadb01ca6ad5c09ccffcf0f6fc72ac7ea2440c9bac7581`) replayed all 43 rows as eight `topK:50` pages. The exact- and concept-family assembly inputs retained the checked-in all-green groups; this proof reran the real-query family only. Comparing the score with the old four-page reference produced:
+
+```text
+ranked_paths_diff=[]
+metrics_diff=[]
+page_zero_common_prefix_diff=[]
+aggregate_diff=[]
+page_zero_length_pairs=[(93, 43), (95, 45), (98, 48), (98, 49), (99, 49), (99, 50), (100, 50)]
+```
+
+The shorter page-zero lists are expected: they collapse only the first 50 raw results instead of the old first 100. Every new page-zero list is the exact common prefix of its old counterpart. `search_quality.py --mode record-reference` was run first with `--dry-run` and then without it; it recorded reference SHA-256 `51e56e32929bf459f65859b6f8ed447bd81b8cea59c163a52e819a3ffdb99e3d` and updated the binding sidecar atomically.
