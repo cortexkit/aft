@@ -363,7 +363,7 @@ fn surface_audit_locks_the_only_request_schema_change_and_runtime_hooks() {
     assert_eq!(properties["offset"]["minimum"], 0);
     assert_eq!(properties["offset"]["maximum"], 100000);
     assert_eq!(properties["topK"]["minimum"], 1);
-    assert_eq!(properties["topK"]["maximum"], 100);
+    assert_eq!(properties["topK"]["maximum"], 50);
     assert!(properties["path"]["description"]
         .as_str()
         .is_some_and(|description| description.contains("not a subdirectory filter")));
