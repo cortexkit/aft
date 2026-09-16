@@ -91,7 +91,7 @@ function run(
   command: string,
   args: string[],
   cwd: string,
-  options: { env?: NodeJS.ProcessEnv; allowFailure?: boolean } = {},
+  options: { env?: NodeJS.ProcessEnv; allowFailure?: boolean; timeoutMs?: number } = {},
 ): CommandResult {
   const result = spawnSync(command, args, {
     cwd,
@@ -100,10 +100,11 @@ function run(
     stdio: ["ignore", "pipe", "pipe"],
     maxBuffer: 50 * 1024 * 1024,
     shell: process.platform === "win32",
+    timeout: options.timeoutMs,
   });
   if (result.status !== 0 && !options.allowFailure) {
     throw new Error(
-      `${command} ${args.join(" ")} failed (${result.status ?? "unknown"})\n${result.stdout}\n${result.stderr}`,
+      `${command} ${args.join(" ")} failed (${result.status ?? result.error?.message ?? "unknown"})\n${result.stdout}\n${result.stderr}`,
     );
   }
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
@@ -359,6 +360,131 @@ function runV1ConfigHost(hostRoot: string, isolation: HostIsolation): CommandRes
     isolation.project,
     { env: isolation.env },
   );
+}
+
+function runV1CoreLoaderHost(
+  hostRoot: string,
+  isolation: HostIsolation,
+  options: { allowFailure?: boolean } = {},
+): CommandResult {
+  // The pinned V1 binary has no --standalone flag. `debug file list` boots
+  // InstanceBootstrap (V1 plugin.init) and locationServices (bundled core
+  // ConfigExternalPlugin) in one process, then exits.
+  return run(
+    v1Binary(hostRoot),
+    ["--print-logs", "--log-level", "DEBUG", "debug", "file", "list", "."],
+    isolation.project,
+    { env: isolation.env, timeoutMs: 90_000, allowFailure: options.allowFailure },
+  );
+}
+
+async function writeV1PluginSpecs(
+  isolation: HostIsolation,
+  specs: string[],
+  aftConfig: Record<string, unknown>,
+): Promise<void> {
+  const configDir = join(isolation.env.XDG_CONFIG_HOME ?? "", "opencode");
+  await mkdir(configDir, { recursive: true });
+  await writeFile(
+    join(configDir, "opencode.json"),
+    `${JSON.stringify({ plugin: specs }, null, 2)}\n`,
+  );
+  await writeAftConfig(isolation, aftConfig);
+}
+
+async function instrumentPluginDist(packageRoot: string): Promise<void> {
+  const indexPath = join(packageRoot, "dist", "index.js");
+  const indexOrig = join(packageRoot, "dist", "index.orig.js");
+  const serverPath = join(packageRoot, "dist", "entry", "server.js");
+  const serverOrig = join(packageRoot, "dist", "entry", "server.orig.js");
+  await cp(indexPath, indexOrig);
+  await cp(serverPath, serverOrig);
+  await writeFile(
+    indexPath,
+    `
+import { appendFileSync } from "node:fs";
+import original from "./index.orig.js";
+appendFileSync(process.env.AFT_LOAD_MATRIX_MARKER, "imported=root\\n");
+export default async function instrumentedRoot(...args) {
+  appendFileSync(process.env.AFT_LOAD_MATRIX_MARKER, "root-called\\n");
+  return original(...args);
+}
+`,
+  );
+  await writeFile(
+    serverPath,
+    `
+import { appendFileSync } from "node:fs";
+import original from "./server.orig.js";
+appendFileSync(process.env.AFT_LOAD_MATRIX_MARKER, "imported=server-entry\\n");
+const entry = {
+  ...original,
+  server: (...args) => {
+    appendFileSync(process.env.AFT_LOAD_MATRIX_MARKER, "server-called\\n");
+    return original.server(...args);
+  },
+  effect: (context) => {
+    appendFileSync(process.env.AFT_LOAD_MATRIX_MARKER, "effect-called\\n");
+    return original.effect(context);
+  },
+};
+export default entry;
+`,
+  );
+}
+
+async function seedCoreNpmCache(
+  isolation: HostIsolation,
+  spec: string,
+  packageRoot: string,
+): Promise<void> {
+  const destination = join(
+    isolation.env.XDG_CACHE_HOME ?? "",
+    "opencode",
+    "packages",
+    spec,
+    "node_modules",
+    "@cortexkit",
+    "aft-opencode",
+  );
+  await mkdir(dirname(destination), { recursive: true });
+  await cp(packageRoot, destination, { recursive: true });
+}
+
+async function runPinnedV1CoreLoaderRow(input: {
+  label: string;
+  specs: string[];
+  packageRoot: string;
+  seedSpec?: string;
+  allowFailure?: boolean;
+}): Promise<{ events: string; transcript: string }> {
+  const { v1 } = await ensureHostInstalls();
+  const isolation = await makeIsolation(input.label);
+  const marker = join(isolation.root, "entry.log");
+  isolation.env.AFT_LOAD_MATRIX_MARKER = marker;
+  if (input.seedSpec) {
+    await seedCoreNpmCache(isolation, input.seedSpec, input.packageRoot);
+  }
+  await writeV1PluginSpecs(isolation, input.specs, { enabled: false });
+  const result = await withOperatorCanary(input.label, () =>
+    runV1CoreLoaderHost(v1, isolation, { allowFailure: input.allowFailure }),
+  );
+  const transcript = `${result.stdout}\n${result.stderr}`;
+  const events = existsSync(marker) ? await readFile(marker, "utf8") : "";
+  console.log(
+    `[${input.label}-transcript]\n${transcript
+      .split(/\r?\n/)
+      .filter(
+        (line) =>
+          line.includes("load-matrix") ||
+          line.includes("AFT V2 runtime") ||
+          line.includes("V2 effect skipped") ||
+          line.includes("plugin"),
+      )
+      .join("\n")}`,
+  );
+  console.log(`[${input.label}-events]\n${events.trim()}`);
+  return { events, transcript };
 }
 
 async function runUntilMarker(
@@ -1283,6 +1409,79 @@ export default entry;
     expect(existsSync(marker)).toBe(false);
   }, 120_000);
 
+  test("pinned V1 core loader ignores the bare package spec's V2 effect", async () => {
+    const { v1 } = await ensureHostInstalls();
+    const packageRoot = await copyInstalledPlugin(v1, "v1-core-bare");
+    await instrumentPluginDist(packageRoot);
+    const manifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
+    const spec = `${packageName}@${manifest.version}`;
+    const { events, transcript } = await runPinnedV1CoreLoaderRow({
+      label: "v1-core-bare",
+      specs: [spec],
+      packageRoot,
+      seedSpec: spec,
+    });
+    // V1 appends ./server and calls it. The bundled core loader resolves the
+    // package name with import.meta.resolve against the install dir and may
+    // skip the import entirely; either way the V2 effect must not run.
+    expect(events).toContain("imported=server-entry");
+    expect(events).toContain("server-called");
+    expect(events).not.toContain("effect-called");
+    expect(events).not.toContain("setup-called");
+    expect(transcript).not.toContain("AFT V2 runtime starting");
+  }, 120_000);
+
+  test("pinned V1 core loader ignores a file:// package directory's V2 effect", async () => {
+    const { v1 } = await ensureHostInstalls();
+    const packageRoot = await copyInstalledPlugin(v1, "v1-core-file");
+    await instrumentPluginDist(packageRoot);
+    const { events, transcript } = await runPinnedV1CoreLoaderRow({
+      label: "v1-core-file",
+      specs: [pathToFileURL(packageRoot).href],
+      packageRoot,
+    });
+    expect(events).toContain("imported=root");
+    expect(events).toContain("server-called");
+    expect(events).not.toContain("effect-called");
+    expect(events).not.toContain("setup-called");
+    expect(transcript).not.toContain("AFT V2 runtime starting");
+  }, 120_000);
+
+  test("pinned V1 core loader cannot run the V2 effect body for a file:// server entry", async () => {
+    const { v1 } = await ensureHostInstalls();
+    const packageRoot = await copyInstalledPlugin(v1, "v1-core-server-file");
+    await instrumentPluginDist(packageRoot);
+    const serverEntry = join(packageRoot, "dist", "entry", "server.js");
+    const { events, transcript } = await runPinnedV1CoreLoaderRow({
+      label: "v1-core-server-file",
+      specs: [pathToFileURL(serverEntry).href],
+      packageRoot,
+    });
+    expect(events).toContain("imported=server-entry");
+    expect(events).toContain("effect-called");
+    expect(events).toContain("server-called");
+    expect(events).not.toContain("setup-called");
+    expect(transcript).not.toContain("AFT V2 runtime starting");
+    expect(transcript).toContain("V2 effect skipped: host context has no location");
+  }, 120_000);
+
+  test("pinned V1 core loader does not import a package subpath spec", async () => {
+    const { v1 } = await ensureHostInstalls();
+    const packageRoot = await copyInstalledPlugin(v1, "v1-core-subpath");
+    await instrumentPluginDist(packageRoot);
+    const { events, transcript } = await runPinnedV1CoreLoaderRow({
+      label: "v1-core-subpath",
+      specs: [`${packageName}/server`],
+      packageRoot,
+      allowFailure: true,
+    });
+    expect(events).not.toContain("imported=root");
+    expect(events).not.toContain("imported=server-entry");
+    expect(events).not.toContain("effect-called");
+    expect(events).not.toContain("server-called");
+    expect(transcript).not.toContain("AFT V2 runtime starting");
+  }, 120_000);
+
   test("operator OpenCode database and logs are unchanged during every host invocation", async () => {
     const operatorAfter = await snapshotOperatorState(!allowLiveOperatorWrites);
     if (allowLiveOperatorWrites) {
@@ -1299,6 +1498,10 @@ export default entry;
       "v2-lifecycle",
       "v1-root-mutation",
       "v2-function-negative",
+      "v1-core-bare",
+      "v1-core-file",
+      "v1-core-server-file",
+      "v1-core-subpath",
     ]);
     for (const canary of hostCanaries) {
       if (typeof canary.before === "string") {
