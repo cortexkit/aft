@@ -12,6 +12,7 @@ import sys
 import time
 from contextlib import ExitStack
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -64,6 +65,16 @@ EMBED_RE = re.compile(
     r'semantic embedder refresh: root="(?P<root>[^"]+)" .*? files=(?P<files>\d+) '
     r'chunks=(?P<chunks>\d+) batches=(?P<batches>\d+)\b'
 )
+# Subject log line emitted when a watcher-driven re-embed actually ran.
+# The leading timestamp is env_logger's RFC3339 prefix; the drill only counts
+# lines stamped after the checkout so a previous switch cannot close this row.
+SEMANTIC_REFRESH_RE = re.compile(
+    r"^(?:(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)Z\s+)?"
+    r".*semantic refresh: (?P<changed>\d+) changed,"
+)
+# Matches the product's SEMANTIC_REFRESH_QUIET_WINDOW_MS: a fast callgraph-correct
+# observation can land before the watcher even schedules a re-embed.
+SEMANTIC_QUIET_WINDOW_S = 15.0
 FUNCTION_PATTERNS = (
     re.compile(r"(?m)^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)\b"),
     re.compile(r"(?m)^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\b"),
@@ -367,6 +378,80 @@ def publication_is_complete(text: str, root: Path) -> bool:
     return latest_pending == 0
 
 
+def _parse_log_timestamp(text: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def semantic_refresh_observed(text: str, checkout_at: datetime) -> bool:
+    """Return whether a post-checkout `semantic refresh: N changed` line is present."""
+    for line in text.splitlines():
+        match = SEMANTIC_REFRESH_RE.search(line)
+        if match is None:
+            continue
+        stamp = match.group("ts")
+        if stamp:
+            parsed = _parse_log_timestamp(stamp + "Z")
+            # Log stamps are second-resolution; drop checkout microseconds so a
+            # refresh in the same second as the switch is not treated as stale.
+            floor = checkout_at.replace(microsecond=0)
+            if parsed is not None and parsed < floor:
+                continue
+        return True
+    return False
+
+
+def _pending_count(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value)
+    return 0
+
+
+def readiness_semantic_idle(ready: Mapping[str, Any]) -> bool:
+    """Return whether readiness shows an idle semantic worker with no pending paths."""
+    status = ready.get("status", ready)
+    if not isinstance(status, Mapping):
+        return False
+    semantic = status.get("semantic_index")
+    if not isinstance(semantic, Mapping):
+        return False
+    if semantic.get("status") not in {"ready", "disabled"}:
+        return False
+    if _pending_count(semantic.get("refreshing_count")) > 0:
+        return False
+    if _pending_count(semantic.get("pending_paths")) > 0:
+        return False
+    views = status.get("views")
+    if isinstance(views, Mapping) and _pending_count(views.get("pending_paths")) > 0:
+        return False
+    return True
+
+
+def legacy_row_close_reason(
+    *,
+    log_text: str,
+    checkout_at: datetime,
+    elapsed_s: float,
+    ready: Mapping[str, Any],
+    quiet_window_s: float | None = None,
+) -> str | None:
+    """Name the views-off close condition, or None if the row must keep waiting."""
+    if semantic_refresh_observed(log_text, checkout_at):
+        return "semantic_refresh_complete"
+    window = SEMANTIC_QUIET_WINDOW_S if quiet_window_s is None else quiet_window_s
+    if elapsed_s >= window and readiness_semantic_idle(ready):
+        return "quiet_window_elapsed"
+    return None
+
+
 def contention_metrics(text: str, root: Path) -> dict[str, Any]:
     root_markers = {f"root={root}", f"root={root.resolve()}"}
     build_progress_lines = 0
@@ -447,6 +532,7 @@ def perform_switch(
     storage: Path,
     expected_manifest_fingerprint: str | None,
     standalone_pid: int | None = None,
+    cold_work_timeout_s: float = 1800.0,
 ) -> dict[str, Any]:
     before_generation = current_generation(view_dir) if views_on else None
     before_manifest_fingerprint = (
@@ -481,12 +567,19 @@ def perform_switch(
         checkout_args.append("--force")
     checkout_args.append(target_sha)
     git_text(checkout, *checkout_args)
+    checkout_at = datetime.now(timezone.utc)
+    checkout_monotonic = time.monotonic()
     if not views_on:
         write_views_off_config(source_root, checkout)
 
-    deadline = started + 300.0
+    # Views-on still uses the historical 300s probe ceiling. Views-off must
+    # outlive the 15s semantic quiet window plus the embed batches that follow,
+    # so its row is bounded by the same cold-work budget as arm warmup.
+    deadline = started + (300.0 if views_on else cold_work_timeout_s)
     publication_ms: int | None = None
     time_to_correct_ms: int | None = None
+    semantic_settle_ms: int | None = None
+    row_close_reason = "timeout"
     readiness_ms: int | None = None
     readiness_error: str | None = None
     query_embedding_calls = 0
@@ -537,9 +630,23 @@ def perform_switch(
             time_to_correct_ms = round((time.monotonic() - started) * 1000)
         if answers_correct:
             current_log_text = read_log_window()
-            if not views_on or publication_is_complete(current_log_text, checkout):
-                contention_log_text = current_log_text
-                break
+            if views_on:
+                if publication_is_complete(current_log_text, checkout):
+                    row_close_reason = "pending_paths=0"
+                    contention_log_text = current_log_text
+                    break
+            else:
+                close_reason = legacy_row_close_reason(
+                    log_text=current_log_text,
+                    checkout_at=checkout_at,
+                    elapsed_s=time.monotonic() - checkout_monotonic,
+                    ready=ready,
+                )
+                if close_reason is not None:
+                    row_close_reason = close_reason
+                    semantic_settle_ms = round((time.monotonic() - started) * 1000)
+                    contention_log_text = current_log_text
+                    break
         time.sleep(0.25)
 
     if contention_log_text is None:
@@ -638,6 +745,8 @@ def perform_switch(
         "host_load_1m": {"start": load_at_start, "end": round(os.getloadavg()[0], 2)},
         "readiness_error": readiness_error,
         "time_to_correct_ms": time_to_correct_ms,
+        "semantic_settle_ms": semantic_settle_ms,
+        "row_close_reason": row_close_reason,
         "correctness": "timeout" if timed_out else "correct",
         "publication": publication,
         "last_search": response_observation(last_search) if timed_out else None,
@@ -708,6 +817,7 @@ def exercise_mode(
     view_dir: Path,
     storage: Path,
     standalone_pid: int,
+    cold_work_timeout_s: float = 1800.0,
 ) -> list[dict[str, Any]]:
     if git_text(checkout, "rev-parse", "HEAD") != head:
         raise SoakError(f"{mode} did not start at HEAD")
@@ -735,6 +845,7 @@ def exercise_mode(
             storage=storage,
             expected_manifest_fingerprint=known_manifest_fingerprints.get(target),
             standalone_pid=standalone_pid,
+            cold_work_timeout_s=cold_work_timeout_s,
         )
         rows.append(row)
         if views_on and row["publication"] in {"published", "no_op"}:
@@ -1050,6 +1161,7 @@ def main(argv: list[str]) -> int:
                         view_dir=storage / "views" / scope,
                         storage=subject["subject_storage"],
                         standalone_pid=client.proc.pid,
+                        cold_work_timeout_s=args.cold_work_timeout_s,
                     )
                 )
     finally:
@@ -1112,7 +1224,7 @@ def main(argv: list[str]) -> int:
     previous_path = RESULT_DIR / "branch-drill-run1-confounded.json"
     previous = json.loads(previous_path.read_text(encoding="utf-8")) if previous_path.is_file() else None
     result = {
-        "schema_version": 3,
+        "schema_version": 4,
         "observed_at": observed_at,
         "root": str(root),
         "baseline": str(baseline),
