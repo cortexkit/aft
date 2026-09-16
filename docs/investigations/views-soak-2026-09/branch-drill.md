@@ -47,3 +47,15 @@ Run 1 used a standalone views-on process and a cold read-only baseline. Its pari
 | a085bf62a459→HEAD | 111284 | 0 | 4 | 111.97 | 2905.906 | 4637 | 224.99 | -4.797 | timeout |
 | HEAD→refs/heads/dev | — | 0 | 0 | 81.07 | -3030.219 | timeout | 214.63 | -6.328 | timeout |
 | refs/heads/dev→HEAD | 212902 | 0 | 0 | 156.48 | 2407.453 | timeout | 3.11 | 10.719 | 7504 |
+
+
+## Attribution gap — legacy semantic refresh after row close
+
+The views-on arm's row runs through terminal view publication (`pending_paths=0`), so its CPU-seconds include the semantic fill. The views-off arm previously closed at callgraph correctness. Legacy semantic refresh sits behind a 15-second quiet window, so on a fast row the refresh fires after the row closed and its embed cost (3–4 batches, ~30 CPU-s on this corpus) is never attributed.
+
+Evidence from the 2026-09-16 run (`~/.cache/aft-views-soak/drill-20260916T1617Z-card103/`):
+
+- Legacy `refs/remotes/upstream/v2-timeouts→HEAD` reads `cpu=11.54 correct=12020 embeds=0`. The arm's stderr shows three `semantic refresh: 259 changed ...` lines for the first three switches and none for the fourth — the fourth never ran before the arm ended.
+- The sibling row `a085bf62a459→HEAD` (same shape, refresh inside the window) reads `cpu=66.72 embeds=4`.
+
+The comparison the drill exists to make is therefore unfair on exactly the rows where views loses. Views-off now closes a row only when callgraph correctness is observed **and** that switch's semantic refresh has completed (the subject's `semantic refresh: N changed, ...` line, timestamped after checkout) or the quiet window has elapsed with readiness reporting semantic idle and no pending paths. Both arms record `row_close_reason` so a reader can see the windows are like-for-like. CPU and RSS are attributed over that full window.
