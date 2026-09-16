@@ -226,9 +226,7 @@ describe("V2 server effect", () => {
 
     await Effect.runPromise(Effect.scoped(effect({})));
     await Effect.runPromise(Effect.scoped(effect({ location: undefined })));
-    await Effect.runPromise(
-      Effect.scoped(effect({ location: { directory: 1 } })),
-    );
+    await Effect.runPromise(Effect.scoped(effect({ location: { directory: 1 } })));
 
     expect(events).toEqual([]);
   });
