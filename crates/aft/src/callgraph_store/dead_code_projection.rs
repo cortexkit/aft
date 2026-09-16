@@ -154,6 +154,35 @@ pub(crate) fn project_dead_code_snapshot_incremental_with_costs(
     previous: Option<(u64, &CallgraphSnapshot)>,
     costs: ProjectionCostEstimates,
 ) -> Result<(Option<u64>, CallgraphSnapshot, ProjectionVerdict, Duration)> {
+    project_snapshot(db_path, previous, costs, None)
+}
+
+/// Project a published view using its reader's explicit checkout root. A pinned
+/// view generation is immutable and cannot acquire stale backend rows, so the
+/// legacy backend-root and stale-row admission checks do not apply. Refuse a
+/// legacy reader rather than letting it bypass those checks through this entry.
+pub(crate) fn project_dead_code_snapshot_from_view(
+    store: &super::ReadonlyCallGraphStore,
+) -> Result<(Option<u64>, CallgraphSnapshot, ProjectionVerdict, Duration)> {
+    if store.reader_kind() != "view" {
+        return Err(CallGraphStoreError::Unavailable(
+            "view projection requires a view reader".to_string(),
+        ));
+    }
+    project_snapshot(
+        store.sqlite_path(),
+        None,
+        ProjectionCostEstimates::default(),
+        Some(store.project_root()),
+    )
+}
+
+fn project_snapshot(
+    db_path: &Path,
+    previous: Option<(u64, &CallgraphSnapshot)>,
+    costs: ProjectionCostEstimates,
+    view_root: Option<&Path>,
+) -> Result<(Option<u64>, CallgraphSnapshot, ProjectionVerdict, Duration)> {
     if !db_path.is_file() {
         return Err(CallGraphStoreError::Unavailable(format!(
             "database does not exist: {}",
@@ -175,19 +204,22 @@ pub(crate) fn project_dead_code_snapshot_incremental_with_costs(
         ));
     }
     let write_revision = projection_write_revision(&tx)?;
-    if let Some(reason) = path_identity_mismatch_reason(&tx)? {
-        return Err(CallGraphStoreError::Unavailable(reason));
-    }
-
-    let project_root = project_root_from_backend_state(&tx)?;
-    // Same predicate as InspectManager::callgraph_ready_for_snapshot: a store
-    // that still has stale backend rows is not ready for dead_code, even if
-    // the SQLite file opens and meta.ready=1.
-    if stale_backend_file_count(&tx, &project_root)? > 0 {
-        return Err(CallGraphStoreError::Unavailable(
-            "callgraph has stale files pending refresh".to_string(),
-        ));
-    }
+    let project_root = if let Some(root) = view_root {
+        root.to_path_buf()
+    } else {
+        if let Some(reason) = path_identity_mismatch_reason(&tx)? {
+            return Err(CallGraphStoreError::Unavailable(reason));
+        }
+        let root = project_root_from_backend_state(&tx)?;
+        // Mutable legacy stores can be ready while backend rows still await
+        // refresh; projecting those rows would turn stale data into a verdict.
+        if stale_backend_file_count(&tx, &root)? > 0 {
+            return Err(CallGraphStoreError::Unavailable(
+                "callgraph has stale files pending refresh".to_string(),
+            ));
+        }
+        root
+    };
     let delta = match (previous, write_revision) {
         (Some((revision, _)), Some(current)) => projection_delta_since(&tx, revision, current)?,
         _ => DeltaRead::Cold,

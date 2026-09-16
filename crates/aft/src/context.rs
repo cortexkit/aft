@@ -4978,7 +4978,7 @@ impl AppContext {
                     let Some(project_root) = self.callgraph_project_root() else {
                         return CallgraphStoreAccess::Unavailable;
                     };
-                    return match ReadonlyCallGraphStore::open_manifest_view(
+                    return match crate::views::read::open_published_callgraph(
                         project_root,
                         view.family,
                         view.view_dir,

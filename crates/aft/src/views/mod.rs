@@ -10,8 +10,9 @@ use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 pub mod assembly;
 mod generation;
-mod profile;
 pub mod materialization;
+mod profile;
+pub(crate) mod read;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

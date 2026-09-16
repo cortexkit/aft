@@ -767,6 +767,15 @@ impl InspectManager {
         if !snapshot.config.callgraph_store {
             return false;
         }
+        if snapshot.config.views.enabled {
+            return current_view_projection_store(
+                &snapshot.project_root,
+                &snapshot.inspect_dir,
+                &snapshot.config,
+                &[],
+            )
+            .is_some();
+        }
         callgraph_store_dirs_from_inspect_dir(&snapshot.inspect_dir, &snapshot.project_root)
             .into_iter()
             .any(|dir| callgraph_store_ready_for_dead_code(dir, snapshot.project_root.clone()))
@@ -2386,7 +2395,13 @@ impl InspectManager {
                         phases.projection = Some(verdict);
                         phases.projection_cost += projection_cost;
                     }
-                    None => phases.projection_skip_reason = Some("no_callgraph"),
+                    None => {
+                        phases.projection_skip_reason = Some(if job.config.views.enabled {
+                            "view_pending"
+                        } else {
+                            "no_callgraph"
+                        })
+                    }
                 }
                 phases.snapshot += snapshot_started.elapsed();
             }
@@ -2503,7 +2518,13 @@ impl InspectManager {
                             phases.projection = Some(verdict);
                             phases.projection_cost += projection_cost;
                         }
-                        None => phases.projection_skip_reason = Some("no_callgraph"),
+                        None => {
+                            phases.projection_skip_reason = Some(if job.config.views.enabled {
+                                "view_pending"
+                            } else {
+                                "no_callgraph"
+                            })
+                        }
                     }
                     phases.snapshot += snapshot_started.elapsed();
                 }
@@ -2577,7 +2598,13 @@ impl InspectManager {
                     phases.projection = Some(verdict);
                     phases.projection_cost += projection_cost;
                 }
-                None => phases.projection_skip_reason = Some("no_callgraph"),
+                None => {
+                    phases.projection_skip_reason = Some(if job.config.views.enabled {
+                        "view_pending"
+                    } else {
+                        "no_callgraph"
+                    })
+                }
             }
             phases.snapshot += snapshot_started.elapsed();
         }
@@ -3478,11 +3505,18 @@ fn merge_callgraph_refresh_paths(
     paths
 }
 
+#[cfg(test)]
+thread_local! {
+    static LEGACY_VIEW_REFRESHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn refresh_writable_dead_code_store(
     store: &CallGraphStore,
     callgraph_dir: &Path,
     refresh_paths: &[PathBuf],
 ) {
+    #[cfg(test)]
+    LEGACY_VIEW_REFRESHES.with(|count| count.set(count.get() + 1));
     match store.refresh_files(refresh_paths) {
         Ok(stats) => {
             crate::slog_info!(
@@ -3512,6 +3546,9 @@ fn refresh_writable_dead_code_store(
 }
 
 fn callgraph_path_identity_gap(job: &InspectJob) -> Option<String> {
+    if job.config.views.enabled {
+        return None;
+    }
     for callgraph_dir in callgraph_store_dirs_from_inspect_dir(&job.inspect_dir, &job.project_root)
     {
         let Ok(Some(store)) =
@@ -3552,6 +3589,133 @@ fn open_writable_dead_code_store(
     }
 }
 
+fn current_view_projection_store(
+    project_root: &Path,
+    inspect_dir: &Path,
+    config: &crate::config::Config,
+    refresh_paths: &[PathBuf],
+) -> Option<(ReadonlyCallGraphStore, String)> {
+    let result = (|| -> Result<Option<(ReadonlyCallGraphStore, String)>, String> {
+        let storage = config
+            .storage_dir
+            .clone()
+            .or_else(|| {
+                callgraph_store_dir_from_inspect_dir(inspect_dir, project_root)
+                    .and_then(|path| path.parent()?.parent().map(Path::to_path_buf))
+            })
+            .ok_or_else(|| "inspect storage unavailable".to_string())?;
+        let scope = crate::path_identity::project_scope_key(project_root);
+        let view =
+            crate::views::ViewStore::open(&storage, &scope).map_err(|error| error.to_string())?;
+        let Some(generation) = view
+            .current_generation()
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(None);
+        };
+        let pin = crate::pins::QueryPin::acquire(view.view_dir(), &generation)
+            .map_err(|error| error.to_string())?;
+        let head =
+            crate::alias::head_tree_entries(project_root).map_err(|error| error.to_string())?;
+        if !generation.ends_with(&crate::views::assembly::head_tree_fingerprint(&head)) {
+            return Ok(None);
+        }
+        if !refresh_paths.is_empty() {
+            let manifest = view
+                .load_manifest(&generation)
+                .map_err(|error| error.to_string())?;
+            if !crate::views::read::callgraph_paths_match(&manifest, project_root, refresh_paths)
+                .map_err(|error| error.to_string())?
+            {
+                return Ok(None);
+            }
+        }
+        let store = crate::views::read::open_published_callgraph(
+            project_root.to_path_buf(),
+            crate::search_index::artifact_cache_key(project_root),
+            view.view_dir().to_path_buf(),
+            &generation,
+            Some(Arc::new(pin)),
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(Some((store, generation)))
+    })();
+    match result {
+        Ok(store) => store,
+        Err(error) => {
+            crate::slog_warn!(
+                "tier2 view reader unavailable root={}: {}",
+                project_root.display(),
+                error
+            );
+            None
+        }
+    }
+}
+
+fn build_view_callgraph_snapshot(
+    job: &InspectJob,
+    projection_cache: Option<&InspectManager>,
+    refresh_paths: &[PathBuf],
+) -> Option<(Arc<CallgraphSnapshot>, ProjectionVerdict, Duration)> {
+    let started = Instant::now();
+    let Some((store, generation)) = current_view_projection_store(
+        &job.project_root,
+        &job.inspect_dir,
+        &job.config,
+        refresh_paths,
+    ) else {
+        crate::slog_info!(
+            "tier2 dead_code: projection=none reason=view_pending root={}",
+            job.project_root.display()
+        );
+        return None;
+    };
+    // View generations are immutable; never share a cache identity with a
+    // mutable legacy database or project across a publication boundary.
+    let identity = CallgraphProjectionIdentity {
+        project_root: job.project_root.clone(),
+        generation: Some(generation),
+        legacy_sqlite_path: None,
+        write_revision: 0,
+    };
+    if let Some(snapshot) =
+        projection_cache.and_then(|cache| cache.cached_callgraph_projection(&identity))
+    {
+        return Some((
+            snapshot,
+            ProjectionVerdict {
+                kind: ProjectionKind::Reused,
+                reason: None,
+                journal_bytes: 0,
+                changed_files: 0,
+            },
+            Duration::ZERO,
+        ));
+    }
+    let (_, snapshot, verdict, cost) =
+        match crate::callgraph_store::project_dead_code_snapshot_from_view(&store) {
+            Ok(projected) => projected,
+            Err(error) => {
+                crate::slog_warn!(
+                    "tier2 view projection unavailable root={}: {}",
+                    job.project_root.display(),
+                    error
+                );
+                return None;
+            }
+        };
+    let snapshot = Arc::new(snapshot);
+    if let Some(cache) = projection_cache {
+        cache.cache_callgraph_projection(identity, Arc::clone(&snapshot));
+    }
+    crate::slog_info!(
+        "perf tier2_callgraph_snapshot: source=view files={} exports={} edges={} entry_points={} ms={}",
+        snapshot.files.len(), snapshot.exported_symbols.len(), snapshot.outbound_calls.len(), snapshot.entry_points.len(), started.elapsed().as_millis()
+    );
+    Some((snapshot, verdict, cost))
+}
+
 fn build_tier2_callgraph_snapshot_with_refresh_inner(
     job: &InspectJob,
     allow_cold_build: bool,
@@ -3565,6 +3729,10 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
             "tier2 dead_code: callgraph store disabled; reporting callgraph_unavailable"
         );
         return None;
+    }
+
+    if job.config.views.enabled {
+        return build_view_callgraph_snapshot(job, projection_cache, refresh_paths);
     }
 
     let callgraph_dirs = callgraph_store_dirs_from_inspect_dir(&job.inspect_dir, &job.project_root);
@@ -5365,6 +5533,8 @@ mod guard_tests {
             .expect("create fixture parent");
         std::fs::write(path, contents).expect("write fixture file");
     }
+
+    include!("view_projection_tests.rs");
 
     fn published_projection_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, InspectJob) {
         let dir = tempfile::tempdir().expect("tempdir");
