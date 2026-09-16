@@ -71,6 +71,35 @@ const V10_ADMIN_TUPLES: &[&str] = &["workflow run", "run rerun"];
 // v13 adds operator-only release maintenance while keeping release deletion
 // and release delete-prefixed flags outside the bypass allowlist.
 const V13_ADMIN_TUPLES: &[&str] = &["release edit", "release upload"];
+// v14 admits two more shapes of bot speech: opening a thread, and editing a
+// comment the calling seat's bot already wrote. Both speak publicly under the
+// bot identity and create no authority, which is the same class as
+// `issue comment` and `issue close`.
+const V14_GOVERNED_TUPLES: &[&str] = &["issue create"];
+/// The only API endpoint admitted as governed speech: the id-addressed edit of
+/// an issue comment. The shim classifies and forwards; the route holder is what
+/// verifies the comment was written by the calling seat's bot.
+const OWN_COMMENT_PATCH_PATH_GLOB: &str = "/repos/*/*/issues/comments/*";
+const OWN_COMMENT_PATCH_METHOD: &str = "PATCH";
+/// Argv form for a governed verb that names no existing target: an issue does
+/// not have a number until it is created, so the declaration carries body
+/// fields and an empty target instead of a positional.
+const FIELDS_ONLY_FORM: &str = "fields-only";
+/// Argv form for the own-comment PATCH: the target comes from the endpoint path
+/// and the only admitted payload field is the replacement body.
+const BODY_ONLY_FORM: &str = "body-only";
+/// `gh issue create` flags the shim refuses outright rather than forwarding.
+/// Assignment, milestones and projects hand out work rather than speak;
+/// `--web`, `--template` and `--recover` need an interactive terminal the
+/// governed seam cannot reproduce.
+const CREATE_UNSUPPORTED_FLAGS: &[&str] = &[
+    "--assignee",
+    "--milestone",
+    "--project",
+    "--web",
+    "--template",
+    "--recover",
+];
 const DESTRUCTIVE_TUPLES: &[&str] = &["release delete", "release delete-asset"];
 // The v10 manifest version is the first version whose code-side allowlist
 // permits these native comment mutations. The allowlist covers only the exact
@@ -117,10 +146,11 @@ pub enum RefusalCode {
     SeamRefusal,
     MissingReason,
     DestructiveFlag,
+    UnsupportedFlag,
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Unclassified,
         Self::AdminTier,
         Self::ManifestBelowFloor,
@@ -134,6 +164,7 @@ impl RefusalCode {
         Self::SeamRefusal,
         Self::MissingReason,
         Self::DestructiveFlag,
+        Self::UnsupportedFlag,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -151,6 +182,7 @@ impl RefusalCode {
             Self::SeamRefusal => "gh_shim_seam_refusal",
             Self::MissingReason => "gh_shim_missing_reason",
             Self::DestructiveFlag => "gh_shim_destructive_flag",
+            Self::UnsupportedFlag => "gh_shim_unsupported_flag",
         }
     }
 }
@@ -319,7 +351,7 @@ fn run(args: &[OsString]) -> i32 {
             }
             GovernanceDisposition::Unclassified { manifest_version } => refuse(
                 RefusalCode::Unclassified,
-                &unclassified_refusal_text(manifest_version),
+                &unclassified_refusal_text(args, manifest_version),
             ),
             GovernanceDisposition::Destructive => refuse(
                 RefusalCode::DestructiveFlag,
@@ -404,11 +436,17 @@ where
             }
         }
         Classification::Governed { tuple, canonical } => {
-            let request =
-                match canonicalize_governed(args, &tuple, &canonical, manifest.manifest_version) {
-                    Ok(request) => request,
-                    Err(error) => return refuse_governed_canonicalization(&error),
-                };
+            // An API row is addressed by endpoint rather than by subcommand and
+            // positional, so it has its own argv reader.
+            let canonicalized = if is_api_tuple(&tuple) {
+                canonicalize_governed_api(args, &tuple, &canonical, manifest.manifest_version)
+            } else {
+                canonicalize_governed(args, &tuple, &canonical, manifest.manifest_version)
+            };
+            let request = match canonicalized {
+                Ok(request) => request,
+                Err(error) => return refuse_governed_canonicalization(&error),
+            };
             let mutation = GithubReadMutation::from_governed_request(&request);
             let outcome = route_governed(paths, rung, agent_binding, request, now);
             invalidate_successful_github_read_mutation(mutation.as_ref(), &outcome);
@@ -416,7 +454,7 @@ where
         }
         Classification::Unclassified => refuse(
             RefusalCode::Unclassified,
-            &unclassified_refusal_text(manifest.manifest_version),
+            &unclassified_refusal_text(args, manifest.manifest_version),
         ),
         Classification::Destructive => refuse(
             RefusalCode::DestructiveFlag,
@@ -425,10 +463,35 @@ where
     }
 }
 
-fn unclassified_refusal_text(manifest_version: u64) -> String {
+/// Refusal text for an undeclared invocation.
+///
+/// It names the verb the classifier decided on, because the decision is made on
+/// the verb alone: a reader who is told only that "this invocation" was refused
+/// cannot tell whether the verb or something in the tail was the problem, and
+/// output flags such as `--json` or `-q` are the usual wrong guess.
+fn unclassified_refusal_text(args: &[OsString], manifest_version: u64) -> String {
+    let subject = match invocation_verb(args) {
+        Some(verb) => format!("verb \"{verb}\""),
+        // A non-UTF-8 argument vector has no verb that can be quoted back.
+        None => "this invocation".to_string(),
+    };
     format!(
-        "no manifest declaration for this invocation (manifest {manifest_version}); GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration"
+        "{subject} is not declared in manifest {manifest_version} (output flags such as --json/-q are not the reason); GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration"
     )
+}
+
+/// The verb tuple `classify` reads out of an argument vector: two words for a
+/// verb with a subcommand (`issue create`), one for a bare verb (`api`).
+fn invocation_verb(args: &[OsString]) -> Option<String> {
+    let (verb, subcommand, _) = command_head(args)?;
+    Some(verb_tuple(verb, subcommand))
+}
+
+fn verb_tuple(verb: String, subcommand: Option<String>) -> String {
+    match subcommand {
+        Some(subcommand) => format!("{verb} {subcommand}"),
+        None => verb,
+    }
 }
 
 fn refuse_governed_canonicalization(error: &CanonicalizeError) -> i32 {
@@ -1770,7 +1833,18 @@ impl Manifest {
             let Some(canonical) = self.canonicalization.get(&tuple) else {
                 return Err(format!("governed tuple {tuple} lacks canonicalization"));
             };
-            if canonical.argv_forms.is_empty() || canonical.target_fields.is_empty() {
+            // A create names no target that exists yet, so a fields-only
+            // declaration carries body fields and an empty target. Requiring
+            // the form name keeps an empty target deliberate rather than a
+            // truncated declaration that would admit an unparsed argv.
+            let fields_only = is_fields_only(canonical);
+            let incomplete = canonical.argv_forms.is_empty()
+                || if fields_only {
+                    canonical.body_fields.is_empty()
+                } else {
+                    canonical.target_fields.is_empty()
+                };
+            if incomplete {
                 return Err(format!(
                     "governed tuple {tuple} has incomplete canonicalization"
                 ));
@@ -2519,6 +2593,35 @@ fn is_reviewed_admin_tuple(manifest_version: u64, tuple: &str) -> bool {
 fn is_reviewed_governed_tuple(manifest_version: u64, tuple: &str) -> bool {
     V1_GOVERNED_TUPLES.contains(&tuple)
         || (manifest_version >= 12 && V12_GOVERNED_TUPLES.contains(&tuple))
+        || (manifest_version >= 14 && V14_GOVERNED_TUPLES.contains(&tuple))
+}
+
+/// True for the one API rule that may be governed rather than admin: the v14
+/// own-comment PATCH. Every other governed API rule stays undeclared, so a
+/// signed rule alone cannot widen raw API writes into bot speech.
+fn is_reviewed_governed_api_rule(manifest_version: u64, rule: &ApiRule) -> bool {
+    manifest_version >= 14
+        && rule.method.eq_ignore_ascii_case(OWN_COMMENT_PATCH_METHOD)
+        && rule.path_glob == OWN_COMMENT_PATCH_PATH_GLOB
+}
+
+/// The own-comment PATCH is declared by an API rule, which carries no
+/// canonicalization of its own (manifest canonicalization keys must name a
+/// governed argv tuple). Its shape is fixed here instead: the comment id comes
+/// from the endpoint path and the body is the only admitted field.
+fn own_comment_patch_canonicalization() -> Canonicalization {
+    Canonicalization {
+        argv_forms: vec![BODY_ONLY_FORM.to_string()],
+        target_fields: vec!["comment_id".to_string()],
+        body_fields: vec!["body".to_string()],
+    }
+}
+
+fn is_fields_only(canonical: &Canonicalization) -> bool {
+    canonical
+        .argv_forms
+        .iter()
+        .any(|form| form == FIELDS_ONLY_FORM)
 }
 
 fn is_target_and_state(canonical: &Canonicalization) -> bool {
@@ -2555,10 +2658,7 @@ fn classify(args: &[OsString], manifest: &Manifest, platform: &str) -> Classific
     if verb == "api" {
         return classify_api(args, manifest, platform);
     }
-    let tuple = match subcommand {
-        Some(subcommand) => format!("{verb} {subcommand}"),
-        None => verb,
-    };
+    let tuple = verb_tuple(verb, subcommand);
     if DESTRUCTIVE_TUPLES.contains(&tuple.as_str())
         || (tuple.starts_with("release ")
             && args.iter().any(|arg| {
@@ -2658,11 +2758,18 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
     let rule = matches[0];
     if rule.tier == Tier::Admin {
         return Classification::Admin {
-            tuple: format!(
-                "api:{}:{}",
-                rule.method.to_ascii_uppercase(),
-                rule.path_glob
-            ),
+            tuple: api_tuple(rule),
+        };
+    }
+    // The own-comment PATCH is the one API write admitted as bot speech. It
+    // crosses the field wall below because the shim parses its payload itself
+    // and forwards only the single body field it recognized, rather than
+    // handing the holder bytes it never read.
+    if rule.tier == Tier::Governed && is_reviewed_governed_api_rule(manifest.manifest_version, rule)
+    {
+        return Classification::Governed {
+            tuple: api_tuple(rule),
+            canonical: own_comment_patch_canonicalization(),
         };
     }
     // Field payloads change request semantics independently of the endpoint.
@@ -2674,13 +2781,29 @@ fn classify_api(args: &[OsString], manifest: &Manifest, platform: &str) -> Class
     }
     match rule.tier {
         Tier::Mechanical => Classification::Mechanical,
-        // API writes are not normalized into governed equivalents until a
-        // parser accepts and validates their exact argv forms. An id-addressed
-        // comment PATCH can target any contributor's comment, unlike native
-        // `--edit-last`, which is scoped to the caller.
+        // Any other governed API rule stays undeclared until a parser accepts
+        // and validates its exact argv forms. An id-addressed comment PATCH can
+        // name any contributor's comment, unlike native `--edit-last`, which is
+        // scoped to the caller; the reviewed own-comment rule above is admitted
+        // only because the route holder checks that the comment's author is the
+        // calling seat's bot before it writes.
         Tier::Governed => Classification::Unclassified,
         Tier::Admin => unreachable!("admin API rules return before field protection"),
     }
+}
+
+/// Stable name for an API rule, shared by admin bypass audit records and the
+/// governed own-comment row: `api:<METHOD>:<path glob>`.
+fn api_tuple(rule: &ApiRule) -> String {
+    format!(
+        "api:{}:{}",
+        rule.method.to_ascii_uppercase(),
+        rule.path_glob
+    )
+}
+
+fn is_api_tuple(tuple: &str) -> bool {
+    tuple.starts_with("api:")
 }
 
 fn api_method_and_path(args: &[OsString]) -> Option<(String, String, bool)> {
@@ -2893,8 +3016,10 @@ fn canonicalize_governed(
         head_index + 1
     };
     let target_and_state = is_target_and_state(canonical);
+    let fields_only = is_fields_only(canonical);
     let mut positional = Vec::new();
     let mut body = Map::new();
+    let mut labels = Vec::new();
     let mut review_event = None;
     let mut explicit_repository = None;
     let mut close_reason = None;
@@ -2923,6 +3048,19 @@ fn canonicalize_governed(
                 format!("{value}: branch deletion stays undeclared"),
             ));
         }
+        if fields_only {
+            if let Some(flag) = unsupported_create_flag(value) {
+                // Refuse before anything is routed: these flags either hand out
+                // work (assignment, milestone, project) or need an interactive
+                // terminal, and neither is bot speech.
+                return Err(CanonicalizeError::typed(
+                    RefusalCode::UnsupportedFlag,
+                    format!(
+                        "{flag}: {tuple} through the shim admits only --title, --body, --body-file, --label, and --repo"
+                    ),
+                ));
+            }
+        }
         if value == "--edit-last" {
             if !is_reviewed_edit_last_tuple(manifest_version, tuple) {
                 return Err(CanonicalizeError::unclassified(
@@ -2944,6 +3082,26 @@ fn canonicalize_governed(
             explicit_repository = Some(repository.to_string());
         } else if let Some(repository) = value.strip_prefix("--repo=") {
             explicit_repository = Some(repository.to_string());
+        } else if fields_only {
+            if let Some(label) = declared_label_value(value, args.get(index + 1))? {
+                labels.push(label);
+                if !value.contains('=') {
+                    index += 1;
+                }
+            } else if let Some((field, supplied)) =
+                declared_body_value(value, canonical, args.get(index + 1))?
+            {
+                body.insert(field, Value::String(supplied));
+                if !value.contains('=') {
+                    index += 1;
+                }
+            } else if value.starts_with('-') {
+                return Err(CanonicalizeError::unclassified(format!(
+                    "undeclared flag {value}"
+                )));
+            } else {
+                positional.push(value.to_string());
+            }
         } else if target_and_state {
             if let Some(supplied) = declared_reason_value(value, args.get(index + 1), tuple)? {
                 if close_reason.replace(supplied).is_some() {
@@ -3011,7 +3169,10 @@ fn canonicalize_governed(
         // field is declared so --comment/--comment-file/-c reuse body plumbing.
         let body_optional_for_state =
             target_and_state && canonical.body_fields.iter().all(|field| field == "comment");
-        if !body_optional_for_review && !body_optional_for_state {
+        // A create's required fields belong to upstream: `gh issue create`
+        // without --title already fails with its own error text, and relaying
+        // that is more useful than a second refusal invented here.
+        if !body_optional_for_review && !body_optional_for_state && !fields_only {
             return Err(CanonicalizeError::unclassified(
                 "required declared body field is absent",
             ));
@@ -3032,6 +3193,14 @@ fn canonicalize_governed(
     }
     if let Some(event) = review_event {
         body.insert("event".to_string(), Value::String(event));
+    }
+    if !labels.is_empty() {
+        // The argv flag is singular and repeatable; GitHub's field is a plural
+        // array, so the repetitions are collected into one.
+        body.insert(
+            "labels".to_string(),
+            Value::Array(labels.into_iter().map(Value::String).collect()),
+        );
     }
     let target = canonical
         .target_fields
@@ -3058,6 +3227,216 @@ fn canonicalize_governed(
         manifest_version,
         edit_last,
     })
+}
+
+/// Canonicalize the one governed API form: an id-addressed PATCH of an issue
+/// comment, which is how `github_read`'s comment editor rewrites a comment the
+/// calling seat's bot already wrote.
+///
+/// The endpoint carries the target (repository and comment id) and the only
+/// admitted payload is a single `body`, supplied either as a JSON object behind
+/// `--input` (including the stdin spelling `-`) or as one `body` field. Every
+/// other flag is refused, because the shim does not run upstream `gh` for a
+/// governed route and silently dropping a flag would change what the caller
+/// asked for.
+fn canonicalize_governed_api(
+    args: &[OsString],
+    tuple: &str,
+    canonical: &Canonicalization,
+    manifest_version: u64,
+) -> Result<GovernedRequest, CanonicalizeError> {
+    canonicalize_governed_api_from(
+        args,
+        tuple,
+        canonical,
+        manifest_version,
+        &mut io::stdin().lock(),
+    )
+}
+
+fn canonicalize_governed_api_from<R: Read>(
+    args: &[OsString],
+    tuple: &str,
+    canonical: &Canonicalization,
+    manifest_version: u64,
+    stdin: &mut R,
+) -> Result<GovernedRequest, CanonicalizeError> {
+    let target_field = canonical
+        .target_fields
+        .first()
+        .ok_or_else(|| CanonicalizeError::unclassified("governed api target is undeclared"))?;
+    let body_field = canonical
+        .body_fields
+        .first()
+        .ok_or_else(|| CanonicalizeError::unclassified("governed api body is undeclared"))?;
+    let (_, path, _) = api_method_and_path(args)
+        .ok_or_else(|| CanonicalizeError::unclassified("api endpoint is undeclared"))?;
+    let (repository, comment_id) = own_comment_patch_target(&path).ok_or_else(|| {
+        CanonicalizeError::unclassified(
+            "only /repos/<owner>/<repo>/issues/comments/<id> is declared for a governed PATCH",
+        )
+    })?;
+    let body_text = own_comment_patch_payload(args, body_field, stdin)?;
+
+    let mut target = Map::new();
+    target.insert(target_field.clone(), Value::String(comment_id));
+    let mut body = Map::new();
+    body.insert(body_field.clone(), Value::String(body_text));
+    Ok(GovernedRequest {
+        action: tuple.to_string(),
+        target,
+        body,
+        repository: Some(repository),
+        manifest_version,
+        edit_last: false,
+    })
+}
+
+/// Split `/repos/<owner>/<repo>/issues/comments/<id>` into the canonical
+/// repository key and the comment id. Anything else - a full URL, a trailing
+/// segment, a non-numeric id - is not the declared endpoint.
+fn own_comment_patch_target(path: &str) -> Option<(String, String)> {
+    let mut segments = path.strip_prefix('/').unwrap_or(path).split('/');
+    (segments.next()? == "repos").then_some(())?;
+    let owner = segments.next()?;
+    let name = segments.next()?;
+    (segments.next()? == "issues").then_some(())?;
+    (segments.next()? == "comments").then_some(())?;
+    let comment_id = segments.next()?;
+    if segments.next().is_some() {
+        return None;
+    }
+    if comment_id.is_empty() || !comment_id.chars().all(|value| value.is_ascii_digit()) {
+        return None;
+    }
+    let repository = canonical_repository_key(&format!("{owner}/{name}"))?;
+    Some((repository, comment_id.to_string()))
+}
+
+fn own_comment_patch_payload<R: Read>(
+    args: &[OsString],
+    body_field: &str,
+    stdin: &mut R,
+) -> Result<String, CanonicalizeError> {
+    let mut body = None;
+    let mut index = 1;
+    while index < args.len() {
+        let value = args[index].to_str().ok_or_else(|| {
+            CanonicalizeError::unclassified("non-UTF-8 governed arguments are undeclared")
+        })?;
+        // The method and the endpoint were both matched against the declared
+        // rule during classification, so they are skipped rather than reparsed.
+        if matches!(value, "--method" | "-X") {
+            index += 2;
+            continue;
+        }
+        if value.starts_with("--method=") {
+            index += 1;
+            continue;
+        }
+        let (supplied, consumed) = match api_payload_argument(value, args.get(index + 1))? {
+            Some(found) => found,
+            None => {
+                if value.starts_with('-') {
+                    return Err(CanonicalizeError::unclassified(format!(
+                        "undeclared flag {value}"
+                    )));
+                }
+                index += 1;
+                continue;
+            }
+        };
+        let text = match supplied {
+            ApiPayload::Field(text) => text,
+            ApiPayload::Document(source) => {
+                let document = read_body_file_from(Path::new(&source), stdin)
+                    .map_err(CanonicalizeError::unclassified)?;
+                json_body_only(&document, body_field)?
+            }
+        };
+        if body.replace(text).is_some() {
+            return Err(CanonicalizeError::unclassified(format!(
+                "the governed comment PATCH admits one {body_field} payload"
+            )));
+        }
+        index += consumed;
+    }
+    body.ok_or_else(|| {
+        CanonicalizeError::unclassified(format!("the governed comment PATCH requires a {body_field}"))
+    })
+}
+
+enum ApiPayload {
+    /// A `body=<text>` field supplied directly on the command line.
+    Field(String),
+    /// A JSON document behind `--input`, where `-` means standard input.
+    Document(String),
+}
+
+fn api_payload_argument(
+    value: &str,
+    next: Option<&OsString>,
+) -> Result<Option<(ApiPayload, usize)>, CanonicalizeError> {
+    let value_of = |flag: &str| -> Result<(String, usize), CanonicalizeError> {
+        next.and_then(|arg| arg.to_str())
+            .map(|supplied| (supplied.to_string(), 2))
+            .ok_or_else(|| CanonicalizeError::unclassified(format!("{flag} requires a value")))
+    };
+    if value == "--input" {
+        let (supplied, consumed) = value_of(value)?;
+        return Ok(Some((ApiPayload::Document(supplied), consumed)));
+    }
+    if let Some(supplied) = value.strip_prefix("--input=") {
+        return Ok(Some((ApiPayload::Document(supplied.to_string()), 1)));
+    }
+    for flag in ["--field", "--raw-field", "-f", "-F"] {
+        let (supplied, consumed) = if value == flag {
+            value_of(flag)?
+        } else if let Some(rest) = value
+            .strip_prefix(&format!("{flag}="))
+            .or_else(|| value.strip_prefix(flag).filter(|_| flag.len() == 2))
+        {
+            (rest.to_string(), 1)
+        } else {
+            continue;
+        };
+        let (name, text) = supplied.split_once('=').ok_or_else(|| {
+            CanonicalizeError::unclassified(format!("{flag} takes name=value"))
+        })?;
+        if name != "body" {
+            return Err(CanonicalizeError::unclassified(format!(
+                "{name} is not declared; the governed comment PATCH is body-only"
+            )));
+        }
+        return Ok(Some((ApiPayload::Field(text.to_string()), consumed)));
+    }
+    Ok(None)
+}
+
+/// Read the one declared field out of a JSON payload. A document carrying
+/// anything besides that field is not the declared request, and forwarding it
+/// would mean routing bytes the shim never interpreted.
+fn json_body_only(document: &str, body_field: &str) -> Result<String, CanonicalizeError> {
+    let value: Value = serde_json::from_str(document).map_err(|error| {
+        CanonicalizeError::unclassified(format!("governed PATCH payload is not JSON: {error}"))
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        CanonicalizeError::unclassified("governed PATCH payload must be a JSON object")
+    })?;
+    let text = object
+        .get(body_field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CanonicalizeError::unclassified(format!(
+                "governed PATCH payload needs a string {body_field}"
+            ))
+        })?;
+    if object.len() != 1 {
+        return Err(CanonicalizeError::unclassified(format!(
+            "governed PATCH payload admits only {body_field}"
+        )));
+    }
+    Ok(text.to_string())
 }
 
 fn declared_body_value(
@@ -3125,6 +3504,36 @@ fn declared_body_value(
         }
     }
     Ok(None)
+}
+
+/// `gh issue create` takes `--label` once per label. The repetitions are
+/// collected here rather than through the single-valued body plumbing, which
+/// would keep only the last one.
+fn declared_label_value(
+    value: &str,
+    next: Option<&OsString>,
+) -> Result<Option<String>, CanonicalizeError> {
+    if value == "--labels" || value.starts_with("--labels=") {
+        // The declared body field is plural, but the flag upstream accepts is
+        // not; refuse rather than let the plural spelling through as one label.
+        return Err(CanonicalizeError::unclassified(
+            "--labels is not a gh flag; pass --label once per label",
+        ));
+    }
+    if value == "--label" {
+        let supplied = next
+            .and_then(|arg| arg.to_str())
+            .ok_or_else(|| CanonicalizeError::unclassified("--label requires a value"))?;
+        return Ok(Some(supplied.to_string()));
+    }
+    Ok(value.strip_prefix("--label=").map(str::to_string))
+}
+
+fn unsupported_create_flag(value: &str) -> Option<&'static str> {
+    CREATE_UNSUPPORTED_FLAGS
+        .iter()
+        .copied()
+        .find(|flag| value == *flag || value.starts_with(&format!("{flag}=")))
 }
 
 fn declared_reason_value(
@@ -6385,13 +6794,17 @@ mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 13);
+        assert_eq!(RefusalCode::ALL.len(), 14);
         assert!(RefusalCode::ALL
             .iter()
             .all(|code| code.as_str().starts_with("gh_shim_")));
         assert_eq!(
             RefusalCode::GovernanceUnavailable.as_str(),
             "gh_shim_governance_unavailable"
+        );
+        assert_eq!(
+            RefusalCode::UnsupportedFlag.as_str(),
+            "gh_shim_unsupported_flag"
         );
         assert_eq!(
             GOVERNANCE_UNAVAILABLE_TEXT,
@@ -6541,6 +6954,370 @@ mod tests {
                 REFUSAL_EXIT_STATUS
             );
         }
+    }
+
+    /// The classifier's view of v14: the v12 fixture plus the two speech rows
+    /// the v14 payload adds. Built here rather than read from the assembled
+    /// payload, which lives under the gitignored `.alfonso/` and is absent on a
+    /// clean checkout.
+    fn v14_manifest() -> Manifest {
+        let mut manifest = v12_fixture_manifest();
+        manifest.manifest_version = 14;
+        manifest
+            .tiers
+            .get_mut(&Tier::Governed)
+            .expect("v14 governed tier")
+            .push(TupleDecl::Details {
+                tuple: "issue create".to_string(),
+                platform: vec!["macos".to_string(), "linux".to_string()],
+                api_match: None,
+                rationale: Some(
+                    "Speech tier, the same authority class as issue comment and issue close"
+                        .to_string(),
+                ),
+            });
+        manifest.canonicalization.insert(
+            "issue create".to_string(),
+            Canonicalization {
+                argv_forms: vec![FIELDS_ONLY_FORM.to_string()],
+                target_fields: Vec::new(),
+                body_fields: vec![
+                    "title".to_string(),
+                    "body".to_string(),
+                    "labels".to_string(),
+                ],
+            },
+        );
+        manifest.api_rules.push(ApiRule {
+            method: OWN_COMMENT_PATCH_METHOD.to_string(),
+            path_glob: OWN_COMMENT_PATCH_PATH_GLOB.to_string(),
+            tier: Tier::Governed,
+            platform: vec!["macos".to_string(), "linux".to_string()],
+            rationale: Some(
+                "Own-comment edit: body-only speech; the holder verifies authorship".to_string(),
+            ),
+        });
+        manifest
+    }
+
+    /// The v13 shape as it is deployed today, for the two-way comparisons the
+    /// v14 rows have to survive.
+    fn v13_manifest() -> Manifest {
+        branch_protection_manifest("PUT", Tier::Admin)
+    }
+
+    #[test]
+    fn v14_issue_create_is_bot_speech_and_v13_leaves_it_undeclared() {
+        let manifest = v14_manifest();
+        manifest.validate().expect("valid v14 speech extensions");
+        assert!(is_reviewed_governed_tuple(14, "issue create"));
+        assert!(!is_reviewed_governed_tuple(13, "issue create"));
+
+        let args = os_args(&["issue", "create", "--title", "Filing", "--body", "Prose"]);
+        let Classification::Governed { tuple, canonical } = classify(&args, &manifest, "macos")
+        else {
+            panic!("v14 issue create must be governed bot speech");
+        };
+        assert_eq!(tuple, "issue create");
+        let request = canonicalize_governed(&args, &tuple, &canonical, manifest.manifest_version)
+            .expect("issue create canonicalizes");
+        assert_eq!(request.action, "issue create");
+        // A create names no target: the issue has no number until it exists.
+        assert!(request.target.is_empty());
+        assert_eq!(request.body["title"], json!("Filing"));
+        assert_eq!(request.body["body"], json!("Prose"));
+
+        // The same argv under the deployed v13 shape is undeclared.
+        assert!(matches!(
+            classify(&args, &v13_manifest(), "macos"),
+            Classification::Unclassified
+        ));
+    }
+
+    #[test]
+    fn v14_issue_create_admits_repeated_labels_and_leaves_a_missing_title_to_upstream() {
+        let manifest = v14_manifest();
+        let args = os_args(&[
+            "issue",
+            "create",
+            "--title",
+            "Filing",
+            "--body-file",
+            "-",
+            "--label",
+            "bug",
+            "--label=p1",
+            "--repo",
+            "cortexkit/aft",
+        ]);
+        let Classification::Governed { tuple, canonical } = classify(&args, &manifest, "macos")
+        else {
+            panic!("labelled issue create must be governed");
+        };
+        let request = canonicalize_governed(&args, &tuple, &canonical, manifest.manifest_version)
+            .expect("labelled issue create canonicalizes");
+        assert_eq!(request.body["labels"], json!(["bug", "p1"]));
+        assert_eq!(request.repository.as_deref(), Some("cortexkit/aft"));
+
+        // `gh issue create` without --title already fails with upstream's own
+        // error text, so the shim must not invent a second refusal for it.
+        let no_title = os_args(&["issue", "create", "--body", "Prose"]);
+        let Classification::Governed { tuple, canonical } = classify(&no_title, &manifest, "macos")
+        else {
+            panic!("a title-less issue create is still the declared verb");
+        };
+        let request =
+            canonicalize_governed(&no_title, &tuple, &canonical, manifest.manifest_version)
+                .expect("a missing title is upstream's problem, not a shim refusal");
+        assert!(!request.body.contains_key("title"));
+
+        // The plural spelling is not a gh flag, and must not slip through the
+        // body plumbing as a single label.
+        let plural = os_args(&["issue", "create", "--title", "Filing", "--labels=bug,p1"]);
+        let Classification::Governed { tuple, canonical } = classify(&plural, &manifest, "macos")
+        else {
+            panic!("the verb is declared even when a flag is not");
+        };
+        let error = canonicalize_governed(&plural, &tuple, &canonical, manifest.manifest_version)
+            .expect_err("--labels is not a gh flag");
+        assert_eq!(error.code, RefusalCode::Unclassified);
+    }
+
+    #[test]
+    fn v14_issue_create_refuses_flags_outside_bot_speech_before_routing() {
+        let manifest = v14_manifest();
+        assert_eq!(
+            RefusalCode::UnsupportedFlag.as_str(),
+            "gh_shim_unsupported_flag"
+        );
+        // Spelled out rather than read from CREATE_UNSUPPORTED_FLAGS: a test
+        // that iterates the same list the classifier consults would still pass
+        // if a flag were dropped from that list, which is the exact regression
+        // it exists to catch.
+        let refused = [
+            "--assignee",
+            "--milestone",
+            "--project",
+            "--web",
+            "--template",
+            "--recover",
+        ];
+        assert_eq!(
+            CREATE_UNSUPPORTED_FLAGS, refused,
+            "the refused set is part of the reviewed row, not an implementation detail"
+        );
+        for flag in refused {
+            for spelling in [
+                os_args(&["issue", "create", "--title", "Filing", flag, "someone"]),
+                os_args(&[
+                    "issue",
+                    "create",
+                    "--title",
+                    "Filing",
+                    &format!("{flag}=someone"),
+                ]),
+            ] {
+                let Classification::Governed { tuple, canonical } =
+                    classify(&spelling, &manifest, "macos")
+                else {
+                    panic!("{flag}: the verb is declared even when the flag is not");
+                };
+                let error =
+                    canonicalize_governed(&spelling, &tuple, &canonical, manifest.manifest_version)
+                        .expect_err(&format!("{flag} must refuse"));
+                assert_eq!(
+                    error.code,
+                    RefusalCode::UnsupportedFlag,
+                    "{flag} must refuse as an unsupported flag"
+                );
+                assert!(
+                    error.text.starts_with(flag),
+                    "{flag} refusal must name the flag: {}",
+                    error.text
+                );
+                // The refusal happens while reading argv, so nothing is routed.
+                assert_eq!(
+                    refuse_governed_canonicalization(&error),
+                    REFUSAL_EXIT_STATUS
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v14_own_comment_patch_is_governed_and_v13_leaves_it_undeclared() {
+        let manifest = v14_manifest();
+        let args = os_args(&[
+            "api",
+            "--method",
+            "PATCH",
+            "repos/cortexkit/aft/issues/comments/123",
+            "--input",
+            "-",
+        ]);
+        let Classification::Governed { tuple, canonical } = classify(&args, &manifest, "macos")
+        else {
+            panic!("v14 own-comment PATCH must be governed bot speech");
+        };
+        assert_eq!(tuple, "api:PATCH:/repos/*/*/issues/comments/*");
+
+        let mut stdin = std::io::Cursor::new(r#"{"body":"edited prose"}"#);
+        let request = canonicalize_governed_api_from(
+            &args,
+            &tuple,
+            &canonical,
+            manifest.manifest_version,
+            &mut stdin,
+        )
+        .expect("own-comment PATCH canonicalizes");
+        assert_eq!(request.target["comment_id"], json!("123"));
+        assert_eq!(request.body["body"], json!("edited prose"));
+        assert_eq!(request.repository.as_deref(), Some("cortexkit/aft"));
+
+        // The deployed v13 shape declares no PATCH rule at all, so the same
+        // invocation is undeclared there.
+        assert!(matches!(
+            classify(&args, &v13_manifest(), "macos"),
+            Classification::Unclassified
+        ));
+    }
+
+    #[test]
+    fn v14_governed_patch_row_admits_only_the_comment_endpoint_and_a_body_payload() {
+        let manifest = v14_manifest();
+        // The issue itself is a different resource: editing it is not an
+        // own-comment edit, and the new row must not reach it.
+        for endpoint in [
+            "repos/cortexkit/aft/issues/123",
+            "repos/cortexkit/aft/issues/comments",
+        ] {
+            let args = os_args(&["api", "--method", "PATCH", endpoint, "--input", "-"]);
+            assert!(
+                matches!(
+                    classify(&args, &manifest, "macos"),
+                    Classification::Unclassified
+                ),
+                "{endpoint} must not be admitted by the own-comment row"
+            );
+        }
+
+        let args = os_args(&[
+            "api",
+            "--method",
+            "PATCH",
+            "repos/cortexkit/aft/issues/comments/123",
+            "--input",
+            "-",
+        ]);
+        let Classification::Governed { tuple, canonical } = classify(&args, &manifest, "macos")
+        else {
+            panic!("the declared endpoint must be governed");
+        };
+        // A payload carrying more than the body is not the declared request.
+        let mut stdin = std::io::Cursor::new(r#"{"body":"edited","state":"closed"}"#);
+        let error = canonicalize_governed_api_from(
+            &args,
+            &tuple,
+            &canonical,
+            manifest.manifest_version,
+            &mut stdin,
+        )
+        .expect_err("a body-only row must refuse a wider payload");
+        assert_eq!(error.code, RefusalCode::Unclassified);
+
+        // An output flag would be silently dropped, because a governed route
+        // never runs upstream gh.
+        let with_jq = os_args(&[
+            "api",
+            "--method",
+            "PATCH",
+            "repos/cortexkit/aft/issues/comments/123",
+            "-f",
+            "body=edited",
+            "--jq",
+            ".id",
+        ]);
+        let mut empty = std::io::Cursor::new("");
+        let error = canonicalize_governed_api_from(
+            &with_jq,
+            &tuple,
+            &canonical,
+            manifest.manifest_version,
+            &mut empty,
+        )
+        .expect_err("an undeclared flag must refuse");
+        assert_eq!(error.code, RefusalCode::Unclassified);
+
+        // The field spelling of the same payload is the declared request.
+        let field_args = os_args(&[
+            "api",
+            "--method",
+            "PATCH",
+            "repos/cortexkit/aft/issues/comments/123",
+            "-f",
+            "body=edited",
+        ]);
+        let request = canonicalize_governed_api_from(
+            &field_args,
+            &tuple,
+            &canonical,
+            manifest.manifest_version,
+            &mut empty,
+        )
+        .expect("a body field is the declared payload");
+        assert_eq!(request.body["body"], json!("edited"));
+    }
+
+    #[test]
+    fn v14_manifest_payload_round_trips_through_serialization() {
+        let bytes = serde_json::to_vec(&v14_manifest()).expect("serialize the v14 shape");
+        let parsed: Manifest = serde_json::from_slice(&bytes).expect("parse the v14 shape back");
+        parsed.validate().expect("the parsed v14 shape is valid");
+        assert_eq!(parsed.manifest_version, 14);
+
+        let create = os_args(&["issue", "create", "--title", "Filing"]);
+        assert!(matches!(
+            classify(&create, &parsed, "macos"),
+            Classification::Governed { ref tuple, .. } if tuple == "issue create"
+        ));
+        let patch = os_args(&[
+            "api",
+            "--method",
+            "PATCH",
+            "/repos/cortexkit/aft/issues/comments/123",
+            "--input",
+            "-",
+        ]);
+        assert!(matches!(
+            classify(&patch, &parsed, "macos"),
+            Classification::Governed { ref tuple, .. }
+                if tuple == "api:PATCH:/repos/*/*/issues/comments/*"
+        ));
+    }
+
+    #[test]
+    fn unclassified_refusal_names_the_verb_the_classifier_decided_on() {
+        // Two-word verb: the decision is about `issue create`, not the tail.
+        assert_eq!(
+            unclassified_refusal_text(
+                &os_args(&["issue", "create", "--title", "Filing", "--json", "number"]),
+                13
+            ),
+            "verb \"issue create\" is not declared in manifest 13 (output flags such as --json/-q are not the reason); GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration"
+        );
+        // One-word verb: a raw API call decides on `api` alone.
+        assert_eq!(
+            unclassified_refusal_text(
+                &os_args(&[
+                    "api",
+                    "--method",
+                    "DELETE",
+                    "repos/cortexkit/aft/actions/runs/123"
+                ]),
+                9
+            ),
+            "verb \"api\" is not declared in manifest 9 (output flags such as --json/-q are not the reason); GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration"
+        );
     }
 
     #[test]

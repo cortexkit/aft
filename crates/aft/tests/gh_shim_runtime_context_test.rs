@@ -340,9 +340,9 @@ fn write_user_config(config_home: &Path, connection_file: &Path, enabled: Option
     .expect("write user config");
 }
 
-fn unclassified_refusal(manifest_version: u64) -> String {
+fn unclassified_refusal(verb: &str, manifest_version: u64) -> String {
     format!(
-        "gh-shim: gh_shim_unclassified: no manifest declaration for this invocation (manifest {manifest_version}); GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration\n"
+        "gh-shim: gh_shim_unclassified: verb \"{verb}\" is not declared in manifest {manifest_version} (output flags such as --json/-q are not the reason); GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration\n"
     )
 }
 
@@ -812,7 +812,7 @@ fn gh_shim_governed_manifest_passthroughs_no_verb_and_help_invocations() {
     assert!(undeclared_write.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&undeclared_write.stderr),
-        unclassified_refusal(1)
+        unclassified_refusal("release publish", 1)
     );
 
     assert_eq!(
@@ -888,7 +888,7 @@ fn gh_shim_v9_admin_tuples_differ_from_raw_delete_and_keep_get_mechanical() {
     assert_eq!(raw_api_delete.status.code(), Some(86));
     assert!(raw_api_delete.stdout.is_empty());
     let raw_api_refusal = String::from_utf8_lossy(&raw_api_delete.stderr);
-    assert_eq!(raw_api_refusal, unclassified_refusal(9));
+    assert_eq!(raw_api_refusal, unclassified_refusal("api", 9));
     assert_ne!(
         expected_admin_refusal, raw_api_refusal,
         "native admin and raw API delete refusals must remain distinguishable"
@@ -956,7 +956,7 @@ fn gh_shim_operator_bypass_does_not_lift_unclassified_refusal_and_keeps_admin_me
     assert!(unclassified_stderr.contains(
         "GH_SHIM_BYPASS does not apply to undeclared invocations - this verb needs a manifest declaration"
     ));
-    assert_eq!(unclassified_stderr, unclassified_refusal(9));
+    assert_eq!(unclassified_stderr, unclassified_refusal("api", 9));
 
     let admin = shim_command(
         &["repo", "edit", "cortexkit/insula", "--visibility", "public"],
@@ -1054,7 +1054,7 @@ fn gh_shim_v10_workflow_run_admin_tuple_differs_from_raw_dispatch_and_is_version
     assert_eq!(raw_v10.status.code(), Some(86));
     assert!(raw_v10.stdout.is_empty());
     let raw_v10_refusal = String::from_utf8_lossy(&raw_v10.stderr);
-    assert_eq!(raw_v10_refusal, unclassified_refusal(10));
+    assert_eq!(raw_v10_refusal, unclassified_refusal("api", 10));
     assert_ne!(
         expected_admin_refusal, raw_v10_refusal,
         "native workflow admin and raw API dispatch refusals must remain distinguishable"
@@ -1086,7 +1086,7 @@ fn gh_shim_v10_workflow_run_admin_tuple_differs_from_raw_dispatch_and_is_version
     assert_eq!(workflow_v9.status.code(), Some(86));
     assert!(workflow_v9.stdout.is_empty());
     let workflow_v9_refusal = String::from_utf8_lossy(&workflow_v9.stderr);
-    assert_eq!(workflow_v9_refusal, unclassified_refusal(9));
+    assert_eq!(workflow_v9_refusal, unclassified_refusal("workflow run", 9));
     assert_ne!(expected_admin_refusal, workflow_v9_refusal);
 
     let raw_v9 = shim_command(
@@ -1104,7 +1104,7 @@ fn gh_shim_v10_workflow_run_admin_tuple_differs_from_raw_dispatch_and_is_version
     assert!(raw_v9.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&raw_v9.stderr),
-        unclassified_refusal(9)
+        unclassified_refusal("api", 9)
     );
     assert!(!v9_recorder.exists());
 }
@@ -1201,7 +1201,7 @@ fn gh_shim_v10_comment_edit_last_is_governed_but_raw_comment_patch_is_unclassifi
     .expect("spawn raw comment PATCH invocation");
     assert_eq!(raw_patch.status.code(), Some(86));
     let raw_patch_refusal = String::from_utf8_lossy(&raw_patch.stderr);
-    assert_eq!(raw_patch_refusal, unclassified_refusal(10));
+    assert_eq!(raw_patch_refusal, unclassified_refusal("api", 10));
     assert_ne!(raw_patch_refusal, governed_stderr);
     assert!(raw_patch.stdout.is_empty());
 
@@ -1228,7 +1228,7 @@ fn gh_shim_v10_comment_edit_last_is_governed_but_raw_comment_patch_is_unclassifi
     assert_eq!(delete_last.status.code(), Some(86));
     assert_eq!(
         String::from_utf8_lossy(&delete_last.stderr),
-        unclassified_refusal(10)
+        unclassified_refusal("pr comment", 10)
     );
     assert!(
         !recorder.exists(),
@@ -1336,7 +1336,7 @@ fn gh_shim_v10_run_rerun_is_operator_bypassed_reads_passthrough_and_cancel_is_re
     assert_eq!(cancel.status.code(), Some(86));
     assert!(cancel.stdout.is_empty());
     let cancel_refusal = String::from_utf8_lossy(&cancel.stderr);
-    assert_eq!(cancel_refusal, unclassified_refusal(10));
+    assert_eq!(cancel_refusal, unclassified_refusal("run cancel", 10));
     assert_ne!(
         expected_admin_refusal, cancel_refusal,
         "rerun's reviewed admin refusal and cancel's unclassified refusal must differ"
@@ -1402,7 +1402,7 @@ fn gh_shim_governed_binding_refuses_writes_when_daemon_is_unreachable() {
     assert!(unclassified.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&unclassified.stderr),
-        unclassified_refusal(1)
+        unclassified_refusal("alias set", 1)
     );
     assert!(
         !recorder.exists(),
