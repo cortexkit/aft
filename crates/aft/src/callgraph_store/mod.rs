@@ -4311,8 +4311,7 @@ impl CallGraphStore {
             if deleted.insert(rel_path.clone()) && load_file_row(&conn, &rel_path)?.is_some() {
                 surface_changed.insert(rel_path.clone());
                 let started = Instant::now();
-                let dependent_refs =
-                    ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
+                let dependent_refs = ref_ids_depending_on(&conn, &self.project_root, &rel_path)?;
                 profile.dependency_selection += started.elapsed();
                 record_dependent_refs(
                     &mut selected_ref_ids,

@@ -124,12 +124,18 @@ describe("BinaryBridge background task accounting", () => {
 
 describe("BinaryBridge background task accounting on bridge death", () => {
   function deathInternals(bridge: BinaryBridge): {
-    handleTimeout(triggeringSessionId?: string): void;
+    handleTimeout(
+      trigger: { requestId: string; tool: string; generation: number },
+      triggeringSessionId?: string,
+    ): void;
     handleCrash(cause?: Error): void;
     rejectAllPending(error: Error): void;
   } {
     return bridge as unknown as {
-      handleTimeout(triggeringSessionId?: string): void;
+      handleTimeout(
+        trigger: { requestId: string; tool: string; generation: number },
+        triggeringSessionId?: string,
+      ): void;
       handleCrash(cause?: Error): void;
       rejectAllPending(error: Error): void;
     };
@@ -161,7 +167,7 @@ describe("BinaryBridge background task accounting on bridge death", () => {
     });
     expect(bridge.hasOutstandingBackgroundTasks()).toBe(true);
 
-    deathInternals(bridge).handleTimeout();
+    deathInternals(bridge).handleTimeout({ requestId: "1", tool: "bash", generation: 1 });
     expect(bridge.hasOutstandingBackgroundTasks()).toBe(false);
   });
 });

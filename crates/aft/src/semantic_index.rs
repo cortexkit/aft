@@ -541,6 +541,29 @@ pub struct SemanticEmbeddingModel {
 
 pub type EmbeddingModel = SemanticEmbeddingModel;
 
+/// Count-only half of [`validate_embedding_batch`]: the build path allows an
+/// empty vector for a row the backend rejected, so it validates dimensions per
+/// row itself and shares only this shape check.
+fn validate_embedding_batch_count(
+    vectors: &[Vec<f32>],
+    expected_count: usize,
+    context: &str,
+) -> Result<(), String> {
+    if expected_count > 0 && vectors.is_empty() {
+        return Err(format!(
+            "{context} returned no vectors for {expected_count} inputs"
+        ));
+    }
+    if vectors.len() != expected_count {
+        return Err(format!(
+            "{context} returned {} vectors for {} inputs",
+            vectors.len(),
+            expected_count
+        ));
+    }
+    Ok(())
+}
+
 fn validate_embedding_batch(
     vectors: &[Vec<f32>],
     expected_count: usize,
@@ -2555,13 +2578,9 @@ where
     let vectors = embed_fn(texts)?;
     let metadata = take_http_build_metadata();
 
-    if vectors.len() != requested_texts.len() {
-        return Err(format!(
-            "embedding backend returned {} vectors for {} inputs",
-            vectors.len(),
-            requested_texts.len()
-        ));
-    }
+    // Skipped rows carry an empty vector on purpose; the count check still
+    // applies because every requested row must have exactly one slot.
+    validate_embedding_batch_count(&vectors, requested_texts.len(), "embedding backend")?;
     if metadata
         .as_ref()
         .is_some_and(|metadata| metadata.len() != requested_texts.len())

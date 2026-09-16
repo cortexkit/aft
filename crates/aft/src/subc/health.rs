@@ -1107,8 +1107,7 @@ fn build_health_diagnostic_rollup(
         // This field deliberately covers only already-open resident stores. A
         // standing report is necessary because stale rows block projection by
         // making dead-code findings disappear rather than raising an error.
-        resident_callgraph_stale_backend_rows:
-            Option<crate::callgraph_store::StalePathCensus>,
+        resident_callgraph_stale_backend_rows: Option<crate::callgraph_store::StalePathCensus>,
         watcher: Option<crate::context::WatcherCountersSnapshot>,
         standing: Option<StandingHealthEntry>,
     }
@@ -1176,11 +1175,8 @@ fn build_health_diagnostic_rollup(
                 .map(|(count, _window_start)| count)
                 .filter(|count| *count > 0)
         });
-        let resident_callgraph_stale_backend_rows = ctx
-            .callgraph_store()
-            .try_read()
-            .ok()
-            .and_then(|store| {
+        let resident_callgraph_stale_backend_rows =
+            ctx.callgraph_store().try_read().ok().and_then(|store| {
                 store
                     .as_ref()
                     .and_then(|store| store.try_stale_path_census().ok().flatten())
@@ -1468,23 +1464,20 @@ mod tests {
         std::fs::create_dir_all(file.parent().expect("fixture file parent")).unwrap();
         std::fs::write(&file, "export function staleFixture() {}\n").unwrap();
         let store_dir = project_root.join(".callgraph-health-test");
-        let writer = crate::callgraph_store::CallGraphStore::open(
-            store_dir.clone(),
-            project_root.clone(),
-        )
-        .unwrap();
+        let writer =
+            crate::callgraph_store::CallGraphStore::open(store_dir.clone(), project_root.clone())
+                .unwrap();
         writer.cold_build(std::slice::from_ref(&file)).unwrap();
-        writer.mark_files_stale(std::slice::from_ref(&file)).unwrap();
+        writer
+            .mark_files_stale(std::slice::from_ref(&file))
+            .unwrap();
         if remove_file {
             std::fs::remove_file(&file).unwrap();
         }
         drop(writer);
-        let reader = crate::callgraph_store::CallGraphStore::open_readonly(
-            store_dir,
-            project_root,
-        )
-        .unwrap()
-        .expect("ready resident callgraph store");
+        let reader = crate::callgraph_store::CallGraphStore::open_readonly(store_dir, project_root)
+            .unwrap()
+            .expect("ready resident callgraph store");
         *ctx.callgraph_store()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(reader));
@@ -1524,20 +1517,14 @@ mod tests {
         };
         let absent = row_for(&absent_root);
         assert_eq!(absent["resident_callgraph_stale_backend_rows"], 1);
-        assert_eq!(
-            absent["resident_callgraph_absent_stale_backend_rows"],
-            1
-        );
+        assert_eq!(absent["resident_callgraph_absent_stale_backend_rows"], 1);
         assert_eq!(
             absent["resident_callgraph_unreadable_stale_backend_rows"],
             0
         );
         let existing = row_for(&existing_root);
         assert_eq!(existing["resident_callgraph_stale_backend_rows"], 1);
-        assert_eq!(
-            existing["resident_callgraph_absent_stale_backend_rows"],
-            0
-        );
+        assert_eq!(existing["resident_callgraph_absent_stale_backend_rows"], 0);
         assert_eq!(
             existing["resident_callgraph_unreadable_stale_backend_rows"],
             0
@@ -1573,7 +1560,10 @@ mod tests {
 
         std::fs::set_permissions(&guarded, std::fs::Permissions::from_mode(original_mode)).unwrap();
         let metrics = report.metrics.expect("health metrics");
-        assert_eq!(metrics["roots"][0]["resident_callgraph_stale_backend_rows"], 1);
+        assert_eq!(
+            metrics["roots"][0]["resident_callgraph_stale_backend_rows"],
+            1
+        );
         assert_eq!(
             metrics["roots"][0]["resident_callgraph_absent_stale_backend_rows"],
             0

@@ -229,7 +229,9 @@ fn count(conn: &Connection, table: &str, filter: Option<(&str, &str)>) -> i64 {
             )
             .unwrap(),
         None => conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
             .unwrap(),
     }
 }
