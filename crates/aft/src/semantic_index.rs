@@ -178,6 +178,8 @@ thread_local! {
     static LAST_HTTP_BUILD_METADATA: RefCell<Option<Vec<BuildEmbeddingRowMetadata>>> = const {
         RefCell::new(None)
     };
+    #[cfg(test)]
+    static TEST_SKIPPED_ROW_WARNINGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 fn clear_http_build_metadata() {
@@ -758,8 +760,12 @@ fn json_token_count(value: &serde_json::Value, keys: &[&str]) -> Option<usize> {
     match value {
         serde_json::Value::Object(fields) => {
             for (key, value) in fields {
-                if keys.iter().any(|candidate| key.eq_ignore_ascii_case(candidate)) {
-                    if let Some(count) = value.as_u64().and_then(|count| usize::try_from(count).ok())
+                if keys
+                    .iter()
+                    .any(|candidate| key.eq_ignore_ascii_case(candidate))
+                {
+                    if let Some(count) =
+                        value.as_u64().and_then(|count| usize::try_from(count).ok())
                     {
                         return Some(count);
                     }
@@ -779,7 +785,10 @@ fn json_token_count(value: &serde_json::Value, keys: &[&str]) -> Option<usize> {
 fn number_after_phrase(value: &str, phrases: &[&str]) -> Option<usize> {
     phrases.iter().find_map(|phrase| {
         let rest = value.split_once(phrase)?.1.trim_start();
-        let digits = rest.chars().take_while(char::is_ascii_digit).collect::<String>();
+        let digits = rest
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>();
         (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
     })
 }
@@ -822,10 +831,7 @@ fn embedding_response_row_too_long(
     let actual_tokens = parsed
         .as_ref()
         .and_then(|value| {
-            json_token_count(
-                value,
-                &["n_prompt_tokens", "input_tokens", "prompt_tokens"],
-            )
+            json_token_count(value, &["n_prompt_tokens", "input_tokens", "prompt_tokens"])
         })
         .or_else(|| {
             number_after_phrase(
@@ -1541,10 +1547,7 @@ impl SemanticEmbeddingModel {
         texts: Vec<String>,
     ) -> Result<Vec<AdaptiveBuildRow>, String> {
         let budget = self.build_request_budget(texts.len());
-        match self.embed_texts(
-            texts.clone(),
-            EmbeddingRequestPolicy::Build(budget),
-        ) {
+        match self.embed_texts(texts.clone(), EmbeddingRequestPolicy::Build(budget)) {
             Ok(vectors) => {
                 validate_embedding_batch(&vectors, texts.len(), "embedding backend")?;
                 Ok(texts
@@ -1566,10 +1569,10 @@ impl SemanticEmbeddingModel {
 
                 if texts.len() > 1 {
                     let right = texts.len().div_ceil(2);
-                    let mut left_rows = self
-                        .embed_http_batch_overflow_resilient(texts[..right].to_vec())?;
-                    let mut right_rows = self
-                        .embed_http_batch_overflow_resilient(texts[right..].to_vec())?;
+                    let mut left_rows =
+                        self.embed_http_batch_overflow_resilient(texts[..right].to_vec())?;
+                    let mut right_rows =
+                        self.embed_http_batch_overflow_resilient(texts[right..].to_vec())?;
                     left_rows.append(&mut right_rows);
                     return Ok(left_rows);
                 }
@@ -2610,11 +2613,7 @@ where
     Ok(rows)
 }
 
-fn format_skipped_row_warning(
-    chunk: &SemanticChunk,
-    embedded_text: &str,
-    reason: &str,
-) -> String {
+fn format_skipped_row_warning(chunk: &SemanticChunk, embedded_text: &str, reason: &str) -> String {
     format!(
         "semantic embed skipped row: file={} symbol={} chars={} reason={}",
         chunk.file.display(),
@@ -2622,6 +2621,18 @@ fn format_skipped_row_warning(
         embedded_text.chars().count(),
         reason,
     )
+}
+
+fn log_skipped_row_warning(chunk: &SemanticChunk, embedded_text: &str, reason: &str) {
+    let warning = format_skipped_row_warning(chunk, embedded_text, reason);
+    #[cfg(test)]
+    TEST_SKIPPED_ROW_WARNINGS.with(|warnings| warnings.borrow_mut().push(warning.clone()));
+    slog_warn!("{}", warning);
+}
+
+#[cfg(test)]
+fn take_test_skipped_row_warnings() -> Vec<String> {
+    TEST_SKIPPED_ROW_WARNINGS.with(|warnings| std::mem::take(&mut *warnings.borrow_mut()))
 }
 
 #[derive(Debug)]
@@ -3704,7 +3715,7 @@ impl SemanticIndex {
             .map(|candidate| candidate.vector.clone())
     }
 
-        fn entries_for_chunks_with_reuse<F, P>(
+    fn entries_for_chunks_with_reuse<F, P>(
         chunks: Vec<SemanticChunk>,
         reuse_map: &ChunkReuseMap,
         embed_fn: &mut F,
@@ -3772,7 +3783,7 @@ impl SemanticIndex {
                         embedded_text,
                         reason,
                     } => {
-                        slog_warn!("{}", format_skipped_row_warning(&chunk, &embedded_text, &reason));
+                        log_skipped_row_warning(&chunk, &embedded_text, &reason);
                         skipped_rows = skipped_rows.saturating_add(1);
                     }
                 }
@@ -3787,7 +3798,7 @@ impl SemanticIndex {
         Ok((entries, observed_dimension, skipped_rows))
     }
 
-        fn build_from_chunks<F, P, C>(
+    fn build_from_chunks<F, P, C>(
         project_root: &Path,
         chunks: Vec<SemanticChunk>,
         file_metadata: HashMap<PathBuf, IndexedFileMetadata>,
@@ -3883,7 +3894,7 @@ impl SemanticIndex {
                         embedded_text,
                         reason,
                     } => {
-                        slog_warn!("{}", format_skipped_row_warning(&chunk, &embedded_text, &reason));
+                        log_skipped_row_warning(&chunk, &embedded_text, &reason);
                         skipped_rows = skipped_rows.saturating_add(1);
                     }
                 }
@@ -4383,16 +4394,15 @@ impl SemanticIndex {
         } else {
             Some(self.dimension)
         };
-        let (new_entries, observed_dimension, skipped_rows) =
-            Self::entries_for_chunks_with_reuse(
-                chunks,
-                &reuse_map,
-                embed_fn,
-                max_batch_size,
-                existing_dimension,
-                "incremental refresh",
-                progress,
-            )?;
+        let (new_entries, observed_dimension, skipped_rows) = Self::entries_for_chunks_with_reuse(
+            chunks,
+            &reuse_map,
+            embed_fn,
+            max_batch_size,
+            existing_dimension,
+            "incremental refresh",
+            progress,
+        )?;
         self.skipped_rows = self.skipped_rows.saturating_add(skipped_rows);
 
         let successful_files: HashSet<PathBuf> = fresh_metadata.keys().cloned().collect();
@@ -4638,16 +4648,15 @@ impl SemanticIndex {
         } else {
             Some(self.dimension)
         };
-        let (new_entries, observed_dimension, skipped_rows) =
-            Self::entries_for_chunks_with_reuse(
-                chunks,
-                &reuse_map,
-                embed_fn,
-                max_batch_size,
-                initial_observed_dimension,
-                "invalidated-file refresh",
-                progress,
-            )?;
+        let (new_entries, observed_dimension, skipped_rows) = Self::entries_for_chunks_with_reuse(
+            chunks,
+            &reuse_map,
+            embed_fn,
+            max_batch_size,
+            initial_observed_dimension,
+            "invalidated-file refresh",
+            progress,
+        )?;
         self.skipped_rows = self.skipped_rows.saturating_add(skipped_rows);
 
         let added_entries = new_entries.clone();
@@ -7915,6 +7924,80 @@ mod tests {
         );
     }
 
+    #[test]
+    fn context_overflow_body_classification_is_narrow_and_extracts_counts() {
+        let fixtures = [
+            (
+                r#"{"error":{"type":"exceed_context_size_error","message":"input is too large to process","n_prompt_tokens":518,"n_ctx":512}}"#,
+                Some(512),
+                Some(518),
+            ),
+            (
+                r#"{"error":{"type":"exceed_context_size_error","message":"input is too large to process"}}"#,
+                None,
+                None,
+            ),
+            (
+                r#"{"error":{"message":"maximum context length is 8192 tokens; you requested 9000 tokens"}}"#,
+                Some(8192),
+                Some(9000),
+            ),
+            (
+                r#"{"error":{"message":"This model's maximum context length is 4096 tokens. Your input resulted in 5000 tokens"}}"#,
+                Some(4096),
+                Some(5000),
+            ),
+            (
+                r#"{"error":"input length exceeds model context"}"#,
+                None,
+                None,
+            ),
+        ];
+
+        for (body, expected_limit, expected_actual) in fixtures {
+            let details = embedding_response_row_too_long(reqwest::StatusCode::BAD_REQUEST, body)
+                .unwrap_or_else(|| panic!("overflow fixture was not classified: {body}"));
+            assert_eq!(details.limit_tokens, expected_limit, "body={body}");
+            assert_eq!(details.actual_tokens, expected_actual, "body={body}");
+        }
+
+        assert_eq!(
+            embedding_response_row_too_long(
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"error":"model not found"}"#,
+            ),
+            None,
+        );
+        assert_eq!(
+            embedding_response_row_too_long(
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"error":"input length exceeds model context"}"#,
+            ),
+            None,
+        );
+
+        let text = "name:dense file:src/dense.rs kind:function name:dense signature:fn dense() body:abcdefghij";
+        assert_eq!(
+            shrink_embed_text(
+                text,
+                RowTooLongDetails {
+                    limit_tokens: None,
+                    actual_tokens: None,
+                },
+            )
+            .as_deref(),
+            Some("name:dense file:src/dense.rs kind:function name:dense signature:fn dense() body:abcde"),
+        );
+        assert!(shrink_embed_text(
+            "header-free-base64",
+            RowTooLongDetails {
+                limit_tokens: None,
+                actual_tokens: None,
+            },
+        )
+        .is_none());
+    }
+
     fn start_slow_embedding_server(
         expected_requests: usize,
         response_delay: Duration,
@@ -8135,6 +8218,164 @@ mod tests {
         if stream.write_all(response.as_bytes()).is_ok() {
             completed.lock().unwrap().push(input_count);
         }
+    }
+
+    enum TestEmbeddingRejection {
+        Oversize { max_bytes: usize },
+        Always { body: String },
+    }
+
+    struct OverflowEmbeddingServer {
+        base_url: String,
+        requests: Arc<Mutex<Vec<Vec<String>>>>,
+        shutdown: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl OverflowEmbeddingServer {
+        fn rejecting_oversize(max_bytes: usize) -> Self {
+            Self::start(TestEmbeddingRejection::Oversize { max_bytes })
+        }
+
+        fn rejecting_all(body: impl Into<String>) -> Self {
+            Self::start(TestEmbeddingRejection::Always { body: body.into() })
+        }
+
+        fn start(rejection: TestEmbeddingRejection) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind overflow server");
+            listener
+                .set_nonblocking(true)
+                .expect("set overflow server nonblocking");
+            let addr = listener.local_addr().expect("overflow server addr");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let requests_for_thread = Arc::clone(&requests);
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_for_thread = Arc::clone(&shutdown);
+            let handle = thread::spawn(move || {
+                while !shutdown_for_thread.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => handle_overflow_embedding_request(
+                            stream,
+                            &rejection,
+                            &requests_for_thread,
+                        ),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("accept overflow request: {error}"),
+                    }
+                }
+            });
+            Self {
+                base_url: format!("http://{addr}"),
+                requests,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+
+        fn requests(&self) -> Vec<Vec<String>> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for OverflowEmbeddingServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                handle.join().expect("overflow embedding server");
+            }
+        }
+    }
+
+    fn handle_overflow_embedding_request(
+        mut stream: TcpStream,
+        rejection: &TestEmbeddingRejection,
+        requests: &Arc<Mutex<Vec<Vec<String>>>>,
+    ) {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let mut header_end = None;
+        let mut content_length = 0usize;
+        loop {
+            let Ok(count) = stream.read(&mut chunk) else {
+                return;
+            };
+            if count == 0 {
+                return;
+            }
+            buf.extend_from_slice(&chunk[..count]);
+            if header_end.is_none() {
+                if let Some(position) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
+                    header_end = Some(position + 4);
+                    for line in String::from_utf8_lossy(&buf[..position + 4]).lines() {
+                        if line.to_ascii_lowercase().starts_with("content-length:") {
+                            content_length = line
+                                .split_once(':')
+                                .and_then(|(_, value)| value.trim().parse().ok())
+                                .unwrap_or(0);
+                        }
+                    }
+                }
+            }
+            if header_end.is_some_and(|end| buf.len() >= end + content_length) {
+                break;
+            }
+        }
+
+        let body_start = header_end.expect("overflow request headers");
+        let body: serde_json::Value =
+            serde_json::from_slice(&buf[body_start..body_start + content_length])
+                .expect("overflow request JSON");
+        let inputs = body["input"]
+            .as_array()
+            .expect("embedding input array")
+            .iter()
+            .map(|value| value.as_str().expect("embedding input text").to_string())
+            .collect::<Vec<_>>();
+        requests.lock().unwrap().push(inputs.clone());
+
+        let rejected = match rejection {
+            TestEmbeddingRejection::Oversize { max_bytes } => inputs
+                .iter()
+                .map(String::len)
+                .max()
+                .filter(|actual| actual > max_bytes)
+                .map(|actual| {
+                    serde_json::json!({
+                        "error": {
+                            "type": "exceed_context_size_error",
+                            "message": "input is too large to process",
+                            "n_prompt_tokens": actual,
+                            "n_ctx": max_bytes,
+                        }
+                    })
+                    .to_string()
+                }),
+            TestEmbeddingRejection::Always { body } => Some(body.clone()),
+        };
+
+        let (status, response_body) = if let Some(body) = rejected {
+            ("400 Bad Request", body)
+        } else {
+            let data = inputs
+                .iter()
+                .enumerate()
+                .map(|(index, text)| {
+                    serde_json::json!({
+                        "embedding": [text.len() as f32, 1.0, 0.5],
+                        "index": index,
+                    })
+                })
+                .collect::<Vec<_>>();
+            ("200 OK", serde_json::json!({"data": data}).to_string())
+        };
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body,
+        );
+        let _ = stream.write_all(response.as_bytes());
     }
 
     fn start_recording_embedding_server(
@@ -10430,6 +10671,224 @@ public class Greeter {
 
     fn embedding_inputs(count: usize) -> Vec<String> {
         (0..count).map(|index| format!("chunk {index}")).collect()
+    }
+
+    fn overflow_http_config(server: &OverflowEmbeddingServer) -> SemanticBackendConfig {
+        SemanticBackendConfig {
+            backend: SemanticBackend::OpenAiCompatible,
+            model: "overflow-test-embedding".to_string(),
+            base_url: Some(server.base_url.clone()),
+            api_key_env: None,
+            timeout_ms: 2_000,
+            query_timeout_ms: DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
+            max_batch_size: 64,
+            max_files: 20_000,
+            ..Default::default()
+        }
+    }
+
+    fn overflow_test_chunk(root: &Path, index: usize, embed_text: String) -> SemanticChunk {
+        SemanticChunk {
+            file: root.join(format!("src/file_{index}.rs")),
+            name: format!("symbol_{index}"),
+            qualified_name: None,
+            kind: SymbolKind::Function,
+            start_line: index as u32,
+            end_line: index as u32 + 1,
+            exported: false,
+            embed_text,
+            snippet: format!("fn symbol_{index}() {{}}"),
+        }
+    }
+
+    fn build_chunks_with_model(
+        root: &Path,
+        chunks: Vec<SemanticChunk>,
+        model: &mut SemanticEmbeddingModel,
+    ) -> Result<SemanticIndex, String> {
+        let file_metadata = chunks
+            .iter()
+            .map(|chunk| {
+                (
+                    chunk.file.clone(),
+                    IndexedFileMetadata {
+                        mtime: SystemTime::UNIX_EPOCH,
+                        size: 0,
+                        content_hash: blake3::hash(b""),
+                    },
+                )
+            })
+            .collect();
+        let mut embed = |texts: Vec<String>| model.embed(texts);
+        let mut should_continue = || true;
+        SemanticIndex::build_from_chunks(
+            root,
+            chunks,
+            file_metadata,
+            &mut embed,
+            64,
+            Option::<&mut fn(usize, usize)>::None,
+            &mut should_continue,
+        )
+    }
+
+    #[test]
+    fn overflow_build_bisects_and_shrinks_only_rejected_rows() {
+        let root = tempfile::tempdir().expect("project root");
+        let server = OverflowEmbeddingServer::rejecting_oversize(240);
+        let config = overflow_http_config(&server);
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let oversize_indices = HashSet::from([7usize, 31, 58]);
+        let chunks = (0..64)
+            .map(|index| {
+                let body = if oversize_indices.contains(&index) {
+                    "dense-token ".repeat(80)
+                } else {
+                    format!("return value_{index};")
+                };
+                overflow_test_chunk(
+                    root.path(),
+                    index,
+                    format!(
+                        "name:symbol_{index} file:src/file_{index}.rs kind:function name:symbol_{index} signature:fn symbol_{index}() body:{body}"
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let originals = chunks
+            .iter()
+            .map(|chunk| (chunk.name.clone(), chunk.embed_text.clone()))
+            .collect::<HashMap<_, _>>();
+
+        let (result, events) = crate::logging::capture_index_events(|| {
+            let (_guard, scope, mut failure_guard) = begin_semantic_index_build(root.path());
+            let result = build_chunks_with_model(root.path(), chunks, &mut model);
+            finish_semantic_index_build(&scope, &mut failure_guard, &result);
+            result
+        });
+        let index = result.unwrap();
+
+        assert_eq!(index.entry_count(), 64);
+        assert_eq!(index.skipped_rows(), 0);
+        assert!(
+            events
+                .iter()
+                .any(|line| line.contains("kind=build_ready") && line.contains("skipped_rows=0")),
+            "semantic ready event must disclose zero skipped rows: {events:?}",
+        );
+        let mut full_rows = 0usize;
+        let mut shrunk_rows = 0usize;
+        for entry in &index.entries {
+            let original = originals.get(&entry.chunk.name).unwrap();
+            let index = entry
+                .chunk
+                .name
+                .strip_prefix("symbol_")
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            if oversize_indices.contains(&index) {
+                assert!(entry.chunk.embed_text.len() < original.len());
+                assert!(entry.chunk.embed_text.contains("name:symbol_"));
+                shrunk_rows += 1;
+            } else {
+                assert_eq!(&entry.chunk.embed_text, original);
+                full_rows += 1;
+            }
+            assert_eq!(entry.vector[0], entry.chunk.embed_text.len() as f32);
+        }
+        assert_eq!((full_rows, shrunk_rows), (61, 3));
+        let restored = SemanticIndex::from_bytes(&index.to_bytes(), root.path()).unwrap();
+        for entry in &restored.entries {
+            assert_eq!(entry.vector[0], entry.chunk.embed_text.len() as f32);
+            assert_eq!(
+                entry.chunk.embed_text,
+                index
+                    .entries
+                    .iter()
+                    .find(|candidate| candidate.chunk.name == entry.chunk.name)
+                    .unwrap()
+                    .chunk
+                    .embed_text,
+            );
+        }
+
+        let request_count = server.requests().len();
+        println!("overflow bisection request_count={request_count}");
+        assert!(
+            (8..40).contains(&request_count),
+            "expected logarithmic bisection rather than 64 single-row probes; request_count={request_count}, request_sizes={:?}",
+            server
+                .requests()
+                .iter()
+                .map(Vec::len)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn overflow_build_skips_unshrinkable_row_and_reports_file() {
+        let root = tempfile::tempdir().expect("project root");
+        let server = OverflowEmbeddingServer::rejecting_oversize(240);
+        let config = overflow_http_config(&server);
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let normal = overflow_test_chunk(
+            root.path(),
+            0,
+            "name:normal file:src/normal.rs kind:function name:normal body:return one;".to_string(),
+        );
+        let unshrinkable = overflow_test_chunk(root.path(), 1, "A".repeat(3_000));
+        let skipped_file = unshrinkable.file.display().to_string();
+        take_test_skipped_row_warnings();
+
+        let (result, events) = crate::logging::capture_index_events(|| {
+            let (_guard, scope, mut failure_guard) = begin_semantic_index_build(root.path());
+            let result =
+                build_chunks_with_model(root.path(), vec![normal, unshrinkable], &mut model);
+            finish_semantic_index_build(&scope, &mut failure_guard, &result);
+            result
+        });
+        let index = result.unwrap();
+
+        assert_eq!(index.entry_count(), 1);
+        assert_eq!(index.skipped_rows(), 1);
+        assert!(index
+            .entries
+            .iter()
+            .all(|entry| entry.chunk.name != "symbol_1"));
+        let warnings = take_test_skipped_row_warnings();
+        assert_eq!(warnings.len(), 1, "warnings={warnings:?}");
+        assert!(warnings[0].contains("semantic embed skipped row:"));
+        assert!(warnings[0].contains(&format!("file={skipped_file}")));
+        assert!(warnings[0].contains("symbol=symbol_1"));
+        assert!(
+            events
+                .iter()
+                .any(|line| line.contains("kind=build_ready") && line.contains("skipped_rows=1")),
+            "semantic ready event must disclose skipped rows: {events:?}",
+        );
+    }
+
+    #[test]
+    fn unknown_4xx_still_aborts_semantic_build() {
+        let root = tempfile::tempdir().expect("project root");
+        let server = OverflowEmbeddingServer::rejecting_all(r#"{"error":"model not found"}"#);
+        let config = overflow_http_config(&server);
+        let mut model = SemanticEmbeddingModel::from_config(&config).unwrap();
+        let chunk = overflow_test_chunk(
+            root.path(),
+            0,
+            format!(
+                "name:unknown file:src/unknown.rs kind:function name:unknown body:{}",
+                "payload ".repeat(80)
+            ),
+        );
+
+        let error = build_chunks_with_model(root.path(), vec![chunk], &mut model).unwrap_err();
+
+        assert!(error.contains("HTTP 400 Bad Request"), "{error}");
+        assert!(error.contains("model not found"), "{error}");
+        assert!(!error.contains(ROW_TOO_LONG_MARKER_PREFIX), "{error}");
     }
 
     #[test]
