@@ -1824,6 +1824,11 @@ fn join_manifest_with_surfaces(
     let mut unbound_non_utf8_paths = Vec::new();
     let mut rebuilt_surface_paths = BTreeSet::new();
     let mut decoded_caller_blobs = 0;
+    let mut restored_surfaces = 0;
+    let mut rebuilt_changed = 0;
+    let mut rebuilt_facts = 0;
+    let mut rebuilt_membership = 0;
+    let mut rebuilt_missing = 0;
     for (path, entry) in manifest.entries() {
         let ManifestEntry::Regular { planes, .. } = entry else {
             continue;
@@ -1851,6 +1856,7 @@ fn join_manifest_with_surfaces(
         if let Some((cache, surface)) =
             cache.and_then(|cache| cache.surface.as_ref().map(|surface| (cache, surface)))
         {
+            restored_surfaces += 1;
             files.insert(rel.to_string(), surface.restore());
             if resolve {
                 bindings.insert(rel.to_string(), cache.clone());
@@ -1868,6 +1874,18 @@ fn join_manifest_with_surfaces(
             blob.bind_with_dependencies(rel, &paths, cache.map(|cache| &cache.references))?;
         let file_index = super::DbFileIndex::from_extract(root, &extract, &paths);
         rebuilt_surface_paths.insert(rel.to_string());
+        match reuse {
+            Some((changed, _, _)) if changed.contains(rel) => rebuilt_changed += 1,
+            Some((_, _, invalidated)) if invalidated.contains(rel) => rebuilt_facts += 1,
+            Some((_, membership, _))
+                if cached
+                    .get(rel)
+                    .is_some_and(|old| !old.dependencies.is_disjoint(membership)) =>
+            {
+                rebuilt_membership += 1;
+            }
+            _ => rebuilt_missing += 1,
+        }
         let mut binding = cache.cloned().unwrap_or_default();
         binding.surface = Some(ViewFileSurface::capture(&blob.language, &file_index));
         files.insert(rel.to_string(), file_index);
@@ -2109,6 +2127,9 @@ fn join_manifest_with_surfaces(
             .collect();
     }
     profile.finish("dependency_union");
+    if std::env::var_os("AFT_VIEW_PROFILE").is_some() {
+        eprintln!("view_profile join.surfaces restored={restored_surfaces} rebuilt_changed={rebuilt_changed} rebuilt_facts={rebuilt_facts} rebuilt_membership={rebuilt_membership} rebuilt_missing={rebuilt_missing} selected={} resolved={} skipped={}", selected.map_or(bindings.len(), BTreeSet::len), resolved_callers.len(), bindings.keys().filter(|path| selected.is_none_or(|set| set.contains(*path)) && !resolved_callers.contains(*path)).count());
+    }
     if let Some(error) = read_error.borrow_mut().take() {
         return Err(error);
     }

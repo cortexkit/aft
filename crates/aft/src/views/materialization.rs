@@ -144,6 +144,7 @@ fn materialize(
     manifest: &crate::views::Manifest,
     mut base: Option<&crate::views::Manifest>,
 ) -> Result<(MaterializeStats, profile::PhaseTimings)> {
+    let write_probe = profile::WriteProbe::start(database_path);
     let mut profile = profile::PhaseTimer::new(if base.is_some() {
         "incremental"
     } else {
@@ -537,6 +538,7 @@ fn materialize(
             Option<String>,
             Option<String>,
         );
+        let mut identical_refs = 0;
         let mut existing = HashMap::<String, HashMap<String, ExistingRef>>::new();
         let mut load_refs = transaction.prepare("SELECT ref_id, caller_node, status, target_node, target_file, target_symbol FROM refs WHERE caller_file = ?1")?;
         let mut delete_edge = transaction.prepare("DELETE FROM edges WHERE ref_id = ?1")?;
@@ -660,6 +662,7 @@ fn materialize(
                     })
                 });
                 if same {
+                    identical_refs += 1;
                     continue;
                 }
                 stats.relinked_deleted += delete_edge.execute([&ref_id])?;
@@ -713,6 +716,11 @@ fn materialize(
                 }
             }
         }
+        if std::env::var_os("AFT_VIEW_PROFILE").is_some() {
+            eprintln!(
+                "view_profile emission identical_refs_skipped={identical_refs} stats={stats:?}"
+            );
+        }
     }
     profile.finish("emit_refs_edges");
     set_meta_ready(&transaction, true)?;
@@ -726,6 +734,9 @@ fn materialize(
     )?;
     transaction.commit()?;
     profile.finish("commit");
+    if let Some(probe) = write_probe {
+        probe.finish(&connection, database_path);
+    }
     // Include destruction in the bracket: freeing decoded blobs and closing
     // SQLite handles happens before the caller observes materialization complete.
     drop((reader, parsed, nodes, cached));

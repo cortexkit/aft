@@ -99,3 +99,77 @@ impl PhaseTimer {
             .unwrap_or_default()
     }
 }
+
+/// Optional diagnostics only; never checkpoint or change the writer's durability.
+pub(super) struct WriteProbe {
+    process_before: Option<(u64, u64)>,
+    wal_before: u64,
+}
+
+impl WriteProbe {
+    pub(super) fn start(path: &std::path::Path) -> Option<Self> {
+        std::env::var_os("AFT_VIEW_PROFILE")?;
+        Some(Self {
+            process_before: process_writes(),
+            wal_before: wal_len(path),
+        })
+    }
+
+    pub(super) fn finish(&self, connection: &rusqlite::Connection, path: &std::path::Path) {
+        let mut current = 0;
+        let mut highwater = 0;
+        // This connection is exclusively owned by the materializer. Reading a
+        // status counter does not flush the pager or reset its accounting.
+        let result = unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                connection.handle(),
+                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_WRITE,
+                &mut current,
+                &mut highwater,
+                0,
+            )
+        };
+        let cache_writes = (result == rusqlite::ffi::SQLITE_OK).then_some(current);
+        let page_size = connection
+            .query_row("PRAGMA page_size", [], |row| row.get::<_, u64>(0))
+            .ok();
+        let process_delta = self
+            .process_before
+            .zip(process_writes())
+            .map(|(before, after)| {
+                (
+                    after.0.saturating_sub(before.0),
+                    after.1.saturating_sub(before.1),
+                )
+            });
+        eprintln!("view_profile derived_writes db={} cache_write_pages={cache_writes:?} page_size={page_size:?} wal_before={} wal_after={} process_physical_logical_delta={process_delta:?}", path.display(), self.wal_before, wal_len(path));
+    }
+}
+
+fn wal_len(path: &std::path::Path) -> u64 {
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    std::fs::metadata(wal).map_or(0, |metadata| metadata.len())
+}
+
+#[cfg(target_os = "macos")]
+fn process_writes() -> Option<(u64, u64)> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    let result = unsafe {
+        libc::proc_pid_rusage(
+            libc::getpid(),
+            libc::RUSAGE_INFO_V4,
+            usage.as_mut_ptr().cast(),
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+    let usage = unsafe { usage.assume_init() };
+    Some((usage.ri_diskio_byteswritten, usage.ri_logical_writes))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_writes() -> Option<(u64, u64)> {
+    None
+}

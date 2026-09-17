@@ -327,3 +327,69 @@ acceptance. It provides a measured bucket answer and two proven lifecycle fixes.
 - Final AFT inspection completed its wait but reported unavailable Rust LSP
   diagnostics (broken pipe); compiler checks, not that incomplete report, are the
   authoritative diagnostic result.
+
+## Materialization-internals continuation (2026-09-17, base 1ddc627dd766)
+
+### Before any optimization: instrumented captured-pair replay
+
+Input `.bg-shell/captured-pair/{base,next}.json` and its offline blob database were
+copied by the owner from the retained HEAD→B capture: 7060→7045 entries, **283**
+changed manifest entries. Only diagnostic counters were added before this run.
+`AFT_VIEW_PROFILE=1 AFT_VIEW_DIFF_INPUT="$PWD/.bg-shell/captured-pair" cargo test
+--release -p agent-file-tools --lib views::materialization::tests::bench_real_manifest_diff
+-- --ignored --nocapture` passed complete cold-row parity for both lookup modes.
+Raw output: `.bg-shell/offline-before-instrumented.log`. Two preceding compilation
+attempts reached their 20-minute timeout; the successful build took 19m33s with a
+one-hour budget. The timings below exclude compilation.
+
+| phase / work | landed in-situ HEAD→B / B→HEAD | captured-pair offline HEAD→B |
+|---|---:|---:|
+| load bindings / selection ms | 579 / 562 | 567 |
+| delete ms | 807 / 833 | 1085 |
+| owned decode / insert ms | 605 / 599 | 553 |
+| selected join ms | 1999 / 1783 | 2052 |
+| ↳ decode / bind index entries ms | — | 737 |
+| ↳ surface replay ms | — | 59 |
+| ↳ decode resolved callers ms | — | 530 |
+| ↳ resolve / record ms | — | 642 |
+| ↳ dependency union ms | — | 55 |
+| binding writes ms | 181 / 207 | 275 |
+| emit refs / edges ms | 1284 / 1393 | 1357 |
+| commit ms | 161 / 84 | 140 |
+| materialization wall / CPU s | 5.715 / 5.552 (wall only) | 6.137 / 4.659 |
+| closure ms (outside materializer) | 1876 / 2536 | not measured |
+| surfaces restored / rebuilt | not captured | 4637 / 284 |
+| rebuild reasons: changed / consulted facts / membership / missing | not captured | 265 / 19 / 0 / 0 |
+| selected paths / resolved callers / replay-skipped callers | not captured | 1430 / 588 / 825 |
+| unchanged dependents actually resolved | not captured | 323 |
+| full_resolution / unattributed callers | not captured | false / 0 |
+| identical dependent references skipped on emission | not captured | 55387 |
+| dependent graph rows deleted / inserted | not captured | 3325 / 3327 |
+| changed-owner graph rows deleted / inserted | not captured | 53914 / 51632 |
+
+Selected paths include configuration/non-callgraph paths and are not a caller
+count. The 588 callers include 265 changed callers and 323 unchanged dependents.
+Thus **323 really is both the measured dependent count and the batched lookup
+count on this pair**; the direct counters, not a SQL-count inference, establish it.
+Fact-level invalidation is already implemented at this base (materialization
+version 6). The 19 fact-invalidated surface rebuilds are not missing surface keys.
+Stable dependent rows are already compared before writing; 55,387 reference
+comparisons avoid deletion/insertion. Neither reimplementing fact invalidation
+nor blanket dependent row comparison is a new optimization opportunity.
+
+| byte attribution, keeper open | isolated offline HEAD→B | new in-situ capture |
+|---|---:|---:|
+| derived SQLite cache-write pages (4096-byte pages) | 74649 | pending |
+| derived WAL bytes, before → after | 0 → 152955032 | pending |
+| process physical bytes, materializer interval | 155062272 | pending |
+| process logical bytes, materializer interval | 309316152 | pending |
+| host load 1m, timed call start → end | 16.86 → 16.12 | pending |
+
+These are literal bytes, not MiB. The offline physical cost is **155 MB**, not the
+18–34 MB quoted from a different incremental workload; it cannot establish that
+all daemon-window writes are unrelated writers. WAL pages include 50,000,320
+frame bytes attributed to `view_bindings`, 19,269,240 to `refs`, plus graph indexes.
+Cache-write pages include repeated spills, whereas WAL size is final file length;
+they are deliberately separate measures. The process interval remains labelled
+process-wide, including in the daemon. The isolated offline run removes other
+daemon writers, not filesystem write-amplification or measurement timing effects.
