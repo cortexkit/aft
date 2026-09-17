@@ -338,6 +338,26 @@ function uuidOf(path: string): string | undefined {
   const result = spawnSync("dwarfdump", ["--uuid", path], { encoding: "utf8", timeout: 10_000 });
   return result.status === 0 ? result.stdout.match(/UUID: ([0-9A-F-]+)/i)?.[1]?.replaceAll("-", "").toUpperCase() : undefined;
 }
+function procRusage(pid: number): { phys_footprint_bytes: number; bytes_written: number } {
+  if (process.platform !== "darwin") throw new Error("proc_pid_rusage sampling is implemented for macOS only");
+  const source = `
+import ctypes, json, sys
+class RusageInfoV4(ctypes.Structure):
+    _fields_ = [("uuid", ctypes.c_ubyte * 16)] + [(name, ctypes.c_uint64) for name in (
+      "user_time", "system_time", "pkg_idle_wkups", "interrupt_wkups", "pageins",
+      "wired_size", "resident_size", "phys_footprint", "proc_start_abstime", "proc_exit_abstime",
+      "child_user_time", "child_system_time", "child_pkg_idle_wkups", "child_interrupt_wkups",
+      "child_pageins", "child_elapsed_abstime", "diskio_bytesread", "diskio_byteswritten")]
+info = RusageInfoV4()
+result = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pid_rusage(int(sys.argv[1]), 4, ctypes.byref(info))
+if result != 0: raise OSError(ctypes.get_errno(), "proc_pid_rusage failed")
+print(json.dumps({"phys_footprint_bytes": info.phys_footprint, "bytes_written": info.diskio_byteswritten}))
+  `;
+  const result = spawnSync("python3", ["-c", source, String(pid)], { encoding: "utf8", timeout: 5_000 });
+  if (result.status !== 0) throw new Error((result.stderr || `python exit ${result.status}`).trim());
+  return JSON.parse(result.stdout);
+}
+
 function collectDsym(pid: number, image?: string): SentinelSample["dsym"] {
   const executable = image || spawnSync("ps", ["-p", String(pid), "-o", "comm="], { encoding: "utf8" }).stdout.trim();
   const requested = uuidOf(executable);
@@ -382,7 +402,8 @@ function collectSample(state: SentinelState): { sample: SentinelSample; cursors:
     if (ps.status !== 0) throw new Error(ps.stderr.trim());
     const match = ps.stdout.trim().match(/^([\d.]+)\s+(\d+)\s+(.+)$/);
     if (!match) throw new Error("ps output was not parseable");
-    sample.process = { pid, cpu_percent: Number(match[1]), phys_footprint_bytes: Number(metrics(sample).memory?.phys_footprint_bytes ?? Number(match[2]) * 1024), image: match[3] };
+    const rusage = procRusage(pid);
+    sample.process = { pid, cpu_percent: Number(match[1]), phys_footprint_bytes: rusage.phys_footprint_bytes || Number(metrics(sample).memory?.phys_footprint_bytes ?? Number(match[2]) * 1024), bytes_written: rusage.bytes_written, image: match[3] };
   } catch (error) { sample.process_error = String(error); }
   sample.memory_census = { roots: Object.fromEntries(roots(sample).map((root) => [root.project_root ?? "unknown", root])) };
   try {
@@ -416,7 +437,7 @@ function sendPeer(findingValue: Finding): void {
     import { SubcClient } from "@cortexkit/subc-client";
     import { homedir } from "node:os";
     import { join } from "node:path";
-    const [target, body] = process.argv.slice(2);
+    const [target, body] = process.argv.slice(1);
     const identity = { project_root: process.cwd(), harness: "alfonso", session: "prefrontal-core" };
     const client = await SubcClient.connect({ connectionFile: join(homedir(), ".local/share/cortexkit/run/subc-connection.json"), identity });
     try { await client.call("prefrontal-core", "peer.enqueue_message", { fromName: "AFT-SENTINEL", fromSessionID: "aft-health-sentinel", toName: "ALF", toSessionID: target, toDirectory: "", body, urgency: "high" }, { timeoutMs: 10000, identity }); }
@@ -428,10 +449,11 @@ function sendPeer(findingValue: Finding): void {
 function notify(title: string, body: string): void {
   spawnSync("osascript", ["-e", `display notification ${JSON.stringify(body)} with title ${JSON.stringify(title)}`], { timeout: 5_000 });
 }
-function nextPrevious(sample: SentinelSample): SentinelState["previous"] {
+function nextPrevious(sample: SentinelSample, state: SentinelState): SentinelState["previous"] {
   const watcher = Object.fromEntries(roots(sample).map((root) => [root.project_root ?? "unknown", [Number(root.watcher?.rescans_kernel_dropped_total ?? 0), Number(root.watcher?.rescans_user_dropped_total ?? 0)] as [number, number]]));
   const dispatch = metrics(sample).dispatch_liveness;
-  return { pid: sample.supervisor?.pid, unreachable_runs: sample.health_error ? 1 : 0, sampled_at_ms: sample.now_ms, bytes_written: sample.process?.bytes_written, sizes: sample.disk?.sizes, watcher, ...(dispatch?.maintenance_inflight > 0 && dispatch?.running?.maintenance === 0 ? { phantom_inflight: true } : {}) } as SentinelState["previous"];
+  const previous = state.previous;
+  return { pid: sample.supervisor?.pid, unreachable_runs: sample.health_error ? (previous?.unreachable_runs ?? 0) + 1 : 0, sampled_at_ms: sample.now_ms, bytes_written: sample.process?.bytes_written, sizes: sample.disk?.sizes, watcher, ...(dispatch?.maintenance_inflight > 0 && dispatch?.running?.maintenance === 0 ? { phantom_inflight: true } : {}) } as SentinelState["previous"];
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
@@ -458,7 +480,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     if (value.rule === "daemon.down" || value.fingerprint === "instrument:health-check") notify("AFT health sentinel", value.text);
   }
   for (const value of reconciled.cleared) appendEvent({ ts: new Date(sample.now_ms).toISOString(), rule: value.prior.rule, state: "cleared", fingerprint: value.fingerprint, text: value.prior.text, severity: value.prior.severity });
-  const next: SentinelState = { ...state, ...cursors, findings: reconciled.next, previous: nextPrevious(sample) };
+  const next: SentinelState = { ...state, ...cursors, findings: reconciled.next, previous: nextPrevious(sample, state) };
   mkdirSync(dirname(STATE_FILE), { recursive: true });
   writeFileSync(STATE_FILE, JSON.stringify(next, null, 2));
   return 0;
