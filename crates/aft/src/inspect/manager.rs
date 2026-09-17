@@ -35,6 +35,7 @@ use crate::cold_build_limiter;
 const DEFAULT_SOFT_DEADLINE: Duration = Duration::from_secs(1);
 
 type WaiterTx = Sender<JobOutcome>;
+type Tier2PermitSlot = Arc<Mutex<Option<cold_build_limiter::ColdBuildPermit>>>;
 
 #[derive(Clone)]
 struct Waiter {
@@ -366,6 +367,7 @@ fn run_tier2_pass_with_deadline<T>(
     project_root: &Path,
     category: InspectCategory,
     timeout: Duration,
+    permit_slot: Option<Tier2PermitSlot>,
     action: impl FnOnce() -> T,
 ) -> (T, bool) {
     let cancellation = crate::executor::JobCancellation::new();
@@ -389,8 +391,13 @@ fn run_tier2_pass_with_deadline<T>(
             if now >= deadline {
                 timer_timed_out.store(true, Ordering::Release);
                 deadline_cancellation.request_cancel();
+                if let Some(slot) = permit_slot.as_ref() {
+                    slot.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take();
+                }
                 crate::slog_warn!(
-                    "tier2 pass timeout: root={} category={} timeout_ms={}",
+                    "tier2 pass timeout: root={} category={} timeout_ms={} slot released, pass still running",
                     root.display(),
                     category,
                     timeout.as_millis()
@@ -1046,6 +1053,8 @@ impl InspectManager {
                 limiter.limit()
             ));
         };
+        let permit_slot = Arc::new(Mutex::new(Some(permit)));
+        let worker_permit_slot = Arc::clone(&permit_slot);
         in_flight.insert(key.clone(), Vec::new());
         drop(in_flight);
         self.record_flight_start(&key);
@@ -1053,10 +1062,12 @@ impl InspectManager {
         let manager = Arc::clone(self);
         let pool = Arc::clone(&self.pool);
         pool.spawn_fifo(move || {
-            let _permit = permit;
             let _flight = manager.tier2_flight_exit_guard(job.key.clone());
-            let result =
-                manager.tier2_run_with_reuse_job_result_catching(job, Tier2ReuseOptions::default());
+            let result = manager.tier2_run_with_reuse_job_result_catching(
+                job,
+                Tier2ReuseOptions::default(),
+                Some(worker_permit_slot),
+            );
             manager.route_tier2_reuse_completion(result);
         });
 
@@ -1165,16 +1176,19 @@ impl InspectManager {
             return submission;
         };
 
+        let permit_slot = Arc::new(Mutex::new(Some(permit)));
         let categories_for_worker = submission.newly_queued_categories.clone();
         let manager = Arc::clone(self);
         let pool = Arc::clone(&self.pool);
         pool.spawn_fifo(move || {
-            let _permit = permit;
             for category in categories_for_worker {
                 let job = manager.tier2_reuse_job(snapshot.clone(), category, None);
                 let _flight = manager.tier2_flight_exit_guard(job.key.clone());
-                let result = manager
-                    .tier2_run_with_reuse_job_result_catching(job, Tier2ReuseOptions::default());
+                let result = manager.tier2_run_with_reuse_job_result_catching(
+                    job,
+                    Tier2ReuseOptions::default(),
+                    Some(Arc::clone(&permit_slot)),
+                );
                 manager.route_tier2_reuse_completion(result);
             }
         });
@@ -1697,8 +1711,11 @@ impl InspectManager {
 
         if claimed {
             let _flight = self.tier2_flight_exit_guard(key.clone());
-            let result =
-                self.tier2_run_with_reuse_job_result_catching(job, Tier2ReuseOptions::default());
+            let result = self.tier2_run_with_reuse_job_result_catching(
+                job,
+                Tier2ReuseOptions::default(),
+                None,
+            );
             self.route_tier2_reuse_completion(result);
         }
 
@@ -1872,7 +1889,7 @@ impl InspectManager {
         pool.spawn_fifo(move || {
             let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
             let _flight = manager.tier2_flight_exit_guard(job.key.clone());
-            let result = manager.tier2_run_with_reuse_job_result_catching(job, options);
+            let result = manager.tier2_run_with_reuse_job_result_catching(job, options, None);
             manager.route_tier2_reuse_completion(result);
         });
     }
@@ -2072,17 +2089,18 @@ impl InspectManager {
     }
 
     fn tier2_run_with_reuse_job_result(&self, job: InspectJob) -> InspectResult {
-        self.tier2_run_with_reuse_job_result_with_options(job, Tier2ReuseOptions::default())
+        self.tier2_run_with_reuse_job_result_with_options(job, Tier2ReuseOptions::default(), None)
     }
 
     fn tier2_run_with_reuse_job_result_catching(
         &self,
         job: InspectJob,
         options: Tier2ReuseOptions,
+        permit_slot: Option<Tier2PermitSlot>,
     ) -> InspectResult {
         let started = Instant::now();
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.tier2_run_with_reuse_job_result_with_options(job.clone(), options)
+            self.tier2_run_with_reuse_job_result_with_options(job.clone(), options, permit_slot)
         })) {
             Ok(result) => result,
             Err(_) => InspectResult::failed(
@@ -2097,6 +2115,7 @@ impl InspectManager {
         &self,
         mut job: InspectJob,
         mut options: Tier2ReuseOptions,
+        permit_slot: Option<Tier2PermitSlot>,
     ) -> InspectResult {
         let started = Instant::now();
         self.reuse_starts.fetch_add(1, Ordering::SeqCst);
@@ -2181,7 +2200,7 @@ impl InspectManager {
         // A blocking inspect that proves it needs real work joins the interactive
         // class instead: it never preempts an in-flight build, but it takes a
         // released slot before another maintenance build can extend the wait.
-        let _interactive_permit = if options.interactive {
+        let interactive_permit_slot = if options.interactive {
             let queued_state = if self.semantic_cold_seed_active.load(Ordering::SeqCst) {
                 InspectBuilderState::GatedBySemanticSeed
             } else {
@@ -2212,16 +2231,20 @@ impl InspectManager {
                 return result;
             };
             self.set_builder_state(&job.key, InspectBuilderState::Building);
-            Some(permit)
+            Some(Arc::new(Mutex::new(Some(permit))))
         } else {
             None
         };
 
+        let permit_slot = permit_slot.or(interactive_permit_slot);
         let timeout = Duration::from_millis(job.config.inspect.tier2_pass_timeout_ms);
-        let (scan_result, timed_out) =
-            run_tier2_pass_with_deadline(&job.project_root, job.category, timeout, || {
-                self.tier2_run_with_reuse_job(&job, &cache, &options)
-            });
+        let (scan_result, timed_out) = run_tier2_pass_with_deadline(
+            &job.project_root,
+            job.category,
+            timeout,
+            permit_slot,
+            || self.tier2_run_with_reuse_job(&job, &cache, &options),
+        );
         let result = if timed_out {
             InspectResult::failed(
                 &job,
@@ -2382,6 +2405,9 @@ impl InspectManager {
         let mut aggregate_job = job.clone();
 
         for record in cached_records {
+            if crate::executor::current_job_cancelled() {
+                return Err("tier2 pass cancelled during freshness scan".to_string());
+            }
             let relative = freshness_record_relative_key(&record);
             let relative_path = PathBuf::from(&relative);
             let Some(current_file) = current_by_relative.get(&relative) else {
@@ -2443,6 +2469,9 @@ impl InspectManager {
         let callgraph_refresh_files = callgraph_refresh_paths.into_iter().collect::<Vec<_>>();
         let dead_code_callgraph_refresh =
             job.category == InspectCategory::DeadCode && !callgraph_refresh_files.is_empty();
+        if crate::executor::current_job_cancelled() {
+            return Err("tier2 pass cancelled before incremental scan".to_string());
+        }
         if !scan_files.is_empty() {
             let mut scan_job = job.clone();
             scan_job.job_id = self.next_job_id.fetch_add(1, Ordering::Relaxed);
@@ -2545,6 +2574,9 @@ impl InspectManager {
             }
         }
 
+        if crate::executor::current_job_cancelled() {
+            return Err("tier2 pass cancelled before projection refresh".to_string());
+        }
         let refresh_dead_code_facts = if job.category == InspectCategory::DeadCode {
             dead_code_contributions_need_fact_refresh(cache, job)?
         } else {
@@ -2650,6 +2682,9 @@ impl InspectManager {
             }
         }
 
+        if crate::executor::current_job_cancelled() {
+            return Err("tier2 pass cancelled before aggregate projection".to_string());
+        }
         if aggregate_job.category == InspectCategory::DeadCode
             && aggregate_job.callgraph_snapshot.is_none()
         {
@@ -2695,6 +2730,9 @@ impl InspectManager {
             ));
         }
         let rollup_started = Instant::now();
+        if crate::executor::current_job_cancelled() {
+            return Err("tier2 pass cancelled before rollup".to_string());
+        }
         let contributions = load_contributions(cache, &aggregate_job)?;
         let aggregate = if aggregate_job.category == InspectCategory::DeadCode
             && aggregate_job.callgraph_snapshot.is_some()
@@ -2748,6 +2786,9 @@ impl InspectManager {
         } else {
             roll_up_tier2_contributions(&aggregate_job, &contributions)
         };
+        if crate::executor::current_job_cancelled() {
+            return Err("tier2 pass cancelled after rollup".to_string());
+        }
         cache
             .store_tier2_aggregate(job.key.clone(), &contribution_set_hash, aggregate.clone())
             .map_err(|error| error.to_string())?;
@@ -7146,7 +7187,11 @@ export function bannerUnused() {}
         let initial_job =
             manager.tier2_reuse_job(snapshot.clone(), InspectCategory::DeadCode, None);
         let initial = manager
-            .tier2_run_with_reuse_job_result_with_options(initial_job, Tier2ReuseOptions::default())
+            .tier2_run_with_reuse_job_result_with_options(
+                initial_job,
+                Tier2ReuseOptions::default(),
+                None,
+            )
             .outcome
             .expect("initial dead_code scan succeeds")
             .aggregate;
@@ -7167,6 +7212,7 @@ export function bannerUnused() {}
                     require_callgraph_snapshot: false,
                     interactive: false,
                 },
+                None,
             )
             .outcome
             .expect("delete refresh dead_code scan succeeds")
@@ -9051,21 +9097,70 @@ mod tier2_deadline_tests {
     use super::*;
 
     #[test]
-    fn tier2_pass_deadline_cancels_a_scanner_stub_that_never_returns() {
+    fn tier2_pass_deadline_releases_limiter_while_ignoring_stub_still_runs() {
+        let limiter = cold_build_limiter::isolated_limiter(1);
+        let request = cold_build_limiter::ColdBuildAdmissionRequest::new(
+            "tier2-timeout-test",
+            cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
+        );
+        let permit = cold_build_limiter::try_acquire_classified_with_limiter(&limiter, &request)
+            .expect("test permit");
+        let permit_slot = Arc::new(Mutex::new(Some(permit)));
+        let (running_tx, running_rx) = bounded(1);
+        let handle = std::thread::spawn({
+            let permit_slot = Arc::clone(&permit_slot);
+            move || {
+                run_tier2_pass_with_deadline(
+                    Path::new("/tmp/tier2-timeout"),
+                    InspectCategory::Duplicates,
+                    Duration::from_millis(20),
+                    Some(permit_slot),
+                    || {
+                        running_tx.send(()).expect("announce running stub");
+                        std::thread::sleep(Duration::from_millis(250));
+                        "ignored cancellation"
+                    },
+                )
+            }
+        });
+        running_rx.recv().expect("stub started");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !limiter.census().holders.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "deadline did not release limiter slot"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            !handle.is_finished(),
+            "stub must still be running when slot is released"
+        );
+        let (value, timed_out) = handle.join().expect("stub thread");
+        assert!(timed_out);
+        assert_eq!(value, "ignored cancellation");
+    }
+
+    #[test]
+    fn tier2_pass_deadline_cooperative_stub_returns_within_grace() {
+        let limiter = cold_build_limiter::isolated_limiter(1);
+        let permit = limiter.try_acquire().expect("test permit");
         let started = Instant::now();
         let (value, timed_out) = run_tier2_pass_with_deadline(
             Path::new("/tmp/tier2-timeout"),
             InspectCategory::Duplicates,
             Duration::from_millis(20),
+            Some(Arc::new(Mutex::new(Some(permit)))),
             || {
-                let token = crate::executor::current_job_cancellation()
-                    .expect("deadline installs JobCancellation for scanners");
-                assert!(token.wait_for_cancellation(Duration::from_secs(2)));
+                while !crate::executor::current_job_cancelled() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 "cancelled"
             },
         );
         assert!(timed_out, "deadline must own the cancellation request");
         assert_eq!(value, "cancelled");
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(limiter.census().holders.is_empty());
     }
 }

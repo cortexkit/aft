@@ -347,23 +347,37 @@ fn run_dead_code_scan_with_oxc_started(
         .map(|result| oxc_skipped_files_payload(&job.project_root, result))
         .unwrap_or_default();
 
+    let cancellation = crate::executor::current_job_cancellation();
     let contributions = job
         .scope_files
         .par_iter()
-        .map_init(DeadCodeFileAnalyzer::default, |file_analyzer, file| {
-            gather_file_contribution(
+        .filter_map(|file| {
+            if cancellation
+                .as_ref()
+                .is_some_and(|token| token.cancel_requested_before_commit())
+            {
+                return None;
+            }
+            let mut file_analyzer = DeadCodeFileAnalyzer::default();
+            Some(gather_file_contribution(
                 job,
                 file,
                 &fallback_exports_by_file,
                 &oxc_facts_by_file,
                 &oxc_parse_errors_by_file,
                 &oxc_skipped_files,
-                file_analyzer,
-            )
+                &mut file_analyzer,
+            ))
         })
         .collect::<Vec<_>>();
+    if crate::executor::current_job_cancelled() {
+        return InspectResult::failed(job, "dead-code scan cancelled", started.elapsed());
+    }
 
     let public_api_files = collect_public_api_files(&job.project_root);
+    if crate::executor::current_job_cancelled() {
+        return InspectResult::failed(job, "dead-code scan cancelled", started.elapsed());
+    }
     let roles = crate::inspect::entry_points::resolve_project_roles(&job.project_root);
     let aggregate = aggregate_dead_code_contributions_with_snapshot(
         &job.project_root,

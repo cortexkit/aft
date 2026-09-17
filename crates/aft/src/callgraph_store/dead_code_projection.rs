@@ -177,12 +177,22 @@ pub(crate) fn project_dead_code_snapshot_from_view(
     )
 }
 
+fn ensure_projection_not_cancelled() -> Result<()> {
+    if crate::executor::current_job_cancelled() {
+        return Err(CallGraphStoreError::Unavailable(
+            "dead-code projection cancelled".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn project_snapshot(
     db_path: &Path,
     previous: Option<(u64, &CallgraphSnapshot)>,
     costs: ProjectionCostEstimates,
     view_root: Option<&Path>,
 ) -> Result<(Option<u64>, CallgraphSnapshot, ProjectionVerdict, Duration)> {
+    ensure_projection_not_cancelled()?;
     if !db_path.is_file() {
         return Err(CallGraphStoreError::Unavailable(format!(
             "database does not exist: {}",
@@ -240,6 +250,7 @@ fn project_snapshot(
                 let mut export_replacements = BTreeMap::new();
                 let mut roots = previous.entry_point_symbols.clone();
                 for file in &callers {
+                    ensure_projection_not_cancelled()?;
                     let path = paths.resolve(file);
                     file_replacements.insert(
                         path.clone(),
@@ -288,6 +299,7 @@ fn project_snapshot(
                     journal_bytes,
                     changed_files,
                 };
+                ensure_projection_not_cancelled()?;
                 (
                     project_files_from_store(&tx, &mut paths, None)?,
                     exported_symbols_from_store(&tx, &mut paths, None)?,
@@ -568,12 +580,13 @@ fn project_files_from_store(
     } else {
         "SELECT path FROM files ORDER BY path"
     })?;
-    let files = statement
-        .query_map(rusqlite::params_from_iter(file), |row| {
-            row.get::<_, String>(0)
-        })?
-        .map(|path| path.map(|path| paths.resolve(&path)))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut files = Vec::new();
+    for path in statement.query_map(rusqlite::params_from_iter(file), |row| {
+        row.get::<_, String>(0)
+    })? {
+        ensure_projection_not_cancelled()?;
+        files.push(paths.resolve(&path?));
+    }
     Ok(files)
 }
 
@@ -606,6 +619,7 @@ fn exported_symbols_from_store(
 
     let mut exports = Vec::new();
     for row in rows {
+        ensure_projection_not_cancelled()?;
         let row = row?;
         let file = paths.resolve(&row.file_path);
         if row.exported {
@@ -658,6 +672,7 @@ fn entry_point_symbols_from_store(
 
     let mut by_file: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
     for row in rows {
+        ensure_projection_not_cancelled()?;
         let row = row?;
         let Some(kind) = symbol_kind_from_label(&row.kind) else {
             continue;
@@ -723,7 +738,7 @@ fn outbound_calls_query(
         None => OUTBOUND_CALLS_SQL.to_owned(),
     };
     let mut statement = conn.prepare(&sql)?;
-    let rows = statement.query_map(rusqlite::params_from_iter(file), |row| {
+    let mapped_rows = statement.query_map(rusqlite::params_from_iter(file), |row| {
         Ok(OutboundRow {
             caller_file: row.get(0)?,
             caller_node: row.get(1)?,
@@ -740,7 +755,11 @@ fn outbound_calls_query(
             ref_id: row.get(12)?,
         })
     })?;
-    let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut rows: Vec<OutboundRow> = Vec::new();
+    for row in mapped_rows {
+        ensure_projection_not_cancelled()?;
+        rows.push(row?);
+    }
     record_outbound_rows(rows.len());
     // SQLite otherwise materializes this 300k+-row ordering in a temporary
     // B-tree. Sorting the already-required projection rows in memory preserves
