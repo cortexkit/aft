@@ -58,6 +58,19 @@ const TEN_MINUTES = 10 * 60_000;
 const FIFTEEN_MINUTES = 15 * 60_000;
 const GB = 1024 ** 3;
 
+const MAX_LAUNCHD_LOG_BYTES = 1024 * 1024;
+const LAUNCHD_LOGS = [join(STATE_DIR, "launchd.stdout.log"), join(STATE_DIR, "launchd.stderr.log")];
+
+export function capLaunchdLogs(paths = LAUNCHD_LOGS): void {
+  for (const path of paths) {
+    try {
+      if (statSync(path).size > MAX_LAUNCHD_LOG_BYTES) truncateSync(path, 0);
+    } catch {
+      // launchd creates these files before the process starts; a missing path is harmless.
+    }
+  }
+}
+
 function finding(rule: string, severity: Severity, fingerprint: string, text: string, clears_when: string): Finding {
   return { rule, severity, fingerprint, text, clears_when };
 }
@@ -480,6 +493,7 @@ function nextPrevious(sample: SentinelSample, state: SentinelState): SentinelSta
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
+  capLaunchdLogs();
   const dryRun = argv.includes("--dry-run");
   const specimenIndex = argv.indexOf("--specimen");
   const state = readState();

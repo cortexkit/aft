@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  capLaunchdLogs,
   detectAll,
   detectDaemon,
   detectDeadSessions,
@@ -42,6 +43,17 @@ const rules = (values: ReturnType<typeof detectAll>) => values.map((value) => va
 // These cases keep detector thresholds executable rather than duplicating the
 // prose contract in a second hand-maintained table.
 describe("health sentinel pure detectors", () => {
+  test("launchd logs are truncated after one MiB", () => {
+    const dir = mkdtempSync(join(tmpdir(), "aft-sentinel-logs-"));
+    const small = join(dir, "small.log");
+    const large = join(dir, "large.log");
+    writeFileSync(small, "kept");
+    writeFileSync(large, Buffer.alloc(1024 * 1024 + 1));
+    capLaunchdLogs([small, large]);
+    expect(readFileSync(small, "utf8")).toBe("kept");
+    expect(statSync(large).size).toBe(0);
+  });
+
   test("daemon.down requires two unreachable health runs", () => {
     const first = detectDaemon(sample({ health: undefined, health_error: "timeout" }), cleanState());
     expect(first.some((value) => value.rule === "daemon.down")).toBe(false);

@@ -12,6 +12,13 @@
   </array>
   <key>WorkingDirectory</key>
   <string>/Users/ufukaltinok/Work/Projects/CortexKit/aft</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/ufukaltinok</string>
+    <key>PATH</key>
+    <string>/Users/ufukaltinok/.bun/bin:/Users/ufukaltinok/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>StartInterval</key>
   <integer>120</integer>
   <key>ProcessType</key>
