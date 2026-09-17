@@ -155,3 +155,44 @@ This is a manual same-artifact comparison, **not a release latency gate**: the t
 All times in milliseconds. Local baseline CPU per switch 73.04 / 58.99 / 68.35 / 63.86 → final 43.18 / 27.09 / 32.81 / 31.22 CPU-s. Final correct latency 18,809 / 15,881 / 10,293 / 15,013 ms. Host load on this final run was approximately 10–15, versus baseline 13–31; these are not controlled isolated-component speedups. The first cold-content manifest remains slower (2239 → 3750 ms); warm returns improve. Closure improves on every paired row. Compared with the supplied card-103 22–24 s / 49–56 CPU-s, both measures improve, but final CPU remains above the historical legacy ~12 CPU-s. The newly measured legacy arm is slower (table above), so **this is not a defensible release-parity certification against the historical card**. Remaining watcher writes and sibling materialization work still matter.
 
 Final raw evidence: `target/hunt-bytes/branch-drill.json`, `branch-drill.md`, both stderr logs and two symbolized samples. Earlier optimized final-tree views-only run is also preserved in `target/hunt-final-optimized` (no correctness defects), but high host load 42–57 made its 37–56 second wall rows unsuitable for claiming speedups. No raw target artifacts are committed.
+
+## Legacy callgraph plane retirement follow-up — 2026-09-17
+
+A views-enabled root now retires watcher writes to the legacy callgraph store after its first successful view publication. The watcher recognizes ownership only when the installed view runtime has both a generation and manifest, logs `reason=views_owner`, and leaves view publication scheduling unchanged. Before that first generation exists, navigation and watcher refresh continue to use the legacy store for first-enable migration. Disabling views resumes the existing legacy refresh worker; the regression test changes a source file and observes the legacy caller count converge from one to two.
+
+Navigation keeps the published view pinned only when its generation fingerprint matches the current Git HEAD. A checkout whose publication is still in flight returns the existing `callgraph_building` adapter response (`callgraph store is building in the background; retry shortly`) rather than serving either the old view or the stale legacy rows planted by the test. The first successful pointer CAS logs exactly once: `views: root=… legacy plane retired at generation=…`.
+
+Red-first results before the ownership and chooser changes:
+
+```text
+runtime_drain::watcher_slice_tests::views_published_watcher_batch_skips_legacy_refresh_and_still_schedules_publication ... FAILED
+assertion failed: a published view must own watcher callgraph writes; left: 1, right: 0
+
+context::callgraph_store_for_ops_tests::views_pending_head_callers_reports_building_instead_of_serving_legacy ... FAILED
+pending HEAD must not serve stale rows
+
+context::callgraph_store_for_ops_tests::views_first_publication_retires_legacy_after_migration_window ... FAILED
+assertion failed: the first publication must retire watcher writes to legacy; left: 1, right: 0
+```
+
+**NON-VACUITY BREAK controls:** each live file was staged first and `git diff --stat` was empty. Neutralizing the watcher ownership condition produced `runtime_drain.rs | 3 ++-` and failed only `views_published_watcher_batch_skips_legacy_refresh_and_still_schedules_publication` with legacy refresh count 1 instead of 0. Filtering the published-view chooser out to restore the legacy fallback produced `context.rs | 5 ++++-` and failed only `views_pending_head_callers_reports_building_instead_of_serving_legacy` at `pending HEAD must not serve stale rows`. Each file was restored with `git checkout -- <path> && touch <path>`; `git diff --stat` was empty and its named test passed after restore.
+
+Verification completed before the drill:
+
+- `RUSTFLAGS='-D warnings' cargo check -p agent-file-tools --lib --bin aft -j 4`: passed.
+- The three ownership/migration/navigation unit tests above: passed after implementation and after mutation restore.
+- `cargo test -p agent-file-tools --test watcher_integration branch_switch`: 2 passed.
+- `cargo test -p agent-file-tools --test integration tool_call_matches_direct_spine_envelopes`: passed (the 69-fixture parity matrix).
+
+### Fresh-storage views-on drill
+
+The optimized binary (`sha256 f7ac35d01790ba46cec1eaec7bca2877fc55491e14fe1687f14e7bedbb565200`) ran `--mode views-on` against `~/Work/OSS/opencode` with fresh storage while the sibling `opencode.aft-drill.lock` directory was held. The drill reported no defects, restored detached HEAD `5716f8ba60e7` with a clean worktree, and released the lock. Publication bytes below sum the root-owned callgraph and semantic-fill `view_publication` events; checkpoint bytes remain separate, matching the byte-accounting rules above. The comparison bytes are the corresponding CG+SF totals from the hunt's final rows.
+
+| switch | publication ms | correct ms | CPU-s (retirement → hunt final) | publication physical bytes (retirement → hunt final) | checkpoint physical bytes | `legacy_callgraph_refresh` events |
+|---|---:|---:|---:|---:|---:|---:|
+| HEAD→A | 37,382 | 37,873 | 59.19 → 43.18 | 1,035,001,856 → 794,812,416 | 506,822,656 | 0 |
+| A→HEAD | 15,186 | 16,085 | 35.90 → 27.09 | 589,627,392 → 380,338,176 | 362,950,656 | 0 |
+| HEAD→B | 29,603 | 29,602 | 28.47 → 32.81 | 792,965,120 → 403,558,400 | 216,432,640 | 0 |
+| B→HEAD | 55,992 | 57,780 | 16.33 → 31.22 | 162,897,920 → 789,827,584 | 219,779,072 | 0 |
+
+The retirement line appeared once at generation 1. There were **zero** `legacy_callgraph_refresh` events after it and zero in every measured row. The first three rows overlapped the first-enable legacy cold build that had started before generation 1 and finished after 1,340,087 ms; that build is not a watcher refresh, but it and host load of roughly 40–65 make these CPU/latency deltas unsuitable as an isolated speedup claim. The ownership result is the event-level one requested here: after publication, every measured watcher-driven callgraph update used view publication rather than legacy refresh. Raw evidence is under `target/views-owner-drill-20260917-125450/` and is intentionally uncommitted.
