@@ -5954,6 +5954,9 @@ fn run_configure_storage_sweeps(storage_root: &Path, harness: Harness) {
     }
     crate::search_index::sweep_orphaned_index_dirs(storage_root);
     crate::search_index::sweep_transient_search_cache_dirs();
+    let inspect_root = storage_root.join(crate::root_cache::RootCacheDomain::Inspect.as_str());
+    let live_scope_keys = crate::root_cache::live_scope_keys_for_storage(storage_root);
+    crate::inspect::cache::sweep_inspect_scope_dirs(&inspect_root, &live_scope_keys);
     match crate::migrate_storage::cleanup_staging_dirs(storage_root, harness) {
         Ok(0) => {}
         Ok(n) => slog_info!(
@@ -12107,6 +12110,34 @@ mod tests {
             median(&mut optimized_warm_pre_ack).as_micros(),
             median(&mut legacy_warm_post_ack).as_micros(),
             median(&mut optimized_warm_post_ack).as_micros(),
+        );
+    }
+}
+
+#[cfg(test)]
+mod inspect_orphan_sweep_tests {
+    use super::*;
+
+    #[test]
+    fn configure_storage_sweep_removes_old_unbound_inspect_scope() {
+        let storage = tempfile::tempdir().expect("storage");
+        let scope = storage.path().join("inspect").join("orphan-scope");
+        fs::create_dir_all(&scope).expect("scope directory");
+        let cache = scope.join("cache.sqlite");
+        fs::write(&cache, vec![0_u8; 4096]).expect("cache fixture");
+        filetime::set_file_mtime(
+            &cache,
+            filetime::FileTime::from_system_time(
+                SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60),
+            ),
+        )
+        .expect("age cache fixture");
+
+        run_configure_storage_sweeps(storage.path(), Harness::Opencode);
+
+        assert!(
+            !scope.exists(),
+            "old scope without a live route must be reaped"
         );
     }
 }

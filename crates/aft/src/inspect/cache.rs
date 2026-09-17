@@ -12,7 +12,7 @@ const INSPECT_WRITER_LEASE_TIMEOUT: Duration = Duration::from_secs(2);
 // had no file newer than seven days. Scope keys hash canonical checkout paths,
 // so reclaimed worktrees cannot ever reach their old directories again. This is
 // a structural fix for that permanent accumulation, not a user-facing knob.
-const INSPECT_SCOPE_MIN_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+const INSPECT_SCOPE_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Bound one process-wide pass so a slow filesystem cannot stall publication;
 /// the first-level cursor resumes the remaining scope directories next time.
 const INSPECT_SCOPE_SWEEP_BUDGET: Duration = Duration::from_secs(5);
