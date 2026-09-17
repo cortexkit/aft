@@ -547,6 +547,26 @@ fn exact_symbol_offsets_are_char_boundaries_on_crlf_multibyte_files() {
 }
 
 #[test]
+fn declaration_scanner_does_not_absorb_unrelated_following_occurrences() {
+    let source = concat!(
+        "export const unrelated = true;\n",
+        "// @opencode-ai consumer\n",
+        "// @opencode-ai consumer\n",
+    );
+    let result = aft::commands::semantic_search::exact_lane::verify_exact_matches_in_text(
+        std::path::Path::new("src/load-matrix.ts"),
+        source,
+        "@opencode-ai",
+        &["opencode".to_string()],
+    )
+    .expect("file-level phrase evidence");
+
+    assert_eq!(result.len(), 1);
+    assert!(result[0].symbol_range.is_none());
+    assert_eq!(result[0].evidence.occurrences, Some(2));
+}
+
+#[test]
 fn bare_identifiers_rank_declarations_before_repeated_consumers() {
     let cases = [
         (

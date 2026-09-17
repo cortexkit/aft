@@ -473,45 +473,48 @@ pub fn scan_symbols_in_text(text: &str) -> Vec<(String, SymbolOffsetRange)> {
         let leading_spaces = line.len() - trimmed.len();
         let line_offset = current_offset + leading_spaces;
 
-        let name_opt = if let Some(rest) = trimmed.strip_prefix("pub fn ") {
-            extract_identifier(rest)
+        let (name_opt, declaration_line_only) = if let Some(rest) = trimmed.strip_prefix("pub fn ") {
+            (extract_identifier(rest), false)
         } else if let Some(rest) = trimmed.strip_prefix("fn ") {
-            extract_identifier(rest)
+            (extract_identifier(rest), false)
         } else if let Some(rest) = trimmed.strip_prefix("pub(crate) fn ") {
-            extract_identifier(rest)
+            (extract_identifier(rest), false)
         } else if let Some(rest) = trimmed.strip_prefix("def ") {
-            extract_identifier(rest)
+            (extract_identifier(rest), false)
         } else if let Some(rest) = trimmed.strip_prefix("export function ") {
-            extract_identifier(rest)
+            (extract_identifier(rest), false)
         } else if let Some(rest) = trimmed.strip_prefix("function ") {
-            extract_identifier(rest)
+            (extract_identifier(rest), false)
         } else if let Some(rest) = trimmed.strip_prefix("pub struct ") {
-            extract_identifier(rest)
+            (extract_identifier(rest), false)
         } else if let Some(rest) = trimmed.strip_prefix("struct ") {
-            extract_identifier(rest)
+            (extract_identifier(rest), false)
         } else {
-            [
-                "export namespace ",
-                "namespace ",
-                "export class ",
-                "class ",
-                "export interface ",
-                "interface ",
-                "export enum ",
-                "pub enum ",
-                "enum ",
-                "pub trait ",
-                "trait ",
-                "export type ",
-                "pub type ",
-                "type ",
-                "export const ",
-                "pub const ",
-                "const ",
-            ]
-            .into_iter()
-            .find_map(|prefix| trimmed.strip_prefix(prefix).and_then(extract_identifier))
-            .or_else(|| extract_field_identifier(trimmed))
+            (
+                [
+                    "export namespace ",
+                    "namespace ",
+                    "export class ",
+                    "class ",
+                    "export interface ",
+                    "interface ",
+                    "export enum ",
+                    "pub enum ",
+                    "enum ",
+                    "pub trait ",
+                    "trait ",
+                    "export type ",
+                    "pub type ",
+                    "type ",
+                    "export const ",
+                    "pub const ",
+                    "const ",
+                ]
+                .into_iter()
+                .find_map(|prefix| trimmed.strip_prefix(prefix).and_then(extract_identifier))
+                .or_else(|| extract_field_identifier(trimmed)),
+                true,
+            )
         };
 
         if let Some(name) = name_opt {
@@ -519,7 +522,11 @@ pub fn scan_symbols_in_text(text: &str) -> Vec<(String, SymbolOffsetRange)> {
             debug_assert!(text.is_char_boundary(start));
             // The lightweight span is byte-addressed because downstream ranges
             // slice UTF-8 source. Clamp the approximate end to a character boundary.
-            let mut end = (start + 500).min(text.len());
+            let mut end = if declaration_line_only {
+                (current_offset + line.len()).min(text.len())
+            } else {
+                (start + 500).min(text.len())
+            };
             while end > start && !text.is_char_boundary(end) {
                 end -= 1;
             }

@@ -12,6 +12,7 @@
     "matching-line-rendering",
     "identifier-fact-lane-join",
     "definition-first-identifiers",
+    "bounded-declaration-spans",
     "numeric-literal-variants"
   ]
 }
