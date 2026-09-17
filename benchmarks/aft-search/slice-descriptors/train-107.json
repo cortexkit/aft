@@ -1,0 +1,16 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "bash-replay-sweep-race",
+    "views-perf-hunt",
+    "views-materialization-fill-reuse"
+  ],
+  "note": "No ranking-fence file changes: persisted-GC/replay race fix; views tier-2 view reader + closure index + byte telemetry; views fill reuse + keeper WAL fix."
+}
