@@ -250,6 +250,24 @@ fn token_ranges(raw: &str, start: usize, end: usize, spans: &[DelimitedSpan]) ->
     ranges
 }
 
+pub(crate) fn identifier_shaped_tokens(query: &str) -> Vec<String> {
+    let analysis = analyze(query);
+    analysis
+        .tokens
+        .iter()
+        .map(|range| {
+            analysis.raw[range.clone()]
+                .trim_matches(|character: char| {
+                    matches!(character, '"' | '\'' | '`')
+                        || (!character.is_alphanumeric()
+                            && !matches!(character, '_' | '-' | '.' | ':'))
+                })
+                .to_string()
+        })
+        .filter(|token| is_identifier_shaped_token(token))
+        .collect()
+}
+
 pub(crate) fn is_identifier_shaped_token(token: &str) -> bool {
     let token = token.trim_matches(|character: char| matches!(character, '"' | '\'' | '`'));
     let is_name_segment = |segment: &str| {
@@ -267,10 +285,18 @@ pub(crate) fn is_identifier_shaped_token(token: &str) -> bool {
         && snake_segments
             .iter()
             .all(|segment| is_name_segment(segment));
+    let kebab_segments = token.split('-').collect::<Vec<_>>();
+    // Short hyphen compounds are common prose; long compounds are much more likely
+    // to be crate or package identifiers such as `cortexkit-cow`.
+    let kebab_case = token.len() >= 12
+        && kebab_segments.len() >= 2
+        && kebab_segments.iter().all(|segment| {
+            is_name_segment(segment) && segment.bytes().any(|byte| byte.is_ascii_alphabetic())
+        });
     let camel_case = token.bytes().all(|byte| byte.is_ascii_alphanumeric())
         && token.bytes().skip(1).any(|byte| byte.is_ascii_uppercase())
         && token.bytes().any(|byte| byte.is_ascii_lowercase());
-    qualified || snake_case || camel_case
+    qualified || snake_case || kebab_case || camel_case
 }
 
 fn is_authoritative_path_token(token: &str) -> bool {

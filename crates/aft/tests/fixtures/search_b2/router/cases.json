@@ -226,5 +226,15 @@
     "has_path_token": true,
     "has_timestamp_or_pid": false,
     "has_identifier_token": true
+  },
+  {
+    "query": "cortexkit-cow isolation backend diff usage",
+    "shape": "nl",
+    "embedded_span": null,
+    "exact_input": "cortexkit-cow isolation backend diff usage",
+    "exact_input_tokens": 6,
+    "has_path_token": false,
+    "has_timestamp_or_pid": false,
+    "has_identifier_token": true
   }
 ]

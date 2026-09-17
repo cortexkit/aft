@@ -270,3 +270,21 @@ fn filename_detection_delegates_to_the_existing_exemption_authority() {
     assert!(router_source.contains("query_shape::pre_tier_exempt(token)"));
     assert!(authority_source.contains("static FILENAME_EXEMPTION_RE"));
 }
+
+#[test]
+fn natural_language_identifier_facts_preserve_dotted_snake_kebab_and_camel_tokens() {
+    let cases = [
+        "manager.ingest_event wire operation handler in core module",
+        "ingest_canonical event into store task lifecycle",
+        "cortexkit-cow isolation backend diff usage",
+        "how is transform_mode resolved per session from project config",
+        "where is Tier2PhaseTimings assembled in the inspect manager today",
+    ];
+
+    for query in cases {
+        let raw_query = RawQuery::new(query);
+        let (shape, facts) = router::classify(&raw_query);
+        assert_eq!(shape, SearchShape::NaturalLanguage, "{query}");
+        assert!(facts.has_identifier_token, "{query}");
+    }
+}

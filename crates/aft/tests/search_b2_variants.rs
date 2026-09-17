@@ -97,6 +97,14 @@ fn six_declared_variant_arrays_are_literal_and_ordered() {
 }
 
 #[test]
+fn snake_identifier_emits_kebab_and_camel_within_the_budget() {
+    let variants = generated_text("transform_mode");
+    assert!(variants.iter().any(|variant| variant == "transform-mode"));
+    assert!(variants.iter().any(|variant| variant == "transformMode"));
+    assert!(variants.len() <= MAX_QUERY_VARIANTS);
+}
+
+#[test]
 fn direct_number_rule_asserts_key_to_keys() {
     assert_eq!(generated_text("key"), ["Key", "KEY", "keys"]);
     assert_eq!(generated_text("day"), ["Day", "DAY", "days"]);

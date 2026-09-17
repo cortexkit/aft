@@ -2419,6 +2419,41 @@ fn run_engine_ranking(
         } else {
             Vec::new()
         };
+    if plan.shape == SearchShape::NaturalLanguage && plan.query_facts.has_identifier_token {
+        let lane = exact_lane::ExactLane::with_memo(ctx.search_exact_memo());
+        for fact in crate::search_b2::router::identifier_shaped_tokens(query) {
+            let mut fact_inputs = vec![(fact.clone(), true)];
+            fact_inputs.extend(
+                extensions
+                    .variants(extensions::Token {
+                        index: 0,
+                        text: &fact,
+                    })
+                    .into_iter()
+                    .map(|variant| (variant.text, false)),
+            );
+            for (fact_input, exact_form) in fact_inputs {
+                let mut fact_candidates = lane
+                    .search(
+                        Some(&index),
+                        project_root,
+                        generation.clone(),
+                        &fact_input,
+                        include_tests,
+                        0,
+                        usize::MAX,
+                        None,
+                    )
+                    .map_err(|error| error.to_string())?
+                    .results;
+                fact_candidates.retain(|candidate| candidate.evidence.kind == EvidenceKind::E1);
+                for candidate in &mut fact_candidates {
+                    candidate.evidence.exact_form = exact_form;
+                }
+                exact_candidates.extend(fact_candidates);
+            }
+        }
+    }
     let retain_definition_evidence = plan.shape == SearchShape::Identifier
         || (plan.shape == SearchShape::NaturalLanguage && plan.query_facts.has_identifier_token);
     if !retain_definition_evidence {

@@ -547,6 +547,82 @@ fn exact_symbol_offsets_are_char_boundaries_on_crlf_multibyte_files() {
 }
 
 #[test]
+fn nl_identifier_facts_join_exact_retrieval_without_rerouting_the_shape() {
+    let cases = [
+        (
+            "manager.ingest_event wire operation handler in core module",
+            "manager.ingest_event(event);",
+            "manager ingest event wire operation handler in core module",
+        ),
+        (
+            "ingest_canonical event into store task lifecycle",
+            "store.ingest_canonical(event);",
+            "ingest canonical event into store task lifecycle",
+        ),
+        (
+            "cortexkit-cow isolation backend diff usage",
+            "const BACKEND: &str = \"cortexkit-cow\";",
+            "cortexkit cow isolation backend diff usage",
+        ),
+        (
+            "how is transform_mode resolved per session from project config on every transform pass",
+            "export function resolveTransformMode() {}",
+            "transform mode resolved per session from project config on every transform pass",
+        ),
+    ];
+
+    for (case_index, (query, target_line, decoy_line)) in cases.into_iter().enumerate() {
+        let dir = create_temp_corpus();
+        let target = dir.path().join("src/target.rs");
+        fs::write(&target, format!("pub fn route() {{ {target_line} }}\n"))
+            .expect("write identifier-fact target");
+        for ordinal in 0..20 {
+            fs::write(
+                dir.path().join(format!("src/decoy_{ordinal:02}.rs")),
+                format!("// {}\n", decoy_line.repeat(20)),
+            )
+            .expect("write identifier-fact decoy");
+        }
+
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(dir.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SearchIndex::build(dir.path()));
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": format!("nl-identifier-fact-{case_index}"),
+            "command": "semantic_search",
+            "query": query,
+            "top_k": 5
+        }))
+        .expect("build identifier-fact request");
+        let response = serde_json::to_value(handle_semantic_search(&request, &ctx))
+            .expect("serialize identifier-fact response");
+        let ranked = response["results"]
+            .as_array()
+            .expect("identifier-fact results");
+
+        assert_eq!(
+            response["structuredContent"]["plan"]["shape"],
+            "natural_language",
+            "query {query}: {response:?}"
+        );
+        assert!(
+            ranked.first().and_then(|result| result["file"].as_str()).is_some_and(|path| {
+                path.replace('\\', "/").ends_with("src/target.rs")
+            }),
+            "identifier fact should recover target for query {query}: {response:?}"
+        );
+    }
+}
+
+#[test]
 fn nl_quoted_span_exact_evidence_ranks_first() {
     let dir = create_temp_corpus();
     let target = dir.path().join("src/settle.rs");
