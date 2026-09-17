@@ -3,9 +3,11 @@
 //!
 //! Replaces the `fastembed` crate. We own the ORT session so we can cap
 //! intra-op threads — `fastembed` hardcoded `with_intra_threads(all cores)`,
-//! which pegged every core during indexing (the sustained-CPU complaint). We
-//! cap to `num_cpus / 2`, which an earlier measurement showed is both faster
-//! (1.7x) and far lighter (3.5x less CPU) than oversubscribing all cores.
+//! which pegged every core during indexing. We cap to half of the process's
+//! available parallelism, the container CPU quota when present, and eight
+//! threads overall. The half-core policy measured 1.7x faster with 3.5x less
+//! CPU than oversubscribing all cores; the quota cap prevents ORT from creating
+//! host-sized pools inside CPU-constrained containers.
 //!
 //! The pipeline reproduces fastembed's MiniLM path byte-for-byte (verified:
 //! cosine 1.000000 vs fastembed across code + prose), so existing semantic
@@ -51,14 +53,146 @@ const MINILM_MAX_LENGTH: usize = 512;
 /// throughput is unaffected and only long-chunk batches are split.
 const MAX_BATCH_ATTENTION_UNITS: usize = 4_000_000;
 
-/// Cap ORT intra-op threads to half the cores (min 1), leaving the rest free
-/// for the agent / editor. Matches the `num_cpus / 2` policy used elsewhere.
-fn intra_thread_cap() -> usize {
-    std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(1)
-        .div_ceil(2)
-        .max(1)
+const MAX_ORT_INTRA_THREADS: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CgroupCpuQuota {
+    Limited(usize),
+    Unlimited,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IntraThreadDerivation {
+    threads: usize,
+    source: &'static str,
+    available_parallelism: usize,
+    quota_threads: Option<usize>,
+}
+
+fn quota_threads(quota: u64, period: u64) -> Option<usize> {
+    if quota == 0 || period == 0 {
+        return None;
+    }
+    usize::try_from(quota.div_ceil(period))
+        .ok()
+        .map(|value| value.max(1))
+}
+
+fn parse_cgroup_v2_cpu_max(contents: &str) -> CgroupCpuQuota {
+    let mut fields = contents.split_whitespace();
+    let Some(quota) = fields.next() else {
+        return CgroupCpuQuota::Invalid;
+    };
+    let Some(period) = fields.next() else {
+        return CgroupCpuQuota::Invalid;
+    };
+    if fields.next().is_some() {
+        return CgroupCpuQuota::Invalid;
+    }
+    if quota == "max" {
+        return period
+            .parse::<u64>()
+            .ok()
+            .filter(|period| *period > 0)
+            .map_or(CgroupCpuQuota::Invalid, |_| CgroupCpuQuota::Unlimited);
+    }
+    match (quota.parse::<u64>().ok(), period.parse::<u64>().ok()) {
+        (Some(quota), Some(period)) => quota_threads(quota, period)
+            .map(CgroupCpuQuota::Limited)
+            .unwrap_or(CgroupCpuQuota::Invalid),
+        _ => CgroupCpuQuota::Invalid,
+    }
+}
+
+fn parse_cgroup_v1_cpu_quota(quota: &str, period: &str) -> CgroupCpuQuota {
+    let Ok(quota) = quota.trim().parse::<i64>() else {
+        return CgroupCpuQuota::Invalid;
+    };
+    let Ok(period) = period.trim().parse::<u64>() else {
+        return CgroupCpuQuota::Invalid;
+    };
+    if quota < 0 {
+        return if period > 0 {
+            CgroupCpuQuota::Unlimited
+        } else {
+            CgroupCpuQuota::Invalid
+        };
+    }
+    quota_threads(quota as u64, period)
+        .map(CgroupCpuQuota::Limited)
+        .unwrap_or(CgroupCpuQuota::Invalid)
+}
+
+fn derive_intra_threads(
+    available_parallelism: usize,
+    v2_cpu_max: Option<&str>,
+    v1_cpu_quota_us: Option<&str>,
+    v1_cpu_period_us: Option<&str>,
+) -> IntraThreadDerivation {
+    let available_parallelism = available_parallelism.max(1);
+    let parallelism_threads = available_parallelism.div_ceil(2).max(1);
+    let quota = match v2_cpu_max.map(parse_cgroup_v2_cpu_max) {
+        Some(CgroupCpuQuota::Invalid) | None => match (v1_cpu_quota_us, v1_cpu_period_us) {
+            (Some(quota), Some(period)) => parse_cgroup_v1_cpu_quota(quota, period),
+            _ => CgroupCpuQuota::Invalid,
+        },
+        Some(quota) => quota,
+    };
+    let quota_threads = match quota {
+        CgroupCpuQuota::Limited(threads) => Some(threads),
+        CgroupCpuQuota::Unlimited | CgroupCpuQuota::Invalid => None,
+    };
+    let threads = parallelism_threads
+        .min(quota_threads.unwrap_or(usize::MAX))
+        .min(MAX_ORT_INTRA_THREADS)
+        .max(1);
+    let source = if quota_threads.is_some_and(|quota| quota <= threads) {
+        "quota"
+    } else if parallelism_threads > MAX_ORT_INTRA_THREADS {
+        "cap"
+    } else {
+        "parallelism"
+    };
+    IntraThreadDerivation {
+        threads,
+        source,
+        available_parallelism,
+        quota_threads,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_first(paths: &[&str]) -> Option<String> {
+    paths
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+}
+
+fn intra_thread_derivation() -> IntraThreadDerivation {
+    let available_parallelism = std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1);
+    #[cfg(target_os = "linux")]
+    {
+        let v2 = read_first(&["/sys/fs/cgroup/cpu.max"]);
+        let v1_quota = read_first(&[
+            "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
+            "/sys/fs/cgroup/cpu.cfs_quota_us",
+        ]);
+        let v1_period = read_first(&[
+            "/sys/fs/cgroup/cpu/cpu.cfs_period_us",
+            "/sys/fs/cgroup/cpu.cfs_period_us",
+        ]);
+        return derive_intra_threads(
+            available_parallelism,
+            v2.as_deref(),
+            v1_quota.as_deref(),
+            v1_period.as_deref(),
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    derive_intra_threads(available_parallelism, None, None, None)
 }
 
 pub struct LocalEmbedder {
@@ -86,7 +220,8 @@ impl LocalEmbedder {
 
         let (model_path, tokenizer_path) = resolve_model_files()?;
 
-        let threads = intra_thread_cap();
+        let thread_derivation = intra_thread_derivation();
+        let threads = thread_derivation.threads;
         let session = Session::builder()
             .map_err(|e| format!("failed to create ONNX session builder: {e}"))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -116,8 +251,14 @@ impl LocalEmbedder {
             .any(|input| input.name() == "token_type_ids");
 
         slog_info!(
-            "local embedder ready: model=all-MiniLM-L6-v2 intra_threads={} token_type_ids={}",
+            "local embedder ready: model=all-MiniLM-L6-v2 intra_threads={} intra_threads_source={} available_parallelism={} cgroup_quota_threads={} token_type_ids={}",
             threads,
+            thread_derivation.source,
+            thread_derivation.available_parallelism,
+            thread_derivation
+                .quota_threads
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
             wants_token_type_ids
         );
 
@@ -384,7 +525,10 @@ fn download_via_hf_hub(cache_dir: &std::path::Path) -> Result<(PathBuf, PathBuf)
 
 #[cfg(test)]
 mod tests {
-    use super::{embedding_cache_dir_from, MINILM_MAX_LENGTH};
+    use super::{
+        derive_intra_threads, embedding_cache_dir_from, parse_cgroup_v1_cpu_quota,
+        parse_cgroup_v2_cpu_max, CgroupCpuQuota, MINILM_MAX_LENGTH,
+    };
     use std::io::Write;
     use tokenizers::Tokenizer;
 
@@ -472,6 +616,49 @@ mod tests {
         assert_eq!(ids.first(), Some(&1));
         assert_eq!(ids.last(), Some(&2));
         assert!(ids[1..MINILM_MAX_LENGTH - 1].iter().all(|id| *id == 4));
+    }
+
+    #[test]
+    fn cgroup_cpu_quota_parsing_and_thread_derivation_cover_v2_v1_and_absence() {
+        assert_eq!(
+            parse_cgroup_v2_cpu_max("max 100000\n"),
+            CgroupCpuQuota::Unlimited
+        );
+        assert_eq!(
+            parse_cgroup_v2_cpu_max("200000 100000\n"),
+            CgroupCpuQuota::Limited(2)
+        );
+        assert_eq!(
+            parse_cgroup_v1_cpu_quota("-1\n", "100000\n"),
+            CgroupCpuQuota::Unlimited
+        );
+        assert_eq!(
+            parse_cgroup_v1_cpu_quota("200000\n", "100000\n"),
+            CgroupCpuQuota::Limited(2)
+        );
+
+        let v2_limited = derive_intra_threads(64, Some("200000 100000"), None, None);
+        assert_eq!(v2_limited.threads, 2);
+        assert_eq!(v2_limited.source, "quota");
+
+        let v1_limited = derive_intra_threads(64, None, Some("200000"), Some("100000"));
+        assert_eq!(v1_limited.threads, 2);
+        assert_eq!(v1_limited.source, "quota");
+
+        let v2_unlimited = derive_intra_threads(64, Some("max 100000"), None, None);
+        assert_eq!(v2_unlimited.threads, 8);
+        assert_eq!(v2_unlimited.source, "cap");
+        assert_eq!(v2_unlimited.quota_threads, None);
+
+        let v1_unlimited = derive_intra_threads(64, None, Some("-1"), Some("100000"));
+        assert_eq!(v1_unlimited.threads, 8);
+        assert_eq!(v1_unlimited.source, "cap");
+        assert_eq!(v1_unlimited.quota_threads, None);
+
+        let absent = derive_intra_threads(64, None, None, None);
+        assert_eq!(absent.threads, 8);
+        assert_eq!(absent.source, "cap");
+        assert_eq!(absent.quota_threads, None);
     }
 
     #[test]
