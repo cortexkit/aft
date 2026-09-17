@@ -11,8 +11,6 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -25,17 +23,21 @@ pub const PATH_IDENTITY_VERSION: u32 = 1;
 
 const GIT_METADATA_TIMEOUT: Duration = Duration::from_secs(30);
 
+// Thread-local because the navigation calls under test run on the test
+// thread; a process-wide counter would count sibling tests' publications.
 #[cfg(test)]
-static HEAD_TREE_ENTRY_CALLS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static HEAD_TREE_ENTRY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 pub(crate) fn reset_head_tree_entry_calls_for_test() {
-    HEAD_TREE_ENTRY_CALLS.store(0, Ordering::SeqCst);
+    HEAD_TREE_ENTRY_CALLS.with(|calls| calls.set(0));
 }
 
 #[cfg(test)]
 pub(crate) fn head_tree_entry_calls_for_test() -> usize {
-    HEAD_TREE_ENTRY_CALLS.load(Ordering::SeqCst)
+    HEAD_TREE_ENTRY_CALLS.with(std::cell::Cell::get)
 }
 
 const ALIAS_SCHEMA: &str = r#"
@@ -771,7 +773,7 @@ fn same_file_path(path: &Path, target: &Path) -> bool {
 /// Lists `HEAD` paths from Git metadata without opening working-tree files.
 pub fn head_tree_entries(repo_root: &Path) -> Result<Vec<TrackedPath>, AliasError> {
     #[cfg(test)]
-    HEAD_TREE_ENTRY_CALLS.fetch_add(1, Ordering::SeqCst);
+    HEAD_TREE_ENTRY_CALLS.with(|calls| calls.set(calls.get() + 1));
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)

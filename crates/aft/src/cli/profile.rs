@@ -1899,7 +1899,8 @@ mod tests {
         });
         let rendered = render_memory_census_human(&value);
         assert!(rendered.contains("allocator slack (virtual, mostly already MADV_FREE'd; not reclaimable physical memory): 20.0 MB\n"));
-        assert!(rendered.contains("process io: read 1.0 GB, written 2.0 GB (logical 3.0 GB) since spawn\n"));
+        assert!(rendered
+            .contains("process io: read 1.0 GB, written 2.0 GB (logical 3.0 GB) since spawn\n"));
     }
 
     #[test]

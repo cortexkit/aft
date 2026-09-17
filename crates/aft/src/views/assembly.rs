@@ -153,6 +153,11 @@ pub fn prepare_checkout(
     phase: &mut impl FnMut(&str) -> Result<()>,
 ) -> Result<PreparedAssembly> {
     let mut timing = super::profile::PublicationTiming::new(&request.project_root);
+    // Every publisher (scheduler, migration import, tests) reaches this point
+    // with the HEAD fingerprint it observed, so the read-path cache that
+    // navigation and Tier-2 compare generations against is populated here
+    // rather than only where the scheduler happened to compute it.
+    super::cache_head_fingerprint(request.project_root.clone(), request.desired_head.clone());
     let mut profile = PublicationProfile::new(&request.project_root);
     profile.enter(0, phase)?;
     let view = ViewStore::open(&request.storage, &request.scope)?;

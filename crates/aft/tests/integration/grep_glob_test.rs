@@ -1129,12 +1129,7 @@ fn glob_files(aft: &mut AftProcess, id: &str, pattern: &str, path: Option<&str>)
         .as_array()
         .expect("files array")
         .iter()
-        .map(|entry| {
-            entry
-                .as_str()
-                .expect("file path")
-                .replace('\\', "/")
-        })
+        .map(|entry| entry.as_str().expect("file path").replace('\\', "/"))
         .collect()
 }
 
@@ -1144,10 +1139,7 @@ fn glob_files(aft: &mut AftProcess, id: &str, pattern: &str, path: Option<&str>)
 /// `path` is the search root and the pattern is evaluated relative to it.
 #[test]
 fn glob_bare_filename_matches_top_level_under_path_fallback() {
-    let project = setup_project(&[
-        ("src/a.rs", "fn a() {}\n"),
-        ("src/sub/b.rs", "fn b() {}\n"),
-    ]);
+    let project = setup_project(&[("src/a.rs", "fn a() {}\n"), ("src/sub/b.rs", "fn b() {}\n")]);
     let mut aft = AftProcess::spawn();
     configure(&mut aft, project.path());
 
@@ -1155,7 +1147,8 @@ fn glob_bare_filename_matches_top_level_under_path_fallback() {
     let files = glob_files(&mut aft, "glob-bare-top", "a.rs", Some("src"));
     let expected = canonical_path_string(&project.path().join("src/a.rs"));
     assert_eq!(
-        files, vec![expected.clone()],
+        files,
+        vec![expected.clone()],
         "bare filename must match a file directly under path (fallback): {files:?}"
     );
 
@@ -1172,7 +1165,8 @@ fn glob_bare_filename_matches_top_level_under_path_fallback() {
     let files = glob_files(&mut aft, "glob-doublestar-b", "**/b.rs", Some("src"));
     let expected_b = canonical_path_string(&project.path().join("src/sub/b.rs"));
     assert_eq!(
-        files, vec![expected_b],
+        files,
+        vec![expected_b],
         "**/b.rs must match nested file under path (fallback): {files:?}"
     );
 
@@ -1185,7 +1179,10 @@ fn glob_bare_filename_matches_top_level_under_path_fallback() {
 #[test]
 fn glob_bare_filename_matches_top_level_under_path_indexed() {
     let project = setup_project(&[
-        (".fixture-id", "glob_bare_filename_matches_top_level_under_path_indexed\n"),
+        (
+            ".fixture-id",
+            "glob_bare_filename_matches_top_level_under_path_indexed\n",
+        ),
         ("src/a.rs", "fn a() {}\n"),
         ("src/sub/b.rs", "fn b() {}\n"),
     ]);
@@ -1206,7 +1203,8 @@ fn glob_bare_filename_matches_top_level_under_path_indexed() {
     let files = glob_files(&mut aft, "glob-bare-top-idx", "a.rs", Some("src"));
     let expected = canonical_path_string(&project.path().join("src/a.rs"));
     assert_eq!(
-        files, vec![expected.clone()],
+        files,
+        vec![expected.clone()],
         "bare filename must match a file directly under path (indexed): {files:?}"
     );
 
@@ -1221,7 +1219,8 @@ fn glob_bare_filename_matches_top_level_under_path_indexed() {
     let files = glob_files(&mut aft, "glob-doublestar-b-idx", "**/b.rs", Some("src"));
     let expected_b = canonical_path_string(&project.path().join("src/sub/b.rs"));
     assert_eq!(
-        files, vec![expected_b],
+        files,
+        vec![expected_b],
         "**/b.rs must match nested file under path (indexed): {files:?}"
     );
 
