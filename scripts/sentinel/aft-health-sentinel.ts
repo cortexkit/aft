@@ -37,7 +37,7 @@ export type SentinelSample = {
   disk_error?: string;
   dsym?: { requested_uuid?: string; found_uuid?: string; path?: string; error?: string };
 };
-export type FindingLedger = Record<string, { last_alerted_at: number; last_seen_at: number; severity: Severity; rule: string; text: string }>;
+export type FindingLedger = Record<string, { last_alerted_at: number; last_seen_at: number; severity: Severity; rule: string; text: string; cleared_at?: number }>;
 export type SentinelState = {
   findings: FindingLedger;
   log?: { path?: string; offset?: number; size?: number };
@@ -378,10 +378,21 @@ export function reconcile(findings: Finding[], previous: FindingLedger, now: num
   for (const current of findings) {
     const prior = previous[current.fingerprint];
     const cooldown = current.severity === "CRITICAL" ? CRITICAL_COOLDOWN : WARNING_COOLDOWN;
+    // A finding that cleared and came back inside its cooldown is the same
+    // subject flapping around a threshold, so the cleared entry keeps its
+    // last_alerted_at and the return does not wake anyone again.
     if (!prior || now - prior.last_alerted_at >= cooldown) raised.push(current);
     next[current.fingerprint] = { last_alerted_at: !prior || now - prior.last_alerted_at >= cooldown ? now : prior.last_alerted_at, last_seen_at: now, severity: current.severity, rule: current.rule, text: current.text };
   }
-  const cleared = Object.entries(previous).filter(([fingerprint]) => !next[fingerprint]).map(([fingerprint, prior]) => ({ fingerprint, prior }));
+  const cleared = Object.entries(previous)
+    .filter(([fingerprint, prior]) => !next[fingerprint] && prior.cleared_at === undefined)
+    .map(([fingerprint, prior]) => ({ fingerprint, prior }));
+  for (const [fingerprint, prior] of Object.entries(previous)) {
+    if (next[fingerprint]) continue;
+    const cooldown = prior.severity === "CRITICAL" ? CRITICAL_COOLDOWN : WARNING_COOLDOWN;
+    if (now - prior.last_alerted_at >= cooldown) continue;
+    next[fingerprint] = { ...prior, cleared_at: prior.cleared_at ?? now };
+  }
   return { raised, cleared, next };
 }
 
@@ -604,8 +615,12 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     sample.supervisor ??= { running: true, pid: 95277 };
   } else ({ sample, cursors } = collectSample(state));
   const findings = detectAll(sample, state);
-  console.log(JSON.stringify({ sample, findings }, null, 2));
-  if (dryRun) return 0;
+  // The full sample is diagnostic output for a hand-run; a launchd tick
+  // prints only what changed so the stdout log stays readable.
+  if (dryRun) {
+    console.log(JSON.stringify({ sample, findings }, null, 2));
+    return 0;
+  }
   const reconciled = reconcile(findings, state.findings ?? {}, sample.now_ms);
   const raised = reconciled.raised;
   for (const value of raised) {

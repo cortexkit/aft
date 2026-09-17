@@ -227,15 +227,23 @@ describe("health sentinel pure detectors", () => {
     expect(missing.fingerprint).toBe("dsym:2CD06659");
   });
 
-  test("dedupe alerts once, clears absent fingerprints, and re-alerts after clear", () => {
+  test("dedupe alerts once, clears absent fingerprints, and stays quiet on a return inside the cooldown", () => {
     const current = detectStorage(sample({ disk: { free_bytes: 30 * 1024 ** 3, sizes: {} } }), cleanState())[0];
     const first = reconcile([current], {}, NOW);
     expect(first.raised).toHaveLength(1);
     const second = reconcile([current], first.next, NOW + 10 * 60_000);
     expect(second.raised).toHaveLength(0);
-    const clear = reconcile([], second.next, NOW + 2);
+    const clear = reconcile([], second.next, NOW + 11 * 60_000);
     expect(clear.cleared.map((value) => value.fingerprint)).toEqual([current.fingerprint]);
-    expect(reconcile([current], clear.next, NOW + 3).raised).toHaveLength(1);
+    // A threshold the subject hovers around clears and returns every tick;
+    // the return inside the cooldown must not wake anyone again, while each
+    // clear still lands in the findings log.
+    const back = reconcile([current], clear.next, NOW + 12 * 60_000);
+    expect(back.raised).toHaveLength(0);
+    const quiet = reconcile([], back.next, NOW + 13 * 60_000);
+    expect(quiet.cleared).toHaveLength(1);
+    expect(reconcile([], quiet.next, NOW + 14 * 60_000).cleared).toHaveLength(0);
+    expect(reconcile([current], quiet.next, NOW + 3 * 60 * 60_000).raised).toHaveLength(1);
   });
 });
 
