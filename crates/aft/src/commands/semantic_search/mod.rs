@@ -2466,9 +2466,14 @@ fn run_engine_ranking(
     }
     exact_candidates.extend(lexical_verifications);
     exact_candidates.sort_by(score_free_r3_cmp);
+    // The ranked unit is the file: after the comparator has put the most
+    // specific evidence first (a bounded declaration span above a file-level
+    // phrase hit), only the leading candidate per path survives. Keying on the
+    // span as well let one file occupy two rows once declaration evidence
+    // arrived beside the file-level hit, which broke the one-file-per-page
+    // contract and rendered the same file twice.
     let mut seen_exact = HashSet::new();
-    exact_candidates
-        .retain(|candidate| seen_exact.insert((candidate.path.clone(), candidate.symbol_range)));
+    exact_candidates.retain(|candidate| seen_exact.insert(candidate.path.clone()));
 
     let path_lookup_candidates = if plan.contains(SearchLaneKind::PathLookup) {
         let query_path_tokens = query

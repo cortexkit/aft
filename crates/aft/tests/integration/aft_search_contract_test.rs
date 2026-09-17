@@ -1185,7 +1185,7 @@ fn natural_language_exact_phrase_marks_rank_one_lexical_fallback() {
     assert!(response["text"]
         .as_str()
         .expect("rendered response")
-        .contains("src/tool/browser.rs [exact]"));
+        .contains("src/tool/browser.rs:1 [exact]"));
 }
 
 #[test]
@@ -1775,7 +1775,7 @@ fn identifier_ready_reports_more_available_when_lexical_fallback_is_capped() {
         0
     );
     assert!(rendered
-        .ends_with("shown 100 of ≥260 results (cap) · narrow: offset, topK, path, includeTests"));
+        .ends_with("shown 100 of ≥210 results (cap) · narrow: offset, topK, path, includeTests"));
 }
 
 #[test]
