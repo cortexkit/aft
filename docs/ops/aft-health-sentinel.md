@@ -29,7 +29,8 @@ The collector reads `ck module status aft --json`, which exposes the same Manage
 | `search.degraded` | WARNING per root when more than 20% of at least five search calls disclose `fully_degraded` or `index: building` | degraded share is at most 20% |
 | `tool.slow` | WARNING per root when more than 10 tool calls exceed 10 seconds | at most 10 calls exceed 10 seconds |
 | `routes.dead_sessions` | WARNING when memory census reports bound routes on a root idle beyond its configured root TTL | routes close or root activity is newer than the TTL |
-| `dsym.missing` | WARNING when the running image's LC_UUID has no dSYM with the same own LC_UUID under `aft/dsym/<UUID>/`; requested and found UUIDs are named | a matching dSYM is stored under its own UUID |
+| `dsym.missing` | WARNING when the running image's LC_UUID has no artifact under `aft/dsym/<UUID>/` | an artifact is stored at that UUID key |
+| `dsym.stale` | WARNING when an artifact exists at the running UUID key but its own LC_UUID differs; the running and found UUIDs are named | the artifact at the key has the running image's LC_UUID |
 
 ## Delivery
 

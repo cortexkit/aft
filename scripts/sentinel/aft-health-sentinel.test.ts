@@ -167,12 +167,15 @@ describe("health sentinel pure detectors", () => {
     expect(detectDeadSessions(input)[0].fingerprint).toBe("route:/repo");
   });
 
-  test("mismatched dSYM under requested UUID key is refused", () => {
-    const input = sample({ dsym: { requested_uuid: "2CD06659", found_uuid: "E570EF4A", path: "/dsym/2CD06659/aft.dSYM" } });
-    const result = detectDsym(input)[0];
-    expect(result.rule).toBe("dsym.missing");
-    expect(result.text).toContain("2CD06659");
-    expect(result.text).toContain("E570EF4A");
+  test("dSYM detector distinguishes stale artifacts from missing keys", () => {
+    const stale = detectDsym(sample({ dsym: { requested_uuid: "2CD06659", found_uuid: "E570EF4A", path: "/dsym/2CD06659/aft.dSYM" } }))[0];
+    expect(stale.rule).toBe("dsym.stale");
+    expect(stale.fingerprint).toBe("dsym:2CD06659");
+    expect(stale.text).toContain("E570EF4A");
+    expect(stale.text).toContain("re-stage");
+    const missing = detectDsym(sample({ dsym: { requested_uuid: "2CD06659" } }))[0];
+    expect(missing.rule).toBe("dsym.missing");
+    expect(missing.fingerprint).toBe("dsym:2CD06659");
   });
 
   test("dedupe alerts once, clears absent fingerprints, and re-alerts after clear", () => {

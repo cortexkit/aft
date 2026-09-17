@@ -300,8 +300,12 @@ export function detectDeadSessions(sample: SentinelSample): Finding[] {
 export function detectDsym(sample: SentinelSample): Finding[] {
   const dsym = sample.dsym;
   if (!dsym || dsym.error) return [instrument("dsym", dsym?.error ?? "running image UUID could not be inspected")];
-  if (dsym.requested_uuid && dsym.found_uuid !== dsym.requested_uuid) {
-    return [finding("dsym.missing", "WARNING", `dsym:${dsym.requested_uuid}`, `running image UUID ${dsym.requested_uuid} has no matching dSYM; found ${dsym.found_uuid ?? "none"}${dsym.path ? ` at ${dsym.path}` : ""}`, `a dSYM whose own LC_UUID is ${dsym.requested_uuid} is stored under that UUID`)];
+  if (!dsym.requested_uuid) return [instrument("dsym", "running image LC_UUID is unavailable")];
+  if (!dsym.path) {
+    return [finding("dsym.missing", "WARNING", `dsym:${dsym.requested_uuid}`, `running image UUID ${dsym.requested_uuid} has no dSYM at its store key`, `a dSYM whose own LC_UUID is ${dsym.requested_uuid} is stored under that UUID`)];
+  }
+  if (dsym.found_uuid !== dsym.requested_uuid) {
+    return [finding("dsym.stale", "WARNING", `dsym:${dsym.requested_uuid}`, `dSYM at ${dsym.path} is for ${dsym.found_uuid ?? "an unreadable UUID"}, running image is ${dsym.requested_uuid}; re-stage`, `the artifact at the running image key has LC_UUID ${dsym.requested_uuid}`)];
   }
   return [];
 }
