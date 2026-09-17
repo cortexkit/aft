@@ -1,0 +1,255 @@
+#![cfg(unix)]
+
+use std::path::Path;
+use std::time::Instant;
+
+use aft::bash_background::persistence::{create_task_layout, write_task_at, PersistedTask};
+use aft::bash_background::BgTaskStatus;
+use aft::db::bash_tasks::{
+    prune_terminal_rows, upsert_bash_task, BashTaskRow, TERMINAL_ROW_RETENTION_AGE_MS,
+};
+use aft::db::compression_events::prune_retention_tick;
+use aft::db::TrackedConnection as Connection;
+use rusqlite::params;
+
+const NOW_MS: i64 = 45 * 24 * 60 * 60 * 1000;
+const OLD_MS: i64 = 1;
+const SESSION: &str = "retention-session";
+
+fn task_id(index: usize) -> String {
+    format!("bash-{index:016x}")
+}
+
+fn insert_task(
+    conn: &Connection,
+    task_id: &str,
+    status: &str,
+    completed_at: Option<i64>,
+    completion_delivered: bool,
+) {
+    upsert_bash_task(
+        conn,
+        &BashTaskRow {
+            harness: "opencode".to_string(),
+            session_id: SESSION.to_string(),
+            task_id: task_id.to_string(),
+            project_key: "project".to_string(),
+            command: "true".to_string(),
+            cwd: ".".to_string(),
+            status: status.to_string(),
+            exit_code: Some(0),
+            pid: None,
+            pgid: None,
+            started_at: OLD_MS,
+            completed_at,
+            stdout_path: None,
+            stderr_path: None,
+            compressed: true,
+            timeout_ms: None,
+            completion_delivered,
+            output_bytes: Some(0),
+            metadata: String::new(),
+        },
+    )
+    .expect("insert bash task");
+}
+
+fn insert_watch(conn: &Connection, task_id: &str) {
+    conn.execute(
+        "INSERT INTO bash_pattern_watches (
+            harness, session_id, task_id, watch_id, pattern_kind, pattern, created_at
+         ) VALUES ('opencode', ?1, ?2, 'watch-00000001', 'substring', 'done', ?3)",
+        params![SESSION, task_id, OLD_MS],
+    )
+    .expect("insert pattern watch");
+}
+
+fn task_exists(conn: &Connection, task_id: &str) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM bash_tasks WHERE task_id = ?1)",
+        [task_id],
+        |row| row.get(0),
+    )
+    .expect("query task existence")
+}
+
+fn task_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM bash_tasks", [], |row| row.get(0))
+        .expect("count bash tasks")
+}
+
+fn create_terminal_layout(storage: &Path, task_id: &str) {
+    let resolved = create_task_layout(storage, SESSION, task_id).expect("create task layout");
+    let mut metadata = PersistedTask::starting(
+        task_id.to_string(),
+        SESSION.to_string(),
+        "true".to_string(),
+        storage.to_path_buf(),
+        Some(storage.to_path_buf()),
+        None,
+        false,
+        true,
+    );
+    metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    write_task_at(&resolved, &metadata).expect("write task metadata");
+}
+
+#[test]
+fn terminal_pruner_preserves_every_delivery_and_layout_invariant() {
+    let storage = tempfile::tempdir().expect("storage tempdir");
+    let conn = aft::db::open(&storage.path().join("aft.db")).expect("open database");
+
+    let running = task_id(1);
+    insert_task(&conn, &running, "running", Some(OLD_MS), true);
+    let killing = task_id(2);
+    insert_task(&conn, &killing, "killing", Some(OLD_MS), true);
+    let fate_unknown = task_id(3);
+    insert_task(&conn, &fate_unknown, "fate_unknown", Some(OLD_MS), true);
+    let recent = task_id(4);
+    insert_task(
+        &conn,
+        &recent,
+        "completed",
+        Some(NOW_MS - TERMINAL_ROW_RETENTION_AGE_MS + 1),
+        true,
+    );
+    let layout_present = task_id(5);
+    insert_task(&conn, &layout_present, "completed", Some(OLD_MS), true);
+    create_terminal_layout(storage.path(), &layout_present);
+    let undelivered = task_id(6);
+    insert_task(&conn, &undelivered, "completed", Some(OLD_MS), false);
+    let watched = task_id(7);
+    insert_task(&conn, &watched, "completed", Some(OLD_MS), true);
+    insert_watch(&conn, &watched);
+    let removable = task_id(8);
+    insert_task(&conn, &removable, "completed", Some(OLD_MS), true);
+
+    let result = prune_terminal_rows(&conn, NOW_MS, 500).expect("prune terminal rows");
+
+    assert_eq!(result.removed, 1);
+    assert_eq!(result.remaining_candidates, 1);
+    for survivor in [
+        &running,
+        &killing,
+        &fate_unknown,
+        &recent,
+        &layout_present,
+        &undelivered,
+        &watched,
+    ] {
+        assert!(task_exists(&conn, survivor), "pruned survivor {survivor}");
+    }
+    assert!(!task_exists(&conn, &removable));
+}
+
+#[test]
+fn terminal_pruner_never_removes_more_than_five_hundred_rows() {
+    let storage = tempfile::tempdir().expect("storage tempdir");
+    let conn = aft::db::open(&storage.path().join("aft.db")).expect("open database");
+    for index in 0..501 {
+        insert_task(&conn, &task_id(index + 1_000), "failed", Some(OLD_MS), true);
+    }
+
+    let result = prune_terminal_rows(&conn, NOW_MS, usize::MAX).expect("prune terminal rows");
+
+    assert_eq!(result.removed, 500);
+    assert_eq!(result.remaining_candidates, 1);
+    assert_eq!(task_count(&conn), 1);
+}
+
+#[test]
+fn retention_tick_rolls_back_task_delete_when_event_pruning_fails() {
+    let storage = tempfile::tempdir().expect("storage tempdir");
+    let mut conn = aft::db::open(&storage.path().join("aft.db")).expect("open database");
+    let task_id = task_id(9_000);
+    insert_task(&conn, &task_id, "completed", Some(OLD_MS), true);
+    conn.execute(
+        "INSERT INTO compression_events (
+            harness, session_id, project_key, tool, task_id, command, compressor,
+            original_bytes, compressed_bytes, original_tokens, compressed_tokens, created_at
+         ) VALUES ('opencode', ?1, 'project', 'bash', ?2, 'true', 'test', 10, 5, 10, 5, ?3)",
+        params![SESSION, task_id, OLD_MS],
+    )
+    .expect("insert linked compression event");
+    conn.execute(
+        "INSERT INTO compression_events (
+            harness, session_id, project_key, tool, task_id, command, compressor,
+            original_bytes, compressed_bytes, original_tokens, compressed_tokens, created_at
+         ) VALUES ('opencode', ?1, 'project', 'bash', NULL, 'watermark', 'test', 1, 1, 1, 1, ?2)",
+        params![SESSION, NOW_MS],
+    )
+    .expect("insert compression watermark");
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER reject_linked_event_delete
+         BEFORE DELETE ON compression_events
+         WHEN OLD.task_id = '{task_id}'
+         BEGIN SELECT RAISE(ABORT, 'linked event delete rejected'); END;"
+    ))
+    .expect("install rejection trigger");
+
+    assert!(prune_retention_tick(&mut conn, NOW_MS).is_err());
+    assert!(task_exists(&conn, &task_id), "task delete escaped rollback");
+    assert_eq!(compression_event_count(&conn, &task_id), 1);
+
+    conn.execute_batch("DROP TRIGGER reject_linked_event_delete")
+        .expect("drop rejection trigger");
+    let tick = prune_retention_tick(&mut conn, NOW_MS).expect("retry retention tick");
+    assert_eq!(tick.bash_tasks.removed, 1);
+    assert_eq!(tick.compression_events_removed, 1);
+    assert!(!task_exists(&conn, &task_id));
+    assert_eq!(compression_event_count(&conn, &task_id), 0);
+}
+
+fn compression_event_count(conn: &Connection, task_id: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM compression_events WHERE task_id = ?1",
+        [task_id],
+        |row| row.get(0),
+    )
+    .expect("count compression events")
+}
+
+#[test]
+#[ignore = "manual measurement against a copied aft.db"]
+fn measure_terminal_pruner_on_database_copy() {
+    let path = std::env::var_os("AFT_BASH_TASK_PRUNE_DB_COPY")
+        .map(std::path::PathBuf::from)
+        .expect("set AFT_BASH_TASK_PRUNE_DB_COPY to an offline copy");
+    assert_ne!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("aft.db")
+    );
+    let mut conn = aft::db::open(&path).expect("open copied database");
+    let before = task_count(&conn);
+    let started = Instant::now();
+    let mut ticks = 0usize;
+    let mut removed = 0usize;
+    let mut max_tick_micros = 0u128;
+    let remaining_candidates;
+    loop {
+        let tick_started = Instant::now();
+        let tick = prune_retention_tick(&mut conn, current_unix_millis()).expect("retention tick");
+        max_tick_micros = max_tick_micros.max(tick_started.elapsed().as_micros());
+        ticks += 1;
+        removed += tick.bash_tasks.removed;
+        if tick.bash_tasks.removed == 0 {
+            remaining_candidates = tick.bash_tasks.remaining_candidates;
+            break;
+        }
+    }
+    let elapsed = started.elapsed();
+    let average_tick_micros = elapsed.as_micros() / ticks as u128;
+    eprintln!(
+        "bash task retention measurement: before_rows={before} after_rows={} removed={removed} ticks={ticks} average_tick_us={average_tick_micros} max_tick_us={max_tick_micros} remaining_candidates={remaining_candidates}",
+        task_count(&conn)
+    );
+}
+
+fn current_unix_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    i64::try_from(millis).unwrap_or(i64::MAX)
+}

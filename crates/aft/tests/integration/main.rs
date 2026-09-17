@@ -20,6 +20,7 @@ mod bash_pty_test;
 mod bash_rewrite_differential_test;
 mod bash_rewrite_test;
 mod bash_tasks_dual_write_test;
+mod bash_tasks_retention_test;
 mod bash_test;
 mod bash_token_count_test;
 mod bash_watch_test;

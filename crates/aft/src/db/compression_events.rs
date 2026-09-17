@@ -446,10 +446,7 @@ fn prune_compression_events_in_transaction(
     Ok(deleted)
 }
 
-pub fn prune_retention_tick(
-    conn: &mut Connection,
-    now_ms: i64,
-) -> rusqlite::Result<RetentionTick> {
+pub fn prune_retention_tick(conn: &mut Connection, now_ms: i64) -> rusqlite::Result<RetentionTick> {
     prune_retention_tick_guarded(conn, now_ms, Some(&[]))
 }
 
@@ -462,18 +459,14 @@ fn prune_retention_tick_guarded(
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // Task rows go first so the event pass in this transaction observes their
     // final liveness, while the commit publishes both retention decisions at once.
-    let bash_tasks = crate::db::bash_tasks::prune_terminal_rows_guarded(
-        &tx,
-        now_ms,
-        500,
-        |task_id| {
+    let bash_tasks =
+        crate::db::bash_tasks::prune_terminal_rows_guarded(&tx, now_ms, 500, |task_id| {
             registries.is_none_or(|registries| {
                 registries
                     .iter()
                     .any(|registry| registry.active_watch_count(task_id) > 0)
             })
-        },
-    )?;
+        })?;
     let compression_events_removed = prune_compression_events_in_transaction(&tx, now_ms)?;
     tx.commit()?;
     Ok(RetentionTick {

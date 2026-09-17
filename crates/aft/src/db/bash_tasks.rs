@@ -204,7 +204,12 @@ pub(crate) fn prune_terminal_rows_guarded(
                  WHERE harness = ?2 AND session_id = ?3 AND task_id = ?4
                    AND {TERMINAL_PRUNE_PREDICATE}"
             ),
-            params![cutoff, candidate.harness, candidate.session_id, candidate.task_id],
+            params![
+                cutoff,
+                candidate.harness,
+                candidate.session_id,
+                candidate.task_id
+            ],
         )?;
     }
 
