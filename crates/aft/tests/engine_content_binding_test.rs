@@ -1,15 +1,26 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::Duration;
 
 use aft::commands::semantic_search::comparator::CandidateResult;
 use aft::commands::semantic_search::evidence_descriptor::EvidenceDescriptor;
 use aft::commands::semantic_search::generation_token::GenerationToken;
 use aft::search_index::exact_lane::ExactLane;
 use aft::search_index::memo::{
-    compute_file_content_digest, ExactMemoStore, MemoKey, VerifiedExactSet,
+    compute_file_content_digest, ExactMemoStore, MemoError, MemoKey, VerifiedExactSet,
 };
+
+fn empty_verified_set() -> VerifiedExactSet {
+    VerifiedExactSet {
+        results: vec![],
+        file_digests: HashMap::new(),
+        bound_disclosure: None,
+        stability_void: false,
+    }
+}
 
 fn create_temp_corpus() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let dir = tempfile::tempdir().expect("create temp dir");
@@ -71,6 +82,98 @@ fn test_at_most_one_verification_per_k_epoch_three_clean_requests() {
         panic!("re-verification of live memo entry must not execute verifier");
     });
     assert!(re_ver.is_ok(), "memo hit serves without executing verifier");
+}
+
+#[test]
+fn retry_after_abandoned_verification_is_admitted() {
+    let (dir, _, _) = create_temp_corpus();
+    let memo = ExactMemoStore::new();
+    let key = MemoKey::new(dir.path(), GenerationToken::new(43), "exact phrase", false);
+
+    let abandoned = memo.get_or_verify(&key, 0, 10, || {
+        Err(MemoError::VerificationFailed("request abandoned".to_string()))
+    });
+    assert!(matches!(abandoned, Err(MemoError::VerificationFailed(_))));
+
+    let retry = memo.get_or_verify(&key, 0, 10, || Ok(empty_verified_set()));
+    assert!(retry.is_ok(), "an abandoned verifier must not burn the epoch");
+    assert_eq!(memo.verifier_call_count(), 2);
+}
+
+#[test]
+fn retry_after_panicked_verification_is_admitted() {
+    let (dir, _, _) = create_temp_corpus();
+    let memo = ExactMemoStore::new();
+    let key = MemoKey::new(dir.path(), GenerationToken::new(44), "exact phrase", false);
+
+    let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = memo.get_or_verify(&key, 0, 10, || -> Result<VerifiedExactSet, MemoError> {
+            panic!("simulated verifier panic");
+        });
+    }));
+    assert!(panic_result.is_err());
+
+    let retry = memo.get_or_verify(&key, 0, 10, || Ok(empty_verified_set()));
+    assert!(retry.is_ok(), "a panicked verifier must not burn the epoch");
+    assert_eq!(memo.verifier_call_count(), 2);
+}
+
+#[test]
+fn concurrent_same_key_waits_for_single_completed_verification() {
+    let (dir, _, _) = create_temp_corpus();
+    let memo = Arc::new(ExactMemoStore::new());
+    let key = MemoKey::new(dir.path(), GenerationToken::new(45), "exact phrase", false);
+    let (verifier_started_tx, verifier_started_rx) = mpsc::channel();
+    let (release_verifier_tx, release_verifier_rx) = mpsc::channel();
+
+    let first_memo = Arc::clone(&memo);
+    let first_key = key.clone();
+    let first = thread::spawn(move || {
+        first_memo.get_or_verify(&first_key, 0, 10, || {
+            verifier_started_tx.send(()).expect("announce verifier start");
+            release_verifier_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release first verifier");
+            Ok(empty_verified_set())
+        })
+    });
+    verifier_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first verifier starts");
+
+    let (second_entered_tx, second_entered_rx) = mpsc::channel();
+    let (second_result_tx, second_result_rx) = mpsc::channel();
+    let second_memo = Arc::clone(&memo);
+    let second_key = key.clone();
+    let second = thread::spawn(move || {
+        second_entered_tx.send(()).expect("announce second request");
+        let result = second_memo.get_or_verify(&second_key, 0, 10, || {
+            panic!("a completed single flight must not run a second verifier");
+        });
+        second_result_tx.send(result).expect("send second result");
+    });
+    second_entered_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("second request starts");
+    assert!(
+        second_result_rx
+            .recv_timeout(Duration::from_millis(250))
+            .is_err(),
+        "the same-key request must wait while verification is in flight"
+    );
+
+    release_verifier_tx.send(()).expect("release verifier");
+    assert!(first.join().expect("first request joins").is_ok());
+    let second_result = second_result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("second request completes after the first verifier");
+    second.join().expect("second request joins");
+    assert!(second_result.is_ok(), "concurrent same-key request must not error");
+    assert_eq!(
+        memo.verifier_call_count(),
+        1,
+        "a completed (key, epoch) admits exactly one verifier"
+    );
 }
 
 #[test]

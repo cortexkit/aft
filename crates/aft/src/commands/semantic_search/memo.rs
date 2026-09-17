@@ -4,8 +4,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
-use parking_lot::RwLock;
+use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::commands::semantic_search::comparator::{CandidateResult, SymbolOffsetRange};
 use crate::commands::semantic_search::evidence_descriptor::EvidenceDescriptor;
@@ -170,7 +171,23 @@ pub struct VerifiedExactSet {
 pub struct ExactMemoStore {
     entries: RwLock<HashMap<MemoKey, MemoEntry>>,
     lifecycle: RwLock<HashMap<MemoKey, KeyLifecycleState>>,
+    in_flight: Mutex<HashSet<(MemoKey, usize)>>,
+    in_flight_changed: Condvar,
     pub verifier_counter: Arc<AtomicUsize>,
+}
+
+struct VerificationPermit<'a> {
+    store: &'a ExactMemoStore,
+    key: MemoKey,
+    epoch: usize,
+}
+
+impl Drop for VerificationPermit<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self.store.in_flight.lock();
+        in_flight.remove(&(self.key.clone(), self.epoch));
+        self.store.in_flight_changed.notify_all();
+    }
 }
 
 impl Default for ExactMemoStore {
@@ -184,6 +201,8 @@ impl ExactMemoStore {
         Self {
             entries: RwLock::new(HashMap::new()),
             lifecycle: RwLock::new(HashMap::new()),
+            in_flight: Mutex::new(HashSet::new()),
+            in_flight_changed: Condvar::new(),
             verifier_counter: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -323,13 +342,31 @@ impl ExactMemoStore {
         let (epoch, is_poisoned) = {
             let mut lifecycle = self.lifecycle.write();
             let state = lifecycle.entry(key.clone()).or_default();
-            let ep = state.current_epoch;
-            let poisoned = state.poisoned;
-            if state.verified_epochs.contains(&ep) {
-                return Err(MemoError::ReverificationRejected(ep));
+            (state.current_epoch, state.poisoned)
+        };
+
+        let flight_key = (key.clone(), epoch);
+        let mut in_flight = self.in_flight.lock();
+        if in_flight.contains(&flight_key) {
+            while in_flight.contains(&flight_key) {
+                if crate::executor::current_job_cancelled() {
+                    return Err(MemoError::VerificationFailed(
+                        "exact verification cancelled while waiting for an in-flight request"
+                            .to_string(),
+                    ));
+                }
+                self.in_flight_changed
+                    .wait_for(&mut in_flight, Duration::from_millis(25));
             }
-            state.verified_epochs.insert(ep);
-            (ep, poisoned)
+            drop(in_flight);
+            return self.get_or_verify(key, offset, top_k, verifier);
+        }
+        in_flight.insert(flight_key);
+        drop(in_flight);
+        let permit = VerificationPermit {
+            store: self,
+            key: key.clone(),
+            epoch,
         };
 
         // Run verifier (increments instrumented counter)
@@ -345,8 +382,15 @@ impl ExactMemoStore {
             is_poisoned,
         );
 
-        // Store into entries
+        // Publish before dropping the permit so same-key waiters observe the entry.
         self.entries.write().insert(key.clone(), entry.clone());
+        self.lifecycle
+            .write()
+            .entry(key.clone())
+            .or_default()
+            .verified_epochs
+            .insert(epoch);
+        drop(permit);
 
         // Slice served page
         let total_len = entry.results.len();
