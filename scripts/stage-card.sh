@@ -44,7 +44,15 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
 fi
 BIN="target/release/aft"
 if [ "$(uname -s)" = "Darwin" ]; then
-  dsymutil "$BIN" -o "$BIN.dSYM"
+  # A card cut from a published release asset (--skip-build) is stripped;
+  # its dSYM is the one the release shipped beside it, unpacked to
+  # $BIN.dSYM by the operator. Regenerating from stripped bytes would mint
+  # a dSYM whose UUID does not match the image and fail the check below.
+  if [ "$SKIP_BUILD" -eq 1 ] && [ -d "$BIN.dSYM" ]; then
+    echo "==> using existing $BIN.dSYM"
+  else
+    dsymutil "$BIN" -o "$BIN.dSYM"
+  fi
 fi
 # Freshness is asserted, not assumed: a card cut from a binary older than
 # this invocation is exactly how a regressed image reached the daemon once.
