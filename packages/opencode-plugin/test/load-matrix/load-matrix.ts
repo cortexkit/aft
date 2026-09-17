@@ -1,9 +1,12 @@
 // Every spawned host receives HOME and XDG directories under this suite's temp root.
 // Otherwise the V2 client can discover the operator's OpenCode service and modify its
 // database or logs. Normal runs hash those operator files before and after the matrix and
-// compare metadata around each invocation. AFT_LOAD_MATRIX_ALLOW_LIVE_OPERATOR is only for
+// compare metadata around each invocation. AFT_LOAD_MATRIX_ALLOW_LIVE_OPERATOR=1 is only for
 // local runs beside an active operator process; it permits database content and mtime
 // changes from that process while still requiring stable database size and unchanged logs.
+// The CLI's V1 version probe (setup/host-generation.ts) reads the same variable the other
+// way round: it is tolerant of concurrent operator writes unless the variable is exactly "0",
+// because in production an OpenCode host is usually running beside the probe.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
