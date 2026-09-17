@@ -8734,6 +8734,11 @@ async fn drive_management_surface_daemon(input: FakeDaemonInput) {
         census.pointer("/data/process").is_some(),
         "census must carry process header: {census:?}"
     );
+    let census_io = census
+        .pointer("/data/process_io")
+        .expect("census must carry process_io: {census:?}");
+    assert!(census_io["available"].is_boolean());
+    assert!(census_io["sampled_at_ms"].is_u64());
 
     send_management_request(
         &mut stream,
@@ -8860,6 +8865,16 @@ async fn drive_health_check_daemon(input: FakeDaemonInput) {
                 "health.check omitted {section}.{field}: {metrics:#}"
             );
         }
+    }
+    let process_io = metrics
+        .get("process_io")
+        .unwrap_or_else(|| panic!("health.check omitted process_io: {metrics:#}"));
+    assert!(process_io["available"].is_boolean());
+    assert!(process_io["sampled_at_ms"].is_u64());
+    if process_io["available"].as_bool() == Some(true) {
+        assert!(process_io["diskio_bytes_read"].is_u64());
+        assert!(process_io["diskio_bytes_written"].is_u64());
+        assert!(process_io["logical_bytes_written"].is_u64());
     }
     assert_eq!(metrics.get("root_count").and_then(Value::as_u64), Some(1));
     assert_eq!(metrics.get("actor_count").and_then(Value::as_u64), Some(1));
