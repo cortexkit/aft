@@ -447,35 +447,48 @@ function appendEvent(event: Record<string, unknown>): void {
   mkdirSync(STATE_DIR, { recursive: true });
   appendFileSync(FINDINGS_FILE, `${JSON.stringify(event)}\n`);
 }
-async function sendPeer(findingValue: Finding): Promise<string> {
-  const prefrontal = join(HOME, "Work", "Projects", "CortexKit", "prefrontal");
-  if (!existsSync(join(prefrontal, "script", "health-sentinel.ts"))) throw new Error(`registry sentinel missing under ${prefrontal}`);
-  let target = process.env.AFT_SENTINEL_TARGET_SESSION;
-  if (!target) {
-    try {
-      const raw = readFileSync(join(prefrontal, ".cortexkit", "alfonso", "health-sentinel.jsonc"), "utf8");
-      target = raw.match(/"targetSessionId"\s*:\s*"([^"]+)"/)?.[1];
-    } catch { /* surfaced by the explicit target check below */ }
-  }
-  if (!target) throw new Error("AFT_SENTINEL_TARGET_SESSION and the registry sentinel target are unset");
-  const identity = { project_root: prefrontal, harness: "alfonso", session: "prefrontal-core" };
+export function buildPeerDelivery(findings: Finding[], targetSession = process.env.AFT_SENTINEL_TARGET_SESSION): {
+  body: string;
+  urgency: "high" | "medium";
+  params: Record<string, unknown>;
+} {
+  const sorted = [...findings].sort((left, right) => {
+    const severity = Number(right.severity === "CRITICAL") - Number(left.severity === "CRITICAL");
+    return severity || left.fingerprint.localeCompare(right.fingerprint);
+  });
+  const critical = sorted.filter((value) => value.severity === "CRITICAL").length;
+  const warning = sorted.length - critical;
+  const body = [
+    `[AFT ${critical} CRITICAL / ${warning} WARNING]`,
+    ...sorted.map((value) => `${value.severity} ${value.rule} (${value.fingerprint}): ${value.text}`),
+  ].join("\n");
+  return {
+    body,
+    urgency: critical > 0 ? "high" : "medium",
+    params: {
+      fromName: "AFT-SENTINEL",
+      fromSessionID: "aft-health-sentinel",
+      toName: "AFT",
+      ...(targetSession ? { session_id: targetSession } : { agent: "AFT" }),
+      body,
+      urgency: critical > 0 ? "high" : "medium",
+    },
+  };
+}
+
+async function sendPeer(findings: Finding[]): Promise<string> {
+  const delivery = buildPeerDelivery(findings);
+  const identity = { project_root: process.cwd(), harness: "alfonso", session: "aft-health-sentinel" };
   const client = await SubcClient.connect({ connectionFile: CONNECTION, identity });
   try {
     const response = await client.call(
       "prefrontal-core",
       "peer.enqueue_message",
-      {
-        fromName: "AFT-SENTINEL",
-        fromSessionID: "aft-health-sentinel",
-        toName: "ALF",
-        toSessionID: target,
-        toDirectory: "",
-        body: `[AFT ${findingValue.severity}] ${findingValue.text}`,
-        urgency: findingValue.severity === "CRITICAL" ? "high" : "medium",
-      },
+      delivery.params,
       { timeoutMs: 10_000, identity },
     );
-    const messageId = (response as { result?: { id?: string } }).result?.id;
+    const result = (response as { result?: { id?: string; pmid?: string } }).result;
+    const messageId = result?.pmid ?? result?.id;
     if (!messageId) throw new Error("peer.enqueue_message returned no message id");
     return messageId;
   } finally {
@@ -511,13 +524,18 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   console.log(JSON.stringify({ sample, findings }, null, 2));
   if (dryRun) return 0;
   const reconciled = reconcile(findings, state.findings ?? {}, sample.now_ms);
-  for (const value of reconciled.raised) {
+  const raised = reconciled.raised;
+  for (const value of raised) {
     appendEvent({ ts: new Date(sample.now_ms).toISOString(), rule: value.rule, state: "raised", fingerprint: value.fingerprint, text: value.text, severity: value.severity });
-    try {
-      const messageId = await sendPeer(value);
-      console.error(`peer delivered id=${messageId} fingerprint=${value.fingerprint}`);
-    } catch (error) { appendEvent({ ts: new Date().toISOString(), rule: "instrument", state: "raised", fingerprint: "instrument:peer-delivery", text: String(error), severity: "WARNING" }); }
     if (value.rule === "daemon.down" || value.fingerprint === "instrument:health-check") notify("AFT health sentinel", value.text);
+  }
+  if (raised.length > 0) {
+    try {
+      const messageId = await sendPeer(raised);
+      console.error(`peer delivered id=${messageId} findings=${raised.length}`);
+    } catch (error) {
+      appendEvent({ ts: new Date().toISOString(), rule: "instrument", state: "raised", fingerprint: "instrument:peer-delivery", text: String(error), severity: "WARNING" });
+    }
   }
   for (const value of reconciled.cleared) appendEvent({ ts: new Date(sample.now_ms).toISOString(), rule: value.prior.rule, state: "cleared", fingerprint: value.fingerprint, text: value.prior.text, severity: value.prior.severity });
   const next: SentinelState = { ...state, ...cursors, findings: reconciled.next, previous: nextPrevious(sample, state) };

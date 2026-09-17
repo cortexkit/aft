@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  buildPeerDelivery,
   capLaunchdLogs,
   detectAll,
   detectDaemon,
@@ -43,6 +44,26 @@ const rules = (values: ReturnType<typeof detectAll>) => values.map((value) => va
 // These cases keep detector thresholds executable rather than duplicating the
 // prose contract in a second hand-maintained table.
 describe("health sentinel pure detectors", () => {
+  test("peer delivery addresses AFT by registry name and folds severity-sorted findings", () => {
+    const warning = { rule: "disk.low", severity: "WARNING" as const, fingerprint: "disk:data", text: "warning", clears_when: "space" };
+    const critical = { rule: "daemon.down", severity: "CRITICAL" as const, fingerprint: "daemon:aft", text: "critical", clears_when: "up" };
+    const delivery = buildPeerDelivery([warning, critical], undefined);
+    expect(delivery.params.toName).toBe("AFT");
+    expect(delivery.params.toName).not.toBe("ALF");
+    expect(delivery.params.agent).toBe("AFT");
+    expect(delivery.params).not.toHaveProperty("session_id");
+    expect(delivery.urgency).toBe("high");
+    expect(delivery.body.split("\n")).toEqual([
+      "[AFT 1 CRITICAL / 1 WARNING]",
+      "CRITICAL daemon.down (daemon:aft): critical",
+      "WARNING disk.low (disk:data): warning",
+    ]);
+    const override = buildPeerDelivery([warning], "session-aft-override");
+    expect(override.params.toName).toBe("AFT");
+    expect(override.params.session_id).toBe("session-aft-override");
+    expect(override.params).not.toHaveProperty("agent");
+  });
+
   test("launchd logs are truncated after one MiB", () => {
     const dir = mkdtempSync(join(tmpdir(), "aft-sentinel-logs-"));
     const small = join(dir, "small.log");
