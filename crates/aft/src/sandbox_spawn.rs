@@ -1090,26 +1090,18 @@ pub fn resolve_sandbox_spawn(
         let profile = match build_native_profile(ctx, principal, task_bundle_dir) {
             Ok(profile) => profile,
             Err(error) => {
-                return SpawnPlan::Refused {
-                    code: "sandbox_unavailable",
-                    message: format!(
-                        "native sandbox setup failed: {error}; set sandbox.enabled=false to disable native sandboxing"
-                    ),
-                    mismatch_class: None,
-                };
+                return sandbox_setup_refusal(ctx, principal, error);
             }
         };
         let launcher_path = match std::env::current_exe() {
             Ok(path) => path,
             Err(error) => {
                 let _ = std::fs::remove_dir_all(&profile.temp_dir);
-                return SpawnPlan::Refused {
-                    code: "sandbox_unavailable",
-                    message: format!(
-                        "native sandbox setup failed to locate the aft executable: {error}; set sandbox.enabled=false to disable native sandboxing"
-                    ),
-                    mismatch_class: None,
-                };
+                return sandbox_setup_refusal(
+                    ctx,
+                    principal,
+                    format!("failed to locate the aft executable: {error}"),
+                );
             }
         };
         crate::slog_info!(
@@ -1136,6 +1128,35 @@ pub fn resolve_sandbox_spawn(
     {
         let _ = (ctx, principal, task_kind, task_bundle_dir);
         unreachable!("unsupported platforms return before native-tier resolution")
+    }
+}
+
+#[cfg(unix)]
+fn sandbox_setup_refusal(
+    ctx: &AppContext,
+    principal: &AuthenticatedPrincipal,
+    cause: impl std::fmt::Display,
+) -> SpawnPlan {
+    let config = ctx.config();
+    let root = config
+        .project_root
+        .as_deref()
+        .map_or_else(|| Path::new("<unknown>"), |root| root);
+    let session = match principal {
+        AuthenticatedPrincipal::RouteBind { session_id, .. } => session_id.clone(),
+        AuthenticatedPrincipal::FirstParty => {
+            crate::log_ctx::current_session().unwrap_or_else(|| "<unknown>".to_string())
+        }
+    };
+    let message = format!(
+        "sandbox setup for {} failed: {cause}; set sandbox.enabled=false to disable native sandboxing",
+        root.display()
+    );
+    crate::slog_warn!("{message}; root={} session={session}", root.display());
+    SpawnPlan::Refused {
+        code: "sandbox_unavailable",
+        message,
+        mismatch_class: None,
     }
 }
 
@@ -3018,6 +3039,26 @@ mod policy_tests {
                 ..crate::config::Config::default()
             },
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_setup_refusal_names_root_and_cause_before_remedy() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = context(project.path().to_path_buf());
+        let plan = crate::log_ctx::with_session(Some("fd-audit".to_string()), || {
+            sandbox_setup_refusal(
+                &ctx,
+                &AuthenticatedPrincipal::FirstParty,
+                "failed to query core.hooksPath: Bad file descriptor (os error 9)",
+            )
+        });
+        let message = plan.refusal_message().expect("sandbox refusal message");
+        assert!(message.starts_with(&format!(
+            "sandbox setup for {} failed: failed to query core.hooksPath: Bad file descriptor (os error 9)",
+            project.path().display()
+        )));
+        assert!(message.ends_with("set sandbox.enabled=false to disable native sandboxing"));
     }
 
     #[cfg(unix)]
