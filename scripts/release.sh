@@ -435,12 +435,29 @@ if mkdir -p "$CACHE_DIR/$TAG" && cp target/release/aft "$CACHE_DIR/$TAG/aft" 2>/
     # (`<hash>  <basename>`) because that is the command the placer runs.
     (cd "$CACHE_DIR/$TAG" && shasum -a 256 aft > aft.sha256.postsign)
 
-    # Preserve the split debug info (dSYM) for the staged release binary, keyed
-    # by the binary's content sha, next to the preswap evidence. The staged
-    # binary is stripped, so without this a thread-stack sample of it would come
-    # back as nameless offsets. `ditto` dereferences the `aft.dSYM` symlink
-    # cargo emits and copies it to a canonical name.
+    # Generate the dSYM from this exact build, then key the durable profile store
+    # by the dSYM's own LC_UUID. A requested UUID must never become a directory
+    # name for an artifact whose DWARF advertises a different UUID.
+    dsymutil target/release/aft -o target/release/aft.dSYM
     if [[ -d "target/release/aft.dSYM" ]]; then
+      IMAGE_UUID="$(dwarfdump --uuid "$CACHE_DIR/$TAG/aft" | awk 'NR == 1 { gsub(/-/, "", $2); print toupper($2) }')"
+      DSYM_UUID="$(dwarfdump --uuid target/release/aft.dSYM | awk 'NR == 1 { gsub(/-/, "", $2); print toupper($2) }')"
+      if [[ -z "$IMAGE_UUID" || -z "$DSYM_UUID" || "$IMAGE_UUID" != "$DSYM_UUID" ]]; then
+        echo "Error: release dSYM mismatch: image UUID ${IMAGE_UUID:-missing}, dSYM UUID ${DSYM_UUID:-missing}" >&2
+        exit 1
+      fi
+      DSYM_ROOT="$HOME/.local/share/cortexkit/aft/dsym"
+      DSYM_DEST="$DSYM_ROOT/$DSYM_UUID"
+      mkdir -p "$DSYM_ROOT"
+      DSYM_TMP="$(mktemp -d "$DSYM_ROOT/.${DSYM_UUID}.tmp.XXXXXX")"
+      ditto target/release/aft.dSYM "$DSYM_TMP/aft.dSYM"
+      rm -rf "$DSYM_DEST"
+      mv "$DSYM_TMP" "$DSYM_DEST"
+      echo "  dSYM store -> $DSYM_DEST/aft.dSYM (UUID $DSYM_UUID)"
+
+      # Keep the preswap copy for the existing rollback evidence bundle.
+      # `ditto` dereferences the cargo dSYM symlink into a canonical name.
+
       PRESWAP_DIR="${HOME}/.local/share/cortexkit/aft/preswap-evidence"
       BIN_SHA="$(shasum -a 256 "$CACHE_DIR/$TAG/aft" | awk '{print $1}' | cut -c1-8)"
       mkdir -p "$PRESWAP_DIR"

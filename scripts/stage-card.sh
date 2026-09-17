@@ -43,6 +43,9 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   cargo build --release -p agent-file-tools --bin aft
 fi
 BIN="target/release/aft"
+if [ "$(uname -s)" = "Darwin" ]; then
+  dsymutil "$BIN" -o "$BIN.dSYM"
+fi
 # Freshness is asserted, not assumed: a card cut from a binary older than
 # this invocation is exactly how a regressed image reached the daemon once.
 if [ "$SKIP_BUILD" -eq 0 ] && [ "$(stat -f %m "$BIN")" -lt "$BUILD_START" ]; then
@@ -59,6 +62,22 @@ if [ "$(uname -s)" = "Darwin" ]; then
   # survive across cards; the default identifier derives from content.
   codesign --force --sign - --identifier ck-aft "$TMP"
   codesign --verify --strict "$TMP"
+
+  DSYM="$BIN.dSYM"
+  IMAGE_UUID="$(dwarfdump --uuid "$TMP" | awk 'NR == 1 { gsub(/-/, "", $2); print toupper($2) }')"
+  DSYM_UUID="$(dwarfdump --uuid "$DSYM" | awk 'NR == 1 { gsub(/-/, "", $2); print toupper($2) }')"
+  if [ -z "$IMAGE_UUID" ] || [ -z "$DSYM_UUID" ] || [ "$IMAGE_UUID" != "$DSYM_UUID" ]; then
+    echo "stage-card: dSYM mismatch: card UUID ${IMAGE_UUID:-missing}, dSYM UUID ${DSYM_UUID:-missing}" >&2
+    exit 2
+  fi
+  DSYM_ROOT="${AFT_DSYM_DIR:-$HOME/.local/share/cortexkit/aft/dsym}"
+  mkdir -p "$DSYM_ROOT"
+  DSYM_DEST="$DSYM_ROOT/$DSYM_UUID"
+  DSYM_TMP="$(mktemp -d "$DSYM_ROOT/.${DSYM_UUID}.tmp.XXXXXX")"
+  ditto "$DSYM" "$DSYM_TMP/aft.dSYM"
+  rm -rf "$DSYM_DEST"
+  mv "$DSYM_TMP" "$DSYM_DEST"
+  echo "    dSYM: $DSYM_DEST/aft.dSYM (UUID $DSYM_UUID)"
 fi
 HASH="$(shasum -a 256 "$TMP" | awk '{print $1}')"
 CARD="ck-aft.${HASH:0:16}"

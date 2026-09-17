@@ -993,14 +993,7 @@ fn resolve_debug_artifact(
         return Ok(artifact);
     }
 
-    download_release_debug(version, expected_id, &cache)?;
-    inspect_debug_candidate(&cache, image, expected_id, true)?.ok_or_else(|| {
-        ProfileError::runtime(format!(
-            "downloaded debug artifact in {} did not contain UUID/build-id {}",
-            cache.display(),
-            expected_id
-        ))
-    })
+    download_release_debug(version, expected_id, image, &cache)
 }
 
 fn inspect_debug_candidate(
@@ -1130,8 +1123,9 @@ fn debug_cache_dir_from(storage_root: &Path, debug_id: &str) -> PathBuf {
 fn download_release_debug(
     version: &str,
     expected_id: &str,
+    image: &Path,
     cache: &Path,
-) -> Result<(), ProfileError> {
+) -> Result<DebugArtifact, ProfileError> {
     let asset_name = release_debug_asset_name();
     let release_url = format!(
         "https://api.github.com/repos/cortexkit/aft/releases/tags/v{}",
@@ -1204,17 +1198,32 @@ fn download_release_debug(
             Err(message) => return Err(ProfileError::runtime(message)),
         }
     };
-    fs::create_dir_all(cache).map_err(|error| {
+    let cache_parent = cache.parent().ok_or_else(|| {
+        ProfileError::runtime(format!("dSYM cache has no parent: {}", cache.display()))
+    })?;
+    fs::create_dir_all(cache_parent).map_err(|error| {
         ProfileError::runtime(format!(
-            "could not create dSYM cache {}: {error}",
-            cache.display()
+            "could not create dSYM cache root {}: {error}",
+            cache_parent.display()
         ))
     })?;
-    let archive = cache.join(&asset_name);
+    let download_dir = cache_parent.join(format!(
+        ".download-{}-{}",
+        normalize_debug_id(expected_id),
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&download_dir);
+    fs::create_dir_all(&download_dir).map_err(|error| {
+        ProfileError::runtime(format!(
+            "could not create temporary dSYM directory {}: {error}",
+            download_dir.display()
+        ))
+    })?;
+    let archive = download_dir.join(&asset_name);
     fs::write(&archive, bytes)
         .map_err(|error| ProfileError::runtime(format!("could not cache {asset_name}: {error}")))?;
     let archive_path = archive.display().to_string();
-    let cache_path = cache.display().to_string();
+    let cache_path = download_dir.display().to_string();
     let mut extract = if cfg!(target_os = "macos") {
         let mut command = Command::new("ditto");
         command.args(["-x", "-k", &archive_path, &cache_path]);
@@ -1230,7 +1239,34 @@ fn download_release_debug(
         ))
     })?;
     let _ = fs::remove_file(archive);
-    Ok(())
+    match inspect_debug_candidate(&download_dir, image, expected_id, true) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let _ = fs::remove_dir_all(&download_dir);
+            return Err(ProfileError::runtime(format!(
+                "downloaded debug artifact did not contain requested UUID/build-id {}",
+                normalize_debug_id(expected_id)
+            )));
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&download_dir);
+            return Err(error);
+        }
+    }
+    let _ = fs::remove_dir_all(cache);
+    fs::rename(&download_dir, cache).map_err(|error| {
+        ProfileError::runtime(format!(
+            "could not install verified dSYM for UUID/build-id {} at {}: {error}",
+            normalize_debug_id(expected_id),
+            cache.display()
+        ))
+    })?;
+    inspect_debug_candidate(cache, image, expected_id, true)?.ok_or_else(|| {
+        ProfileError::runtime(format!(
+            "verified debug artifact disappeared while installing UUID/build-id {}",
+            normalize_debug_id(expected_id)
+        ))
+    })
 }
 
 fn release_debug_asset_name() -> String {
@@ -2125,6 +2161,22 @@ mod tests {
             .to_string()
             .contains("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"));
         assert!(error.to_string().contains("fake-other.dwarf"));
+    }
+
+    #[test]
+    fn mismatched_dsym_planted_under_requested_key_is_refused_with_both_uuids() {
+        let storage = tempfile::tempdir().expect("storage");
+        let requested = "2CD06659-A5DD-3A77-8CB8-6C3469841BF4";
+        let found = "E570EF4A-1111-2222-3333-444444444444";
+        let planted = debug_cache_dir_from(storage.path(), requested).join("aft.dSYM");
+        fs::create_dir_all(&planted).expect("mismatched dSYM fixture");
+
+        let error = validate_debug_artifact_uuid(requested, found, &planted)
+            .expect_err("a directory key cannot authenticate the dSYM inside it");
+        let message = error.to_string();
+        assert!(message.contains("2CD06659A5DD3A778CB86C3469841BF4"));
+        assert!(message.contains("E570EF4A111122223333444444444444"));
+        assert!(message.contains(&planted.display().to_string()));
     }
 
     #[test]
