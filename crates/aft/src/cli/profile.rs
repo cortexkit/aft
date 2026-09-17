@@ -1659,7 +1659,7 @@ pub fn render_memory_census_human(value: &serde_json::Value) -> String {
     .unwrap();
     writeln!(
         &mut output,
-        "allocator slack (reclaimable by relief): {} MB",
+        "allocator slack (virtual, mostly already MADV_FREE'd; not reclaimable physical memory): {} MB",
         mb(process["allocator_slack_bytes"].as_u64().unwrap_or(0))
     )
     .unwrap();
@@ -1676,6 +1676,35 @@ pub fn render_memory_census_human(value: &serde_json::Value) -> String {
         mb_signed(process["unattributed_bytes"].as_i64().unwrap_or(0))
     )
     .unwrap();
+    if let Some(io) = value
+        .get("process_io")
+        .or_else(|| value.get("process").and_then(|p| p.get("process_io")))
+    {
+        if io.get("available").and_then(serde_json::Value::as_bool) == Some(true) {
+            let read = io
+                .get("diskio_bytes_read")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let written = io
+                .get("diskio_bytes_written")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let logical = io
+                .get("logical_bytes_written")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            writeln!(
+                &mut output,
+                "process io: read {} GB, written {} GB (logical {} GB) since spawn",
+                gb(read),
+                gb(written),
+                gb(logical),
+            )
+            .unwrap();
+        } else {
+            writeln!(&mut output, "process io: unavailable").unwrap();
+        }
+    }
     writeln!(&mut output, "\nroot (short: basename, worktree pool ids kept) | bound | idle | search semantic symbols callgraph inspect | attributed | evictable | evicts in | lsp").unwrap();
     let mut roots = value["roots"]
         .as_object()
@@ -1721,6 +1750,9 @@ pub fn render_memory_census_human(value: &serde_json::Value) -> String {
 
 fn mb(bytes: u64) -> String {
     format!("{:.1}", bytes as f64 / (1024.0 * 1024.0))
+}
+fn gb(bytes: u64) -> String {
+    format!("{:.1}", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
 }
 fn mb_signed(bytes: i64) -> String {
     format!("{:.1}", bytes as f64 / (1024.0 * 1024.0))
@@ -1843,6 +1875,31 @@ mod tests {
         assert_eq!(root_lines.len(), 30);
         assert!(root_lines[0].contains("pool-00"));
         assert!(root_lines[29].contains("pool-29"));
+    }
+
+    #[test]
+    fn render_memory_census_human_renders_process_io_line_and_updated_slack_label() {
+        let value = serde_json::json!({
+            "process": {
+                "phys_footprint_bytes": 100 * 1024 * 1024,
+                "rss_bytes": 80 * 1024 * 1024,
+                "allocator_slack_bytes": 20 * 1024 * 1024,
+                "sqlite_bytes": 5 * 1024 * 1024,
+                "total_attributed_bytes": 50 * 1024 * 1024,
+                "unattributed_bytes": 30 * 1024 * 1024,
+            },
+            "process_io": {
+                "available": true,
+                "sampled_at_ms": 1_000,
+                "diskio_bytes_read": 1024_u64 * 1024 * 1024,
+                "diskio_bytes_written": 2_u64 * 1024 * 1024 * 1024,
+                "logical_bytes_written": 3_u64 * 1024 * 1024 * 1024,
+            },
+            "roots": {}
+        });
+        let rendered = render_memory_census_human(&value);
+        assert!(rendered.contains("allocator slack (virtual, mostly already MADV_FREE'd; not reclaimable physical memory): 20.0 MB\n"));
+        assert!(rendered.contains("process io: read 1.0 GB, written 2.0 GB (logical 3.0 GB) since spawn\n"));
     }
 
     #[test]

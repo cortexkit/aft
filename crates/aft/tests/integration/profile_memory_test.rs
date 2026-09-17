@@ -255,6 +255,13 @@ fn fake_census() -> Value {
             "total_attributed_bytes": 22 * MIB,
             "unattributed_bytes": 34 * MIB,
         },
+        "process_io": {
+            "available": true,
+            "sampled_at_ms": 1_000,
+            "diskio_bytes_read": 1024_u64 * 1024 * 1024,
+            "diskio_bytes_written": 2_u64 * 1024 * 1024 * 1024,
+            "logical_bytes_written": 3_u64 * 1024 * 1024 * 1024,
+        },
         "roots": {
             "/fake/root-alpha": {
                 "bound_routes": 2,
@@ -306,7 +313,11 @@ fn profile_memory_renders_fake_management_surface_census() {
     assert!(stdout.contains("phys footprint: 64.0 MB\n"), "{stdout}");
     assert!(stdout.contains("rss: 48.0 MB\n"), "{stdout}");
     assert!(
-        stdout.contains("allocator slack (reclaimable by relief): 8.0 MB\n"),
+        stdout.contains("allocator slack (virtual, mostly already MADV_FREE'd; not reclaimable physical memory): 8.0 MB\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("process io: read 1.0 GB, written 2.0 GB (logical 3.0 GB) since spawn\n"),
         "{stdout}"
     );
     assert!(
