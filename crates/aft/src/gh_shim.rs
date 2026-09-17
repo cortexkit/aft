@@ -36,6 +36,7 @@ pub const SCHEMA_FLOOR: u64 = 1;
 /// the distributed bytes themselves (see the verifier-site contract).
 pub const ENVELOPE_VERSION: u64 = 2;
 pub const REFUSAL_EXIT_STATUS: i32 = 86;
+pub const OUTCOME_UNKNOWN_EXIT_STATUS: i32 = 87;
 const UPSTREAM_FAILURE_EXIT_STATUS: i32 = 1;
 const DISCOVERY_BUDGET: Duration = Duration::from_secs(2);
 /// Backoff before the single retry of the whole discovery probe. A loaded host
@@ -147,10 +148,11 @@ pub enum RefusalCode {
     MissingReason,
     DestructiveFlag,
     UnsupportedFlag,
+    OutcomeUnknown,
 }
 
 impl RefusalCode {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Unclassified,
         Self::AdminTier,
         Self::ManifestBelowFloor,
@@ -165,6 +167,7 @@ impl RefusalCode {
         Self::MissingReason,
         Self::DestructiveFlag,
         Self::UnsupportedFlag,
+        Self::OutcomeUnknown,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -183,6 +186,7 @@ impl RefusalCode {
             Self::MissingReason => "gh_shim_missing_reason",
             Self::DestructiveFlag => "gh_shim_destructive_flag",
             Self::UnsupportedFlag => "gh_shim_unsupported_flag",
+            Self::OutcomeUnknown => "gh_shim_outcome_unknown",
         }
     }
 }
@@ -544,6 +548,9 @@ fn governed_outcome_status(
             };
             refuse_governance_unavailable(paths, agent_binding, now, &text)
         }
+        RouteOutcome::OutcomeUnknown { elapsed_ms } => {
+            refuse_outcome_unknown(paths, agent_binding, now, elapsed_ms)
+        }
         RouteOutcome::Unavailable(message) => refuse(RefusalCode::SeamUnavailable, &message),
     }
 }
@@ -564,6 +571,7 @@ enum ProbeStage {
     Connect,
     CatalogList,
     OpenRoute,
+    Request,
 }
 
 impl ProbeStage {
@@ -572,6 +580,7 @@ impl ProbeStage {
             Self::Connect => "connect",
             Self::CatalogList => "catalog_list",
             Self::OpenRoute => "open_route",
+            Self::Request => "request",
         }
     }
 }
@@ -3637,6 +3646,7 @@ enum RouteOutcome {
     SchemaMismatch(String),
     GovernanceUnavailable,
     GovernanceUnavailableTimedOut { stage: ProbeStage, elapsed_ms: u64 },
+    OutcomeUnknown { elapsed_ms: u64 },
     Unavailable(String),
 }
 
@@ -3682,7 +3692,8 @@ fn route_governed(
     let current_stage = Arc::new(Mutex::new(ProbeStage::Connect));
     let stage_handle = Arc::clone(&current_stage);
     let call_timeout = Duration::from_secs(5);
-    let deadline = Instant::now() + call_timeout;
+    let start = Instant::now();
+    let deadline = start + call_timeout;
     let result = runtime.block_on(async move {
         tokio::time::timeout(call_timeout, async move {
             let options = ConsumerOptions {
@@ -3737,14 +3748,24 @@ fn route_governed(
                 governed_wire_request(determination, &agent_binding.agent_id, request);
             let body = serde_json::to_vec(&wire_request)
                 .map_err(|error| RouteOutcome::SchemaMismatch(error.to_string()))?;
+            *stage_handle.lock().unwrap() = ProbeStage::Request;
             let response = consumer
                 .request(&route, body, CallOptions::default())
-                .await
-                .map_err(|error| RouteOutcome::Unavailable(error.to_string()));
+                .await;
             let _ = consumer
                 .close_handle(&route, CloseRouteOptions::default())
                 .await;
-            let response = response?;
+            let response = match response {
+                Ok(response) => response,
+                Err(_) => {
+                    let elapsed_ms = if Instant::now() >= deadline {
+                        call_timeout.as_millis() as u64
+                    } else {
+                        start.elapsed().as_millis() as u64
+                    };
+                    return Err(RouteOutcome::OutcomeUnknown { elapsed_ms });
+                }
+            };
             let outcome = parse_governed_response(&response)?;
             if let RouteOutcome::Refusal(code) = &outcome {
                 write_seam_state(
@@ -3788,17 +3809,31 @@ fn route_governed(
                 RouteOutcome::GovernanceUnavailable
             }
         }
-        Ok(Err(outcome)) => outcome,
-        Err(_) => {
+        Ok(Err(RouteOutcome::OutcomeUnknown { elapsed_ms })) => {
             let probe = LastProbeReport {
                 stage: final_stage.as_str().to_string(),
-                elapsed_ms: call_timeout.as_millis() as u64,
+                elapsed_ms,
                 outcome: "timed_out".to_string(),
             };
             write_last_probe_silently(paths, &probe);
-            RouteOutcome::GovernanceUnavailableTimedOut {
-                stage: final_stage,
-                elapsed_ms: call_timeout.as_millis() as u64,
+            RouteOutcome::OutcomeUnknown { elapsed_ms }
+        }
+        Ok(Err(outcome)) => outcome,
+        Err(_) => {
+            let elapsed_ms = call_timeout.as_millis() as u64;
+            let probe = LastProbeReport {
+                stage: final_stage.as_str().to_string(),
+                elapsed_ms,
+                outcome: "timed_out".to_string(),
+            };
+            write_last_probe_silently(paths, &probe);
+            if final_stage == ProbeStage::Request {
+                RouteOutcome::OutcomeUnknown { elapsed_ms }
+            } else {
+                RouteOutcome::GovernanceUnavailableTimedOut {
+                    stage: final_stage,
+                    elapsed_ms,
+                }
             }
         }
     };
@@ -3836,6 +3871,35 @@ fn refuse_governance_unavailable(
         );
     }
     refuse(RefusalCode::GovernanceUnavailable, text)
+}
+
+fn outcome_unknown_text(elapsed_ms: u64) -> String {
+    format!(
+        "the governed request was sent but no reply arrived within {elapsed_ms} ms — it may have executed; check before retrying (for comments: gh api repos/<owner>/<repo>/issues/<n>/comments --jq '.[-1]')"
+    )
+}
+
+fn refuse_outcome_unknown(
+    paths: &StatePaths,
+    agent_binding: &AgentBinding,
+    now: u64,
+    elapsed_ms: u64,
+) -> i32 {
+    let state = SeamState {
+        bound_holder: seam_state(paths).bound_holder,
+        agent_binding: Some(agent_binding.clone()),
+        last_seam_refusal: Some(LastSeamRefusal {
+            code: RefusalCode::OutcomeUnknown.as_str().to_string(),
+            at_unix_secs: now,
+        }),
+    };
+    if let Err(error) = write_seam_state(paths, state) {
+        return refuse(
+            RefusalCode::SeamUnavailable,
+            &format!("governed self-report update failed: {error}"),
+        );
+    }
+    refuse(RefusalCode::OutcomeUnknown, &outcome_unknown_text(elapsed_ms))
 }
 
 fn governed_seam_state(
@@ -4655,7 +4719,10 @@ fn exec_real_gh(real_gh: PathBuf, args: &[OsString]) -> i32 {
 fn refuse(code: RefusalCode, text: &str) -> i32 {
     let text = text.replace(['\n', '\r'], " ");
     eprintln!("gh-shim: {}: {text}", code.as_str());
-    REFUSAL_EXIT_STATUS
+    match code {
+        RefusalCode::OutcomeUnknown => OUTCOME_UNKNOWN_EXIT_STATUS,
+        _ => REFUSAL_EXIT_STATUS,
+    }
 }
 
 fn current_platform() -> &'static str {
@@ -6806,13 +6873,17 @@ mod tests {
 
     #[test]
     fn refusal_and_self_report_codes_are_separate_closed_sets() {
-        assert_eq!(RefusalCode::ALL.len(), 14);
+        assert_eq!(RefusalCode::ALL.len(), 15);
         assert!(RefusalCode::ALL
             .iter()
             .all(|code| code.as_str().starts_with("gh_shim_")));
         assert_eq!(
             RefusalCode::GovernanceUnavailable.as_str(),
             "gh_shim_governance_unavailable"
+        );
+        assert_eq!(
+            RefusalCode::OutcomeUnknown.as_str(),
+            "gh_shim_outcome_unknown"
         );
         assert_eq!(
             RefusalCode::UnsupportedFlag.as_str(),
@@ -6830,6 +6901,7 @@ mod tests {
             .iter()
             .all(|code| !code.as_str().contains("stale")));
         assert_eq!(REFUSAL_EXIT_STATUS, 86);
+        assert_eq!(OUTCOME_UNKNOWN_EXIT_STATUS, 87);
     }
 
     #[test]

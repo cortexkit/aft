@@ -2003,6 +2003,7 @@ struct SlowDaemonConfig {
     handshake_delay: Duration,
     catalog_delay: Duration,
     open_route_delay: Duration,
+    request_delay: Duration,
     /// When true, the configured stage delays apply only to the first
     /// accepted connection, so a retried probe (attempt 2) sees a fast
     /// daemon. Used to prove the discovery retry succeeds when the first
@@ -2063,6 +2064,11 @@ impl SlowTestDaemon {
                                     Duration::ZERO
                                 } else {
                                     config.open_route_delay
+                                };
+                                let req_delay = if config.first_connection_only && !first_connection {
+                                    Duration::ZERO
+                                } else {
+                                    config.request_delay
                                 };
                                 tokio::spawn(async move {
                                 if hs_delay > Duration::ZERO {
@@ -2185,6 +2191,9 @@ impl SlowTestDaemon {
                                                     break;
                                                 }
                                             } else if frame.header.channel == 42 {
+                                                if !req_delay.is_zero() {
+                                                    tokio::time::sleep(req_delay).await;
+                                                }
                                                 let response_body = json!({
                                                     "outcome": "result",
                                                     "gh_route_schema": 1,
@@ -2260,6 +2269,7 @@ fn gh_shim_slow_daemon_catalog_list_delay_routes_under_fallback_and_records_last
         handshake_delay: Duration::ZERO,
         catalog_delay: Duration::from_secs(3),
         open_route_delay: Duration::ZERO,
+        request_delay: Duration::ZERO,
         first_connection_only: false,
     });
     let temp = tempfile::tempdir().expect("create test root");
@@ -2323,6 +2333,7 @@ fn gh_shim_slow_daemon_catalog_list_delay_expired_fallback_refuses_naming_stage(
         handshake_delay: Duration::ZERO,
         catalog_delay: Duration::from_secs(6),
         open_route_delay: Duration::ZERO,
+        request_delay: Duration::ZERO,
         first_connection_only: false,
     });
     let temp = tempfile::tempdir().expect("create test root");
@@ -2378,6 +2389,7 @@ fn gh_shim_slow_daemon_open_route_delay_expired_fallback_refuses_naming_stage() 
         handshake_delay: Duration::ZERO,
         catalog_delay: Duration::ZERO,
         open_route_delay: Duration::from_secs(6),
+        request_delay: Duration::ZERO,
         first_connection_only: false,
     });
     let temp = tempfile::tempdir().expect("create test root");
@@ -2433,6 +2445,7 @@ fn gh_shim_slow_daemon_connect_delay_routes_under_fallback_and_records_last_prob
         handshake_delay: Duration::from_millis(2050),
         catalog_delay: Duration::ZERO,
         open_route_delay: Duration::ZERO,
+        request_delay: Duration::ZERO,
         first_connection_only: false,
     });
     let temp = tempfile::tempdir().expect("create test root");
@@ -2494,6 +2507,7 @@ fn gh_shim_slow_daemon_connect_delay_expired_fallback_refuses_with_unreachable_o
         handshake_delay: Duration::from_secs(6),
         catalog_delay: Duration::ZERO,
         open_route_delay: Duration::ZERO,
+        request_delay: Duration::ZERO,
         first_connection_only: false,
     });
     let temp = tempfile::tempdir().expect("create test root");
@@ -2553,6 +2567,7 @@ fn gh_shim_discovery_retry_succeeds_when_only_the_first_attempt_times_out() {
         handshake_delay: Duration::ZERO,
         catalog_delay: Duration::from_secs(6),
         open_route_delay: Duration::ZERO,
+        request_delay: Duration::ZERO,
         first_connection_only: true,
     });
     let temp = tempfile::tempdir().expect("create test root");
@@ -2603,4 +2618,136 @@ fn gh_shim_discovery_retry_succeeds_when_only_the_first_attempt_times_out() {
         &recorder,
     );
     assert_eq!(status["last_probe"]["outcome"], "ready");
+}
+
+#[test]
+fn gh_shim_slow_daemon_request_delay_reports_outcome_unknown_exit_87_and_records_seam_state() {
+    let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+        handshake_delay: Duration::ZERO,
+        catalog_delay: Duration::ZERO,
+        open_route_delay: Duration::ZERO,
+        request_delay: Duration::from_secs(6),
+        first_connection_only: false,
+    });
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = temp.path().join("subc-connection.json");
+    daemon.write_connection_file(&connection_file);
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    let now = unix_seconds();
+    write_fresh_manifest(&state_home, now);
+    write_user_config(&config_home, &connection_file, None);
+
+    // Write recently reachable R3 (30s ago, within 300s window) so discovery is skipped
+    // and route_governed is reached immediately.
+    write_recently_reachable_r3_cache(&state_home, now, 30);
+
+    let output = shim_command(
+        &["issue", "comment", "1", "--body", "test comment"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn gh shim");
+
+    assert_eq!(output.status.code(), Some(87));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("gh_shim_outcome_unknown"),
+        "stderr must name gh_shim_outcome_unknown: {stderr}"
+    );
+    assert!(
+        stderr.contains("the governed request was sent but no reply arrived within 5000 ms — it may have executed; check before retrying"),
+        "stderr must explain request was sent and outcome is unknown: {stderr}"
+    );
+    assert!(
+        stderr.contains("for comments: gh api repos/<owner>/<repo>/issues/<n>/comments --jq '.[-1]'"),
+        "stderr must include guidance for checking comment outcome: {stderr}"
+    );
+    assert!(!recorder.exists(), "must not reach upstream gh");
+
+    // --status renders the new code in last_seam_refusal and last_probe
+    let status = shim_status(
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    );
+    assert_eq!(status["last_seam_refusal"]["code"], "gh_shim_outcome_unknown");
+    assert_eq!(status["last_probe"]["stage"], "request");
+    assert_eq!(status["last_probe"]["outcome"], "timed_out");
+    assert_eq!(status["last_probe"]["elapsed_ms"], 5000);
+}
+
+#[test]
+fn gh_shim_slow_daemon_open_route_delay_during_governed_call_refuses_as_not_run_exit_86() {
+    let daemon = SlowTestDaemon::spawn(SlowDaemonConfig {
+        handshake_delay: Duration::ZERO,
+        catalog_delay: Duration::ZERO,
+        open_route_delay: Duration::from_secs(6),
+        request_delay: Duration::ZERO,
+        first_connection_only: false,
+    });
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = temp.path().join("subc-connection.json");
+    daemon.write_connection_file(&connection_file);
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    let now = unix_seconds();
+    write_fresh_manifest(&state_home, now);
+    write_user_config(&config_home, &connection_file, None);
+
+    // Recently reachable R3 skips discovery and enters route_governed,
+    // where open_route times out after 5000 ms before the request is written.
+    write_recently_reachable_r3_cache(&state_home, now, 30);
+
+    let output = shim_command(
+        &["issue", "comment", "1", "--body", "test comment"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn gh shim");
+
+    assert_eq!(output.status.code(), Some(86));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("gh-shim: gh_shim_governance_unavailable: governance probe timed out after 5000 ms at open_route (daemon may be busy; host load?) - this repository's actions are identity-governed, so the command was not run; retry"),
+        "stderr must retain not-run message and exit 86: {stderr}"
+    );
+    assert!(!recorder.exists(), "must not reach upstream gh");
+
+    // --status reflects open_route timeout and governance_unavailable
+    let status = shim_status(
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    );
+    assert_eq!(status["last_seam_refusal"]["code"], "gh_shim_governance_unavailable");
+    assert_eq!(status["last_probe"]["stage"], "open_route");
+    assert_eq!(status["last_probe"]["outcome"], "timed_out");
+    assert_eq!(status["last_probe"]["elapsed_ms"], 5000);
 }
