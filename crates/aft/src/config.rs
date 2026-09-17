@@ -21,6 +21,7 @@ pub(crate) const MAX_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 15_000;
 pub(crate) const DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 120_000;
 pub(crate) const MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 10_000;
 pub(crate) const MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 600_000;
+pub const DEFAULT_INSPECT_TIER2_PASS_TIMEOUT_MS: u64 = 600_000;
 pub const DEFAULT_BASH_WATCH_SYNC_MAX_MS: u64 = 120_000;
 pub const MIN_BASH_WATCH_SYNC_MAX_MS: u64 = 1_000;
 pub const MAX_BASH_WATCH_SYNC_MAX_MS: u64 = 1_800_000;
@@ -40,6 +41,10 @@ const fn default_semantic_query_timeout_ms() -> u64 {
 
 const fn default_inspect_diagnostics_timeout_ms() -> u64 {
     DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS
+}
+
+const fn default_inspect_tier2_pass_timeout_ms() -> u64 {
+    DEFAULT_INSPECT_TIER2_PASS_TIMEOUT_MS
 }
 
 const fn default_bash_detach_on_user_message() -> bool {
@@ -289,6 +294,9 @@ pub struct InspectConfig {
     /// Deadline for the blocking LSP diagnostics phase of `aft_inspect`.
     #[serde(default = "default_inspect_diagnostics_timeout_ms")]
     pub diagnostics_timeout_ms: u64,
+    /// Hard deadline for one Tier-2 pass, including projection and scanning.
+    #[serde(default = "default_inspect_tier2_pass_timeout_ms")]
+    pub tier2_pass_timeout_ms: u64,
     pub duplicates: InspectDuplicatesConfig,
 }
 
@@ -303,6 +311,7 @@ impl Default for InspectConfig {
         Self {
             enabled: true,
             diagnostics_timeout_ms: default_inspect_diagnostics_timeout_ms(),
+            tier2_pass_timeout_ms: default_inspect_tier2_pass_timeout_ms(),
             duplicates: InspectDuplicatesConfig::default(),
         }
     }

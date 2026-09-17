@@ -1,0 +1,5 @@
+{
+  "inspect": {
+    "tier2_pass_timeout_ms": 45000
+  }
+}

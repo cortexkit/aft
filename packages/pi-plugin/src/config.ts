@@ -183,6 +183,7 @@ export interface InspectConfig {
   enabled?: boolean;
   diagnostics_timeout_ms?: number;
   tier2_idle_minutes?: number;
+  tier2_pass_timeout_ms?: number;
   categories?: Record<string, boolean>;
   tier2_soft_deadline_ms?: number;
   max_drill_down_items?: number;
@@ -816,6 +817,7 @@ const InspectConfigSchema = z.object({
       value === undefined ? undefined : clampInspectDiagnosticsTimeoutMs(value),
     ),
   tier2_idle_minutes: z.number().min(0).optional(),
+  tier2_pass_timeout_ms: z.number().int().positive().optional(),
   categories: z.record(z.string(), z.boolean()).optional(),
   tier2_soft_deadline_ms: z.number().int().positive().optional(),
   max_drill_down_items: z.number().int().positive().max(100).optional(),

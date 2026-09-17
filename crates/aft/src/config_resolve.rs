@@ -435,6 +435,8 @@ pub struct RawInspect {
     pub enabled: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
     pub diagnostics_timeout_ms: Option<u64>,
+    #[serde(default, deserialize_with = "deserialize_opt_positive_u64")]
+    pub tier2_pass_timeout_ms: Option<u64>,
     #[serde(deserialize_with = "deserialize_opt_nonnegative_f64")]
     pub tier2_idle_minutes: Option<f64>,
     pub categories: Option<HashMap<String, bool>>,
@@ -449,6 +451,7 @@ impl RawInspect {
     fn is_empty(&self) -> bool {
         self.enabled.is_none()
             && self.diagnostics_timeout_ms.is_none()
+            && self.tier2_pass_timeout_ms.is_none()
             && self.tier2_idle_minutes.is_none()
             && self.categories.is_none()
             && self.tier2_soft_deadline_ms.is_none()
@@ -1358,6 +1361,9 @@ fn merge_inspect_config(
             ),
         );
     }
+    inspect.tier2_pass_timeout_ms = override_inspect
+        .tier2_pass_timeout_ms
+        .or(inspect.tier2_pass_timeout_ms);
     inspect.tier2_idle_minutes = override_inspect
         .tier2_idle_minutes
         .or(inspect.tier2_idle_minutes);
@@ -1856,6 +1862,9 @@ fn resolve_inspect_config(raw: Option<&RawInspect>) -> InspectConfig {
             MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
             MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
         );
+    }
+    if let Some(value) = raw.tier2_pass_timeout_ms {
+        inspect.tier2_pass_timeout_ms = value;
     }
     if let Some(expected_mirrors) = raw
         .duplicates

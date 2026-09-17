@@ -239,6 +239,13 @@ function buildSchema(): Record<string, unknown> {
             description:
               "OpenCode session.idle delay in minutes before Tier 2 inspect prewarm runs. Default: 4.",
           },
+          tier2_pass_timeout_ms: {
+            type: "integer",
+            minimum: 1,
+            default: 600000,
+            description:
+              "Hard deadline for one Tier-2 pass, including projection and scanning. On expiry AFT cooperatively cancels the pass and releases its cold-build slot.",
+          },
           categories: {
             type: "object",
             additionalProperties: { type: "boolean" },

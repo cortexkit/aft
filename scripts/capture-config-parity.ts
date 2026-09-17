@@ -471,6 +471,10 @@ const CASES: ParityCase[] = [
     project: { inspect: { diagnostics_timeout_ms: 700000 } },
   },
   {
+    name: "inspect_tier2_pass_timeout",
+    user: { inspect: { tier2_pass_timeout_ms: 45000 } },
+  },
+  {
     // User disables the gh routing shim; the resolved config must carry the
     // disabled gate so the Rust resolver matches.
     name: "gh_shim_user_disabled",

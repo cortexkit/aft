@@ -400,6 +400,8 @@ const InspectConfigSchema = z.object({
     ),
   /** OpenCode session.idle delay before Tier 2 inspect prewarm. Default: 4 minutes. */
   tier2_idle_minutes: z.number().min(0).optional(),
+  /** Hard deadline for one Tier-2 pass. Default: 10 minutes. */
+  tier2_pass_timeout_ms: z.number().int().positive().optional(),
   categories: z.record(z.string(), z.boolean()).optional(),
   tier2_soft_deadline_ms: z.number().int().positive().optional(),
   max_drill_down_items: z.number().int().positive().max(100).optional(),

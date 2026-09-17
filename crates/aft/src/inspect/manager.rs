@@ -362,6 +362,57 @@ fn unix_now_secs() -> u64 {
     unix_millis_now() / 1_000
 }
 
+fn run_tier2_pass_with_deadline<T>(
+    project_root: &Path,
+    category: InspectCategory,
+    timeout: Duration,
+    action: impl FnOnce() -> T,
+) -> (T, bool) {
+    let cancellation = crate::executor::JobCancellation::new();
+    let parent_cancellation = crate::executor::current_job_cancellation();
+    let deadline_cancellation = cancellation.clone();
+    let root = project_root.to_path_buf();
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let timer_timed_out = Arc::clone(&timed_out);
+    let (done_tx, done_rx) = bounded::<()>(1);
+    let timer = std::thread::spawn(move || {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if parent_cancellation
+                .as_ref()
+                .is_some_and(|token| token.cancel_requested_before_commit())
+            {
+                deadline_cancellation.request_cancel();
+                return;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                timer_timed_out.store(true, Ordering::Release);
+                deadline_cancellation.request_cancel();
+                crate::slog_warn!(
+                    "tier2 pass timeout: root={} category={} timeout_ms={}",
+                    root.display(),
+                    category,
+                    timeout.as_millis()
+                );
+                return;
+            }
+            let slice = deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(100));
+            match done_rx.recv_timeout(slice) {
+                Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    });
+    let _cancellation = crate::executor::install_job_cancellation(cancellation);
+    let result = action();
+    let _ = done_tx.send(());
+    let _ = timer.join();
+    (result, timed_out.load(Ordering::Acquire))
+}
+
 enum BuilderAttemptTerminal {
     Succeeded,
     Failed(String),
@@ -2166,9 +2217,25 @@ impl InspectManager {
             None
         };
 
-        let result = match self.tier2_run_with_reuse_job(&job, &cache, &options) {
-            Ok(success) => InspectResult::success(&job, success, started.elapsed()),
-            Err(message) => InspectResult::failed(&job, message, started.elapsed()),
+        let timeout = Duration::from_millis(job.config.inspect.tier2_pass_timeout_ms);
+        let (scan_result, timed_out) =
+            run_tier2_pass_with_deadline(&job.project_root, job.category, timeout, || {
+                self.tier2_run_with_reuse_job(&job, &cache, &options)
+            });
+        let result = if timed_out {
+            InspectResult::failed(
+                &job,
+                format!(
+                    "tier2 pass timed out after {}ms and was cancelled",
+                    timeout.as_millis()
+                ),
+                started.elapsed(),
+            )
+        } else {
+            match scan_result {
+                Ok(success) => InspectResult::success(&job, success, started.elapsed()),
+                Err(message) => InspectResult::failed(&job, message, started.elapsed()),
+            }
         };
         // Always-on perf line: a full (reuse=miss) scan is the expensive path —
         // for dead_code it includes store snapshot projection plus the scanner.
@@ -8976,5 +9043,29 @@ export function main() { foo(); }
                 payload.len()
             )
         );
+    }
+}
+
+#[cfg(test)]
+mod tier2_deadline_tests {
+    use super::*;
+
+    #[test]
+    fn tier2_pass_deadline_cancels_a_scanner_stub_that_never_returns() {
+        let started = Instant::now();
+        let (value, timed_out) = run_tier2_pass_with_deadline(
+            Path::new("/tmp/tier2-timeout"),
+            InspectCategory::Duplicates,
+            Duration::from_millis(20),
+            || {
+                let token = crate::executor::current_job_cancellation()
+                    .expect("deadline installs JobCancellation for scanners");
+                assert!(token.wait_for_cancellation(Duration::from_secs(2)));
+                "cancelled"
+            },
+        );
+        assert!(timed_out, "deadline must own the cancellation request");
+        assert_eq!(value, "cancelled");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
