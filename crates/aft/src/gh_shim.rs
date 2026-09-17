@@ -3372,7 +3372,9 @@ fn own_comment_patch_payload<R: Read>(
         index += consumed;
     }
     body.ok_or_else(|| {
-        CanonicalizeError::unclassified(format!("the governed comment PATCH requires a {body_field}"))
+        CanonicalizeError::unclassified(format!(
+            "the governed comment PATCH requires a {body_field}"
+        ))
     })
 }
 
@@ -3410,9 +3412,9 @@ fn api_payload_argument(
         } else {
             continue;
         };
-        let (name, text) = supplied.split_once('=').ok_or_else(|| {
-            CanonicalizeError::unclassified(format!("{flag} takes name=value"))
-        })?;
+        let (name, text) = supplied
+            .split_once('=')
+            .ok_or_else(|| CanonicalizeError::unclassified(format!("{flag} takes name=value")))?;
         if name != "body" {
             return Err(CanonicalizeError::unclassified(format!(
                 "{name} is not declared; the governed comment PATCH is body-only"
