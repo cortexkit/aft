@@ -120,8 +120,9 @@ use crate::search_index::{
     INTERACTIVE_ARTIFACT_READ_BUDGET,
 };
 use crate::semantic_index::{
-    query_embedding_timeout_budget, strip_query_embedding_timeout_marker, EmbeddingModel,
-    QueryBudget, SemanticIndex, SemanticIndexFingerprint, SemanticResult,
+    query_embedding_is_busy, query_embedding_timeout_budget, strip_query_embedding_busy_marker,
+    strip_query_embedding_timeout_marker, EmbeddingModel, QueryBudget, SemanticIndex,
+    SemanticIndexFingerprint, SemanticResult,
 };
 use crate::symbols::{Range, Symbol, SymbolKind};
 
@@ -4345,6 +4346,14 @@ fn classify_embed_query_error(error: &str) -> ClassifiedEmbedQueryError {
             detail,
             footer_reason,
         }
+    } else if query_embedding_is_busy(error) {
+        let clean = strip_query_embedding_busy_marker(error);
+        ClassifiedEmbedQueryError {
+            detail: format!(
+                "Semantic search unavailable: local query embedder is busy finishing an earlier inference; using lexical search only. {clean}"
+            ),
+            footer_reason: "query embed busy",
+        }
     } else {
         ClassifiedEmbedQueryError {
             detail: format!("Semantic search unavailable: {error}"),
@@ -5366,12 +5375,15 @@ mod tests {
         AppContext,
     };
     use crate::parser::TreeSitterProvider;
-    use crate::semantic_index::SemanticIndex;
+    use crate::semantic_index::{
+        with_query_budget_for_test, LocalEmbeddingProvider, SemanticEmbeddingModel, SemanticIndex,
+    };
     use serde_json::Value;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
     use std::thread;
     use std::time::Duration;
 
@@ -5436,6 +5448,29 @@ mod tests {
         *ctx.callgraph_store()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(store));
+    }
+
+    struct BlockingLocalProvider {
+        calls: Arc<AtomicUsize>,
+        started: std::sync::mpsc::Sender<()>,
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl LocalEmbeddingProvider for BlockingLocalProvider {
+        fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let _ = self.started.send(());
+            let (released, wake) = &*self.gate;
+            let mut released = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*released {
+                released = wake
+                    .wait(released)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            Ok(vec![vec![0.1, 0.2, 0.3]; texts.len()])
+        }
     }
 
     fn start_mock_embedding_server() -> (String, thread::JoinHandle<()>) {
@@ -5528,6 +5563,132 @@ mod tests {
             "successful retry should install the constructed model"
         );
         handle.join().expect("embedding server thread");
+    }
+
+    #[test]
+    fn blocked_local_query_times_out_falls_back_and_late_result_populates_cache() {
+        let project = tempfile::tempdir().expect("create project dir");
+        std::fs::write(
+            project.path().join("remix-panel.ts"),
+            "// where remix panel mounted option switching handled\nexport const panel = true;\n",
+        )
+        .expect("write lexical fallback fixture");
+        let ctx = test_context(project.path());
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
+        *ctx.semantic_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SemanticIndex::new(project.path().to_path_buf(), 3));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        *ctx.semantic_embedding_model().lock() =
+            Some(SemanticEmbeddingModel::from_local_provider_for_test(
+                Box::new(BlockingLocalProvider {
+                    calls: Arc::clone(&calls),
+                    started: started_tx,
+                    gate: Arc::clone(&gate),
+                }),
+                project.path().to_path_buf(),
+            ));
+
+        let query = "where remix panel mounted option switching handled";
+        let started_at = Instant::now();
+        let timeout_response = with_query_budget_for_test(200, || {
+            response_value(handle_semantic_search(&semantic_request(query, 5), &ctx))
+        });
+        assert!(
+            started_at.elapsed() < Duration::from_secs(1),
+            "local query timeout must bound the search request"
+        );
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("local embed call started");
+        assert_eq!(timeout_response["success"], true);
+        assert_eq!(timeout_response["lexical_only_fallback"], true);
+        let timeout_text = timeout_response["text"]
+            .as_str()
+            .expect("timeout fallback text");
+        assert!(timeout_text.contains("query embedding timed out after 200ms"));
+        assert!(timeout_text.contains("semantic.query_timeout_ms"));
+        assert!(timeout_text.contains("[semantic: query embed timeout (200ms)]"));
+        assert!(timeout_response["warnings"]
+            .as_array()
+            .expect("timeout warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("lexical-only fallback"))));
+
+        let busy_request_id = "semantic-search-test";
+        let busy_started = Instant::now();
+        let busy_response = with_query_budget_for_test(200, || {
+            response_value(handle_semantic_search(
+                &semantic_request("how remix panel option state changes", 5),
+                &ctx,
+            ))
+        });
+        assert!(
+            busy_started.elapsed() < Duration::from_millis(200),
+            "a new query must not queue behind the late inference"
+        );
+        assert_eq!(busy_response["success"], true);
+        assert_eq!(busy_response["lexical_only_fallback"], true);
+        assert!(busy_response["text"]
+            .as_str()
+            .expect("busy fallback text")
+            .contains("busy finishing an earlier inference"));
+        assert_eq!(
+            crate::search_b2::embed_counter::read(busy_request_id),
+            crate::search_b2::embed_counter::EmbedCounts {
+                requested: 1,
+                cache_hits: 0,
+                live_calls: 0,
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let (released, wake) = &*gate;
+        *released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        wake.notify_all();
+        let cache_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let cache_len = ctx
+                .semantic_embedding_model()
+                .lock()
+                .as_ref()
+                .expect("installed local model")
+                .query_embedding_cache_stats()
+                .2;
+            if cache_len == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < cache_deadline,
+                "late local query vector did not reach the cache"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let request_id = "local-query-late-cache-hit";
+        let _counter = crate::search_b2::embed_counter::install(request_id);
+        let cached_vector = with_query_budget_for_test(200, || embed_query(query, &ctx))
+            .expect("identical query reads late vector from cache");
+        assert_eq!(cached_vector, vec![0.1, 0.2, 0.3]);
+        assert_eq!(
+            crate::search_b2::embed_counter::read(request_id),
+            crate::search_b2::embed_counter::EmbedCounts {
+                requested: 0,
+                cache_hits: 1,
+                live_calls: 0,
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

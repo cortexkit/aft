@@ -1307,6 +1307,21 @@ fn build_health_diagnostic_rollup(
             let root_label = snapshot.project_root.clone();
             let mut value = standing_root_health_value(snapshot, candidate.standing.as_ref());
             cache.annotate_plane_timings(&root_label, &mut value);
+            let query_embed =
+                crate::semantic_index::query_embed_health_snapshot(Path::new(&root_label));
+            if let Some(semantic) = value
+                .get_mut("semantic_index")
+                .and_then(Value::as_object_mut)
+            {
+                semantic.insert(
+                    "query_embed_timeouts".to_string(),
+                    json!(query_embed.query_embed_timeouts),
+                );
+                semantic.insert(
+                    "query_embed_p50_ms".to_string(),
+                    json!(query_embed.query_embed_p50_ms),
+                );
+            }
             if let Some(object) = value.as_object_mut() {
                 if let Some(census) = candidate.resident_callgraph_stale_backend_rows {
                     object.insert(
@@ -2456,6 +2471,28 @@ mod tests {
             "cached 50-root reply exceeded CI bound: {fifty_median:?}"
         );
         std::hint::black_box((five_dirs, fifty_dirs));
+    }
+
+    #[test]
+    fn health_payload_exposes_root_local_query_embed_timeout_and_p50_metrics() {
+        let executor = Executor::new();
+        let (_dir, root) = test_root("semantic-query-embed-health");
+        let ctx = test_ctx();
+        crate::semantic_index::record_query_embed_observation_for_test(root.as_path(), 120, false);
+        crate::semantic_index::record_query_embed_observation_for_test(root.as_path(), 200, true);
+        crate::semantic_index::record_query_embed_observation_for_test(root.as_path(), 900, false);
+        assert!(executor.register_actor(root.clone(), ctx));
+        let app = App::default_shared();
+        let metrics = DispatchPathMetrics::new();
+        let cache = HealthRollupCache::new();
+
+        refresh_until_root_count(&cache, &executor, &app, 1);
+        let report = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app)
+            .metrics
+            .expect("health metrics");
+        let semantic = &report["roots"][0]["semantic_index"];
+        assert_eq!(semantic["query_embed_timeouts"], 1);
+        assert_eq!(semantic["query_embed_p50_ms"], 200);
     }
 
     #[test]

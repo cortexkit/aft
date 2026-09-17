@@ -22,7 +22,7 @@ use std::fmt::Display;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use url::Url;
@@ -145,6 +145,8 @@ const DEFAULT_OLLAMA_EMBEDDING_PATH: &str = "/api/embed";
 const DEFAULT_OPENAI_EMBEDDING_TIMEOUT_MS: u64 = 25_000;
 const DEFAULT_MAX_BATCH_SIZE: usize = 64;
 const QUERY_EMBEDDING_CACHE_CAP: usize = 1_000;
+const QUERY_EMBED_HEALTH_SAMPLE_CAP: usize = 1_000;
+const QUERY_EMBED_OK_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const FALLBACK_BACKEND: &str = "none";
 const EMBEDDING_REQUEST_MAX_ATTEMPTS: usize = 3;
 const EMBEDDING_REQUEST_BACKOFF_MS: [u64; 2] = [500, 1_000];
@@ -180,6 +182,8 @@ thread_local! {
     };
     #[cfg(test)]
     static TEST_SKIPPED_ROW_WARNINGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    #[cfg(test)]
+    static TEST_QUERY_BUDGET_MS: RefCell<Option<u64>> = const { RefCell::new(None) };
 }
 
 fn clear_http_build_metadata() {
@@ -208,6 +212,10 @@ pub struct QueryBudget {
 
 impl QueryBudget {
     pub fn from_config(config: &SemanticBackendConfig) -> Self {
+        #[cfg(test)]
+        if let Some(timeout_ms) = TEST_QUERY_BUDGET_MS.with(|slot| *slot.borrow()) {
+            return Self { timeout_ms };
+        }
         let configured = if config.query_timeout_ms == 0 {
             DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS
         } else {
@@ -223,6 +231,20 @@ impl QueryBudget {
     fn timeout_ms(self) -> u64 {
         self.timeout_ms
     }
+}
+
+#[cfg(test)]
+pub(crate) fn with_query_budget_for_test<R>(timeout_ms: u64, action: impl FnOnce() -> R) -> R {
+    struct Reset(Option<u64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_QUERY_BUDGET_MS.with(|slot| *slot.borrow_mut() = self.0);
+        }
+    }
+
+    let previous = TEST_QUERY_BUDGET_MS.with(|slot| slot.borrow_mut().replace(timeout_ms));
+    let _reset = Reset(previous);
+    action()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -501,10 +523,199 @@ fn log_fingerprint_mismatch(cached: Option<&SemanticIndexFingerprint>, expected:
     }
 }
 
+pub(crate) trait LocalEmbeddingProvider: Send {
+    fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, String>;
+}
+
+impl LocalEmbeddingProvider for LocalEmbedder {
+    fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        LocalEmbedder::embed(self, texts)
+    }
+}
+
+type SharedLocalEmbeddingProvider = Arc<Mutex<Box<dyn LocalEmbeddingProvider>>>;
+
+#[derive(Default)]
+struct QueryEmbeddingCache {
+    query_embedding_cache: HashMap<String, Vec<f32>>,
+    query_embedding_cache_order: VecDeque<String>,
+    hits: u64,
+    misses: u64,
+}
+
+impl QueryEmbeddingCache {
+    fn insert(&mut self, query: String, vector: Vec<f32>) {
+        if self.query_embedding_cache.contains_key(&query) {
+            return;
+        }
+        if self.query_embedding_cache.len() >= QUERY_EMBEDDING_CACHE_CAP {
+            if let Some(oldest) = self.query_embedding_cache_order.pop_front() {
+                self.query_embedding_cache.remove(&oldest);
+            }
+        }
+        self.query_embedding_cache.insert(query.clone(), vector);
+        self.query_embedding_cache_order.push_back(query);
+    }
+}
+
+struct LocalQueryEmbedRequest {
+    texts: Vec<String>,
+    cache_key: String,
+    response: crossbeam_channel::Sender<Result<Vec<Vec<f32>>, String>>,
+}
+
+struct LocalQueryEmbedWorker {
+    requests: crossbeam_channel::Sender<LocalQueryEmbedRequest>,
+    busy: Arc<AtomicBool>,
+}
+
+impl LocalQueryEmbedWorker {
+    fn start(
+        model: SharedLocalEmbeddingProvider,
+        query_cache: Arc<Mutex<QueryEmbeddingCache>>,
+    ) -> Result<Self, String> {
+        let (requests, receiver) = crossbeam_channel::unbounded::<LocalQueryEmbedRequest>();
+        let busy = Arc::new(AtomicBool::new(false));
+        let worker_busy = Arc::clone(&busy);
+        std::thread::Builder::new()
+            .name("aft-local-query-embed".to_string())
+            .spawn(move || {
+                while let Ok(request) = receiver.recv() {
+                    let result = model
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .embed(&request.texts)
+                        .map_err(|error| format!("failed to embed batch: {error}"));
+                    if let Ok(vectors) = &result {
+                        if let Some(vector) = vectors.first() {
+                            query_cache
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(request.cache_key, vector.clone());
+                        }
+                    }
+                    worker_busy.store(false, Ordering::Release);
+                    let _ = request.response.send(result);
+                }
+            })
+            .map_err(|error| format!("failed to start local query embed worker: {error}"))?;
+        Ok(Self { requests, busy })
+    }
+
+    fn try_submit(
+        &self,
+        texts: Vec<String>,
+        cache_key: String,
+    ) -> Option<crossbeam_channel::Receiver<Result<Vec<Vec<f32>>, String>>> {
+        if self
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
+        let (response, receiver) = crossbeam_channel::bounded(1);
+        if self
+            .requests
+            .send(LocalQueryEmbedRequest {
+                texts,
+                cache_key,
+                response,
+            })
+            .is_err()
+        {
+            self.busy.store(false, Ordering::Release);
+            return None;
+        }
+        Some(receiver)
+    }
+}
+
+struct LocalEmbeddingEngine {
+    model: SharedLocalEmbeddingProvider,
+    query_worker: LocalQueryEmbedWorker,
+}
+
+impl LocalEmbeddingEngine {
+    fn new(
+        model: Box<dyn LocalEmbeddingProvider>,
+        query_cache: Arc<Mutex<QueryEmbeddingCache>>,
+    ) -> Result<Self, String> {
+        let model = Arc::new(Mutex::new(model));
+        let query_worker = LocalQueryEmbedWorker::start(Arc::clone(&model), query_cache)?;
+        Ok(Self {
+            model,
+            query_worker,
+        })
+    }
+}
+
+#[derive(Default)]
+struct QueryEmbedHealthState {
+    timeouts: u64,
+    elapsed_ms: VecDeque<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct QueryEmbedHealthSnapshot {
+    pub(crate) query_embed_timeouts: u64,
+    pub(crate) query_embed_p50_ms: u64,
+}
+
+fn query_embed_health_registry() -> &'static Mutex<HashMap<PathBuf, QueryEmbedHealthState>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, QueryEmbedHealthState>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_query_embed_observation(root: Option<&Path>, elapsed_ms: u64, timed_out: bool) {
+    let Some(root) = root else {
+        return;
+    };
+    let mut registry = query_embed_health_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = registry.entry(root.to_path_buf()).or_default();
+    if timed_out {
+        state.timeouts = state.timeouts.saturating_add(1);
+    }
+    if state.elapsed_ms.len() >= QUERY_EMBED_HEALTH_SAMPLE_CAP {
+        state.elapsed_ms.pop_front();
+    }
+    state.elapsed_ms.push_back(elapsed_ms);
+}
+
+pub(crate) fn query_embed_health_snapshot(root: &Path) -> QueryEmbedHealthSnapshot {
+    let registry = query_embed_health_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(state) = registry.get(root) else {
+        return QueryEmbedHealthSnapshot::default();
+    };
+    let mut elapsed_ms = state.elapsed_ms.iter().copied().collect::<Vec<_>>();
+    elapsed_ms.sort_unstable();
+    let query_embed_p50_ms = elapsed_ms
+        .get(elapsed_ms.len().saturating_sub(1) / 2)
+        .copied()
+        .unwrap_or(0);
+    QueryEmbedHealthSnapshot {
+        query_embed_timeouts: state.timeouts,
+        query_embed_p50_ms,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn record_query_embed_observation_for_test(
+    root: &Path,
+    elapsed_ms: u64,
+    timed_out: bool,
+) {
+    record_query_embed_observation(Some(root), elapsed_ms, timed_out);
+}
+
 enum SemanticEmbeddingEngine {
     /// Local ONNX embedder (all-MiniLM-L6-v2 via raw `ort`). The config-facing
     /// backend string stays "fastembed" for index-fingerprint compatibility.
-    Local(LocalEmbedder),
+    Local(LocalEmbeddingEngine),
     OpenAiCompatible {
         client: Client,
         model: String,
@@ -530,10 +741,8 @@ pub struct SemanticEmbeddingModel {
     per_item_ema_ms: Option<f64>,
     dimension: Option<usize>,
     engine: SemanticEmbeddingEngine,
-    query_embedding_cache: HashMap<String, Vec<f32>>,
-    query_embedding_cache_order: VecDeque<String>,
-    query_embedding_cache_hits: u64,
-    query_embedding_cache_misses: u64,
+    query_embedding_cache: Arc<Mutex<QueryEmbeddingCache>>,
+    local_query_last_ok_log: Option<Instant>,
     query_instruction: Option<String>,
     query_instruction_logged: bool,
     query_instruction_root: Option<PathBuf>,
@@ -1141,6 +1350,16 @@ pub fn strip_query_embedding_timeout_marker(error: &str) -> String {
     }
 }
 
+const QUERY_EMBEDDING_BUSY_MARKER: &str = "[query-embed-busy]";
+
+pub(crate) fn query_embedding_is_busy(error: &str) -> bool {
+    error.contains(QUERY_EMBEDDING_BUSY_MARKER)
+}
+
+pub(crate) fn strip_query_embedding_busy_marker(error: &str) -> String {
+    error.replace(QUERY_EMBEDDING_BUSY_MARKER, "")
+}
+
 fn sleep_before_embedding_retry(attempt_index: usize) {
     if let Some(delay_ms) = EMBEDDING_REQUEST_BACKOFF_MS.get(attempt_index) {
         std::thread::sleep(Duration::from_millis(*delay_ms));
@@ -1386,6 +1605,7 @@ impl SemanticEmbeddingModel {
         let api_key_env = normalize_api_key(config.api_key_env.clone());
         let model = config.model.clone();
 
+        let query_embedding_cache = Arc::new(Mutex::new(QueryEmbeddingCache::default()));
         let tls_config = crate::platform_tls::client_config()
             .map_err(|error| format!("failed to configure embedding client TLS: {error}"))?;
         let client = Client::builder()
@@ -1397,7 +1617,10 @@ impl SemanticEmbeddingModel {
 
         let engine = match config.backend {
             SemanticBackend::Fastembed => {
-                SemanticEmbeddingEngine::Local(LocalEmbedder::new(&model)?)
+                SemanticEmbeddingEngine::Local(LocalEmbeddingEngine::new(
+                    Box::new(LocalEmbedder::new(&model)?),
+                    Arc::clone(&query_embedding_cache),
+                )?)
             }
             SemanticBackend::OpenAiCompatible => {
                 let raw = config.base_url.as_ref().ok_or_else(|| {
@@ -1452,14 +1675,41 @@ impl SemanticEmbeddingModel {
             per_item_ema_ms: None,
             dimension: None,
             engine,
-            query_embedding_cache: HashMap::new(),
-            query_embedding_cache_order: VecDeque::new(),
-            query_embedding_cache_hits: 0,
-            query_embedding_cache_misses: 0,
+            query_embedding_cache,
+            local_query_last_ok_log: None,
             query_instruction: config.resolved_query_instruction().map(str::to_string),
             query_instruction_logged: false,
             query_instruction_root: config.route_project_root.clone(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_local_provider_for_test(
+        provider: Box<dyn LocalEmbeddingProvider>,
+        project_root: PathBuf,
+    ) -> Self {
+        let query_embedding_cache = Arc::new(Mutex::new(QueryEmbeddingCache::default()));
+        let engine = SemanticEmbeddingEngine::Local(
+            LocalEmbeddingEngine::new(provider, Arc::clone(&query_embedding_cache))
+                .expect("start test local query embed worker"),
+        );
+        Self {
+            backend: SemanticBackend::Fastembed,
+            model: "test-local".to_string(),
+            base_url: None,
+            timeout_ms: DEFAULT_OPENAI_EMBEDDING_TIMEOUT_MS,
+            max_batch_size: DEFAULT_MAX_BATCH_SIZE,
+            adaptive_build_batch_size: DEFAULT_MAX_BATCH_SIZE,
+            successful_build_batches_at_size: 0,
+            per_item_ema_ms: None,
+            dimension: None,
+            engine,
+            query_embedding_cache,
+            local_query_last_ok_log: None,
+            query_instruction: None,
+            query_instruction_logged: false,
+            query_instruction_root: Some(project_root),
+        }
     }
 
     pub fn backend(&self) -> SemanticBackend {
@@ -1716,8 +1966,12 @@ impl SemanticEmbeddingModel {
                 .ok_or_else(|| "embedding backend returned no vectors".to_string())?
         } else {
             match &mut self.engine {
-                SemanticEmbeddingEngine::Local(model) => {
-                    let vectors = model.embed(&["semantic index fingerprint probe".to_string()])?;
+                SemanticEmbeddingEngine::Local(engine) => {
+                    let vectors = engine
+                        .model
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .embed(&["semantic index fingerprint probe".to_string()])?;
                     vectors
                         .first()
                         .map(|v| v.len())
@@ -1780,11 +2034,82 @@ impl SemanticEmbeddingModel {
     }
 
     pub fn query_embedding_cache_stats(&self) -> (u64, u64, usize) {
-        (
-            self.query_embedding_cache_hits,
-            self.query_embedding_cache_misses,
-            self.query_embedding_cache.len(),
-        )
+        let cache = self
+            .query_embedding_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (cache.hits, cache.misses, cache.query_embedding_cache.len())
+    }
+
+    fn log_local_query_embed(&mut self, elapsed: Duration, budget: QueryBudget, outcome: &str) {
+        let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        if outcome != "busy" {
+            record_query_embed_observation(
+                self.query_instruction_root.as_deref(),
+                elapsed_ms,
+                outcome == "timeout",
+            );
+        }
+        let should_log = if outcome == "ok" {
+            self.local_query_last_ok_log
+                .is_none_or(|last| last.elapsed() >= QUERY_EMBED_OK_LOG_INTERVAL)
+        } else {
+            true
+        };
+        if !should_log {
+            return;
+        }
+        if outcome == "ok" {
+            self.local_query_last_ok_log = Some(Instant::now());
+        }
+        slog_info!(
+            "semantic query embed: backend=fastembed model={} elapsed_ms={} budget_ms={} outcome={}",
+            self.model,
+            elapsed_ms,
+            budget.timeout_ms,
+            outcome,
+        );
+    }
+
+    fn embed_local_query(
+        &mut self,
+        texts: Vec<String>,
+        cache_key: String,
+        budget: QueryBudget,
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let started = Instant::now();
+        let receiver = match &self.engine {
+            SemanticEmbeddingEngine::Local(engine) => {
+                engine.query_worker.try_submit(texts, cache_key)
+            }
+            _ => unreachable!("local query path requires the local embedding engine"),
+        };
+        let Some(receiver) = receiver else {
+            self.log_local_query_embed(started.elapsed(), budget, "busy");
+            return Err(format!(
+                "{QUERY_EMBEDDING_BUSY_MARKER}fastembed query embedder is busy finishing an earlier inference"
+            ));
+        };
+        match receiver.recv_timeout(Duration::from_millis(budget.timeout_ms)) {
+            Ok(result) => {
+                self.log_local_query_embed(started.elapsed(), budget, "ok");
+                result
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                self.log_local_query_embed(started.elapsed(), budget, "timeout");
+                Err(format!(
+                    "{}{TRANSIENT_EMBEDDING_MARKER}fastembed query embedding timed out after {}ms",
+                    query_embedding_timeout_marker(budget.timeout_ms),
+                    budget.timeout_ms,
+                ))
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                self.log_local_query_embed(started.elapsed(), budget, "busy");
+                Err(format!(
+                    "{QUERY_EMBEDDING_BUSY_MARKER}fastembed query embed worker disconnected"
+                ))
+            }
+        }
     }
 
     fn embed_texts(
@@ -1797,21 +2122,51 @@ impl SemanticEmbeddingModel {
             EmbeddingRequestPolicy::Query(_) => texts.first().cloned(),
         };
         let cached_vectors = query_cache_key.as_ref().and_then(|query| {
-            self.query_embedding_cache.get(query).map(|vector| {
-                self.query_embedding_cache_hits += 1;
-                vec![vector.clone()]
-            })
+            let mut cache = self
+                .query_embedding_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let vector = cache.query_embedding_cache.get(query).cloned();
+            if vector.is_some() {
+                cache.hits = cache.hits.saturating_add(1);
+            } else {
+                cache.misses = cache.misses.saturating_add(1);
+            }
+            vector.map(|vector| vec![vector])
         });
         let cache_hit = u64::from(cached_vectors.is_some());
-        if query_cache_key.is_some() && cached_vectors.is_none() {
-            self.query_embedding_cache_misses += 1;
-        }
         let requested = if query_cache_key.is_some() && cached_vectors.is_none() {
             texts.len() as u64
         } else {
             0
         };
-        let live_calls = u64::from(requested > 0 && self.is_live_query_provider());
+        let local_query_result = if cached_vectors.is_none() {
+            match policy {
+                EmbeddingRequestPolicy::Query(budget)
+                    if matches!(&self.engine, SemanticEmbeddingEngine::Local(_)) =>
+                {
+                    Some(
+                        self.embed_local_query(
+                            texts.clone(),
+                            query_cache_key
+                                .clone()
+                                .expect("query policy has a cache key"),
+                            budget,
+                        ),
+                    )
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let local_worker_busy = local_query_result.as_ref().is_some_and(|result| {
+            result
+                .as_ref()
+                .is_err_and(|error| query_embedding_is_busy(error))
+        });
+        let live_calls =
+            u64::from(requested > 0 && self.is_live_query_provider() && !local_worker_busy);
         crate::search_b2::embed_counter::record(crate::search_b2::embed_counter::EmbedCounts {
             requested,
             cache_hits: cache_hit,
@@ -1820,9 +2175,15 @@ impl SemanticEmbeddingModel {
         if let Some(vectors) = cached_vectors {
             return Ok(vectors);
         }
+        if let Some(result) = local_query_result {
+            return result;
+        }
 
         let result = match &mut self.engine {
-            SemanticEmbeddingEngine::Local(model) => model
+            SemanticEmbeddingEngine::Local(engine) => engine
+                .model
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .embed(&texts)
                 .map_err(|error| format!("failed to embed batch: {error}")),
             SemanticEmbeddingEngine::OpenAiCompatible {
@@ -1984,14 +2345,10 @@ impl SemanticEmbeddingModel {
 
         if let (Some(query), Ok(vectors)) = (query_cache_key, &result) {
             if let Some(vector) = vectors.first() {
-                if self.query_embedding_cache.len() >= QUERY_EMBEDDING_CACHE_CAP {
-                    if let Some(oldest) = self.query_embedding_cache_order.pop_front() {
-                        self.query_embedding_cache.remove(&oldest);
-                    }
-                }
                 self.query_embedding_cache
-                    .insert(query.clone(), vector.clone());
-                self.query_embedding_cache_order.push_back(query);
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(query, vector.clone());
             }
         }
 
@@ -7497,6 +7854,53 @@ mod tests {
     #[cfg(unix)]
     const RUST_QUERY_BASELINE_OUTPUT_HASH: &str =
         "36315439db74ed8e186076f79ed261079b2b13a4443ed4272861a2518c78d98b";
+
+    struct CountingLocalProvider {
+        calls: Arc<AtomicUsize>,
+        threads: Arc<Mutex<Vec<std::thread::ThreadId>>>,
+    }
+
+    impl LocalEmbeddingProvider for CountingLocalProvider {
+        fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.threads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(std::thread::current().id());
+            Ok(vec![vec![0.25, 0.5, 0.75]; texts.len()])
+        }
+    }
+
+    #[test]
+    fn local_build_embeddings_stay_on_the_build_caller_and_run_once() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let threads = Arc::new(Mutex::new(Vec::new()));
+        let mut model = SemanticEmbeddingModel::from_local_provider_for_test(
+            Box::new(CountingLocalProvider {
+                calls: Arc::clone(&calls),
+                threads: Arc::clone(&threads),
+            }),
+            PathBuf::from("/build-counting-test"),
+        );
+        let caller = std::thread::current().id();
+
+        let vectors = model
+            .embed(vec![
+                "first build row".to_string(),
+                "second build row".to_string(),
+            ])
+            .expect("build embedding");
+
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            threads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_slice(),
+            &[caller]
+        );
+    }
 
     #[cfg(unix)]
     fn rust_fixture_semantic_output_fingerprint(project_root: &Path) -> (usize, usize, String) {
