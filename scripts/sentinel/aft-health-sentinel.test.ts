@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   buildPeerDelivery,
   capLaunchdLogs,
+  collectProcessMetrics,
   detectAll,
   detectDaemon,
   detectDeadSessions,
@@ -21,6 +22,8 @@ import {
   detectWatcher,
   healthBytesWritten,
   reconcile,
+  STATE_DIR,
+  writeGrowthAttribution,
   type SentinelSample,
   type SentinelState,
 } from "./aft-health-sentinel";
@@ -36,7 +39,7 @@ const sample = (patch: Partial<SentinelSample> = {}): SentinelSample => ({
   process: { pid: 42, phys_footprint_bytes: 1, cpu_percent: 1, bytes_written: 1 },
   disk: { free_bytes: 100 * 1024 ** 3, sizes: {} },
   memory_census: { roots: {} },
-  dsym: { requested_uuid: "AA", found_uuid: "AA" },
+  dsym: { requested_uuid: "AA", found_uuid: "AA", path: "/dsym/AA/aft.dSYM" },
   ...patch,
 });
 const rules = (values: ReturnType<typeof detectAll>) => values.map((value) => value.rule);
@@ -44,6 +47,23 @@ const rules = (values: ReturnType<typeof detectAll>) => values.map((value) => va
 // These cases keep detector thresholds executable rather than duplicating the
 // prose contract in a second hand-maintained table.
 describe("health sentinel pure detectors", () => {
+  test("test imports use a temporary sentinel state directory", () => {
+    expect(STATE_DIR.startsWith(tmpdir())).toBe(true);
+    expect(STATE_DIR).toContain("aft-health-sentinel-test-");
+  });
+
+  test("process collection does not depend on python in PATH", () => {
+    const oldPath = process.env.PATH;
+    process.env.PATH = "/nonexistent";
+    try {
+      const collected = collectProcessMetrics(process.pid, sample({ health: { metrics: { process_io: { available: true, diskio_bytes_written: 123 } } } }));
+      expect(collected.bytes_written).toBe(123);
+      expect(collected.pid).toBe(process.pid);
+    } finally {
+      process.env.PATH = oldPath;
+    }
+  });
+
   test("peer delivery addresses AFT by registry name and folds severity-sorted findings", () => {
     const warning = { rule: "disk.low", severity: "WARNING" as const, fingerprint: "disk:data", text: "warning", clears_when: "space" };
     const critical = { rule: "daemon.down", severity: "CRITICAL" as const, fingerprint: "daemon:aft", text: "critical", clears_when: "up" };
@@ -143,10 +163,39 @@ describe("health sentinel pure detectors", () => {
     expect(detectStorage(sample(), cleanState())).toEqual([]);
   });
 
+  test("executor detector uses legacy maintenance fields when dispatch_liveness is absent", () => {
+    const legacy = sample({ health: { metrics: { maintenance_inflight: 2, maintenance_queue_oldest_age_ms: 45_000, running_maintenance: 0 } } });
+    const result = detectExecutor(legacy, { findings: {}, previous: { sampled_at_ms: NOW - 1, phantom_inflight: true } } as any);
+    expect(result[0].rule).toBe("executor.phantom");
+    expect(result[0].text).toContain("legacy fallback");
+    const missing = detectExecutor(sample({ health: { metrics: {} } }), cleanState())[0];
+    expect(missing.fingerprint).toBe("instrument:executor-health");
+    expect(missing.text).toContain("waits on the sentinel health card");
+  });
+
   test("health process_io prefers physical writes and falls back to logical writes", () => {
     expect(healthBytesWritten(sample({ health: { metrics: { process_io: { available: true, diskio_bytes_written: 42, logical_bytes_written: 99 } } } }))).toEqual({ available: true, bytes: 42 });
     expect(healthBytesWritten(sample({ health: { metrics: { process_io: { available: true, logical_bytes_written: 99 } } } }))).toEqual({ available: true, bytes: 99 });
     expect(healthBytesWritten(sample({ health: { metrics: { process_io: { available: false } } } }))).toEqual({ available: false });
+  });
+
+  test("write attribution ranks artifact growth and names unexplained WAL churn", () => {
+    const input = sample({ disk: {
+      free_bytes: 100 * 1024 ** 3,
+      sizes: {},
+      artifact_sizes: { "callgraph/aaa": 2.5 * 1024 ** 3, "inspect/bbb": 1.25 * 1024 ** 3, "semantic/ccc": 0.5 * 1024 ** 3, "views/ddd": 0.25 * 1024 ** 3 },
+      artifact_roots: { "callgraph/aaa": "/root/a", "inspect/bbb": "/root/b", "semantic/ccc": "/root/c", "views/ddd": "/root/d" },
+    } });
+    const state: SentinelState = { findings: {}, previous: {
+      sampled_at_ms: NOW - 120_000,
+      artifact_sizes: { "callgraph/aaa": 2 * 1024 ** 3, "inspect/bbb": 1 * 1024 ** 3, "semantic/ccc": 0.4 * 1024 ** 3, "views/ddd": 0 },
+    } };
+    expect(writeGrowthAttribution(input, state, 4 * 1024 ** 3).split("\n").slice(1)).toEqual([
+      "1. 0.50 GiB callgraph/aaa (/root/a) grew; 13% of write delta",
+      "2. 0.25 GiB inspect/bbb (/root/b) grew; 6% of write delta",
+      "3. 0.25 GiB views/ddd (/root/d) grew; 6% of write delta",
+      "remainder: in-place rewrites (WAL churn)",
+    ]);
   });
 
   test("process footprint, cpu, and write rate are independent", () => {
@@ -182,7 +231,7 @@ describe("health sentinel pure detectors", () => {
     const current = detectStorage(sample({ disk: { free_bytes: 30 * 1024 ** 3, sizes: {} } }), cleanState())[0];
     const first = reconcile([current], {}, NOW);
     expect(first.raised).toHaveLength(1);
-    const second = reconcile([current], first.next, NOW + 1);
+    const second = reconcile([current], first.next, NOW + 10 * 60_000);
     expect(second.raised).toHaveLength(0);
     const clear = reconcile([], second.next, NOW + 2);
     expect(clear.cleared.map((value) => value.fingerprint)).toEqual([current.fingerprint]);

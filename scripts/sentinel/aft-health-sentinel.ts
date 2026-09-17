@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 /** Short-lived AFT health sentinel. Collection is impure; every detector below is pure. */
 import { SubcClient } from "@cortexkit/subc-client";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, truncateSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, truncateSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 
@@ -33,7 +33,7 @@ export type SentinelSample = {
   plugin_error?: string;
   process?: { pid?: number; phys_footprint_bytes?: number; cpu_percent?: number; bytes_written?: number; image?: string };
   process_error?: string;
-  disk?: { free_bytes?: number; sizes?: Record<string, number> };
+  disk?: { free_bytes?: number; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; artifact_roots?: Record<string, string> };
   disk_error?: string;
   dsym?: { requested_uuid?: string; found_uuid?: string; path?: string; error?: string };
 };
@@ -42,13 +42,16 @@ export type SentinelState = {
   findings: FindingLedger;
   log?: { path?: string; offset?: number; size?: number };
   plugin_log?: { path?: string; offset?: number; size?: number };
-  previous?: { pid?: number; unreachable_runs?: number; sampled_at_ms?: number; bytes_written?: number; sizes?: Record<string, number>; watcher?: Record<string, [number, number]> };
+  previous?: { pid?: number; unreachable_runs?: number; sampled_at_ms?: number; bytes_written?: number; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; watcher?: Record<string, [number, number]> };
 };
 
 const HOME = homedir();
 const SHARE = join(HOME, ".local", "share", "cortexkit");
 const AFT = join(SHARE, "aft");
-const STATE_DIR = join(HOME, ".local", "state", "cortexkit", "aft", "sentinel");
+export const STATE_DIR = process.env.AFT_SENTINEL_STATE_DIR
+  ?? (process.env.NODE_ENV === "test"
+    ? mkdtempSync(join(tmpdir(), "aft-health-sentinel-test-"))
+    : join(HOME, ".local", "state", "cortexkit", "aft", "sentinel-dev"));
 export const STATE_FILE = join(STATE_DIR, "state.json");
 export const FINDINGS_FILE = join(STATE_DIR, "findings.jsonl");
 const CONNECTION = join(SHARE, "run", "subc-connection.json");
@@ -195,15 +198,43 @@ export function detectTier2Overlong(sample: SentinelSample): Finding[] {
   return out;
 }
 
+function executorHealth(sample: SentinelSample): {
+  source: "dispatch_liveness" | "legacy" | "missing";
+  zombie: number;
+  inflight: number;
+  workersIdle: boolean;
+  queueAgeMs?: number;
+} {
+  const all = metrics(sample);
+  const dispatch = all.dispatch_liveness;
+  if (dispatch) {
+    return {
+      source: "dispatch_liveness",
+      zombie: Number(dispatch.executor_zombie_reader ?? dispatch.running?.phantom?.maintenance ?? 0),
+      inflight: Number(dispatch.maintenance_inflight ?? dispatch.running?.maintenance ?? 0),
+      workersIdle: Number(dispatch.running?.interactive ?? 0) === 0 && Number(dispatch.running?.maintenance ?? 0) === 0,
+      queueAgeMs: dispatch.maintenance?.oldest_age_ms ?? undefined,
+    };
+  }
+  const legacy = all.executor ?? all;
+  const inflight = legacy.maintenance_inflight ?? legacy.dispatch_path?.completion_channels?.maintenance;
+  const queueAgeMs = legacy.maintenance_queue_oldest_age_ms ?? legacy.maintenance_oldest_age_ms;
+  if (inflight !== undefined || queueAgeMs !== undefined) {
+    const runningMaintenance = Number(legacy.running_maintenance ?? legacy.maintenance_running ?? 0);
+    return { source: "legacy", zombie: Number(legacy.executor_zombie_reader ?? 0), inflight: Number(inflight ?? 0), workersIdle: runningMaintenance === 0, queueAgeMs: queueAgeMs === undefined ? undefined : Number(queueAgeMs) };
+  }
+  return { source: "missing", zombie: 0, inflight: 0, workersIdle: true };
+}
+
 export function detectExecutor(sample: SentinelSample, state: SentinelState): Finding[] {
-  const dispatch = metrics(sample).dispatch_liveness;
-  if (!dispatch) return [instrument("executor-health", "dispatch_liveness is absent")];
-  const zombie = Number(dispatch.executor_zombie_reader ?? 0);
-  const inflight = Number(dispatch.maintenance_inflight ?? dispatch.running?.maintenance ?? 0);
-  const workersIdle = Number(dispatch.running?.interactive ?? 0) === 0 && Number(dispatch.running?.maintenance ?? 0) === 0;
+  const executor = executorHealth(sample);
+  if (executor.source === "missing") {
+    return [instrument("executor-health", "metrics.dispatch_liveness waits on the sentinel health card; legacy fallback fields maintenance_inflight and maintenance_queue_oldest_age_ms are also absent")];
+  }
   const priorPhantom = state.previous?.sampled_at_ms && (state as any).previous?.phantom_inflight;
-  if (zombie > 0 || (inflight > 0 && workersIdle && priorPhantom)) {
-    return [finding("executor.phantom", "CRITICAL", "executor:maintenance", `executor health reports zombie_reader=${zombie}, maintenance_inflight=${inflight} while workers are idle`, "zombie readers are zero and maintenance in-flight agrees with active workers")];
+  if (executor.zombie > 0 || (executor.inflight > 0 && executor.workersIdle && priorPhantom)) {
+    const source = executor.source === "legacy" ? "legacy fallback maintenance_inflight/queue age" : "dispatch_liveness";
+    return [finding("executor.phantom", "CRITICAL", "executor:maintenance", `executor health (${source}) reports zombie_reader=${executor.zombie}, maintenance_inflight=${executor.inflight}, queue_age_ms=${executor.queueAgeMs ?? "unknown"} while workers are idle`, "zombie readers are zero and maintenance in-flight agrees with active workers")];
   }
   return [];
 }
@@ -251,6 +282,25 @@ export function detectStorage(sample: SentinelSample, state: SentinelState): Fin
   return out;
 }
 
+export function writeGrowthAttribution(sample: SentinelSample, state: SentinelState, writeDelta: number): string {
+  if (writeDelta <= 0) return "";
+  const current = sample.disk?.artifact_sizes ?? {};
+  const previous = state.previous?.artifact_sizes ?? {};
+  const growers = Object.entries(current)
+    .map(([subject, size]) => ({ subject, bytes: Math.max(0, size - (previous[subject] ?? size)) }))
+    .filter((entry) => entry.bytes > 0)
+    .sort((left, right) => right.bytes - left.bytes || left.subject.localeCompare(right.subject))
+    .slice(0, 3);
+  const explained = growers.reduce((sum, entry) => sum + entry.bytes, 0);
+  const lines = growers.map((entry, index) => {
+    const share = Math.min(100, entry.bytes / writeDelta * 100);
+    const root = sample.disk?.artifact_roots?.[entry.subject] ?? "unmapped";
+    return `${index + 1}. ${(entry.bytes / GB).toFixed(2)} GiB ${entry.subject} (${root}) grew; ${share.toFixed(0)}% of write delta`;
+  });
+  if (explained < writeDelta / 2) lines.push("remainder: in-place rewrites (WAL churn)");
+  return lines.length > 0 ? `\n${lines.join("\n")}` : "\nremainder: in-place rewrites (WAL churn)";
+}
+
 export function detectProcess(sample: SentinelSample, state: SentinelState): Finding[] {
   if (sample.process_error) return [instrument("process", sample.process_error)];
   const out: Finding[] = [];
@@ -260,9 +310,13 @@ export function detectProcess(sample: SentinelSample, state: SentinelState): Fin
   const previous = state.previous;
   if (typeof proc.bytes_written === "number" && typeof previous?.bytes_written === "number" && previous.sampled_at_ms) {
     const hours = Math.max(1 / 3600, (sample.now_ms - previous.sampled_at_ms) / 3_600_000);
-    const rate = (proc.bytes_written - previous.bytes_written) / hours;
-    if (rate > GB) out.push(finding("process.writes", "WARNING", `process:${proc.pid ?? "aft"}:writes`, `AFT physical write rate is ${(rate / GB).toFixed(1)} GiB/h`, "physical write rate is at most 1 GiB/h"));
-  } else if (proc.bytes_written === undefined) out.push(instrument("process-writes", "proc_pid_rusage bytes_written is unavailable"));
+    const writeDelta = proc.bytes_written - previous.bytes_written;
+    const rate = writeDelta / hours;
+    if (rate > GB) {
+      const attribution = writeGrowthAttribution(sample, state, writeDelta);
+      out.push(finding("process.writes", "WARNING", `process:${proc.pid ?? "aft"}:writes`, `AFT physical write rate is ${(rate / GB).toFixed(1)} GiB/h${attribution}`, "physical write rate is at most 1 GiB/h"));
+    }
+  } else if (proc.bytes_written === undefined) out.push(instrument("process-writes", "health metrics.process_io has no available bytes-written counter"));
   return out;
 }
 
@@ -355,6 +409,36 @@ function sizeOf(path: string): number {
   if (stat.isFile()) return stat.size;
   return readdirSync(path).reduce((sum, name) => sum + sizeOf(join(path, name)), 0);
 }
+function artifactCensus(storage: string): { sizes: Record<string, number>; roots: Record<string, string> } {
+  const sizes: Record<string, number> = {};
+  for (const plane of ["callgraph", "inspect", "semantic", "views"]) {
+    const planePath = join(storage, plane);
+    if (!existsSync(planePath)) continue;
+    for (const key of readdirSync(planePath)) {
+      const keyPath = join(planePath, key);
+      if (!statSync(keyPath).isDirectory()) continue;
+      sizes[`${plane}/${key}`] = sizeOf(keyPath);
+    }
+  }
+  sizes["aft.db"] = sizeOf(join(storage, "aft.db")) + sizeOf(join(storage, "aft.db-wal"));
+
+  const roots: Record<string, string> = { "aft.db": "unmapped" };
+  const newest = new Map<string, { root: string; recordedAt: number }>();
+  const memo = readJson(join(storage, "cache-keys.json")) as Record<string, { key?: string; recorded_at_ms?: number }>;
+  for (const [root, record] of Object.entries(memo)) {
+    if (!record.key) continue;
+    const recordedAt = Number(record.recorded_at_ms ?? 0);
+    if (!newest.has(record.key) || recordedAt > newest.get(record.key)!.recordedAt) {
+      newest.set(record.key, { root, recordedAt });
+    }
+  }
+  for (const subject of Object.keys(sizes)) {
+    const key = subject.split("/")[1];
+    if (key) roots[subject] = newest.get(key)?.root ?? "unmapped";
+  }
+  return { sizes, roots };
+}
+
 function diskFree(path: string): number {
   const result = spawnSync("df", ["-Pk", path], { encoding: "utf8" });
   if (result.status !== 0) throw new Error(result.stderr.trim());
@@ -365,24 +449,23 @@ function uuidOf(path: string): string | undefined {
   const result = spawnSync("dwarfdump", ["--uuid", path], { encoding: "utf8", timeout: 10_000 });
   return result.status === 0 ? result.stdout.match(/UUID: ([0-9A-F-]+)/i)?.[1]?.replaceAll("-", "").toUpperCase() : undefined;
 }
-function procRusage(pid: number): { phys_footprint_bytes: number; bytes_written: number } {
-  if (process.platform !== "darwin") throw new Error("proc_pid_rusage sampling is implemented for macOS only");
-  const source = `
-import ctypes, json, sys
-class RusageInfoV4(ctypes.Structure):
-    _fields_ = [("uuid", ctypes.c_ubyte * 16)] + [(name, ctypes.c_uint64) for name in (
-      "user_time", "system_time", "pkg_idle_wkups", "interrupt_wkups", "pageins",
-      "wired_size", "resident_size", "phys_footprint", "proc_start_abstime", "proc_exit_abstime",
-      "child_user_time", "child_system_time", "child_pkg_idle_wkups", "child_interrupt_wkups",
-      "child_pageins", "child_elapsed_abstime", "diskio_bytesread", "diskio_byteswritten")]
-info = RusageInfoV4()
-result = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pid_rusage(int(sys.argv[1]), 4, ctypes.byref(info))
-if result != 0: raise OSError(ctypes.get_errno(), "proc_pid_rusage failed")
-print(json.dumps({"phys_footprint_bytes": info.phys_footprint, "bytes_written": info.diskio_byteswritten}))
-  `;
-  const result = spawnSync("python3", ["-c", source, String(pid)], { encoding: "utf8", timeout: 5_000 });
-  if (result.status !== 0) throw new Error((result.stderr || `python exit ${result.status}`).trim());
-  return JSON.parse(result.stdout);
+export function collectProcessMetrics(pid: number, sample: SentinelSample): NonNullable<SentinelSample["process"]> {
+  const ps = spawnSync("/bin/ps", ["-p", String(pid), "-o", "%cpu=,rss=,comm="], { encoding: "utf8", timeout: 5_000 });
+  if (ps.status !== 0) throw new Error((ps.stderr || `ps exit ${ps.status}`).trim());
+  const match = ps.stdout.trim().match(/^([\d.]+)\s+(\d+)\s+(.+)$/);
+  if (!match) throw new Error("ps output was not parseable");
+  const healthIo = healthBytesWritten(sample);
+  const bytesWritten = healthIo.bytes;
+  if (healthIo.available && bytesWritten === undefined) {
+    throw new Error("health metrics.process_io is available but has no bytes-written counter");
+  }
+  return {
+    pid,
+    cpu_percent: Number(match[1]),
+    phys_footprint_bytes: Number(metrics(sample).memory?.phys_footprint_bytes ?? Number(match[2]) * 1024),
+    bytes_written: bytesWritten,
+    image: match[3],
+  };
 }
 
 function collectDsym(pid: number, image?: string): SentinelSample["dsym"] {
@@ -425,21 +508,17 @@ function collectSample(state: SentinelState): { sample: SentinelSample; cursors:
   try {
     const pid = sample.supervisor?.pid;
     if (!pid) throw new Error("AFT pid unavailable");
-    const ps = spawnSync("ps", ["-p", String(pid), "-o", "%cpu=,rss=,comm="], { encoding: "utf8" });
-    if (ps.status !== 0) throw new Error(ps.stderr.trim());
-    const match = ps.stdout.trim().match(/^([\d.]+)\s+(\d+)\s+(.+)$/);
-    if (!match) throw new Error("ps output was not parseable");
-    const healthIo = healthBytesWritten(sample);
-    const rusage = healthIo.available ? undefined : procRusage(pid);
-    const bytesWritten = healthIo.bytes ?? rusage?.bytes_written;
-    if (healthIo.available && bytesWritten === undefined) {
-      throw new Error("health metrics.process_io is available but has no bytes-written counter");
-    }
-    sample.process = { pid, cpu_percent: Number(match[1]), phys_footprint_bytes: rusage?.phys_footprint_bytes || Number(metrics(sample).memory?.phys_footprint_bytes ?? Number(match[2]) * 1024), bytes_written: bytesWritten, image: match[3] };
+    sample.process = collectProcessMetrics(pid, sample);
   } catch (error) { sample.process_error = String(error); }
   sample.memory_census = { roots: Object.fromEntries(roots(sample).map((root) => [root.project_root ?? "unknown", root])) };
   try {
-    sample.disk = { free_bytes: diskFree(AFT), sizes: Object.fromEntries(["aft.db", "logs", "inspect", "callgraph", "blobs", "views"].map((name) => [name, sizeOf(join(AFT, name))])) };
+    const artifacts = artifactCensus(AFT);
+    sample.disk = {
+      free_bytes: diskFree(AFT),
+      sizes: Object.fromEntries(["aft.db", "logs", "inspect", "callgraph", "blobs", "views"].map((name) => [name, sizeOf(join(AFT, name))])),
+      artifact_sizes: artifacts.sizes,
+      artifact_roots: artifacts.roots,
+    };
   } catch (error) { sample.disk_error = String(error); }
   try { sample.dsym = collectDsym(sample.supervisor?.pid ?? 0, sample.process?.image); } catch (error) { sample.dsym = { error: String(error) }; }
   return { sample, cursors };
@@ -504,9 +583,9 @@ function notify(title: string, body: string): void {
 }
 function nextPrevious(sample: SentinelSample, state: SentinelState): SentinelState["previous"] {
   const watcher = Object.fromEntries(roots(sample).map((root) => [root.project_root ?? "unknown", [Number(root.watcher?.rescans_kernel_dropped_total ?? 0), Number(root.watcher?.rescans_user_dropped_total ?? 0)] as [number, number]]));
-  const dispatch = metrics(sample).dispatch_liveness;
+  const executor = executorHealth(sample);
   const previous = state.previous;
-  return { pid: sample.supervisor?.pid, unreachable_runs: sample.health_error ? (previous?.unreachable_runs ?? 0) + 1 : 0, sampled_at_ms: sample.now_ms, bytes_written: sample.process?.bytes_written, sizes: sample.disk?.sizes, watcher, ...(dispatch?.maintenance_inflight > 0 && dispatch?.running?.maintenance === 0 ? { phantom_inflight: true } : {}) } as SentinelState["previous"];
+  return { pid: sample.supervisor?.pid, unreachable_runs: sample.health_error ? (previous?.unreachable_runs ?? 0) + 1 : 0, sampled_at_ms: sample.now_ms, bytes_written: sample.process?.bytes_written, sizes: sample.disk?.sizes, artifact_sizes: sample.disk?.artifact_sizes, watcher, ...(executor.inflight > 0 && executor.workersIdle ? { phantom_inflight: true } : {}) } as SentinelState["previous"];
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {

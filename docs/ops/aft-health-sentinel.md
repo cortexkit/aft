@@ -2,7 +2,7 @@
 
 `bun scripts/sentinel/aft-health-sentinel.ts --once` is a short-lived external observer for the AFT daemon. Launchd runs it every 120 seconds; it does not keep a probe process or polling loop alive. `--once --dry-run` prints the complete sample and every detector finding without changing state or delivering alerts.
 
-State is stored in `~/.local/state/cortexkit/aft/sentinel/state.json`. Raised and cleared transitions are appended to `findings.jsonl`; this file's mtime is the integration arm used by ALF. A fingerprint identifies the subject, not its current age or count. A still-present CRITICAL finding re-alerts after 30 minutes and a WARNING after two hours. Missing fingerprints are removed from state, logged as cleared, and alert immediately if they recur.
+State is stored in `$AFT_SENTINEL_STATE_DIR/state.json`; launchd sets this to `~/.local/state/cortexkit/aft/sentinel`. Manual runs default to the disjoint `sentinel-dev` directory, and tests create a temporary directory, so development cannot consume or reset the live cooldown ledger. Raised and cleared transitions are appended to `findings.jsonl`; this file's mtime is the integration arm used by ALF. A fingerprint identifies the subject, not its current age or count. A still-present CRITICAL finding re-alerts after 30 minutes and a WARNING after two hours. Missing fingerprints are removed from state, logged as cleared, and alert immediately if they recur.
 
 The collector reads `ck module status aft --json`, which exposes the same ManagementSurface `health.check` report as `subc-probe --health-probe aft`. It also reads only new bytes from the current `aft-<pid>.log` and OpenCode plugin log, accounting for rotation; process and filesystem counters; storage sizes; and the running image's LC_UUID and dSYM. Every unreadable input raises `instrument:<name>` rather than silently disabling a detector. A serving daemon with zero new pid-log lines raises `instrument:log-silent`.
 
@@ -25,7 +25,7 @@ The collector reads `ck module status aft --json`, which exposes the same Manage
 | `storage.growth` | WARNING when `aft.db`, `inspect`, `callgraph`, `blobs`, `views`, or `logs` grows over 5 GiB in one interval | the next interval grows by at most 5 GiB |
 | `process.footprint` | WARNING above 6 GiB physical footprint | footprint is at most 6 GiB |
 | `process.cpu` | WARNING above 150% CPU averaged over the interval | interval CPU is at most 150% |
-| `process.writes` | WARNING above 1 GiB/hour physical writes | write rate is at most 1 GiB/hour |
+| `process.writes` | WARNING above 1 GiB/hour writes; includes the three largest growing cache-key artifacts, their mapped roots and share of the write delta, and calls out likely in-place/WAL churn when growth explains under half | write rate is at most 1 GiB/hour |
 | `search.degraded` | WARNING per root when more than 20% of at least five search calls disclose `fully_degraded` or `index: building` | degraded share is at most 20% |
 | `tool.slow` | WARNING per root when more than 10 tool calls exceed 10 seconds | at most 10 calls exceed 10 seconds |
 | `routes.dead_sessions` | WARNING when memory census reports bound routes on a root idle beyond its configured root TTL | routes close or root activity is newer than the TTL |
