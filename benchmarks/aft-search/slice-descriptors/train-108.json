@@ -1,0 +1,17 @@
+{
+  "slice_class": "ranking",
+  "targeted_mechanism": "wrong_lane_nl",
+  "kind": "ranking",
+  "fixtures": [
+    "crates/aft/tests/engine_exact_test.rs",
+    "crates/aft/tests/search_b2_router.rs",
+    "crates/aft/tests/search_b2_variants.rs"
+  ],
+  "slices": [
+    "exact-corpus-eligibility",
+    "matching-line-rendering",
+    "identifier-fact-lane-join",
+    "definition-first-identifiers",
+    "numeric-literal-variants"
+  ]
+}
