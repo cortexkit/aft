@@ -527,6 +527,7 @@ mod tests {
             ".venv",
             "venv",
             "__pycache__",
+            "coverage",
             ".turbo",
         ] {
             std::fs::create_dir(root.join(directory)).unwrap();
