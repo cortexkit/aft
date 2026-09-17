@@ -105,6 +105,14 @@ fn snake_identifier_emits_kebab_and_camel_within_the_budget() {
 }
 
 #[test]
+fn numeric_literal_emits_rust_digit_separators_without_displacing_other_variants() {
+    let variants = generated_text("83329");
+    assert!(variants.iter().any(|variant| variant == "83_329"));
+    assert!(variants.iter().any(|variant| variant == "83329S"));
+    assert!(variants.len() <= MAX_QUERY_VARIANTS);
+}
+
+#[test]
 fn direct_number_rule_asserts_key_to_keys() {
     assert_eq!(generated_text("key"), ["Key", "KEY", "keys"]);
     assert_eq!(generated_text("day"), ["Day", "DAY", "days"]);

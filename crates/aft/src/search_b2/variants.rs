@@ -73,6 +73,10 @@ fn variants_for_token(token: &str) -> Vec<String> {
     variants.push(convert_case(&words, leading_hash, CaseForm::Pascal));
     variants.push(convert_case(&words, leading_hash, CaseForm::ScreamingSnake));
 
+    if let Some(numeric) = digit_separator_variant(token) {
+        variants.push(numeric);
+    }
+
     let last = words.last().expect("non-empty words have a last word");
     let toggled = toggle_number(last.text);
     variants.push(format!(
@@ -220,6 +224,22 @@ const SINGULAR_EXCEPTIONS: [(&str, &str); 12] = [
     ("focus", "focuses"),
     ("lens", "lenses"),
 ];
+
+fn digit_separator_variant(token: &str) -> Option<String> {
+    if token.len() < 4 || !token.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let first_group = match token.len() % 3 {
+        0 => 3,
+        remainder => remainder,
+    };
+    let mut separated = token[..first_group].to_string();
+    for chunk in token[first_group..].as_bytes().chunks(3) {
+        separated.push('_');
+        separated.push_str(std::str::from_utf8(chunk).expect("ASCII digits are valid UTF-8"));
+    }
+    Some(separated)
+}
 
 fn toggle_number(word: &str) -> String {
     let lowercase = word.to_ascii_lowercase();
