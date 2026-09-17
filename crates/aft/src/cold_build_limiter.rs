@@ -1,7 +1,7 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(not(test))]
 const DEFAULT_COLD_BUILD_LIMIT: usize = 2;
@@ -117,13 +117,29 @@ pub(crate) struct ColdBuildAdmissionEvent {
     pub(crate) admission_order: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ColdBuildCensusEntry {
+    pub(crate) domain: &'static str,
+    pub(crate) root: String,
+    pub(crate) kind: String,
+    pub(crate) acquired_at_ms: u64,
+    pub(crate) age_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ColdBuildLimiterCensus {
+    pub(crate) cap: usize,
+    pub(crate) holders: Vec<ColdBuildCensusEntry>,
+    pub(crate) queued: Vec<ColdBuildCensusEntry>,
+}
+
 /// Attempt immediate admission without bypassing queued requests from the other
 /// class. Background schedulers use this when they can defer rejected work.
 pub(crate) fn try_acquire_classified_with_limiter(
     limiter: &Arc<ColdBuildLimiter>,
     request: &ColdBuildAdmissionRequest,
 ) -> Option<ColdBuildPermit> {
-    limiter.try_acquire_classified(request, || true)
+    limiter.try_acquire_classified(request, &request.request_id, || true)
 }
 
 /// Acquire a limiter permit for a classified request while it remains admitted
@@ -180,7 +196,7 @@ fn acquire_blocking_while_inner(
     admitted: impl Fn() -> bool,
     cancelled: impl Fn() -> bool,
 ) -> Option<ColdBuildPermit> {
-    let _waiter = request.map(|request| AdmissionWaiter::register(limiter, request.class));
+    let _waiter = request.map(|request| AdmissionWaiter::register(limiter, request, kind));
     let started = Instant::now();
     let mut logged = false;
     loop {
@@ -197,7 +213,7 @@ fn acquire_blocking_while_inner(
         }
         let revoked_after_acquire = std::cell::Cell::new(false);
         let permit = match request {
-            Some(request) => limiter.try_acquire_classified(request, || {
+            Some(request) => limiter.try_acquire_classified(request, kind, || {
                 let still_admitted = admitted()
                     && !cancelled()
                     && (request.class != ColdBuildAdmissionClass::Standing
@@ -301,7 +317,34 @@ pub(crate) struct ColdBuildLimiter {
 struct AdmissionState {
     last_admitted_class: Option<ColdBuildAdmissionClass>,
     next_admission_order: u64,
+    next_census_id: u64,
     events: VecDeque<ColdBuildAdmissionEvent>,
+    holders: BTreeMap<u64, CensusRecord>,
+    queued: BTreeMap<u64, CensusRecord>,
+}
+
+#[derive(Clone, Debug)]
+struct CensusRecord {
+    domain: &'static str,
+    root: String,
+    kind: String,
+    started_at_ms: u64,
+}
+
+fn unix_millis_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn request_root(request_id: &str) -> String {
+    request_id
+        .strip_prefix("inspect:")
+        .and_then(|value| value.rsplit_once(':').map(|(root, _)| root))
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 impl ColdBuildLimiter {
@@ -314,7 +357,10 @@ impl ColdBuildLimiter {
             admission_state: Mutex::new(AdmissionState {
                 last_admitted_class: None,
                 next_admission_order: 1,
+                next_census_id: 1,
                 events: VecDeque::with_capacity(ADMISSION_EVENT_RETENTION),
+                holders: BTreeMap::new(),
+                queued: BTreeMap::new(),
             }),
         }
     }
@@ -323,11 +369,11 @@ impl ColdBuildLimiter {
         self.limit
     }
 
-    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<ColdBuildPermit> {
+    fn try_take_slot(&self) -> bool {
         loop {
             let available = self.available.load(Ordering::Acquire);
             if available == 0 {
-                return None;
+                return false;
             }
             if self
                 .available
@@ -339,16 +385,40 @@ impl ColdBuildLimiter {
                 )
                 .is_ok()
             {
-                return Some(ColdBuildPermit {
-                    limiter: Arc::clone(self),
-                });
+                return true;
             }
         }
+    }
+
+    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<ColdBuildPermit> {
+        if !self.try_take_slot() {
+            return None;
+        }
+        let mut state = self
+            .admission_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let census_id = state.next_census_id;
+        state.next_census_id = state.next_census_id.saturating_add(1);
+        state.holders.insert(
+            census_id,
+            CensusRecord {
+                domain: "unclassified",
+                root: "unknown".to_string(),
+                kind: "unclassified".to_string(),
+                started_at_ms: unix_millis_now(),
+            },
+        );
+        Some(ColdBuildPermit {
+            limiter: Arc::clone(self),
+            census_id,
+        })
     }
 
     fn try_acquire_classified(
         self: &Arc<Self>,
         request: &ColdBuildAdmissionRequest,
+        kind: &str,
         admitted_after_acquire: impl FnOnce() -> bool,
     ) -> Option<ColdBuildPermit> {
         let mut state = self
@@ -365,13 +435,29 @@ impl ColdBuildLimiter {
         {
             return None;
         }
-        let permit = self.try_acquire()?;
+        if !self.try_take_slot() {
+            return None;
+        }
         if !admitted_after_acquire() {
-            drop(permit);
+            self.available.fetch_add(1, Ordering::Release);
             return None;
         }
         Self::record_admission_locked(&mut state, request);
-        Some(permit)
+        let census_id = state.next_census_id;
+        state.next_census_id = state.next_census_id.saturating_add(1);
+        state.holders.insert(
+            census_id,
+            CensusRecord {
+                domain: request.class.label(),
+                root: request_root(&request.request_id),
+                kind: kind.to_string(),
+                started_at_ms: unix_millis_now(),
+            },
+        );
+        Some(ColdBuildPermit {
+            limiter: Arc::clone(self),
+            census_id,
+        })
     }
 
     fn record_admission_locked(state: &mut AdmissionState, request: &ColdBuildAdmissionRequest) {
@@ -404,6 +490,26 @@ impl ColdBuildLimiter {
     /// O(1) waiter-set inspection used by Standing before its initial permit
     /// and every checkpoint reacquisition. The counters are maintained by RAII
     /// waiters and therefore need no scheduler-state lock on this hot path.
+    pub(crate) fn census(&self) -> ColdBuildLimiterCensus {
+        let now_ms = unix_millis_now();
+        let state = self
+            .admission_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let render = |entry: &CensusRecord| ColdBuildCensusEntry {
+            domain: entry.domain,
+            root: entry.root.clone(),
+            kind: entry.kind.clone(),
+            acquired_at_ms: entry.started_at_ms,
+            age_ms: now_ms.saturating_sub(entry.started_at_ms),
+        };
+        ColdBuildLimiterCensus {
+            cap: self.limit,
+            holders: state.holders.values().map(render).collect(),
+            queued: state.queued.values().map(render).collect(),
+        }
+    }
+
     pub(crate) fn has_non_standing_waiters(&self) -> bool {
         self.waiting_by_class[ColdBuildAdmissionClass::InspectTriggered.index()]
             .load(Ordering::Acquire)
@@ -429,14 +535,36 @@ impl ColdBuildLimiter {
 struct AdmissionWaiter {
     limiter: Arc<ColdBuildLimiter>,
     class: ColdBuildAdmissionClass,
+    census_id: u64,
 }
 
 impl AdmissionWaiter {
-    fn register(limiter: &Arc<ColdBuildLimiter>, class: ColdBuildAdmissionClass) -> Self {
-        limiter.waiting_by_class[class.index()].fetch_add(1, Ordering::AcqRel);
+    fn register(
+        limiter: &Arc<ColdBuildLimiter>,
+        request: &ColdBuildAdmissionRequest,
+        kind: &str,
+    ) -> Self {
+        limiter.waiting_by_class[request.class.index()].fetch_add(1, Ordering::AcqRel);
+        let mut state = limiter
+            .admission_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let census_id = state.next_census_id;
+        state.next_census_id = state.next_census_id.saturating_add(1);
+        state.queued.insert(
+            census_id,
+            CensusRecord {
+                domain: request.class.label(),
+                root: request_root(&request.request_id),
+                kind: kind.to_string(),
+                started_at_ms: unix_millis_now(),
+            },
+        );
+        drop(state);
         Self {
             limiter: Arc::clone(limiter),
-            class,
+            class: request.class,
+            census_id,
         }
     }
 }
@@ -446,16 +574,29 @@ impl Drop for AdmissionWaiter {
         let previous =
             self.limiter.waiting_by_class[self.class.index()].fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0);
+        self.limiter
+            .admission_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .queued
+            .remove(&self.census_id);
     }
 }
 
 #[derive(Debug)]
 pub struct ColdBuildPermit {
     limiter: Arc<ColdBuildLimiter>,
+    census_id: u64,
 }
 
 impl Drop for ColdBuildPermit {
     fn drop(&mut self) {
+        self.limiter
+            .admission_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .holders
+            .remove(&self.census_id);
         let previous = self.limiter.available.fetch_add(1, Ordering::Release);
         debug_assert!(previous < self.limiter.limit);
     }
@@ -600,8 +741,12 @@ mod tests {
     #[test]
     fn standing_yields_before_initial_and_checkpoint_reacquisition_when_non_standing_waits() {
         let limiter = test_limiter(1);
+        let maintenance = ColdBuildAdmissionRequest::new(
+            "maintenance-waiter",
+            ColdBuildAdmissionClass::Maintenance,
+        );
         let non_standing_waiter =
-            AdmissionWaiter::register(&limiter, ColdBuildAdmissionClass::Maintenance);
+            AdmissionWaiter::register(&limiter, &maintenance, "maintenance waiter");
 
         assert!(acquire_standing_while_cancellable_with_limiter(
             &limiter,
@@ -626,8 +771,11 @@ mod tests {
         assert_eq!(first.admission_epoch, 41);
         drop(first);
 
-        let non_standing_waiter =
-            AdmissionWaiter::register(&limiter, ColdBuildAdmissionClass::InspectTriggered);
+        let inspect = ColdBuildAdmissionRequest::new(
+            "inspect-waiter",
+            ColdBuildAdmissionClass::InspectTriggered,
+        );
+        let non_standing_waiter = AdmissionWaiter::register(&limiter, &inspect, "inspect waiter");
         assert!(acquire_standing_while_cancellable_with_limiter(
             &limiter,
             "standing-reacquire",
@@ -788,5 +936,42 @@ mod tests {
             1,
             "releasing the consumed build permit must restore the limiter slot"
         );
+    }
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::*;
+
+    #[test]
+    fn census_names_holders_and_queued_requests_without_holding_work_locks() {
+        let limiter = isolated_limiter(1);
+        let permit =
+            acquire_blocking_while_with_limiter(&limiter, "inspect:/tmp/project:1", || true)
+                .expect("first permit");
+        let holder = limiter.census().holders.pop().expect("holder census");
+        assert_eq!(holder.domain, "maintenance");
+        assert_eq!(holder.root, "/tmp/project");
+        assert!(holder.kind.contains("inspect:/tmp/project:1"));
+
+        let waiter_limiter = Arc::clone(&limiter);
+        let waiter = std::thread::spawn(move || {
+            acquire_blocking_while_with_limiter(&waiter_limiter, "inspect:/tmp/queued:2", || true)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while limiter.census().queued.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let queued = limiter.census().queued.pop().expect("queued census");
+        assert_eq!(queued.root, "/tmp/queued");
+        drop(permit);
+        drop(
+            waiter
+                .join()
+                .expect("waiter thread")
+                .expect("queued permit"),
+        );
+        assert!(limiter.census().holders.is_empty());
+        assert!(limiter.census().queued.is_empty());
     }
 }

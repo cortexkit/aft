@@ -826,6 +826,14 @@ impl HealthDiagnosticRollup {
     }
 }
 
+#[derive(Clone)]
+struct PlaneTiming {
+    status: String,
+    since_ms: u64,
+    last_progress_at_ms: u64,
+    progress_signature: String,
+}
+
 pub(super) struct HealthRollupCache {
     origin: Instant,
     generated_at_ms: AtomicU64,
@@ -836,6 +844,7 @@ pub(super) struct HealthRollupCache {
     snapshot: std::sync::RwLock<Arc<HealthDiagnosticRollup>>,
     breakers:
         std::sync::Mutex<HashMap<std::path::PathBuf, Arc<crate::build_breaker::BuildDeathBreaker>>>,
+    plane_timings: std::sync::Mutex<HashMap<(String, &'static str), PlaneTiming>>,
 }
 
 impl HealthRollupCache {
@@ -846,6 +855,7 @@ impl HealthRollupCache {
             refreshes: AtomicU64::new(0),
             snapshot: std::sync::RwLock::new(Arc::new(HealthDiagnosticRollup::unavailable())),
             breakers: std::sync::Mutex::new(HashMap::new()),
+            plane_timings: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -927,6 +937,54 @@ impl HealthRollupCache {
     }
 
     #[cfg(test)]
+    fn annotate_plane_timings(&self, root: &str, value: &mut Value) {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let Some(object) = value.as_object_mut() else {
+            return;
+        };
+        let mut timings = self
+            .plane_timings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for plane in ["search_index", "semantic_index", "tier2"] {
+            let Some(component) = object.get_mut(plane).and_then(Value::as_object_mut) else {
+                timings.remove(&(root.to_string(), plane));
+                continue;
+            };
+            let status = component
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let progress_signature = serde_json::to_string(component).unwrap_or_default();
+            let key = (root.to_string(), plane);
+            let timing = timings.entry(key).or_insert_with(|| PlaneTiming {
+                status: status.clone(),
+                since_ms: now_ms,
+                last_progress_at_ms: now_ms,
+                progress_signature: progress_signature.clone(),
+            });
+            if timing.status != status {
+                timing.status = status;
+                timing.since_ms = now_ms;
+                timing.last_progress_at_ms = now_ms;
+                timing.progress_signature = progress_signature;
+            } else if timing.progress_signature != progress_signature {
+                timing.last_progress_at_ms = now_ms;
+                timing.progress_signature = progress_signature;
+            }
+            component.insert("since_ms".to_string(), json!(timing.since_ms));
+            component.insert(
+                "last_progress_at_ms".to_string(),
+                json!(timing.last_progress_at_ms),
+            );
+        }
+    }
+
     pub(super) fn refresh_count_for_test(&self) -> u64 {
         self.refreshes.load(Ordering::Acquire)
     }
@@ -1248,6 +1306,7 @@ fn build_health_diagnostic_rollup(
             snapshot.callgraph_repair_entries_60s = candidate.repair_entries_60s;
             let root_label = snapshot.project_root.clone();
             let mut value = standing_root_health_value(snapshot, candidate.standing.as_ref());
+            cache.annotate_plane_timings(&root_label, &mut value);
             if let Some(object) = value.as_object_mut() {
                 if let Some(census) = candidate.resident_callgraph_stale_backend_rows {
                     object.insert(
@@ -1379,6 +1438,24 @@ pub(super) fn build_health_report(
         json!(backup_skipped_temp_path_total),
     );
     metrics.insert("reap".to_string(), dispatch_path_metrics.reap_snapshot());
+    let limiter = crate::cold_build_limiter::global_limiter().census();
+    let render_limiter_entry = |entry: crate::cold_build_limiter::ColdBuildCensusEntry| {
+        json!({
+            "domain": entry.domain,
+            "root": entry.root,
+            "kind": entry.kind,
+            "acquired_at_ms": entry.acquired_at_ms,
+            "age_ms": entry.age_ms,
+        })
+    };
+    metrics.insert(
+        "cold_build_limiter".to_string(),
+        json!({
+            "cap": limiter.cap,
+            "holders": limiter.holders.into_iter().map(&render_limiter_entry).collect::<Vec<_>>(),
+            "queued": limiter.queued.into_iter().map(render_limiter_entry).collect::<Vec<_>>(),
+        }),
+    );
     metrics.insert(
         "dispatch_liveness".to_string(),
         dispatch_liveness_metrics(executor),
@@ -1819,6 +1896,12 @@ mod tests {
             Some(0)
         );
         assert_eq!(cold_runtime["bg_arm_misses_60s_total"].as_u64(), Some(0));
+        assert_eq!(
+            cold_metrics["cold_build_limiter"]["cap"].as_u64(),
+            Some(crate::cold_build_limiter::limit() as u64)
+        );
+        assert!(cold_metrics["cold_build_limiter"]["holders"].is_array());
+        assert!(cold_metrics["cold_build_limiter"]["queued"].is_array());
 
         metrics.record_bg_runtime(2, 1, 3);
         metrics.record_bg_wake_rearm();
@@ -2916,5 +2999,62 @@ fn unhosted_standing_health_snapshot(entry: &StandingHealthEntry) -> RootHealthS
         tier2: None,
         bash: None,
         suspended_domains: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod plane_timing_tests {
+    use super::*;
+
+    #[test]
+    fn plane_timing_tracks_build_entry_and_progress_changes() {
+        let cache = HealthRollupCache::new();
+        let mut first = json!({
+            "search_index": { "status": "building" },
+            "semantic_index": { "status": "building", "stage": "embedding", "embedded_chunks": 1 },
+            "tier2": { "status": "ready" },
+        });
+        cache.annotate_plane_timings("/tmp/root", &mut first);
+        let search_since = first["search_index"]["since_ms"]
+            .as_u64()
+            .expect("search since");
+        let semantic_progress = first["semantic_index"]["last_progress_at_ms"]
+            .as_u64()
+            .expect("semantic progress");
+
+        let mut unchanged = json!({
+            "search_index": { "status": "building" },
+            "semantic_index": { "status": "building", "stage": "embedding", "embedded_chunks": 1 },
+            "tier2": { "status": "ready" },
+        });
+        cache.annotate_plane_timings("/tmp/root", &mut unchanged);
+        assert_eq!(
+            unchanged["search_index"]["since_ms"].as_u64(),
+            Some(search_since)
+        );
+        assert_eq!(
+            unchanged["semantic_index"]["last_progress_at_ms"].as_u64(),
+            Some(semantic_progress)
+        );
+
+        std::thread::sleep(Duration::from_millis(2));
+        let mut progressed = json!({
+            "search_index": { "status": "ready" },
+            "semantic_index": { "status": "building", "stage": "embedding", "embedded_chunks": 2 },
+            "tier2": { "status": "ready" },
+        });
+        cache.annotate_plane_timings("/tmp/root", &mut progressed);
+        assert!(
+            progressed["search_index"]["since_ms"]
+                .as_u64()
+                .expect("ready since")
+                >= search_since
+        );
+        assert!(
+            progressed["semantic_index"]["last_progress_at_ms"]
+                .as_u64()
+                .expect("new progress")
+                > semantic_progress
+        );
     }
 }
