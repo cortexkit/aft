@@ -3,7 +3,7 @@ use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 const FIRE_COUNT: u64 = 3;
 const ESCALATE_COUNT: u64 = 6;
@@ -171,12 +171,55 @@ pub fn output_hash(rendered_text: &str) -> u64 {
     hash_value(&rendered_text)
 }
 
-pub fn semantic_key(_tool: &str, input: &Value) -> String {
-    let mut semantic_input = input.clone();
-    if let Some(object) = semantic_input.as_object_mut() {
-        object.remove("description");
+pub fn semantic_key(tool: &str, input: &Value) -> String {
+    let selected = match tool {
+        "bash" | "powershell" => select_fields(input, &["command", "workdir"]),
+        "read" => select_fields(
+            input,
+            &[
+                "path",
+                "filePath",
+                "startLine",
+                "endLine",
+                "offset",
+                "limit",
+            ],
+        ),
+        "grep" => select_fields(
+            input,
+            &[
+                "pattern",
+                "path",
+                "include",
+                "topK",
+                "offset",
+                "includeTests",
+            ],
+        ),
+        "glob" => select_fields(input, &["pattern", "path", "topK", "offset"]),
+        "aft_search" => select_fields(input, &["query", "path", "topK", "offset", "includeTests"]),
+        _ => {
+            let mut value = input.clone();
+            if let Some(object) = value.as_object_mut() {
+                object.remove("description");
+            }
+            value
+        }
+    };
+
+    serde_json::to_string(&canonicalize(selected)).unwrap_or_default()
+}
+
+fn select_fields(input: &Value, fields: &[&str]) -> Value {
+    let mut selected = Map::new();
+    if let Some(input) = input.as_object() {
+        for field in fields {
+            if let Some(value) = input.get(*field) {
+                selected.insert((*field).to_string(), value.clone());
+            }
+        }
     }
-    serde_json::to_string(&canonicalize(semantic_input)).unwrap_or_default()
+    Value::Object(selected)
 }
 
 fn canonicalize(value: Value) -> Value {

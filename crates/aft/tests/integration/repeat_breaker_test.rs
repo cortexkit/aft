@@ -228,19 +228,26 @@ fn repeat_breaker_does_not_group_sequential_reads_of_different_files() {
 }
 
 #[test]
-fn repeat_breaker_treats_different_execution_arguments_as_different_keys() {
+fn repeat_breaker_groups_execution_knob_changes_under_one_semantic_key() {
     let breaker = RepeatBreaker::default();
     let start = Instant::now();
+    let mut third = None;
 
     for (index, timeout) in [1_000, 2_000, 3_000].into_iter().enumerate() {
-        assert!(observe(
+        third = observe(
             &breaker,
             &json!({ "command": "ci status", "timeout": timeout }),
             STABLE_OUTPUT,
             start + Duration::from_secs(index as u64 * 16),
-        )
-        .is_none());
+        );
+        if index < 2 {
+            assert!(third.is_none());
+        }
     }
+
+    assert!(third
+        .expect("execution-knob changes must not split the bash command key")
+        .contains("This is the 3rd identical call"));
 }
 
 #[test]
