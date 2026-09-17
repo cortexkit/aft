@@ -17,6 +17,7 @@ import {
   detectTier2Overlong,
   detectWakes,
   detectWatcher,
+  healthBytesWritten,
   reconcile,
   type SentinelSample,
   type SentinelState,
@@ -107,6 +108,12 @@ describe("health sentinel pure detectors", () => {
     const raised = detectStorage(sample({ disk: { free_bytes: 30 * 1024 ** 3, sizes: { inspect: 6 * 1024 ** 3 + 2 } } }), state);
     expect(rules(raised)).toEqual(expect.arrayContaining(["disk.low", "storage.growth"]));
     expect(detectStorage(sample(), cleanState())).toEqual([]);
+  });
+
+  test("health process_io prefers physical writes and falls back to logical writes", () => {
+    expect(healthBytesWritten(sample({ health: { metrics: { process_io: { available: true, diskio_bytes_written: 42, logical_bytes_written: 99 } } } }))).toEqual({ available: true, bytes: 42 });
+    expect(healthBytesWritten(sample({ health: { metrics: { process_io: { available: true, logical_bytes_written: 99 } } } }))).toEqual({ available: true, bytes: 99 });
+    expect(healthBytesWritten(sample({ health: { metrics: { process_io: { available: false } } } }))).toEqual({ available: false });
   });
 
   test("process footprint, cpu, and write rate are independent", () => {

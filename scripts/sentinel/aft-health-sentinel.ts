@@ -65,6 +65,15 @@ function instrument(name: string, detail: string): Finding {
   return finding("instrument", "WARNING", `instrument:${name}`, `instrument ${name} unavailable: ${detail}`, "the input is readable again");
 }
 function metrics(sample: SentinelSample): Record<string, any> { return sample.health?.metrics ?? sample.health?.health?.metrics ?? {}; }
+export function healthBytesWritten(sample: SentinelSample): { available: boolean; bytes?: number } {
+  const processIo = metrics(sample).process_io;
+  if (!processIo || processIo.available === false) return { available: false };
+  const bytes = processIo.diskio_bytes_written ?? processIo.logical_bytes_written;
+  return typeof bytes === "number" && Number.isFinite(bytes)
+    ? { available: true, bytes }
+    : { available: true };
+}
+
 function roots(sample: SentinelSample): RootHealth[] { return Array.isArray(metrics(sample).roots) ? metrics(sample).roots : []; }
 function linesSince(lines: string[], now: number, windowMs: number): string[] {
   return lines.filter((line) => {
@@ -403,8 +412,13 @@ function collectSample(state: SentinelState): { sample: SentinelSample; cursors:
     if (ps.status !== 0) throw new Error(ps.stderr.trim());
     const match = ps.stdout.trim().match(/^([\d.]+)\s+(\d+)\s+(.+)$/);
     if (!match) throw new Error("ps output was not parseable");
-    const rusage = procRusage(pid);
-    sample.process = { pid, cpu_percent: Number(match[1]), phys_footprint_bytes: rusage.phys_footprint_bytes || Number(metrics(sample).memory?.phys_footprint_bytes ?? Number(match[2]) * 1024), bytes_written: rusage.bytes_written, image: match[3] };
+    const healthIo = healthBytesWritten(sample);
+    const rusage = healthIo.available ? undefined : procRusage(pid);
+    const bytesWritten = healthIo.bytes ?? rusage?.bytes_written;
+    if (healthIo.available && bytesWritten === undefined) {
+      throw new Error("health metrics.process_io is available but has no bytes-written counter");
+    }
+    sample.process = { pid, cpu_percent: Number(match[1]), phys_footprint_bytes: rusage?.phys_footprint_bytes || Number(metrics(sample).memory?.phys_footprint_bytes ?? Number(match[2]) * 1024), bytes_written: bytesWritten, image: match[3] };
   } catch (error) { sample.process_error = String(error); }
   sample.memory_census = { roots: Object.fromEntries(roots(sample).map((root) => [root.project_root ?? "unknown", root])) };
   try {
