@@ -547,6 +547,54 @@ fn exact_symbol_offsets_are_char_boundaries_on_crlf_multibyte_files() {
 }
 
 #[test]
+fn bare_identifiers_rank_declarations_before_repeated_consumers() {
+    let cases = [
+        (
+            "SessionStatus",
+            "export namespace SessionStatus { export type Value = string; }\n",
+            "// SessionStatus consumer SessionStatus consumer SessionStatus\n",
+        ),
+        (
+            "fn write_gather_log",
+            "fn write_gather_log() {}\n",
+            "// fn write_gather_log consumer fn write_gather_log consumer\n",
+        ),
+        (
+            "carry_required",
+            "struct TransformState {\n    carry_required: bool,\n}\n",
+            "// carry_required consumer carry_required consumer carry_required\n",
+        ),
+    ];
+
+    for (case_index, (query, definition, consumer)) in cases.into_iter().enumerate() {
+        let dir = create_temp_corpus();
+        let definition_path = dir.path().join(format!("src/definition_{case_index}.txt"));
+        let consumer_path = dir.path().join(format!("src/consumer_{case_index}.txt"));
+        fs::write(&definition_path, definition).expect("write definition fixture");
+        fs::write(&consumer_path, consumer.repeat(20)).expect("write consumer fixture");
+        let index = SearchIndex::build(dir.path());
+
+        let result = ExactLane::new().execute_ready_mode(
+            &index.snapshot(),
+            dir.path(),
+            query,
+            true,
+        );
+
+        assert_eq!(
+            result
+                .results
+                .first()
+                .and_then(|candidate| fs::canonicalize(&candidate.path).ok()),
+            fs::canonicalize(&definition_path).ok(),
+            "definition should lead repeated consumers for {query}: {:?}",
+            result.results
+        );
+        assert_eq!(result.results[0].evidence.kind, EvidenceKind::Definition);
+    }
+}
+
+#[test]
 fn nl_identifier_facts_join_exact_retrieval_without_rerouting_the_shape() {
     let cases = [
         (

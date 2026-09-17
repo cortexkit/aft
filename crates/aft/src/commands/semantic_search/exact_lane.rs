@@ -390,23 +390,22 @@ pub fn verify_exact_matches_in_text(
             continue;
         };
         let norm_sym_text = normalize_exact_phrase(sym_text);
-        if !norm_phrase.is_empty() && norm_sym_text.contains(norm_phrase) {
+        if !content_tokens.is_empty()
+            && content_tokens
+                .iter()
+                .any(|token| name.to_ascii_lowercase() == *token)
+        {
+            matches.push(CandidateResult::new_exact(
+                file_path.to_path_buf(),
+                Some(*range),
+                EvidenceDescriptor::for_definition(true, false),
+            ));
+        } else if !norm_phrase.is_empty() && norm_sym_text.contains(norm_phrase) {
             let occ = norm_sym_text.matches(norm_phrase).count();
             matches.push(CandidateResult::new_exact(
                 file_path.to_path_buf(),
                 Some(*range),
                 EvidenceDescriptor::for_e1(occ, true, false),
-            ));
-        } else if !content_tokens.is_empty()
-            && content_tokens
-                .iter()
-                .any(|t| name.to_ascii_lowercase() == *t)
-        {
-            // Symbol definition match for identifier / token
-            matches.push(CandidateResult::new_exact(
-                file_path.to_path_buf(),
-                Some(*range),
-                EvidenceDescriptor::for_definition(true, false),
             ));
         }
     }
@@ -482,6 +481,8 @@ pub fn scan_symbols_in_text(text: &str) -> Vec<(String, SymbolOffsetRange)> {
             extract_identifier(rest)
         } else if let Some(rest) = trimmed.strip_prefix("def ") {
             extract_identifier(rest)
+        } else if let Some(rest) = trimmed.strip_prefix("export function ") {
+            extract_identifier(rest)
         } else if let Some(rest) = trimmed.strip_prefix("function ") {
             extract_identifier(rest)
         } else if let Some(rest) = trimmed.strip_prefix("pub struct ") {
@@ -489,7 +490,28 @@ pub fn scan_symbols_in_text(text: &str) -> Vec<(String, SymbolOffsetRange)> {
         } else if let Some(rest) = trimmed.strip_prefix("struct ") {
             extract_identifier(rest)
         } else {
-            None
+            [
+                "export namespace ",
+                "namespace ",
+                "export class ",
+                "class ",
+                "export interface ",
+                "interface ",
+                "export enum ",
+                "pub enum ",
+                "enum ",
+                "pub trait ",
+                "trait ",
+                "export type ",
+                "pub type ",
+                "type ",
+                "export const ",
+                "pub const ",
+                "const ",
+            ]
+            .into_iter()
+            .find_map(|prefix| trimmed.strip_prefix(prefix).and_then(extract_identifier))
+            .or_else(|| extract_field_identifier(trimmed))
         };
 
         if let Some(name) = name_opt {
@@ -508,6 +530,22 @@ pub fn scan_symbols_in_text(text: &str) -> Vec<(String, SymbolOffsetRange)> {
     }
 
     symbols
+}
+
+fn extract_field_identifier(line: &str) -> Option<String> {
+    let (candidate, suffix) = line.split_once(':')?;
+    if suffix.starts_with(':') {
+        return None;
+    }
+    let candidate = candidate.trim();
+    if candidate.is_empty()
+        || !candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return None;
+    }
+    Some(candidate.to_string())
 }
 
 fn extract_identifier(s: &str) -> Option<String> {
