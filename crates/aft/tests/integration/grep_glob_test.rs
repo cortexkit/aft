@@ -1163,7 +1163,7 @@ fn glob_bare_filename_matches_top_level_under_path_fallback() {
 
     // `**/b.rs` must match the nested file.
     let files = glob_files(&mut aft, "glob-doublestar-b", "**/b.rs", Some("src"));
-    let expected_b = canonical_path_string(&project.path().join("src/sub/b.rs"));
+    let expected_b = canonical_path_string(&project.path().join("src/sub/b.rs")).replace('\\', "/");
     assert_eq!(
         files,
         vec![expected_b],
@@ -1217,7 +1217,7 @@ fn glob_bare_filename_matches_top_level_under_path_indexed() {
 
     // `**/b.rs` must match the nested file.
     let files = glob_files(&mut aft, "glob-doublestar-b-idx", "**/b.rs", Some("src"));
-    let expected_b = canonical_path_string(&project.path().join("src/sub/b.rs"));
+    let expected_b = canonical_path_string(&project.path().join("src/sub/b.rs")).replace('\\', "/");
     assert_eq!(
         files,
         vec![expected_b],

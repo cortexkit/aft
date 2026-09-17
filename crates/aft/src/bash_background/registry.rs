@@ -3451,6 +3451,13 @@ impl BgTaskRegistry {
                             continue;
                         }
                         Err(error) => {
+                            // A metadata file replaced under the open, eight times
+                            // in a row, is a writer that never paused — proof the
+                            // task is alive, not a layout to quarantine. Skip this
+                            // pass; the next one reads whatever the writer left.
+                            if concurrently_replaced(&error) {
+                                continue;
+                            }
                             if self.db_has_live_process_for_task(&task_id) {
                                 crate::slog_warn!(
                                     "refusing to quarantine unresolved live background task {task_id} during GC: {error}"
@@ -3474,6 +3481,9 @@ impl BgTaskRegistry {
                     let metadata = match read_task_at(&resolved) {
                         Ok(metadata) => metadata,
                         Err(error) => {
+                            if concurrently_replaced(&error) {
+                                continue;
+                            }
                             if self.db_has_live_process_for_task(&task_id) {
                                 crate::slog_warn!(
                                     "refusing to quarantine unreadable live background task {task_id} during GC: {error}"
@@ -6254,6 +6264,17 @@ fn session_recovery_key(storage_dir: &Path, session_id: &str) -> Option<String> 
         .file_name()
         .and_then(|name| name.to_str())
         .map(str::to_string)
+}
+
+/// True when a validated open lost its race against an atomic replacement
+/// of the same artifact for every attempt it was allowed. The persistence
+/// layer reports that case distinctly so the sweep can tell a busy writer
+/// from a damaged layout.
+fn concurrently_replaced(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::Interrupted
+        && error
+            .to_string()
+            .contains(super::persistence::ARTIFACT_CONCURRENTLY_REPLACED)
 }
 
 fn modified_within(path: &Path, grace: Duration) -> bool {
