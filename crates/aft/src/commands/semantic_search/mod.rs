@@ -2202,6 +2202,81 @@ struct EngineRanking {
     structured_content: serde_json::Value,
 }
 
+fn matching_line_from_source(
+    file: &Path,
+    query: &str,
+    symbol_range: Option<SymbolOffsetRange>,
+) -> Option<(u32, String)> {
+    let source = std::fs::read_to_string(file).ok()?;
+    let normalized_phrase = exact_lane::normalize_exact_phrase(exact_lane::exact_phrase(query));
+    if !normalized_phrase.is_empty() {
+        if let Some((line_index, line)) = source
+            .lines()
+            .enumerate()
+            .find(|(_, line)| exact_lane::normalize_exact_phrase(line).contains(&normalized_phrase))
+        {
+            return Some((u32::try_from(line_index).ok()?, line.to_string()));
+        }
+    }
+
+    let content_tokens = query_shape::extract_content_tokens(query);
+    let compact_tokens = content_tokens
+        .iter()
+        .map(|token| {
+            token
+                .chars()
+                .filter(|character| character.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        })
+        .filter(|token| token.len() >= 3)
+        .collect::<Vec<_>>();
+    let best = source
+        .lines()
+        .enumerate()
+        .filter_map(|(line_index, line)| {
+            let compact_line = line
+                .chars()
+                .filter(|character| character.is_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>();
+            let score = compact_tokens
+                .iter()
+                .map(|token| {
+                    if compact_line.contains(token) {
+                        token.len().saturating_mul(4)
+                    } else {
+                        token
+                            .as_bytes()
+                            .windows(3)
+                            .filter(|trigram| {
+                                compact_line
+                                    .as_bytes()
+                                    .windows(3)
+                                    .any(|candidate| candidate == *trigram)
+                            })
+                            .count()
+                    }
+                })
+                .sum::<usize>();
+            (score > 0).then_some((score, line_index, line))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)));
+    if let Some((_, line_index, line)) = best {
+        return Some((u32::try_from(line_index).ok()?, line.to_string()));
+    }
+
+    let offset = symbol_range?.start.min(source.len());
+    let line_index = source.as_bytes()[..offset]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    Some((
+        u32::try_from(line_index).ok()?,
+        source.lines().nth(line_index)?.to_string(),
+    ))
+}
+
 fn definition_matches_identifier_token(candidate: &CandidateResult, query: &str) -> bool {
     let Some(range) = candidate.symbol_range else {
         return false;
@@ -2734,6 +2809,18 @@ fn run_engine_ranking(
                 _ => "hybrid",
             },
         };
+        if matches!(result.kind, SymbolKind::FileSummary)
+            && (result.exact || result.source == "lexical")
+        {
+            let match_query = if result.exact { exact_input } else { query };
+            if let Some((line, text)) =
+                matching_line_from_source(&ranked.path, match_query, ranked.symbol_range)
+            {
+                result.start_line = line;
+                result.end_line = line;
+                result.snippet = text;
+            }
+        }
         results.push(result);
     }
 
@@ -4650,6 +4737,9 @@ fn enrich_snippets_from_source_with_context(
             .and_then(|lines| lines.as_ref());
 
         if matches!(result.kind, SymbolKind::FileSummary) {
+            if result.exact && !result.snippet.is_empty() {
+                continue;
+            }
             if let Some(lines) = lines {
                 result.snippet = lines
                     .iter()
@@ -4742,6 +4832,9 @@ fn enrich_snippets_from_source_reference(
         });
 
         if matches!(result.kind, SymbolKind::FileSummary) {
+            if result.exact && !result.snippet.is_empty() {
+                continue;
+            }
             if let Some(lines) = lines {
                 result.snippet = lines
                     .iter()
@@ -4921,9 +5014,26 @@ fn format_result_sections_with_context(
     group_order
         .iter()
         .map(|file| {
-            let mut section = file.clone();
+            let matching_line = groups[file].iter().find(|(_, result)| {
+                matches!(result.kind, SymbolKind::FileSummary)
+                    && (result.exact || result.source == "lexical")
+                    && !result.snippet.trim().is_empty()
+            });
+            let mut section = matching_line.map_or_else(
+                || file.clone(),
+                |(_, result)| format!("{file}:{}", display_line_number(result.start_line)),
+            );
             if groups[file].iter().any(|(_, result)| result.exact) {
                 section.push_str(" [exact]");
+            }
+            if matching_line.is_some_and(|(_, result)| result.source == "lexical") {
+                section.push_str(" [lexical match]");
+            }
+            if let Some((_, result)) = matching_line {
+                for line in result.snippet.lines() {
+                    section.push_str("\n      ");
+                    section.push_str(line);
+                }
             }
 
             // Three distinct indent levels disambiguate the three roles for a
@@ -4932,8 +5042,11 @@ fn format_result_sections_with_context(
             // this, file paths and symbol headers were both at col 0 and could
             // only be told apart by parsing the "[kind] lines X-Y" suffix.
             for (index, result) in &groups[file] {
+                if matching_line.is_some_and(|(matching_index, _)| matching_index == index) {
+                    continue;
+                }
                 if result.source == "lexical" {
-                    // Whole-file lexical match (no specific symbol).
+                    // A lexical result without a readable source line keeps the file-level marker.
                     section.push_str(" [lexical match]");
                     continue;
                 }
@@ -5047,7 +5160,10 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 
 fn result_to_json(result: &HybridResult) -> serde_json::Value {
     let is_file_level = matches!(result.kind, SymbolKind::FileSummary);
-    let (start_line, end_line) = if is_file_level {
+    let is_matching_line = is_file_level
+        && (result.exact || result.source == "lexical")
+        && !result.snippet.trim().is_empty();
+    let (start_line, end_line) = if is_file_level && !is_matching_line {
         (serde_json::Value::Null, serde_json::Value::Null)
     } else {
         (
@@ -5062,7 +5178,7 @@ fn result_to_json(result: &HybridResult) -> serde_json::Value {
         "kind": result.kind,
         "start_line": start_line,
         "end_line": end_line,
-        "location": if result.source == "lexical" { "[lexical match]" } else if is_file_level { "[file summary]" } else { "line range" },
+        "location": if is_matching_line { "matching line" } else if is_file_level { "[file summary]" } else { "line range" },
         "score": result.score,
         "source": result.source,
         "semantic_score": result.semantic_score,
@@ -6754,6 +6870,55 @@ mod tests {
         assert_eq!(response["semantic_status"], "ready");
         assert!(response["results"].as_array().expect("results").is_empty());
         handle.join().expect("embedding server thread");
+    }
+
+    #[test]
+    fn matching_line_prefers_the_line_with_identifier_variants() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("transform-mode.ts");
+        std::fs::write(
+            &file,
+            "// transform configuration\nexport function resolveTransformMode() {}\nconst unrelated = true;\n",
+        )
+        .expect("write matching-line fixture");
+
+        let matched = matching_line_from_source(
+            &file,
+            "how is transform_mode resolved for every transform pass",
+            None,
+        )
+        .expect("matching line");
+
+        assert_eq!(matched.0, 1);
+        assert_eq!(matched.1, "export function resolveTransformMode() {}");
+    }
+
+    #[test]
+    fn lexical_matching_line_text_includes_location_and_source_line() {
+        let project_root = Path::new("/project");
+        let results = vec![HybridResult {
+            file: PathBuf::from("/project/src/transform-mode.ts"),
+            name: "transform-mode".to_string(),
+            kind: SymbolKind::FileSummary,
+            start_line: 7,
+            end_line: 7,
+            exported: false,
+            snippet: "export function resolveTransformMode() {".to_string(),
+            score: 0.75,
+            source: "lexical",
+            semantic_score: None,
+            lexical_score: Some(0.75),
+            hybrid_boosted: false,
+            exact: false,
+            exact_phrase_count: 0,
+            exact_window_lines: None,
+            fusion_score: 0.0,
+        }];
+
+        let text = format_semantic_text(&results, project_root, false, false, None);
+
+        assert!(text.contains("src/transform-mode.ts:8 [lexical match]"));
+        assert!(text.contains("export function resolveTransformMode() {"));
     }
 
     #[test]
