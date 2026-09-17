@@ -1184,11 +1184,23 @@ impl InspectManager {
             for category in categories_for_worker {
                 let job = manager.tier2_reuse_job(snapshot.clone(), category, None);
                 let _flight = manager.tier2_flight_exit_guard(job.key.clone());
-                let result = manager.tier2_run_with_reuse_job_result_catching(
-                    job,
-                    Tier2ReuseOptions::default(),
-                    Some(Arc::clone(&permit_slot)),
-                );
+                let permit_available = permit_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some();
+                let result = if permit_available {
+                    manager.tier2_run_with_reuse_job_result_catching(
+                        job,
+                        Tier2ReuseOptions::default(),
+                        Some(Arc::clone(&permit_slot)),
+                    )
+                } else {
+                    InspectResult::failed(
+                        &job,
+                        "serial Tier-2 run stopped after the limiter slot deadline",
+                        Duration::ZERO,
+                    )
+                };
                 manager.route_tier2_reuse_completion(result);
             }
         });
