@@ -3749,9 +3749,7 @@ fn route_governed(
             let body = serde_json::to_vec(&wire_request)
                 .map_err(|error| RouteOutcome::SchemaMismatch(error.to_string()))?;
             *stage_handle.lock().unwrap() = ProbeStage::Request;
-            let response = consumer
-                .request(&route, body, CallOptions::default())
-                .await;
+            let response = consumer.request(&route, body, CallOptions::default()).await;
             let _ = consumer
                 .close_handle(&route, CloseRouteOptions::default())
                 .await;
@@ -3899,7 +3897,10 @@ fn refuse_outcome_unknown(
             &format!("governed self-report update failed: {error}"),
         );
     }
-    refuse(RefusalCode::OutcomeUnknown, &outcome_unknown_text(elapsed_ms))
+    refuse(
+        RefusalCode::OutcomeUnknown,
+        &outcome_unknown_text(elapsed_ms),
+    )
 }
 
 fn governed_seam_state(

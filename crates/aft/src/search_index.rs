@@ -2521,27 +2521,40 @@ impl SearchIndexSnapshot {
             Ok(filters) => filters,
             Err(_) => return (Vec::new(), false, 0),
         };
-        let search_root = canonicalize_for_search_membership(search_root);
+        // Indexed entries carry the project root's spelling as configured,
+        // which on Windows can differ from the canonical form in ways
+        // normalize_path does not reconcile (8.3 short names such as
+        // RUNNER~1 against runneradmin). Containment is therefore checked
+        // against both the root as passed and its canonical form, and the
+        // pattern is matched relative to whichever root contained the entry.
+        let raw_root = search_root.to_path_buf();
+        let canonical_root = canonicalize_for_search_membership(search_root);
+        let containing_root = |path: &Path| -> Option<&Path> {
+            if is_within_search_root(&raw_root, path) {
+                Some(raw_root.as_path())
+            } else if is_within_search_root(&canonical_root, path) {
+                Some(canonical_root.as_path())
+            } else {
+                None
+            }
+        };
         let entries_visited = self.files.len();
         let mut scope_has_files = false;
         let mut entries = self
             .files
             .iter()
             .filter(|file| !file.path.as_os_str().is_empty())
-            .filter(|file| {
-                let in_scope = is_within_search_root(&search_root, &file.path);
-                scope_has_files |= in_scope;
-                in_scope
+            .filter_map(|file| {
+                let root = containing_root(&file.path)?;
+                scope_has_files = true;
+                Some((file, root))
             })
             // Match the glob pattern relative to the search root, not the
             // project root. When a caller passes `{path: "src", pattern:
             // "a.rs"}`, the pattern must match `a.rs` (the path relative to
             // `src`), not `src/a.rs` (the path relative to the project root).
-            // Files outside the search root are already excluded by the
-            // `is_within_search_root` filter above, so the strip-prefix in
-            // `matches` always succeeds for the candidates that reach here.
-            .filter(|file| filters.matches(&search_root, &file.path))
-            .map(|file| (file.path.clone(), file.modified))
+            .filter(|(file, root)| filters.matches(root, &file.path))
+            .map(|(file, _)| (file.path.clone(), file.modified))
             .collect::<Vec<_>>();
 
         if sort_by_mtime {

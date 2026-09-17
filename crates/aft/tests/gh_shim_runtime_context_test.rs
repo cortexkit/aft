@@ -2670,7 +2670,8 @@ fn gh_shim_slow_daemon_request_delay_reports_outcome_unknown_exit_87_and_records
         "stderr must explain request was sent and outcome is unknown: {stderr}"
     );
     assert!(
-        stderr.contains("for comments: gh api repos/<owner>/<repo>/issues/<n>/comments --jq '.[-1]'"),
+        stderr
+            .contains("for comments: gh api repos/<owner>/<repo>/issues/<n>/comments --jq '.[-1]'"),
         "stderr must include guidance for checking comment outcome: {stderr}"
     );
     assert!(!recorder.exists(), "must not reach upstream gh");
@@ -2684,7 +2685,10 @@ fn gh_shim_slow_daemon_request_delay_reports_outcome_unknown_exit_87_and_records
         &upstream_bin,
         &recorder,
     );
-    assert_eq!(status["last_seam_refusal"]["code"], "gh_shim_outcome_unknown");
+    assert_eq!(
+        status["last_seam_refusal"]["code"],
+        "gh_shim_outcome_unknown"
+    );
     assert_eq!(status["last_probe"]["stage"], "request");
     assert_eq!(status["last_probe"]["outcome"], "timed_out");
     assert_eq!(status["last_probe"]["elapsed_ms"], 5000);
@@ -2746,7 +2750,10 @@ fn gh_shim_slow_daemon_open_route_delay_during_governed_call_refuses_as_not_run_
         &upstream_bin,
         &recorder,
     );
-    assert_eq!(status["last_seam_refusal"]["code"], "gh_shim_governance_unavailable");
+    assert_eq!(
+        status["last_seam_refusal"]["code"],
+        "gh_shim_governance_unavailable"
+    );
     assert_eq!(status["last_probe"]["stage"], "open_route");
     assert_eq!(status["last_probe"]["outcome"], "timed_out");
     assert_eq!(status["last_probe"]["elapsed_ms"], 5000);
