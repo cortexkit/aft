@@ -324,7 +324,7 @@ impl WatcherExclusionSource {
         }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Seed => "seed",
