@@ -41,17 +41,27 @@ pub(super) fn assert_transport_repeat_sequence(texts: &[String]) {
     assert!(texts[2].contains("end the turn"));
 }
 
-fn observe(breaker: &RepeatBreaker, input: &Value, output: &str, now: Instant) -> Option<String> {
+fn observe_tool(
+    breaker: &RepeatBreaker,
+    tool: &str,
+    input: &Value,
+    output: &str,
+    now: Instant,
+) -> Option<String> {
     let intervention = breaker.observe_at(
         SESSION,
-        TOOL,
-        semantic_key(TOOL, input),
+        tool,
+        semantic_key(tool, input),
         output_hash(output),
         now,
     )?;
     let mut text = output.to_string();
     append_repeat_breaker_reminder(&mut text, SESSION, &intervention);
     Some(text)
+}
+
+fn observe(breaker: &RepeatBreaker, input: &Value, output: &str, now: Instant) -> Option<String> {
+    observe_tool(breaker, TOOL, input, output, now)
 }
 
 #[test]
@@ -108,17 +118,126 @@ fn repeat_breaker_uses_semantic_key_ignoring_description() {
 }
 
 #[test]
-fn repeat_breaker_requires_identical_output() {
+fn repeat_breaker_steers_when_output_drifts() {
     let breaker = RepeatBreaker::default();
     let start = Instant::now();
     let input = json!({ "command": "ci status" });
+    let mut third = None;
 
-    for (index, output) in ["queued", "running", "complete"].into_iter().enumerate() {
-        assert!(observe(
+    for (index, output) in ["queued at 10:00", "running at 10:01", "running at 10:02"]
+        .into_iter()
+        .enumerate()
+    {
+        third = observe(
             &breaker,
             &input,
             output,
-            start + Duration::from_secs(index as u64 * 31),
+            start + Duration::from_secs(index as u64 * 16),
+        );
+    }
+
+    let third = third.expect("same arguments must steer even when output changes");
+    assert!(third.contains("3rd call with the same arguments"));
+    assert!(third.contains("output is drifting"));
+    assert!(third.contains("use a background task with a watch"));
+}
+
+#[test]
+fn repeat_breaker_steers_both_keys_in_interleaved_timestamp_polling() {
+    let breaker = RepeatBreaker::default();
+    let start = Instant::now();
+    let bash_input = json!({
+        "command": "cat X | cut -c1-200; date -u +%H:%MZ",
+    });
+    let status_input = json!({ "taskId": "bash-2026-09-17" });
+    let mut third_bash = None;
+    let mut third_status = None;
+
+    for round in 0..3 {
+        third_bash = observe_tool(
+            &breaker,
+            "bash",
+            &bash_input,
+            &format!("task stdout\n10:0{round}Z"),
+            start + Duration::from_secs(round * 16),
+        );
+        third_status = observe_tool(
+            &breaker,
+            "bash_status",
+            &status_input,
+            &format!("task still running at 10:0{round}Z"),
+            start + Duration::from_secs(round * 16 + 1),
+        );
+        if round < 2 {
+            assert!(third_bash.is_none());
+            assert!(third_status.is_none());
+        }
+    }
+
+    let third_bash = third_bash.expect("third interleaved bash call must steer");
+    assert!(third_bash.contains("3rd call with the same arguments"));
+    assert!(third_bash.contains("output is drifting"));
+    let third_status = third_status.expect("third interleaved bash_status call must steer");
+    assert!(third_status.contains("3rd call with the same arguments"));
+    assert!(third_status.contains("output is drifting"));
+}
+
+#[test]
+fn repeat_breaker_steers_third_a_across_three_alternating_keys() {
+    let breaker = RepeatBreaker::default();
+    let start = Instant::now();
+    let inputs = [
+        json!({ "command": "A" }),
+        json!({ "command": "B" }),
+        json!({ "command": "C" }),
+    ];
+    let sequence = [0, 1, 2, 0, 1, 2, 0];
+    let mut seventh = None;
+
+    for (index, input_index) in sequence.into_iter().enumerate() {
+        seventh = observe(
+            &breaker,
+            &inputs[input_index],
+            STABLE_OUTPUT,
+            start + Duration::from_secs(index as u64 * 6),
+        );
+        if index < 6 {
+            assert!(seventh.is_none());
+        }
+    }
+
+    let seventh = seventh.expect("third A must steer despite B and C calls between repeats");
+    assert!(seventh.contains("This is the 3rd identical call"));
+}
+
+#[test]
+fn repeat_breaker_does_not_group_sequential_reads_of_different_files() {
+    let breaker = RepeatBreaker::default();
+    let start = Instant::now();
+
+    for index in 0..6 {
+        assert!(observe_tool(
+            &breaker,
+            "read",
+            &json!({ "filePath": format!("src/file-{index}.rs") }),
+            STABLE_OUTPUT,
+            start + Duration::from_secs(index * 10),
+        )
+        .is_none());
+    }
+}
+
+#[test]
+fn repeat_breaker_treats_different_execution_arguments_as_different_keys() {
+    let breaker = RepeatBreaker::default();
+    let start = Instant::now();
+
+    for (index, timeout) in [1_000, 2_000, 3_000].into_iter().enumerate() {
+        assert!(observe(
+            &breaker,
+            &json!({ "command": "ci status", "timeout": timeout }),
+            STABLE_OUTPUT,
+            start + Duration::from_secs(index as u64 * 16),
         )
         .is_none());
     }
@@ -150,7 +269,7 @@ fn repeat_breaker_requires_wall_clock_span() {
 }
 
 #[test]
-fn repeat_breaker_unrelated_tool_resets_the_run() {
+fn repeat_breaker_tracks_a_key_across_unrelated_calls() {
     let breaker = RepeatBreaker::default();
     let start = Instant::now();
     let bash = json!({ "command": "ci status" });
@@ -163,20 +282,178 @@ fn repeat_breaker_unrelated_tool_resets_the_run() {
         start + Duration::from_secs(15),
     )
     .is_none());
-    assert!(breaker
-        .observe_at(
-            SESSION,
-            "glob",
-            semantic_key("glob", &json!({ "pattern": "*.rs" })),
-            output_hash(STABLE_OUTPUT),
-            start + Duration::from_secs(31),
-        )
-        .is_none());
-    assert!(observe(
+    assert!(observe_tool(
+        &breaker,
+        "glob",
+        &json!({ "pattern": "*.rs" }),
+        STABLE_OUTPUT,
+        start + Duration::from_secs(31),
+    )
+    .is_none());
+    let third = observe(
         &breaker,
         &bash,
         STABLE_OUTPUT,
         start + Duration::from_secs(62),
+    )
+    .expect("an unrelated tool must not reset the bash key");
+    assert!(third.contains("This is the 3rd identical call"));
+}
+
+#[test]
+fn repeat_breaker_expires_a_key_after_ten_minutes_idle() {
+    let input = json!({ "command": "ci status" });
+    let start = Instant::now();
+    let expired = RepeatBreaker::default();
+
+    assert!(observe(&expired, &input, STABLE_OUTPUT, start).is_none());
+    assert!(observe(
+        &expired,
+        &input,
+        STABLE_OUTPUT,
+        start + Duration::from_secs(15),
+    )
+    .is_none());
+    assert!(observe(
+        &expired,
+        &input,
+        STABLE_OUTPUT,
+        start + Duration::from_secs(15 + 10 * 60 + 1),
+    )
+    .is_none());
+
+    let active = RepeatBreaker::default();
+    assert!(observe(&active, &input, STABLE_OUTPUT, start).is_none());
+    assert!(observe(
+        &active,
+        &input,
+        STABLE_OUTPUT,
+        start + Duration::from_secs(15),
+    )
+    .is_none());
+    assert!(observe(
+        &active,
+        &input,
+        STABLE_OUTPUT,
+        start + Duration::from_secs(15 + 9 * 60),
+    )
+    .expect("a key idle for less than ten minutes must retain its count")
+    .contains("This is the 3rd identical call"));
+}
+
+#[test]
+fn repeat_breaker_evicts_the_oldest_of_sixty_five_live_keys() {
+    let start = Instant::now();
+    let oldest = json!({ "command": "oldest" });
+    let retained = RepeatBreaker::default();
+
+    assert!(observe(&retained, &oldest, STABLE_OUTPUT, start).is_none());
+    assert!(observe(
+        &retained,
+        &oldest,
+        STABLE_OUTPUT,
+        start + Duration::from_secs(15),
+    )
+    .is_none());
+    for index in 0..63 {
+        assert!(observe(
+            &retained,
+            &json!({ "command": format!("retained-key-{index}") }),
+            STABLE_OUTPUT,
+            start + Duration::from_secs(16 + index),
+        )
+        .is_none());
+    }
+    assert!(observe(
+        &retained,
+        &oldest,
+        STABLE_OUTPUT,
+        start + Duration::from_secs(79),
+    )
+    .expect("the oldest of sixty-four keys must retain its count")
+    .contains("This is the 3rd identical call"));
+
+    let evicted = RepeatBreaker::default();
+    assert!(observe(&evicted, &oldest, STABLE_OUTPUT, start).is_none());
+    assert!(observe(
+        &evicted,
+        &oldest,
+        STABLE_OUTPUT,
+        start + Duration::from_secs(15),
+    )
+    .is_none());
+    for index in 0..64 {
+        assert!(observe(
+            &evicted,
+            &json!({ "command": format!("evicting-key-{index}") }),
+            STABLE_OUTPUT,
+            start + Duration::from_secs(16 + index),
+        )
+        .is_none());
+    }
+    assert!(observe(
+        &evicted,
+        &oldest,
+        STABLE_OUTPUT,
+        start + Duration::from_secs(80),
+    )
+    .is_none());
+}
+
+#[test]
+fn repeat_breaker_discards_occurrences_beyond_the_record_cap() {
+    let start = Instant::now();
+    let oldest = json!({ "command": "oldest" });
+    let filler = json!({ "command": "filler" });
+    let retained = RepeatBreaker::default();
+
+    assert!(observe(&retained, &oldest, STABLE_OUTPUT, start).is_none());
+    assert!(observe(
+        &retained,
+        &oldest,
+        STABLE_OUTPUT,
+        start + Duration::from_secs(15),
+    )
+    .is_none());
+    for index in 0..253 {
+        let _ = observe(
+            &retained,
+            &filler,
+            STABLE_OUTPUT,
+            start + Duration::from_secs(16 + index),
+        );
+    }
+    assert!(observe(
+        &retained,
+        &oldest,
+        STABLE_OUTPUT,
+        start + Duration::from_secs(269),
+    )
+    .expect("all three oldest-key calls fit in a 256-record ring")
+    .contains("This is the 3rd identical call"));
+
+    let evicted = RepeatBreaker::default();
+    assert!(observe(&evicted, &oldest, STABLE_OUTPUT, start).is_none());
+    assert!(observe(
+        &evicted,
+        &oldest,
+        STABLE_OUTPUT,
+        start + Duration::from_secs(15),
+    )
+    .is_none());
+    for index in 0..254 {
+        let _ = observe(
+            &evicted,
+            &filler,
+            STABLE_OUTPUT,
+            start + Duration::from_secs(16 + index),
+        );
+    }
+    assert!(observe(
+        &evicted,
+        &oldest,
+        STABLE_OUTPUT,
+        start + Duration::from_secs(270),
     )
     .is_none());
 }
@@ -209,8 +486,8 @@ fn repeat_breaker_ndjson_real_binary_uses_shared_transport_fixture() {
         assert!(!text.is_empty(), "empty tool response text: {response:?}");
         texts.push(text);
         // The plugin drains background completions after every agent tool call
-        // under the same session. The first live probe never fired because that
-        // plumbing call sat between every pair of agent calls and reset the run.
+        // under the same session. The drain must neither reset the agent call's
+        // key nor accumulate its own repeat count.
         let drain = aft.send_with_timeout(
             &serde_json::to_string(&json!({
                 "id": format!("repeat-ndjson-drain-{index}"),
@@ -225,6 +502,13 @@ fn repeat_breaker_ndjson_real_binary_uses_shared_transport_fixture() {
         assert!(
             drain["success"].as_bool().unwrap_or(false),
             "drain between agent calls must succeed: {drain:?}"
+        );
+        assert!(
+            !drain["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("<system-reminder>"),
+            "plumbing calls must not accumulate a repeat count: {drain:?}"
         );
         if index < 2 {
             std::thread::sleep(Duration::from_secs(16));
