@@ -725,9 +725,30 @@ mod tests {
         let canonical_root = std::fs::canonicalize(root.path()).unwrap();
         let matcher = Arc::new(RwLock::new(None));
         let generation = Arc::new(AtomicU64::new(1));
-        let (tx, rx) = mpsc::channel();
-        let watcher =
-            ProjectWatcher::create(canonical_root, Vec::new(), tx, matcher, generation).unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let filter_shutdown = Arc::clone(&shutdown);
+        let attach_matcher = Arc::clone(&matcher);
+        let attach_generation = Arc::clone(&generation);
+        let (dispatch_tx, dispatch_rx) = crate::watcher_filter::watcher_dispatch_channel();
+        let filter_thread = thread::spawn(move || {
+            crate::watcher_filter::run_watcher_thread(
+                crate::watcher_filter::WatcherFilterConfig::new(canonical_root, None),
+                Vec::new(),
+                matcher,
+                generation,
+                dispatch_tx,
+                filter_shutdown,
+                move |root, extra_watch_paths, tx| {
+                    ProjectWatcher::create(
+                        root,
+                        extra_watch_paths,
+                        tx,
+                        attach_matcher,
+                        attach_generation,
+                    )
+                },
+            );
+        });
         wait_until(&COMPLETION_DRAIN_REACHED, "completion drain pause");
 
         for index in 0..5_000 {
@@ -740,16 +761,39 @@ mod tests {
             .unwrap();
         }
         PAUSE_COMPLETION_DRAIN.store(false, Ordering::Release);
-        thread::sleep(Duration::from_secs(1));
-        drop(watcher);
 
-        let events = rx.into_iter().collect::<Result<Vec<_>, _>>().unwrap();
-        let rescans = events
-            .iter()
-            .filter(|event| event.need_rescan())
-            .collect::<Vec<_>>();
-        assert_eq!(rescans.len(), 1, "events: {events:?}");
-        assert_eq!(rescans[0].info(), Some("rescan: buffer overflow"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut rescans = Vec::new();
+        while Instant::now() < deadline {
+            match dispatch_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(crate::watcher_filter::WatcherDispatchEvent::RescanRequired(reason)) => {
+                    rescans.push(reason);
+                    if rescans.len() > 1 {
+                        break;
+                    }
+                }
+                Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+            if rescans.len() == 1 {
+                thread::sleep(Duration::from_millis(250));
+                while let Ok(event) = dispatch_rx.try_recv() {
+                    if let crate::watcher_filter::WatcherDispatchEvent::RescanRequired(reason) =
+                        event
+                    {
+                        rescans.push(reason);
+                    }
+                }
+                break;
+            }
+        }
+        shutdown.store(true, Ordering::Release);
+        filter_thread.join().unwrap();
+
+        assert_eq!(
+            rescans,
+            vec![crate::watcher_filter::RescanReason::BufferOverflow]
+        );
     }
 
     #[test]
