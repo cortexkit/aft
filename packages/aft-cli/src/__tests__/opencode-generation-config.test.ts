@@ -179,6 +179,7 @@ describe("OpenCode generation detection", () => {
       probeOpenCodeV1Version("/fixture/opencode", {
         operatorHome,
         tempParent: root,
+        env: { AFT_LOAD_MATRIX_ALLOW_LIVE_OPERATOR: "0" },
         spawn: () => {
           writeFileSync(database, "mutated");
           return { status: 0, stdout: MODERN_V1_VERSION };

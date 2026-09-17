@@ -37,6 +37,10 @@ function fakeSpawn(during?: () => void) {
   };
 }
 
+function strictCanaryEnv(): NodeJS.ProcessEnv {
+  return { AFT_LOAD_MATRIX_ALLOW_LIVE_OPERATOR: "0" };
+}
+
 describe("operator canary", () => {
   test("probes a host whose database is larger than the runtime can hold", () => {
     // Issue #316: the canary hashed every byte with readFileSync, so a real
@@ -71,6 +75,7 @@ describe("operator canary", () => {
       expect(() =>
         probeOpenCodeV1Version("/does/not/matter", {
           operatorHome: home,
+          env: strictCanaryEnv(),
           spawn: fakeSpawn(() => {
             truncateSync(database, 3 * 1024 * 1024 * 1024 + 4096);
           }) as never,
@@ -90,6 +95,7 @@ describe("operator canary", () => {
       expect(() =>
         probeOpenCodeV1Version("/does/not/matter", {
           operatorHome: home,
+          env: strictCanaryEnv(),
           spawn: fakeSpawn(() => {
             writeFileSync(`${database}-wal`, "after!");
           }) as never,
@@ -107,6 +113,7 @@ describe("operator canary", () => {
       expect(() =>
         probeOpenCodeV1Version("/does/not/matter", {
           operatorHome: home,
+          env: strictCanaryEnv(),
           spawn: fakeSpawn(() => {
             writeFileSync(logFile, "LINE\n");
           }) as never,
@@ -114,6 +121,56 @@ describe("operator canary", () => {
       ).toThrow(/changed the operator database/);
     } finally {
       rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("allows concurrent operator writes in production but retains the strict test canary", () => {
+    const { home, database } = operatorHomeWith(1024);
+    const originalWarn = console.warn;
+    const notices: string[] = [];
+    console.warn = (...args: unknown[]) => notices.push(args.join(" "));
+    try {
+      expect(
+        probeOpenCodeV1Version("/does/not/matter", {
+          operatorHome: home,
+          env: {},
+          spawn: fakeSpawn(() => writeFileSync(database, "concurrent host write")) as never,
+        }),
+      ).toBe("1.18.30");
+      expect(notices).toHaveLength(1);
+
+      expect(() =>
+        probeOpenCodeV1Version("/does/not/matter", {
+          operatorHome: home,
+          env: strictCanaryEnv(),
+          spawn: fakeSpawn(() => writeFileSync(database, "escaped probe write")) as never,
+        }),
+      ).toThrow(/changed the operator database/);
+    } finally {
+      console.warn = originalWarn;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test("accepts isolated data-root writes in production and strict modes", () => {
+    for (const env of [{}, strictCanaryEnv()]) {
+      const { home } = operatorHomeWith(1024);
+      try {
+        expect(
+          probeOpenCodeV1Version("/does/not/matter", {
+            operatorHome: home,
+            env,
+            spawn: (_executable, _args, options) => {
+              const isolatedData = join(options.env.XDG_DATA_HOME as string, "opencode");
+              mkdirSync(isolatedData, { recursive: true });
+              writeFileSync(join(isolatedData, "opencode.db"), "isolated probe write");
+              return { status: 0, stdout: "1.18.30\n", stderr: "" };
+            },
+          }),
+        ).toBe("1.18.30");
+      } finally {
+        rmSync(home, { recursive: true, force: true });
+      }
     }
   });
 

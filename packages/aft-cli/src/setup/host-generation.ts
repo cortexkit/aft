@@ -220,9 +220,20 @@ function snapshotOperatorState(operatorHome: string): string {
   });
 }
 
+function probeCreatedIsolatedState(dataRoot: string, stateRoot: string): boolean {
+  return [dataRoot, stateRoot].some((root) => {
+    const opencodeRoot = join(root, "opencode");
+    const database = join(opencodeRoot, "opencode.db");
+    return [database, `${database}-wal`, `${database}-shm`, join(opencodeRoot, "log")].some(
+      existsSync,
+    );
+  });
+}
+
 /**
- * Run the V1 version probe in disposable host roots. The operator canary fails
- * the probe if the live OpenCode database or logs change while it runs.
+ * Run the V1 version probe in disposable host roots. CI can enable the strict
+ * operator canary used by the load matrix, while production tolerates writes
+ * from an OpenCode process that is already using the live operator store.
  */
 export function probeOpenCodeV1Version(
   executable: string,
@@ -270,9 +281,15 @@ export function probeOpenCodeV1Version(
     probeError = error;
   }
   const after = snapshotOperatorState(operatorHome);
+  const createdIsolatedState = probeCreatedIsolatedState(data, state);
   rmSync(root, { recursive: true, force: true });
-  if (after !== before) {
+  if (after !== before && env.AFT_LOAD_MATRIX_ALLOW_LIVE_OPERATOR === "0") {
     throw new Error("OpenCode host probe changed the operator database or log directory");
+  }
+  if (after !== before && !createdIsolatedState) {
+    console.warn(
+      "OpenCode operator state changed during an isolated host probe while its data and state roots stayed empty; an active host may be writing concurrently",
+    );
   }
   if (probeError) throw probeError;
 
