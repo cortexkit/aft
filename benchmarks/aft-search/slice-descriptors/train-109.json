@@ -1,0 +1,16 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "gh-shim-v14-classifier",
+    "views-drill-legacy-attribution",
+    "playbook-core-loader-notes"
+  ],
+  "note": "No ranking-fence file changes: gh-shim v14 classifier rows + refusal texts; views drill legacy-arm attribution; playbook."
+}
