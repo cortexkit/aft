@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::ffi::{c_void, OsString};
+use std::ffi::{c_void, OsStr, OsString};
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -301,7 +301,9 @@ fn run_completion_loop(
     }
 
     pause_completion_drain_for_test(&shutdown);
-    let mut drain_stats = DrainStats::default();
+    let measure_drain =
+        std::env::var_os("AFT_WINDOWS_WATCHER_DRAIN_METRICS").as_deref() == Some(OsStr::new("1"));
+    let mut drain_stats = DrainStats::new(measure_drain);
     let mut loop_result = Ok(());
     while !shutdown.load(Ordering::Acquire) {
         let generation = matcher_generation.load(Ordering::Acquire);
@@ -397,7 +399,7 @@ fn run_completion_loop(
                 break;
             }
         }
-        drain_stats.note(drain_started.elapsed(), event_count);
+        drain_stats.note(drain_started.elapsed(), event_count, &root);
     }
 
     cancel_and_drain(completion_port, &mut watches);
@@ -622,23 +624,30 @@ struct DrainStats {
     events: u64,
     total_micros: u128,
     max_micros: u128,
+    measure_to_stderr: bool,
 }
 
 impl DrainStats {
-    fn note(&mut self, elapsed: Duration, event_count: usize) {
+    fn new(measure_to_stderr: bool) -> Self {
+        Self {
+            measure_to_stderr,
+            ..Self::default()
+        }
+    }
+
+    fn note(&mut self, elapsed: Duration, event_count: usize, root: &Path) {
         let micros = elapsed.as_micros();
         self.completions += 1;
         self.events += event_count as u64;
         self.total_micros += micros;
         self.max_micros = self.max_micros.max(micros);
+        if self.measure_to_stderr {
+            self.emit("sample", root);
+        }
     }
 
     fn log(&self, root: &Path) {
-        let average_micros = if self.completions == 0 {
-            0
-        } else {
-            self.total_micros / u128::from(self.completions)
-        };
+        let average_micros = self.average_micros();
         crate::slog_info!(
             "Windows watcher drain: root={} completions={} events={} average_us={} max_us={}",
             root.display(),
@@ -647,6 +656,25 @@ impl DrainStats {
             average_micros,
             self.max_micros
         );
+    }
+
+    fn emit(&self, label: &str, root: &Path) {
+        eprintln!(
+            "Windows watcher drain {label}: root={} completions={} events={} average_us={} max_us={}",
+            root.display(),
+            self.completions,
+            self.events,
+            self.average_micros(),
+            self.max_micros
+        );
+    }
+
+    fn average_micros(&self) -> u128 {
+        if self.completions == 0 {
+            0
+        } else {
+            self.total_micros / u128::from(self.completions)
+        }
     }
 }
 
