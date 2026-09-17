@@ -1,8 +1,9 @@
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 
 use crate::bash_background::persistence::{
     resolve_task_layout, session_tasks_dir, uninitialized_layout_is_recent,
@@ -35,6 +36,8 @@ struct TerminalPruneCandidate {
     harness: String,
     session_id: String,
     task_id: String,
+    stdout_path: Option<String>,
+    stderr_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,63 +171,90 @@ pub(crate) fn prune_terminal_rows_guarded(
 ) -> rusqlite::Result<TerminalRowsPrune> {
     let cutoff = now_ms.saturating_sub(TERMINAL_ROW_RETENTION_AGE_MS);
     let bounded_limit = limit.min(MAX_TERMINAL_PRUNE_ROWS);
-    let candidates = if bounded_limit == 0 {
-        Vec::new()
+    let (candidates, total_candidates) = if bounded_limit == 0 {
+        let total = conn.query_row(
+            &format!("SELECT COUNT(*) FROM bash_tasks WHERE {TERMINAL_PRUNE_PREDICATE}"),
+            [cutoff],
+            |row| row.get::<_, i64>(0),
+        )?;
+        (Vec::new(), total)
     } else {
-        conn.prepare(&format!(
-            "SELECT harness, session_id, task_id
-             FROM bash_tasks
-             WHERE {TERMINAL_PRUNE_PREDICATE}
-             ORDER BY completed_at, harness, session_id, task_id
-             LIMIT ?2"
-        ))?
-        .query_map(
-            params![cutoff, i64::try_from(bounded_limit).unwrap_or(500)],
-            |row| {
-                Ok(TerminalPruneCandidate {
-                    harness: row.get(0)?,
-                    session_id: row.get(1)?,
-                    task_id: row.get(2)?,
-                })
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?
+        let candidates = conn
+            .prepare(&format!(
+                "SELECT harness, session_id, task_id, stdout_path, stderr_path, COUNT(*) OVER ()
+                 FROM bash_tasks
+                 WHERE {TERMINAL_PRUNE_PREDICATE}
+                 LIMIT ?2"
+            ))?
+            .query_map(
+                params![cutoff, i64::try_from(bounded_limit).unwrap_or(500)],
+                |row| {
+                    Ok((
+                        TerminalPruneCandidate {
+                            harness: row.get(0)?,
+                            session_id: row.get(1)?,
+                            task_id: row.get(2)?,
+                            stdout_path: row.get(3)?,
+                            stderr_path: row.get(4)?,
+                        },
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let total = candidates.first().map(|(_, total)| *total).unwrap_or(0);
+        (
+            candidates
+                .into_iter()
+                .map(|(candidate, _)| candidate)
+                .collect(),
+            total,
+        )
     };
 
-    let mut removed = 0;
-    for candidate in candidates {
-        if is_registered_in_process(&candidate.task_id)
-            || !task_layout_is_gone(conn, &candidate.session_id, &candidate.task_id)
-        {
-            continue;
-        }
-        removed += conn.execute(
+    let removable = candidates
+        .into_iter()
+        .filter(|candidate| {
+            !is_registered_in_process(&candidate.task_id) && task_layout_is_gone(conn, candidate)
+        })
+        .collect::<Vec<_>>();
+    let removed = if removable.is_empty() {
+        0
+    } else {
+        let mut values = Vec::with_capacity(1 + removable.len() * 3);
+        values.push(Value::Integer(cutoff));
+        let identities = removable
+            .into_iter()
+            .enumerate()
+            .map(|(index, candidate)| {
+                let parameter = 2 + index * 3;
+                values.extend([
+                    Value::Text(candidate.harness),
+                    Value::Text(candidate.session_id),
+                    Value::Text(candidate.task_id),
+                ]);
+                format!("(?{parameter}, ?{}, ?{})", parameter + 1, parameter + 2)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute(
             &format!(
                 "DELETE FROM bash_tasks
-                 WHERE harness = ?2 AND session_id = ?3 AND task_id = ?4
-                   AND {TERMINAL_PRUNE_PREDICATE}"
+                 WHERE {TERMINAL_PRUNE_PREDICATE}
+                   AND (harness, session_id, task_id) IN (VALUES {identities})"
             ),
-            params![
-                cutoff,
-                candidate.harness,
-                candidate.session_id,
-                candidate.task_id
-            ],
-        )?;
-    }
+            params_from_iter(values),
+        )?
+    };
 
-    let remaining_candidates = conn.query_row(
-        &format!("SELECT COUNT(*) FROM bash_tasks WHERE {TERMINAL_PRUNE_PREDICATE}"),
-        [cutoff],
-        |row| row.get::<_, i64>(0),
-    )?;
+    let remaining_candidates = total_candidates.saturating_sub(i64::try_from(removed).unwrap_or(0));
     Ok(TerminalRowsPrune {
         removed,
         remaining_candidates: usize::try_from(remaining_candidates).unwrap_or(usize::MAX),
     })
 }
 
-fn task_layout_is_gone(conn: &Connection, session_id: &str, task_id: &str) -> bool {
+fn task_layout_is_gone(conn: &Connection, candidate: &TerminalPruneCandidate) -> bool {
     let Some(storage_root) = conn
         .path()
         .and_then(|path| Path::new(path).parent())
@@ -232,20 +262,59 @@ fn task_layout_is_gone(conn: &Connection, session_id: &str, task_id: &str) -> bo
     else {
         return false;
     };
-    let session_dir = session_tasks_dir(storage_root, session_id);
+    let session_dir = candidate_session_dir(candidate)
+        .unwrap_or_else(|| session_tasks_dir(storage_root, &candidate.session_id));
+    let task_id = &candidate.task_id;
+    let directory_layout = session_dir.join(task_id);
+    let flat_layout = session_dir.join(format!("{task_id}.json"));
     match resolve_task_layout(&session_dir, task_id) {
         Ok(_) => false,
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            let directory_layout = session_dir.join(task_id);
-            let flat_layout = session_dir.join(format!("{task_id}.json"));
             if !directory_layout.exists() && !flat_layout.exists() {
                 return true;
             }
             !uninitialized_layout_is_recent(&session_dir, task_id, LAYOUT_CREATION_GRACE)
                 .unwrap_or(true)
         }
+        // Releases before the 64-bit random suffix used eight hexadecimal
+        // digits. Current layout validation intentionally rejects those IDs,
+        // so retain any surviving legacy artifact and prune only full absence.
+        Err(error) if error.kind() == ErrorKind::InvalidInput && is_legacy_task_id(task_id) => {
+            !directory_layout.exists()
+                && !flat_layout.exists()
+                && !candidate
+                    .stdout_path
+                    .iter()
+                    .chain(&candidate.stderr_path)
+                    .any(|path| Path::new(path).exists())
+        }
         Err(_) => false,
     }
+}
+
+fn candidate_session_dir(candidate: &TerminalPruneCandidate) -> Option<PathBuf> {
+    candidate
+        .stdout_path
+        .iter()
+        .chain(&candidate.stderr_path)
+        .find_map(|path| {
+            let path = Path::new(path);
+            let parent = path.parent()?;
+            let file_name = path.file_name()?.to_str()?;
+            if file_name.starts_with(&format!("{}.", candidate.task_id)) {
+                return Some(parent.to_path_buf());
+            }
+            let task_dir = parent.parent()?;
+            (task_dir.file_name()?.to_str()? == candidate.task_id)
+                .then(|| task_dir.parent().map(Path::to_path_buf))
+                .flatten()
+        })
+}
+
+fn is_legacy_task_id(task_id: &str) -> bool {
+    task_id.strip_prefix("bash-").is_some_and(|suffix| {
+        suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
 }
 
 pub fn get_bash_task(

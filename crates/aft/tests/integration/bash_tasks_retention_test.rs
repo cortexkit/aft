@@ -3,7 +3,9 @@
 use std::path::Path;
 use std::time::Instant;
 
-use aft::bash_background::persistence::{create_task_layout, write_task_at, PersistedTask};
+use aft::bash_background::persistence::{
+    create_task_layout, session_tasks_dir, write_task_at, PersistedTask,
+};
 use aft::bash_background::BgTaskStatus;
 use aft::db::bash_tasks::{
     prune_terminal_rows, upsert_bash_task, BashTaskRow, TERMINAL_ROW_RETENTION_AGE_MS,
@@ -143,6 +145,27 @@ fn terminal_pruner_preserves_every_delivery_and_layout_invariant() {
 }
 
 #[test]
+fn terminal_pruner_handles_legacy_ids_without_deleting_surviving_artifacts() {
+    let storage = tempfile::tempdir().expect("storage tempdir");
+    let conn = aft::db::open(&storage.path().join("aft.db")).expect("open database");
+    let absent = "bash-deadbeef";
+    let present = "bash-cafebabe";
+    insert_task(&conn, absent, "completed", Some(OLD_MS), true);
+    insert_task(&conn, present, "completed", Some(OLD_MS), true);
+    let session_dir = session_tasks_dir(storage.path(), SESSION);
+    std::fs::create_dir_all(&session_dir).expect("create legacy session directory");
+    std::fs::write(session_dir.join(format!("{present}.json")), b"legacy")
+        .expect("write legacy artifact");
+
+    let result = prune_terminal_rows(&conn, NOW_MS, 500).expect("prune terminal rows");
+
+    assert_eq!(result.removed, 1);
+    assert_eq!(result.remaining_candidates, 1);
+    assert!(!task_exists(&conn, absent));
+    assert!(task_exists(&conn, present));
+}
+
+#[test]
 fn terminal_pruner_never_removes_more_than_five_hundred_rows() {
     let storage = tempfile::tempdir().expect("storage tempdir");
     let conn = aft::db::open(&storage.path().join("aft.db")).expect("open database");
@@ -222,26 +245,17 @@ fn measure_terminal_pruner_on_database_copy() {
     let mut conn = aft::db::open(&path).expect("open copied database");
     let before = task_count(&conn);
     let started = Instant::now();
-    let mut ticks = 0usize;
-    let mut removed = 0usize;
-    let mut max_tick_micros = 0u128;
-    let remaining_candidates;
-    loop {
-        let tick_started = Instant::now();
-        let tick = prune_retention_tick(&mut conn, current_unix_millis()).expect("retention tick");
-        max_tick_micros = max_tick_micros.max(tick_started.elapsed().as_micros());
-        ticks += 1;
-        removed += tick.bash_tasks.removed;
-        if tick.bash_tasks.removed == 0 {
-            remaining_candidates = tick.bash_tasks.remaining_candidates;
-            break;
-        }
-    }
-    let elapsed = started.elapsed();
-    let average_tick_micros = elapsed.as_micros() / ticks as u128;
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .expect("begin retention transaction");
+    let result = prune_terminal_rows(&tx, current_unix_millis(), 500).expect("retention tick");
+    tx.commit().expect("commit retention transaction");
+    let tick_micros = started.elapsed().as_micros();
     eprintln!(
-        "bash task retention measurement: before_rows={before} after_rows={} removed={removed} ticks={ticks} average_tick_us={average_tick_micros} max_tick_us={max_tick_micros} remaining_candidates={remaining_candidates}",
-        task_count(&conn)
+        "bash task retention measurement: before_rows={before} after_rows={} removed={} tick_us={tick_micros} remaining_candidates={}",
+        task_count(&conn),
+        result.removed,
+        result.remaining_candidates
     );
 }
 
