@@ -228,7 +228,11 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
           logPath: opencodeHarness.logFile.path,
           pluginCachePath: opencodeHarness.pluginCache.path,
           cachedPluginVersion: opencodeHarness.pluginCache.cached,
-          expectedPluginEntry: opencodeAdapter.pluginEntryWithVersion,
+          expectedPluginEntry:
+            hostDetection.status === "v1"
+              ? `${opencodeAdapter.pluginPackageName}@latest`
+              : opencodeAdapter.pluginEntryWithVersion,
+          acceptExplicitPluginVersion: hostDetection.status === "v1",
         })
       : null;
 

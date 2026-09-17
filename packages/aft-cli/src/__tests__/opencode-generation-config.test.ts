@@ -307,7 +307,10 @@ describe("exact OpenCode config pins", () => {
   });
 });
 
-function doctorFixture(root: string): {
+function doctorFixture(
+  root: string,
+  pluginEntry = pinnedPluginEntry(getSelfVersion()),
+): {
   adapter: HarnessAdapter;
   harness: HarnessDiagnostic;
   report: DiagnosticReport;
@@ -322,10 +325,7 @@ function doctorFixture(root: string): {
     tuiConfig: join(root, "tui.json"),
     tuiConfigFormat: "none",
   };
-  writeFileSync(
-    configPaths.harnessConfig,
-    JSON.stringify({ plugin: [pinnedPluginEntry(version)] }),
-  );
+  writeFileSync(configPaths.harnessConfig, JSON.stringify({ plugin: [pluginEntry] }));
   const adapter: HarnessAdapter = {
     kind: "opencode",
     displayName: "OpenCode",
@@ -396,7 +396,7 @@ describe("OpenCode doctor generation and load path", () => {
   test("keeps the reported load path inside the closed enum and detects mismatches", () => {
     const root = tempRoot("aft-cli-doctor-load-");
     const fixture = doctorFixture(root);
-    writeFileSync(fixture.harness.logFile.path, "load_path=export-server-v1\n");
+    writeFileSync(fixture.harness.logFile.path, "load_path=root-default\n");
 
     const result = diagnoseOpenCodeLoad({
       detection: detection("v2", "bun"),
@@ -406,18 +406,23 @@ describe("OpenCode doctor generation and load path", () => {
     });
 
     expect(OPENCODE_LOAD_PATHS).toContain(result.takenLoadPath);
-    expect(result.takenLoadPath).toBe("export-server-v1");
+    expect(result.takenLoadPath).toBe("root-default");
     expect(result.expectedLoadPath).toBe("export-server-effect-bun");
     expect(result.problems).toHaveLength(1);
   });
 
-  test("derives the V1 root fallback from the installed plugin manifest", () => {
+  test("treats a V1 server-export manifest as a root-default load without a log line", () => {
     const root = tempRoot("aft-cli-doctor-root-fallback-");
     const pluginRoot = join(root, "plugin");
     mkdirSync(pluginRoot, { recursive: true });
     writeFileSync(
       join(pluginRoot, "package.json"),
-      JSON.stringify({ name: AFT_OPENCODE_PACKAGE, version: getSelfVersion() }),
+      JSON.stringify({
+        name: AFT_OPENCODE_PACKAGE,
+        version: getSelfVersion(),
+        exports: { ".": "./dist/index.js", "./server": "./dist/server.js" },
+        "oc-plugin": ["server"],
+      }),
     );
     const configPath = join(root, "opencode.json");
     writeFileSync(configPath, JSON.stringify({ plugin: [pathToFileURL(pluginRoot).href] }));
@@ -430,9 +435,76 @@ describe("OpenCode doctor generation and load path", () => {
     });
 
     expect(result.takenLoadPath).toBe("root-default");
-    expect(result.expectedLoadPath).toBe("export-server-v1");
+    expect(result.expectedLoadPath).toBe("root-default");
     expect(result.pluginVersion).toBe(getSelfVersion());
-    expect(result.problems).toHaveLength(1);
+    expect(result.problems).toEqual([]);
+  });
+
+  test("accepts V1 latest registration on a logged root-default load", async () => {
+    const root = tempRoot("aft-cli-doctor-v1-latest-");
+    const fixture = doctorFixture(root, `${AFT_OPENCODE_PACKAGE}@latest`);
+    writeFileSync(fixture.harness.logFile.path, "load path: root-default\n");
+    const lines = captureOutput();
+
+    const code = await runDoctor({
+      clear: false,
+      fix: false,
+      force: false,
+      issue: false,
+      argv: [],
+      resolveAdapters: async () => [fixture.adapter],
+      collectDiagnostics: async () => fixture.report,
+      collectRemovalHealth: async () => ({ available: false, message: "fixture" }),
+      detectOpenCodeHost: () => detection("v1"),
+    });
+
+    const output = lines.join("\n");
+    expect(code).toBe(0);
+    expect(output).toContain("host generation: V1");
+    expect(output).toContain("load path: root-default");
+    expect(output).not.toContain("required exact pin");
+  });
+
+  test("accepts an explicit semver registration on V1", () => {
+    const root = tempRoot("aft-cli-doctor-v1-semver-");
+    const fixture = doctorFixture(root);
+    writeFileSync(fixture.harness.logFile.path, "load path: root-default\n");
+
+    const result = diagnoseOpenCodeLoad({
+      detection: detection("v1"),
+      configPath: fixture.harness.configPaths.harnessConfig,
+      logPath: fixture.harness.logFile.path,
+      pluginCachePath: fixture.harness.pluginCache.path,
+      expectedPluginEntry: `${AFT_OPENCODE_PACKAGE}@latest`,
+      acceptExplicitPluginVersion: true,
+    });
+
+    expect(result.problems).toEqual([]);
+  });
+
+  test("still requires the exact plugin pin on V2", async () => {
+    const root = tempRoot("aft-cli-doctor-v2-latest-");
+    const fixture = doctorFixture(root, `${AFT_OPENCODE_PACKAGE}@latest`);
+    writeFileSync(fixture.harness.logFile.path, "load path: export-server-effect-node\n");
+    const lines = captureOutput();
+
+    const code = await runDoctor({
+      clear: false,
+      fix: false,
+      force: false,
+      issue: false,
+      argv: [],
+      resolveAdapters: async () => [fixture.adapter],
+      collectDiagnostics: async () => fixture.report,
+      collectRemovalHealth: async () => ({ available: false, message: "fixture" }),
+      detectOpenCodeHost: () => detection("v2", "node"),
+    });
+
+    const output = lines.join("\n");
+    expect(code).toBe(1);
+    expect(output).toContain(
+      `plugin entry ${AFT_OPENCODE_PACKAGE}@latest is not the required exact pin ${pinnedPluginEntry(getSelfVersion())}`,
+    );
   });
 
   test("reports the configured V2 plugin version and exits non-zero on a path mismatch", async () => {

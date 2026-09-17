@@ -8,7 +8,6 @@ import { AFT_OPENCODE_PACKAGE, isAftNpmEntry } from "../setup/opencode-config.js
 
 export const OPENCODE_LOAD_PATHS = [
   "root-default",
-  "export-server-v1",
   "export-server-effect-bun",
   "export-server-effect-node",
 ] as const;
@@ -22,6 +21,7 @@ export interface OpenCodeDoctorInput {
   pluginCachePath: string;
   cachedPluginVersion?: string;
   expectedPluginEntry?: string;
+  acceptExplicitPluginVersion?: boolean;
 }
 
 export interface OpenCodeDoctorResult {
@@ -34,8 +34,6 @@ export interface OpenCodeDoctorResult {
 interface PluginManifest {
   name?: unknown;
   version?: unknown;
-  exports?: unknown;
-  "oc-plugin"?: unknown;
 }
 
 function isLoadPath(value: string): value is OpenCodeLoadPath {
@@ -99,16 +97,13 @@ function pluginManifest(entry: string | null, cachePath: string): PluginManifest
   );
 }
 
-function manifestUsesServerExport(manifest: PluginManifest | null): boolean {
-  if (!manifest) return true;
-  const discovered = manifest["oc-plugin"];
-  const exports = manifest.exports;
-  return (
-    Array.isArray(discovered) &&
-    discovered.includes("server") &&
-    typeof exports === "object" &&
-    exports !== null &&
-    Object.hasOwn(exports, "./server")
+function hasExplicitSemver(entry: string): boolean {
+  const version = configuredVersion(entry);
+  return Boolean(
+    version &&
+      /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.test(
+        version,
+      ),
   );
 }
 
@@ -117,7 +112,7 @@ function latestLoggedLoadPath(logPath: string): OpenCodeLoadPath | null {
   try {
     const text = readFileSync(logPath, "utf8");
     const pattern =
-      /(?:load path|load_path)\s*[:=]\s*(root-default|export-server-v1|export-server-effect-bun|export-server-effect-node)/gi;
+      /(?:load path|load_path)\s*[:=]\s*(root-default|export-server-effect-bun|export-server-effect-node)/gi;
     let latest: OpenCodeLoadPath | null = null;
     for (const match of text.matchAll(pattern)) {
       const value = match[1];
@@ -136,7 +131,7 @@ function detectedV2Runtime(detection: OpenCodeHostDetection): OpenCodeHostRuntim
 export function expectedOpenCodeLoadPath(
   detection: OpenCodeHostDetection,
 ): OpenCodeLoadPath | null {
-  if (detection.status === "v1") return "export-server-v1";
+  if (detection.status === "v1") return "root-default";
   if (detection.status === "v2") {
     return detectedV2Runtime(detection) === "bun"
       ? "export-server-effect-bun"
@@ -154,7 +149,7 @@ export function diagnoseOpenCodeLoad(input: OpenCodeDoctorInput): OpenCodeDoctor
   let takenLoadPath = logged;
 
   if (!takenLoadPath && input.detection.status === "v1") {
-    takenLoadPath = manifestUsesServerExport(manifest) ? "export-server-v1" : "root-default";
+    takenLoadPath = "root-default";
   } else if (!takenLoadPath && input.detection.status === "v2") {
     takenLoadPath = expectedLoadPath;
   }
@@ -172,7 +167,8 @@ export function diagnoseOpenCodeLoad(input: OpenCodeDoctorInput): OpenCodeDoctor
     entry &&
     isAftNpmEntry(entry) &&
     input.expectedPluginEntry &&
-    entry !== input.expectedPluginEntry
+    entry !== input.expectedPluginEntry &&
+    !(input.acceptExplicitPluginVersion && hasExplicitSemver(entry))
   ) {
     problems.push(
       `plugin entry ${entry} is not the required exact pin ${input.expectedPluginEntry}`,
