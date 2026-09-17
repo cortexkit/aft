@@ -337,11 +337,37 @@ fn compression_event_watermark_before(
 /// Raw history is kept for thirty days; lifetime counters survive in rollups.
 pub const RETENTION_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const RETENTION_BATCH: i64 = 500;
+// Probe up to 500 filesystem rows without holding the shared database mutex.
+// Capping the write phase at 250 keeps total connection lock holds below 100 ms.
+const BASH_TASK_MUTATION_BATCH: usize = 250;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionTick {
     pub bash_tasks: crate::db::bash_tasks::TerminalRowsPrune,
     pub compression_events_removed: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPhaseTimings {
+    pub selection_lock_micros: u128,
+    pub stat_micros: u128,
+    pub task_delete_micros: u128,
+    pub event_prune_micros: u128,
+    pub commit_micros: u128,
+    pub mutation_lock_micros: u128,
+}
+
+impl RetentionPhaseTimings {
+    pub fn total_lock_micros(self) -> u128 {
+        self.selection_lock_micros
+            .saturating_add(self.mutation_lock_micros)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionPass {
+    pub tick: RetentionTick,
+    pub timings: RetentionPhaseTimings,
 }
 
 const RETENTION_CANDIDATES: &str = "
@@ -447,32 +473,126 @@ fn prune_compression_events_in_transaction(
 }
 
 pub fn prune_retention_tick(conn: &mut Connection, now_ms: i64) -> rusqlite::Result<RetentionTick> {
-    prune_retention_tick_guarded(conn, now_ms, Some(&[]))
+    let plan = crate::db::bash_tasks::select_terminal_prune_candidates(conn, now_ms, 500)?;
+    let prepared = crate::db::bash_tasks::prepare_terminal_prune(plan, |_| false);
+    apply_prepared_retention_tick(conn, now_ms, prepared)
 }
 
-fn prune_retention_tick_guarded(
+struct RetentionMutation {
+    tick: RetentionTick,
+    task_delete_micros: u128,
+    event_prune_micros: u128,
+    commit_micros: u128,
+}
+
+fn apply_prepared_retention_tick(
     conn: &mut Connection,
     now_ms: i64,
-    registries: Option<&[crate::bash_background::BgTaskRegistry]>,
+    prepared: crate::db::bash_tasks::PreparedTerminalPrune,
 ) -> rusqlite::Result<RetentionTick> {
+    apply_prepared_retention_tick_timed(conn, now_ms, prepared).map(|mutation| mutation.tick)
+}
+
+fn apply_prepared_retention_tick_timed(
+    conn: &mut Connection,
+    now_ms: i64,
+    prepared: crate::db::bash_tasks::PreparedTerminalPrune,
+) -> rusqlite::Result<RetentionMutation> {
     use rusqlite::TransactionBehavior;
+    use std::time::Instant;
+
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     // Task rows go first so the event pass in this transaction observes their
     // final liveness, while the commit publishes both retention decisions at once.
-    let bash_tasks =
-        crate::db::bash_tasks::prune_terminal_rows_guarded(&tx, now_ms, 500, |task_id| {
+    let task_delete_started = Instant::now();
+    let bash_tasks = crate::db::bash_tasks::delete_prepared_terminal_rows(&tx, prepared)?;
+    let task_delete_micros = task_delete_started.elapsed().as_micros();
+    let event_prune_started = Instant::now();
+    let compression_events_removed = prune_compression_events_in_transaction(&tx, now_ms)?;
+    let event_prune_micros = event_prune_started.elapsed().as_micros();
+    let commit_started = Instant::now();
+    tx.commit()?;
+    let commit_micros = commit_started.elapsed().as_micros();
+    Ok(RetentionMutation {
+        tick: RetentionTick {
+            bash_tasks,
+            compression_events_removed,
+        },
+        task_delete_micros,
+        event_prune_micros,
+        commit_micros,
+    })
+}
+
+pub fn prune_retention_once(
+    db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+    now_ms: i64,
+    registries: Option<&[crate::bash_background::BgTaskRegistry]>,
+) -> Result<Option<RetentionPass>, String> {
+    prune_retention_once_observed(db, now_ms, registries, || {})
+}
+
+fn prune_retention_once_observed(
+    db: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+    now_ms: i64,
+    registries: Option<&[crate::bash_background::BgTaskRegistry]>,
+    observe_stat_phase: impl FnOnce(),
+) -> Result<Option<RetentionPass>, String> {
+    use std::sync::TryLockError;
+    use std::time::Instant;
+
+    let conn = match db.try_lock() {
+        Ok(conn) => conn,
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(TryLockError::Poisoned(_)) => {
+            return Err("retention database mutex poisoned".to_string())
+        }
+    };
+    let selection_started = Instant::now();
+    let plan = crate::db::bash_tasks::select_terminal_prune_candidates(&conn, now_ms, 500)
+        .map_err(|error| error.to_string())?;
+    drop(conn);
+    let selection_lock_micros = selection_started.elapsed().as_micros();
+
+    let stat_started = Instant::now();
+    let mut prepared = crate::db::bash_tasks::prepare_terminal_prune_observed(
+        plan,
+        |task_id| {
             registries.is_none_or(|registries| {
                 registries
                     .iter()
                     .any(|registry| registry.active_watch_count(task_id) > 0)
             })
-        })?;
-    let compression_events_removed = prune_compression_events_in_transaction(&tx, now_ms)?;
-    tx.commit()?;
-    Ok(RetentionTick {
-        bash_tasks,
-        compression_events_removed,
-    })
+        },
+        observe_stat_phase,
+    );
+    crate::db::bash_tasks::cap_prepared_terminal_rows(&mut prepared, BASH_TASK_MUTATION_BATCH);
+    let stat_micros = stat_started.elapsed().as_micros();
+
+    let mut conn = match db.try_lock() {
+        Ok(conn) => conn,
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(TryLockError::Poisoned(_)) => {
+            return Err("retention database mutex poisoned".to_string())
+        }
+    };
+    let mutation_started = Instant::now();
+    let mutation = apply_prepared_retention_tick_timed(&mut conn, now_ms, prepared)
+        .map_err(|error| error.to_string())?;
+    drop(conn);
+    let mutation_lock_micros = mutation_started.elapsed().as_micros();
+
+    Ok(Some(RetentionPass {
+        tick: mutation.tick,
+        timings: RetentionPhaseTimings {
+            selection_lock_micros,
+            stat_micros,
+            task_delete_micros: mutation.task_delete_micros,
+            event_prune_micros: mutation.event_prune_micros,
+            commit_micros: mutation.commit_micros,
+            mutation_lock_micros,
+        },
+    }))
 }
 
 /// Schedule bounded retention away from the daemon and standalone request loops.
@@ -501,31 +621,30 @@ pub fn maybe_spawn_retention(
     if let Err(error) = std::thread::Builder::new()
         .name("aft-retention".into())
         .spawn(move || {
-            if let Ok(mut conn) = db.try_lock() {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis();
-                match prune_retention_tick_guarded(
-                    &mut conn,
-                    i64::try_from(now).unwrap_or(i64::MAX),
-                    registries.as_deref(),
-                ) {
-                    Ok(tick) => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            match prune_retention_once(
+                &db,
+                i64::try_from(now).unwrap_or(i64::MAX),
+                registries.as_deref(),
+            ) {
+                Ok(Some(pass)) => {
+                    crate::slog_info!(
+                        "bash task retention: removed={} remaining_candidates={}",
+                        pass.tick.bash_tasks.removed,
+                        pass.tick.bash_tasks.remaining_candidates
+                    );
+                    if pass.tick.compression_events_removed > 0 {
                         crate::slog_info!(
-                            "bash task retention: removed={} remaining_candidates={}",
-                            tick.bash_tasks.removed,
-                            tick.bash_tasks.remaining_candidates
+                            "compression retention: folded {} raw events",
+                            pass.tick.compression_events_removed
                         );
-                        if tick.compression_events_removed > 0 {
-                            crate::slog_info!(
-                                "compression retention: folded {} raw events",
-                                tick.compression_events_removed
-                            );
-                        }
                     }
-                    Err(error) => crate::slog_warn!("retention failed: {}", error),
                 }
+                Ok(None) => {}
+                Err(error) => crate::slog_warn!("retention failed: {}", error),
             }
             IN_FLIGHT.store(false, Ordering::Release);
         })
@@ -539,6 +658,40 @@ pub fn maybe_spawn_retention(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn retention_releases_database_mutex_before_layout_stats() {
+        let dir = tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        conn.execute(
+            "INSERT INTO bash_tasks (
+                harness, session_id, task_id, project_key, command, cwd, status,
+                started_at, completed_at, completion_delivered
+             ) VALUES ('opencode', 'session', 'bash-0000000000000001', 'project',
+                       'true', '.', 'completed', 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+        let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+        let observed = std::sync::atomic::AtomicBool::new(false);
+
+        let pass = prune_retention_once_observed(
+            &db,
+            crate::db::bash_tasks::TERMINAL_ROW_RETENTION_AGE_MS + 100,
+            Some(&[]),
+            || {
+                let _guard = db
+                    .try_lock()
+                    .expect("database mutex held during layout stat phase");
+                observed.store(true, Ordering::SeqCst);
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert!(observed.load(Ordering::SeqCst));
+        assert_eq!(pass.tick.bash_tasks.removed, 1);
+    }
 
     #[test]
     fn retention_preserves_lifetime_totals_and_live_task_identity() {

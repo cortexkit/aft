@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use aft::bash_background::persistence::{
@@ -10,7 +11,7 @@ use aft::bash_background::BgTaskStatus;
 use aft::db::bash_tasks::{
     prune_terminal_rows, upsert_bash_task, BashTaskRow, TERMINAL_ROW_RETENTION_AGE_MS,
 };
-use aft::db::compression_events::prune_retention_tick;
+use aft::db::compression_events::{prune_retention_once, prune_retention_tick};
 use aft::db::TrackedConnection as Connection;
 use rusqlite::params;
 
@@ -242,20 +243,26 @@ fn measure_terminal_pruner_on_database_copy() {
         path.file_name().and_then(|name| name.to_str()),
         Some("aft.db")
     );
-    let mut conn = aft::db::open(&path).expect("open copied database");
-    let before = task_count(&conn);
+    let conn = aft::db::open(&path).expect("open copied database");
+    let db = Arc::new(Mutex::new(conn));
+    let before = task_count(&db.lock().expect("database lock"));
     let started = Instant::now();
-    let tx = conn
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .expect("begin retention transaction");
-    let result = prune_terminal_rows(&tx, current_unix_millis(), 500).expect("retention tick");
-    tx.commit().expect("commit retention transaction");
-    let tick_micros = started.elapsed().as_micros();
+    let pass = prune_retention_once(&db, current_unix_millis(), Some(&[]))
+        .expect("retention pass")
+        .expect("uncontended retention pass");
+    let elapsed_micros = started.elapsed().as_micros();
     eprintln!(
-        "bash task retention measurement: before_rows={before} after_rows={} removed={} tick_us={tick_micros} remaining_candidates={}",
-        task_count(&conn),
-        result.removed,
-        result.remaining_candidates
+        "bash task retention measurement: before_rows={before} after_rows={} removed={} selection_lock_us={} stat_us={} task_delete_us={} event_prune_us={} commit_us={} mutation_lock_us={} total_lock_us={} elapsed_us={elapsed_micros} remaining_candidates={}",
+        task_count(&db.lock().expect("database lock")),
+        pass.tick.bash_tasks.removed,
+        pass.timings.selection_lock_micros,
+        pass.timings.stat_micros,
+        pass.timings.task_delete_micros,
+        pass.timings.event_prune_micros,
+        pass.timings.commit_micros,
+        pass.timings.mutation_lock_micros,
+        pass.timings.total_lock_micros(),
+        pass.tick.bash_tasks.remaining_candidates
     );
 }
 

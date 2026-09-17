@@ -28,6 +28,8 @@ const TERMINAL_PRUNE_PREDICATE: &str = "
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalRowsPrune {
     pub removed: usize,
+    /// Rows left in the bounded `limit + 1` probe. Reaching the probe limit
+    /// means additional SQL candidates may remain beyond this count.
     pub remaining_candidates: usize,
 }
 
@@ -38,6 +40,21 @@ struct TerminalPruneCandidate {
     task_id: String,
     stdout_path: Option<String>,
     stderr_path: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TerminalPrunePlan {
+    storage_root: Option<PathBuf>,
+    candidates: Vec<TerminalPruneCandidate>,
+    probed_candidates: usize,
+    cutoff: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedTerminalPrune {
+    identities: Vec<TerminalPruneCandidate>,
+    probed_candidates: usize,
+    cutoff: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -169,61 +186,97 @@ pub(crate) fn prune_terminal_rows_guarded(
     limit: usize,
     is_registered_in_process: impl Fn(&str) -> bool,
 ) -> rusqlite::Result<TerminalRowsPrune> {
+    let plan = select_terminal_prune_candidates(conn, now_ms, limit)?;
+    let prepared = prepare_terminal_prune(plan, is_registered_in_process);
+    delete_prepared_terminal_rows(conn, prepared)
+}
+
+pub(crate) fn select_terminal_prune_candidates(
+    conn: &Connection,
+    now_ms: i64,
+    limit: usize,
+) -> rusqlite::Result<TerminalPrunePlan> {
     let cutoff = now_ms.saturating_sub(TERMINAL_ROW_RETENTION_AGE_MS);
     let bounded_limit = limit.min(MAX_TERMINAL_PRUNE_ROWS);
-    let (candidates, total_candidates) = if bounded_limit == 0 {
-        let total = conn.query_row(
-            &format!("SELECT COUNT(*) FROM bash_tasks WHERE {TERMINAL_PRUNE_PREDICATE}"),
-            [cutoff],
-            |row| row.get::<_, i64>(0),
-        )?;
-        (Vec::new(), total)
-    } else {
-        let candidates = conn
-            .prepare(&format!(
-                "SELECT harness, session_id, task_id, stdout_path, stderr_path, COUNT(*) OVER ()
-                 FROM bash_tasks
-                 WHERE {TERMINAL_PRUNE_PREDICATE}
-                 LIMIT ?2"
-            ))?
-            .query_map(
-                params![cutoff, i64::try_from(bounded_limit).unwrap_or(500)],
-                |row| {
-                    Ok((
-                        TerminalPruneCandidate {
-                            harness: row.get(0)?,
-                            session_id: row.get(1)?,
-                            task_id: row.get(2)?,
-                            stdout_path: row.get(3)?,
-                            stderr_path: row.get(4)?,
-                        },
-                        row.get::<_, i64>(5)?,
-                    ))
-                },
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let total = candidates.first().map(|(_, total)| *total).unwrap_or(0);
-        (
-            candidates
-                .into_iter()
-                .map(|(candidate, _)| candidate)
-                .collect(),
-            total,
-        )
-    };
+    let probe_limit = bounded_limit.saturating_add(1);
+    let mut candidates = conn
+        .prepare(&format!(
+            "SELECT harness, session_id, task_id, stdout_path, stderr_path
+             FROM bash_tasks
+             WHERE {TERMINAL_PRUNE_PREDICATE}
+             LIMIT ?2"
+        ))?
+        .query_map(
+            params![cutoff, i64::try_from(probe_limit).unwrap_or(501)],
+            |row| {
+                Ok(TerminalPruneCandidate {
+                    harness: row.get(0)?,
+                    session_id: row.get(1)?,
+                    task_id: row.get(2)?,
+                    stdout_path: row.get(3)?,
+                    stderr_path: row.get(4)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let probed_candidates = candidates.len();
+    candidates.truncate(bounded_limit);
+    let storage_root = conn
+        .path()
+        .and_then(|path| Path::new(path).parent())
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf);
+    Ok(TerminalPrunePlan {
+        storage_root,
+        candidates,
+        probed_candidates,
+        cutoff,
+    })
+}
 
-    let removable = candidates
+pub(crate) fn prepare_terminal_prune(
+    plan: TerminalPrunePlan,
+    is_registered_in_process: impl Fn(&str) -> bool,
+) -> PreparedTerminalPrune {
+    prepare_terminal_prune_observed(plan, is_registered_in_process, || {})
+}
+
+pub(crate) fn prepare_terminal_prune_observed(
+    plan: TerminalPrunePlan,
+    is_registered_in_process: impl Fn(&str) -> bool,
+    observe_stat_phase: impl FnOnce(),
+) -> PreparedTerminalPrune {
+    observe_stat_phase();
+    let identities = plan
+        .candidates
         .into_iter()
         .filter(|candidate| {
-            !is_registered_in_process(&candidate.task_id) && task_layout_is_gone(conn, candidate)
+            !is_registered_in_process(&candidate.task_id)
+                && task_layout_is_gone(plan.storage_root.as_deref(), candidate)
         })
-        .collect::<Vec<_>>();
-    let removed = if removable.is_empty() {
+        .collect();
+    PreparedTerminalPrune {
+        identities,
+        probed_candidates: plan.probed_candidates,
+        cutoff: plan.cutoff,
+    }
+}
+
+pub(crate) fn cap_prepared_terminal_rows(prepared: &mut PreparedTerminalPrune, limit: usize) {
+    prepared.identities.truncate(limit);
+}
+
+pub(crate) fn delete_prepared_terminal_rows(
+    conn: &Connection,
+    prepared: PreparedTerminalPrune,
+) -> rusqlite::Result<TerminalRowsPrune> {
+    let removed = if prepared.identities.is_empty() {
         0
     } else {
-        let mut values = Vec::with_capacity(1 + removable.len() * 3);
-        values.push(Value::Integer(cutoff));
-        let identities = removable
+        let mut values = Vec::with_capacity(1 + prepared.identities.len() * 3);
+        values.push(Value::Integer(prepared.cutoff));
+        let identities = prepared
+            .identities
             .into_iter()
             .enumerate()
             .map(|(index, candidate)| {
@@ -247,23 +300,19 @@ pub(crate) fn prune_terminal_rows_guarded(
         )?
     };
 
-    let remaining_candidates = total_candidates.saturating_sub(i64::try_from(removed).unwrap_or(0));
     Ok(TerminalRowsPrune {
         removed,
-        remaining_candidates: usize::try_from(remaining_candidates).unwrap_or(usize::MAX),
+        remaining_candidates: prepared.probed_candidates.saturating_sub(removed),
     })
 }
 
-fn task_layout_is_gone(conn: &Connection, candidate: &TerminalPruneCandidate) -> bool {
-    let Some(storage_root) = conn
-        .path()
-        .and_then(|path| Path::new(path).parent())
-        .filter(|path| !path.as_os_str().is_empty())
-    else {
+fn task_layout_is_gone(storage_root: Option<&Path>, candidate: &TerminalPruneCandidate) -> bool {
+    let session_dir = candidate_session_dir(candidate).or_else(|| {
+        storage_root.map(|storage_root| session_tasks_dir(storage_root, &candidate.session_id))
+    });
+    let Some(session_dir) = session_dir else {
         return false;
     };
-    let session_dir = candidate_session_dir(candidate)
-        .unwrap_or_else(|| session_tasks_dir(storage_root, &candidate.session_id));
     let task_id = &candidate.task_id;
     let directory_layout = session_dir.join(task_id);
     let flat_layout = session_dir.join(format!("{task_id}.json"));
