@@ -1110,3 +1110,121 @@ fn inspect_scoped_diagnostics_respects_aftignore() {
     let status = aft.shutdown();
     assert!(status.success());
 }
+/// Helper: run a glob tool_call and return the set of matched files (normalized).
+fn glob_files(aft: &mut AftProcess, id: &str, pattern: &str, path: Option<&str>) -> Vec<String> {
+    let mut req = json!({
+        "id": id,
+        "command": "glob",
+        "pattern": pattern,
+    });
+    if let Some(p) = path {
+        req["path"] = json!(p);
+    }
+    let response = send(aft, req);
+    assert_eq!(
+        response["success"], true,
+        "glob should succeed: {response:?}"
+    );
+    response["files"]
+        .as_array()
+        .expect("files array")
+        .iter()
+        .map(|entry| {
+            entry
+                .as_str()
+                .expect("file path")
+                .replace('\\', "/")
+        })
+        .collect()
+}
+
+/// A bare filename pattern with a `path` directory must match a file directly
+/// under that directory. The pattern is relative to `path`, so `{path: "src",
+/// pattern: "a.rs"}` must return `src/a.rs`. This is the standard glob contract:
+/// `path` is the search root and the pattern is evaluated relative to it.
+#[test]
+fn glob_bare_filename_matches_top_level_under_path_fallback() {
+    let project = setup_project(&[
+        ("src/a.rs", "fn a() {}\n"),
+        ("src/sub/b.rs", "fn b() {}\n"),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    // Bare filename at the top level of the search root — must match.
+    let files = glob_files(&mut aft, "glob-bare-top", "a.rs", Some("src"));
+    let expected = canonical_path_string(&project.path().join("src/a.rs"));
+    assert_eq!(
+        files, vec![expected.clone()],
+        "bare filename must match a file directly under path (fallback): {files:?}"
+    );
+
+    // Bare filename must NOT match a file in a subdirectory — `b.rs` is at
+    // `src/sub/b.rs`, so relative to `src` it is `sub/b.rs`, which `b.rs`
+    // does not match.
+    let files = glob_files(&mut aft, "glob-bare-nested", "b.rs", Some("src"));
+    assert!(
+        files.is_empty(),
+        "bare filename must not match nested file under path (fallback): {files:?}"
+    );
+
+    // `**/b.rs` must match the nested file.
+    let files = glob_files(&mut aft, "glob-doublestar-b", "**/b.rs", Some("src"));
+    let expected_b = canonical_path_string(&project.path().join("src/sub/b.rs"));
+    assert_eq!(
+        files, vec![expected_b],
+        "**/b.rs must match nested file under path (fallback): {files:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+/// Same as above but with the search index enabled and ready, so the indexed
+/// route is exercised. The indexed and fallback routes must agree.
+#[test]
+fn glob_bare_filename_matches_top_level_under_path_indexed() {
+    let project = setup_project(&[
+        (".fixture-id", "glob_bare_filename_matches_top_level_under_path_indexed\n"),
+        ("src/a.rs", "fn a() {}\n"),
+        ("src/sub/b.rs", "fn b() {}\n"),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure_with_index(&mut aft, project.path());
+
+    // Wait for index to be ready.
+    wait_for_index_ready(&mut aft, || {
+        json!({
+            "id": "glob-index-ready-probe",
+            "command": "grep",
+            "pattern": "fn a",
+            "include": ["src/**/*.rs"],
+        })
+    });
+
+    // Bare filename at the top level of the search root — must match.
+    let files = glob_files(&mut aft, "glob-bare-top-idx", "a.rs", Some("src"));
+    let expected = canonical_path_string(&project.path().join("src/a.rs"));
+    assert_eq!(
+        files, vec![expected.clone()],
+        "bare filename must match a file directly under path (indexed): {files:?}"
+    );
+
+    // Bare filename must NOT match a file in a subdirectory.
+    let files = glob_files(&mut aft, "glob-bare-nested-idx", "b.rs", Some("src"));
+    assert!(
+        files.is_empty(),
+        "bare filename must not match nested file under path (indexed): {files:?}"
+    );
+
+    // `**/b.rs` must match the nested file.
+    let files = glob_files(&mut aft, "glob-doublestar-b-idx", "**/b.rs", Some("src"));
+    let expected_b = canonical_path_string(&project.path().join("src/sub/b.rs"));
+    assert_eq!(
+        files, vec![expected_b],
+        "**/b.rs must match nested file under path (indexed): {files:?}"
+    );
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}

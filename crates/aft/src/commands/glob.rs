@@ -290,13 +290,14 @@ fn fallback_glob(
     pattern: &str,
 ) -> GlobDiscovery {
     let filters = build_path_filters(&[pattern.to_string()], &[]).unwrap_or_default();
-    let filter_root = if search_root.starts_with(project_root) {
-        project_root
-    } else {
-        search_root
-    };
+    // Match the glob pattern relative to the search root so that a bare
+    // filename like `a.rs` matches a file directly under `path` (e.g.
+    // `src/a.rs` when `path` is `src`). Using `project_root` as the filter
+    // root would make the relative path `src/a.rs`, which `a.rs` does not
+    // match. The `ripgrep_glob` path already passes `search_root` as both
+    // arguments, so this keeps the two fallback routes in agreement.
     let walk_started = Instant::now();
-    let outcome = bounded_fallback_walk_files(filter_root, search_root, &filters);
+    let outcome = bounded_fallback_walk_files(search_root, search_root, &filters);
     let walk_time = walk_started.elapsed();
     let scope_started = Instant::now();
     let scope_has_files = scope_has_files(project_root, search_root);

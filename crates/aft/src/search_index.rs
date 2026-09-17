@@ -2516,7 +2516,14 @@ impl SearchIndexSnapshot {
                 scope_has_files |= in_scope;
                 in_scope
             })
-            .filter(|file| filters.matches(&self.project_root, &file.path))
+            // Match the glob pattern relative to the search root, not the
+            // project root. When a caller passes `{path: "src", pattern:
+            // "a.rs"}`, the pattern must match `a.rs` (the path relative to
+            // `src`), not `src/a.rs` (the path relative to the project root).
+            // Files outside the search root are already excluded by the
+            // `is_within_search_root` filter above, so the strip-prefix in
+            // `matches` always succeeds for the candidates that reach here.
+            .filter(|file| filters.matches(&search_root, &file.path))
             .map(|file| (file.path.clone(), file.modified))
             .collect::<Vec<_>>();
 
