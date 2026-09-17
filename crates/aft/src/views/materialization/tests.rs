@@ -384,9 +384,17 @@ fn bench_real_manifest_diff() {
     let original = temp.join("base.sqlite");
     materialize_manifest_view_database(&original, &blobs, &base).unwrap();
     let mut outputs = Vec::new();
-    for (incremental, per_reference) in [(false, false), (true, true), (true, false)] {
+    for (incremental, per_reference, scan_callers) in [
+        (false, false, false),
+        (true, true, false),
+        (true, false, true),
+        (true, false, false),
+    ] {
         PER_REFERENCE_LOOKUP.with(|enabled| enabled.set(per_reference));
-        let db = temp.join(if per_reference {
+        join::SCAN_CALLER_NODES.with(|enabled| enabled.set(scan_callers));
+        let db = temp.join(if scan_callers {
+            "scan-callers.sqlite"
+        } else if per_reference {
             "per-reference.sqlite"
         } else if incremental {
             "incremental.sqlite"
@@ -416,12 +424,13 @@ fn bench_real_manifest_diff() {
         let wal = std::fs::metadata(format!("{}-wal", db.display()))
             .unwrap()
             .len();
-        println!("per_reference={per_reference} incremental={incremental} wall_s={elapsed:.3} cpu_s={:.3} physical_bytes={} logical_bytes={} wal_bytes={wal} stats={stats:?}", after.2-before.2, after.0-before.0, after.1-before.1);
+        println!("scan_callers={scan_callers} per_reference={per_reference} incremental={incremental} wall_s={elapsed:.3} cpu_s={:.3} physical_bytes={} logical_bytes={} wal_bytes={wal} stats={stats:?}", after.2-before.2, after.0-before.0, after.1-before.1);
         report_wal_pages(&db);
         outputs.push(snapshot(&db));
     }
     assert_snapshot_parity(&outputs[0], &outputs[1]);
     assert_snapshot_parity(&outputs[0], &outputs[2]);
+    assert_snapshot_parity(&outputs[0], &outputs[3]);
 }
 
 #[test]

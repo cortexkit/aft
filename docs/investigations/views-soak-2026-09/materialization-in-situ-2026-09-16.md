@@ -479,3 +479,116 @@ Incremental wall/CPU was 8.536/5.956 s versus 6.137/4.659 s. Selected join was
 2113 ms (decode/bind 808, caller decode 530, resolve 625) versus 2052 ms before.
 All work counts, 74,649 cache-write pages, and 152,955,032 WAL bytes are unchanged.
 The unit proves a work bound, not a demonstrated in-situ wall-time improvement.
+
+### Paired offline scan/index control on final code
+
+The ignored real-pair benchmark now runs both caller-node lookup modes in the
+same process, in addition to the existing per-reference SQL control and cold
+writer. The scan control is test-only and retains the index construction, so its
+small extra construction cost makes it conservative rather than a binary-exact
+old-implementation timing. All four resulting databases match every cold table.
+`.bg-shell/offline-paired.log` records the final run:
+
+| same-process arm | load 1m start→end | wall s | CPU s | selected join ms | bind index ms | caller decode ms | physical bytes | logical bytes | WAL bytes |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| previous node scan, batched SQL | 23.56→22.95 | 6.200 | 4.728 | 1932 | 776 | 508 | 155062272 | 309402168 | 152955032 |
+| indexed caller lookup, batched SQL | 22.95→22.47 | 5.506 | 4.377 | 1773 | 703 | 467 | 155095040 | 309037624 | 152955032 |
+
+This is a nearby-load paired observation, not proof that all 694 ms of wall
+variation belongs to lookup (deletion and emission also varied). Work, row counts,
+full-resolution=false, unattributed=0, and WAL bytes are identical. The final
+indexed offline call is still **above five seconds**. Its remaining phases are
+selection 616, deletion 1034, owned insert 657, selected join 1773, bindings 200,
+emission 1024, commit 105, memory cleanup 88 ms.
+
+### Final fresh-storage views-on drill (14:05:10Z)
+
+Production code is `f94f2482d`; subsequent changes only add the test-build paired
+control above and this report. `cargo build --release -p agent-file-tools --bin
+aft` passed before running the drill. Storage/output:
+`.bg-shell/in-situ-after/{storage,output}`. The wrapper acquired the external
+opencode lock, the drill restored the subject, and the wrapper released the lock.
+All four probes are correct and `defects=[]`; both return legs have zero puts and
+embeds. **Performance acceptance is not achieved.**
+
+| switch | landed correct s | final correct s | landed CPU s | final CPU s | load start→end | puts / embeds |
+|---|---:|---:|---:|---:|---|---:|
+| HEAD→A | 12.8 | 36.977 | 54 | 65.41 | 40.14→38.68 | 269 / 3 |
+| A→HEAD | 10.7 | 13.977 | 43 | 28.48 | 38.68→34.57 | 0 / 0 |
+| HEAD→B | 13.6 | 23.280 | 49 | 29.96 | 34.57→30.73 | 13 / 1 |
+| B→HEAD | 14.3 | 26.446 | 42 | 28.01 | 30.73→33.10 | 0 / 0 |
+
+HEAD→A contains **two graph publications**, 13,072 and 7,838 ms materialization,
+not one; its final correctness row must not be paired with just the first call.
+The B legs have the following actual per-publication measurements:
+
+| phase / counter | final HEAD→B | final B→HEAD |
+|---|---:|---:|
+| derived inclusive ms | 14310 | 17829 |
+| materialization call ms | 14155 | 17643 |
+| closure ms (reported only) | 130 | 161 |
+| selection ms | 3123 | 1811 |
+| deletion ms | 2839 | 2291 |
+| owned decode / insert ms | 955 | 924 |
+| selected join ms | 2486 | 4794 |
+| ↳ bind index entries ms | 971 | 2192 |
+| ↳ surface replay ms | 65 | 76 |
+| ↳ caller decode ms | 729 | 894 |
+| ↳ resolve / record ms | 615 | 1106 |
+| ↳ dependency union ms | 63 | 359 |
+| binding writes ms | 727 | 1144 |
+| emit refs / edges ms | 3517 | 5500 |
+| commit ms | 191 | 376 |
+| memory / connection cleanup ms | 298 / 4 | 776 / 6 |
+| restored surfaces | 4632 | 4637 |
+| rebuilt changed / facts / membership / missing | 270/19/0/0 | 278/19/0/0 |
+| resolved callers / unchanged dependents | 593/323 | 601/323 |
+| selected paths / replay-skipped callers | 1635/1025 | 1430/825 |
+| full_resolution / unattributed callers | false/0 | false/0 |
+| identical dependent references skipped | 55387 | 55387 |
+| dependent rows deleted / inserted | 3325/3327 | 3327/3325 |
+| SQLite cache-write pages (4096-byte pages) | 61738 | 60087 |
+| derived WAL before → after bytes | 0→132486872 | 0→129994272 |
+| process physical bytes inside probe | 743448576 | 537341952 |
+| process logical bytes inside probe | 1569821170 | 926211644 |
+
+The later daemon observation shows why process-wide bytes cannot be assigned to
+the derived file: its own WAL remains ~130 MB and cache writes ~60k pages, while
+the process interval grows to 537–743 MB physical and 926–1570 MB logical. The
+before drill's B legs had the same logical row workload but 57,101/64,097 cache
+writes, reflecting different spill/layout history. The retained offline pair
+has 283 changes and 588 resolved callers, versus 288 and 593 on the in-situ
+forward leg; it is not an equal-counter isolation proof. The evidence supports
+reporting **both scopes separately**, not declaring the byte attribution closed
+or attributing the entire difference to one unidentified writer. The final
+process-wide numbers also must not be compared to the alleged 18–34 MB offline
+cost: this same retained pair measured ~155 MB physical in isolation.
+
+**Remaining measured bottleneck:** final B emission is 3517/5500 ms; selected
+join is 2486/4794 ms, including bind/index 971/2192 ms. Deletion adds 2839/2291 ms.
+Closure adds only 130/161 ms in this base and was not changed. Higher host load
+and different publication splitting prevent treating this drill as a causal
+before/after regression estimate. It nevertheless fails the ≤5 s criterion and
+the supplied ~12 CPU-s legacy transition criterion. No widening of the fence,
+reader changes, or legacy-plane retirement is included in this delivery.
+
+### Final verification
+
+- `cargo test -p agent-file-tools --test integration tool_call_parity_test`:
+  12 passed, including the owner-confirmed 69-fixture
+  `tool_call_matches_direct_spine_envelopes` matrix, with default views-off.
+- `cargo test -p agent-file-tools --test watcher_integration branch_switch`:
+  2 passed (134.20 s), including views-on round-trip reuse and the branch matrix.
+- `cargo test --release -p agent-file-tools --lib -- views::materialization::tests
+  callgraph_store::join::`: 46 passed, 2 ignored, on final test-control code.
+- Real captured-pair cold-table parity: passed before, after, and in the final
+  same-process scan/index control. Selected mutation/restore: only the named
+  work-bound test red, then both selected tests green after checkout/touch.
+- Release executable build and Rust compilation through all test targets passed.
+  Two scoped AFT inspections timed out in tier-2 rescan; no clean LSP report is
+  claimed. One benchmark comment flagged in review was clarified; formatting
+  and diff checks passed.
+- No separate views-on version of the 69-fixture route/envelope harness was
+  introduced: this is a binding implementation/work-bound change with unchanged
+  cold rows, not a reader-return contract change. Views-on behavior is exercised
+  by the existing watcher matrix and both real drills.

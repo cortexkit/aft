@@ -1063,6 +1063,16 @@ impl ParseBlob {
             let caller_node = caller_symbol.as_ref().and_then(|name| {
                 #[cfg(test)]
                 CALLER_NODE_LOOKUP_WORK.with(|work| work.set(work.get() + 1));
+                #[cfg(test)]
+                if SCAN_CALLER_NODES.with(std::cell::Cell::get) {
+                    return nodes
+                        .iter()
+                        .find(|node| {
+                            CALLER_NODE_LOOKUP_WORK.with(|work| work.set(work.get() + 1));
+                            &node.scoped_name == name
+                        })
+                        .map(|node| node.id.clone());
+                }
                 caller_nodes.get(name).map(|id| (*id).clone())
             });
             raw_refs.push(super::RawRef {
@@ -2386,6 +2396,9 @@ mod consultation_tests {
 #[cfg(test)]
 thread_local! {
     static CALLER_NODE_LOOKUP_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // Select the original caller-node scan in tests so the benchmark can
+    // compare scan and indexed lookup in the same process and host-load window.
+    pub(crate) static SCAN_CALLER_NODES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[test]
