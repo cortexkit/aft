@@ -547,11 +547,14 @@ pub(crate) fn derive_excluded_subtrees(
 
 const WATCHER_OBSERVATION_STATE_PREFIX: &str = "watcher.observed_exclusion_prefixes";
 
+/// Overflow rankings are shared by repository identity so a newly-created
+/// linked worktree starts with evidence learned by existing checkouts. We keep
+/// one repository ranking rather than a per-root override; the most recently
+/// persisted observation becomes the next bind's ranking for every sibling.
 fn watcher_observation_state_key(root: &Path) -> String {
-    format!(
-        "{WATCHER_OBSERVATION_STATE_PREFIX}:{}",
-        crate::path_identity::project_scope_key(root)
-    )
+    let repository_key = crate::search_index::artifact_cache_key_memoized_only(root)
+        .unwrap_or_else(|| crate::search_index::artifact_cache_key(root));
+    format!("{WATCHER_OBSERVATION_STATE_PREFIX}:{repository_key}")
 }
 
 fn valid_observed_exclusion_prefix(prefix: &crate::context::WatcherOverflowPrefix) -> bool {
@@ -1108,6 +1111,7 @@ mod tests {
         AccessKind, AccessMode, CreateKind, DataChange, Flag, MetadataKind, ModifyKind,
     };
     use notify::EventKind;
+    use std::process::Command;
     use tempfile::TempDir;
 
     fn shared_matcher(root: &Path) -> SharedGitignore {
@@ -1122,6 +1126,19 @@ mod tests {
         let matcher = builder.build().unwrap();
         let matcher = (matcher.num_ignores() > 0).then(|| Arc::new(matcher));
         Arc::new(RwLock::new(matcher))
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .status()
+                .expect("run git")
+                .success(),
+            "git {args:?} failed in {}",
+            root.display()
+        );
     }
 
     #[test]
@@ -1264,6 +1281,84 @@ mod tests {
             exclusions.last().unwrap().source(),
             WatcherExclusionSource::Ranked
         );
+    }
+
+    #[test]
+    fn sibling_worktree_inherits_repository_ranking_on_first_bind() {
+        let container = TempDir::new().unwrap();
+        let storage = TempDir::new().unwrap();
+        let main = container.path().join("main");
+        let sibling = container.path().join("sibling");
+        std::fs::create_dir(&main).unwrap();
+        run_git(&main, &["init"]);
+        std::fs::write(main.join(".gitignore"), "packages/*/tmp/\n").unwrap();
+        std::fs::write(main.join("tracked.txt"), "repository identity\n").unwrap();
+        run_git(&main, &["add", "."]);
+        run_git(
+            &main,
+            &[
+                "-c",
+                "user.name=AFT Test",
+                "-c",
+                "user.email=aft@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        );
+        run_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "watcher-sibling",
+                sibling.to_str().unwrap(),
+            ],
+        );
+
+        let main = std::fs::canonicalize(main).unwrap();
+        let sibling = std::fs::canonicalize(sibling).unwrap();
+        let relative_hot = "packages/opencode-plugin/tmp";
+        std::fs::create_dir_all(main.join(relative_hot)).unwrap();
+        std::fs::create_dir_all(sibling.join(relative_hot)).unwrap();
+        assert_ne!(
+            crate::path_identity::project_scope_key(&main),
+            crate::path_identity::project_scope_key(&sibling)
+        );
+        assert_eq!(
+            crate::search_index::artifact_cache_key(&main),
+            crate::search_index::artifact_cache_key(&sibling)
+        );
+
+        let db = Arc::new(Mutex::new(
+            crate::db::open(&storage.path().join("aft.db")).unwrap(),
+        ));
+        let main_counters = crate::context::watcher_counters_for_root(&main);
+        main_counters.set_observed_exclusion_prefixes(vec![
+            crate::context::WatcherOverflowPrefix {
+                prefix: relative_hot.to_string(),
+                count: 91,
+            },
+        ]);
+        persist_watcher_observations(&main, &main_counters, Some(&db));
+
+        let sibling_counters = crate::context::watcher_counters_for_root(&sibling);
+        sibling_counters.set_observed_exclusion_prefixes(Vec::new());
+        load_watcher_observations(&sibling, &sibling_counters, Some(&db));
+
+        assert_eq!(
+            sibling_counters.observed_exclusion_prefixes(),
+            vec![crate::context::WatcherOverflowPrefix {
+                prefix: relative_hot.to_string(),
+                count: 91,
+            }]
+        );
+        let matcher = shared_matcher(&sibling);
+        let exclusions =
+            derive_excluded_subtrees(&sibling, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        assert_eq!(exclusions[0].path(), sibling.join(relative_hot));
+        assert_eq!(exclusions[0].source(), WatcherExclusionSource::Ranked);
     }
 
     #[test]
