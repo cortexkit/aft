@@ -810,6 +810,7 @@ impl HealthDiagnosticRollup {
             "lsp_children": { "spawned": 0, "cwd_gone": 0 },
             "memory": memory_rollup_metrics(None),
             "mutating_lanes": { "scheduler_busy": true },
+            "process_io": crate::process_io::ProcessIoSnapshot::capture().to_value(),
             "roots": [],
         });
         insert_lifecycle_metrics(
@@ -1315,6 +1316,7 @@ fn build_health_diagnostic_rollup(
         },
         "memory": memory,
         "mutating_lanes": mutating_lanes_metrics(executor),
+        "process_io": crate::process_io::ProcessIoSnapshot::capture().to_value(),
         "roots": roots,
     });
     insert_lifecycle_metrics(&mut metrics, lifecycle);
@@ -1386,6 +1388,10 @@ pub(super) fn build_health_report(
         dispatch_path.insert("mutating_lanes".to_string(), mutating_lanes);
     }
     metrics.insert("dispatch_path".to_string(), dispatch_path);
+    metrics.insert(
+        "process_io".to_string(),
+        crate::process_io::ProcessIoSnapshot::capture().to_value(),
+    );
 
     let scheduler_busy = executor.try_actor_count().is_none();
     HealthReport {
@@ -2710,6 +2716,27 @@ mod tests {
             root_row["suspended_domains"][0]["reason"],
             "zero_credit_death_limit"
         );
+    }
+
+    #[test]
+    fn health_report_carries_process_io_object() {
+        let app = App::default_shared();
+        let executor = Executor::new();
+        let metrics = DispatchPathMetrics::new();
+        let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
+        let metrics = report.metrics.expect("health metrics");
+        let io = metrics.get("process_io").expect("process_io field");
+        assert!(io["available"].is_boolean());
+        assert!(io["sampled_at_ms"].is_u64());
+        if io["available"].as_bool() == Some(true) {
+            assert!(io["diskio_bytes_read"].is_u64());
+            assert!(io["diskio_bytes_written"].is_u64());
+            assert!(io["logical_bytes_written"].is_u64());
+        } else {
+            assert!(io.get("diskio_bytes_read").is_none());
+            assert!(io.get("diskio_bytes_written").is_none());
+            assert!(io.get("logical_bytes_written").is_none());
+        }
     }
 }
 

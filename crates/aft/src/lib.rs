@@ -113,6 +113,7 @@ pub mod path_status;
 pub mod pattern_compile;
 pub mod pins;
 mod platform_tls;
+pub mod process_io;
 pub mod protocol;
 pub mod pty_render;
 pub mod query_shape;

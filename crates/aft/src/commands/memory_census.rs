@@ -89,13 +89,14 @@ pub fn render_memory_census(
         )),
         (None, None) => None,
     };
+    let process_io = crate::process_io::ProcessIoSnapshot::capture().to_value();
     json!({
         "roots": roots,
         "process": {
             "phys_footprint_bytes": process.phys_footprint_bytes,
             "rss_bytes": process.rss_bytes,
             "allocator_slack_bytes": slack,
-            "allocator_slack_label": "reclaimable by relief",
+            "allocator_slack_label": "allocator slack (virtual, mostly already MADV_FREE'd; not reclaimable physical memory)",
             "allocator_slack_measured": process.allocator_slack_measured,
             "allocator_observation_age_ms": process.allocator_observation_age_ms,
             "sqlite_bytes": process.sqlite.memory_used_bytes,
@@ -108,7 +109,9 @@ pub fn render_memory_census(
                 "bytes": dead_code_snapshots.bytes,
                 "drops": dead_code_snapshots.drops,
             },
-        }
+            "process_io": process_io.clone(),
+        },
+        "process_io": process_io,
     })
 }
 
@@ -245,5 +248,28 @@ mod tests {
         assert_eq!(row["planes"]["search"], json!(17));
         assert_eq!(row["planes"]["symbols"], json!(29));
         assert_eq!(row["attributed_bytes"], json!(46));
+    }
+
+    #[test]
+    fn census_carries_process_io_object_and_updated_slack_label() {
+        let snapshot = MemorySnapshot::new("ready", BTreeMap::new());
+        let value = render_memory_census(&snapshot, None);
+        assert_eq!(
+            value["process"]["allocator_slack_label"],
+            "allocator slack (virtual, mostly already MADV_FREE'd; not reclaimable physical memory)"
+        );
+        for io in [&value["process_io"], &value["process"]["process_io"]] {
+            assert!(io["available"].is_boolean());
+            assert!(io["sampled_at_ms"].is_u64());
+            if io["available"].as_bool() == Some(true) {
+                assert!(io["diskio_bytes_read"].is_u64());
+                assert!(io["diskio_bytes_written"].is_u64());
+                assert!(io["logical_bytes_written"].is_u64());
+            } else {
+                assert!(io.get("diskio_bytes_read").is_none());
+                assert!(io.get("diskio_bytes_written").is_none());
+                assert!(io.get("logical_bytes_written").is_none());
+            }
+        }
     }
 }

@@ -3,61 +3,7 @@
 //! concurrent publications but cannot rule out other concurrent I/O.
 use std::sync::{Mutex, OnceLock};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Bytes {
-    pub written: u64,
-    pub logical: u64,
-    pub read: u64,
-}
-impl Bytes {
-    pub(crate) fn capture() -> Option<Self> {
-        #[cfg(target_os = "macos")]
-        {
-            let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
-            // A successful kernel call initializes the versioned buffer.
-            let rc = unsafe {
-                libc::proc_pid_rusage(
-                    libc::getpid(),
-                    libc::RUSAGE_INFO_V4,
-                    usage.as_mut_ptr().cast(),
-                )
-            };
-            if rc != 0 {
-                return None;
-            }
-            let usage = unsafe { usage.assume_init() };
-            Some(Self {
-                written: usage.ri_diskio_byteswritten,
-                logical: usage.ri_logical_writes,
-                read: usage.ri_diskio_bytesread,
-            })
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            None
-        }
-    }
-    fn delta(self, before: Self) -> Option<Self> {
-        Some(Self {
-            written: self.written.checked_sub(before.written)?,
-            logical: self.logical.checked_sub(before.logical)?,
-            read: self.read.checked_sub(before.read)?,
-        })
-    }
-    fn add(self, other: Self) -> Self {
-        Self {
-            written: self.written + other.written,
-            logical: self.logical + other.logical,
-            read: self.read + other.read,
-        }
-    }
-    fn fields(value: Option<Self>, prefix: &str) -> String {
-        match value {
-            Some(v) => format!("{prefix}_physical_bytes_written={} {prefix}_logical_bytes_written={} {prefix}_bytes_read={}", v.written, v.logical, v.read),
-            None => format!("{prefix}_physical_bytes_written=unknown {prefix}_logical_bytes_written=unknown {prefix}_bytes_read=unknown"),
-        }
-    }
-}
+pub(crate) use crate::process_io::Bytes;
 #[derive(Default)]
 struct Activity {
     active: u64,
@@ -280,13 +226,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn darwin_logical_bytes_observe_file_write() {
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        let before = Bytes::capture().unwrap();
-        let mut file = std::fs::File::create(dir.path().join("bytes")).unwrap();
-        file.write_all(&vec![0x5a; 8 * 1024 * 1024]).unwrap();
-        file.sync_all().unwrap();
-        let delta = Bytes::capture().unwrap().delta(before).unwrap();
-        assert!(delta.logical >= 8 * 1024 * 1024, "{delta:?}");
+        crate::process_io::assert_darwin_logical_bytes_observe_file_write();
     }
 }
