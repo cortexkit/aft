@@ -22,4 +22,36 @@ A preceding attempt used a fresh Cargo target directory and is excluded from the
 
 ## After: owned `ReadDirectoryChangesW` backend
 
-Pending implementation and native re-measurement.
+Backend commit: `3197a989d`.
+
+| Backend | Build exit / duration | Raw events | Kept after gitignore | Notify error or typed rescan | Marker found after build | Trigram stale |
+|---|---:|---:|---:|---|---|---|
+| owned `ReadDirectoryChangesW` + IOCP | 0 / 78.609 s | 470 | 2 | none; all rescan counters 0 | yes, one match | no |
+
+The completion thread drained 467 root completions containing 472 translated events in this window. Cumulative opt-in samples reported **44 µs average** and **165 µs maximum** completion-to-channel drain latency. The timing includes copying the completed bytes, rearming the directory read, translating every entry, and sending the resulting events; it excludes downstream gitignore and index work. The read is rearmed before translation so that work cannot leave the recursive root handle without a pending 1 MiB kernel buffer.
+
+The owned backend uses the larger reference allocation: parcel-watcher's 1 MiB starting buffer (`src/windows/WindowsBackend.cc:8-10,70-80` in the pinned reference snapshot). A network handle that rejects that allocation with `ERROR_INVALID_PARAMETER` retries at 64 KiB. `ERROR_NOTIFY_ENUM_DIR` and a successful zero-byte completion both emit a `Flag::Rescan` event tagged `rescan: buffer overflow`. The filter maps that tag to `BufferOverflow`, the existing drain coalesces it into a full-root rescan, and health exposes `rescans_buffer_overflow_total` alongside the three pre-existing reason totals. Raw, invalidating, kept, dispatched, and aggregate overflow accounting remains in the shared filter, so Windows has the same per-root telemetry path as FSEvents and inotify.
+
+Because `ReadDirectoryChangesW` has no exclusion API, the root uses one recursive handle rather than per-directory handles. The completion buffer is copied and immediately rearmed before target-like paths reach the shared filter. External ignore files outside the root each use a non-recursive parent handle. Matcher generation is captured before backend startup and updated by the completion thread; the native race test pauses the thread before its first instruction and verifies that an intervening generation bump is not swallowed.
+
+## Native Windows verification
+
+All commands below ran on `asusallyko.local` while the mkdir lock and `HOLDER.txt` were held.
+
+```text
+cargo test -p agent-file-tools --lib watcher_backend::windows::tests:: -- --nocapture --test-threads=1
+running 2 tests
+windows_buffer_overflow_emits_exactly_one_typed_rescan ... ok
+windows_generation_bump_before_backend_start_is_observed ... ok
+test result: ok. 2 passed; 0 failed
+```
+
+The overflow test holds the completion consumer while 5,000 files are created with the test-only 256-byte buffer, then routes the native overflow through the production filter. It receives exactly one `RescanRequired(BufferOverflow)`. Replacing the buffer-overflow mapping with `Unknown` under the `NON-VACUITY BREAK` mutation made that exact test fail alone (`0 passed; 1 failed`); restoring the file returned the diff stat to empty.
+
+```text
+cargo nextest run -p agent-file-tools --test watcher_integration --no-fail-fast
+Starting 23 tests across 1 binary
+Summary [113.705s] 23 tests run: 23 passed (1 slow), 0 skipped
+```
+
+The required `scripts/ally-gate.sh 'test(watcher)'` invocation was also made under the lock. Its compile completed, but Windows Application Control blocked unrelated freshly emitted test-list binaries with OS error 4551 before nextest could apply the watcher filter. The package-scoped native tests above avoid that machine-policy enumeration failure while exercising the owned backend and the complete existing watcher integration binary.
