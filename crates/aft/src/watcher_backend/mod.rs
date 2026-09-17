@@ -8,18 +8,22 @@ use crate::watcher_filter::SharedGitignore;
 mod fsevents;
 #[cfg(target_os = "linux")]
 mod inotify;
+#[cfg(windows)]
+mod windows;
 
 #[cfg(target_os = "macos")]
 pub(crate) use fsevents::ProjectWatcher;
 #[cfg(target_os = "linux")]
 pub(crate) use inotify::ProjectWatcher;
+#[cfg(windows)]
+pub(crate) use windows::ProjectWatcher;
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub(crate) struct ProjectWatcher {
     _watcher: notify::RecommendedWatcher,
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 impl ProjectWatcher {
     fn create(
         root: PathBuf,
@@ -54,7 +58,11 @@ pub(crate) fn create_project_watcher(
     {
         return ProjectWatcher::create(root, extra_watch_paths, tx, matcher, matcher_generation);
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(windows)]
+    {
+        return ProjectWatcher::create(root, extra_watch_paths, tx, matcher, matcher_generation);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         let _ = (matcher, matcher_generation);
         ProjectWatcher::create(root, extra_watch_paths, tx)

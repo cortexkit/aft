@@ -54,6 +54,7 @@ impl WatcherFilterConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RescanReason {
+    BufferOverflow,
     KernelDropped,
     UserDropped,
     Unknown,
@@ -62,6 +63,7 @@ pub enum RescanReason {
 impl RescanReason {
     fn from_event_info(info: Option<&str>) -> Self {
         match info {
+            Some("rescan: buffer overflow") => Self::BufferOverflow,
             Some("rescan: kernel dropped") => Self::KernelDropped,
             Some("rescan: user dropped") => Self::UserDropped,
             _ => Self::Unknown,
@@ -70,6 +72,7 @@ impl RescanReason {
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::BufferOverflow => "buffer_overflow",
             Self::KernelDropped => "kernel_dropped",
             Self::UserDropped => "user_dropped",
             Self::Unknown => "unknown",
@@ -1222,6 +1225,10 @@ mod tests {
         granular.paths.push(pending);
         raw_tx.send(Ok(granular)).unwrap();
         for (info, expected) in [
+            (
+                Some("rescan: buffer overflow"),
+                RescanReason::BufferOverflow,
+            ),
             (Some("rescan: kernel dropped"), RescanReason::KernelDropped),
             (Some("rescan: user dropped"), RescanReason::UserDropped),
             (None, RescanReason::Unknown),
@@ -1245,7 +1252,7 @@ mod tests {
             "pending granular paths should be cleared by a rescan signal"
         );
         let snapshot = counters.snapshot();
-        assert_eq!(snapshot.raw_events_total, 4);
+        assert_eq!(snapshot.raw_events_total, 5);
         assert_eq!(snapshot.invalidating_events_total, 1);
         assert_eq!(snapshot.paths_after_gitignore_total, 0);
         assert_eq!(snapshot.paths_dispatched_total, 0);

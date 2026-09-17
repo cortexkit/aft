@@ -695,6 +695,7 @@ pub(crate) struct WatcherCountersSnapshot {
     pub(crate) overflows_total: u64,
     pub(crate) overflows_during_rescan: u64,
     pub(crate) last_overflow_prefixes: Vec<WatcherOverflowPrefix>,
+    pub(crate) rescans_buffer_overflow_total: u64,
     pub(crate) rescans_kernel_dropped_total: u64,
     pub(crate) rescans_user_dropped_total: u64,
     pub(crate) rescans_unknown_total: u64,
@@ -727,6 +728,7 @@ pub(crate) struct WatcherCounters {
     backend_exclusions: RwLock<WatcherBackendExclusions>,
     rescan_state: AtomicU8,
     rescan_again_reason: AtomicU8,
+    rescans_buffer_overflow_total: AtomicU64,
     rescans_kernel_dropped_total: AtomicU64,
     rescans_user_dropped_total: AtomicU64,
     rescans_unknown_total: AtomicU64,
@@ -786,6 +788,7 @@ impl WatcherCounters {
             crate::watcher_filter::RescanReason::KernelDropped => 1,
             crate::watcher_filter::RescanReason::UserDropped => 2,
             crate::watcher_filter::RescanReason::Unknown => 3,
+            crate::watcher_filter::RescanReason::BufferOverflow => 4,
         };
         loop {
             let state = self.rescan_state.load(Ordering::Acquire);
@@ -835,6 +838,7 @@ impl WatcherCounters {
                         return Some(match self.rescan_again_reason.load(Ordering::Acquire) {
                             1 => crate::watcher_filter::RescanReason::KernelDropped,
                             2 => crate::watcher_filter::RescanReason::UserDropped,
+                            4 => crate::watcher_filter::RescanReason::BufferOverflow,
                             _ => crate::watcher_filter::RescanReason::Unknown,
                         });
                     }
@@ -877,9 +881,9 @@ impl WatcherCounters {
             .clone()
     }
 
-    // Only the FSEvents and inotify backends take an exclusion list; the
-    // Windows backend has no exclusion API, so nothing calls this there.
-    #[cfg_attr(windows, allow(dead_code))]
+    // Windows cannot install these paths in ReadDirectoryChangesW, so its
+    // backend records an empty list while still publishing the matcher
+    // generation that its root handle setup observed.
     pub(crate) fn set_backend_exclusions(&self, matcher_generation: u64, paths: Vec<PathBuf>) {
         *self
             .backend_exclusions
@@ -903,6 +907,9 @@ impl WatcherCounters {
         reason: crate::watcher_filter::RescanReason,
     ) -> WatcherRescanInterval {
         match reason {
+            crate::watcher_filter::RescanReason::BufferOverflow => {
+                &self.rescans_buffer_overflow_total
+            }
             crate::watcher_filter::RescanReason::KernelDropped => {
                 &self.rescans_kernel_dropped_total
             }
@@ -964,6 +971,9 @@ impl WatcherCounters {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
+            rescans_buffer_overflow_total: self
+                .rescans_buffer_overflow_total
+                .load(Ordering::Relaxed),
             rescans_kernel_dropped_total: self.rescans_kernel_dropped_total.load(Ordering::Relaxed),
             rescans_user_dropped_total: self.rescans_user_dropped_total.load(Ordering::Relaxed),
             rescans_unknown_total: self.rescans_unknown_total.load(Ordering::Relaxed),
