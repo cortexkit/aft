@@ -14,7 +14,9 @@ use notify::event::{
 };
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
-use crate::watcher_filter::{derive_excluded_subtrees, SharedGitignore, WATCHER_EXCLUSION_LIMIT};
+use crate::watcher_filter::{
+    derive_excluded_subtrees, watcher_exclusion_paths, SharedGitignore, WATCHER_EXCLUSION_LIMIT,
+};
 
 const FSEVENTS_LATENCY_SECONDS: f64 = 0.03;
 const BACKEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -38,12 +40,13 @@ impl ProjectWatcher {
         // rather than on the backend thread after spawn.
         let observed_generation = matcher_generation.load(Ordering::Acquire);
         let exclusions = derive_excluded_subtrees(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        let exclusion_paths = watcher_exclusion_paths(&exclusions);
         super::log_exclusions(&root, &exclusions);
 
         let (backend_tx, backend_rx) = mpsc::channel();
-        let stream = FsEventsStream::start(&root, &exclusions, backend_tx.clone())?;
+        let stream = FsEventsStream::start(&root, &exclusion_paths, backend_tx.clone())?;
         let counters = crate::context::watcher_counters_for_root(&root);
-        counters.set_backend_exclusions(observed_generation, exclusions.clone());
+        counters.set_backend_exclusions(observed_generation, exclusion_paths);
         let mut external_watcher = notify::recommended_watcher(backend_tx)?;
         for path in extra_watch_paths {
             if path.exists() {
@@ -69,14 +72,14 @@ impl ProjectWatcher {
                             &matcher,
                             Some(WATCHER_EXCLUSION_LIMIT),
                         );
-                        match FsEventsStream::start(&root, &replacement_exclusions, stream.sender())
-                        {
+                        let replacement_paths = watcher_exclusion_paths(&replacement_exclusions);
+                        match FsEventsStream::start(&root, &replacement_paths, stream.sender()) {
                             Ok(replacement) => {
                                 stream = replacement;
                                 observed_generation = generation;
                                 counters.set_backend_exclusions(
                                     observed_generation,
-                                    replacement_exclusions.clone(),
+                                    replacement_paths,
                                 );
                                 if replacement_exclusions != exclusions {
                                     super::log_exclusions(&root, &replacement_exclusions);

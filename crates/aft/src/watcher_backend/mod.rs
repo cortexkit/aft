@@ -70,10 +70,19 @@ pub(crate) fn create_project_watcher(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub(crate) fn log_exclusions(root: &std::path::Path, exclusions: &[PathBuf]) {
+pub(crate) fn log_exclusions(
+    root: &std::path::Path,
+    exclusions: &[crate::watcher_filter::WatcherExclusion],
+) {
     let rendered = exclusions
         .iter()
-        .map(|path| path.display().to_string())
+        .map(|exclusion| {
+            format!(
+                "{} source={}",
+                exclusion.path().display(),
+                exclusion.source().as_str()
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
     crate::slog_info!(

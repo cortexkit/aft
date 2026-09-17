@@ -9,8 +9,8 @@ use notify::event::CreateKind;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
 use crate::watcher_filter::{
-    derive_excluded_subtrees, watcher_path_is_ignored_by_matcher, SharedGitignore,
-    WATCHER_EXCLUSION_LIMIT,
+    derive_excluded_subtrees, watcher_exclusion_paths, watcher_path_is_ignored_by_matcher,
+    SharedGitignore, WATCHER_EXCLUSION_LIMIT,
 };
 
 const BACKEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -36,13 +36,14 @@ impl ProjectWatcher {
         // observed" and the rebuild it requires would never run.
         let observed_generation = matcher_generation.load(Ordering::Acquire);
         let exclusions = derive_excluded_subtrees(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        let exclusion_paths = watcher_exclusion_paths(&exclusions);
         super::log_exclusions(&root, &exclusions);
 
         let (backend_tx, backend_rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(backend_tx)?;
-        let mut watched_directories = collect_watch_directories(&root, &matcher, &exclusions);
+        let mut watched_directories = collect_watch_directories(&root, &matcher, &exclusion_paths);
         let counters = crate::context::watcher_counters_for_root(&root);
-        counters.set_backend_exclusions(observed_generation, exclusions.clone());
+        counters.set_backend_exclusions(observed_generation, exclusion_paths.clone());
         for directory in &watched_directories {
             watcher.watch(directory, RecursiveMode::NonRecursive)?;
         }
@@ -60,6 +61,7 @@ impl ProjectWatcher {
             .name("aft-inotify-backend".to_string())
             .spawn(move || {
                 let mut exclusions = exclusions;
+                let mut exclusion_paths = exclusion_paths;
                 let mut observed_generation = observed_generation;
 
                 while !thread_shutdown.load(Ordering::Acquire) {
@@ -70,8 +72,9 @@ impl ProjectWatcher {
                             &matcher,
                             Some(WATCHER_EXCLUSION_LIMIT),
                         );
+                        let replacement_paths = watcher_exclusion_paths(&replacement_exclusions);
                         let desired =
-                            collect_watch_directories(&root, &matcher, &replacement_exclusions);
+                            collect_watch_directories(&root, &matcher, &replacement_paths);
                         for directory in watched_directories.difference(&desired) {
                             let _ = watcher.unwatch(directory);
                         }
@@ -89,20 +92,24 @@ impl ProjectWatcher {
 
                         counters.set_backend_exclusions(
                             observed_generation,
-                            replacement_exclusions.clone(),
+                            replacement_paths.clone(),
                         );
                         if replacement_exclusions != exclusions {
                             super::log_exclusions(&root, &replacement_exclusions);
                             exclusions = replacement_exclusions;
                         }
+                        exclusion_paths = replacement_paths;
                     }
 
                     match backend_rx.recv_timeout(BACKEND_POLL_INTERVAL) {
                         Ok(Ok(event)) => {
                             if matches!(event.kind, EventKind::Create(CreateKind::Folder)) {
                                 for path in &event.paths {
-                                    for directory in
-                                        collect_watch_directories(path, &matcher, &exclusions)
+                                    for directory in collect_watch_directories(
+                                        path,
+                                        &matcher,
+                                        &exclusion_paths,
+                                    )
                                     {
                                         if watched_directories.insert(directory.clone()) {
                                             if let Err(error) = watcher
