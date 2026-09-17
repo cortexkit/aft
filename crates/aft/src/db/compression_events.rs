@@ -338,6 +338,12 @@ fn compression_event_watermark_before(
 pub const RETENTION_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const RETENTION_BATCH: i64 = 500;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionTick {
+    pub bash_tasks: crate::db::bash_tasks::TerminalRowsPrune,
+    pub compression_events_removed: usize,
+}
+
 const RETENTION_CANDIDATES: &str = "
     SELECT id, created_at, harness, project_key, session_id, original_tokens, compressed_tokens,
            task_id IS NOT NULL AND EXISTS (
@@ -358,9 +364,19 @@ const RETENTION_CANDIDATES: &str = "
 /// because they can still emit compression events; completed history outside
 /// the retention window no longer participates in duplicate suppression.
 pub fn prune_compression_events(conn: &mut Connection, now_ms: i64) -> rusqlite::Result<usize> {
-    use rusqlite::{OptionalExtension, TransactionBehavior};
+    use rusqlite::TransactionBehavior;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let (created_at, event_id) = tx
+    let deleted = prune_compression_events_in_transaction(&tx, now_ms)?;
+    tx.commit()?;
+    Ok(deleted)
+}
+
+fn prune_compression_events_in_transaction(
+    conn: &Connection,
+    now_ms: i64,
+) -> rusqlite::Result<usize> {
+    use rusqlite::OptionalExtension;
+    let (created_at, event_id) = conn
         .query_row(
             "SELECT created_at, event_id FROM compression_retention_cursor WHERE singleton = 1",
             [],
@@ -368,8 +384,8 @@ pub fn prune_compression_events(conn: &mut Connection, now_ms: i64) -> rusqlite:
         )
         .optional()?
         .unwrap_or((i64::MIN, 0));
-    let max_id = compression_event_watermark(&tx)?;
-    let candidates = tx
+    let max_id = compression_event_watermark(conn)?;
+    let candidates = conn
         .prepare(RETENTION_CANDIDATES)?
         .query_map(
             params![
@@ -404,10 +420,10 @@ pub fn prune_compression_events(conn: &mut Connection, now_ms: i64) -> rusqlite:
         totals.0 += 1;
         totals.1 += original;
         totals.2 += compressed;
-        deleted += tx.execute("DELETE FROM compression_events WHERE id = ?1", [id])?;
+        deleted += conn.execute("DELETE FROM compression_events WHERE id = ?1", [id])?;
     }
     for ((harness, project, session), (events, original, compressed)) in folded {
-        tx.execute(
+        conn.execute(
             "INSERT INTO compression_event_rollups
              (harness, project_key, session_is_null, session_id, events, original_tokens, compressed_tokens)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -422,19 +438,55 @@ pub fn prune_compression_events(conn: &mut Connection, now_ms: i64) -> rusqlite:
         .last()
         .map(|row| (row.1, row.0))
         .unwrap_or((i64::MIN, 0));
-    tx.execute(
+    conn.execute(
         "INSERT INTO compression_retention_cursor VALUES (1, ?1, ?2)
          ON CONFLICT(singleton) DO UPDATE SET created_at = excluded.created_at, event_id = excluded.event_id",
         params![next_created, next_id],
     )?;
-    tx.commit()?;
     Ok(deleted)
+}
+
+pub fn prune_retention_tick(
+    conn: &mut Connection,
+    now_ms: i64,
+) -> rusqlite::Result<RetentionTick> {
+    prune_retention_tick_guarded(conn, now_ms, Some(&[]))
+}
+
+fn prune_retention_tick_guarded(
+    conn: &mut Connection,
+    now_ms: i64,
+    registries: Option<&[crate::bash_background::BgTaskRegistry]>,
+) -> rusqlite::Result<RetentionTick> {
+    use rusqlite::TransactionBehavior;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Task rows go first so the event pass in this transaction observes their
+    // final liveness, while the commit publishes both retention decisions at once.
+    let bash_tasks = crate::db::bash_tasks::prune_terminal_rows_guarded(
+        &tx,
+        now_ms,
+        500,
+        |task_id| {
+            registries.is_none_or(|registries| {
+                registries
+                    .iter()
+                    .any(|registry| registry.active_watch_count(task_id) > 0)
+            })
+        },
+    )?;
+    let compression_events_removed = prune_compression_events_in_transaction(&tx, now_ms)?;
+    tx.commit()?;
+    Ok(RetentionTick {
+        bash_tasks,
+        compression_events_removed,
+    })
 }
 
 /// Schedule bounded retention away from the daemon and standalone request loops.
 /// A process can have only one pass in flight and attempts at most once a minute.
 pub fn maybe_spawn_retention(
     db: Option<std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>>,
+    registries: Option<Vec<crate::bash_background::BgTaskRegistry>>,
 ) {
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -454,19 +506,32 @@ pub fn maybe_spawn_retention(
     }
     *last = Some(Instant::now());
     if let Err(error) = std::thread::Builder::new()
-        .name("aft-compression-retention".into())
+        .name("aft-retention".into())
         .spawn(move || {
             if let Ok(mut conn) = db.try_lock() {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis();
-                match prune_compression_events(&mut conn, i64::try_from(now).unwrap_or(i64::MAX)) {
-                    Ok(0) => {}
-                    Ok(rows) => {
-                        crate::slog_info!("compression retention: folded {} raw events", rows)
+                match prune_retention_tick_guarded(
+                    &mut conn,
+                    i64::try_from(now).unwrap_or(i64::MAX),
+                    registries.as_deref(),
+                ) {
+                    Ok(tick) => {
+                        crate::slog_info!(
+                            "bash task retention: removed={} remaining_candidates={}",
+                            tick.bash_tasks.removed,
+                            tick.bash_tasks.remaining_candidates
+                        );
+                        if tick.compression_events_removed > 0 {
+                            crate::slog_info!(
+                                "compression retention: folded {} raw events",
+                                tick.compression_events_removed
+                            );
+                        }
                     }
-                    Err(error) => crate::slog_warn!("compression retention failed: {}", error),
+                    Err(error) => crate::slog_warn!("retention failed: {}", error),
                 }
             }
             IN_FLIGHT.store(false, Ordering::Release);

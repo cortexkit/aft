@@ -1,4 +1,41 @@
+use std::io::ErrorKind;
+use std::path::Path;
+use std::time::Duration;
+
 use rusqlite::{params, Connection, OptionalExtension, Row};
+
+use crate::bash_background::persistence::{
+    resolve_task_layout, session_tasks_dir, uninitialized_layout_is_recent,
+};
+
+pub const TERMINAL_ROW_RETENTION_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+const MAX_TERMINAL_PRUNE_ROWS: usize = 500;
+const LAYOUT_CREATION_GRACE: Duration = Duration::from_secs(5 * 60);
+
+const TERMINAL_PRUNE_PREDICATE: &str = "
+    status IN ('completed', 'failed', 'killed', 'timed_out')
+    AND completed_at IS NOT NULL
+    AND completed_at < ?1
+    AND completion_delivered = 1
+    AND NOT EXISTS (
+        SELECT 1 FROM bash_pattern_watches AS watch
+        WHERE watch.harness = bash_tasks.harness
+          AND watch.session_id = bash_tasks.session_id
+          AND watch.task_id = bash_tasks.task_id
+    )";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalRowsPrune {
+    pub removed: usize,
+    pub remaining_candidates: usize,
+}
+
+#[derive(Debug)]
+struct TerminalPruneCandidate {
+    harness: String,
+    session_id: String,
+    task_id: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct BashTaskRow {
@@ -109,6 +146,101 @@ pub fn delete_bash_task(
          WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3",
         params![harness, session_id, task_id],
     )
+}
+
+/// Remove acknowledged terminal rows only after the retention age has passed
+/// and the task layout is absent. The filesystem check uses the same lookup and
+/// initialization grace as persisted-task garbage collection, so a task being
+/// created concurrently is not mistaken for a missing task.
+pub fn prune_terminal_rows(
+    conn: &Connection,
+    now_ms: i64,
+    limit: usize,
+) -> rusqlite::Result<TerminalRowsPrune> {
+    prune_terminal_rows_guarded(conn, now_ms, limit, |_| false)
+}
+
+pub(crate) fn prune_terminal_rows_guarded(
+    conn: &Connection,
+    now_ms: i64,
+    limit: usize,
+    is_registered_in_process: impl Fn(&str) -> bool,
+) -> rusqlite::Result<TerminalRowsPrune> {
+    let cutoff = now_ms.saturating_sub(TERMINAL_ROW_RETENTION_AGE_MS);
+    let bounded_limit = limit.min(MAX_TERMINAL_PRUNE_ROWS);
+    let candidates = if bounded_limit == 0 {
+        Vec::new()
+    } else {
+        conn.prepare(&format!(
+            "SELECT harness, session_id, task_id
+             FROM bash_tasks
+             WHERE {TERMINAL_PRUNE_PREDICATE}
+             ORDER BY completed_at, harness, session_id, task_id
+             LIMIT ?2"
+        ))?
+        .query_map(
+            params![cutoff, i64::try_from(bounded_limit).unwrap_or(500)],
+            |row| {
+                Ok(TerminalPruneCandidate {
+                    harness: row.get(0)?,
+                    session_id: row.get(1)?,
+                    task_id: row.get(2)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut removed = 0;
+    for candidate in candidates {
+        if is_registered_in_process(&candidate.task_id)
+            || !task_layout_is_gone(conn, &candidate.session_id, &candidate.task_id)
+        {
+            continue;
+        }
+        removed += conn.execute(
+            &format!(
+                "DELETE FROM bash_tasks
+                 WHERE harness = ?2 AND session_id = ?3 AND task_id = ?4
+                   AND {TERMINAL_PRUNE_PREDICATE}"
+            ),
+            params![cutoff, candidate.harness, candidate.session_id, candidate.task_id],
+        )?;
+    }
+
+    let remaining_candidates = conn.query_row(
+        &format!("SELECT COUNT(*) FROM bash_tasks WHERE {TERMINAL_PRUNE_PREDICATE}"),
+        [cutoff],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(TerminalRowsPrune {
+        removed,
+        remaining_candidates: usize::try_from(remaining_candidates).unwrap_or(usize::MAX),
+    })
+}
+
+fn task_layout_is_gone(conn: &Connection, session_id: &str, task_id: &str) -> bool {
+    let Some(storage_root) = conn
+        .path()
+        .and_then(|path| Path::new(path).parent())
+        .filter(|path| !path.as_os_str().is_empty())
+    else {
+        return false;
+    };
+    let session_dir = session_tasks_dir(storage_root, session_id);
+    match resolve_task_layout(&session_dir, task_id) {
+        Ok(_) => false,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let directory_layout = session_dir.join(task_id);
+            let flat_layout = session_dir.join(format!("{task_id}.json"));
+            if !directory_layout.exists() && !flat_layout.exists() {
+                return true;
+            }
+            !uninitialized_layout_is_recent(&session_dir, task_id, LAYOUT_CREATION_GRACE)
+                .unwrap_or(true)
+        }
+        Err(_) => false,
+    }
 }
 
 pub fn get_bash_task(
