@@ -70,6 +70,14 @@ pub fn normalize_exact_phrase(text: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Return whether a file can possibly contain an E2 window for all query tokens.
+pub fn e2_window_scan_needed(normalized_text: &str, content_tokens: &[String]) -> bool {
+    content_tokens.len() >= 2
+        && content_tokens
+            .iter()
+            .all(|token| normalized_text.contains(token))
+}
+
 /// Options controlling fallback execution.
 #[derive(Clone, Default)]
 pub struct FallbackExactOptions {
@@ -409,8 +417,10 @@ pub fn verify_exact_matches_in_text(
         }
     }
 
-    // 3. Check 3-line window match (E2) if no E1 match on file-level
-    if matches.is_empty() && content_tokens.len() >= 2 {
+    // 3. Check 3-line window match (E2) if no E1 match on file-level.
+    // Files missing any query token cannot contain an all-token window, so reject
+    // them before allocating and joining every one-, two-, and three-line window.
+    if matches.is_empty() && e2_window_scan_needed(&norm_text, content_tokens) {
         let lines: Vec<&str> = text.lines().collect();
         for width in 1..=3 {
             if lines.len() < width {

@@ -9,7 +9,7 @@ use aft::config::Config;
 use aft::context::AppContext;
 use aft::parser::TreeSitterProvider;
 use aft::protocol::RawRequest;
-use aft::search_index::exact_lane::ExactLane;
+use aft::search_index::exact_lane::{e2_window_scan_needed, ExactLane};
 use aft::search_index::memo::ExactMemoStore;
 use aft::search_index::SearchIndex;
 
@@ -63,6 +63,30 @@ pub fn cap_chars(s: &str) -> String {
     index.ready = true;
 
     (dir, index, rooms_path)
+}
+
+#[test]
+fn e2_preflight_rejects_2000_single_token_candidates_without_window_scans() {
+    let tokens = ["resolve", "request", "cache", "policy"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let candidate_texts = (0..2_000)
+        .map(|index| format!("module contains only {}", tokens[index % tokens.len()]))
+        .collect::<Vec<_>>();
+    let window_scan_count = candidate_texts
+        .iter()
+        .filter(|text| e2_window_scan_needed(text, &tokens))
+        .count();
+
+    assert_eq!(
+        window_scan_count, 0,
+        "single-token posting candidates cannot contain an all-token E2 window"
+    );
+    assert!(e2_window_scan_needed(
+        "resolve the request cache policy",
+        &tokens
+    ));
 }
 
 #[test]
