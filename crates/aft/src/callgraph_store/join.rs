@@ -1025,6 +1025,14 @@ impl ParseBlob {
                 }
             })
             .collect::<Vec<_>>();
+        // Overloads can share a scoped name. Preserve the first node chosen by
+        // the source-order scan without rescanning all symbols for every call.
+        let mut caller_nodes = HashMap::with_capacity(nodes.len());
+        for node in &nodes {
+            #[cfg(test)]
+            CALLER_NODE_LOOKUP_WORK.with(|work| work.set(work.get() + 1));
+            caller_nodes.entry(&node.scoped_name).or_insert(&node.id);
+        }
         let abs = facts.root.join(path);
         let mut raw_refs = Vec::new();
         for (position, raw) in self.refs.iter().enumerate() {
@@ -1053,10 +1061,9 @@ impl ParseBlob {
                 .as_ref()
                 .map(|name| bound_name(name, path));
             let caller_node = caller_symbol.as_ref().and_then(|name| {
-                nodes
-                    .iter()
-                    .find(|n| &n.scoped_name == name)
-                    .map(|n| n.id.clone())
+                #[cfg(test)]
+                CALLER_NODE_LOOKUP_WORK.with(|work| work.set(work.get() + 1));
+                caller_nodes.get(name).map(|id| (*id).clone())
             });
             raw_refs.push(super::RawRef {
                 ref_id: format!("{path}:{}:{:?}", raw.ordinal, raw.kind),
@@ -2373,5 +2380,54 @@ mod consultation_tests {
         assert!(facts.take_config().unattributed());
         facts.memo_replay(Path::new("/"), "test", "");
         assert!(facts.take_config().unattributed());
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CALLER_NODE_LOOKUP_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[test]
+fn binding_caller_node_lookup_is_linear_and_preserves_first_duplicate() {
+    let source = (0..200)
+        .map(|i| format!("export function f{i}() {{ f0(); }}\n"))
+        .collect::<String>();
+    let blob = CallgraphBlob::extract(&source, "typescript", "lookup-test").unwrap();
+    let mut parse = blob.parse().unwrap().clone();
+    let mut duplicate = parse.symbols[0].clone();
+    duplicate.ordinal += 10000;
+    parse.symbols.push(duplicate);
+    let manifest = Manifest::new([]).unwrap();
+    let reader = |_: &BlobKey| None;
+    let facts = ManifestFacts {
+        manifest: &manifest,
+        blobs: &reader,
+    };
+    let paths = FactPaths {
+        root: Path::new("/"),
+        facts: &facts,
+    };
+    CALLER_NODE_LOOKUP_WORK.with(|work| work.set(0));
+    let extract = parse
+        .bind_with_dependencies("caller.ts", &paths, None)
+        .unwrap();
+    let work = CALLER_NODE_LOOKUP_WORK.with(std::cell::Cell::get);
+    assert!(work > 0, "lookup work must actually be observed");
+    assert!(
+        work <= parse.symbols.len() + parse.refs.len(),
+        "caller node lookup must be linear: {work} operations for {} symbols and {} refs",
+        parse.symbols.len(),
+        parse.refs.len()
+    );
+    for reference in &extract.raw_refs {
+        let expected = reference.caller_symbol.as_ref().and_then(|caller| {
+            extract
+                .nodes
+                .iter()
+                .find(|node| &node.scoped_name == caller)
+                .map(|node| node.id.clone())
+        });
+        assert_eq!(reference.caller_node, expected);
     }
 }

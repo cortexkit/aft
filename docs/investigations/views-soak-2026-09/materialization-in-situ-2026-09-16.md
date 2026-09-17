@@ -393,3 +393,89 @@ Cache-write pages include repeated spills, whereas WAL size is final file length
 they are deliberately separate measures. The process interval remains labelled
 process-wide, including in the daemon. The isolated offline run removes other
 daemon writers, not filesystem write-amplification or measurement timing effects.
+
+### Fresh instrumented baseline drill (12:25:57Z)
+
+The baseline executable was built before the caller-lookup change from the
+instrumentation-only tree (commit `146359023`, formatting aside). Fresh storage
+and raw JSON/stderr: `.bg-shell/in-situ-before/{storage,output}`. The wrapper held
+`~/Work/OSS/opencode.aft-drill.lock`; the script restored the clone. All four rows
+were correct, `defects=[]`; return rows put/embed zero. A release-test compilation
+was running concurrently: these are not low-load timing controls.
+
+| switch | landed wall s | baseline wall s | landed CPU s | baseline CPU s | load start→end | puts / embeds |
+|---|---:|---:|---:|---:|---|---:|
+| HEAD→A | 12.8 | 29.326 | 54 | 52.02 | 26.11→23.24 | 269 / 3 |
+| A→HEAD | 10.7 | 13.270 | 43 | 14.28 | 23.24→19.86 | 0 / 0 |
+| HEAD→B | 13.6 | 11.627 | 49 | 32.65 | 19.86→17.70 | 13 / 1 |
+| B→HEAD | 14.3 | 12.772 | 42 | 28.65 | 17.70→23.25 | 0 / 0 |
+
+| phase / counter | HEAD→A | A→HEAD | HEAD→B | B→HEAD |
+|---|---:|---:|---:|---:|
+| materialization call ms | 13319 | 8463 | 7463 | 8638 |
+| closure ms, outside materializer | 137 | 37 | 69 | 41 |
+| selection ms | 1033 | 1568 | 783 | 896 |
+| delete ms | 1406 | 1188 | 1261 | 1178 |
+| owned decode / insert ms | 892 | 896 | 787 | 692 |
+| selected join ms | 4025 | 2282 | 2476 | 3194 |
+| decode / bind index entries ms | 1004 | 970 | 1036 | 912 |
+| decode resolved callers ms | 2076 | 538 | 632 | 578 |
+| resolve / record ms | 751 | 616 | 645 | 1451 |
+| emit refs / edges ms | 5021 | 1805 | 1530 | 1925 |
+| restored surfaces | 4635 | 4635 | 4632 | 4637 |
+| rebuilt changed / facts / membership / missing | 267/19/0/0 | 280/19/0/0 | 270/19/0/0 | 278/19/0/0 |
+| resolved callers / unchanged dependents | 563/296 | 576/296 | 593/323 | 601/323 |
+| selected paths / replay-skipped callers | 1621/1041 | 1621/1041 | 1635/1025 | 1430/825 |
+| full_resolution / unattributed | false/0 | false/0 | false/0 | false/0 |
+| identical dependent refs skipped | 53283 | 53283 | 55387 | 55387 |
+| dependent rows deleted / inserted | 2949/2951 | 2951/2949 | 3325/3327 | 3327/3325 |
+| cache-write pages (4096 bytes) | 67123 | 63461 | 57101 | 64097 |
+| WAL bytes after (all before=0) | 149065752 | 128745912 | 132503352 | 130060192 |
+| process physical bytes inside probe | 654708736 | 130875392 | 134635520 | 132194304 |
+| process logical bytes inside probe | 768019078 | 263721740 | 237742244 | 267145460 |
+
+The isolation comparison does **not** have identical SQLite counters: offline B
+rebuilt 284 surfaces versus 289 in situ; the fresh in-situ diff touched 288 paths
+versus 283 in the retained pair. The SQLite base also has a different physical
+layout from a freshly cold-built offline base. Offline cache-write pages 74,649
+and WAL 152,955,032 bytes differ from in-situ 57,101 and 132,503,352 bytes. Neither
+run fell back to full resolution or unattributed reads. Thus this is not the
+requested equal-work proof that the daemon excess is entirely other writers.
+On these B legs, however, the actual in-materializer physical delta is about
+133–135 MB and closely tracks its own WAL length, not 349–411 MB. HEAD→A visibly
+overlapped the legacy callgraph build's final resolution and dispatch stage;
+its process physical delta greatly exceeds the derived WAL. No attribution of
+that excess to the derived writer is justified by process counters alone.
+Closure is reported rather than modified: this base's 37–137 ms differs from the
+landed historical 1.9–2.5 s and is not credited to a materialization-internal fix.
+
+### Caller-node binding unit: bounded lookup, not another invalidation cache
+
+The measured decode/bind bucket still builds changed and actually re-resolved
+caller extracts. `ParseBlob::bind_with_dependencies` scanned every node to find
+the caller of every reference. A per-extract scoped-name map now makes that work
+linear in nodes plus references, preserving the **first** source-order node for
+overloads/duplicate scoped names. No resolver selection, binding dependencies,
+row schema, reference tuple, or publication boundary changes.
+
+Red-first test `callgraph_store::join::binding_caller_node_lookup_is_linear_and_preserves_first_duplicate`
+failed with **20,100** inspected nodes for 201 symbols and 200 refs. It passes with
+401 indexed-node/lookup operations and checks caller-node IDs against the former
+first-match semantics. The 46 selected materialization/join tests pass (2 opt-in
+benchmarks ignored), including complete derived-table parity.
+
+Mutation proof: the optimized source and test were staged, and `git diff --stat`
+was empty. Restoring the symbol scan under `NON-VACUITY BREAK` produced
+`join.rs | 7 ++++++-` (6 insertions, 1 deletion). Running the bound test alongside
+`incremental_rows_match_cold_with_cross_file_relink` failed **only** the bound test
+(20,501 operations); row parity remained green. `git checkout -- join.rs` followed
+by `touch` restored the staged implementation with an empty diff. Recompiling and
+running those exact two tests returned **2 passed**. Raw logs:
+`.bg-shell/caller-node-{red,green,mutation,restored}.log`. No mutant remains.
+
+The first after replay (`.bg-shell/offline-after.log`) passed cold-row parity but
+is **not a matched-load speedup claim**: load 28.10→27.38 versus 16.86→16.12 before.
+Incremental wall/CPU was 8.536/5.956 s versus 6.137/4.659 s. Selected join was
+2113 ms (decode/bind 808, caller decode 530, resolve 625) versus 2052 ms before.
+All work counts, 74,649 cache-write pages, and 152,955,032 WAL bytes are unchanged.
+The unit proves a work bound, not a demonstrated in-situ wall-time improvement.
