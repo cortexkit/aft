@@ -1,16 +1,18 @@
 {
-  "slice_class": "non_ranking",
-  "targeted_mechanism": "none",
-  "kind": "harness",
+  "slice_class": "ranking",
+  "targeted_mechanism": "wrong_lane_nl",
+  "kind": "ranking",
   "fixtures": [
-    "harness-goldens",
-    "profile-grammar",
-    "paging"
+    "crates/aft/tests/engine_exact_test.rs",
+    "crates/aft/tests/search_b2_router.rs",
+    "crates/aft/tests/search_b2_variants.rs"
   ],
   "slices": [
-    "bash-replay-sweep-race",
-    "views-perf-hunt",
-    "views-materialization-fill-reuse"
-  ],
-  "note": "No ranking-fence file changes: persisted-GC/replay race fix; views tier-2 view reader + closure index + byte telemetry; views fill reuse + keeper WAL fix."
+    "exact-corpus-eligibility",
+    "matching-line-rendering",
+    "identifier-fact-lane-join",
+    "definition-first-identifiers",
+    "bounded-declaration-spans",
+    "numeric-literal-variants"
+  ]
 }

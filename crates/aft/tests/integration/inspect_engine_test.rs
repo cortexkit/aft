@@ -103,15 +103,23 @@ fn interleaving_worker(
     small_finished: Arc<AtomicBool>,
     small_interleaved: Arc<AtomicBool>,
 ) -> InspectWorker {
+    let small_started = Arc::new(AtomicBool::new(false));
     Arc::new(move |job| {
         let started = Instant::now();
         let is_large = job.project_root == large_root;
         if is_large {
             large_started.store(true, Ordering::SeqCst);
-            thread::sleep(Duration::from_millis(800));
+            // Hold the worker until the small job has started (or a liveness
+            // ceiling passes). A fixed sleep here made the interleaving
+            // observation a race against submission latency on loaded runners;
+            // a serialized pool still reds because the small job cannot start
+            // while this one holds the only worker, so the wait runs to the
+            // ceiling and the small job observes the large one finished.
+            wait_for_flag(small_started.as_ref(), Duration::from_secs(10));
             large_finished.store(true, Ordering::SeqCst);
         } else {
             small_interleaved.store(!large_finished.load(Ordering::SeqCst), Ordering::SeqCst);
+            small_started.store(true, Ordering::SeqCst);
             thread::sleep(Duration::from_millis(25));
             small_finished.store(true, Ordering::SeqCst);
         }
@@ -406,8 +414,10 @@ fn inspect_engine_small_root_interleaves_with_large_scan() {
     // large-scan sleep, producing a false serialization failure.
     let small_result =
         small_manager.submit_category(small_snapshot, InspectCategory::Todos, small_scope);
+    // Longer than the large job's ceiling so a serialized pool fails on the
+    // interleaving assertion below rather than on this completion wait.
     let small_completed_before_timeout =
-        wait_for_flag(small_finished.as_ref(), Duration::from_secs(5));
+        wait_for_flag(small_finished.as_ref(), Duration::from_secs(15));
     let large_result = large.join().expect("large scan");
 
     assert!(
