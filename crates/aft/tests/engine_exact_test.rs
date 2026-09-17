@@ -9,7 +9,7 @@ use aft::config::Config;
 use aft::context::AppContext;
 use aft::parser::TreeSitterProvider;
 use aft::protocol::RawRequest;
-use aft::search_index::exact_lane::{e2_window_scan_needed, ExactLane};
+use aft::search_index::exact_lane::{e2_window_scan_needed, ExactLane, FallbackExactOptions};
 use aft::search_index::memo::ExactMemoStore;
 use aft::search_index::SearchIndex;
 
@@ -447,6 +447,39 @@ fn test_project_identity_isolation_continuity_key() {
     assert!(
         !spurious_in_b,
         "no cross-root transition disclosure should fire in B"
+    );
+}
+
+#[test]
+fn exact_fallback_uses_the_indexers_corpus_eligibility() {
+    let dir = create_temp_corpus();
+    let phrase = "log retention sweep: removed_files=";
+    let oversized = dir.path().join("src/oversized.txt");
+    let mut oversized_text = phrase.as_bytes().to_vec();
+    oversized_text.resize(1_048_577, b'x');
+    fs::write(&oversized, oversized_text).expect("write oversized fixture");
+
+    let archive = dir.path().join("src/stored.zip");
+    let source_archive = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../benchmarks/aft-search/bundles/aft-evidence-30d4a64f.zip");
+    fs::copy(source_archive, &archive).expect("copy stored zip fixture");
+
+    let lane = ExactLane::new();
+    let result = lane.execute_fallback_mode(
+        dir.path(),
+        phrase,
+        true,
+        &FallbackExactOptions {
+            file_limit: Some(10),
+            result_limit: Some(10),
+            ..Default::default()
+        },
+    );
+
+    assert!(
+        result.verified_set.results.is_empty(),
+        "files excluded from the trigram corpus must also be excluded from exact fallback: {:?}",
+        result.verified_set.results
     );
 }
 

@@ -33,7 +33,7 @@ pub struct ExactPassMatch {
     pub content_digest: String,
 }
 
-const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
+pub(crate) const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
 const CACHE_MAGIC: u32 = 0x3144_4958; // "XID1" little-endian
 const INDEX_MAGIC: &[u8; 8] = b"AFTIDX01";
 const LOOKUP_MAGIC: &[u8; 8] = b"AFTLKP01";
@@ -370,6 +370,7 @@ pub struct SearchIndexSnapshot {
     path_to_id: Arc<HashMap<PathBuf, u32>>,
     ready: bool,
     project_root: PathBuf,
+    max_file_size: u64,
     file_trigram_count: Arc<Vec<u32>>,
     unindexed_files: Arc<HashSet<u32>>,
 }
@@ -547,6 +548,7 @@ impl SearchIndex {
             path_to_id: Arc::clone(&self.path_to_id),
             ready: self.ready,
             project_root: self.project_root.clone(),
+            max_file_size: self.max_file_size,
             file_trigram_count: Arc::clone(&self.file_trigram_count),
             unindexed_files: Arc::clone(&self.unindexed_files),
         }
@@ -866,11 +868,13 @@ impl SearchIndexSnapshot {
                 }
             }
 
-            let Ok(bytes) = fs::read(&file_entry.path) else {
+            let SearchCorpusEligibility::Eligible(file) =
+                read_search_corpus_file(&file_entry.path, self.max_file_size)
+            else {
                 continue;
             };
-            let digest = blake3::hash(&bytes).to_hex().to_string();
-            let text = String::from_utf8_lossy(&bytes);
+            let digest = blake3::hash(&file.bytes).to_hex().to_string();
+            let text = String::from_utf8_lossy(&file.bytes);
 
             if let Some(candidates) = exact_lane::verify_exact_matches_in_text(
                 &file_entry.path,
@@ -878,7 +882,8 @@ impl SearchIndexSnapshot {
                 &norm_phrase,
                 &content_tokens,
             ) {
-                for cand in candidates {
+                for mut cand in candidates {
+                    cand.evidence.generated = file.generated;
                     matches.push(ExactPassMatch {
                         path: cand.path,
                         symbol_range: cand.symbol_range,
@@ -976,7 +981,7 @@ pub(crate) struct PostingFilter {
 }
 
 #[derive(Clone, Copy)]
-struct SearchFileMetadata {
+pub(crate) struct SearchFileMetadata {
     size: u64,
     modified: SystemTime,
 }
@@ -985,6 +990,18 @@ struct PreparedIndexedFile {
     metadata: SearchFileMetadata,
     content_hash: blake3::Hash,
     trigram_map: BTreeMap<u32, PostingFilter>,
+}
+
+pub(crate) struct SearchCorpusFile {
+    metadata: SearchFileMetadata,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) generated: bool,
+}
+
+pub(crate) enum SearchCorpusEligibility {
+    Eligible(SearchCorpusFile),
+    Unindexed(SearchFileMetadata),
+    Skipped,
 }
 
 enum PreparedSearchPath {
@@ -2935,28 +2952,41 @@ fn metadata_for_indexed_content(path: &Path, size_hint: u64) -> SearchFileMetada
 }
 
 fn prepare_search_path(path: &Path, max_file_size: u64) -> PreparedSearchPath {
+    match read_search_corpus_file(path, max_file_size) {
+        SearchCorpusEligibility::Eligible(file) => {
+            PreparedSearchPath::Indexed(PreparedIndexedFile {
+                metadata: file.metadata,
+                content_hash: cache_freshness::hash_bytes(&file.bytes),
+                trigram_map: trigram_filter_map(&file.bytes, true),
+            })
+        }
+        SearchCorpusEligibility::Unindexed(metadata) => PreparedSearchPath::Unindexed(metadata),
+        SearchCorpusEligibility::Skipped => PreparedSearchPath::Skipped,
+    }
+}
+
+pub(crate) fn read_search_corpus_file(path: &Path, max_file_size: u64) -> SearchCorpusEligibility {
     let metadata = match fs::metadata(path) {
         Ok(metadata) if metadata.is_file() => search_file_metadata(&metadata),
-        _ => return PreparedSearchPath::Skipped,
+        _ => return SearchCorpusEligibility::Skipped,
     };
 
     if is_binary_path(path, metadata.size) || metadata.size > max_file_size {
-        return PreparedSearchPath::Unindexed(metadata);
+        return SearchCorpusEligibility::Unindexed(metadata);
     }
 
-    let content = match fs::read(path) {
-        Ok(content) => content,
-        Err(_) => return PreparedSearchPath::Skipped,
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return SearchCorpusEligibility::Skipped,
     };
-
-    if is_binary_bytes(&content) {
-        return PreparedSearchPath::Unindexed(metadata);
+    if is_binary_bytes(&bytes) {
+        return SearchCorpusEligibility::Unindexed(metadata);
     }
 
-    PreparedSearchPath::Indexed(PreparedIndexedFile {
+    SearchCorpusEligibility::Eligible(SearchCorpusFile {
         metadata,
-        content_hash: cache_freshness::hash_bytes(&content),
-        trigram_map: trigram_filter_map(&content, true),
+        generated: crate::inspect::is_generated_file(path, path),
+        bytes,
     })
 }
 

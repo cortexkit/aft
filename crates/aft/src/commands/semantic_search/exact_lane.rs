@@ -16,7 +16,10 @@ use crate::commands::semantic_search::plan_table::SearchLaneKind;
 use crate::commands::semantic_search::{LaneExecution, LaneInput, SearchLane};
 use crate::inspect::job::is_test_file;
 use crate::query_shape::{contains_all_content_tokens, extract_content_tokens};
-use crate::search_index::{SearchIndex, SearchIndexSnapshot};
+use crate::search_index::{
+    read_search_corpus_file, SearchCorpusEligibility, SearchIndex, SearchIndexSnapshot,
+    DEFAULT_MAX_FILE_SIZE,
+};
 
 pub const DEFAULT_FALLBACK_FILE_LIMIT: usize = 1_000;
 pub const DEFAULT_FALLBACK_RESULT_LIMIT: usize = 100;
@@ -232,24 +235,27 @@ impl ExactLane {
                 break;
             }
 
+            // Only files eligible for the trigram corpus can contribute exact evidence.
+            let SearchCorpusEligibility::Eligible(file) =
+                read_search_corpus_file(&file_path, DEFAULT_MAX_FILE_SIZE)
+            else {
+                continue;
+            };
             files_visited += 1;
-
-            // Injected delay hook if configured
             if let Some(delay_fn) = &options.delay_hook {
                 delay_fn(&file_path);
             }
+            let digest = compute_content_digest(&file.bytes);
+            file_digests.insert(file_path.clone(), digest);
 
-            // Check match in file
-            if let Ok(bytes) = fs::read(&file_path) {
-                let digest = compute_content_digest(&bytes);
-                file_digests.insert(file_path.clone(), digest);
-
-                let text = String::from_utf8_lossy(&bytes);
-                if let Some(candidates) =
-                    verify_exact_matches_in_text(&file_path, &text, &norm_phrase, &content_tokens)
-                {
-                    results.extend(candidates);
+            let text = String::from_utf8_lossy(&file.bytes);
+            if let Some(mut candidates) =
+                verify_exact_matches_in_text(&file_path, &text, &norm_phrase, &content_tokens)
+            {
+                for candidate in &mut candidates {
+                    candidate.evidence.generated = file.generated;
                 }
+                results.extend(candidates);
             }
         }
 
