@@ -77,10 +77,8 @@ impl ProjectWatcher {
                             Ok(replacement) => {
                                 stream = replacement;
                                 observed_generation = generation;
-                                counters.set_backend_exclusions(
-                                    observed_generation,
-                                    replacement_paths,
-                                );
+                                counters
+                                    .set_backend_exclusions(observed_generation, replacement_paths);
                                 if replacement_exclusions != exclusions {
                                     super::log_exclusions(&root, &replacement_exclusions);
                                     exclusions = replacement_exclusions;

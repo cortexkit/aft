@@ -520,9 +520,7 @@ pub(crate) fn derive_excluded_subtrees(
             .priority()
             .cmp(&right.source.priority())
             .then_with(|| match left.source {
-                WatcherExclusionSource::Seed => {
-                    left.seed_priority.cmp(&right.seed_priority)
-                }
+                WatcherExclusionSource::Seed => left.seed_priority.cmp(&right.seed_priority),
                 WatcherExclusionSource::Ranked => right
                     .observed_count
                     .cmp(&left.observed_count)

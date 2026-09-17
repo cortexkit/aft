@@ -473,7 +473,8 @@ pub fn scan_symbols_in_text(text: &str) -> Vec<(String, SymbolOffsetRange)> {
         let leading_spaces = line.len() - trimmed.len();
         let line_offset = current_offset + leading_spaces;
 
-        let (name_opt, declaration_line_only) = if let Some(rest) = trimmed.strip_prefix("pub fn ") {
+        let (name_opt, declaration_line_only) = if let Some(rest) = trimmed.strip_prefix("pub fn ")
+        {
             (extract_identifier(rest), false)
         } else if let Some(rest) = trimmed.strip_prefix("fn ") {
             (extract_identifier(rest), false)

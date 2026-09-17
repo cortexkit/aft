@@ -1145,7 +1145,7 @@ fn glob_bare_filename_matches_top_level_under_path_fallback() {
 
     // Bare filename at the top level of the search root — must match.
     let files = glob_files(&mut aft, "glob-bare-top", "a.rs", Some("src"));
-    let expected = canonical_path_string(&project.path().join("src/a.rs"));
+    let expected = canonical_path_string(&project.path().join("src/a.rs")).replace('\\', "/");
     assert_eq!(
         files,
         vec![expected.clone()],
@@ -1201,7 +1201,7 @@ fn glob_bare_filename_matches_top_level_under_path_indexed() {
 
     // Bare filename at the top level of the search root — must match.
     let files = glob_files(&mut aft, "glob-bare-top-idx", "a.rs", Some("src"));
-    let expected = canonical_path_string(&project.path().join("src/a.rs"));
+    let expected = canonical_path_string(&project.path().join("src/a.rs")).replace('\\', "/");
     assert_eq!(
         files,
         vec![expected.clone()],

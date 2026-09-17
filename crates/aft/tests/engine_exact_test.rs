@@ -594,12 +594,8 @@ fn bare_identifiers_rank_declarations_before_repeated_consumers() {
         fs::write(&consumer_path, consumer.repeat(20)).expect("write consumer fixture");
         let index = SearchIndex::build(dir.path());
 
-        let result = ExactLane::new().execute_ready_mode(
-            &index.snapshot(),
-            dir.path(),
-            query,
-            true,
-        );
+        let result =
+            ExactLane::new().execute_ready_mode(&index.snapshot(), dir.path(), query, true);
 
         assert_eq!(
             result
@@ -677,14 +673,14 @@ fn nl_identifier_facts_join_exact_retrieval_without_rerouting_the_shape() {
             .expect("identifier-fact results");
 
         assert_eq!(
-            response["structuredContent"]["plan"]["shape"],
-            "natural_language",
+            response["structuredContent"]["plan"]["shape"], "natural_language",
             "query {query}: {response:?}"
         );
         assert!(
-            ranked.first().and_then(|result| result["file"].as_str()).is_some_and(|path| {
-                path.replace('\\', "/").ends_with("src/target.rs")
-            }),
+            ranked
+                .first()
+                .and_then(|result| result["file"].as_str())
+                .is_some_and(|path| { path.replace('\\', "/").ends_with("src/target.rs") }),
             "identifier fact should recover target for query {query}: {response:?}"
         );
     }
@@ -749,9 +745,7 @@ fn nl_quoted_span_exact_evidence_ranks_first() {
     assert_eq!(results[0]["exact"], true);
     assert!(response["text"]
         .as_str()
-        .is_some_and(|text| text
-            .replace('\\', "/")
-            .contains("src/settle.rs:1 [exact]")));
+        .is_some_and(|text| text.replace('\\', "/").contains("src/settle.rs:1 [exact]")));
     assert!(response["text"]
         .as_str()
         .is_some_and(|text| text.contains("pub const SETTLE_ERROR")));

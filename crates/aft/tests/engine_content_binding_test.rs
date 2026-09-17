@@ -91,12 +91,17 @@ fn retry_after_abandoned_verification_is_admitted() {
     let key = MemoKey::new(dir.path(), GenerationToken::new(43), "exact phrase", false);
 
     let abandoned = memo.get_or_verify(&key, 0, 10, || {
-        Err(MemoError::VerificationFailed("request abandoned".to_string()))
+        Err(MemoError::VerificationFailed(
+            "request abandoned".to_string(),
+        ))
     });
     assert!(matches!(abandoned, Err(MemoError::VerificationFailed(_))));
 
     let retry = memo.get_or_verify(&key, 0, 10, || Ok(empty_verified_set()));
-    assert!(retry.is_ok(), "an abandoned verifier must not burn the epoch");
+    assert!(
+        retry.is_ok(),
+        "an abandoned verifier must not burn the epoch"
+    );
     assert_eq!(memo.verifier_call_count(), 2);
 }
 
@@ -130,7 +135,9 @@ fn concurrent_same_key_waits_for_single_completed_verification() {
     let first_key = key.clone();
     let first = thread::spawn(move || {
         first_memo.get_or_verify(&first_key, 0, 10, || {
-            verifier_started_tx.send(()).expect("announce verifier start");
+            verifier_started_tx
+                .send(())
+                .expect("announce verifier start");
             release_verifier_rx
                 .recv_timeout(Duration::from_secs(2))
                 .expect("release first verifier");
@@ -168,7 +175,10 @@ fn concurrent_same_key_waits_for_single_completed_verification() {
         .recv_timeout(Duration::from_secs(1))
         .expect("second request completes after the first verifier");
     second.join().expect("second request joins");
-    assert!(second_result.is_ok(), "concurrent same-key request must not error");
+    assert!(
+        second_result.is_ok(),
+        "concurrent same-key request must not error"
+    );
     assert_eq!(
         memo.verifier_call_count(),
         1,

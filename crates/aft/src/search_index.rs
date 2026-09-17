@@ -5969,7 +5969,13 @@ pub(crate) fn count_ignore_rule_discovery_dirs_legacy_stack(root: &Path) -> usiz
 
 impl PathFilters {
     pub(crate) fn matches(&self, root: &Path, path: &Path) -> bool {
-        let relative = to_glob_path(&relative_to_root(root, path));
+        // Compare normalized copies: the search root arrives non-verbatim while
+        // indexed entries may carry the Windows `\\?\` form, and a raw
+        // strip_prefix between the two forms fails, which read as "no match".
+        let relative = to_glob_path(&relative_to_root(
+            &normalize_path(root),
+            &normalize_path(path),
+        ));
         if self
             .includes
             .as_ref()

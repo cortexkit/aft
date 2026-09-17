@@ -90,10 +90,8 @@ impl ProjectWatcher {
                         thread_count.store(watched_directories.len(), Ordering::Release);
                         observed_generation = generation;
 
-                        counters.set_backend_exclusions(
-                            observed_generation,
-                            replacement_paths.clone(),
-                        );
+                        counters
+                            .set_backend_exclusions(observed_generation, replacement_paths.clone());
                         if replacement_exclusions != exclusions {
                             super::log_exclusions(&root, &replacement_exclusions);
                             exclusions = replacement_exclusions;
@@ -105,11 +103,8 @@ impl ProjectWatcher {
                         Ok(Ok(event)) => {
                             if matches!(event.kind, EventKind::Create(CreateKind::Folder)) {
                                 for path in &event.paths {
-                                    for directory in collect_watch_directories(
-                                        path,
-                                        &matcher,
-                                        &exclusion_paths,
-                                    )
+                                    for directory in
+                                        collect_watch_directories(path, &matcher, &exclusion_paths)
                                     {
                                         if watched_directories.insert(directory.clone()) {
                                             if let Err(error) = watcher
