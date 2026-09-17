@@ -20,7 +20,7 @@
     },
     "packages/aft-bridge": {
       "name": "@cortexkit/aft-bridge",
-      "version": "0.56.1",
+      "version": "0.56.2",
       "dependencies": {
         "@cortexkit/subc-client": "^0.8.1",
         "undici": "^7.25.0",
@@ -32,7 +32,7 @@
     },
     "packages/aft-cli": {
       "name": "@cortexkit/aft",
-      "version": "0.56.1",
+      "version": "0.56.2",
       "bin": {
         "aft": "dist/index.js",
       },
@@ -48,10 +48,10 @@
     },
     "packages/opencode-plugin": {
       "name": "@cortexkit/aft-opencode",
-      "version": "0.56.1",
+      "version": "0.56.2",
       "dependencies": {
         "@clack/prompts": "^1.6.0",
-        "@cortexkit/aft-bridge": "0.56.1",
+        "@cortexkit/aft-bridge": "0.56.2",
         "@opentui/core": "0.4.3",
         "@opentui/solid": "0.4.3",
         "comment-json": "^4.6.2",
@@ -68,12 +68,12 @@
         "typescript": "^5.8.0",
       },
       "optionalDependencies": {
-        "@cortexkit/aft-darwin-arm64": "0.56.1",
-        "@cortexkit/aft-darwin-x64": "0.56.1",
-        "@cortexkit/aft-linux-arm64": "0.56.1",
-        "@cortexkit/aft-linux-x64": "0.56.1",
-        "@cortexkit/aft-win32-arm64": "0.56.1",
-        "@cortexkit/aft-win32-x64": "0.56.1",
+        "@cortexkit/aft-darwin-arm64": "0.56.2",
+        "@cortexkit/aft-darwin-x64": "0.56.2",
+        "@cortexkit/aft-linux-arm64": "0.56.2",
+        "@cortexkit/aft-linux-x64": "0.56.2",
+        "@cortexkit/aft-win32-arm64": "0.56.2",
+        "@cortexkit/aft-win32-x64": "0.56.2",
       },
       "peerDependencies": {
         "@opencode-ai/plugin": ">=0.0.0-beta-0",
@@ -82,9 +82,9 @@
     },
     "packages/pi-plugin": {
       "name": "@cortexkit/aft-pi",
-      "version": "0.56.1",
+      "version": "0.56.2",
       "dependencies": {
-        "@cortexkit/aft-bridge": "0.56.1",
+        "@cortexkit/aft-bridge": "0.56.2",
         "comment-json": "^5.0.0",
         "diff": "^8.0.4",
         "typebox": "1.1.38",
@@ -98,12 +98,12 @@
         "typescript": "^5.8.0",
       },
       "optionalDependencies": {
-        "@cortexkit/aft-darwin-arm64": "0.56.1",
-        "@cortexkit/aft-darwin-x64": "0.56.1",
-        "@cortexkit/aft-linux-arm64": "0.56.1",
-        "@cortexkit/aft-linux-x64": "0.56.1",
-        "@cortexkit/aft-win32-arm64": "0.56.1",
-        "@cortexkit/aft-win32-x64": "0.56.1",
+        "@cortexkit/aft-darwin-arm64": "0.56.2",
+        "@cortexkit/aft-darwin-x64": "0.56.2",
+        "@cortexkit/aft-linux-arm64": "0.56.2",
+        "@cortexkit/aft-linux-x64": "0.56.2",
+        "@cortexkit/aft-win32-arm64": "0.56.2",
+        "@cortexkit/aft-win32-x64": "0.56.2",
       },
       "peerDependencies": {
         "@earendil-works/pi-coding-agent": "*",
