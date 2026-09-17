@@ -584,17 +584,76 @@ jobs:
           echo "Using $notes_file as the release body."
           wc -l "$notes_file"
 
+      # The release is assembled with the gh CLI rather than an upload action:
+      # v0.56.2 failed three times in a row inside softprops/action-gh-release,
+      # which pushes all 21 assets (~1.1 GB) through parallel streams and
+      # surfaces whatever the upload service returns ("Error creating asset
+      # temp dir", "Headers Timeout Error") as a job failure, then deletes and
+      # re-uploads everything on the next attempt. Here each asset goes up on
+      # its own stream with bounded retries, an asset that is already present
+      # is replaced only if its size differs, and the draft is published only
+      # after the asset set on the server matches the set on disk.
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          body_path: .alfonso/release-notes/${{ github.ref_name }}.md
-          files: release-assets/*
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          notes_file=".alfonso/release-notes/${TAG}.md"
+          if ! gh release view "$TAG" --json id --jq .id >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --title "$TAG" --notes-file "$notes_file" --verify-tag
+          else
+            gh release edit "$TAG" --draft --title "$TAG" --notes-file "$notes_file"
+          fi
+
+          # name<TAB>size of what the server holds now, so a completed upload
+          # from an earlier attempt is kept instead of pushed again.
+          server_assets() {
+            gh release view "$TAG" --json assets --jq '.assets[] | "\(.name)\t\(.size)"'
+          }
+
+          for path in release-assets/*; do
+            name=$(basename "$path")
+            size=$(stat -c %s "$path")
+            if server_assets | grep -qx "$(printf '%s\t%s' "$name" "$size")"; then
+              echo "present: $name ($size bytes)"
+              continue
+            fi
+            for attempt in 1 2 3 4; do
+              if gh release upload "$TAG" "$path" --clobber; then
+                echo "uploaded: $name ($size bytes) on attempt $attempt"
+                break
+              fi
+              if [ "$attempt" = 4 ]; then
+                echo "::error::upload of $name failed on every attempt"
+                exit 1
+              fi
+              echo "upload of $name failed on attempt $attempt; retrying"
+              sleep $((attempt * 15))
+            done
+          done
+
+          expected=$(find release-assets -mindepth 1 -maxdepth 1 -type f | wc -l)
+          actual=$(server_assets | wc -l)
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::release holds $actual assets, expected $expected"
+            server_assets
+            exit 1
+          fi
+          for path in release-assets/*; do
+            name=$(basename "$path"); size=$(stat -c %s "$path")
+            server_assets | grep -qx "$(printf '%s\t%s' "$name" "$size")" \
+              || { echo "::error::size mismatch on server for $name"; exit 1; }
+          done
+
+          gh release edit "$TAG" --draft=false
+          echo "published $TAG with $actual assets"
 
   # Announce on Discord after the GitHub release is created.
   #
   # Why this lives here (not in discord-release.yml as `on: release: published`):
   # GitHub Actions intentionally suppresses event-triggered workflow cascades
-  # from `GITHUB_TOKEN`-authored events. `softprops/action-gh-release@v2` uses
+  # from `GITHUB_TOKEN`-authored events. The release is published above with
   # the default `GITHUB_TOKEN`, so the `release: published` event it emits does
   # not trigger downstream workflows. Inlining the Discord post here is the
   # cleanest fix (vs rotating PATs for release creation).
