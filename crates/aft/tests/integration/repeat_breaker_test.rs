@@ -219,7 +219,7 @@ fn repeat_breaker_does_not_group_sequential_reads_of_different_files() {
         assert!(observe_tool(
             &breaker,
             "read",
-            &json!({ "filePath": format!("src/file-{index}.rs") }),
+            &json!({ "path": format!("src/file-{index}.rs") }),
             STABLE_OUTPUT,
             start + Duration::from_secs(index * 10),
         )
