@@ -936,7 +936,6 @@ impl HealthRollupCache {
         (snapshot, age_ms)
     }
 
-    #[cfg(test)]
     fn annotate_plane_timings(&self, root: &str, value: &mut Value) {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -985,6 +984,7 @@ impl HealthRollupCache {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn refresh_count_for_test(&self) -> u64 {
         self.refreshes.load(Ordering::Acquire)
     }
