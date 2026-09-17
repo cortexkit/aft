@@ -518,6 +518,17 @@ fn external_ignore_watch_paths(ctx: &AppContext, root_path: &Path) -> Vec<PathBu
     if info_exclude.is_file() {
         paths.push(info_exclude);
     }
+    if let Ok(metadata) =
+        crate::alias::capture_git_head_metadata(root_path, ctx.git_common_dir().as_deref())
+    {
+        paths.extend(metadata.watch_paths().map(Path::to_path_buf));
+        if let Some(git_common_dir) = ctx.git_common_dir() {
+            let refs = git_common_dir.join("refs");
+            if refs.is_dir() {
+                paths.push(refs);
+            }
+        }
+    }
     paths.sort();
     paths.dedup();
     paths
@@ -5828,6 +5839,12 @@ fn open_view_runtime_for_configure(
     let head_entries = crate::alias::head_tree_entries(&job.canonical_cache_root)
         .map_err(|error| error.to_string())?;
     let desired_head = crate::views::assembly::head_tree_fingerprint(&head_entries);
+    crate::views::cache_head_fingerprint(job.canonical_cache_root.clone(), desired_head.clone());
+    let head_metadata = crate::alias::capture_git_head_metadata(
+        &job.canonical_cache_root,
+        ctx.git_common_dir().as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
     let generation = view
         .current_generation()
         .map_err(|error| error.to_string())?;
@@ -5901,6 +5918,8 @@ fn open_view_runtime_for_configure(
             view_dir: view.view_dir().to_path_buf(),
             generation,
             manifest,
+            head_fingerprint: desired_head,
+            head_metadata,
             pending_paths,
         },
         pin,

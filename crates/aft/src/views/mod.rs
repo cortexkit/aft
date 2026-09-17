@@ -15,11 +15,12 @@ pub mod materialization;
 mod profile;
 pub(crate) mod read;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 /// Version number for the byte encoding used to identify manifest paths.
@@ -28,6 +29,29 @@ pub const PATH_IDENTITY_VERSION: u8 = 1;
 const POINTER_DATABASE: &str = "pointer.sqlite";
 const POINTER_BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 const FILE_OPEN_RETRY_TIMEOUT: Duration = Duration::from_millis(5_000);
+
+static HEAD_FINGERPRINTS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+pub(crate) fn cache_head_fingerprint(root: PathBuf, fingerprint: String) {
+    HEAD_FINGERPRINTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(crate::path_identity::project_scope_key(&root), fingerprint);
+}
+
+pub(crate) fn cached_head_fingerprint(root: &Path) -> Option<String> {
+    HEAD_FINGERPRINTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&crate::path_identity::project_scope_key(root))
+        .cloned()
+}
+
+pub(crate) fn generation_matches_head(generation: &str, head_fingerprint: &str) -> bool {
+    !head_fingerprint.is_empty() && generation.ends_with(head_fingerprint)
+}
 
 pub(crate) fn resolve_derived_path(view_dir: &Path, generation: &str) -> Result<PathBuf> {
     ViewStore {

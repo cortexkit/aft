@@ -3617,9 +3617,10 @@ fn current_view_projection_store(
         };
         let pin = crate::pins::QueryPin::acquire(view.view_dir(), &generation)
             .map_err(|error| error.to_string())?;
-        let head =
-            crate::alias::head_tree_entries(project_root).map_err(|error| error.to_string())?;
-        if !generation.ends_with(&crate::views::assembly::head_tree_fingerprint(&head)) {
+        let Some(head_fingerprint) = crate::views::cached_head_fingerprint(project_root) else {
+            return Ok(None);
+        };
+        if !crate::views::generation_matches_head(&generation, &head_fingerprint) {
             return Ok(None);
         }
         if !refresh_paths.is_empty() {

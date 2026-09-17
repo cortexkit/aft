@@ -2944,6 +2944,12 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 ctx.tick_tier2_refresh_scheduler(usize::from(ignore_changed));
                 state.status_changed = false;
             } else {
+                let git_head_paths = if ctx.config().views.enabled {
+                    ctx.refresh_view_head_for_watcher(paths.make_contiguous())
+                } else {
+                    BTreeSet::new()
+                };
+                paths.retain(|path| !git_head_paths.contains(path));
                 if ctx.config().views.enabled {
                     state.view_publication_paths.extend(paths.iter().cloned());
                     state.view_publication_due =
@@ -4872,6 +4878,14 @@ mod watcher_slice_tests {
                     )>())
                     .unwrap(),
                 ),
+                head_fingerprint: "published".to_owned(),
+                head_metadata: crate::alias::capture_git_head_metadata(root.path(), None)
+                    .unwrap_or_else(|_| crate::alias::GitHeadMetadata {
+                        head_path: root.path().join(".git/HEAD"),
+                        head_mtime: None,
+                        resolved_ref_path: None,
+                        resolved_ref_mtime: None,
+                    }),
                 pending_paths: BTreeSet::new(),
             },
             None,

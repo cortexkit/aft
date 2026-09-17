@@ -11,7 +11,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -22,6 +24,19 @@ use sha2::Digest;
 pub const PATH_IDENTITY_VERSION: u32 = 1;
 
 const GIT_METADATA_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+static HEAD_TREE_ENTRY_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_head_tree_entry_calls_for_test() {
+    HEAD_TREE_ENTRY_CALLS.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn head_tree_entry_calls_for_test() -> usize {
+    HEAD_TREE_ENTRY_CALLS.load(Ordering::SeqCst)
+}
 
 const ALIAS_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS oid_aliases (
@@ -214,6 +229,28 @@ pub struct TrackedPath {
     /// `false` is accepted for report inputs so untracked files cannot accidentally
     /// become eligible when callers combine Git and watcher path lists.
     pub tracked: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitHeadMetadata {
+    pub head_path: PathBuf,
+    pub head_mtime: Option<SystemTime>,
+    pub resolved_ref_path: Option<PathBuf>,
+    pub resolved_ref_mtime: Option<SystemTime>,
+}
+
+impl GitHeadMetadata {
+    pub fn matches_path(&self, path: &Path) -> bool {
+        same_file_path(path, &self.head_path)
+            || self
+                .resolved_ref_path
+                .as_deref()
+                .is_some_and(|resolved| same_file_path(path, resolved))
+    }
+
+    pub fn watch_paths(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.head_path.as_path()).chain(self.resolved_ref_path.as_deref())
+    }
 }
 
 impl TrackedPath {
@@ -672,8 +709,69 @@ pub fn is_lfs_pointer(bytes: &[u8]) -> bool {
     bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n")
 }
 
+pub fn capture_git_head_metadata(
+    repo_root: &Path,
+    git_common_dir: Option<&Path>,
+) -> Result<GitHeadMetadata, AliasError> {
+    let dot_git = repo_root.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        canonical_or_original(dot_git)
+    } else {
+        let marker = fs::read_to_string(&dot_git)?;
+        let relative = marker
+            .trim()
+            .strip_prefix("gitdir:")
+            .map(str::trim)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("invalid gitdir marker at {}", dot_git.display()),
+                )
+            })?;
+        let path = PathBuf::from(relative);
+        canonical_or_original(if path.is_absolute() {
+            path
+        } else {
+            repo_root.join(path)
+        })
+    };
+    let head_path = canonical_or_original(git_dir.join("HEAD"));
+    let head = fs::read_to_string(&head_path)?;
+    let resolved_ref_path = head
+        .trim()
+        .strip_prefix("ref:")
+        .map(str::trim)
+        .filter(|reference| !reference.is_empty())
+        .map(|reference| canonical_or_original(git_common_dir.unwrap_or(&git_dir).join(reference)));
+    Ok(GitHeadMetadata {
+        head_mtime: modified_time(&head_path),
+        resolved_ref_mtime: resolved_ref_path.as_deref().and_then(modified_time),
+        head_path,
+        resolved_ref_path,
+    })
+}
+
+fn canonical_or_original(path: PathBuf) -> PathBuf {
+    fs::canonicalize(&path).unwrap_or(path)
+}
+
+fn modified_time(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
+fn same_file_path(path: &Path, target: &Path) -> bool {
+    path == target
+        || fs::canonicalize(target)
+            .map(|target| path == target)
+            .unwrap_or(false)
+}
+
 /// Lists `HEAD` paths from Git metadata without opening working-tree files.
 pub fn head_tree_entries(repo_root: &Path) -> Result<Vec<TrackedPath>, AliasError> {
+    #[cfg(test)]
+    HEAD_TREE_ENTRY_CALLS.fetch_add(1, Ordering::SeqCst);
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)

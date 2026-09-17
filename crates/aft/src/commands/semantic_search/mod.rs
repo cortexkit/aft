@@ -7753,6 +7753,13 @@ mod tests {
             view_dir: storage.path().join("views/semantic-reader-view"),
             generation: Some("1-head".to_string()),
             manifest: Some(manifest),
+            head_fingerprint: "head".to_owned(),
+            head_metadata: crate::alias::GitHeadMetadata {
+                head_path: project.path().join(".git/HEAD"),
+                head_mtime: None,
+                resolved_ref_path: None,
+                resolved_ref_mtime: None,
+            },
             pending_paths: Default::default(),
         };
 

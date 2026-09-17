@@ -221,6 +221,11 @@ fn watcher_same_path(path: &Path, target: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn watcher_path_is_git_head_metadata(config: &WatcherFilterConfig, path: &Path) -> bool {
+    crate::alias::capture_git_head_metadata(&config.project_root, config.git_common_dir.as_deref())
+        .is_ok_and(|metadata| metadata.matches_path(path))
+}
+
 fn watcher_path_is_git_info_exclude(config: &WatcherFilterConfig, path: &Path) -> bool {
     watcher_same_path(path, &config.git_info_exclude_path())
 }
@@ -477,6 +482,9 @@ fn filter_canonical_paths(
     let changed = raw_paths
         .into_iter()
         .filter(|path| {
+            if watcher_path_is_git_head_metadata(config, path) {
+                return true;
+            }
             if watcher_path_is_infra_skip(path) {
                 return false;
             }
@@ -1197,6 +1205,29 @@ mod tests {
         )));
         // The full filter still drops .git (and everything high-churn does).
         assert!(watcher_path_is_infra_skip(Path::new("/proj/.git/index")));
+    }
+
+    #[test]
+    fn git_head_and_resolved_ref_bypass_git_infra_filter() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let git = root.join(".git");
+        let head = git.join("HEAD");
+        let resolved_ref = git.join("refs/heads/main");
+        std::fs::create_dir_all(resolved_ref.parent().unwrap()).unwrap();
+        std::fs::write(&head, "ref: refs/heads/main\n").unwrap();
+        std::fs::write(&resolved_ref, "0000000000000000000000000000000000000000\n").unwrap();
+        std::fs::write(git.join("index"), []).unwrap();
+        let config = WatcherFilterConfig::new(root.clone(), None);
+        let matcher = shared_matcher(&root);
+
+        let filtered = filter_watcher_raw_paths_for_test(
+            &config,
+            &matcher,
+            [head.clone(), resolved_ref.clone(), git.join("index")],
+        );
+
+        assert_eq!(filtered.changed, BTreeSet::from([head, resolved_ref]));
     }
 
     #[test]

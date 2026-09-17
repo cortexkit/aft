@@ -124,6 +124,8 @@ impl Fixture {
                 view_dir: view.view_dir().to_owned(),
                 generation: None,
                 manifest: None,
+                head_fingerprint: String::new(),
+                head_metadata: crate::alias::capture_git_head_metadata(&root_path, None).unwrap(),
                 pending_paths: BTreeSet::new(),
             },
             None,

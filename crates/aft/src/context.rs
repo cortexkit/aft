@@ -1141,6 +1141,8 @@ pub(crate) struct ViewRuntimeSnapshot {
     pub(crate) view_dir: PathBuf,
     pub(crate) generation: Option<String>,
     pub(crate) manifest: Option<Manifest>,
+    pub(crate) head_fingerprint: String,
+    pub(crate) head_metadata: crate::alias::GitHeadMetadata,
     pub(crate) pending_paths: BTreeSet<Vec<u8>>,
 }
 
@@ -4572,6 +4574,55 @@ impl AppContext {
             .map(|state| state.snapshot.clone())
     }
 
+    pub(crate) fn refresh_view_head_for_watcher(&self, paths: &[PathBuf]) -> BTreeSet<PathBuf> {
+        let Some(root) = self.canonical_cache_root_opt() else {
+            return BTreeSet::new();
+        };
+        let Some(snapshot) = self.view_runtime_snapshot() else {
+            return BTreeSet::new();
+        };
+        let matched = paths
+            .iter()
+            .filter(|path| snapshot.head_metadata.matches_path(path))
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if matched.is_empty() {
+            return matched;
+        }
+        let refreshed = (|| {
+            let head = crate::alias::head_tree_entries(&root).map_err(|error| error.to_string())?;
+            let fingerprint = crate::views::assembly::head_tree_fingerprint(&head);
+            let metadata =
+                crate::alias::capture_git_head_metadata(&root, self.git_common_dir().as_deref())
+                    .map_err(|error| error.to_string())?;
+            Ok::<_, String>((fingerprint, metadata))
+        })();
+        let mut runtime = self
+            .view_runtime
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(state) = runtime.as_mut() else {
+            return matched;
+        };
+        match refreshed {
+            Ok((fingerprint, metadata)) => {
+                crate::views::cache_head_fingerprint(root.clone(), fingerprint.clone());
+                state.snapshot.head_fingerprint = fingerprint;
+                state.snapshot.head_metadata = metadata;
+            }
+            Err(error) => {
+                crate::views::cache_head_fingerprint(root.clone(), String::new());
+                state.snapshot.head_fingerprint.clear();
+                crate::slog_warn!(
+                    "view HEAD refresh failed root={}: {}",
+                    root.display(),
+                    error
+                );
+            }
+        }
+        matched
+    }
+
     pub(crate) fn pinned_view_runtime(&self) -> Option<ViewRuntimeSnapshot> {
         self.view_runtime
             .read()
@@ -4611,6 +4662,10 @@ impl AppContext {
             .ok_or_else(|| "view root is not configured".to_string())?;
         let head = crate::alias::head_tree_entries(&root).map_err(|error| error.to_string())?;
         let desired_head = crate::views::assembly::head_tree_fingerprint(&head);
+        crate::views::cache_head_fingerprint(root.clone(), desired_head.clone());
+        let head_metadata =
+            crate::alias::capture_git_head_metadata(&root, self.git_common_dir().as_deref())
+                .map_err(|error| error.to_string())?;
         let semantic_search = self.config().semantic_search;
         let semantic_keys = if semantic_search && allow_blob_put {
             let index = self
@@ -4670,6 +4725,8 @@ impl AppContext {
             snapshot: Some(ViewRuntimeSnapshot {
                 generation,
                 manifest,
+                head_fingerprint: desired_head,
+                head_metadata,
                 pending_paths: report.pending_paths.clone(),
                 ..snapshot
             }),
@@ -4989,12 +5046,7 @@ impl AppContext {
                         return CallgraphStoreAccess::Unavailable;
                     };
                     let generation = view.generation.as_deref().expect("pinned generation");
-                    let generation_matches_head = crate::alias::head_tree_entries(&project_root)
-                        .is_ok_and(|head| {
-                            generation
-                                .ends_with(&crate::views::assembly::head_tree_fingerprint(&head))
-                        });
-                    if !generation_matches_head {
+                    if !crate::views::generation_matches_head(generation, &view.head_fingerprint) {
                         crate::slog_debug!(
                             "callgraph view unavailable root={} reason=view_pending generation={}",
                             project_root.display(),
@@ -9236,6 +9288,7 @@ mod callgraph_store_for_ops_tests {
         root: PathBuf,
         source: PathBuf,
         ctx: AppContext,
+        watcher_tx: crossbeam_channel::Sender<crate::watcher_filter::WatcherDispatchEvent>,
         legacy: Arc<ReadonlyCallGraphStore>,
     }
 
@@ -9280,6 +9333,8 @@ mod callgraph_store_for_ops_tests {
                 },
             );
             ctx.set_canonical_cache_root(root.clone());
+            let (watcher_tx, watcher_rx) = crossbeam_channel::unbounded();
+            *ctx.watcher_rx().lock() = Some(watcher_rx);
             let view = crate::views::ViewStore::open(storage.path(), &scope).expect("view store");
             ctx.install_view_runtime(
                 ViewRuntimeSnapshot {
@@ -9290,6 +9345,8 @@ mod callgraph_store_for_ops_tests {
                     view_dir: view.view_dir().to_path_buf(),
                     generation: None,
                     manifest: None,
+                    head_fingerprint: String::new(),
+                    head_metadata: crate::alias::capture_git_head_metadata(&root, None).unwrap(),
                     pending_paths: BTreeSet::from([b"lib.rs".to_vec()]),
                 },
                 None,
@@ -9305,6 +9362,7 @@ mod callgraph_store_for_ops_tests {
                 root,
                 source,
                 ctx,
+                watcher_tx,
                 legacy,
             }
         }
@@ -9365,6 +9423,31 @@ mod callgraph_store_for_ops_tests {
                     message,
                 ],
             );
+            let metadata = self
+                .ctx
+                .view_runtime_snapshot()
+                .expect("view runtime")
+                .head_metadata;
+            let paths = metadata
+                .watch_paths()
+                .map(Path::to_path_buf)
+                .collect::<Vec<_>>();
+            self.watcher_tx
+                .send(crate::watcher_filter::WatcherDispatchEvent::Paths(
+                    paths.clone(),
+                ))
+                .expect("watcher HEAD event");
+            let outcome =
+                crate::runtime_drain::drain_watcher_events_bounded(&self.ctx, paths.len());
+            assert_eq!(outcome.processed, paths.len());
+            assert!(
+                self.ctx
+                    .watcher_drain_slice()
+                    .lock()
+                    .as_ref()
+                    .is_some_and(|state| state.view_publication_due.is_some()),
+                "watcher HEAD metadata event must schedule publication"
+            );
         }
     }
 
@@ -9393,6 +9476,25 @@ mod callgraph_store_for_ops_tests {
         assert_eq!(
             response.data["message"],
             "callers: callgraph store is building in the background; retry shortly"
+        );
+    }
+
+    #[test]
+    fn views_published_navigation_uses_cached_head_without_git_spawns() {
+        let fixture = ViewsCallgraphFixture::new();
+        fixture.publish();
+        crate::alias::reset_head_tree_entry_calls_for_test();
+
+        for _ in 0..20 {
+            let response = fixture.callers();
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["total_callers"], 1);
+        }
+
+        assert_eq!(
+            crate::alias::head_tree_entry_calls_for_test(),
+            0,
+            "navigation must not rebuild the HEAD manifest on its read path"
         );
     }
 
