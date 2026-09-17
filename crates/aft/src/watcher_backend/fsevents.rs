@@ -519,6 +519,18 @@ mod tests {
         let root = &worktree.path;
         let probe = root.join("watcher-exclusion-probe");
         std::fs::create_dir(root.join("target")).unwrap();
+        for directory in [
+            "node_modules",
+            "dist",
+            "build",
+            ".next",
+            ".venv",
+            "venv",
+            "__pycache__",
+            ".turbo",
+        ] {
+            std::fs::create_dir(root.join(directory)).unwrap();
+        }
         std::fs::create_dir_all(probe.join("src")).unwrap();
         std::fs::write(
             probe.join("Cargo.toml"),
