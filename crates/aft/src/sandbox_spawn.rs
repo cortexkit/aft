@@ -3041,6 +3041,132 @@ mod policy_tests {
         )
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn concurrent_sandbox_marker_pty_and_git_spawns_preserve_fd_ownership() {
+        use portable_pty::{CommandBuilder, PtySize};
+        use std::fs::OpenOptions;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::process::Stdio;
+        use std::sync::{Arc, Barrier};
+
+        const ITERATIONS: usize = 32;
+        let fixture = tempfile::tempdir().unwrap();
+        let project = fixture.path().join("project");
+        let task_io = fixture
+            .path()
+            .join("tasks/session/bash-0000000000000001/io");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&task_io).unwrap();
+        let initialized = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&project)
+            .status()
+            .unwrap();
+        assert!(initialized.success());
+
+        let ctx = Arc::new(context(project));
+        let task_io = Arc::new(task_io);
+        let barrier = Arc::new(Barrier::new(4));
+
+        let resolver = {
+            let ctx = Arc::clone(&ctx);
+            let task_io = Arc::clone(&task_io);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..ITERATIONS {
+                    let plan = resolve_sandbox_spawn(
+                        &ctx,
+                        &AuthenticatedPrincipal::FirstParty,
+                        RequestedSandboxTier::Native,
+                        SandboxTaskKind::BashBackground,
+                        &task_io,
+                        None,
+                    );
+                    assert!(plan.is_native_launcher(), "unexpected plan: {plan:?}");
+                    plan.cleanup_unspawned();
+                }
+            })
+        };
+        let detached = {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..ITERATIONS {
+                    let exit = tempfile::tempfile().unwrap();
+                    let failure = tempfile::tempfile().unwrap();
+                    crate::bash_background::persistence::set_close_on_exec(exit.as_raw_fd(), false)
+                        .unwrap();
+                    crate::bash_background::persistence::set_close_on_exec(
+                        failure.as_raw_fd(),
+                        false,
+                    )
+                    .unwrap();
+                    let mut command = Command::new("/usr/bin/true");
+                    apply_marker_fd_allowlist(
+                        &mut command,
+                        exit.as_raw_fd(),
+                        failure.as_raw_fd(),
+                        None,
+                    )
+                    .unwrap();
+                    let status = command
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .unwrap();
+                    assert!(status.success());
+                }
+            })
+        };
+        let pty = {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..ITERATIONS {
+                    let pair = portable_pty::native_pty_system()
+                        .openpty(PtySize {
+                            rows: 24,
+                            cols: 80,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        })
+                        .unwrap();
+                    let mut child = pair
+                        .slave
+                        .spawn_command(CommandBuilder::new("/usr/bin/true"))
+                        .unwrap();
+                    child.wait().unwrap();
+                }
+            })
+        };
+        let probes = {
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..ITERATIONS {
+                    let output = Command::new("git").arg("--version").output().unwrap();
+                    assert!(output.status.success());
+                    let file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .custom_flags(libc::O_CLOEXEC)
+                        .open("/dev/null")
+                        .unwrap();
+                    drop(file);
+                }
+            })
+        };
+
+        resolver.join().unwrap();
+        detached.join().unwrap();
+        pty.join().unwrap();
+        probes.join().unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn sandbox_setup_refusal_names_root_and_cause_before_remedy() {
