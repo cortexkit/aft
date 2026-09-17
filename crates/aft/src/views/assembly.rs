@@ -86,6 +86,7 @@ impl PreparedAssembly {
 
     pub fn commit(&mut self) -> Result<AssemblyReport> {
         if let Some(publication) = self.publication.take() {
+            let retires_legacy_plane = publication.base_generation.is_none();
             let pointer_started = Instant::now();
             let outcome = publication.commit();
             self.profile.pointer_ms = pointer_started.elapsed().as_millis();
@@ -93,6 +94,16 @@ impl PreparedAssembly {
                 PublishOutcome::Published => {
                     self.report.published = true;
                     self.files = None;
+                    if retires_legacy_plane {
+                        log::info!(
+                            "views: root={} legacy plane retired at generation={}",
+                            self.profile.root.display(),
+                            self.report
+                                .generation
+                                .as_deref()
+                                .expect("prepared publication has a generation")
+                        );
+                    }
                     if let Some((path, connection)) = self.derived_checkpoint.take() {
                         self.profile.finish();
                         super::generation::schedule_derived_checkpoint(

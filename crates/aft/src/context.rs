@@ -4988,11 +4988,25 @@ impl AppContext {
                     let Some(project_root) = self.callgraph_project_root() else {
                         return CallgraphStoreAccess::Unavailable;
                     };
+                    let generation = view.generation.as_deref().expect("pinned generation");
+                    let generation_matches_head = crate::alias::head_tree_entries(&project_root)
+                        .is_ok_and(|head| {
+                            generation
+                                .ends_with(&crate::views::assembly::head_tree_fingerprint(&head))
+                        });
+                    if !generation_matches_head {
+                        crate::slog_debug!(
+                            "callgraph view unavailable root={} reason=view_pending generation={}",
+                            project_root.display(),
+                            generation
+                        );
+                        return CallgraphStoreAccess::Building;
+                    }
                     return match crate::views::read::open_published_callgraph(
                         project_root,
                         view.family,
                         view.view_dir,
-                        view.generation.as_deref().expect("pinned generation"),
+                        generation,
                         view.query_pin,
                     ) {
                         Ok(store) => CallgraphStoreAccess::Ready(Arc::new(store)),
@@ -8574,6 +8588,7 @@ mod callgraph_store_for_ops_tests {
     use crate::parser::TreeSitterProvider;
     use crate::protocol::RawRequest;
     use serde_json::json;
+    use std::collections::HashSet;
     use std::path::Path;
     use std::sync::Barrier;
     use tempfile::TempDir;
@@ -9213,6 +9228,236 @@ mod callgraph_store_for_ops_tests {
             vec![pending],
             "inline reopen failure must preserve pending watcher paths"
         );
+    }
+
+    struct ViewsCallgraphFixture {
+        _project: TempDir,
+        _storage: TempDir,
+        root: PathBuf,
+        source: PathBuf,
+        ctx: AppContext,
+        legacy: Arc<ReadonlyCallGraphStore>,
+    }
+
+    impl ViewsCallgraphFixture {
+        fn new() -> Self {
+            let project = TempDir::new().expect("project tempdir");
+            let storage = TempDir::new().expect("storage tempdir");
+            let source = project.path().join("lib.rs");
+            std::fs::write(
+                &source,
+                "pub fn caller() { target(); }\npub fn target() {}\n",
+            )
+            .expect("initial source");
+            Self::git(project.path(), &["init", "--quiet"]);
+            Self::git(project.path(), &["add", "lib.rs"]);
+            Self::git(
+                project.path(),
+                &[
+                    "-c",
+                    "user.name=AFT Tests",
+                    "-c",
+                    "user.email=aft-tests@example.com",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "initial",
+                ],
+            );
+            let root = std::fs::canonicalize(project.path()).expect("canonical project root");
+            let family = crate::search_index::artifact_cache_key(&root);
+            let scope = crate::path_identity::project_scope_key(&root);
+            crate::root_cache::configure_artifact_access(&root, &family, false);
+            let ctx = AppContext::new(
+                Box::new(TreeSitterProvider::new()),
+                Config {
+                    project_root: Some(root.clone()),
+                    storage_dir: Some(storage.path().to_path_buf()),
+                    callgraph_store: true,
+                    callgraph_chunk_size: 1,
+                    views: crate::config::ViewsConfig { enabled: true },
+                    ..Config::default()
+                },
+            );
+            ctx.set_canonical_cache_root(root.clone());
+            let view = crate::views::ViewStore::open(storage.path(), &scope).expect("view store");
+            ctx.install_view_runtime(
+                ViewRuntimeSnapshot {
+                    query_pin: None,
+                    storage: storage.path().to_path_buf(),
+                    family,
+                    scope,
+                    view_dir: view.view_dir().to_path_buf(),
+                    generation: None,
+                    manifest: None,
+                    pending_paths: BTreeSet::from([b"lib.rs".to_vec()]),
+                },
+                None,
+            );
+            let legacy = ctx
+                .ensure_callgraph_store()
+                .expect("legacy callgraph build")
+                .expect("legacy callgraph reader");
+            assert_eq!(legacy.reader_kind(), "legacy");
+            Self {
+                _project: project,
+                _storage: storage,
+                root,
+                source,
+                ctx,
+                legacy,
+            }
+        }
+
+        fn git(root: &Path, args: &[&str]) {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .status()
+                .expect("git command");
+            assert!(status.success(), "git {args:?} failed with {status}");
+        }
+
+        fn publish(&self) {
+            let report = self
+                .ctx
+                .publish_view_paths(BTreeSet::new(), true)
+                .expect("view publication");
+            assert!(report.published, "first view generation must publish");
+            assert_eq!(
+                self.ctx
+                    .view_runtime_snapshot()
+                    .and_then(|view| view.generation),
+                report.generation
+            );
+        }
+
+        fn callers(&self) -> crate::protocol::Response {
+            crate::commands::callers::handle_callers(
+                &RawRequest {
+                    id: "views-callers".to_owned(),
+                    command: "callers".to_owned(),
+                    lsp_hints: None,
+                    session_id: None,
+                    params: json!({
+                        "file": self.source,
+                        "symbol": "target",
+                    }),
+                },
+                &self.ctx,
+            )
+        }
+
+        fn commit_source(&self, source: &str, message: &str) {
+            std::fs::write(&self.source, source).expect("updated source");
+            Self::git(&self.root, &["add", "lib.rs"]);
+            Self::git(
+                &self.root,
+                &[
+                    "-c",
+                    "user.name=AFT Tests",
+                    "-c",
+                    "user.email=aft-tests@example.com",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    message,
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn views_pending_head_callers_reports_building_instead_of_serving_legacy() {
+        let fixture = ViewsCallgraphFixture::new();
+        fixture.publish();
+        fixture.commit_source(
+            "pub fn caller() {}\npub fn target() {}\n",
+            "remove stale call",
+        );
+        let stale = crate::commands::callgraph_store_adapter::callers_result(
+            fixture.legacy.as_ref(),
+            &fixture.source,
+            "target",
+            1,
+            false,
+        )
+        .expect("stale legacy callers");
+        assert_eq!(stale.total_callers, 1, "legacy fixture must remain stale");
+
+        let response = fixture.callers();
+
+        assert!(!response.success, "pending HEAD must not serve stale rows");
+        assert_eq!(response.data["code"], "callgraph_building");
+        assert_eq!(
+            response.data["message"],
+            "callers: callgraph store is building in the background; retry shortly"
+        );
+    }
+
+    #[test]
+    fn views_first_publication_retires_legacy_after_migration_window() {
+        let fixture = ViewsCallgraphFixture::new();
+        crate::runtime_drain::reset_legacy_watcher_refreshes_for_test();
+        crate::runtime_drain::refresh_callgraph_store_for_watcher(
+            &fixture.ctx,
+            &HashSet::from([fixture.source.clone()]),
+        );
+        assert_eq!(
+            crate::runtime_drain::legacy_watcher_refreshes_for_test(),
+            1,
+            "legacy refresh must remain active before the first publication"
+        );
+        let legacy_response = fixture.callers();
+        assert!(legacy_response.success, "{legacy_response:?}");
+        assert_eq!(legacy_response.data["total_callers"], 1);
+
+        fixture.publish();
+        assert!(matches!(
+            fixture.ctx.callgraph_store_for_ops(),
+            CallgraphStoreAccess::Ready(store) if store.reader_kind() == "view"
+        ));
+        crate::runtime_drain::reset_legacy_watcher_refreshes_for_test();
+        crate::runtime_drain::refresh_callgraph_store_for_watcher(
+            &fixture.ctx,
+            &HashSet::from([fixture.source.clone()]),
+        );
+        assert_eq!(
+            crate::runtime_drain::legacy_watcher_refreshes_for_test(),
+            0,
+            "the first publication must retire watcher writes to legacy"
+        );
+
+        std::fs::write(
+            &fixture.source,
+            "pub fn caller() { target(); }\npub fn resumed() { target(); }\npub fn target() {}\n",
+        )
+        .expect("views-off source update");
+        fixture
+            .ctx
+            .update_config(|config| config.views.enabled = false);
+        crate::runtime_drain::refresh_callgraph_store_for_watcher(
+            &fixture.ctx,
+            &HashSet::from([fixture.source.clone()]),
+        );
+        assert_eq!(
+            crate::runtime_drain::legacy_watcher_refreshes_for_test(),
+            1,
+            "disabling views must enqueue legacy refresh again"
+        );
+        let deadline = Instant::now() + Duration::from_secs(12);
+        loop {
+            let response = fixture.callers();
+            if response.success && response.data["total_callers"] == 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "views-off legacy refresh did not converge: {response:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

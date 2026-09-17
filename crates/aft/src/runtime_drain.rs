@@ -36,6 +36,29 @@ const WATCHER_DRAIN_UNIT_FINAL_AFTER: Duration = Duration::from_secs(30);
 pub const LSP_EVENT_DRAIN_BATCH_CAP: usize = 256;
 
 #[cfg(test)]
+thread_local! {
+    static LEGACY_WATCHER_REFRESHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_legacy_watcher_refreshes_for_test() {
+    LEGACY_WATCHER_REFRESHES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn legacy_watcher_refreshes_for_test() -> usize {
+    LEGACY_WATCHER_REFRESHES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn note_legacy_watcher_refresh_for_test() {
+    LEGACY_WATCHER_REFRESHES.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(not(test))]
+fn note_legacy_watcher_refresh_for_test() {}
+
+#[cfg(test)]
 struct ArtifactDrainCommitGate {
     context_id: usize,
     reached_tx: crossbeam_channel::Sender<()>,
@@ -2121,6 +2144,33 @@ fn watcher_path_is_generated_for_callgraph(ctx: &AppContext, path: &Path) -> boo
         .is_some_and(|project_root| crate::inspect::is_generated_file(&project_root, path))
 }
 
+fn published_view_owns_callgraph_writes(ctx: &AppContext) -> bool {
+    ctx.config().views.enabled
+        && ctx
+            .view_runtime_snapshot()
+            .is_some_and(|view| view.generation.is_some() && view.manifest.is_some())
+}
+
+fn enqueue_legacy_callgraph_refresh_for_watcher(
+    ctx: &AppContext,
+    paths: impl IntoIterator<Item = PathBuf>,
+    generation: u64,
+) -> bool {
+    if published_view_owns_callgraph_writes(ctx) {
+        let root = ctx
+            .canonical_cache_root_opt()
+            .or_else(|| ctx.config().project_root.clone())
+            .unwrap_or_default();
+        log::debug!(
+            "legacy callgraph refresh skipped root={} reason=views_owner",
+            root.display()
+        );
+        return true;
+    }
+    note_legacy_watcher_refresh_for_test();
+    ctx.enqueue_callgraph_store_refresh_for_generation(paths, generation)
+}
+
 pub fn refresh_callgraph_store_for_watcher(
     ctx: &AppContext,
     changed: &HashSet<std::path::PathBuf>,
@@ -2143,7 +2193,11 @@ pub fn refresh_callgraph_store_for_watcher(
     // This is intentionally the only watcher call-site action. Opening and
     // mutating SQLite belongs to the process-wide store worker, outside every
     // executor lane and its epoch gate.
-    ctx.enqueue_callgraph_store_refresh(refresh_paths);
+    let _ = enqueue_legacy_callgraph_refresh_for_watcher(
+        ctx,
+        refresh_paths,
+        ctx.configure_generation(),
+    );
 }
 
 /// Drain pre-filtered watcher events and apply cache invalidations on the
@@ -2392,7 +2446,8 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                 WATCHER_DRAIN_SLICE_BUDGET,
                 heavy_root_work_allowed,
                 |ctx, changed| {
-                    let _ = ctx.enqueue_callgraph_store_refresh_for_generation(
+                    let _ = enqueue_legacy_callgraph_refresh_for_watcher(
+                        ctx,
                         changed.iter().cloned(),
                         lifecycle_generation,
                     );
@@ -4745,7 +4800,7 @@ mod tests {
 mod watcher_slice_tests {
     use super::*;
     use crate::config::Config;
-    use crate::context::{default_language_provider_factory, AppContext};
+    use crate::context::{default_language_provider_factory, AppContext, ViewRuntimeSnapshot};
 
     fn context_with_watcher(
         root: &Path,
@@ -4786,6 +4841,74 @@ mod watcher_slice_tests {
         assert!(
             due < applied_at + crate::commands::configure::semantic_refresh_quiet_window(),
             "view publication inherited the semantic refresh quiet window"
+        );
+    }
+
+    #[test]
+    fn views_published_watcher_batch_skips_legacy_refresh_and_still_schedules_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let (ctx, tx) = context_with_watcher(root.path());
+        ctx.update_config(|config| {
+            config.callgraph_store = true;
+            config.views.enabled = true;
+        });
+        ctx.set_cache_writer_capabilities(false, false);
+        let family = crate::search_index::artifact_cache_key(root.path());
+        let scope = crate::path_identity::project_scope_key(root.path());
+        let view = crate::views::ViewStore::open(storage.path(), &scope).unwrap();
+        ctx.install_view_runtime(
+            ViewRuntimeSnapshot {
+                query_pin: None,
+                storage: storage.path().to_path_buf(),
+                family,
+                scope,
+                view_dir: view.view_dir().to_path_buf(),
+                generation: Some("1-published".to_owned()),
+                manifest: Some(
+                    crate::views::Manifest::new(std::iter::empty::<(
+                        crate::views::RelPath,
+                        crate::views::ManifestEntry,
+                    )>())
+                    .unwrap(),
+                ),
+                pending_paths: BTreeSet::new(),
+            },
+            None,
+        );
+        reset_legacy_watcher_refreshes_for_test();
+        tx.send(WatcherDispatchEvent::Paths(vec![root
+            .path()
+            .join("changed.rs")]))
+            .unwrap();
+
+        let outcome = drain_watcher_events_bounded(&ctx, 1);
+
+        assert_eq!(outcome.processed, 1);
+        assert_eq!(
+            legacy_watcher_refreshes_for_test(),
+            0,
+            "a published view must own watcher callgraph writes"
+        );
+        assert!(
+            ctx.watcher_drain_slice()
+                .lock()
+                .as_ref()
+                .is_some_and(|state| state.view_publication_due.is_some()),
+            "view publication must remain scheduled"
+        );
+
+        ctx.update_config(|config| config.views.enabled = false);
+        tx.send(WatcherDispatchEvent::Paths(vec![root
+            .path()
+            .join("legacy.rs")]))
+            .unwrap();
+        let outcome = drain_watcher_events_bounded(&ctx, 1);
+        assert_eq!(outcome.processed, 1);
+        assert_eq!(
+            legacy_watcher_refreshes_for_test(),
+            1,
+            "disabling views must resume legacy refresh on the next watcher batch"
         );
     }
 
