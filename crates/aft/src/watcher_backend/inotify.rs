@@ -255,6 +255,37 @@ mod tests {
     }
 
     #[test]
+    fn inotify_skips_ignored_directory_created_after_bind() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".gitignore"), "target/\n").unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let mut builder = GitignoreBuilder::new(&canonical_root);
+        builder.add(root.path().join(".gitignore"));
+        let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
+        let generation = Arc::new(AtomicU64::new(1));
+        let (tx, _rx) = mpsc::channel();
+        let watcher = ProjectWatcher::create(
+            canonical_root.clone(),
+            Vec::new(),
+            tx,
+            Arc::clone(&matcher),
+            generation,
+        )
+        .unwrap();
+        assert_eq!(watcher.watched_directory_count(), 1);
+
+        std::fs::create_dir(root.path().join("target")).unwrap();
+        std::fs::create_dir(root.path().join("target/not-watched")).unwrap();
+        std::fs::create_dir(root.path().join("new-source")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while watcher.watched_directory_count() != 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert_eq!(watcher.watched_directory_count(), 2);
+    }
+
+    #[test]
     fn inotify_adds_only_new_nonignored_directories() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("target")).unwrap();

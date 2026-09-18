@@ -502,11 +502,13 @@ fn exclusion_seed_priority(relative: &Path, is_git: bool, is_ignored: bool) -> O
 
 /// Choose ignored directory boundaries that an OS watcher can omit entirely.
 ///
-/// The eight backend slots are filled in three passes: existing root-level
-/// directories with a known high event volume, prefixes ranked by a previous
-/// overflow, then the remaining ignored boundaries in gitignore order. `.git`
-/// is eligible for the first seed slot only when it is a directory; linked
-/// worktrees use a `.git` file and must keep watching their root normally.
+/// Existing ignored directories keep their current priority: root-level
+/// high-volume names, prefixes ranked by a previous overflow, then remaining
+/// boundaries in gitignore order. Ignored high-volume names that do not exist
+/// yet follow every existing candidate, so they can use spare backend slots
+/// without displacing a real directory. `.git` is eligible for the first seed
+/// slot only when it is a directory; linked worktrees use a `.git` file and
+/// must keep watching their root normally.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) fn derive_excluded_subtrees(
     root: &Path,
@@ -520,6 +522,7 @@ pub(crate) fn derive_excluded_subtrees(
         seed_priority: usize,
         observed_count: u64,
         gitignore_order: GitignoreOrder,
+        is_existing: bool,
     }
 
     let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
@@ -572,6 +575,7 @@ pub(crate) fn derive_excluded_subtrees(
                     gitignore_order: matched_glob
                         .map(|glob| GitignoreOrder::for_glob(&root, glob))
                         .unwrap_or_default(),
+                    is_existing: true,
                 });
             } else {
                 stack.push(path);
@@ -579,10 +583,35 @@ pub(crate) fn derive_excluded_subtrees(
         }
     }
 
+    if let Some(matcher) = matcher.as_deref() {
+        for (seed_priority, name) in WATCHER_EXCLUSION_SEEDS.iter().enumerate() {
+            let path = root.join(name);
+            if !matches!(
+                fs::symlink_metadata(&path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            ) {
+                continue;
+            }
+            let ignore::Match::Ignore(glob) = matcher.matched_path_or_any_parents(&path, true)
+            else {
+                continue;
+            };
+            candidates.push(Candidate {
+                path,
+                source: WatcherExclusionSource::Seed,
+                seed_priority,
+                observed_count: 0,
+                gitignore_order: GitignoreOrder::for_glob(&root, glob),
+                is_existing: false,
+            });
+        }
+    }
+
     candidates.sort_by(|left, right| {
-        left.source
-            .priority()
-            .cmp(&right.source.priority())
+        right
+            .is_existing
+            .cmp(&left.is_existing)
+            .then_with(|| left.source.priority().cmp(&right.source.priority()))
             .then_with(|| match left.source {
                 WatcherExclusionSource::Seed => left.seed_priority.cmp(&right.seed_priority),
                 WatcherExclusionSource::Ranked => right
@@ -1470,7 +1499,7 @@ mod tests {
     }
 
     #[test]
-    fn exclusion_derivation_uses_fixed_priority_caps_and_skips_missing_directories() {
+    fn exclusion_derivation_uses_fixed_priority_caps_and_skips_missing_nonseeds() {
         let root = TempDir::new().unwrap();
         std::fs::create_dir(root.path().join(".git")).unwrap();
         let priorities = [
@@ -1522,6 +1551,58 @@ mod tests {
         assert!(!exclusions
             .iter()
             .any(|exclusion| exclusion.path().ends_with("other-generated")));
+    }
+
+    #[test]
+    fn exclusion_derivation_seeds_only_ignored_absent_priority_directories() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(
+            root.path().join(".gitignore"),
+            "target/\nnode_modules/\ngenerated/\ndist/\n!dist/\n",
+        )
+        .unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let matcher = shared_matcher(&canonical_root);
+
+        let exclusions = derive_excluded_subtrees(&canonical_root, &matcher, None);
+
+        assert_eq!(
+            watcher_exclusion_paths(&exclusions),
+            ["target", "node_modules"]
+                .iter()
+                .map(|name| canonical_root.join(name))
+                .collect::<Vec<_>>()
+        );
+        assert!(exclusions
+            .iter()
+            .all(|exclusion| exclusion.source() == WatcherExclusionSource::Seed));
+    }
+
+    #[test]
+    fn exclusion_derivation_ranks_existing_boundaries_above_absent_seeds() {
+        let root = TempDir::new().unwrap();
+        std::fs::create_dir(root.path().join("node_modules")).unwrap();
+        std::fs::create_dir(root.path().join("generated")).unwrap();
+        std::fs::write(
+            root.path().join(".gitignore"),
+            "target/\nnode_modules/\ngenerated/\n",
+        )
+        .unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let matcher = shared_matcher(&canonical_root);
+
+        let exclusions = derive_excluded_subtrees(&canonical_root, &matcher, Some(3));
+
+        assert_eq!(
+            watcher_exclusion_paths(&exclusions),
+            ["node_modules", "generated", "target"]
+                .iter()
+                .map(|name| canonical_root.join(name))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(exclusions[0].source(), WatcherExclusionSource::Seed);
+        assert_eq!(exclusions[1].source(), WatcherExclusionSource::Gitignore);
+        assert_eq!(exclusions[2].source(), WatcherExclusionSource::Seed);
     }
 
     #[test]

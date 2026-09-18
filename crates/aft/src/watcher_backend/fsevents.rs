@@ -441,7 +441,10 @@ mod tests {
     use ignore::gitignore::GitignoreBuilder;
 
     use super::*;
-    use crate::watcher_filter::{filter_watcher_raw_paths_for_test, WatcherFilterConfig};
+    use crate::watcher_filter::{
+        filter_watcher_raw_paths_for_test, run_watcher_thread, watcher_dispatch_channel,
+        WatcherDispatchEvent, WatcherFilterConfig,
+    };
 
     struct LinkedWorktree {
         repository_root: PathBuf,
@@ -519,19 +522,18 @@ mod tests {
         assert!(!excluded.exists());
 
         let (tx, rx) = mpsc::channel();
-        let stream = FsEventsStream::start(
-            &canonical_root,
-            std::slice::from_ref(&excluded),
-            tx,
-        )
-        .unwrap();
+        let stream =
+            FsEventsStream::start(&canonical_root, std::slice::from_ref(&excluded), tx).unwrap();
         thread::sleep(Duration::from_millis(100));
         let _startup_events = rx.try_iter().collect::<Vec<_>>();
 
         std::fs::create_dir(&excluded).unwrap();
         for index in 0..200 {
-            std::fs::write(excluded.join(format!("package-{index}.js")), b"export {};\n")
-                .unwrap();
+            std::fs::write(
+                excluded.join(format!("package-{index}.js")),
+                b"export {};\n",
+            )
+            .unwrap();
         }
         thread::sleep(Duration::from_millis(500));
 
@@ -564,6 +566,88 @@ mod tests {
 
         assert_eq!(delivered_for_excluded_prefix, 1);
         assert_eq!(delivered_for_excluded_descendants, 0);
+    }
+
+    #[test]
+    #[ignore = "requires a live macOS FSEvents service"]
+    fn fresh_root_node_modules_burst_has_no_overflow_or_rescan() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".gitignore"), "node_modules/\n").unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let excluded = canonical_root.join("node_modules");
+        let mut builder = GitignoreBuilder::new(&canonical_root);
+        builder.add(root.path().join(".gitignore"));
+        let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
+        let generation = Arc::new(AtomicU64::new(1));
+        let config = WatcherFilterConfig::new(canonical_root.clone(), None);
+        let counters = crate::context::watcher_counters_for_root(&canonical_root);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = Arc::clone(&shutdown);
+        let backend_matcher = Arc::clone(&matcher);
+        let backend_generation = Arc::clone(&generation);
+        let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
+        let watcher_thread = thread::spawn(move || {
+            run_watcher_thread(
+                config,
+                Vec::new(),
+                matcher,
+                generation,
+                dispatch_tx,
+                thread_shutdown,
+                move |root, extra_paths, tx| {
+                    ProjectWatcher::create(
+                        root,
+                        extra_paths,
+                        tx,
+                        backend_matcher,
+                        backend_generation,
+                    )
+                },
+            );
+        });
+        let startup_deadline = Instant::now() + Duration::from_secs(2);
+        while counters.backend_exclusions().matcher_generation != 1
+            && Instant::now() < startup_deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(counters.backend_exclusions().matcher_generation, 1);
+
+        std::fs::create_dir(&excluded).unwrap();
+        for index in 0..2_000 {
+            std::fs::write(
+                excluded.join(format!("package-{index}.js")),
+                b"export {};\n",
+            )
+            .unwrap();
+        }
+
+        let observation_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < observation_deadline {
+            match dispatch_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(WatcherDispatchEvent::RescanRequired(reason)) => {
+                    let _ = counters.begin_rescan(reason);
+                }
+                Ok(
+                    WatcherDispatchEvent::Paths(_)
+                    | WatcherDispatchEvent::IgnoreRulesChanged { .. }
+                    | WatcherDispatchEvent::RootDeleted,
+                ) => {}
+                Ok(WatcherDispatchEvent::Error(error)) => panic!("watcher error: {error}"),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        shutdown.store(true, Ordering::SeqCst);
+        watcher_thread.join().unwrap();
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.overflows_total, 0);
+        assert_eq!(snapshot.rescans_buffer_overflow_total, 0);
+        assert_eq!(snapshot.rescans_kernel_dropped_total, 0);
+        assert_eq!(snapshot.rescans_user_dropped_total, 0);
+        assert_eq!(snapshot.rescans_unknown_total, 0);
+        assert!(counters.backend_exclusions().paths.contains(&excluded));
     }
 
     #[test]
