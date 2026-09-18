@@ -274,6 +274,10 @@ pub(super) fn build_manifest() -> ModuleManifest {
                         name: crate::commands::memory_census::MEMORY_CENSUS_OPERATION.to_string(),
                         kind: ManagementOperationKind::Query,
                     },
+                    ManagementOperation {
+                        name: crate::commands::writes_census::WRITES_CENSUS_OPERATION.to_string(),
+                        kind: ManagementOperationKind::Query,
+                    },
                 ],
                 config_schema: json!({
                     "type": "object",

@@ -6,9 +6,7 @@
 use rustc_demangle::try_demangle;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-#[cfg(target_os = "linux")]
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fmt;
 use std::fmt::Write as FmtWrite;
@@ -23,14 +21,14 @@ use std::process::Command;
 use std::process::Stdio;
 #[cfg(target_os = "linux")]
 use std::thread;
-#[cfg(target_os = "linux")]
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use subc_client_rs::{CallOptions, CloseRouteOptions, ConsumerOptions};
 use subc_protocol::manifest::ProviderRole;
 use subc_protocol::{BindIdentity, RouteTarget};
 
 use aft::commands::memory_census::MEMORY_CENSUS_OPERATION;
+use aft::commands::writes_census::WRITES_CENSUS_OPERATION;
 
 const DEFAULT_SECONDS: u64 = 4;
 const TOP_THREADS: usize = 5;
@@ -87,6 +85,44 @@ pub fn run(args: Vec<OsString>) -> Result<(), ProfileError> {
             );
         } else {
             print!("{}", render_memory_census_human(&census));
+        }
+        return Ok(());
+    }
+    if args.writes {
+        let until_ms = epoch_ms();
+        let since_ms = until_ms.saturating_sub(
+            args.since_ms
+                .unwrap_or(aft::write_ledger::DEFAULT_WINDOW_MS),
+        );
+        let root = args.root.as_ref().map(|path| {
+            fs::canonicalize(path)
+                .unwrap_or_else(|_| path.clone())
+                .display()
+                .to_string()
+        });
+        let params = serde_json::json!({
+            "since_ms": since_ms,
+            "root": root,
+        });
+        let before = fetch_management_census(WRITES_CENSUS_OPERATION, params.clone())
+            .map_err(ProfileError::runtime)?;
+        let census = if let Some(seconds) = args.live {
+            std::thread::sleep(Duration::from_secs(seconds));
+            let after = fetch_management_census(WRITES_CENSUS_OPERATION, params)
+                .map_err(ProfileError::runtime)?;
+            subtract_write_census(&after, &before, seconds.saturating_mul(1_000))
+        } else {
+            before
+        };
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&census).map_err(|error| {
+                    ProfileError::runtime(format!("could not render write census JSON: {error}"))
+                })?
+            );
+        } else {
+            print!("{}", render_writes_census_human(&census));
         }
         return Ok(());
     }
@@ -182,6 +218,14 @@ impl fmt::Display for ProfileError {
 impl std::error::Error for ProfileError {}
 
 fn fetch_memory_census() -> Result<serde_json::Value, String> {
+    fetch_management_census(MEMORY_CENSUS_OPERATION, serde_json::json!({}))
+}
+
+fn fetch_management_census(
+    operation: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let requested_operation = operation.to_owned();
     let connection_file = aft::gh_shim::configured_connection_file()
         .ok_or_else(|| "no daemon connection file was discovered".to_string())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -204,13 +248,15 @@ fn fetch_memory_census() -> Result<serde_json::Value, String> {
                         role,
                         ProviderRole::ManagementSurface { operations, .. }
                             if operations.iter().any(|operation| {
-                                operation.name == MEMORY_CENSUS_OPERATION
+                                operation.name == requested_operation
                             })
                     )
                 })
         });
         if !advertises_census {
-            return Err("daemon does not advertise AFT's memory census".to_string());
+            return Err(format!(
+                "daemon does not advertise AFT's {requested_operation}"
+            ));
         }
 
         let project_root = std::env::current_dir()
@@ -230,8 +276,8 @@ fn fetch_memory_census() -> Result<serde_json::Value, String> {
             .await
             .map_err(|error| format!("memory census route failed: {error}"))?;
         let body = serde_json::to_vec(&serde_json::json!({
-            "op": MEMORY_CENSUS_OPERATION,
-            "params": {},
+            "op": requested_operation.clone(),
+            "params": params,
         }))
         .map_err(|error| format!("could not encode memory census request: {error}"))?;
         let response = consumer
@@ -244,7 +290,8 @@ fn fetch_memory_census() -> Result<serde_json::Value, String> {
         let response = response?;
         let envelope: serde_json::Value = serde_json::from_slice(&response)
             .map_err(|error| format!("invalid memory census response: {error}"))?;
-        if envelope.get("op").and_then(serde_json::Value::as_str) != Some(MEMORY_CENSUS_OPERATION)
+        if envelope.get("op").and_then(serde_json::Value::as_str)
+            != Some(requested_operation.as_str())
             || envelope.get("status").and_then(serde_json::Value::as_str) != Some("ok")
         {
             return Err("daemon returned an unsuccessful memory census".to_string());
@@ -265,6 +312,10 @@ struct ProfileArgs {
     json: bool,
     raw: bool,
     memory: bool,
+    writes: bool,
+    since_ms: Option<u64>,
+    root: Option<PathBuf>,
+    live: Option<u64>,
     help: bool,
 }
 
@@ -277,6 +328,10 @@ impl ProfileArgs {
             json: false,
             raw: false,
             memory: false,
+            writes: false,
+            since_ms: None,
+            root: None,
+            live: None,
             help: false,
         };
         let mut iter = args.into_iter();
@@ -291,6 +346,12 @@ impl ProfileArgs {
                 "--json" => parsed.json = true,
                 "--raw" => parsed.raw = true,
                 "--memory" => parsed.memory = true,
+                "--writes" => parsed.writes = true,
+                "--since" => {
+                    parsed.since_ms = Some(parse_duration(&next_value(&mut iter, "--since")?)?)
+                }
+                "--root" => parsed.root = Some(PathBuf::from(next_value(&mut iter, "--root")?)),
+                "--live" => parsed.live = Some(parse_seconds(next_value(&mut iter, "--live")?)?),
                 "--help" | "-h" => parsed.help = true,
                 value if value.starts_with("--pid=") => {
                     parsed.pid = Some(parse_pid(value.trim_start_matches("--pid=").to_string())?)
@@ -298,6 +359,21 @@ impl ProfileArgs {
                 value if value.starts_with("--seconds=") => {
                     parsed.seconds =
                         parse_seconds(value.trim_start_matches("--seconds=").to_string())?
+                }
+                value if value.starts_with("--since=") => {
+                    parsed.since_ms = Some(parse_duration(value.trim_start_matches("--since="))?)
+                }
+                value if value.starts_with("--root=") => {
+                    let path = value.trim_start_matches("--root=");
+                    if path.is_empty() {
+                        return Err(ProfileError::usage("--root requires a path"));
+                    }
+                    parsed.root = Some(PathBuf::from(path));
+                }
+                value if value.starts_with("--live=") => {
+                    parsed.live = Some(parse_seconds(
+                        value.trim_start_matches("--live=").to_string(),
+                    )?)
                 }
                 value if value.starts_with("--dsym=") => {
                     let path = value.trim_start_matches("--dsym=");
@@ -312,6 +388,18 @@ impl ProfileArgs {
                     )))
                 }
             }
+        }
+        if parsed.memory && parsed.writes {
+            return Err(ProfileError::usage(
+                "--memory and --writes are mutually exclusive",
+            ));
+        }
+        if !parsed.writes
+            && (parsed.since_ms.is_some() || parsed.root.is_some() || parsed.live.is_some())
+        {
+            return Err(ProfileError::usage(
+                "--since, --root, and --live require --writes",
+            ));
         }
         Ok(parsed)
     }
@@ -347,9 +435,211 @@ fn parse_seconds(value: String) -> Result<u64, ProfileError> {
         })
 }
 
+fn parse_duration(value: &str) -> Result<u64, ProfileError> {
+    let (number, multiplier) = match value.chars().last() {
+        Some('s') => (&value[..value.len() - 1], 1_000_u64),
+        Some('m') => (&value[..value.len() - 1], 60_000_u64),
+        Some('h') => (&value[..value.len() - 1], 60 * 60_000_u64),
+        Some('d') => (&value[..value.len() - 1], 24 * 60 * 60_000_u64),
+        Some(character) if character.is_ascii_digit() => (value, 1_000_u64),
+        _ => {
+            return Err(ProfileError::usage(
+                "--since requires a positive duration such as 30s, 10m, 2h, or 1d",
+            ))
+        }
+    };
+    number
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number > 0)
+        .and_then(|number| number.checked_mul(multiplier))
+        .ok_or_else(|| {
+            ProfileError::usage(format!(
+                "--since requires a positive duration such as 30s, 10m, 2h, or 1d; got {value}"
+            ))
+        })
+}
+
+fn epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn subtract_write_census(
+    after: &serde_json::Value,
+    before: &serde_json::Value,
+    elapsed_ms: u64,
+) -> serde_json::Value {
+    let keyed = |value: &serde_json::Value| {
+        value
+            .get("writers")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|row| {
+                Some((
+                    (
+                        row.get("domain")?.as_str()?.to_owned(),
+                        row.get("root_id")?.as_str()?.to_owned(),
+                    ),
+                    (
+                        row.get("logical_bytes")?.as_u64()?,
+                        row.get("physical_bytes")?.as_u64()?,
+                        row.get("seam_labels")
+                            .and_then(serde_json::Value::as_array)
+                            .cloned()
+                            .unwrap_or_default(),
+                    ),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    let before_rows = keyed(before);
+    let mut writers = keyed(after)
+        .into_iter()
+        .filter_map(|((domain, root_id), (logical, physical, seam_labels))| {
+            let previous = before_rows
+                .get(&(domain.clone(), root_id.clone()))
+                .cloned()
+                .unwrap_or_default();
+            let logical_bytes = logical.saturating_sub(previous.0);
+            let physical_bytes = physical.saturating_sub(previous.1);
+            (logical_bytes > 0 || physical_bytes > 0).then(|| {
+                serde_json::json!({
+                    "domain": domain,
+                    "root_id": root_id,
+                    "logical_bytes": logical_bytes,
+                    "physical_bytes": physical_bytes,
+                    "seam_labels": seam_labels,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    writers.sort_by(|left, right| {
+        right["physical_bytes"]
+            .as_u64()
+            .cmp(&left["physical_bytes"].as_u64())
+    });
+    let attributed = writers.iter().fold(0_u64, |total, row| {
+        total.saturating_add(row["physical_bytes"].as_u64().unwrap_or(0))
+    });
+    let delta_field = |field: &str| {
+        after["process"][field]
+            .as_u64()
+            .zip(before["process"][field].as_u64())
+            .map(|(after, before)| after.saturating_sub(before))
+    };
+    let process_physical = delta_field("physical_bytes");
+    serde_json::json!({
+        "since_ms": after["until_ms"].as_u64().unwrap_or(0).saturating_sub(elapsed_ms),
+        "until_ms": after["until_ms"],
+        "root": after["root"],
+        "writers": writers,
+        "process": {
+            "available": process_physical.is_some(),
+            "logical_bytes": delta_field("logical_bytes"),
+            "physical_bytes": process_physical,
+        },
+        "attributed_physical_bytes": attributed,
+        "unattributed_physical_bytes": process_physical.map(|physical| {
+            let difference = i128::from(physical) - i128::from(attributed);
+            difference.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+        }),
+        "coverage": after["coverage"],
+        "live_elapsed_ms": elapsed_ms,
+    })
+}
+
+pub fn render_writes_census_human(value: &serde_json::Value) -> String {
+    let mut output = String::new();
+    let process_physical = value["process"]["physical_bytes"].as_u64();
+    let window_ms = value["until_ms"]
+        .as_u64()
+        .unwrap_or(0)
+        .saturating_sub(value["since_ms"].as_u64().unwrap_or(0));
+    let _ = writeln!(output, "AFT writes ({:.1}m)", window_ms as f64 / 60_000.0);
+    let _ = writeln!(
+        output,
+        "{:>12} {:>7} {:>12}  {:<24} root",
+        "physical", "share", "logical", "domain"
+    );
+    if let Some(rows) = value.get("writers").and_then(serde_json::Value::as_array) {
+        for row in rows {
+            let physical = row["physical_bytes"].as_u64().unwrap_or(0);
+            let logical = row["logical_bytes"].as_u64().unwrap_or(0);
+            let share = process_physical
+                .filter(|total| *total > 0)
+                .map(|total| format!("{:.1}%", physical as f64 / total as f64 * 100.0))
+                .unwrap_or_else(|| "n/a".to_owned());
+            let _ = writeln!(
+                output,
+                "{:>12} {:>7} {:>12}  {:<24} {}",
+                human_bytes(physical),
+                share,
+                human_bytes(logical),
+                row["domain"].as_str().unwrap_or("other"),
+                row["root_id"].as_str().unwrap_or("unknown")
+            );
+            if let Some(labels) = row.get("seam_labels").and_then(serde_json::Value::as_array) {
+                if !labels.is_empty() {
+                    let labels = labels
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let _ = writeln!(output, "             unmapped seams: {labels}");
+                }
+            }
+        }
+    }
+    let physical = process_physical
+        .map(human_bytes)
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let logical = value["process"]["logical_bytes"]
+        .as_u64()
+        .map(human_bytes)
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let unattributed = value["unattributed_physical_bytes"]
+        .as_i64()
+        .map(human_bytes_signed)
+        .unwrap_or_else(|| "unavailable".to_owned());
+    let _ = writeln!(output, "process: physical={physical} logical={logical}");
+    let _ = writeln!(output, "unattributed physical: {unattributed}");
+    if value["coverage"]["complete"].as_bool() == Some(false) {
+        let _ = writeln!(
+            output,
+            "coverage gap: requested window predates ledger by {}ms",
+            value["coverage"]["gap_ms"].as_u64().unwrap_or(0)
+        );
+    }
+    output
+}
+
+fn human_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GiB", bytes as f64 / (1024_f64 * 1024_f64 * 1024_f64))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.2} MiB", bytes as f64 / (1024_f64 * 1024_f64))
+    } else if bytes >= 1024 {
+        format!("{:.2} KiB", bytes as f64 / 1024_f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn human_bytes_signed(bytes: i64) -> String {
+    if bytes < 0 {
+        format!("-{}", human_bytes(bytes.unsigned_abs()))
+    } else {
+        human_bytes(bytes as u64)
+    }
+}
+
 fn print_usage() {
     println!(
-        "aft profile [--pid <pid>] [--seconds <N>] [--dsym <path>] [--json] [--raw] [--memory]"
+        "aft profile [--pid <pid>] [--seconds <N>] [--dsym <path>] [--json] [--raw] [--memory] [--writes [--since <duration>] [--root <path>] [--live <secs>]]"
     );
     println!("  Profiles the running AFT subc daemon when --pid is omitted.");
     println!("  --raw includes the platform sampler output; it is omitted by default.");
@@ -1880,6 +2170,41 @@ mod tests {
             .starts_with("aft-profile-424242-"));
         assert_eq!(fs::read_to_string(&path).expect("read kept sample"), raw);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn writes_profile_args_and_renderer_keep_filters_gap_and_unattributed() {
+        let parsed = ProfileArgs::parse(vec![
+            OsString::from("--writes"),
+            OsString::from("--since"),
+            OsString::from("10m"),
+            OsString::from("--root=/repo"),
+            OsString::from("--live=2"),
+        ])
+        .unwrap();
+        assert!(parsed.writes);
+        assert_eq!(parsed.since_ms, Some(600_000));
+        assert_eq!(parsed.root, Some(PathBuf::from("/repo")));
+        assert_eq!(parsed.live, Some(2));
+
+        let rendered = render_writes_census_human(&serde_json::json!({
+            "since_ms": 0,
+            "until_ms": 600_000,
+            "writers": [{
+                "domain": "semantic_delta",
+                "root_id": "/repo",
+                "logical_bytes": 4096,
+                "physical_bytes": 1024,
+                "seam_labels": []
+            }],
+            "process": {"available": true, "logical_bytes": 8192, "physical_bytes": 2048},
+            "unattributed_physical_bytes": 1024,
+            "coverage": {"complete": false, "gap_ms": 3000}
+        }));
+        assert!(rendered.contains("semantic_delta"));
+        assert!(rendered.contains("50.0%"));
+        assert!(rendered.contains("unattributed physical: 1.00 KiB"));
+        assert!(rendered.contains("coverage gap"));
     }
 
     #[test]

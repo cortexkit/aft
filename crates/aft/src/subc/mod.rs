@@ -3660,6 +3660,7 @@ where
                         .map(|(_, context)| context.bash_background().clone())
                         .collect()
                 });
+                crate::db::write_ledger::maybe_spawn_fold(shared_app.db());
                 crate::db::compression_events::maybe_spawn_retention(
                     shared_app.db(),
                     retention_registries,
@@ -4878,6 +4879,49 @@ async fn handle_management_request(
                 root_channels,
             ),
         ),
+        crate::commands::writes_census::WRITES_CENSUS_OPERATION => {
+            let params = decoded
+                .as_ref()
+                .and_then(|value| value.get("params"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let Some(params) = params.as_object() else {
+                return send_management_response(
+                    tx,
+                    frame,
+                    operation,
+                    Response::error(
+                        "management-writes-census",
+                        "invalid_request",
+                        "writes.census params must be an object",
+                    ),
+                    metrics,
+                )
+                .await;
+            };
+            match shared_app.db() {
+                Some(db) => match db.try_lock() {
+                    Ok(mut conn) => {
+                        crate::commands::writes_census::handle_writes_census(&mut conn, params)
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => Response::error(
+                        "management-writes-census",
+                        "database_busy",
+                        "writes.census database is busy; retry shortly",
+                    ),
+                    Err(std::sync::TryLockError::Poisoned(_)) => Response::error(
+                        "management-writes-census",
+                        "database_unavailable",
+                        "writes.census database mutex is poisoned",
+                    ),
+                },
+                None => Response::error(
+                    "management-writes-census",
+                    "database_unavailable",
+                    "writes.census database is not configured",
+                ),
+            }
+        }
         crate::commands::health_digest::HEALTH_DIGEST_OPERATION => {
             let params = decoded
                 .as_ref()

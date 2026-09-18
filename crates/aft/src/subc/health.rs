@@ -1484,6 +1484,10 @@ pub(super) fn build_health_report(
         "process_io".to_string(),
         crate::process_io::ProcessIoSnapshot::capture().to_value(),
     );
+    metrics.insert(
+        "write_ledger_top_10m".to_string(),
+        json!(crate::write_ledger::recent_top_writers()),
+    );
 
     let scheduler_busy = executor.try_actor_count().is_none();
     HealthReport {
@@ -2839,7 +2843,7 @@ mod tests {
     }
 
     #[test]
-    fn health_report_carries_process_io_object() {
+    fn health_report_carries_process_io_and_write_ledger_top_writers() {
         let app = App::default_shared();
         let executor = Executor::new();
         let metrics = DispatchPathMetrics::new();
@@ -2857,6 +2861,7 @@ mod tests {
             assert!(io.get("diskio_bytes_written").is_none());
             assert!(io.get("logical_bytes_written").is_none());
         }
+        assert!(metrics["write_ledger_top_10m"].is_array());
     }
 }
 

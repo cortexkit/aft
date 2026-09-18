@@ -206,6 +206,16 @@ describe("health sentinel pure detectors", () => {
     ]);
   });
 
+  test("write attribution prefers ledger domains and roots", () => {
+    const input = sample({ health: { metrics: { write_ledger_top_10m: [
+      { domain: "callgraph_refresh", root_id: "/root/a", physical_bytes: 2 * 1024 ** 3 },
+      { domain: "semantic_compaction", root_id: "/root/b", physical_bytes: 1024 ** 3 },
+    ] } } });
+    const rendered = writeGrowthAttribution(input, cleanState(), 4 * 1024 ** 3);
+    expect(rendered).toContain("callgraph_refresh (/root/a); 50% of write delta");
+    expect(rendered).toContain("semantic_compaction (/root/b); 25% of write delta");
+  });
+
   test("process footprint, cpu, and write rate are independent", () => {
     const state: SentinelState = { findings: {}, previous: { sampled_at_ms: NOW - 3_600_000, bytes_written: 0 } };
     expect(rules(detectProcess(sample({ process: { pid: 42, phys_footprint_bytes: 7 * 1024 ** 3, cpu_percent: 151, bytes_written: 2 * 1024 ** 3 } }), state))).toEqual(expect.arrayContaining(["process.footprint", "process.cpu", "process.writes"]));

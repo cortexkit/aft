@@ -291,6 +291,15 @@ export function detectStorage(sample: SentinelSample, state: SentinelState): Fin
 
 export function writeGrowthAttribution(sample: SentinelSample, state: SentinelState, writeDelta: number): string {
   if (writeDelta <= 0) return "";
+  const ledger = metrics(sample).write_ledger_top_10m;
+  if (Array.isArray(ledger) && ledger.length > 0) {
+    const lines = ledger.slice(0, 3).map((entry: Record<string, unknown>, index: number) => {
+      const bytes = Number(entry.physical_bytes ?? 0);
+      const share = Math.min(100, bytes / writeDelta * 100);
+      return `${index + 1}. ${(bytes / GB).toFixed(2)} GiB ${entry.domain ?? "other"} (${entry.root_id ?? "unknown"}); ${share.toFixed(0)}% of write delta`;
+    });
+    return `\n${lines.join("\n")}`;
+  }
   const current = sample.disk?.artifact_sizes ?? {};
   const previous = state.previous?.artifact_sizes ?? {};
   const growers = Object.entries(current)
