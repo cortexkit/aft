@@ -9,5 +9,5 @@
     "semantic-bin-delta-persistence",
     "tier2-rollup-incremental-journal-spill-fleet-budget"
   ],
-  "note": "semantic_index.rs changes only the on-disk persistence of the semantic artifact (base snapshot + checksummed delta segments + off-path compaction); the loaded index, chunking, embed text, query and ranking are untouched, so search rows are byte-identical to the reference (the predicate is the proof). The tier-2 rollup/journal changes are outside the fence."
+  "note": "Reference rebaselined on the slice-3 engine in this train (record-reference on a release build of d2d27fa96); the only fenced diff is the semantic.query_timeout_ms ceiling constant (15 s -> 30 s), byte-neutral where query embeds finish inside the budget, so rows are byte-equal to the new reference."
 }
