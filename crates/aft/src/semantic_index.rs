@@ -5717,6 +5717,12 @@ impl SemanticIndex {
         let started = Instant::now();
         match loaded.index.write_full_snapshot_at(dir, data_path, true) {
             Ok(bytes_written) => {
+                crate::write_ledger::credit(
+                    crate::write_ledger::Domain::SemanticCompaction,
+                    project_root.display().to_string(),
+                    bytes_written as u64,
+                    0,
+                );
                 slog_info!(
                     "semantic index compaction finished: root=\"{}\" segments={} segment_bytes={} entries={} bytes={} elapsed_ms={}",
                     project_root.display(),
@@ -5866,6 +5872,12 @@ impl SemanticIndex {
                                     self.entries.len(),
                                     bytes_written as f64 / 1024.0
                                 );
+                                crate::write_ledger::credit(
+                                    crate::write_ledger::Domain::SemanticCold,
+                                    self.project_root.display().to_string(),
+                                    bytes_written as u64,
+                                    0,
+                                );
                                 true
                             });
                     }
@@ -5890,6 +5902,12 @@ impl SemanticIndex {
                                     valid_bytes: bytes_written,
                                 }));
                                 self.set_dirty_paths(Some(BTreeSet::new()));
+                                crate::write_ledger::credit(
+                                    crate::write_ledger::Domain::SemanticCold,
+                                    self.project_root.display().to_string(),
+                                    bytes_written as u64,
+                                    0,
+                                );
                                 true
                             });
                     }
@@ -5949,6 +5967,12 @@ impl SemanticIndex {
                 valid_bytes: layout.valid_bytes.saturating_add(frame.len()),
             }));
             self.set_dirty_paths(Some(BTreeSet::new()));
+            crate::write_ledger::credit(
+                crate::write_ledger::Domain::SemanticDelta,
+                self.project_root.display().to_string(),
+                frame.len() as u64,
+                0,
+            );
             slog_info!(
                 "semantic index delta persisted: {} files, {:.1} KB, artifact_read_bytes={}",
                 changed_paths.len(),
@@ -5972,6 +5996,12 @@ impl SemanticIndex {
                     valid_bytes: bytes_written,
                 }));
                 self.set_dirty_paths(Some(BTreeSet::new()));
+                crate::write_ledger::credit(
+                    crate::write_ledger::Domain::SemanticCold,
+                    self.project_root.display().to_string(),
+                    bytes_written as u64,
+                    0,
+                );
                 slog_info!(
                     "semantic index persisted: {} entries, {:.1} KB",
                     self.entries.len(),

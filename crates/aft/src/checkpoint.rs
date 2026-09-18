@@ -812,6 +812,7 @@ impl CheckpointStore {
         })?;
 
         let mut files = Vec::with_capacity(checkpoint.file_contents.len());
+        let mut ledger_bytes = 0_u64;
         for (index, (path, file)) in checkpoint.file_contents.iter().enumerate() {
             let blob = format!(
                 "file_{}_{}_{}.blob",
@@ -826,6 +827,7 @@ impl CheckpointStore {
                     message: format!("failed to write durable checkpoint blob: {error}"),
                 }
             })?;
+            ledger_bytes = ledger_bytes.saturating_add(bytes.len() as u64);
             files.push(DiskCheckpointFileMeta {
                 original_path: path.display().to_string(),
                 blob,
@@ -866,6 +868,7 @@ impl CheckpointStore {
                 message: format!("failed to write durable checkpoint metadata: {error}"),
             }
         })?;
+        ledger_bytes = ledger_bytes.saturating_add(bytes.len() as u64);
         fsync_dir(&checkpoint_dir).map_err(|error| AftError::IoError {
             path: checkpoint_dir.display().to_string(),
             message: format!("failed to sync durable checkpoint metadata: {error}"),
@@ -876,6 +879,12 @@ impl CheckpointStore {
                 message: format!("failed to prune stale durable checkpoint blobs: {error}"),
             }
         })?;
+        crate::write_ledger::credit(
+            crate::write_ledger::Domain::Checkpoints,
+            checkpoint_dir.display().to_string(),
+            ledger_bytes,
+            0,
+        );
         Ok(())
     }
 

@@ -1,6 +1,7 @@
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 pub mod lifecycle;
+pub mod write_ledger;
 pub use lifecycle::{
     connection_snapshot, SqliteConnectionSnapshot, SqliteStore, SqliteStoreCount, TrackedConnection,
 };
@@ -18,7 +19,29 @@ pub mod removal;
 pub mod standing_roots;
 pub mod state;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 10;
+pub const CURRENT_SCHEMA_VERSION: u32 = 11;
+
+const MIGRATION_V11: &str = r#"
+CREATE TABLE IF NOT EXISTS write_ledger_minutes (
+  minute_ts INTEGER NOT NULL,
+  domain TEXT NOT NULL,
+  root_id TEXT NOT NULL,
+  logical_bytes INTEGER NOT NULL,
+  physical_bytes INTEGER NOT NULL,
+  PRIMARY KEY (minute_ts, domain, root_id)
+);
+CREATE INDEX IF NOT EXISTS idx_write_ledger_minutes_window
+  ON write_ledger_minutes (minute_ts);
+CREATE TABLE IF NOT EXISTS write_ledger_process_minutes (
+  minute_ts INTEGER NOT NULL PRIMARY KEY,
+  logical_bytes INTEGER NOT NULL,
+  physical_bytes INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS write_ledger_meta (
+  singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
+  started_ms INTEGER NOT NULL
+);
+"#;
 
 const MIGRATION_V10: &str = r#"
 CREATE TABLE IF NOT EXISTS compression_event_rollups (
@@ -486,6 +509,18 @@ fn migration_already_applied(conn: &Connection, version: u32) -> rusqlite::Resul
                 |row| row.get::<_, u32>(0),
             )
             .map(|object_count| object_count == 3),
+        11 => conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE (type = 'table' AND name IN (
+                   'write_ledger_minutes',
+                   'write_ledger_process_minutes',
+                   'write_ledger_meta'
+                 )) OR (type = 'index' AND name = 'idx_write_ledger_minutes_window')",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .map(|object_count| object_count == 4),
         _ => Ok(false),
     }
 }
@@ -502,6 +537,7 @@ fn apply_migration_statements(conn: &Connection, version: u32) -> rusqlite::Resu
         8 => conn.execute_batch(MIGRATION_V8),
         9 => conn.execute_batch(MIGRATION_V9),
         10 => conn.execute_batch(MIGRATION_V10),
+        11 => conn.execute_batch(MIGRATION_V11),
         _ => Ok(()),
     }
 }

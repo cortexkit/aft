@@ -9,6 +9,8 @@ use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
+use crate::write_ledger::{Counter as WriteCounter, Domain as WriteDomain};
+
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 
@@ -19,15 +21,20 @@ pub enum SqliteStore {
     AftDb,
     BlobStore,
     CallgraphGeneration,
+    CallgraphColdGeneration,
     InspectScopeCache,
     BreakerFile,
+    /// A deliberately unmapped seam remains attributable instead of silently
+    /// disappearing from the ledger.
+    Unmapped(&'static str),
 }
 
 impl SqliteStore {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::AftDb,
         Self::BlobStore,
         Self::CallgraphGeneration,
+        Self::CallgraphColdGeneration,
         Self::InspectScopeCache,
         Self::BreakerFile,
     ];
@@ -37,8 +44,21 @@ impl SqliteStore {
             Self::AftDb => "aft.db",
             Self::BlobStore => "blob_stores",
             Self::CallgraphGeneration => "callgraph_generations",
+            Self::CallgraphColdGeneration => "callgraph_cold_generations",
             Self::InspectScopeCache => "inspect_scope_caches",
             Self::BreakerFile => "breaker_files",
+            Self::Unmapped(label) => label,
+        }
+    }
+
+    pub const fn write_domain(self) -> Option<WriteDomain> {
+        match self {
+            Self::AftDb | Self::BreakerFile => Some(WriteDomain::AftDb),
+            Self::BlobStore => Some(WriteDomain::ViewsBlob),
+            Self::CallgraphGeneration => Some(WriteDomain::CallgraphRefresh),
+            Self::CallgraphColdGeneration => Some(WriteDomain::CallgraphCold),
+            Self::InspectScopeCache => Some(WriteDomain::InspectCache),
+            Self::Unmapped(_) => None,
         }
     }
 }
@@ -153,11 +173,21 @@ pub fn connection_snapshot() -> SqliteConnectionSnapshot {
 pub struct TrackedConnection {
     connection: Option<Connection>,
     store: SqliteStore,
+    write_counter: WriteCounter,
+    page_size: u64,
 }
 
 impl TrackedConnection {
     pub fn open(path: &Path, store: SqliteStore) -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open(path)?, store)
+        Self::open_attributed(path, store, path.display().to_string())
+    }
+
+    pub fn open_attributed(
+        path: &Path,
+        store: SqliteStore,
+        root_id: impl Into<String>,
+    ) -> rusqlite::Result<Self> {
+        Self::from_connection_attributed(Connection::open(path)?, store, root_id)
     }
 
     pub fn open_with_flags(
@@ -165,7 +195,11 @@ impl TrackedConnection {
         flags: OpenFlags,
         store: SqliteStore,
     ) -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open_with_flags(path, flags)?, store)
+        Self::from_connection_attributed(
+            Connection::open_with_flags(path, flags)?,
+            store,
+            path.to_owned(),
+        )
     }
 
     pub fn open_path_with_flags(
@@ -173,19 +207,83 @@ impl TrackedConnection {
         flags: OpenFlags,
         store: SqliteStore,
     ) -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open_with_flags(path, flags)?, store)
+        Self::from_connection_attributed(
+            Connection::open_with_flags(path, flags)?,
+            store,
+            path.display().to_string(),
+        )
     }
 
     pub fn open_in_memory(store: SqliteStore) -> rusqlite::Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?, store)
+        Self::from_connection_attributed(Connection::open_in_memory()?, store, "<memory>")
     }
 
     pub fn from_connection(connection: Connection, store: SqliteStore) -> rusqlite::Result<Self> {
+        Self::from_connection_attributed(connection, store, "<unknown>")
+    }
+
+    pub fn from_connection_attributed(
+        connection: Connection,
+        store: SqliteStore,
+        root_id: impl Into<String>,
+    ) -> rusqlite::Result<Self> {
+        let page_size = connection
+            .pragma_query_value(None, "page_size", |row| row.get::<_, u64>(0))
+            .unwrap_or(4096);
+        let write_counter = crate::write_ledger::register(
+            store.write_domain().unwrap_or(WriteDomain::Other),
+            root_id,
+        );
+        if store.write_domain().is_none() {
+            write_counter.note_seam_label(store.label());
+        }
         register_open(store);
-        Ok(Self {
+        let tracked = Self {
             connection: Some(connection),
             store,
-        })
+            write_counter,
+            page_size,
+        };
+        tracked.reset_write_page_sample();
+        Ok(tracked)
+    }
+
+    fn cache_write_pages(&self, reset: bool) -> u64 {
+        let Some(connection) = self.connection.as_ref() else {
+            return 0;
+        };
+        let mut current = 0;
+        let mut highwater = 0;
+        // SQLite serializes db-status access with the connection mutex. This is
+        // sampled only by the connection owner at maintenance boundaries/close.
+        let result = unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                connection.handle(),
+                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_WRITE,
+                &mut current,
+                &mut highwater,
+                i32::from(reset),
+            )
+        };
+        if result == rusqlite::ffi::SQLITE_OK {
+            u64::try_from(current).unwrap_or(0)
+        } else {
+            0
+        }
+    }
+
+    fn reset_write_page_sample(&self) {
+        let _ = self.cache_write_pages(true);
+    }
+
+    pub fn sample_write_pages(&self) -> u64 {
+        self.sample_write_pages_as(self.write_counter.domain())
+    }
+
+    pub fn sample_write_pages_as(&self, domain: WriteDomain) -> u64 {
+        let bytes = self.cache_write_pages(true).saturating_mul(self.page_size);
+        crate::write_ledger::register(domain, self.write_counter.root_id()).credit(0, bytes);
+        bytes
     }
 }
 
@@ -209,6 +307,7 @@ impl DerefMut for TrackedConnection {
 
 impl Drop for TrackedConnection {
     fn drop(&mut self) {
+        self.sample_write_pages();
         // Drop the SQLite handle before decrementing so the counter never says
         // closed while rusqlite still owns the descriptor and page cache.
         drop(self.connection.take());
@@ -267,6 +366,92 @@ mod tests {
         assert_eq!(
             open_on_this_thread(SqliteStore::CallgraphGeneration),
             baseline_callgraph
+        );
+    }
+
+    #[test]
+    fn callgraph_refresh_credits_physical_pages_in_wal_frame_order_of_magnitude() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("callgraph.sqlite");
+        let root = format!("/callgraph-ledger/{}", std::process::id());
+        let conn = TrackedConnection::open_attributed(
+            &path,
+            SqliteStore::CallgraphGeneration,
+            root.clone(),
+        )
+        .unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        conn.execute_batch("CREATE TABLE nodes(id INTEGER PRIMARY KEY, payload BLOB);")
+            .unwrap();
+        conn.sample_write_pages();
+        let tx = conn.unchecked_transaction().unwrap();
+        for id in 0..128_u64 {
+            tx.execute(
+                "INSERT INTO nodes(id, payload) VALUES (?1, zeroblob(1024))",
+                [id],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let physical = conn.sample_write_pages();
+        assert_eq!(
+            conn.sample_write_pages(),
+            0,
+            "an idle follow-up sample must not recount prior page writes"
+        );
+        let page_size: u64 = conn
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        let wal_bytes = std::fs::metadata(std::path::PathBuf::from(wal))
+            .unwrap()
+            .len();
+        let frames = wal_bytes.saturating_sub(32) / (page_size + 24);
+        assert!(physical > 0, "callgraph refresh must credit physical bytes");
+        assert!(frames > 0, "fixture must retain WAL frames");
+        let credited_pages = physical / page_size;
+        assert!(
+            credited_pages.saturating_mul(4) >= frames
+                && credited_pages <= frames.saturating_mul(4),
+            "credited pages={credited_pages}, WAL frames={frames}"
+        );
+        let credited = crate::write_ledger::pending_for_test(
+            crate::write_ledger::Domain::CallgraphRefresh,
+            &root,
+        )
+        .1;
+        let other =
+            crate::write_ledger::pending_for_test(crate::write_ledger::Domain::Other, &root).1;
+        let labels =
+            crate::write_ledger::seam_labels_for_test(crate::write_ledger::Domain::Other, &root);
+        assert!(
+            credited >= physical,
+            "CallgraphRefresh credited={credited}, expected at least {physical}; Other credited={other}, labels={labels:?}"
+        );
+    }
+
+    #[test]
+    fn unmapped_sqlite_seam_lands_in_other_and_reports_its_label() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = format!("/unmapped-ledger/{}", std::process::id());
+        let label = "fixture_unmapped_callgraph";
+        let conn = TrackedConnection::open_attributed(
+            &dir.path().join("unknown.sqlite"),
+            SqliteStore::Unmapped(label),
+            root.clone(),
+        )
+        .unwrap();
+        conn.execute_batch("CREATE TABLE writes(value TEXT); INSERT INTO writes VALUES ('x');")
+            .unwrap();
+        conn.sample_write_pages();
+        assert!(
+            crate::write_ledger::pending_for_test(crate::write_ledger::Domain::Other, &root).1 > 0
+        );
+        assert_eq!(
+            crate::write_ledger::seam_labels_for_test(crate::write_ledger::Domain::Other, &root,),
+            vec![label.to_owned()]
         );
     }
 

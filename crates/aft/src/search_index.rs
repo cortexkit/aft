@@ -1525,6 +1525,7 @@ impl SearchIndex {
             return false;
         };
 
+        let was_delta = self.base.is_some();
         let write_result = {
             let mut sources = self.compaction_record_sources(Arc::clone(&plan.id_map));
             write_cache_file_from_sources(cache_dir, &plan, &mut sources)
@@ -1543,6 +1544,19 @@ impl SearchIndex {
                 self.file_trigram_count = Arc::new(plan.file_trigram_count);
                 self.git_head = plan.git_head.filter(|head| !head.is_empty());
                 self.ignore_rules_fingerprint = plan.ignore_fingerprint;
+                let bytes = std::fs::metadata(cache_dir.join("cache.bin"))
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(0);
+                crate::write_ledger::credit(
+                    if was_delta {
+                        crate::write_ledger::Domain::SearchIndexDelta
+                    } else {
+                        crate::write_ledger::Domain::SearchIndexBuild
+                    },
+                    self.project_root.display().to_string(),
+                    bytes,
+                    0,
+                );
                 true
             }
             Err(error) => {

@@ -146,6 +146,7 @@ pub(crate) mod walk_boundary;
 pub mod watcher;
 pub(crate) mod watcher_backend;
 pub mod watcher_filter;
+pub mod write_ledger;
 // Compiled on all platforms so cross-platform unit tests in
 // `commands::bash::try_spawn_with_fallback` can exercise the retry
 // decision logic without a real Windows runtime. The module itself only

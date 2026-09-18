@@ -622,7 +622,7 @@ impl PublicationProfile {
         let now = Instant::now();
         Self {
             root: root.to_owned(),
-            io: super::io::PublicationIo::new(),
+            io: super::io::PublicationIo::new(root),
             overlap: super::io::Overlap::new(true),
             concurrent_publications: 0,
             semantic_fill: false,

@@ -2874,6 +2874,7 @@ impl BackupStore {
         let retained = &stack[retained_start..];
         let mut referenced_content = HashSet::new();
         let mut wrote_content = false;
+        let mut ledger_bytes = 0_u64;
 
         for entry in retained {
             if let Some(content_path) = content_filename_for_entry(entry) {
@@ -2889,6 +2890,7 @@ impl BackupStore {
                         message: error.to_string(),
                     }
                 })?;
+                ledger_bytes = ledger_bytes.saturating_add(bytes.len() as u64);
                 wrote_content = true;
             }
         }
@@ -2919,6 +2921,7 @@ impl BackupStore {
                 message: error.to_string(),
             }
         })?;
+        ledger_bytes = ledger_bytes.saturating_add(meta_content.len() as u64);
         fsync_dir(&dir).map_err(|error| AftError::IoError {
             path: dir.display().to_string(),
             message: error.to_string(),
@@ -2931,6 +2934,12 @@ impl BackupStore {
             }
         })?;
         let _ = fsync_dir(&dir);
+        crate::write_ledger::credit(
+            crate::write_ledger::Domain::Backups,
+            key.display().to_string(),
+            ledger_bytes,
+            0,
+        );
 
         // Keep the in-memory disk_index in sync so tracked_files() and
         // disk_history_count() immediately reflect what we just wrote.

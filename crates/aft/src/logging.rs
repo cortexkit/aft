@@ -863,6 +863,7 @@ struct RotatingFile {
     generations: usize,
     check_every: u64,
     writes_since_check: u64,
+    write_counter: crate::write_ledger::Counter,
 }
 
 impl RotatingFile {
@@ -882,6 +883,9 @@ impl RotatingFile {
             generations,
             check_every: check_every.max(1),
             writes_since_check: 0,
+            write_counter: crate::write_ledger::process_root_counter(
+                crate::write_ledger::Domain::Logs,
+            ),
         };
         if size > threshold {
             sink.rotate()?;
@@ -908,6 +912,7 @@ impl RotatingFile {
         // The worker batches channel messages before this flush. File I/O never
         // runs on request, watcher, executor, or transport threads.
         writer.flush()?;
+        self.write_counter.credit_logical(batch_bytes);
         self.size = self.size.saturating_add(batch_bytes);
         if self.writes_since_check >= self.check_every {
             self.writes_since_check = 0;

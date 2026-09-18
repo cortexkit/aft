@@ -3695,7 +3695,16 @@ impl CallGraphStore {
         if let Some(parent) = sqlite_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut conn = TrackedConnection::open(&sqlite_path, SqliteStore::CallgraphGeneration)?;
+        let store = if use_wal {
+            SqliteStore::CallgraphGeneration
+        } else {
+            SqliteStore::CallgraphColdGeneration
+        };
+        let mut conn = TrackedConnection::open_attributed(
+            &sqlite_path,
+            store,
+            project_root.display().to_string(),
+        )?;
         if use_wal {
             configure_connection(&conn)?;
         } else {
@@ -3855,7 +3864,10 @@ impl CallGraphStore {
 
     fn checkpoint_wal_truncate(&self) -> bool {
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        checkpoint_wal_truncate(&conn)
+        conn.sample_write_pages();
+        let completed = checkpoint_wal_truncate(&conn);
+        conn.sample_write_pages_as(crate::write_ledger::Domain::CallgraphCheckpoint);
+        completed
     }
 
     /// True if this store still reflects the currently-published generation.
@@ -6992,7 +7004,8 @@ fn publish_backup_migration(
     remove_sqlite_file_set(&temp_path);
 
     let source_conn = open_readonly_connection(&source.sqlite_path)?;
-    let mut destination = TrackedConnection::open(&temp_path, SqliteStore::CallgraphGeneration)?;
+    let mut destination =
+        TrackedConnection::open(&temp_path, SqliteStore::CallgraphColdGeneration)?;
     destination.busy_timeout(Duration::from_secs(5))?;
     let backup = rusqlite::backup::Backup::new(&source_conn, &mut destination)?;
     let started = Instant::now();

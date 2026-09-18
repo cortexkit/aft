@@ -183,6 +183,16 @@ pub fn write_to_disk(
 
     if write_result.is_err() {
         let _ = fs::remove_file(&tmp_path);
+    } else {
+        let bytes = fs::metadata(&data_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        crate::write_ledger::credit(
+            crate::write_ledger::Domain::SymbolCache,
+            project_root.display().to_string(),
+            bytes,
+            0,
+        );
     }
 
     write_result

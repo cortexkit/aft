@@ -537,7 +537,11 @@ impl InspectCache {
         std::fs::create_dir_all(&inspect_dir)?;
         let (sqlite_path, generation, needs_publish) =
             resolve_or_create_inspect_target(&inspect_dir, &project_key);
-        let conn = TrackedConnection::open(&sqlite_path, SqliteStore::InspectScopeCache)?;
+        let conn = TrackedConnection::open_attributed(
+            &sqlite_path,
+            SqliteStore::InspectScopeCache,
+            project_root.display().to_string(),
+        )?;
         configure_connection(&conn)?;
         if !writer_lease.verify().map_err(InspectCacheError::from)? {
             return Err(InspectCacheError::Io(std::io::Error::other(

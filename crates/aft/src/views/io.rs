@@ -75,22 +75,49 @@ pub(crate) struct PublicationIo {
     buckets: [Bytes; 7],
     available: bool,
     phase: Phase,
+    blob_counter: crate::write_ledger::Counter,
+    derived_counter: crate::write_ledger::Counter,
+    closure_counter: crate::write_ledger::Counter,
 }
 impl PublicationIo {
-    pub(crate) fn new() -> Self {
-        Self::from_sample(Bytes::capture())
+    pub(crate) fn new(root: &std::path::Path) -> Self {
+        Self::from_sample(Bytes::capture(), root)
     }
-    fn from_sample(sample: Option<Bytes>) -> Self {
+    fn from_sample(sample: Option<Bytes>, root: &std::path::Path) -> Self {
+        let root = root.display().to_string();
         Self {
             previous: sample,
             buckets: [Bytes::default(); 7],
             available: sample.is_some(),
             phase: Phase::Manifest,
+            blob_counter: crate::write_ledger::register(
+                crate::write_ledger::Domain::ViewsBlob,
+                root.clone(),
+            ),
+            derived_counter: crate::write_ledger::register(
+                crate::write_ledger::Domain::ViewsDerived,
+                root.clone(),
+            ),
+            closure_counter: crate::write_ledger::register(
+                crate::write_ledger::Domain::ViewsClosure,
+                root,
+            ),
         }
     }
     fn advance(&mut self, next: Option<Bytes>) {
         if let Some(delta) = self.previous.zip(next).and_then(|(a, b)| b.delta(a)) {
             self.buckets[self.phase as usize] = self.buckets[self.phase as usize].add(delta);
+            let counter = match self.phase {
+                Phase::Blobs => Some(&self.blob_counter),
+                Phase::Clone | Phase::Materialize | Phase::DerivedOther => {
+                    Some(&self.derived_counter)
+                }
+                Phase::Closure => Some(&self.closure_counter),
+                Phase::Manifest | Phase::Cas => None,
+            };
+            if let Some(counter) = counter {
+                counter.credit(delta.logical, delta.written);
+            }
         } else {
             self.available = false;
         }
@@ -187,7 +214,8 @@ mod tests {
             logical: n * 2,
             read: n * 3,
         };
-        let mut p = PublicationIo::from_sample(Some(bytes(100)));
+        let root = std::path::Path::new("/ledger-view-fixture");
+        let mut p = PublicationIo::from_sample(Some(bytes(100)), root);
         for (phase, n) in [
             (Phase::Manifest, 101),
             (Phase::Blobs, 103),
@@ -216,10 +244,28 @@ mod tests {
             p.buckets.iter().copied().fold(Bytes::default(), Bytes::add),
             bytes(227).delta(bytes(100)).unwrap()
         );
+        let root = root.display().to_string();
+        let blob =
+            crate::write_ledger::pending_for_test(crate::write_ledger::Domain::ViewsBlob, &root);
+        let derived =
+            crate::write_ledger::pending_for_test(crate::write_ledger::Domain::ViewsDerived, &root);
+        let closure =
+            crate::write_ledger::pending_for_test(crate::write_ledger::Domain::ViewsClosure, &root);
+        assert_eq!(blob, (4, 2));
+        assert_eq!(derived, (88, 44));
+        assert_eq!(closure, (32, 16));
+        assert_eq!(
+            (
+                blob.0 + derived.0 + closure.0,
+                blob.1 + derived.1 + closure.1
+            ),
+            (124, 62),
+            "ledger uses the exact blobs + derived publication byte buckets"
+        );
     }
     #[test]
     fn missing_counters_are_unknown_not_zero() {
-        let mut p = PublicationIo::from_sample(None);
+        let mut p = PublicationIo::from_sample(None, std::path::Path::new("/missing"));
         p.advance(Some(Bytes::default()));
         assert!(p.fields().contains("total_physical_bytes_written=unknown"));
     }

@@ -1597,6 +1597,7 @@ pub struct TaskIoHandles {
     pty: Option<File>,
     pipeline_status: Option<File>,
     sandbox_unavailable: File,
+    write_counter: crate::write_ledger::Counter,
 }
 
 impl TaskIoHandles {
@@ -1655,6 +1656,10 @@ impl TaskIoHandles {
                 .dirs
                 .io
                 .open_new_file(OsStr::new(TaskArtifact::SandboxUnavailable.file_name()))?,
+            write_counter: crate::write_ledger::register(
+                crate::write_ledger::Domain::BashTaskIo,
+                task.paths.dir.display().to_string(),
+            ),
         })
     }
 
@@ -1697,7 +1702,9 @@ impl TaskIoHandles {
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         file.write_all(content)?;
-        file.sync_all()
+        file.sync_all()?;
+        self.write_counter.credit_logical(content.len() as u64);
+        Ok(())
     }
 
     pub fn artifact_len(&self, artifact: TaskArtifact) -> io::Result<u64> {
