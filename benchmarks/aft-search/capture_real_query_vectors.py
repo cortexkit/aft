@@ -10,7 +10,7 @@ import threading
 from pathlib import Path
 
 from embedding_fixture_server import Server
-from run_real_query import DEFAULT_BINARY, NdjsonClient, materialized_bundle
+from run_real_query import DEFAULT_BINARY, NdjsonClient, load_inputs, runtime_evidence_tree
 from search_quality_lib import EVIDENCE_SHA, InputFault, canonical_json, sha256_file
 
 HERE = Path(__file__).resolve().parent
@@ -29,14 +29,8 @@ def parser() -> argparse.ArgumentParser:
 
 def run(args: argparse.Namespace) -> int:
     manifest_path = Path(args.manifest).resolve()
-    manifest = json.loads(manifest_path.read_text())
+    manifest, provisioned_tree, _, _ = load_inputs(manifest_path)
     rows = [row for row in manifest.get("rows", []) if "excluded_reason" not in row]
-    if manifest.get("evidence_sha") != EVIDENCE_SHA or not rows:
-        raise InputFault("corpus_vector_model_mismatch:manifest")
-    bundle_paths = {str(row["bundle"]) for row in rows}
-    if len(bundle_paths) != 1:
-        raise InputFault("corpus_vector_model_mismatch:bundle")
-    bundle = ROOT / next(iter(bundle_paths))
     output = Path(args.output).resolve()
     current = json.loads(output.read_text()) if output.is_file() else {}
     vectors = dict(current.get("vectors", {}))
@@ -47,7 +41,7 @@ def run(args: argparse.Namespace) -> int:
     if not binary.is_file():
         raise InputFault(f"aft_binary_missing:{binary}")
 
-    with tempfile.TemporaryDirectory(prefix="aft-vector-authoring-") as directory, materialized_bundle(bundle) as project_root:
+    with tempfile.TemporaryDirectory(prefix="aft-vector-authoring-") as directory, runtime_evidence_tree(provisioned_tree) as project_root:
         runtime = Path(directory)
         server = Server(
             ("127.0.0.1", 0),

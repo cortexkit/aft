@@ -20,7 +20,22 @@ case "${1:-}" in
     ;;
   --search-quality)
     shift
-    exec python3 "$benchmark_dir/run_search_quality.py" "$@"
+    quality_mode="evaluate"
+    quality_arguments=("$@")
+    for ((index = 0; index < ${#quality_arguments[@]}; index++)); do
+      argument="${quality_arguments[$index]}"
+      if [[ "$argument" == "--self-test" ]]; then
+        quality_mode="self-test"
+      elif [[ "$argument" == --mode=* ]]; then
+        quality_mode="${argument#--mode=}"
+      elif [[ "$argument" == "--mode" && $((index + 1)) -lt ${#quality_arguments[@]} ]]; then
+        quality_mode="${quality_arguments[$((index + 1))]}"
+      fi
+    done
+    if [[ "$quality_mode" != "self-test" ]]; then
+      python3 "$benchmark_dir/provision_evidence.py"
+    fi
+    exec python3 "$benchmark_dir/run_search_quality.py" "${quality_arguments[@]}"
     ;;
   --record-vectors)
     shift

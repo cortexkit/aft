@@ -13,14 +13,14 @@ import struct
 import tempfile
 import time
 import urllib.request
-import zipfile
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Iterator, Mapping, Optional, Sequence
 
 import run_embed_body_cap_ab as body_cap
+from evidence_tree import evidence_tree_sha256
 from metrics import evaluate_retrieval, file_path_relevance
 from run import AftProtocolError, normalize_result_path
 from run_exact_recall import (
@@ -29,7 +29,7 @@ from run_exact_recall import (
     load_fixtures as load_exact_fixtures,
     validate_corpus,
 )
-from run_real_query import load_capability, load_inputs, materialized_bundle, score_manifest_rows
+from run_real_query import load_capability, load_inputs, runtime_evidence_tree, score_manifest_rows
 from search_quality_lib import PAGE_SIZE, aggregate_real_query
 from setup_corpus import parse_corpus_toml
 
@@ -393,35 +393,29 @@ def exact_family(args: argparse.Namespace, arm: Arm) -> tuple[JsonObject, list[J
 
 
 @contextmanager
-def materialized_real_bundle(bundle: Path, storage_root: Optional[str]):
+def runtime_real_tree(tree: Path, storage_root: Optional[str]) -> Iterator[Path]:
     if not storage_root:
-        with materialized_bundle(bundle) as root:
+        with runtime_evidence_tree(tree) as root:
             yield root
         return
     corpus_dir = Path(storage_root).resolve() / "corpora"
     root = corpus_dir / "real-query-tree"
     marker = corpus_dir / "real-query-tree.sha256"
-    bundle_hash = body_cap.sha256_file(bundle)
-    if not marker.is_file() or marker.read_text().strip() != bundle_hash:
+    tree_hash = evidence_tree_sha256(tree)
+    if not marker.is_file() or marker.read_text().strip() != tree_hash:
         if root.exists():
             shutil.rmtree(root)
-        root.mkdir(parents=True)
-        with zipfile.ZipFile(bundle) as archive:
-            for info in archive.infolist():
-                target = (root / info.filename).resolve()
-                mode = (info.external_attr >> 16) & 0o170000
-                if root.resolve() not in target.parents or info.is_dir() or mode == 0o120000:
-                    raise ValueError(f"invalid real-query bundle member: {info.filename}")
-            archive.extractall(root)
-        marker.write_text(bundle_hash + "\n")
+        corpus_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(tree, root, ignore=shutil.ignore_patterns(".git"))
+        marker.write_text(tree_hash + "\n")
     yield root
 
 
 def real_query_family(args: argparse.Namespace, arm: Arm) -> tuple[JsonObject, JsonObject]:
     manifest_path = Path(args.real_manifest).resolve()
-    manifest, bundle, _, _ = load_inputs(manifest_path)
+    manifest, provisioned_tree, _, _ = load_inputs(manifest_path)
     capability = load_capability(Path(args.schema).resolve())
-    with materialized_real_bundle(bundle, args.storage_root) as project_root:
+    with runtime_real_tree(provisioned_tree, args.storage_root) as project_root:
         temporary, client, index_metrics, index_path = build_client(args, project_root, arm, "real-query-b0")
         try:
             rows = score_manifest_rows(manifest, REAL_QUERY_PROFILE, capability, client, project_root)

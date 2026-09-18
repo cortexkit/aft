@@ -13,21 +13,19 @@ import ast
 import hashlib
 import json
 import math
-import os
 import re
 import subprocess
 import sys
-import zipfile
 from pathlib import Path
 from typing import Any
 
+from evidence_tree import evidence_tree_sha256_from_contents, pinned_text_contents
 from search_quality_lib import (
     EVIDENCE_SHA, FIXTURE_IDS, MECHANISMS, PINNED_SHAPES, QUERY_KINDS, STRATA,
     InputFault, canonical_json, sample_plan, sha256_file, validate_census,
 )
 
 ARTIFACT_NAMES = ("summary.md", "mechanism-report.md", "labels.jsonl", "mechanisms.jsonl")
-DROP_PARTS = {".git", "target", "node_modules", "dist", "build"}
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -101,45 +99,10 @@ def projection_function(mechanism_py: Path) -> str:
     return candidates[0]
 
 
-def eligible_files(root: Path) -> list[Path]:
-    files: list[Path] = []
-    for current, directories, names in os.walk(root):
-        directories[:] = sorted(name for name in directories if name not in DROP_PARTS)
-        for name in sorted(names):
-            path = Path(current) / name
-            relative = path.relative_to(root)
-            if any(part in DROP_PARTS for part in relative.parts) or path.stat().st_size > 2 * 1024 * 1024:
-                continue
-            try:
-                path.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                continue
-            files.append(relative)
-    return files
-
-
-def pinned_bundle(repo: Path, output: Path) -> tuple[str, set[str], dict[str, str]]:
-    """Bundle the pin without accepting any query or relevance-label argument."""
-    listing = subprocess.run(["git", "ls-tree", "-rz", "--name-only", EVIDENCE_SHA], cwd=repo, capture_output=True, check=True).stdout
-    candidates = sorted(item.decode() for item in listing.split(b"\0") if item)
-    contents: dict[str, str] = {}
-    for relative in candidates:
-        path = Path(relative)
-        if any(part in DROP_PARTS for part in path.parts):
-            continue
-        raw = subprocess.run(["git", "show", f"{EVIDENCE_SHA}:{relative}"], cwd=repo, capture_output=True, check=True).stdout
-        if len(raw) > 2 * 1024 * 1024:
-            continue
-        try:
-            contents[relative] = raw.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-        for relative, text in contents.items():
-            info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0)); info.external_attr = 0o100644 << 16
-            archive.writestr(info, text.encode())
-    return sha256_file(output), set(contents), contents
+def pinned_evidence(repo: Path) -> tuple[str, set[str], dict[str, str]]:
+    """Project the pin without accepting any query or relevance-label argument."""
+    contents = pinned_text_contents(repo, EVIDENCE_SHA)
+    return evidence_tree_sha256_from_contents(contents), set(contents), contents
 
 
 def classify_queries(repo: Path, queries: list[str]) -> list[str]:
@@ -196,13 +159,12 @@ def author(args: argparse.Namespace) -> dict[str, Any]:
     domains = pinned_domains(Path(args.repo_root))
     producer = projection_function(census_dir / "mechanism.py")
     repo = Path(args.repo_root)
-    bundle_path = Path(args.bundle_output)
-    bundle_digest, bundled_paths, bundle_contents = pinned_bundle(repo, bundle_path)
+    tree_digest, evidence_paths, evidence_contents = pinned_evidence(repo)
     label_ids = {row["episode_id"] for row in labels}
     plan = sample_plan(mechanisms, args.manifest_seed, label_ids)
     selected_queries = [row["query"] for row in mechanisms if row["episode_id"] in set(plan["union_order"])]
     vector_path = Path(args.vector_output)
-    vector_digest = vector_pack(vector_path, bundle_contents, selected_queries)
+    vector_digest = vector_pack(vector_path, evidence_contents, selected_queries)
     pinned_by_id = dict(zip((row["episode_id"] for row in mechanisms), classify_queries(repo, [row["query"] for row in mechanisms])))
     source_by_id = {row["episode_id"]: row for row in mechanisms}
     label_by_id = {row["episode_id"]: row for row in labels}
@@ -222,7 +184,7 @@ def author(args: argparse.Namespace) -> dict[str, Any]:
             if cited:
                 row["opened_file"] = cited[0]
             opened = row.get("opened_file", "")
-            if opened.startswith("/") or opened not in bundled_paths:
+            if opened.startswith("/") or opened not in evidence_paths:
                 row["excluded_reason"] = "repo_unowned_or_unavailable"
             else:
                 row.update({"repo": "cortexkit/aft", "sha": EVIDENCE_SHA})
@@ -240,9 +202,9 @@ def author(args: argparse.Namespace) -> dict[str, Any]:
                     "recorded_top_k": int(source.get("top_k", source.get("recorded_top_k", 10))),
                     "confidence_split": "calibration" if int(episode_id.split(":")[1]) % 2 == 0 else "evaluation",
                     "pruning_policy_id": "v1",
-                    "bundle": str(bundle_path.relative_to(repo)), "bundle_sha256": bundle_digest,
+                    "evidence_tree_sha256": tree_digest,
                     "embedding_pack": str(vector_path.relative_to(repo)), "embedding_pack_sha256": vector_digest,
-                    "competitor_count": competitor_counts(source["query"], row["opened_file"], bundle_contents),
+                    "competitor_count": competitor_counts(source["query"], row["opened_file"], evidence_contents),
                     "policy_excluded_competitor_count": 0,
                 })
                 if row["pinned_shape"] not in PINNED_SHAPES:
@@ -272,7 +234,6 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--expected-digests", required=True)
     result.add_argument("--repo-root", default=str(Path(__file__).resolve().parents[2]))
     result.add_argument("--manifest-seed", default="20260908")
-    result.add_argument("--bundle-output", default=str(Path(__file__).resolve().parent / "bundles/aft-evidence-30d4a64f.zip"))
     result.add_argument("--vector-output", default=str(Path(__file__).resolve().parent / "real-query-vectors.json"))
     result.add_argument("--output", required=True)
     result.add_argument("--plan-output")

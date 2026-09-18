@@ -13,18 +13,23 @@ Build the release binary first:
 cargo build --release -p agent-file-tools
 ```
 
-Provision the Vera-compatible corpus from the repository root:
+Provision the Vera-compatible corpus and pinned real-query evidence from the
+repository root:
 
 ```bash
 python3 benchmarks/aft-search/provision_corpus.py
+python3 benchmarks/aft-search/provision_evidence.py
 ```
 
 `provision_corpus.py` reads `corpus/corpus.toml`, fetches each immutable commit
 with depth one into `.bench/repos/<name>/`, and writes
-`.bench/repos/provisioned.json`. `.bench/` is ignored by git and must not be
-committed. Quality-gate execution is offline: it validates that record and every
-checkout before starting AFT, never fetches, and exits 2 with
-`corpus_missing:<name>` plus the provisioning command when an input is absent.
+`.bench/repos/provisioned.json`. `provision_evidence.py` materializes the pinned
+AFT commit under `.bench/repos/aft-evidence-<sha>/`, using the local Git object
+when available and fetching that SHA from origin otherwise. Its digest is the
+SHA-256 of a canonical map from every projected relative path to that file's
+SHA-256. `.bench/` is ignored by git and must not be committed. The runners
+validate the exact-recall record and the complete evidence-tree digest before
+starting AFT.
 
 ## In-tree benchmark
 
@@ -76,18 +81,18 @@ beside the index-cost artifacts.
 
 ## Real-query quality gate
 
-The aggregate gate provisions no network input itself. After running the corpus
-provisioner once, this command builds `target/release/aft` unless
-`AFT_BINARY_PATH` names a binary, runs exact recall and concept recall, replays
-every included real-query row, writes an ignored score under `.bench/`, and
-passes that score to the predicate:
+After the exact-recall corpus has been provisioned once, this command provisions
+or repairs the pinned real-query evidence tree, builds `target/release/aft`
+unless `AFT_BINARY_PATH` names a binary, runs exact recall and concept recall,
+replays every included real-query row, writes an ignored score under `.bench/`,
+and passes that score to the predicate:
 
 ```bash
 scripts/telemetry/cost-gate.sh --search-quality --mode record-reference --dry-run
 ```
 
-The real-query replay extracts the checked-in pinned-tree bundle, starts the
-loopback-only embedding fixture server with empty temporary caches, and calls the
+The real-query replay verifies and consumes the provisioned pinned tree, starts
+the loopback-only embedding fixture server with empty temporary caches, and calls the
 public `search` tool through standalone AFT's `tool_call` NDJSON command. The
 `single_page` profile sends one request at the product's maximum `topK` without
 an offset. The `paged` profile requires a declared, working offset, sends enough
@@ -106,6 +111,8 @@ Run the independently named cases with, for example:
 
 ```bash
 cd benchmarks/aft-search
+python3 -m unittest -v test_run_real_query.RealQueryRunnerTests.test_missing_checkout_is_provisioned_from_local_repository_with_manifest_digest
+python3 -m unittest -v test_run_real_query.RealQueryRunnerTests.test_mutated_evidence_tree_is_rejected_with_mismatch_fault
 python3 -m unittest -v test_run_real_query.RealQueryRunnerTests.test_runner_is_byte_deterministic_on_the_same_tree
 python3 -m unittest -v test_run_real_query.RealQueryRunnerTests.test_single_page_request_grammar_rejects_an_offset
 python3 -m unittest -v test_run_real_query.RealQueryRunnerTests.test_paged_profile_covers_frozen_depth_and_runs_invariance_requests

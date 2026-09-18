@@ -177,10 +177,12 @@ jobs:
       - name: Build the product binary when the artifact is absent
         if: steps.release-aft.outputs.available != 'true'
         run: cargo build --release --locked -p agent-file-tools --bin aft
-      - name: Provision the exact-recall corpus at its pinned commits
-        # The only network-enabled step: the gate itself runs offline against
-        # these clones and fails corpus_missing if they are absent.
-        run: python3 benchmarks/aft-search/provision_corpus.py
+      - name: Provision search-quality corpora at their pinned commits
+        # The only network-enabled step: evaluation itself runs offline against
+        # these trees and fails with an input fault if either one is absent.
+        run: |
+          python3 benchmarks/aft-search/provision_corpus.py
+          python3 benchmarks/aft-search/provision_evidence.py
       - name: Evaluate committed search-quality reference
         env:
           AFT_SEARCH_NETWORK_POLICY: loopback-only

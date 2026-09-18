@@ -8,8 +8,10 @@ import unittest
 from pathlib import Path
 from typing import Any, Mapping
 
+from evidence_tree import evidence_tree_sha256
+from provision_evidence import provision
 from run_exact_recall import CorpusMissing, validate_corpus
-from run_real_query import assemble_score, score_manifest_rows
+from run_real_query import ROOT, assemble_score, load_inputs, score_manifest_rows
 from search_quality_lib import (
     D_0,
     INVARIANCE_DEPTH,
@@ -101,6 +103,33 @@ def concept_report() -> dict[str, Any]:
 
 
 class RealQueryRunnerTests(unittest.TestCase):
+    def test_missing_checkout_is_provisioned_from_local_repository_with_manifest_digest(self) -> None:
+        manifest_path = Path(__file__).with_name("real-query-manifest.json")
+        document = json.loads(manifest_path.read_text())
+        expected = {
+            row["evidence_tree_sha256"]
+            for row in document["rows"]
+            if "excluded_reason" not in row
+        }
+        self.assertEqual(len(expected), 1)
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "missing-evidence-tree"
+            self.assertFalse(destination.exists())
+            provision(manifest_path, ROOT, destination)
+            self.assertTrue(destination.is_dir())
+            self.assertEqual(evidence_tree_sha256(destination), next(iter(expected)))
+
+    def test_mutated_evidence_tree_is_rejected_with_mismatch_fault(self) -> None:
+        manifest_path = Path(__file__).with_name("real-query-manifest.json")
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "evidence-tree"
+            provision(manifest_path, ROOT, destination)
+            mutated = next(path for path in sorted(destination.rglob("*")) if path.is_file())
+            original = mutated.read_bytes()
+            mutated.write_bytes(original + b"\nmutated evidence\n")
+            with self.assertRaisesRegex(InputFault, "corpus_vector_model_mismatch"):
+                load_inputs(manifest_path, destination)
+
     def test_runner_is_byte_deterministic_on_the_same_tree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

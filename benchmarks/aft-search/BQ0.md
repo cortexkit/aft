@@ -1,6 +1,6 @@
 # BQ0 search-quality harness
 
-BQ0 pins all evidence to `30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17`. Moving that value requires regenerating `load-bearing-citations.json`, both campaign references, the census plan, corpus bundle, vectors, and manifest; `imports-resolve.sh` rejects a partial move.
+BQ0 pins all evidence to `30d4a64f99b3b15fd88be6cf962fff4b3fe5ea17`. Moving that value requires regenerating `load-bearing-citations.json`, both campaign references, the census plan, evidence tree digest, vectors, and manifest; `imports-resolve.sh` rejects a partial move.
 
 ## Authoring
 
@@ -16,13 +16,13 @@ python3 benchmarks/aft-search/author_real_query.py \
 
 The command validates all four source digests, 6,469 unique identities, the five exact populations, and 300 retained labels. It uses numeric identity sorting and the frozen R35 BLAKE3/ChaCha8 shuffle. The mechanism estimates total 6,470 because each stratum projection is rounded independently; they are not an identity partition. `mechanism_record` in the pinned census `mechanism.py` produces the source frame consumed by that projection.
 
-The bundle pruner takes only a repository and immutable SHA. It receives no query, opened file, label, or score. The committed manifest contains 43 rows whose labels resolve in the pinned aft tree; 257 retained cross-repository rows preserve their known provenance and are explicitly excluded as `repo_unowned_or_unavailable`. There is no silent omission or census dependency at scoring time.
+The evidence-tree projection takes only a repository and immutable SHA. It receives no query, opened file, label, or score. The committed manifest contains 43 rows whose labels resolve in the pinned AFT tree; 257 retained cross-repository rows preserve their known provenance and are explicitly excluded as `repo_unowned_or_unavailable`. `evidence_tree_sha256` hashes the canonical map of each projected relative path to its file SHA-256, so the pin is independent of archive metadata. There is no silent omission or census dependency at scoring time.
 
 ## Modes and bootstrap
 
 `cost-gate.sh --search-quality` defaults to `evaluate`. `verify` writes no reference. Initial `record-reference` is reserved for B0; later manifest maintenance must use `record-reference --manifest-changed`. A missing baseline is an exit-2 input fault, never a verify fallback. Consequently BQ0 does not claim ordinary gate acceptance until B0 commits `real-query-baseline.json` and `manifest.sha256`.
 
-The CI mode exception is narrow: only a complete diff containing the manifest and no paths outside that manifest and `bundles/**` selects verify. A completed manifest/reference maintenance diff selects evaluate. Descriptor class is always derived from the same audited diff. A conflicting declaration is an input fault; an undescribed ranking diff is a regression.
+The CI mode exception is narrow: only a manifest-only diff selects verify. A completed manifest/reference maintenance diff selects evaluate. Descriptor class is always derived from the same audited diff. A conflicting declaration is an input fault; an undescribed ranking diff is a regression.
 
 ## Offline vectors and profiles
 
@@ -46,10 +46,13 @@ allowed. It fetches each declared commit at depth one and records
 runs either validate those checkouts or exit 2 as
 `corpus_missing:<name>:run=python3 benchmarks/aft-search/provision_corpus.py`.
 
-`run_real_query.py` extracts the checked-in AFT bundle into a temporary tree,
-uses empty temporary storage and model caches, starts the embedding fixture on
-loopback, and invokes public `search` calls through standalone AFT's NDJSON
-`tool_call` command. `AFT_BINARY_PATH` overrides the default release binary.
+`provision_evidence.py` materializes the pinned AFT commit's authoring-eligible
+text files under `.bench/repos/aft-evidence-<sha>/`, using the local Git object
+when present and fetching that SHA from origin otherwise. `run_real_query.py`
+checks the complete tree digest on every run, uses empty temporary storage and
+model caches, starts the embedding fixture on loopback, and invokes public
+`search` calls through standalone AFT's NDJSON `tool_call` command.
+`AFT_BINARY_PATH` overrides the default release binary.
 The fixture pack was captured from the actual semantic chunks at the pinned
 product state; unknown texts still return `vector_missing` during gate runs.
 

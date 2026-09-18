@@ -8,17 +8,19 @@ import json
 import os
 import re
 import select
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
-import zipfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional, Sequence
 
 from embedding_fixture_server import Server
+from evidence_tree import evidence_tree_sha256
+from provision_evidence import evidence_root
 from search_quality_lib import (
     EVIDENCE_SHA,
     INVARIANCE_DEPTH,
@@ -456,42 +458,42 @@ def assemble_score(
     }
 
 
-def load_inputs(manifest_path: Path) -> tuple[JsonObject, Path, Path, JsonObject]:
+def load_inputs(
+    manifest_path: Path, project_root: Optional[Path] = None
+) -> tuple[JsonObject, Path, Path, JsonObject]:
     manifest = json.loads(manifest_path.read_text())
     if not isinstance(manifest, dict) or manifest.get("evidence_sha") != EVIDENCE_SHA:
         raise InputFault("corpus_vector_model_mismatch:manifest")
     included = [row for row in manifest.get("rows", []) if "excluded_reason" not in row]
     if not included:
         raise InputFault("empty_population")
-    bundles = {str(row.get("bundle")) for row in included}
     packs = {str(row.get("embedding_pack")) for row in included}
-    bundle_digests = {str(row.get("bundle_sha256")) for row in included}
+    tree_digests = {str(row.get("evidence_tree_sha256")) for row in included}
     pack_digests = {str(row.get("embedding_pack_sha256")) for row in included}
-    if len(bundles) != 1 or len(packs) != 1 or len(bundle_digests) != 1 or len(pack_digests) != 1:
+    if len(packs) != 1 or len(tree_digests) != 1 or len(pack_digests) != 1:
         raise InputFault("corpus_vector_model_mismatch:row_bindings")
-    bundle = ROOT / next(iter(bundles))
+    tree = project_root or evidence_root(EVIDENCE_SHA)
     pack_path = ROOT / next(iter(packs))
-    if not bundle.is_file() or sha256_file(bundle) != next(iter(bundle_digests)):
-        raise InputFault(f"corpus_vector_model_mismatch:{_display_path(bundle)}")
+    try:
+        tree_digest = evidence_tree_sha256(tree)
+    except (FileNotFoundError, OSError, ValueError):
+        tree_digest = None
+    if tree_digest != next(iter(tree_digests)):
+        raise InputFault(f"corpus_vector_model_mismatch:{_display_path(tree)}")
     if not pack_path.is_file() or sha256_file(pack_path) != next(iter(pack_digests)):
         raise InputFault(f"corpus_vector_model_mismatch:{_display_path(pack_path)}")
     pack = json.loads(pack_path.read_text())
     if pack.get("pinned_sha") != EVIDENCE_SHA or pack.get("schema") != "aft-search-vector-pack-v1":
         raise InputFault("corpus_vector_model_mismatch:embedding_pack")
-    return manifest, bundle, pack_path, pack
+    return manifest, tree, pack_path, pack
 
 
 @contextmanager
-def materialized_bundle(bundle: Path) -> Iterator[Path]:
+def runtime_evidence_tree(tree: Path) -> Iterator[Path]:
+    """Copy the verified tree outside its parent checkout before starting AFT."""
     with tempfile.TemporaryDirectory(prefix="aft-real-query-tree-") as directory:
         root = Path(directory) / "tree"
-        root.mkdir()
-        with zipfile.ZipFile(bundle) as archive:
-            for info in archive.infolist():
-                target = (root / info.filename).resolve()
-                if root.resolve() not in target.parents or info.is_dir() or (info.external_attr >> 16) & 0o170000 == 0o120000:
-                    raise InputFault(f"invalid_bundle_member:{info.filename}")
-            archive.extractall(root)
+        shutil.copytree(tree, root, ignore=shutil.ignore_patterns(".git"))
         yield root
 
 
@@ -540,11 +542,11 @@ def run(args: argparse.Namespace) -> int:
     manifest_path = Path(args.manifest).resolve()
     binary = Path(args.binary).resolve()
     ensure_binary(binary)
-    manifest, bundle, _pack_path, pack = load_inputs(manifest_path)
+    manifest, provisioned_tree, _pack_path, pack = load_inputs(manifest_path)
     capability = load_capability(Path(args.schema).resolve())
     exact_report = json.loads(Path(args.exact_score).read_text())
     concept_report = json.loads(Path(args.concept_score).read_text())
-    with tempfile.TemporaryDirectory(prefix="aft-real-query-run-") as run_dir, materialized_bundle(bundle) as project_root:
+    with tempfile.TemporaryDirectory(prefix="aft-real-query-run-") as run_dir, runtime_evidence_tree(provisioned_tree) as project_root:
         runtime = Path(run_dir)
         log_path = runtime / "embedding-requests.log"
         stderr_path = runtime / "aft.stderr"
@@ -582,7 +584,7 @@ def run(args: argparse.Namespace) -> int:
 def main() -> int:
     try:
         return run(parser().parse_args())
-    except (AftProtocolError, InputFault, OSError, KeyError, ValueError, json.JSONDecodeError, zipfile.BadZipFile) as error:
+    except (AftProtocolError, InputFault, OSError, KeyError, ValueError, json.JSONDecodeError) as error:
         print(str(error), file=sys.stderr)
         return 2
 

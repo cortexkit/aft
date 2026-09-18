@@ -1,0 +1,16 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "evidence-tree-provisioning",
+    "evidence-tree-integrity",
+    "manifest-only-quality-mode"
+  ],
+  "note": "No ranking-fence changes: replace the committed AFT evidence archive with a SHA-pinned, digest-checked checkout and provision it before evaluation."
+}

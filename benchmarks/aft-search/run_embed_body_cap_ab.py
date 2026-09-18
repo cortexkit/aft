@@ -28,12 +28,7 @@ from run_exact_recall import (
     load_fixtures as load_exact_fixtures,
     validate_corpus,
 )
-from run_real_query import (
-    load_capability,
-    load_inputs,
-    materialized_bundle,
-    score_manifest_rows,
-)
+from run_real_query import load_capability, load_inputs, runtime_evidence_tree, score_manifest_rows
 from search_quality_lib import PAGE_SIZE, aggregate_real_query
 
 HERE = Path(__file__).resolve().parent
@@ -414,9 +409,9 @@ def exact_family(args: argparse.Namespace, arm: Arm) -> tuple[JsonObject, list[J
 
 def real_query_family(args: argparse.Namespace, arm: Arm) -> tuple[JsonObject, JsonObject]:
     manifest_path = Path(args.real_manifest).resolve()
-    manifest, bundle, _, _ = load_inputs(manifest_path)
+    manifest, provisioned_tree, _, _ = load_inputs(manifest_path)
     capability = load_capability(Path(args.schema).resolve())
-    with materialized_bundle(bundle) as project_root:
+    with runtime_evidence_tree(provisioned_tree) as project_root:
         temporary, client, index_metrics = build_client(args, project_root, arm, "real-query-b0")
         try:
             rows = score_manifest_rows(
