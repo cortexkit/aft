@@ -26,6 +26,47 @@ const WATCHER_ATTRIBUTION_RING_CAPACITY: usize = 512;
 const WATCHER_OVERFLOW_PREFIX_LIMIT: usize = 5;
 const WATCHER_OBSERVED_EXCLUSION_LIMIT: usize = 32;
 
+pub(crate) fn rewrite_nested_ignore_line(relative_dir: &Path, line: &str) -> Option<String> {
+    if line.trim().is_empty() || line.starts_with('#') {
+        return None;
+    }
+
+    let escaped_dir = relative_dir
+        .components()
+        .map(|component| {
+            component
+                .as_os_str()
+                .to_string_lossy()
+                .chars()
+                .flat_map(|character| {
+                    if matches!(character, '[' | '*' | '?' | '\\') {
+                        [Some('\\'), Some(character)]
+                    } else {
+                        [Some(character), None]
+                    }
+                })
+                .flatten()
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    let (negation, pattern) = line
+        .strip_prefix('!')
+        .map_or(("", line), |pattern| ("!", pattern));
+    let has_non_trailing_slash = pattern.strip_suffix('/').unwrap_or(pattern).contains('/');
+    let rewritten = if let Some(rest) = pattern.strip_prefix("**/") {
+        format!("{escaped_dir}/**/{rest}")
+    } else if has_non_trailing_slash {
+        format!(
+            "{escaped_dir}/{}",
+            pattern.strip_prefix('/').unwrap_or(pattern)
+        )
+    } else {
+        format!("{escaped_dir}/**/{pattern}")
+    };
+    Some(format!("{negation}{rewritten}"))
+}
+
 #[derive(Debug, Clone)]
 pub struct WatcherFilterConfig {
     pub project_root: PathBuf,
@@ -1144,6 +1185,42 @@ mod tests {
     use notify::EventKind;
     use std::process::Command;
     use tempfile::TempDir;
+
+    #[test]
+    fn nested_ignore_rewrite_preserves_gitignore_syntax() {
+        let dir = Path::new("foo[1]/bar*");
+
+        assert_eq!(rewrite_nested_ignore_line(dir, ""), None);
+        assert_eq!(rewrite_nested_ignore_line(dir, "# comment"), None);
+        assert_eq!(
+            rewrite_nested_ignore_line(dir, r"\#literal"),
+            Some(r"foo\[1]/bar\*/**/\#literal".to_string())
+        );
+        assert_eq!(
+            rewrite_nested_ignore_line(dir, r"\!literal"),
+            Some(r"foo\[1]/bar\*/**/\!literal".to_string())
+        );
+        assert_eq!(
+            rewrite_nested_ignore_line(dir, "!keep.log"),
+            Some(r"!foo\[1]/bar\*/**/keep.log".to_string())
+        );
+        assert_eq!(
+            rewrite_nested_ignore_line(dir, "/build"),
+            Some(r"foo\[1]/bar\*/build".to_string())
+        );
+        assert_eq!(
+            rewrite_nested_ignore_line(dir, "build/"),
+            Some(r"foo\[1]/bar\*/**/build/".to_string())
+        );
+        assert_eq!(
+            rewrite_nested_ignore_line(dir, "generated/output"),
+            Some(r"foo\[1]/bar\*/generated/output".to_string())
+        );
+        assert_eq!(
+            rewrite_nested_ignore_line(dir, "**/cache"),
+            Some(r"foo\[1]/bar\*/**/cache".to_string())
+        );
+    }
 
     fn shared_matcher(root: &Path) -> SharedGitignore {
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());

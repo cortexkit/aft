@@ -3316,15 +3316,61 @@ impl AppContext {
                 )
             })
             .build();
-        for entry in walker.flatten() {
-            let file_name = entry.file_name();
-            let is_nested_gitignore = file_name == ".gitignore" && entry.path() != root_ignore;
-            let is_nested_aftignore = file_name == ".aftignore" && entry.path() != root_aftignore;
-            if is_nested_gitignore || is_nested_aftignore {
-                if let Some(err) = builder.add(entry.path()) {
+        let mut nested_ignore_files = walker
+            .flatten()
+            .filter_map(|entry| {
+                let file_name = entry.file_name();
+                let is_nested_gitignore = file_name == ".gitignore" && entry.path() != root_ignore;
+                let is_nested_aftignore =
+                    file_name == ".aftignore" && entry.path() != root_aftignore;
+                (is_nested_gitignore || is_nested_aftignore).then(|| entry.into_path())
+            })
+            .collect::<Vec<_>>();
+        nested_ignore_files.sort_by(|left, right| {
+            let left_relative = left.strip_prefix(&root).unwrap_or(left);
+            let right_relative = right.strip_prefix(&root).unwrap_or(right);
+            left_relative
+                .components()
+                .count()
+                .cmp(&right_relative.components().count())
+                .then_with(|| left_relative.parent().cmp(&right_relative.parent()))
+                // Match the root ordering: `.aftignore` layers on top of
+                // `.gitignore` when both files live in the same directory.
+                .then_with(|| {
+                    let left_is_aftignore = left.file_name().is_some_and(|name| name == ".aftignore");
+                    let right_is_aftignore =
+                        right.file_name().is_some_and(|name| name == ".aftignore");
+                    left_is_aftignore.cmp(&right_is_aftignore)
+                })
+        });
+        for ignore_path in nested_ignore_files {
+            let Some(relative_dir) = ignore_path
+                .parent()
+                .and_then(|parent| parent.strip_prefix(&root).ok())
+            else {
+                continue;
+            };
+            let contents = match std::fs::read_to_string(&ignore_path) {
+                Ok(contents) => contents,
+                Err(err) => {
+                    crate::slog_warn!(
+                        "nested ignore read error in {}: {}",
+                        ignore_path.display(),
+                        err
+                    );
+                    continue;
+                }
+            };
+            for line in contents.lines() {
+                let Some(rewritten) =
+                    crate::watcher_filter::rewrite_nested_ignore_line(relative_dir, line)
+                else {
+                    continue;
+                };
+                if let Err(err) = builder.add_line(Some(ignore_path.clone()), &rewritten) {
                     crate::slog_warn!(
                         "nested ignore parse error in {}: {}",
-                        entry.path().display(),
+                        ignore_path.display(),
                         err
                     );
                 }
@@ -11117,6 +11163,68 @@ mod gitignore_tests {
         assert!(!is_ignored(&ctx, &public));
     }
 
+    fn write_fixture_file(root: &Path, relative: &str) -> PathBuf {
+        let path = root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, relative).unwrap();
+        path
+    }
+
+    fn collect_fixture_files(root: &Path, directory: &Path, files: &mut BTreeSet<PathBuf>) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                collect_fixture_files(root, &path, files);
+            } else {
+                files.insert(path.strip_prefix(root).unwrap().to_path_buf());
+            }
+        }
+    }
+
+    fn assert_matcher_matches_project_walker(ctx: &AppContext, root: &Path) {
+        // Standard git filters activate only inside a repository. An empty
+        // metadata directory is enough for this fixture and keeps the oracle
+        // on the same WalkBuilder path used by project indexing.
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let mut builder = ignore::WalkBuilder::new(root);
+        builder
+            .same_file_system(true)
+            .standard_filters(true)
+            .hidden(false)
+            .add_custom_ignore_filename(".aftignore");
+        let walked = builder
+            .build()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+            .map(|entry| entry.path().strip_prefix(root).unwrap().to_path_buf())
+            .collect::<BTreeSet<_>>();
+
+        let mut all_files = BTreeSet::new();
+        collect_fixture_files(root, root, &mut all_files);
+        let matcher_visible = all_files
+            .into_iter()
+            .filter(|relative| !is_ignored(ctx, &root.join(relative)))
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            matcher_visible, walked,
+            "watcher matcher and project walker must expose the same files"
+        );
+    }
+
+    fn nested_wildcard_fixture() -> (TempDir, AppContext) {
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join(".gitignore"), "/target/\n").unwrap();
+        write_fixture_file(tmp.path(), "crates/lib.rs");
+        write_fixture_file(tmp.path(), "docs/x.md");
+        write_fixture_file(tmp.path(), "target/output.bin");
+        write_fixture_file(tmp.path(), "tests/docker/fixtures/anything");
+        fs::write(tmp.path().join("tests/docker/fixtures/.gitignore"), "*\n").unwrap();
+        let ctx = make_ctx_with_root(tmp.path());
+        (tmp, ctx)
+    }
+
     #[test]
     fn matcher_picks_up_nested_gitignore() {
         let tmp = TempDir::new().unwrap();
@@ -11136,6 +11244,174 @@ mod gitignore_tests {
             is_ignored(&ctx, &generated_file),
             "nested gitignore in packages/foo/.gitignore should ignore generated/"
         );
+    }
+
+    #[test]
+    fn nested_wildcard_is_scoped_to_its_directory() {
+        with_neutralized_global_gitignore(|| {
+            let (tmp, ctx) = nested_wildcard_fixture();
+            ctx.rebuild_gitignore();
+
+            assert!(!is_ignored(&ctx, &tmp.path().join("crates/lib.rs")));
+            assert!(!is_ignored(&ctx, &tmp.path().join("docs/x.md")));
+            assert!(is_ignored(
+                &ctx,
+                &tmp.path().join("tests/docker/fixtures/anything")
+            ));
+            assert!(is_ignored(&ctx, &tmp.path().join("target")));
+            assert_matcher_matches_project_walker(&ctx, tmp.path());
+        });
+    }
+
+    #[test]
+    fn nested_unanchored_pattern_matches_at_every_depth_below_its_directory() {
+        with_neutralized_global_gitignore(|| {
+            let tmp = TempDir::new().unwrap();
+            fs::create_dir_all(tmp.path().join("sub")).unwrap();
+            fs::write(tmp.path().join("sub/.gitignore"), "build\n").unwrap();
+            let direct = write_fixture_file(tmp.path(), "sub/build/direct.txt");
+            let deep = write_fixture_file(tmp.path(), "sub/deep/build/deep.txt");
+            let root_build = write_fixture_file(tmp.path(), "build/root.txt");
+            let ctx = make_ctx_with_root(tmp.path());
+            ctx.rebuild_gitignore();
+
+            assert!(is_ignored(&ctx, &direct));
+            assert!(is_ignored(&ctx, &deep));
+            assert!(!is_ignored(&ctx, &root_build));
+            assert_matcher_matches_project_walker(&ctx, tmp.path());
+        });
+    }
+
+    #[test]
+    fn nested_anchored_pattern_matches_only_at_its_directory_root() {
+        with_neutralized_global_gitignore(|| {
+            let tmp = TempDir::new().unwrap();
+            fs::create_dir_all(tmp.path().join("sub")).unwrap();
+            fs::write(tmp.path().join("sub/.gitignore"), "/build\n").unwrap();
+            let direct = write_fixture_file(tmp.path(), "sub/build/direct.txt");
+            let deep = write_fixture_file(tmp.path(), "sub/deep/build/deep.txt");
+            let ctx = make_ctx_with_root(tmp.path());
+            ctx.rebuild_gitignore();
+
+            assert!(is_ignored(&ctx, &direct));
+            assert!(!is_ignored(&ctx, &deep));
+            assert_matcher_matches_project_walker(&ctx, tmp.path());
+        });
+    }
+
+    #[test]
+    fn nested_negation_only_unignores_files_below_its_directory() {
+        with_neutralized_global_gitignore(|| {
+            let tmp = TempDir::new().unwrap();
+            fs::write(tmp.path().join(".gitignore"), "*.log\n").unwrap();
+            fs::create_dir_all(tmp.path().join("sub")).unwrap();
+            fs::write(tmp.path().join("sub/.gitignore"), "!keep.log\n").unwrap();
+            let nested_keep = write_fixture_file(tmp.path(), "sub/keep.log");
+            let root_keep = write_fixture_file(tmp.path(), "keep.log");
+            let other = write_fixture_file(tmp.path(), "other.log");
+            let ctx = make_ctx_with_root(tmp.path());
+            ctx.rebuild_gitignore();
+
+            assert!(!is_ignored(&ctx, &nested_keep));
+            assert!(is_ignored(&ctx, &root_keep));
+            assert!(is_ignored(&ctx, &other));
+            assert_matcher_matches_project_walker(&ctx, tmp.path());
+        });
+    }
+
+    #[test]
+    fn deeper_nested_ignore_file_takes_precedence() {
+        with_neutralized_global_gitignore(|| {
+            let tmp = TempDir::new().unwrap();
+            fs::write(tmp.path().join(".gitignore"), "gen/\n").unwrap();
+            fs::create_dir_all(tmp.path().join("a/b")).unwrap();
+            fs::write(tmp.path().join("a/.gitignore"), "!gen/\n").unwrap();
+            fs::write(tmp.path().join("a/b/.gitignore"), "gen/\n").unwrap();
+            let shallow = write_fixture_file(tmp.path(), "a/gen/shallow.txt");
+            let deep = write_fixture_file(tmp.path(), "a/b/gen/deep.txt");
+            let ctx = make_ctx_with_root(tmp.path());
+            ctx.rebuild_gitignore();
+
+            assert!(!is_ignored(&ctx, &shallow));
+            assert!(is_ignored(&ctx, &deep));
+            assert_matcher_matches_project_walker(&ctx, tmp.path());
+        });
+    }
+
+    #[test]
+    fn nested_aftignore_pattern_is_scoped_to_its_directory() {
+        with_neutralized_global_gitignore(|| {
+            let tmp = TempDir::new().unwrap();
+            fs::create_dir_all(tmp.path().join("sub")).unwrap();
+            fs::write(tmp.path().join("sub/.aftignore"), "*\n").unwrap();
+            let nested = write_fixture_file(tmp.path(), "sub/nested.txt");
+            let root = write_fixture_file(tmp.path(), "root.txt");
+            let ctx = make_ctx_with_root(tmp.path());
+            ctx.rebuild_gitignore();
+
+            assert!(is_ignored(&ctx, &nested));
+            assert!(!is_ignored(&ctx, &root));
+            assert_matcher_matches_project_walker(&ctx, tmp.path());
+        });
+    }
+
+    #[test]
+    fn nested_ignore_directory_glob_metacharacters_are_literal() {
+        with_neutralized_global_gitignore(|| {
+            let tmp = TempDir::new().unwrap();
+            fs::create_dir_all(tmp.path().join("foo[1]")).unwrap();
+            fs::write(tmp.path().join("foo[1]/.gitignore"), "build\n").unwrap();
+            let nested = write_fixture_file(tmp.path(), "foo[1]/build/nested.txt");
+            let lookalike = write_fixture_file(tmp.path(), "foo1/build/lookalike.txt");
+            let ctx = make_ctx_with_root(tmp.path());
+            ctx.rebuild_gitignore();
+
+            assert!(is_ignored(&ctx, &nested));
+            assert!(!is_ignored(&ctx, &lookalike));
+            assert_matcher_matches_project_walker(&ctx, tmp.path());
+        });
+    }
+
+    #[test]
+    fn nested_wildcard_does_not_poison_watcher_exclusions() {
+        with_neutralized_global_gitignore(|| {
+            let (tmp, ctx) = nested_wildcard_fixture();
+            ctx.rebuild_gitignore();
+            let root = fs::canonicalize(tmp.path()).unwrap();
+
+            let exclusions = crate::watcher_filter::derive_excluded_subtrees(
+                &root,
+                &ctx.shared_gitignore(),
+                None,
+            );
+            let paths = crate::watcher_filter::watcher_exclusion_paths(&exclusions);
+
+            assert!(!paths.contains(&root.join("crates")));
+            assert!(!paths.contains(&root.join("docs")));
+            assert!(paths.contains(&root.join("target")));
+            assert_matcher_matches_project_walker(&ctx, &root);
+        });
+    }
+
+    #[test]
+    fn nested_wildcard_keeps_visible_paths_in_watcher_filter() {
+        with_neutralized_global_gitignore(|| {
+            let (tmp, ctx) = nested_wildcard_fixture();
+            ctx.rebuild_gitignore();
+            let root = fs::canonicalize(tmp.path()).unwrap();
+            let visible = root.join("crates/lib.rs");
+            let ignored = root.join("tests/docker/fixtures/anything");
+            let config = crate::watcher_filter::WatcherFilterConfig::new(root.clone(), None);
+
+            let filtered = crate::watcher_filter::filter_watcher_raw_paths_for_test(
+                &config,
+                &ctx.shared_gitignore(),
+                [visible.clone(), ignored],
+            );
+
+            assert_eq!(filtered.changed, BTreeSet::from([visible]));
+            assert_matcher_matches_project_walker(&ctx, &root);
+        });
     }
 }
 
