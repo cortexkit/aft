@@ -974,6 +974,10 @@ struct SweepSummary {
     /// nothing can be read from the log as "nothing was dead" versus "the
     /// recycled-PID verdict never fired".
     recycled_pids: usize,
+    /// Bytes the directory still holds above its budget after the sweep,
+    /// because the only remaining candidates were protected (the newest dead
+    /// process log inside its forensic window). Zero when the budget was met.
+    over_budget_bytes: u64,
 }
 
 struct ProcessLogFile {
@@ -985,6 +989,22 @@ struct ProcessLogFile {
     removed: bool,
 }
 
+/// A numbered rotation the plugin logger no longer owns. The TypeScript sink
+/// keeps exactly one backup generation (`aft-plugin.log.1`); higher numbers
+/// are relics of an earlier multi-generation policy and nothing rotates or
+/// removes them, so they sat at 140 MB of a 200 MB budget for months.
+fn relic_plugin_rotation(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("aft-plugin") else {
+        return false;
+    };
+    let Some((_, generation)) = rest.rsplit_once(".log.") else {
+        return false;
+    };
+    generation
+        .parse::<u32>()
+        .is_ok_and(|generation| generation >= 2)
+}
+
 fn log_sweep_summary(summary: SweepSummary) {
     crate::slog_info!(
         "log retention sweep: removed_files={} bytes_freed={} recycled_pids={}",
@@ -992,6 +1012,12 @@ fn log_sweep_summary(summary: SweepSummary) {
         summary.bytes_freed,
         summary.recycled_pids
     );
+    if summary.over_budget_bytes > 0 {
+        crate::slog_warn!(
+            "log directory over budget by {} bytes after sweep: the newest dead process log is kept as the record of that process's exit",
+            summary.over_budget_bytes
+        );
+    }
 }
 
 /// Sweep dead Rust process logs, then enforce the directory budget without ever
@@ -1004,6 +1030,7 @@ fn sweep_logs(
 ) -> io::Result<SweepSummary> {
     let mut total_bytes = 0_u64;
     let mut process_logs = Vec::new();
+    let mut relic_rotations = Vec::new();
     let mut live_pids = BTreeMap::new();
     let mut recycled_count = 0_usize;
     let own_pid = std::process::id();
@@ -1021,6 +1048,10 @@ fn sweep_logs(
         total_bytes = total_bytes.saturating_add(bytes);
         let name = entry.file_name();
         let name = name.to_string_lossy();
+        if relic_plugin_rotation(&name) {
+            relic_rotations.push((entry.path(), bytes));
+            continue;
+        }
         let pid = match name.as_ref() {
             // This shared TypeScript-owned file has no PID. Keep this explicit
             // so a future default branch cannot accidentally make it reaped.
@@ -1067,17 +1098,43 @@ fn sweep_logs(
         }
     }
 
+    // Relic rotations have no owner and no reader; they go unconditionally,
+    // and before any process log is weighed against the budget.
+    for (path, bytes) in &relic_rotations {
+        if remove_sweep_candidate(path) {
+            total_bytes = total_bytes.saturating_sub(*bytes);
+            summary.removed_files += 1;
+            summary.bytes_freed = summary.bytes_freed.saturating_add(*bytes);
+        }
+    }
+
     // The budget backstop is deliberately separate from the age-gated reap:
     // once liveness says a PID is dead, budget pressure may remove even a fresh
     // dead file so the directory can actually converge under its hard limit.
     // Live files remain ineligible regardless of age or budget pressure.
+    //
+    // One dead file is exempt: the newest one, while it is younger than the
+    // age reap. It is the log of the process that died last — the record of
+    // an unexplained exit — and on 2026-09-18 a successor's startup sweep
+    // deleted exactly that file (the directory was over budget on relic
+    // rotations, and the predecessor's log was the only eligible candidate)
+    // while the supervisor's own exit record died with the daemon restart
+    // that caused the exit. Losing budget headroom for one 32 MB file is the
+    // cheaper failure.
     process_logs.sort_by_key(|file| file.modified);
-    for file in process_logs
+    let protected = process_logs
+        .iter()
+        .rposition(|file| file.dead && !file.removed && !file.old_enough);
+    for (index, file) in process_logs
         .iter_mut()
-        .filter(|file| file.dead && !file.removed)
+        .enumerate()
+        .filter(|(_, file)| file.dead && !file.removed)
     {
         if total_bytes <= budget_bytes {
             break;
+        }
+        if Some(index) == protected {
+            continue;
         }
         if remove_sweep_candidate(&file.path) {
             file.removed = true;
@@ -1086,6 +1143,7 @@ fn sweep_logs(
             summary.bytes_freed = summary.bytes_freed.saturating_add(file.bytes);
         }
     }
+    summary.over_budget_bytes = total_bytes.saturating_sub(budget_bytes);
 
     Ok(summary)
 }
@@ -1764,6 +1822,87 @@ mod tests {
         assert!(!oldest.exists());
         assert!(newest.exists());
         assert!(live.exists());
+    }
+
+    #[test]
+    fn budget_backstop_keeps_the_newest_dead_log_inside_its_forensic_window() {
+        // 2026-09-18: a successor's startup sweep deleted the log of the
+        // process that had just died, because the directory was over budget
+        // and that log was the only eligible candidate. The newest dead log
+        // younger than the age reap is the record of the last exit and stays.
+        let temp = TempDir::new().unwrap();
+        let older = temp.path().join("aft-4294967294.log");
+        let predecessor = temp.path().join("aft-4294967293.log");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 24 * 60 * 60);
+        fs::write(&older, "older-older-older").unwrap();
+        fs::write(&predecessor, "predecessor-predecessor").unwrap();
+        set_file_mtime(&older, FileTime::from_unix_time(1, 0)).unwrap();
+        // Modified moments before `now`: dead, but inside the 24 h window.
+        set_file_mtime(
+            &predecessor,
+            FileTime::from_unix_time(10 * 24 * 60 * 60 - 30, 0),
+        )
+        .unwrap();
+
+        let summary = sweep_logs(temp.path(), now, DEAD_PROCESS_LOG_MAX_AGE, 4).unwrap();
+
+        assert!(
+            !older.exists(),
+            "the older dead log is still budget-reapable"
+        );
+        assert!(predecessor.exists(), "the newest dead log is protected");
+        assert_eq!(summary.removed_files, 1);
+        assert_eq!(
+            summary.over_budget_bytes,
+            "predecessor-predecessor".len() as u64 - 4,
+            "the shortfall is reported instead of destroying the record"
+        );
+
+        // Once it is older than the age reap it is an ordinary dead log again.
+        set_file_mtime(&predecessor, FileTime::from_unix_time(1, 0)).unwrap();
+        let summary = sweep_logs(temp.path(), now, DEAD_PROCESS_LOG_MAX_AGE, 4).unwrap();
+        assert!(!predecessor.exists());
+        assert_eq!(summary.over_budget_bytes, 0);
+    }
+
+    #[test]
+    fn relic_plugin_rotations_are_reaped_before_process_logs_are_weighed() {
+        let temp = TempDir::new().unwrap();
+        let active = temp.path().join("aft-plugin.log");
+        let backup = temp.path().join("aft-plugin.log.1");
+        let relic_two = temp.path().join("aft-plugin.log.2");
+        let relic_five = temp.path().join("aft-plugin.log.5");
+        let test_relic = temp.path().join("aft-plugin-test.log.3");
+        let predecessor = temp.path().join("aft-4294967293.log");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 24 * 60 * 60);
+        for (path, content) in [
+            (&active, "active"),
+            (&backup, "backup"),
+            (&relic_two, "relic-two-relic-two"),
+            (&relic_five, "relic-five-relic-five"),
+            (&test_relic, "test-relic-test-relic"),
+            (&predecessor, "predecessor"),
+        ] {
+            fs::write(path, content).unwrap();
+            set_file_mtime(path, FileTime::from_unix_time(10 * 24 * 60 * 60 - 30, 0)).unwrap();
+        }
+
+        // Budget fits the owned files plus the predecessor only once the
+        // relics are gone; the predecessor must not be the thing that pays.
+        let budget = ("active".len() + "backup".len() + "predecessor".len()) as u64;
+        let summary = sweep_logs(temp.path(), now, DEAD_PROCESS_LOG_MAX_AGE, budget).unwrap();
+
+        assert!(!relic_two.exists());
+        assert!(!relic_five.exists());
+        assert!(!test_relic.exists());
+        assert!(active.exists(), "the plugin's live file is never touched");
+        assert!(
+            backup.exists(),
+            "the plugin's one owned backup is never touched"
+        );
+        assert!(predecessor.exists());
+        assert_eq!(summary.removed_files, 3);
+        assert_eq!(summary.over_budget_bytes, 0);
     }
 
     #[test]

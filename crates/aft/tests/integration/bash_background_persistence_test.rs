@@ -801,7 +801,9 @@ fn bash_status_legacy_persisted_task_is_quarantined_on_replay() {
             std::ffi::OsStr::new("bash-legacy1.json"),
         )
         .expect("quarantine of the legacy metadata file failed during replay");
-        panic!("replay left the legacy metadata file in place, but a direct quarantine of it succeeds");
+        panic!(
+            "replay left the legacy metadata file in place, but a direct quarantine of it succeeds"
+        );
     }
 
     let quarantine_session = storage
