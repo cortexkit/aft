@@ -10257,8 +10257,30 @@ mod status_emitter_tests {
     #[test]
     fn status_emitter_debounces_burst() {
         let (ctx, rx) = ctx_with_frame_rx();
-        for _ in 0..10 {
-            ctx.status_emitter().signal(ctx.build_status_snapshot());
+        // The claim is "signals inside one window produce one push", so the
+        // burst must provably fit inside the window: a loaded CI runner has
+        // stretched ten signals past 1 s and read the second, legitimate push
+        // as a debounce failure (train 117). Measure the burst and retry it
+        // until it fits; only then does the single-push assertion mean anything.
+        let mut attempts = 0;
+        loop {
+            let started = Instant::now();
+            for _ in 0..10 {
+                ctx.status_emitter().signal(ctx.build_status_snapshot());
+            }
+            if started.elapsed() < Duration::from_millis(STATUS_DEBOUNCE_MS / 2) {
+                break;
+            }
+            attempts += 1;
+            assert!(
+                attempts < 20,
+                "could not issue ten signals inside half a debounce window"
+            );
+            // Drain whatever the slow burst produced before trying again.
+            while rx
+                .recv_timeout(Duration::from_millis(STATUS_DEBOUNCE_MS + 500))
+                .is_ok()
+            {}
         }
         let frame = rx
             .recv_timeout(Duration::from_millis(STATUS_DEBOUNCE_MS + 500))
