@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "views-per-binding-resolution",
+    "oc2-playbook-ga-facts"
+  ],
+  "note": "No ranking-fence file changes: views materialization per-binding resolution + refresh bench, playbook facts."
+}
