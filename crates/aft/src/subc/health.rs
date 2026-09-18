@@ -786,6 +786,7 @@ fn pending_bind_breadcrumb(
 }
 
 const HEALTH_ROOT_DETAIL_CAP: usize = crate::memory::MEMORY_SNAPSHOT_ROOT_DETAIL_CAP;
+// SUBC caches at most 16 KiB; reserve 4 KiB for its envelope and future counters.
 const HEALTH_METRICS_BUDGET_BYTES: usize = 12 * 1024;
 pub(super) const HEALTH_ROLLUP_TTL: Duration = Duration::from_secs(3);
 
