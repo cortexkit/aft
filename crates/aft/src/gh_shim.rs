@@ -107,11 +107,32 @@ const DESTRUCTIVE_TUPLES: &[&str] = &["release delete", "release delete-asset"];
 // flag variants below and does not broaden raw API writes.
 const V10_EDIT_LAST_TUPLES: &[&str] = &["issue comment", "pr comment"];
 const READ_ONLY_ACTION_TUPLES: &[&str] = &[
+    "issue view",
+    "issue list",
+    "issue status",
+    "pr view",
+    "pr list",
+    "pr status",
+    "pr checks",
+    "pr diff",
+    "release view",
+    "release list",
+    "release download",
+    "repo view",
+    "repo list",
     "run view",
     "run list",
     "run watch",
+    "run download",
     "workflow view",
     "workflow list",
+    "label list",
+    "search issues",
+    "search prs",
+    "search repos",
+    "search code",
+    "search commits",
+    "cache list",
 ];
 const RESERVED_SELF_REPORT: &[&str] = &["--status", "--shim-version"];
 const CO_AUTHOR_LINE_REPORT: &str = "--co-author-line";
@@ -6238,6 +6259,123 @@ mod tests {
     }
 
     #[test]
+    fn read_only_cli_actions_are_mechanical_and_delegate_on_a_bound_v13_manifest() {
+        use std::cell::Cell;
+
+        let directory = tempfile::tempdir().expect("create read-only dispatch state directory");
+        let paths = StatePaths::from_root(directory.path().to_path_buf());
+        let mut manifest = v13_manifest();
+        // Clear the manifest's declared reads so each case verifies that read
+        // access comes from the code-defined allowlist, not a manifest tier row.
+        manifest
+            .tiers
+            .get_mut(&Tier::Mechanical)
+            .expect("v13 mechanical tier")
+            .clear();
+        let rung =
+            RungDetermination::r3(TEST_NOW, manifest.manifest_version, &test_rung_provenance())
+                .record;
+        let binding = AgentBinding {
+            repo: "cortexkit/aft".to_string(),
+            agent_id: manifest
+                .bindings
+                .get("cortexkit/aft")
+                .expect("bound v13 repository")
+                .clone(),
+        };
+        let cases: &[(&str, &[&str])] = &[
+            ("issue view", &["issue", "view", "319", "--comments"]),
+            ("issue list", &["issue", "list"]),
+            ("issue status", &["issue", "status"]),
+            ("pr view", &["pr", "view", "313", "--web"]),
+            ("pr list", &["pr", "list"]),
+            ("pr status", &["pr", "status"]),
+            ("pr checks", &["pr", "checks", "313", "--watch"]),
+            ("pr diff", &["pr", "diff", "313"]),
+            ("release view", &["release", "view", "v0.56.2"]),
+            ("release list", &["release", "list"]),
+            (
+                "release download",
+                &["release", "download", "v0.56.2", "--dir", "artifacts"],
+            ),
+            ("repo view", &["repo", "view"]),
+            ("repo list", &["repo", "list"]),
+            ("run view", &["run", "view", "123"]),
+            ("run list", &["run", "list"]),
+            ("run watch", &["run", "watch", "123"]),
+            (
+                "run download",
+                &["run", "download", "123", "--dir", "artifacts"],
+            ),
+            ("workflow view", &["workflow", "view", "ci.yml"]),
+            ("workflow list", &["workflow", "list"]),
+            ("label list", &["label", "list"]),
+            ("search issues", &["search", "issues", "routing shim"]),
+            ("search prs", &["search", "prs", "routing shim"]),
+            ("search repos", &["search", "repos", "cortexkit"]),
+            (
+                "search code",
+                &["search", "code", "READ_ONLY_ACTION_TUPLES"],
+            ),
+            ("search commits", &["search", "commits", "read-only gh"]),
+            ("cache list", &["cache", "list"]),
+        ];
+
+        for (tuple, raw_args) in cases {
+            let args = os_args(raw_args);
+            let classification = classify(&args, &manifest, "macos");
+            assert!(
+                matches!(&classification, Classification::Mechanical),
+                "expected classification-only read passthrough for {tuple}: {classification:?}"
+            );
+
+            let delegated = Cell::new(0);
+            let status = dispatch_r3(
+                &args,
+                classification,
+                &manifest,
+                &paths,
+                &rung,
+                &binding,
+                TEST_NOW,
+                |delegated_args| {
+                    assert_eq!(delegated_args, args);
+                    delegated.set(delegated.get() + 1);
+                    73
+                },
+            );
+            assert_eq!(status, 73, "upstream status for {tuple}");
+            assert_eq!(delegated.get(), 1, "upstream delegation count for {tuple}");
+        }
+
+        for (raw_args, expected) in [
+            (&["issue", "close", "319"][..], "governed"),
+            (&["pr", "merge", "313"][..], "admin"),
+            (&["release", "delete", "v0.56.2"][..], "destructive"),
+            (
+                &["release", "upload", "v0.56.2", "artifact.tar.gz"][..],
+                "admin",
+            ),
+            (
+                &["issue", "comment", "319", "--body", "hello"][..],
+                "governed",
+            ),
+        ] {
+            let classification = classify(&os_args(raw_args), &manifest, "macos");
+            let matches_expected = match expected {
+                "governed" => matches!(&classification, Classification::Governed { .. }),
+                "admin" => matches!(&classification, Classification::Admin { .. }),
+                "destructive" => matches!(&classification, Classification::Destructive),
+                _ => unreachable!("unknown expected classification"),
+            };
+            assert!(
+                matches_expected,
+                "negative control {raw_args:?} changed from {expected}: {classification:?}"
+            );
+        }
+    }
+
+    #[test]
     fn classification_is_allowlist_driven_without_a_write_heuristic() {
         let manifest = fixture_manifest();
         assert!(matches!(
@@ -6948,7 +7086,7 @@ mod tests {
         // assembled draft under the gitignored `.alfonso/`, so neither exists
         // on a clean checkout. This is the classifier's view of v13 - the
         // admin release rows plus the branch-protection API rules.
-        let mut manifest = branch_protection_manifest("PUT", Tier::Admin);
+        let mut manifest = v13_manifest();
         manifest.api_rules.push(ApiRule {
             method: "DELETE".to_string(),
             path_glob: BRANCH_PROTECTION_PATH_GLOB.to_string(),
@@ -6959,18 +7097,6 @@ mod tests {
                     .to_string(),
             ),
         });
-        let admin = manifest
-            .tiers
-            .get_mut(&Tier::Admin)
-            .expect("v13 admin tier");
-        for tuple in ["release edit", "release upload"] {
-            admin.push(TupleDecl::Details {
-                tuple: tuple.to_string(),
-                platform: vec!["macos".to_string(), "linux".to_string()],
-                api_match: None,
-                rationale: None,
-            });
-        }
         manifest.validate().expect("valid v13 admin extensions");
         for method in ["PUT", "DELETE"] {
             let rule = manifest
@@ -7088,7 +7214,20 @@ mod tests {
     /// The v13 shape as it is deployed today, for the two-way comparisons the
     /// v14 rows have to survive.
     fn v13_manifest() -> Manifest {
-        branch_protection_manifest("PUT", Tier::Admin)
+        let mut manifest = branch_protection_manifest("PUT", Tier::Admin);
+        let admin = manifest
+            .tiers
+            .get_mut(&Tier::Admin)
+            .expect("v13 admin tier");
+        for tuple in V13_ADMIN_TUPLES {
+            admin.push(TupleDecl::Details {
+                tuple: (*tuple).to_string(),
+                platform: vec!["macos".to_string(), "linux".to_string()],
+                api_match: None,
+                rationale: None,
+            });
+        }
+        manifest
     }
 
     #[test]
