@@ -459,7 +459,11 @@ fn stored_zip(name: &str, payload: &[u8]) -> Vec<u8> {
         for &byte in bytes {
             crc ^= u32::from(byte);
             for _ in 0..8 {
-                crc = if crc & 1 == 1 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
             }
         }
         !crc
@@ -512,7 +516,10 @@ fn exact_fallback_uses_the_indexers_corpus_eligibility() {
     let archive = dir.path().join("src/stored.zip");
     fs::write(
         &archive,
-        stored_zip("evidence/log.txt", format!("{phrase}3 bytes_freed=11\n").as_bytes()),
+        stored_zip(
+            "evidence/log.txt",
+            format!("{phrase}3 bytes_freed=11\n").as_bytes(),
+        ),
     )
     .expect("write stored zip fixture");
 
