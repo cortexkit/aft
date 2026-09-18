@@ -132,6 +132,36 @@ describe("health sentinel pure detectors", () => {
     expect(detectIndexes(sample({ health: { metrics: { roots: [{ project_root: root, search_index: { status: "ready" } }] } } }))).toEqual([]);
   });
 
+  test("backend outage raises once and suppresses per-root stuck findings", () => {
+    const roots = ["/repo/prefrontal", "/repo/magic-context"];
+    const input = sample({ health: { metrics: {
+      embedding_backend: { available: false, last_error: "connection refused", since_ms: NOW - 700_000 },
+      roots: roots.map((project_root) => ({
+        project_root,
+        semantic_index: {
+          status: "backend_unavailable",
+          reason: "connection refused",
+          since_ms: NOW - 700_000,
+          next_retry_ms: NOW + 30_000,
+        },
+      })),
+    } } });
+
+    const findings = detectIndexes(input);
+    expect(findings.filter((value) => value.rule === "embedding.backend_down")).toHaveLength(1);
+    expect(findings.filter((value) => value.rule === "index.stuck")).toHaveLength(0);
+    expect(findings[0].severity).toBe("WARNING");
+    expect(findings[0].text).toContain(roots.join(", "));
+  });
+
+  test("building index with recent progress is not stuck", () => {
+    const input = sample({ health: { metrics: { roots: [{
+      project_root: "/repo/active",
+      tier2: { status: "building", since_ms: NOW - 700_000, last_progress_at_ms: NOW - 30_000 },
+    }] } } });
+    expect(detectIndexes(input)).toEqual([]);
+  });
+
   test("overlong tier2 pass requires an unmatched old acquisition", () => {
     const root = "/repo/worktree";
     expect(detectTier2Overlong(sample({ log_lines: [`2026-09-17T14:00:00Z [aft] inspect-triggered cold-build slot acquired after 1ms wait: request=inspect:${root}:1 kind=explicit inspect Tier-2 run`] }))[0].fingerprint).toBe(`tier2:${root}`);

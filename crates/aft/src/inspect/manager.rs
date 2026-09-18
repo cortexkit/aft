@@ -544,6 +544,9 @@ pub struct InspectManager {
     /// `drain_completions`, so the `&AppContext`-side drain polls this counter
     /// to know when to refresh the agent status bar after a background scan.
     reuse_completions: AtomicU64,
+    /// Successful reuse completions are tracked separately because failed passes
+    /// must not make a stale health plane look ready.
+    successful_reuse_completions: AtomicU64,
     /// Test observability for distinguishing queued reuse work from a worker that
     /// has actually begun executing it.
     reuse_starts: AtomicU64,
@@ -615,6 +618,7 @@ impl InspectManager {
             automatic_tier2_skip_logged: AtomicBool::new(false),
             automatic_tier2_schedule_count: AtomicU64::new(0),
             reuse_completions: AtomicU64::new(0),
+            successful_reuse_completions: AtomicU64::new(0),
             reuse_starts: AtomicU64::new(0),
         }
     }
@@ -706,8 +710,16 @@ impl InspectManager {
         let Some(waiters) = self.take_waiters(key) else {
             return;
         };
+        let succeeded = matches!(
+            builder_attempt_terminal(&outcome),
+            BuilderAttemptTerminal::Succeeded
+        );
         self.record_builder_attempt_outcome(key, &outcome);
         self.reuse_completions.fetch_add(1, Ordering::SeqCst);
+        if succeeded {
+            self.successful_reuse_completions
+                .fetch_add(1, Ordering::SeqCst);
+        }
         Self::deliver_waiters(waiters, outcome);
     }
 
@@ -3055,6 +3067,10 @@ impl InspectManager {
     /// value to detect background scans that finished since the previous tick.
     pub fn reuse_completion_count(&self) -> u64 {
         self.reuse_completions.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn successful_reuse_completion_count(&self) -> u64 {
+        self.successful_reuse_completions.load(Ordering::SeqCst)
     }
 
     #[doc(hidden)]

@@ -8,7 +8,7 @@ import { spawnSync } from "node:child_process";
 
 export type Severity = "CRITICAL" | "WARNING";
 export type Finding = { severity: Severity; rule: string; fingerprint: string; text: string; clears_when: string };
-export type Plane = { status?: string; since_ms?: number | null; last_progress_at_ms?: number | null };
+export type Plane = { status?: string; reason?: string; since_ms?: number | null; next_retry_ms?: number | null; last_progress_at_ms?: number | null };
 export type RootHealth = {
   project_root?: string;
   search_index?: Plane;
@@ -162,10 +162,27 @@ export function detectLimiter(sample: SentinelSample): Finding[] {
 
 export function detectIndexes(sample: SentinelSample): Finding[] {
   const out: Finding[] = [];
+  const healthMetrics = metrics(sample);
+  const backend = healthMetrics.embedding_backend;
+  if (backend?.available === false) {
+    const affectedRoots = roots(sample)
+      .filter((root) => root.semantic_index?.status === "backend_unavailable")
+      .map((root) => root.project_root ?? "unknown");
+    const rootText = affectedRoots.length > 0 ? affectedRoots.join(", ") : "affected roots omitted from metrics";
+    const reason = typeof backend.last_error === "string" ? backend.last_error : "embedding backend unavailable";
+    out.push(finding(
+      "embedding.backend_down",
+      "WARNING",
+      "embedding:backend",
+      `embedding backend unavailable for ${rootText}: ${reason}`,
+      "the embedding backend answers successfully",
+    ));
+  }
   for (const root of roots(sample)) {
     const rootPath = root.project_root ?? "unknown";
     for (const plane of ["search_index", "semantic_index", "tier2"] as const) {
       const status = root[plane];
+      if (status?.status === "backend_unavailable") continue;
       if (status?.status !== "building") continue;
       const since = status.since_ms;
       const progress = status.last_progress_at_ms;

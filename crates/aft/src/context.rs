@@ -302,6 +302,10 @@ struct StatusBarTier2 {
     duplicates: Option<usize>,
     todos: Option<usize>,
     stale: bool,
+    /// Successful reuse completions observed when this snapshot first became
+    /// stale. Health compares against this marker so a completed background
+    /// pass can become ready before the request-thread status-bar drain runs.
+    stale_after_successful_completion: u64,
     generation: u64,
     /// True when the latest dead_code aggregate reported `callgraph_available:
     /// false` (the callgraph store was not ready when dead_code scanned). Health
@@ -407,6 +411,12 @@ impl SemanticBuildProgress {
 pub struct SemanticHealthComponentSnapshot {
     pub status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_retry_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub embedded_chunks: Option<usize>,
@@ -429,6 +439,9 @@ pub struct ViewHealthSnapshot {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Tier2HealthSnapshot {
     pub status: &'static str,
+    /// Advances when a background Tier-2 pass publishes successfully, even if
+    /// health never sampled the short-lived `building` state.
+    pub completion_generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -474,6 +487,7 @@ pub(crate) struct RootHealthSummary {
     callgraph_store_status: Option<&'static str>,
     views: Option<ViewHealthSnapshot>,
     tier2_status: Option<&'static str>,
+    tier2_completion_generation: Option<u64>,
     bash: Option<BgTaskHealthCounts>,
     suspended_domains: Vec<SuspendedDomainHealthSnapshot>,
 }
@@ -487,6 +501,7 @@ impl RootHealthSummary {
             callgraph_store_status: None,
             views: None,
             tier2_status: None,
+            tier2_completion_generation: None,
             bash: None,
             suspended_domains: Vec::new(),
         }
@@ -551,9 +566,10 @@ impl RootHealthSummary {
             callgraph_commits_60s,
             callgraph_pages_or_bytes_written_60s,
             views: self.views,
-            tier2: self
-                .tier2_status
-                .map(|status| Tier2HealthSnapshot { status }),
+            tier2: self.tier2_status.map(|status| Tier2HealthSnapshot {
+                status,
+                completion_generation: self.tier2_completion_generation.unwrap_or_default(),
+            }),
             bash: self.bash,
             suspended_domains: self.suspended_domains,
         }
@@ -1259,6 +1275,21 @@ pub struct SemanticRefreshAccounting {
     pub in_flight: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct EmbeddingBackendHealthSnapshot {
+    pub(crate) available: bool,
+    pub(crate) last_error: Option<String>,
+    pub(crate) since_ms: Option<u64>,
+    pub(crate) next_retry_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct SemanticBackendOutage {
+    last_error: String,
+    since_ms: u64,
+    next_retry_ms: u64,
+}
+
 #[derive(Debug, Default)]
 struct SemanticRefreshCircuit {
     consecutive_transient_failures: AtomicUsize,
@@ -1266,6 +1297,15 @@ struct SemanticRefreshCircuit {
     probe_in_flight: AtomicBool,
     probe_ready: AtomicBool,
     probe_token: AtomicU64,
+    backend_outage: RwLock<Option<SemanticBackendOutage>>,
+}
+
+fn semantic_health_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2881,6 +2921,10 @@ impl AppContext {
             Ok(guard) => guard.clone(),
             Err(_) => return RootHealthSummary::busy(),
         };
+        let semantic_backend = match self.try_semantic_backend_health_snapshot() {
+            Some(snapshot) => snapshot,
+            None => return RootHealthSummary::busy(),
+        };
         let callgraph_store = match self.callgraph_store.try_read() {
             Ok(guard) => guard,
             Err(_) => return RootHealthSummary::busy(),
@@ -2933,44 +2977,70 @@ impl AppContext {
         } else {
             "disabled"
         };
-        let semantic_index = match &*semantic_status {
-            SemanticIndexStatus::Ready { .. } => SemanticHealthComponentSnapshot {
-                status: "ready",
+        let semantic_index = if !semantic_backend.available {
+            SemanticHealthComponentSnapshot {
+                status: "backend_unavailable",
+                reason: semantic_backend.last_error,
+                since_ms: semantic_backend.since_ms,
+                next_retry_ms: semantic_backend.next_retry_ms,
                 stage: None,
                 embedded_chunks: None,
                 total_chunks: None,
                 current_batch: None,
                 total_batches: None,
-            },
-            SemanticIndexStatus::Building { stage, .. } => {
-                let progress = semantic_build_progress
-                    .as_ref()
-                    .map(SemanticBuildProgress::snapshot);
-                SemanticHealthComponentSnapshot {
-                    status: "building",
-                    stage: Some(stage.clone()),
-                    embedded_chunks: progress.as_ref().map(|progress| progress.embedded_chunks),
-                    total_chunks: progress.as_ref().map(|progress| progress.total_chunks),
-                    current_batch: progress.as_ref().map(|progress| progress.current_batch),
-                    total_batches: progress.as_ref().map(|progress| progress.total_batches),
-                }
             }
-            SemanticIndexStatus::Disabled => SemanticHealthComponentSnapshot {
-                status: "disabled",
-                stage: None,
-                embedded_chunks: None,
-                total_chunks: None,
-                current_batch: None,
-                total_batches: None,
-            },
-            SemanticIndexStatus::Failed(_) => SemanticHealthComponentSnapshot {
-                status: "degraded",
-                stage: None,
-                embedded_chunks: None,
-                total_chunks: None,
-                current_batch: None,
-                total_batches: None,
-            },
+        } else {
+            match &*semantic_status {
+                SemanticIndexStatus::Ready { .. } => SemanticHealthComponentSnapshot {
+                    status: "ready",
+                    reason: None,
+                    since_ms: None,
+                    next_retry_ms: None,
+                    stage: None,
+                    embedded_chunks: None,
+                    total_chunks: None,
+                    current_batch: None,
+                    total_batches: None,
+                },
+                SemanticIndexStatus::Building { stage, .. } => {
+                    let progress = semantic_build_progress
+                        .as_ref()
+                        .map(SemanticBuildProgress::snapshot);
+                    SemanticHealthComponentSnapshot {
+                        status: "building",
+                        reason: None,
+                        since_ms: None,
+                        next_retry_ms: None,
+                        stage: Some(stage.clone()),
+                        embedded_chunks: progress.as_ref().map(|progress| progress.embedded_chunks),
+                        total_chunks: progress.as_ref().map(|progress| progress.total_chunks),
+                        current_batch: progress.as_ref().map(|progress| progress.current_batch),
+                        total_batches: progress.as_ref().map(|progress| progress.total_batches),
+                    }
+                }
+                SemanticIndexStatus::Disabled => SemanticHealthComponentSnapshot {
+                    status: "disabled",
+                    reason: None,
+                    since_ms: None,
+                    next_retry_ms: None,
+                    stage: None,
+                    embedded_chunks: None,
+                    total_chunks: None,
+                    current_batch: None,
+                    total_batches: None,
+                },
+                SemanticIndexStatus::Failed(_) => SemanticHealthComponentSnapshot {
+                    status: "degraded",
+                    reason: None,
+                    since_ms: None,
+                    next_retry_ms: None,
+                    stage: None,
+                    embedded_chunks: None,
+                    total_chunks: None,
+                    current_batch: None,
+                    total_batches: None,
+                },
+            }
         };
         let callgraph_writer = self.callgraph_writer.load(Ordering::SeqCst);
         let callgraph_store_status = if !heavy_root_work_allowed {
@@ -2996,10 +3066,14 @@ impl AppContext {
         // Let the callgraph component report that dependency instead of leaving
         // tier2 permanently "building" with no refresh able to complete it.
         let dead_code_blocked_on_callgraph = tier2.dead_code_blocked_on_callgraph;
+        let successful_tier2_completions = self.inspect_manager.successful_reuse_completion_count();
+        let background_refresh_completed = tier2.stale
+            && !tier2_builder_busy
+            && successful_tier2_completions > tier2.stale_after_successful_completion;
         let tier2_complete = (tier2.dead_code.is_some() || dead_code_blocked_on_callgraph)
             && tier2.unused_exports.is_some()
             && tier2.duplicates.is_some()
-            && !tier2.stale;
+            && (!tier2.stale || background_refresh_completed);
         let tier2_has_aggregates = tier2.dead_code.is_some()
             || tier2.unused_exports.is_some()
             || tier2.duplicates.is_some();
@@ -3033,6 +3107,7 @@ impl AppContext {
                 None
             },
             tier2_status: Some(tier2_status),
+            tier2_completion_generation: Some(successful_tier2_completions),
             bash: Some(bash),
             suspended_domains,
         }
@@ -3089,6 +3164,8 @@ impl AppContext {
             let changed = !tier2.stale;
             tier2.stale = true;
             if changed {
+                tier2.stale_after_successful_completion =
+                    self.inspect_manager.successful_reuse_completion_count();
                 tier2.generation = tier2.generation.wrapping_add(1);
             }
             return changed;
@@ -3131,6 +3208,10 @@ impl AppContext {
         }
         if let Some(todos) = todos {
             tier2.todos = Some(todos);
+        }
+        if stale && !tier2.stale {
+            tier2.stale_after_successful_completion =
+                self.inspect_manager.successful_reuse_completion_count();
         }
         tier2.stale = stale;
         let current = (
@@ -6865,6 +6946,76 @@ impl AppContext {
         self.semantic_refresh_circuit.open.load(Ordering::SeqCst)
     }
 
+    fn record_embedding_backend_outage(&self, reason: &str) {
+        let now_ms = semantic_health_unix_millis();
+        let mut outage = self
+            .semantic_refresh_circuit
+            .backend_outage
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match outage.as_mut() {
+            Some(outage) => {
+                outage.last_error = reason.to_string();
+                outage.next_retry_ms = outage.next_retry_ms.max(now_ms);
+            }
+            None => {
+                *outage = Some(SemanticBackendOutage {
+                    last_error: reason.to_string(),
+                    since_ms: now_ms,
+                    next_retry_ms: now_ms,
+                });
+            }
+        }
+    }
+
+    fn set_embedding_backend_next_retry(&self, next_retry_ms: u64) {
+        if let Ok(mut outage) = self.semantic_refresh_circuit.backend_outage.write() {
+            if let Some(outage) = outage.as_mut() {
+                outage.next_retry_ms = next_retry_ms;
+            }
+        }
+    }
+
+    pub(crate) fn semantic_backend_health_snapshot(&self) -> EmbeddingBackendHealthSnapshot {
+        let outage = self
+            .semantic_refresh_circuit
+            .backend_outage
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match outage.as_ref() {
+            Some(outage) => EmbeddingBackendHealthSnapshot {
+                available: false,
+                last_error: Some(outage.last_error.clone()),
+                since_ms: Some(outage.since_ms),
+                next_retry_ms: Some(outage.next_retry_ms),
+            },
+            None => EmbeddingBackendHealthSnapshot {
+                available: true,
+                ..EmbeddingBackendHealthSnapshot::default()
+            },
+        }
+    }
+
+    fn try_semantic_backend_health_snapshot(&self) -> Option<EmbeddingBackendHealthSnapshot> {
+        let outage = self
+            .semantic_refresh_circuit
+            .backend_outage
+            .try_read()
+            .ok()?;
+        Some(match outage.as_ref() {
+            Some(outage) => EmbeddingBackendHealthSnapshot {
+                available: false,
+                last_error: Some(outage.last_error.clone()),
+                since_ms: Some(outage.since_ms),
+                next_retry_ms: Some(outage.next_retry_ms),
+            },
+            None => EmbeddingBackendHealthSnapshot {
+                available: true,
+                ..EmbeddingBackendHealthSnapshot::default()
+            },
+        })
+    }
+
     pub fn record_semantic_refresh_transient_failure(
         &self,
         trip_threshold: usize,
@@ -6875,6 +7026,9 @@ impl AppContext {
             .consecutive_transient_failures
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1);
+        if failures >= trip_threshold {
+            self.record_embedding_backend_outage(reason);
+        }
         if failures >= trip_threshold
             && !self
                 .semantic_refresh_circuit
@@ -6893,6 +7047,7 @@ impl AppContext {
         self.semantic_refresh_circuit
             .consecutive_transient_failures
             .store(trip_threshold, Ordering::SeqCst);
+        self.record_embedding_backend_outage(reason);
         if !self
             .semantic_refresh_circuit
             .open
@@ -6916,6 +7071,11 @@ impl AppContext {
         self.semantic_refresh_circuit
             .probe_ready
             .store(false, Ordering::SeqCst);
+        *self
+            .semantic_refresh_circuit
+            .backend_outage
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         if self
             .semantic_refresh_circuit
             .open
@@ -6981,6 +7141,10 @@ impl AppContext {
             .probe_token
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1);
+        self.set_embedding_backend_next_retry(
+            semantic_health_unix_millis()
+                .saturating_add(delay.as_millis().min(u128::from(u64::MAX)) as u64),
+        );
         drop(receiver);
 
         let circuit = Arc::clone(&self.semantic_refresh_circuit);

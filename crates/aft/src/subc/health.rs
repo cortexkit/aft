@@ -786,7 +786,79 @@ fn pending_bind_breadcrumb(
 }
 
 const HEALTH_ROOT_DETAIL_CAP: usize = crate::memory::MEMORY_SNAPSHOT_ROOT_DETAIL_CAP;
+const HEALTH_METRICS_BUDGET_BYTES: usize = 12 * 1024;
 pub(super) const HEALTH_ROLLUP_TTL: Duration = Duration::from_secs(3);
+
+fn encoded_health_metrics_len(metrics: &serde_json::Map<String, Value>) -> usize {
+    serde_json::to_vec(&Value::Object(metrics.clone()))
+        .map(|encoded| encoded.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn refresh_metrics_bytes(metrics: &mut serde_json::Map<String, Value>) -> usize {
+    metrics.insert("metrics_bytes".to_string(), json!(0));
+    for _ in 0..4 {
+        let encoded_bytes = encoded_health_metrics_len(metrics);
+        if metrics.get("metrics_bytes").and_then(Value::as_u64) == Some(encoded_bytes as u64) {
+            return encoded_bytes;
+        }
+        metrics.insert("metrics_bytes".to_string(), json!(encoded_bytes));
+    }
+    encoded_health_metrics_len(metrics)
+}
+
+fn compact_write_ledger_root_ids(metrics: &mut serde_json::Map<String, Value>) {
+    let Some(rows) = metrics
+        .get_mut("write_ledger_top_10m")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for row in rows {
+        let Some(root_id) = row.get_mut("root_id") else {
+            continue;
+        };
+        let Some(raw) = root_id.as_str() else {
+            continue;
+        };
+        if raw.starts_with('<') && raw.ends_with('>') {
+            continue;
+        }
+        let basename = raw
+            .rsplit(['/', '\\'])
+            .find(|segment| !segment.is_empty())
+            .unwrap_or(raw);
+        *root_id = json!(if basename == raw { "<key>" } else { basename });
+    }
+}
+
+fn budget_health_metrics(metrics: &mut serde_json::Map<String, Value>) {
+    let mut ledger_compacted = false;
+    loop {
+        if refresh_metrics_bytes(metrics) <= HEALTH_METRICS_BUDGET_BYTES {
+            return;
+        }
+        if metrics
+            .get_mut("roots")
+            .and_then(Value::as_array_mut)
+            .is_some_and(|roots| roots.pop().is_some())
+        {
+            let omitted = metrics
+                .get("root_details_omitted")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .saturating_add(1);
+            metrics.insert("root_details_omitted".to_string(), json!(omitted));
+            continue;
+        }
+        if !ledger_compacted {
+            compact_write_ledger_root_ids(metrics);
+            ledger_compacted = true;
+            continue;
+        }
+        return;
+    }
+}
 
 #[derive(Clone)]
 struct HealthDiagnosticRollup {
@@ -808,6 +880,11 @@ impl HealthDiagnosticRollup {
             "callgraph_commits_60s_total": 0,
             "callgraph_pages_or_bytes_written_60s_total": 0,
             "lsp_children": { "spawned": 0, "cwd_gone": 0 },
+            "embedding_backend": {
+                "available": true,
+                "last_error": Value::Null,
+                "since_ms": Value::Null,
+            },
             "memory": memory_rollup_metrics(None),
             "mutating_lanes": { "scheduler_busy": true },
             "process_io": crate::process_io::ProcessIoSnapshot::capture().to_value(),
@@ -959,17 +1036,18 @@ impl HealthRollupCache {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
                 .to_string();
+            let reported_since_ms = component.get("since_ms").and_then(Value::as_u64);
             let progress_signature = serde_json::to_string(component).unwrap_or_default();
             let key = (root.to_string(), plane);
             let timing = timings.entry(key).or_insert_with(|| PlaneTiming {
                 status: status.clone(),
-                since_ms: now_ms,
+                since_ms: reported_since_ms.unwrap_or(now_ms),
                 last_progress_at_ms: now_ms,
                 progress_signature: progress_signature.clone(),
             });
             if timing.status != status {
                 timing.status = status;
-                timing.since_ms = now_ms;
+                timing.since_ms = reported_since_ms.unwrap_or(now_ms);
                 timing.last_progress_at_ms = now_ms;
                 timing.progress_signature = progress_signature;
             } else if timing.progress_signature != progress_signature {
@@ -1193,6 +1271,9 @@ fn build_health_diagnostic_rollup(
     let mut census_roots = std::collections::BTreeMap::new();
     let mut candidates = Vec::with_capacity(actor_count.saturating_add(standing_entries.len()));
     let mut repair_roots_annotated = 0usize;
+    let mut embedding_backend_available = true;
+    let mut embedding_backend_last_error = None;
+    let mut embedding_backend_since_ms = None;
     for (root_id, ctx) in actor_entries {
         let root_label = root_id.as_path().display().to_string();
         let standing_index = standing_entries.iter().position(|entry| {
@@ -1240,6 +1321,19 @@ fn build_health_diagnostic_rollup(
                     .as_ref()
                     .and_then(|store| store.try_stale_path_census().ok().flatten())
             });
+        let backend = ctx.semantic_backend_health_snapshot();
+        if !backend.available {
+            embedding_backend_available = false;
+            let replace_error = embedding_backend_since_ms
+                .is_none_or(|since| backend.since_ms.is_some_and(|candidate| candidate <= since));
+            if replace_error {
+                embedding_backend_last_error = backend.last_error;
+            }
+            embedding_backend_since_ms = match (embedding_backend_since_ms, backend.since_ms) {
+                (Some(current), Some(candidate)) => Some(current.min(candidate)),
+                (current, candidate) => current.or(candidate),
+            };
+        }
         let health_summary = ctx.try_health_summary();
         let busy = health_summary.is_busy();
         let fully_ready = health_summary.is_fully_ready();
@@ -1298,7 +1392,7 @@ fn build_health_diagnostic_rollup(
             .then_with(|| left.root_label.cmp(&right.root_label))
     });
     let root_details_omitted = candidates.len().saturating_sub(HEALTH_ROOT_DETAIL_CAP);
-    let mut roots: Vec<(String, Value)> = candidates
+    let roots: Vec<(String, Value)> = candidates
         .into_iter()
         .take(HEALTH_ROOT_DETAIL_CAP)
         .map(|candidate| {
@@ -1344,7 +1438,6 @@ fn build_health_diagnostic_rollup(
             (root_label, value)
         })
         .collect();
-    roots.sort_by(|(left, _), (right, _)| left.cmp(right));
     let roots = roots
         .into_iter()
         .map(|(_, snapshot)| snapshot)
@@ -1387,6 +1480,11 @@ fn build_health_diagnostic_rollup(
         "lsp_children": {
             "spawned": lifecycle.lsp.children_total,
             "cwd_gone": lifecycle.lsp.children_with_deleted_cwd,
+        },
+        "embedding_backend": {
+            "available": embedding_backend_available,
+            "last_error": embedding_backend_last_error,
+            "since_ms": embedding_backend_since_ms,
         },
         "memory": memory,
         "mutating_lanes": mutating_lanes_metrics(executor),
@@ -1488,6 +1586,7 @@ pub(super) fn build_health_report(
         "write_ledger_top_10m".to_string(),
         json!(crate::write_ledger::recent_top_writers()),
     );
+    budget_health_metrics(&mut metrics);
 
     let scheduler_busy = executor.try_actor_count().is_none();
     HealthReport {
@@ -2500,6 +2599,44 @@ mod tests {
     }
 
     #[test]
+    fn semantic_backend_outage_is_distinct_per_root_and_aggregated_once() {
+        let executor = Executor::new();
+        let (_dir, root) = test_root("semantic-backend-unavailable-health");
+        let ctx = test_ctx();
+        *ctx.semantic_index_status().write().unwrap() =
+            crate::context::SemanticIndexStatus::Building {
+                stage: "embedding_symbols".to_string(),
+                files: Some(1),
+                entries_done: Some(0),
+                entries_total: Some(12),
+            };
+        ctx.trip_semantic_refresh_circuit(1, "connection refused by embedding backend");
+        assert!(executor.register_actor(root.clone(), ctx));
+        let app = App::default_shared();
+        let metrics = DispatchPathMetrics::new();
+        let cache = HealthRollupCache::new();
+
+        refresh_until_root_count(&cache, &executor, &app, 1);
+        let report = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app)
+            .metrics
+            .expect("health metrics");
+        let semantic = &report["roots"][0]["semantic_index"];
+        assert_eq!(semantic["status"], "backend_unavailable");
+        assert_eq!(
+            semantic["reason"],
+            "connection refused by embedding backend"
+        );
+        assert!(semantic["since_ms"].is_u64());
+        assert!(semantic["next_retry_ms"].is_u64());
+        assert_eq!(report["embedding_backend"]["available"], false);
+        assert_eq!(
+            report["embedding_backend"]["last_error"],
+            "connection refused by embedding backend"
+        );
+        assert!(report["embedding_backend"]["since_ms"].is_u64());
+    }
+
+    #[test]
     fn health_payload_carries_live_semantic_build_progress_only_while_running() {
         let executor = Executor::new();
         let (_dir, root) = test_root("semantic-build-progress-health");
@@ -2543,6 +2680,115 @@ mod tests {
         assert!(ready["roots"][0]["semantic_index"]
             .get("total_chunks")
             .is_none());
+    }
+
+    #[test]
+    fn completed_tier2_pass_returns_plane_to_ready_and_advances_progress() {
+        let executor = Executor::new();
+        let (_dir, root) = test_root("tier2-pass-health-transition");
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(root.as_path().to_path_buf());
+        config.search_index = false;
+        config.semantic_search = false;
+        config.callgraph_store = false;
+        config.inspect.enabled = true;
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            config,
+        ));
+        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), Some(4), false);
+        ctx.mark_status_bar_tier2_stale();
+        ctx.inspect_manager()
+            .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::Duplicates, true);
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let app = App::default_shared();
+        let dispatch = DispatchPathMetrics::new();
+        let cache = HealthRollupCache::new();
+
+        refresh_until_root_count(&cache, &executor, &app, 1);
+        let building = build_health_report(&cache, &executor, &HashMap::new(), &dispatch, &app)
+            .metrics
+            .expect("building health metrics");
+        assert_eq!(building["roots"][0]["tier2"]["status"], "building");
+        let building_progress = building["roots"][0]["tier2"]["last_progress_at_ms"]
+            .as_u64()
+            .expect("building progress timestamp");
+
+        std::thread::sleep(Duration::from_millis(2));
+        ctx.inspect_manager().record_tier2_attempt_outcome_for_test(
+            crate::inspect::InspectCategory::Duplicates,
+            crate::inspect::JobOutcome::Fresh {
+                payload: json!({ "count": 3 }),
+            },
+        );
+        refresh_until_root_count(&cache, &executor, &app, 1);
+        let ready = build_health_report(&cache, &executor, &HashMap::new(), &dispatch, &app)
+            .metrics
+            .expect("ready health metrics");
+        assert_eq!(ready["roots"][0]["tier2"]["status"], "ready");
+        assert!(
+            ready["roots"][0]["tier2"]["last_progress_at_ms"]
+                .as_u64()
+                .expect("ready progress timestamp")
+                > building_progress
+        );
+    }
+
+    #[test]
+    fn budgeted_health_metrics_fit_subc_headroom_with_many_roots() {
+        let long_segment = "root-segment".repeat(18);
+        let roots = (0..71)
+            .map(|index| {
+                json!({
+                    "project_root": format!("/synthetic/{index:02}/{long_segment}"),
+                    "state": "ready",
+                    "search_index": { "status": "ready", "since_ms": 1, "last_progress_at_ms": 1 },
+                    "semantic_index": { "status": "ready", "since_ms": 1, "last_progress_at_ms": 1 },
+                    "tier2": { "status": "ready", "since_ms": 1, "last_progress_at_ms": 1 },
+                })
+            })
+            .collect::<Vec<_>>();
+        let ledger = (0..3)
+            .map(|index| {
+                json!({
+                    "domain": "callgraph_refresh",
+                    "root_id": format!("/very/long/root/{index}/{long_segment}"),
+                    "logical_bytes": 1024,
+                    "physical_bytes": 2048,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut metrics = json!({
+            "actor_count": 71,
+            "root_count": 71,
+            "root_details_omitted": 0,
+            "embedding_backend": { "available": true, "last_error": null, "since_ms": null },
+            "write_ledger_top_10m": ledger,
+            "roots": roots,
+        })
+        .as_object()
+        .expect("metrics object")
+        .clone();
+
+        budget_health_metrics(&mut metrics);
+        let encoded =
+            serde_json::to_vec(&Value::Object(metrics.clone())).expect("encode budgeted metrics");
+        assert!(
+            encoded.len() <= 12 * 1024,
+            "health metrics exceeded SUBC headroom: {} bytes",
+            encoded.len()
+        );
+        assert_eq!(metrics["actor_count"], 71);
+        assert_eq!(metrics["root_count"], 71);
+        assert!(metrics["embedding_backend"].is_object());
+        assert_eq!(
+            metrics["write_ledger_top_10m"].as_array().map(Vec::len),
+            Some(3)
+        );
+        assert_eq!(
+            metrics["metrics_bytes"].as_u64(),
+            Some(encoded.len() as u64)
+        );
     }
 
     #[test]
