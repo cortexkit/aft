@@ -131,6 +131,22 @@ fn write_fresh_v12_manifest(state_home: &Path, now: u64) {
     );
 }
 
+fn write_fresh_v13_manifest(state_home: &Path, now: u64) {
+    let mut manifest: Value =
+        serde_json::from_str(include_str!("fixtures/gh_shim/v12-manifest.json"))
+            .expect("parse v12 manifest fixture");
+    let admin = manifest["tiers"]["admin"]
+        .as_array_mut()
+        .expect("v13 admin tier");
+    for tuple in ["release edit", "release upload"] {
+        admin.push(json!({
+            "tuple": tuple,
+            "platform": ["macos", "linux"]
+        }));
+    }
+    write_manifest_value(state_home, now, manifest, 13);
+}
+
 fn write_fresh_s2_manifest(state_home: &Path, now: u64) {
     write_fresh_manifest_from_fixture(
         state_home,
@@ -1350,6 +1366,46 @@ fn gh_shim_v10_run_rerun_is_operator_bypassed_reads_passthrough_and_cancel_is_re
     assert_eq!(
         fs::read_to_string(recorder).expect("read upstream invocation record"),
         "run rerun 123 --job 17\nrun view 123\nrun watch 123\n"
+    );
+}
+
+#[test]
+fn gh_shim_bound_v13_release_view_delegates_to_upstream() {
+    let temp = tempfile::tempdir().expect("create test root");
+    let config_home = temp.path().join("config");
+    let state_home = temp.path().join("state");
+    let home = temp.path().join("home");
+    let project = write_project_repo(temp.path());
+    let connection_file = write_dead_connection_file(temp.path());
+    let upstream_bin = temp.path().join("upstream-bin");
+    let recorder = temp.path().join("upstream-invocations.txt");
+    write_upstream_gh(&upstream_bin);
+    let now = unix_seconds();
+    write_fresh_v13_manifest(&state_home, now);
+    write_fresh_r3_cache_for_manifest(&state_home, now, 13);
+    write_user_config(&config_home, &connection_file, None);
+
+    let release_view = shim_command(
+        &["release", "view", "v0.56.2"],
+        &project,
+        &config_home,
+        &state_home,
+        &home,
+        &upstream_bin,
+        &recorder,
+    )
+    .output()
+    .expect("spawn mechanical release view");
+
+    assert_eq!(release_view.status.code(), Some(73));
+    assert_eq!(
+        String::from_utf8_lossy(&release_view.stdout),
+        "r2-passthrough\n"
+    );
+    assert!(release_view.stderr.is_empty());
+    assert_eq!(
+        fs::read_to_string(recorder).expect("read upstream invocation record"),
+        "release view v0.56.2\n"
     );
 }
 
