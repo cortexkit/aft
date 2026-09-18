@@ -450,6 +450,53 @@ fn test_project_identity_isolation_continuity_key() {
     );
 }
 
+/// Build a minimal valid zip archive with one stored (method 0) member, so
+/// the fixture is a genuine archive rather than a file that merely ends in
+/// `.zip`. CRC-32 over the payload is required for the entry to be readable.
+fn stored_zip(name: &str, payload: &[u8]) -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &byte in bytes {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+            }
+        }
+        !crc
+    }
+    let crc = crc32(payload).to_le_bytes();
+    let size = (payload.len() as u32).to_le_bytes();
+    let name_len = (name.len() as u16).to_le_bytes();
+    let mut out = Vec::new();
+    // Local file header.
+    out.extend_from_slice(&[0x50, 0x4B, 0x03, 0x04, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    out.extend_from_slice(&crc);
+    out.extend_from_slice(&size);
+    out.extend_from_slice(&size);
+    out.extend_from_slice(&name_len);
+    out.extend_from_slice(&[0, 0]);
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(payload);
+    // Central directory.
+    let central_offset = (out.len() as u32).to_le_bytes();
+    let mut central = Vec::new();
+    central.extend_from_slice(&[0x50, 0x4B, 0x01, 0x02, 20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    central.extend_from_slice(&crc);
+    central.extend_from_slice(&size);
+    central.extend_from_slice(&size);
+    central.extend_from_slice(&name_len);
+    central.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    central.extend_from_slice(name.as_bytes());
+    let central_len = (central.len() as u32).to_le_bytes();
+    out.extend_from_slice(&central);
+    // End of central directory.
+    out.extend_from_slice(&[0x50, 0x4B, 0x05, 0x06, 0, 0, 0, 0, 1, 0, 1, 0]);
+    out.extend_from_slice(&central_len);
+    out.extend_from_slice(&central_offset);
+    out.extend_from_slice(&[0, 0]);
+    out
+}
+
 #[test]
 fn exact_fallback_uses_the_indexers_corpus_eligibility() {
     let dir = create_temp_corpus();
@@ -459,10 +506,15 @@ fn exact_fallback_uses_the_indexers_corpus_eligibility() {
     oversized_text.resize(1_048_577, b'x');
     fs::write(&oversized, oversized_text).expect("write oversized fixture");
 
+    // A real single-member stored (uncompressed) zip carrying the phrase
+    // verbatim: an archive is binary to the corpus sniff even when its payload
+    // is plain text, so the phrase must not surface from it.
     let archive = dir.path().join("src/stored.zip");
-    let source_archive = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../benchmarks/aft-search/bundles/aft-evidence-30d4a64f.zip");
-    fs::copy(source_archive, &archive).expect("copy stored zip fixture");
+    fs::write(
+        &archive,
+        stored_zip("evidence/log.txt", format!("{phrase}3 bytes_freed=11\n").as_bytes()),
+    )
+    .expect("write stored zip fixture");
 
     let lane = ExactLane::new();
     let result = lane.execute_fallback_mode(
