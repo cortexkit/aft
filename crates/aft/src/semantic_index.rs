@@ -35,6 +35,8 @@ const MAX_DIMENSION: usize = 4096;
 const F32_BYTES: usize = std::mem::size_of::<f32>();
 const HEADER_BYTES_V1: usize = 9;
 const HEADER_BYTES_V2: usize = 13;
+// Status reporting mirrors the retry cadence owned by configure's build loop;
+// the build itself remains the sole owner of sleeping and retry admission.
 const BUILD_BACKEND_RETRY_SCHEDULE_SECS: [u64; 3] = [15, 30, 60];
 
 #[derive(Clone, Debug)]
