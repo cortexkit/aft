@@ -455,6 +455,16 @@ pub fn census(
     root: Option<&str>,
     until_ms: u64,
 ) -> rusqlite::Result<Census> {
+    census_with_sample(conn, since_ms, root, until_ms, Bytes::capture())
+}
+
+fn census_with_sample(
+    conn: &rusqlite::Connection,
+    since_ms: u64,
+    root: Option<&str>,
+    until_ms: u64,
+    process_sample: Option<Bytes>,
+) -> rusqlite::Result<Census> {
     let minute_since = since_ms / MINUTE_MS * MINUTE_MS;
     let mut totals = BTreeMap::<(Domain, String), (u64, u64, BTreeSet<String>)>::new();
     {
@@ -540,7 +550,7 @@ pub fn census(
         .clone();
     let live_process = baseline
         .bytes
-        .zip(Bytes::capture())
+        .zip(process_sample)
         .and_then(|(before, after)| after.delta(before));
     let process = live_process.map_or(
         ProcessTotals {
@@ -641,7 +651,9 @@ mod tests {
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     #[test]
@@ -774,7 +786,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = census(&conn, 0, Some(&root), minute + MINUTE_MS).unwrap();
+        let report = census_with_sample(&conn, 0, Some(&root), minute + MINUTE_MS, None).unwrap();
         assert!(!report.coverage.complete);
         assert!(report.coverage.gap_ms > 0);
         assert_eq!(report.attributed_physical_bytes, 40);

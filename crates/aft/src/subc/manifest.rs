@@ -455,6 +455,10 @@ mod tests {
                     crate::commands::memory_census::MEMORY_CENSUS_OPERATION,
                     &ManagementOperationKind::Query,
                 ),
+                (
+                    crate::commands::writes_census::WRITES_CENSUS_OPERATION,
+                    &ManagementOperationKind::Query,
+                ),
             ]
         );
         for operation in operations {
@@ -473,6 +477,10 @@ mod tests {
             .expect("control operations")
             .iter()
             .any(|operation| operation == crate::commands::memory_census::MEMORY_CENSUS_OPERATION));
+        assert!(!control_ops()
+            .expect("control operations")
+            .iter()
+            .any(|operation| operation == crate::commands::writes_census::WRITES_CENSUS_OPERATION));
     }
 
     #[test]
