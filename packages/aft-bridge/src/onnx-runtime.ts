@@ -45,6 +45,7 @@ import {
   readFileSync,
   readlinkSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -57,6 +58,7 @@ import { pipeline } from "node:stream/promises";
 import { error, log, warn } from "./active-logger.js";
 import { withPathPrepended } from "./path-env.js";
 import { PLATFORM_ARCH_MAP } from "./platform.js";
+import { execTarExtractionSync } from "./tar-executable.js";
 
 const ORT_VERSION = "1.24.4";
 const ORT_REPO = "microsoft/onnxruntime";
@@ -772,13 +774,15 @@ async function downloadOnnxRuntime(
 
   log(`Downloading ONNX Runtime v${ORT_VERSION} for ${process.platform}/${process.arch}...`);
 
-  // Use a parent-of-targetDir staging path so the validation walk can compare
-  // resolved paths via realpathSync without rejecting symlinks that happen to
-  // resolve into the parent (e.g. when storageDir is itself behind a symlink).
+  // Keep every unverified byte under the version-scoped staging directory.
+  // The managed target is not touched until extraction and library validation
+  // have completed, so a failed repair cannot erase a working older runtime.
   const tmpDir = `${targetDir}.tmp.${process.pid}.${Date.now().toString(36)}`;
+  const extractionRoot = join(tmpDir, "extract");
+  const stagedInstallDir = join(tmpDir, "install");
 
   try {
-    mkdirSync(tmpDir, { recursive: true });
+    mkdirSync(extractionRoot, { recursive: true });
     const archivePath = join(tmpDir, `onnxruntime.${info.archiveType}`);
 
     // Download with a streaming size cap.
@@ -788,14 +792,10 @@ async function downloadOnnxRuntime(
     const archiveSha256 = sha256File(archivePath);
     log(`ONNX Runtime archive sha256=${archiveSha256}`);
 
-    // Extract.
     if (info.archiveType === "tgz") {
-      execFileSync("tar", ["xzf", archivePath, "-C", tmpDir], {
-        stdio: "pipe",
-        timeout: 120_000,
-      });
+      execTarExtractionSync(["xzf", archivePath, "-C", extractionRoot], 120_000);
     } else {
-      await extractZipArchive(archivePath, tmpDir);
+      await extractZipArchive(archivePath, extractionRoot);
     }
 
     // Drop the archive itself before validation so it doesn't double-count
@@ -807,16 +807,13 @@ async function downloadOnnxRuntime(
     }
 
     // Containment + size-bomb check.
-    validateExtractedTree(tmpDir);
+    validateExtractedTree(extractionRoot);
 
     // Find and copy the library file.
-    const extractedDir = join(tmpDir, info.assetName, "lib");
+    const extractedDir = join(extractionRoot, info.assetName, "lib");
     if (!existsSync(extractedDir)) {
       throw new Error(`Expected directory not found: ${extractedDir}`);
     }
-
-    // Create target directory and copy library files.
-    mkdirSync(targetDir, { recursive: true });
 
     // Copy all library files (main + versioned symlinks).
     // On Linux, .so files are often symlinks (libonnxruntime.so → libonnxruntime.so.1.24.4).
@@ -847,42 +844,58 @@ async function downloadOnnxRuntime(
       }
     }
 
-    copyOnnxLibraries(info, extractedDir, targetDir, realFiles, symlinks);
+    copyOnnxLibraries(info, extractedDir, stagedInstallDir, realFiles, symlinks);
 
-    // Persist version + archive sha256 for TOFU on
-    // future sessions. Hash the actual main library file (not the
-    // archive) because that's what we'll re-hash on the next ensure call.
-    const libPath = join(targetDir, info.libName);
-    let libHash: string | null = null;
-    try {
-      libHash = sha256File(libPath);
-    } catch (err) {
-      // If we can't even hash our just-installed library, skip TOFU rather
-      // than blocking semantic search. Future sessions will trust the path.
-      warn(`Could not hash newly-installed ONNX library at ${libPath}: ${err}`);
-    }
-    writeOnnxInstalledMeta(targetDir, ORT_VERSION, libHash, archiveSha256);
+    // Persist the installed version, archive SHA-256, and main-library hash so
+    // future sessions can verify the runtime against the first installation.
+    // Hash the actual main library because steady-state resolution checks it.
+    const libPath = join(stagedInstallDir, info.libName);
+    const libHash = sha256File(libPath);
+    writeOnnxInstalledMeta(stagedInstallDir, ORT_VERSION, libHash, archiveSha256);
 
-    // Cleanup temp directory
+    publishOnnxRuntime(stagedInstallDir, targetDir);
     rmSync(tmpDir, { recursive: true, force: true });
 
     log(`ONNX Runtime v${ORT_VERSION} installed to ${targetDir}`);
     return targetDir;
   } catch (err) {
     error(`Failed to download ONNX Runtime: ${err}`);
-    // Cleanup on failure — both the staging dir and any partially populated
-    // target dir, so the next attempt starts from a clean slate.
     try {
       rmSync(tmpDir, { recursive: true, force: true });
     } catch {
       // ignore cleanup errors
     }
-    try {
-      rmSync(targetDir, { recursive: true, force: true });
-    } catch {
-      // ignore
-    }
     return null;
+  }
+}
+
+function publishOnnxRuntime(stagedInstallDir: string, targetDir: string): void {
+  const backupDir = `${targetDir}.backup.${process.pid}.${Date.now().toString(36)}`;
+  const hadTarget = existsSync(targetDir);
+
+  if (hadTarget) renameSync(targetDir, backupDir);
+  try {
+    renameSync(stagedInstallDir, targetDir);
+  } catch (installError) {
+    if (hadTarget) {
+      try {
+        renameSync(backupDir, targetDir);
+      } catch (restoreError) {
+        throw new Error(
+          `ONNX Runtime replacement failed and the previous runtime could not be restored from ${backupDir}: ${restoreError}`,
+          { cause: installError },
+        );
+      }
+    }
+    throw installError;
+  }
+
+  if (hadTarget) {
+    try {
+      rmSync(backupDir, { recursive: true, force: true });
+    } catch (err) {
+      warn(`Could not remove replaced ONNX Runtime backup at ${backupDir}: ${err}`);
+    }
   }
 }
 
@@ -958,15 +971,9 @@ function copyOnnxLibraries(
 
 async function extractZipArchive(archivePath: string, destinationDir: string): Promise<void> {
   if (process.platform === "win32") {
-    // Avoid PowerShell. Even via execFileSync, PowerShell
-    // applies its own quoting rules to `$args[N]` lookups that could allow
-    // attacker-controlled fragments to escape into command interpretation.
-    // tar.exe ships in System32 on Windows 10 build 17063+ — execFileSync
-    // with argv has no shell parser in the chain.
-    execFileSync("tar.exe", ["-xf", archivePath, "-C", destinationDir], {
-      stdio: "pipe",
-      timeout: 120_000,
-    });
+    // Avoid PowerShell and PATH-resolved GNU tar. System32 bsdtar accepts
+    // drive-letter paths and direct argv execution adds no shell parser.
+    execTarExtractionSync(["-xf", archivePath, "-C", destinationDir], 120_000);
     return;
   }
 

@@ -15,7 +15,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { DiagnosticReport, HarnessDiagnostic } from "../lib/diagnostics.js";
@@ -243,10 +243,12 @@ describe("runOnnxFix", () => {
     expect(rmCalls).toBe(0); // critical: must not delete on decline
   });
 
-  test("clears the storage onnxruntime dir on consent", async () => {
+  test("replaces the storage onnxruntime dir only after staging succeeds", async () => {
     const storagePath = join(workDir, "storage");
     const onnxDir = join(storagePath, "onnxruntime");
+    const previousMarker = join(onnxDir, "1.18.0", "previous-runtime");
     mkdirSync(join(onnxDir, "1.18.0"), { recursive: true });
+    writeFileSync(previousMarker, "keep until replacement is ready");
 
     const report = makeReport([
       makeHarness({
@@ -266,7 +268,12 @@ describe("runOnnxFix", () => {
       rmFn: (path) => {
         removed.push(path);
       },
-      ensureFn: async () => join(storagePath, "onnxruntime", "1.24.4"),
+      ensureFn: async (stagingStorageDir) => {
+        expect(existsSync(previousMarker)).toBe(true);
+        const installedPath = join(stagingStorageDir, "onnxruntime", "1.24.4");
+        mkdirSync(installedPath, { recursive: true });
+        return installedPath;
+      },
     });
 
     expect(result).not.toBe(null);
@@ -276,8 +283,48 @@ describe("runOnnxFix", () => {
     // Critical safety: the path deleted must be inside our test workDir,
     // never `/usr/lib/...`.
     expect(removed).toHaveLength(1);
-    expect(removed[0]).toBe(onnxDir);
+    expect(removed[0]).toStartWith(`${onnxDir}.backup.`);
     expect(removed[0]).toContain(workDir);
+    expect(existsSync(join(onnxDir, "1.24.4"))).toBe(true);
+  });
+
+  test("keeps the previous managed runtime when staging fails", async () => {
+    const storagePath = join(workDir, "storage");
+    const onnxDir = join(storagePath, "onnxruntime");
+    const previousMarker = join(onnxDir, "1.18.0", "previous-runtime");
+    mkdirSync(join(onnxDir, "1.18.0"), { recursive: true });
+    writeFileSync(previousMarker, "still usable");
+
+    const report = makeReport([
+      makeHarness({
+        storageDir: { path: storagePath, exists: true, accessible: true, sizesByKey: {} },
+        onnxRuntime: {
+          ...makeHarness().onnxRuntime,
+          cachedPath: join(onnxDir, "1.18.0"),
+          cachedVersion: "1.18.0",
+          cachedCompatible: false,
+        },
+      }),
+    ]);
+    const removed: string[] = [];
+
+    const result = await runOnnxFix([], report, {
+      yes: true,
+      rmFn: (path) => removed.push(path),
+      ensureFn: async (stagingStorageDir) => {
+        mkdirSync(join(stagingStorageDir, "onnxruntime", "1.24.4.tmp.failed"), {
+          recursive: true,
+        });
+        return null;
+      },
+    });
+
+    expect(result?.installed).toBe(0);
+    expect(result?.cleared).toBe(0);
+    expect(result?.errors[0]?.error).toContain("download was unavailable");
+    expect(removed).toEqual([]);
+    expect(existsSync(onnxDir)).toBe(true);
+    expect(existsSync(previousMarker)).toBe(true);
   });
 
   test("never targets system paths even when the issue is a system install", async () => {
@@ -300,7 +347,11 @@ describe("runOnnxFix", () => {
     await runOnnxFix([], report, {
       confirmFn: async () => true,
       rmFn: (path) => removed.push(path),
-      ensureFn: async () => join(storagePath, "onnxruntime", "1.24.4"),
+      ensureFn: async (stagingStorageDir) => {
+        const installedPath = join(stagingStorageDir, "onnxruntime", "1.24.4");
+        mkdirSync(installedPath, { recursive: true });
+        return installedPath;
+      },
     });
 
     // The candidate's storage dir doesn't exist (we never downloaded
@@ -332,11 +383,14 @@ describe("runOnnxFix", () => {
       yes: true,
       ensureFn: async (storageDir) => {
         ensured.push(storageDir);
-        return join(storageDir, "onnxruntime", "1.24.4");
+        const installedPath = join(storageDir, "onnxruntime", "1.24.4");
+        mkdirSync(installedPath, { recursive: true });
+        return installedPath;
       },
     });
 
-    expect(ensured).toEqual([storagePath]);
+    expect(ensured).toHaveLength(1);
+    expect(ensured[0]).toStartWith(`${storagePath}.onnx-fix.tmp.`);
     expect(result?.installed).toBe(1);
     expect(result?.errors).toEqual([]);
   });

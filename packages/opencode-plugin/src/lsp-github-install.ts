@@ -51,7 +51,11 @@ import {
 import { dirname, join, relative, resolve } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { getAftLspBinariesDir } from "@cortexkit/aft-bridge";
+import {
+  execTarExtractionSync,
+  getAftLspBinariesDir,
+  windowsTarExecutable,
+} from "@cortexkit/aft-bridge";
 import { error, log, warn } from "./logger.js";
 import {
   readInstalledMetaIn,
@@ -857,8 +861,7 @@ export function precheckArchiveContents(
       if (entry.length > 0) assertArchiveEntryPath(entry);
     }
   } else {
-    const command = process.platform === "win32" ? "tar.exe" : "tar";
-    totalBytes = precheckWithTar(archivePath, command);
+    totalBytes = precheckWithTar(archivePath, windowsTarExecutable());
   }
   if (totalBytes > MAX_EXTRACT_BYTES) {
     throw new Error(`archive uncompressed size ${totalBytes} exceeds ${MAX_EXTRACT_BYTES}`);
@@ -973,21 +976,9 @@ function validateCachedGithubInstall(spec: GithubServerSpec, platform: Platform)
 function runPlatformExtractor(archivePath: string, destDir: string, archiveType: string): void {
   if (archiveType === "zip") {
     if (process.platform === "win32") {
-      // PowerShell-via-execFileSync is technically argv-mode
-      // (no shell parser between us and `Expand-Archive`), but PowerShell still
-      // applies its own quoting/escape rules to `$args[N]` lookups, and a
-      // determined attacker-controlled path or tag can hit those edges. We
-      // also previously had a cmd.exe fallback that is plainly unsafe.
-      //
-      // Solution: drop PowerShell entirely. Windows 10 build 17063+ ships
-      // tar.exe in System32, which is the only modern Windows we'd ever run
-      // an LSP installer on (Node 20+ also drops Windows 8.1). Direct
-      // execFileSync to tar.exe with an argv array has no shell parser in
-      // the chain at all.
-      execFileSync("tar.exe", ["-xf", archivePath, "-C", destDir], {
-        stdio: "pipe",
-        timeout: 180_000,
-      });
+      // Avoid PowerShell and PATH-resolved GNU tar. System32 bsdtar accepts
+      // drive-letter paths and direct argv execution adds no shell parser.
+      execTarExtractionSync(["-xf", archivePath, "-C", destDir], 180_000);
       return;
     }
     execFileSync("unzip", ["-q", "-o", archivePath, "-d", destDir], {
@@ -998,18 +989,12 @@ function runPlatformExtractor(archivePath: string, destDir: string, archiveType:
   }
 
   if (archiveType === "tar.gz") {
-    execFileSync("tar", ["-xzf", archivePath, "-C", destDir], {
-      stdio: "pipe",
-      timeout: 180_000,
-    });
+    execTarExtractionSync(["-xzf", archivePath, "-C", destDir], 180_000);
     return;
   }
 
   if (archiveType === "tar.xz") {
-    execFileSync("tar", ["-xf", archivePath, "-C", destDir], {
-      stdio: "pipe",
-      timeout: 180_000,
-    });
+    execTarExtractionSync(["-xf", archivePath, "-C", destDir], 180_000);
     return;
   }
 

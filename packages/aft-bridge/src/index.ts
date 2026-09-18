@@ -224,6 +224,7 @@ export {
   type SubcTransportPoolOptions,
   SubcTransportShuttingDownError,
 } from "./subc-transport.js";
+export { execTarExtractionSync, windowsTarExecutable } from "./tar-executable.js";
 // --- shared agent-facing tool formatting ---
 export type { ReadFooterOptions } from "./tool-format.js";
 export { formatBridgeErrorMessage, formatReadFooter } from "./tool-format.js";

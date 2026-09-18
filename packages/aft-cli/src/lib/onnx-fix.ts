@@ -12,9 +12,9 @@
  *   2. Install ONNX 1.24 system-wide — manual, slow, distro-specific.
  *   3. Run doctor — diagnostics only.
  *
- * AFT owns a safe fourth option end-to-end: clear only
- * `<storage_dir>/onnxruntime/` and immediately download a managed v1.24.
- * That's what `--fix` does.
+ * AFT owns a safe fourth option end-to-end: stage and verify a managed v1.24,
+ * then transactionally replace only `<storage_dir>/onnxruntime/`. That's what
+ * `--fix` does.
  *
  * Pair this with the resolver fix in `packages/aft-bridge/src/onnx-runtime.ts`
  * (which now skips system installs below v1.20) and the user gets a working
@@ -22,8 +22,9 @@
  * to system files.
  */
 
-import { existsSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
+import { isAbsolute, join, relative } from "node:path";
 import { ensureOnnxRuntime } from "@cortexkit/aft-bridge";
 
 import type { HarnessAdapter } from "../adapters/types.js";
@@ -51,9 +52,9 @@ export function findOnnxFixCandidates(report: DiagnosticReport): OnnxFixCandidat
 
     const storageOnnxDir = join(harness.storageDir.path, "onnxruntime");
 
-    // A stale managed runtime must be removed before ensureOnnxRuntime can
-    // install the current version. An incompatible system runtime is never
-    // deleted; the bridge resolver skips it while installing managed storage.
+    // A stale managed runtime needs replacement. An incompatible system
+    // runtime is never deleted; the bridge resolver skips it while installing
+    // the replacement in managed storage.
     const systemTooOld =
       harness.onnxRuntime.systemPath !== null && harness.onnxRuntime.systemCompatible === false;
     const cachedTooOld =
@@ -63,7 +64,7 @@ export function findOnnxFixCandidates(report: DiagnosticReport): OnnxFixCandidat
     if (cachedTooOld) {
       candidates.push({
         harness,
-        reason: `cached ONNX Runtime at ${harness.onnxRuntime.cachedPath} is v${harness.onnxRuntime.cachedVersion}, but AFT requires ${harness.onnxRuntime.requirement}. Clearing it allows an immediate managed download.`,
+        reason: `cached ONNX Runtime at ${harness.onnxRuntime.cachedPath} is v${harness.onnxRuntime.cachedVersion}, but AFT requires ${harness.onnxRuntime.requirement}. AFT will stage and verify a managed replacement before removing it.`,
         storageOnnxDir,
         storageOnnxBytes: existsSync(storageOnnxDir) ? dirSize(storageOnnxDir) : 0,
       });
@@ -114,6 +115,81 @@ export interface OnnxFixOptions {
   ensureFn?: (storageDir: string) => Promise<string | null>;
 }
 
+interface ManagedReplacementResult {
+  installedPath: string;
+  clearedPrevious: boolean;
+  cleanupError?: string;
+}
+
+async function installManagedReplacement(
+  candidate: OnnxFixCandidate,
+  ensureFn: NonNullable<OnnxFixOptions["ensureFn"]>,
+  rmFn: NonNullable<OnnxFixOptions["rmFn"]>,
+): Promise<ManagedReplacementResult> {
+  const suffix = `${process.pid}.${Date.now().toString(36)}.${randomBytes(6).toString("hex")}`;
+  const stagingStorageDir = `${candidate.harness.storageDir.path}.onnx-fix.tmp.${suffix}`;
+  const stagedOnnxDir = join(stagingStorageDir, "onnxruntime");
+  const backupDir = `${candidate.storageOnnxDir}.backup.${suffix}`;
+
+  try {
+    const stagedInstalledPath = await ensureFn(stagingStorageDir);
+    if (!stagedInstalledPath || !existsSync(stagedInstalledPath)) {
+      throw new Error("managed ONNX Runtime download was unavailable");
+    }
+
+    const installedRelativePath = relative(stagedOnnxDir, stagedInstalledPath);
+    if (
+      isAbsolute(installedRelativePath) ||
+      installedRelativePath === ".." ||
+      installedRelativePath.startsWith("../") ||
+      installedRelativePath.startsWith("..\\")
+    ) {
+      throw new Error(`managed ONNX Runtime was installed outside staging: ${stagedInstalledPath}`);
+    }
+
+    mkdirSync(candidate.harness.storageDir.path, { recursive: true });
+    const hadPrevious = existsSync(candidate.storageOnnxDir);
+    if (hadPrevious) renameSync(candidate.storageOnnxDir, backupDir);
+
+    try {
+      renameSync(stagedOnnxDir, candidate.storageOnnxDir);
+    } catch (installError) {
+      if (hadPrevious) {
+        try {
+          renameSync(backupDir, candidate.storageOnnxDir);
+        } catch (restoreError) {
+          throw new Error(
+            `managed ONNX Runtime replacement failed and the previous runtime could not be restored from ${backupDir}: ${restoreError}`,
+            { cause: installError },
+          );
+        }
+      }
+      throw installError;
+    }
+
+    let cleanupError: string | undefined;
+    if (hadPrevious) {
+      try {
+        rmFn(backupDir, { recursive: true, force: true });
+      } catch (err) {
+        cleanupError = err instanceof Error ? err.message : String(err);
+      }
+    }
+
+    return {
+      installedPath: join(candidate.storageOnnxDir, installedRelativePath),
+      clearedPrevious: hadPrevious && cleanupError === undefined,
+      cleanupError,
+    };
+  } finally {
+    try {
+      rmSync(stagingStorageDir, { recursive: true, force: true });
+    } catch {
+      // A leftover staging parent does not invalidate the published runtime.
+    }
+  }
+}
+
 export async function runOnnxFix(
   adapters: HarnessAdapter[],
   report: DiagnosticReport,
@@ -130,7 +206,7 @@ export async function runOnnxFix(
     log.info(`  • ${candidate.harness.displayName}: ${candidate.reason}`);
     if (candidate.storageOnnxBytes > 0) {
       log.info(
-        `    will delete: ${candidate.storageOnnxDir} (${formatBytes(candidate.storageOnnxBytes)})`,
+        `    will replace after a verified download: ${candidate.storageOnnxDir} (${formatBytes(candidate.storageOnnxBytes)})`,
       );
     } else {
       log.info("    no AFT-managed ONNX cache to delete");
@@ -138,7 +214,7 @@ export async function runOnnxFix(
   }
 
   note(
-    "This NEVER touches system paths like /usr/lib or C:\\Windows\\System32. It only replaces AFT's own ONNX cache, then downloads the compatible managed runtime.",
+    "This NEVER touches system paths like /usr/lib or C:\\Windows\\System32. It downloads and verifies a replacement before swapping AFT's own ONNX cache.",
     "Safe operation",
   );
 
@@ -157,35 +233,28 @@ export async function runOnnxFix(
   const ensureFn = options.ensureFn ?? ensureOnnxRuntime;
 
   for (const candidate of candidates) {
-    if (existsSync(candidate.storageOnnxDir)) {
-      try {
-        rmFn(candidate.storageOnnxDir, { recursive: true, force: true });
+    try {
+      log.info(`${candidate.harness.displayName}: downloading managed ONNX Runtime…`);
+      const replacement = await installManagedReplacement(candidate, ensureFn, rmFn);
+
+      if (replacement.clearedPrevious) {
         result.cleared += 1;
         result.bytesReclaimed += candidate.storageOnnxBytes;
         log.success(
-          `${candidate.harness.displayName}: cleared ${candidate.storageOnnxDir} (reclaimed ${formatBytes(candidate.storageOnnxBytes)})`,
+          `${candidate.harness.displayName}: replaced ${candidate.storageOnnxDir} (reclaimed ${formatBytes(candidate.storageOnnxBytes)})`,
         );
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        log.error(
-          `${candidate.harness.displayName}: failed to clear ${candidate.storageOnnxDir}: ${message}`,
-        );
-        result.errors.push({ path: candidate.storageOnnxDir, error: message });
-        continue;
       }
-    }
+      if (replacement.cleanupError) {
+        log.warn(
+          `${candidate.harness.displayName}: installed the replacement but could not remove the previous runtime backup: ${replacement.cleanupError}`,
+        );
+        result.errors.push({ path: candidate.storageOnnxDir, error: replacement.cleanupError });
+      }
 
-    try {
-      log.info(`${candidate.harness.displayName}: downloading managed ONNX Runtime…`);
-      const installedPath = await ensureFn(candidate.harness.storageDir.path);
-      if (!installedPath) {
-        const message = "managed ONNX Runtime download was unavailable";
-        log.error(`${candidate.harness.displayName}: ${message}`);
-        result.errors.push({ path: candidate.storageOnnxDir, error: message });
-        continue;
-      }
       result.installed += 1;
-      log.success(`${candidate.harness.displayName}: ONNX Runtime installed at ${installedPath}`);
+      log.success(
+        `${candidate.harness.displayName}: ONNX Runtime installed at ${replacement.installedPath}`,
+      );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       log.error(`${candidate.harness.displayName}: ONNX Runtime download failed: ${message}`);
