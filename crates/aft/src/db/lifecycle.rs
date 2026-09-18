@@ -6,13 +6,39 @@
 
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
+use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::write_ledger::{Counter as WriteCounter, Domain as WriteDomain};
 
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
+
+pub const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalCheckpointMode {
+    Passive,
+    Truncate,
+}
+
+impl WalCheckpointMode {
+    const fn pragma_sql(self) -> &'static str {
+        match self {
+            Self::Passive => "PRAGMA wal_checkpoint(PASSIVE)",
+            Self::Truncate => "PRAGMA wal_checkpoint(TRUNCATE)",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalCheckpointResult {
+    pub busy: i64,
+    pub log_frames: i64,
+    pub checkpointed_frames: i64,
+}
 
 /// Names each production connection-opening seam so health can attribute a live
 /// connection without exposing cache-key paths in the process-wide report.
@@ -61,6 +87,15 @@ impl SqliteStore {
             Self::Unmapped(_) => None,
         }
     }
+
+    const fn checkpoint_domain(self) -> Option<WriteDomain> {
+        match self {
+            Self::CallgraphGeneration | Self::CallgraphColdGeneration => {
+                Some(WriteDomain::CallgraphCheckpoint)
+            }
+            _ => self.write_domain(),
+        }
+    }
 }
 
 /// A store/count row is used instead of a map so status consumers can retain a
@@ -82,10 +117,20 @@ pub struct SqliteConnectionSnapshot {
 }
 
 /// Production `rusqlite::Connection::open*` call sites that intentionally do
-/// not pass through [`TrackedConnection`]. The list is empty today. Test-only
-/// fixture openers are excluded because they cannot affect daemon lifecycle
-/// health and are compiled out of non-test builds.
-pub const SQLITE_UNINSTRUMENTED_OPENERS: &[&str] = &[];
+/// not pass through [`TrackedConnection`]. Read-only probes are listed because
+/// they retain SQLite's built-in WAL policy; write-capable seams name the
+/// accounting mechanism or residual explicitly.
+pub const SQLITE_UNINSTRUMENTED_OPENERS: &[&str] = &[
+    "alias::AliasStore::open: WAL writer retains SQLite's built-in autocheckpoint and remains a named residual",
+    "alias::ManifestSqliteStore::open: rollback-journal bytes remain a named residual",
+    "gc::sweep_plane: WAL blob-store writer retains SQLite's built-in autocheckpoint and remains a named residual",
+    "views::assembly::assemble: derived WAL keeper; checkpoint credited by views::generation::checkpoint_derived",
+    "views::generation::checkpoint_derived: raw WAL connection; explicit checkpoint credited at call site",
+    "views::materialization::materialize: raw WAL connection; publication phase process-I/O attribution",
+    "views::ViewStore::open_pointer_connection: raw WAL connection; publication phase process-I/O attribution",
+    "path_status::PathStatusStore::open_at: rollback-journal bytes remain a named residual",
+    "commands::semantic_search::view_semantic_search: read-only WAL opener retains SQLite's built-in policy",
+];
 
 fn live_counts() -> &'static Mutex<BTreeMap<SqliteStore, u64>> {
     static COUNTS: OnceLock<Mutex<BTreeMap<SqliteStore, u64>>> = OnceLock::new();
@@ -166,6 +211,91 @@ pub fn connection_snapshot() -> SqliteConnectionSnapshot {
     }
 }
 
+#[derive(Debug)]
+struct WalHookState {
+    threshold_pages: AtomicI32,
+    last_log_frames: AtomicI32,
+    last_checkpointed_frames: AtomicI32,
+    page_size: u64,
+    checkpoint_counter: WriteCounter,
+}
+
+impl WalHookState {
+    fn observe_log(&self, log_frames: i32) {
+        let log_frames = log_frames.max(0);
+        let previous = self.last_log_frames.swap(log_frames, Ordering::Relaxed);
+        if log_frames < previous {
+            self.last_checkpointed_frames.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn record_checkpoint(&self, log_frames: i32, checkpointed_frames: i32) -> u64 {
+        if log_frames < 0 || checkpointed_frames < 0 {
+            return 0;
+        }
+        self.observe_log(log_frames);
+        let previous = self.last_checkpointed_frames.load(Ordering::Relaxed).max(0);
+        let checkpointed_frames = checkpointed_frames.max(previous);
+        self.last_checkpointed_frames
+            .store(checkpointed_frames, Ordering::Relaxed);
+        u64::try_from(checkpointed_frames.saturating_sub(previous)).unwrap_or(0)
+    }
+
+    fn outstanding_frames(&self) -> u64 {
+        let log_frames = self.last_log_frames.load(Ordering::Relaxed).max(0);
+        let checkpointed_frames = self
+            .last_checkpointed_frames
+            .load(Ordering::Relaxed)
+            .clamp(0, log_frames);
+        u64::try_from(log_frames.saturating_sub(checkpointed_frames)).unwrap_or(0)
+    }
+
+    fn reset_after_truncate(&self) {
+        self.last_log_frames.store(0, Ordering::Relaxed);
+        self.last_checkpointed_frames.store(0, Ordering::Relaxed);
+    }
+
+    fn bytes_for_frames(&self, frames: u64) -> u64 {
+        frames.saturating_mul(self.page_size)
+    }
+}
+
+unsafe extern "C" fn tracked_wal_hook(
+    context: *mut c_void,
+    db: *mut rusqlite::ffi::sqlite3,
+    database_name: *const c_char,
+    frame_count: c_int,
+) -> c_int {
+    let state = unsafe { &*(context.cast::<WalHookState>()) };
+    state.observe_log(frame_count);
+    if frame_count < state.threshold_pages.load(Ordering::Relaxed) {
+        return rusqlite::ffi::SQLITE_OK;
+    }
+
+    let mut log_frames = 0;
+    let mut checkpointed_frames = 0;
+    // This is the same threshold check and PASSIVE checkpoint used by SQLite's
+    // sqlite3WalDefaultHook. The custom hook only adds byte attribution.
+    let result = unsafe {
+        rusqlite::ffi::sqlite3_wal_checkpoint_v2(
+            db,
+            database_name,
+            rusqlite::ffi::SQLITE_CHECKPOINT_PASSIVE,
+            &mut log_frames,
+            &mut checkpointed_frames,
+        )
+    };
+    if result == rusqlite::ffi::SQLITE_OK {
+        let frames = state.record_checkpoint(log_frames, checkpointed_frames);
+        state
+            .checkpoint_counter
+            .credit(0, state.bytes_for_frames(frames));
+    }
+    // SQLite's built-in autocheckpoint hook deliberately does not fail the
+    // already-committed transaction when a PASSIVE checkpoint is busy.
+    rusqlite::ffi::SQLITE_OK
+}
+
 /// A `rusqlite::Connection` whose lifetime contributes to the process-wide
 /// health census. It dereferences to `Connection`, keeping existing query APIs
 /// and transaction helpers unchanged while making close accounting automatic.
@@ -175,6 +305,7 @@ pub struct TrackedConnection {
     store: SqliteStore,
     write_counter: WriteCounter,
     page_size: u64,
+    wal_hook: Box<WalHookState>,
 }
 
 impl TrackedConnection {
@@ -230,12 +361,30 @@ impl TrackedConnection {
         let page_size = connection
             .pragma_query_value(None, "page_size", |row| row.get::<_, u64>(0))
             .unwrap_or(4096);
+        let root_id = root_id.into();
         let write_counter = crate::write_ledger::register(
             store.write_domain().unwrap_or(WriteDomain::Other),
-            root_id,
+            root_id.clone(),
         );
         if store.write_domain().is_none() {
             write_counter.note_seam_label(store.label());
+        }
+        let checkpoint_counter = crate::write_ledger::register(
+            store.checkpoint_domain().unwrap_or(WriteDomain::Other),
+            root_id,
+        );
+        let wal_hook = Box::new(WalHookState {
+            threshold_pages: AtomicI32::new(DEFAULT_WAL_AUTOCHECKPOINT_PAGES as i32),
+            last_log_frames: AtomicI32::new(0),
+            last_checkpointed_frames: AtomicI32::new(0),
+            page_size,
+            checkpoint_counter,
+        });
+        let context = std::ptr::from_ref(wal_hook.as_ref())
+            .cast_mut()
+            .cast::<c_void>();
+        unsafe {
+            rusqlite::ffi::sqlite3_wal_hook(connection.handle(), Some(tracked_wal_hook), context);
         }
         register_open(store);
         let tracked = Self {
@@ -243,6 +392,7 @@ impl TrackedConnection {
             store,
             write_counter,
             page_size,
+            wal_hook,
         };
         tracked.reset_write_page_sample();
         Ok(tracked)
@@ -284,6 +434,106 @@ impl TrackedConnection {
         let bytes = self.cache_write_pages(true).saturating_mul(self.page_size);
         crate::write_ledger::register(domain, self.write_counter.root_id()).credit(0, bytes);
         bytes
+    }
+
+    /// Replace SQLite's built-in WAL autocheckpoint threshold without changing
+    /// its threshold or PASSIVE-mode policy. The installed hook owns the checkpoint
+    /// so it can attribute bytes copied from the WAL into the main database,
+    /// including copies performed outside the usual pager accounting.
+    pub fn set_wal_autocheckpoint(&self, pages: i64) -> rusqlite::Result<()> {
+        let pages = i32::try_from(pages).map_err(|_| {
+            rusqlite::Error::InvalidParameterName(format!(
+                "wal_autocheckpoint pages out of range: {pages}"
+            ))
+        })?;
+        if pages <= 0 {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "wal_autocheckpoint pages must be positive: {pages}"
+            )));
+        }
+        self.wal_hook
+            .threshold_pages
+            .store(pages, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn wal_autocheckpoint_pages(&self) -> i64 {
+        i64::from(self.wal_hook.threshold_pages.load(Ordering::Relaxed))
+    }
+
+    fn query_wal_checkpoint(
+        &self,
+        mode: WalCheckpointMode,
+    ) -> rusqlite::Result<WalCheckpointResult> {
+        self.connection
+            .as_ref()
+            .expect("tracked SQLite connection accessed after drop")
+            .query_row(mode.pragma_sql(), [], |row| {
+                Ok(WalCheckpointResult {
+                    busy: row.get(0)?,
+                    log_frames: row.get(1)?,
+                    checkpointed_frames: row.get(2)?,
+                })
+            })
+    }
+
+    fn credit_checkpoint_result_as(&self, result: WalCheckpointResult, domain: WriteDomain) -> u64 {
+        let frames = self.wal_hook.record_checkpoint(
+            i32::try_from(result.log_frames).unwrap_or(-1),
+            i32::try_from(result.checkpointed_frames).unwrap_or(-1),
+        );
+        let bytes = self.wal_hook.bytes_for_frames(frames);
+        crate::write_ledger::register(domain, self.write_counter.root_id()).credit(0, bytes);
+        bytes
+    }
+
+    fn checkpoint_outstanding_frames(&self) -> u64 {
+        let Some(path) = self
+            .connection
+            .as_ref()
+            .and_then(Connection::path)
+            .map(Path::new)
+        else {
+            return self.wal_hook.outstanding_frames();
+        };
+        let wal_bytes = std::fs::metadata(format!("{}-wal", path.display()))
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let log_frames = wal_bytes.saturating_sub(32) / (self.page_size + 24);
+        let backfilled = std::fs::read(format!("{}-shm", path.display()))
+            .ok()
+            .and_then(|bytes| bytes.get(96..100)?.try_into().ok())
+            .map(u32::from_ne_bytes)
+            .map(u64::from)
+            .unwrap_or(0);
+        log_frames.saturating_sub(backfilled.min(log_frames))
+    }
+
+    /// Run an explicit WAL checkpoint and credit only frames newly copied into
+    /// the main database. SQLite zeros the frame counts after a successful
+    /// TRUNCATE, so that mode snapshots the WAL-index backfill counter before
+    /// running the requested checkpoint once with its original busy policy.
+    pub fn checkpoint_wal_as(
+        &self,
+        mode: WalCheckpointMode,
+        domain: WriteDomain,
+    ) -> rusqlite::Result<WalCheckpointResult> {
+        if mode == WalCheckpointMode::Truncate {
+            let outstanding = self.checkpoint_outstanding_frames();
+            let result = self.query_wal_checkpoint(WalCheckpointMode::Truncate)?;
+            if result.busy == 0 {
+                crate::write_ledger::register(domain, self.write_counter.root_id())
+                    .credit(0, self.wal_hook.bytes_for_frames(outstanding));
+                self.wal_hook.reset_after_truncate();
+            } else {
+                self.credit_checkpoint_result_as(result, domain);
+            }
+            Ok(result)
+        } else {
+            let result = self.query_wal_checkpoint(mode)?;
+            self.credit_checkpoint_result_as(result, domain);
+            Ok(result)
+        }
     }
 }
 
@@ -381,7 +631,6 @@ mod tests {
         )
         .unwrap();
         conn.pragma_update(None, "journal_mode", "WAL").unwrap();
-        conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
         conn.execute_batch("CREATE TABLE nodes(id INTEGER PRIMARY KEY, payload BLOB);")
             .unwrap();
         conn.sample_write_pages();
@@ -432,6 +681,199 @@ mod tests {
         );
     }
 
+    fn wal_path(path: &Path) -> std::path::PathBuf {
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        wal.into()
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct WalWorkloadMetrics {
+        checkpoints: u64,
+        wal_high_water: u64,
+        cache_write_bytes: u64,
+        backfill_bytes: u64,
+    }
+
+    fn shm_checkpoint_state(path: &Path) -> (u32, u32) {
+        // Reading mxFrame/nBackfill from the WAL-index is observational. Using
+        // PRAGMA wal_checkpoint(PASSIVE) here would itself move the quantity the
+        // parity test is intended to measure.
+        let mut shm = path.as_os_str().to_owned();
+        shm.push("-shm");
+        let bytes = std::fs::read(std::path::PathBuf::from(shm)).unwrap();
+        let mx_frame = u32::from_ne_bytes(bytes[16..20].try_into().unwrap());
+        let duplicate_mx_frame = u32::from_ne_bytes(bytes[64..68].try_into().unwrap());
+        assert_eq!(mx_frame, duplicate_mx_frame, "unstable WAL-index header");
+        let backfilled = u32::from_ne_bytes(bytes[96..100].try_into().unwrap());
+        (mx_frame, backfilled)
+    }
+
+    fn raw_cache_write_bytes(connection: &Connection, page_size: u64, reset: bool) -> u64 {
+        let mut current = 0;
+        let mut highwater = 0;
+        let result = unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                connection.handle(),
+                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_WRITE,
+                &mut current,
+                &mut highwater,
+                i32::from(reset),
+            )
+        };
+        assert_eq!(result, rusqlite::ffi::SQLITE_OK);
+        u64::try_from(current).unwrap().saturating_mul(page_size)
+    }
+
+    fn run_fixed_wal_workload(connection: &Connection, path: &Path) -> (u64, u64, u64) {
+        let mut checkpoints = 0_u64;
+        let mut wal_high_water = 0_u64;
+        let mut backfilled_frames = 0_u64;
+        for batch in 0..12_i64 {
+            let tx = connection.unchecked_transaction().unwrap();
+            for offset in 0..3_i64 {
+                tx.execute(
+                    "INSERT INTO payloads(id, payload) VALUES (?1, zeroblob(3500))",
+                    [batch * 3 + offset],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+            wal_high_water = wal_high_water.max(std::fs::metadata(wal_path(path)).unwrap().len());
+            let (log_frames, checkpointed_frames) = shm_checkpoint_state(path);
+            if log_frames > 0 && checkpointed_frames == log_frames {
+                checkpoints += 1;
+                backfilled_frames = backfilled_frames.saturating_add(u64::from(log_frames));
+            }
+        }
+        (checkpoints, wal_high_water, backfilled_frames)
+    }
+
+    // This fixed-workload byte-identity test proves the hook is behaviour-preserving
+    // where the checkpoint predicate is deterministic (the mechanism). The live
+    // fs_usage before/after proves the same policy under real writer interleaving
+    // (the population). Either proof can pass while the other fails, so neither is
+    // a duplicate of the other.
+    #[test]
+    fn tracked_wal_hook_matches_builtin_checkpoint_frequency_size_and_bytes() {
+        const THRESHOLD: i64 = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let builtin_path = dir.path().join("builtin.sqlite");
+        let builtin = Connection::open(&builtin_path).unwrap();
+        builtin.pragma_update(None, "journal_mode", "WAL").unwrap();
+        builtin
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        builtin
+            .execute_batch("CREATE TABLE payloads(id INTEGER PRIMARY KEY, payload BLOB);")
+            .unwrap();
+        builtin
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
+        let page_size: u64 = builtin
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        raw_cache_write_bytes(&builtin, page_size, true);
+        builtin
+            .pragma_update(None, "wal_autocheckpoint", THRESHOLD)
+            .unwrap();
+        let (checkpoints, wal_high_water, backfilled_frames) =
+            run_fixed_wal_workload(&builtin, &builtin_path);
+        let builtin_metrics = WalWorkloadMetrics {
+            checkpoints,
+            wal_high_water,
+            cache_write_bytes: raw_cache_write_bytes(&builtin, page_size, true),
+            backfill_bytes: backfilled_frames.saturating_mul(page_size),
+        };
+
+        let tracked_path = dir.path().join("tracked.sqlite");
+        let root = format!("/wal-parity/{}", std::process::id());
+        let tracked =
+            TrackedConnection::open_attributed(&tracked_path, SqliteStore::AftDb, root.clone())
+                .unwrap();
+        tracked.pragma_update(None, "journal_mode", "WAL").unwrap();
+        tracked.set_wal_autocheckpoint(1_000).unwrap();
+        tracked
+            .execute_batch("CREATE TABLE payloads(id INTEGER PRIMARY KEY, payload BLOB);")
+            .unwrap();
+        tracked
+            .checkpoint_wal_as(WalCheckpointMode::Truncate, WriteDomain::AftDb)
+            .unwrap();
+        tracked.cache_write_pages(true);
+        let credited_before = crate::write_ledger::pending_for_test(WriteDomain::AftDb, &root).1;
+        tracked.set_wal_autocheckpoint(THRESHOLD).unwrap();
+        let (checkpoints, wal_high_water, observed_backfilled_frames) =
+            run_fixed_wal_workload(&tracked, &tracked_path);
+        let credited_after = crate::write_ledger::pending_for_test(WriteDomain::AftDb, &root).1;
+        let tracked_metrics = WalWorkloadMetrics {
+            checkpoints,
+            wal_high_water,
+            cache_write_bytes: tracked.cache_write_pages(true).saturating_mul(page_size),
+            backfill_bytes: credited_after.saturating_sub(credited_before),
+        };
+
+        assert!(
+            builtin_metrics.checkpoints > 0 && builtin_metrics.backfill_bytes > 0,
+            "fixed workload did not cross the autocheckpoint threshold"
+        );
+        assert_eq!(
+            tracked_metrics.backfill_bytes,
+            observed_backfilled_frames.saturating_mul(page_size),
+            "the hook credit must equal the WAL-index backfill movement"
+        );
+        assert_eq!(tracked_metrics, builtin_metrics);
+    }
+
+    #[test]
+    fn forced_wal_checkpoint_credits_cache_writes_and_main_file_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("checkpoint-credit.sqlite");
+        let root = format!("/checkpoint-credit/{}", std::process::id());
+        let conn =
+            TrackedConnection::open_attributed(&path, SqliteStore::AftDb, root.clone()).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.sample_write_pages();
+
+        let page_size: u64 = conn
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        let main_before = std::fs::metadata(&path).unwrap().len();
+        let credited_before = crate::write_ledger::pending_for_test(WriteDomain::AftDb, &root).1;
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute_batch("CREATE TABLE payloads(id INTEGER PRIMARY KEY, payload BLOB);")
+            .unwrap();
+        for id in 0..64_i64 {
+            tx.execute(
+                "INSERT INTO payloads(id, payload) VALUES (?1, zeroblob(3500))",
+                [id],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let wal_bytes = std::fs::metadata(wal_path(&path)).unwrap().len();
+        let wal_frames = wal_bytes.saturating_sub(32) / (page_size + 24);
+        let cache_write_bytes = conn.sample_write_pages();
+        let checkpoint = conn
+            .checkpoint_wal_as(WalCheckpointMode::Passive, WriteDomain::AftDb)
+            .unwrap();
+        let main_after = std::fs::metadata(&path).unwrap().len();
+        let credited_after = crate::write_ledger::pending_for_test(WriteDomain::AftDb, &root).1;
+        let credited = credited_after.saturating_sub(credited_before);
+        let expected = main_after
+            .saturating_sub(main_before)
+            .saturating_add(wal_frames.saturating_mul(page_size));
+
+        assert!(wal_frames > 0, "fixture did not write WAL frames");
+        assert!(checkpoint.checkpointed_frames > 0);
+        assert!(cache_write_bytes > 0);
+        assert!(
+            credited.abs_diff(expected) <= page_size,
+            "credited={credited}, expected={expected}, main_growth={}, WAL frames={wal_frames}",
+            main_after.saturating_sub(main_before)
+        );
+    }
+
     #[test]
     fn unmapped_sqlite_seam_lands_in_other_and_reports_its_label() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -457,9 +899,13 @@ mod tests {
 
     #[test]
     fn every_uninstrumented_production_opener_is_documented() {
-        // This assertion intentionally names the documentation seam. If a
-        // production bypass is ever necessary, add its stable module/function
-        // name to the constant before accepting an incomplete health count.
-        assert!(SQLITE_UNINSTRUMENTED_OPENERS.is_empty());
+        assert!(SQLITE_UNINSTRUMENTED_OPENERS.iter().any(|opener| {
+            opener.contains("path_status::PathStatusStore::open_at")
+                && opener.contains("rollback-journal")
+        }));
+        assert!(SQLITE_UNINSTRUMENTED_OPENERS.iter().any(|opener| {
+            opener.contains("views::generation::checkpoint_derived")
+                && opener.contains("credited at call site")
+        }));
     }
 }

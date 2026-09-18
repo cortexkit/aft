@@ -659,7 +659,7 @@ fn validate_artifact_key(artifact_key: &str) -> Result<(), BlobStoreError> {
     Ok(())
 }
 
-fn configure_connection(connection: &Connection) -> Result<(), BlobStoreError> {
+fn configure_connection(connection: &TrackedConnection) -> Result<(), BlobStoreError> {
     // Set the wait policy before WAL attempts to acquire the journal lock so
     // concurrent first-open callers wait instead of failing immediately.
     connection.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
@@ -673,6 +673,7 @@ fn configure_connection(connection: &Connection) -> Result<(), BlobStoreError> {
         connection.pragma_update(None, "journal_mode", "WAL")
     })?;
     connection.pragma_update(None, "synchronous", "NORMAL")?;
+    connection.set_wal_autocheckpoint(DEFAULT_WAL_AUTOCHECKPOINT_PAGES)?;
     Ok(())
 }
 
@@ -730,19 +731,17 @@ fn unix_millis_now() -> u64 {
         .as_millis() as u64
 }
 
-fn read_and_assert_pragmas(connection: &Connection) -> Result<BlobStorePragmas, BlobStoreError> {
+fn read_and_assert_pragmas(
+    connection: &TrackedConnection,
+) -> Result<BlobStorePragmas, BlobStoreError> {
     let pragmas = BlobStorePragmas {
         journal_mode: connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?,
         synchronous: connection.pragma_query_value(None, "synchronous", |row| row.get(0))?,
         busy_timeout_ms: connection.pragma_query_value(None, "busy_timeout", |row| row.get(0))?,
         foreign_keys: connection.pragma_query_value(None, "foreign_keys", |row| row.get(0))?,
-        // Do not write this pragma: preserving SQLite's default is part of the
-        // storage contract and querying it catches accidental future overrides.
-        wal_autocheckpoint_pages: connection.pragma_query_value(
-            None,
-            "wal_autocheckpoint",
-            |row| row.get(0),
-        )?,
+        // TrackedConnection owns SQLite's default threshold while replacing
+        // the built-in hook with an accounting-equivalent PASSIVE checkpoint.
+        wal_autocheckpoint_pages: connection.wal_autocheckpoint_pages(),
     };
     assert_pragma("journal_mode", "wal", &pragmas.journal_mode)?;
     assert_pragma("synchronous", "1", &pragmas.synchronous.to_string())?;

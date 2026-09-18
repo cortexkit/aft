@@ -14,6 +14,7 @@ use facts::{byte_path, EntryKind, FactPaths, ProjectFacts};
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph::{self, EdgeResolution, FileCallData, TraceToSymbolCandidate};
 use crate::context::SubcLifecycleAdmission;
+use crate::db::lifecycle::WalCheckpointMode;
 use crate::db::{SqliteStore, TrackedConnection};
 use crate::error::AftError;
 use crate::imports::{ImportForm, ImportGroup, ImportKind, ImportStatement};
@@ -447,7 +448,8 @@ mod write_amplification_tests {
 
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let configure = std::thread::spawn(move || {
-            let conn = Connection::open(sqlite_path).expect("open contending connection");
+            let conn = TrackedConnection::open(&sqlite_path, SqliteStore::CallgraphGeneration)
+                .expect("open contending connection");
             started_tx.send(()).expect("signal configure start");
             configure_connection(&conn)
         });
@@ -475,9 +477,7 @@ mod write_amplification_tests {
         let synchronous: i64 = conn
             .pragma_query_value(None, "synchronous", |row| row.get(0))
             .unwrap();
-        let autocheckpoint: i64 = conn
-            .pragma_query_value(None, "wal_autocheckpoint", |row| row.get(0))
-            .unwrap();
+        let autocheckpoint = conn.wal_autocheckpoint_pages();
         let cache_size: i64 = conn
             .pragma_query_value(None, "cache_size", |row| row.get(0))
             .unwrap();
@@ -3745,20 +3745,24 @@ impl CallGraphStore {
 
     fn prepare_for_atomic_swap(&self) -> Result<()> {
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
-        conn.execute_batch(self.atomic_swap_checkpoint_sql())?;
+        conn.checkpoint_wal_as(
+            self.atomic_swap_checkpoint_mode(),
+            crate::write_ledger::Domain::CallgraphCheckpoint,
+        )?;
+        conn.pragma_update(None, "journal_mode", "DELETE")?;
         Ok(())
     }
 
-    fn atomic_swap_checkpoint_sql(&self) -> &'static str {
+    fn atomic_swap_checkpoint_mode(&self) -> WalCheckpointMode {
         let protected_reader = self.generation.as_deref().is_some_and(|generation| {
             self.sqlite_path
                 .parent()
                 .is_some_and(|dir| crate::root_cache::protected_read_marker_exists(dir, generation))
         });
         if protected_reader {
-            "PRAGMA wal_checkpoint(PASSIVE); PRAGMA journal_mode=DELETE;"
+            WalCheckpointMode::Passive
         } else {
-            "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;"
+            WalCheckpointMode::Truncate
         }
     }
 
@@ -7375,23 +7379,19 @@ fn percent_encode_sqlite_uri_path(path: &str) -> String {
     encoded
 }
 
-fn configure_connection(conn: &Connection) -> Result<()> {
+fn configure_connection(conn: &TrackedConnection) -> Result<()> {
     // Changing journal mode takes a database lock. Install the busy handler
     // first so concurrent cold-build and refresh connections wait rather than
     // failing immediately, especially under Windows byte-range locking.
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.pragma_update(
-        None,
-        "wal_autocheckpoint",
-        CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES,
-    )?;
+    conn.set_wal_autocheckpoint(CALLGRAPH_WAL_AUTOCHECKPOINT_PAGES)?;
     conn.pragma_update(None, "cache_size", CALLGRAPH_SQLITE_CACHE_KIB)?;
     Ok(())
 }
 
-fn configure_build_connection(conn: &Connection) -> Result<()> {
+fn configure_build_connection(conn: &TrackedConnection) -> Result<()> {
     // The staging database commits independently recoverable batches. WAL keeps
     // those commits durable without forcing a rollback journal rewrite per batch.
     // Set the busy handler before WAL because selecting the journal mode itself
@@ -7399,6 +7399,7 @@ fn configure_build_connection(conn: &Connection) -> Result<()> {
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.set_wal_autocheckpoint(crate::db::lifecycle::DEFAULT_WAL_AUTOCHECKPOINT_PAGES)?;
     conn.pragma_update(None, "cache_size", CALLGRAPH_SQLITE_CACHE_KIB)?;
     Ok(())
 }
@@ -7418,11 +7419,12 @@ fn checkpoint_sqlite_before_publication(path: &Path) {
     let _ = checkpoint_wal_truncate(&conn);
 }
 
-fn checkpoint_wal_truncate(conn: &Connection) -> bool {
-    match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
-        row.get::<_, i64>(0)
-    }) {
-        Ok(0) => true,
+fn checkpoint_wal_truncate(conn: &TrackedConnection) -> bool {
+    match conn.checkpoint_wal_as(
+        WalCheckpointMode::Truncate,
+        crate::write_ledger::Domain::CallgraphCheckpoint,
+    ) {
+        Ok(result) if result.busy == 0 => true,
         Ok(_) => false,
         Err(rusqlite::Error::SqliteFailure(error, _))
             if matches!(
@@ -16324,10 +16326,16 @@ mod cold_build_insert_tests {
         );
 
         let marker = crate::root_cache::ReadMarker::create(dir.path(), &generation).unwrap();
-        assert!(store.atomic_swap_checkpoint_sql().contains("PASSIVE"));
+        assert_eq!(
+            store.atomic_swap_checkpoint_mode(),
+            WalCheckpointMode::Passive
+        );
 
         drop(marker);
-        assert!(store.atomic_swap_checkpoint_sql().contains("TRUNCATE"));
+        assert_eq!(
+            store.atomic_swap_checkpoint_mode(),
+            WalCheckpointMode::Truncate
+        );
     }
 
     #[test]
@@ -17747,8 +17755,9 @@ export function leaf() {}
         project_root: &Path,
         extract: &FileExtract,
         resolved: &ResolvedRef,
-    ) -> Connection {
-        let mut conn = Connection::open_in_memory().expect("open reference db");
+    ) -> TrackedConnection {
+        let mut conn = TrackedConnection::open_in_memory(SqliteStore::CallgraphColdGeneration)
+            .expect("open reference db");
         configure_build_connection(&conn).expect("configure reference db");
         initialize_schema(&conn).expect("initialize reference schema");
         {
@@ -17769,8 +17778,9 @@ export function leaf() {}
         project_root: &Path,
         extract: &FileExtract,
         resolved: &ResolvedRef,
-    ) -> Connection {
-        let mut conn = Connection::open_in_memory().expect("open optimized db");
+    ) -> TrackedConnection {
+        let mut conn = TrackedConnection::open_in_memory(SqliteStore::CallgraphColdGeneration)
+            .expect("open optimized db");
         configure_build_connection(&conn).expect("configure optimized db");
         initialize_schema(&conn).expect("initialize optimized schema");
         {

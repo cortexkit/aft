@@ -228,7 +228,11 @@ fn checkpoint_lock(path: &Path) -> Arc<Mutex<()>> {
     lock
 }
 
-fn checkpoint_derived(path: &Path, connection: Option<&Connection>) -> Result<()> {
+fn checkpoint_derived(
+    path: &Path,
+    connection: Option<&Connection>,
+    ledger_root: Option<&Path>,
+) -> Result<()> {
     let lock = checkpoint_lock(path);
     let _guard = lock
         .lock()
@@ -242,10 +246,36 @@ fn checkpoint_derived(path: &Path, connection: Option<&Connection>) -> Result<()
     };
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.pragma_update(None, "synchronous", "FULL")?;
+    let page_size: u64 = connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
+    let wal_bytes = fs::metadata(format!("{}-wal", path.display()))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let log_frames_before = wal_bytes.saturating_sub(32) / (page_size + 24);
+    let backfilled_before = fs::read(format!("{}-shm", path.display()))
+        .ok()
+        .and_then(|bytes| bytes.get(96..100)?.try_into().ok())
+        .map(u32::from_ne_bytes)
+        .map(u64::from)
+        .unwrap_or(0);
+    let outstanding_before =
+        log_frames_before.saturating_sub(backfilled_before.min(log_frames_before));
     let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
         connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
+    if let Some(root) = ledger_root {
+        let checkpointed = if busy == 0 {
+            outstanding_before
+        } else {
+            u64::try_from(checkpointed_frames).unwrap_or(0)
+        };
+        crate::write_ledger::credit(
+            crate::write_ledger::Domain::ViewsDerived,
+            root.display().to_string(),
+            0,
+            checkpointed.saturating_mul(page_size),
+        );
+    }
     if busy != 0 {
         return Err(ViewError::InvalidManifest(format!(
             "derived WAL checkpoint remained busy: path={} log_frames={} checkpointed_frames={}",
@@ -292,7 +322,7 @@ pub(super) fn schedule_derived_checkpoint(path: PathBuf, connection: Connection,
             let mut io = super::io::Window::new();
             let skipped = cancelled.load(Ordering::Acquire);
             if !skipped {
-                match checkpoint_derived(&path, Some(&connection)) {
+                match checkpoint_derived(&path, Some(&connection), Some(&root)) {
                     Ok(()) => log::info!(
                         "view derived checkpoint completed ms={} path={}",
                         started.elapsed().as_millis(),
@@ -351,7 +381,7 @@ pub(super) fn schedule_derived_checkpoint(path: PathBuf, connection: Connection,
 /// Checkpoint the source before copying its main file. This also recovers a
 /// commit-durable WAL left by a process that exited before detached maintenance.
 pub(super) fn clone_derived(source: &Path, destination: &Path) -> Result<()> {
-    checkpoint_derived(source, None)?;
+    checkpoint_derived(source, None, None)?;
     let started = Instant::now();
     let mechanism = if try_clone(source, destination) {
         if cfg!(target_os = "macos") {
