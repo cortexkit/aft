@@ -84,7 +84,7 @@ pub struct SqliteConnectionSnapshot {
 /// Production `rusqlite::Connection::open*` call sites that intentionally do
 /// not pass through [`TrackedConnection`]. The list is empty today. Test-only
 /// fixture openers are excluded because they cannot affect daemon lifecycle
-/// health and are compiled out of release builds.
+/// health and are compiled out of non-test builds.
 pub const SQLITE_UNINSTRUMENTED_OPENERS: &[&str] = &[];
 
 fn live_counts() -> &'static Mutex<BTreeMap<SqliteStore, u64>> {
