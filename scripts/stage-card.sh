@@ -43,15 +43,23 @@ if [ "$SKIP_BUILD" -eq 0 ]; then
   cargo build --release -p agent-file-tools --bin aft
 fi
 BIN="target/release/aft"
+# Never write the dSYM to "$BIN.dSYM": cargo owns that name as a symlink
+# into deps/ and unlinks it on the next build, which fails with EPERM once a
+# real bundle sits there (unlink on a directory) and breaks every later
+# `cargo build --release` in the checkout (2026-09-18). The generated bundle
+# lives beside the binary under a name cargo never touches.
+DSYM="target/release/ck-aft-card.dSYM"
 if [ "$(uname -s)" = "Darwin" ]; then
   # A card cut from a published release asset (--skip-build) is stripped;
   # its dSYM is the one the release shipped beside it, unpacked to
   # $BIN.dSYM by the operator. Regenerating from stripped bytes would mint
   # a dSYM whose UUID does not match the image and fail the check below.
-  if [ "$SKIP_BUILD" -eq 1 ] && [ -d "$BIN.dSYM" ]; then
+  if [ "$SKIP_BUILD" -eq 1 ] && [ -d "$BIN.dSYM" ] && [ ! -L "$BIN.dSYM" ]; then
     echo "==> using existing $BIN.dSYM"
+    DSYM="$BIN.dSYM"
   else
-    dsymutil "$BIN" -o "$BIN.dSYM"
+    rm -rf "$DSYM"
+    dsymutil "$BIN" -o "$DSYM"
   fi
 fi
 # Freshness is asserted, not assumed: a card cut from a binary older than
@@ -71,7 +79,6 @@ if [ "$(uname -s)" = "Darwin" ]; then
   codesign --force --sign - --identifier ck-aft "$TMP"
   codesign --verify --strict "$TMP"
 
-  DSYM="$BIN.dSYM"
   IMAGE_UUID="$(dwarfdump --uuid "$TMP" | awk 'NR == 1 { gsub(/-/, "", $2); print toupper($2) }')"
   DSYM_UUID="$(dwarfdump --uuid "$DSYM" | awk 'NR == 1 { gsub(/-/, "", $2); print toupper($2) }')"
   if [ -z "$IMAGE_UUID" ] || [ -z "$DSYM_UUID" ] || [ "$IMAGE_UUID" != "$DSYM_UUID" ]; then
