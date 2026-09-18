@@ -269,3 +269,22 @@ All 29 failed query strings occurred once, so frequency does not distinguish the
 - An episode is one `aft_search` and its next three tool calls. Qualifying follow-ups are AFT `grep`, `ast_grep_search`, or conservatively parsed bash command segments whose executable is `grep`, `rg`, `ag`, or `git grep`; every bash decision carries a reason in `episodes.jsonl`. Search→search calls are refinements, counted separately.
 - Discriminating means grep produced a path absent from the full search output and a later call inside the same three-call window opened or edited that path.
 - `.alfonso/data/search-sweep-2d/episodes.jsonl` contains all 447 qualifying episodes, labels, reasons, and current rerun ranks. `raw/*.txt` retains full stored search/follow-up inputs and outputs plus intervening agent text. These files are intentionally gitignored and are not part of this commit.
+
+## Reference rebaseline after ranking slice 3 (2026-09-18)
+
+Slice 3 landed on train 107 under a `ranking` descriptor (targeted mechanism
+`wrong_lane_nl`): real-query MRR@10 0.154 → 0.188, hit@5 0.233 → 0.302,
+census-weighted MRR 0.124 → 0.152. A ranking landing passes the gate but does
+not move the committed reference; that is an audited act, and it was not done
+in the following train. Trains 108–113 carried no ranking-fence file, so the
+byte-equality predicate never ran, and train 114 — the first fenced diff
+since (the `semantic.query_timeout_ms` ceiling constant) — refused with
+`engine_unwired_mismatch` on row `followup-census:3184`, its uploaded diff
+showing exactly slice 3's numbers.
+
+The reference pair was re-recorded with `cost-gate.sh --search-quality
+--mode record-reference` on a release build of main at `d2d27fa96` (slice-3
+engine plus the ceiling constant, which is byte-neutral where query embeds
+finish inside the budget): 43 rows, profile `paged`, MRR@10 0.187984 —
+identical to the CI head score that exposed the gap. Rule recorded: the
+train after any `ranking` landing carries the rebaseline.
