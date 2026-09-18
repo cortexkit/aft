@@ -198,7 +198,7 @@ fn schema_sql(conn: &Connection) -> Vec<Option<String>> {
 }
 
 #[test]
-fn migration_fast_path_avoids_writes_and_v8_runs_only_two_steps() {
+fn migration_fast_path_avoids_writes_and_v8_runs_one_step_per_missing_version() {
     let current_storage = tempfile::tempdir().expect("current temporary storage");
     let current_database = current_storage.path().join("aft.db");
     drop(aft::db::open(&current_database).expect("create current database"));
@@ -222,7 +222,13 @@ fn migration_fast_path_avoids_writes_and_v8_runs_only_two_steps() {
 
     aft::db::run_migrations(&mut v8).expect("migrate v8 schema");
 
-    assert_eq!(MIGRATION_WRITE_TRANSACTIONS.load(Ordering::SeqCst), 2);
+    // One write transaction per version the v8 fixture lacks: the count
+    // follows the schema forward so a new migration does not re-pin it.
+    let missing_versions = usize::try_from(aft::db::CURRENT_SCHEMA_VERSION - 8).unwrap();
+    assert_eq!(
+        MIGRATION_WRITE_TRANSACTIONS.load(Ordering::SeqCst),
+        missing_versions
+    );
 }
 
 #[test]
