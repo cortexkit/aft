@@ -51,6 +51,7 @@ impl WritePhase {
         Self::IndexMaintenance,
     ];
 
+    #[cfg(test)]
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::DeleteRows => "delete_rows",
@@ -117,6 +118,7 @@ impl WritePhaseTimings {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn offline_phase_table(
     clone: PhaseMeasurement,
     timings: &PhaseTimings,

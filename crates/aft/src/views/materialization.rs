@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rayon::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use self::profile::{PhaseProbe, WritePhase};
@@ -1119,12 +1120,14 @@ fn load_bindings(
     connection: &Connection,
 ) -> Result<BTreeMap<String, join::ViewBindingDependencies>> {
     let mut statement = connection.prepare("SELECT file_path, payload FROM view_bindings")?;
-    let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut bindings = rows
-        .map(|row| {
-            let (path, payload) = row?;
+        .into_par_iter()
+        .map(|(path, payload)| {
             let binding: join::ViewBindingDependencies = serde_json::from_str(&payload)
                 .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
             Ok((path, binding))
@@ -1142,16 +1145,18 @@ fn load_surfaces(
     connection: &Connection,
 ) -> Result<BTreeMap<String, join::ViewBindingDependencies>> {
     let mut statement = connection.prepare("SELECT file_path, payload FROM view_file_surfaces")?;
-    let rows = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    rows.map(|row| {
-        let (path, surface) = row?;
-        let binding = join::ViewBindingDependencies::from_surface_json(&surface)
-            .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
-        Ok((path, binding))
-    })
-    .collect()
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    rows.into_par_iter()
+        .map(|(path, surface)| {
+            let binding = join::ViewBindingDependencies::from_surface_json(&surface)
+                .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+            Ok((path, binding))
+        })
+        .collect()
 }
 
 fn load_bindings_for_selection(
@@ -1186,13 +1191,20 @@ fn load_bindings_for_selection(
              CROSS JOIN view_bindings AS bindings INDEXED BY sqlite_autoindex_view_bindings_1
                  ON bindings.file_path = selected_view_paths.path",
         )?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (path, payload) = row?;
-            let mut binding: join::ViewBindingDependencies = serde_json::from_str(&payload)
-                .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let selected = rows
+            .into_par_iter()
+            .map(|(path, payload)| {
+                let binding: join::ViewBindingDependencies = serde_json::from_str(&payload)
+                    .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+                Ok((path, binding))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (path, mut binding) in selected {
             if let Some(surface) = bindings.get(&path) {
                 binding.copy_surface_from(surface);
             }
