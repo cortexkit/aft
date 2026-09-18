@@ -15,6 +15,7 @@ const INSPECT_WRITER_LEASE_TIMEOUT: Duration = Duration::from_secs(2);
 const INSPECT_SCOPE_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Bound one process-wide pass so a slow filesystem cannot stall publication;
 /// the first-level cursor resumes the remaining scope directories next time.
+const INSPECT_SCOPE_SWEEP_LIMIT: usize = 200;
 const INSPECT_SCOPE_SWEEP_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
@@ -1634,6 +1635,7 @@ pub(crate) struct InspectScopeSweepSummary {
     bytes: u64,
     skipped_live: usize,
     skipped_marker: usize,
+    skipped_lease: usize,
     scanned: usize,
     budget_exhausted: bool,
 }
@@ -1659,6 +1661,7 @@ enum InspectScopeCandidateResult {
     },
     SkippedLive,
     SkippedMarker,
+    SkippedLease,
     BudgetExceeded,
 }
 
@@ -1673,7 +1676,7 @@ pub(crate) fn sweep_inspect_scope_dirs(
         inspect_root,
         live_scope_keys,
         INSPECT_SCOPE_SWEEP_BUDGET,
-        usize::MAX,
+        INSPECT_SCOPE_SWEEP_LIMIT,
     )
 }
 
@@ -1735,6 +1738,7 @@ fn sweep_inspect_scope_dirs_with_limits(
             }
             InspectScopeCandidateResult::SkippedLive => summary.skipped_live += 1,
             InspectScopeCandidateResult::SkippedMarker => summary.skipped_marker += 1,
+            InspectScopeCandidateResult::SkippedLease => summary.skipped_lease += 1,
         }
         summary.scanned += 1;
         cursor_name = Some(name);
@@ -1752,14 +1756,9 @@ fn sweep_inspect_scope_dirs_with_limits(
         crate::fs_lock::sync_parent(inspect_root);
     }
     crate::slog_info!(
-        "inspect scope cache sweep root={} removed={} bytes={} skipped_live={} skipped_marker={} scanned={} budget_exhausted={}",
-        inspect_root.display(),
+        "inspect cache sweep: removed {} scope dirs, {:.1} MiB",
         summary.removed,
-        summary.bytes,
-        summary.skipped_live,
-        summary.skipped_marker,
-        summary.scanned,
-        summary.budget_exhausted
+        summary.bytes as f64 / (1024.0 * 1024.0)
     );
     summary
 }
@@ -1787,6 +1786,15 @@ fn inspect_scope_candidate(
         return InspectScopeCandidateResult::Processed;
     }
 
+    // Keep the lease through deletion so a concurrent writer either wins first
+    // and protects the scope, or starts after this directory has been removed.
+    let _writer_lease = match crate::fs_lock::try_acquire(
+        &crate::root_cache::writer_lease_path(scope_dir),
+        Duration::ZERO,
+    ) {
+        Ok(lease) => lease,
+        Err(_) => return InspectScopeCandidateResult::SkippedLease,
+    };
     if crate::root_cache::sweep_all_read_markers(scope_dir).protected {
         return InspectScopeCandidateResult::SkippedMarker;
     }
@@ -2671,6 +2679,7 @@ mod tests {
         .unwrap();
 
         let first = sweep_inspect_scope_dirs(&inspect_root, &HashSet::new());
+        assert_eq!(first.skipped_lease, 1);
         assert!(scope.is_dir(), "a live writer lease protects an aged scope");
         drop(writer_lease);
 
