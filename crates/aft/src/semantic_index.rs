@@ -11038,6 +11038,19 @@ public class Greeter {
 
         config.query_timeout_ms = 700;
         assert_eq!(QueryBudget::from_config(&config).timeout_ms(), 700);
+
+        // A self-hosted embedding server on a slow box or a provider spike
+        // (#320) is what the ceiling exists to admit; the transport still
+        // bounds the whole search at 60 s, so 30 s leaves room for the
+        // lexical fallback to render.
+        config.query_timeout_ms = 30_000;
+        assert_eq!(QueryBudget::from_config(&config).timeout_ms(), 30_000);
+        config.query_timeout_ms = 45_000;
+        assert_eq!(
+            QueryBudget::from_config(&config).timeout_ms(),
+            MAX_SEMANTIC_QUERY_TIMEOUT_MS,
+            "values above the ceiling clamp to it"
+        );
     }
 
     #[test]

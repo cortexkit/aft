@@ -626,10 +626,10 @@ function buildSchema(): Record<string, unknown> {
           query_timeout_ms: {
             type: "integer",
             minimum: 500,
-            maximum: 15000,
+            maximum: 30000,
             default: 3000,
             description:
-              "Interactive query embedding deadline in milliseconds. Project-scoped configs cannot set this field; values are clamped to 500..15000.",
+              "Interactive query embedding deadline in milliseconds. Project-scoped configs cannot set this field; values are clamped to 500..30000.",
           },
           query_instruction: {
             type: "string",

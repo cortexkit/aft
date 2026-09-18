@@ -17,7 +17,7 @@ pub const QWEN3_EMBEDDING_MODEL_CARD_RETRIEVAL_TASK: &str =
 pub const QWEN3_EMBEDDING_CODE_SEARCH_TASK: &str =
     "Given a code search query, retrieve relevant source code, symbols, and documentation";
 pub(crate) const MIN_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 500;
-pub(crate) const MAX_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 15_000;
+pub(crate) const MAX_SEMANTIC_QUERY_TIMEOUT_MS: u64 = 30_000;
 pub(crate) const DEFAULT_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 120_000;
 pub(crate) const MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 10_000;
 pub(crate) const MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS: u64 = 600_000;

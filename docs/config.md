@@ -226,7 +226,7 @@ Raw sampler output is withheld unless native `aft profile --raw` is explicitly r
                                          // deadline is max(timeout_ms, timeout_ms * batch_size / 16).
                                          // A timed-out batch halves immediately; only a one-item timeout
                                          // at this base floor is treated as backend-down evidence.
-    "query_timeout_ms": 3000,           // per-request timeout for interactive QUERY embeds (500-15000).
+    "query_timeout_ms": 3000,           // per-request timeout for interactive QUERY embeds (500-30000).
                                         // Raise for slow providers; on timeout, search degrades to
                                         // lexical for that query instead of failing.
     "max_batch_size": 64,               // maximum adaptive build batch size. Timeout halves the active
