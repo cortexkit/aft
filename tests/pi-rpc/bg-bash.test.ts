@@ -127,7 +127,10 @@ describe("background bash lifecycle (real Pi RPC)", () => {
       await enableAftBash(env);
       aimock.registerToolCallFixture({
         predicate: (request) => latestUserText(request).includes("Run a slow foreground command."),
-        toolCalls: [{ name: "bash", arguments: { command: "sleep 0.2 && echo late" } }],
+        // The command must still be running when the orchestrator first polls
+        // after the 25 ms window: a 0.2 s sleep lost that race on a loaded CI
+        // runner (first poll at 610 ms, command already done, no promotion).
+        toolCalls: [{ name: "bash", arguments: { command: "sleep 5 && echo late" } }],
         followupText: "Started.",
       });
       process.env.AFT_TEST_FOREGROUND_WAIT_MS = "25";
