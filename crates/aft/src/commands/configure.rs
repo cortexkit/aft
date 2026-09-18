@@ -711,19 +711,7 @@ pub fn ensure_project_watcher(ctx: &AppContext) {
 /// (the build re-walks files each attempt) while recovering within a minute of
 /// the backend returning.
 fn semantic_build_retry_backoff(attempt: usize) -> Duration {
-    // Test seam: shrink the schedule to a fixed small interval so recovery
-    // integration tests don't wait real 15s+ windows. Not a user-facing knob.
-    if let Ok(raw) = std::env::var("AFT_SEMANTIC_RETRY_BACKOFF_MS") {
-        if let Ok(ms) = raw.parse::<u64>() {
-            return Duration::from_millis(ms);
-        }
-    }
-    const SCHEDULE_SECS: [u64; 3] = [15, 30, 60];
-    let secs = SCHEDULE_SECS
-        .get(attempt)
-        .copied()
-        .unwrap_or(*SCHEDULE_SECS.last().unwrap());
-    Duration::from_secs(secs)
+    Duration::from_millis(crate::semantic_index::build_backend_retry_delay_ms(attempt))
 }
 
 #[derive(Clone, Debug)]

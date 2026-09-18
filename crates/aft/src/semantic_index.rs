@@ -35,8 +35,9 @@ const MAX_DIMENSION: usize = 4096;
 const F32_BYTES: usize = std::mem::size_of::<f32>();
 const HEADER_BYTES_V1: usize = 9;
 const HEADER_BYTES_V2: usize = 13;
-// Status reporting mirrors the retry cadence owned by configure's build loop;
-// the build itself remains the sole owner of sleeping and retry admission.
+// One retry schedule for the cold semantic build: configure's build loop sleeps
+// on it and the health status reports the deadline it produces, so the two can
+// never drift apart.
 const BUILD_BACKEND_RETRY_SCHEDULE_SECS: [u64; 3] = [15, 30, 60];
 const BUILD_BACKEND_STATUS_EXPIRY_GRACE_MS: u64 = 5_000;
 
@@ -63,7 +64,10 @@ fn unix_millis_now() -> u64 {
         .min(u128::from(u64::MAX)) as u64
 }
 
-fn build_backend_retry_delay_ms(attempt: usize) -> u64 {
+/// Delay before the cold semantic build retries an unreachable embedding backend.
+/// `AFT_SEMANTIC_RETRY_BACKOFF_MS` is a test seam that shrinks the schedule so
+/// recovery integration tests do not wait real 15s+ windows; not a user knob.
+pub(crate) fn build_backend_retry_delay_ms(attempt: usize) -> u64 {
     if let Ok(raw) = env::var("AFT_SEMANTIC_RETRY_BACKOFF_MS") {
         if let Ok(ms) = raw.parse::<u64>() {
             return ms;
