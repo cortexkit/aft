@@ -147,7 +147,15 @@ describe("health sentinel pure detectors", () => {
   });
 
   test("wake failures and stale unacked completions raise", () => {
-    expect(detectWakes(sample({ plugin_lines: ["TypeError: this._client is undefined"] }))[0].rule).toBe("wakes.backlog");
+    expect(detectWakes(sample({ plugin_lines: ["event=bash_completion_wake_prompt_async_error session=ses_1 error=TypeError"] }))[0].rule).toBe("wakes.backlog");
+  });
+
+  test("a host permission line quoting the failure words is not a wake failure", () => {
+    // The host log records every bash permission decision with the command text;
+    // an operator grepping for the failure words must not read as a failure.
+    const quoted = 'message=evaluated permission=bash pattern="grep -iE \\"this\\._client|promptAsync\\" aft-plugin.log"';
+    const ok = "event=bash_completion_wake_prompt_async_ok session=ses_1";
+    expect(detectWakes(sample({ plugin_lines: [quoted, ok] }))).toEqual([]);
   });
 
   test("watcher overflow compares counters to prior sample", () => {

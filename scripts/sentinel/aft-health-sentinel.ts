@@ -239,10 +239,17 @@ export function detectExecutor(sample: SentinelSample, state: SentinelState): Fi
   return [];
 }
 
+// A wake failure is one of the plugin's own failure events. Matching the
+// words `promptAsync` or `this._client` anywhere was wrong twice over: the
+// OpenCode host log records every bash permission decision with the command
+// text, so an operator grepping for those words planted "failures", and a
+// successful `bash_completion_wake_prompt_async_ok` line matched too.
+export const WAKE_FAILURE_LINE = /bash_completion_wake_(prompt_async_error|client_unavailable|refire_error)/;
+
 export function detectWakes(sample: SentinelSample): Finding[] {
   const runtime = metrics(sample).runtime ?? {};
   const oldest = Number(runtime.bg_wake_oldest_unacked_age_ms ?? 0);
-  const failures = (sample.plugin_lines ?? []).filter((line) => /this\._client|promptAsync/i.test(line));
+  const failures = (sample.plugin_lines ?? []).filter((line) => WAKE_FAILURE_LINE.test(line));
   if (sample.plugin_error) return [instrument("plugin-log", sample.plugin_error)];
   if (oldest > 5 * 60_000 || failures.length) {
     return [finding("wakes.backlog", "CRITICAL", "wakes:opencode", `${failures.length} plugin wake failures; oldest unacked completion age=${oldest}ms`, "oldest unacked age is at most five minutes and no plugin delivery failure occurs in the window")];
@@ -510,10 +517,12 @@ function collectSample(state: SentinelState): { sample: SentinelSample; cursors:
     sample.log_lines = read.lines;
     cursors.log = { path: current.path, offset: read.offset, size: read.offset };
   } catch (error) { sample.log_error = String(error); }
-  const pluginPath = join(HOME, ".local", "share", "opencode", "log", "opencode.log");
+  // The plugin's own structured log, not the OpenCode host log: the host log
+  // quotes bash command text in permission decisions, which is not a wake.
+  const pluginPath = join(AFT, "logs", "aft-plugin.log");
   try {
     const read = readNew(pluginPath, state.plugin_log);
-    sample.plugin_lines = read.lines.filter((line) => /this\._client|promptAsync/i.test(line));
+    sample.plugin_lines = read.lines.filter((line) => WAKE_FAILURE_LINE.test(line));
     cursors.plugin_log = { path: pluginPath, offset: read.offset, size: read.offset };
   } catch (error) { sample.plugin_error = String(error); }
   try {
