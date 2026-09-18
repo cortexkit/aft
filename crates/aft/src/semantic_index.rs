@@ -38,6 +38,7 @@ const HEADER_BYTES_V2: usize = 13;
 // Status reporting mirrors the retry cadence owned by configure's build loop;
 // the build itself remains the sole owner of sleeping and retry admission.
 const BUILD_BACKEND_RETRY_SCHEDULE_SECS: [u64; 3] = [15, 30, 60];
+const BUILD_BACKEND_STATUS_EXPIRY_GRACE_MS: u64 = 5_000;
 
 #[derive(Clone, Debug)]
 pub(crate) struct EmbeddingBackendBuildHealth {
@@ -104,11 +105,21 @@ fn clear_embedding_backend_build_failure(project_root: &Path) {
 pub(crate) fn embedding_backend_build_health(
     project_root: &Path,
 ) -> Option<EmbeddingBackendBuildHealth> {
-    embedding_backend_build_health_registry()
+    let now_ms = unix_millis_now();
+    let mut registry = embedding_backend_build_health_registry()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(project_root)
-        .cloned()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let expired = registry.get(project_root).is_some_and(|health| {
+        now_ms
+            > health
+                .next_retry_ms
+                .saturating_add(BUILD_BACKEND_STATUS_EXPIRY_GRACE_MS)
+    });
+    if expired {
+        registry.remove(project_root);
+        return None;
+    }
+    registry.get(project_root).cloned()
 }
 
 #[cfg(test)]
@@ -126,6 +137,8 @@ fn begin_semantic_index_build(
     crate::logging::IndexBuildScope,
     crate::logging::IndexBuildFailureGuard,
 ) {
+    // A retry is executing now, so the parked-backoff status no longer applies.
+    clear_embedding_backend_build_failure(project_root);
     if let Some(scope) = crate::logging::current_index_build() {
         if scope.plane == crate::logging::IndexPlane::Semantic {
             return (None, scope, crate::logging::IndexBuildFailureGuard::new());
