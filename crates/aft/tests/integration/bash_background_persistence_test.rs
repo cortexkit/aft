@@ -776,6 +776,17 @@ fn bash_status_legacy_persisted_task_is_quarantined_on_replay() {
 
     let same = registry();
     same.replay_session(storage.path(), "session-a").unwrap();
+    // Legacy-layout quarantine is the detached persisted GC's job, not the
+    // inline replay's, so the assertion waits for that first sweep to record
+    // its exit (macOS CI read the file as still present before the sweep ran).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while same.persisted_gc_thread().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "persisted GC never finished after replay"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     assert!(!legacy_path.exists());
     let quarantine_session = storage
