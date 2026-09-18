@@ -511,6 +511,62 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a live macOS FSEvents service"]
+    fn fsevents_excludes_directory_created_after_stream_start() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let excluded = canonical_root.join("node_modules");
+        assert!(!excluded.exists());
+
+        let (tx, rx) = mpsc::channel();
+        let stream = FsEventsStream::start(
+            &canonical_root,
+            std::slice::from_ref(&excluded),
+            tx,
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let _startup_events = rx.try_iter().collect::<Vec<_>>();
+
+        std::fs::create_dir(&excluded).unwrap();
+        for index in 0..200 {
+            std::fs::write(excluded.join(format!("package-{index}.js")), b"export {};\n")
+                .unwrap();
+        }
+        thread::sleep(Duration::from_millis(500));
+
+        let events = rx.try_iter().collect::<Vec<_>>();
+        for event in &events {
+            if let Err(error) = event {
+                panic!("watcher error during exclusion measurement: {error}");
+            }
+        }
+        let delivered_for_excluded_prefix = events
+            .iter()
+            .filter_map(|event| event.as_ref().ok())
+            .filter(|event| event.paths.iter().any(|path| path.starts_with(&excluded)))
+            .count();
+        let delivered_for_excluded_descendants = events
+            .iter()
+            .filter_map(|event| event.as_ref().ok())
+            .filter(|event| {
+                event
+                    .paths
+                    .iter()
+                    .any(|path| path.starts_with(&excluded) && path != &excluded)
+            })
+            .count();
+        eprintln!(
+            "absent FSEvents exclusion delivered {delivered_for_excluded_prefix} events for {}",
+            excluded.display()
+        );
+        drop(stream);
+
+        assert_eq!(delivered_for_excluded_prefix, 1);
+        assert_eq!(delivered_for_excluded_descendants, 0);
+    }
+
+    #[test]
     #[ignore = "requires a live macOS FSEvents service and Cargo"]
     fn fsevents_exclusions_drop_fresh_worktree_cargo_build() {
         let worktree = fresh_linked_worktree();
