@@ -145,8 +145,23 @@ while true; do
 
   if [ "$STATUS" = "completed" ]; then
     CONC=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json conclusion --jq '.conclusion')
-    echo "CI_DONE run=$RID conclusion=$CONC"
-    [ "$CONC" = "success" ] && exit 0 || exit 1
+    if [ "$CONC" = "success" ]; then
+      echo "CI_DONE run=$RID conclusion=$CONC"
+      exit 0
+    fi
+    # An advisory job cancelled at its own time cap makes the RUN read
+    # 'cancelled' while every gating job passed (train 114 round 2: only
+    # 'OpenCode 2 (Linux Docker)' was cancelled and main's 25 required checks
+    # were all green). The sha is landable then, so the verdict is the set of
+    # non-advisory jobs, not the run's summary conclusion.
+    GATING_BAD=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json jobs \
+      --jq '[.jobs[] | select(.conclusion!="success" and .conclusion!="skipped") | select(.name | test("Bash permission|OpenCode 2 \\(Linux Docker\\)") | not) | .name] | join("; ")')
+    if [ -z "$GATING_BAD" ]; then
+      echo "CI_DONE run=$RID conclusion=$CONC advisory_only=1"
+      exit 0
+    fi
+    echo "CI_DONE run=$RID conclusion=$CONC gating_failed='$GATING_BAD'"
+    exit 1
   fi
 
   sleep 45
