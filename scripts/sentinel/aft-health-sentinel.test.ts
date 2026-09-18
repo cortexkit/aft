@@ -207,10 +207,10 @@ describe("health sentinel pure detectors", () => {
   });
 
   test("write attribution prefers ledger domains and roots", () => {
-    const input = sample({ health: { metrics: { write_ledger_top_10m: [
+    const input = sample({ writes_census: { writers: [
       { domain: "callgraph_refresh", root_id: "/root/a", physical_bytes: 2 * 1024 ** 3 },
       { domain: "semantic_compaction", root_id: "/root/b", physical_bytes: 1024 ** 3 },
-    ] } } });
+    ] } });
     const rendered = writeGrowthAttribution(input, cleanState(), 4 * 1024 ** 3);
     expect(rendered).toContain("callgraph_refresh (/root/a); 50% of write delta");
     expect(rendered).toContain("semantic_compaction (/root/b); 25% of write delta");

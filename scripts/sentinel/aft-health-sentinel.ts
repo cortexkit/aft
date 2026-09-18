@@ -27,6 +27,8 @@ export type SentinelSample = {
   health_error?: string;
   memory_census?: Record<string, any>;
   memory_error?: string;
+  writes_census?: Record<string, any>;
+  writes_error?: string;
   log_lines?: string[];
   log_error?: string;
   plugin_lines?: string[];
@@ -291,7 +293,7 @@ export function detectStorage(sample: SentinelSample, state: SentinelState): Fin
 
 export function writeGrowthAttribution(sample: SentinelSample, state: SentinelState, writeDelta: number): string {
   if (writeDelta <= 0) return "";
-  const ledger = metrics(sample).write_ledger_top_10m;
+  const ledger = sample.writes_census?.writers ?? metrics(sample).write_ledger_top_10m;
   if (Array.isArray(ledger) && ledger.length > 0) {
     const lines = ledger.slice(0, 3).map((entry: Record<string, unknown>, index: number) => {
       const bytes = Number(entry.physical_bytes ?? 0);
@@ -540,6 +542,11 @@ function collectSample(state: SentinelState): { sample: SentinelSample; cursors:
     sample.process = collectProcessMetrics(pid, sample);
   } catch (error) { sample.process_error = String(error); }
   sample.memory_census = { roots: Object.fromEntries(roots(sample).map((root) => [root.project_root ?? "unknown", root])) };
+  try {
+    const image = sample.process?.image;
+    if (!image) throw new Error("AFT image unavailable");
+    sample.writes_census = commandJson(image, ["profile", "--writes", "--since", "10m", "--json"]);
+  } catch (error) { sample.writes_error = String(error); }
   try {
     const artifacts = artifactCensus(AFT);
     sample.disk = {
