@@ -1334,6 +1334,18 @@ fn build_health_diagnostic_rollup(
                 (current, candidate) => current.or(candidate),
             };
         }
+        if let Some(backend) =
+            crate::semantic_index::embedding_backend_build_health(root_id.as_path())
+        {
+            embedding_backend_available = false;
+            if embedding_backend_since_ms.is_none_or(|since| backend.since_ms <= since) {
+                embedding_backend_last_error = Some(backend.last_error);
+            }
+            embedding_backend_since_ms = Some(
+                embedding_backend_since_ms
+                    .map_or(backend.since_ms, |since| since.min(backend.since_ms)),
+            );
+        }
         let health_summary = ctx.try_health_summary();
         let busy = health_summary.is_busy();
         let fully_ready = health_summary.is_fully_ready();
@@ -1400,6 +1412,24 @@ fn build_health_diagnostic_rollup(
             snapshot.callgraph_repair_entries_60s = candidate.repair_entries_60s;
             let root_label = snapshot.project_root.clone();
             let mut value = standing_root_health_value(snapshot, candidate.standing.as_ref());
+            if let Some(backend) =
+                crate::semantic_index::embedding_backend_build_health(Path::new(&root_label))
+            {
+                if let Some(semantic) = value
+                    .get_mut("semantic_index")
+                    .and_then(Value::as_object_mut)
+                {
+                    semantic.insert("status".to_string(), json!("backend_unavailable"));
+                    semantic.insert("reason".to_string(), json!(backend.last_error));
+                    semantic.insert("since_ms".to_string(), json!(backend.since_ms));
+                    semantic.insert("next_retry_ms".to_string(), json!(backend.next_retry_ms));
+                    semantic.remove("stage");
+                    semantic.remove("embedded_chunks");
+                    semantic.remove("total_chunks");
+                    semantic.remove("current_batch");
+                    semantic.remove("total_batches");
+                }
+            }
             cache.annotate_plane_timings(&root_label, &mut value);
             let query_embed =
                 crate::semantic_index::query_embed_health_snapshot(Path::new(&root_label));
@@ -2634,6 +2664,43 @@ mod tests {
             "connection refused by embedding backend"
         );
         assert!(report["embedding_backend"]["since_ms"].is_u64());
+    }
+
+    #[test]
+    fn cold_semantic_retry_reports_backend_unavailable_with_retry_deadline() {
+        let executor = Executor::new();
+        let (_dir, root) = test_root("semantic-cold-backend-unavailable-health");
+        let ctx = test_ctx();
+        *ctx.semantic_index_status().write().unwrap() =
+            crate::context::SemanticIndexStatus::Building {
+                stage: "waiting_for_embedding_backend: connection refused".to_string(),
+                files: None,
+                entries_done: None,
+                entries_total: None,
+            };
+        crate::semantic_index::record_embedding_backend_build_failure_for_test(
+            root.as_path(),
+            "connection refused",
+        );
+        assert!(executor.register_actor(root.clone(), ctx));
+        let app = App::default_shared();
+        let metrics = DispatchPathMetrics::new();
+        let cache = HealthRollupCache::new();
+
+        refresh_until_root_count(&cache, &executor, &app, 1);
+        let report = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app)
+            .metrics
+            .expect("health metrics");
+        let semantic = &report["roots"][0]["semantic_index"];
+        assert_eq!(semantic["status"], "backend_unavailable");
+        assert_eq!(semantic["reason"], "connection refused");
+        assert!(semantic["since_ms"].is_u64());
+        assert!(semantic["next_retry_ms"].as_u64() > semantic["since_ms"].as_u64());
+        assert_eq!(report["embedding_backend"]["available"], false);
+        assert_eq!(
+            report["embedding_backend"]["last_error"],
+            "connection refused"
+        );
     }
 
     #[test]

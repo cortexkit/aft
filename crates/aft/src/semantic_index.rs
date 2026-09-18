@@ -35,6 +35,88 @@ const MAX_DIMENSION: usize = 4096;
 const F32_BYTES: usize = std::mem::size_of::<f32>();
 const HEADER_BYTES_V1: usize = 9;
 const HEADER_BYTES_V2: usize = 13;
+const BUILD_BACKEND_RETRY_SCHEDULE_SECS: [u64; 3] = [15, 30, 60];
+
+#[derive(Clone, Debug)]
+pub(crate) struct EmbeddingBackendBuildHealth {
+    pub(crate) last_error: String,
+    pub(crate) since_ms: u64,
+    pub(crate) next_retry_ms: u64,
+    failures: usize,
+}
+
+fn embedding_backend_build_health_registry(
+) -> &'static Mutex<HashMap<PathBuf, EmbeddingBackendBuildHealth>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, EmbeddingBackendBuildHealth>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn unix_millis_now() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn build_backend_retry_delay_ms(attempt: usize) -> u64 {
+    if let Ok(raw) = env::var("AFT_SEMANTIC_RETRY_BACKOFF_MS") {
+        if let Ok(ms) = raw.parse::<u64>() {
+            return ms;
+        }
+    }
+    BUILD_BACKEND_RETRY_SCHEDULE_SECS
+        .get(attempt)
+        .copied()
+        .unwrap_or(*BUILD_BACKEND_RETRY_SCHEDULE_SECS.last().unwrap())
+        .saturating_mul(1_000)
+}
+
+fn record_embedding_backend_build_failure(project_root: &Path, error: &str) {
+    let now_ms = unix_millis_now();
+    let clean = strip_transient_embedding_marker(error);
+    let mut registry = embedding_backend_build_health_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = registry
+        .entry(project_root.to_path_buf())
+        .or_insert_with(|| EmbeddingBackendBuildHealth {
+            last_error: clean.clone(),
+            since_ms: now_ms,
+            next_retry_ms: now_ms,
+            failures: 0,
+        });
+    entry.last_error = clean;
+    entry.next_retry_ms = now_ms.saturating_add(build_backend_retry_delay_ms(entry.failures));
+    entry.failures = entry.failures.saturating_add(1);
+}
+
+fn clear_embedding_backend_build_failure(project_root: &Path) {
+    embedding_backend_build_health_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(project_root);
+}
+
+pub(crate) fn embedding_backend_build_health(
+    project_root: &Path,
+) -> Option<EmbeddingBackendBuildHealth> {
+    embedding_backend_build_health_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(project_root)
+        .cloned()
+}
+
+#[cfg(test)]
+pub(crate) fn record_embedding_backend_build_failure_for_test(project_root: &Path, reason: &str) {
+    record_embedding_backend_build_failure(
+        project_root,
+        &format!("{TRANSIENT_EMBEDDING_MARKER}{reason}"),
+    );
+}
+
 fn begin_semantic_index_build(
     project_root: &Path,
 ) -> (
@@ -72,6 +154,7 @@ fn finish_semantic_index_build(
 ) {
     match result {
         Ok(index) => {
+            clear_embedding_backend_build_failure(&scope.root);
             crate::logging::log_index_event(
                 crate::logging::IndexEvent::from_scope(
                     crate::logging::IndexEventKind::BuildReady,
@@ -85,6 +168,7 @@ fn finish_semantic_index_build(
             failure_guard.disarm();
         }
         Err(error) if error.contains("superseded") => {
+            clear_embedding_backend_build_failure(&scope.root);
             crate::logging::log_index_event(
                 crate::logging::IndexEvent::from_scope(
                     crate::logging::IndexEventKind::BuildSuperseded,
@@ -95,6 +179,11 @@ fn finish_semantic_index_build(
             failure_guard.disarm();
         }
         Err(error) => {
+            if embedding_failure_is_transient(error) {
+                record_embedding_backend_build_failure(&scope.root, error);
+            } else {
+                clear_embedding_backend_build_failure(&scope.root);
+            }
             crate::logging::log_index_event(
                 crate::logging::IndexEvent::from_scope(
                     crate::logging::IndexEventKind::BuildFailed,
