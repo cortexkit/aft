@@ -2582,8 +2582,18 @@ mod tests {
         let report_metrics = report.metrics.expect("health metrics");
 
         assert_eq!(report_metrics["root_count"].as_u64(), Some(50));
-        assert_eq!(report_metrics["root_details_omitted"].as_u64(), Some(42));
-        assert_eq!(report_metrics["roots"].as_array().map(Vec::len), Some(8));
+        let rendered_roots = report_metrics["roots"]
+            .as_array()
+            .expect("rendered root details")
+            .len();
+        let omitted_roots = report_metrics["root_details_omitted"]
+            .as_u64()
+            .expect("omitted root count") as usize;
+        assert_eq!(rendered_roots + omitted_roots, 50);
+        assert!(rendered_roots <= HEALTH_ROOT_DETAIL_CAP);
+        assert!(report_metrics["metrics_bytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes <= HEALTH_METRICS_BUDGET_BYTES as u64));
         assert_eq!(report_metrics["memory"]["roots_total"].as_u64(), Some(50));
         assert_eq!(
             report_metrics["memory"]["roots"]
@@ -2852,6 +2862,41 @@ mod tests {
             metrics["write_ledger_top_10m"].as_array().map(Vec::len),
             Some(3)
         );
+        assert_eq!(
+            metrics["metrics_bytes"].as_u64(),
+            Some(encoded.len() as u64)
+        );
+    }
+
+    #[test]
+    fn budget_compacts_write_ledger_roots_without_dropping_rows() {
+        let long_prefix = "nested-root/".repeat(700);
+        let mut metrics = json!({
+            "actor_count": 0,
+            "root_count": 0,
+            "root_details_omitted": 0,
+            "embedding_backend": { "available": false, "last_error": "connection refused", "since_ms": 1 },
+            "write_ledger_top_10m": [
+                { "domain": "callgraph_refresh", "root_id": format!("/{long_prefix}project-a"), "logical_bytes": 1, "physical_bytes": 2 },
+                { "domain": "semantic_compaction", "root_id": format!("/{long_prefix}project-b"), "logical_bytes": 3, "physical_bytes": 4 },
+            ],
+            "roots": [],
+        })
+        .as_object()
+        .expect("metrics object")
+        .clone();
+
+        budget_health_metrics(&mut metrics);
+        let encoded =
+            serde_json::to_vec(&Value::Object(metrics.clone())).expect("encode budgeted metrics");
+        assert!(encoded.len() <= HEALTH_METRICS_BUDGET_BYTES);
+        let rows = metrics["write_ledger_top_10m"]
+            .as_array()
+            .expect("write ledger rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["root_id"], "project-a");
+        assert_eq!(rows[1]["root_id"], "project-b");
+        assert_eq!(metrics["embedding_backend"]["available"], false);
         assert_eq!(
             metrics["metrics_bytes"].as_u64(),
             Some(encoded.len() as u64)
