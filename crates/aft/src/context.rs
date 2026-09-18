@@ -302,9 +302,9 @@ struct StatusBarTier2 {
     duplicates: Option<usize>,
     todos: Option<usize>,
     stale: bool,
-    /// Successful reuse completions observed when this snapshot first became
-    /// stale. Health compares against this marker so a completed background
-    /// pass can become ready before the request-thread status-bar drain runs.
+    /// Reuse completions observed when this snapshot first became stale. Health
+    /// requires every later completion to have succeeded before reporting ready.
+    stale_after_reuse_completion: u64,
     stale_after_successful_completion: u64,
     generation: u64,
     /// True when the latest dead_code aggregate reported `callgraph_available:
@@ -3066,10 +3066,16 @@ impl AppContext {
         // Let the callgraph component report that dependency instead of leaving
         // tier2 permanently "building" with no refresh able to complete it.
         let dead_code_blocked_on_callgraph = tier2.dead_code_blocked_on_callgraph;
+        let tier2_completions = self.inspect_manager.reuse_completion_count();
         let successful_tier2_completions = self.inspect_manager.successful_reuse_completion_count();
+        let completions_since_stale =
+            tier2_completions.saturating_sub(tier2.stale_after_reuse_completion);
+        let successful_since_stale =
+            successful_tier2_completions.saturating_sub(tier2.stale_after_successful_completion);
         let background_refresh_completed = tier2.stale
             && !tier2_builder_busy
-            && successful_tier2_completions > tier2.stale_after_successful_completion;
+            && completions_since_stale > 0
+            && successful_since_stale == completions_since_stale;
         let tier2_complete = (tier2.dead_code.is_some() || dead_code_blocked_on_callgraph)
             && tier2.unused_exports.is_some()
             && tier2.duplicates.is_some()
@@ -3164,6 +3170,7 @@ impl AppContext {
             let changed = !tier2.stale;
             tier2.stale = true;
             if changed {
+                tier2.stale_after_reuse_completion = self.inspect_manager.reuse_completion_count();
                 tier2.stale_after_successful_completion =
                     self.inspect_manager.successful_reuse_completion_count();
                 tier2.generation = tier2.generation.wrapping_add(1);
@@ -3210,6 +3217,7 @@ impl AppContext {
             tier2.todos = Some(todos);
         }
         if stale && !tier2.stale {
+            tier2.stale_after_reuse_completion = self.inspect_manager.reuse_completion_count();
             tier2.stale_after_successful_completion =
                 self.inspect_manager.successful_reuse_completion_count();
         }
@@ -10658,6 +10666,30 @@ mod health_warming_honesty_tests {
                 .starts_with("last attempt failed: callgraph_unavailable (attempt 1, first at "),
             "inspect refusals must carry the failed-attempt history the health surface no longer treats as busy"
         );
+    }
+
+    #[test]
+    fn failed_tier2_pass_does_not_turn_stale_plane_ready() {
+        let ctx = ctx_with_config(Config::default());
+        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), None, false);
+        assert!(ctx.mark_status_bar_tier2_stale());
+        ctx.inspect_manager()
+            .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::Duplicates, true);
+        ctx.inspect_manager().record_tier2_attempt_outcome_for_test(
+            crate::inspect::InspectCategory::DeadCode,
+            crate::inspect::JobOutcome::Fresh {
+                payload: serde_json::json!({ "count": 1 }),
+            },
+        );
+        assert_eq!(health_tier2_status(&ctx), "building");
+
+        ctx.inspect_manager().record_tier2_attempt_outcome_for_test(
+            crate::inspect::InspectCategory::Duplicates,
+            crate::inspect::JobOutcome::Failed {
+                message: "scan failed".to_string(),
+            },
+        );
+        assert_eq!(health_tier2_status(&ctx), "building");
     }
 
     #[test]
