@@ -316,7 +316,12 @@ if [ "$scanner_rc" -ne 0 ]; then
   refuse "could not read the workflow files (workflow-gates.py exit $scanner_rc)"
 fi
 
-if ! printf '%s\n' "$gate_report" | grep -qx 'trigger|ok'; then
+# A here-string rather than `printf | grep -q`: under pipefail, grep -q closes
+# the pipe on its first match and a producer still writing takes SIGPIPE, so
+# the pipeline returns 141 and the guard reads FALSE exactly when the row is
+# present. The report is small enough today that the writer usually finishes
+# first, which is the kind of reasoning that hides the defect until it does not.
+if ! grep -qx 'trigger|ok' <<<"$gate_report"; then
   refuse "tests.yml does not run on $train_ref — add \`train/**\` to on.push.branches in .github/workflows/tests.yml"
 fi
 
