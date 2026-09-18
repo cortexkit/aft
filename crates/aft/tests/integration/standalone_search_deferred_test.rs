@@ -412,7 +412,11 @@ fn standalone_tool_call_read_finishes_before_slow_inspect() {
             "symbol": "main"
         }))
         .expect("serialize callgraph warmup"),
-        Duration::from_secs(30),
+        // A positive wait on a 2,000-file cold build: a contended Windows runner
+        // took 27 s for the build alone (train 120), so the budget is sized for
+        // the runner, not the box. The claim under test is the 3 s read liveness
+        // below, which keeps its tight bound.
+        Duration::from_secs(120),
     );
     assert_eq!(
         callgraph["success"], true,
