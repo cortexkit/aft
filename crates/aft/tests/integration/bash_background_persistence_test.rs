@@ -788,7 +788,22 @@ fn bash_status_legacy_persisted_task_is_quarantined_on_replay() {
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    assert!(!legacy_path.exists());
+    // Legacy-layout files are invalid entries; replay quarantines them inline
+    // and logs (not returns) a failed rename. A logger is not installed in this
+    // binary, so when the file survives, redo that one rename here to surface
+    // the OS error instead of a bare `exists()` (macOS CI, train 113).
+    if legacy_path.exists() {
+        let session_dir =
+            aft::bash_background::persistence::session_tasks_dir(storage.path(), "session-a");
+        aft::bash_background::persistence::quarantine_invalid_entry(
+            storage.path(),
+            &session_dir,
+            std::ffi::OsStr::new("bash-legacy1.json"),
+        )
+        .expect("quarantine of the legacy metadata file failed during replay");
+        panic!("replay left the legacy metadata file in place, but a direct quarantine of it succeeds");
+    }
+
     let quarantine_session = storage
         .path()
         .join("bash-tasks-quarantine")
