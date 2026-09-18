@@ -2650,7 +2650,41 @@ mod tests {
     }
 
     #[test]
-    fn inspect_scope_sweep_cursor_resumes_after_tiny_budget() {
+    fn inspect_scope_sweep_keeps_live_writer_lease_then_reaps_released_scope() {
+        reset_inspect_scope_sweep_cursor_for_test();
+        let temp = tempfile::tempdir().unwrap();
+        let inspect_root = temp.path().join("inspect");
+        let scope = inspect_root.join("leased-scope");
+        write_aged_scope_file(&scope, "facts.sqlite");
+        let writer_lease = crate::fs_lock::try_acquire(
+            &crate::root_cache::writer_lease_path(&scope),
+            Duration::ZERO,
+        )
+        .unwrap();
+        let old = SystemTime::now()
+            .checked_sub(INSPECT_SCOPE_MIN_AGE + Duration::from_secs(60))
+            .unwrap();
+        filetime::set_file_mtime(
+            writer_lease.path(),
+            filetime::FileTime::from_system_time(old),
+        )
+        .unwrap();
+
+        let first = sweep_inspect_scope_dirs(&inspect_root, &HashSet::new());
+        assert!(scope.is_dir(), "a live writer lease protects an aged scope");
+        drop(writer_lease);
+
+        let second = sweep_inspect_scope_dirs(&inspect_root, &HashSet::new());
+        assert_eq!(second.removed, 1);
+        assert!(
+            !scope.exists(),
+            "the scope is reapable after its writer lease is released"
+        );
+        assert_eq!(first.removed, 0);
+    }
+
+    #[test]
+    fn inspect_scope_sweep_cursor_resumes_after_entry_bound() {
         reset_inspect_scope_sweep_cursor_for_test();
         let temp = tempfile::tempdir().unwrap();
         let inspect_root = temp.path().join("inspect");
@@ -2662,30 +2696,22 @@ mod tests {
             &inspect_root,
             &HashSet::new(),
             INSPECT_SCOPE_SWEEP_BUDGET,
-            1,
+            2,
         );
         assert!(first.budget_exhausted);
+        assert_eq!(first.removed, 2);
         assert!(!inspect_root.join("scope-a").exists());
-        assert!(inspect_root.join("scope-b").exists());
+        assert!(!inspect_root.join("scope-b").exists());
         assert!(inspect_root.join("scope-c").exists());
 
         let second = sweep_inspect_scope_dirs_with_limits(
             &inspect_root,
             &HashSet::new(),
             INSPECT_SCOPE_SWEEP_BUDGET,
-            1,
+            2,
         );
-        assert!(second.budget_exhausted);
-        assert!(!inspect_root.join("scope-b").exists());
-        assert!(inspect_root.join("scope-c").exists());
-
-        let third = sweep_inspect_scope_dirs_with_limits(
-            &inspect_root,
-            &HashSet::new(),
-            INSPECT_SCOPE_SWEEP_BUDGET,
-            1,
-        );
-        assert!(!third.budget_exhausted);
+        assert!(!second.budget_exhausted);
+        assert_eq!(second.removed, 1);
         assert!(!inspect_root.join("scope-c").exists());
         reset_inspect_scope_sweep_cursor_for_test();
     }
