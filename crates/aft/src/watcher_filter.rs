@@ -285,6 +285,29 @@ fn watcher_path_is_ignored(matcher: Option<&Gitignore>, path: &Path) -> bool {
     })
 }
 
+/// True when `path` is an in-tree ignore rule file whose parent directory
+/// the current matcher already ignores. Only in-tree rule files have a
+/// parent that can be ignored; the global excludes file and
+/// `.git/info/exclude` never do.
+fn ignore_file_parent_is_ignored(matcher: &SharedGitignore, path: &Path) -> bool {
+    if !watcher_path_is_ignore_file(path) {
+        return false;
+    }
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let guard = matcher
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.as_deref().is_some_and(|matcher| {
+        parent.starts_with(matcher.path())
+            && parent != matcher.path()
+            && matcher
+                .matched_path_or_any_parents(parent, true)
+                .is_ignore()
+    })
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 const WATCHER_EXCLUSION_SEEDS: [&str; 17] = [
     ".git",
@@ -630,9 +653,18 @@ fn filter_canonical_paths(
     matcher: &SharedGitignore,
     raw_paths: BTreeSet<PathBuf>,
 ) -> FilteredWatcherPaths {
-    let ignore_file_changed = raw_paths
-        .iter()
-        .any(|path| watcher_path_can_change_corpus_ignore(config, path));
+    // A `.gitignore` written inside a directory the current rules already
+    // ignore cannot change the corpus: git never descends into an ignored
+    // directory to read one, and neither does the matcher. wrangler, for one,
+    // writes a `.gitignore` into every dev directory it creates under an
+    // ignored `.wrangler/tmp/`; treating each as a rule change rebuilt the
+    // matcher and cold-rebuilt the search index every few seconds for an hour
+    // (2026-09-18). A rule file whose parent is not ignored, or any rule file
+    // while no matcher exists yet, still counts.
+    let ignore_file_changed = raw_paths.iter().any(|path| {
+        watcher_path_can_change_corpus_ignore(config, path)
+            && !ignore_file_parent_is_ignored(matcher, path)
+    });
 
     let changed = raw_paths
         .into_iter()
@@ -1780,6 +1812,43 @@ mod tests {
 
         assert!(!filtered.changed.contains(&root.join("ignored/file.ts")));
         assert!(filtered.changed.contains(&root.join("kept.ts")));
+    }
+
+    #[test]
+    fn ignore_file_inside_an_ignored_directory_is_not_a_rule_change() {
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::write(root.join(".gitignore"), "/worker/.wrangler/tmp\n").unwrap();
+        let dev_dir = root.join("worker/.wrangler/tmp/dev-1");
+        std::fs::create_dir_all(&dev_dir).unwrap();
+        std::fs::write(dev_dir.join(".gitignore"), "*\n").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/.gitignore"), "gen/\n").unwrap();
+        let matcher = shared_matcher(&root);
+        let config = WatcherFilterConfig::new(root.clone(), None);
+
+        // wrangler writes a `.gitignore` into every dev directory it creates
+        // under the already-ignored tmp tree: no rule change, no rebuild.
+        let inside_ignored =
+            filter_watcher_raw_paths_for_test(&config, &matcher, [dev_dir.join(".gitignore")]);
+        assert!(!inside_ignored.ignore_file_changed);
+        assert!(inside_ignored.changed.is_empty());
+
+        // A rule file in a visible directory, and the root rule file itself,
+        // still count.
+        let visible =
+            filter_watcher_raw_paths_for_test(&config, &matcher, [root.join("src/.gitignore")]);
+        assert!(visible.ignore_file_changed);
+        let at_root =
+            filter_watcher_raw_paths_for_test(&config, &matcher, [root.join(".gitignore")]);
+        assert!(at_root.ignore_file_changed);
+
+        // With no matcher yet there is nothing to say the parent is ignored,
+        // so the conservative answer stands.
+        let no_matcher: SharedGitignore = Arc::new(RwLock::new(None));
+        let unknown =
+            filter_watcher_raw_paths_for_test(&config, &no_matcher, [dev_dir.join(".gitignore")]);
+        assert!(unknown.ignore_file_changed);
     }
 
     #[test]
