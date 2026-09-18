@@ -311,6 +311,35 @@ fn missing_blob_rolls_back_deletions_and_fingerprint() {
 }
 
 #[test]
+fn incremental_phase_table_requires_every_phase_timed() {
+    let f = fixture();
+    let (_, copy) = prepare(&f);
+    let (_, timings) = apply_manifest_diff_profiled(&copy, &f.base, &f.next, &f.blobs).unwrap();
+    let table = profile::offline_phase_table(
+        profile::PhaseMeasurement::observed(1, 0),
+        &timings,
+        profile::PhaseMeasurement::observed(1, 1),
+    )
+    .expect("phase table must reject an untimed materialization bucket");
+    for phase in [
+        "clone",
+        "selected_join",
+        "delete_rows",
+        "emit_files",
+        "emit_nodes",
+        "emit_view_file_surfaces",
+        "emit_file_dependencies",
+        "emit_view_bindings",
+        "emit_refs",
+        "emit_edges",
+        "index_maintenance",
+        "checkpoint",
+    ] {
+        assert!(table.contains(&format!("| {phase} |")), "missing {phase}");
+    }
+}
+
+#[test]
 fn identical_manifest_performs_zero_writes() {
     let f = fixture();
     let (_, copy) = prepare(&f);
@@ -366,6 +395,16 @@ fn bench_real_manifest_diff() {
         |name: &str| Manifest::from_json_bytes(&std::fs::read(input.join(name)).unwrap()).unwrap();
     let base = load("base.json");
     let next = load("next.json");
+    assert_eq!(
+        fingerprint(&base).unwrap(),
+        "ffc2ece68208cd454853233d2bad29627131be253c78da5a6644cfcd3d8c3ffb",
+        "offline benchmark must use the retained opencode HEAD manifest"
+    );
+    assert_eq!(
+        fingerprint(&next).unwrap(),
+        "e0b49e85a7b8674087a9026489c830ae954f82a337299a2ea9d6505e96955a29",
+        "offline benchmark must use the retained 300-Git-path target manifest"
+    );
     let blobs = input.join("callgraph.sqlite");
     let changed = base
         .entries()
@@ -383,25 +422,18 @@ fn bench_real_manifest_diff() {
     println!("measurement databases: {}", temp.display());
     let original = temp.join("base.sqlite");
     materialize_manifest_view_database(&original, &blobs, &base).unwrap();
-    let mut outputs = Vec::new();
-    for (incremental, per_reference, scan_callers) in [
-        (false, false, false),
-        (true, true, false),
-        (true, false, true),
-        (true, false, false),
-    ] {
-        PER_REFERENCE_LOOKUP.with(|enabled| enabled.set(per_reference));
-        join::SCAN_CALLER_NODES.with(|enabled| enabled.set(scan_callers));
-        let db = temp.join(if scan_callers {
-            "scan-callers.sqlite"
-        } else if per_reference {
-            "per-reference.sqlite"
-        } else if incremental {
-            "incremental.sqlite"
-        } else {
-            "cold.sqlite"
-        });
-        std::fs::copy(&original, &db).unwrap();
+    let cold = temp.join("cold.sqlite");
+    materialize_manifest_view_database(&cold, &blobs, &next).unwrap();
+    let cold_snapshot = snapshot(&cold);
+    let repetitions = std::env::var("AFT_VIEW_BENCH_REPETITIONS")
+        .map(|value| value.parse::<usize>().expect("benchmark repetitions"))
+        .unwrap_or(1);
+
+    for run in 1..=repetitions {
+        let db = temp.join(format!("incremental-{run}.sqlite"));
+        let clone_started = std::time::Instant::now();
+        crate::views::generation::clone_derived(&original, &db).unwrap();
+        let clone = profile::PhaseMeasurement::observed(clone_started.elapsed().as_nanos(), 0);
         let keeper = Connection::open(&db).unwrap();
         keeper
             .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_checkpoint(TRUNCATE)")
@@ -413,24 +445,45 @@ fn bench_real_manifest_diff() {
             libc::getloadavg(load_before.as_mut_ptr(), 3);
         }
         let start = std::time::Instant::now();
-        let stats = materialize(&db, &blobs, &next, incremental.then_some(&base)).unwrap();
+        let (stats, timings) = materialize(&db, &blobs, &next, Some(&base)).unwrap();
         let elapsed = start.elapsed().as_secs_f64();
         let after = usage();
         let mut load_after = [0.0; 3];
         unsafe {
             libc::getloadavg(load_after.as_mut_ptr(), 3);
         }
-        println!("load_before={load_before:?} load_after={load_after:?}");
-        let wal = std::fs::metadata(format!("{}-wal", db.display()))
-            .unwrap()
-            .len();
-        println!("scan_callers={scan_callers} per_reference={per_reference} incremental={incremental} wall_s={elapsed:.3} cpu_s={:.3} physical_bytes={} logical_bytes={} wal_bytes={wal} stats={stats:?}", after.2-before.2, after.0-before.0, after.1-before.1);
+        let wal_path = format!("{}-wal", db.display());
+        let wal = std::fs::metadata(&wal_path).unwrap().len();
         report_wal_pages(&db);
-        outputs.push(snapshot(&db));
+        let checkpoint_started = std::time::Instant::now();
+        let (_, _, checkpointed): (i64, i64, i64) = keeper
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        keeper
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let checkpoint = profile::PhaseMeasurement::observed(
+            checkpoint_started.elapsed().as_nanos(),
+            checkpointed.max(0) as u64,
+        );
+        println!("offline incremental phase table run={run}");
+        let table = profile::offline_phase_table(clone, &timings, checkpoint)
+            .expect("every offline materialization phase must be timed");
+        println!("{table}");
+        if timings
+            .writes
+            .get(profile::WritePhase::IndexMaintenance)
+            .wall_ns
+            == 0
+        {
+            println!("index_maintenance is inline and charged to delete/emission rows");
+        }
+        println!("load_before={load_before:?} load_after={load_after:?}");
+        println!("incremental=true run={run} wall_s={elapsed:.3} cpu_s={:.3} physical_bytes={} logical_bytes={} wal_bytes={wal} stats={stats:?}", after.2-before.2, after.0-before.0, after.1-before.1);
+        assert_snapshot_parity(&cold_snapshot, &snapshot(&db));
     }
-    assert_snapshot_parity(&outputs[0], &outputs[1]);
-    assert_snapshot_parity(&outputs[0], &outputs[2]);
-    assert_snapshot_parity(&outputs[0], &outputs[3]);
 }
 
 #[test]

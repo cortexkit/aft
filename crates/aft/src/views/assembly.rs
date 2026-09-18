@@ -753,6 +753,7 @@ mod tests {
             commit_ms: 23,
             cleanup_memory_ms: 24,
             cleanup_connections_ms: 25,
+            writes: Default::default(),
         };
         let line = publication_profile_line(&profile);
         assert!(line.contains("plane=views root=/checkout outcome=published"));

@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use self::profile::{PhaseProbe, WritePhase};
 use crate::callgraph_store::{
     initialize_schema, join, set_meta_ready, CallGraphStoreError, Result, PROVENANCE_TREESITTER,
 };
@@ -288,6 +289,9 @@ fn materialize(
         ..MaterializeStats::default()
     };
     profile.finish("load_bindings_select");
+    let mut existing_binding_paths = BTreeSet::new();
+    let mut existing_surface_paths = BTreeSet::new();
+    let delete_probe = PhaseProbe::start(&transaction);
     if let Some(changed) = &changed {
         transaction.execute_batch(
             "CREATE TEMP TABLE changed_view_paths (
@@ -305,6 +309,8 @@ fn materialize(
                 stats.delete_paths_touched += insert.execute([path])?;
             }
         }
+        existing_binding_paths = existing_changed_paths(&transaction, "view_bindings")?;
+        existing_surface_paths = existing_changed_paths(&transaction, "view_file_surfaces")?;
         // Edges are owned through their ref_id, not their target. Delete them
         // before refs so cross-file incoming edges remain available. Starting
         // every lookup from the bounded path table keeps deletion on the diff.
@@ -328,17 +334,11 @@ fn materialize(
             "DELETE FROM files WHERE path IN (SELECT path FROM changed_view_paths)",
             [],
         )?;
-        stats.dependency_deleted += transaction.execute(
-            "DELETE FROM file_dependencies WHERE file_path IN (SELECT path FROM changed_view_paths)",
+        stats.dependency_deleted += transaction.query_row(
+            "SELECT COUNT(*) FROM file_dependencies
+             WHERE file_path IN (SELECT path FROM changed_view_paths)",
             [],
-        )?;
-        stats.dependency_deleted += transaction.execute(
-            "DELETE FROM view_bindings WHERE file_path IN (SELECT path FROM changed_view_paths)",
-            [],
-        )?;
-        stats.surface_deleted += transaction.execute(
-            "DELETE FROM view_file_surfaces WHERE file_path IN (SELECT path FROM changed_view_paths)",
-            [],
+            |row| row.get::<_, usize>(0),
         )?;
     } else {
         for table in ["edges", "refs", "nodes", "files"] {
@@ -351,10 +351,13 @@ fn materialize(
         }
         stats.surface_deleted += transaction.execute("DELETE FROM view_file_surfaces", [])?;
     }
+    profile.record(WritePhase::DeleteRows, delete_probe.finish(&transaction));
     profile.finish("delete_rows");
     let mut parsed = BTreeMap::new();
     let mut nodes = HashMap::<String, HashMap<String, String>>::new();
     let mut loaded_paths = BTreeSet::new();
+    let mut owned_files = Vec::new();
+    let mut owned_nodes = Vec::new();
     for (path, entry) in manifest.entries() {
         if changed
             .as_ref()
@@ -390,41 +393,31 @@ fn materialize(
             .as_ref()
             .is_none_or(|paths| paths.contains(path.as_bytes()));
         if write_owned {
-            stats.inserted += transaction.execute(
-                "INSERT OR REPLACE INTO files
-             (path, content_hash, mtime_ns, size, lang, is_dead_code_root, is_public_api,
-              surface_fingerprint, indexed_at)
-             VALUES (?1, ?2, 0, 0, ?3, 0, 0, '', 0)",
-                params![path, key, parse.language],
-            )?;
+            owned_files.push(OwnedFileRow {
+                path: path.clone(),
+                content_hash: key.to_string(),
+                language: parse.language.clone(),
+            });
         }
         let file_nodes = nodes.entry(path.clone()).or_default();
         for symbol in &parse.symbols {
             let id = format!("view:{path}:{}:{}", symbol.scoped_name, symbol.ordinal);
             if write_owned {
-                stats.inserted += transaction.execute(
-                    "INSERT OR REPLACE INTO nodes
-                 (id, file_path, name, scoped_name, kind, start_line, start_col, end_line,
-                  end_col, range_ordinal, signature, exported, is_default_export,
-                  is_type_like, is_callgraph_entry_point, provenance)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?12, ?14)",
-                    params![
-                        id,
-                        path,
-                        symbol.name,
-                        symbol.scoped_name,
-                        symbol.kind,
-                        i64::from(symbol.start_line),
-                        i64::from(symbol.start_col),
-                        i64::from(symbol.end_line),
-                        i64::from(symbol.end_col),
-                        i64::from(symbol.ordinal),
-                        symbol.signature,
-                        i64::from(symbol.exported),
-                        i64::from(symbol.is_default_export),
-                        PROVENANCE_TREESITTER,
-                    ],
-                )?;
+                owned_nodes.push(OwnedNodeRow {
+                    id: id.clone(),
+                    file_path: path.clone(),
+                    name: symbol.name.clone(),
+                    scoped_name: symbol.scoped_name.clone(),
+                    kind: symbol.kind.clone(),
+                    start_line: symbol.start_line,
+                    start_col: symbol.start_col,
+                    end_line: symbol.end_line,
+                    end_col: symbol.end_col,
+                    ordinal: symbol.ordinal,
+                    signature: symbol.signature.clone(),
+                    exported: symbol.exported,
+                    default_export: symbol.is_default_export,
+                });
             }
             file_nodes.insert(symbol.scoped_name.clone(), id.clone());
             file_nodes.entry(symbol.name.clone()).or_insert(id);
@@ -434,6 +427,48 @@ fn materialize(
         }
     }
 
+    stats.inserted += profile.measure(WritePhase::Files, &transaction, || {
+        let mut insert = transaction.prepare(
+            "INSERT OR REPLACE INTO files
+             (path, content_hash, mtime_ns, size, lang, is_dead_code_root, is_public_api,
+              surface_fingerprint, indexed_at)
+             VALUES (?1, ?2, 0, 0, ?3, 0, 0, '', 0)",
+        )?;
+        owned_files.iter().try_fold(0, |count, row| {
+            insert
+                .execute(params![row.path, row.content_hash, row.language])
+                .map(|written| count + written)
+        })
+    })?;
+    stats.inserted += profile.measure(WritePhase::Nodes, &transaction, || {
+        let mut insert = transaction.prepare(
+            "INSERT OR REPLACE INTO nodes
+             (id, file_path, name, scoped_name, kind, start_line, start_col, end_line,
+              end_col, range_ordinal, signature, exported, is_default_export,
+              is_type_like, is_callgraph_entry_point, provenance)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0, ?12, ?14)",
+        )?;
+        owned_nodes.iter().try_fold(0, |count, row| {
+            insert
+                .execute(params![
+                    row.id,
+                    row.file_path,
+                    row.name,
+                    row.scoped_name,
+                    row.kind,
+                    i64::from(row.start_line),
+                    i64::from(row.start_col),
+                    i64::from(row.end_line),
+                    i64::from(row.end_col),
+                    i64::from(row.ordinal),
+                    row.signature,
+                    i64::from(row.exported),
+                    i64::from(row.default_export),
+                    PROVENANCE_TREESITTER,
+                ])
+                .map(|written| count + written)
+        })
+    })?;
     profile.finish("owned_blob_decode_and_insert");
     let changed_strings = changed.as_ref().map_or_else(BTreeSet::new, |paths| {
         paths
@@ -457,6 +492,7 @@ fn materialize(
     {
         membership_changed.insert(join::VIEW_CONFIG_MEMBERSHIP_DOMAIN.into());
     }
+    let selected_join_probe = PhaseProbe::start(&transaction);
     let joined = join::join_selected_manifest_reusing_surfaces(
         manifest,
         &reader,
@@ -467,6 +503,10 @@ fn materialize(
         &fact_invalidated,
     )
     .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
+    profile.record(
+        WritePhase::SelectedJoin,
+        selected_join_probe.finish(&transaction),
+    );
     profile.finish("selected_join");
     stats.unattributed_callers = joined
         .bindings
@@ -484,16 +524,18 @@ fn materialize(
         .iter()
         .filter(|path| !changed_strings.contains(*path) && changed.is_some())
         .count();
+    let mut surface_rows = Vec::new();
+    let mut dependency_deletes = Vec::new();
+    let mut dependency_inserts = Vec::new();
+    let mut changed_dependencies = Vec::new();
+    let mut binding_inserts = Vec::new();
     for (path, binding) in &joined.bindings {
         if joined.rebuilt_surface_paths.contains(path) {
             if let Some(payload) = binding
                 .surface_json()
                 .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?
             {
-                stats.surface_inserted += transaction.execute(
-                    "INSERT OR REPLACE INTO view_file_surfaces(file_path, payload) VALUES(?1, ?2)",
-                    params![path, payload],
-                )?;
+                surface_rows.push((path.clone(), payload, existing_surface_paths.contains(path)));
             }
         }
         let old = cached.get(path).filter(|_| {
@@ -506,223 +548,428 @@ fn materialize(
         }
         let empty = BTreeSet::new();
         let previous = old.map_or(&empty, |old| &old.dependencies);
-        for dependency in previous.difference(&binding.dependencies) {
-            stats.dependency_deleted += transaction.execute(
-                "DELETE FROM file_dependencies WHERE file_path=?1 AND dep_file=?2",
-                params![path, dependency],
-            )?;
+        if changed
+            .as_ref()
+            .is_some_and(|paths| paths.contains(path.as_bytes()))
+        {
+            changed_dependencies.extend(
+                binding
+                    .dependencies
+                    .iter()
+                    .map(|dependency| (path.clone(), dependency.clone())),
+            );
         }
-        for dependency in binding.dependencies.difference(previous) {
-            stats.dependency_inserted += transaction.execute(
-                "INSERT INTO file_dependencies(file_path, dep_file) VALUES(?1, ?2)",
-                params![path, dependency],
-            )?;
-        }
-        stats.dependency_deleted +=
-            transaction.execute("DELETE FROM view_bindings WHERE file_path=?1", [path])?;
+        dependency_deletes.extend(
+            previous
+                .difference(&binding.dependencies)
+                .map(|dependency| (path.clone(), dependency.clone())),
+        );
+        dependency_inserts.extend(
+            binding
+                .dependencies
+                .difference(previous)
+                .map(|dependency| (path.clone(), dependency.clone())),
+        );
+        let replaced = old.is_some() || existing_binding_paths.contains(path);
         let payload = serde_json::to_string(binding)
             .map_err(|error| CallGraphStoreError::Unavailable(error.to_string()))?;
-        stats.dependency_inserted += transaction.execute(
-            "INSERT INTO view_bindings(file_path, payload) VALUES(?1, ?2)",
-            params![path, payload],
-        )?;
+        binding_inserts.push((path.clone(), payload, replaced));
     }
-    profile.finish("write_bindings");
-    // Retain prepared statements across the fan-out. Preparing each statement
-    // again costs more than binding many of these small reference rows.
-    {
-        type ExistingRef = (
-            Option<String>,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        );
-        let mut identical_refs = 0;
-        let mut existing = HashMap::<String, HashMap<String, ExistingRef>>::new();
-        let mut load_refs = transaction.prepare("SELECT ref_id, caller_node, status, target_node, target_file, target_symbol FROM refs WHERE caller_file = ?1")?;
-        let mut delete_edge = transaction.prepare("DELETE FROM edges WHERE ref_id = ?1")?;
-        let mut delete_ref = transaction.prepare("DELETE FROM refs WHERE ref_id = ?1")?;
-        let mut insert_ref = transaction.prepare(
-            "INSERT OR REPLACE INTO refs
-             (ref_id, caller_node, caller_file, kind, short_name, full_ref, module_path,
-              import_kind, local_name, requested_name, namespace_alias, wildcard, line,
-              byte_start, byte_end, status, target_node, target_file, target_symbol, provenance)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17, ?18, ?19, ?20)",
-        )?;
-        let mut insert_edge = transaction.prepare(
-            "INSERT OR REPLACE INTO edges
-                     (edge_id, ref_id, source_node, target_node, target_file, target_symbol,
-                      kind, line, provenance)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'call', ?7, ?8)",
-        )?;
-        #[cfg(test)]
-        let mut control_lookup = transaction.prepare("SELECT EXISTS(SELECT 1 FROM refs WHERE ref_id=?1 AND caller_node IS ?2 AND status=?3 AND target_node IS ?4 AND target_file IS ?5 AND target_symbol IS ?6)")?;
-        for row in joined.result.rows {
-            let caller_path = String::from_utf8(row.caller_path).map_err(|_| {
-                CallGraphStoreError::Unavailable("non-UTF-8 manifest caller path".to_string())
+    let surface_updates = surface_rows
+        .iter()
+        .map(|(path, _, _)| path.as_str())
+        .collect::<BTreeSet<_>>();
+    let surface_deletes = existing_surface_paths
+        .iter()
+        .filter(|path| !surface_updates.contains(path.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let binding_updates = binding_inserts
+        .iter()
+        .map(|(path, _, _)| path.as_str())
+        .collect::<BTreeSet<_>>();
+    let binding_deletes = existing_binding_paths
+        .iter()
+        .filter(|path| !binding_updates.contains(path.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let (surface_deleted, surface_inserted) = profile.measure(
+        WritePhase::FileSurfaces,
+        &transaction,
+        || -> rusqlite::Result<_> {
+            let mut delete =
+                transaction.prepare("DELETE FROM view_file_surfaces WHERE file_path=?1")?;
+            let stale_deleted = surface_deletes.iter().try_fold(0, |count, path| {
+                delete.execute([path]).map(|written| count + written)
             })?;
+            let mut insert = transaction.prepare(
+                "INSERT INTO view_file_surfaces(file_path, payload) VALUES(?1, ?2)
+                 ON CONFLICT(file_path) DO UPDATE SET payload=excluded.payload",
+            )?;
+            let mut inserted = 0;
+            let mut replaced = 0;
+            for (path, payload, existed) in &surface_rows {
+                inserted += insert.execute(params![path, payload])?;
+                replaced += usize::from(*existed);
+            }
+            Ok((stale_deleted + replaced, inserted))
+        },
+    )?;
+    stats.surface_deleted += surface_deleted;
+    stats.surface_inserted += surface_inserted;
+    let (dependency_deleted, dependency_inserted) = profile.measure(
+        WritePhase::FileDependencies,
+        &transaction,
+        || -> rusqlite::Result<_> {
+            if changed.is_some() {
+                transaction.execute_batch(
+                    "CREATE TEMP TABLE next_changed_dependencies (
+                         file_path TEXT NOT NULL,
+                         dep_file TEXT NOT NULL,
+                         PRIMARY KEY(file_path, dep_file)
+                     ) WITHOUT ROWID",
+                )?;
+                let mut stage = transaction.prepare(
+                    "INSERT INTO next_changed_dependencies(file_path, dep_file) VALUES(?1, ?2)",
+                )?;
+                for (path, dependency) in &changed_dependencies {
+                    stage.execute(params![path, dependency])?;
+                }
+                transaction.execute(
+                    "DELETE FROM file_dependencies
+                     WHERE file_path IN (SELECT path FROM changed_view_paths)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM next_changed_dependencies AS next
+                           WHERE next.file_path=file_dependencies.file_path
+                             AND next.dep_file=file_dependencies.dep_file
+                       )",
+                    [],
+                )?;
+                transaction.execute(
+                    "INSERT OR IGNORE INTO file_dependencies(file_path, dep_file)
+                     SELECT file_path, dep_file FROM next_changed_dependencies",
+                    [],
+                )?;
+            }
+            let mut delete = transaction
+                .prepare("DELETE FROM file_dependencies WHERE file_path=?1 AND dep_file=?2")?;
+            let deleted = dependency_deletes
+                .iter()
+                .try_fold(0, |count, (path, dependency)| {
+                    delete
+                        .execute(params![path, dependency])
+                        .map(|written| count + written)
+                })?;
+            let mut insert = transaction.prepare(
+                "INSERT OR IGNORE INTO file_dependencies(file_path, dep_file) VALUES(?1, ?2)",
+            )?;
+            for (path, dependency) in dependency_inserts.iter().filter(|(path, _)| {
+                changed
+                    .as_ref()
+                    .is_none_or(|paths| !paths.contains(path.as_bytes()))
+            }) {
+                insert.execute(params![path, dependency])?;
+            }
+            Ok((deleted, dependency_inserts.len()))
+        },
+    )?;
+    stats.dependency_deleted += dependency_deleted;
+    stats.dependency_inserted += dependency_inserted;
+    let (binding_deleted, binding_inserted) = profile.measure(
+        WritePhase::Bindings,
+        &transaction,
+        || -> rusqlite::Result<_> {
+            let mut delete = transaction.prepare("DELETE FROM view_bindings WHERE file_path=?1")?;
+            let deleted = binding_deletes.iter().try_fold(0, |count, path| {
+                delete.execute([path]).map(|written| count + written)
+            })?;
+            let mut insert = transaction.prepare(
+                "INSERT INTO view_bindings(file_path, payload) VALUES(?1, ?2)
+                 ON CONFLICT(file_path) DO UPDATE SET payload=excluded.payload",
+            )?;
+            let mut inserted = 0;
+            let mut replaced = 0;
+            for (path, payload, existed) in &binding_inserts {
+                inserted += insert.execute(params![path, payload])?;
+                replaced += usize::from(*existed);
+            }
+            Ok((deleted + replaced, inserted))
+        },
+    )?;
+    stats.dependency_deleted += binding_deleted;
+    stats.dependency_inserted += binding_inserted;
+    profile.finish("write_bindings");
+    type ExistingRef = (
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let mut identical_refs = 0;
+    let mut existing = HashMap::<String, HashMap<String, ExistingRef>>::new();
+    let mut ref_deletes = Vec::new();
+    let mut pending_refs = Vec::new();
+    let mut pending_edges = Vec::new();
+    let mut load_refs = transaction.prepare("SELECT ref_id, caller_node, status, target_node, target_file, target_symbol FROM refs WHERE caller_file = ?1")?;
+    #[cfg(test)]
+    let mut control_lookup = transaction.prepare("SELECT EXISTS(SELECT 1 FROM refs WHERE ref_id=?1 AND caller_node IS ?2 AND status=?3 AND target_node IS ?4 AND target_file IS ?5 AND target_symbol IS ?6)")?;
+    for row in joined.result.rows {
+        let caller_path = String::from_utf8(row.caller_path).map_err(|_| {
+            CallGraphStoreError::Unavailable("non-UTF-8 manifest caller path".to_string())
+        })?;
+        ensure_manifest_path(
+            &caller_path,
+            manifest,
+            &reader,
+            &mut loaded_paths,
+            &mut parsed,
+            &mut nodes,
+        )?;
+        let target_path = row
+            .target_path
+            .and_then(|path| String::from_utf8(path).ok());
+        if let Some(target) = target_path.as_deref() {
             ensure_manifest_path(
-                &caller_path,
+                target,
                 manifest,
                 &reader,
                 &mut loaded_paths,
                 &mut parsed,
                 &mut nodes,
             )?;
-            let target_path = row
-                .target_path
-                .and_then(|path| String::from_utf8(path).ok());
-            if let Some(target) = target_path.as_deref() {
-                ensure_manifest_path(
-                    target,
-                    manifest,
-                    &reader,
-                    &mut loaded_paths,
-                    &mut parsed,
-                    &mut nodes,
-                )?;
-            }
-            let Some(parse) = parsed.get(&caller_path) else {
-                continue;
-            };
-            let Some(reference) = parse.reference(row.ref_ordinal) else {
-                continue;
-            };
-            let caller_node = reference
-                .caller_symbol
-                .as_ref()
-                .and_then(|symbol| nodes.get(&caller_path)?.get(symbol))
-                .cloned();
-            let target_symbol = row.target_symbol;
-            let target_node = target_path
-                .as_ref()
-                .zip(target_symbol.as_ref())
-                .and_then(|(path, symbol)| nodes.get(path)?.get(symbol))
-                .cloned();
-            let ref_id = format!("view:{caller_path}:{}", row.ref_ordinal);
-            let relink = changed
-                .as_ref()
-                .is_some_and(|paths| !paths.contains(caller_path.as_bytes()));
-            let status = if row.status == join::ResolutionStatus::Resolved {
-                "resolved"
-            } else {
-                "unresolved"
-            };
-            if relink {
-                // Symbol IDs encode path, scoped name and ordinal. Even an unchanged
-                // caller must be re-linked when target ordinals or resolution change.
-                // Resolve against the complete new manifest: additions, reexports and
-                // configuration changes can affect callers with no previous target.
-                #[cfg(test)]
-                let control_same = if tests::PER_REFERENCE_LOOKUP.with(|enabled| enabled.get()) {
-                    stats.emission_lookup_queries += 1;
-                    Some(control_lookup.query_row(
-                        params![
-                            ref_id,
-                            caller_node,
-                            status,
-                            target_node,
-                            target_path,
-                            target_symbol
-                        ],
-                        |row| row.get::<_, bool>(0),
-                    )?)
-                } else {
-                    None
-                };
-                #[cfg(not(test))]
-                let control_same: Option<bool> = None;
-                if control_same.is_none() && !existing.contains_key(&caller_path) {
-                    stats.emission_lookup_queries += 1;
-                    let rows = load_refs
-                        .query_map([&caller_path], |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                (
-                                    row.get(1)?,
-                                    row.get(2)?,
-                                    row.get(3)?,
-                                    row.get(4)?,
-                                    row.get(5)?,
-                                ),
-                            ))
-                        })?
-                        .collect::<std::result::Result<HashMap<String, ExistingRef>, _>>()?;
-                    existing.insert(caller_path.clone(), rows);
-                }
-                let same = control_same.unwrap_or_else(|| {
-                    existing[&caller_path].get(&ref_id).is_some_and(|old| {
-                        old.0 == caller_node
-                            && old.1 == status
-                            && old.2 == target_node
-                            && old.3 == target_path
-                            && old.4 == target_symbol
-                    })
-                });
-                if same {
-                    identical_refs += 1;
-                    continue;
-                }
-                stats.relinked_deleted += delete_edge.execute([&ref_id])?;
-                stats.relinked_deleted += delete_ref.execute([&ref_id])?;
-            }
-            let inserted = if relink {
-                &mut stats.relinked_inserted
-            } else {
-                &mut stats.inserted
-            };
-            *inserted += insert_ref.execute(params![
-                ref_id,
-                caller_node,
-                caller_path,
-                manifest_ref_kind(row.kind),
-                reference.short_name,
-                reference.full_ref,
-                reference.module_path,
-                reference.import_kind,
-                reference.local_name,
-                reference.requested_name,
-                reference.namespace_alias,
-                i64::from(reference.wildcard),
-                i64::from(reference.line),
-                reference.byte_start as i64,
-                reference.byte_end as i64,
-                if row.status == join::ResolutionStatus::Resolved {
-                    "resolved"
-                } else {
-                    "unresolved"
-                },
-                target_node,
-                target_path,
-                target_symbol,
-                PROVENANCE_TREESITTER,
-            ])?;
-            if row.kind == join::BlobRefKind::Call {
-                if let (Some(source_node), Some(target_file), Some(target_symbol)) =
-                    (caller_node, target_path, target_symbol)
-                {
-                    *inserted += insert_edge.execute(params![
-                        format!("edge:{ref_id}"),
+        }
+        let Some(parse) = parsed.get(&caller_path) else {
+            continue;
+        };
+        let Some(reference) = parse.reference(row.ref_ordinal) else {
+            continue;
+        };
+        let caller_node = reference
+            .caller_symbol
+            .as_ref()
+            .and_then(|symbol| nodes.get(&caller_path)?.get(symbol))
+            .cloned();
+        let target_symbol = row.target_symbol;
+        let target_node = target_path
+            .as_ref()
+            .zip(target_symbol.as_ref())
+            .and_then(|(path, symbol)| nodes.get(path)?.get(symbol))
+            .cloned();
+        let ref_id = format!("view:{caller_path}:{}", row.ref_ordinal);
+        let relink = changed
+            .as_ref()
+            .is_some_and(|paths| !paths.contains(caller_path.as_bytes()));
+        let status = if row.status == join::ResolutionStatus::Resolved {
+            "resolved"
+        } else {
+            "unresolved"
+        };
+        if relink {
+            // Symbol IDs encode path, scoped name and ordinal. Even an unchanged
+            // caller must be re-linked when target ordinals or resolution change.
+            #[cfg(test)]
+            let control_same = if tests::PER_REFERENCE_LOOKUP.with(|enabled| enabled.get()) {
+                stats.emission_lookup_queries += 1;
+                Some(control_lookup.query_row(
+                    params![
                         ref_id,
-                        source_node,
+                        caller_node,
+                        status,
                         target_node,
-                        target_file,
-                        target_symbol,
-                        i64::from(reference.line),
-                        PROVENANCE_TREESITTER,
-                    ])?;
-                }
+                        target_path,
+                        target_symbol
+                    ],
+                    |row| row.get::<_, bool>(0),
+                )?)
+            } else {
+                None
+            };
+            #[cfg(not(test))]
+            let control_same: Option<bool> = None;
+            if control_same.is_none() && !existing.contains_key(&caller_path) {
+                stats.emission_lookup_queries += 1;
+                let rows = load_refs
+                    .query_map([&caller_path], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            (
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ),
+                        ))
+                    })?
+                    .collect::<std::result::Result<HashMap<String, ExistingRef>, _>>()?;
+                existing.insert(caller_path.clone(), rows);
+            }
+            let same = control_same.unwrap_or_else(|| {
+                existing[&caller_path].get(&ref_id).is_some_and(|old| {
+                    old.0 == caller_node
+                        && old.1 == status
+                        && old.2 == target_node
+                        && old.3 == target_path
+                        && old.4 == target_symbol
+                })
+            });
+            if same {
+                identical_refs += 1;
+                continue;
+            }
+            ref_deletes.push(ref_id.clone());
+        }
+        if row.kind == join::BlobRefKind::Call {
+            if let (Some(source_node), Some(target_file), Some(edge_target_symbol)) = (
+                caller_node.clone(),
+                target_path.clone(),
+                target_symbol.clone(),
+            ) {
+                pending_edges.push(PendingEdgeRow {
+                    ref_id: ref_id.clone(),
+                    source_node,
+                    target_node: target_node.clone(),
+                    target_file,
+                    target_symbol: edge_target_symbol,
+                    line: reference.line,
+                    relink,
+                });
             }
         }
-        if std::env::var_os("AFT_VIEW_PROFILE").is_some() {
-            eprintln!(
-                "view_profile emission identical_refs_skipped={identical_refs} stats={stats:?}"
-            );
-        }
+        pending_refs.push(PendingRefRow {
+            ref_id,
+            caller_node,
+            caller_file: caller_path,
+            kind: manifest_ref_kind(row.kind),
+            short_name: reference.short_name.clone(),
+            full_ref: reference.full_ref.clone(),
+            module_path: reference.module_path.clone(),
+            import_kind: reference.import_kind.clone(),
+            local_name: reference.local_name.clone(),
+            requested_name: reference.requested_name.clone(),
+            namespace_alias: reference.namespace_alias.clone(),
+            wildcard: reference.wildcard,
+            line: reference.line,
+            byte_start: reference.byte_start,
+            byte_end: reference.byte_end,
+            status,
+            target_node,
+            target_file: target_path,
+            target_symbol,
+            relink,
+        });
+    }
+    drop(load_refs);
+    #[cfg(test)]
+    drop(control_lookup);
+    let edges_deleted = profile.measure(WritePhase::Edges, &transaction, || {
+        let mut delete = transaction.prepare("DELETE FROM edges WHERE ref_id = ?1")?;
+        ref_deletes.iter().try_fold(0, |count, ref_id| {
+            delete.execute([ref_id]).map(|written| count + written)
+        })
+    })?;
+    let (refs_deleted, relinked_refs, owned_refs) =
+        profile.measure(WritePhase::Refs, &transaction, || -> rusqlite::Result<_> {
+            let mut delete = transaction.prepare("DELETE FROM refs WHERE ref_id = ?1")?;
+            let deleted = ref_deletes.iter().try_fold(0, |count, ref_id| {
+                delete.execute([ref_id]).map(|written| count + written)
+            })?;
+            let mut insert = transaction.prepare(
+                "INSERT OR REPLACE INTO refs
+                 (ref_id, caller_node, caller_file, kind, short_name, full_ref, module_path,
+                  import_kind, local_name, requested_name, namespace_alias, wildcard, line,
+                  byte_start, byte_end, status, target_node, target_file, target_symbol, provenance)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                         ?15, ?16, ?17, ?18, ?19, ?20)",
+            )?;
+            let mut relinked = 0;
+            let mut owned = 0;
+            for row in &pending_refs {
+                let written = insert.execute(params![
+                    row.ref_id,
+                    row.caller_node,
+                    row.caller_file,
+                    row.kind,
+                    row.short_name,
+                    row.full_ref,
+                    row.module_path,
+                    row.import_kind,
+                    row.local_name,
+                    row.requested_name,
+                    row.namespace_alias,
+                    i64::from(row.wildcard),
+                    i64::from(row.line),
+                    row.byte_start as i64,
+                    row.byte_end as i64,
+                    row.status,
+                    row.target_node,
+                    row.target_file,
+                    row.target_symbol,
+                    PROVENANCE_TREESITTER,
+                ])?;
+                if row.relink {
+                    relinked += written;
+                } else {
+                    owned += written;
+                }
+            }
+            Ok((deleted, relinked, owned))
+        })?;
+    let (relinked_edges, owned_edges) = profile.measure(
+        WritePhase::Edges,
+        &transaction,
+        || -> rusqlite::Result<_> {
+            let mut insert = transaction.prepare(
+                "INSERT OR REPLACE INTO edges
+                 (edge_id, ref_id, source_node, target_node, target_file, target_symbol,
+                  kind, line, provenance)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'call', ?7, ?8)",
+            )?;
+            let mut relinked = 0;
+            let mut owned = 0;
+            for row in &pending_edges {
+                let written = insert.execute(params![
+                    format!("edge:{}", row.ref_id),
+                    row.ref_id,
+                    row.source_node,
+                    row.target_node,
+                    row.target_file,
+                    row.target_symbol,
+                    i64::from(row.line),
+                    PROVENANCE_TREESITTER,
+                ])?;
+                if row.relink {
+                    relinked += written;
+                } else {
+                    owned += written;
+                }
+            }
+            Ok((relinked, owned))
+        },
+    )?;
+    stats.relinked_deleted += refs_deleted + edges_deleted;
+    stats.relinked_inserted += relinked_refs + relinked_edges;
+    stats.inserted += owned_refs + owned_edges;
+    if std::env::var_os("AFT_VIEW_PROFILE").is_some() {
+        eprintln!("view_profile emission identical_refs_skipped={identical_refs} stats={stats:?}");
     }
     profile.finish("emit_refs_edges");
+    for phase in [
+        WritePhase::Files,
+        WritePhase::Nodes,
+        WritePhase::FileSurfaces,
+        WritePhase::FileDependencies,
+        WritePhase::Bindings,
+        WritePhase::Refs,
+        WritePhase::Edges,
+    ] {
+        // A table with no emitted rows is still an observed zero, not a missing timer.
+        profile.observe_empty(phase);
+    }
+    // Secondary indexes remain live because updating them as rows change is cheaper
+    // than rebuilding them; that maintenance cost is included in row-phase timings.
+    profile.observe_empty(WritePhase::IndexMaintenance);
     set_meta_ready(&transaction, true)?;
     transaction.execute(
         "INSERT OR REPLACE INTO meta(k, v) VALUES('view_manifest_fingerprint', ?1)",
@@ -856,6 +1103,17 @@ fn configure_materialization_connection(connection: &Connection) -> Result<()> {
 
 #[cfg(test)]
 mod tests;
+
+fn existing_changed_paths(connection: &Connection, table: &str) -> Result<BTreeSet<String>> {
+    debug_assert!(matches!(table, "view_bindings" | "view_file_surfaces"));
+    let mut statement = connection.prepare(&format!(
+        "SELECT file_path FROM {table} WHERE file_path IN (SELECT path FROM changed_view_paths)"
+    ))?;
+    let paths = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<BTreeSet<_>, _>>()?;
+    Ok(paths)
+}
 
 fn load_bindings(
     connection: &Connection,
@@ -1002,6 +1260,61 @@ fn requires_full_resolution(
                     )
             })
     })
+}
+
+struct OwnedFileRow {
+    path: String,
+    content_hash: String,
+    language: String,
+}
+
+struct OwnedNodeRow {
+    id: String,
+    file_path: String,
+    name: String,
+    scoped_name: String,
+    kind: String,
+    start_line: u32,
+    start_col: u32,
+    end_line: u32,
+    end_col: u32,
+    ordinal: u32,
+    signature: Option<String>,
+    exported: bool,
+    default_export: bool,
+}
+
+struct PendingRefRow {
+    ref_id: String,
+    caller_node: Option<String>,
+    caller_file: String,
+    kind: &'static str,
+    short_name: Option<String>,
+    full_ref: Option<String>,
+    module_path: Option<String>,
+    import_kind: Option<String>,
+    local_name: Option<String>,
+    requested_name: Option<String>,
+    namespace_alias: Option<String>,
+    wildcard: bool,
+    line: u32,
+    byte_start: usize,
+    byte_end: usize,
+    status: &'static str,
+    target_node: Option<String>,
+    target_file: Option<String>,
+    target_symbol: Option<String>,
+    relink: bool,
+}
+
+struct PendingEdgeRow {
+    ref_id: String,
+    source_node: String,
+    target_node: Option<String>,
+    target_file: String,
+    target_symbol: String,
+    line: u32,
+    relink: bool,
 }
 
 struct EmissionParse {
