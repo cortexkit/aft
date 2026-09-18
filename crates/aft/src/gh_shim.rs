@@ -72,11 +72,11 @@ const V10_ADMIN_TUPLES: &[&str] = &["workflow run", "run rerun"];
 // v13 adds operator-only release maintenance while keeping release deletion
 // and release delete-prefixed flags outside the bypass allowlist.
 const V13_ADMIN_TUPLES: &[&str] = &["release edit", "release upload"];
-// v14 admits two more shapes of bot speech: opening a thread, and editing a
-// comment the calling seat's bot already wrote. Both speak publicly under the
-// bot identity and create no authority, which is the same class as
-// `issue comment` and `issue close`.
-const V14_GOVERNED_TUPLES: &[&str] = &["issue create"];
+// v14 admits three more shapes of bot speech: opening a thread, editing an
+// issue the calling seat's bot already opened, and editing a comment the bot
+// already wrote. They speak publicly under the bot identity and create no
+// authority, which is the same class as `issue comment` and `issue close`.
+const V14_GOVERNED_TUPLES: &[&str] = &["issue create", "issue edit"];
 /// The only API endpoint admitted as governed speech: the id-addressed edit of
 /// an issue comment. The shim classifies and forwards; the route holder is what
 /// verifies the comment was written by the calling seat's bot.
@@ -100,6 +100,15 @@ const CREATE_UNSUPPORTED_FLAGS: &[&str] = &[
     "--web",
     "--template",
     "--recover",
+];
+/// `gh issue edit` planning flags are not bot speech. Refusing these as
+/// destructive keeps repository planning changes out of the governed route.
+const ISSUE_EDIT_DESTRUCTIVE_FLAGS: &[&str] = &[
+    "--milestone",
+    "--remove-milestone",
+    "--project",
+    "--add-project",
+    "--remove-project",
 ];
 const DESTRUCTIVE_TUPLES: &[&str] = &["release delete", "release delete-asset"];
 // The v10 manifest version is the first version whose code-side allowlist
@@ -2968,6 +2977,7 @@ struct GovernedRequest {
     repository: Option<String>,
     manifest_version: u64,
     edit_last: bool,
+    author_scope: Option<String>,
 }
 
 /// The normalized GitHub resource changed by a structured governed request.
@@ -2981,7 +2991,7 @@ struct GithubReadMutation {
 impl GithubReadMutation {
     fn from_governed_request(request: &GovernedRequest) -> Option<Self> {
         let resource_kind = match request.action.as_str() {
-            "issue comment" | "issue reaction" | "issue close" | "issue reopen" => {
+            "issue comment" | "issue edit" | "issue reaction" | "issue close" | "issue reopen" => {
                 GithubReadResourceKind::Issue
             }
             "pr comment" | "pr review" | "pr close" | "pr reopen" => {
@@ -3048,6 +3058,22 @@ fn canonicalize_governed(
     canonical: &Canonicalization,
     manifest_version: u64,
 ) -> Result<GovernedRequest, CanonicalizeError> {
+    canonicalize_governed_from(
+        args,
+        tuple,
+        canonical,
+        manifest_version,
+        &mut io::stdin().lock(),
+    )
+}
+
+fn canonicalize_governed_from<R: Read>(
+    args: &[OsString],
+    tuple: &str,
+    canonical: &Canonicalization,
+    manifest_version: u64,
+    stdin: &mut R,
+) -> Result<GovernedRequest, CanonicalizeError> {
     let (_, _, head_index) = command_head(args)
         .ok_or_else(|| CanonicalizeError::unclassified("missing command head"))?;
     let subcommand_index = if tuple.starts_with("api ") {
@@ -3060,6 +3086,7 @@ fn canonicalize_governed(
     let mut positional = Vec::new();
     let mut body = Map::new();
     let mut labels = Vec::new();
+    let mut repeated_fields = BTreeMap::<String, Vec<String>>::new();
     let mut review_event = None;
     let mut explicit_repository = None;
     let mut close_reason = None;
@@ -3101,6 +3128,24 @@ fn canonicalize_governed(
                 ));
             }
         }
+        if tuple == "issue edit" {
+            if let Some(flag) = unsupported_issue_edit_flag(value) {
+                return Err(CanonicalizeError::typed(
+                    RefusalCode::DestructiveFlag,
+                    format!("{flag}: repository planning changes stay undeclared"),
+                ));
+            }
+            if let Some((field, supplied)) =
+                declared_issue_edit_repeated_value(value, args.get(index + 1))?
+            {
+                repeated_fields.entry(field).or_default().push(supplied);
+                if !value.contains('=') {
+                    index += 1;
+                }
+                index += 1;
+                continue;
+            }
+        }
         if value == "--edit-last" {
             if !is_reviewed_edit_last_tuple(manifest_version, tuple) {
                 return Err(CanonicalizeError::unclassified(
@@ -3129,7 +3174,7 @@ fn canonicalize_governed(
                     index += 1;
                 }
             } else if let Some((field, supplied)) =
-                declared_body_value(value, canonical, args.get(index + 1))?
+                declared_body_value(value, canonical, args.get(index + 1), stdin)?
             {
                 body.insert(field, Value::String(supplied));
                 if !value.contains('=') {
@@ -3153,7 +3198,7 @@ fn canonicalize_governed(
                     index += 1;
                 }
             } else if let Some((field, supplied)) =
-                declared_body_value(value, canonical, args.get(index + 1))?
+                declared_body_value(value, canonical, args.get(index + 1), stdin)?
             {
                 body.insert(field, Value::String(supplied));
                 if !value.contains('=') {
@@ -3167,7 +3212,7 @@ fn canonicalize_governed(
                 positional.push(value.to_string());
             }
         } else if let Some((field, supplied)) =
-            declared_body_value(value, canonical, args.get(index + 1))?
+            declared_body_value(value, canonical, args.get(index + 1), stdin)?
         {
             body.insert(field, Value::String(supplied));
             if !value.contains('=') && !value.starts_with('-') {
@@ -3209,10 +3254,15 @@ fn canonicalize_governed(
         // field is declared so --comment/--comment-file/-c reuse body plumbing.
         let body_optional_for_state =
             target_and_state && canonical.body_fields.iter().all(|field| field == "comment");
-        // A create's required fields belong to upstream: `gh issue create`
-        // without --title already fails with its own error text, and relaying
-        // that is more useful than a second refusal invented here.
-        if !body_optional_for_review && !body_optional_for_state && !fields_only {
+        // A create's required fields and an edit's empty-field rejection belong
+        // to upstream. Individual edit fields are optional, while `gh issue
+        // create` without --title already fails with its own useful error text.
+        let body_optional_for_issue_edit = tuple == "issue edit";
+        if !body_optional_for_review
+            && !body_optional_for_state
+            && !fields_only
+            && !body_optional_for_issue_edit
+        {
             return Err(CanonicalizeError::unclassified(
                 "required declared body field is absent",
             ));
@@ -3242,6 +3292,12 @@ fn canonicalize_governed(
             Value::Array(labels.into_iter().map(Value::String).collect()),
         );
     }
+    for (field, values) in repeated_fields {
+        body.insert(
+            field,
+            Value::Array(values.into_iter().map(Value::String).collect()),
+        );
+    }
     let target = canonical
         .target_fields
         .iter()
@@ -3266,6 +3322,7 @@ fn canonicalize_governed(
         repository,
         manifest_version,
         edit_last,
+        author_scope: (tuple == "issue edit").then(|| "own".to_string()),
     })
 }
 
@@ -3329,6 +3386,7 @@ fn canonicalize_governed_api_from<R: Read>(
         repository: Some(repository),
         manifest_version,
         edit_last: false,
+        author_scope: Some("own".to_string()),
     })
 }
 
@@ -3481,10 +3539,11 @@ fn json_body_only(document: &str, body_field: &str) -> Result<String, Canonicali
     Ok(text.to_string())
 }
 
-fn declared_body_value(
+fn declared_body_value<R: Read>(
     value: &str,
     canonical: &Canonicalization,
     next: Option<&OsString>,
+    stdin: &mut R,
 ) -> Result<Option<(String, String)>, String> {
     for field in &canonical.body_fields {
         let long = format!("--{field}");
@@ -3521,8 +3580,8 @@ fn declared_body_value(
                     .or_else(|| value.strip_prefix("-F"))
             };
             if let Some(file) = file {
-                let supplied =
-                    read_body_file(Path::new(file)).map_err(|error| format!("{value}: {error}"))?;
+                let supplied = read_body_file_from(Path::new(file), stdin)
+                    .map_err(|error| format!("{value}: {error}"))?;
                 return Ok(Some((field.clone(), supplied)));
             }
         }
@@ -3539,8 +3598,8 @@ fn declared_body_value(
                 value.strip_prefix("--comment-file=")
             };
             if let Some(file) = file {
-                let supplied =
-                    read_body_file(Path::new(file)).map_err(|error| format!("{value}: {error}"))?;
+                let supplied = read_body_file_from(Path::new(file), stdin)
+                    .map_err(|error| format!("{value}: {error}"))?;
                 return Ok(Some((field.clone(), supplied)));
             }
         }
@@ -3578,6 +3637,36 @@ fn unsupported_create_flag(value: &str) -> Option<&'static str> {
         .find(|flag| value == *flag || value.starts_with(&format!("{flag}=")))
 }
 
+fn unsupported_issue_edit_flag(value: &str) -> Option<&'static str> {
+    ISSUE_EDIT_DESTRUCTIVE_FLAGS
+        .iter()
+        .copied()
+        .find(|flag| value == *flag || value.starts_with(&format!("{flag}=")))
+}
+
+fn declared_issue_edit_repeated_value(
+    value: &str,
+    next: Option<&OsString>,
+) -> Result<Option<(String, String)>, CanonicalizeError> {
+    for (flag, field) in [
+        ("--add-label", "add_labels"),
+        ("--remove-label", "remove_labels"),
+        ("--add-assignee", "add_assignees"),
+        ("--remove-assignee", "remove_assignees"),
+    ] {
+        if value == flag {
+            let supplied = next.and_then(|arg| arg.to_str()).ok_or_else(|| {
+                CanonicalizeError::unclassified(format!("{flag} requires a value"))
+            })?;
+            return Ok(Some((field.to_string(), supplied.to_string())));
+        }
+        if let Some(supplied) = value.strip_prefix(&format!("{flag}=")) {
+            return Ok(Some((field.to_string(), supplied.to_string())));
+        }
+    }
+    Ok(None)
+}
+
 fn declared_reason_value(
     value: &str,
     next: Option<&OsString>,
@@ -3606,11 +3695,6 @@ fn declared_reason_value(
         ));
     }
     Ok(Some(supplied))
-}
-
-fn read_body_file(path: &Path) -> Result<String, String> {
-    let mut stdin = io::stdin().lock();
-    read_body_file_from(path, &mut stdin)
 }
 
 fn read_body_file_from<R: Read>(path: &Path, stdin: &mut R) -> Result<String, String> {
@@ -3995,6 +4079,7 @@ fn governed_wire_request(
         return wire;
     }
     let edit_last = request.edit_last;
+    let author_scope = request.author_scope;
     let mut wire = json!({
         "operation": ROUTING_OPERATION,
         "gh_route_schema": 1,
@@ -4006,6 +4091,9 @@ fn governed_wire_request(
         "rung_as_of_unix_secs": determination.as_of_unix_secs,
         "metadata": metadata,
     });
+    if let Some(author_scope) = author_scope {
+        wire["author_scope"] = Value::String(author_scope);
+    }
     // Keep the create wire shape byte-for-byte compatible. The explicit marker
     // lets the route holder perform the same authenticated-user-only mutation
     // that gh's native --edit-last flag requests.
@@ -6090,6 +6178,7 @@ mod tests {
             repository: Some("cortexkit/aft".to_string()),
             manifest_version: 1,
             edit_last: false,
+            author_scope: None,
         };
         let determination = RungDetermination::r3(7, 1, &test_rung_provenance());
         let wire = governed_wire_request(&determination.record, "alfonso-aft", request);
@@ -7167,8 +7256,8 @@ mod tests {
         }
     }
 
-    /// The classifier's view of v14: the v12 fixture plus the two speech rows
-    /// the v14 payload adds. Built here rather than read from the assembled
+    /// The classifier's view of v14: the v12 fixture plus the speech rows the
+    /// v14 payload adds. Built here rather than read from the assembled
     /// payload, which lives under the gitignored `.alfonso/` and is absent on a
     /// clean checkout.
     fn v14_manifest() -> Manifest {
@@ -7187,6 +7276,18 @@ mod tests {
                         .to_string(),
                 ),
             });
+        manifest
+            .tiers
+            .get_mut(&Tier::Governed)
+            .expect("v14 governed tier")
+            .push(TupleDecl::Details {
+                tuple: "issue edit".to_string(),
+                platform: vec!["macos".to_string(), "linux".to_string()],
+                api_match: None,
+                rationale: Some(
+                    "Own-issue edit: public speech; the holder verifies authorship".to_string(),
+                ),
+            });
         manifest.canonicalization.insert(
             "issue create".to_string(),
             Canonicalization {
@@ -7196,6 +7297,21 @@ mod tests {
                     "title".to_string(),
                     "body".to_string(),
                     "labels".to_string(),
+                ],
+            },
+        );
+        manifest.canonicalization.insert(
+            "issue edit".to_string(),
+            Canonicalization {
+                argv_forms: vec!["target-and-fields".to_string()],
+                target_fields: vec!["number".to_string()],
+                body_fields: vec![
+                    "title".to_string(),
+                    "body".to_string(),
+                    "add_labels".to_string(),
+                    "remove_labels".to_string(),
+                    "add_assignees".to_string(),
+                    "remove_assignees".to_string(),
                 ],
             },
         );
@@ -7369,6 +7485,115 @@ mod tests {
     }
 
     #[test]
+    fn v14_issue_edit_is_author_scoped_bot_speech_and_v13_leaves_it_undeclared() {
+        let manifest = v14_manifest();
+        manifest.validate().expect("valid v14 speech extensions");
+        assert!(is_reviewed_governed_tuple(14, "issue edit"));
+        assert!(!is_reviewed_governed_tuple(13, "issue edit"));
+
+        let args = os_args(&["issue", "edit", "42", "--title", "T", "--body", "B"]);
+        let Classification::Governed { tuple, canonical } = classify(&args, &manifest, "macos")
+        else {
+            panic!("v14 issue edit must be governed bot speech");
+        };
+        assert_eq!(tuple, "issue edit");
+        let request = canonicalize_governed(&args, &tuple, &canonical, manifest.manifest_version)
+            .expect("issue edit canonicalizes");
+        assert_eq!(request.author_scope.as_deref(), Some("own"));
+        let determination = RungDetermination::r3(1, 14, &test_rung_provenance());
+        let wire = governed_wire_request(&determination.record, "agent-7", request);
+        assert_eq!(wire["action"], "issue edit");
+        assert_eq!(wire["target"]["number"], "42");
+        assert_eq!(wire["body"]["title"], "T");
+        assert_eq!(wire["body"]["body"], "B");
+        assert_eq!(wire["author_scope"], "own");
+
+        assert!(matches!(
+            classify(&args, &v13_manifest(), "macos"),
+            Classification::Unclassified
+        ));
+    }
+
+    #[test]
+    fn v14_issue_edit_collects_repeated_fields_and_reads_body_from_stdin() {
+        let manifest = v14_manifest();
+        let args = os_args(&[
+            "issue",
+            "edit",
+            "--repo",
+            "cortexkit/aft",
+            "42",
+            "--body-file",
+            "-",
+            "--add-label",
+            "a",
+            "--add-label=b",
+            "--remove-label",
+            "old",
+            "--add-assignee=octocat",
+            "--remove-assignee",
+            "hubot",
+        ]);
+        let Classification::Governed { tuple, canonical } = classify(&args, &manifest, "macos")
+        else {
+            panic!("issue edit fields must remain on the governed route");
+        };
+        let mut stdin = std::io::Cursor::new("body supplied through stdin");
+        let request = canonicalize_governed_from(
+            &args,
+            &tuple,
+            &canonical,
+            manifest.manifest_version,
+            &mut stdin,
+        )
+        .expect("issue edit fields canonicalize");
+        assert_eq!(request.body["body"], "body supplied through stdin");
+        assert_eq!(request.body["add_labels"], json!(["a", "b"]));
+        assert_eq!(request.body["remove_labels"], json!(["old"]));
+        assert_eq!(request.body["add_assignees"], json!(["octocat"]));
+        assert_eq!(request.body["remove_assignees"], json!(["hubot"]));
+        assert_eq!(request.repository.as_deref(), Some("cortexkit/aft"));
+    }
+
+    #[test]
+    fn v14_issue_edit_refuses_planning_flags_and_leaves_delete_undeclared() {
+        let manifest = v14_manifest();
+        for flag in [
+            "--milestone",
+            "--remove-milestone",
+            "--project",
+            "--add-project",
+            "--remove-project",
+        ] {
+            for spelling in [
+                os_args(&["issue", "edit", "42", flag, "roadmap"]),
+                os_args(&["issue", "edit", "42", &format!("{flag}=roadmap")]),
+            ] {
+                let Classification::Governed { tuple, canonical } =
+                    classify(&spelling, &manifest, "macos")
+                else {
+                    panic!("{flag}: the verb is declared even when the flag is not");
+                };
+                let error =
+                    canonicalize_governed(&spelling, &tuple, &canonical, manifest.manifest_version)
+                        .expect_err(&format!("{flag} must refuse"));
+                assert_eq!(error.code, RefusalCode::DestructiveFlag);
+                assert!(
+                    error.text.starts_with(flag),
+                    "{flag} refusal must name the flag: {}",
+                    error.text
+                );
+            }
+        }
+
+        let delete = os_args(&["issue", "delete", "42"]);
+        assert!(matches!(
+            classify(&delete, &manifest, "macos"),
+            Classification::Unclassified
+        ));
+    }
+
+    #[test]
     fn v14_own_comment_patch_is_governed_and_v13_leaves_it_undeclared() {
         let manifest = v14_manifest();
         let args = os_args(&[
@@ -7397,6 +7622,10 @@ mod tests {
         assert_eq!(request.target["comment_id"], json!("123"));
         assert_eq!(request.body["body"], json!("edited prose"));
         assert_eq!(request.repository.as_deref(), Some("cortexkit/aft"));
+        assert_eq!(request.author_scope.as_deref(), Some("own"));
+        let determination = RungDetermination::r3(1, 14, &test_rung_provenance());
+        let wire = governed_wire_request(&determination.record, "agent-7", request);
+        assert_eq!(wire["author_scope"], "own");
 
         // The deployed v13 shape declares no PATCH rule at all, so the same
         // invocation is undeclared there.
@@ -7503,6 +7732,11 @@ mod tests {
         assert!(matches!(
             classify(&create, &parsed, "macos"),
             Classification::Governed { ref tuple, .. } if tuple == "issue create"
+        ));
+        let edit = os_args(&["issue", "edit", "42", "--title", "Retitled"]);
+        assert!(matches!(
+            classify(&edit, &parsed, "macos"),
+            Classification::Governed { ref tuple, .. } if tuple == "issue edit"
         ));
         let patch = os_args(&[
             "api",
@@ -9474,6 +9708,7 @@ mod github_read_mutation_tests {
             repository: Some(repository.to_string()),
             manifest_version: 1,
             edit_last: false,
+            author_scope: None,
         }
     }
 
@@ -9561,6 +9796,16 @@ mod github_read_mutation_tests {
             cached_issue_exists(&conn, "cortexkit/aft", 42, "principal:alice"),
             "a failed mutation must preserve the cached issue"
         );
+    }
+
+    #[test]
+    fn issue_edit_maps_to_the_edited_issue_cache_resource() {
+        let request = github_read_mutation_request("issue edit", "CortexKit/AFT", 42);
+        let mutation = GithubReadMutation::from_governed_request(&request)
+            .expect("structured issue edit has a cache resource");
+        assert_eq!(mutation.normalized_repository, "cortexkit/aft");
+        assert_eq!(mutation.resource_kind, GithubReadResourceKind::Issue);
+        assert_eq!(mutation.resource_number, 42);
     }
 
     #[test]
