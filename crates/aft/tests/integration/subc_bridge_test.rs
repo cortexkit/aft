@@ -8602,7 +8602,7 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
             .iter()
             .map(|operation| operation.name.as_str())
             .collect::<HashSet<_>>(),
-        HashSet::from(["health.digest", "memory.census"])
+        HashSet::from(["health.digest", "memory.census", "writes.census"])
     );
     let schema_count = serde_json::from_str::<serde_json::Map<String, Value>>(include_str!(
         "../../src/subc_tool_schemas.json"
