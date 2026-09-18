@@ -1,15 +1,13 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "harness-goldens",
-    "profile-grammar",
-    "paging"
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
   "slices": [
-    "views-per-binding-resolution",
-    "oc2-playbook-ga-facts"
+    "semantic-bin-delta-persistence",
+    "tier2-rollup-incremental-journal-spill-fleet-budget"
   ],
-  "note": "No ranking-fence file changes: views materialization per-binding resolution + refresh bench, playbook facts."
+  "note": "semantic_index.rs changes only the on-disk persistence of the semantic artifact (base snapshot + checksummed delta segments + off-path compaction); the loaded index, chunking, embed text, query and ranking are untouched, so search rows are byte-identical to the reference (the predicate is the proof). The tier-2 rollup/journal changes are outside the fence."
 }
