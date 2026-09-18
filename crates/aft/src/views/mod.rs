@@ -5,12 +5,16 @@
 //! membership representation is the manifest itself; closure inputs remain
 //! transient while a generation is published.
 
+#![allow(unexpected_cfgs)]
+
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 pub mod assembly;
 mod generation;
 pub(crate) mod io;
+#[cfg(aft_views_lazy_benchmark)]
+pub mod lazy_read_benchmark;
 pub mod materialization;
 mod profile;
 pub(crate) mod read;
