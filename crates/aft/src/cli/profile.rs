@@ -100,10 +100,12 @@ pub fn run(args: Vec<OsString>) -> Result<(), ProfileError> {
                 .display()
                 .to_string()
         });
-        let params = serde_json::json!({
-            "since_ms": since_ms,
-            "root": root,
-        });
+        // An omitted --root must omit the key: the daemon reads a JSON null as
+        // an invalid root, not as "no filter".
+        let mut params = serde_json::json!({ "since_ms": since_ms });
+        if let Some(root) = root {
+            params["root"] = serde_json::Value::String(root);
+        }
         let before = fetch_management_census(WRITES_CENSUS_OPERATION, params.clone())
             .map_err(ProfileError::runtime)?;
         let census = if let Some(seconds) = args.live {
@@ -274,33 +276,55 @@ fn fetch_management_census(
                 CallOptions::default(),
             )
             .await
-            .map_err(|error| format!("memory census route failed: {error}"))?;
+            .map_err(|error| format!("{requested_operation} route failed: {error}"))?;
         let body = serde_json::to_vec(&serde_json::json!({
             "op": requested_operation.clone(),
             "params": params,
         }))
-        .map_err(|error| format!("could not encode memory census request: {error}"))?;
+        .map_err(|error| format!("could not encode {requested_operation} request: {error}"))?;
         let response = consumer
             .request(&route, body, CallOptions::default())
             .await
-            .map_err(|error| format!("memory census request failed: {error}"));
+            .map_err(|error| format!("{requested_operation} request failed: {error}"));
         let _ = consumer
             .close_handle(&route, CloseRouteOptions::default())
             .await;
         let response = response?;
         let envelope: serde_json::Value = serde_json::from_slice(&response)
-            .map_err(|error| format!("invalid memory census response: {error}"))?;
+            .map_err(|error| format!("invalid {requested_operation} response: {error}"))?;
         if envelope.get("op").and_then(serde_json::Value::as_str)
             != Some(requested_operation.as_str())
             || envelope.get("status").and_then(serde_json::Value::as_str) != Some("ok")
         {
-            return Err("daemon returned an unsuccessful memory census".to_string());
+            // Carry the daemon's own verdict: a refusal with its code and
+            // message is actionable, "unsuccessful" alone sends the reader
+            // back to the daemon log.
+            let status = envelope
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("missing");
+            let detail = envelope
+                .get("error")
+                .map(|error| {
+                    let code = error.get("code").and_then(serde_json::Value::as_str);
+                    let message = error.get("message").and_then(serde_json::Value::as_str);
+                    match (code, message) {
+                        (Some(code), Some(message)) => format!("{code}: {message}"),
+                        (Some(code), None) => code.to_string(),
+                        (None, Some(message)) => message.to_string(),
+                        (None, None) => error.to_string(),
+                    }
+                })
+                .unwrap_or_else(|| envelope.to_string());
+            return Err(format!(
+                "daemon returned an unsuccessful {requested_operation} (status {status}): {detail}"
+            ));
         }
         envelope
             .get("data")
             .filter(|data| data.is_object())
             .cloned()
-            .ok_or_else(|| "memory census response did not contain object data".to_string())
+            .ok_or_else(|| format!("{requested_operation} response did not contain object data"))
     })
 }
 
