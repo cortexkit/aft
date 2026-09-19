@@ -496,6 +496,7 @@ async function spawnReadyDaemon(
       void writeFile(dirs.stderrPath, stderrChunks.join(""), "utf8").catch(() => undefined);
     });
     daemon.stdout.resume();
+    trackDaemon(daemon);
 
     try {
       await waitForAftCatalog(dirs.connectionFile, daemon, stderrChunks, START_TIMEOUT_MS);
@@ -706,8 +707,62 @@ function numberField(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+/**
+ * Every daemon this module has spawned and not yet reaped. The process-exit
+ * handler below walks it, so a runner that dies without running teardown does
+ * not leave the daemon (and its module children) running.
+ */
+const liveDaemons = new Set<ChildProcessWithoutNullStreams>();
+let exitKillerRegistered = false;
+
+/**
+ * Kill every still-running daemon when this process exits.
+ *
+ * `beforeExit` is not usable here: it only fires when the event loop drains on
+ * its own, and a test runner ends the process with an explicit `process.exit`
+ * while the daemon's stdout/stderr pipes still hold the loop open. `exit` fires
+ * for explicit exits too, so this is the hook that actually runs. An `exit`
+ * handler cannot await anything, so both kills are the synchronous
+ * `child.kill()` form and nothing here returns a promise.
+ */
+function registerDaemonExitKiller(): void {
+  if (exitKillerRegistered) return;
+  exitKillerRegistered = true;
+  process.on("exit", killLiveDaemonsOnExit);
+}
+
+function killLiveDaemonsOnExit(): void {
+  const daemons = Array.from(liveDaemons);
+  liveDaemons.clear();
+  // Ask politely first (one pass over all of them), then make sure. On Windows
+  // Node has no real signals and terminates the process for either name, which
+  // is the sane no-op-equivalent behavior for this handler.
+  for (const daemon of daemons) signalQuietly(daemon, "SIGTERM");
+  for (const daemon of daemons) signalQuietly(daemon, "SIGKILL");
+}
+
+function signalQuietly(
+  daemon: ChildProcessWithoutNullStreams,
+  signal: "SIGTERM" | "SIGKILL",
+): void {
+  if (daemon.exitCode !== null || daemon.signalCode !== null) return;
+  try {
+    daemon.kill(signal);
+  } catch {
+    // Already gone, or the platform refused the signal; nothing left to do.
+  }
+}
+
+function trackDaemon(daemon: ChildProcessWithoutNullStreams): void {
+  liveDaemons.add(daemon);
+  daemon.once("close", () => liveDaemons.delete(daemon));
+  registerDaemonExitKiller();
+}
+
 async function stopDaemon(daemon: ChildProcessWithoutNullStreams | null): Promise<void> {
-  if (!daemon || daemon.exitCode !== null) return;
+  if (!daemon) return;
+  liveDaemons.delete(daemon);
+  if (daemon.exitCode !== null) return;
   const close = new Promise<void>((resolveClose) => daemon.once("close", () => resolveClose()));
   daemon.kill("SIGTERM");
   const stopped = await Promise.race([close.then(() => true), sleep(2_000).then(() => false)]);
