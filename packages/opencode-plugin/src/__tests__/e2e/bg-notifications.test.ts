@@ -1,6 +1,6 @@
 /// <reference path="../../bun-test.d.ts" />
 
-import { afterEach, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { BridgePool } from "@cortexkit/aft-bridge";
 import type { ToolContext } from "@opencode-ai/plugin";
 
@@ -16,6 +16,7 @@ import type { PluginContext } from "../../types.js";
 import { noopAsk } from "../test-helpers";
 import {
   cleanupHarnesses,
+  cleanupSharedSubcRig,
   configureParamsFromLegacyOverrides,
   createHarness,
   type E2EHarness,
@@ -38,6 +39,13 @@ maybeDescribe("e2e bg notifications (OpenCode adapter + bridge + Rust)", () => {
   afterEach(async () => {
     __resetBgNotificationStateForTests();
     await cleanupHarnesses(harnesses);
+  });
+
+  // The subc tests below start the process-wide subc rig, whose daemon outlives
+  // every harness in this file. Without this the daemon stays up for as long as
+  // the machine does.
+  afterAll(async () => {
+    await cleanupSharedSubcRig();
   });
 
   async function pluginHarness() {

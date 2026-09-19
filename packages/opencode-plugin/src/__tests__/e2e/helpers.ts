@@ -301,7 +301,6 @@ let sharedSubcRigPromise: Promise<SubcRig> | null = null;
 let sharedSubcRig: SubcRig | null = null;
 let sharedSubcRigBinaryPath: string | null = null;
 let sharedSubcCleanupPromise: Promise<void> | null = null;
-let sharedSubcCleanupRegistered = false;
 
 export function prepareBinary(): Promise<PreparedBinary> {
   preparedBinaryPromise ??= prepareBinaryOnce();
@@ -329,6 +328,16 @@ export async function prepareSubcHarness(
   return { buildAttempted: lane.buildAttempted || preparedBinary.buildAttempted };
 }
 
+/**
+ * Shut down the process-wide subc rig. Safe to call from several `afterAll`
+ * hooks and safe to call when no rig was ever started.
+ *
+ * Every e2e file that can start a rig must call this. There is deliberately no
+ * `beforeExit` fallback: that event only fires when the event loop drains on
+ * its own, which never happens under `bun test` (it exits explicitly, and the
+ * daemon's stdio pipes keep the loop alive anyway). The daemon's hard-exit
+ * safety net lives in the rig itself, on `process.on("exit")`.
+ */
 export async function cleanupSharedSubcRig(): Promise<void> {
   if (sharedSubcCleanupPromise) return sharedSubcCleanupPromise;
   const rigPromise = sharedSubcRigPromise;
@@ -459,14 +468,6 @@ export async function createHarness(
   };
 }
 
-function registerSharedSubcCleanup(): void {
-  if (sharedSubcCleanupRegistered) return;
-  sharedSubcCleanupRegistered = true;
-  process.once("beforeExit", () => {
-    void cleanupSharedSubcRig();
-  });
-}
-
 async function sharedSubcRigFor(preparedBinary: PreparedBinary): Promise<SubcRig> {
   if (!preparedBinary.binaryPath) {
     throw new Error(preparedBinary.skipReason ?? "aft binary unavailable");
@@ -493,7 +494,6 @@ async function sharedSubcRigFor(preparedBinary: PreparedBinary): Promise<SubcRig
       };
       const rig = await startSubcRig(preparedLane);
       sharedSubcRig = rig;
-      registerSharedSubcCleanup();
       return rig;
     })().catch((err) => {
       sharedSubcRigPromise = null;
