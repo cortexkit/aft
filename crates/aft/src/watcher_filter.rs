@@ -364,11 +364,11 @@ fn watcher_path_is_ignored(matcher: Option<&Gitignore>, path: &Path) -> bool {
     })
 }
 
-/// True when `path` is an in-tree ignore rule file whose parent directory
-/// the current matcher already ignores. Only in-tree rule files have a
-/// parent that can be ignored; the global excludes file and
+/// True when `path` is an in-tree ignore rule file that the current matcher
+/// already excludes, either directly or through an ignored parent directory.
+/// Only in-tree rule files can satisfy this; the global excludes file and
 /// `.git/info/exclude` never do.
-fn ignore_file_parent_is_ignored(matcher: &SharedGitignore, path: &Path) -> bool {
+fn ignore_file_is_ignored_by_matcher(matcher: &SharedGitignore, path: &Path) -> bool {
     if !watcher_path_is_ignore_file(path) {
         return false;
     }
@@ -379,11 +379,14 @@ fn ignore_file_parent_is_ignored(matcher: &SharedGitignore, path: &Path) -> bool
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.as_deref().is_some_and(|matcher| {
-        parent.starts_with(matcher.path())
-            && parent != matcher.path()
-            && matcher
-                .matched_path_or_any_parents(parent, true)
+        path.starts_with(matcher.path())
+            && (matcher
+                .matched_path_or_any_parents(path, false)
                 .is_ignore()
+                || (parent != matcher.path()
+                    && matcher
+                        .matched_path_or_any_parents(parent, true)
+                        .is_ignore()))
     })
 }
 
@@ -1133,7 +1136,7 @@ fn filter_canonical_paths(
         .iter()
         .filter(|path| {
             watcher_path_can_change_corpus_ignore(config, path)
-                && !ignore_file_parent_is_ignored(matcher, path)
+                && !ignore_file_is_ignored_by_matcher(matcher, path)
         })
         .cloned()
         .collect::<BTreeSet<_>>();
@@ -2846,14 +2849,47 @@ mod tests {
             BTreeSet::from([root.join(".gitignore")])
         );
 
-        // With no matcher yet there is nothing to say the parent is ignored,
-        // so the conservative answer stands.
+        // With no matcher yet there is nothing to say the file or its parent is
+        // ignored, so the conservative answer stands.
         let no_matcher: SharedGitignore = Arc::new(RwLock::new(None));
         let unknown_path = dev_dir.join(".gitignore");
         let unknown =
             filter_watcher_raw_paths_for_test(&config, &no_matcher, [unknown_path.clone()]);
         assert!(unknown.ignore_file_changed);
         assert_eq!(unknown.ignore_file_paths, BTreeSet::from([unknown_path]));
+    }
+
+    #[test]
+    fn self_ignored_nested_gitignore_rewrites_do_not_report_rule_changes() {
+        const REWRITES: usize = 8;
+
+        let tmp = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let build_dir = root.join("engram-worker/build");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        let ignore_path = build_dir.join(".gitignore");
+        std::fs::write(&ignore_path, b"*").unwrap();
+
+        let mut builder = GitignoreBuilder::new(&root);
+        let rewritten = rewrite_nested_ignore_line(Path::new("engram-worker/build"), "*")
+            .expect("bare wildcard is an effective nested rule");
+        builder
+            .add_line(Some(ignore_path.clone()), &rewritten)
+            .unwrap();
+        let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
+        let config = WatcherFilterConfig::new(root, None);
+
+        for _ in 0..REWRITES {
+            std::fs::write(&ignore_path, b"*").unwrap();
+            let filtered = filter_watcher_raw_paths_for_test(
+                &config,
+                &matcher,
+                [ignore_path.clone()],
+            );
+            assert!(!filtered.ignore_file_changed);
+            assert!(filtered.ignore_file_paths.is_empty());
+            assert!(filtered.changed.is_empty());
+        }
     }
 
     #[test]
