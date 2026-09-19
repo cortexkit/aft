@@ -641,6 +641,125 @@ mod write_amplification_tests {
         assert_eq!(changes_after - changes_before, LOGICAL_ROWS_CHANGED);
     }
 
+    #[test]
+    fn three_file_real_change_delta_stays_within_ten_wal_pages_per_changed_row() {
+        const FILE_COUNT: usize = 3;
+        const FUNCTIONS_PER_FILE: usize = 192;
+        const LOGICAL_ROWS_CHANGED: u64 = 11;
+        const MAX_WAL_PAGES_PER_CHANGED_ROW: u64 = 10;
+
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let mut files = Vec::new();
+        let mut contents = Vec::new();
+        for file_index in 0..FILE_COUNT {
+            let path = root.join(format!("large{file_index}.ts"));
+            let mut source = String::new();
+            for function_index in 0..FUNCTIONS_PER_FILE {
+                source.push_str(&format!(
+                    "export function symbol{file_index}_{function_index}() {{ console.log('{file_index}:{function_index}'); }}\n"
+                ));
+            }
+            fs::write(&path, &source).unwrap();
+            files.push(path);
+            contents.push(source);
+        }
+
+        let store =
+            CallGraphStore::open(temp.path().join("store-incremental"), root.clone()).unwrap();
+        store.cold_build(&files).unwrap();
+        assert!(store.checkpoint_wal_truncate());
+        let wal_path = sqlite_file_set_path(store.sqlite_path(), "-wal");
+        assert_eq!(
+            fs::metadata(&wal_path).map(|meta| meta.len()).unwrap_or(0),
+            0
+        );
+
+        for (file_index, (path, source)) in files.iter().zip(contents.iter()).enumerate() {
+            fs::write(
+                path,
+                format!(
+                    "{source}function delta_symbol_{file_index}() {{ return {file_index}; }}\n"
+                ),
+            )
+            .unwrap();
+        }
+        let changes_before = store.conn.lock().unwrap().total_changes();
+        let stats = store.refresh_files(&files).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let changes_after = conn.total_changes();
+        let page_size: u64 = conn
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(stats.refreshed_own_files, FILE_COUNT);
+        assert_eq!(stats.unchanged_extract_files, 0);
+        let wal_bytes = fs::metadata(&wal_path).unwrap().len();
+        let max_wal_frames = LOGICAL_ROWS_CHANGED * MAX_WAL_PAGES_PER_CHANGED_ROW;
+        let max_wal_bytes = 32 + max_wal_frames * (page_size + 24);
+        assert!(
+            wal_bytes <= max_wal_bytes,
+            "three-file real-change refresh appended {wal_bytes} WAL bytes; bound is {max_wal_bytes} bytes ({max_wal_frames} pages for {LOGICAL_ROWS_CHANGED} changed rows)"
+        );
+        assert_eq!(
+            changes_after - changes_before,
+            LOGICAL_ROWS_CHANGED,
+            "the delta should update three file rows, three backend rows, insert three nodes, and append the two-row projection journal"
+        );
+
+        let cold_store = CallGraphStore::open(temp.path().join("store-cold"), root).unwrap();
+        cold_store.cold_build(&files).unwrap();
+        for table in [
+            "nodes",
+            "refs",
+            "file_dependencies",
+            "edges",
+            "dispatch_hints",
+            "type_ref_names",
+            "staging_file_inventory",
+            "staging_ref_context",
+        ] {
+            assert_eq!(
+                super::cold_build_insert_tests::graph_table_rows(&store, table),
+                super::cold_build_insert_tests::graph_table_rows(&cold_store, table),
+                "incremental delta rows in `{table}` must match a cold rebuild"
+            );
+        }
+        assert_eq!(
+            super::cold_build_insert_tests::graph_table_rows_without(
+                &store,
+                "files",
+                &["indexed_at"],
+            ),
+            super::cold_build_insert_tests::graph_table_rows_without(
+                &cold_store,
+                "files",
+                &["indexed_at"],
+            ),
+            "incremental files rows must match apart from wall-clock metadata"
+        );
+        assert_eq!(
+            super::cold_build_insert_tests::graph_table_rows_without(
+                &store,
+                "backend_file_state",
+                &["updated_at"],
+            ),
+            super::cold_build_insert_tests::graph_table_rows_without(
+                &cold_store,
+                "backend_file_state",
+                &["updated_at"],
+            ),
+            "incremental backend rows must match apart from wall-clock metadata"
+        );
+        assert_eq!(
+            super::cold_build_insert_tests::meta_schema_identity_rows(&store),
+            super::cold_build_insert_tests::meta_schema_identity_rows(&cold_store),
+            "schema identity metadata must match a cold rebuild"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn deleted_symlink_alias_refresh_removes_the_original_stale_row() {
@@ -4545,11 +4664,10 @@ impl CallGraphStore {
 
                 own_refresh.insert(rel_path.clone());
                 let started = Instant::now();
-                delete_file_rows(&tx, rel_path)?;
-                clear_backend_state_for_file(&tx, &self.project_root, rel_path)?;
+                delete_stale_file_extract_rows(&tx, extract)?;
                 profile.row_deletes += started.elapsed();
                 let started = Instant::now();
-                insert_file_extract_prepared(&mut inserts, &workspace_root, extract)?;
+                upsert_file_extract_prepared(&tx, &mut inserts, &workspace_root, extract)?;
                 profile.row_inserts += started.elapsed();
             }
 
@@ -4570,11 +4688,10 @@ impl CallGraphStore {
 
                 own_refresh.insert(rel_path.clone());
                 let started = Instant::now();
-                delete_file_rows(&tx, &rel_path)?;
-                clear_backend_state_for_file(&tx, &self.project_root, &rel_path)?;
+                delete_stale_file_extract_rows(&tx, extract)?;
                 profile.row_deletes += started.elapsed();
                 let started = Instant::now();
-                insert_file_extract_prepared(&mut inserts, &workspace_root, extract)?;
+                upsert_file_extract_prepared(&tx, &mut inserts, &workspace_root, extract)?;
                 profile.row_inserts += started.elapsed();
             }
             let started = Instant::now();
@@ -4586,11 +4703,7 @@ impl CallGraphStore {
                     continue;
                 };
                 if own_refresh.contains(rel_path) {
-                    delete_refs_for_caller(&tx, rel_path)?;
-                    for raw_ref in &extract.raw_refs {
-                        let resolved = resolve_ref(raw_ref.clone(), &index)?;
-                        insert_resolved_ref_prepared(&mut inserts, &resolved)?;
-                    }
+                    upsert_resolved_ref_delta(&tx, &mut inserts, extract, &index, None)?;
                     continue;
                 }
 
@@ -4598,20 +4711,25 @@ impl CallGraphStore {
                     .get(rel_path)
                     .cloned()
                     .unwrap_or_default();
-                delete_ref_ids(&tx, &selected_for_caller)?;
-                for raw_ref in &extract.raw_refs {
-                    if selected_for_caller.contains(&raw_ref.ref_id) {
-                        let resolved = resolve_ref(raw_ref.clone(), &index)?;
-                        insert_resolved_ref_prepared(&mut inserts, &resolved)?;
-                    }
-                }
+                upsert_resolved_ref_delta(
+                    &tx,
+                    &mut inserts,
+                    extract,
+                    &index,
+                    Some(&selected_for_caller),
+                )?;
             }
             profile.ref_resolution += started.elapsed();
         }
 
         let started = Instant::now();
-        delete_method_dispatch_edges_for_callers(&tx, &own_refresh)?;
-        insert_method_dispatch_edges(&tx, &self.project_root, Some(&own_refresh))?;
+        let expected_dispatch_edges =
+            insert_method_dispatch_edges(&tx, &self.project_root, Some(&own_refresh))?;
+        delete_stale_method_dispatch_edges_for_callers(
+            &tx,
+            &own_refresh,
+            &expected_dispatch_edges,
+        )?;
         profile.method_dispatch += started.elapsed();
 
         // Freshness metadata is not an input to the projection. Only changed
@@ -11278,6 +11396,8 @@ fn load_file_dependencies_index(tx: &Transaction<'_>) -> Result<HashMap<String, 
     Ok(by_file)
 }
 
+// Cold builds insert into empty tables, while incremental refreshes reuse these
+// statements. Conflict predicates make that shared path leave equal B-tree rows untouched.
 struct ColdBuildInsertStatements<'stmt> {
     file: Statement<'stmt>,
     node: Statement<'stmt>,
@@ -11293,55 +11413,176 @@ impl<'stmt> ColdBuildInsertStatements<'stmt> {
     fn new(tx: &'stmt Transaction<'_>) -> Result<Self> {
         Ok(Self {
             file: tx.prepare(
-                "INSERT OR REPLACE INTO files(
+                "INSERT INTO files(
                     path, content_hash, mtime_ns, size, lang, is_dead_code_root,
                     is_public_api, surface_fingerprint, indexed_at
-                ) VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?7)",
+                ) VALUES(?1, ?2, ?3, ?4, ?5, 0, 0, ?6, ?7)
+                ON CONFLICT(path) DO UPDATE SET
+                    content_hash=excluded.content_hash,
+                    mtime_ns=excluded.mtime_ns,
+                    size=excluded.size,
+                    lang=excluded.lang,
+                    is_dead_code_root=excluded.is_dead_code_root,
+                    is_public_api=excluded.is_public_api,
+                    surface_fingerprint=excluded.surface_fingerprint,
+                    indexed_at=excluded.indexed_at
+                WHERE content_hash IS NOT excluded.content_hash
+                   OR mtime_ns IS NOT excluded.mtime_ns
+                   OR size IS NOT excluded.size
+                   OR lang IS NOT excluded.lang
+                   OR is_dead_code_root IS NOT excluded.is_dead_code_root
+                   OR is_public_api IS NOT excluded.is_public_api
+                   OR surface_fingerprint IS NOT excluded.surface_fingerprint",
             )?,
             node: tx.prepare(
-                "INSERT OR REPLACE INTO nodes(
+                "INSERT INTO nodes(
                     id, file_path, name, scoped_name, kind, start_line, start_col,
                     end_line, end_col, range_ordinal, signature, exported,
                     is_default_export, is_type_like, is_callgraph_entry_point, provenance
-                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                ON CONFLICT(id) DO UPDATE SET
+                    file_path=excluded.file_path,
+                    name=excluded.name,
+                    scoped_name=excluded.scoped_name,
+                    kind=excluded.kind,
+                    start_line=excluded.start_line,
+                    start_col=excluded.start_col,
+                    end_line=excluded.end_line,
+                    end_col=excluded.end_col,
+                    range_ordinal=excluded.range_ordinal,
+                    signature=excluded.signature,
+                    exported=excluded.exported,
+                    is_default_export=excluded.is_default_export,
+                    is_type_like=excluded.is_type_like,
+                    is_callgraph_entry_point=excluded.is_callgraph_entry_point,
+                    provenance=excluded.provenance
+                WHERE file_path IS NOT excluded.file_path
+                   OR name IS NOT excluded.name
+                   OR scoped_name IS NOT excluded.scoped_name
+                   OR kind IS NOT excluded.kind
+                   OR start_line IS NOT excluded.start_line
+                   OR start_col IS NOT excluded.start_col
+                   OR end_line IS NOT excluded.end_line
+                   OR end_col IS NOT excluded.end_col
+                   OR range_ordinal IS NOT excluded.range_ordinal
+                   OR signature IS NOT excluded.signature
+                   OR exported IS NOT excluded.exported
+                   OR is_default_export IS NOT excluded.is_default_export
+                   OR is_type_like IS NOT excluded.is_type_like
+                   OR is_callgraph_entry_point IS NOT excluded.is_callgraph_entry_point
+                   OR provenance IS NOT excluded.provenance",
             )?,
             file_dependency: tx.prepare(
                 "INSERT OR IGNORE INTO file_dependencies(file_path, dep_file) VALUES(?1, ?2)",
             )?,
             dispatch_hint: tx.prepare(
-                "INSERT OR REPLACE INTO dispatch_hints(
+                "INSERT INTO dispatch_hints(
                     id, method_name, caller_node, file, line, byte_start, byte_end, provenance
-                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                ON CONFLICT(id) DO UPDATE SET
+                    method_name=excluded.method_name,
+                    caller_node=excluded.caller_node,
+                    file=excluded.file,
+                    line=excluded.line,
+                    byte_start=excluded.byte_start,
+                    byte_end=excluded.byte_end,
+                    provenance=excluded.provenance
+                WHERE method_name IS NOT excluded.method_name
+                   OR caller_node IS NOT excluded.caller_node
+                   OR file IS NOT excluded.file
+                   OR line IS NOT excluded.line
+                   OR byte_start IS NOT excluded.byte_start
+                   OR byte_end IS NOT excluded.byte_end
+                   OR provenance IS NOT excluded.provenance",
             )?,
             backend_state: tx.prepare(
-                "INSERT OR REPLACE INTO backend_file_state(
+                "INSERT INTO backend_file_state(
                     backend, workspace_root, file_path, content_hash, status, updated_at
-                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(backend, workspace_root, file_path, content_hash) DO UPDATE SET
+                    status=excluded.status,
+                    updated_at=excluded.updated_at
+                WHERE status IS NOT excluded.status",
             )?,
             reference: tx.prepare(
-                "INSERT OR REPLACE INTO refs(
+                "INSERT INTO refs(
                     ref_id, caller_node, caller_file, kind, short_name, full_ref, module_path,
                     import_kind, local_name, requested_name, namespace_alias, wildcard, line,
                     byte_start, byte_end, status, target_node, target_file, target_symbol,
                     provenance
-                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                ON CONFLICT(ref_id) DO UPDATE SET
+                    caller_node=excluded.caller_node,
+                    caller_file=excluded.caller_file,
+                    kind=excluded.kind,
+                    short_name=excluded.short_name,
+                    full_ref=excluded.full_ref,
+                    module_path=excluded.module_path,
+                    import_kind=excluded.import_kind,
+                    local_name=excluded.local_name,
+                    requested_name=excluded.requested_name,
+                    namespace_alias=excluded.namespace_alias,
+                    wildcard=excluded.wildcard,
+                    line=excluded.line,
+                    byte_start=excluded.byte_start,
+                    byte_end=excluded.byte_end,
+                    status=excluded.status,
+                    target_node=excluded.target_node,
+                    target_file=excluded.target_file,
+                    target_symbol=excluded.target_symbol,
+                    provenance=excluded.provenance
+                WHERE caller_node IS NOT excluded.caller_node
+                   OR caller_file IS NOT excluded.caller_file
+                   OR kind IS NOT excluded.kind
+                   OR short_name IS NOT excluded.short_name
+                   OR full_ref IS NOT excluded.full_ref
+                   OR module_path IS NOT excluded.module_path
+                   OR import_kind IS NOT excluded.import_kind
+                   OR local_name IS NOT excluded.local_name
+                   OR requested_name IS NOT excluded.requested_name
+                   OR namespace_alias IS NOT excluded.namespace_alias
+                   OR wildcard IS NOT excluded.wildcard
+                   OR line IS NOT excluded.line
+                   OR byte_start IS NOT excluded.byte_start
+                   OR byte_end IS NOT excluded.byte_end
+                   OR status IS NOT excluded.status
+                   OR target_node IS NOT excluded.target_node
+                   OR target_file IS NOT excluded.target_file
+                   OR target_symbol IS NOT excluded.target_symbol
+                   OR provenance IS NOT excluded.provenance",
             )?,
             staging_ref_context: tx.prepare(
                 "INSERT OR REPLACE INTO staging_ref_context(ref_id, caller_symbol) VALUES(?1, ?2)",
             )?,
             edge: tx.prepare(
-                "INSERT OR REPLACE INTO edges(
+                "INSERT INTO edges(
                     edge_id, ref_id, source_node, target_node, target_file, target_symbol,
                     kind, line, provenance
-                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                ON CONFLICT(edge_id) DO UPDATE SET
+                    ref_id=excluded.ref_id,
+                    source_node=excluded.source_node,
+                    target_node=excluded.target_node,
+                    target_file=excluded.target_file,
+                    target_symbol=excluded.target_symbol,
+                    kind=excluded.kind,
+                    line=excluded.line,
+                    provenance=excluded.provenance
+                WHERE ref_id IS NOT excluded.ref_id
+                   OR source_node IS NOT excluded.source_node
+                   OR target_node IS NOT excluded.target_node
+                   OR target_file IS NOT excluded.target_file
+                   OR target_symbol IS NOT excluded.target_symbol
+                   OR kind IS NOT excluded.kind
+                   OR line IS NOT excluded.line
+                   OR provenance IS NOT excluded.provenance",
             )?,
         })
     }
 }
 
-fn insert_file_extract_prepared(
+fn insert_file_graph_rows_prepared(
     statements: &mut ColdBuildInsertStatements<'_>,
-    workspace_root: &str,
     extract: &FileExtract,
 ) -> Result<()> {
     statements.file.execute(params![
@@ -11396,14 +11637,22 @@ fn insert_file_extract_prepared(
             PROVENANCE_TREESITTER,
         ])?;
     }
+    Ok(())
+}
+
+fn insert_file_extract_prepared(
+    statements: &mut ColdBuildInsertStatements<'_>,
+    workspace_root: &str,
+    extract: &FileExtract,
+) -> Result<()> {
+    insert_file_graph_rows_prepared(statements, extract)?;
     insert_backend_state_prepared(
         &mut statements.backend_state,
         workspace_root,
         &extract.rel_path,
         Some(&extract.freshness.content_hash),
         "fresh",
-    )?;
-    Ok(())
+    )
 }
 
 fn insert_backend_state_prepared(
@@ -11499,6 +11748,181 @@ fn insert_resolved_ref_prepared(
             edge.line as i64,
             ref_provenance(raw),
         ])?;
+    }
+    Ok(())
+}
+
+fn delete_stale_file_extract_rows(tx: &Transaction<'_>, extract: &FileExtract) -> Result<()> {
+    let node_ids = extract
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect::<BTreeSet<_>>();
+    delete_stale_string_rows(
+        tx,
+        "SELECT id FROM nodes WHERE file_path = ?1",
+        "DELETE FROM nodes WHERE id = ?1",
+        &extract.rel_path,
+        &node_ids,
+    )?;
+
+    let dependencies = extract
+        .raw_refs
+        .iter()
+        .flat_map(|raw| raw.dependencies.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let mut select_dependencies =
+        tx.prepare("SELECT dep_file FROM file_dependencies WHERE file_path = ?1")?;
+    let stored_dependencies = select_dependencies
+        .query_map(params![extract.rel_path], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut delete_dependency =
+        tx.prepare("DELETE FROM file_dependencies WHERE file_path = ?1 AND dep_file = ?2")?;
+    for dependency in stored_dependencies {
+        if !dependencies.contains(&dependency) {
+            delete_dependency.execute(params![extract.rel_path, dependency])?;
+        }
+    }
+
+    let hint_ids = extract
+        .dispatch_hints
+        .iter()
+        .map(|hint| hint.id.clone())
+        .collect::<BTreeSet<_>>();
+    delete_stale_string_rows(
+        tx,
+        "SELECT id FROM dispatch_hints WHERE file = ?1",
+        "DELETE FROM dispatch_hints WHERE id = ?1",
+        &extract.rel_path,
+        &hint_ids,
+    )?;
+    Ok(())
+}
+
+fn delete_stale_string_rows(
+    tx: &Transaction<'_>,
+    select_sql: &str,
+    delete_sql: &str,
+    owner: &str,
+    expected: &BTreeSet<String>,
+) -> Result<()> {
+    let mut select = tx.prepare(select_sql)?;
+    let stored = select
+        .query_map(params![owner], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut delete = tx.prepare(delete_sql)?;
+    for key in stored {
+        if !expected.contains(&key) {
+            delete.execute(params![key])?;
+        }
+    }
+    Ok(())
+}
+
+fn upsert_file_extract_prepared(
+    tx: &Transaction<'_>,
+    statements: &mut ColdBuildInsertStatements<'_>,
+    workspace_root: &str,
+    extract: &FileExtract,
+) -> Result<()> {
+    insert_file_graph_rows_prepared(statements, extract)?;
+    let hash = hash_to_hex(extract.freshness.content_hash);
+    let existing: usize = tx.query_row(
+        "SELECT count(*) FROM backend_file_state
+         WHERE backend = ?1 AND workspace_root = ?2 AND file_path = ?3",
+        params![BACKEND_TREESITTER, workspace_root, extract.rel_path],
+        |row| row.get(0),
+    )?;
+    if existing > 1 {
+        tx.execute(
+            "DELETE FROM backend_file_state
+             WHERE backend = ?1 AND workspace_root = ?2 AND file_path = ?3",
+            params![BACKEND_TREESITTER, workspace_root, extract.rel_path],
+        )?;
+    } else if existing == 1 {
+        tx.execute(
+            "UPDATE backend_file_state
+             SET content_hash = ?4, status = 'fresh', updated_at = ?5
+             WHERE backend = ?1 AND workspace_root = ?2 AND file_path = ?3",
+            params![
+                BACKEND_TREESITTER,
+                workspace_root,
+                extract.rel_path,
+                hash,
+                unix_seconds_now(),
+            ],
+        )?;
+    }
+    insert_backend_state_prepared(
+        &mut statements.backend_state,
+        workspace_root,
+        &extract.rel_path,
+        Some(&extract.freshness.content_hash),
+        "fresh",
+    )
+}
+
+fn upsert_resolved_ref_delta<I: ResolverIndex>(
+    tx: &Transaction<'_>,
+    statements: &mut ColdBuildInsertStatements<'_>,
+    extract: &FileExtract,
+    index: &I,
+    selected: Option<&BTreeSet<String>>,
+) -> Result<()> {
+    let resolved = extract
+        .raw_refs
+        .iter()
+        .filter(|raw| selected.map_or(true, |ids| ids.contains(&raw.ref_id)))
+        .cloned()
+        .map(|raw| resolve_ref(raw, index))
+        .collect::<Result<Vec<_>>>()?;
+    let expected_ids = resolved
+        .iter()
+        .map(|resolved| resolved.raw.ref_id.clone())
+        .collect::<BTreeSet<_>>();
+
+    let stale_ids = if let Some(selected) = selected {
+        selected
+            .difference(&expected_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>()
+    } else {
+        let mut select = tx.prepare("SELECT ref_id FROM refs WHERE caller_file = ?1")?;
+        let stored = select
+            .query_map(params![extract.rel_path], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        stored.difference(&expected_ids).cloned().collect()
+    };
+    delete_ref_ids(tx, &stale_ids)?;
+
+    for resolved in &resolved {
+        insert_resolved_ref_prepared(statements, resolved)?;
+        delete_stale_direct_edges(tx, resolved)?;
+    }
+    Ok(())
+}
+
+fn delete_stale_direct_edges(tx: &Transaction<'_>, resolved: &ResolvedRef) -> Result<()> {
+    if let Some(expected) = &resolved.edge {
+        tx.execute(
+            "DELETE FROM edges
+             WHERE ref_id = ?1 AND provenance IN (?2, ?3) AND edge_id <> ?4",
+            params![
+                resolved.raw.ref_id,
+                PROVENANCE_TREESITTER,
+                PROVENANCE_VALUE_REF,
+                expected.edge_id,
+            ],
+        )?;
+    } else {
+        tx.execute(
+            "DELETE FROM edges WHERE ref_id = ?1 AND provenance IN (?2, ?3)",
+            params![
+                resolved.raw.ref_id,
+                PROVENANCE_TREESITTER,
+                PROVENANCE_VALUE_REF,
+            ],
+        )?;
     }
     Ok(())
 }
@@ -11667,15 +12091,15 @@ fn insert_method_dispatch_edges(
     tx: &Transaction<'_>,
     project_root: &Path,
     caller_files: Option<&BTreeSet<String>>,
-) -> Result<usize> {
+) -> Result<BTreeSet<String>> {
     let references = load_name_match_refs(tx, caller_files)?;
     if references.is_empty() {
-        return Ok(0);
+        return Ok(BTreeSet::new());
     }
 
     let mut candidates_by_name: HashMap<(String, String), Vec<NameMatchCandidate>> = HashMap::new();
     let mut source_cache: DispatchSourceCache = HashMap::new();
-    let mut inserted = 0usize;
+    let mut edge_ids = BTreeSet::new();
     for reference in references {
         let key = (reference.method_name.clone(), reference.lang.clone());
         let candidates = match candidates_by_name.entry(key) {
@@ -11694,8 +12118,12 @@ fn insert_method_dispatch_edges(
                 else {
                     continue;
                 };
-                insert_method_dispatch_edge(tx, &reference, &candidate, PROVENANCE_TYPE_MATCH)?;
-                inserted += 1;
+                edge_ids.insert(insert_method_dispatch_edge(
+                    tx,
+                    &reference,
+                    &candidate,
+                    PROVENANCE_TYPE_MATCH,
+                )?);
                 continue;
             }
             ReceiverTypeInference::RustDirectSelfField {
@@ -11714,8 +12142,12 @@ fn insert_method_dispatch_edges(
                 ) else {
                     continue;
                 };
-                insert_method_dispatch_edge(tx, &reference, &candidate, PROVENANCE_TYPE_MATCH)?;
-                inserted += 1;
+                edge_ids.insert(insert_method_dispatch_edge(
+                    tx,
+                    &reference,
+                    &candidate,
+                    PROVENANCE_TYPE_MATCH,
+                )?);
                 continue;
             }
             ReceiverTypeInference::KnownButUnresolved => continue,
@@ -11729,10 +12161,14 @@ fn insert_method_dispatch_edges(
         let Some(candidate) = select_name_match_candidate(&reference, candidates.as_slice()) else {
             continue;
         };
-        insert_method_dispatch_edge(tx, &reference, &candidate, PROVENANCE_NAME_MATCH)?;
-        inserted += 1;
+        edge_ids.insert(insert_method_dispatch_edge(
+            tx,
+            &reference,
+            &candidate,
+            PROVENANCE_NAME_MATCH,
+        )?);
     }
-    Ok(inserted)
+    Ok(edge_ids)
 }
 
 fn insert_method_dispatch_edges_chunked(
@@ -11766,7 +12202,7 @@ fn insert_method_dispatch_edges_chunked(
         let Some(last_file) = caller_files.last().cloned() else {
             break;
         };
-        inserted += insert_method_dispatch_edges(tx, project_root, Some(&caller_files))?;
+        inserted += insert_method_dispatch_edges(tx, project_root, Some(&caller_files))?.len();
         after_file = last_file;
         completed_files = completed_files
             .saturating_add(caller_files.len())
@@ -11782,14 +12218,32 @@ fn insert_method_dispatch_edge(
     reference: &NameMatchRef,
     candidate: &NameMatchCandidate,
     provenance: &str,
-) -> Result<()> {
+) -> Result<String> {
+    let edge_id = ref_id(&[&reference.ref_id, provenance, "edge"]);
     tx.execute(
-        "INSERT OR REPLACE INTO edges(
+        "INSERT INTO edges(
             edge_id, ref_id, source_node, target_node, target_file, target_symbol,
             kind, line, provenance
-        ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'call', ?7, ?8)",
+        ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'call', ?7, ?8)
+        ON CONFLICT(edge_id) DO UPDATE SET
+            ref_id=excluded.ref_id,
+            source_node=excluded.source_node,
+            target_node=excluded.target_node,
+            target_file=excluded.target_file,
+            target_symbol=excluded.target_symbol,
+            kind=excluded.kind,
+            line=excluded.line,
+            provenance=excluded.provenance
+        WHERE ref_id IS NOT excluded.ref_id
+           OR source_node IS NOT excluded.source_node
+           OR target_node IS NOT excluded.target_node
+           OR target_file IS NOT excluded.target_file
+           OR target_symbol IS NOT excluded.target_symbol
+           OR kind IS NOT excluded.kind
+           OR line IS NOT excluded.line
+           OR provenance IS NOT excluded.provenance",
         params![
-            ref_id(&[&reference.ref_id, provenance, "edge"]),
+            edge_id,
             &reference.ref_id,
             &reference.caller_node,
             &candidate.node_id,
@@ -11799,28 +12253,36 @@ fn insert_method_dispatch_edge(
             provenance,
         ],
     )?;
-    Ok(())
+    Ok(edge_id)
 }
 
-fn delete_method_dispatch_edges_for_callers(
+fn delete_stale_method_dispatch_edges_for_callers(
     tx: &Transaction<'_>,
     caller_files: &BTreeSet<String>,
+    expected_edge_ids: &BTreeSet<String>,
 ) -> Result<()> {
     if caller_files.is_empty() {
         return Ok(());
     }
 
-    let mut stmt = tx.prepare(
-        "DELETE FROM edges
-         WHERE provenance IN (?1, ?2)
-           AND ref_id IN (SELECT ref_id FROM refs WHERE caller_file = ?3)",
+    let mut select = tx.prepare(
+        "SELECT e.edge_id
+         FROM edges e JOIN refs r ON r.ref_id = e.ref_id
+         WHERE e.provenance IN (?1, ?2) AND r.caller_file = ?3",
     )?;
+    let mut delete = tx.prepare("DELETE FROM edges WHERE edge_id = ?1")?;
     for caller_file in caller_files {
-        stmt.execute(params![
-            PROVENANCE_NAME_MATCH,
-            PROVENANCE_TYPE_MATCH,
-            caller_file
-        ])?;
+        let stored = select
+            .query_map(
+                params![PROVENANCE_NAME_MATCH, PROVENANCE_TYPE_MATCH, caller_file,],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for edge_id in stored {
+            if !expected_edge_ids.contains(&edge_id) {
+                delete.execute(params![edge_id])?;
+            }
+        }
     }
     Ok(())
 }
@@ -11829,6 +12291,8 @@ fn load_name_match_refs(
     tx: &Transaction<'_>,
     caller_files: Option<&BTreeSet<String>>,
 ) -> Result<Vec<NameMatchRef>> {
+    // Existing dispatch edges remain until the incremental pass has computed the
+    // expected IDs. Do not let those edges hide unresolved calls that still need processing.
     let base_sql = "SELECT r.ref_id, r.caller_node, r.caller_file, n.scoped_name,
                            n.signature, r.short_name, r.full_ref, r.line, f.lang
                     FROM refs r
@@ -11838,10 +12302,7 @@ fn load_name_match_refs(
                       AND r.status = 'unresolved'
                       AND r.caller_node IS NOT NULL
                       AND r.full_ref IS NOT NULL
-                      AND (r.full_ref LIKE '%.%' OR r.full_ref LIKE '%::%' OR r.full_ref LIKE '%->%')
-                      AND NOT EXISTS (
-                          SELECT 1 FROM edges e WHERE e.ref_id = r.ref_id AND e.kind = 'call'
-                      )";
+                      AND (r.full_ref LIKE '%.%' OR r.full_ref LIKE '%::%' OR r.full_ref LIKE '%->%')";
     let mut references = Vec::new();
 
     if let Some(caller_files) = caller_files {
@@ -17768,7 +18229,7 @@ export function leaf() {}
             insert_resolved_ref(&tx, resolved).expect("reference resolved ref");
             let supplemental = insert_method_dispatch_edges(&tx, project_root, None)
                 .expect("reference dispatch edges");
-            assert_eq!(supplemental, 0);
+            assert!(supplemental.is_empty());
             tx.commit().expect("reference commit");
         }
         conn
@@ -17799,7 +18260,7 @@ export function leaf() {}
             create_cold_build_secondary_indexes(&tx).expect("create secondary indexes");
             let supplemental = insert_method_dispatch_edges(&tx, project_root, None)
                 .expect("optimized dispatch edges");
-            assert_eq!(supplemental, 0);
+            assert!(supplemental.is_empty());
             tx.commit().expect("optimized commit");
         }
         conn
@@ -18131,18 +18592,35 @@ pub fn handle_{name}(ctx: &AppContext) -> usize {{
         files
     }
 
-    fn graph_table_rows(store: &CallGraphStore, table: &str) -> Vec<String> {
+    pub(super) fn graph_table_rows(store: &CallGraphStore, table: &str) -> Vec<String> {
         let conn = store.conn.lock().expect("callgraph store mutex poisoned");
         table_rows(&conn, table)
     }
 
-    fn graph_table_rows_without(
+    pub(super) fn graph_table_rows_without(
         store: &CallGraphStore,
         table: &str,
         excluded_columns: &[&str],
     ) -> Vec<String> {
         let conn = store.conn.lock().expect("callgraph store mutex poisoned");
         table_rows_without(&conn, table, excluded_columns)
+    }
+
+    pub(super) fn meta_schema_identity_rows(store: &CallGraphStore) -> Vec<String> {
+        let conn = store.conn.lock().expect("callgraph store mutex poisoned");
+        let mut statement = conn
+            .prepare(
+                "SELECT k, v FROM meta
+                 WHERE k IN ('schema_version', 'fingerprint')
+                 ORDER BY k, v",
+            )
+            .expect("prepare identity metadata");
+        let rows = statement
+            .query_map([], |row| row_to_strings(row, 2))
+            .expect("query identity metadata")
+            .collect::<std::result::Result<_, _>>()
+            .expect("collect identity metadata");
+        rows
     }
 
     fn table_rows(conn: &Connection, table: &str) -> Vec<String> {

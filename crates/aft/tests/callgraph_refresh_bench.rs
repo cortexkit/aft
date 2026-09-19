@@ -87,6 +87,7 @@ fn bench_refresh_files_on_store_copy() {
         .unwrap_or(0);
     let wal_frames = wal_frame_count(wal_bytes, page_size);
     let wal_pages_by_object = wal_page_breakdown(store.sqlite_path(), &wal_path, page_size);
+    let object_kinds = sqlite_object_kinds(store.sqlite_path());
 
     let checkpoint_usage_before = process_write_usage();
     let passive_checkpoint = wal_checkpoint(store.sqlite_path(), "PASSIVE");
@@ -118,9 +119,14 @@ fn bench_refresh_files_on_store_copy() {
         checkpoint_usage.logical_bytes,
     );
     for (object, pages) in wal_pages_by_object {
+        let bytes = pages.saturating_mul(page_size);
+        let kind = object_kinds
+            .get(&object)
+            .map(String::as_str)
+            .unwrap_or("unmapped");
         eprintln!(
-            "wal_pages object={object} pages={pages} mb={:.3}",
-            mib(pages.saturating_mul(page_size))
+            "wal_pages kind={kind} object={object} pages={pages} bytes={bytes} mb={:.3}",
+            mib(bytes)
         );
     }
     if count_rows {
@@ -393,6 +399,22 @@ fn wal_frame_count(wal_bytes: u64, page_size: u64) -> u64 {
         .saturating_sub(32)
         .checked_div(page_size + 24)
         .unwrap_or(0)
+}
+
+fn sqlite_object_kinds(db: &Path) -> BTreeMap<String, String> {
+    let conn = Connection::open(db).expect("open store for SQLite object types");
+    let mut kinds = conn
+        .prepare("SELECT name, type FROM sqlite_master WHERE type IN ('table', 'index')")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<BTreeMap<_, _>>>()
+        })
+        .unwrap_or_default();
+    kinds.insert("sqlite_schema".to_string(), "table".to_string());
+    kinds
 }
 
 fn wal_page_breakdown(db: &Path, wal: &Path, page_size: u64) -> BTreeMap<String, u64> {
