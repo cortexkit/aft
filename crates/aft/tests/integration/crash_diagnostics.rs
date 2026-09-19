@@ -9,6 +9,7 @@ mod unix {
     const CHILD_ENV: &str = "AFT_CRASH_DIAGNOSTIC_TEST_CHILD";
     const PREFIX: &[u8] = b"\nAFT integration fatal signal: signal=";
     const ADDRESS: &[u8] = b" fault_address=";
+    const THREAD: &[u8] = b" native_thread=";
     const BACKTRACE: &[u8] = b"\nAFT integration fatal signal backtrace:\n";
 
     static INSTALL: Once = Once::new();
@@ -47,9 +48,11 @@ mod unix {
         info: *mut libc::siginfo_t,
         _context: *mut c_void,
     ) {
-        // These writes avoid Rust locks and allocation. backtrace_symbols_fd is
-        // diagnostic-only and intentionally best-effort: the alternative is a
-        // signal-only nextest result with no fault site to investigate.
+        // The scalar fields use only stack storage and async-signal-safe writes.
+        // backtrace/backtrace_symbols_fd are best-effort diagnostics rather than
+        // POSIX async-signal-safe calls, so the gate also retains a core-dump
+        // path if unwinding cannot make progress. SA_RESETHAND plus re-raising
+        // preserves the original fatal signal after diagnostics are emitted.
         unsafe {
             write_bytes(PREFIX);
             write_decimal(signal);
@@ -59,6 +62,11 @@ mod unix {
                 .map(|details| details.si_addr() as usize)
                 .unwrap_or_default();
             write_hex(address);
+            write_bytes(THREAD);
+            // Synchronous SIGBUS/SIGSEGV delivery runs this handler on the
+            // faulting thread, so this native handle identifies whose stack
+            // backtrace_symbols_fd prints below.
+            write_hex(libc::pthread_self() as usize);
             write_bytes(BACKTRACE);
 
             let mut frames = [std::ptr::null_mut(); 128];
@@ -134,6 +142,7 @@ mod unix {
         assert!(
             stderr.contains("AFT integration fatal signal: signal=")
                 && stderr.contains(" fault_address=0x")
+                && stderr.contains(" native_thread=0x")
                 && stderr.contains("AFT integration fatal signal backtrace:"),
             "fatal-signal context missing from stderr: {stderr}"
         );
