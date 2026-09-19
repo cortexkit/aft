@@ -6,7 +6,10 @@
     "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
   "slices": [
-    "search-cache-sweep-bound"
+    "search-cache-sweep-bound",
+    "ignore-retirement-at-matcher-publication",
+    "ignore-change-scoped-not-corpus",
+    "mc-refresh-evidence"
   ],
-  "note": "search_index.rs touched only in the transient scratch-directory sweep (location + scan bound + log field); no ranking, lexical or index-content change."
+  "note": "search_index.rs touched only in the transient scratch-directory sweep (location + scan bound + log field) and in the ignore-retirement filter of pending paths; no ranking, lexical or index-content change. Byte-equality against the reference is the proof."
 }
