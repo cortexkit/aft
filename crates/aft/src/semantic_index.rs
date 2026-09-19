@@ -8745,6 +8745,25 @@ mod tests {
         }
     }
 
+    /// Close a fake server's connection the way a real HTTP server does: flush,
+    /// half-close the write side, then drain whatever the client still sends
+    /// until it closes. Dropping the socket with unread client bytes makes
+    /// Windows answer with RST instead of FIN, and hyper then reports
+    /// "connection aborted" (WSAECONNABORTED) before it has read the response
+    /// (train 127, unknown_4xx_still_aborts_semantic_build).
+    fn finish_test_response(mut stream: TcpStream) {
+        let _ = stream.flush();
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let _ = stream.set_nonblocking(false);
+        let mut sink = [0u8; 4096];
+        while let Ok(count) = stream.read(&mut sink) {
+            if count == 0 {
+                break;
+            }
+        }
+    }
+
     fn handle_programmable_embedding_request(
         mut stream: TcpStream,
         per_item_delay_ms: Arc<AtomicU64>,
@@ -8821,6 +8840,7 @@ mod tests {
         if stream.write_all(response.as_bytes()).is_ok() {
             completed.lock().unwrap().push(input_count);
         }
+        finish_test_response(stream);
     }
 
     enum TestEmbeddingRejection {
@@ -8979,6 +8999,7 @@ mod tests {
             response_body,
         );
         let _ = stream.write_all(response.as_bytes());
+        finish_test_response(stream);
     }
 
     fn start_recording_embedding_server(
