@@ -4826,8 +4826,12 @@ fn schedule_artifact_loads(
                 // semantic receiver, so the next `tx`/`tx_progress.send` returns
                 // Err (receiver dropped) and this thread exits without competing
                 // with the fresh build.
+                // Every exit from this loop that abandons the retry (superseded
+                // epoch, dropped receiver) clears the parked backend status so
+                // health never shows a deadline nothing will honour.
                 let build_result = loop {
                     if semantic_build_epoch_flag.load(Ordering::SeqCst) != semantic_build_epoch {
+                        crate::semantic_index::clear_embedding_backend_retry_status(&root_clone);
                         clear_cold_seed_active();
                         return;
                     }
@@ -4840,6 +4844,11 @@ fn schedule_artifact_loads(
                                 crate::semantic_index::strip_transient_embedding_marker(error);
                             let backoff = semantic_build_retry_backoff(semantic_retry_attempt);
                             semantic_retry_attempt += 1;
+                            crate::semantic_index::record_embedding_backend_retry_deadline(
+                                &root_clone,
+                                error,
+                                backoff,
+                            );
                             slog_warn!(
                             "semantic index build: embedding backend unavailable ({}); retrying in {}s",
                             clean,
@@ -4858,12 +4867,18 @@ fn schedule_artifact_loads(
                                 })
                                 .is_err()
                             {
+                                crate::semantic_index::clear_embedding_backend_retry_status(
+                                    &root_clone,
+                                );
                                 return;
                             }
                             if tx_progress
                                 .send(SemanticIndexEvent::ColdSeedGateCleared)
                                 .is_err()
                             {
+                                crate::semantic_index::clear_embedding_backend_retry_status(
+                                    &root_clone,
+                                );
                                 return;
                             }
                             thread::sleep(backoff);

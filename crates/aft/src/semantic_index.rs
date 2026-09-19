@@ -39,7 +39,12 @@ const HEADER_BYTES_V2: usize = 13;
 // on it and the health status reports the deadline it produces, so the two can
 // never drift apart.
 const BUILD_BACKEND_RETRY_SCHEDULE_SECS: [u64; 3] = [15, 30, 60];
-const BUILD_BACKEND_STATUS_EXPIRY_GRACE_MS: u64 = 5_000;
+// A parked status outlives its retry deadline by this much before it is
+// treated as abandoned. The retry itself re-walks and re-chunks the corpus
+// before it reaches the backend, which takes tens of seconds on large roots,
+// so the grace must cover a whole attempt; a loop that exits clears the
+// status explicitly, so the grace only ever bounds a loop that died.
+const BUILD_BACKEND_STATUS_EXPIRY_GRACE_MS: u64 = 5 * 60 * 1_000;
 
 #[derive(Clone, Debug)]
 pub(crate) struct EmbeddingBackendBuildHealth {
@@ -99,6 +104,40 @@ fn record_embedding_backend_build_failure(project_root: &Path, error: &str) {
     entry.failures = entry.failures.saturating_add(1);
 }
 
+/// The retry loop owns the sleep, so it stamps the deadline it will actually
+/// sleep to. The builder's own record (above) runs first with its schedule
+/// position; this overrides it with the loop's, which is the one that matters
+/// when the two counters differ (a loop inherits an entry from a superseded
+/// loop, or a builder outside the loop recorded the failure).
+pub(crate) fn record_embedding_backend_retry_deadline(
+    project_root: &Path,
+    error: &str,
+    backoff: std::time::Duration,
+) {
+    let now_ms = unix_millis_now();
+    let clean = strip_transient_embedding_marker(error);
+    let backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX);
+    let mut registry = embedding_backend_build_health_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = registry
+        .entry(project_root.to_path_buf())
+        .or_insert_with(|| EmbeddingBackendBuildHealth {
+            last_error: clean.clone(),
+            since_ms: now_ms,
+            next_retry_ms: now_ms,
+            failures: 0,
+        });
+    entry.last_error = clean;
+    entry.next_retry_ms = now_ms.saturating_add(backoff_ms);
+}
+
+/// Called on every exit path of a cold-build retry loop so a parked status
+/// never outlives the loop that would have retried it.
+pub(crate) fn clear_embedding_backend_retry_status(project_root: &Path) {
+    clear_embedding_backend_build_failure(project_root);
+}
+
 fn clear_embedding_backend_build_failure(project_root: &Path) {
     embedding_backend_build_health_registry()
         .lock()
@@ -141,8 +180,11 @@ fn begin_semantic_index_build(
     crate::logging::IndexBuildScope,
     crate::logging::IndexBuildFailureGuard,
 ) {
-    // A retry is executing now, so the parked-backoff status no longer applies.
-    clear_embedding_backend_build_failure(project_root);
+    // The parked-backoff status is deliberately kept while a retry runs: the
+    // attempt re-walks and re-chunks the corpus before it touches the backend,
+    // and clearing here read as "building" for that whole window and reset the
+    // failure count every cycle. Success or a non-transient failure clears it
+    // in `finish_semantic_index_build`.
     if let Some(scope) = crate::logging::current_index_build() {
         if scope.plane == crate::logging::IndexPlane::Semantic {
             return (None, scope, crate::logging::IndexBuildFailureGuard::new());
@@ -12559,5 +12601,62 @@ public class Greeter {
                 .join(MANAGED_ORT_LIB_NAME)
         );
         std::env::remove_var("ORT_DYLIB_PATH");
+    }
+}
+
+#[cfg(test)]
+mod embedding_backend_retry_status_tests {
+    use super::*;
+
+    fn unique_root(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("aft-backend-status-{name}-{}", std::process::id()))
+    }
+
+    // The parked status must survive the start of the retry that will re-probe
+    // the backend: the retry re-walks and re-chunks the corpus before it reaches
+    // the backend, and on a large root that window is most of the cycle. On the
+    // 2026-09-19 card the status was cleared at `begin`, so health read
+    // "building" for every retry window and the sentinel fired index.stuck.
+    #[test]
+    fn parked_status_survives_the_start_of_a_retry() {
+        let root = unique_root("survives-begin");
+        record_embedding_backend_build_failure_for_test(&root, "connection refused");
+        let (_guard, _scope, _failure_guard) = begin_semantic_index_build(&root);
+        let health = embedding_backend_build_health(&root)
+            .expect("parked status was cleared by the retry's own begin");
+        assert_eq!(health.last_error, "connection refused");
+        clear_embedding_backend_build_failure(&root);
+    }
+
+    // The deadline health reports is the one the loop sleeps to. The builder's
+    // own record runs first with its schedule position; the loop then stamps
+    // the backoff it computed, so a loop on its fourth attempt (60 s) never
+    // shows the builder's first-attempt 15 s.
+    #[test]
+    fn loop_deadline_overrides_the_builder_schedule_position() {
+        let root = unique_root("loop-deadline");
+        record_embedding_backend_build_failure_for_test(&root, "connection refused");
+        let before = unix_millis_now();
+        record_embedding_backend_retry_deadline(
+            &root,
+            "connection refused",
+            std::time::Duration::from_secs(60),
+        );
+        let health = embedding_backend_build_health(&root).expect("status recorded");
+        assert!(
+            health.next_retry_ms >= before + 60_000,
+            "deadline {} is not the loop's 60 s backoff from {before}",
+            health.next_retry_ms
+        );
+        clear_embedding_backend_build_failure(&root);
+    }
+
+    // A parked status must not outlive the loop that would retry it.
+    #[test]
+    fn abandoned_loop_clears_the_parked_status() {
+        let root = unique_root("abandoned");
+        record_embedding_backend_build_failure_for_test(&root, "connection refused");
+        clear_embedding_backend_retry_status(&root);
+        assert!(embedding_backend_build_health(&root).is_none());
     }
 }
