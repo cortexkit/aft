@@ -1223,6 +1223,7 @@ pub type PendingCallGraphStorePaths = Arc<parking_lot::Mutex<BTreeSet<PathBuf>>>
 pub(crate) struct CallgraphRefreshState {
     store: Arc<std::sync::RwLock<Option<Arc<ReadonlyCallGraphStore>>>>,
     heavy_root_work_allowed: Arc<AtomicBool>,
+    matcher: Option<crate::watcher_filter::SharedGitignore>,
 }
 
 impl CallgraphRefreshState {
@@ -1233,7 +1234,13 @@ impl CallgraphRefreshState {
         Self {
             store,
             heavy_root_work_allowed,
+            matcher: None,
         }
+    }
+
+    pub(crate) fn with_matcher(mut self, matcher: crate::watcher_filter::SharedGitignore) -> Self {
+        self.matcher = Some(matcher);
+        self
     }
 
     fn installed_store_snapshot(&self) -> Option<Arc<ReadonlyCallGraphStore>> {
@@ -1316,9 +1323,17 @@ struct RefreshBatch {
 }
 
 impl RefreshBatch {
+    fn path_is_ignored(&self, path: &Path) -> bool {
+        self.refresh_states.iter().any(|state| {
+            state.matcher.as_ref().is_some_and(|matcher| {
+                crate::watcher_filter::watcher_path_is_ignored_by_matcher(matcher, path)
+            })
+        })
+    }
+
     fn defer(&self) {
         for sink in &self.pending_sinks {
-            sink.lock().extend(self.paths.iter().cloned());
+            sink.lock().extend(self.paths.iter().filter(|path| !self.path_is_ignored(path)).cloned());
         }
     }
 
@@ -1655,6 +1670,25 @@ fn enqueue_callgraph_store_refresh_inner(
     )
 }
 
+pub(crate) fn retire_ignored_refresh_paths(
+    project_root: &Path,
+    matcher: &crate::watcher_filter::SharedGitignore,
+) -> usize {
+    let Some(slot) = CALLGRAPH_REFRESH_WORKER.get() else { return 0; };
+    let worker = slot.lock().expect("callgraph refresh worker mutex poisoned").clone();
+    let Some(worker) = worker else { return 0; };
+    let mut queue = worker.shared.queue.lock().expect("callgraph refresh queue mutex poisoned");
+    let mut dropped = 0;
+    for batch in queue.queued.values_mut().filter(|batch| batch.root.project_root == project_root) {
+        let before = batch.paths.len();
+        batch.paths.retain(|path| !crate::watcher_filter::watcher_path_is_ignored_by_matcher(matcher, path));
+        dropped += before - batch.paths.len();
+    }
+    // The active batch is worker-owned and may already be resolving a graph.
+    // Its admission and defer gates read the shared matcher instead.
+    dropped
+}
+
 pub fn flush_callgraph_store_refreshes_on_graceful_shutdown() -> bool {
     flush_callgraph_store_refreshes_with_budget(REFRESH_WORKER_GRACEFUL_SHUTDOWN_BUDGET)
 }
@@ -1770,7 +1804,7 @@ fn process_callgraph_refresh_batch(
     let paths = batch
         .paths
         .iter()
-        .filter(|path| crate::parser::detect_language(path).is_some())
+        .filter(|path| crate::parser::detect_language(path).is_some() && !batch.path_is_ignored(path))
         .cloned()
         .collect::<Vec<_>>();
     if paths.is_empty() {

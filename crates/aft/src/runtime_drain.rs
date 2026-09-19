@@ -2796,6 +2796,27 @@ fn publish_view_if_quiet(ctx: &AppContext, state: &mut WatcherDrainSliceState) {
     }
 }
 
+fn rebuild_gitignore_for_drain(
+    ctx: &AppContext,
+    state: &mut WatcherDrainSliceState,
+    heavy_root_work_allowed: bool,
+) {
+    // The drain owns this continuation while dispatching control events. Return
+    // it to the context so the matcher publication retires all parked queues
+    // together, before acknowledging the rebuild to the watcher thread.
+    let placeholder = WatcherDrainSliceState::new(
+        state.configure_generation,
+        state.configure_content_generation,
+    );
+    *ctx.watcher_drain_slice().lock() = Some(std::mem::replace(state, placeholder));
+    if heavy_root_work_allowed {
+        ctx.rebuild_gitignore();
+    } else {
+        ctx.clear_gitignore();
+    }
+    *state = ctx.watcher_drain_slice().lock().take().expect("parked watcher continuation");
+}
+
 pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> DrainBatchOutcome {
     let started = Instant::now();
     let configure_generation = ctx.configure_generation();
@@ -2838,7 +2859,11 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 Ok(WatcherDispatchEvent::Paths(paths)) => {
                     dispatch_events_received += 1;
                     if !state.rescan_required {
-                        state.pending_paths.extend(paths);
+                        state.pending_paths.extend(paths.into_iter().filter(|path| {
+                            !crate::watcher_filter::queued_path_is_ignored_by_matcher(
+                                &ctx.shared_gitignore(), path,
+                            )
+                        }));
                     }
                 }
                 Ok(WatcherDispatchEvent::RescanRequired(reason)) => {
@@ -2860,11 +2885,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     if !state.rescan_required {
                         let heavy_root_work_allowed = ctx.heavy_root_work_allowed();
                         let _ = ctx.run_if_subc_bound_generation(configure_generation, || {
-                            if heavy_root_work_allowed {
-                                ctx.rebuild_gitignore();
-                            } else {
-                                ctx.clear_gitignore();
-                            }
+                            rebuild_gitignore_for_drain(ctx, &mut state, heavy_root_work_allowed);
                         });
                     }
                 }
@@ -2952,11 +2973,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 &watcher_counters,
                 db.as_ref(),
             );
-            if ctx.heavy_root_work_allowed() {
-                ctx.rebuild_gitignore();
-            } else {
-                ctx.clear_gitignore();
-            }
+            rebuild_gitignore_for_drain(ctx, &mut state, ctx.heavy_root_work_allowed());
             let rss_before = watcher_rescan_rss_bytes();
             let rescan_started = Instant::now();
             state.status_changed |= refresh_project_after_watcher_rescan(ctx);

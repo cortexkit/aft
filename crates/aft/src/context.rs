@@ -1106,6 +1106,36 @@ impl WatcherDrainSliceState {
         }
     }
 
+    pub(crate) fn retire_ignored_paths(&mut self, keep: &impl Fn(&PathBuf) -> bool) -> usize {
+        let mut dropped = 0;
+        let before = self.pending_paths.len();
+        self.pending_paths.retain(keep);
+        dropped += before - self.pending_paths.len();
+        if let WatcherDrainPhase::Apply { paths, remaining, .. } = &mut self.phase {
+            // The deque rotates processed paths behind the unprocessed prefix.
+            // Preserve that boundary when retiring a continuation between slices.
+            let mut position = 0;
+            let mut remaining_kept = 0;
+            let before = paths.len();
+            paths.retain(|path| {
+                let retain = keep(path);
+                if position < *remaining && retain {
+                    remaining_kept += 1;
+                }
+                position += 1;
+                retain
+            });
+            *remaining = remaining_kept;
+            dropped += before - paths.len();
+        }
+        let before = self.semantic_refresh_paths.len();
+        self.semantic_refresh_paths.retain(keep);
+        dropped += before - self.semantic_refresh_paths.len();
+        let before = self.view_publication_paths.len();
+        self.view_publication_paths.retain(keep);
+        dropped + before - self.view_publication_paths.len()
+    }
+
     pub(crate) fn has_pending_work(&self) -> bool {
         !matches!(self.phase, WatcherDrainPhase::Collect)
             || !self.pending_paths.is_empty()
@@ -3346,7 +3376,34 @@ impl AppContext {
             .gitignore
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = matcher;
+        let generation = self.gitignore_generation.load(Ordering::SeqCst) + 1;
+        self.retire_ignored_pending_paths(generation);
         self.gitignore_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn retire_ignored_pending_paths(&self, generation: u64) {
+        let keep = |path: &PathBuf| {
+            !crate::watcher_filter::queued_path_is_ignored_by_matcher(&self.gitignore, path)
+        };
+        let retire = |pending: &mut BTreeSet<PathBuf>| {
+            let before = pending.len();
+            pending.retain(&keep);
+            before - pending.len()
+        };
+        let search = retire(&mut self.pending_search_index_paths.lock());
+        let semantic = retire(&mut self.pending_semantic_index_paths.lock());
+        let tier2 = retire(&mut self.pending_tier2_paths.lock());
+        let callgraph = retire(&mut self.pending_callgraph_store_paths.lock());
+        let callgraph_queued = self.canonical_cache_root_opt().map_or(0, |root| {
+            crate::callgraph_store::retire_ignored_refresh_paths(&root, &self.gitignore)
+        });
+        let watcher = self.watcher_drain_slice.lock().as_mut().map_or(0, |state| {
+            state.retire_ignored_paths(&keep)
+        });
+        crate::slog_info!(
+            "ignore queue retirement: generation={} watcher={} callgraph_pending={} callgraph_queued={} tier2={} semantic_pending={} search_pending={}",
+            generation, watcher, callgraph, callgraph_queued, tier2, semantic, search
+        );
     }
 
     /// Rebuild the gitignore matcher from the current `project_root` and
@@ -5900,7 +5957,7 @@ impl AppContext {
                 crate::callgraph_store::CallgraphRefreshState::new(
                     Arc::clone(&self.callgraph_store),
                     Arc::clone(&self.heavy_root_work_allowed),
-                ),
+                ).with_matcher(Arc::clone(&self.gitignore)),
                 ticket,
             )
         })
@@ -5933,6 +5990,9 @@ impl AppContext {
                     );
                 }
                 in_root
+                    && !crate::watcher_filter::queued_path_is_ignored_by_matcher(
+                        &self.gitignore, path,
+                    )
             })
             .collect()
     }
@@ -9962,6 +10022,49 @@ mod callgraph_store_for_ops_tests {
             ),
             "semantic-disabled config maps to Disabled status"
         );
+    }
+
+    #[test]
+    fn matcher_rebuild_retires_queued_ignored_paths_and_keeps_sibling() {
+        let project = TempDir::new().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::create_dir(root.join("scratch")).unwrap();
+        let scratch = root.join("scratch/source.rs");
+        let sibling = root.join("kept.rs");
+        std::fs::write(&scratch, "fn scratch() {}\n").unwrap();
+        std::fs::write(&sibling, "fn kept() {}\n").unwrap();
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config {
+            project_root: Some(root.clone()), ..Config::default()
+        });
+        let paths = BTreeSet::from([scratch.clone(), sibling.clone()]);
+        ctx.add_pending_search_index_paths(paths.clone());
+        ctx.add_pending_semantic_index_paths(paths.clone());
+        ctx.add_pending_tier2_paths(paths.clone());
+        ctx.pending_callgraph_store_paths.lock().extend(paths.clone());
+        let mut state = WatcherDrainSliceState::new(ctx.configure_generation(), ctx.configure_content_generation());
+        state.pending_paths.extend(paths.clone());
+        state.semantic_refresh_paths.extend(paths.clone());
+        state.view_publication_paths.extend(paths.clone());
+        state.phase = WatcherDrainPhase::Apply {
+            stage: WatcherDrainApplyPhase::PendingTier2,
+            paths: VecDeque::from([scratch.clone(), sibling.clone()]),
+            remaining: 1,
+            oversized_inline_batch: false,
+        };
+        *ctx.watcher_drain_slice.lock() = Some(state);
+        std::fs::write(root.join(".gitignore"), "scratch/\n").unwrap();
+        ctx.rebuild_gitignore();
+        assert_eq!(ctx.take_pending_search_index_paths(), vec![sibling.clone()]);
+        assert_eq!(ctx.take_pending_semantic_index_paths(), vec![sibling.clone()]);
+        assert_eq!(ctx.pending_tier2_paths(), vec![sibling.clone()]);
+        assert_eq!(ctx.take_pending_callgraph_store_paths(), vec![sibling.clone()]);
+        let state = ctx.watcher_drain_slice.lock().take().unwrap();
+        assert_eq!(state.pending_paths, VecDeque::from([sibling.clone()]));
+        assert_eq!(state.semantic_refresh_paths, vec![sibling.clone()]);
+        assert_eq!(state.view_publication_paths, BTreeSet::from([sibling.clone()]));
+        let WatcherDrainPhase::Apply { paths, remaining, .. } = state.phase else { panic!("apply continuation lost"); };
+        assert_eq!(paths, VecDeque::from([sibling]));
+        assert_eq!(remaining, 0);
     }
 
     #[cfg(unix)]

@@ -336,8 +336,27 @@ pub(crate) fn watcher_path_is_ignored_by_matcher(matcher: &SharedGitignore, path
     watcher_path_is_ignored(guard.as_deref(), path)
 }
 
+pub(crate) fn queued_path_is_ignored_by_matcher(matcher: &SharedGitignore, path: &Path) -> bool {
+    // The raw filter deliberately admits HEAD/ref metadata as control events.
+    // Retirement must not turn those already-admitted events into infra skips.
+    if path.components().any(|part| part.as_os_str() == ".git") {
+        return false;
+    }
+    let guard = matcher.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+    watcher_path_is_ignored(guard.as_deref(), path)
+}
+
 fn watcher_path_is_ignored(matcher: Option<&Gitignore>, path: &Path) -> bool {
     matcher.is_some_and(|matcher| {
+        let joined;
+        let path = if path.is_relative() {
+            joined = matcher.path().join(path);
+            joined.as_path()
+        } else {
+            path
+        };
+        let canonical = std::fs::canonicalize(path).ok();
+        let path = canonical.as_deref().unwrap_or(path);
         path.starts_with(matcher.path())
             && matcher
                 .matched_path_or_any_parents(path, path.is_dir())
