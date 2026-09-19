@@ -913,6 +913,46 @@ describe("OpenCode background notifications", () => {
     expect(send.mock.calls.some((call) => call[0] === "bash_ack_completions")).toBe(true);
   });
 
+  test("busy session holds an older completion for in-turn or idle delivery", async () => {
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({
+      success: true,
+      bg_completions: [completion("task-1", "npm test")],
+      acked_task_ids: ["task-1"],
+    }));
+    const promptAsync = mock(async () => {});
+    const client = makeClient(promptAsync);
+    const state = sessionBgStates.get("s1");
+    if (!state) throw new Error("tracked session state missing");
+    state.wakeDeferredTaskIds.clear();
+    observeOpenCodeBgNotificationEvent({
+      type: "session.status",
+      properties: { sessionID: "s1", status: { type: "busy" } },
+    });
+
+    await handleSubcBgEventsNudge({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client,
+    });
+    await sleep(300);
+
+    expect(promptAsync).toHaveBeenCalledTimes(0);
+    expect(state.pendingCompletions).toHaveLength(1);
+
+    observeOpenCodeBgNotificationEvent({
+      type: "session.idle",
+      properties: { sessionID: "s1" },
+    });
+    await waitForMockCallCount(promptAsync, 1);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    const text = (promptAsync.mock.calls[0][0] as { body: { parts: Array<{ text: string }> } }).body
+      .parts[0].text;
+    expect(text).toContain("- task task-1 (exit 0)");
+  });
+
   test("same-turn push completion waits for sync bash_watch instead of waking", async () => {
     trackBgTask("s1", "task-1");
     const { ctx } = harness(() => ({ success: true, bg_completions: [] }));

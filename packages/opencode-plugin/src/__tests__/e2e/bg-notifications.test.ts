@@ -7,7 +7,11 @@ import type { ToolContext } from "@opencode-ai/plugin";
 import {
   __resetBgNotificationStateForTests,
   appendInTurnBgCompletions,
+  consumeBgCompletion,
   handleIdleBgCompletions,
+  handleSubcBgEventsNudge,
+  markBgCompletionDelivered,
+  observeOpenCodeBgNotificationEvent,
   sessionBgStates,
   trackBgTask,
 } from "../../bg-notifications.js";
@@ -19,6 +23,7 @@ import {
   configureParamsFromLegacyOverrides,
   createHarness,
   type E2EHarness,
+  harnessPool,
   type PreparedBinary,
   prepareBinary,
 } from "./helpers.js";
@@ -94,6 +99,145 @@ maybeDescribe("e2e bg notifications (OpenCode adapter + bridge + Rust)", () => {
     expect(output.output).toContain("    done");
     expect(output.output).not.toContain(": printf done");
   });
+
+  async function subcPluginHarness() {
+    const h = await createHarness(preparedBinary, {
+      fixtureNames: [],
+      transport: "subc",
+      bridgeOptions: { timeoutMs: 20_000 },
+      configOverrides: {
+        restrict_to_project_root: false,
+        bash_permissions: false,
+        experimental_bash_background: true,
+        harness: "opencode",
+      },
+    });
+    harnesses.push(h);
+    const pool = harnessPool(h);
+    const ctx: PluginContext = {
+      pool,
+      client: {} as PluginContext["client"],
+      config: {} as PluginContext["config"],
+      storageDir: h.path(".aft-storage"),
+    };
+    return { h, ctx, bash: createBashTool(ctx), pool };
+  }
+
+  test("detached foreground task emits no completion footer before exit and one after", async () => {
+    const { h, ctx, bash, pool } = await subcPluginHarness();
+    const sessionID = "e2e-session";
+    const bridge = pool.getBridge(h.tempDir);
+    const alreadyFinishedTaskId = await spawnBackground(h, bash, "printf older-finished");
+    await waitUntil(async () => {
+      const status = await bridge.send("bash_status", {
+        session_id: sessionID,
+        task_id: alreadyFinishedTaskId,
+      });
+      return status.status !== "running" && status.status !== "starting";
+    });
+    observeOpenCodeBgNotificationEvent({
+      type: "session.status",
+      properties: { sessionID, status: { type: "busy" } },
+    });
+    const injectedReminders: string[] = [];
+    const client = {
+      session: {
+        promptAsync: async (payload: { body?: { parts?: Array<{ text?: string }> } }) => {
+          injectedReminders.push(payload.body?.parts?.[0]?.text ?? "");
+          await waitUntil(async () => {
+            const response = await bridge.send("bash_wait_detach", { session_id: sessionID });
+            return response.detached === true;
+          });
+        },
+        messages: async () => ({ data: [] }),
+      },
+    };
+    const waitResult = bash.execute(
+      {
+        command:
+          process.platform === "win32"
+            ? "Start-Sleep -Seconds 40; Write-Output finished"
+            : "sleep 40; printf finished",
+        wait: true,
+        timeout: 45_000,
+      },
+      {
+        sessionID,
+        messageID: "e2e-message",
+        agent: "e2e-agent",
+        directory: h.tempDir,
+        worktree: h.tempDir,
+        abort: new AbortController().signal,
+        metadata: () => {},
+        ask: noopAsk,
+        callID: `call-${Date.now()}`,
+      } as ToolContext,
+    );
+
+    await handleSubcBgEventsNudge({
+      ctx,
+      directory: h.tempDir,
+      sessionID,
+      client,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(injectedReminders).toHaveLength(0);
+    consumeBgCompletion(sessionID, alreadyFinishedTaskId);
+    await markBgCompletionDelivered(
+      { ctx, directory: h.tempDir, sessionID },
+      alreadyFinishedTaskId,
+    );
+
+    await waitUntil(async () => {
+      const response = await bridge.send("bash_wait_detach", { session_id: sessionID });
+      return response.detached === true;
+    });
+    const detached = await waitResult;
+    const detachedResult = detached as { output?: string; metadata?: { taskId?: string } };
+    const taskId = detachedResult.metadata?.taskId;
+    if (!taskId)
+      throw new Error(`detached bash did not return a task id: ${detachedResult.output}`);
+
+    const beforeExit = [
+      { output: detachedResult.output ?? "" },
+      { output: "unrelated read result" },
+      { output: "unrelated status result" },
+    ];
+    for (const output of beforeExit) {
+      await appendInTurnBgCompletions({ ctx, directory: h.tempDir, sessionID }, output);
+      expect(output.output).not.toContain("[BACKGROUND BASH COMPLETED]");
+    }
+    expect(detachedResult.output).not.toContain("[BACKGROUND BASH COMPLETED]");
+    expect(detachedResult.output).not.toContain(`- task ${taskId} (exit 0`);
+    expect(detachedResult.output).not.toContain(`- task ${alreadyFinishedTaskId} (exit 0`);
+    const running = await bridge.send("bash_status", { session_id: sessionID, task_id: taskId });
+    expect(running.status).toBe("running");
+    const statusCompletions = Array.isArray(running.bg_completions) ? running.bg_completions : [];
+    expect(statusCompletions).toHaveLength(0);
+
+    const killed = await bridge.send("bash_kill", { session_id: sessionID, task_id: taskId });
+    expect(killed.success).toBe(true);
+    const afterExit: Array<{ output: string }> = [];
+    await waitUntil(async () => {
+      const output = { output: `post-exit tool ${afterExit.length + 1}` };
+      afterExit.push(output);
+      await appendInTurnBgCompletions({ ctx, directory: h.tempDir, sessionID }, output);
+      return output.output.includes("[BACKGROUND BASH COMPLETED]");
+    });
+    for (const label of ["second post-exit tool", "third post-exit tool"]) {
+      const output = { output: label };
+      afterExit.push(output);
+      await appendInTurnBgCompletions({ ctx, directory: h.tempDir, sessionID }, output);
+    }
+
+    const footerCount = afterExit.reduce(
+      (count, output) =>
+        count + (output.output.match(/\[BACKGROUND BASH COMPLETED\]/g)?.length ?? 0),
+      0,
+    );
+    expect(footerCount).toBe(1);
+    expect(afterExit.map((output) => output.output).join("\n")).toContain(`- task ${taskId} (`);
+  }, 30_000);
 
   test("turn-end wake sends promptAsync through OpenCode client", async () => {
     const { h, ctx, bash } = await pluginHarness();

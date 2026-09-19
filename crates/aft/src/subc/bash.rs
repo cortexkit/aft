@@ -204,8 +204,15 @@ fn finish_bash_poll_done(
     format_context: &crate::subc_format::FormatContext,
     text_tx: &mut Option<oneshot::Sender<String>>,
     control_tx: &mut Option<oneshot::Sender<BashPollControl>>,
+    allow_bg_completions: bool,
 ) -> Response {
-    let result = finalized_bash_result(response, ctx, session_id, format_context, true);
+    let result = finalized_bash_result(
+        response,
+        ctx,
+        session_id,
+        format_context,
+        allow_bg_completions,
+    );
     let ToolCallResult { text, response } = result;
     if let Some(tx) = text_tx.take() {
         let _ = tx.send(text);
@@ -647,6 +654,7 @@ async fn run_deferred_bash_wait(
                                     &format_context_for_poll,
                                     &mut poll_text_tx,
                                     &mut poll_control_tx,
+                                    true,
                                 );
                             };
 
@@ -673,6 +681,7 @@ async fn run_deferred_bash_wait(
                                     &format_context_for_poll,
                                     &mut poll_text_tx,
                                     &mut poll_control_tx,
+                                    false,
                                 );
                             }
                             match crate::commands::bash_orchestrate::decide_bash_step(
@@ -701,6 +710,7 @@ async fn run_deferred_bash_wait(
                                         &format_context_for_poll,
                                         &mut poll_text_tx,
                                         &mut poll_control_tx,
+                                        true,
                                     )
                                 }
                                 crate::commands::bash_orchestrate::BashStep::Promote => {
@@ -854,7 +864,7 @@ async fn submit_bash_promote(
                     ctx,
                     &session_for_promote,
                     &format_context_for_promote,
-                    true,
+                    false,
                 );
                 let ToolCallResult { text, response } = result;
                 let _ = text_tx.send(text);

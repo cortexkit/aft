@@ -200,6 +200,7 @@ let lastWakeMessageTimestamp = 0;
 let wakeMessageCounter = 0;
 const subcNudgesInFlight = new Map<string, Promise<void>>();
 const subcNudgeLogState = new Map<string, { lastEmittedAt: number; suppressed: number }>();
+const deferredBusyWakeContexts = new Map<string, DrainContext & { client: unknown }>();
 
 interface DrainContext {
   ctx: PluginContext;
@@ -434,7 +435,7 @@ export async function handlePushedPatternMatch(
   }
   const state = stateFor(drainContext.sessionID);
   queuePendingPatternMatch(state, { ...frame, ackCompletionOnDelivery: true });
-  await triggerWakeIfPending(drainContext, true);
+  await triggerWakeIfPending(drainContext, true, true, false, true);
 }
 
 export function ingestBgCompletions(
@@ -487,7 +488,7 @@ export async function handlePushedBgCompletion(
   completion: unknown,
 ): Promise<void> {
   ingestBgCompletions(drainContext.sessionID, [completion]);
-  await triggerWakeIfPending(drainContext, true, false);
+  await triggerWakeIfPending(drainContext, true, false, false, true);
 }
 
 export async function handlePushedBgLongRunning(
@@ -495,7 +496,7 @@ export async function handlePushedBgLongRunning(
   reminder: BgLongRunningReminder,
 ): Promise<void> {
   stateFor(drainContext.sessionID).pendingLongRunning.push(reminder);
-  await triggerWakeIfPending(drainContext, true);
+  await triggerWakeIfPending(drainContext, true, true, false, true);
 }
 
 export async function appendInTurnBgCompletions(
@@ -632,7 +633,7 @@ async function handleSubcBgEventsNudgeOnce(
   const state = stateFor(drainContext.sessionID);
   state.wakeDeferredTaskIds.clear();
   rearmHardStoppedWake(state, drainContext);
-  await triggerWakeIfPending(drainContext, false, true, true);
+  await triggerWakeIfPending(drainContext, false, true, true, true);
 }
 
 function logSubcNudgeLifecycle(drainContext: DrainContext, kind: string, message: string): void {
@@ -998,6 +999,11 @@ export function observeOpenCodeBgNotificationEvent(event: unknown): void {
       return;
     }
     if (nextStatus === "idle") {
+      const deferredContext = deferredBusyWakeContexts.get(sessionID);
+      if (deferredContext) {
+        deferredBusyWakeContexts.delete(sessionID);
+        void triggerWakeIfPending(deferredContext, true).catch(() => undefined);
+      }
       for (const admission of state.wakeAdmissions.values()) queueWakeRefire(state, admission);
     }
   } catch {
@@ -1010,6 +1016,7 @@ async function triggerWakeIfPending(
   skipDrain: boolean,
   includeDeferredCompletions = true,
   forceDrain = false,
+  deferWhileBusy = false,
 ): Promise<void> {
   // Note: previously bailed on `isActive()` (bridge.hasPendingRequests())
   // to defer wakes until the bridge was idle. That was wrong:
@@ -1031,6 +1038,14 @@ async function triggerWakeIfPending(
   }
   routeExplicitControlCompletions(state);
   if (!hasWakeEligiblePending(state, includeDeferredCompletions)) return;
+  // promptAsync creates a synthetic user message. Autonomous pushes and daemon
+  // nudges must not send one while OpenCode is already running a turn: doing so
+  // re-enters chat.message and can detach an unrelated wait:true bash call. The
+  // next tool result appends the pending completion, or session.idle wakes it.
+  if (deferWhileBusy && state.hostStatus === "busy") {
+    deferredBusyWakeContexts.set(drainContext.sessionID, drainContext);
+    return;
+  }
 
   scheduleWake(
     state,
@@ -1333,6 +1348,7 @@ export function __resetBgNotificationStateForTests(): void {
   sessionBgStates.clear();
   subcNudgesInFlight.clear();
   subcNudgeLogState.clear();
+  deferredBusyWakeContexts.clear();
   foreignSessionDropLogState.clear();
   activeSessionId = undefined;
   bgHopTimeoutMs = DEFAULT_BG_HOP_TIMEOUT_MS;
