@@ -404,20 +404,32 @@ fn standalone_tool_call_read_finishes_before_slow_inspect() {
         "configure failed: {configure:#}"
     );
 
-    let callgraph = aft.send_with_timeout(
-        &serde_json::to_string(&json!({
-            "id": "warm-inspect-callgraph",
-            "command": "callers",
-            "file": src.join("main.rs").display().to_string(),
-            "symbol": "main"
-        }))
-        .expect("serialize callgraph warmup"),
-        // A positive wait on a 2,000-file cold build: a contended Windows runner
-        // took 27 s for the build alone (train 120), so the budget is sized for
-        // the runner, not the box. The claim under test is the 3 s read liveness
-        // below, which keeps its tight bound.
-        Duration::from_secs(120),
-    );
+    // Poll rather than budget: the build's duration is the runner's business,
+    // and a single long wait that returns `callgraph_building` reads as a
+    // product failure when it is only a slow box (a contended Windows runner
+    // exceeded a 120 s budget on this 2,000-file fixture, train 132). The
+    // claim under test is the 3 s read liveness below, which keeps its bound.
+    let warm_deadline = Instant::now() + Duration::from_secs(300);
+    let mut callgraph;
+    loop {
+        callgraph = aft.send_with_timeout(
+            &serde_json::to_string(&json!({
+                "id": "warm-inspect-callgraph",
+                "command": "callers",
+                "file": src.join("main.rs").display().to_string(),
+                "symbol": "main"
+            }))
+            .expect("serialize callgraph warmup"),
+            Duration::from_secs(120),
+        );
+        if callgraph["success"] == true
+            || callgraph["code"] != "callgraph_building"
+            || Instant::now() >= warm_deadline
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
     assert_eq!(
         callgraph["success"], true,
         "callgraph warmup failed: {callgraph:#}"
