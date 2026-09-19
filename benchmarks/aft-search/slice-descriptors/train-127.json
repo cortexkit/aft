@@ -1,15 +1,15 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "harness-goldens",
-    "profile-grammar",
-    "paging"
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
   "slices": [
-    "views-per-binding-resolution",
-    "oc2-playbook-ga-facts"
+    "tier2-stale-not-building",
+    "false-completion-footers",
+    "watcher-seed-ecosystem-first",
+    "semantic-index-fake-server-graceful-close"
   ],
-  "note": "No ranking-fence file changes: views materialization per-binding resolution + refresh bench, playbook facts."
+  "note": "semantic_index.rs changes are confined to the #[cfg(test)] fake embedding servers (graceful connection close); no product line in the ranking fence moves, so search rows are byte-identical to the reference (the predicate is the proof). The tier2 health, bash completion wake, and watcher exclusion changes are outside the fence."
 }
