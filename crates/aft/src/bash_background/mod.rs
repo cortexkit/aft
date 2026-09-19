@@ -834,7 +834,10 @@ mod shell_resolution_tests {
             None => std::env::remove_var("SHELL"),
         }
 
-        assert_eq!(pty, pipe, "PTY and pipe modes must launch the same interpreter");
+        assert_eq!(
+            pty, pipe,
+            "PTY and pipe modes must launch the same interpreter"
+        );
         assert_ne!(
             pty.file_name().and_then(|name| name.to_str()),
             Some("sh"),
