@@ -343,8 +343,9 @@ export function writeGrowthAttribution(sample: SentinelSample, state: SentinelSt
     // sentinel's sampling interval, so shares are taken against that window's
     // process total; against the interval delta they summed past 100%.
     const census = sample.writes_census;
-    const windowTotal = Number(census?.process?.physical_bytes ?? 0) > 0
-      ? Number(census.process.physical_bytes)
+    const censusProcessBytes = Number(census?.process?.physical_bytes ?? 0);
+    const windowTotal = censusProcessBytes > 0
+      ? censusProcessBytes
       : ledger.reduce((sum: number, entry: Record<string, unknown>) => sum + Number(entry.physical_bytes ?? 0), 0);
     const windowMinutes = census?.since_ms && census?.until_ms
       ? Math.round((Number(census.until_ms) - Number(census.since_ms)) / 60_000)
