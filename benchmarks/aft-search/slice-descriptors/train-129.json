@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "ignore-rule-refresh-coalesce"
+  ],
+  "note": "No ranking-fence file changes: ignore-rule refresh coalescing in the watcher drain.",
+  "train": null
+}
