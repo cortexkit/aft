@@ -7,11 +7,7 @@ import type { ToolContext } from "@opencode-ai/plugin";
 import {
   __resetBgNotificationStateForTests,
   appendInTurnBgCompletions,
-  consumeBgCompletion,
   handleIdleBgCompletions,
-  handleSubcBgEventsNudge,
-  markBgCompletionDelivered,
-  observeOpenCodeBgNotificationEvent,
   sessionBgStates,
   trackBgTask,
 } from "../../bg-notifications.js";
@@ -109,10 +105,18 @@ maybeDescribe("e2e bg notifications (OpenCode adapter + bridge + Rust)", () => {
         restrict_to_project_root: false,
         bash_permissions: false,
         experimental_bash_background: true,
+        bash: { background: true, foreground_wait_window_ms: 250 },
         harness: "opencode",
       },
     });
     harnesses.push(h);
+    const rawBashResponses: Array<Record<string, unknown>> = [];
+    const originalSend = h.bridge.send.bind(h.bridge);
+    h.bridge.send = async (...args: Parameters<typeof h.bridge.send>) => {
+      const result = await originalSend(...args);
+      if (args[0] === "bash") rawBashResponses.push(result);
+      return result;
+    };
     const pool = harnessPool(h);
     const ctx: PluginContext = {
       pool,
@@ -120,38 +124,22 @@ maybeDescribe("e2e bg notifications (OpenCode adapter + bridge + Rust)", () => {
       config: {} as PluginContext["config"],
       storageDir: h.path(".aft-storage"),
     };
-    return { h, ctx, bash: createBashTool(ctx), pool };
+    return { h, ctx, bash: createBashTool(ctx), pool, rawBashResponses };
   }
 
-  test("detached foreground task emits no completion footer before exit and one after", async () => {
-    const { h, ctx, bash, pool } = await subcPluginHarness();
+  test("detach response leaves an earlier completion queued for the next tool result", async () => {
+    const { h, ctx, bash, pool, rawBashResponses } = await subcPluginHarness();
     const sessionID = "e2e-session";
     const bridge = pool.getBridge(h.tempDir);
-    const alreadyFinishedTaskId = await spawnBackground(h, bash, "printf older-finished");
-    await waitUntil(async () => {
-      const status = await bridge.send("bash_status", {
-        session_id: sessionID,
-        task_id: alreadyFinishedTaskId,
-      });
-      return status.status !== "running" && status.status !== "starting";
-    });
-    observeOpenCodeBgNotificationEvent({
-      type: "session.status",
-      properties: { sessionID, status: { type: "busy" } },
-    });
-    const injectedReminders: string[] = [];
-    const client = {
-      session: {
-        promptAsync: async (payload: { body?: { parts?: Array<{ text?: string }> } }) => {
-          injectedReminders.push(payload.body?.parts?.[0]?.text ?? "");
-          await waitUntil(async () => {
-            const response = await bridge.send("bash_wait_detach", { session_id: sessionID });
-            return response.detached === true;
-          });
-        },
-        messages: async () => ({ data: [] }),
-      },
-    };
+    const alreadyFinishedTaskId = await spawnBackground(
+      h,
+      bash,
+      process.platform === "win32"
+        ? "Start-Sleep -Seconds 2; Write-Output older-finished"
+        : "sleep 2; printf older-finished",
+    );
+    expect(sessionBgStates.get(sessionID)?.pendingCompletions ?? []).toHaveLength(0);
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
     const waitResult = bash.execute(
       {
         command:
@@ -174,20 +162,6 @@ maybeDescribe("e2e bg notifications (OpenCode adapter + bridge + Rust)", () => {
       } as ToolContext,
     );
 
-    await handleSubcBgEventsNudge({
-      ctx,
-      directory: h.tempDir,
-      sessionID,
-      client,
-    });
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    expect(injectedReminders).toHaveLength(0);
-    consumeBgCompletion(sessionID, alreadyFinishedTaskId);
-    await markBgCompletionDelivered(
-      { ctx, directory: h.tempDir, sessionID },
-      alreadyFinishedTaskId,
-    );
-
     await waitUntil(async () => {
       const response = await bridge.send("bash_wait_detach", { session_id: sessionID });
       return response.detached === true;
@@ -198,18 +172,34 @@ maybeDescribe("e2e bg notifications (OpenCode adapter + bridge + Rust)", () => {
     if (!taskId)
       throw new Error(`detached bash did not return a task id: ${detachedResult.output}`);
 
+    expect(detachedResult.output).not.toContain(`- task ${alreadyFinishedTaskId} (exit 0`);
+    expect(detachedResult.output).not.toContain(`- task ${taskId} (`);
+    const detachedRaw = [...rawBashResponses].reverse().find((result) => result.task_id === taskId);
+    if (!detachedRaw)
+      throw new Error(
+        `raw detach response missing for ${taskId}: ${JSON.stringify(rawBashResponses)}`,
+      );
+    const detachedSidecars = Array.isArray(detachedRaw.bg_completions)
+      ? detachedRaw.bg_completions
+      : [];
+    expect(detachedSidecars).not.toContainEqual(
+      expect.objectContaining({ task_id: alreadyFinishedTaskId }),
+    );
+
     const beforeExit = [
-      { output: detachedResult.output ?? "" },
       { output: "unrelated read result" },
       { output: "unrelated status result" },
+      { output: "third unrelated tool result" },
     ];
     for (const output of beforeExit) {
       await appendInTurnBgCompletions({ ctx, directory: h.tempDir, sessionID }, output);
-      expect(output.output).not.toContain("[BACKGROUND BASH COMPLETED]");
     }
-    expect(detachedResult.output).not.toContain("[BACKGROUND BASH COMPLETED]");
-    expect(detachedResult.output).not.toContain(`- task ${taskId} (exit 0`);
-    expect(detachedResult.output).not.toContain(`- task ${alreadyFinishedTaskId} (exit 0`);
+    const beforeExitText = beforeExit.map((output) => output.output).join("\n");
+    expect(beforeExitText).toContain(`- task ${alreadyFinishedTaskId} (exit 0`);
+    expect(
+      beforeExitText.match(new RegExp(`- task ${alreadyFinishedTaskId} \\(`, "g")),
+    ).toHaveLength(1);
+    expect(beforeExitText).not.toContain(`- task ${taskId} (`);
     const running = await bridge.send("bash_status", { session_id: sessionID, task_id: taskId });
     expect(running.status).toBe("running");
     const statusCompletions = Array.isArray(running.bg_completions) ? running.bg_completions : [];
@@ -237,6 +227,67 @@ maybeDescribe("e2e bg notifications (OpenCode adapter + bridge + Rust)", () => {
     );
     expect(footerCount).toBe(1);
     expect(afterExit.map((output) => output.output).join("\n")).toContain(`- task ${taskId} (`);
+  }, 30_000);
+
+  test("auto-promotion response leaves an earlier completion queued for the next tool result", async () => {
+    const { h, ctx, bash, pool, rawBashResponses } = await subcPluginHarness();
+    const sessionID = "e2e-session";
+    const bridge = pool.getBridge(h.tempDir);
+    const alreadyFinishedTaskId = await spawnBackground(
+      h,
+      bash,
+      process.platform === "win32"
+        ? "Start-Sleep -Seconds 2; Write-Output older-promote"
+        : "sleep 2; printf older-promote",
+    );
+    expect(sessionBgStates.get(sessionID)?.pendingCompletions ?? []).toHaveLength(0);
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+
+    const promoted = (await bash.execute(
+      {
+        command:
+          process.platform === "win32"
+            ? "Start-Sleep -Seconds 40; Write-Output finished"
+            : "sleep 40; printf finished",
+        timeout: 45_000,
+      },
+      {
+        sessionID,
+        messageID: "e2e-promote-message",
+        agent: "e2e-agent",
+        directory: h.tempDir,
+        worktree: h.tempDir,
+        abort: new AbortController().signal,
+        metadata: () => {},
+        ask: noopAsk,
+        callID: `call-${Date.now()}`,
+      } as ToolContext,
+    )) as { output?: string; metadata?: { taskId?: string } };
+    const taskId = promoted.metadata?.taskId;
+    if (!taskId) throw new Error(`promoted bash did not return a task id: ${promoted.output}`);
+
+    expect(promoted.output).not.toContain(`- task ${alreadyFinishedTaskId} (exit 0`);
+    const promotedRaw = [...rawBashResponses].reverse().find((result) => result.task_id === taskId);
+    if (!promotedRaw) throw new Error(`raw promotion response missing for ${taskId}`);
+    const promotedSidecars = Array.isArray(promotedRaw.bg_completions)
+      ? promotedRaw.bg_completions
+      : [];
+    expect(promotedSidecars).not.toContainEqual(
+      expect.objectContaining({ task_id: alreadyFinishedTaskId }),
+    );
+
+    const nextTool = { output: "tool result after promotion" };
+    await appendInTurnBgCompletions({ ctx, directory: h.tempDir, sessionID }, nextTool);
+    expect(nextTool.output).toContain(`- task ${alreadyFinishedTaskId} (exit 0`);
+    expect(nextTool.output).not.toContain(`- task ${taskId} (`);
+
+    const killed = await bridge.send("bash_kill", { session_id: sessionID, task_id: taskId });
+    expect(killed.success).toBe(true);
+    await waitUntil(async () => {
+      const output = { output: "post-kill tool result" };
+      await appendInTurnBgCompletions({ ctx, directory: h.tempDir, sessionID }, output);
+      return output.output.includes(`- task ${taskId} (`);
+    });
   }, 30_000);
 
   test("turn-end wake sends promptAsync through OpenCode client", async () => {
