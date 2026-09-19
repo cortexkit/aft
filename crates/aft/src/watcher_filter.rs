@@ -350,7 +350,8 @@ fn ignore_file_parent_is_ignored(matcher: &SharedGitignore, path: &Path) -> bool
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-const WATCHER_ECOSYSTEM_EXCLUSIONS: [&str; 9] = [
+const WATCHER_ECOSYSTEM_EXCLUSIONS: [&str; 10] = [
+    ".git",
     "target",
     "node_modules",
     ".venv",
@@ -499,6 +500,7 @@ fn ecosystem_exclusion_priority(root: &Path, name: &str) -> Option<usize> {
         .iter()
         .position(|candidate| *candidate == name)?;
     let enabled = match name {
+        ".git" => root.join(".git").is_dir(),
         "target" => root.join("Cargo.toml").is_file(),
         "node_modules" => root.join("package.json").is_file(),
         ".venv" | "venv" | "__pycache__" => root_has_python_manifest(root),
@@ -519,12 +521,14 @@ fn exclusion_path_is_directory_or_absent(path: &Path) -> bool {
 /// Choose ignored directory boundaries that an OS watcher can omit entirely.
 ///
 /// Root-level directories implied by a repository's ecosystem are reserved
-/// first, even before they exist. Persisted overflow observations come next,
-/// followed by existing ignored boundaries in ignore-file order. An
-/// unobserved nested copy of a selected name is deferred so six workspace
-/// `node_modules` directories cannot crowd out a root `target` slot. This is a
-/// priority rule, not a coverage claim: FSEvents exclusions are exact paths, so
-/// excluding root `node_modules` does not exclude `packages/app/node_modules`.
+/// first, even before they exist. A checkout's `.git` directory always owns
+/// slot zero; linked worktrees use a `.git` file and do not seed that path.
+/// Persisted overflow observations come next, followed by existing ignored
+/// boundaries in ignore-file order. An unobserved nested copy of a selected
+/// name is deferred so six workspace `node_modules` directories cannot crowd
+/// out a root `target` slot. This is a priority rule, not a coverage claim:
+/// FSEvents exclusions are exact paths, so excluding root `node_modules` does
+/// not exclude `packages/app/node_modules`.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) fn derive_excluded_subtrees(
     root: &Path,
@@ -597,6 +601,22 @@ pub(crate) fn derive_excluded_subtrees(
         }
     }
 
+    if root_git.is_dir() {
+        let relative = PathBuf::from(".git");
+        candidates.insert(
+            relative.clone(),
+            Candidate {
+                path: root_git,
+                relative,
+                source: WatcherExclusionSource::Ecosystem,
+                ecosystem_priority: ecosystem_exclusion_priority(&root, ".git")
+                    .expect(".git is an ecosystem exclusion"),
+                observed_count: 0,
+                gitignore_order: GitignoreOrder::default(),
+            },
+        );
+    }
+
     if let Some(matcher) = matcher.as_deref() {
         for (relative, observed_count) in &observed {
             let path = root.join(relative);
@@ -621,6 +641,9 @@ pub(crate) fn derive_excluded_subtrees(
         }
 
         for name in WATCHER_ECOSYSTEM_EXCLUSIONS {
+            if name == ".git" {
+                continue;
+            }
             let Some(ecosystem_priority) = ecosystem_exclusion_priority(&root, name) else {
                 continue;
             };
@@ -1569,6 +1592,48 @@ mod tests {
             derive_excluded_subtrees(&sibling, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
         assert_eq!(exclusions[0].path(), sibling.join(relative_hot));
         assert_eq!(exclusions[0].source(), WatcherExclusionSource::Observed);
+    }
+
+    #[test]
+    fn git_directory_is_slot_zero_but_git_file_is_not_seeded() {
+        let checkout = TempDir::new().unwrap();
+        std::fs::create_dir(checkout.path().join(".git")).unwrap();
+        std::fs::write(checkout.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(checkout.path().join(".gitignore"), "target/\n").unwrap();
+        let checkout_root = std::fs::canonicalize(checkout.path()).unwrap();
+        let checkout_matcher = shared_matcher(&checkout_root);
+
+        let checkout_exclusions = derive_excluded_subtrees(
+            &checkout_root,
+            &checkout_matcher,
+            Some(WATCHER_EXCLUSION_LIMIT),
+        );
+
+        assert_eq!(checkout_exclusions[0].path(), checkout_root.join(".git"));
+        assert_eq!(
+            checkout_exclusions[0].source(),
+            WatcherExclusionSource::Ecosystem
+        );
+        assert_eq!(checkout_exclusions[1].path(), checkout_root.join("target"));
+
+        let linked = TempDir::new().unwrap();
+        std::fs::write(
+            linked.path().join(".git"),
+            "gitdir: ../main/.git/worktrees/linked\n",
+        )
+        .unwrap();
+        std::fs::write(linked.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(linked.path().join(".gitignore"), "target/\n").unwrap();
+        let linked_root = std::fs::canonicalize(linked.path()).unwrap();
+        let linked_matcher = shared_matcher(&linked_root);
+
+        let linked_exclusions =
+            derive_excluded_subtrees(&linked_root, &linked_matcher, Some(WATCHER_EXCLUSION_LIMIT));
+
+        assert_eq!(
+            watcher_exclusion_paths(&linked_exclusions),
+            vec![linked_root.join("target")]
+        );
     }
 
     #[test]
