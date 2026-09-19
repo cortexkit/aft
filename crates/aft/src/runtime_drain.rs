@@ -42,6 +42,7 @@ pub const LSP_EVENT_DRAIN_BATCH_CAP: usize = 256;
 thread_local! {
     static LEGACY_WATCHER_REFRESHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static IGNORE_RULE_REFRESHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static IGNORE_RULE_CORPUS_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static IGNORE_RULE_CALLGRAPH_INVALIDATIONS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
@@ -71,12 +72,18 @@ fn note_legacy_watcher_refresh_for_test() {}
 #[cfg(test)]
 fn reset_ignore_rule_refreshes_for_test() {
     IGNORE_RULE_REFRESHES.with(|count| count.set(0));
+    IGNORE_RULE_CORPUS_REBUILDS.with(|count| count.set(0));
     IGNORE_RULE_CALLGRAPH_INVALIDATIONS.with(|count| count.set(0));
 }
 
 #[cfg(test)]
 fn ignore_rule_refreshes_for_test() -> usize {
     IGNORE_RULE_REFRESHES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn ignore_rule_corpus_rebuilds_for_test() -> usize {
+    IGNORE_RULE_CORPUS_REBUILDS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -87,8 +94,18 @@ fn ignore_rule_callgraph_invalidations_for_test() -> usize {
 #[cfg(test)]
 fn note_ignore_rule_refresh_for_test() {
     IGNORE_RULE_REFRESHES.with(|count| count.set(count.get() + 1));
+    IGNORE_RULE_CORPUS_REBUILDS.with(|count| count.set(count.get() + 1));
     IGNORE_RULE_CALLGRAPH_INVALIDATIONS.with(|count| count.set(count.get() + 1));
 }
+
+#[cfg(test)]
+fn note_scoped_ignore_rule_refresh_for_test() {
+    IGNORE_RULE_REFRESHES.with(|count| count.set(count.get() + 1));
+    IGNORE_RULE_CALLGRAPH_INVALIDATIONS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(not(test))]
+fn note_scoped_ignore_rule_refresh_for_test() {}
 
 #[cfg(not(test))]
 fn note_ignore_rule_refresh_for_test() {}
@@ -2563,7 +2580,9 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                                 .write()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if let Some(index) = index_ref.as_mut() {
-                                if path.exists() {
+                                if path.exists()
+                                    && !watcher_path_is_ignored_by_current_matcher(ctx, path)
+                                {
                                     index.update_file(path);
                                 } else {
                                     index.remove_file(path);
@@ -2611,6 +2630,9 @@ fn apply_watcher_slice(ctx: &AppContext, state: &mut WatcherDrainSliceState, sta
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if matches!(&*status, SemanticIndexStatus::Ready { .. }) {
                                 for path in invalidated_paths {
+                                    if watcher_path_is_ignored_by_current_matcher(ctx, &path) {
+                                        continue;
+                                    }
                                     status.add_refreshing_file(path.clone());
                                     semantic_refresh_paths.push(path);
                                 }
@@ -2825,12 +2847,12 @@ fn rebuild_gitignore_for_drain(
             Some(paths) => ctx.rebuild_gitignore_after_changes(paths),
             None => {
                 ctx.rebuild_gitignore();
-                crate::context::IgnoreRuleChange::Changed
+                crate::context::IgnoreRuleChange::Full { scopes: Vec::new() }
             }
         }
     } else {
         ctx.clear_gitignore();
-        crate::context::IgnoreRuleChange::Changed
+        crate::context::IgnoreRuleChange::Full { scopes: Vec::new() }
     };
     *state = ctx
         .watcher_drain_slice()
@@ -2911,13 +2933,41 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                                     Some(&paths),
                                 )
                             })
-                            .unwrap_or(crate::context::IgnoreRuleChange::Changed);
-                        if change == crate::context::IgnoreRuleChange::Changed {
-                            log::debug!(
-                                "watcher: ignore rules changed at {:?}, rebuilt matcher",
-                                paths
-                            );
-                            arm_ignore_rule_refresh(&mut state, paths);
+                            .unwrap_or(crate::context::IgnoreRuleChange::Full {
+                                scopes: Vec::new(),
+                            });
+                        match change {
+                            crate::context::IgnoreRuleChange::Unchanged => {}
+                            crate::context::IgnoreRuleChange::AddOnly {
+                                retired_paths,
+                                scopes,
+                            } => {
+                                log::debug!(
+                                    "watcher: ignore rules added exclusions in {:?}; retiring {} path(s)",
+                                    scopes,
+                                    retired_paths.len()
+                                );
+                                state.pending_paths.extend(retired_paths);
+                            }
+                            crate::context::IgnoreRuleChange::Scoped {
+                                affected_paths,
+                                scopes,
+                            } => {
+                                log::debug!(
+                                    "watcher: ignore rules changed in {:?}; refreshing {} affected path(s)",
+                                    scopes,
+                                    affected_paths.len()
+                                );
+                                note_scoped_ignore_rule_refresh_for_test();
+                                state.pending_paths.extend(affected_paths);
+                            }
+                            crate::context::IgnoreRuleChange::Full { scopes } => {
+                                log::debug!(
+                                    "watcher: ignore rules changed in {:?}; rebuilt matcher",
+                                    scopes
+                                );
+                                arm_ignore_rule_refresh(&mut state, paths);
+                            }
                         }
                     }
                 }
@@ -3411,12 +3461,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let (ctx, tx) = watcher_context(&root);
+        let ignore_path = root.join(".gitignore");
+        std::fs::write(&ignore_path, "seed/\n").unwrap();
+        ctx.rebuild_gitignore();
 
         for index in 0..6 {
-            let ignore_path = root.join(format!("rules-{index}/.gitignore"));
-            std::fs::create_dir_all(ignore_path.parent().unwrap()).unwrap();
             std::fs::write(&ignore_path, format!("generated-{index}/\n")).unwrap();
-            send_ignore_rule_change(&tx, ignore_path);
+            send_ignore_rule_change(&tx, ignore_path.clone());
             let outcome = drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
             assert!(
                 !outcome.has_more,
@@ -3447,8 +3498,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let (ctx, tx) = watcher_context(&root);
-        let ignore_path = root.join("config/.aftignore");
-        std::fs::create_dir_all(ignore_path.parent().unwrap()).unwrap();
+        let ignore_path = root.join(".aftignore");
+        std::fs::write(&ignore_path, "old/\n").unwrap();
+        ctx.rebuild_gitignore();
         std::fs::write(&ignore_path, "generated/\n").unwrap();
         send_ignore_rule_change(&tx, ignore_path);
 
@@ -3559,11 +3611,10 @@ mod tests {
 
         std::fs::write(&ignore_path, b"other/\n").unwrap();
         send_ignore_rule_change(&tx, ignore_path);
-        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        while drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {}
         assert_eq!(ctx.gitignore_matcher_rebuild_count_for_test(), rebuilds + 1);
-        advance_ignore_rule_refresh_clock(IGNORE_RULE_REFRESH_QUIET_WINDOW);
-        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
         assert_eq!(ignore_rule_refreshes_for_test(), 1);
+        assert_eq!(ignore_rule_corpus_rebuilds_for_test(), 0);
         assert_eq!(ignore_rule_callgraph_invalidations_for_test(), 1);
     }
 
@@ -3588,6 +3639,57 @@ mod tests {
 
         assert_eq!(ctx.gitignore_matcher_rebuild_count_for_test(), rebuilds + 1);
         assert!(watcher_path_is_ignored_by_current_matcher(&ctx, &generated));
+    }
+
+    #[test]
+    fn add_only_nested_rule_retires_paths_without_corpus_rebuild_and_removal_restores_them() {
+        let _reset = begin_ignore_rule_refresh_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let nested = root.join("worker");
+        std::fs::create_dir_all(nested.join("generated")).unwrap();
+        let generated = nested.join("generated/file.rs");
+        std::fs::write(&generated, "fn retired_marker() {}\n").unwrap();
+        let ignore_path = nested.join(".gitignore");
+        std::fs::write(&ignore_path, b"").unwrap();
+        let (ctx, tx) = watcher_context(&root);
+        ctx.update_config(|config| config.search_index = true);
+        ctx.rebuild_gitignore();
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(crate::search_index::SearchIndex::build(&root));
+        let grep_total = |ctx: &AppContext| {
+            ctx.search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .expect("search index installed")
+                .grep("retired_marker", true, &[], &[], &root, usize::MAX)
+                .total_matches
+        };
+        assert_eq!(grep_total(&ctx), 1);
+
+        std::fs::write(&ignore_path, b"generated/\n").unwrap();
+        send_ignore_rule_change(&tx, ignore_path.clone());
+        while drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {}
+
+        assert_eq!(grep_total(&ctx), 0);
+        assert_eq!(ignore_rule_corpus_rebuilds_for_test(), 0);
+        assert!(ctx
+            .watcher_drain_slice()
+            .lock()
+            .as_ref()
+            .is_some_and(|state| state.ignore_refresh_due.is_none()));
+
+        std::fs::write(&ignore_path, b"").unwrap();
+        send_ignore_rule_change(&tx, ignore_path);
+        while drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP).has_more {}
+
+        assert_eq!(grep_total(&ctx), 1);
+        assert_eq!(ignore_rule_refreshes_for_test(), 1);
+        assert_eq!(ignore_rule_corpus_rebuilds_for_test(), 0);
+        assert_eq!(ignore_rule_callgraph_invalidations_for_test(), 1);
     }
 
     #[test]

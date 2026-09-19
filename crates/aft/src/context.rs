@@ -3457,7 +3457,7 @@ impl AppContext {
             None => {
                 *self.gitignore_inputs.lock() = None;
                 self.set_gitignore(None);
-                return IgnoreRuleChange::Changed;
+                return IgnoreRuleChange::Full { scopes: Vec::new() };
             }
         };
         // Watcher paths are canonicalized before dispatch. Keep the matcher's
@@ -3486,6 +3486,7 @@ impl AppContext {
 
         self.gitignore_matcher_rebuilds
             .fetch_add(1, Ordering::SeqCst);
+        let old_matcher = self.gitignore();
         let matcher = inputs.build_matcher();
         if let Some(matcher) = &matcher {
             crate::slog_info!(
@@ -3493,9 +3494,14 @@ impl AppContext {
                 matcher.num_ignores()
             );
         }
+        let change = inputs.classify_against(
+            previous_inputs.as_ref(),
+            old_matcher.as_deref(),
+            matcher.as_deref(),
+        );
         *self.gitignore_inputs.lock() = Some(inputs);
         self.set_gitignore(matcher);
-        IgnoreRuleChange::Changed
+        change
     }
 
     #[doc(hidden)]
