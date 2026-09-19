@@ -10,6 +10,12 @@ pub const TIER2_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const TIER2_REFRESH_COLD_CACHE_DELAY: Duration = Duration::from_secs(90);
 pub const TIER2_REFRESH_STORM_DEBOUNCE: Duration = Duration::from_secs(120);
 pub const TIER2_REFRESH_STORM_PATH_THRESHOLD: usize = 200;
+// How long a dispatch that the cold-build limiter turned away waits before it
+// is retried. The maintenance tick pumps the scheduler on its own timer rather
+// than only when files change, so without this pause a root whose dispatch
+// keeps being refused would retry (and log) several times a second for as long
+// as the limiter stays full.
+pub const TIER2_REFRESH_DEFERRAL_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier2TriggerReason {
@@ -26,6 +32,41 @@ impl Tier2TriggerReason {
             Self::Ceiling => "ceiling",
             Self::Pull => "pull",
             Self::ConfigureWarm => "configure_warm",
+        }
+    }
+}
+
+/// Why a dispatch did not happen even though the deadline the scheduler
+/// publishes (`next_dispatch_at`, which health reports as `next_refresh_at_ms`)
+/// has already passed. Reported once per overdue stretch so the daemon log
+/// names the predicate holding a root's Tier-2 refresh back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier2DispatchBlock {
+    /// The root may not write inspect artifacts, or heavy root work is off.
+    ReadOnly,
+    /// Another Tier-2 category is still building.
+    InFlight,
+    /// The semantic cold seed owns the machine until it finishes.
+    SemanticColdSeed,
+    /// The first scan after configure is still inside its cold-cache delay.
+    ColdCacheDelay,
+    /// A dispatch the cold-build limiter turned away is waiting out its retry
+    /// pause.
+    DeferralBackoff,
+    /// Nothing external is holding the dispatch back and no trigger matched:
+    /// the published deadline and the dispatch predicate disagree.
+    NoTrigger,
+}
+
+impl Tier2DispatchBlock {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read_only",
+            Self::InFlight => "tier2_in_flight",
+            Self::SemanticColdSeed => "semantic_cold_seed",
+            Self::ColdCacheDelay => "cold_cache_delay",
+            Self::DeferralBackoff => "deferral_backoff",
+            Self::NoTrigger => "deadline_without_trigger",
         }
     }
 }
@@ -51,6 +92,8 @@ pub struct Tier2RefreshScheduler {
     configure_warm_pending: bool,
     last_trigger_reason: Option<Tier2TriggerReason>,
     dispatch_rollback: Option<Tier2DispatchRollback>,
+    deferred_retry_at: Option<Instant>,
+    overdue_reported: bool,
 }
 
 impl Tier2RefreshScheduler {
@@ -65,6 +108,8 @@ impl Tier2RefreshScheduler {
             configure_warm_pending: false,
             last_trigger_reason: None,
             dispatch_rollback: None,
+            deferred_retry_at: None,
+            overdue_reported: false,
         }
     }
 
@@ -78,6 +123,8 @@ impl Tier2RefreshScheduler {
         self.configure_warm_pending = true;
         self.last_trigger_reason = None;
         self.dispatch_rollback = None;
+        self.deferred_retry_at = None;
+        self.overdue_reported = false;
     }
 
     pub fn request_pull(&mut self, can_write: bool) -> bool {
@@ -118,6 +165,10 @@ impl Tier2RefreshScheduler {
             return None;
         }
 
+        if self.deferral_backoff_pending(now) {
+            return None;
+        }
+
         if self.pull_demand_pending {
             return Some(self.record_scan_start(now, Tier2TriggerReason::Pull));
         }
@@ -143,13 +194,19 @@ impl Tier2RefreshScheduler {
         self.pull_demand_pending = false;
         self.configure_warm_pending = false;
         self.dispatch_rollback = None;
+        self.deferred_retry_at = None;
+        self.overdue_reported = false;
         self.clear_activity_window();
     }
 
     /// Restore the trigger state when the cold-build permit rejects a dispatch.
     /// An automatic debounce must not become pull demand, because pull demand
     /// intentionally bypasses the watcher quiet window.
-    pub fn note_dispatch_deferred(&mut self) {
+    ///
+    /// The restored demand is held back until the deferral backoff elapses.
+    /// Restoring it alone would re-arm a dispatch the limiter is certain to
+    /// reject again on the very next maintenance tick.
+    pub fn note_dispatch_deferred(&mut self, now: Instant) {
         let Some(rollback) = self.dispatch_rollback.take() else {
             return;
         };
@@ -159,6 +216,7 @@ impl Tier2RefreshScheduler {
         self.last_scan_started_at = rollback.last_scan_started_at;
         self.pull_demand_pending = rollback.pull_demand_pending;
         self.configure_warm_pending = rollback.configure_warm_pending;
+        self.deferred_retry_at = Some(now + TIER2_REFRESH_DEFERRAL_BACKOFF);
     }
 
     pub fn last_trigger_reason(&self) -> Option<Tier2TriggerReason> {
@@ -204,11 +262,58 @@ impl Tier2RefreshScheduler {
             .flatten();
 
         Some(
-            [min_interval_at, cold_cache_at]
+            [min_interval_at, cold_cache_at, self.deferred_retry_at]
                 .into_iter()
                 .flatten()
                 .fold(requested_at, Instant::max),
         )
+    }
+
+    /// True when the deadline this scheduler publishes has arrived, so a tick
+    /// now would dispatch unless an external gate blocks it.
+    ///
+    /// The maintenance tick uses this to pump the scheduler while a root sits
+    /// quiet. Every other tick arrives with a watcher change in hand, which
+    /// pushes the debounce forward — so the quiet window the debounce waits
+    /// for is exactly the window in which nothing else would look.
+    pub fn dispatch_due(&self, now: Instant) -> bool {
+        self.next_dispatch_at(now)
+            .is_some_and(|deadline| now >= deadline)
+    }
+
+    /// Name the predicate that held a dispatch back after the published
+    /// deadline passed, at most once per overdue stretch. Returns `None` while
+    /// no deadline is due, when the current stretch was already reported, and
+    /// again after a dispatch or reset clears the stretch.
+    pub fn take_overdue_dispatch_block(
+        &mut self,
+        now: Instant,
+        can_write: bool,
+        in_flight: bool,
+        semantic_cold_seed_active: bool,
+    ) -> Option<Tier2DispatchBlock> {
+        let due = self.dispatch_due(now);
+        if !due {
+            self.overdue_reported = false;
+            return None;
+        }
+        let block = if !can_write {
+            Tier2DispatchBlock::ReadOnly
+        } else if in_flight {
+            Tier2DispatchBlock::InFlight
+        } else if semantic_cold_seed_active {
+            Tier2DispatchBlock::SemanticColdSeed
+        } else if self.deferral_backoff_pending(now) {
+            Tier2DispatchBlock::DeferralBackoff
+        } else if !self.cold_delay_elapsed(now) {
+            Tier2DispatchBlock::ColdCacheDelay
+        } else {
+            Tier2DispatchBlock::NoTrigger
+        };
+        if std::mem::replace(&mut self.overdue_reported, true) {
+            return None;
+        }
+        Some(block)
     }
 
     fn record_changes(&mut self, now: Instant, changed_path_count: usize) {
@@ -248,6 +353,11 @@ impl Tier2RefreshScheduler {
             .unwrap_or(false)
     }
 
+    fn deferral_backoff_pending(&self, now: Instant) -> bool {
+        self.deferred_retry_at
+            .is_some_and(|retry_at| now < retry_at)
+    }
+
     fn record_scan_start(
         &mut self,
         now: Instant,
@@ -265,6 +375,8 @@ impl Tier2RefreshScheduler {
         self.pull_demand_pending = false;
         self.configure_warm_pending = false;
         self.last_trigger_reason = Some(reason);
+        self.deferred_retry_at = None;
+        self.overdue_reported = false;
         self.clear_activity_window();
         reason
     }
@@ -483,7 +595,7 @@ mod tests {
             scheduler.tick(first_deadline, 0, true, false),
             Some(Tier2TriggerReason::Debounce)
         );
-        scheduler.note_dispatch_deferred();
+        scheduler.note_dispatch_deferred(first_deadline);
 
         let mut last_change = first_deadline;
         for edit in 1..=6 {
@@ -564,6 +676,141 @@ mod tests {
         assert_eq!(
             scheduler.tick(first + TIER2_REFRESH_MIN_INTERVAL, 0, true, false),
             Some(Tier2TriggerReason::Pull)
+        );
+    }
+
+    #[test]
+    fn debounce_deadline_can_only_be_consumed_by_a_change_free_tick() {
+        let (mut scheduler, base) = configured_scheduler();
+        let change = base + TIER2_REFRESH_COLD_CACHE_DELAY;
+        assert_eq!(scheduler.tick(change, 1, true, false), None);
+
+        let deadline = change + TIER2_REFRESH_DEBOUNCE;
+        assert_eq!(scheduler.next_dispatch_at(change), Some(deadline));
+        assert!(!scheduler.dispatch_due(deadline - Duration::from_secs(1)));
+        assert!(scheduler.dispatch_due(deadline));
+
+        // A tick that arrives WITH a change restarts the quiet window it is
+        // being measured against, so it can never satisfy its own debounce.
+        // Only a tick with nothing new in hand can, and the watcher drain --
+        // the scheduler's only tick site -- runs when paths arrive.
+        let mut arriving_changes = scheduler.clone();
+        assert_eq!(arriving_changes.tick(deadline, 1, true, false), None);
+        assert_eq!(
+            arriving_changes.tick(deadline + Duration::from_secs(1), 1, true, false),
+            None
+        );
+
+        assert_eq!(
+            scheduler.tick(deadline, 0, true, false),
+            Some(Tier2TriggerReason::Debounce)
+        );
+    }
+
+    #[test]
+    fn overdue_deadline_names_the_blocking_predicate_once() {
+        let (mut scheduler, base) = configured_scheduler();
+        let change = base + TIER2_REFRESH_COLD_CACHE_DELAY;
+        assert_eq!(scheduler.tick(change, 1, true, false), None);
+        let deadline = change + TIER2_REFRESH_DEBOUNCE;
+
+        assert_eq!(
+            scheduler.take_overdue_dispatch_block(
+                deadline - Duration::from_secs(1),
+                true,
+                false,
+                false
+            ),
+            None,
+            "a deadline that has not arrived is not overdue"
+        );
+
+        assert_eq!(
+            scheduler.take_overdue_dispatch_block(deadline, true, true, false),
+            Some(Tier2DispatchBlock::InFlight)
+        );
+        assert_eq!(
+            scheduler.take_overdue_dispatch_block(
+                deadline + Duration::from_secs(1),
+                true,
+                true,
+                false
+            ),
+            None,
+            "one overdue stretch reports once"
+        );
+
+        assert_eq!(
+            scheduler.tick(deadline + Duration::from_secs(2), 0, true, false),
+            Some(Tier2TriggerReason::Debounce)
+        );
+        assert_eq!(
+            scheduler.take_overdue_dispatch_block(
+                deadline + Duration::from_secs(3),
+                true,
+                true,
+                false
+            ),
+            None,
+            "a dispatched refresh ends the overdue stretch"
+        );
+    }
+
+    #[test]
+    fn overdue_block_distinguishes_read_only_and_semantic_cold_seed() {
+        let (mut scheduler, base) = configured_scheduler();
+        let change = base + TIER2_REFRESH_COLD_CACHE_DELAY;
+        assert_eq!(scheduler.tick(change, 1, true, false), None);
+        let deadline = change + TIER2_REFRESH_DEBOUNCE;
+
+        assert_eq!(
+            scheduler
+                .clone()
+                .take_overdue_dispatch_block(deadline, false, false, false),
+            Some(Tier2DispatchBlock::ReadOnly)
+        );
+        assert_eq!(
+            scheduler.take_overdue_dispatch_block(deadline, true, false, true),
+            Some(Tier2DispatchBlock::SemanticColdSeed)
+        );
+    }
+
+    #[test]
+    fn cold_build_deferral_pauses_retries_and_moves_the_published_deadline() {
+        let (mut scheduler, base) = configured_scheduler();
+        let change = base + TIER2_REFRESH_COLD_CACHE_DELAY;
+        assert_eq!(scheduler.tick(change, 1, true, false), None);
+        let deadline = change + TIER2_REFRESH_DEBOUNCE;
+        assert_eq!(
+            scheduler.tick(deadline, 0, true, false),
+            Some(Tier2TriggerReason::Debounce)
+        );
+        scheduler.note_dispatch_deferred(deadline);
+
+        let retry_at = deadline + TIER2_REFRESH_DEFERRAL_BACKOFF;
+        assert_eq!(
+            scheduler.next_dispatch_at(deadline),
+            Some(retry_at),
+            "health must publish the retry pause, not a deadline already passed"
+        );
+        assert!(!scheduler.dispatch_due(retry_at - Duration::from_secs(1)));
+        assert_eq!(
+            scheduler.tick(retry_at - Duration::from_secs(1), 0, true, false),
+            None,
+            "a deferred dispatch must not be retried on every maintenance tick"
+        );
+        assert_eq!(
+            scheduler.take_overdue_dispatch_block(
+                retry_at - Duration::from_secs(1),
+                true,
+                false,
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            scheduler.tick(retry_at, 0, true, false),
+            Some(Tier2TriggerReason::Debounce)
         );
     }
 }

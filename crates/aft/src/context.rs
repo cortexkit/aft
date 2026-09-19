@@ -6478,19 +6478,75 @@ impl AppContext {
             && manager.automatic_tier2_refresh_allowed();
         let in_flight = manager.tier2_any_in_flight();
         let semantic_cold_seed_active = self.semantic_cold_seed_active();
-        let decision = self.tier2_refresh_scheduler.lock().tick_with_semantic_gate(
+        let mut scheduler = self.tier2_refresh_scheduler.lock();
+        let decision = scheduler.tick_with_semantic_gate(
             now,
             changed_path_count,
             can_write,
             in_flight,
             semantic_cold_seed_active,
         );
+        // A deadline the daemon publishes and then does not honour is invisible
+        // in the daemon's own log; only the external health sentinel sees it.
+        // Name the predicate that held it, once per overdue stretch.
+        let overdue_block = if decision.is_none() {
+            scheduler.take_overdue_dispatch_block(
+                now,
+                can_write,
+                in_flight,
+                semantic_cold_seed_active,
+            )
+        } else {
+            None
+        };
+        drop(scheduler);
+
+        if let Some(block) = overdue_block {
+            crate::slog_info!(
+                "tier2 refresh deadline passed without dispatch: blocked_by={}, pending_paths={}",
+                block.as_str(),
+                self.pending_tier2_paths
+                    .try_lock()
+                    .map(|paths| paths.len().to_string())
+                    .unwrap_or_else(|| "busy".to_string())
+            );
+        }
 
         if let Some(reason) = decision {
             self.start_tier2_refresh(reason, manager);
         }
 
         decision
+    }
+
+    /// True when the Tier-2 refresh this root's scheduler has already promised
+    /// (the `next_refresh_at_ms` health publishes) is due and no external gate
+    /// is holding it back.
+    ///
+    /// The maintenance tick probes this so a due refresh gets a watcher drain
+    /// pass to run in. The scheduler is ticked only from that drain, and the
+    /// drain is otherwise enqueued only when the watcher has paths to apply —
+    /// so on a root that falls quiet after its last edit, the debounce deadline
+    /// passes with nothing left to observe it and the refresh waits for the
+    /// next file change. Mirroring the dispatch gates here keeps a blocked root
+    /// (read-only, scan in flight, cold seed) from asking for a drain pass
+    /// several times a second.
+    pub fn tier2_refresh_dispatch_due(&self) -> bool {
+        if !self.inspect_writer()
+            || self.try_heavy_root_work_allowed() != Some(true)
+            || !self.inspect_manager.automatic_tier2_refresh_enabled()
+            || self.semantic_cold_seed_active()
+        {
+            return false;
+        }
+        // A contended source is busy with the very work a dispatch would wait
+        // for; the next maintenance tick re-probes.
+        if self.inspect_manager.try_tier2_any_in_flight() != Some(false) {
+            return false;
+        }
+        self.tier2_refresh_scheduler
+            .try_lock()
+            .is_some_and(|scheduler| scheduler.dispatch_due(Instant::now()))
     }
 
     pub fn note_tier2_refresh_started(&self) {
@@ -6542,7 +6598,9 @@ impl AppContext {
         let submission =
             manager.submit_tier2_run_with_reuse_serial_background(snapshot, categories);
         if !submission.deferred_categories.is_empty() {
-            self.tier2_refresh_scheduler.lock().note_dispatch_deferred();
+            self.tier2_refresh_scheduler
+                .lock()
+                .note_dispatch_deferred(Instant::now());
             crate::slog_info!(
                 "tier2 refresh deferred by cold build limit: categories={:?}",
                 submission

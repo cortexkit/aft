@@ -3225,6 +3225,15 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         .lock()
         .as_ref()
         .is_some_and(|rx| !rx.is_empty());
+    // The Tier-2 debounce waits for a quiet window, and every other tick site
+    // in this drain runs while paths are being applied — those ticks arrive
+    // WITH changes, which push the debounce forward. A pass that finds nothing
+    // left to apply IS the quiet window, so evaluate the scheduler here too:
+    // otherwise a refresh that came due during the silence waits for the next
+    // file change, which restarts the window it was waiting on.
+    if !state.has_pending_work() && !receiver_has_more {
+        ctx.tick_tier2_refresh_scheduler(0);
+    }
     outcome.has_more = state.has_pending_work() || receiver_has_more;
     // Retain the continuation across lifecycle-only generation changes (a
     // mid-drain unbind advances the generation; the rebind rebases). Only a

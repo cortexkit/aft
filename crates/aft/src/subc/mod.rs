@@ -995,7 +995,15 @@ fn due_maintenance_jobs(
                             return false;
                         }
                         match kind {
-                            MaintenanceDrainKind::Watcher => ctx.watcher_drain_has_work(),
+                            // A Tier-2 refresh that comes due while this root
+                            // sits quiet has no other pump: the refresh
+                            // scheduler is ticked only from the watcher drain,
+                            // so gating the drain on watcher paths alone would
+                            // leave a due refresh waiting for the next file
+                            // change.
+                            MaintenanceDrainKind::Watcher => {
+                                ctx.watcher_drain_has_work() || ctx.tier2_refresh_dispatch_due()
+                            }
                             MaintenanceDrainKind::Lsp => ctx.lsp_drain_has_work(),
                             MaintenanceDrainKind::ConfigureTail => ctx.configure_tail_has_work(),
                             // Every CompletionDrains source is visible at this enqueue site:
@@ -9017,6 +9025,69 @@ mod tests {
             next_tick_jobs,
             vec![(root, MaintenanceDrainKind::CompletionDrains)]
         );
+        assert!(!deferred);
+    }
+
+    /// The Tier-2 refresh scheduler is ticked only from the watcher drain. A
+    /// root that falls quiet after its last edit has no watcher work left, so
+    /// gating the drain on watcher paths alone would leave the refresh the
+    /// scheduler has already promised waiting for the next file change.
+    #[test]
+    fn quiet_root_with_an_overdue_tier2_deadline_still_gets_a_watcher_drain() {
+        let (_dir, root) = test_root("maintenance-tier2-deadline");
+        let ctx = test_ctx();
+        assert!(
+            !ctx.watcher_drain_has_work(),
+            "the fixture root has no watcher work"
+        );
+        assert!(
+            !ctx.tier2_refresh_dispatch_due(),
+            "a scheduler with no demand publishes no deadline"
+        );
+
+        let executor = Executor::new();
+        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
+        let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
+        let bg_sub_by_session = BgSubsBySession::new();
+        let bg_wake_pending = BgWakePending::new();
+
+        let (quiet_jobs, deferred) = due_maintenance_jobs(
+            &mut live_roots,
+            Some(&executor),
+            &bg_sub_by_session,
+            &bg_wake_pending,
+            MAINTENANCE_SUBMIT_BUDGET,
+            &HashSet::new(),
+        );
+        assert!(quiet_jobs.is_empty());
+        assert!(!deferred);
+
+        // Configure, one watcher batch, then silence: the debounce deadline
+        // elapses with no watcher event left to carry a tick.
+        let configured_at = Instant::now()
+            .checked_sub(
+                crate::inspect::tier2_scheduler::TIER2_REFRESH_COLD_CACHE_DELAY
+                    + crate::inspect::tier2_scheduler::TIER2_REFRESH_DEBOUNCE
+                    + Duration::from_secs(5),
+            )
+            .expect("monotonic clock is older than the scheduler's windows");
+        ctx.reset_tier2_refresh_scheduler_at(configured_at);
+        assert_eq!(
+            ctx.tick_tier2_refresh_scheduler_at(configured_at + Duration::from_secs(1), 3),
+            None
+        );
+        assert!(ctx.tier2_refresh_dispatch_due());
+        assert!(!ctx.watcher_drain_has_work());
+
+        let (due_jobs, deferred) = due_maintenance_jobs(
+            &mut live_roots,
+            Some(&executor),
+            &bg_sub_by_session,
+            &bg_wake_pending,
+            MAINTENANCE_SUBMIT_BUDGET,
+            &HashSet::new(),
+        );
+        assert_eq!(due_jobs, vec![(root, MaintenanceDrainKind::Watcher)]);
         assert!(!deferred);
     }
 

@@ -10,11 +10,13 @@ use aft::commands::configure::handle_configure;
 use aft::commands::inspect::handle_inspect_tier2_run;
 use aft::config::Config;
 use aft::context::{AppContext, CallgraphStoreAccess};
-use aft::inspect::tier2_scheduler::TIER2_REFRESH_COLD_CACHE_DELAY;
+use aft::inspect::tier2_scheduler::{TIER2_REFRESH_COLD_CACHE_DELAY, TIER2_REFRESH_DEBOUNCE};
 use aft::inspect::{InspectCache, InspectCategory, InspectSnapshot, Tier2TriggerReason};
 use aft::lsp::registry::ServerKind;
 use aft::parser::TreeSitterProvider;
 use aft::protocol::RawRequest;
+use aft::runtime_drain::{drain_watcher_events_bounded, WATCHER_PATH_DRAIN_BATCH_CAP};
+use aft::watcher_filter::WatcherDispatchEvent;
 use serde_json::{json, Value};
 
 fn fixture_project() -> (tempfile::TempDir, PathBuf) {
@@ -597,4 +599,72 @@ fn linked_worktree_explicit_inspect_keeps_parent_aggregates_byte_identical() {
         .expect("open worktree inspect cache")
         .expect("worktree inspect cache exists");
     assert_ne!(parent_cache.project_key(), worktree_cache.project_key());
+}
+
+/// A root that falls quiet after its last edit must still get the Tier-2
+/// refresh its scheduler promised.
+///
+/// The refresh scheduler is ticked only from the watcher drain, and every tick
+/// that arrives with paths in hand restarts the debounce window it is measured
+/// against. The drain pass that finds an empty queue IS the quiet window, so it
+/// is the only place a deadline that came due in the silence can be observed.
+/// Without that pass the refresh waits for the next file change — which starts
+/// the wait over — and health keeps publishing a deadline nothing will honour.
+#[test]
+fn quiet_watcher_drain_dispatches_a_refresh_that_came_due_in_the_silence() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(
+        &root,
+        "src/lib.ts",
+        "export function unused() { return 1; }\n",
+    );
+    let ctx = configured_context(&root);
+
+    // A live daemon root always has a watcher receiver installed. Without one
+    // the drain takes its no-watcher shortcut, which is not the path a real
+    // root runs.
+    let (_watcher_tx, watcher_rx) = crossbeam_channel::unbounded::<WatcherDispatchEvent>();
+    *ctx.watcher_rx().lock() = Some(watcher_rx);
+
+    // Configure, one watcher batch, then silence: the scheduler state of a root
+    // whose last edit is older than the debounce window.
+    let configured_at = Instant::now()
+        .checked_sub(
+            TIER2_REFRESH_COLD_CACHE_DELAY + TIER2_REFRESH_DEBOUNCE + Duration::from_secs(5),
+        )
+        .expect("monotonic clock is older than the scheduler's windows");
+    ctx.reset_tier2_refresh_scheduler_at(configured_at);
+    assert_eq!(
+        ctx.tick_tier2_refresh_scheduler_at(configured_at + Duration::from_secs(1), 3),
+        None,
+        "a tick that carries changes restarts the debounce instead of dispatching"
+    );
+    assert_eq!(
+        ctx.tier2_trigger_reason(),
+        None,
+        "no refresh has dispatched yet"
+    );
+    assert!(
+        ctx.tier2_refresh_dispatch_due(),
+        "the deadline health publishes as next_refresh_at_ms has already passed"
+    );
+
+    let outcome = drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+
+    assert!(!outcome.has_more, "the watcher queue is empty");
+    assert_eq!(
+        ctx.tier2_trigger_reason(),
+        Some("debounce"),
+        "a drain pass over an empty queue must dispatch the overdue refresh"
+    );
+    assert_eq!(
+        ctx.inspect_manager()
+            .automatic_tier2_schedule_count_for_test(),
+        5,
+        "the dispatched refresh should cover every automatic Tier-2 category"
+    );
+    assert!(
+        !ctx.tier2_refresh_dispatch_due(),
+        "a dispatched refresh clears the deadline until the min interval elapses"
+    );
 }
