@@ -2406,8 +2406,16 @@ mod tests {
         let canonical_root = std::fs::canonicalize(root.path()).unwrap();
         let matcher = shared_matcher(&canonical_root);
 
-        let exclusions =
-            derive_excluded_subtrees(&canonical_root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        // Pin the exact-path coverage: this test is about copies that an
+        // exact-path kernel filter must each name, and the compiled-in default
+        // is Subtree on Linux, where the root copy covers the nested ones.
+        let exclusions = derive_exclusion_plan(
+            &canonical_root,
+            &matcher,
+            Some(WATCHER_EXCLUSION_LIMIT),
+            WatcherExclusionCoverage::ExactPath,
+        )
+        .selected;
 
         // The two root ecosystem names still take the first slots.
         assert_eq!(
@@ -2443,8 +2451,16 @@ mod tests {
                 count: 200,
             }],
         );
-        let exclusions =
-            derive_excluded_subtrees(&canonical_root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        // Pin the exact-path coverage: this test is about copies that an
+        // exact-path kernel filter must each name, and the compiled-in default
+        // is Subtree on Linux, where the root copy covers the nested ones.
+        let exclusions = derive_exclusion_plan(
+            &canonical_root,
+            &matcher,
+            Some(WATCHER_EXCLUSION_LIMIT),
+            WatcherExclusionCoverage::ExactPath,
+        )
+        .selected;
         let observed_position = exclusions
             .iter()
             .position(|exclusion| exclusion.path() == canonical_root.join(&observed_nested))
