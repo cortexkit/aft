@@ -1541,6 +1541,26 @@ fn build_health_diagnostic_rollup(
     }
 }
 
+fn render_cold_build_limiter_census(
+    limiter: crate::cold_build_limiter::ColdBuildLimiterCensus,
+) -> Value {
+    let render_entry = |entry: crate::cold_build_limiter::ColdBuildCensusEntry| {
+        json!({
+            "domain": entry.domain,
+            "root": entry.root,
+            "kind": entry.kind,
+            "sharers": entry.sharers,
+            "acquired_at_ms": entry.acquired_at_ms,
+            "age_ms": entry.age_ms,
+        })
+    };
+    json!({
+        "cap": limiter.cap,
+        "holders": limiter.holders.into_iter().map(&render_entry).collect::<Vec<_>>(),
+        "queued": limiter.queued.into_iter().map(render_entry).collect::<Vec<_>>(),
+    })
+}
+
 pub(super) fn build_health_report(
     cache: &HealthRollupCache,
     executor: &Executor,
@@ -1588,23 +1608,9 @@ pub(super) fn build_health_report(
         json!(backup_skipped_temp_path_total),
     );
     metrics.insert("reap".to_string(), dispatch_path_metrics.reap_snapshot());
-    let limiter = crate::cold_build_limiter::global_limiter().census();
-    let render_limiter_entry = |entry: crate::cold_build_limiter::ColdBuildCensusEntry| {
-        json!({
-            "domain": entry.domain,
-            "root": entry.root,
-            "kind": entry.kind,
-            "acquired_at_ms": entry.acquired_at_ms,
-            "age_ms": entry.age_ms,
-        })
-    };
     metrics.insert(
         "cold_build_limiter".to_string(),
-        json!({
-            "cap": limiter.cap,
-            "holders": limiter.holders.into_iter().map(&render_limiter_entry).collect::<Vec<_>>(),
-            "queued": limiter.queued.into_iter().map(render_limiter_entry).collect::<Vec<_>>(),
-        }),
+        render_cold_build_limiter_census(crate::cold_build_limiter::global_limiter().census()),
     );
     metrics.insert(
         "dispatch_liveness".to_string(),
@@ -1719,6 +1725,37 @@ mod tests {
         *ctx.callgraph_store()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(reader));
+    }
+
+    #[test]
+    fn cold_build_holder_census_renders_one_row_per_root_with_sharers() {
+        let limiter = crate::cold_build_limiter::isolated_limiter(2);
+        let first = crate::cold_build_limiter::try_acquire_classified_with_limiter(
+            &limiter,
+            &crate::cold_build_limiter::ColdBuildAdmissionRequest::for_root(
+                "/project/shared",
+                "health-first",
+                crate::cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
+            ),
+        )
+        .expect("first holder");
+        let second = crate::cold_build_limiter::try_acquire_classified_with_limiter(
+            &limiter,
+            &crate::cold_build_limiter::ColdBuildAdmissionRequest::for_root(
+                "/project/shared",
+                "health-second",
+                crate::cold_build_limiter::ColdBuildAdmissionClass::InspectTriggered,
+            ),
+        )
+        .expect("shared holder");
+
+        let rendered = render_cold_build_limiter_census(limiter.census());
+        let holders = rendered["holders"].as_array().expect("holder rows");
+        assert_eq!(holders.len(), 1);
+        assert_eq!(holders[0]["root"], "/project/shared");
+        assert_eq!(holders[0]["sharers"], 2);
+
+        drop((first, second));
     }
 
     #[test]

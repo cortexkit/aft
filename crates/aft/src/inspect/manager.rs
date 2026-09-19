@@ -531,6 +531,9 @@ pub struct InspectManager {
     heavy_root_work_allowed: Arc<AtomicBool>,
     semantic_cold_seed_active: Arc<AtomicBool>,
     cold_build_limiter: Mutex<Arc<cold_build_limiter::ColdBuildLimiter>>,
+    interactive_tier2_permits: Mutex<HashMap<PathBuf, cold_build_limiter::WeakColdBuildPermit>>,
+    #[cfg(test)]
+    interactive_tier2_acquisitions: AtomicU64,
     /// Inspect refusals (`builder_state=...`) and health's `tier2` field both
     /// read this registry. The waiter map (`in_flight`) fans out completions;
     /// both surfaces treat a category as busy when it has an entry here, and
@@ -613,6 +616,9 @@ impl InspectManager {
             heavy_root_work_allowed,
             semantic_cold_seed_active,
             cold_build_limiter: Mutex::new(cold_build_limiter::global_limiter()),
+            interactive_tier2_permits: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            interactive_tier2_acquisitions: AtomicU64::new(0),
             builder_states: Mutex::new(HashMap::new()),
             automatic_tier2_refresh_allowed: AtomicBool::new(true),
             automatic_tier2_skip_logged: AtomicBool::new(false),
@@ -644,6 +650,44 @@ impl InspectManager {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
+    }
+
+    fn acquire_interactive_tier2_permit_slot(&self, job: &InspectJob) -> Option<Tier2PermitSlot> {
+        let mut permits = self
+            .interactive_tier2_permits
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        permits.retain(|_, permit| permit.upgrade().is_some());
+        if let Some(permit) = permits
+            .get(&job.project_root)
+            .and_then(cold_build_limiter::WeakColdBuildPermit::upgrade)
+        {
+            return Some(Arc::new(Mutex::new(Some(permit))));
+        }
+
+        // All Tier-2 categories in one blocking inspect start concurrently. Keep
+        // the root lookup and first acquisition atomic so they clone one permit
+        // instead of each consuming process-wide capacity.
+        #[cfg(test)]
+        self.interactive_tier2_acquisitions
+            .fetch_add(1, Ordering::SeqCst);
+        let request = cold_build_limiter::ColdBuildAdmissionRequest::for_root(
+            job.project_root.display().to_string(),
+            format!("inspect:{}:{}", job.project_root.display(), job.job_id),
+            cold_build_limiter::ColdBuildAdmissionClass::InspectTriggered,
+        );
+        let permit = cold_build_limiter::acquire_blocking_while_cancellable_with_limiter(
+            &self.cold_build_limiter(),
+            "explicit inspect Tier-2 run",
+            request,
+            || self.heavy_root_work_allowed(),
+            || {
+                crate::executor::current_job_cancellation()
+                    .is_some_and(|token| token.cancel_requested_before_commit())
+            },
+        )?;
+        permits.insert(job.project_root.clone(), permit.downgrade());
+        Some(Arc::new(Mutex::new(Some(permit))))
     }
 
     fn set_builder_state(&self, key: &JobKey, state: InspectBuilderState) {
@@ -1053,7 +1097,8 @@ impl InspectManager {
             return Ok(Some(key));
         }
         let limiter = self.cold_build_limiter();
-        let request = cold_build_limiter::ColdBuildAdmissionRequest::new(
+        let request = cold_build_limiter::ColdBuildAdmissionRequest::for_root(
+            job.project_root.display().to_string(),
             format!("tier2-background:{}", category.as_str()),
             cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
         );
@@ -1164,7 +1209,8 @@ impl InspectManager {
         }
 
         let limiter = self.cold_build_limiter();
-        let request = cold_build_limiter::ColdBuildAdmissionRequest::new(
+        let request = cold_build_limiter::ColdBuildAdmissionRequest::for_root(
+            snapshot.project_root.display().to_string(),
             "tier2-serial-background",
             cold_build_limiter::ColdBuildAdmissionClass::Maintenance,
         );
@@ -2231,21 +2277,7 @@ impl InspectManager {
                 InspectBuilderState::QueuedBehindColdBuilds
             };
             self.set_builder_state(&job.key, queued_state);
-            let request = cold_build_limiter::ColdBuildAdmissionRequest::new(
-                format!("inspect:{}:{}", job.project_root.display(), job.job_id),
-                cold_build_limiter::ColdBuildAdmissionClass::InspectTriggered,
-            );
-            let permit = cold_build_limiter::acquire_blocking_while_cancellable_with_limiter(
-                &self.cold_build_limiter(),
-                "explicit inspect Tier-2 run",
-                request,
-                || self.heavy_root_work_allowed(),
-                || {
-                    crate::executor::current_job_cancellation()
-                        .is_some_and(|token| token.cancel_requested_before_commit())
-                },
-            );
-            let Some(permit) = permit else {
+            let Some(permit_slot) = self.acquire_interactive_tier2_permit_slot(&job) else {
                 let result = InspectResult::failed(
                     &job,
                     "explicit inspect Tier-2 cold-build admission was cancelled",
@@ -2255,7 +2287,7 @@ impl InspectManager {
                 return result;
             };
             self.set_builder_state(&job.key, InspectBuilderState::Building);
-            Some(Arc::new(Mutex::new(Some(permit))))
+            Some(permit_slot)
         } else {
             None
         };
@@ -5925,6 +5957,67 @@ mod guard_tests {
             callgraph_writer: true,
             callgraph_snapshot: None,
         }
+    }
+
+    #[test]
+    fn explicit_inspect_five_categories_share_one_permit_acquisition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(dir.path()).expect("canonical fixture root");
+        let inspect_dir = root.join(".aft-cache").join("inspect");
+        let limiter = cold_build_limiter::test_limiter(2);
+        let manager = InspectManager::new();
+        manager.set_cold_build_limiter(Arc::clone(&limiter));
+
+        let mut slots = Vec::new();
+        for (index, category) in InspectCategory::active()
+            .iter()
+            .copied()
+            .filter(|category| category.is_tier2())
+            .enumerate()
+        {
+            let mut job = snapshot_job(&root, &inspect_dir, false);
+            job.job_id = index as u64 + 1;
+            job.category = category;
+            job.key = JobKey::for_project_category(category);
+            slots.push(
+                manager
+                    .acquire_interactive_tier2_permit_slot(&job)
+                    .expect("explicit category acquires the request permit"),
+            );
+        }
+
+        assert_eq!(
+            slots.len(),
+            5,
+            "the active inspect has five Tier-2 categories"
+        );
+        assert_eq!(
+            manager
+                .interactive_tier2_acquisitions
+                .load(Ordering::SeqCst),
+            1,
+            "one explicit inspect calls the limiter once"
+        );
+        assert_eq!(
+            limiter.admission_events().len(),
+            1,
+            "the one limiter call acquires one process-wide slot"
+        );
+        let holder = limiter.census().holders.pop().expect("shared root holder");
+        assert_eq!(holder.root, root.display().to_string());
+        assert_eq!(holder.sharers, 5);
+
+        slots[0]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        assert_eq!(
+            limiter.census().holders[0].sharers,
+            4,
+            "cancelling one category leaves the other category permits live"
+        );
+        drop(slots);
+        assert!(limiter.census().holders.is_empty());
     }
 
     #[test]

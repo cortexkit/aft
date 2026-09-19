@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(not(test))]
@@ -93,13 +93,31 @@ impl ColdBuildAdmissionClass {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ColdBuildAdmissionRequest {
     request_id: String,
+    root: Option<String>,
     class: ColdBuildAdmissionClass,
 }
 
 impl ColdBuildAdmissionRequest {
     pub(crate) fn new(request_id: impl Into<String>, class: ColdBuildAdmissionClass) -> Self {
+        let request_id = request_id.into();
+        let root = request_id
+            .strip_prefix("inspect:")
+            .and_then(|value| value.rsplit_once(':').map(|(root, _)| root.to_string()));
+        Self {
+            request_id,
+            root,
+            class,
+        }
+    }
+
+    pub(crate) fn for_root(
+        root: impl Into<String>,
+        request_id: impl Into<String>,
+        class: ColdBuildAdmissionClass,
+    ) -> Self {
         Self {
             request_id: request_id.into(),
+            root: Some(root.into()),
             class,
         }
     }
@@ -122,6 +140,7 @@ pub(crate) struct ColdBuildCensusEntry {
     pub(crate) domain: &'static str,
     pub(crate) root: String,
     pub(crate) kind: String,
+    pub(crate) sharers: usize,
     pub(crate) acquired_at_ms: u64,
     pub(crate) age_ms: u64,
 }
@@ -320,7 +339,14 @@ struct AdmissionState {
     next_census_id: u64,
     events: VecDeque<ColdBuildAdmissionEvent>,
     holders: BTreeMap<u64, CensusRecord>,
+    holders_by_root: BTreeMap<String, RootHolder>,
     queued: BTreeMap<u64, CensusRecord>,
+}
+
+#[derive(Debug)]
+struct RootHolder {
+    census_id: u64,
+    permit: Weak<ColdBuildPermitLease>,
 }
 
 #[derive(Clone, Debug)]
@@ -328,6 +354,7 @@ struct CensusRecord {
     domain: &'static str,
     root: String,
     kind: String,
+    permit: Option<Weak<ColdBuildPermitLease>>,
     started_at_ms: u64,
 }
 
@@ -337,14 +364,6 @@ fn unix_millis_now() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
-}
-
-fn request_root(request_id: &str) -> String {
-    request_id
-        .strip_prefix("inspect:")
-        .and_then(|value| value.rsplit_once(':').map(|(root, _)| root))
-        .unwrap_or("unknown")
-        .to_string()
 }
 
 impl ColdBuildLimiter {
@@ -360,6 +379,7 @@ impl ColdBuildLimiter {
                 next_census_id: 1,
                 events: VecDeque::with_capacity(ADMISSION_EVENT_RETENTION),
                 holders: BTreeMap::new(),
+                holders_by_root: BTreeMap::new(),
                 queued: BTreeMap::new(),
             }),
         }
@@ -398,21 +418,7 @@ impl ColdBuildLimiter {
             .admission_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let census_id = state.next_census_id;
-        state.next_census_id = state.next_census_id.saturating_add(1);
-        state.holders.insert(
-            census_id,
-            CensusRecord {
-                domain: "unclassified",
-                root: "unknown".to_string(),
-                kind: "unclassified".to_string(),
-                started_at_ms: unix_millis_now(),
-            },
-        );
-        Some(ColdBuildPermit {
-            limiter: Arc::clone(self),
-            census_id,
-        })
+        Some(self.install_permit_locked(&mut state, "unclassified", None, "unclassified"))
     }
 
     fn try_acquire_classified(
@@ -425,6 +431,23 @@ impl ColdBuildLimiter {
             .admission_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(root) = request.root.as_deref() {
+            if let Some(holder) = state.holders_by_root.get(root) {
+                let Some(lease) = holder.permit.upgrade() else {
+                    // The final sharer is dropping and will return the slot after
+                    // removing this entry. Retry rather than briefly double-owning
+                    // capacity for the same root on another free slot.
+                    return None;
+                };
+                if !admitted_after_acquire() {
+                    drop(state);
+                    drop(lease);
+                    return None;
+                }
+                return Some(ColdBuildPermit { lease });
+            }
+        }
+
         // Class alternation arbitrates the final released slot. When several
         // slots are free, admitting both classes is not starvation and avoids
         // stranding independent roots behind an artificial one-at-a-time turn.
@@ -443,21 +466,49 @@ impl ColdBuildLimiter {
             return None;
         }
         Self::record_admission_locked(&mut state, request);
+        Some(self.install_permit_locked(
+            &mut state,
+            request.class.label(),
+            request.root.as_deref(),
+            kind,
+        ))
+    }
+
+    fn install_permit_locked(
+        self: &Arc<Self>,
+        state: &mut AdmissionState,
+        domain: &'static str,
+        root: Option<&str>,
+        kind: &str,
+    ) -> ColdBuildPermit {
         let census_id = state.next_census_id;
         state.next_census_id = state.next_census_id.saturating_add(1);
+        let lease = Arc::new(ColdBuildPermitLease {
+            limiter: Arc::clone(self),
+            census_id,
+            root: root.map(ToOwned::to_owned),
+        });
+        let weak = Arc::downgrade(&lease);
         state.holders.insert(
             census_id,
             CensusRecord {
-                domain: request.class.label(),
-                root: request_root(&request.request_id),
+                domain,
+                root: root.unwrap_or("unknown").to_string(),
                 kind: kind.to_string(),
+                permit: Some(Weak::clone(&weak)),
                 started_at_ms: unix_millis_now(),
             },
         );
-        Some(ColdBuildPermit {
-            limiter: Arc::clone(self),
-            census_id,
-        })
+        if let Some(root) = root {
+            state.holders_by_root.insert(
+                root.to_string(),
+                RootHolder {
+                    census_id,
+                    permit: weak,
+                },
+            );
+        }
+        ColdBuildPermit { lease }
     }
 
     fn record_admission_locked(state: &mut AdmissionState, request: &ColdBuildAdmissionRequest) {
@@ -500,6 +551,10 @@ impl ColdBuildLimiter {
             domain: entry.domain,
             root: entry.root.clone(),
             kind: entry.kind.clone(),
+            sharers: entry
+                .permit
+                .as_ref()
+                .map_or(1, |permit| permit.strong_count().max(1)),
             acquired_at_ms: entry.started_at_ms,
             age_ms: now_ms.saturating_sub(entry.started_at_ms),
         };
@@ -555,8 +610,9 @@ impl AdmissionWaiter {
             census_id,
             CensusRecord {
                 domain: request.class.label(),
-                root: request_root(&request.request_id),
+                root: request.root.as_deref().unwrap_or("unknown").to_string(),
                 kind: kind.to_string(),
+                permit: None,
                 started_at_ms: unix_millis_now(),
             },
         );
@@ -583,20 +639,55 @@ impl Drop for AdmissionWaiter {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ColdBuildPermit {
-    limiter: Arc<ColdBuildLimiter>,
-    census_id: u64,
+    lease: Arc<ColdBuildPermitLease>,
 }
 
-impl Drop for ColdBuildPermit {
+impl ColdBuildPermit {
+    pub(crate) fn downgrade(&self) -> WeakColdBuildPermit {
+        WeakColdBuildPermit {
+            lease: Arc::downgrade(&self.lease),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WeakColdBuildPermit {
+    lease: Weak<ColdBuildPermitLease>,
+}
+
+impl WeakColdBuildPermit {
+    pub(crate) fn upgrade(&self) -> Option<ColdBuildPermit> {
+        self.lease.upgrade().map(|lease| ColdBuildPermit { lease })
+    }
+}
+
+#[derive(Debug)]
+struct ColdBuildPermitLease {
+    limiter: Arc<ColdBuildLimiter>,
+    census_id: u64,
+    root: Option<String>,
+}
+
+impl Drop for ColdBuildPermitLease {
     fn drop(&mut self) {
-        self.limiter
+        let mut state = self
+            .limiter
             .admission_state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .holders
-            .remove(&self.census_id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.holders.remove(&self.census_id);
+        if let Some(root) = self.root.as_deref() {
+            let owns_root_entry = state
+                .holders_by_root
+                .get(root)
+                .is_some_and(|holder| holder.census_id == self.census_id);
+            if owns_root_entry {
+                state.holders_by_root.remove(root);
+            }
+        }
+        drop(state);
         let previous = self.limiter.available.fetch_add(1, Ordering::Release);
         debug_assert!(previous < self.limiter.limit);
     }
@@ -848,6 +939,100 @@ mod tests {
     }
 
     #[test]
+    fn same_root_requests_share_one_slot_and_last_sharer_releases_it() {
+        let limiter = test_limiter(2);
+        let first = try_acquire_classified_with_limiter(
+            &limiter,
+            &ColdBuildAdmissionRequest::for_root(
+                "/project/a",
+                "maintenance-a",
+                ColdBuildAdmissionClass::Maintenance,
+            ),
+        )
+        .expect("first root acquires one slot");
+        let second = try_acquire_classified_with_limiter(
+            &limiter,
+            &ColdBuildAdmissionRequest::for_root(
+                "/project/a",
+                "inspect-a",
+                ColdBuildAdmissionClass::InspectTriggered,
+            ),
+        )
+        .expect("same root shares its existing slot across classes");
+        let third = try_acquire_classified_with_limiter(
+            &limiter,
+            &ColdBuildAdmissionRequest::for_root(
+                "/project/b",
+                "inspect-b",
+                ColdBuildAdmissionClass::InspectTriggered,
+            ),
+        )
+        .expect("another root can use the fleet's second slot");
+
+        assert_eq!(limiter.available.load(Ordering::Acquire), 0);
+        let census = limiter.census();
+        assert_eq!(census.holders.len(), 2);
+        assert_eq!(
+            census
+                .holders
+                .iter()
+                .find(|holder| holder.root == "/project/a")
+                .map(|holder| holder.sharers),
+            Some(2)
+        );
+        assert_eq!(
+            limiter.admission_events().len(),
+            2,
+            "sharing an existing root permit is not a second slot acquisition"
+        );
+
+        drop(first);
+        assert_eq!(limiter.available.load(Ordering::Acquire), 0);
+        assert_eq!(
+            limiter.census().holders[0].sharers,
+            1,
+            "the first drop leaves the other same-root sharer admitted"
+        );
+        drop(second);
+        assert_eq!(limiter.available.load(Ordering::Acquire), 1);
+        drop(third);
+        assert_eq!(limiter.available.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn cancelling_one_same_root_sharer_does_not_release_the_other() {
+        let limiter = test_limiter(1);
+        let remaining = try_acquire_classified_with_limiter(
+            &limiter,
+            &ColdBuildAdmissionRequest::for_root(
+                "/project/shared",
+                "remaining",
+                ColdBuildAdmissionClass::Maintenance,
+            ),
+        )
+        .expect("remaining work acquires the root slot");
+        let cancelled = try_acquire_classified_with_limiter(
+            &limiter,
+            &ColdBuildAdmissionRequest::for_root(
+                "/project/shared",
+                "cancelled",
+                ColdBuildAdmissionClass::InspectTriggered,
+            ),
+        )
+        .expect("cancellable work shares the root slot");
+
+        drop(cancelled);
+        assert_eq!(limiter.available.load(Ordering::Acquire), 0);
+        let holder = limiter.census().holders.pop().expect("remaining holder");
+        assert_eq!(holder.root, "/project/shared");
+        assert_eq!(holder.sharers, 1);
+
+        drop(remaining);
+        assert_eq!(limiter.available.load(Ordering::Acquire), 1);
+        assert!(limiter.census().holders.is_empty());
+    }
+
+    #[test]
     fn admission_events_cover_both_classes_across_the_fixed_32_release_schedule() {
         const RELEASE_COUNT: usize = 32;
 
@@ -946,17 +1131,35 @@ mod census_tests {
     #[test]
     fn census_names_holders_and_queued_requests_without_holding_work_locks() {
         let limiter = isolated_limiter(1);
-        let permit =
-            acquire_blocking_while_with_limiter(&limiter, "inspect:/tmp/project:1", || true)
-                .expect("first permit");
+        let permit = acquire_blocking_while_cancellable_with_limiter(
+            &limiter,
+            "explicit inspect Tier-2 run",
+            ColdBuildAdmissionRequest::new(
+                "inspect:/tmp/project:1",
+                ColdBuildAdmissionClass::InspectTriggered,
+            ),
+            || true,
+            || false,
+        )
+        .expect("first permit");
         let holder = limiter.census().holders.pop().expect("holder census");
-        assert_eq!(holder.domain, "maintenance");
+        assert_eq!(holder.domain, "inspect-triggered");
         assert_eq!(holder.root, "/tmp/project");
-        assert!(holder.kind.contains("inspect:/tmp/project:1"));
+        assert_eq!(holder.sharers, 1);
+        assert_eq!(holder.kind, "explicit inspect Tier-2 run");
 
         let waiter_limiter = Arc::clone(&limiter);
         let waiter = std::thread::spawn(move || {
-            acquire_blocking_while_with_limiter(&waiter_limiter, "inspect:/tmp/queued:2", || true)
+            acquire_blocking_while_cancellable_with_limiter(
+                &waiter_limiter,
+                "queued background refresh",
+                ColdBuildAdmissionRequest::new(
+                    "inspect:/tmp/queued:2",
+                    ColdBuildAdmissionClass::Maintenance,
+                ),
+                || true,
+                || false,
+            )
         });
         let deadline = Instant::now() + Duration::from_secs(2);
         while limiter.census().queued.is_empty() && Instant::now() < deadline {
@@ -964,6 +1167,7 @@ mod census_tests {
         }
         let queued = limiter.census().queued.pop().expect("queued census");
         assert_eq!(queued.root, "/tmp/queued");
+        assert_eq!(queued.sharers, 1);
         drop(permit);
         drop(
             waiter
