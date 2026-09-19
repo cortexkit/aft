@@ -125,7 +125,7 @@ impl RescanReason {
 pub enum WatcherDispatchEvent {
     Paths(Vec<PathBuf>),
     RescanRequired(RescanReason),
-    IgnoreRulesChanged { path: PathBuf },
+    IgnoreRulesChanged { paths: Vec<PathBuf> },
     RootDeleted,
     Error(String),
 }
@@ -835,6 +835,7 @@ pub(crate) fn persist_watcher_observations(
 pub struct FilteredWatcherPaths {
     pub changed: BTreeSet<PathBuf>,
     pub ignore_file_changed: bool,
+    pub ignore_file_paths: BTreeSet<PathBuf>,
 }
 
 fn filter_canonical_paths(
@@ -850,10 +851,15 @@ fn filter_canonical_paths(
     // matcher and cold-rebuilt the search index every few seconds for an hour
     // (2026-09-18). A rule file whose parent is not ignored, or any rule file
     // while no matcher exists yet, still counts.
-    let ignore_file_changed = raw_paths.iter().any(|path| {
-        watcher_path_can_change_corpus_ignore(config, path)
-            && !ignore_file_parent_is_ignored(matcher, path)
-    });
+    let ignore_file_paths = raw_paths
+        .iter()
+        .filter(|path| {
+            watcher_path_can_change_corpus_ignore(config, path)
+                && !ignore_file_parent_is_ignored(matcher, path)
+        })
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let ignore_file_changed = !ignore_file_paths.is_empty();
 
     let changed = raw_paths
         .into_iter()
@@ -881,6 +887,7 @@ fn filter_canonical_paths(
     FilteredWatcherPaths {
         changed,
         ignore_file_changed,
+        ignore_file_paths,
     }
 }
 
@@ -1235,23 +1242,21 @@ impl WatcherFilterThread {
 
         let raw_paths = std::mem::take(&mut self.raw_paths);
         self.flush_deadline = None;
-        let ignore_path = raw_paths
-            .iter()
-            .find(|path| watcher_path_can_change_corpus_ignore(&self.config, path))
-            .cloned();
-        let ignore_file_changed = ignore_path.is_some();
-        if let Some(path) = ignore_path {
+        let initial = filter_canonical_paths(&self.config, &self.matcher, raw_paths.clone());
+        let filtered = if initial.ignore_file_changed {
             let observed_generation = self.matcher_generation.load(Ordering::SeqCst);
-            if !self.send_dispatch(WatcherDispatchEvent::IgnoreRulesChanged { path }) {
+            if !self.send_dispatch(WatcherDispatchEvent::IgnoreRulesChanged {
+                paths: initial.ignore_file_paths.into_iter().collect(),
+            }) {
                 return false;
             }
             if !self.wait_for_gitignore_rebuild(observed_generation) {
                 return false;
             }
-        }
-
-        let filtered = filter_canonical_paths(&self.config, &self.matcher, raw_paths);
-        debug_assert_eq!(filtered.ignore_file_changed, ignore_file_changed);
+            filter_canonical_paths(&self.config, &self.matcher, raw_paths)
+        } else {
+            initial
+        };
         self.config
             .counters
             .note_paths_after_gitignore(filtered.changed.len());
@@ -2253,23 +2258,38 @@ mod tests {
         let inside_ignored =
             filter_watcher_raw_paths_for_test(&config, &matcher, [dev_dir.join(".gitignore")]);
         assert!(!inside_ignored.ignore_file_changed);
+        assert!(inside_ignored.ignore_file_paths.is_empty());
         assert!(inside_ignored.changed.is_empty());
 
         // A rule file in a visible directory, and the root rule file itself,
         // still count.
-        let visible =
-            filter_watcher_raw_paths_for_test(&config, &matcher, [root.join("src/.gitignore")]);
+        let visible_path = root.join("src/.gitignore");
+        let visible = filter_watcher_raw_paths_for_test(
+            &config,
+            &matcher,
+            [visible_path.clone(), root.join("src/.aftignore")],
+        );
         assert!(visible.ignore_file_changed);
+        assert_eq!(
+            visible.ignore_file_paths,
+            BTreeSet::from([visible_path, root.join("src/.aftignore")])
+        );
         let at_root =
             filter_watcher_raw_paths_for_test(&config, &matcher, [root.join(".gitignore")]);
         assert!(at_root.ignore_file_changed);
+        assert_eq!(
+            at_root.ignore_file_paths,
+            BTreeSet::from([root.join(".gitignore")])
+        );
 
         // With no matcher yet there is nothing to say the parent is ignored,
         // so the conservative answer stands.
         let no_matcher: SharedGitignore = Arc::new(RwLock::new(None));
+        let unknown_path = dev_dir.join(".gitignore");
         let unknown =
-            filter_watcher_raw_paths_for_test(&config, &no_matcher, [dev_dir.join(".gitignore")]);
+            filter_watcher_raw_paths_for_test(&config, &no_matcher, [unknown_path.clone()]);
         assert!(unknown.ignore_file_changed);
+        assert_eq!(unknown.ignore_file_paths, BTreeSet::from([unknown_path]));
     }
 
     #[test]
@@ -2283,9 +2303,10 @@ mod tests {
         let matcher = Arc::new(RwLock::new(None));
         let config = WatcherFilterConfig::new(root, None);
 
-        let filtered = filter_watcher_raw_paths_for_test(&config, &matcher, [exclude]);
+        let filtered = filter_watcher_raw_paths_for_test(&config, &matcher, [exclude.clone()]);
 
         assert!(filtered.ignore_file_changed);
+        assert_eq!(filtered.ignore_file_paths, BTreeSet::from([exclude]));
         assert!(filtered.changed.is_empty());
     }
 

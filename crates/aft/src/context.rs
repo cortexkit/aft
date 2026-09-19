@@ -1049,6 +1049,9 @@ pub(crate) struct WatcherDrainSliceState {
     pub(crate) phase: WatcherDrainPhase,
     pub(crate) pending_paths: VecDeque<PathBuf>,
     pub(crate) ignore_changed: bool,
+    pub(crate) ignore_refresh_due: Option<Instant>,
+    pub(crate) ignore_changed_paths: Vec<PathBuf>,
+    pub(crate) ignore_changed_path_count: usize,
     pub(crate) rescan_required: bool,
     pub(crate) rescan_reason: crate::watcher_filter::RescanReason,
     pub(crate) status_changed: bool,
@@ -1078,6 +1081,9 @@ impl WatcherDrainSliceState {
             phase: WatcherDrainPhase::Collect,
             pending_paths: VecDeque::new(),
             ignore_changed: false,
+            ignore_refresh_due: None,
+            ignore_changed_paths: Vec::new(),
+            ignore_changed_path_count: 0,
             rescan_required: false,
             rescan_reason: crate::watcher_filter::RescanReason::Unknown,
             status_changed: false,
@@ -3810,7 +3816,12 @@ impl AppContext {
                 .watcher_drain_slice
                 .lock()
                 .as_ref()
-                .is_some_and(WatcherDrainSliceState::has_pending_work)
+                .is_some_and(|state| {
+                    state.has_pending_work()
+                        || state
+                            .ignore_refresh_due
+                            .is_some_and(|due| Instant::now() >= due)
+                })
     }
 
     pub fn lsp_drain_has_work(&self) -> bool {

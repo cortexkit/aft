@@ -31,6 +31,9 @@ pub const WATCHER_DRAIN_SLICE_BUDGET: Duration = Duration::from_millis(250);
 // View assembly may waste one superseded build, but it must not inherit the
 // semantic embedder's human-edit debounce before publishing callgraph data.
 const VIEW_PUBLICATION_QUIET_WINDOW: Duration = Duration::from_secs(1);
+const IGNORE_RULE_REFRESH_QUIET_WINDOW: Duration = Duration::from_secs(5);
+const IGNORE_RULE_CHANGED_PATHS_RETAINED: usize = 8;
+const IGNORE_RULE_CHANGED_PATHS_LOGGED: usize = 3;
 const WATCHER_DRAIN_UNIT_WARN_AFTER: Duration = Duration::from_secs(5);
 const WATCHER_DRAIN_UNIT_FINAL_AFTER: Duration = Duration::from_secs(30);
 pub const LSP_EVENT_DRAIN_BATCH_CAP: usize = 256;
@@ -38,6 +41,10 @@ pub const LSP_EVENT_DRAIN_BATCH_CAP: usize = 256;
 #[cfg(test)]
 thread_local! {
     static LEGACY_WATCHER_REFRESHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static IGNORE_RULE_REFRESHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static IGNORE_RULE_REFRESH_TEST_NOW: std::cell::Cell<Option<Instant>> = const {
+        std::cell::Cell::new(None)
+    };
 }
 
 #[cfg(test)]
@@ -57,6 +64,37 @@ fn note_legacy_watcher_refresh_for_test() {
 
 #[cfg(not(test))]
 fn note_legacy_watcher_refresh_for_test() {}
+
+#[cfg(test)]
+fn reset_ignore_rule_refreshes_for_test() {
+    IGNORE_RULE_REFRESHES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn ignore_rule_refreshes_for_test() -> usize {
+    IGNORE_RULE_REFRESHES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn note_ignore_rule_refresh_for_test() {
+    IGNORE_RULE_REFRESHES.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(not(test))]
+fn note_ignore_rule_refresh_for_test() {}
+
+fn ignore_rule_refresh_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = IGNORE_RULE_REFRESH_TEST_NOW.with(std::cell::Cell::get) {
+        return now;
+    }
+    Instant::now()
+}
+
+#[cfg(test)]
+fn set_ignore_rule_refresh_now_for_test(now: Option<Instant>) {
+    IGNORE_RULE_REFRESH_TEST_NOW.with(|clock| clock.set(now));
+}
 
 #[cfg(test)]
 struct ArtifactDrainCommitGate {
@@ -2020,7 +2058,7 @@ pub fn refresh_project_corpus(
         if config.search_index && !ctx.shared_artifacts_read_only() {
             spawn_search_corpus_refresh_admitted(ctx, root.clone(), config.clone(), generation);
             status_changed = true;
-            aft::slog_info!("started search index refresh after {}", reason);
+            aft::slog_info!("{}", search_refresh_started_log(reason));
         }
 
         if config.semantic_search && !ctx.shared_artifacts_read_only() {
@@ -2058,8 +2096,56 @@ pub fn refresh_project_corpus(
     .unwrap_or(false)
 }
 
+fn search_refresh_started_log(reason: &str) -> String {
+    format!("started search index refresh after {reason}")
+}
+
 pub fn refresh_corpus_after_ignore_change(ctx: &AppContext) -> bool {
+    note_ignore_rule_refresh_for_test();
     refresh_project_corpus(ctx, "ignore-rule change", true)
+}
+
+fn refresh_corpus_after_named_ignore_change(ctx: &AppContext, reason: &str) -> bool {
+    note_ignore_rule_refresh_for_test();
+    refresh_project_corpus(ctx, reason, true)
+}
+
+fn arm_ignore_rule_refresh(state: &mut WatcherDrainSliceState, paths: Vec<PathBuf>) {
+    state.ignore_changed = false;
+    state.ignore_refresh_due = Some(ignore_rule_refresh_now() + IGNORE_RULE_REFRESH_QUIET_WINDOW);
+    state.ignore_changed_path_count = state.ignore_changed_path_count.saturating_add(paths.len());
+    for path in paths {
+        if state.ignore_changed_paths.len() == IGNORE_RULE_CHANGED_PATHS_RETAINED {
+            break;
+        }
+        if !state.ignore_changed_paths.contains(&path) {
+            state.ignore_changed_paths.push(path);
+        }
+    }
+}
+
+fn ignore_rule_change_reason(
+    root: Option<&Path>,
+    paths: &[PathBuf],
+    observed_path_count: usize,
+) -> String {
+    let mut rendered = paths
+        .iter()
+        .map(|path| {
+            root.and_then(|root| path.strip_prefix(root).ok())
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect::<Vec<_>>();
+    rendered.sort_unstable();
+    rendered.dedup();
+    rendered.truncate(IGNORE_RULE_CHANGED_PATHS_LOGGED);
+    let hidden = observed_path_count.saturating_sub(rendered.len());
+    let tail = (hidden > 0)
+        .then(|| format!(" (+{hidden})"))
+        .unwrap_or_default();
+    format!("ignore-rule change: paths=[{}]{tail}", rendered.join(", "))
 }
 
 fn watcher_rescan_rss_bytes() -> Option<u64> {
@@ -2764,13 +2850,13 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     state.semantic_refresh_paths.clear();
                     state.scheduler_changed_path_count = 0;
                 }
-                Ok(WatcherDispatchEvent::IgnoreRulesChanged { path }) => {
+                Ok(WatcherDispatchEvent::IgnoreRulesChanged { paths }) => {
                     dispatch_events_received += 1;
-                    state.ignore_changed = true;
                     log::debug!(
-                        "watcher: ignore rules changed at {}, rebuilding matcher",
-                        path.display()
+                        "watcher: ignore rules changed at {:?}, rebuilding matcher",
+                        paths
                     );
+                    arm_ignore_rule_refresh(&mut state, paths);
                     if !state.rescan_required {
                         let heavy_root_work_allowed = ctx.heavy_root_work_allowed();
                         let _ = ctx.run_if_subc_bound_generation(configure_generation, || {
@@ -2838,6 +2924,15 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         return outcome;
     }
 
+    if !state.rescan_required
+        && !state.ignore_changed
+        && state
+            .ignore_refresh_due
+            .is_some_and(|due| ignore_rule_refresh_now() >= due)
+    {
+        state.ignore_changed = true;
+    }
+
     if state.rescan_required {
         crate::logging::note_watcher_overflow();
         let root = ctx
@@ -2897,6 +2992,9 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
         {
             state.rescan_required = false;
             state.ignore_changed = false;
+            state.ignore_refresh_due = None;
+            state.ignore_changed_paths.clear();
+            state.ignore_changed_path_count = 0;
             if ctx.config().views.enabled {
                 state.view_publication_paths.clear();
                 state.view_publication_due = Some(Instant::now() + VIEW_PUBLICATION_QUIET_WINDOW);
@@ -2907,7 +3005,13 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
     } else if matches!(state.phase, WatcherDrainPhase::Collect) {
         let ignore_changed = state.ignore_changed;
         if ignore_changed {
-            state.status_changed |= refresh_corpus_after_ignore_change(ctx);
+            let root = ctx.canonical_cache_root_opt();
+            let reason = ignore_rule_change_reason(
+                root.as_deref(),
+                &state.ignore_changed_paths,
+                state.ignore_changed_path_count,
+            );
+            state.status_changed |= refresh_corpus_after_named_ignore_change(ctx, &reason);
             // Same partial-sequence rule as the rescan path: acknowledge only
             // when the refresh ran fully under this lifecycle generation.
             if ctx
@@ -2915,6 +3019,9 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 .is_some()
             {
                 state.ignore_changed = false;
+                state.ignore_refresh_due = None;
+                state.ignore_changed_paths.clear();
+                state.ignore_changed_path_count = 0;
                 if ctx.config().views.enabled {
                     state.view_publication_paths.clear();
                     state.view_publication_due =
@@ -3216,6 +3323,202 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         *ctx.watcher_rx().lock() = Some(rx);
         (ctx, tx)
+    }
+
+    struct IgnoreRuleRefreshTestReset;
+
+    impl Drop for IgnoreRuleRefreshTestReset {
+        fn drop(&mut self) {
+            set_ignore_rule_refresh_now_for_test(None);
+            reset_ignore_rule_refreshes_for_test();
+        }
+    }
+
+    fn begin_ignore_rule_refresh_test() -> IgnoreRuleRefreshTestReset {
+        reset_ignore_rule_refreshes_for_test();
+        set_ignore_rule_refresh_now_for_test(Some(Instant::now()));
+        IgnoreRuleRefreshTestReset
+    }
+
+    fn advance_ignore_rule_refresh_clock(duration: Duration) {
+        IGNORE_RULE_REFRESH_TEST_NOW.with(|clock| {
+            let now = clock.get().expect("ignore refresh test clock is installed");
+            clock.set(Some(now + duration));
+        });
+    }
+
+    fn send_ignore_rule_change(
+        tx: &crossbeam_channel::Sender<WatcherDispatchEvent>,
+        path: PathBuf,
+    ) {
+        tx.send(WatcherDispatchEvent::IgnoreRulesChanged { paths: vec![path] })
+            .unwrap();
+    }
+
+    #[test]
+    fn six_ignore_rule_events_over_four_seconds_coalesce_into_one_refresh() {
+        let _reset = begin_ignore_rule_refresh_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let (ctx, tx) = watcher_context(&root);
+
+        for index in 0..6 {
+            send_ignore_rule_change(&tx, root.join(format!("rules-{index}/.gitignore")));
+            let outcome = drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+            assert!(
+                !outcome.has_more,
+                "an armed quiet window must not busy-loop"
+            );
+            if index < 5 {
+                advance_ignore_rule_refresh_clock(Duration::from_millis(800));
+            }
+        }
+
+        assert_eq!(
+            ignore_rule_refreshes_for_test(),
+            0,
+            "the six-event burst must stay quiet until five seconds after its last event"
+        );
+        advance_ignore_rule_refresh_clock(Duration::from_millis(4_999));
+        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        assert_eq!(ignore_rule_refreshes_for_test(), 0);
+
+        advance_ignore_rule_refresh_clock(Duration::from_millis(1));
+        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        assert_eq!(ignore_rule_refreshes_for_test(), 1);
+    }
+
+    #[test]
+    fn single_ignore_rule_event_refreshes_after_five_second_quiet_window() {
+        let _reset = begin_ignore_rule_refresh_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let (ctx, tx) = watcher_context(&root);
+        send_ignore_rule_change(&tx, root.join("config/.aftignore"));
+
+        let outcome = drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+
+        assert!(
+            !outcome.has_more,
+            "the deadline is not immediately runnable work"
+        );
+        assert_eq!(ignore_rule_refreshes_for_test(), 0);
+        {
+            let state = ctx.watcher_drain_slice().lock();
+            let state = state.as_ref().expect("armed ignore refresh state");
+            assert!(state.ignore_refresh_due.is_some());
+            assert!(!state.ignore_changed);
+            assert!(
+                !state.status_changed,
+                "arming must not change search health"
+            );
+        }
+
+        advance_ignore_rule_refresh_clock(Duration::from_millis(4_999));
+        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        assert_eq!(ignore_rule_refreshes_for_test(), 0);
+
+        advance_ignore_rule_refresh_clock(Duration::from_millis(1));
+        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        assert_eq!(ignore_rule_refreshes_for_test(), 1);
+    }
+
+    #[test]
+    fn armed_ignore_window_keeps_the_ready_search_index_serving() {
+        let _reset = begin_ignore_rule_refresh_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let (ctx, tx) = watcher_context(&root);
+        ctx.update_config(|config| config.search_index = true);
+        *ctx.search_index()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(crate::search_index::SearchIndex::build(&root));
+        send_ignore_rule_change(&tx, root.join(".gitignore"));
+
+        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+
+        assert!(
+            ctx.search_index()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|index| index.ready),
+            "the current search index must remain ready while the window is armed"
+        );
+        assert!(ctx
+            .search_index_rx()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_none());
+    }
+
+    #[test]
+    fn subc_watcher_probe_becomes_ready_only_when_ignore_window_expires() {
+        let _reset = begin_ignore_rule_refresh_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let (ctx, tx) = watcher_context(&root);
+        send_ignore_rule_change(&tx, root.join(".aftignore"));
+        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+
+        assert!(!ctx.watcher_drain_has_work());
+        let expired = Instant::now() - Duration::from_millis(1);
+        ctx.watcher_drain_slice()
+            .lock()
+            .as_mut()
+            .expect("armed watcher state")
+            .ignore_refresh_due = Some(expired);
+        set_ignore_rule_refresh_now_for_test(Some(Instant::now()));
+        assert!(ctx.watcher_drain_has_work());
+
+        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        assert_eq!(ignore_rule_refreshes_for_test(), 1);
+        assert!(!ctx.watcher_drain_has_work());
+    }
+
+    #[test]
+    fn ignore_rule_refresh_armed_during_unbind_replays_after_rebind() {
+        let _reset = begin_ignore_rule_refresh_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let (ctx, tx) = watcher_context(&root);
+        send_ignore_rule_change(&tx, root.join(".gitignore"));
+        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+
+        ctx.mark_subc_unbound();
+        advance_ignore_rule_refresh_clock(IGNORE_RULE_REFRESH_QUIET_WINDOW);
+        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        assert_eq!(ignore_rule_refreshes_for_test(), 0);
+
+        ctx.mark_subc_bound();
+        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        assert_eq!(ignore_rule_refreshes_for_test(), 1);
+        let state = ctx.watcher_drain_slice().lock();
+        let state = state.as_ref().expect("replayed watcher state");
+        assert!(state.ignore_refresh_due.is_none());
+        assert!(state.ignore_changed_paths.is_empty());
+    }
+
+    #[test]
+    fn ignore_rule_refresh_log_caps_paths_and_counts_the_rest() {
+        let root = Path::new("/workspace");
+        let paths = [
+            "a/.gitignore",
+            "b/.aftignore",
+            "c/.gitignore",
+            "d/.aftignore",
+            "e/.gitignore",
+        ]
+        .into_iter()
+        .map(|path| root.join(path))
+        .collect::<Vec<_>>();
+        let reason = ignore_rule_change_reason(Some(root), &paths, paths.len());
+
+        assert_eq!(
+            search_refresh_started_log(&reason),
+            "started search index refresh after ignore-rule change: paths=[a/.gitignore, b/.aftignore, c/.gitignore] (+2)"
+        );
     }
 
     #[test]
