@@ -10256,7 +10256,12 @@ mod tests {
             );
             std::thread::yield_now();
         }
-        assert_eq!(configure_artifact_load_attempts_for_test(), 0);
+        // The per-root count: another test's background load in this libtest
+        // process would otherwise be read as this worker having started one.
+        assert_eq!(
+            configure_artifact_load_attempts_for_root_for_test(root.path()),
+            0
+        );
         assert!(ctx.search_index_rx().read().unwrap().is_none());
     }
 
