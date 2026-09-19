@@ -99,6 +99,10 @@ CARD="ck-aft.${HASH:0:16}"
 mv "$TMP" "$STAGING/$CARD"
 # The sidecar is written from the final name so `shasum -c` matches as-is.
 (cd "$STAGING" && shasum -a 256 "$CARD" > "$CARD.sha256.postsign" && shasum -c "$CARD.sha256.postsign" >/dev/null)
+# Owner declaration of the current card, so the placement gate reads it as
+# declared rather than inferring the newest card from mtimes. One shasum-shaped
+# line plus a UTC stamp; the gate treats it as inert if absent.
+printf '%s  %s  %s\n' "$HASH" "$CARD" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$STAGING/ck-aft.current"
 
 VERSION="$("$STAGING/$CARD" --version 2>/dev/null | head -1)"
 echo "==> card: $STAGING/$CARD"
