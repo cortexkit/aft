@@ -39,6 +39,7 @@ mod compression_events_test;
 mod config_parity_test;
 mod configure_test;
 mod conflicts_discovery_test;
+mod crash_diagnostics;
 mod cuda_test;
 mod db_migration_race_test;
 mod db_read_fallback_test;

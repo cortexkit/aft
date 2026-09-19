@@ -1559,6 +1559,7 @@ fn run_subc_bridge_test_inner<E, F, Fut, A>(
     Fut: Future<Output = ()> + 'static,
     A: FnOnce(&Arc<BridgeState>, &Arc<Executor>, &SubcBridgeTestRoots),
 {
+    crate::crash_diagnostics::install();
     let _serial = bridge_test_serial_guard();
     crate::test_helpers::disable_in_process_file_watcher();
     let _git_env = crate::test_helpers::hermetic_git_env_guard();

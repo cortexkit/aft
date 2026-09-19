@@ -314,6 +314,18 @@ jobs:
           AFT_NEXTEST_EXTRACT_TO: ${{ github.workspace }}
           AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3
           AFT_GATE_SKIP_RELEASE_STORM: "1"
+          AFT_CAPTURE_CRASH_DIAGNOSTICS: ${{ matrix.shard == 2 && '1' || '0' }}
+
+      - name: Upload Linux integration crash cores
+        if: failure() && matrix.shard == 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-integration-crash-${{ matrix.shard }}
+          path: |
+            ${{ github.workspace }}/core*
+            ${{ runner.temp }}/core*
+          if-no-files-found: warn
+          retention-days: 3
 
   # ---------------------------------------------------------------------------
   # Real-kernel Landlock probes. This stays separate from the general unit lane
@@ -657,6 +669,19 @@ jobs:
           AFT_NEXTEST_EXTRACT_TO: ${{ github.workspace }}
           AFT_NEXTEST_PARTITION: hash:${{ matrix.shard }}/3
           AFT_GATE_SKIP_RELEASE_STORM: "1"
+          AFT_CAPTURE_CRASH_DIAGNOSTICS: ${{ matrix.shard == 2 && '1' || '0' }}
+
+      - name: Upload macOS integration crash cores
+        if: failure() && matrix.shard == 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-integration-crash-${{ matrix.shard }}
+          path: |
+            ${{ github.workspace }}/core*
+            ${{ runner.temp }}/core*
+            /cores/core.*
+          if-no-files-found: warn
+          retention-days: 3
 
   # ---------------------------------------------------------------------------
   # Rust integration tests on Windows
