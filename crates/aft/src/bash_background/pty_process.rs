@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::fs::{self, File};
+#[cfg(any(windows, test))]
+use std::fs;
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
