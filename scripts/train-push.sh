@@ -448,9 +448,19 @@ sibling_lock_drift_packages() {
   [ "$(git status --porcelain)" = " M Cargo.lock" ] || return 1
   # Every changed line must be a version line. -U1 keeps the `name =` line
   # that precedes `version =` in a [[package]] block as context.
-  local diff
+  local diff non_version
   diff="$(git diff -U1 -- Cargo.lock)"
-  if printf '%s\n' "$diff" | grep -E '^[-+]' | grep -vE '^(\+\+\+|---)' | grep -qvE '^[-+]version = "'; then
+  # One awk pass rather than a grep pipeline ending in -q: under pipefail a
+  # `grep -qv` that meets a non-version line first exits, the writers behind
+  # it take SIGPIPE, the pipeline returns 141, and the `if` reads FALSE — so a
+  # real working-tree change early in a large diff was classified as pure
+  # drift and Cargo.lock was RESTORED over the operator's uncommitted work.
+  # Reading to EOF and counting cannot be inverted that way.
+  non_version="$(printf '%s\n' "$diff" | awk '
+    /^(\+\+\+|---)/ { next }
+    /^[-+]/ && !/^[-+]version = "/ { n++ }
+    END { print n + 0 }')"
+  if [ "$non_version" -ne 0 ]; then
     return 1
   fi
   # For each removed version line, find the [[package]] block in HEAD's lock

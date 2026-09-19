@@ -609,6 +609,39 @@ expect_no_out "working tree is not clean" "lock drift alone is not a dirty tree"
 git -C "$dir/work" diff --quiet -- Cargo.lock ||
   fail "lock drift restore left Cargo.lock modified"
 
+# --- refusal: a real change FIRST in a diff too large for the pipe buffer --
+# ASTRO's measured inversion: the classifier's grep pipeline ended in -qv,
+# which exits on the first non-version line; with thousands of version lines
+# still to come the writers took SIGPIPE, the pipeline returned 141 under
+# pipefail, and the working-tree change was classified as pure drift and
+# RESTORED. The small fixtures above never hit it because the writer finished
+# before grep closed the pipe. This arm puts the checksum change first and
+# 20,000 source-less version bumps after it, and must still refuse.
+dir="$(new_fixture lockbig)"
+add_cargo_lock "$dir/work"
+{
+  i=0
+  while [ "$i" -lt 20000 ]; do
+    printf '\n[[package]]\nname = "bulk%d"\nversion = "2.0.0"\n' "$i"
+    i=$((i + 1))
+  done
+} >> "$dir/work/Cargo.lock"
+git -C "$dir/work" add Cargo.lock
+git -C "$dir/work" commit -qm "big lock"
+git -C "$dir/work" push -q origin "$DEFAULT_BRANCH"
+add_train_commit "$dir/work" "lockbig"
+# The real change is a dependency-list edit on the FIRST block (pathdep is
+# source-less, so the per-package ownership check cannot catch it); every
+# line after it is a source-less version bump the classifier accepts. Only
+# the non-version-line scan stands between this and a restore.
+sed -i.bak -e 's/^ "regdep",$/ "regdep-renamed",/' -e 's/^version = "2.0.0"$/version = "2.0.1"/' "$dir/work/Cargo.lock"
+rm -f "$dir/work/Cargo.lock.bak"
+run_train "$dir" lockbig
+expect_rc 2 "a dependency-list change first in a 40k-line diff still refuses"
+expect_out "working tree is not clean" "large diff with a real change refuses as a dirty tree"
+expect_no_out "restored Cargo.lock" "the large diff is never restored over the operator's change"
+git -C "$dir/work" diff --quiet -- Cargo.lock && fail "the operator's lock change was discarded"
+
 # --- refusal: a lock change that touches a source or checksum line ---------
 dir="$(new_fixture locksource)"
 add_cargo_lock "$dir/work"
