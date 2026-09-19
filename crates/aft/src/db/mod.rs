@@ -1,5 +1,6 @@
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
+pub mod file_identity;
 pub mod lifecycle;
 pub mod write_ledger;
 pub use lifecycle::{

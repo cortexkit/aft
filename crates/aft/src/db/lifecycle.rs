@@ -421,6 +421,10 @@ pub struct TrackedConnection {
     write_counter: WriteCounter,
     page_size: u64,
     wal_hook: Box<WalHookState>,
+    /// Key this connection is filed under in [`crate::db::file_identity`],
+    /// resolved at open time because the database file may be gone by close.
+    /// `None` for connections with no file of their own, such as in-memory ones.
+    file_identity_key: Option<PathBuf>,
 }
 
 impl TrackedConnection {
@@ -510,6 +514,10 @@ impl TrackedConnection {
         unsafe {
             rusqlite::ffi::sqlite3_wal_hook(connection.handle(), Some(tracked_wal_hook), context);
         }
+        let file_identity_key = connection
+            .path()
+            .filter(|path| !path.is_empty() && *path != ":memory:")
+            .map(|path| crate::db::file_identity::note_open(Path::new(path), store));
         register_open(store);
         let tracked = Self {
             connection: Some(connection),
@@ -517,6 +525,7 @@ impl TrackedConnection {
             write_counter,
             page_size,
             wal_hook,
+            file_identity_key,
         };
         tracked.reset_write_page_sample();
         Ok(tracked)
@@ -725,6 +734,9 @@ impl Drop for TrackedConnection {
         // closed while rusqlite still owns the descriptor and page cache.
         drop(self.connection.take());
         self.credit_close_checkpoint(close_checkpoint);
+        if let Some(key) = self.file_identity_key.take() {
+            crate::db::file_identity::note_close(&key, self.store);
+        }
         register_close(self.store);
     }
 }
