@@ -182,7 +182,7 @@ fn report(hazard: DatabaseHazard) {
         // The test run that arms fatal-signal diagnostics collects stderr, and a
         // hazard reported here is the earlier event a later SIGBUS is downstream
         // of, so the two land in one log next to each other.
-        eprintln!("\nAFT sqlite database hazard: {message}");
+        write_stderr_line(&format!("\nAFT sqlite database hazard: {message}\n"));
     }
     let mut reported = reported()
         .lock()
@@ -191,6 +191,30 @@ fn report(hazard: DatabaseHazard) {
         reported.remove(0);
     }
     reported.push(hazard);
+}
+
+/// Write straight to the standard error descriptor.
+///
+/// Rust's test harness captures `eprintln!` and discards it for a test that
+/// passes, and throws it away entirely when the process dies by signal. A
+/// hazard is most valuable in exactly those two cases: a run that did not crash
+/// but set the crash up, and the run that crashed. Writing to the descriptor
+/// bypasses the capture, which is what the fatal-signal handler already does.
+#[cfg(unix)]
+fn write_stderr_line(line: &str) {
+    let bytes = line.as_bytes();
+    unsafe {
+        libc::write(
+            libc::STDERR_FILENO,
+            bytes.as_ptr().cast::<std::ffi::c_void>(),
+            bytes.len(),
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn write_stderr_line(line: &str) {
+    eprint!("{line}");
 }
 
 /// Record that a tracked connection has opened `path`, and return the key the
