@@ -140,6 +140,24 @@ describe.skipIf(POSIX_ONLY)("subc rig orphan daemon sweep", () => {
   }, 30_000);
 });
 
+describe("subc rig orphan daemon sweep on win32", () => {
+  test("no-ops with a log line instead of reading a process table", async () => {
+    const realPlatform = process.platform;
+    Object.defineProperty(process, "platform", { value: "win32", configurable: true });
+    try {
+      const lines: string[] = [];
+      const reaped = await sweepReparentedSubcDaemons({
+        cacheRoot: join(tmpdir(), "subc-rig-sweep-win32-absent"),
+        log: (line) => lines.push(line),
+      });
+      expect(reaped).toEqual([]);
+      expect(lines.join("\n")).toContain("win32");
+    } finally {
+      Object.defineProperty(process, "platform", { value: realPlatform, configurable: true });
+    }
+  });
+});
+
 interface PlantedProcess {
   pid: number;
   dispose(): void;
