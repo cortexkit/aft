@@ -85,7 +85,21 @@
 #      conflicted
 set -euo pipefail
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Run from a private copy of this file. bash reads a script incrementally, so an
+# edit to scripts/train-push.sh while a train is watching CI (a pick of a
+# peer's fix, a rebase that moves the file) shifts the running instance's read
+# offset and it dies at its next statement with a syntax error, after CI went
+# green and before the fast-forward (train 121, 2026-09-19). The copy is
+# immune; the instance remembers the real path for its own diagnostics.
+if [ -z "${TRAIN_PUSH_EXEC_COPY:-}" ]; then
+  train_push_copy="$(mktemp "${TMPDIR:-/tmp}/train-push.XXXXXX")"
+  cp "${BASH_SOURCE[0]}" "$train_push_copy"
+  TRAIN_PUSH_EXEC_COPY="$train_push_copy" TRAIN_PUSH_SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")" \
+    exec bash "$train_push_copy" "$@"
+fi
+trap 'rm -f "$TRAIN_PUSH_EXEC_COPY"' EXIT
+
+script_dir="$(dirname "${TRAIN_PUSH_SOURCE:-${BASH_SOURCE[0]}}")"
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
@@ -687,7 +701,9 @@ verified_sha=""
 
 watch_log="$(mktemp "${TMPDIR:-/tmp}/train-push-watch.XXXXXX")"
 push_log="$(mktemp "${TMPDIR:-/tmp}/train-push-push.XXXXXX")"
-trap 'rm -f "$watch_log" "$push_log"' EXIT
+# Replaces the EXIT trap set at the top (bash traps are global), so the
+# private script copy is named here too.
+trap 'rm -f "$watch_log" "$push_log" "$TRAIN_PUSH_EXEC_COPY"' EXIT
 
 # What we believe $remote/$train_ref points at. Tracked explicitly so every
 # re-push leases against the sha WE pushed instead of trusting a remote-tracking

@@ -236,14 +236,26 @@ describe("health sentinel pure detectors", () => {
     ]);
   });
 
-  test("write attribution prefers ledger domains and roots", () => {
-    const input = sample({ writes_census: { writers: [
-      { domain: "callgraph_refresh", root_id: "/root/a", physical_bytes: 2 * 1024 ** 3 },
-      { domain: "semantic_compaction", root_id: "/root/b", physical_bytes: 1024 ** 3 },
-    ] } });
-    const rendered = writeGrowthAttribution(input, cleanState(), 4 * 1024 ** 3);
-    expect(rendered).toContain("callgraph_refresh (/root/a); 50% of write delta");
-    expect(rendered).toContain("semantic_compaction (/root/b); 25% of write delta");
+  test("write attribution shares are taken against the census window, not the interval delta", () => {
+    // The ledger rows cover the census's 10-minute window while the sentinel's
+    // delta covers its 2-minute interval; on 2026-09-19 the shares summed to
+    // 161% because they were divided by the smaller delta. The window's own
+    // process total is the denominator, and the unattributed remainder is a row.
+    const input = sample({ writes_census: {
+      since_ms: NOW - 600_000,
+      until_ms: NOW,
+      process: { available: true, physical_bytes: 4 * 1024 ** 3 },
+      unattributed_physical_bytes: 1024 ** 3,
+      writers: [
+        { domain: "callgraph_refresh", root_id: "/root/a", physical_bytes: 2 * 1024 ** 3 },
+        { domain: "semantic_compaction", root_id: "/root/b", physical_bytes: 1024 ** 3 },
+      ],
+    } });
+    const rendered = writeGrowthAttribution(input, cleanState(), 0.5 * 1024 ** 3);
+    expect(rendered).toContain("callgraph_refresh (/root/a); 50% of the 10-minute window");
+    expect(rendered).toContain("semantic_compaction (/root/b); 25% of the 10-minute window");
+    expect(rendered).toContain("unattributed: 1.00 GiB; 25% of the 10-minute window");
+    expect(rendered).not.toContain("of write delta");
   });
 
   test("process footprint, cpu, and write rate are independent", () => {

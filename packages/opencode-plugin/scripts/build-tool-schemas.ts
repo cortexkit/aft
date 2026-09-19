@@ -34,13 +34,27 @@ async function main() {
     await Bun.write(outputPath, json);
   }
 
+  // The generator is a tiny debug binary, so a compile cache buys nothing and
+  // the sccache wrapper configured in .cargo/config.toml has wedged this step
+  // twice (its client sleeps on the server socket, the check never returns).
+  // Run it with the wrapper off and a bound so a wedge fails the check loudly
+  // instead of parking the push.
   const generator = Bun.spawn(
     ["cargo", "run", "--quiet", "-p", "agent-file-tools", "--bin", "hashline-schema-artifact"],
-    { cwd: repoRoot, stdout: "pipe", stderr: "inherit" },
+    {
+      cwd: repoRoot,
+      stdout: "pipe",
+      stderr: "inherit",
+      env: { ...process.env, CARGO_BUILD_RUSTC_WRAPPER: "", RUSTC_WRAPPER: "" },
+      timeout: 10 * 60 * 1000,
+      killSignal: "SIGKILL",
+    },
   );
   const hashlineJson = await new Response(generator.stdout).text();
   if ((await generator.exited) !== 0) {
-    throw new Error("governed hashline edit schema generator failed");
+    throw new Error(
+      "governed hashline edit schema generator failed (or exceeded its 10-minute bound)",
+    );
   }
   if (checkOnly) {
     const existing = await Bun.file(hashlineOutputPath).text();

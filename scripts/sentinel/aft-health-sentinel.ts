@@ -312,11 +312,25 @@ export function writeGrowthAttribution(sample: SentinelSample, state: SentinelSt
   if (writeDelta <= 0) return "";
   const ledger = sample.writes_census?.writers ?? metrics(sample).write_ledger_top_10m;
   if (Array.isArray(ledger) && ledger.length > 0) {
+    // The ledger rows come from the census's own window (10 minutes), not the
+    // sentinel's sampling interval, so shares are taken against that window's
+    // process total; against the interval delta they summed past 100%.
+    const census = sample.writes_census;
+    const windowTotal = Number(census?.process?.physical_bytes ?? 0) > 0
+      ? Number(census.process.physical_bytes)
+      : ledger.reduce((sum: number, entry: Record<string, unknown>) => sum + Number(entry.physical_bytes ?? 0), 0);
+    const windowMinutes = census?.since_ms && census?.until_ms
+      ? Math.round((Number(census.until_ms) - Number(census.since_ms)) / 60_000)
+      : 10;
     const lines = ledger.slice(0, 3).map((entry: Record<string, unknown>, index: number) => {
       const bytes = Number(entry.physical_bytes ?? 0);
-      const share = Math.min(100, bytes / writeDelta * 100);
-      return `${index + 1}. ${(bytes / GB).toFixed(2)} GiB ${entry.domain ?? "other"} (${entry.root_id ?? "unknown"}); ${share.toFixed(0)}% of write delta`;
+      const share = windowTotal > 0 ? Math.min(100, bytes / windowTotal * 100) : 0;
+      return `${index + 1}. ${(bytes / GB).toFixed(2)} GiB ${entry.domain ?? "other"} (${entry.root_id ?? "unknown"}); ${share.toFixed(0)}% of the ${windowMinutes}-minute window`;
     });
+    const unattributed = Number(census?.unattributed_physical_bytes ?? 0);
+    if (unattributed > 0 && windowTotal > 0) {
+      lines.push(`unattributed: ${(unattributed / GB).toFixed(2)} GiB; ${Math.min(100, unattributed / windowTotal * 100).toFixed(0)}% of the ${windowMinutes}-minute window`);
+    }
     return `\n${lines.join("\n")}`;
   }
   const current = sample.disk?.artifact_sizes ?? {};
