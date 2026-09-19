@@ -162,6 +162,40 @@ describe("health sentinel pure detectors", () => {
     expect(detectIndexes(input)).toEqual([]);
   });
 
+  test("tier2 refresh overdue waits through the five-minute grace and clears on dispatch states", () => {
+    const root = "/repo/busy";
+    const nextRefreshAt = NOW - 5 * 60_000;
+    const staleHealth = (now_ms: number) => sample({
+      now_ms,
+      health: { metrics: { roots: [{
+        project_root: root,
+        tier2: { status: "stale", stale_since_ms: NOW - 20 * 60_000, next_refresh_at_ms: nextRefreshAt, pending_paths: 3 },
+      }] } },
+    });
+
+    expect(detectIndexes(staleHealth(NOW))).toEqual([]);
+    const overdue = detectIndexes(staleHealth(NOW + 1));
+    expect(overdue).toHaveLength(1);
+    expect(overdue[0]).toMatchObject({
+      rule: "tier2.refresh_overdue",
+      severity: "WARNING",
+      fingerprint: `tier2-refresh:${root}`,
+    });
+    expect(overdue[0].text).toContain("3 pending paths");
+    expect(overdue.some((value) => value.rule === "index.stuck")).toBe(false);
+
+    const previous = reconcile(overdue, {}, NOW + 1).next;
+    for (const status of ["ready", "building"]) {
+      const findings = detectIndexes(sample({ health: { metrics: { roots: [{
+        project_root: root,
+        tier2: { status, since_ms: NOW, last_progress_at_ms: NOW },
+      }] } } }));
+      expect(reconcile(findings, previous, NOW + 2).cleared.map((value) => value.fingerprint)).toEqual([
+        `tier2-refresh:${root}`,
+      ]);
+    }
+  });
+
   test("overlong tier2 pass requires an unmatched old acquisition", () => {
     const root = "/repo/worktree";
     expect(detectTier2Overlong(sample({ log_lines: [`2026-09-17T14:00:00Z [aft] inspect-triggered cold-build slot acquired after 1ms wait: request=inspect:${root}:1 kind=explicit inspect Tier-2 run`] }))[0].fingerprint).toBe(`tier2:${root}`);

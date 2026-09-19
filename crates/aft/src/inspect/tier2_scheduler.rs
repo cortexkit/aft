@@ -169,6 +169,48 @@ impl Tier2RefreshScheduler {
         self.pull_demand_pending
     }
 
+    /// Earliest instant at which the scheduler's current demand can dispatch,
+    /// before external gates such as an in-flight builder or semantic cold seed.
+    pub fn next_dispatch_at(&self, now: Instant) -> Option<Instant> {
+        let min_interval_at = self
+            .last_scan_started_at
+            .map(|started| started + TIER2_REFRESH_MIN_INTERVAL);
+
+        let requested_at = if self.pull_demand_pending {
+            Some(now)
+        } else if self.last_change_at.is_some() {
+            let debounce_at = self
+                .last_change_at
+                .map(|changed| changed + self.debounce_delay);
+            let ceiling_at = self
+                .activity_started_at
+                .map(|started| started + TIER2_REFRESH_MAX_STALENESS);
+            match (debounce_at, ceiling_at) {
+                (Some(debounce), Some(ceiling)) => Some(debounce.min(ceiling)),
+                (deadline, None) | (None, deadline) => deadline,
+            }
+        } else if self.configure_warm_pending {
+            self.configured_at
+                .map(|configured| configured + TIER2_REFRESH_COLD_CACHE_DELAY)
+        } else {
+            None
+        }?;
+
+        let cold_cache_at = (self.last_scan_started_at.is_none() && !self.pull_demand_pending)
+            .then(|| {
+                self.configured_at
+                    .map(|configured| configured + TIER2_REFRESH_COLD_CACHE_DELAY)
+            })
+            .flatten();
+
+        Some(
+            [min_interval_at, cold_cache_at]
+                .into_iter()
+                .flatten()
+                .fold(requested_at, Instant::max),
+        )
+    }
+
     fn record_changes(&mut self, now: Instant, changed_path_count: usize) {
         if self.activity_started_at.is_none() {
             self.activity_started_at = Some(now);
@@ -352,6 +394,36 @@ mod tests {
         assert_eq!(
             scheduler.tick(warm + TIER2_REFRESH_STORM_DEBOUNCE, 0, true, false),
             Some(Tier2TriggerReason::Debounce)
+        );
+    }
+
+    #[test]
+    fn next_dispatch_tracks_min_interval_and_continuous_activity_ceiling() {
+        let (mut scheduler, base) = configured_scheduler();
+        let first_scan = base + TIER2_REFRESH_COLD_CACHE_DELAY;
+        assert_eq!(
+            scheduler.tick(first_scan, 0, true, false),
+            Some(Tier2TriggerReason::ConfigureWarm)
+        );
+        let first_change = first_scan + Duration::from_secs(1);
+        assert_eq!(scheduler.tick(first_change, 1, true, false), None);
+        assert_eq!(
+            scheduler.next_dispatch_at(first_change),
+            Some(first_scan + TIER2_REFRESH_MIN_INTERVAL)
+        );
+
+        let (mut continuous, base) = configured_scheduler();
+        let activity_start = base + TIER2_REFRESH_COLD_CACHE_DELAY;
+        assert_eq!(continuous.tick(activity_start, 1, true, false), None);
+        assert_eq!(
+            continuous.next_dispatch_at(activity_start),
+            Some(activity_start + TIER2_REFRESH_DEBOUNCE)
+        );
+        let last_change = activity_start + TIER2_REFRESH_MAX_STALENESS - Duration::from_secs(1);
+        assert_eq!(continuous.tick(last_change, 1, true, false), None);
+        assert_eq!(
+            continuous.next_dispatch_at(last_change),
+            Some(activity_start + TIER2_REFRESH_MAX_STALENESS)
         );
     }
 

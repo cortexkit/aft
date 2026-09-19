@@ -1037,9 +1037,15 @@ impl HealthRollupCache {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
                 .to_string();
+            let key = (root.to_string(), plane);
+            if plane == "tier2" && status == "stale" {
+                timings.remove(&key);
+                component.remove("since_ms");
+                component.remove("last_progress_at_ms");
+                continue;
+            }
             let reported_since_ms = component.get("since_ms").and_then(Value::as_u64);
             let progress_signature = serde_json::to_string(component).unwrap_or_default();
-            let key = (root.to_string(), plane);
             let timing = timings.entry(key).or_insert_with(|| PlaneTiming {
                 status: status.clone(),
                 since_ms: reported_since_ms.unwrap_or(now_ms),
@@ -3457,5 +3463,30 @@ mod plane_timing_tests {
                 .expect("new progress")
                 > semantic_progress
         );
+    }
+
+    #[test]
+    fn stale_tier2_uses_scheduler_fields_instead_of_build_timings() {
+        let cache = HealthRollupCache::new();
+        let mut stale = json!({
+            "tier2": {
+                "status": "stale",
+                "stale_since_ms": 10,
+                "next_refresh_at_ms": 20,
+                "pending_paths": 3,
+            },
+        });
+        cache.annotate_plane_timings("/tmp/root", &mut stale);
+
+        assert_eq!(stale["tier2"]["stale_since_ms"], 10);
+        assert_eq!(stale["tier2"]["next_refresh_at_ms"], 20);
+        assert_eq!(stale["tier2"]["pending_paths"], 3);
+        assert!(stale["tier2"].get("since_ms").is_none());
+        assert!(stale["tier2"].get("last_progress_at_ms").is_none());
+
+        let mut building = json!({ "tier2": { "status": "building" } });
+        cache.annotate_plane_timings("/tmp/root", &mut building);
+        assert!(building["tier2"]["since_ms"].is_u64());
+        assert!(building["tier2"]["last_progress_at_ms"].is_u64());
     }
 }

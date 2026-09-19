@@ -302,6 +302,7 @@ struct StatusBarTier2 {
     duplicates: Option<usize>,
     todos: Option<usize>,
     stale: bool,
+    stale_since_ms: Option<u64>,
     /// Reuse completions observed when this snapshot first became stale. Health
     /// requires every later completion to have succeeded before reporting ready.
     stale_after_reuse_completion: u64,
@@ -442,6 +443,12 @@ pub struct Tier2HealthSnapshot {
     /// Advances when a background Tier-2 pass publishes successfully, even if
     /// health never sampled the short-lived `building` state.
     pub completion_generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_since_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_refresh_at_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_paths: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -488,6 +495,9 @@ pub(crate) struct RootHealthSummary {
     views: Option<ViewHealthSnapshot>,
     tier2_status: Option<&'static str>,
     tier2_completion_generation: Option<u64>,
+    tier2_stale_since_ms: Option<u64>,
+    tier2_next_refresh_at_ms: Option<u64>,
+    tier2_pending_paths: Option<usize>,
     bash: Option<BgTaskHealthCounts>,
     suspended_domains: Vec<SuspendedDomainHealthSnapshot>,
 }
@@ -502,6 +512,9 @@ impl RootHealthSummary {
             views: None,
             tier2_status: None,
             tier2_completion_generation: None,
+            tier2_stale_since_ms: None,
+            tier2_next_refresh_at_ms: None,
+            tier2_pending_paths: None,
             bash: None,
             suspended_domains: Vec::new(),
         }
@@ -569,6 +582,9 @@ impl RootHealthSummary {
             tier2: self.tier2_status.map(|status| Tier2HealthSnapshot {
                 status,
                 completion_generation: self.tier2_completion_generation.unwrap_or_default(),
+                stale_since_ms: self.tier2_stale_since_ms,
+                next_refresh_at_ms: self.tier2_next_refresh_at_ms,
+                pending_paths: self.tier2_pending_paths,
             }),
             bash: self.bash,
             suspended_domains: self.suspended_domains,
@@ -1306,6 +1322,21 @@ fn semantic_health_unix_millis() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u128::from(u64::MAX)) as u64
+}
+
+fn instant_to_unix_millis(deadline: Instant, now: Instant, now_ms: u64) -> u64 {
+    let delta_ms = if deadline >= now {
+        deadline.duration_since(now).as_millis()
+    } else {
+        now.duration_since(deadline).as_millis()
+    }
+    .min(u128::from(u64::MAX)) as u64;
+
+    if deadline >= now {
+        now_ms.saturating_add(delta_ms)
+    } else {
+        now_ms.saturating_sub(delta_ms)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -3095,12 +3126,30 @@ impl AppContext {
         } else if tier2_complete {
             "ready"
         } else if !config.inspect.enabled || !tier2_has_aggregates || tier2_refresh_gated {
-            // A partial snapshot can be "building" only when this root is
-            // allowed to run the refresh that would complete it.
             "disabled"
         } else {
-            "building"
+            "stale"
         };
+        let (tier2_stale_since_ms, tier2_next_refresh_at_ms, tier2_pending_paths) =
+            if tier2_status == "stale" {
+                let now = Instant::now();
+                let now_ms = semantic_health_unix_millis();
+                let next_dispatch = match self.tier2_refresh_scheduler.try_lock() {
+                    Some(scheduler) => scheduler.next_dispatch_at(now).unwrap_or(now),
+                    None => return RootHealthSummary::busy(),
+                };
+                let pending_paths = match self.pending_tier2_paths.try_lock() {
+                    Some(paths) => paths.len(),
+                    None => return RootHealthSummary::busy(),
+                };
+                (
+                    Some(tier2.stale_since_ms.unwrap_or(now_ms)),
+                    Some(instant_to_unix_millis(next_dispatch, now, now_ms)),
+                    Some(pending_paths),
+                )
+            } else {
+                (None, None, None)
+            };
 
         RootHealthSummary {
             state: RootHealthState::Ready,
@@ -3114,6 +3163,9 @@ impl AppContext {
             },
             tier2_status: Some(tier2_status),
             tier2_completion_generation: Some(successful_tier2_completions),
+            tier2_stale_since_ms,
+            tier2_next_refresh_at_ms,
+            tier2_pending_paths,
             bash: Some(bash),
             suspended_domains,
         }
@@ -3170,6 +3222,7 @@ impl AppContext {
             let changed = !tier2.stale;
             tier2.stale = true;
             if changed {
+                tier2.stale_since_ms = Some(semantic_health_unix_millis());
                 tier2.stale_after_reuse_completion = self.inspect_manager.reuse_completion_count();
                 tier2.stale_after_successful_completion =
                     self.inspect_manager.successful_reuse_completion_count();
@@ -3217,9 +3270,12 @@ impl AppContext {
             tier2.todos = Some(todos);
         }
         if stale && !tier2.stale {
+            tier2.stale_since_ms = Some(semantic_health_unix_millis());
             tier2.stale_after_reuse_completion = self.inspect_manager.reuse_completion_count();
             tier2.stale_after_successful_completion =
                 self.inspect_manager.successful_reuse_completion_count();
+        } else if !stale {
+            tier2.stale_since_ms = None;
         }
         tier2.stale = stale;
         let current = (
@@ -8451,7 +8507,7 @@ mod subc_lifecycle_admission_tests {
                 .tier2
                 .expect("tier2 health")
                 .status,
-            "building"
+            "stale"
         );
 
         ctx.set_cache_role(true, None);
@@ -10669,6 +10725,42 @@ mod health_warming_honesty_tests {
     }
 
     #[test]
+    fn stale_tier2_reports_scheduler_deadline_while_builder_is_idle() {
+        let ctx = ctx_with_config(Config::default());
+        ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), None, false);
+
+        let now = Instant::now();
+        ctx.note_tier2_refresh_started_at(now);
+        assert_eq!(ctx.tick_tier2_refresh_scheduler_at(now, 1), None);
+        ctx.add_pending_tier2_paths([PathBuf::from("src/lib.rs")]);
+        let sampled_at_ms = semantic_health_unix_millis();
+        assert!(ctx.mark_status_bar_tier2_stale());
+
+        let tier2 = serde_json::to_value(
+            ctx.try_health_snapshot(Path::new("/tmp/health-warming-honesty-test"))
+                .tier2
+                .expect("tier2 component present"),
+        )
+        .expect("tier2 health serializes");
+
+        assert_eq!(tier2["status"], "stale");
+        assert_eq!(tier2["pending_paths"], 1);
+        assert!(
+            tier2["stale_since_ms"]
+                .as_u64()
+                .is_some_and(|stale_since| stale_since >= sampled_at_ms),
+            "stale health must expose the first stale mark: {tier2:#}"
+        );
+        assert!(
+            tier2["next_refresh_at_ms"]
+                .as_u64()
+                .is_some_and(|deadline| deadline > sampled_at_ms),
+            "the scheduler's minimum interval must leave a future refresh deadline: {tier2:#}"
+        );
+        assert!(!ctx.inspect_manager().tier2_any_in_flight());
+    }
+
+    #[test]
     fn failed_tier2_pass_does_not_turn_stale_plane_ready() {
         let ctx = ctx_with_config(Config::default());
         ctx.update_status_bar_tier2(Some(1), Some(2), Some(3), None, false);
@@ -10689,18 +10781,16 @@ mod health_warming_honesty_tests {
                 message: "scan failed".to_string(),
             },
         );
-        assert_eq!(health_tier2_status(&ctx), "building");
+        assert_eq!(health_tier2_status(&ctx), "stale");
     }
 
     #[test]
-    fn tier2_missing_dead_code_without_callgraph_block_reports_building() {
-        // Control: with no callgraph block recorded, a missing dead_code count is
-        // a genuine in-progress scan and must still report building.
+    fn tier2_missing_dead_code_without_callgraph_block_reports_stale_when_idle() {
         let ctx = ctx_with_config(Config::default());
-        ctx.update_status_bar_tier2(None, Some(3), Some(2), None, false);
+        ctx.update_status_bar_tier2(None, Some(3), Some(2), None, true);
         ctx.set_status_bar_tier2_dead_code_blocked_on_callgraph(false);
 
-        assert_eq!(health_tier2_status(&ctx), "building");
+        assert_eq!(health_tier2_status(&ctx), "stale");
     }
 }
 
