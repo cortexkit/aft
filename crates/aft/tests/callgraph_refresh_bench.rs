@@ -88,6 +88,7 @@ fn bench_refresh_files_on_store_copy() {
     let wal_frames = wal_frame_count(wal_bytes, page_size);
     let wal_pages_by_object = wal_page_breakdown(store.sqlite_path(), &wal_path, page_size);
     let object_kinds = sqlite_object_kinds(store.sqlite_path());
+    let index_keys = sqlite_index_keys(store.sqlite_path());
 
     let checkpoint_usage_before = process_write_usage();
     let passive_checkpoint = wal_checkpoint(store.sqlite_path(), "PASSIVE");
@@ -128,6 +129,9 @@ fn bench_refresh_files_on_store_copy() {
             "wal_pages kind={kind} object={object} pages={pages} bytes={bytes} mb={:.3}",
             mib(bytes)
         );
+        if let Some((table, columns)) = index_keys.get(&object) {
+            eprintln!("wal_index_key object={object} table={table} columns={columns:?}");
+        }
     }
     if count_rows {
         report_row_audit(store.sqlite_path(), store.project_root(), &changed_files);
@@ -415,6 +419,70 @@ fn sqlite_object_kinds(db: &Path) -> BTreeMap<String, String> {
         .unwrap_or_default();
     kinds.insert("sqlite_schema".to_string(), "table".to_string());
     kinds
+}
+
+// Autoindexes have no CREATE INDEX SQL, so query their keys through the pragma
+// as well. Column names describe the SQL key, not inputs to hashed row IDs.
+fn sqlite_index_keys(db: &Path) -> BTreeMap<String, (String, Vec<String>)> {
+    let conn = Connection::open(db).expect("open store for index keys");
+    let mut statement = conn
+        .prepare("SELECT name, tbl_name FROM sqlite_master WHERE type = 'index' ORDER BY name")
+        .expect("prepare index owners");
+    let indexes = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("query index owners")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("read index owners");
+    indexes
+        .into_iter()
+        .map(|(index, table)| {
+            let columns = conn
+                .prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+                .expect("prepare index key columns")
+                .query_map([&index], |row| row.get::<_, Option<String>>(0))
+                .expect("query index key columns")
+                .map(|column| {
+                    column
+                        .expect("read index key column")
+                        .unwrap_or_else(|| "<expression>".to_string())
+                })
+                .collect();
+            (index, (table, columns))
+        })
+        .collect()
+}
+
+#[test]
+fn index_keys_include_autoindexes_composites_and_expressions() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("keys.sqlite");
+    Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE refs (ref_id TEXT PRIMARY KEY, line INTEGER, byte_start INTEGER);
+         CREATE INDEX positions ON refs(line, byte_start);
+         CREATE INDEX computed ON refs(lower(ref_id));",
+        )
+        .unwrap();
+    assert_eq!(
+        sqlite_index_keys(&db),
+        BTreeMap::from([
+            (
+                "sqlite_autoindex_refs_1".into(),
+                ("refs".into(), vec!["ref_id".into()])
+            ),
+            (
+                "positions".into(),
+                ("refs".into(), vec!["line".into(), "byte_start".into()])
+            ),
+            (
+                "computed".into(),
+                ("refs".into(), vec!["<expression>".into()])
+            ),
+        ])
+    );
 }
 
 fn wal_page_breakdown(db: &Path, wal: &Path, page_size: u64) -> BTreeMap<String, u64> {
