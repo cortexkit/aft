@@ -350,7 +350,7 @@ fn ignore_file_parent_is_ignored(matcher: &SharedGitignore, path: &Path) -> bool
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-const WATCHER_ECOSYSTEM_EXCLUSIONS: [&str; 10] = [
+const WATCHER_ECOSYSTEM_EXCLUSIONS: [&str; 17] = [
     ".git",
     "target",
     "node_modules",
@@ -361,6 +361,13 @@ const WATCHER_ECOSYSTEM_EXCLUSIONS: [&str; 10] = [
     "dist",
     ".next",
     ".turbo",
+    ".cache",
+    "coverage",
+    "out",
+    ".gradle",
+    ".dart_tool",
+    "Pods",
+    "DerivedData",
 ];
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -495,6 +502,31 @@ fn root_has_python_manifest(root: &Path) -> bool {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn root_has_gradle_manifest(root: &Path) -> bool {
+    fs::read_dir(root).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let is_file = entry.file_type().is_ok_and(|file_type| file_type.is_file());
+            is_file
+                && (matches!(name.as_ref(), "build.gradle" | "build.gradle.kts")
+                    || name.starts_with("settings.gradle"))
+        })
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn root_has_xcode_project(root: &Path) -> bool {
+    fs::read_dir(root).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.ends_with(".xcodeproj") || name.ends_with(".xcworkspace")
+        })
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn ecosystem_exclusion_priority(root: &Path, name: &str) -> Option<usize> {
     let priority = WATCHER_ECOSYSTEM_EXCLUSIONS
         .iter()
@@ -504,7 +536,11 @@ fn ecosystem_exclusion_priority(root: &Path, name: &str) -> Option<usize> {
         "target" => root.join("Cargo.toml").is_file(),
         "node_modules" => root.join("package.json").is_file(),
         ".venv" | "venv" | "__pycache__" => root_has_python_manifest(root),
-        "build" | "dist" | ".next" | ".turbo" => true,
+        "build" | ".gradle" => root_has_gradle_manifest(root),
+        ".dart_tool" => root.join("pubspec.yaml").is_file(),
+        "Pods" => root.join("Podfile").is_file(),
+        "DerivedData" => root_has_xcode_project(root),
+        "dist" | ".next" | ".turbo" | ".cache" | "coverage" | "out" => true,
         _ => false,
     };
     enabled.then_some(priority)
@@ -1637,10 +1673,91 @@ mod tests {
     }
 
     #[test]
+    fn ecosystem_manifest_gates_seed_only_when_the_root_marker_exists() {
+        let cases: [(&str, &[&str]); 8] = [
+            ("build.gradle", &["build", ".gradle"]),
+            ("build.gradle.kts", &["build", ".gradle"]),
+            ("settings.gradle", &["build", ".gradle"]),
+            ("settings.gradle.kts", &["build", ".gradle"]),
+            ("pubspec.yaml", &[".dart_tool"]),
+            ("Podfile", &["Pods"]),
+            ("App.xcodeproj", &["DerivedData"]),
+            ("App.xcworkspace", &["DerivedData"]),
+        ];
+
+        for (marker, directories) in cases {
+            let root = TempDir::new().unwrap();
+            std::fs::write(
+                root.path().join(".gitignore"),
+                directories
+                    .iter()
+                    .map(|directory| format!("{directory}/\n"))
+                    .collect::<String>(),
+            )
+            .unwrap();
+            let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+            let matcher = shared_matcher(&canonical_root);
+
+            let without_marker = derive_excluded_subtrees(&canonical_root, &matcher, None);
+            assert!(
+                directories.iter().all(|directory| without_marker
+                    .iter()
+                    .all(|exclusion| exclusion.path() != canonical_root.join(directory))),
+                "{marker} gate seeded without its root marker"
+            );
+
+            let marker_path = root.path().join(marker);
+            if marker.ends_with(".xcodeproj") || marker.ends_with(".xcworkspace") {
+                std::fs::create_dir(marker_path).unwrap();
+            } else {
+                std::fs::write(marker_path, "fixture\n").unwrap();
+            }
+            let with_marker = derive_excluded_subtrees(&canonical_root, &matcher, None);
+            for directory in directories {
+                let exclusion = with_marker
+                    .iter()
+                    .find(|exclusion| exclusion.path() == canonical_root.join(directory))
+                    .unwrap_or_else(|| panic!("{marker} did not seed {directory}"));
+                assert_eq!(exclusion.source(), WatcherExclusionSource::Ecosystem);
+            }
+        }
+    }
+
+    #[test]
+    fn ungated_ecosystem_exclusions_are_seeded_when_ignored() {
+        let root = TempDir::new().unwrap();
+        let directories = ["dist", ".next", ".turbo", ".cache", "coverage", "out"];
+        std::fs::write(
+            root.path().join(".gitignore"),
+            directories
+                .iter()
+                .map(|directory| format!("{directory}/\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let matcher = shared_matcher(&canonical_root);
+
+        let exclusions = derive_excluded_subtrees(&canonical_root, &matcher, None);
+
+        assert_eq!(
+            watcher_exclusion_paths(&exclusions),
+            directories
+                .iter()
+                .map(|directory| canonical_root.join(directory))
+                .collect::<Vec<_>>()
+        );
+        assert!(exclusions
+            .iter()
+            .all(|exclusion| exclusion.source() == WatcherExclusionSource::Ecosystem));
+    }
+
+    #[test]
     fn exclusion_derivation_uses_fixed_priority_caps_and_skips_missing_nonseeds() {
         let root = TempDir::new().unwrap();
         std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
         std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(root.path().join("build.gradle"), "plugins {}\n").unwrap();
         std::fs::write(
             root.path().join("pyproject.toml"),
             "[project]\nname='fixture'\n",
