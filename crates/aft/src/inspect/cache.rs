@@ -1626,6 +1626,7 @@ fn gc_old_inspect_generations(inspect_dir: &Path, project_key: &str, current: &s
             continue;
         }
         let path = entry.path();
+        crate::db::file_identity::guard_replacement(&path, "inspect scope cache generation sweep");
         let _ = std::fs::remove_file(&path);
         for suffix in INSPECT_SQLITE_SIDECAR_SUFFIXES {
             let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", path.display())));

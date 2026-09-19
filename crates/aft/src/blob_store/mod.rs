@@ -789,6 +789,7 @@ fn move_corrupt_database_aside(path: &Path) -> Result<PathBuf, BlobStoreError> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| BlobStoreError::InvalidArtifactKey(path.display().to_string()))?;
     let destination = path.with_file_name(format!("{file_name}.corrupt-{timestamp}"));
+    crate::db::file_identity::guard_replacement(path, "blob store corrupt-database quarantine");
     fs::rename(path, &destination)?;
     for suffix in ["-wal", "-shm"] {
         let sidecar = PathBuf::from(format!("{}{suffix}", path.display()));

@@ -3726,6 +3726,16 @@ impl CallGraphStore {
             crate::fs_lock::rename_over(&temp_path, &gen_path)?;
             crate::fs_lock::sync_parent(&gen_path);
             remove_sqlite_sidecars(&gen_path);
+            // The rename moves the staging database file alone. Its WAL and
+            // WAL-index describe the file that just left, and the staging path
+            // is reused by name for every later build of this cache key, so
+            // leaving them behind would hand the next build a WAL-index
+            // belonging to a different database file. SQLite truncates such a
+            // WAL-index the moment it attaches, and any connection in this
+            // process that still has it mapped then reads past the end of the
+            // mapping and dies with SIGBUS. Remove them with the file they
+            // describe.
+            remove_sqlite_sidecars(&temp_path);
 
             notify_cold_build_swap_observer(&temp_path, &gen_path);
 
@@ -7296,6 +7306,11 @@ fn copy_sqlite_file_set(source: &Path, destination: &Path) -> Result<()> {
 }
 
 fn rename_sqlite_file_set(source: &Path, destination: &Path) -> Result<()> {
+    crate::db::file_identity::guard_replacement(source, "callgraph sqlite file-set rename source");
+    crate::db::file_identity::guard_replacement(
+        destination,
+        "callgraph sqlite file-set rename destination",
+    );
     for suffix in SQLITE_FILE_SET_SUFFIXES {
         let source_path = sqlite_file_set_path(source, suffix);
         if !source_path.exists() {
@@ -8584,11 +8599,17 @@ fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) {
 }
 
 fn remove_sqlite_file_set(path: &Path) {
+    crate::db::file_identity::guard_replacement(path, "callgraph sqlite file-set removal");
     let _ = std::fs::remove_file(path);
-    remove_sqlite_sidecars(path);
+    remove_sidecar_files(path);
 }
 
 fn remove_sqlite_sidecars(path: &Path) {
+    crate::db::file_identity::guard_replacement(path, "callgraph sqlite sidecar removal");
+    remove_sidecar_files(path);
+}
+
+fn remove_sidecar_files(path: &Path) {
     let path_text = path.to_string_lossy();
     let _ = std::fs::remove_file(PathBuf::from(format!("{path_text}-wal")));
     let _ = std::fs::remove_file(PathBuf::from(format!("{path_text}-shm")));
@@ -17295,6 +17316,83 @@ export function leaf() {}
             0,
             "completed staging must not repeat extraction"
         );
+        drop(store);
+    }
+
+    /// The staging database is the one callgraph database whose path is reused
+    /// by name: a build resumes from `<key>.staging.sqlite.tmp.resume` so a
+    /// replacement process can adopt batches an earlier one already committed.
+    /// Publication renames that database file to its generation path and leaves
+    /// the name free for the next build, so the WAL-index has to go with it.
+    ///
+    /// A WAL-index left at a name whose database file has moved describes a
+    /// file that is no longer there. SQLite truncates such a WAL-index as soon
+    /// as the next build creates a database at that name, and any connection in
+    /// this process that still has the old one mapped then reads past the end
+    /// of its mapping and takes a SIGBUS.
+    ///
+    /// A second connection on the staging database is what leaves one behind:
+    /// publication switches the staging database off WAL first, and SQLite only
+    /// deletes the WAL-index once the last connection lets go. Two roots that
+    /// share one cache key stage at the same name, so a second holder is a real
+    /// state rather than a contrived one.
+    ///
+    /// Unix only: the assertion is about removing a file another connection
+    /// still holds open, which Windows refuses, and the SIGBUS being defended
+    /// against is a POSIX shared-memory fault in the first place.
+    #[cfg(unix)]
+    #[test]
+    fn cold_build_publication_removes_the_wal_index_from_the_reused_staging_path() {
+        let root = tempfile::tempdir().unwrap();
+        let callgraph_dir = tempfile::tempdir().unwrap();
+        let source = root.path().join("lib.rs");
+        std::fs::write(&source, "pub fn staging_marker() {}\n").unwrap();
+        let files = vec![source];
+        let project_key = crate::search_index::artifact_cache_key(root.path());
+        let staging = callgraph_dir
+            .path()
+            .join(format!("{project_key}.staging.sqlite.tmp.resume"));
+        let staging_shm = PathBuf::from(format!("{}-shm", staging.display()));
+
+        let held = Arc::new(std::sync::Mutex::new(None::<Connection>));
+        let mapped_before_publish = Arc::new(AtomicBool::new(false));
+        let held_for_observer = Arc::clone(&held);
+        let mapped_for_observer = Arc::clone(&mapped_before_publish);
+        let staging_for_observer = staging.clone();
+        let staging_shm_for_observer = staging_shm.clone();
+        set_cold_build_before_publish_observer(Some(Arc::new(move || {
+            let connection = Connection::open(&staging_for_observer).unwrap();
+            connection
+                .pragma_update(None, "journal_mode", "WAL")
+                .unwrap();
+            // Read through the WAL so SQLite really maps the WAL-index rather
+            // than only recording the journal mode.
+            connection
+                .query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap();
+            mapped_for_observer.store(staging_shm_for_observer.exists(), AtomicOrdering::SeqCst);
+            *held_for_observer.lock().unwrap() = Some(connection);
+        })));
+        let published = CallGraphStore::cold_build_with_lease(
+            callgraph_dir.path().to_path_buf(),
+            root.path().to_path_buf(),
+            &files,
+        );
+        set_cold_build_before_publish_observer(None);
+        let (store, _) = published.expect("cold build publishes");
+
+        assert!(
+            mapped_before_publish.load(AtomicOrdering::SeqCst),
+            "fixture never put a WAL-index at the staging name, so publication had nothing to clean up"
+        );
+        assert!(
+            !staging_shm.exists(),
+            "publication left a WAL-index at {} after moving its database file away",
+            staging.display()
+        );
+        drop(held.lock().unwrap().take());
         drop(store);
     }
 

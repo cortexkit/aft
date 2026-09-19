@@ -195,6 +195,7 @@ impl ViewStore {
         .into_iter()
         .flatten()
         {
+            crate::db::file_identity::guard_replacement(&path, "view generation sweep");
             for suffix in ["", "-wal", "-shm"] {
                 let mut name = path.as_os_str().to_owned();
                 name.push(suffix);
