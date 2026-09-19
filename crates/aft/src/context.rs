@@ -1115,7 +1115,10 @@ impl WatcherDrainSliceState {
         let before = self.pending_paths.len();
         self.pending_paths.retain(keep);
         dropped += before - self.pending_paths.len();
-        if let WatcherDrainPhase::Apply { paths, remaining, .. } = &mut self.phase {
+        if let WatcherDrainPhase::Apply {
+            paths, remaining, ..
+        } = &mut self.phase
+        {
             // The deque rotates processed paths behind the unprocessed prefix.
             // Preserve that boundary when retiring a continuation between slices.
             let mut position = 0;
@@ -3405,9 +3408,11 @@ impl AppContext {
         let callgraph_queued = self.canonical_cache_root_opt().map_or(0, |root| {
             crate::callgraph_store::retire_ignored_refresh_paths(&root, &self.gitignore)
         });
-        let watcher = self.watcher_drain_slice.lock().as_mut().map_or(0, |state| {
-            state.retire_ignored_paths(&keep)
-        });
+        let watcher = self
+            .watcher_drain_slice
+            .lock()
+            .as_mut()
+            .map_or(0, |state| state.retire_ignored_paths(&keep));
         crate::slog_info!(
             "ignore queue retirement: generation={} watcher={} callgraph_pending={} callgraph_queued={} tier2={} semantic_pending={} search_pending={}",
             generation, watcher, callgraph, callgraph_queued, tier2, semantic, search
@@ -5854,7 +5859,8 @@ impl AppContext {
                 crate::callgraph_store::CallgraphRefreshState::new(
                     Arc::clone(&self.callgraph_store),
                     Arc::clone(&self.heavy_root_work_allowed),
-                ).with_matcher(Arc::clone(&self.gitignore)),
+                )
+                .with_matcher(Arc::clone(&self.gitignore)),
                 ticket,
             )
         })
@@ -5888,7 +5894,8 @@ impl AppContext {
                 }
                 in_root
                     && !crate::watcher_filter::queued_path_is_ignored_by_matcher(
-                        &self.gitignore, path,
+                        &self.gitignore,
+                        path,
                     )
             })
             .collect()
@@ -9930,15 +9937,24 @@ mod callgraph_store_for_ops_tests {
         let sibling = root.join("kept.rs");
         std::fs::write(&scratch, "fn scratch() {}\n").unwrap();
         std::fs::write(&sibling, "fn kept() {}\n").unwrap();
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config {
-            project_root: Some(root.clone()), ..Config::default()
-        });
+        let ctx = AppContext::new(
+            Box::new(TreeSitterProvider::new()),
+            Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            },
+        );
         let paths = BTreeSet::from([scratch.clone(), sibling.clone()]);
         ctx.add_pending_search_index_paths(paths.clone());
         ctx.add_pending_semantic_index_paths(paths.clone());
         ctx.add_pending_tier2_paths(paths.clone());
-        ctx.pending_callgraph_store_paths.lock().extend(paths.clone());
-        let mut state = WatcherDrainSliceState::new(ctx.configure_generation(), ctx.configure_content_generation());
+        ctx.pending_callgraph_store_paths
+            .lock()
+            .extend(paths.clone());
+        let mut state = WatcherDrainSliceState::new(
+            ctx.configure_generation(),
+            ctx.configure_content_generation(),
+        );
         state.pending_paths.extend(paths.clone());
         state.semantic_refresh_paths.extend(paths.clone());
         state.view_publication_paths.extend(paths.clone());
@@ -9952,14 +9968,28 @@ mod callgraph_store_for_ops_tests {
         std::fs::write(root.join(".gitignore"), "scratch/\n").unwrap();
         ctx.rebuild_gitignore();
         assert_eq!(ctx.take_pending_search_index_paths(), vec![sibling.clone()]);
-        assert_eq!(ctx.take_pending_semantic_index_paths(), vec![sibling.clone()]);
+        assert_eq!(
+            ctx.take_pending_semantic_index_paths(),
+            vec![sibling.clone()]
+        );
         assert_eq!(ctx.pending_tier2_paths(), vec![sibling.clone()]);
-        assert_eq!(ctx.take_pending_callgraph_store_paths(), vec![sibling.clone()]);
+        assert_eq!(
+            ctx.take_pending_callgraph_store_paths(),
+            vec![sibling.clone()]
+        );
         let state = ctx.watcher_drain_slice.lock().take().unwrap();
         assert_eq!(state.pending_paths, VecDeque::from([sibling.clone()]));
         assert_eq!(state.semantic_refresh_paths, vec![sibling.clone()]);
-        assert_eq!(state.view_publication_paths, BTreeSet::from([sibling.clone()]));
-        let WatcherDrainPhase::Apply { paths, remaining, .. } = state.phase else { panic!("apply continuation lost"); };
+        assert_eq!(
+            state.view_publication_paths,
+            BTreeSet::from([sibling.clone()])
+        );
+        let WatcherDrainPhase::Apply {
+            paths, remaining, ..
+        } = state.phase
+        else {
+            panic!("apply continuation lost");
+        };
         assert_eq!(paths, VecDeque::from([sibling]));
         assert_eq!(remaining, 0);
     }

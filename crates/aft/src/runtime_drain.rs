@@ -2906,7 +2906,8 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                     if !state.rescan_required {
                         state.pending_paths.extend(paths.into_iter().filter(|path| {
                             !crate::watcher_filter::queued_path_is_ignored_by_matcher(
-                                &ctx.shared_gitignore(), path,
+                                &ctx.shared_gitignore(),
+                                path,
                             )
                         }));
                     }
@@ -2942,7 +2943,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                                 retired_paths,
                                 scopes,
                             } => {
-                                log::debug!(
+                                crate::slog_info!(
                                     "watcher: ignore rules added exclusions in {:?}; retiring {} path(s)",
                                     scopes,
                                     retired_paths.len()
@@ -2953,7 +2954,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                                 affected_paths,
                                 scopes,
                             } => {
-                                log::debug!(
+                                crate::slog_info!(
                                     "watcher: ignore rules changed in {:?}; refreshing {} affected path(s)",
                                     scopes,
                                     affected_paths.len()
@@ -2962,7 +2963,7 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                                 state.pending_paths.extend(affected_paths);
                             }
                             crate::context::IgnoreRuleChange::Full { scopes } => {
-                                log::debug!(
+                                crate::slog_info!(
                                     "watcher: ignore rules changed in {:?}; rebuilt matcher",
                                     scopes
                                 );
@@ -3630,7 +3631,9 @@ mod tests {
         let (ctx, tx) = watcher_context(&root);
         ctx.rebuild_gitignore();
         let rebuilds = ctx.gitignore_matcher_rebuild_count_for_test();
-        assert!(!watcher_path_is_ignored_by_current_matcher(&ctx, &generated));
+        assert!(!watcher_path_is_ignored_by_current_matcher(
+            &ctx, &generated
+        ));
 
         let ignore_path = nested.join(".gitignore");
         std::fs::write(&ignore_path, b"generated/\n").unwrap();

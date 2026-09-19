@@ -342,7 +342,9 @@ pub(crate) fn queued_path_is_ignored_by_matcher(matcher: &SharedGitignore, path:
     if path.components().any(|part| part.as_os_str() == ".git") {
         return false;
     }
-    let guard = matcher.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard = matcher
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     watcher_path_is_ignored(guard.as_deref(), path)
 }
 
@@ -380,9 +382,7 @@ fn ignore_file_is_ignored_by_matcher(matcher: &SharedGitignore, path: &Path) -> 
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.as_deref().is_some_and(|matcher| {
         path.starts_with(matcher.path())
-            && (matcher
-                .matched_path_or_any_parents(path, false)
-                .is_ignore()
+            && (matcher.matched_path_or_any_parents(path, false).is_ignore()
                 || (parent != matcher.path()
                     && matcher
                         .matched_path_or_any_parents(parent, true)
@@ -2881,11 +2881,8 @@ mod tests {
 
         for _ in 0..REWRITES {
             std::fs::write(&ignore_path, b"*").unwrap();
-            let filtered = filter_watcher_raw_paths_for_test(
-                &config,
-                &matcher,
-                [ignore_path.clone()],
-            );
+            let filtered =
+                filter_watcher_raw_paths_for_test(&config, &matcher, [ignore_path.clone()]);
             assert!(!filtered.ignore_file_changed);
             assert!(filtered.ignore_file_paths.is_empty());
             assert!(filtered.changed.is_empty());
