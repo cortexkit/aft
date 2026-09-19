@@ -8,8 +8,8 @@
     "paging"
   ],
   "slices": [
-    "views-per-binding-resolution",
-    "oc2-playbook-ga-facts"
+    "limiter-one-slot-per-root",
+    "callgraph-refresh-real-change-writes"
   ],
-  "note": "No ranking-fence file changes: views materialization per-binding resolution + refresh bench, playbook facts."
+  "note": "No ranking-fence file changes: cold-build limiter root sharing and callgraph refresh row deltas."
 }
