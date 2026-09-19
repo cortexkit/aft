@@ -149,6 +149,7 @@ const DEBOUNCE_STEP_MS = 200;
 const DEBOUNCE_CAP_MS = 1000;
 const MAX_WAKE_SEND_ATTEMPTS = 5;
 const DEFAULT_WAKE_CONFIRMATION_WINDOW_MS = 5_000;
+const BUSY_WAKE_DEFER_CEILING_MS = 60_000;
 const UNKNOWN_COMPLETION_TTL_MS = 5000;
 const UNKNOWN_COMPLETION_CAP = 32;
 const DEFAULT_SESSION_ID = "__default__";
@@ -196,11 +197,17 @@ function logDroppedForeignSessionFrame(
 const DEFAULT_BG_HOP_TIMEOUT_MS = 15_000;
 let bgHopTimeoutMs = DEFAULT_BG_HOP_TIMEOUT_MS;
 let wakeConfirmationWindowMs = DEFAULT_WAKE_CONFIRMATION_WINDOW_MS;
+let busyWakeDeferCeilingMs = BUSY_WAKE_DEFER_CEILING_MS;
 let lastWakeMessageTimestamp = 0;
 let wakeMessageCounter = 0;
 const subcNudgesInFlight = new Map<string, Promise<void>>();
 const subcNudgeLogState = new Map<string, { lastEmittedAt: number; suppressed: number }>();
-const deferredBusyWakeContexts = new Map<string, DrainContext & { client: unknown }>();
+interface DeferredBusyWake {
+  context: DrainContext & { client: unknown };
+  deferredAt: number;
+  timer: ReturnType<typeof setTimeout>;
+}
+const deferredBusyWakes = new Map<string, DeferredBusyWake>();
 
 interface DrainContext {
   ctx: PluginContext;
@@ -276,6 +283,13 @@ export function consumeBgCompletion(sessionID: string | undefined, taskId: strin
   // fire with empty pending (defensive skip catches that), but firing
   // the timer at all consumes the scheduler slot.
   clearWakeTimerIfNoPending(state);
+  if (
+    state.pendingCompletions.length === 0 &&
+    state.pendingLongRunning.length === 0 &&
+    state.pendingPatternMatches.length === 0
+  ) {
+    clearDeferredBusyWake(sessionID || DEFAULT_SESSION_ID);
+  }
 }
 
 export async function markBgCompletionDelivered(
@@ -575,6 +589,7 @@ export async function appendInTurnBgCompletions(
   // with no bullets) since the timer reads `state.pendingLongRunning`
   // again at fire time.
   clearWakeTimerIfNoPending(state);
+  clearDeferredBusyWake(drainContext.sessionID);
 }
 
 export async function handleIdleBgCompletions(
@@ -938,6 +953,41 @@ function registerWakeAdmission(
   tracked.confirmationTimer.unref?.();
 }
 
+function clearDeferredBusyWake(sessionID: string): DeferredBusyWake | undefined {
+  const deferred = deferredBusyWakes.get(sessionID);
+  if (!deferred) return undefined;
+  deferredBusyWakes.delete(sessionID);
+  clearTimeout(deferred.timer);
+  return deferred;
+}
+
+function deferBusyWake(drainContext: DrainContext & { client: unknown }): void {
+  const existing = deferredBusyWakes.get(drainContext.sessionID);
+  if (existing) {
+    existing.context = drainContext;
+    return;
+  }
+
+  const deferredAt = Date.now();
+  const deferred: DeferredBusyWake = {
+    context: drainContext,
+    deferredAt,
+    timer: setTimeout(() => {
+      if (deferredBusyWakes.get(drainContext.sessionID) !== deferred) return;
+      deferredBusyWakes.delete(drainContext.sessionID);
+      const waitMs = Math.max(0, Date.now() - deferredAt);
+      sessionLog(drainContext.sessionID, `${LOG_PREFIX} busy wake defer ceiling reached`, {
+        event: "bash_completion_wake_deferred_ceiling",
+        wait_ms: waitMs,
+        ceiling_ms: busyWakeDeferCeilingMs,
+      });
+      void triggerWakeIfPending(deferred.context, true).catch(() => undefined);
+    }, busyWakeDeferCeilingMs),
+  };
+  deferred.timer.unref?.();
+  deferredBusyWakes.set(drainContext.sessionID, deferred);
+}
+
 /**
  * Observe the OpenCode event hook already owned by the plugin. Unknown and
  * malformed event shapes are ignored so host event delivery can never fail.
@@ -999,11 +1049,8 @@ export function observeOpenCodeBgNotificationEvent(event: unknown): void {
       return;
     }
     if (nextStatus === "idle") {
-      const deferredContext = deferredBusyWakeContexts.get(sessionID);
-      if (deferredContext) {
-        deferredBusyWakeContexts.delete(sessionID);
-        void triggerWakeIfPending(deferredContext, true).catch(() => undefined);
-      }
+      const deferred = clearDeferredBusyWake(sessionID);
+      if (deferred) void triggerWakeIfPending(deferred.context, true).catch(() => undefined);
       for (const admission of state.wakeAdmissions.values()) queueWakeRefire(state, admission);
     }
   } catch {
@@ -1043,7 +1090,7 @@ async function triggerWakeIfPending(
   // re-enters chat.message and can detach an unrelated wait:true bash call. The
   // next tool result appends the pending completion, or session.idle wakes it.
   if (deferWhileBusy && state.hostStatus === "busy") {
-    deferredBusyWakeContexts.set(drainContext.sessionID, drainContext);
+    deferBusyWake(drainContext);
     return;
   }
 
@@ -1340,6 +1387,10 @@ export function __setWakeConfirmationWindowForTests(timeoutMs: number): void {
   wakeConfirmationWindowMs = timeoutMs;
 }
 
+export function __setBusyWakeDeferCeilingForTests(timeoutMs: number): void {
+  busyWakeDeferCeilingMs = timeoutMs;
+}
+
 export function __resetBgNotificationStateForTests(): void {
   for (const state of sessionBgStates.values()) {
     if (state.debounceTimer) clearTimeout(state.debounceTimer);
@@ -1348,11 +1399,13 @@ export function __resetBgNotificationStateForTests(): void {
   sessionBgStates.clear();
   subcNudgesInFlight.clear();
   subcNudgeLogState.clear();
-  deferredBusyWakeContexts.clear();
+  for (const deferred of deferredBusyWakes.values()) clearTimeout(deferred.timer);
+  deferredBusyWakes.clear();
   foreignSessionDropLogState.clear();
   activeSessionId = undefined;
   bgHopTimeoutMs = DEFAULT_BG_HOP_TIMEOUT_MS;
   wakeConfirmationWindowMs = DEFAULT_WAKE_CONFIRMATION_WINDOW_MS;
+  busyWakeDeferCeilingMs = BUSY_WAKE_DEFER_CEILING_MS;
   lastWakeMessageTimestamp = 0;
   wakeMessageCounter = 0;
 }

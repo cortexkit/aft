@@ -41,6 +41,7 @@ afterAll(() => {
 import {
   __resetBgNotificationStateForTests,
   __setBgNotificationHopTimeoutForTests,
+  __setBusyWakeDeferCeilingForTests,
   __setWakeConfirmationWindowForTests,
   appendInTurnBgCompletions,
   consumeBgCompletion,
@@ -951,6 +952,45 @@ describe("OpenCode background notifications", () => {
     const text = (promptAsync.mock.calls[0][0] as { body: { parts: Array<{ text: string }> } }).body
       .parts[0].text;
     expect(text).toContain("- task task-1 (exit 0)");
+  });
+
+  test("busy session wakes once at the defer ceiling when no idle event arrives", async () => {
+    __setBusyWakeDeferCeilingForTests(25);
+    trackBgTask("s1", "task-1");
+    const { ctx } = harness(() => ({
+      success: true,
+      bg_completions: [completion("task-1", "npm test")],
+      acked_task_ids: ["task-1"],
+    }));
+    const promptAsync = mock(async () => {});
+    const client = makeClient(promptAsync);
+    const state = sessionBgStates.get("s1");
+    if (!state) throw new Error("tracked session state missing");
+    state.wakeDeferredTaskIds.clear();
+    observeOpenCodeBgNotificationEvent({
+      type: "session.status",
+      properties: { sessionID: "s1", status: { type: "busy" } },
+    });
+
+    await handleSubcBgEventsNudge({
+      ctx,
+      directory: "/tmp/project",
+      sessionID: "s1",
+      client,
+    });
+    await sleep(10);
+    expect(promptAsync).toHaveBeenCalledTimes(0);
+
+    await waitForMockCallCount(promptAsync, 1, 1_000);
+    await sleep(250);
+
+    expect(promptAsync).toHaveBeenCalledTimes(1);
+    expect(findTraceEvent("bash_completion_wake_deferred_ceiling")).toEqual(
+      expect.objectContaining({
+        wait_ms: expect.any(Number),
+        ceiling_ms: 25,
+      }),
+    );
   });
 
   test("same-turn push completion waits for sync bash_watch instead of waking", async () => {
