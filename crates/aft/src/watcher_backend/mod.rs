@@ -70,18 +70,31 @@ pub(crate) fn create_project_watcher(
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-fn render_exclusions(exclusions: &[crate::watcher_filter::WatcherExclusion]) -> String {
-    exclusions
+fn render_exclusions(
+    root: &std::path::Path,
+    exclusions: &[crate::watcher_filter::WatcherExclusion],
+) -> String {
+    let seeded = exclusions
         .iter()
         .map(|exclusion| {
-            format!(
-                "{} source={}",
-                exclusion.path().display(),
-                exclusion.source().as_str()
-            )
+            exclusion
+                .path()
+                .strip_prefix(root)
+                .unwrap_or(exclusion.path())
+                .display()
+                .to_string()
         })
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(",");
+    let sources = exclusions
+        .iter()
+        .map(|exclusion| exclusion.source().as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "watcher exclusions: seeded=[{seeded}] by=[{sources}] root={}",
+        root.display()
+    )
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -89,13 +102,7 @@ pub(crate) fn log_exclusions(
     root: &std::path::Path,
     exclusions: &[crate::watcher_filter::WatcherExclusion],
 ) {
-    let rendered = render_exclusions(exclusions);
-    crate::slog_info!(
-        "watcher exclusions for {} ({}): [{}]",
-        root.display(),
-        exclusions.len(),
-        rendered
-    );
+    crate::slog_info!("{}", render_exclusions(root, exclusions));
 }
 
 #[cfg(test)]
@@ -108,9 +115,9 @@ mod tests {
     use crate::watcher_filter::{derive_excluded_subtrees, WATCHER_EXCLUSION_LIMIT};
 
     #[test]
-    fn exclusion_log_keeps_shape_and_names_each_slot_source() {
+    fn exclusion_log_names_each_seed_and_decision_source() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
         std::fs::create_dir(root.path().join("target")).unwrap();
         std::fs::create_dir(root.path().join("generated")).unwrap();
         std::fs::write(root.path().join(".gitignore"), "target/\ngenerated/\n").unwrap();
@@ -120,21 +127,11 @@ mod tests {
         let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
         let exclusions = derive_excluded_subtrees(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
 
-        let rendered = format!(
-            "watcher exclusions for {} ({}): [{}]",
-            root.display(),
-            exclusions.len(),
-            render_exclusions(&exclusions)
-        );
-
         assert_eq!(
-            rendered,
+            render_exclusions(&root, &exclusions),
             format!(
-                "watcher exclusions for {} (3): [{} source=seed, {} source=seed, {} source=gitignore]",
-                root.display(),
-                root.join(".git").display(),
-                root.join("target").display(),
-                root.join("generated").display()
+                "watcher exclusions: seeded=[target,generated] by=[ecosystem,gitignore] root={}",
+                root.display()
             )
         );
     }

@@ -570,6 +570,69 @@ mod tests {
 
     #[test]
     #[ignore = "requires a live macOS FSEvents service"]
+    fn ecosystem_seed_drops_fresh_target_debug_burst_from_raw_stream() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
+        std::fs::create_dir(root.path().join("node_modules")).unwrap();
+        let packages = ["one", "two", "three", "four", "five", "six"];
+        for package in packages {
+            std::fs::create_dir_all(root.path().join(format!("packages/{package}/node_modules")))
+                .unwrap();
+        }
+        let nested_ignores = packages
+            .iter()
+            .map(|package| format!("/packages/{package}/node_modules/\n"))
+            .collect::<String>();
+        std::fs::write(
+            root.path().join(".gitignore"),
+            format!("/node_modules/\n{nested_ignores}/target/\n"),
+        )
+        .unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let target = canonical_root.join("target");
+        let mut builder = GitignoreBuilder::new(&canonical_root);
+        builder.add(root.path().join(".gitignore"));
+        let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
+        let exclusions =
+            derive_excluded_subtrees(&canonical_root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        let exclusion_paths = watcher_exclusion_paths(&exclusions);
+        assert_eq!(
+            exclusion_paths[..2],
+            [target.clone(), canonical_root.join("node_modules")]
+        );
+        assert!(!target.exists());
+
+        let (tx, rx) = mpsc::channel();
+        let stream = FsEventsStream::start(&canonical_root, &exclusion_paths, tx).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let _startup_events = rx.try_iter().collect::<Vec<_>>();
+        let debug = target.join("debug");
+        std::fs::create_dir_all(&debug).unwrap();
+        thread::sleep(Duration::from_millis(500));
+        let _boundary_events = rx.try_iter().collect::<Vec<_>>();
+
+        for index in 0..200 {
+            std::fs::write(debug.join(format!("artifact-{index}.o")), b"object\n").unwrap();
+        }
+        thread::sleep(Duration::from_millis(500));
+        let events = rx.try_iter().collect::<Vec<_>>();
+        drop(stream);
+
+        for event in &events {
+            if let Err(error) = event {
+                panic!("watcher error during excluded target burst: {error}");
+            }
+        }
+        assert_eq!(
+            events.len(),
+            0,
+            "the excluded target/debug burst must not reach the raw stream"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a live macOS FSEvents service"]
     fn fresh_root_node_modules_burst_has_no_overflow_or_rescan() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join(".gitignore"), "node_modules/\n").unwrap();

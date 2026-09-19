@@ -350,31 +350,23 @@ fn ignore_file_parent_is_ignored(matcher: &SharedGitignore, path: &Path) -> bool
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-const WATCHER_EXCLUSION_SEEDS: [&str; 17] = [
-    ".git",
+const WATCHER_ECOSYSTEM_EXCLUSIONS: [&str; 9] = [
     "target",
     "node_modules",
-    "dist",
-    "build",
-    ".next",
     ".venv",
     "venv",
     "__pycache__",
+    "build",
+    "dist",
+    ".next",
     ".turbo",
-    ".cache",
-    "coverage",
-    "out",
-    ".gradle",
-    ".dart_tool",
-    "Pods",
-    "DerivedData",
 ];
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WatcherExclusionSource {
-    Seed,
-    Ranked,
+    Ecosystem,
+    Observed,
     Gitignore,
 }
 
@@ -382,8 +374,8 @@ pub(crate) enum WatcherExclusionSource {
 impl WatcherExclusionSource {
     fn priority(self) -> u8 {
         match self {
-            Self::Seed => 0,
-            Self::Ranked => 1,
+            Self::Ecosystem => 0,
+            Self::Observed => 1,
             Self::Gitignore => 2,
         }
     }
@@ -391,8 +383,8 @@ impl WatcherExclusionSource {
     #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            Self::Seed => "seed",
-            Self::Ranked => "ranked",
+            Self::Ecosystem => "ecosystem",
+            Self::Observed => "observed",
             Self::Gitignore => "gitignore",
         }
     }
@@ -486,29 +478,53 @@ impl GitignoreOrder {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
-fn exclusion_seed_priority(relative: &Path, is_git: bool, is_ignored: bool) -> Option<usize> {
-    let mut components = relative.components();
-    let Component::Normal(name) = components.next()? else {
-        return None;
-    };
-    if components.next().is_some() {
-        return None;
+fn root_has_python_manifest(root: &Path) -> bool {
+    if root.join("pyproject.toml").is_file() || root.join("requirements.txt").is_file() {
+        return true;
     }
-    let priority = WATCHER_EXCLUSION_SEEDS
+    fs::read_dir(root).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            entry.file_type().is_ok_and(|file_type| file_type.is_file())
+                && name.starts_with("requirements-")
+                && name.ends_with(".txt")
+        })
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn ecosystem_exclusion_priority(root: &Path, name: &str) -> Option<usize> {
+    let priority = WATCHER_ECOSYSTEM_EXCLUSIONS
         .iter()
-        .position(|candidate| name == std::ffi::OsStr::new(candidate))?;
-    (is_git || is_ignored).then_some(priority)
+        .position(|candidate| *candidate == name)?;
+    let enabled = match name {
+        "target" => root.join("Cargo.toml").is_file(),
+        "node_modules" => root.join("package.json").is_file(),
+        ".venv" | "venv" | "__pycache__" => root_has_python_manifest(root),
+        "build" | "dist" | ".next" | ".turbo" => true,
+        _ => false,
+    };
+    enabled.then_some(priority)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn exclusion_path_is_directory_or_absent(path: &Path) -> bool {
+    match fs::metadata(path) {
+        Ok(metadata) => metadata.is_dir(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Choose ignored directory boundaries that an OS watcher can omit entirely.
 ///
-/// Existing ignored directories keep their current priority: root-level
-/// high-volume names, prefixes ranked by a previous overflow, then remaining
-/// boundaries in gitignore order. Ignored high-volume names that do not exist
-/// yet follow every existing candidate, so they can use spare backend slots
-/// without displacing a real directory. `.git` is eligible for the first seed
-/// slot only when it is a directory; linked worktrees use a `.git` file and
-/// must keep watching their root normally.
+/// Root-level directories implied by a repository's ecosystem are reserved
+/// first, even before they exist. Persisted overflow observations come next,
+/// followed by existing ignored boundaries in ignore-file order. An
+/// unobserved nested copy of a selected name is deferred so six workspace
+/// `node_modules` directories cannot crowd out a root `target` slot. This is a
+/// priority rule, not a coverage claim: FSEvents exclusions are exact paths, so
+/// excluding root `node_modules` does not exclude `packages/app/node_modules`.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) fn derive_excluded_subtrees(
     root: &Path,
@@ -518,11 +534,11 @@ pub(crate) fn derive_excluded_subtrees(
     #[derive(Debug)]
     struct Candidate {
         path: PathBuf,
+        relative: PathBuf,
         source: WatcherExclusionSource,
-        seed_priority: usize,
+        ecosystem_priority: usize,
         observed_count: u64,
         gitignore_order: GitignoreOrder,
-        is_existing: bool,
     }
 
     let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
@@ -536,7 +552,7 @@ pub(crate) fn derive_excluded_subtrees(
         .map(|prefix| (PathBuf::from(prefix.prefix), prefix.count))
         .collect::<BTreeMap<_, _>>();
     let root_git = root.join(".git");
-    let mut candidates = Vec::<Candidate>::new();
+    let mut candidates = BTreeMap::<PathBuf, Candidate>::new();
     let mut stack = vec![root.clone()];
 
     while let Some(directory) = stack.pop() {
@@ -548,73 +564,99 @@ pub(crate) fn derive_excluded_subtrees(
             if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
                 continue;
             }
-            let is_git = path == root_git;
+            if path == root_git {
+                continue;
+            }
             let matched_glob = matcher.as_deref().and_then(|matcher| {
                 match matcher.matched_path_or_any_parents(&path, true) {
                     ignore::Match::Ignore(glob) => Some(glob),
                     ignore::Match::None | ignore::Match::Whitelist(_) => None,
                 }
             });
-            let is_ignored = matched_glob.is_some();
-            if is_git || is_ignored {
-                let relative = path.strip_prefix(&root).unwrap_or(&path);
-                let observed_count = observed.get(relative).copied();
-                let seed_priority = exclusion_seed_priority(relative, is_git, is_ignored);
-                let source = if seed_priority.is_some() {
-                    WatcherExclusionSource::Seed
-                } else if observed_count.is_some() {
-                    WatcherExclusionSource::Ranked
-                } else {
-                    WatcherExclusionSource::Gitignore
-                };
-                candidates.push(Candidate {
-                    path,
-                    source,
-                    seed_priority: seed_priority.unwrap_or(usize::MAX),
-                    observed_count: observed_count.unwrap_or_default(),
-                    gitignore_order: matched_glob
-                        .map(|glob| GitignoreOrder::for_glob(&root, glob))
-                        .unwrap_or_default(),
-                    is_existing: true,
-                });
-            } else {
+            let Some(glob) = matched_glob else {
                 stack.push(path);
-            }
+                continue;
+            };
+            let relative = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
+            let observed_count = observed.get(&relative).copied();
+            candidates.insert(
+                relative.clone(),
+                Candidate {
+                    path,
+                    relative,
+                    source: if observed_count.is_some() {
+                        WatcherExclusionSource::Observed
+                    } else {
+                        WatcherExclusionSource::Gitignore
+                    },
+                    ecosystem_priority: usize::MAX,
+                    observed_count: observed_count.unwrap_or_default(),
+                    gitignore_order: GitignoreOrder::for_glob(&root, glob),
+                },
+            );
         }
     }
 
     if let Some(matcher) = matcher.as_deref() {
-        for (seed_priority, name) in WATCHER_EXCLUSION_SEEDS.iter().enumerate() {
-            let path = root.join(name);
-            if !matches!(
-                fs::symlink_metadata(&path),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound
-            ) {
+        for (relative, observed_count) in &observed {
+            let path = root.join(relative);
+            if !exclusion_path_is_directory_or_absent(&path) {
                 continue;
             }
             let ignore::Match::Ignore(glob) = matcher.matched_path_or_any_parents(&path, true)
             else {
                 continue;
             };
-            candidates.push(Candidate {
-                path,
-                source: WatcherExclusionSource::Seed,
-                seed_priority,
-                observed_count: 0,
-                gitignore_order: GitignoreOrder::for_glob(&root, glob),
-                is_existing: false,
-            });
+            candidates.insert(
+                relative.clone(),
+                Candidate {
+                    path,
+                    relative: relative.clone(),
+                    source: WatcherExclusionSource::Observed,
+                    ecosystem_priority: usize::MAX,
+                    observed_count: *observed_count,
+                    gitignore_order: GitignoreOrder::for_glob(&root, glob),
+                },
+            );
+        }
+
+        for name in WATCHER_ECOSYSTEM_EXCLUSIONS {
+            let Some(ecosystem_priority) = ecosystem_exclusion_priority(&root, name) else {
+                continue;
+            };
+            let relative = PathBuf::from(name);
+            let path = root.join(&relative);
+            if !exclusion_path_is_directory_or_absent(&path) {
+                continue;
+            }
+            let ignore::Match::Ignore(glob) = matcher.matched_path_or_any_parents(&path, true)
+            else {
+                continue;
+            };
+            candidates.insert(
+                relative.clone(),
+                Candidate {
+                    path,
+                    relative,
+                    source: WatcherExclusionSource::Ecosystem,
+                    ecosystem_priority,
+                    observed_count: 0,
+                    gitignore_order: GitignoreOrder::for_glob(&root, glob),
+                },
+            );
         }
     }
 
+    let mut candidates = candidates.into_values().collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
-        right
-            .is_existing
-            .cmp(&left.is_existing)
-            .then_with(|| left.source.priority().cmp(&right.source.priority()))
+        left.source
+            .priority()
+            .cmp(&right.source.priority())
             .then_with(|| match left.source {
-                WatcherExclusionSource::Seed => left.seed_priority.cmp(&right.seed_priority),
-                WatcherExclusionSource::Ranked => right
+                WatcherExclusionSource::Ecosystem => {
+                    left.ecosystem_priority.cmp(&right.ecosystem_priority)
+                }
+                WatcherExclusionSource::Observed => right
                     .observed_count
                     .cmp(&left.observed_count)
                     .then_with(|| left.path.cmp(&right.path)),
@@ -624,15 +666,30 @@ pub(crate) fn derive_excluded_subtrees(
                     .then_with(|| left.path.cmp(&right.path)),
             })
     });
-    let mut exclusions = candidates
-        .into_iter()
-        .map(|candidate| WatcherExclusion {
+
+    let mut exclusions = Vec::<WatcherExclusion>::new();
+    if max_paths == Some(0) {
+        return exclusions;
+    }
+    for candidate in candidates {
+        if candidate.source != WatcherExclusionSource::Observed {
+            let candidate_depth = candidate.relative.components().count();
+            let nested_copy = exclusions.iter().any(|selected| {
+                let selected_relative = selected.path.strip_prefix(&root).unwrap_or(&selected.path);
+                selected.path.file_name() == candidate.path.file_name()
+                    && selected_relative.components().count() < candidate_depth
+            });
+            if nested_copy {
+                continue;
+            }
+        }
+        exclusions.push(WatcherExclusion {
             path: candidate.path,
             source: candidate.source,
-        })
-        .collect::<Vec<_>>();
-    if let Some(max_paths) = max_paths {
-        exclusions.truncate(max_paths);
+        });
+        if max_paths.is_some_and(|max_paths| exclusions.len() >= max_paths) {
+            break;
+        }
     }
     exclusions
 }
@@ -1348,12 +1405,20 @@ mod tests {
 
         let exclusions =
             derive_excluded_subtrees(&canonical_root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
-        assert_eq!(exclusions[0].path(), canonical_root.join(".git"));
-        assert_eq!(exclusions.last().unwrap().path(), hot);
+        let observed = exclusions
+            .iter()
+            .position(|exclusion| exclusion.path() == hot)
+            .expect("observed nested prefix is selected");
+        assert!(exclusions[..observed]
+            .iter()
+            .all(|exclusion| exclusion.source() == WatcherExclusionSource::Ecosystem));
         assert_eq!(
-            exclusions.last().unwrap().source(),
-            WatcherExclusionSource::Ranked
+            exclusions[observed].source(),
+            WatcherExclusionSource::Observed
         );
+        assert!(exclusions[observed + 1..]
+            .iter()
+            .all(|exclusion| exclusion.source() == WatcherExclusionSource::Gitignore));
     }
 
     #[test]
@@ -1412,12 +1477,20 @@ mod tests {
         );
         let exclusions =
             derive_excluded_subtrees(&canonical_root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
-        assert_eq!(exclusions[0].path(), canonical_root.join(".git"));
-        assert_eq!(exclusions.last().unwrap().path(), hot);
+        let observed = exclusions
+            .iter()
+            .position(|exclusion| exclusion.path() == hot)
+            .expect("observed nested prefix is selected");
+        assert!(exclusions[..observed]
+            .iter()
+            .all(|exclusion| exclusion.source() == WatcherExclusionSource::Ecosystem));
         assert_eq!(
-            exclusions.last().unwrap().source(),
-            WatcherExclusionSource::Ranked
+            exclusions[observed].source(),
+            WatcherExclusionSource::Observed
         );
+        assert!(exclusions[observed + 1..]
+            .iter()
+            .all(|exclusion| exclusion.source() == WatcherExclusionSource::Gitignore));
     }
 
     #[test]
@@ -1495,22 +1568,29 @@ mod tests {
         let exclusions =
             derive_excluded_subtrees(&sibling, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
         assert_eq!(exclusions[0].path(), sibling.join(relative_hot));
-        assert_eq!(exclusions[0].source(), WatcherExclusionSource::Ranked);
+        assert_eq!(exclusions[0].source(), WatcherExclusionSource::Observed);
     }
 
     #[test]
     fn exclusion_derivation_uses_fixed_priority_caps_and_skips_missing_nonseeds() {
         let root = TempDir::new().unwrap();
-        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            root.path().join("pyproject.toml"),
+            "[project]\nname='fixture'\n",
+        )
+        .unwrap();
         let priorities = [
             "target",
             "node_modules",
-            "dist",
-            "build",
-            ".next",
             ".venv",
             "venv",
             "__pycache__",
+            "build",
+            "dist",
+            ".next",
+            ".turbo",
         ];
         for name in priorities {
             std::fs::create_dir(root.path().join(name)).unwrap();
@@ -1535,16 +1615,15 @@ mod tests {
 
         assert_eq!(exclusions.len(), WATCHER_EXCLUSION_LIMIT);
         assert_eq!(
-            exclusions[0].path(),
-            std::fs::canonicalize(root.path().join(".git")).unwrap()
-        );
-        assert_eq!(
-            watcher_exclusion_paths(&exclusions[1..]),
-            priorities[..WATCHER_EXCLUSION_LIMIT - 1]
+            watcher_exclusion_paths(&exclusions),
+            priorities[..WATCHER_EXCLUSION_LIMIT]
                 .iter()
                 .map(|name| std::fs::canonicalize(root.path().join(name)).unwrap())
                 .collect::<Vec<_>>()
         );
+        assert!(exclusions
+            .iter()
+            .all(|exclusion| exclusion.source() == WatcherExclusionSource::Ecosystem));
         assert!(!exclusions
             .iter()
             .any(|exclusion| exclusion.path().ends_with("missing")));
@@ -1556,6 +1635,8 @@ mod tests {
     #[test]
     fn exclusion_derivation_seeds_only_ignored_absent_priority_directories() {
         let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
         std::fs::write(
             root.path().join(".gitignore"),
             "target/\nnode_modules/\ngenerated/\ndist/\n!dist/\n",
@@ -1575,17 +1656,19 @@ mod tests {
         );
         assert!(exclusions
             .iter()
-            .all(|exclusion| exclusion.source() == WatcherExclusionSource::Seed));
+            .all(|exclusion| exclusion.source() == WatcherExclusionSource::Ecosystem));
     }
 
     #[test]
-    fn exclusion_derivation_ranks_existing_boundaries_above_absent_seeds() {
+    fn ecosystem_exclusions_rank_above_existing_gitignore_boundaries() {
         let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
         std::fs::create_dir(root.path().join("node_modules")).unwrap();
         std::fs::create_dir(root.path().join("generated")).unwrap();
         std::fs::write(
             root.path().join(".gitignore"),
-            "target/\nnode_modules/\ngenerated/\n",
+            "generated/\nnode_modules/\ntarget/\n",
         )
         .unwrap();
         let canonical_root = std::fs::canonicalize(root.path()).unwrap();
@@ -1595,43 +1678,35 @@ mod tests {
 
         assert_eq!(
             watcher_exclusion_paths(&exclusions),
-            ["node_modules", "generated", "target"]
+            ["target", "node_modules", "generated"]
                 .iter()
                 .map(|name| canonical_root.join(name))
                 .collect::<Vec<_>>()
         );
-        assert_eq!(exclusions[0].source(), WatcherExclusionSource::Seed);
-        assert_eq!(exclusions[1].source(), WatcherExclusionSource::Gitignore);
-        assert_eq!(exclusions[2].source(), WatcherExclusionSource::Seed);
+        assert_eq!(exclusions[0].source(), WatcherExclusionSource::Ecosystem);
+        assert_eq!(exclusions[1].source(), WatcherExclusionSource::Ecosystem);
+        assert_eq!(exclusions[2].source(), WatcherExclusionSource::Gitignore);
     }
 
     #[test]
-    fn fresh_root_seeds_heavy_directories_before_late_gitignore_patterns() {
+    fn fresh_mixed_rust_node_root_reserves_ecosystem_exclusions_first() {
         let root = TempDir::new().unwrap();
-        std::fs::create_dir(root.path().join(".git")).unwrap();
-        let patterns = [
-            "generated-01",
-            "generated-02",
-            "generated-03",
-            "generated-04",
-            "generated-05",
-            "generated-06",
-            "generated-07",
-            "generated-08",
-            "generated-09",
-            "build",
-            "target",
-            "node_modules",
-        ];
-        for pattern in patterns {
-            std::fs::create_dir(root.path().join(pattern)).unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
+        std::fs::create_dir(root.path().join("node_modules")).unwrap();
+        let packages = ["one", "two", "three", "four", "five", "six"];
+        for package in packages {
+            std::fs::create_dir_all(root.path().join(format!("packages/{package}/node_modules")))
+                .unwrap();
         }
+        std::fs::create_dir(root.path().join("generated")).unwrap();
+        let nested_ignores = packages
+            .iter()
+            .map(|package| format!("/packages/{package}/node_modules/\n"))
+            .collect::<String>();
         std::fs::write(
             root.path().join(".gitignore"),
-            patterns
-                .iter()
-                .map(|pattern| format!("{pattern}/\n"))
-                .collect::<String>(),
+            format!("/node_modules/\n{nested_ignores}/target/\n/generated/\n"),
         )
         .unwrap();
         let canonical_root = std::fs::canonicalize(root.path()).unwrap();
@@ -1640,40 +1715,41 @@ mod tests {
         let exclusions =
             derive_excluded_subtrees(&canonical_root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
 
-        assert_eq!(exclusions.len(), WATCHER_EXCLUSION_LIMIT);
         assert_eq!(
-            watcher_exclusion_paths(&exclusions[..4]),
-            [".git", "target", "node_modules", "build"]
+            watcher_exclusion_paths(&exclusions[..2]),
+            ["target", "node_modules"]
                 .iter()
                 .map(|name| canonical_root.join(name))
                 .collect::<Vec<_>>()
         );
-        assert!(exclusions[..4]
+        assert!(exclusions[..2]
             .iter()
-            .all(|exclusion| exclusion.source() == WatcherExclusionSource::Seed));
-        assert_eq!(
-            watcher_exclusion_paths(&exclusions[4..]),
-            patterns[..4]
-                .iter()
-                .map(|name| canonical_root.join(name))
-                .collect::<Vec<_>>()
-        );
-        assert!(exclusions[4..]
-            .iter()
-            .all(|exclusion| exclusion.source() == WatcherExclusionSource::Gitignore));
+            .all(|exclusion| exclusion.source() == WatcherExclusionSource::Ecosystem));
+        assert!(exclusions.iter().all(|exclusion| {
+            !exclusion
+                .path()
+                .strip_prefix(&canonical_root)
+                .is_ok_and(|path| {
+                    path.components().count() > 1
+                        && path.file_name() == Some(std::ffi::OsStr::new("node_modules"))
+                })
+        }));
+        assert_eq!(exclusions[2].path(), canonical_root.join("generated"));
+        assert_eq!(exclusions[2].source(), WatcherExclusionSource::Gitignore);
+        assert!(!canonical_root.join("target").exists());
 
-        let source_root = TempDir::new().unwrap();
-        std::fs::create_dir(source_root.path().join(".git")).unwrap();
-        std::fs::create_dir(source_root.path().join("build")).unwrap();
-        std::fs::create_dir(source_root.path().join("ignored")).unwrap();
-        std::fs::write(source_root.path().join(".gitignore"), "ignored/\n").unwrap();
-        let source_root = std::fs::canonicalize(source_root.path()).unwrap();
-        let matcher = shared_matcher(&source_root);
+        let observed_nested = PathBuf::from("packages/six/node_modules");
+        crate::context::watcher_counters_for_root(&canonical_root).set_observed_exclusion_prefixes(
+            vec![crate::context::WatcherOverflowPrefix {
+                prefix: observed_nested.to_string_lossy().into_owned(),
+                count: 200,
+            }],
+        );
         let exclusions =
-            derive_excluded_subtrees(&source_root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
-        assert!(!exclusions
-            .iter()
-            .any(|exclusion| exclusion.path() == source_root.join("build")));
+            derive_excluded_subtrees(&canonical_root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        assert_eq!(exclusions[2].path(), canonical_root.join(&observed_nested));
+        assert_eq!(exclusions[2].source(), WatcherExclusionSource::Observed);
+        assert_eq!(exclusions[3].path(), canonical_root.join("generated"));
     }
 
     #[test]
