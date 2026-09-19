@@ -129,8 +129,19 @@ describe("tool surface transport invariance", () => {
     } as PluginContext;
     const before =
       "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.";
-    const description = hoistedTools(legacyCtx).edit?.description ?? "";
+    const edit = hoistedTools(legacyCtx).edit;
+    const description = edit?.description ?? "";
     expect(description.startsWith(before)).toBe(true);
+    expect(description).toContain(
+      "`symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete.",
+    );
+    const editArgs = edit?.args as
+      | Record<string, { description?: string } | undefined>
+      | undefined;
+    expect(editArgs?.symbol?.description).toContain("only meaningful together with `content`");
+    expect(editArgs?.symbol?.description).toContain("one without the other is incomplete");
+    expect(editArgs?.content?.description).toContain("only meaningful together with `symbol`");
+    expect(editArgs?.content?.description).toContain("one without the other is incomplete");
     expect(description).not.toContain("mint hashline tags");
 
     const opts = {

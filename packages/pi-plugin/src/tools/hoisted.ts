@@ -323,12 +323,15 @@ const EditParams = Type.Object({
     description: "Path to the file to edit (absolute or relative to project root)",
   }),
   symbol: Type.Optional(
-    Type.String({ description: "Named symbol to replace (function, class, type)" }),
+    Type.String({
+      description:
+        "Named symbol to replace; only meaningful together with `content`. A call carrying one without the other is incomplete.",
+    }),
   ),
   content: Type.Optional(
     Type.String({
       description:
-        "Replacement content for symbol mode. For whole-file writes, use the `write` tool.",
+        "Replacement content for symbol mode; only meaningful together with `symbol`. A call carrying one without the other is incomplete. For whole-file writes, use the `write` tool.",
     }),
   ),
   appendContent: Type.Optional(
@@ -759,7 +762,7 @@ export function registerHoistedTools(
         name: editName,
         label: editName,
         description:
-          "Edit part of a file via `appendContent`, batch `edits[]`, or symbol plus `content`. Batch `{ oldString, newString, replaceAll: true }` replaces every match. Provide exactly one mode per call: appendContent, edits[], or symbol plus content (mixing modes is rejected)." +
+          "Edit part of a file via `appendContent`, batch `edits[]`, or symbol plus `content`. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Batch `{ oldString, newString, replaceAll: true }` replaces every match. Provide exactly one mode per call: appendContent, edits[], or symbol plus content (mixing modes is rejected)." +
           (resolveGithubConfig(ctx.config).write
             ? ' GitHub conversation comments can be edited with `edit("issue://N/comments/K", edits=[{oldString, newString}])` or the equivalent `pr://` path.'
             : ""),

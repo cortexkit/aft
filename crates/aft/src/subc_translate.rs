@@ -211,12 +211,8 @@ fn normalize_edit_arguments(map: &mut Map<String, Value>) -> Result<(), Translat
         return Err(invalid_request(format_unknown_keys(unknown_root_keys)));
     }
 
+    validate_symbol_mode_pair(map)?;
     let modes = edit_modes_present(map);
-    if has_orphaned_symbol_content(map) {
-        return Err(invalid_request(
-            "edit: 'content' requires a non-empty string 'symbol' when symbol mode is selected",
-        ));
-    }
     if modes.len() > 1 {
         return Err(invalid_request(format!(
             "edit: conflicting modes: {}. Omit unused optional fields entirely; do not send empty strings or empty arrays for them.",
@@ -255,7 +251,7 @@ fn normalize_edit_arguments(map: &mut Map<String, Value>) -> Result<(), Translat
             }
             if !matches!(map.get("content"), Some(Value::String(_))) {
                 return Err(invalid_request(
-                    "edit: symbol mode requires both 'symbol' and 'content' string properties",
+                    "edit: incomplete symbol mode: property 'content' must be a string. Retry with `symbol` + `content`, or use `edits[]`.",
                 ));
             }
         }
@@ -300,6 +296,44 @@ fn normalize_edit_path_alias(map: &mut Map<String, Value>) -> Result<(), Transla
         (true, true) => normalize_path_alias_pair(map, "path", "filePath", false),
         (false, true) => normalize_path_alias_pair(map, "path", "filePath", false),
         (false, false) | (true, false) => Ok(()),
+    }
+}
+
+fn validate_symbol_mode_pair(map: &Map<String, Value>) -> Result<(), TranslateError> {
+    const COMPLETE_SHAPES: &str = "Retry with `symbol` + `content`, or use `edits[]`.";
+
+    let symbol = map.get("symbol");
+    let content = map.get("content");
+    if is_non_empty_string(symbol) {
+        match content {
+            None => {
+                return Err(invalid_request(format!(
+                    "edit: incomplete symbol mode: missing property 'content'. {COMPLETE_SHAPES}"
+                )));
+            }
+            Some(Value::Null) => {
+                return Err(invalid_request(format!(
+                    "edit: incomplete symbol mode: property 'content' is null. {COMPLETE_SHAPES}"
+                )));
+            }
+            _ => return Ok(()),
+        }
+    }
+
+    if is_non_empty_string(content) {
+        match symbol {
+            None => Err(invalid_request(format!(
+                "edit: incomplete symbol mode: missing property 'symbol'. {COMPLETE_SHAPES}"
+            ))),
+            Some(Value::Null) => Err(invalid_request(format!(
+                "edit: incomplete symbol mode: property 'symbol' is null. {COMPLETE_SHAPES}"
+            ))),
+            _ => Err(invalid_request(format!(
+                "edit: incomplete symbol mode: property 'symbol' must be a non-empty string. {COMPLETE_SHAPES}"
+            ))),
+        }
+    } else {
+        Ok(())
     }
 }
 
@@ -463,10 +497,6 @@ fn normalize_edit_array_sentinels(map: &mut Map<String, Value>) -> bool {
         },
         _ => false,
     }
-}
-
-fn has_orphaned_symbol_content(map: &Map<String, Value>) -> bool {
-    is_non_empty_string(map.get("content")) && !is_non_empty_string(map.get("symbol"))
 }
 
 fn format_unknown_keys(mut keys: Vec<String>) -> String {
@@ -2797,7 +2827,7 @@ mod tests {
                     "content": "replacement",
                 }),
                 None,
-                Some("requires a non-empty string 'symbol'"),
+                Some("property 'symbol' must be a non-empty string"),
             ),
             (
                 "two real modes conflict",
@@ -3319,8 +3349,8 @@ mod tests {
         .expect_err("null oldString with real replacement must remain invalid");
         assert!(malformed.message.contains("requires string 'oldString'"));
 
-        // Top-level nulls are absent mode sentinels, but null content in an
-        // otherwise selected symbol mode still fails the required-content check.
+        // When `edits[]` is present, null values for unrelated top-level mode
+        // fields are treated as omitted so the batch remains valid.
         let top_level_base = serde_json::json!({
             "path": "src/example.ts",
             "edits": [{ "oldString": "before", "newString": "after" }],
@@ -3354,21 +3384,6 @@ mod tests {
         .expect("top-level null edits must be absent");
         assert_eq!(null_edits.command, "edit_match");
 
-        let symbol_error = subc_translate_owned(
-            "edit",
-            serde_json::json!({
-                "path": "src/example.ts",
-                "symbol": "greetUser",
-                "content": null,
-            }),
-            project,
-        )
-        .expect_err("null symbol content must fail the required-content check");
-        assert_eq!(
-            symbol_error.message,
-            "edit: symbol mode requires both 'symbol' and 'content' string properties"
-        );
-
         let occurrence_zero = subc_translate_owned(
             "edit",
             serde_json::json!({
@@ -3379,6 +3394,78 @@ mod tests {
         )
         .expect_err("occurrence zero must not be treated as a null sentinel");
         assert!(occurrence_zero.message.contains("occurrence"));
+    }
+
+    #[test]
+    fn incomplete_symbol_mode_errors_distinguish_missing_and_null_properties() {
+        let project = Path::new("/project");
+        let cases = [
+            (
+                "missing content",
+                serde_json::json!({ "path": "src/main.ts", "symbol": "greetUser" }),
+                "edit: incomplete symbol mode: missing property 'content'. Retry with `symbol` + `content`, or use `edits[]`.",
+            ),
+            (
+                "missing symbol",
+                serde_json::json!({ "path": "src/main.ts", "content": "fn greet_user() {}" }),
+                "edit: incomplete symbol mode: missing property 'symbol'. Retry with `symbol` + `content`, or use `edits[]`.",
+            ),
+            (
+                "null content",
+                serde_json::json!({
+                    "path": "src/main.ts",
+                    "symbol": "greetUser",
+                    "content": null,
+                }),
+                "edit: incomplete symbol mode: property 'content' is null. Retry with `symbol` + `content`, or use `edits[]`.",
+            ),
+            (
+                "null symbol",
+                serde_json::json!({
+                    "path": "src/main.ts",
+                    "symbol": null,
+                    "content": "fn greet_user() {}",
+                }),
+                "edit: incomplete symbol mode: property 'symbol' is null. Retry with `symbol` + `content`, or use `edits[]`.",
+            ),
+        ];
+
+        let mut messages = Vec::new();
+        for (case, arguments, expected) in cases {
+            let error = subc_translate_owned("edit", arguments, project).expect_err(case);
+            messages.push(error.message.clone());
+            assert_eq!(error.message, expected, "{case}");
+        }
+        messages.sort();
+        messages.dedup();
+        assert_eq!(
+            messages.len(),
+            4,
+            "each incomplete shape must be distinguishable"
+        );
+
+        let symbol = subc_translate_owned(
+            "edit",
+            serde_json::json!({
+                "path": "src/main.ts",
+                "symbol": "greetUser",
+                "content": "fn greet_user() {}",
+            }),
+            project,
+        )
+        .expect("complete symbol mode");
+        assert_eq!(symbol.command, "edit_symbol");
+
+        let edits = subc_translate_owned(
+            "edit",
+            serde_json::json!({
+                "path": "src/main.ts",
+                "edits": [{ "oldString": "before", "newString": "after" }],
+            }),
+            project,
+        )
+        .expect("complete edits mode");
+        assert_eq!(edits.command, "batch");
     }
 
     #[test]

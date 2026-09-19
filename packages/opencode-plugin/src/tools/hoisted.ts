@@ -684,7 +684,7 @@ function getEditDescription(ctx: PluginContext, writeToolName: string): string {
 
 **Modes** (determined by which parameters you provide):
 
-Provide exactly one mode per call: appendContent, edits[], or symbol plus content. Mixing modes or providing none is rejected — there is no implicit "write" fallback. To edit multiple files, make parallel \`edit\` calls in one response.
+Provide exactly one mode per call: appendContent, edits[], or symbol plus content. \`symbol\` and \`content\` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit "write" fallback. To edit multiple files, make parallel \`edit\` calls in one response.
 
 1. **Append** — pass \`path\` + \`appendContent\`
    Appends text to the end of a file, creating it if it does not exist.
@@ -799,12 +799,17 @@ function createEditTool(ctx: PluginContext, writeToolName = "write"): ToolDefini
       filePath: z
         .string()
         .describe("Path to the file to edit (absolute or relative to project root)"),
-      symbol: z.string().optional().describe("Named symbol to replace (function, class, type)"),
+      symbol: z
+        .string()
+        .optional()
+        .describe(
+          "Named symbol to replace; only meaningful together with `content`. A call carrying one without the other is incomplete.",
+        ),
       content: z
         .string()
         .optional()
         .describe(
-          "Replacement content for symbol mode. For whole-file writes, use the `write` tool.",
+          "Replacement content for symbol mode; only meaningful together with `symbol`. A call carrying one without the other is incomplete. For whole-file writes, use the `write` tool.",
         ),
       appendContent: z
         .string()

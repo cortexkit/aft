@@ -69,11 +69,28 @@ describe("hoisted tool adapters", () => {
     expectRootObjectSchema(tools.get("write")!.parameters);
     const editSchema = tools.get("edit")!.parameters as {
       properties?: {
+        symbol?: { description?: string };
+        content?: { description?: string };
         edits?: { items?: { properties?: Record<string, Record<string, unknown>> } };
       };
     };
     expectRootObjectSchema(editSchema);
     expect(schemaHasProperty(editSchema, "edits")).toBe(true);
+    expect(tools.get("edit")!.description).toContain(
+      "`symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete.",
+    );
+    expect(editSchema.properties?.symbol?.description).toContain(
+      "only meaningful together with `content`",
+    );
+    expect(editSchema.properties?.symbol?.description).toContain(
+      "one without the other is incomplete",
+    );
+    expect(editSchema.properties?.content?.description).toContain(
+      "only meaningful together with `symbol`",
+    );
+    expect(editSchema.properties?.content?.description).toContain(
+      "one without the other is incomplete",
+    );
     expect(
       schemaAccepts(editSchema, {
         path: "batch.ts",
