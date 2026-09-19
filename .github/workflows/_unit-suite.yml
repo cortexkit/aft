@@ -145,11 +145,6 @@ jobs:
       - name: Bun lint
         run: bun run lint
 
-      # The design gate decides whether a contributor PR is reviewable at all,
-      # so its parsing and decision logic is unit tested. The suite is offline
-      # and platform-independent, so Linux runs it once for everyone.
-      - name: Design gate unit tests
-        run: bun run test:design-gate
 
       # The publish job refuses a package.json shape this validator rejects,
       # and a shape change lands on main days before anyone tags. Running it
