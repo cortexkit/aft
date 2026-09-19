@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::write_ledger::{Counter as WriteCounter, Domain as WriteDomain};
@@ -18,9 +18,13 @@ use serde::Serialize;
 
 pub const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
 
-const WAL_FILE_HEADER_BYTES: u64 = 32;
-const WAL_FRAME_HEADER_BYTES: u64 = 24;
-const WAL_INDEX_BACKFILL_OFFSET: usize = 96;
+/// Layout of the WAL-index header: two identical 48-byte copies, the second of
+/// which is a torn-read guard, followed by the checkpoint-info block.
+const WAL_INDEX_HEADER_BYTES: usize = 48;
+const WAL_INDEX_INITIALISED_OFFSET: usize = 12;
+const WAL_INDEX_MX_FRAME_OFFSET: usize = 16;
+const WAL_INDEX_SALT_OFFSET: usize = 32;
+const WAL_INDEX_BACKFILL_OFFSET: usize = 2 * WAL_INDEX_HEADER_BYTES;
 const WAL_INDEX_HEADER_PREFIX_BYTES: usize = WAL_INDEX_BACKFILL_OFFSET + 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -221,7 +225,12 @@ struct WalHookState {
     threshold_pages: AtomicI32,
     last_log_frames: AtomicI32,
     last_checkpointed_frames: AtomicI32,
+    last_generation_salt: AtomicU64,
     page_size: u64,
+    /// The WAL-index path, resolved once at open. Used to tell one WAL
+    /// generation from the next; `None` for databases with no WAL-index of
+    /// their own, such as in-memory ones.
+    wal_index_path: Option<PathBuf>,
     checkpoint_counter: WriteCounter,
 }
 
@@ -238,12 +247,35 @@ impl WalHookState {
         if log_frames < 0 || checkpointed_frames < 0 {
             return 0;
         }
+        self.observe_generation();
         self.observe_log(log_frames);
         let previous = self.last_checkpointed_frames.load(Ordering::Relaxed).max(0);
         let checkpointed_frames = checkpointed_frames.max(previous);
         self.last_checkpointed_frames
             .store(checkpointed_frames, Ordering::Relaxed);
         u64::try_from(checkpointed_frames.saturating_sub(previous)).unwrap_or(0)
+    }
+
+    /// Rewind the credited-frame baseline when SQLite has started a new WAL.
+    ///
+    /// Once a checkpoint has copied a whole WAL into the main database, the next
+    /// write transaction restarts the log from frame 1 and stamps it with a
+    /// fresh salt. Frame numbers alone cannot see that: a restarted log whose
+    /// frames run past the previous log's high-water mark looks exactly like the
+    /// previous log growing, and subtracting the old mark then throws away every
+    /// frame below it. The salt is what distinguishes the two.
+    fn observe_generation(&self) {
+        let Some(salt) = self
+            .wal_index_path
+            .as_deref()
+            .and_then(wal_index_generation_salt)
+        else {
+            return;
+        };
+        if self.last_generation_salt.swap(salt, Ordering::Relaxed) != salt {
+            self.last_log_frames.store(0, Ordering::Relaxed);
+            self.last_checkpointed_frames.store(0, Ordering::Relaxed);
+        }
     }
 
     fn outstanding_frames(&self) -> u64 {
@@ -258,6 +290,7 @@ impl WalHookState {
     fn reset_after_truncate(&self) {
         self.last_log_frames.store(0, Ordering::Relaxed);
         self.last_checkpointed_frames.store(0, Ordering::Relaxed);
+        self.last_generation_salt.store(0, Ordering::Relaxed);
     }
 
     fn bytes_for_frames(&self, frames: u64) -> u64 {
@@ -265,49 +298,81 @@ impl WalHookState {
     }
 }
 
-/// Frames sitting in the WAL that no checkpoint has copied into the main
+/// Frames in the current WAL that no checkpoint has copied into the main
 /// database file yet.
 ///
-/// This reads the two sidecar files rather than asking the connection, because
-/// the same count has to be taken after the handle is gone: `PRAGMA
+/// Both counts come from the WAL-index rather than from the connection, because
+/// the same measurement has to be taken after the handle is gone: `PRAGMA
 /// wal_checkpoint` is unavailable once SQLite has closed the database, and the
-/// close itself is one of the checkpoints whose bytes need attributing.
-fn outstanding_wal_frames(path: &Path, page_size: u64) -> u64 {
-    let mut wal = path.as_os_str().to_owned();
-    wal.push("-wal");
-    let wal_bytes = std::fs::metadata(PathBuf::from(wal))
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    let log_frames =
-        wal_bytes.saturating_sub(WAL_FILE_HEADER_BYTES) / (page_size + WAL_FRAME_HEADER_BYTES);
-    if log_frames == 0 {
-        return 0;
-    }
+/// close performs one of the checkpoints whose bytes need attributing.
+///
+/// `mxFrame` is read rather than derived from the WAL file's length. SQLite
+/// restarts a drained WAL from frame 1 without shortening the file, so its
+/// length also counts frames from earlier generations that have already been
+/// copied and credited.
+fn outstanding_wal_frames(path: &Path) -> u64 {
     let mut shm = path.as_os_str().to_owned();
     shm.push("-shm");
-    let backfilled = wal_index_backfilled_frames(&PathBuf::from(shm));
+    let Some((log_frames, backfilled)) = wal_index_frame_counts(&PathBuf::from(shm)) else {
+        return 0;
+    };
     log_frames.saturating_sub(backfilled.min(log_frames))
 }
 
-/// `nBackfill` from the WAL-index: two 48-byte header copies, then the
-/// checkpoint-info block whose first field is the backfilled frame count.
+/// `mxFrame` and `nBackfill` from the WAL-index: two identical 48-byte header
+/// copies, then the checkpoint-info block whose first field is the backfilled
+/// frame count.
 ///
-/// Only the header prefix is read. The WAL-index is as large as the WAL is long,
+/// Returns `None` for a WAL-index that is absent, unreadable, uninitialised, or
+/// caught mid-update, so an unknown state credits nothing rather than guessing.
+/// Only the header prefix is read: a WAL-index is as large as its WAL is long,
 /// and this runs on every connection close.
-fn wal_index_backfilled_frames(shm_path: &Path) -> u64 {
+fn wal_index_frame_counts(shm_path: &Path) -> Option<(u64, u64)> {
+    let header = wal_index_header_prefix(shm_path)?;
+    if header[WAL_INDEX_INITIALISED_OFFSET] == 0 {
+        return None;
+    }
+    let frames = |offset: usize| -> u32 {
+        u32::from_ne_bytes(
+            header[offset..offset + 4]
+                .try_into()
+                .expect("the field sits inside the WAL-index prefix"),
+        )
+    };
+    let log_frames = frames(WAL_INDEX_MX_FRAME_OFFSET);
+    if log_frames != frames(WAL_INDEX_MX_FRAME_OFFSET + WAL_INDEX_HEADER_BYTES) {
+        return None;
+    }
+    Some((
+        u64::from(log_frames),
+        u64::from(frames(WAL_INDEX_BACKFILL_OFFSET)),
+    ))
+}
+
+/// The salt SQLite stamps on the current WAL, taken from the WAL-index.
+///
+/// Returns `None` unless both copies of the WAL-index header agree, so a header
+/// caught mid-update is reported as unknown rather than as a new WAL.
+fn wal_index_generation_salt(shm_path: &Path) -> Option<u64> {
+    let header = wal_index_header_prefix(shm_path)?;
+    let salt = |offset: usize| -> u64 {
+        u64::from_ne_bytes(
+            header[offset..offset + 8]
+                .try_into()
+                .expect("both salt fields sit inside the WAL-index prefix"),
+        )
+    };
+    let primary = salt(WAL_INDEX_SALT_OFFSET);
+    (primary == salt(WAL_INDEX_SALT_OFFSET + WAL_INDEX_HEADER_BYTES)).then_some(primary)
+}
+
+fn wal_index_header_prefix(shm_path: &Path) -> Option<[u8; WAL_INDEX_HEADER_PREFIX_BYTES]> {
     use std::io::Read;
 
     let mut header = [0_u8; WAL_INDEX_HEADER_PREFIX_BYTES];
-    let Ok(mut file) = std::fs::File::open(shm_path) else {
-        return 0;
-    };
-    if file.read_exact(&mut header).is_err() {
-        return 0;
-    }
-    let backfilled = header[WAL_INDEX_BACKFILL_OFFSET..]
-        .try_into()
-        .expect("the WAL-index prefix ends with the four backfill-counter bytes");
-    u64::from(u32::from_ne_bytes(backfilled))
+    let mut file = std::fs::File::open(shm_path).ok()?;
+    file.read_exact(&mut header).ok()?;
+    Some(header)
 }
 
 unsafe extern "C" fn tracked_wal_hook(
@@ -427,7 +492,16 @@ impl TrackedConnection {
             threshold_pages: AtomicI32::new(DEFAULT_WAL_AUTOCHECKPOINT_PAGES as i32),
             last_log_frames: AtomicI32::new(0),
             last_checkpointed_frames: AtomicI32::new(0),
+            last_generation_salt: AtomicU64::new(0),
             page_size,
+            wal_index_path: connection
+                .path()
+                .filter(|path| !path.is_empty())
+                .map(|path| {
+                    let mut shm = std::ffi::OsString::from(path);
+                    shm.push("-shm");
+                    PathBuf::from(shm)
+                }),
             checkpoint_counter,
         });
         let context = std::ptr::from_ref(wal_hook.as_ref())
@@ -546,7 +620,7 @@ impl TrackedConnection {
         else {
             return self.wal_hook.outstanding_frames();
         };
-        outstanding_wal_frames(path, self.page_size)
+        outstanding_wal_frames(path)
     }
 
     /// Run an explicit WAL checkpoint and credit only frames newly copied into
@@ -582,7 +656,7 @@ impl TrackedConnection {
     /// WAL-index as part of that checkpoint and the count is unreadable after.
     fn close_checkpoint_probe(&self) -> Option<CloseCheckpointProbe> {
         let path = PathBuf::from(self.connection.as_ref()?.path()?);
-        let outstanding_frames = outstanding_wal_frames(&path, self.page_size);
+        let outstanding_frames = outstanding_wal_frames(&path);
         (outstanding_frames > 0).then_some(CloseCheckpointProbe {
             path,
             outstanding_frames,
@@ -606,7 +680,7 @@ impl TrackedConnection {
         let Some(probe) = probe else {
             return 0;
         };
-        let remaining = outstanding_wal_frames(&probe.path, self.page_size);
+        let remaining = outstanding_wal_frames(&probe.path);
         let backfilled = probe.outstanding_frames.saturating_sub(remaining);
         if backfilled == 0 {
             return 0;
@@ -1111,6 +1185,79 @@ mod tests {
             std::fs::metadata(&builtin_path).unwrap().len(),
             std::fs::metadata(&tracked_path).unwrap().len(),
             "the tracked close wrote a different amount into the main file"
+        );
+    }
+
+    /// A restarted WAL whose frames run past the previous WAL's high-water mark
+    /// is the case a frame-number comparison cannot see, so it is the case that
+    /// silently dropped the frames below that mark. Two transactions, the second
+    /// larger than the first, reproduce it.
+    #[test]
+    fn credit_survives_a_wal_restart_into_a_longer_log() {
+        const THRESHOLD: i64 = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal-restart.sqlite");
+        let root = format!("/wal-restart/{}", std::process::id());
+        let conn = TrackedConnection::open_attributed(
+            &path,
+            SqliteStore::CallgraphGeneration,
+            root.clone(),
+        )
+        .unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch("CREATE TABLE payloads(id INTEGER PRIMARY KEY, payload BLOB);")
+            .unwrap();
+        conn.checkpoint_wal_as(
+            WalCheckpointMode::Truncate,
+            WriteDomain::CallgraphCheckpoint,
+        )
+        .unwrap();
+        let page_size: u64 = conn
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        conn.set_wal_autocheckpoint(THRESHOLD).unwrap();
+
+        let credited_before =
+            crate::write_ledger::pending_for_test(WriteDomain::CallgraphCheckpoint, &root).1;
+        let mut backfilled_frames = 0_u64;
+        let mut log_lengths = Vec::new();
+        let mut next_id = 0_i64;
+        for rows in [16_i64, 48] {
+            let tx = conn.unchecked_transaction().unwrap();
+            for _ in 0..rows {
+                tx.execute(
+                    "INSERT INTO payloads(id, payload) VALUES (?1, zeroblob(3500))",
+                    [next_id],
+                )
+                .unwrap();
+                next_id += 1;
+            }
+            tx.commit().unwrap();
+            let (log_frames, backfilled) = shm_checkpoint_state(&path);
+            // Each commit's autocheckpoint has to drain its WAL completely,
+            // otherwise SQLite never restarts the log and the case under test
+            // does not arise.
+            assert_eq!(
+                log_frames, backfilled,
+                "commit of {rows} rows left an undrained WAL"
+            );
+            backfilled_frames += u64::from(backfilled);
+            log_lengths.push(log_frames);
+        }
+        let credited =
+            crate::write_ledger::pending_for_test(WriteDomain::CallgraphCheckpoint, &root)
+                .1
+                .saturating_sub(credited_before);
+
+        assert!(
+            log_lengths[1] > log_lengths[0],
+            "the second log must outgrow the first for this to test anything: {log_lengths:?}"
+        );
+        assert_eq!(
+            credited,
+            backfilled_frames * page_size,
+            "credit lost the frames below the previous log's high-water mark \
+             (logs={log_lengths:?}, frames={backfilled_frames})"
         );
     }
 
