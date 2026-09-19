@@ -701,6 +701,10 @@ pub(crate) struct WatcherOverflowPrefix {
 pub(crate) struct WatcherBackendExclusions {
     pub(crate) matcher_generation: u64,
     pub(crate) paths: Vec<PathBuf>,
+    /// The next candidates that lost a slot to the exclusion cap, best first.
+    /// Carried beside the installed set so the overflow log can say what the
+    /// cap left watched.
+    pub(crate) candidates_dropped: Vec<PathBuf>,
     pub(crate) queue_depth: Option<usize>,
 }
 
@@ -709,6 +713,7 @@ impl Default for WatcherBackendExclusions {
         Self {
             matcher_generation: 0,
             paths: Vec::new(),
+            candidates_dropped: Vec::new(),
             queue_depth: None,
         }
     }
@@ -916,13 +921,19 @@ impl WatcherCounters {
     // Windows cannot install these paths in ReadDirectoryChangesW, so its
     // backend records an empty list while still publishing the matcher
     // generation that its root handle setup observed.
-    pub(crate) fn set_backend_exclusions(&self, matcher_generation: u64, paths: Vec<PathBuf>) {
+    pub(crate) fn set_backend_exclusions(
+        &self,
+        matcher_generation: u64,
+        paths: Vec<PathBuf>,
+        candidates_dropped: Vec<PathBuf>,
+    ) {
         *self
             .backend_exclusions
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = WatcherBackendExclusions {
             matcher_generation,
             paths,
+            candidates_dropped,
             queue_depth: None,
         };
     }

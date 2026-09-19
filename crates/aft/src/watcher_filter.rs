@@ -19,6 +19,25 @@ pub const WATCHER_MAX_BATCH_PATHS: usize = 1024;
 pub const WATCHER_DISPATCH_CHANNEL_CAPACITY: usize = 1024;
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(crate) const WATCHER_EXCLUSION_LIMIT: usize = 8;
+/// How deep below the root a bare ecosystem name is still enumerated. A
+/// gitignore pattern like `node_modules` matches at every depth, but an
+/// exclusion is one exact path, so the copies that exist have to be found. The
+/// bound keeps that search off the deep end of a monorepo: workspace layouts
+/// put the heavy directory at `packages/<name>/node_modules`, which is depth 3.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+const WATCHER_NESTED_ECOSYSTEM_MAX_DEPTH: usize = 3;
+/// Entries read from one directory's top level when sizing it. The count only
+/// has to separate a populated copy from an empty one, so it stops early.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+const WATCHER_DIRECTORY_SIZE_SAMPLE_CAP: usize = 1024;
+/// Entries read from an observed prefix when looking for the ignored child that
+/// produced its events.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+const WATCHER_OBSERVED_CHILD_SCAN_CAP: usize = 256;
+/// Candidates named in the overflow log after the cap is reached, so a specimen
+/// says what the cap cost.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+const WATCHER_DROPPED_CANDIDATE_LOG_LIMIT: usize = 3;
 const ROOT_DELETED_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const GITIGNORE_REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DISPATCH_SEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -378,12 +397,44 @@ pub(crate) enum WatcherExclusionSource {
     Gitignore,
 }
 
+/// How far one installed exclusion reaches.
+///
+/// This is a statement about the kernel interface, not about the directory: it
+/// decides whether excluding `node_modules` at the root says anything at all
+/// about `packages/plugin/node_modules`. Which one the running backend has is
+/// named once, in `watcher_backend`, so no rule here has to spell out a
+/// platform.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatcherExclusionCoverage {
+    /// The exclusion covers the whole subtree below the excluded directory:
+    /// watches are added one directory at a time and an excluded directory is
+    /// never descended into.
+    Subtree,
+    /// The kernel matches the exact path it was handed, so an excluded parent
+    /// covers nothing below it and every copy that floods needs its own entry.
+    ExactPath,
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 impl WatcherExclusionSource {
+    /// Slot ranking between sources, best first.
     fn priority(self) -> u8 {
         match self {
             Self::Ecosystem => 0,
             Self::Observed => 1,
+            Self::Gitignore => 2,
+        }
+    }
+
+    /// How directly this source knows the directory is heavy, best first. Used
+    /// only when two producers describe the same path: a recorded event count
+    /// is a measurement, an ecosystem name is a well-founded guess, and an
+    /// ignore rule only says the directory is not tracked.
+    fn evidence_rank(self) -> u8 {
+        match self {
+            Self::Observed => 0,
+            Self::Ecosystem => 1,
             Self::Gitignore => 2,
         }
     }
@@ -557,31 +608,147 @@ fn exclusion_path_is_directory_or_absent(path: &Path) -> bool {
     }
 }
 
+/// The exclusion set an OS watcher should install, plus what the cap cost.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WatcherExclusionPlan {
+    /// Exclusions to install, best first.
+    pub(crate) selected: Vec<WatcherExclusion>,
+    /// The next candidates that lost a slot to the cap, best first. Named in
+    /// the overflow log so a flood specimen shows what the cap left watched.
+    pub(crate) dropped: Vec<WatcherExclusion>,
+}
+
+/// Cheap size signal for one directory: how many entries its top level holds,
+/// counted up to `WATCHER_DIRECTORY_SIZE_SAMPLE_CAP`.
+///
+/// Nothing recursive happens here. The number only has to separate a populated
+/// copy of a name from an empty one when both compete for the same slot, and a
+/// capped `read_dir` is the one way to ask that on every platform (`st_blocks`
+/// is Unix-only).
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn directory_size_signal(path: &Path) -> usize {
+    match fs::read_dir(path) {
+        Ok(entries) => entries.take(WATCHER_DIRECTORY_SIZE_SAMPLE_CAP).count(),
+        Err(_) => 0,
+    }
+}
+
+/// Is this a directory the exclusion walk must never enter or seed by itself?
+///
+/// A repository's own `.git` is seeded deliberately as slot zero; every other
+/// `.git` (submodule, nested checkout) is a large tree with nothing indexable
+/// in it, so the walk stops at the name rather than reading `objects/`.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn exclusion_walk_skips_git_directory(path: &Path) -> bool {
+    path.file_name() == Some(std::ffi::OsStr::new(".git"))
+}
+
 /// Choose ignored directory boundaries that an OS watcher can omit entirely.
 ///
-/// Root-level directories implied by a repository's ecosystem are reserved
-/// first, even before they exist. A checkout's `.git` directory always owns
-/// slot zero; linked worktrees use a `.git` file and do not seed that path.
-/// Persisted overflow observations come next, followed by existing ignored
-/// boundaries in ignore-file order. An unobserved nested copy of a selected
-/// name is deferred so six workspace `node_modules` directories cannot crowd
-/// out a root `target` slot. This is a priority rule, not a coverage claim:
-/// FSEvents exclusions are exact paths, so excluding root `node_modules` does
-/// not exclude `packages/app/node_modules`.
+/// Slots are scarce (`WATCHER_EXCLUSION_LIMIT` of them), so the ranking decides
+/// what the kernel stops reporting:
+///
+/// 1. A checkout's `.git` directory owns slot zero; linked worktrees use a
+///    `.git` file and do not seed that path.
+/// 2. Directories that exist outrank names that do not, whatever the source.
+///    Only an existing directory can be producing the events that fill the
+///    kernel queue, so a live `packages/plugin/node_modules` beats a reserved
+///    slot for the `target/` a TypeScript repository will never create. Absent
+///    seeds keep their ecosystem order among themselves.
+/// 3. Inside each of those two groups: ecosystem names first, then directories
+///    the overflow ring actually observed, then the remaining ignored
+///    boundaries in ignore-file order.
+///
+/// Ecosystem names are bare (`node_modules`), and a bare gitignore pattern
+/// matches at every depth, so every copy that exists down to
+/// `WATCHER_NESTED_ECOSYSTEM_MAX_DEPTH` is seeded with its own path. Copies of
+/// one name are ordered by a cheap size signal.
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub(crate) fn derive_watcher_exclusion_plan(
+    root: &Path,
+    matcher: &SharedGitignore,
+    max_paths: Option<usize>,
+) -> WatcherExclusionPlan {
+    derive_exclusion_plan(
+        root,
+        matcher,
+        max_paths,
+        crate::watcher_backend::BACKEND_EXCLUSION_COVERAGE,
+    )
+}
+
+/// The selected exclusions of [`derive_watcher_exclusion_plan`].
+#[cfg(test)]
 pub(crate) fn derive_excluded_subtrees(
     root: &Path,
     matcher: &SharedGitignore,
     max_paths: Option<usize>,
 ) -> Vec<WatcherExclusion> {
+    derive_watcher_exclusion_plan(root, matcher, max_paths).selected
+}
+
+/// [`derive_watcher_exclusion_plan`] for a stated backend coverage.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn derive_exclusion_plan(
+    root: &Path,
+    matcher: &SharedGitignore,
+    max_paths: Option<usize>,
+    coverage: WatcherExclusionCoverage,
+) -> WatcherExclusionPlan {
     #[derive(Debug)]
     struct Candidate {
         path: PathBuf,
         relative: PathBuf,
         source: WatcherExclusionSource,
+        exists: bool,
         ecosystem_priority: usize,
         observed_count: u64,
+        size_signal: usize,
         gitignore_order: GitignoreOrder,
+    }
+
+    impl Candidate {
+        /// Fold in a second reading of the same path.
+        ///
+        /// Each producer knows a different fact about a directory: the tree
+        /// walk knows which ignore rule matched, the overflow ring knows how
+        /// many events came out of it, the ecosystem table knows its priority.
+        /// Keep every fact and label the candidate by its strongest evidence,
+        /// so the order the producers run in cannot change the outcome.
+        fn absorb(&mut self, other: Self) {
+            if other.source.evidence_rank() < self.source.evidence_rank() {
+                self.source = other.source;
+            }
+            self.exists |= other.exists;
+            self.ecosystem_priority = self.ecosystem_priority.min(other.ecosystem_priority);
+            self.observed_count = self.observed_count.max(other.observed_count);
+            self.size_signal = self.size_signal.max(other.size_signal);
+            self.gitignore_order = self.gitignore_order.clone().min(other.gitignore_order);
+        }
+    }
+
+    fn admit(candidates: &mut BTreeMap<PathBuf, Candidate>, candidate: Candidate) {
+        match candidates.get_mut(&candidate.relative) {
+            Some(existing) => existing.absorb(candidate),
+            None => {
+                candidates.insert(candidate.relative.clone(), candidate);
+            }
+        }
+    }
+
+    /// Ecosystem priority for a directory that exists at `depth` below the
+    /// root, or `None` when the name is not an enabled ecosystem name or sits
+    /// below the enumeration bound.
+    fn nested_ecosystem_priority(root: &Path, path: &Path, depth: usize) -> Option<usize> {
+        if depth > WATCHER_NESTED_ECOSYSTEM_MAX_DEPTH {
+            return None;
+        }
+        let name = path.file_name()?.to_str()?;
+        if name == ".git" {
+            return None;
+        }
+        ecosystem_exclusion_priority(root, name)
     }
 
     let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
@@ -596,9 +763,9 @@ pub(crate) fn derive_excluded_subtrees(
         .collect::<BTreeMap<_, _>>();
     let root_git = root.join(".git");
     let mut candidates = BTreeMap::<PathBuf, Candidate>::new();
-    let mut stack = vec![root.clone()];
+    let mut stack = vec![(root.clone(), 0usize)];
 
-    while let Some(directory) = stack.pop() {
+    while let Some((directory, depth)) = stack.pop() {
         let Ok(entries) = fs::read_dir(&directory) else {
             continue;
         };
@@ -607,9 +774,10 @@ pub(crate) fn derive_excluded_subtrees(
             if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
                 continue;
             }
-            if path == root_git {
+            if exclusion_walk_skips_git_directory(&path) {
                 continue;
             }
+            let child_depth = depth + 1;
             let matched_glob = matcher.as_deref().and_then(|matcher| {
                 match matcher.matched_path_or_any_parents(&path, true) {
                     ignore::Match::Ignore(glob) => Some(glob),
@@ -617,23 +785,34 @@ pub(crate) fn derive_excluded_subtrees(
                 }
             });
             let Some(glob) = matched_glob else {
-                stack.push(path);
+                stack.push((path, child_depth));
                 continue;
             };
             let relative = path.strip_prefix(&root).unwrap_or(&path).to_path_buf();
             let observed_count = observed.get(&relative).copied();
-            candidates.insert(
-                relative.clone(),
+            let ecosystem_priority = nested_ecosystem_priority(&root, &path, child_depth);
+            let source = if observed_count.is_some() {
+                WatcherExclusionSource::Observed
+            } else if ecosystem_priority.is_some() {
+                WatcherExclusionSource::Ecosystem
+            } else {
+                WatcherExclusionSource::Gitignore
+            };
+            let size_signal = if ecosystem_priority.is_some() {
+                directory_size_signal(&path)
+            } else {
+                0
+            };
+            admit(
+                &mut candidates,
                 Candidate {
                     path,
                     relative,
-                    source: if observed_count.is_some() {
-                        WatcherExclusionSource::Observed
-                    } else {
-                        WatcherExclusionSource::Gitignore
-                    },
-                    ecosystem_priority: usize::MAX,
+                    source,
+                    exists: true,
+                    ecosystem_priority: ecosystem_priority.unwrap_or(usize::MAX),
                     observed_count: observed_count.unwrap_or_default(),
+                    size_signal,
                     gitignore_order: GitignoreOrder::for_glob(&root, glob),
                 },
             );
@@ -642,15 +821,17 @@ pub(crate) fn derive_excluded_subtrees(
 
     if root_git.is_dir() {
         let relative = PathBuf::from(".git");
-        candidates.insert(
-            relative.clone(),
+        admit(
+            &mut candidates,
             Candidate {
                 path: root_git,
                 relative,
                 source: WatcherExclusionSource::Ecosystem,
+                exists: true,
                 ecosystem_priority: ecosystem_exclusion_priority(&root, ".git")
                     .expect(".git is an ecosystem exclusion"),
                 observed_count: 0,
+                size_signal: 0,
                 gitignore_order: GitignoreOrder::default(),
             },
         );
@@ -662,21 +843,72 @@ pub(crate) fn derive_excluded_subtrees(
             if !exclusion_path_is_directory_or_absent(&path) {
                 continue;
             }
-            let ignore::Match::Ignore(glob) = matcher.matched_path_or_any_parents(&path, true)
-            else {
-                continue;
-            };
-            candidates.insert(
-                relative.clone(),
-                Candidate {
-                    path,
-                    relative: relative.clone(),
-                    source: WatcherExclusionSource::Observed,
-                    ecosystem_priority: usize::MAX,
-                    observed_count: *observed_count,
-                    gitignore_order: GitignoreOrder::for_glob(&root, glob),
-                },
-            );
+            match matcher.matched_path_or_any_parents(&path, true) {
+                ignore::Match::Ignore(glob) => {
+                    let exists = path.is_dir();
+                    admit(
+                        &mut candidates,
+                        Candidate {
+                            path,
+                            relative: relative.clone(),
+                            source: WatcherExclusionSource::Observed,
+                            exists,
+                            ecosystem_priority: usize::MAX,
+                            observed_count: *observed_count,
+                            size_signal: 0,
+                            gitignore_order: GitignoreOrder::for_glob(&root, glob),
+                        },
+                    );
+                }
+                ignore::Match::None | ignore::Match::Whitelist(_) => {
+                    // The ring records the leading components of the flooding
+                    // path, which is often a tracked package directory whose
+                    // ignored child does the writing (`packages/plugin` for a
+                    // `bun install` into `packages/plugin/node_modules`). A
+                    // tracked directory can never be excluded, so credit its
+                    // events one level down to the ignored children that can.
+                    let Ok(entries) = fs::read_dir(&path) else {
+                        continue;
+                    };
+                    for entry in entries.flatten().take(WATCHER_OBSERVED_CHILD_SCAN_CAP) {
+                        let child = entry.path();
+                        if !entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                            continue;
+                        }
+                        if exclusion_walk_skips_git_directory(&child) {
+                            continue;
+                        }
+                        let ignore::Match::Ignore(glob) =
+                            matcher.matched_path_or_any_parents(&child, true)
+                        else {
+                            continue;
+                        };
+                        let child_relative =
+                            child.strip_prefix(&root).unwrap_or(&child).to_path_buf();
+                        let child_depth = child_relative.components().count();
+                        let ecosystem_priority =
+                            nested_ecosystem_priority(&root, &child, child_depth);
+                        let size_signal = if ecosystem_priority.is_some() {
+                            directory_size_signal(&child)
+                        } else {
+                            0
+                        };
+                        admit(
+                            &mut candidates,
+                            Candidate {
+                                path: child,
+                                relative: child_relative,
+                                source: WatcherExclusionSource::Observed,
+                                exists: true,
+                                ecosystem_priority: ecosystem_priority.unwrap_or(usize::MAX),
+                                observed_count: *observed_count,
+                                size_signal,
+                                gitignore_order: GitignoreOrder::for_glob(&root, glob),
+                            },
+                        );
+                    }
+                }
+            }
         }
 
         for name in WATCHER_ECOSYSTEM_EXCLUSIONS {
@@ -695,14 +927,22 @@ pub(crate) fn derive_excluded_subtrees(
             else {
                 continue;
             };
-            candidates.insert(
-                relative.clone(),
+            let exists = path.is_dir();
+            let size_signal = if exists {
+                directory_size_signal(&path)
+            } else {
+                0
+            };
+            admit(
+                &mut candidates,
                 Candidate {
                     path,
                     relative,
                     source: WatcherExclusionSource::Ecosystem,
+                    exists,
                     ecosystem_priority,
                     observed_count: 0,
+                    size_signal,
                     gitignore_order: GitignoreOrder::for_glob(&root, glob),
                 },
             );
@@ -711,13 +951,19 @@ pub(crate) fn derive_excluded_subtrees(
 
     let mut candidates = candidates.into_values().collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
-        left.source
-            .priority()
-            .cmp(&right.source.priority())
+        left.exists
+            .cmp(&right.exists)
+            .reverse()
+            .then_with(|| left.source.priority().cmp(&right.source.priority()))
             .then_with(|| match left.source {
-                WatcherExclusionSource::Ecosystem => {
-                    left.ecosystem_priority.cmp(&right.ecosystem_priority)
-                }
+                WatcherExclusionSource::Ecosystem => left
+                    .ecosystem_priority
+                    .cmp(&right.ecosystem_priority)
+                    // Two copies of one name: prefer the heavier top level. An
+                    // install target holds thousands of entries, a stale copy
+                    // holds none.
+                    .then_with(|| right.size_signal.cmp(&left.size_signal))
+                    .then_with(|| left.path.cmp(&right.path)),
                 WatcherExclusionSource::Observed => right
                     .observed_count
                     .cmp(&left.observed_count)
@@ -729,14 +975,22 @@ pub(crate) fn derive_excluded_subtrees(
             })
     });
 
-    let mut exclusions = Vec::<WatcherExclusion>::new();
-    if max_paths == Some(0) {
-        return exclusions;
-    }
+    let limit = max_paths.unwrap_or(usize::MAX);
+    let mut selected = Vec::<WatcherExclusion>::new();
+    let mut dropped = Vec::<WatcherExclusion>::new();
     for candidate in candidates {
-        if candidate.source != WatcherExclusionSource::Observed {
+        if coverage == WatcherExclusionCoverage::Subtree
+            && candidate.source != WatcherExclusionSource::Observed
+        {
+            // With inherited coverage the watch walk never descends into an
+            // excluded directory, and it skips every ignored directory anyway,
+            // so a deeper copy of an already selected name buys nothing and a
+            // shallower one is the copy worth naming. On an exact-path backend
+            // the same entry is the bug this rule used to cause: the root copy
+            // covers nothing, so the nested copy doing the writing never gets
+            // a slot.
             let candidate_depth = candidate.relative.components().count();
-            let nested_copy = exclusions.iter().any(|selected| {
+            let nested_copy = selected.iter().any(|selected| {
                 let selected_relative = selected.path.strip_prefix(&root).unwrap_or(&selected.path);
                 selected.path.file_name() == candidate.path.file_name()
                     && selected_relative.components().count() < candidate_depth
@@ -745,15 +999,20 @@ pub(crate) fn derive_excluded_subtrees(
                 continue;
             }
         }
-        exclusions.push(WatcherExclusion {
+        let exclusion = WatcherExclusion {
             path: candidate.path,
             source: candidate.source,
-        });
-        if max_paths.is_some_and(|max_paths| exclusions.len() >= max_paths) {
+        };
+        if selected.len() < limit {
+            selected.push(exclusion);
+            continue;
+        }
+        dropped.push(exclusion);
+        if dropped.len() >= WATCHER_DROPPED_CANDIDATE_LOG_LIMIT {
             break;
         }
     }
-    exclusions
+    WatcherExclusionPlan { selected, dropped }
 }
 
 const WATCHER_OBSERVATION_STATE_PREFIX: &str = "watcher.observed_exclusion_prefixes";
@@ -1146,17 +1405,22 @@ impl WatcherFilterThread {
             .set_observed_exclusion_prefixes(self.observed_exclusion_prefixes());
         let during_rescan = self.config.counters.note_overflow(reason, prefixes.clone());
         let backend = self.config.counters.backend_exclusions();
-        let exclusions = backend
-            .paths
-            .iter()
-            .map(|path| {
-                path.strip_prefix(&self.config.project_root)
-                    .unwrap_or(path)
-                    .display()
-                    .to_string()
-            })
-            .collect::<Vec<_>>()
-            .join(",");
+        let render_paths = |paths: &[PathBuf]| {
+            paths
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(&self.config.project_root)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let exclusions = render_paths(&backend.paths);
+        // What the cap cost: the next candidates that lost a slot are still
+        // watched, so a burst attributed to one of them explains the overflow.
+        let candidates_dropped = render_paths(&backend.candidates_dropped);
         let prefixes = prefixes
             .iter()
             .map(|prefix| format!("{}:{}", prefix.prefix, prefix.count))
@@ -1177,10 +1441,11 @@ impl WatcherFilterThread {
             .map(|depth| depth.to_string())
             .unwrap_or_else(|| "unavailable".to_string());
         let line = format!(
-            "watcher overflow: reason={} root={} exclusions=[{}] matcher_generation={} top_prefixes=[{}] ring_span_ms={} queue_depth={} rescan_in_progress={}",
+            "watcher overflow: reason={} root={} exclusions=[{}] candidates_dropped=[{}] matcher_generation={} top_prefixes=[{}] ring_span_ms={} queue_depth={} rescan_in_progress={}",
             reason.as_str(),
             self.config.project_root.display(),
             exclusions,
+            candidates_dropped,
             backend.matcher_generation,
             prefixes,
             span_ms,
@@ -1849,6 +2114,228 @@ mod tests {
         assert!(exclusions
             .iter()
             .all(|exclusion| exclusion.source() == WatcherExclusionSource::Ecosystem));
+
+        // Absent seeds hold slots only while nothing that exists wants one.
+        // `generated/` is ignored and not an ecosystem name, and it still
+        // outranks both reserved names once it exists.
+        std::fs::create_dir(canonical_root.join("generated")).unwrap();
+        let exclusions = derive_excluded_subtrees(&canonical_root, &matcher, None);
+
+        assert_eq!(
+            watcher_exclusion_paths(&exclusions),
+            ["generated", "target", "node_modules"]
+                .iter()
+                .map(|name| canonical_root.join(name))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(exclusions[0].source(), WatcherExclusionSource::Gitignore);
+    }
+
+    /// A TypeScript worktree whose only heavy ignored directory is a nested
+    /// `node_modules`, with reserved root names that will never exist
+    /// competing for the same slots.
+    #[test]
+    fn nested_node_modules_outranks_absent_root_seeds_in_typescript_worktree() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
+        // `node_modules` is last so a gitignore-ordered candidate for the
+        // nested copy would lose to the three boundaries above it: the nested
+        // copy has to win its slot as an ecosystem name, not as a line number.
+        std::fs::write(
+            root.path().join(".gitignore"),
+            "tmp-logs/\ngenerated/\nreports/\ndist\npackages/plugin/dist\npackages/pi-plugin/dist\nnode_modules\n",
+        )
+        .unwrap();
+        for existing in [
+            "tmp-logs",
+            "generated",
+            "reports",
+            "packages/plugin/node_modules",
+            "packages/plugin/dist",
+            "packages/pi-plugin/dist",
+        ] {
+            std::fs::create_dir_all(root.path().join(existing)).unwrap();
+        }
+        // An install target holds a real dependency tree; the sibling `dist`
+        // copies are what a build left behind.
+        for index in 0..4 {
+            std::fs::write(
+                root.path()
+                    .join("packages/plugin/dist")
+                    .join(format!("chunk-{index}.js")),
+                b"export {};\n",
+            )
+            .unwrap();
+        }
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let matcher = shared_matcher(&canonical_root);
+        let nested_node_modules = canonical_root.join("packages/plugin/node_modules");
+        for absent in ["target", "build", "dist", ".cache", "coverage"] {
+            assert!(!canonical_root.join(absent).exists());
+        }
+
+        let exclusions = derive_excluded_subtrees(&canonical_root, &matcher, Some(3));
+
+        assert_eq!(
+            watcher_exclusion_paths(&exclusions),
+            [
+                "packages/plugin/node_modules",
+                "packages/plugin/dist",
+                "packages/pi-plugin/dist",
+            ]
+            .iter()
+            .map(|relative| canonical_root.join(relative))
+            .collect::<Vec<_>>()
+        );
+        assert!(exclusions
+            .iter()
+            .all(|exclusion| exclusion.source() == WatcherExclusionSource::Ecosystem));
+        assert!(
+            exclusions
+                .iter()
+                .any(|exclusion| exclusion.path() == nested_node_modules),
+            "the directory producing the events must hold a slot"
+        );
+        for absent_seed in ["node_modules", "dist"] {
+            let absent_seed = canonical_root.join(absent_seed);
+            assert!(
+                !exclusions
+                    .iter()
+                    .any(|exclusion| exclusion.path() == absent_seed),
+                "absent root seed {} displaced an existing ignored directory",
+                absent_seed.display()
+            );
+        }
+    }
+
+    #[test]
+    fn same_name_copies_keep_their_own_slot_only_on_exact_path_backends() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(root.path().join(".gitignore"), "node_modules\n").unwrap();
+        for existing in [
+            "node_modules",
+            "packages/one/node_modules",
+            "packages/two/node_modules",
+        ] {
+            std::fs::create_dir_all(root.path().join(existing)).unwrap();
+        }
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let matcher = shared_matcher(&canonical_root);
+        let nested = ["packages/one/node_modules", "packages/two/node_modules"]
+            .iter()
+            .map(|relative| canonical_root.join(relative))
+            .collect::<Vec<_>>();
+
+        let exact_path = derive_exclusion_plan(
+            &canonical_root,
+            &matcher,
+            Some(WATCHER_EXCLUSION_LIMIT),
+            WatcherExclusionCoverage::ExactPath,
+        );
+        let subtree = derive_exclusion_plan(
+            &canonical_root,
+            &matcher,
+            Some(WATCHER_EXCLUSION_LIMIT),
+            WatcherExclusionCoverage::Subtree,
+        );
+
+        // An exact-path kernel filter compares the path it was handed, so the
+        // root copy covers neither nested copy and each needs its own entry.
+        assert_eq!(
+            watcher_exclusion_paths(&exact_path.selected),
+            std::iter::once(canonical_root.join("node_modules"))
+                .chain(nested.iter().cloned())
+                .collect::<Vec<_>>()
+        );
+        // Where an exclusion is inherited, the walk that adds watches stops at
+        // the root copy, so naming the copies below it would waste slots.
+        assert_eq!(
+            watcher_exclusion_paths(&subtree.selected),
+            vec![canonical_root.join("node_modules")]
+        );
+    }
+
+    #[test]
+    fn observed_prefix_deepens_to_the_ignored_child_that_flooded() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(root.path().join(".gitignore"), "node_modules\ndist\n").unwrap();
+        for existing in [
+            "packages/plugin/node_modules",
+            "packages/plugin/src",
+            "packages/plugin/dist",
+        ] {
+            std::fs::create_dir_all(root.path().join(existing)).unwrap();
+        }
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let matcher = shared_matcher(&canonical_root);
+        // What the ring recorded in the specimen: two components of the
+        // flooding path, naming a tracked package directory that no exclusion
+        // can ever cover.
+        crate::context::watcher_counters_for_root(&canonical_root).set_observed_exclusion_prefixes(
+            vec![crate::context::WatcherOverflowPrefix {
+                prefix: "packages/plugin".to_string(),
+                count: 42,
+            }],
+        );
+
+        let exclusions =
+            derive_excluded_subtrees(&canonical_root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+
+        let credited = exclusions
+            .iter()
+            .filter(|exclusion| exclusion.source() == WatcherExclusionSource::Observed)
+            .map(|exclusion| exclusion.path().to_path_buf())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            credited,
+            ["packages/plugin/dist", "packages/plugin/node_modules"]
+                .iter()
+                .map(|relative| canonical_root.join(relative))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !exclusions
+                .iter()
+                .any(|exclusion| exclusion.path() == canonical_root.join("packages/plugin")),
+            "a tracked directory must never be excluded"
+        );
+        crate::context::watcher_counters_for_root(&canonical_root)
+            .set_observed_exclusion_prefixes(Vec::new());
+    }
+
+    #[test]
+    fn exclusion_plan_names_the_candidates_the_cap_dropped() {
+        let root = TempDir::new().unwrap();
+        std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            root.path().join(".gitignore"),
+            "node_modules\nfirst/\nsecond/\nthird/\nfourth/\n",
+        )
+        .unwrap();
+        for existing in ["node_modules", "first", "second", "third", "fourth"] {
+            std::fs::create_dir(root.path().join(existing)).unwrap();
+        }
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+        let matcher = shared_matcher(&canonical_root);
+
+        let plan = derive_watcher_exclusion_plan(&canonical_root, &matcher, Some(2));
+
+        assert_eq!(
+            watcher_exclusion_paths(&plan.selected),
+            ["node_modules", "first"]
+                .iter()
+                .map(|name| canonical_root.join(name))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            watcher_exclusion_paths(&plan.dropped),
+            ["second", "third", "fourth"]
+                .iter()
+                .map(|name| canonical_root.join(name))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1868,6 +2355,22 @@ mod tests {
 
         let exclusions = derive_excluded_subtrees(&canonical_root, &matcher, Some(3));
 
+        // `node_modules` exists and is an ecosystem name, so it outranks the
+        // ignored boundary; `target` does not exist yet and ranks behind both.
+        assert_eq!(
+            watcher_exclusion_paths(&exclusions),
+            ["node_modules", "generated", "target"]
+                .iter()
+                .map(|name| canonical_root.join(name))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(exclusions[0].source(), WatcherExclusionSource::Ecosystem);
+        assert_eq!(exclusions[1].source(), WatcherExclusionSource::Gitignore);
+        assert_eq!(exclusions[2].source(), WatcherExclusionSource::Ecosystem);
+
+        std::fs::create_dir(canonical_root.join("target")).unwrap();
+        let exclusions = derive_excluded_subtrees(&canonical_root, &matcher, Some(3));
+
         assert_eq!(
             watcher_exclusion_paths(&exclusions),
             ["target", "node_modules", "generated"]
@@ -1875,8 +2378,6 @@ mod tests {
                 .map(|name| canonical_root.join(name))
                 .collect::<Vec<_>>()
         );
-        assert_eq!(exclusions[0].source(), WatcherExclusionSource::Ecosystem);
-        assert_eq!(exclusions[1].source(), WatcherExclusionSource::Ecosystem);
         assert_eq!(exclusions[2].source(), WatcherExclusionSource::Gitignore);
     }
 
@@ -1885,8 +2386,9 @@ mod tests {
         let root = TempDir::new().unwrap();
         std::fs::write(root.path().join("Cargo.toml"), "[workspace]\n").unwrap();
         std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
+        std::fs::create_dir(root.path().join("target")).unwrap();
         std::fs::create_dir(root.path().join("node_modules")).unwrap();
-        let packages = ["one", "two", "three", "four", "five", "six"];
+        let packages = ["one", "two", "three", "four"];
         for package in packages {
             std::fs::create_dir_all(root.path().join(format!("packages/{package}/node_modules")))
                 .unwrap();
@@ -1907,6 +2409,7 @@ mod tests {
         let exclusions =
             derive_excluded_subtrees(&canonical_root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
 
+        // The two root ecosystem names still take the first slots.
         assert_eq!(
             watcher_exclusion_paths(&exclusions[..2]),
             ["target", "node_modules"]
@@ -1917,20 +2420,23 @@ mod tests {
         assert!(exclusions[..2]
             .iter()
             .all(|exclusion| exclusion.source() == WatcherExclusionSource::Ecosystem));
-        assert!(exclusions.iter().all(|exclusion| {
-            !exclusion
-                .path()
-                .strip_prefix(&canonical_root)
-                .is_ok_and(|path| {
-                    path.components().count() > 1
-                        && path.file_name() == Some(std::ffi::OsStr::new("node_modules"))
-                })
-        }));
-        assert_eq!(exclusions[2].path(), canonical_root.join("generated"));
-        assert_eq!(exclusions[2].source(), WatcherExclusionSource::Gitignore);
-        assert!(!canonical_root.join("target").exists());
+        // Each workspace copy is a separate path to an exact-path kernel
+        // filter, so each is seeded in its own right rather than deferred
+        // behind the root copy that does not cover it.
+        for package in packages {
+            let nested = canonical_root.join(format!("packages/{package}/node_modules"));
+            let seeded = exclusions
+                .iter()
+                .find(|exclusion| exclusion.path() == nested)
+                .unwrap_or_else(|| panic!("{} was not seeded", nested.display()));
+            assert_eq!(seeded.source(), WatcherExclusionSource::Ecosystem);
+        }
+        // A plain ignored boundary ranks behind every ecosystem name.
+        let generated = exclusions.last().expect("a boundary is seeded last");
+        assert_eq!(generated.path(), canonical_root.join("generated"));
+        assert_eq!(generated.source(), WatcherExclusionSource::Gitignore);
 
-        let observed_nested = PathBuf::from("packages/six/node_modules");
+        let observed_nested = PathBuf::from("packages/four/node_modules");
         crate::context::watcher_counters_for_root(&canonical_root).set_observed_exclusion_prefixes(
             vec![crate::context::WatcherOverflowPrefix {
                 prefix: observed_nested.to_string_lossy().into_owned(),
@@ -1939,9 +2445,25 @@ mod tests {
         );
         let exclusions =
             derive_excluded_subtrees(&canonical_root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
-        assert_eq!(exclusions[2].path(), canonical_root.join(&observed_nested));
-        assert_eq!(exclusions[2].source(), WatcherExclusionSource::Observed);
-        assert_eq!(exclusions[3].path(), canonical_root.join("generated"));
+        let observed_position = exclusions
+            .iter()
+            .position(|exclusion| exclusion.path() == canonical_root.join(&observed_nested))
+            .expect("the observed copy keeps its slot");
+        let generated_position = exclusions
+            .iter()
+            .position(|exclusion| exclusion.path() == canonical_root.join("generated"))
+            .expect("the ignored boundary keeps its slot");
+        assert_eq!(
+            exclusions[observed_position].source(),
+            WatcherExclusionSource::Observed
+        );
+        assert!(
+            observed_position < generated_position,
+            "a directory the ring observed must outrank a plain ignored boundary: {:?}",
+            watcher_exclusion_paths(&exclusions)
+        );
+        crate::context::watcher_counters_for_root(&canonical_root)
+            .set_observed_exclusion_prefixes(Vec::new());
     }
 
     #[test]
@@ -2099,6 +2621,9 @@ mod tests {
             (0..WATCHER_EXCLUSION_LIMIT)
                 .map(|index| root.join(format!("excluded-{index}")))
                 .collect(),
+            (0..3)
+                .map(|index| root.join(format!("dropped-{index}")))
+                .collect(),
         );
         let counters = Arc::clone(&config.counters);
         let mut filter = WatcherFilterThread::new(
@@ -2149,6 +2674,10 @@ mod tests {
         for index in 0..WATCHER_EXCLUSION_LIMIT {
             assert!(line.contains(&format!("excluded-{index}")), "line: {line}");
         }
+        assert!(
+            line.contains("candidates_dropped=[dropped-0,dropped-1,dropped-2]"),
+            "line: {line}"
+        );
         let snapshot = counters.snapshot();
         assert_eq!(snapshot.overflows_total, 1);
         assert_eq!(snapshot.overflows_during_rescan, 0);

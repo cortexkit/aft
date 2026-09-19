@@ -15,7 +15,8 @@ use notify::event::{
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
 use crate::watcher_filter::{
-    derive_excluded_subtrees, watcher_exclusion_paths, SharedGitignore, WATCHER_EXCLUSION_LIMIT,
+    derive_watcher_exclusion_plan, watcher_exclusion_paths, SharedGitignore,
+    WATCHER_EXCLUSION_LIMIT,
 };
 
 const FSEVENTS_LATENCY_SECONDS: f64 = 0.03;
@@ -39,14 +40,19 @@ impl ProjectWatcher {
         // matcher at this generation, so the generation is captured beside it
         // rather than on the backend thread after spawn.
         let observed_generation = matcher_generation.load(Ordering::Acquire);
-        let exclusions = derive_excluded_subtrees(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        let plan = derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        let exclusions = plan.selected;
         let exclusion_paths = watcher_exclusion_paths(&exclusions);
         super::log_exclusions(&root, &exclusions);
 
         let (backend_tx, backend_rx) = mpsc::channel();
         let stream = FsEventsStream::start(&root, &exclusion_paths, backend_tx.clone())?;
         let counters = crate::context::watcher_counters_for_root(&root);
-        counters.set_backend_exclusions(observed_generation, exclusion_paths);
+        counters.set_backend_exclusions(
+            observed_generation,
+            exclusion_paths,
+            watcher_exclusion_paths(&plan.dropped),
+        );
         let mut external_watcher = notify::recommended_watcher(backend_tx)?;
         for path in extra_watch_paths {
             if path.exists() {
@@ -67,18 +73,22 @@ impl ProjectWatcher {
                 while !thread_shutdown.load(Ordering::Acquire) {
                     let generation = matcher_generation.load(Ordering::Acquire);
                     if generation != observed_generation {
-                        let replacement_exclusions = derive_excluded_subtrees(
+                        let replacement_plan = derive_watcher_exclusion_plan(
                             &root,
                             &matcher,
                             Some(WATCHER_EXCLUSION_LIMIT),
                         );
+                        let replacement_exclusions = replacement_plan.selected;
                         let replacement_paths = watcher_exclusion_paths(&replacement_exclusions);
                         match FsEventsStream::start(&root, &replacement_paths, stream.sender()) {
                             Ok(replacement) => {
                                 stream = replacement;
                                 observed_generation = generation;
-                                counters
-                                    .set_backend_exclusions(observed_generation, replacement_paths);
+                                counters.set_backend_exclusions(
+                                    observed_generation,
+                                    replacement_paths,
+                                    watcher_exclusion_paths(&replacement_plan.dropped),
+                                );
                                 if replacement_exclusions != exclusions {
                                     super::log_exclusions(&root, &replacement_exclusions);
                                     exclusions = replacement_exclusions;
@@ -442,9 +452,101 @@ mod tests {
 
     use super::*;
     use crate::watcher_filter::{
-        filter_watcher_raw_paths_for_test, run_watcher_thread, watcher_dispatch_channel,
-        WatcherDispatchEvent, WatcherFilterConfig,
+        derive_excluded_subtrees, derive_watcher_exclusion_plan, filter_watcher_raw_paths_for_test,
+        run_watcher_thread, watcher_dispatch_channel, WatcherDispatchEvent, WatcherFilterConfig,
     };
+
+    fn run_git(directory: &Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .current_dir(directory)
+                .args(args)
+                .status()
+                .expect("run git")
+                .success(),
+            "git {args:?} failed in {}",
+            directory.display()
+        );
+    }
+
+    /// A real linked worktree shaped like a TypeScript monorepo: `.git` is a
+    /// file, the only heavy ignored directory is `packages/plugin/node_modules`,
+    /// and the ignore file lists eight boundaries that exist ahead of it. The
+    /// root names a Rust repository would spend slots on (`target`, `build`,
+    /// `.cache`, `coverage`) never exist here.
+    fn specimen_typescript_worktree() -> (tempfile::TempDir, PathBuf) {
+        let container = tempfile::tempdir().unwrap();
+        let main = container.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        run_git(&main, &["init"]);
+        std::fs::write(main.join("package.json"), "{}\n").unwrap();
+        let contested = (0..8)
+            .map(|index| format!("logs-{index}/\n"))
+            .collect::<String>();
+        std::fs::write(
+            main.join(".gitignore"),
+            format!(
+                "{contested}node_modules\ndist\npackages/plugin/dist\npackages/pi-plugin/dist\n"
+            ),
+        )
+        .unwrap();
+        run_git(&main, &["add", "."]);
+        run_git(
+            &main,
+            &[
+                "-c",
+                "user.name=AFT Test",
+                "-c",
+                "user.email=aft@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+        );
+        let worktree = container.path().join("pool");
+        run_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "watcher-specimen",
+                worktree.to_str().unwrap(),
+            ],
+        );
+
+        for index in 0..8 {
+            std::fs::create_dir(worktree.join(format!("logs-{index}"))).unwrap();
+        }
+        for existing in [
+            "packages/plugin/node_modules",
+            "packages/plugin/src",
+            "packages/plugin/dist",
+            "packages/pi-plugin/dist",
+        ] {
+            std::fs::create_dir_all(worktree.join(existing)).unwrap();
+        }
+        assert!(worktree.join(".git").is_file(), "a linked worktree");
+        for absent in ["target", "build", "dist", ".cache", "coverage"] {
+            assert!(!worktree.join(absent).exists());
+        }
+        let worktree = std::fs::canonicalize(worktree).unwrap();
+        (container, worktree)
+    }
+
+    fn count_events_under(
+        rx: &mpsc::Receiver<notify::Result<Event>>,
+        prefix: &Path,
+    ) -> notify::Result<usize> {
+        let mut count = 0;
+        for event in rx.try_iter() {
+            let event = event?;
+            if event.paths.iter().any(|path| path.starts_with(prefix)) {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
 
     struct LinkedWorktree {
         repository_root: PathBuf,
@@ -597,10 +699,14 @@ mod tests {
         let exclusions =
             derive_excluded_subtrees(&canonical_root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
         let exclusion_paths = watcher_exclusion_paths(&exclusions);
-        assert_eq!(
-            exclusion_paths[..2],
-            [target.clone(), canonical_root.join("node_modules")]
+        // The absent `target` seed still holds a slot, behind the ignored
+        // directories that exist: this root's `node_modules` copies.
+        assert!(
+            exclusion_paths.contains(&target),
+            "absent target seed lost its slot: {exclusion_paths:?}"
         );
+        assert!(exclusion_paths.contains(&canonical_root.join("node_modules")));
+        assert!(exclusion_paths.contains(&canonical_root.join("packages/one/node_modules")));
         assert!(!target.exists());
 
         let (tx, rx) = mpsc::channel();
@@ -842,5 +948,62 @@ mod tests {
             "control writes delivered {raw_event_count} raw events"
         );
         assert_eq!(filtered.changed, expected);
+    }
+
+    /// The install burst that drove a fleet worktree into repeated watcher
+    /// overflow, measured live: a `bun install` into
+    /// `packages/plugin/node_modules` must deliver nothing, and the control
+    /// shows the same churn is delivered when that path holds no slot.
+    #[test]
+    #[ignore = "requires a live macOS FSEvents service"]
+    fn nested_node_modules_install_burst_never_reaches_the_stream() {
+        let (_container, root) = specimen_typescript_worktree();
+        let nested = root.join("packages/plugin/node_modules");
+        let mut builder = GitignoreBuilder::new(&root);
+        builder.add(root.join(".gitignore"));
+        let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
+        let plan = derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        let exclusion_paths = watcher_exclusion_paths(&plan.selected);
+
+        let (tx, rx) = mpsc::channel();
+        let stream = FsEventsStream::start(&root, &exclusion_paths, tx).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let _startup_events = rx.try_iter().count();
+        for index in 0..200 {
+            std::fs::write(nested.join(format!("module-{index}.js")), b"export {};\n").unwrap();
+        }
+        thread::sleep(Duration::from_millis(500));
+        let excluded_events = count_events_under(&rx, &nested).unwrap();
+        drop(stream);
+        assert_eq!(
+            excluded_events, 0,
+            "the install burst reached the raw stream; installed exclusions: {exclusion_paths:?}"
+        );
+        assert!(
+            exclusion_paths.contains(&nested),
+            "the directory that floods holds no slot: {exclusion_paths:?}"
+        );
+
+        // Same churn, same fixture, one slot removed: if this stream were also
+        // silent the zero above would be measuring a quiet directory instead of
+        // the exclusion.
+        let control_exclusions = exclusion_paths
+            .into_iter()
+            .filter(|path| path != &nested)
+            .collect::<Vec<_>>();
+        let (tx, rx) = mpsc::channel();
+        let stream = FsEventsStream::start(&root, &control_exclusions, tx).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let _startup_events = rx.try_iter().count();
+        for index in 200..400 {
+            std::fs::write(nested.join(format!("module-{index}.js")), b"export {};\n").unwrap();
+        }
+        thread::sleep(Duration::from_millis(500));
+        let control_events = count_events_under(&rx, &nested).unwrap();
+        drop(stream);
+        assert!(
+            control_events > 0,
+            "the unexcluded control stream saw no churn at all"
+        );
     }
 }

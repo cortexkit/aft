@@ -18,6 +18,23 @@ pub(crate) use inotify::ProjectWatcher;
 #[cfg(windows)]
 pub(crate) use windows::ProjectWatcher;
 
+/// Whether the backend compiled into this binary inherits an exclusion down
+/// the subtree below it.
+///
+/// Only the Linux backend does: it adds one watch per directory and never
+/// descends into an excluded or ignored one. FSEvents exclusion paths and the
+/// Windows per-directory handles are both matched as exact paths, so an
+/// excluded parent covers nothing underneath it. This lives here, in the
+/// module that picks the backend, so the derivation rules in `watcher_filter`
+/// never name a platform themselves.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+pub(crate) const BACKEND_EXCLUSION_COVERAGE: crate::watcher_filter::WatcherExclusionCoverage =
+    if cfg!(target_os = "linux") {
+        crate::watcher_filter::WatcherExclusionCoverage::Subtree
+    } else {
+        crate::watcher_filter::WatcherExclusionCoverage::ExactPath
+    };
+
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub(crate) struct ProjectWatcher {
     _watcher: notify::RecommendedWatcher,

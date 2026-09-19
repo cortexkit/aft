@@ -9,7 +9,7 @@ use notify::event::CreateKind;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
 use crate::watcher_filter::{
-    derive_excluded_subtrees, watcher_exclusion_paths, watcher_path_is_ignored_by_matcher,
+    derive_watcher_exclusion_plan, watcher_exclusion_paths, watcher_path_is_ignored_by_matcher,
     SharedGitignore, WATCHER_EXCLUSION_LIMIT,
 };
 
@@ -35,7 +35,8 @@ impl ProjectWatcher {
         // thread's first instruction would otherwise be read as "already
         // observed" and the rebuild it requires would never run.
         let observed_generation = matcher_generation.load(Ordering::Acquire);
-        let exclusions = derive_excluded_subtrees(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        let plan = derive_watcher_exclusion_plan(&root, &matcher, Some(WATCHER_EXCLUSION_LIMIT));
+        let exclusions = plan.selected;
         let exclusion_paths = watcher_exclusion_paths(&exclusions);
         super::log_exclusions(&root, &exclusions);
 
@@ -43,7 +44,11 @@ impl ProjectWatcher {
         let mut watcher = notify::recommended_watcher(backend_tx)?;
         let mut watched_directories = collect_watch_directories(&root, &matcher, &exclusion_paths);
         let counters = crate::context::watcher_counters_for_root(&root);
-        counters.set_backend_exclusions(observed_generation, exclusion_paths.clone());
+        counters.set_backend_exclusions(
+            observed_generation,
+            exclusion_paths.clone(),
+            watcher_exclusion_paths(&plan.dropped),
+        );
         for directory in &watched_directories {
             watcher.watch(directory, RecursiveMode::NonRecursive)?;
         }
@@ -67,11 +72,12 @@ impl ProjectWatcher {
                 while !thread_shutdown.load(Ordering::Acquire) {
                     let generation = matcher_generation.load(Ordering::Acquire);
                     if generation != observed_generation {
-                        let replacement_exclusions = derive_excluded_subtrees(
+                        let replacement_plan = derive_watcher_exclusion_plan(
                             &root,
                             &matcher,
                             Some(WATCHER_EXCLUSION_LIMIT),
                         );
+                        let replacement_exclusions = replacement_plan.selected;
                         let replacement_paths = watcher_exclusion_paths(&replacement_exclusions);
                         let desired =
                             collect_watch_directories(&root, &matcher, &replacement_paths);
@@ -90,8 +96,11 @@ impl ProjectWatcher {
                         thread_count.store(watched_directories.len(), Ordering::Release);
                         observed_generation = generation;
 
-                        counters
-                            .set_backend_exclusions(observed_generation, replacement_paths.clone());
+                        counters.set_backend_exclusions(
+                            observed_generation,
+                            replacement_paths.clone(),
+                            watcher_exclusion_paths(&replacement_plan.dropped),
+                        );
                         if replacement_exclusions != exclusions {
                             super::log_exclusions(&root, &replacement_exclusions);
                             exclusions = replacement_exclusions;

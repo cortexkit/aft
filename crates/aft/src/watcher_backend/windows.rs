@@ -72,7 +72,7 @@ impl ProjectWatcher {
         // used to create the watch.
         let observed_generation = matcher_generation.load(Ordering::Acquire);
         let counters = crate::context::watcher_counters_for_root(&root);
-        counters.set_backend_exclusions(observed_generation, Vec::new());
+        counters.set_backend_exclusions(observed_generation, Vec::new(), Vec::new());
 
         let completion_port = create_completion_port()?;
         let completion_port_address = completion_port as usize;
@@ -310,7 +310,7 @@ fn run_completion_loop(
         if generation != observed_generation {
             observed_generation = generation;
             observed_generation_out.store(generation, Ordering::Release);
-            counters.set_backend_exclusions(generation, Vec::new());
+            counters.set_backend_exclusions(generation, Vec::new(), Vec::new());
         }
 
         let Some(completion) = wait_for_completion(completion_port)? else {
