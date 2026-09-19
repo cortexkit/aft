@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::os::raw::{c_char, c_int, c_void};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -17,6 +17,11 @@ use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 
 pub const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
+
+const WAL_FILE_HEADER_BYTES: u64 = 32;
+const WAL_FRAME_HEADER_BYTES: u64 = 24;
+const WAL_INDEX_BACKFILL_OFFSET: usize = 96;
+const WAL_INDEX_HEADER_PREFIX_BYTES: usize = WAL_INDEX_BACKFILL_OFFSET + 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WalCheckpointMode {
@@ -260,6 +265,51 @@ impl WalHookState {
     }
 }
 
+/// Frames sitting in the WAL that no checkpoint has copied into the main
+/// database file yet.
+///
+/// This reads the two sidecar files rather than asking the connection, because
+/// the same count has to be taken after the handle is gone: `PRAGMA
+/// wal_checkpoint` is unavailable once SQLite has closed the database, and the
+/// close itself is one of the checkpoints whose bytes need attributing.
+fn outstanding_wal_frames(path: &Path, page_size: u64) -> u64 {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    let wal_bytes = std::fs::metadata(PathBuf::from(wal))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let log_frames =
+        wal_bytes.saturating_sub(WAL_FILE_HEADER_BYTES) / (page_size + WAL_FRAME_HEADER_BYTES);
+    if log_frames == 0 {
+        return 0;
+    }
+    let mut shm = path.as_os_str().to_owned();
+    shm.push("-shm");
+    let backfilled = wal_index_backfilled_frames(&PathBuf::from(shm));
+    log_frames.saturating_sub(backfilled.min(log_frames))
+}
+
+/// `nBackfill` from the WAL-index: two 48-byte header copies, then the
+/// checkpoint-info block whose first field is the backfilled frame count.
+///
+/// Only the header prefix is read. The WAL-index is as large as the WAL is long,
+/// and this runs on every connection close.
+fn wal_index_backfilled_frames(shm_path: &Path) -> u64 {
+    use std::io::Read;
+
+    let mut header = [0_u8; WAL_INDEX_HEADER_PREFIX_BYTES];
+    let Ok(mut file) = std::fs::File::open(shm_path) else {
+        return 0;
+    };
+    if file.read_exact(&mut header).is_err() {
+        return 0;
+    }
+    let backfilled = header[WAL_INDEX_BACKFILL_OFFSET..]
+        .try_into()
+        .expect("the WAL-index prefix ends with the four backfill-counter bytes");
+    u64::from(u32::from_ne_bytes(backfilled))
+}
+
 unsafe extern "C" fn tracked_wal_hook(
     context: *mut c_void,
     db: *mut rusqlite::ffi::sqlite3,
@@ -496,17 +546,7 @@ impl TrackedConnection {
         else {
             return self.wal_hook.outstanding_frames();
         };
-        let wal_bytes = std::fs::metadata(format!("{}-wal", path.display()))
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        let log_frames = wal_bytes.saturating_sub(32) / (self.page_size + 24);
-        let backfilled = std::fs::read(format!("{}-shm", path.display()))
-            .ok()
-            .and_then(|bytes| bytes.get(96..100)?.try_into().ok())
-            .map(u32::from_ne_bytes)
-            .map(u64::from)
-            .unwrap_or(0);
-        log_frames.saturating_sub(backfilled.min(log_frames))
+        outstanding_wal_frames(path, self.page_size)
     }
 
     /// Run an explicit WAL checkpoint and credit only frames newly copied into
@@ -535,6 +575,54 @@ impl TrackedConnection {
             Ok(result)
         }
     }
+
+    /// Snapshot the frames a close-time checkpoint would have to copy.
+    ///
+    /// Taken before the handle is dropped, because SQLite deletes the WAL and
+    /// WAL-index as part of that checkpoint and the count is unreadable after.
+    fn close_checkpoint_probe(&self) -> Option<CloseCheckpointProbe> {
+        let path = PathBuf::from(self.connection.as_ref()?.path()?);
+        let outstanding_frames = outstanding_wal_frames(&path, self.page_size);
+        (outstanding_frames > 0).then_some(CloseCheckpointProbe {
+            path,
+            outstanding_frames,
+        })
+    }
+
+    /// Credit the bytes the close-time checkpoint copied into the main database.
+    ///
+    /// Closing the last connection to a WAL database makes SQLite run a full
+    /// checkpoint and truncate the WAL. That copy is neither the autocheckpoint
+    /// the WAL hook models (the hook only runs when a commit appends frames) nor
+    /// an explicit `wal_checkpoint` call, so without this the main-file bytes it
+    /// pushes are never attributed to anything.
+    ///
+    /// The frames are re-counted after the handle is gone instead of assumed:
+    /// that is what separates a close which did checkpoint (WAL emptied or
+    /// deleted) from one which could not, because another connection to the same
+    /// database is still open or this handle was read-only. A close that
+    /// checkpointed nothing must credit nothing.
+    fn credit_close_checkpoint(&self, probe: Option<CloseCheckpointProbe>) -> u64 {
+        let Some(probe) = probe else {
+            return 0;
+        };
+        let remaining = outstanding_wal_frames(&probe.path, self.page_size);
+        let backfilled = probe.outstanding_frames.saturating_sub(remaining);
+        if backfilled == 0 {
+            return 0;
+        }
+        let bytes = self.wal_hook.bytes_for_frames(backfilled);
+        self.wal_hook.checkpoint_counter.credit(0, bytes);
+        bytes
+    }
+}
+
+/// The WAL state captured just before a tracked handle closes, so the frames
+/// SQLite's close-time checkpoint copies can be measured across the close.
+#[derive(Debug)]
+struct CloseCheckpointProbe {
+    path: PathBuf,
+    outstanding_frames: u64,
 }
 
 impl Deref for TrackedConnection {
@@ -558,9 +646,11 @@ impl DerefMut for TrackedConnection {
 impl Drop for TrackedConnection {
     fn drop(&mut self) {
         self.sample_write_pages();
+        let close_checkpoint = self.close_checkpoint_probe();
         // Drop the SQLite handle before decrementing so the counter never says
         // closed while rusqlite still owns the descriptor and page cache.
         drop(self.connection.take());
+        self.credit_close_checkpoint(close_checkpoint);
         register_close(self.store);
     }
 }
@@ -871,6 +961,156 @@ mod tests {
             credited.abs_diff(expected) <= page_size,
             "credited={credited}, expected={expected}, main_growth={}, WAL frames={wal_frames}",
             main_after.saturating_sub(main_before)
+        );
+    }
+
+    #[test]
+    fn closing_the_last_wal_connection_credits_the_frames_it_backfills() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("close-checkpoint.sqlite");
+        let root = format!("/close-checkpoint/{}", std::process::id());
+        let credited_before =
+            crate::write_ledger::pending_for_test(WriteDomain::CallgraphCheckpoint, &root).1;
+
+        let (page_size, outstanding_frames, main_before) = {
+            let conn = TrackedConnection::open_attributed(
+                &path,
+                SqliteStore::CallgraphGeneration,
+                root.clone(),
+            )
+            .unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            // Park the autocheckpoint threshold out of reach so the WAL hook
+            // credits nothing during the workload. Whatever the ledger ends up
+            // holding for this root is then attributable to the close alone.
+            conn.set_wal_autocheckpoint(1_000_000).unwrap();
+            let page_size: u64 = conn
+                .pragma_query_value(None, "page_size", |row| row.get(0))
+                .unwrap();
+
+            // One transaction, so each database page reaches the WAL once and
+            // the frame count the credit uses is also the page count the
+            // checkpoint pushes into the main file.
+            let tx = conn.unchecked_transaction().unwrap();
+            tx.execute_batch("CREATE TABLE payloads(id INTEGER PRIMARY KEY, payload BLOB);")
+                .unwrap();
+            for id in 0..256_i64 {
+                tx.execute(
+                    "INSERT INTO payloads(id, payload) VALUES (?1, zeroblob(3500))",
+                    [id],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+
+            let main_before = std::fs::metadata(&path).unwrap().len();
+            let (log_frames, backfilled) = shm_checkpoint_state(&path);
+            assert!(log_frames > 0, "fixture wrote no WAL frames");
+            assert_eq!(
+                backfilled, 0,
+                "fixture checkpointed before the close; the close has nothing left to credit"
+            );
+            assert_eq!(
+                crate::write_ledger::pending_for_test(WriteDomain::CallgraphCheckpoint, &root).1,
+                credited_before,
+                "no checkpoint should have been credited before the close"
+            );
+            (page_size, u64::from(log_frames - backfilled), main_before)
+        };
+
+        let credited =
+            crate::write_ledger::pending_for_test(WriteDomain::CallgraphCheckpoint, &root)
+                .1
+                .saturating_sub(credited_before);
+        let main_growth = std::fs::metadata(&path).unwrap().len() - main_before;
+
+        // SQLite removes both sidecars as part of the close-time checkpoint.
+        // Their absence, and a main file that grew by the same bytes and still
+        // answers for every row on its own, is what says the frames were
+        // really copied rather than thrown away.
+        assert!(
+            !wal_path(&path).exists(),
+            "close did not checkpoint and remove the WAL"
+        );
+        assert_eq!(
+            credited,
+            outstanding_frames * page_size,
+            "close-checkpoint credit must equal the frames it backfilled \
+             (frames={outstanding_frames}, page_size={page_size}, main_growth={main_growth})"
+        );
+        assert!(
+            main_growth.abs_diff(credited) <= 4 * page_size,
+            "credited {credited} bytes but the main file grew by {main_growth}"
+        );
+        let reopened = Connection::open(&path).unwrap();
+        let rows: i64 = reopened
+            .query_row("SELECT COUNT(*) FROM payloads", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 256);
+    }
+
+    /// The close-time credit reads the WAL and WAL-index files and issues no
+    /// SQL, so it must not move SQLite's checkpoint policy. Running the same
+    /// workload through a plain connection and a tracked one pins that: both
+    /// have to reach the close having checkpointed the same number of times and
+    /// leave the same main file behind.
+    #[test]
+    fn crediting_the_close_checkpoint_does_not_add_a_checkpoint() {
+        const THRESHOLD: i64 = 8;
+        let dir = tempfile::tempdir().unwrap();
+
+        let builtin_path = dir.path().join("builtin-close.sqlite");
+        let builtin_checkpoints = {
+            let builtin = Connection::open(&builtin_path).unwrap();
+            builtin.pragma_update(None, "journal_mode", "WAL").unwrap();
+            builtin
+                .execute_batch("CREATE TABLE payloads(id INTEGER PRIMARY KEY, payload BLOB);")
+                .unwrap();
+            builtin
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+                .unwrap();
+            builtin
+                .pragma_update(None, "wal_autocheckpoint", THRESHOLD)
+                .unwrap();
+            run_fixed_wal_workload(&builtin, &builtin_path).0
+        };
+
+        let tracked_path = dir.path().join("tracked-close.sqlite");
+        let root = format!("/close-parity/{}", std::process::id());
+        let tracked_checkpoints = {
+            let tracked = TrackedConnection::open_attributed(
+                &tracked_path,
+                SqliteStore::CallgraphGeneration,
+                root.clone(),
+            )
+            .unwrap();
+            tracked.pragma_update(None, "journal_mode", "WAL").unwrap();
+            tracked
+                .execute_batch("CREATE TABLE payloads(id INTEGER PRIMARY KEY, payload BLOB);")
+                .unwrap();
+            tracked
+                .checkpoint_wal_as(
+                    WalCheckpointMode::Truncate,
+                    WriteDomain::CallgraphCheckpoint,
+                )
+                .unwrap();
+            tracked.set_wal_autocheckpoint(THRESHOLD).unwrap();
+            run_fixed_wal_workload(&tracked, &tracked_path).0
+        };
+
+        assert!(
+            builtin_checkpoints > 0,
+            "fixed workload did not cross the autocheckpoint threshold"
+        );
+        assert_eq!(
+            tracked_checkpoints, builtin_checkpoints,
+            "crediting the close changed how often SQLite checkpoints"
+        );
+        assert!(!wal_path(&builtin_path).exists() && !wal_path(&tracked_path).exists());
+        assert_eq!(
+            std::fs::metadata(&builtin_path).unwrap().len(),
+            std::fs::metadata(&tracked_path).unwrap().len(),
+            "the tracked close wrote a different amount into the main file"
         );
     }
 
