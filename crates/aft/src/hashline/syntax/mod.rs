@@ -704,6 +704,14 @@ fn parse_put(remainder: &str, line: usize) -> Result<Operation, HashlineRejectio
             HashlineRejection::parse(format!("PUT at line {line} lacks an address"))
         })?;
         let register = match parts.next() {
+            Some(register) if address.ends_with(':') && !register.starts_with('@') => {
+                return Err(HashlineRejection::parse(format!(
+                    "invalid text PUT body row at patch line {line}; \
+                     expected `+<text>` for content or bare `+` for a blank row, \
+                     but the row carried its body inline; PUT bodies go on the following lines \
+                     as `+TEXT` rows"
+                )));
+            }
             Some(register) => parse_register(register)?,
             // When no register is specified, use the anonymous register. This
             // supports `PUT >$` immediately after a bare CUT.
@@ -1452,6 +1460,34 @@ mod tests {
         assert!(body.message.contains("blank row"));
 
         assert!(parse_hashline_patch("[a.rs#CAFE]\nPUT 1:\n+replacement\n").is_ok());
+    }
+
+    #[test]
+    fn inline_put_body_probes_report_the_body_row_rule() {
+        let inline = parse_hashline_patch("[example.txt#CAFE]\nPUT 2: INLINE")
+            .expect_err("inline PUT body must be rejected");
+        assert_eq!(
+            inline.message,
+            "invalid text PUT body row at patch line 2; expected `+<text>` for content or bare `+` for a blank row, but the row carried its body inline; PUT bodies go on the following lines as `+TEXT` rows"
+        );
+        assert!(!inline.message.contains("registers must begin with @"));
+
+        let unmarked = parse_hashline_patch("[example.txt#CAFE]\nPUT 2:\nplain line without plus")
+            .expect_err("unmarked PUT body row must be rejected");
+        assert_eq!(
+            unmarked.message,
+            "invalid text PUT body row at patch line 3; expected `+<text>` for content or bare `+` for a blank row, but the row does not begin with `+`"
+        );
+
+        let attached = parse_hashline_patch("[example.txt#CAFE]\nPUT 2:INLINE_TEXT")
+            .expect_err("attached text remains part of the invalid address");
+        assert_eq!(
+            attached.message,
+            "\"2:INLINE_TEXT\" is not a valid positive line number"
+        );
+
+        parse_hashline_patch("[example.txt#CAFE]\nPUT 2:\n+BETA_REPLACED")
+            .expect("a following +TEXT row is a valid PUT body");
     }
 
     #[test]
