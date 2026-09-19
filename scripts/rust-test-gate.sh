@@ -37,6 +37,23 @@ mkdir -p "$XDG_DATA_HOME"
 runner="${AFT_RUST_TEST_RUNNER:-nextest}"
 unit_runner="${AFT_UNIT_TEST_RUNNER:-cargo}"
 
+if [[ "${AFT_CAPTURE_CRASH_DIAGNOSTICS:-}" == "1" ]]; then
+  # Limits are process-local, so this must run in the same shell that later
+  # launches nextest. The integration harness also prints SIGBUS/SIGSEGV fault
+  # addresses and stacks; a core remains the fallback if unwinding is damaged.
+  ulimit -c unlimited || echo "warning: unable to enable core dumps" >&2
+  case "$(uname)" in
+    Linux)
+      printf 'core dump pattern: '
+      cat /proc/sys/kernel/core_pattern 2>/dev/null || echo '<unavailable>'
+      ;;
+    Darwin)
+      printf 'core dump pattern: '
+      sysctl -n kern.corefile 2>/dev/null || echo '<unavailable>'
+      ;;
+  esac
+fi
+
 # Shared-box gate mutual exclusion. Full serial gates saturate this machine
 # badly enough to fail NEIGHBORING seats' work (spawn timeouts in release
 # pipelines, cross-gate test flakes, GC races) - three separate casualties on
