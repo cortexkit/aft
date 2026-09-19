@@ -37,6 +37,10 @@ use crate::views::Manifest;
 use crate::watcher_filter::WatcherJoinOutcome;
 use crate::watcher_filter::{SharedGitignore, WatcherDispatchEvent, WatcherThreadHandle};
 
+#[path = "gitignore_state.rs"]
+mod gitignore_state;
+pub(crate) use gitignore_state::IgnoreRuleChange;
+
 pub type ProgressSender = Arc<Box<dyn Fn(PushFrame) + Send + Sync>>;
 pub type SharedProgressSender = Arc<Mutex<Option<ProgressSender>>>;
 pub type SharedStdoutWriter = Arc<Mutex<BufWriter<io::Stdout>>>;
@@ -2441,6 +2445,8 @@ pub struct AppContext {
     /// case the watcher falls back to a small hardcoded infra-directory skip.
     gitignore: SharedGitignore,
     gitignore_generation: Arc<AtomicU64>,
+    gitignore_inputs: parking_lot::Mutex<Option<gitignore_state::IgnoreInputSnapshot>>,
+    gitignore_matcher_rebuilds: AtomicU64,
     /// Last-known Tier-2 + todos counts for the agent status bar, refreshed off
     /// the hot path (on `aft_inspect` reads and background Tier-2 completions).
     /// Errors/warnings are read live and not stored here.
@@ -2873,6 +2879,8 @@ impl AppContext {
             bash_compress_flag: Arc::new(std::sync::atomic::AtomicBool::new(bash_compress_enabled)),
             gitignore: Arc::new(std::sync::RwLock::new(None)),
             gitignore_generation: Arc::new(AtomicU64::new(0)),
+            gitignore_inputs: parking_lot::Mutex::new(None),
+            gitignore_matcher_rebuilds: AtomicU64::new(0),
             status_bar_tier2: RwLock::new(StatusBarTier2::default()),
             tsconfig_membership: parking_lot::Mutex::new(
                 crate::lsp::tsconfig_membership::TsconfigMembershipCache::new(),
@@ -3428,188 +3436,71 @@ impl AppContext {
     /// budget. The watcher event filter falls back to the hardcoded infra-dir
     /// skip list when no matcher is present.
     pub fn clear_gitignore(&self) {
+        *self.gitignore_inputs.lock() = None;
         self.set_gitignore(None);
     }
 
     pub fn rebuild_gitignore(&self) {
-        use ignore::gitignore::GitignoreBuilder;
-        use std::path::Path;
+        let _ = self.rebuild_gitignore_inner(None);
+    }
+
+    pub(crate) fn rebuild_gitignore_after_changes(
+        &self,
+        changed_paths: &[PathBuf],
+    ) -> IgnoreRuleChange {
+        self.rebuild_gitignore_inner(Some(changed_paths))
+    }
+
+    fn rebuild_gitignore_inner(&self, changed_paths: Option<&[PathBuf]>) -> IgnoreRuleChange {
         let root_raw = match self.config().project_root.clone() {
-            Some(r) => r,
+            Some(root) => root,
             None => {
+                *self.gitignore_inputs.lock() = None;
                 self.set_gitignore(None);
-                return;
+                return IgnoreRuleChange::Changed;
             }
         };
-        // Canonicalize the root so symlink-prefix mismatches don't cause
-        // `Gitignore::matched_path_or_any_parents` to panic on watcher event
-        // paths. macOS routinely surfaces `/private/var/...` while `project_root`
-        // arrives as `/var/...` (a symlink to `/private/var`); the `ignore`
-        // crate's matcher panics when a query path isn't lexically under the
-        // matcher's root. Canonicalizing both ends (here for root, naturally
-        // for watcher events on macOS) keeps them in the same prefix space.
+        // Watcher paths are canonicalized before dispatch. Keep the matcher's
+        // root in the same spelling so the ignore crate never receives a path
+        // outside its lexical root on platforms with root aliases.
         let root = std::fs::canonicalize(&root_raw).unwrap_or(root_raw);
-        let mut builder = GitignoreBuilder::new(&root);
-        // Git's global excludes file — keep the live watcher matcher aligned
-        // with the project walkers (`WalkBuilder::git_global(true)`). The
-        // ignore crate exposes the same path discovery it uses internally, so
-        // this handles the default XDG location and configured excludesFile.
-        if let Some(global_ignore) = ignore::gitignore::gitconfig_excludes_path() {
-            if global_ignore.is_file() {
-                if let Some(err) = builder.add(&global_ignore) {
-                    crate::slog_warn!(
-                        "global gitignore parse error in {}: {}",
-                        global_ignore.display(),
-                        err
-                    );
-                }
-            }
+        let previous_inputs = self.gitignore_inputs.lock().clone();
+        if changed_paths.is_some_and(|paths| {
+            previous_inputs
+                .as_ref()
+                .is_some_and(|inputs| inputs.changed_paths_match_bytes(paths))
+        }) {
+            // The watcher thread waits on this generation before it re-filters
+            // the batch. A byte-identical write still needs an acknowledgement,
+            // but it must not publish or rebuild a matcher.
+            self.gitignore_generation.fetch_add(1, Ordering::SeqCst);
+            return IgnoreRuleChange::Unchanged;
         }
-        // Add root .gitignore (the most common case)
-        let root_ignore = Path::new(&root).join(".gitignore");
-        if root_ignore.exists() {
-            if let Some(err) = builder.add(&root_ignore) {
-                crate::slog_warn!(
-                    "gitignore parse error in {}: {}",
-                    root_ignore.display(),
-                    err
-                );
-            }
+
+        let git_common_dir = self.git_common_dir.lock().clone();
+        let inputs = gitignore_state::IgnoreInputSnapshot::collect(root, git_common_dir.as_deref());
+        if inputs.has_same_effective_inputs(previous_inputs.as_ref()) {
+            self.gitignore_generation.fetch_add(1, Ordering::SeqCst);
+            return IgnoreRuleChange::Unchanged;
         }
-        // Root .aftignore — AFT-specific ignores layered on top of .gitignore.
-        // Lets users exclude paths git can't (e.g. submodules) from AFT's
-        // walks/indexes. Honored by the watcher matcher too, so edits under an
-        // aftignored path don't trigger reindexing.
-        let root_aftignore = Path::new(&root).join(".aftignore");
-        if root_aftignore.exists() {
-            if let Some(err) = builder.add(&root_aftignore) {
-                crate::slog_warn!(
-                    "aftignore parse error in {}: {}",
-                    root_aftignore.display(),
-                    err
-                );
-            }
+
+        self.gitignore_matcher_rebuilds
+            .fetch_add(1, Ordering::SeqCst);
+        let matcher = inputs.build_matcher();
+        if let Some(matcher) = &matcher {
+            crate::slog_info!(
+                "gitignore matcher built: {} pattern(s)",
+                matcher.num_ignores()
+            );
         }
-        // .git/info/exclude — manually added because GitignoreBuilder::new()
-        // does not auto-discover it (verified against ignore-0.4.25 source).
-        // In linked worktrees this lives under the repository common dir, not
-        // under `<worktree>/.git/info/exclude` (where `.git` is only a file).
-        let info_exclude = self
-            .git_common_dir
-            .lock()
-            .clone()
-            .unwrap_or_else(|| Path::new(&root).join(".git"))
-            .join("info")
-            .join("exclude");
-        if info_exclude.exists() {
-            if let Some(err) = builder.add(&info_exclude) {
-                crate::slog_warn!(
-                    "gitignore parse error in {}: {}",
-                    info_exclude.display(),
-                    err
-                );
-            }
-        }
-        // Walk the project to pick up nested .gitignore/.aftignore files at
-        // arbitrary depth. The main project walkers honor deeply nested ignore
-        // files, so the watcher matcher must do the same or live invalidation
-        // can disagree with startup indexing. Skip obvious infra dirs so we
-        // don't accidentally load a vendored repo's ignore file as ours.
-        // Prevent a disappearing child mount from making ReadDir::drop abort on ENXIO.
-        let walker = ignore::WalkBuilder::new(&root)
-            .same_file_system(true)
-            .standard_filters(true)
-            // Hidden files are filtered by default, but `.gitignore` starts with
-            // `.` so we need to traverse "hidden" entries to find nested ones.
-            // No `max_depth`: nested `.gitignore`/`.aftignore` files are honored
-            // at arbitrary depth (see configure_watcher_honors_deep_nested_aftignore).
-            // The walk is pruned by standard gitignore filters plus the infra
-            // skip below; configure never runs this against `$HOME` (guarded by
-            // `home_match`), and tests use bounded roots rather than `/`.
-            .hidden(false)
-            .filter_entry(|entry| {
-                let name = entry.file_name().to_string_lossy();
-                !matches!(
-                    name.as_ref(),
-                    "node_modules" | "target" | ".git" | ".opencode" | ".alfonso"
-                )
-            })
-            .build();
-        let mut nested_ignore_files = walker
-            .flatten()
-            .filter_map(|entry| {
-                let file_name = entry.file_name();
-                let is_nested_gitignore = file_name == ".gitignore" && entry.path() != root_ignore;
-                let is_nested_aftignore =
-                    file_name == ".aftignore" && entry.path() != root_aftignore;
-                (is_nested_gitignore || is_nested_aftignore).then(|| entry.into_path())
-            })
-            .collect::<Vec<_>>();
-        nested_ignore_files.sort_by(|left, right| {
-            let left_relative = left.strip_prefix(&root).unwrap_or(left);
-            let right_relative = right.strip_prefix(&root).unwrap_or(right);
-            left_relative
-                .components()
-                .count()
-                .cmp(&right_relative.components().count())
-                .then_with(|| left_relative.parent().cmp(&right_relative.parent()))
-                // Match the root ordering: `.aftignore` layers on top of
-                // `.gitignore` when both files live in the same directory.
-                .then_with(|| {
-                    let left_is_aftignore = left.file_name().is_some_and(|name| name == ".aftignore");
-                    let right_is_aftignore =
-                        right.file_name().is_some_and(|name| name == ".aftignore");
-                    left_is_aftignore.cmp(&right_is_aftignore)
-                })
-        });
-        for ignore_path in nested_ignore_files {
-            let Some(relative_dir) = ignore_path
-                .parent()
-                .and_then(|parent| parent.strip_prefix(&root).ok())
-            else {
-                continue;
-            };
-            let contents = match std::fs::read_to_string(&ignore_path) {
-                Ok(contents) => contents,
-                Err(err) => {
-                    crate::slog_warn!(
-                        "nested ignore read error in {}: {}",
-                        ignore_path.display(),
-                        err
-                    );
-                    continue;
-                }
-            };
-            for line in contents.lines() {
-                let Some(rewritten) =
-                    crate::watcher_filter::rewrite_nested_ignore_line(relative_dir, line)
-                else {
-                    continue;
-                };
-                if let Err(err) = builder.add_line(Some(ignore_path.clone()), &rewritten) {
-                    crate::slog_warn!(
-                        "nested ignore parse error in {}: {}",
-                        ignore_path.display(),
-                        err
-                    );
-                }
-            }
-        }
-        match builder.build() {
-            Ok(gi) => {
-                let count = gi.num_ignores();
-                if count > 0 {
-                    crate::slog_info!("gitignore matcher built: {} pattern(s)", count);
-                    self.set_gitignore(Some(Arc::new(gi)));
-                } else {
-                    self.set_gitignore(None);
-                }
-            }
-            Err(err) => {
-                crate::slog_warn!("gitignore matcher build failed: {}", err);
-                self.set_gitignore(None);
-            }
-        }
+        *self.gitignore_inputs.lock() = Some(inputs);
+        self.set_gitignore(matcher);
+        IgnoreRuleChange::Changed
+    }
+
+    #[doc(hidden)]
+    pub fn gitignore_matcher_rebuild_count_for_test(&self) -> u64 {
+        self.gitignore_matcher_rebuilds.load(Ordering::SeqCst)
     }
 
     /// Shared atomic mirror of `experimental.bash.compress`. Updated by the

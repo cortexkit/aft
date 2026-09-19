@@ -42,6 +42,9 @@ pub const LSP_EVENT_DRAIN_BATCH_CAP: usize = 256;
 thread_local! {
     static LEGACY_WATCHER_REFRESHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static IGNORE_RULE_REFRESHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static IGNORE_RULE_CALLGRAPH_INVALIDATIONS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
     static IGNORE_RULE_REFRESH_TEST_NOW: std::cell::Cell<Option<Instant>> = const {
         std::cell::Cell::new(None)
     };
@@ -68,6 +71,7 @@ fn note_legacy_watcher_refresh_for_test() {}
 #[cfg(test)]
 fn reset_ignore_rule_refreshes_for_test() {
     IGNORE_RULE_REFRESHES.with(|count| count.set(0));
+    IGNORE_RULE_CALLGRAPH_INVALIDATIONS.with(|count| count.set(0));
 }
 
 #[cfg(test)]
@@ -76,8 +80,14 @@ fn ignore_rule_refreshes_for_test() -> usize {
 }
 
 #[cfg(test)]
+fn ignore_rule_callgraph_invalidations_for_test() -> usize {
+    IGNORE_RULE_CALLGRAPH_INVALIDATIONS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
 fn note_ignore_rule_refresh_for_test() {
     IGNORE_RULE_REFRESHES.with(|count| count.set(count.get() + 1));
+    IGNORE_RULE_CALLGRAPH_INVALIDATIONS.with(|count| count.set(count.get() + 1));
 }
 
 #[cfg(not(test))]
@@ -2800,7 +2810,8 @@ fn rebuild_gitignore_for_drain(
     ctx: &AppContext,
     state: &mut WatcherDrainSliceState,
     heavy_root_work_allowed: bool,
-) {
+    changed_paths: Option<&[PathBuf]>,
+) -> crate::context::IgnoreRuleChange {
     // The drain owns this continuation while dispatching control events. Return
     // it to the context so the matcher publication retires all parked queues
     // together, before acknowledging the rebuild to the watcher thread.
@@ -2809,12 +2820,24 @@ fn rebuild_gitignore_for_drain(
         state.configure_content_generation,
     );
     *ctx.watcher_drain_slice().lock() = Some(std::mem::replace(state, placeholder));
-    if heavy_root_work_allowed {
-        ctx.rebuild_gitignore();
+    let change = if heavy_root_work_allowed {
+        match changed_paths {
+            Some(paths) => ctx.rebuild_gitignore_after_changes(paths),
+            None => {
+                ctx.rebuild_gitignore();
+                crate::context::IgnoreRuleChange::Changed
+            }
+        }
     } else {
         ctx.clear_gitignore();
-    }
-    *state = ctx.watcher_drain_slice().lock().take().expect("parked watcher continuation");
+        crate::context::IgnoreRuleChange::Changed
+    };
+    *state = ctx
+        .watcher_drain_slice()
+        .lock()
+        .take()
+        .expect("parked watcher continuation");
+    change
 }
 
 pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> DrainBatchOutcome {
@@ -2877,16 +2900,25 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 }
                 Ok(WatcherDispatchEvent::IgnoreRulesChanged { paths }) => {
                     dispatch_events_received += 1;
-                    log::debug!(
-                        "watcher: ignore rules changed at {:?}, rebuilding matcher",
-                        paths
-                    );
-                    arm_ignore_rule_refresh(&mut state, paths);
                     if !state.rescan_required {
                         let heavy_root_work_allowed = ctx.heavy_root_work_allowed();
-                        let _ = ctx.run_if_subc_bound_generation(configure_generation, || {
-                            rebuild_gitignore_for_drain(ctx, &mut state, heavy_root_work_allowed);
-                        });
+                        let change = ctx
+                            .run_if_subc_bound_generation(configure_generation, || {
+                                rebuild_gitignore_for_drain(
+                                    ctx,
+                                    &mut state,
+                                    heavy_root_work_allowed,
+                                    Some(&paths),
+                                )
+                            })
+                            .unwrap_or(crate::context::IgnoreRuleChange::Changed);
+                        if change == crate::context::IgnoreRuleChange::Changed {
+                            log::debug!(
+                                "watcher: ignore rules changed at {:?}, rebuilt matcher",
+                                paths
+                            );
+                            arm_ignore_rule_refresh(&mut state, paths);
+                        }
                     }
                 }
                 Ok(WatcherDispatchEvent::RootDeleted) => {
@@ -2973,7 +3005,8 @@ pub fn drain_watcher_events_bounded(ctx: &AppContext, max_paths: usize) -> Drain
                 &watcher_counters,
                 db.as_ref(),
             );
-            rebuild_gitignore_for_drain(ctx, &mut state, ctx.heavy_root_work_allowed());
+            let _ =
+                rebuild_gitignore_for_drain(ctx, &mut state, ctx.heavy_root_work_allowed(), None);
             let rss_before = watcher_rescan_rss_bytes();
             let rescan_started = Instant::now();
             state.status_changed |= refresh_project_after_watcher_rescan(ctx);
@@ -3380,7 +3413,10 @@ mod tests {
         let (ctx, tx) = watcher_context(&root);
 
         for index in 0..6 {
-            send_ignore_rule_change(&tx, root.join(format!("rules-{index}/.gitignore")));
+            let ignore_path = root.join(format!("rules-{index}/.gitignore"));
+            std::fs::create_dir_all(ignore_path.parent().unwrap()).unwrap();
+            std::fs::write(&ignore_path, format!("generated-{index}/\n")).unwrap();
+            send_ignore_rule_change(&tx, ignore_path);
             let outcome = drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
             assert!(
                 !outcome.has_more,
@@ -3411,7 +3447,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let (ctx, tx) = watcher_context(&root);
-        send_ignore_rule_change(&tx, root.join("config/.aftignore"));
+        let ignore_path = root.join("config/.aftignore");
+        std::fs::create_dir_all(ignore_path.parent().unwrap()).unwrap();
+        std::fs::write(&ignore_path, "generated/\n").unwrap();
+        send_ignore_rule_change(&tx, ignore_path);
 
         let outcome = drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
 
@@ -3438,6 +3477,117 @@ mod tests {
         advance_ignore_rule_refresh_clock(Duration::from_millis(1));
         drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
         assert_eq!(ignore_rule_refreshes_for_test(), 1);
+    }
+
+    #[test]
+    fn repeated_bare_wildcard_ignore_rewrites_have_zero_downstream_work() {
+        const REWRITES: usize = 8;
+
+        let _reset = begin_ignore_rule_refresh_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let build_dir = root.join("engram-worker/build");
+        std::fs::create_dir_all(&build_dir).unwrap();
+        let ignore_path = build_dir.join(".gitignore");
+        std::fs::write(&ignore_path, b"*").unwrap();
+        let (ctx, tx) = watcher_context(&root);
+        ctx.rebuild_gitignore();
+        let rebuilds = ctx.gitignore_matcher_rebuild_count_for_test();
+        let config = crate::watcher_filter::WatcherFilterConfig::new(root, None);
+        let mut rule_changes = 0;
+
+        for _ in 0..REWRITES {
+            std::fs::write(&ignore_path, b"*").unwrap();
+            let filtered = crate::watcher_filter::filter_watcher_raw_paths_for_test(
+                &config,
+                &ctx.shared_gitignore(),
+                [ignore_path.clone()],
+            );
+            if filtered.ignore_file_changed {
+                rule_changes += 1;
+                tx.send(WatcherDispatchEvent::IgnoreRulesChanged {
+                    paths: filtered.ignore_file_paths.into_iter().collect(),
+                })
+                .unwrap();
+            }
+            drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        }
+
+        assert_eq!(rule_changes, 0);
+        assert_eq!(ctx.gitignore_matcher_rebuild_count_for_test(), rebuilds);
+        assert_eq!(ignore_rule_refreshes_for_test(), 0);
+        assert_eq!(ignore_rule_callgraph_invalidations_for_test(), 0);
+    }
+
+    #[test]
+    fn repeated_identical_nested_ignore_writes_do_no_refresh_work() {
+        const REWRITES: usize = 8;
+
+        let _reset = begin_ignore_rule_refresh_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let nested = root.join("worker");
+        std::fs::create_dir_all(nested.join("generated")).unwrap();
+        std::fs::write(nested.join("generated/file.rs"), "fn generated() {}\n").unwrap();
+        let ignore_path = nested.join(".gitignore");
+        std::fs::write(&ignore_path, b"generated/\n").unwrap();
+        let (ctx, tx) = watcher_context(&root);
+        ctx.rebuild_gitignore();
+        let rebuilds = ctx.gitignore_matcher_rebuild_count_for_test();
+        let generation = ctx.gitignore_generation().load(Ordering::SeqCst);
+
+        for _ in 0..REWRITES {
+            std::fs::write(&ignore_path, b"generated/\n").unwrap();
+            send_ignore_rule_change(&tx, ignore_path.clone());
+            let outcome = drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+            assert!(!outcome.has_more);
+        }
+
+        assert_eq!(ctx.gitignore_matcher_rebuild_count_for_test(), rebuilds);
+        assert_eq!(ignore_rule_refreshes_for_test(), 0);
+        assert_eq!(ignore_rule_callgraph_invalidations_for_test(), 0);
+        assert_eq!(
+            ctx.gitignore_generation().load(Ordering::SeqCst),
+            generation + REWRITES as u64,
+            "each no-op event must still acknowledge the waiting watcher thread"
+        );
+        assert!(ctx
+            .watcher_drain_slice()
+            .lock()
+            .as_ref()
+            .is_some_and(|state| state.ignore_refresh_due.is_none()));
+
+        std::fs::write(&ignore_path, b"other/\n").unwrap();
+        send_ignore_rule_change(&tx, ignore_path);
+        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        assert_eq!(ctx.gitignore_matcher_rebuild_count_for_test(), rebuilds + 1);
+        advance_ignore_rule_refresh_clock(IGNORE_RULE_REFRESH_QUIET_WINDOW);
+        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+        assert_eq!(ignore_rule_refreshes_for_test(), 1);
+        assert_eq!(ignore_rule_callgraph_invalidations_for_test(), 1);
+    }
+
+    #[test]
+    fn newly_created_nested_ignore_file_changes_effective_input_set() {
+        let _reset = begin_ignore_rule_refresh_test();
+        let temp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let nested = root.join("worker");
+        std::fs::create_dir_all(nested.join("generated")).unwrap();
+        let generated = nested.join("generated/file.rs");
+        std::fs::write(&generated, "fn generated() {}\n").unwrap();
+        let (ctx, tx) = watcher_context(&root);
+        ctx.rebuild_gitignore();
+        let rebuilds = ctx.gitignore_matcher_rebuild_count_for_test();
+        assert!(!watcher_path_is_ignored_by_current_matcher(&ctx, &generated));
+
+        let ignore_path = nested.join(".gitignore");
+        std::fs::write(&ignore_path, b"generated/\n").unwrap();
+        send_ignore_rule_change(&tx, ignore_path);
+        drain_watcher_events_bounded(&ctx, WATCHER_PATH_DRAIN_BATCH_CAP);
+
+        assert_eq!(ctx.gitignore_matcher_rebuild_count_for_test(), rebuilds + 1);
+        assert!(watcher_path_is_ignored_by_current_matcher(&ctx, &generated));
     }
 
     #[test]
