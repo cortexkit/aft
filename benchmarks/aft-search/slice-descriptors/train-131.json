@@ -1,0 +1,16 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "write-ledger-close-checkpoint-credit",
+    "watcher-nested-ecosystem-exclusions"
+  ],
+  "note": "No ranking-fence file changes: close-time checkpoint credit and WAL-restart baseline in the write ledger; watcher exclusions rank existing directories and nested ecosystem copies.",
+  "train": null
+}
