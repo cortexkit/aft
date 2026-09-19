@@ -1,0 +1,13 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "semantic-bin-delta-persistence",
+    "tier2-rollup-incremental-journal-spill-fleet-budget"
+  ],
+  "note": "semantic_index.rs changes only the on-disk persistence of the semantic artifact (base snapshot + checksummed delta segments + off-path compaction); the loaded index, chunking, embed text, query and ranking are untouched, so search rows are byte-identical to the reference (the predicate is the proof). The tier-2 rollup/journal changes are outside the fence."
+}
