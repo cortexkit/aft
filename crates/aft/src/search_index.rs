@@ -59,11 +59,23 @@ const ARTIFACT_CACHE_KEY_MEMO_READ_REFRESH_AGE: Duration = Duration::from_secs(2
 const INDEX_ORPHAN_MIN_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const INDEX_ORPHAN_SWEEP_LIMIT: usize = 200;
 const TRANSIENT_SEARCH_CACHE_PREFIX: &str = "aft-search-cache.";
+/// Our scratch caches live in one directory of our own inside the system
+/// temporary directory. The sweep below reads whatever directory it is given,
+/// and the shared `$TMPDIR` is a fleet dumping ground: on this box it held
+/// 290,697 entries and one bare listing of it took ~870 s, which pinned six of
+/// eight executor workers inside a configure sweep and starved route binds
+/// (2026-09-19). Owning a subdirectory makes the sweep O(our entries).
+const TRANSIENT_SEARCH_CACHE_DIR_NAME: &str = "aft-search-caches";
 /// A streaming build owns its temporary cache for minutes, not days. Use the
 /// same conservative age-only predicate as other interrupted-build reapers so
 /// a recycled PID can never protect abandoned data.
 const TRANSIENT_SEARCH_CACHE_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const TRANSIENT_SEARCH_CACHE_SWEEP_LIMIT: usize = 200;
+/// Raw directory entries examined in one sweep, whether or not they are ours.
+/// The reap limit above bounds what we act on; this bounds what we *read*, so
+/// a foreign directory with hundreds of thousands of entries cannot hold the
+/// calling worker for the length of a full listing.
+const TRANSIENT_SEARCH_CACHE_SCAN_LIMIT: usize = 2_048;
 const TRANSIENT_SEARCH_CACHE_SWEEP_BUDGET: Duration = Duration::from_secs(5);
 static CACHE_LOCK_ACQUIRE_MUTEX: Mutex<()> = Mutex::new(());
 static ARTIFACT_CACHE_KEY_MEMO_STATE: OnceLock<Mutex<ArtifactCacheKeyMemoState>> = OnceLock::new();
@@ -126,6 +138,9 @@ struct IndexOrphanSweepSummary {
 #[derive(Default)]
 struct TransientSearchCacheSweepSummary {
     scanned: usize,
+    /// Raw directory entries read, including entries that are not ours. The
+    /// reaping numbers below cannot show a listing that never reached us.
+    examined: usize,
     removed: usize,
     bytes: u64,
     skipped_fresh: usize,
@@ -3750,8 +3765,12 @@ fn sweep_stale_search_build_dirs(cache_dir: &Path) {
     }
 }
 
+fn transient_search_cache_home() -> PathBuf {
+    std::env::temp_dir().join(TRANSIENT_SEARCH_CACHE_DIR_NAME)
+}
+
 fn transient_search_cache_dir(root: &Path) -> PathBuf {
-    std::env::temp_dir().join(format!(
+    transient_search_cache_home().join(format!(
         "{TRANSIENT_SEARCH_CACHE_PREFIX}{}.{}",
         artifact_cache_key(root),
         std::process::id()
@@ -3800,7 +3819,8 @@ fn truncate_transient_search_cache_dir(cache_dir: &Path) -> std::io::Result<()> 
 /// name contains a PID for diagnostics, but PID liveness is intentionally not
 /// consulted: a bare PID can be recycled, while age remains trustworthy.
 pub(crate) fn sweep_transient_search_cache_dirs() {
-    let root = std::env::temp_dir();
+    // Our own directory, which holds one entry per process/root pair.
+    let root = transient_search_cache_home();
     let summary = sweep_transient_search_cache_dirs_with_limits(
         &root,
         TRANSIENT_SEARCH_CACHE_MIN_AGE,
@@ -3808,15 +3828,53 @@ pub(crate) fn sweep_transient_search_cache_dirs() {
         TRANSIENT_SEARCH_CACHE_SWEEP_LIMIT,
     );
     crate::slog_info!(
-        "transient search cache sweep root={} scanned={} removed={} bytes={} skipped_fresh={} skipped_unreadable={} budget_exhausted={}",
+        "transient search cache sweep root={} scanned={} examined={} removed={} bytes={} skipped_fresh={} skipped_unreadable={} budget_exhausted={}",
         root.display(),
         summary.scanned,
+        summary.examined,
         summary.removed,
         summary.bytes,
         summary.skipped_fresh,
         summary.skipped_unreadable,
         summary.budget_exhausted
     );
+    sweep_legacy_transient_search_cache_dirs_once();
+}
+
+/// Reap caches left at the top level of `$TMPDIR` by versions that wrote there
+/// directly.
+///
+/// This runs once per process, on a detached thread: the directory it reads is
+/// shared with every other tool on the machine and can be arbitrarily large, so
+/// its listing must never be paid by a worker that a route bind is waiting
+/// behind. The per-configure sweep above reads only our own directory.
+fn sweep_legacy_transient_search_cache_dirs_once() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        std::thread::Builder::new()
+            .name("aft-legacy-cache-sweep".to_string())
+            .spawn(|| {
+                let root = std::env::temp_dir();
+                let summary = sweep_transient_search_cache_dirs_with_limits(
+                    &root,
+                    TRANSIENT_SEARCH_CACHE_MIN_AGE,
+                    TRANSIENT_SEARCH_CACHE_SWEEP_BUDGET,
+                    TRANSIENT_SEARCH_CACHE_SWEEP_LIMIT,
+                );
+                if summary.scanned > 0 || summary.removed > 0 {
+                    crate::slog_info!(
+                        "legacy transient search cache sweep root={} scanned={} examined={} removed={} bytes={} budget_exhausted={}",
+                        root.display(),
+                        summary.scanned,
+                        summary.examined,
+                        summary.removed,
+                        summary.bytes,
+                        summary.budget_exhausted
+                    );
+                }
+            })
+            .ok();
+    });
 }
 
 fn sweep_transient_search_cache_dirs_with_limits(
@@ -3843,16 +3901,34 @@ fn sweep_transient_search_cache_dirs_with_limits(
             };
         }
     };
+    // Read entries under an explicit bound. The directory may be shared with
+    // the rest of the machine, and a full listing of a fat one costs minutes on
+    // the worker that calls this; the reap limit further down cannot help,
+    // because it only bounds what we act on after the listing is complete.
+    let mut examined = 0usize;
+    let mut scan_truncated = false;
     let mut entries = match fs::read_dir(root) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .filter_map(|entry| {
-                let file_type = entry.file_type().ok()?;
+        Ok(iterator) => {
+            let mut collected = Vec::new();
+            for entry in iterator {
+                if examined >= TRANSIENT_SEARCH_CACHE_SCAN_LIMIT || Instant::now() >= deadline {
+                    scan_truncated = true;
+                    break;
+                }
+                examined += 1;
+                let Ok(entry) = entry else {
+                    continue;
+                };
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
                 let name = entry.file_name().to_string_lossy().into_owned();
-                (file_type.is_dir() && parse_transient_search_cache_name(&name).is_some())
-                    .then(|| (name, entry.path()))
-            })
-            .collect::<Vec<_>>(),
+                if file_type.is_dir() && parse_transient_search_cache_name(&name).is_some() {
+                    collected.push((name, entry.path()));
+                }
+            }
+            collected
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(error) => {
             crate::slog_warn!(
@@ -3861,6 +3937,7 @@ fn sweep_transient_search_cache_dirs_with_limits(
                 error
             );
             return TransientSearchCacheSweepSummary {
+                examined,
                 skipped_unreadable: 1,
                 ..TransientSearchCacheSweepSummary::default()
             };
@@ -3882,7 +3959,11 @@ fn sweep_transient_search_cache_dirs_with_limits(
     }
 
     let now = SystemTime::now();
-    let mut summary = TransientSearchCacheSweepSummary::default();
+    let mut summary = TransientSearchCacheSweepSummary {
+        examined,
+        budget_exhausted: scan_truncated,
+        ..TransientSearchCacheSweepSummary::default()
+    };
     let mut cursor_name = last_name;
     for (processed, (name, path)) in entries.into_iter().enumerate() {
         if processed >= entry_limit || Instant::now() >= deadline {
@@ -6607,12 +6688,16 @@ mod tests {
             .expect("write project source");
         let key = artifact_cache_key(&root);
         let prefix = format!("{TRANSIENT_SEARCH_CACHE_PREFIX}{key}.");
-        let temp_root = std::env::temp_dir();
+        // Our own directory, not the shared one: a listing of `$TMPDIR` costs
+        // whatever the rest of the machine left in it (~870 s at 290k entries
+        // on a fleet box), which is the same trap the product hit.
+        let temp_root = transient_search_cache_home();
+        let _ = fs::create_dir_all(&temp_root);
         let remove_matching = || {
-            for entry in fs::read_dir(&temp_root)
-                .expect("read system temp directory")
-                .flatten()
-            {
+            let Ok(entries) = fs::read_dir(&temp_root) else {
+                return;
+            };
+            for entry in entries.flatten() {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if name.starts_with(&prefix) && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                     let _ = fs::remove_dir_all(entry.path());
@@ -6750,6 +6835,56 @@ mod tests {
         );
         assert_eq!(second_pass.removed, 1);
         assert!(!first.exists() && !second.exists());
+    }
+
+    /// Our scratch must not sit loose in the shared temporary directory, whose
+    /// listing is the fleet's, not ours.
+    #[test]
+    fn transient_cache_lives_in_a_directory_of_our_own() {
+        let root = tempfile::tempdir().expect("temporary project root");
+        let cache_dir = transient_search_cache_dir(root.path());
+
+        let parent = cache_dir.parent().expect("cache dir has a parent");
+        assert_eq!(
+            parent.file_name().and_then(|name| name.to_str()),
+            Some(TRANSIENT_SEARCH_CACHE_DIR_NAME)
+        );
+        assert_eq!(parent.parent(), Some(std::env::temp_dir().as_path()));
+    }
+
+    /// The sweep reads a directory it does not own the size of. A listing must
+    /// cost the caller a bounded number of entries whatever is in there: the
+    /// unbounded version pinned six executor workers for minutes on a $TMPDIR
+    /// holding 290,697 entries and starved route binds (2026-09-19).
+    #[test]
+    fn sweep_stops_reading_a_fat_directory_at_the_scan_limit() {
+        let root = tempfile::tempdir().expect("temporary sweep root");
+        let litter = TRANSIENT_SEARCH_CACHE_SCAN_LIMIT + 256;
+        for index in 0..litter {
+            fs::write(root.path().join(format!("foreign-{index}")), b"x")
+                .expect("write foreign temp entry");
+        }
+
+        let summary = sweep_transient_search_cache_dirs_with_limits(
+            root.path(),
+            TRANSIENT_SEARCH_CACHE_MIN_AGE,
+            TRANSIENT_SEARCH_CACHE_SWEEP_BUDGET,
+            TRANSIENT_SEARCH_CACHE_SWEEP_LIMIT,
+        );
+
+        assert!(
+            summary.examined <= TRANSIENT_SEARCH_CACHE_SCAN_LIMIT,
+            "read {} of {litter} entries; the scan limit is {TRANSIENT_SEARCH_CACHE_SCAN_LIMIT}",
+            summary.examined
+        );
+        assert!(
+            summary.budget_exhausted,
+            "a truncated listing must say so rather than read as a complete pass"
+        );
+        // Nothing of ours was in there, so a bounded read is not a licence to
+        // report work it did not do.
+        assert_eq!(summary.scanned, 0);
+        assert_eq!(summary.removed, 0);
     }
 
     fn lexical_rank_mixed_storage_fixture() -> (tempfile::TempDir, SearchIndex) {
