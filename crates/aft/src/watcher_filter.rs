@@ -536,11 +536,14 @@ fn ecosystem_exclusion_priority(root: &Path, name: &str) -> Option<usize> {
         "target" => root.join("Cargo.toml").is_file(),
         "node_modules" => root.join("package.json").is_file(),
         ".venv" | "venv" | "__pycache__" => root_has_python_manifest(root),
-        "build" | ".gradle" => root_has_gradle_manifest(root),
+        ".gradle" => root_has_gradle_manifest(root),
         ".dart_tool" => root.join("pubspec.yaml").is_file(),
         "Pods" => root.join("Podfile").is_file(),
         "DerivedData" => root_has_xcode_project(root),
-        "dist" | ".next" | ".turbo" | ".cache" | "coverage" | "out" => true,
+        // Generic build outputs: too many ecosystems write these to gate on
+        // one manifest (`build/` is Gradle, setuptools, and half of the JS
+        // bundlers at once).
+        "build" | "dist" | ".next" | ".turbo" | ".cache" | "coverage" | "out" => true,
         _ => false,
     };
     enabled.then_some(priority)
@@ -1675,10 +1678,10 @@ mod tests {
     #[test]
     fn ecosystem_manifest_gates_seed_only_when_the_root_marker_exists() {
         let cases: [(&str, &[&str]); 8] = [
-            ("build.gradle", &["build", ".gradle"]),
-            ("build.gradle.kts", &["build", ".gradle"]),
-            ("settings.gradle", &["build", ".gradle"]),
-            ("settings.gradle.kts", &["build", ".gradle"]),
+            ("build.gradle", &[".gradle"]),
+            ("build.gradle.kts", &[".gradle"]),
+            ("settings.gradle", &[".gradle"]),
+            ("settings.gradle.kts", &[".gradle"]),
             ("pubspec.yaml", &[".dart_tool"]),
             ("Podfile", &["Pods"]),
             ("App.xcodeproj", &["DerivedData"]),
@@ -1726,7 +1729,9 @@ mod tests {
     #[test]
     fn ungated_ecosystem_exclusions_are_seeded_when_ignored() {
         let root = TempDir::new().unwrap();
-        let directories = ["dist", ".next", ".turbo", ".cache", "coverage", "out"];
+        let directories = [
+            "build", "dist", ".next", ".turbo", ".cache", "coverage", "out",
+        ];
         std::fs::write(
             root.path().join(".gitignore"),
             directories
