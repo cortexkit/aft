@@ -1,7 +1,7 @@
 {
   "artifact_id": "ART-V049-S5-AGENT-PREFIX-CAPTURE-001",
   "artifact_version": "0.49.0",
-  "source_commit": "3808b5635c6482e2a0a405a0d452785d0158da5c",
+  "source_commit": "aadf4dfee2b0002eb4bed2ea63b7de3709ec7bcd",
   "capture_scope": "complete plugin-owned production agent-prefix input for every checked host profile; host-owned base prompt text is outside the plugin boundary",
   "captures": [
     {
@@ -18,7 +18,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "3808b5635c6482e2a0a405a0d452785d0158da5c",
+      "source_commit": "aadf4dfee2b0002eb4bed2ea63b7de3709ec7bcd",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -201,7 +201,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "3808b5635c6482e2a0a405a0d452785d0158da5c",
+      "source_commit": "aadf4dfee2b0002eb4bed2ea63b7de3709ec7bcd",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -288,7 +288,7 @@
             }
           },
           "edit": {
-            "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\n\n**Modes** (determined by which parameters you provide):\n\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. Mixing modes or providing none is rejected — there is no implicit \"write\" fallback. To edit multiple files, make parallel `edit` calls in one response.\n\n1. **Append** — pass `path` + `appendContent`\n   Appends text to the end of a file, creating it if it does not exist.\n   Example: `{ \"path\": \"notes.txt\", \"appendContent\": \"new line\\n\" }`\n\n2. **Batch edits** — pass `path` + `edits` array\n   Multiple edits in one file atomically. Each edit is either:\n   - `{ \"oldString\": \"old\", \"newString\": \"new\" }` — find/replace\n   - `{ \"oldString\": \"old\", \"newString\": \"new\", \"replaceAll\": true }` — replace every match\n   - `{ \"startLine\": 5, \"endLine\": 7, \"content\": \"new lines\" }` — replace line range (1-based, both inclusive)\n   Set content to empty string to delete lines.\n\n3. **Symbol replace** — pass `path` + `symbol` + `content`\n   Replaces an entire named symbol (function, class, type).\n   Includes decorators, attributes, and doc comments in the replacement range.\n   Example: `{ \"path\": \"src/app.ts\", \"symbol\": \"handleRequest\", \"content\": \"function handleRequest() { ... }\" }`\n\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\n   Finds the exact text in `oldString` and replaces it with `newString`.\n   Supports fuzzy matching (handles whitespace differences automatically).\n   If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\n\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\n\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\n   When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\n\n**Behavior:**\n- Backs up files before editing (recoverable via aft_safety undo)\n- Auto-formats using project formatter if configured\n- Tree-sitter syntax validation on all edits\n- Symbol replace includes decorators, attributes, and doc comments in range\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.",
+            "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\n\n**Modes** (determined by which parameters you provide):\n\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit \"write\" fallback. To edit multiple files, make parallel `edit` calls in one response.\n\n1. **Append** — pass `path` + `appendContent`\n   Appends text to the end of a file, creating it if it does not exist.\n   Example: `{ \"path\": \"notes.txt\", \"appendContent\": \"new line\\n\" }`\n\n2. **Batch edits** — pass `path` + `edits` array\n   Multiple edits in one file atomically. Each edit is either:\n   - `{ \"oldString\": \"old\", \"newString\": \"new\" }` — find/replace\n   - `{ \"oldString\": \"old\", \"newString\": \"new\", \"replaceAll\": true }` — replace every match\n   - `{ \"startLine\": 5, \"endLine\": 7, \"content\": \"new lines\" }` — replace line range (1-based, both inclusive)\n   Set content to empty string to delete lines.\n\n3. **Symbol replace** — pass `path` + `symbol` + `content`\n   Replaces an entire named symbol (function, class, type).\n   Includes decorators, attributes, and doc comments in the replacement range.\n   Example: `{ \"path\": \"src/app.ts\", \"symbol\": \"handleRequest\", \"content\": \"function handleRequest() { ... }\" }`\n\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\n   Finds the exact text in `oldString` and replaces it with `newString`.\n   Supports fuzzy matching (handles whitespace differences automatically).\n   If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\n\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\n\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\n   When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\n\n**Behavior:**\n- Backs up files before editing (recoverable via aft_safety undo)\n- Auto-formats using project formatter if configured\n- Tree-sitter syntax validation on all edits\n- Symbol replace includes decorators, attributes, and doc comments in range\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -298,11 +298,11 @@
                   "type": "string"
                 },
                 "symbol": {
-                  "description": "Named symbol to replace (function, class, type)",
+                  "description": "Named symbol to replace; only meaningful together with `content`. A call carrying one without the other is incomplete.",
                   "type": "string"
                 },
                 "content": {
-                  "description": "Replacement content for symbol mode. For whole-file writes, use the `write` tool.",
+                  "description": "Replacement content for symbol mode; only meaningful together with `symbol`. A call carrying one without the other is incomplete. For whole-file writes, use the `write` tool.",
                   "type": "string"
                 },
                 "appendContent": {
@@ -1071,7 +1071,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "3808b5635c6482e2a0a405a0d452785d0158da5c",
+      "source_commit": "aadf4dfee2b0002eb4bed2ea63b7de3709ec7bcd",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
@@ -1161,7 +1161,7 @@
             }
           },
           "edit": {
-            "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\n\n**Modes** (determined by which parameters you provide):\n\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. Mixing modes or providing none is rejected — there is no implicit \"write\" fallback. To edit multiple files, make parallel `edit` calls in one response.\n\n1. **Append** — pass `path` + `appendContent`\n   Appends text to the end of a file, creating it if it does not exist.\n   Example: `{ \"path\": \"notes.txt\", \"appendContent\": \"new line\\n\" }`\n\n2. **Batch edits** — pass `path` + `edits` array\n   Multiple edits in one file atomically. Each edit is either:\n   - `{ \"oldString\": \"old\", \"newString\": \"new\" }` — find/replace\n   - `{ \"oldString\": \"old\", \"newString\": \"new\", \"replaceAll\": true }` — replace every match\n   - `{ \"startLine\": 5, \"endLine\": 7, \"content\": \"new lines\" }` — replace line range (1-based, both inclusive)\n   Set content to empty string to delete lines.\n\n3. **Symbol replace** — pass `path` + `symbol` + `content`\n   Replaces an entire named symbol (function, class, type).\n   Includes decorators, attributes, and doc comments in the replacement range.\n   Example: `{ \"path\": \"src/app.ts\", \"symbol\": \"handleRequest\", \"content\": \"function handleRequest() { ... }\" }`\n\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\n   Finds the exact text in `oldString` and replaces it with `newString`.\n   Supports fuzzy matching (handles whitespace differences automatically).\n   If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\n\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\n\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\n   When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\n\n**Behavior:**\n- Backs up files before editing (recoverable via aft_safety undo)\n- Auto-formats using project formatter if configured\n- Tree-sitter syntax validation on all edits\n- Symbol replace includes decorators, attributes, and doc comments in range\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.",
+            "description": "Edit a file by finding and replacing text, or by targeting named symbols. To write or overwrite a whole file, use the `write` tool — `edit` requires an explicit edit mode and will not silently overwrite a file from `content` alone.\n\n**Modes** (determined by which parameters you provide):\n\nProvide exactly one mode per call: appendContent, edits[], or symbol plus content. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Mixing modes or providing none is rejected — there is no implicit \"write\" fallback. To edit multiple files, make parallel `edit` calls in one response.\n\n1. **Append** — pass `path` + `appendContent`\n   Appends text to the end of a file, creating it if it does not exist.\n   Example: `{ \"path\": \"notes.txt\", \"appendContent\": \"new line\\n\" }`\n\n2. **Batch edits** — pass `path` + `edits` array\n   Multiple edits in one file atomically. Each edit is either:\n   - `{ \"oldString\": \"old\", \"newString\": \"new\" }` — find/replace\n   - `{ \"oldString\": \"old\", \"newString\": \"new\", \"replaceAll\": true }` — replace every match\n   - `{ \"startLine\": 5, \"endLine\": 7, \"content\": \"new lines\" }` — replace line range (1-based, both inclusive)\n   Set content to empty string to delete lines.\n\n3. **Symbol replace** — pass `path` + `symbol` + `content`\n   Replaces an entire named symbol (function, class, type).\n   Includes decorators, attributes, and doc comments in the replacement range.\n   Example: `{ \"path\": \"src/app.ts\", \"symbol\": \"handleRequest\", \"content\": \"function handleRequest() { ... }\" }`\n\n4. **Find and replace** — put `oldString` and optional `newString` in an item of `edits[]`\n   Finds the exact text in `oldString` and replaces it with `newString`.\n   Supports fuzzy matching (handles whitespace differences automatically).\n   If multiple matches exist, specify `occurrence` or set `replaceAll: true` in that item.\n\n5. **Replace all occurrences** — add `replaceAll: true` to a find/replace item.\n\n6. **Select specific occurrence** — add `occurrence: N` to a find/replace item (1-based).\n   When multiple matches exist, select the Nth one (1 = first, 2 = second, etc.).\n\n**Behavior:**\n- Backs up files before editing (recoverable via aft_safety undo)\n- Auto-formats using project formatter if configured\n- Tree-sitter syntax validation on all edits\n- Symbol replace includes decorators, attributes, and doc comments in range\n- Response is a compact server-rendered summary; before/after diff details are attached as UI metadata when available.",
             "schema": {
               "$schema": "https://json-schema.org/draft/2020-12/schema",
               "type": "object",
@@ -1171,11 +1171,11 @@
                   "type": "string"
                 },
                 "symbol": {
-                  "description": "Named symbol to replace (function, class, type)",
+                  "description": "Named symbol to replace; only meaningful together with `content`. A call carrying one without the other is incomplete.",
                   "type": "string"
                 },
                 "content": {
-                  "description": "Replacement content for symbol mode. For whole-file writes, use the `write` tool.",
+                  "description": "Replacement content for symbol mode; only meaningful together with `symbol`. A call carrying one without the other is incomplete. For whole-file writes, use the `write` tool.",
                   "type": "string"
                 },
                 "appendContent": {
@@ -2049,7 +2049,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "3808b5635c6482e2a0a405a0d452785d0158da5c",
+      "source_commit": "aadf4dfee2b0002eb4bed2ea63b7de3709ec7bcd",
       "prefix_input": {
         "registered_tool_names": [
           "aft_outline",
@@ -2240,7 +2240,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "3808b5635c6482e2a0a405a0d452785d0158da5c",
+      "source_commit": "aadf4dfee2b0002eb4bed2ea63b7de3709ec7bcd",
       "prefix_input": {
         "registered_tool_names": [
           "aft_conflicts",
@@ -2613,7 +2613,7 @@
           "edit": {
             "name": "edit",
             "label": "edit",
-            "description": "Edit part of a file via `appendContent`, batch `edits[]`, or symbol plus `content`. Batch `{ oldString, newString, replaceAll: true }` replaces every match. Provide exactly one mode per call: appendContent, edits[], or symbol plus content (mixing modes is rejected).",
+            "description": "Edit part of a file via `appendContent`, batch `edits[]`, or symbol plus `content`. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Batch `{ oldString, newString, replaceAll: true }` replaces every match. Provide exactly one mode per call: appendContent, edits[], or symbol plus content (mixing modes is rejected).",
             "promptSnippet": "Partial file edits via appendContent, edits[], or symbol plus content (exactly one mode per call).",
             "promptGuidelines": [
               "Prefer edit over write when changing part of an existing file.",
@@ -2633,11 +2633,11 @@
                 },
                 "symbol": {
                   "type": "string",
-                  "description": "Named symbol to replace (function, class, type)"
+                  "description": "Named symbol to replace; only meaningful together with `content`. A call carrying one without the other is incomplete."
                 },
                 "content": {
                   "type": "string",
-                  "description": "Replacement content for symbol mode. For whole-file writes, use the `write` tool."
+                  "description": "Replacement content for symbol mode; only meaningful together with `symbol`. A call carrying one without the other is incomplete. For whole-file writes, use the `write` tool."
                 },
                 "appendContent": {
                   "type": "string",
@@ -3219,7 +3219,7 @@
         "exposed": false,
         "source": "host did not expose a production cache key"
       },
-      "source_commit": "3808b5635c6482e2a0a405a0d452785d0158da5c",
+      "source_commit": "aadf4dfee2b0002eb4bed2ea63b7de3709ec7bcd",
       "prefix_input": {
         "registered_tool_names": [
           "aft_callgraph",
@@ -3595,7 +3595,7 @@
           "edit": {
             "name": "edit",
             "label": "edit",
-            "description": "Edit part of a file via `appendContent`, batch `edits[]`, or symbol plus `content`. Batch `{ oldString, newString, replaceAll: true }` replaces every match. Provide exactly one mode per call: appendContent, edits[], or symbol plus content (mixing modes is rejected).",
+            "description": "Edit part of a file via `appendContent`, batch `edits[]`, or symbol plus `content`. `symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete. Batch `{ oldString, newString, replaceAll: true }` replaces every match. Provide exactly one mode per call: appendContent, edits[], or symbol plus content (mixing modes is rejected).",
             "promptSnippet": "Partial file edits via appendContent, edits[], or symbol plus content (exactly one mode per call).",
             "promptGuidelines": [
               "Prefer edit over write when changing part of an existing file.",
@@ -3615,11 +3615,11 @@
                 },
                 "symbol": {
                   "type": "string",
-                  "description": "Named symbol to replace (function, class, type)"
+                  "description": "Named symbol to replace; only meaningful together with `content`. A call carrying one without the other is incomplete."
                 },
                 "content": {
                   "type": "string",
-                  "description": "Replacement content for symbol mode. For whole-file writes, use the `write` tool."
+                  "description": "Replacement content for symbol mode; only meaningful together with `symbol`. A call carrying one without the other is incomplete. For whole-file writes, use the `write` tool."
                 },
                 "appendContent": {
                   "type": "string",
