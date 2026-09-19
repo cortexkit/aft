@@ -1,0 +1,16 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "pty-launcher-uses-bash-resolver",
+    "subc-rig-daemon-leak"
+  ],
+  "note": "No ranking-fence file changes: PTY tasks launch through the bash resolver; e2e subc rig daemons die with their runner.",
+  "train": null
+}
