@@ -3838,43 +3838,44 @@ pub(crate) fn sweep_transient_search_cache_dirs() {
         summary.skipped_unreadable,
         summary.budget_exhausted
     );
-    sweep_legacy_transient_search_cache_dirs_once();
+    sweep_legacy_transient_search_cache_dirs(&root);
 }
 
 /// Reap caches left at the top level of `$TMPDIR` by versions that wrote there
 /// directly.
 ///
-/// This runs once per process, on a detached thread: the directory it reads is
-/// shared with every other tool on the machine and can be arbitrarily large, so
-/// its listing must never be paid by a worker that a route bind is waiting
-/// behind. The per-configure sweep above reads only our own directory.
-fn sweep_legacy_transient_search_cache_dirs_once() {
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    STARTED.call_once(|| {
-        std::thread::Builder::new()
-            .name("aft-legacy-cache-sweep".to_string())
-            .spawn(|| {
-                let root = std::env::temp_dir();
-                let summary = sweep_transient_search_cache_dirs_with_limits(
-                    &root,
-                    TRANSIENT_SEARCH_CACHE_MIN_AGE,
-                    TRANSIENT_SEARCH_CACHE_SWEEP_BUDGET,
-                    TRANSIENT_SEARCH_CACHE_SWEEP_LIMIT,
-                );
-                if summary.scanned > 0 || summary.removed > 0 {
-                    crate::slog_info!(
-                        "legacy transient search cache sweep root={} scanned={} examined={} removed={} bytes={} budget_exhausted={}",
-                        root.display(),
-                        summary.scanned,
-                        summary.examined,
-                        summary.removed,
-                        summary.bytes,
-                        summary.budget_exhausted
-                    );
-                }
-            })
-            .ok();
-    });
+/// Runs inline, under the same iterator bound as the sweep above: the bound is
+/// what makes reading a directory we do not own safe, and it is cheaper than
+/// owning a thread. A legacy entry that sits beyond the scan limit is simply
+/// reaped by a later pass once the directory shrinks; the entries are one
+/// scratch directory per process and root, so nothing accumulates while we wait.
+///
+/// It does not run on a thread of its own on purpose: a detached thread that
+/// outlives a test process aborted the storm suite on macOS (SIGBUS, train 132)
+/// because it was still inside the sweep while the process tore its globals
+/// down.
+fn sweep_legacy_transient_search_cache_dirs(home: &Path) {
+    let root = std::env::temp_dir();
+    if root == home {
+        return;
+    }
+    let summary = sweep_transient_search_cache_dirs_with_limits(
+        &root,
+        TRANSIENT_SEARCH_CACHE_MIN_AGE,
+        TRANSIENT_SEARCH_CACHE_SWEEP_BUDGET,
+        TRANSIENT_SEARCH_CACHE_SWEEP_LIMIT,
+    );
+    if summary.scanned > 0 || summary.removed > 0 {
+        crate::slog_info!(
+            "legacy transient search cache sweep root={} scanned={} examined={} removed={} bytes={} budget_exhausted={}",
+            root.display(),
+            summary.scanned,
+            summary.examined,
+            summary.removed,
+            summary.bytes,
+            summary.budget_exhausted
+        );
+    }
 }
 
 fn sweep_transient_search_cache_dirs_with_limits(
