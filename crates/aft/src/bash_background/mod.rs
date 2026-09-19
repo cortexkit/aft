@@ -77,11 +77,14 @@ pub(crate) fn resolve_shell_path(pty: bool, shell: BashShell) -> Result<PathBuf,
 
     #[cfg(unix)]
     {
-        Ok(if pty {
-            pty_process::resolve_posix_shell()
-        } else {
-            registry::resolve_posix_shell()
-        })
+        // One interpreter for both modes: the tool is named `bash`, the model
+        // writes bash syntax, and a PTY only changes how the child's terminal is
+        // wired, not which shell reads the command. Resolving the PTY launcher
+        // from $SHELL (fish on many machines) made `$?` and `&&` fail only when
+        // `pty: true` was set, which read as a flaky tool rather than a syntax
+        // mismatch.
+        let _ = pty;
+        Ok(registry::resolve_posix_shell())
     }
     #[cfg(windows)]
     {
@@ -802,6 +805,40 @@ mod storage_root_tests {
                 .expect_err("primary panic must escape the inner scope")
                 .downcast_ref::<&str>(),
             Some(&"primary test failure")
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod shell_resolution_tests {
+    use super::{resolve_shell_path, BashShell};
+
+    /// `pty: true` must not change which shell reads the command. The model
+    /// writes bash for a tool named `bash`; a fish `$SHELL` on the host used to
+    /// make only the PTY path interpret it, so `$?` and `&&` failed there and
+    /// nowhere else.
+    #[test]
+    fn pty_and_pipe_modes_resolve_the_same_shell_regardless_of_shell_env() {
+        let _env = crate::test_env::process_env_lock();
+        let previous = std::env::var_os("SHELL");
+        // A path that exists on every macOS/Linux box so the old $SHELL-first
+        // resolver would have accepted it; the assertion below is what proves
+        // the resolver no longer looks.
+        std::env::set_var("SHELL", "/bin/sh");
+
+        let pty = resolve_shell_path(true, BashShell::Bash).expect("pty shell resolves");
+        let pipe = resolve_shell_path(false, BashShell::Bash).expect("pipe shell resolves");
+
+        match previous {
+            Some(value) => std::env::set_var("SHELL", value),
+            None => std::env::remove_var("SHELL"),
+        }
+
+        assert_eq!(pty, pipe, "PTY and pipe modes must launch the same interpreter");
+        assert_ne!(
+            pty.file_name().and_then(|name| name.to_str()),
+            Some("sh"),
+            "the PTY launcher must come from the bash resolver, not from $SHELL"
         );
     }
 }

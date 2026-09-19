@@ -2,11 +2,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -114,43 +110,6 @@ pub(crate) fn spawn_pty_for_command(
 
         Err(last_err)
     }
-}
-
-#[cfg(unix)]
-pub(crate) fn resolve_posix_shell() -> PathBuf {
-    resolve_posix_shell_with(
-        || std::env::var_os("SHELL").map(PathBuf::from),
-        is_executable_file,
-    )
-}
-
-#[cfg(unix)]
-fn resolve_posix_shell_with<S, X>(shell_env: S, is_executable: X) -> PathBuf
-where
-    S: FnOnce() -> Option<PathBuf>,
-    X: Fn(&Path) -> bool,
-{
-    if let Some(shell) =
-        shell_env().filter(|path| !path.as_os_str().is_empty() && is_executable(path.as_path()))
-    {
-        return shell;
-    }
-
-    for fallback in ["/bin/bash", "/bin/sh", "/bin/zsh"] {
-        let path = PathBuf::from(fallback);
-        if is_executable(&path) {
-            return path;
-        }
-    }
-
-    PathBuf::from("/bin/sh")
-}
-
-#[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
-    fs::metadata(path)
-        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
 }
 
 #[cfg(windows)]
@@ -467,39 +426,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn pty_shell_prefers_executable_shell_env() {
-        let shell = PathBuf::from("/custom/zsh");
-        let resolved =
-            resolve_posix_shell_with(|| Some(shell.clone()), |path| path == shell.as_path());
-
-        assert_eq!(resolved, shell);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pty_shell_ignores_unusable_shell_env_and_uses_fallback_order() {
-        let resolved = resolve_posix_shell_with(
-            || Some(PathBuf::from("/missing/fish")),
-            |path| path == Path::new("/bin/sh") || path == Path::new("/bin/zsh"),
-        );
-
-        assert_eq!(resolved, PathBuf::from("/bin/sh"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pty_shell_uses_bin_bash_before_later_fallbacks() {
-        let resolved = resolve_posix_shell_with(
-            || None,
-            |path| path == Path::new("/bin/bash") || path == Path::new("/bin/sh"),
-        );
-
-        assert_eq!(resolved, PathBuf::from("/bin/bash"));
-    }
-
-    #[cfg(unix)]
     #[test]
     fn pty_waiter_retries_wait_on_interrupted() {
         let temp = tempfile::tempdir().unwrap();
