@@ -267,12 +267,22 @@ fn configure_artifact_load_cancellations_for_test() -> usize {
     CONFIGURE_ARTIFACT_LOAD_CANCELLATIONS.load(Ordering::SeqCst)
 }
 
+// Test seam between the worker's start gate and its lifecycle recheck. A
+// non-zero "delay" HOLDS the worker here until the test releases it (bounded so
+// a test that forgets cannot hang the suite) rather than sleeping a fixed time:
+// the tests using it change the lifecycle in that window, and on a loaded
+// Windows runner a 500 ms sleep elapsed before the test thread got scheduled,
+// so the worker rechecked a still-bound lifecycle and the test read one load
+// attempt where it expected none (train 126).
 #[cfg(test)]
 fn delay_configure_artifact_load_after_gate_for_test() {
     CONFIGURE_ARTIFACT_POST_GATE_REACHED.fetch_add(1, Ordering::SeqCst);
-    let delay_ms = CONFIGURE_ARTIFACT_POST_GATE_DELAY_MS.load(Ordering::SeqCst);
-    if delay_ms > 0 {
-        std::thread::sleep(Duration::from_millis(delay_ms));
+    let hold_deadline = Instant::now() + Duration::from_secs(30);
+    while CONFIGURE_ARTIFACT_POST_GATE_DELAY_MS.load(Ordering::SeqCst) > 0 {
+        if Instant::now() >= hold_deadline {
+            panic!("artifact post-gate hold was never released by the test");
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -289,10 +299,19 @@ fn configure_deferred_delay_reached_for_test() -> usize {
     CONFIGURE_DEFERRED_DELAY_REACHED.load(Ordering::SeqCst)
 }
 
+/// Non-zero arms the post-gate hold; zero releases it (and is what the tests'
+/// drop guards call so a panicking test still frees the worker).
 #[cfg(test)]
 fn set_configure_artifact_post_gate_delay_for_test(delay_ms: u64) {
-    CONFIGURE_ARTIFACT_POST_GATE_REACHED.store(0, Ordering::SeqCst);
+    if delay_ms > 0 {
+        CONFIGURE_ARTIFACT_POST_GATE_REACHED.store(0, Ordering::SeqCst);
+    }
     CONFIGURE_ARTIFACT_POST_GATE_DELAY_MS.store(delay_ms, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn release_configure_artifact_post_gate_for_test() {
+    CONFIGURE_ARTIFACT_POST_GATE_DELAY_MS.store(0, Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -6045,6 +6064,7 @@ mod tests {
         external_ignore_watch_paths, handle_configure, install_project_watcher_with,
         only_lsp_process_state_changed, parse_lsp_paths_extra,
         release_callgraph_start_waiters_for_generation_change,
+        release_configure_artifact_post_gate_for_test,
         reset_configure_artifact_load_attempts_for_test,
         reset_configure_artifact_load_cancellations_for_test,
         reset_configure_deferred_delay_reached_for_test, semantic_build_retry_backoff,
@@ -9457,6 +9477,7 @@ mod tests {
 
         ctx.mark_subc_unbound();
         ctx.cancel_unbound_artifact_work();
+        release_configure_artifact_post_gate_for_test();
         let deadline = Instant::now() + Duration::from_secs(2);
         while configure_artifact_load_cancellations_for_test() == 0 {
             assert!(
@@ -10224,6 +10245,7 @@ mod tests {
         }
         ctx.mark_subc_unbound();
         super::cancel_deferred_configure_maintenance(&ctx);
+        release_configure_artifact_post_gate_for_test();
         drain.join().unwrap();
 
         let cancel_deadline = Instant::now() + Duration::from_secs(2);
