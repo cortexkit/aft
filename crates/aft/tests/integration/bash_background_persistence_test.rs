@@ -1,7 +1,9 @@
 #![cfg(unix)]
 
+use std::ffi::CString;
 use std::fs;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -767,6 +769,80 @@ fn bash_status_cross_session_different_project_returns_not_found() {
         .is_none());
 }
 
+/// Replay opens its per-session quarantine directory before renaming invalid
+/// task artifacts into it. The detached sweep used to unlink that directory
+/// while it was still empty, so the following rename failed with `ENOENT` and
+/// replay left the legacy artifact behind. Hold replay's recovery gate and the
+/// pinned destination across the sweep to drive that interleave exactly.
+#[test]
+fn persisted_gc_keeps_replays_open_quarantine_destination() {
+    let storage = tempfile::tempdir().unwrap();
+    let session_id = "session-quarantine-race";
+    let session_dir = session_tasks_dir(storage.path(), session_id);
+    fs::create_dir_all(&session_dir).unwrap();
+    let legacy_name = CString::new("bash-legacy1.json").unwrap();
+    let legacy_path = session_dir.join("bash-legacy1.json");
+    fs::write(&legacy_path, b"{}").unwrap();
+
+    let quarantine_session = storage
+        .path()
+        .join("bash-tasks-quarantine")
+        .join(aft::backup::hash_session(session_id));
+    fs::create_dir_all(&quarantine_session).unwrap();
+    let quarantined_name = CString::new("bash-legacy1.json.invalid-test").unwrap();
+
+    let pinned_session = fs::File::open(&session_dir).unwrap();
+    let pinned_destination = fs::File::open(&quarantine_session).unwrap();
+    let registry = registry();
+    let _recovery = registry.begin_session_recovery(storage.path(), session_id);
+    registry.maybe_gc_persisted(storage.path()).unwrap();
+
+    let renamed = unsafe {
+        libc::renameat(
+            pinned_session.as_raw_fd(),
+            legacy_name.as_ptr(),
+            pinned_destination.as_raw_fd(),
+            quarantined_name.as_ptr(),
+        )
+    };
+    assert_eq!(
+        renamed,
+        0,
+        "persisted GC invalidated replay's pinned quarantine destination: {}",
+        std::io::Error::last_os_error()
+    );
+    assert!(!legacy_path.exists());
+    assert!(quarantine_session
+        .join("bash-legacy1.json.invalid-test")
+        .is_file());
+}
+
+#[test]
+fn replay_reports_invalid_entry_quarantine_failure_with_source_path() {
+    let storage = tempfile::tempdir().unwrap();
+    let session_id = "session-quarantine-error";
+    let session_dir = session_tasks_dir(storage.path(), session_id);
+    fs::create_dir_all(&session_dir).unwrap();
+    let legacy_path = session_dir.join("bash-legacy1.json");
+    fs::write(&legacy_path, b"{}").unwrap();
+    fs::write(storage.path().join("bash-tasks-quarantine"), b"blocked").unwrap();
+
+    let registry = registry();
+    let error = registry
+        .replay_session(storage.path(), session_id)
+        .expect_err("replay swallowed the invalid-entry quarantine failure");
+
+    assert!(
+        error.contains(&legacy_path.display().to_string()),
+        "replay error omitted source path {}: {error}",
+        legacy_path.display()
+    );
+    assert!(
+        error.contains("os error"),
+        "replay error omitted the underlying I/O error: {error}"
+    );
+}
+
 #[test]
 fn bash_status_legacy_persisted_task_is_quarantined_on_replay() {
     let project = tempfile::tempdir().unwrap();
@@ -776,9 +852,8 @@ fn bash_status_legacy_persisted_task_is_quarantined_on_replay() {
 
     let same = registry();
     same.replay_session(storage.path(), "session-a").unwrap();
-    // Legacy-layout quarantine is the detached persisted GC's job, not the
-    // inline replay's, so the assertion waits for that first sweep to record
-    // its exit (macOS CI read the file as still present before the sweep ran).
+    // Wait for the detached sweep as well as inline replay so this assertion
+    // covers the exact overlap that left the file behind on macOS CI.
     let deadline = Instant::now() + Duration::from_secs(30);
     while same.persisted_gc_thread().is_none() {
         assert!(
@@ -788,10 +863,9 @@ fn bash_status_legacy_persisted_task_is_quarantined_on_replay() {
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    // Legacy-layout files are invalid entries; replay quarantines them inline
-    // and logs (not returns) a failed rename. A logger is not installed in this
-    // binary, so when the file survives, redo that one rename here to surface
-    // the OS error instead of a bare `exists()` (macOS CI, train 113).
+    // If a legacy file remains after replay reports success, retry the same
+    // quarantine rename so the failure distinguishes an I/O error from missed
+    // discovery instead of showing only a bare `exists()` assertion.
     if legacy_path.exists() {
         let session_dir =
             aft::bash_background::persistence::session_tasks_dir(storage.path(), "session-a");

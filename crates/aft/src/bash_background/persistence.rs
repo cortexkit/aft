@@ -1016,20 +1016,31 @@ pub fn quarantine_task_layout(
     task_id: &str,
     reason: &str,
 ) -> io::Result<()> {
-    validate_task_id(task_id)?;
-    let session = PinnedDir::open(session_dir)?;
-    let names = session.list_names()?;
-    let flat_prefix = format!("{task_id}.");
-    let selected = names
-        .into_iter()
-        .filter(|name| {
-            name == OsStr::new(task_id)
-                || name
-                    .to_str()
-                    .is_some_and(|name| name.starts_with(&flat_prefix))
-        })
-        .collect::<Vec<_>>();
-    quarantine_names(storage_dir, session_dir, &session, selected, reason)
+    let result = (|| -> io::Result<()> {
+        validate_task_id(task_id)?;
+        let session = PinnedDir::open(session_dir)?;
+        let names = session.list_names()?;
+        let flat_prefix = format!("{task_id}.");
+        let selected = names
+            .into_iter()
+            .filter(|name| {
+                name == OsStr::new(task_id)
+                    || name
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(&flat_prefix))
+            })
+            .collect::<Vec<_>>();
+        quarantine_names(storage_dir, session_dir, &session, selected, reason)
+    })();
+    result.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to quarantine background task {task_id} from {}: {error}",
+                session_dir.display()
+            ),
+        )
+    })
 }
 
 pub fn quarantine_invalid_entry(
@@ -1037,14 +1048,25 @@ pub fn quarantine_invalid_entry(
     session_dir: &Path,
     entry: &OsStr,
 ) -> io::Result<()> {
-    let session = PinnedDir::open(session_dir)?;
-    quarantine_names(
-        storage_dir,
-        session_dir,
-        &session,
-        vec![entry.to_os_string()],
-        "invalid",
-    )
+    let result = (|| -> io::Result<()> {
+        let session = PinnedDir::open(session_dir)?;
+        quarantine_names(
+            storage_dir,
+            session_dir,
+            &session,
+            vec![entry.to_os_string()],
+            "invalid",
+        )
+    })();
+    result.map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to quarantine invalid background task entry {}: {error}",
+                session_dir.join(entry).display()
+            ),
+        )
+    })
 }
 
 fn quarantine_names(
