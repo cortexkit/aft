@@ -1,8 +1,8 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { constants } from "node:fs";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, join, relative, resolve } from "node:path";
+import { basename, join, relative, resolve, sep } from "node:path";
 
 import { type CatalogEntry, SubcClient } from "@cortexkit/subc-client";
 
@@ -93,7 +93,29 @@ interface DaemonDirs {
 interface ProcessInfo {
   pid: number;
   ppid: number;
+  /** Raw `ps` elapsed time, e.g. `02:58:31` or `4-00:31:58`. */
+  elapsed: string;
   command: string;
+}
+
+/** A daemon the sweep found orphaned and terminated. */
+export interface ReapedSubcDaemon {
+  pid: number;
+  /** Uptime as `ps` reported it, i.e. how long the orphan had been running. */
+  uptime: string;
+  executable: string;
+}
+
+export interface SweepSubcDaemonOptions {
+  /**
+   * Directory tree that identifies a test daemon. Only processes whose
+   * executable lives under it are candidates. Tests point this at a temp dir.
+   */
+  cacheRoot?: string;
+  /** Where the per-pid report goes; defaults to console.info. */
+  log?: (line: string) => void;
+  /** How long a reaped pid may take to die before it gets SIGKILL. */
+  graceMs?: number;
 }
 
 let preparedPromise: Promise<PreparedSubcLane> | null = null;
@@ -282,6 +304,12 @@ async function writeBulkFixtureFiles(
 }
 
 async function prepareSubcLaneOnce(): Promise<PreparedSubcLane> {
+  // A killed runner (test timeout, SIGKILL, worktree reclaim) runs no exit
+  // handler at all, so the daemon it started is still alive and has been
+  // reparented to init. Reap those leftovers before starting another daemon,
+  // otherwise they accumulate one per run.
+  await sweepReparentedSubcDaemons();
+
   const subc = await resolveSubcCore();
   if (!subc.path) {
     return {
@@ -662,22 +690,143 @@ async function findAftModuleProcess(
   );
 }
 
+/**
+ * Terminate leftover test daemons whose runner is gone.
+ *
+ * A process qualifies only when both hold:
+ *   - its executable lives under `cacheRoot` (the fetched test-binary cache).
+ *     The name `ck-subc` is deliberately NOT part of the test: the production
+ *     supervisor and other checkouts' supervisors share that name, and only the
+ *     cache path distinguishes a daemon this test rig fetched and started.
+ *   - its parent is pid 1, meaning the process that started it has exited and
+ *     the kernel reparented it. A process with a live parent belongs to a
+ *     running test run and is never touched.
+ */
+export async function sweepReparentedSubcDaemons(
+  options: SweepSubcDaemonOptions = {},
+): Promise<ReapedSubcDaemon[]> {
+  const cacheRoot = options.cacheRoot ?? FETCHED_SUBC_CORE_CACHE_ROOT;
+  const log = options.log ?? ((line: string) => console.info(line));
+
+  if (process.platform === "win32") {
+    // No `ps` process table to read here, and Windows orphans are not
+    // reparented to a known pid, so there is nothing safe to match on.
+    log(`[subc-rig] orphan daemon sweep skipped on win32 (cache root ${cacheRoot})`);
+    return [];
+  }
+
+  let rows: ProcessInfo[];
+  try {
+    rows = await listProcessTable();
+  } catch (err) {
+    log(`[subc-rig] orphan daemon sweep could not read the process table: ${errorText(err)}`);
+    return [];
+  }
+
+  const roots = await cacheRootPrefixes(cacheRoot);
+  const reaped: ReapedSubcDaemon[] = [];
+  for (const row of rows) {
+    if (row.pid <= 1 || row.pid === process.pid) continue;
+    if (row.ppid !== 1) continue;
+    const executable = commandExecutable(row.command);
+    if (!isUnderAnyRoot(executable, roots)) continue;
+    log(
+      `[subc-rig] reaping orphaned subc daemon pid=${row.pid} uptime=${row.elapsed} exe=${executable}`,
+    );
+    if (await terminatePid(row.pid, options.graceMs ?? 2_000)) {
+      reaped.push({ pid: row.pid, uptime: row.elapsed, executable });
+    } else {
+      log(`[subc-rig] orphaned subc daemon pid=${row.pid} did not die; leaving it to the OS`);
+    }
+  }
+  return reaped;
+}
+
+async function cacheRootPrefixes(cacheRoot: string): Promise<string[]> {
+  const roots = [resolve(cacheRoot)];
+  try {
+    // macOS temp dirs (and any symlinked cache path) can be reported by `ps`
+    // under their resolved location, so match either spelling.
+    const real = await realpath(cacheRoot);
+    if (!roots.includes(real)) roots.push(real);
+  } catch {
+    // The cache root may not exist yet; the literal path is enough.
+  }
+  return roots;
+}
+
+function isUnderAnyRoot(executable: string, roots: string[]): boolean {
+  if (executable.length === 0) return false;
+  return roots.some((root) => executable.startsWith(`${root}${sep}`));
+}
+
+function commandExecutable(command: string): string {
+  return command.trim().split(/\s+/, 1)[0] ?? "";
+}
+
+/** SIGTERM a pid, then SIGKILL it if it is still alive after the grace window. */
+async function terminatePid(pid: number, graceMs: number): Promise<boolean> {
+  if (!signalPid(pid, "SIGTERM")) return true;
+  const deadline = Date.now() + graceMs;
+  while (Date.now() < deadline) {
+    await sleep(50);
+    if (!isAlive(pid)) return true;
+  }
+  signalPid(pid, "SIGKILL");
+  const killDeadline = Date.now() + 1_000;
+  while (Date.now() < killDeadline) {
+    await sleep(50);
+    if (!isAlive(pid)) return true;
+  }
+  return false;
+}
+
+/** Returns false when the pid is already gone or not ours to signal. */
+function signalPid(pid: number, signal: "SIGTERM" | "SIGKILL"): boolean {
+  try {
+    process.kill(pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 async function listProcessTable(): Promise<ProcessInfo[]> {
   if (process.platform === "win32") return [];
-  const result = await runProcess("ps", ["-eo", "pid=,ppid=,command="], PROJECT_ROOT);
+  const result = await runProcess("ps", ["-eo", "pid=,ppid=,etime=,command="], PROJECT_ROOT);
   if (result.code !== 0) throw new Error(`ps failed (${result.code}): ${result.output}`);
   return result.output
     .split("\n")
     .flatMap((line): ProcessInfo[] => {
-      const match = line.trim().match(/^(\d+)\s+(\d+)\s+(.*)$/);
+      const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
       if (!match) return [];
-      return [{ pid: Number(match[1]), ppid: Number(match[2]), command: match[3] ?? "" }];
+      return [
+        {
+          pid: Number(match[1]),
+          ppid: Number(match[2]),
+          elapsed: match[3] ?? "",
+          command: match[4] ?? "",
+        },
+      ];
     })
     .filter((row) => Number.isFinite(row.pid) && Number.isFinite(row.ppid));
 }
 
 function isAftProcessCommand(command: string, aftBinaryPath: string): boolean {
-  const executable = command.split(/\s+/, 1)[0] ?? "";
+  const executable = commandExecutable(command);
   return (
     executable === aftBinaryPath ||
     (basename(executable) === AFT_BINARY_NAME && command.includes(" --subc "))
