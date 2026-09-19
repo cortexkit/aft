@@ -818,28 +818,57 @@ fn persisted_gc_keeps_replays_open_quarantine_destination() {
 }
 
 #[test]
-fn replay_reports_invalid_entry_quarantine_failure_with_source_path() {
+fn replay_continues_after_invalid_entry_quarantine_failure() {
+    let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let session_id = "session-quarantine-error";
+    let task_id = "bash-aaaaaaaaaaaaaaaa";
+    fake_task(
+        storage.path(),
+        project.path(),
+        session_id,
+        task_id,
+        BgTaskStatus::Completed,
+        false,
+    );
+
     let session_dir = session_tasks_dir(storage.path(), session_id);
-    fs::create_dir_all(&session_dir).unwrap();
     let legacy_path = session_dir.join("bash-legacy1.json");
     fs::write(&legacy_path, b"{}").unwrap();
     fs::write(storage.path().join("bash-tasks-quarantine"), b"blocked").unwrap();
 
+    init_test_logger();
     let registry = registry();
-    let error = registry
-        .replay_session(storage.path(), session_id)
-        .expect_err("replay swallowed the invalid-entry quarantine failure");
+    registry.replay_session(storage.path(), session_id).unwrap();
 
     assert!(
-        error.contains(&legacy_path.display().to_string()),
-        "replay error omitted source path {}: {error}",
+        legacy_path.exists(),
+        "failed quarantine moved the invalid file"
+    );
+    assert!(
+        registry
+            .list(1024)
+            .iter()
+            .any(|snapshot| snapshot.info.task_id == task_id),
+        "quarantine failure prevented the valid task from being replayed"
+    );
+    assert!(
+        registry
+            .drain_completions_for_session(Some(session_id))
+            .iter()
+            .any(|completion| completion.task_id == task_id),
+        "quarantine failure prevented completion redelivery"
+    );
+
+    let logs = take_logs().join("\n");
+    assert!(
+        logs.contains(&legacy_path.display().to_string()),
+        "quarantine warning omitted source path {}: {logs}",
         legacy_path.display()
     );
     assert!(
-        error.contains("os error"),
-        "replay error omitted the underlying I/O error: {error}"
+        logs.contains("os error"),
+        "quarantine warning omitted the underlying I/O error: {logs}"
     );
 }
 

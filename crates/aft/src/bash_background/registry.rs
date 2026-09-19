@@ -2530,18 +2530,17 @@ impl BgTaskRegistry {
                         "quarantining unresolved background task {}: {error}",
                         metadata.task_id
                     );
-                    quarantine_task_layout(
+                    if let Err(quarantine_error) = quarantine_task_layout(
                         storage_dir,
                         &session_dir,
                         &metadata.task_id,
                         "invalid",
-                    )
-                    .map_err(|quarantine_error| {
-                        format!(
+                    ) {
+                        crate::slog_warn!(
                             "failed to quarantine unresolved background task {} during replay after layout error ({error}): {quarantine_error}",
                             metadata.task_id
-                        )
-                    })?;
+                        );
+                    }
                     continue;
                 }
             };
@@ -2557,18 +2556,17 @@ impl BgTaskRegistry {
                         );
                         continue;
                     }
-                    quarantine_task_layout(
+                    if let Err(error) = quarantine_task_layout(
                         storage_dir,
                         &session_dir,
                         &metadata.task_id,
                         "mismatch",
-                    )
-                    .map_err(|error| {
-                        format!(
+                    ) {
+                        crate::slog_warn!(
                             "failed to quarantine mismatched background task {} during replay: {error}",
                             metadata.task_id
-                        )
-                    })?;
+                        );
+                    }
                     continue;
                 }
             }
@@ -2739,9 +2737,11 @@ impl BgTaskRegistry {
         let (task_ids, invalid_entries) = discover_task_ids(&dir)
             .map_err(|error| format!("failed to discover background task layouts: {error}"))?;
         for entry in invalid_entries {
-            quarantine_invalid_entry(storage_dir, &dir, &entry).map_err(|error| {
-                format!("failed to quarantine invalid background task entry during replay: {error}")
-            })?;
+            if let Err(error) = quarantine_invalid_entry(storage_dir, &dir, &entry) {
+                crate::slog_warn!(
+                    "failed to quarantine invalid background task entry during replay: {error}"
+                );
+            }
         }
 
         let mut tasks = Vec::new();
@@ -2769,13 +2769,13 @@ impl BgTaskRegistry {
                     crate::slog_warn!(
                         "quarantining unresolved background task {task_id} during replay: {error}"
                     );
-                    quarantine_task_layout(storage_dir, &dir, &task_id, "invalid").map_err(
-                        |quarantine_error| {
-                            format!(
-                                "failed to quarantine unresolved background task {task_id} during replay after layout error ({error}): {quarantine_error}"
-                            )
-                        },
-                    )?;
+                    if let Err(quarantine_error) =
+                        quarantine_task_layout(storage_dir, &dir, &task_id, "invalid")
+                    {
+                        crate::slog_warn!(
+                            "failed to quarantine unresolved background task {task_id} during replay after layout error ({error}): {quarantine_error}"
+                        );
+                    }
                     continue;
                 }
             };
@@ -2785,13 +2785,13 @@ impl BgTaskRegistry {
                     crate::slog_warn!(
                         "quarantining background task {task_id} with mismatched session metadata"
                     );
-                    quarantine_task_layout(storage_dir, &dir, &task_id, "mismatch").map_err(
-                        |error| {
-                            format!(
-                                "failed to quarantine background task {task_id} with mismatched session metadata during replay: {error}"
-                            )
-                        },
-                    )?;
+                    if let Err(error) =
+                        quarantine_task_layout(storage_dir, &dir, &task_id, "mismatch")
+                    {
+                        crate::slog_warn!(
+                            "failed to quarantine background task {task_id} with mismatched session metadata during replay: {error}"
+                        );
+                    }
                 }
                 Err(error) => {
                     if self.db_has_live_process_for_task(&task_id) {
@@ -2803,13 +2803,13 @@ impl BgTaskRegistry {
                     crate::slog_warn!(
                         "quarantining invalid background task metadata {task_id} during replay: {error}"
                     );
-                    quarantine_task_layout(storage_dir, &dir, &task_id, "invalid").map_err(
-                        |quarantine_error| {
-                            format!(
-                                "failed to quarantine invalid background task metadata {task_id} during replay after read error ({error}): {quarantine_error}"
-                            )
-                        },
-                    )?;
+                    if let Err(quarantine_error) =
+                        quarantine_task_layout(storage_dir, &dir, &task_id, "invalid")
+                    {
+                        crate::slog_warn!(
+                            "failed to quarantine invalid background task metadata {task_id} during replay after read error ({error}): {quarantine_error}"
+                        );
+                    }
                 }
             }
         }
