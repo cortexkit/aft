@@ -10,8 +10,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createReadStream, existsSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { cp, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
 import { homedir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -527,6 +528,172 @@ async function runUntilMarker(
     }, 2_000).unref();
   });
   return { status: child.exitCode, stdout, stderr };
+}
+
+function freeLoopbackPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const probe = createServer();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      if (address === null || typeof address === "string") {
+        probe.close(() => reject(new Error("could not reserve a loopback port")));
+        return;
+      }
+      probe.close(() => resolve(address.port));
+    });
+  });
+}
+
+function v2Binary(hostRoot: string): string {
+  return join(
+    hostRoot,
+    "node_modules",
+    ".bin",
+    process.platform === "win32" ? "opencode.cmd" : "opencode",
+  );
+}
+
+async function writeV2HostConfig(
+  isolation: HostIsolation,
+  targets: string[],
+  aftConfig: Record<string, unknown>,
+): Promise<void> {
+  const configDir = join(isolation.env.XDG_CONFIG_HOME ?? "", "opencode");
+  await mkdir(configDir, { recursive: true });
+  // A throwaway HOME and four XDG roots are not enough to isolate a V2 TUI
+  // host. It talks to a managed background service whose port is a constant
+  // per release channel -- the release line this matrix pins always means
+  // 49374 on this machine -- so two isolated runs, or a run beside the
+  // operator's own editor, land on one port and the loser either fails to
+  // start or silently attaches to the winner's service and its database.
+  // Reserving a free port per row in the service config, which does live under
+  // the isolated config root, is what keeps the runs apart.
+  await writeFile(
+    join(configDir, "service.json"),
+    `${JSON.stringify({ hostname: "127.0.0.1", port: await freeLoopbackPort() }, null, 2)}\n`,
+  );
+  await writeFile(
+    join(configDir, "opencode.json"),
+    `${JSON.stringify({ plugin: targets }, null, 2)}\n`,
+  );
+  await writeAftConfig(isolation, aftConfig);
+}
+
+// Wraps the packaged TUI entry so a run can tell three states apart that the
+// host's own log does not distinguish: setup never ran, setup threw, and setup
+// returned but a slot render threw afterwards. `keymap.layer` is only legal
+// from inside a slot render, so "the app slot rendered" is the assertion that
+// actually proves the status command registered.
+const v2TuiObserverEntry = `
+import { appendFileSync } from "node:fs";
+import original from "./src/entry/tui.mjs";
+
+const record = (line) => appendFileSync(process.env.AFT_LOAD_MATRIX_MARKER, line + "\\n");
+
+function observe(context) {
+  // The host context exposes reactive getters, so it is proxied rather than
+  // spread: spreading would freeze values the plugin re-reads later.
+  const ui = new Proxy(context.ui, {
+    get(target, property) {
+      if (property !== "slot") return Reflect.get(target, property, target);
+      return (claim) =>
+        target.slot({
+          ...claim,
+          render: (input) => {
+            try {
+              const node = claim.render(input);
+              record("slot-rendered:" + claim.append);
+              return node;
+            } catch (error) {
+              record("slot-render-failed:" + claim.append + ":" + String(error));
+              throw error;
+            }
+          },
+        });
+    },
+  });
+  return new Proxy(context, {
+    get: (target, property) =>
+      property === "ui" ? ui : Reflect.get(target, property, target),
+  });
+}
+
+export default {
+  ...original,
+  setup: async (context) => {
+    record("tui-setup-start");
+    const cleanup = await original.setup(observe(context));
+    record("tui-setup-complete");
+    return cleanup;
+  },
+};
+`;
+
+const v2TuiSetupOutcome =
+  /message="plugin operation (?:completed|failed)"[^\n]*stage=setup[^\n]*plugin=aft-opencode/;
+// Reconciliation 1 runs before the configured plugins are known and 2 is the
+// pass that loads them, so a third completed pass means the host settled --
+// including the case where it silently skipped the target and AFT never
+// appears in the log at all.
+const v2TuiSettled = /message="plugin reconciliation completed"[^\n]*\bid=3\b/;
+
+async function runV2TuiHost(input: {
+  label: string;
+  packageRoot: string;
+  timeoutMs?: number;
+}): Promise<{ transcript: string; events: string }> {
+  const { v2 } = await ensureHostInstalls();
+  const isolation = await makeIsolation(input.label);
+  const marker = join(isolation.root, "tui-entry.log");
+  isolation.env.AFT_LOAD_MATRIX_MARKER = marker;
+  await writeV2HostConfig(isolation, [input.packageRoot], { enabled: false });
+
+  const result = await withOperatorCanary(input.label, async () => {
+    let stderr = "";
+    // Only stderr is captured: `--print-logs` writes the plugin log there,
+    // while stdout is the terminal repaint stream and grows without bound.
+    const child: ChildProcess = spawn(v2Binary(v2), ["--print-logs", "--log-level", "debug"], {
+      cwd: isolation.project,
+      env: isolation.env,
+      stdio: ["ignore", "ignore", "pipe"],
+      shell: process.platform === "win32",
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    const deadline = Date.now() + (input.timeoutMs ?? 120_000);
+    const done = (): boolean => {
+      const observed = existsSync(marker) ? readFileSync(marker, "utf8") : "";
+      if (observed.includes("slot-rendered:app")) return true;
+      // A row that does not instrument the entry has no marker to wait on, so
+      // the host's own setup verdict is the stop signal.
+      if (observed === "" && v2TuiSetupOutcome.test(stderr)) return true;
+      return v2TuiSettled.test(stderr);
+    };
+    while (!done() && child.exitCode === null && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    child.kill("SIGTERM");
+    await new Promise<void>((resolve) => {
+      if (child.exitCode !== null) return resolve();
+      child.once("exit", () => resolve());
+      setTimeout(() => {
+        child.kill("SIGKILL");
+        resolve();
+      }, 2_000).unref();
+    });
+    return stderr;
+  });
+
+  const events = existsSync(marker) ? await readFile(marker, "utf8") : "";
+  const transcript = result
+    .split(/\r?\n/)
+    .filter((line) => line.includes("component=plugin") || line.includes("Keymap"))
+    .join("\n");
+  console.log(`[${input.label}-transcript]\n${transcript}`);
+  console.log(`[${input.label}-events]\n${events.trim()}`);
+  return { transcript: result, events };
 }
 
 async function writeV2CoreProbe(hostRoot: string, mode: "load" | "reject"): Promise<string> {
@@ -1276,6 +1443,59 @@ export default { id: original.id, effect };
     expect(events).not.toContain("permissions:");
   }, 180_000);
 
+  test("GA TUI host mounts the sidebar and its status command without a keymap error", async () => {
+    const { v2 } = await ensureHostInstalls();
+    const packageRoot = await copyInstalledPlugin(v2, "v2-tui-keymap");
+    await writeFile(join(packageRoot, "tui.js"), v2TuiObserverEntry);
+
+    const { transcript, events } = await runV2TuiHost({
+      label: "v2-tui-keymap",
+      packageRoot,
+    });
+
+    // The host reports a throwing setup as a failed plugin operation and puts
+    // the message on a toast; both AFT's own registration and every later
+    // registration in the same setup are lost with it.
+    expect(transcript).not.toContain("Keymap.Provider is missing");
+    expect(transcript).not.toMatch(/message="plugin operation failed"[^\n]*plugin=aft-opencode/);
+    expect(transcript).toMatch(
+      /message="plugin operation completed"[^\n]*stage=setup[^\n]*plugin=aft-opencode/,
+    );
+
+    expect(events).toContain("tui-setup-start\n");
+    expect(events).toContain("tui-setup-complete\n");
+    // The status command is owned by the component rendered into `app`, so a
+    // completed render of that slot is what proves `keymap.layer` succeeded
+    // where the host allows it.
+    expect(events).toContain("slot-rendered:app\n");
+    expect(events).not.toContain("slot-render-failed:");
+  }, 240_000);
+
+  test("GA TUI host loads a directory target through its root tui entrypoint", async () => {
+    const { v2 } = await ensureHostInstalls();
+    const packageRoot = await copyInstalledPlugin(v2, "v2-tui-directory");
+
+    // The target is the package directory itself: not the package name, which
+    // would resolve through the exports map, and not an entry file, which this
+    // host skips outright. A directory is resolved by joining `tui` onto it, so
+    // the file that has to exist is `<dir>/tui.js` in the package root. Every
+    // resolution failure there is swallowed, so without that file the TUI
+    // feature disappears with nothing in the log to explain it.
+    const { transcript, events } = await runV2TuiHost({
+      label: "v2-tui-directory",
+      packageRoot,
+    });
+
+    expect(transcript).toContain(`entrypoint=${pathToFileURL(join(packageRoot, "tui.js")).href}`);
+    expect(transcript).toContain(`target=${packageRoot}`);
+    expect(transcript).toMatch(
+      /message="plugin operation completed"[^\n]*stage=setup[^\n]*plugin=aft-opencode/,
+    );
+    expect(transcript).not.toContain("Keymap.Provider is missing");
+    // This row deliberately runs the shipped entry, so nothing instruments it.
+    expect(events).toBe("");
+  }, 240_000);
+
   test("manifest mutation converges multiple V1 root invocations on one daemon owner", async () => {
     // This is the one row that needs a real subconscious daemon. The sibling
     // subc lanes skip their whole describe when the core binary is absent
@@ -1499,6 +1719,8 @@ export default entry;
       "v2-bun",
       "v2-node",
       "v2-lifecycle",
+      "v2-tui-keymap",
+      "v2-tui-directory",
       "v1-root-mutation",
       "v2-function-negative",
       "v1-core-bare",
