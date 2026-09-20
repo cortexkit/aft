@@ -242,7 +242,7 @@ fn checkpoint_derived(
     let connection = if let Some(connection) = connection {
         connection
     } else {
-        owned = crate::db::file_identity::IdentityConnection::new(Connection::open(path)?, "views::generation::checkpoint_derived");
+        owned = crate::db::file_identity::IdentityConnection::open(path, "views::generation::checkpoint_derived")?;
         &owned
     };
     connection.busy_timeout(Duration::from_secs(5))?;

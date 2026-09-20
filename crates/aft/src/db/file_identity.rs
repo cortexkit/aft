@@ -2,7 +2,8 @@
 //!
 //! SQLite keeps one WAL-index (the `-shm` file) per database file inside a
 //! process, and the first connection to win the exclusive dead-man-switch lock
-//! on a `-shm` truncates that file to zero length before mapping it. POSIX
+//! on a `-shm` shrinks that file (to three bytes on Darwin, zero on other Unix
+//! platforms) before mapping it. POSIX
 //! advisory locks never conflict between two descriptors held by the *same*
 //! process, so that lock protects nothing once one process holds two
 //! connections attached to two *different* database files at the *same* path:
@@ -19,10 +20,9 @@
 //! replaced while this process still has a connection open on it, which is the
 //! operation that creates the divergence in the first place.
 //!
-//! This is detection, not enforcement: nothing here refuses an operation. A
-//! report that turns a nameless SIGBUS into a located bug is worth having even
-//! where the code doing the replacing turns out to be safe, whereas a refusal
-//! could break a legitimate replacement.
+//! Callgraph file-set mutations also use this registry for enforcement: opening
+//! and registering a handle is serialized with checking for live users and
+//! removing or renaming its files.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -217,6 +217,15 @@ fn write_stderr_line(line: &str) {
     eprint!("{line}");
 }
 
+/// Serialize SQLite opens with AFT file-set mutations. The staging database
+/// keeps this gate while checking whether its file exists and calling the open
+/// helper; reentrancy permits that nested call. Connection lifetimes do not hold
+/// this gate; the registry protects live users.
+pub(crate) fn filesystem_guard() -> parking_lot::ReentrantMutexGuard<'static, ()> {
+    static GATE: parking_lot::ReentrantMutex<()> = parking_lot::ReentrantMutex::new(());
+    GATE.lock()
+}
+
 /// Identity-only accounting for connections that retain SQLite's native WAL policy.
 /// Kept after the raw connection in `IdentityConnection`, so close completes before
 /// the registry forgets the handle, including on early returns and worker moves.
@@ -252,6 +261,16 @@ pub(crate) struct IdentityConnection {
 }
 
 impl IdentityConnection {
+    pub(crate) fn open(path: impl AsRef<Path>, seam: &'static str) -> rusqlite::Result<Self> {
+        let _guard = filesystem_guard();
+        Ok(Self::new(rusqlite::Connection::open(path)?, seam))
+    }
+
+    pub(crate) fn open_with_flags(path: impl AsRef<Path>, flags: rusqlite::OpenFlags, seam: &'static str) -> rusqlite::Result<Self> {
+        let _guard = filesystem_guard();
+        Ok(Self::new(rusqlite::Connection::open_with_flags(path, flags)?, seam))
+    }
+
     pub(crate) fn new(connection: rusqlite::Connection, seam: &'static str) -> Self {
         let record = OpenRecord::new(&connection, SqliteStore::Unmapped(seam));
         Self { connection, _record: record }
@@ -337,14 +356,22 @@ fn replacement_hazard(
     })
 }
 
-/// Number of tracked connections this process currently has open on `path`.
+/// Number of registered connections at `path` or at another name for its inode.
+/// Hold [`filesystem_guard`] across this query and any file-set mutation so an
+/// opener cannot appear between checking the registry and changing the files.
 pub fn open_connections(path: &Path) -> usize {
     let key = registry_key(path);
+    let identity = identity_of(&key);
     open_databases()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&key)
-        .map_or(0, |entry| entry.openers.len())
+        .iter()
+        .map(|(registered_path, entry)| {
+            entry.openers.iter().filter(|opener| {
+                registered_path == &key || identity.is_some() && opener.identity == identity
+            }).count()
+        })
+        .sum()
 }
 
 /// Report `action` if it is about to delete, rename, or replace the database

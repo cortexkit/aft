@@ -9,7 +9,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
 
 /// Maximum paths included in a refresh-status response; counts include paths beyond this limit.
 pub const VISIBLE_PATH_CAP: usize = 20;
@@ -141,7 +141,7 @@ impl PathStatusStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let connection = crate::db::file_identity::IdentityConnection::new(Connection::open(path)?, "path_status::PathStatusStore::open_at");
+        let connection = crate::db::file_identity::IdentityConnection::open(path, "path_status::PathStatusStore::open_at")?;
         connection.execute_batch(PATH_STATUS_SCHEMA)?;
         Ok(Self {
             path: path.to_path_buf(),

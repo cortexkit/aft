@@ -3,7 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use rusqlite::{Connection, OptionalExtension};
+#[cfg(test)]
+use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 
 use crate::alias::{head_tree_entries, AliasStore, GitMode};
 use crate::blob_store::{
@@ -490,7 +492,7 @@ pub fn prepare_checkout(
         prepared.profile.derived_clone_ms = clone_started.elapsed().as_millis();
         // Keep one connection alive so SQLite does not checkpoint the committed WAL
         // when the materializer closes its writer before pointer publication.
-        let derived_keeper = crate::db::file_identity::IdentityConnection::new(Connection::open(&derived)?, "views::assembly::assemble");
+        let derived_keeper = crate::db::file_identity::IdentityConnection::open(&derived, "views::assembly::assemble")?;
         derived_keeper.busy_timeout(std::time::Duration::from_secs(5))?;
         // Opening a handle or setting journal_mode alone does not attach its
         // pager to the WAL. Read the schema so closing the materializer is not

@@ -3631,6 +3631,8 @@ impl CallGraphStore {
         // Keep its identity stable so a replacement process adopts committed
         // batches instead of minting a second temp and starting from zero.
         let temp_path = callgraph_dir.join(format!("{project_key}.staging.sqlite.tmp.resume"));
+        let staging_guard = crate::db::file_identity::filesystem_guard();
+        ensure_sqlite_files_closed(&temp_path)?;
         let adopting_staging = temp_path.exists();
         if !adopting_staging {
             remove_sqlite_file_set(&temp_path);
@@ -3669,6 +3671,7 @@ impl CallGraphStore {
                 None,
             )?
             .store;
+            drop(staging_guard);
             // Admission must precede every expensive build phase and every
             // staging write: a suspended root is refused before the process
             // spends anything, and a death during enumeration is attributable
@@ -3720,6 +3723,9 @@ impl CallGraphStore {
         notify_cold_build_before_publish_observer();
         let publication = publish_if_current(|| {
             verify_writer_lease(&writer_lease)?;
+            let _files = crate::db::file_identity::filesystem_guard();
+            ensure_sqlite_files_closed(&temp_path)?;
+            ensure_sqlite_files_closed(&gen_path)?;
             // Move the finished build to its final generation path. This target is
             // brand-new and owned by us, so the rename never hits an open file.
             remove_sqlite_file_set(&gen_path);
@@ -3736,6 +3742,7 @@ impl CallGraphStore {
             // mapping and dies with SIGBUS. Remove them with the file they
             // describe.
             remove_sqlite_sidecars(&temp_path);
+            drop(_files);
 
             notify_cold_build_swap_observer(&temp_path, &gen_path);
 
@@ -3932,11 +3939,18 @@ impl CallGraphStore {
 
     fn prepare_for_atomic_swap(&self) -> Result<()> {
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
+        let _files = crate::db::file_identity::filesystem_guard();
+        if crate::db::file_identity::open_connections(&self.sqlite_path) > 1 {
+            return Err(CallGraphStoreError::Unavailable("cannot change journal mode with another live connection".into()));
+        }
         conn.checkpoint_wal_as(
             self.atomic_swap_checkpoint_mode(),
             crate::write_ledger::Domain::CallgraphCheckpoint,
         )?;
-        conn.pragma_update(None, "journal_mode", "DELETE")?;
+        let mode: String = conn.query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("delete") {
+            return Err(CallGraphStoreError::Unavailable(format!("atomic swap requires DELETE journal mode, got {mode}")));
+        }
         Ok(())
     }
 
@@ -8541,7 +8555,13 @@ fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) {
         // Orphaned temp files from a crashed build/publish: remove once aged out.
         if name.contains(".tmp.") {
             if aged_out && tmp_prefixes.iter().any(|p| name.starts_with(p)) {
-                let _ = std::fs::remove_file(entry.path());
+                // Directory iteration includes sidecars; guard by the database
+                // they belong to rather than treating them as independent temps.
+                let database = name.strip_suffix("-wal")
+                    .or_else(|| name.strip_suffix("-shm"))
+                    .or_else(|| name.strip_suffix("-journal"))
+                    .unwrap_or(&name);
+                remove_sqlite_file_set(&callgraph_dir.join(database));
             }
             continue;
         }
@@ -8598,14 +8618,29 @@ fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) {
     }
 }
 
+fn ensure_sqlite_files_closed(path: &Path) -> Result<()> {
+    if crate::db::file_identity::open_connections(path) != 0 {
+        return Err(CallGraphStoreError::Unavailable(format!(
+            "SQLite file set is still open: {}", path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn remove_sqlite_file_set(path: &Path) {
-    crate::db::file_identity::guard_replacement(path, "callgraph sqlite file-set removal");
+    let _files = crate::db::file_identity::filesystem_guard();
+    if ensure_sqlite_files_closed(path).is_err() {
+        return;
+    }
     let _ = std::fs::remove_file(path);
     remove_sidecar_files(path);
 }
 
 fn remove_sqlite_sidecars(path: &Path) {
-    crate::db::file_identity::guard_replacement(path, "callgraph sqlite sidecar removal");
+    let _files = crate::db::file_identity::filesystem_guard();
+    if ensure_sqlite_files_closed(path).is_err() {
+        return;
+    }
     remove_sidecar_files(path);
 }
 
@@ -17319,30 +17354,74 @@ export function leaf() {}
         drop(store);
     }
 
-    /// The staging database is the one callgraph database whose path is reused
-    /// by name: a build resumes from `<key>.staging.sqlite.tmp.resume` so a
-    /// replacement process can adopt batches an earlier one already committed.
-    /// Publication renames that database file to its generation path and leaves
-    /// the name free for the next build, so the WAL-index has to go with it.
-    ///
-    /// A WAL-index left at a name whose database file has moved describes a
-    /// file that is no longer there. SQLite truncates such a WAL-index as soon
-    /// as the next build creates a database at that name, and any connection in
-    /// this process that still has the old one mapped then reads past the end
-    /// of its mapping and takes a SIGBUS.
-    ///
-    /// A second connection on the staging database is what leaves one behind:
-    /// publication switches the staging database off WAL first, and SQLite only
-    /// deletes the WAL-index once the last connection lets go. Two roots that
-    /// share one cache key stage at the same name, so a second holder is a real
-    /// state rather than a contrived one.
-    ///
-    /// Unix only: the assertion is about removing a file another connection
-    /// still holds open, which Windows refuses, and the SIGBUS being defended
-    /// against is a POSIX shared-memory fault in the first place.
+    #[test]
+    fn sqlite_cleanup_preserves_live_files_and_collects_after_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.sqlite");
+        let connection = TrackedConnection::open(&path, SqliteStore::CallgraphGeneration).unwrap();
+        configure_connection(&connection).unwrap();
+        connection.execute_batch("CREATE TABLE t(value); INSERT INTO t VALUES(42);").unwrap();
+        let shm = PathBuf::from(format!("{}-shm", path.display()));
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        let identity = crate::db::file_identity::identity_of(&shm);
+        let length = std::fs::metadata(&shm).unwrap().len();
+        #[cfg(unix)]
+        {
+            let alias = dir.path().join("hardlink.sqlite");
+            std::fs::hard_link(&path, &alias).unwrap();
+            remove_sqlite_file_set(&alias);
+            assert!(alias.exists(), "inode aliases must also be protected");
+        }
+        remove_sqlite_sidecars(&path);
+        remove_sqlite_file_set(&path);
+        assert!(path.exists() && shm.exists() && wal.exists(), "cleanup removed live SQLite files");
+        assert_eq!(crate::db::file_identity::identity_of(&shm), identity);
+        assert_eq!(std::fs::metadata(&shm).unwrap().len(), length);
+        assert_eq!(connection.query_row("SELECT value FROM t", [], |row| row.get::<_, i64>(0)).unwrap(), 42);
+        drop(connection);
+        remove_sqlite_file_set(&path);
+        assert!(!path.exists() && !shm.exists() && !wal.exists());
+    }
+
+    #[test]
+    fn callgraph_close_persists_wal_for_the_next_opener() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("persist.sqlite");
+        let connection = TrackedConnection::open(&path, SqliteStore::CallgraphGeneration).unwrap();
+        configure_connection(&connection).unwrap();
+        connection.execute_batch("CREATE TABLE t(value); INSERT INTO t VALUES(42);").unwrap();
+        drop(connection);
+        assert!(PathBuf::from(format!("{}-wal", path.display())).exists(), "last close deleted WAL");
+        assert!(PathBuf::from(format!("{}-shm", path.display())).exists(), "last close deleted WAL-index");
+        let next = TrackedConnection::open(&path, SqliteStore::CallgraphGeneration).unwrap();
+        assert_eq!(next.query_row("SELECT value FROM t", [], |row| row.get::<_, i64>(0)).unwrap(), 42);
+    }
+
+    #[test]
+    fn cold_build_adoption_refuses_live_staging() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let source = root.path().join("lib.rs");
+        std::fs::write(&source, "pub fn staged() {}\n").unwrap();
+        let key = crate::search_index::artifact_cache_key(root.path());
+        let path = dir.path().join(format!("{key}.staging.sqlite.tmp.resume"));
+        let connection = TrackedConnection::open(&path, SqliteStore::CallgraphColdGeneration).unwrap();
+        configure_build_connection(&connection).unwrap();
+        connection.execute_batch("CREATE TABLE sentinel(value); INSERT INTO sentinel VALUES(42);").unwrap();
+        let result = CallGraphStore::cold_build_with_lease(dir.path().to_path_buf(), root.path().to_path_buf(), &[source]);
+        let error = result.err().expect("live staging must be refused before adoption");
+        assert!(error.to_string().contains("SQLite file set is still open"), "{error}");
+        assert_eq!(connection.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(connection.query_row("SELECT value FROM sentinel", [], |row| row.get::<_, i64>(0)).unwrap(), 42);
+    }
+
+    /// A reader arriving after the build closes but before publication must pin
+    /// the staging file and its mapped WAL-index. After that reader closes, the
+    /// next build can adopt the staging file and clean its sidecars on publish.
+    /// Unix allows renaming live files, so refusal must come from our registry.
     #[cfg(unix)]
     #[test]
-    fn cold_build_publication_removes_the_wal_index_from_the_reused_staging_path() {
+    fn cold_build_publication_refuses_a_live_staging_wal_index() {
         let root = tempfile::tempdir().unwrap();
         let callgraph_dir = tempfile::tempdir().unwrap();
         let source = root.path().join("lib.rs");
@@ -17354,14 +17433,14 @@ export function leaf() {}
             .join(format!("{project_key}.staging.sqlite.tmp.resume"));
         let staging_shm = PathBuf::from(format!("{}-shm", staging.display()));
 
-        let held = Arc::new(std::sync::Mutex::new(None::<Connection>));
+        let held = Arc::new(std::sync::Mutex::new(None::<TrackedConnection>));
         let mapped_before_publish = Arc::new(AtomicBool::new(false));
         let held_for_observer = Arc::clone(&held);
         let mapped_for_observer = Arc::clone(&mapped_before_publish);
         let staging_for_observer = staging.clone();
         let staging_shm_for_observer = staging_shm.clone();
         set_cold_build_before_publish_observer(Some(Arc::new(move || {
-            let connection = Connection::open(&staging_for_observer).unwrap();
+            let connection = TrackedConnection::open(&staging_for_observer, SqliteStore::CallgraphColdGeneration).unwrap();
             connection
                 .pragma_update(None, "journal_mode", "WAL")
                 .unwrap();
@@ -17381,18 +17460,20 @@ export function leaf() {}
             &files,
         );
         set_cold_build_before_publish_observer(None);
-        let (store, _) = published.expect("cold build publishes");
+        assert!(matches!(published, Err(CallGraphStoreError::Unavailable(_))));
 
         assert!(
             mapped_before_publish.load(AtomicOrdering::SeqCst),
             "fixture never put a WAL-index at the staging name, so publication had nothing to clean up"
         );
-        assert!(
-            !staging_shm.exists(),
-            "publication left a WAL-index at {} after moving its database file away",
-            staging.display()
-        );
+        assert!(staging.exists());
+        assert!(staging_shm.exists(), "live WAL-index must not be removed");
         drop(held.lock().unwrap().take());
+        let (store, _) = CallGraphStore::cold_build_with_lease(
+            callgraph_dir.path().to_path_buf(), root.path().to_path_buf(), &files,
+        ).expect("closed staging may be adopted and published");
+        assert!(!staging.exists());
+        assert!(!staging_shm.exists());
         drop(store);
     }
 

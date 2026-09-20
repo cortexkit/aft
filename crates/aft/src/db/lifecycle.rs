@@ -439,6 +439,7 @@ impl TrackedConnection {
         store: SqliteStore,
         root_id: impl Into<String>,
     ) -> rusqlite::Result<Self> {
+        let _guard = crate::db::file_identity::filesystem_guard();
         Self::from_connection_attributed(Connection::open(path)?, store, root_id)
     }
 
@@ -447,6 +448,7 @@ impl TrackedConnection {
         flags: OpenFlags,
         store: SqliteStore,
     ) -> rusqlite::Result<Self> {
+        let _guard = crate::db::file_identity::filesystem_guard();
         Self::from_connection_attributed(
             Connection::open_with_flags(path, flags)?,
             store,
@@ -459,6 +461,7 @@ impl TrackedConnection {
         flags: OpenFlags,
         store: SqliteStore,
     ) -> rusqlite::Result<Self> {
+        let _guard = crate::db::file_identity::filesystem_guard();
         Self::from_connection_attributed(
             Connection::open_with_flags(path, flags)?,
             store,
@@ -479,6 +482,24 @@ impl TrackedConnection {
         store: SqliteStore,
         root_id: impl Into<String>,
     ) -> rusqlite::Result<Self> {
+        if matches!(store, SqliteStore::CallgraphGeneration | SqliteStore::CallgraphColdGeneration) {
+            // Keep WAL files across the last close: another opener may already
+            // have resolved this generation and be about to attach to its index.
+            let mut persist: std::ffi::c_int = 1;
+            let result = unsafe {
+                rusqlite::ffi::sqlite3_file_control(
+                    connection.handle(),
+                    c"main".as_ptr(),
+                    rusqlite::ffi::SQLITE_FCNTL_PERSIST_WAL,
+                    std::ptr::from_mut(&mut persist).cast(),
+                )
+            };
+            if result != rusqlite::ffi::SQLITE_OK
+                && connection.path().is_some_and(|path| !path.is_empty() && path != ":memory:")
+            {
+                return Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(result), None));
+            }
+        }
         // Register before the first PRAGMA: it can enter WAL recovery and fault
         // on a truncated shared-memory mapping before later registration runs.
         let file_identity_key = connection
@@ -665,8 +686,8 @@ impl TrackedConnection {
 
     /// Snapshot the frames a close-time checkpoint would have to copy.
     ///
-    /// Taken before the handle is dropped, because SQLite deletes the WAL and
-    /// WAL-index as part of that checkpoint and the count is unreadable after.
+    /// Taken before the handle is dropped, because without persistent WAL,
+    /// SQLite deletes the sidecars and the count is unreadable after close.
     fn close_checkpoint_probe(&self) -> Option<CloseCheckpointProbe> {
         let path = PathBuf::from(self.connection.as_ref()?.path()?);
         let outstanding_frames = outstanding_wal_frames(&path);
@@ -679,14 +700,15 @@ impl TrackedConnection {
     /// Credit the bytes the close-time checkpoint copied into the main database.
     ///
     /// Closing the last connection to a WAL database makes SQLite run a full
-    /// checkpoint and truncate the WAL. That copy is neither the autocheckpoint
+    /// checkpoint (retaining the sidecars when persistent WAL is enabled). That
+    /// copy is neither the autocheckpoint
     /// the WAL hook models (the hook only runs when a commit appends frames) nor
     /// an explicit `wal_checkpoint` call, so without this the main-file bytes it
     /// pushes are never attributed to anything.
     ///
     /// The frames are re-counted after the handle is gone instead of assumed:
-    /// that is what separates a close which did checkpoint (WAL emptied or
-    /// deleted) from one which could not, because another connection to the same
+    /// that is what separates a close which did checkpoint (frames backfilled,
+    /// WAL emptied or deleted) from one which could not, because another connection to the same
     /// database is still open or this handle was read-only. A close that
     /// checkpointed nothing must credit nothing.
     fn credit_close_checkpoint(&self, probe: Option<CloseCheckpointProbe>) -> u64 {
@@ -1114,14 +1136,12 @@ mod tests {
                 .saturating_sub(credited_before);
         let main_growth = std::fs::metadata(&path).unwrap().len() - main_before;
 
-        // SQLite removes both sidecars as part of the close-time checkpoint.
-        // Their absence, and a main file that grew by the same bytes and still
-        // answers for every row on its own, is what says the frames were
-        // really copied rather than thrown away.
-        assert!(
-            !wal_path(&path).exists(),
-            "close did not checkpoint and remove the WAL"
-        );
+        // Persistent WAL retains the sidecars after close. Check the backfill
+        // count and query a copy of the main file alone to prove its contents
+        // reached the database rather than merely surviving in the WAL.
+        assert!(wal_path(&path).exists());
+        let (log_frames, backfilled) = shm_checkpoint_state(&path);
+        assert_eq!(log_frames, backfilled);
         assert_eq!(
             credited,
             outstanding_frames * page_size,
@@ -1132,7 +1152,9 @@ mod tests {
             main_growth.abs_diff(credited) <= 4 * page_size,
             "credited {credited} bytes but the main file grew by {main_growth}"
         );
-        let reopened = Connection::open(&path).unwrap();
+        let standalone = dir.path().join("standalone.sqlite");
+        std::fs::copy(&path, &standalone).unwrap();
+        let reopened = Connection::open(&standalone).unwrap();
         let rows: i64 = reopened
             .query_row("SELECT COUNT(*) FROM payloads", [], |row| row.get(0))
             .unwrap();
@@ -1196,7 +1218,10 @@ mod tests {
             tracked_checkpoints, builtin_checkpoints,
             "crediting the close changed how often SQLite checkpoints"
         );
-        assert!(!wal_path(&builtin_path).exists() && !wal_path(&tracked_path).exists());
+        assert!(!wal_path(&builtin_path).exists());
+        assert!(wal_path(&tracked_path).exists());
+        let (log_frames, backfilled) = shm_checkpoint_state(&tracked_path);
+        assert_eq!(log_frames, backfilled, "persistent WAL still needs a checkpoint");
         assert_eq!(
             std::fs::metadata(&builtin_path).unwrap().len(),
             std::fs::metadata(&tracked_path).unwrap().len(),

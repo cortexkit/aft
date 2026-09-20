@@ -97,7 +97,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{OpenFlags, OptionalExtension};
 use serde::Deserialize;
 
 use crate::commands::callgraph_store_adapter::callers_result;
@@ -1999,12 +1999,12 @@ fn view_semantic_search(
         .join("blobs")
         .join(&view.family)
         .join("semantic.sqlite");
-    let connection = Connection::open_with_flags(
+    let connection = crate::db::file_identity::IdentityConnection::open_with_flags(
         database,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        "commands::semantic_search::view_semantic_search",
     )
         .map_err(|error| error.to_string())?;
-    let connection = crate::db::file_identity::IdentityConnection::new(connection, "commands::semantic_search::view_semantic_search");
     let mut results = Vec::new();
     for (rel_path, entry) in manifest.entries() {
         let crate::views::ManifestEntry::Regular { planes, .. } = entry else {
