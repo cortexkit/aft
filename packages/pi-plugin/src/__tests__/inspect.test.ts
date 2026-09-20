@@ -78,6 +78,8 @@ describe("Pi aft_inspect surface", () => {
     const parameters = inspect.parameters as {
       properties?: Record<string, Record<string, unknown>>;
     };
+    expect(parameters.properties?.scope?.description).toContain("one path, or an array of paths");
+    expect(parameters.properties?.scope?.description).toContain("not a space-separated list");
     expect(parameters.properties?.scope?.description).toContain("`scope=` narrows results");
     expect(parameters.properties?.scope?.description).not.toContain("Tier 1 scopes the scan");
   });

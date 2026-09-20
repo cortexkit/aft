@@ -111,6 +111,8 @@ describe("aft_inspect tool", () => {
     expect(inspect.description).not.toContain("short deadline");
     expect(inspect.description).not.toContain("pending_categories");
     expect(inspect.description).not.toContain("background warmup");
+    expect(schemaDescription(inspect.args.scope)).toContain("one path, or an array of paths");
+    expect(schemaDescription(inspect.args.scope)).toContain("not a space-separated list");
     expect(schemaDescription(inspect.args.scope)).toContain("`scope=` narrows results");
     expect(schemaDescription(inspect.args.scope)).not.toContain("Tier 1 scopes the scan");
   });

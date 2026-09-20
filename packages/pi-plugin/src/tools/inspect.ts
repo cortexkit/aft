@@ -42,7 +42,7 @@ const InspectParams = Type.Object({
   scope: Type.Optional(
     Type.Union([Type.String(), Type.Array(Type.String())], {
       description:
-        "Restrict returned results to paths under this scope (file or directory, absolute or relative to project root). `scope=` narrows results and limits Rust LSP startup to owning Cargo workspaces; it does not trigger per-file diagnostic collection. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result.",
+        "Restrict returned results to paths under this scope (one path, or an array of paths — not a space-separated list; file or directory; absolute or relative to project root). `scope=` narrows results and limits Rust LSP startup to owning Cargo workspaces; it does not trigger per-file diagnostic collection. Scoped files no producer has authoritatively analyzed are reported as named gaps (complete: false), never as a clean empty result.",
     }),
   ),
   topK: Type.Optional(
