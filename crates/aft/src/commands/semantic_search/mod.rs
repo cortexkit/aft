@@ -6330,9 +6330,10 @@ mod tests {
         assert_eq!(response["success"], true);
         assert_eq!(response["include_tests"], true);
         assert_eq!(response["results"][0]["kind"], "GrepLine");
+        // The response spells the path with the host separator.
         assert!(response["results"][0]["file"]
             .as_str()
-            .is_some_and(|path| path.ends_with("tests/search_test.rs")));
+            .is_some_and(|path| path.replace('\\', "/").ends_with("tests/search_test.rs")));
     }
 
     #[test]
