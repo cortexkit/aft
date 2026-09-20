@@ -12,6 +12,8 @@
   },
   "files": [
     "dist",
+    "index.js",
+    "server.js",
     "src/entry",
     "src/tui",
     "src/tui-compiled",
