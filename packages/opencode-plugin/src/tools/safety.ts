@@ -57,7 +57,7 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
         "- 'undo': Undo the entire last tool call when 'path' is omitted (typical), or undo the last edit to one file when 'path' is provided. Note: pops from the undo stack (irreversible, no redo). Use 'history' to inspect per-file history before undoing.\n" +
         "- 'history': List all edit snapshots for a file. Requires 'path'.\n" +
         "- 'checkpoint': Save a named snapshot. Explicit 'files' may be untracked or gitignored; omit them to snapshot backup-tracked files. Checkpoints are session-scoped and lost on bridge or daemon restart. Requires 'name'.\n" +
-        "- 'restore': Restore files to a previously saved checkpoint. Requires 'name'.\n" +
+        "- 'restore': Restore files to a previously saved checkpoint. Optional 'path'/'files' scopes the restore; omitted scope restores the whole checkpoint. Requires 'name'.\n" +
         "- 'list': List all available named checkpoints. No extra params needed.\n\n" +
         "Each op requires specific parameters — see parameter descriptions for requirements.\n\n" +
         "Use checkpoint before risky multi-file changes. Use undo for quick single-file rollback.",
@@ -71,14 +71,14 @@ export function safetyTools(ctx: PluginContext): Record<string, ToolDefinition> 
           .string()
           .optional()
           .describe(
-            "File path (required for history, optional for undo). Absolute or relative to project root",
+            "File path (required for history, optional for undo, optional for restore — restores only that file). Absolute or relative to project root",
           ),
         name: z.string().optional().describe("Checkpoint name (required for checkpoint, restore)"),
         files: z
           .array(z.string())
           .optional()
           .describe(
-            "Specific files to include in checkpoint (optional, defaults to backup-tracked files; explicit files may be untracked or gitignored)",
+            "Specific files to include in checkpoint, or to restore from a checkpoint (optional; restore without path/files restores the whole checkpoint; explicit checkpoint files may be untracked or gitignored)",
           ),
       },
       execute: async (args, context): Promise<string> => {

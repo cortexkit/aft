@@ -112,6 +112,140 @@ fn test_checkpoint_create_restore_cycle() {
 }
 
 #[test]
+fn checkpoint_restore_honors_one_file_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_a = dir.path().join("a.txt");
+    let file_b = dir.path().join("b.txt");
+    let file_c = dir.path().join("c.txt");
+    fs::write(&file_a, "original-a").unwrap();
+    fs::write(&file_b, "original-b").unwrap();
+    fs::write(&file_c, "original-c").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let create = serde_json::json!({
+        "id": "scoped-create",
+        "command": "checkpoint",
+        "name": "scoped",
+        "files": [file_a, file_b, file_c],
+    });
+    let response = aft.send(&create.to_string());
+    assert_eq!(response["success"], true, "checkpoint: {response:?}");
+
+    fs::write(&file_a, "modified-a").unwrap();
+    fs::write(&file_b, "modified-b").unwrap();
+    let restore = serde_json::json!({
+        "id": "scoped-restore",
+        "command": "restore_checkpoint",
+        "name": "scoped",
+        "file": file_a,
+    });
+    let response = aft.send(&restore.to_string());
+    assert_eq!(response["success"], true, "restore: {response:?}");
+    assert_eq!(fs::read_to_string(&file_a).unwrap(), "original-a");
+    assert_eq!(
+        fs::read_to_string(&file_b).unwrap(),
+        "modified-b",
+        "a scoped restore must not overwrite another checkpoint file"
+    );
+    assert_eq!(fs::read_to_string(&file_c).unwrap(), "original-c");
+    assert_eq!(response["file_count"], 1);
+    assert_eq!(response["paths"], serde_json::json!([file_a]));
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn checkpoint_restore_rejects_a_scope_path_absent_from_checkpoint_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_a = dir.path().join("a.txt");
+    let file_b = dir.path().join("b.txt");
+    let absent = dir.path().join("not-checkpointed.txt");
+    fs::write(&file_a, "original-a").unwrap();
+    fs::write(&file_b, "original-b").unwrap();
+    fs::write(&absent, "outside-checkpoint").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    let create = serde_json::json!({
+        "id": "missing-scope-create",
+        "command": "checkpoint",
+        "name": "missing-scope",
+        "files": [file_a, file_b],
+    });
+    let response = aft.send(&create.to_string());
+    assert_eq!(response["success"], true, "checkpoint: {response:?}");
+
+    fs::write(&file_a, "modified-a").unwrap();
+    fs::write(&file_b, "modified-b").unwrap();
+    let restore = serde_json::json!({
+        "id": "missing-scope-restore",
+        "command": "restore_checkpoint",
+        "name": "missing-scope",
+        "files": [file_a, absent],
+    });
+    let response = aft.send(&restore.to_string());
+    assert_eq!(response["success"], false, "restore: {response:?}");
+    assert_eq!(response["code"], "invalid_request");
+    assert!(
+        response["message"]
+            .as_str()
+            .is_some_and(|message| message.contains(absent.to_str().unwrap())),
+        "missing path should be named: {response:?}"
+    );
+    assert_eq!(fs::read_to_string(&file_a).unwrap(), "modified-a");
+    assert_eq!(fs::read_to_string(&file_b).unwrap(), "modified-b");
+    assert_eq!(fs::read_to_string(&absent).unwrap(), "outside-checkpoint");
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
+fn checkpoint_restore_without_scope_restores_every_checkpoint_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let files = [
+        dir.path().join("a.txt"),
+        dir.path().join("b.txt"),
+        dir.path().join("c.txt"),
+    ];
+    for (index, file) in files.iter().enumerate() {
+        fs::write(file, format!("original-{index}")).unwrap();
+    }
+
+    let mut aft = AftProcess::spawn();
+    let create = serde_json::json!({
+        "id": "all-create",
+        "command": "checkpoint",
+        "name": "all",
+        "files": files,
+    });
+    let response = aft.send(&create.to_string());
+    assert_eq!(response["success"], true, "checkpoint: {response:?}");
+    for file in &files {
+        fs::write(file, "modified").unwrap();
+    }
+
+    let response = aft.send(
+        &serde_json::json!({
+            "id": "all-restore",
+            "command": "restore_checkpoint",
+            "name": "all",
+        })
+        .to_string(),
+    );
+    assert_eq!(response["success"], true, "restore: {response:?}");
+    assert_eq!(response["file_count"], 3);
+    let restored_paths = response["paths"].as_array().expect("restore paths");
+    for (index, file) in files.iter().enumerate() {
+        assert!(restored_paths.contains(&serde_json::json!(file)));
+        assert_eq!(
+            fs::read_to_string(file).unwrap(),
+            format!("original-{index}")
+        );
+    }
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn checkpoint_explicit_gitignored_file_is_counted_stored_and_restored() {
     let project = tempfile::tempdir().unwrap();
     let root = project.path();

@@ -45,7 +45,7 @@ const SafetyParams = Type.Object({
   path: Type.Optional(
     Type.String({
       description:
-        "File path (required for history, optional for undo). Absolute or relative to project root.",
+        "File path (required for history, optional for undo, optional for restore — restores only that file). Absolute or relative to project root.",
     }),
   ),
   name: Type.Optional(
@@ -54,7 +54,7 @@ const SafetyParams = Type.Object({
   files: Type.Optional(
     Type.Array(Type.String(), {
       description:
-        "Specific files for checkpoint (optional, defaults to all backup-tracked files; explicit files may be untracked or gitignored)",
+        "Specific files for checkpoint, or to restore from a checkpoint (optional; restore without path/files restores the whole checkpoint; explicit checkpoint files may be untracked or gitignored)",
     }),
   ),
 });
@@ -185,7 +185,7 @@ export function registerSafetyTool(pi: ExtensionAPI, ctx: PluginContext): void {
       name: "aft_safety",
       label: "safety",
       description:
-        "File safety and recovery operations. Ops: `undo` (omit path to undo the entire last tool call; pass path to pop latest snapshot for one file — irreversible), `history` (list snapshots for a file), `checkpoint` (save named snapshot), `restore` (restore named checkpoint), `list` (list checkpoints). Per-file undo stack is capped at 20.",
+        "File safety and recovery operations. Ops: `undo` (omit path to undo the entire last tool call; pass path to pop latest snapshot for one file — irreversible), `history` (list snapshots for a file), `checkpoint` (save named snapshot), `restore` (restore named checkpoint; optional path/files scopes it), `list` (list checkpoints). Per-file undo stack is capped at 20.",
       parameters: SafetyParams,
       async execute(
         _toolCallId: string,
