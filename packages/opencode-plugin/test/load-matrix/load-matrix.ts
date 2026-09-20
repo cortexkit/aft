@@ -798,33 +798,19 @@ const loaded = await Effect.runPromise(
 if (loaded.pending) throw new Error("host loader returned pending");
 const entrypoints = Host.resolve(installed);
 
-function permissionStream() {
-  const queued = [];
-  const waiters = [];
-  let closed = false;
-  return {
-    emit: (event) => {
-      const waiter = waiters.shift();
-      if (waiter) waiter({ done: false, value: event });
-      else queued.push(event);
-    },
-    stream: {
-      [Symbol.asyncIterator]() {
-        return {
-          next: () => {
-            const value = queued.shift();
-            if (value) return Promise.resolve({ done: false, value });
-            if (closed) return Promise.resolve({ done: true, value: undefined });
-            return new Promise((resolveNext) => waiters.push(resolveNext));
-          },
-          return: () => {
-            closed = true;
-            return Promise.resolve({ done: true, value: undefined });
-          },
-        };
-      },
-    },
-  };
+function permissionRules() {
+  // Mirrors OpenCode's own starting ruleset plus three explicit rows, so the
+  // probe can exercise an allowed tool, a denied one, and one the rules leave
+  // to a prompt this host cannot show. The denied rows start with "*" because
+  // "edit" states the project-relative path while "aft_delete" states an
+  // absolute one, and one rule has to cover both spellings.
+  return [
+    { action: "*", resource: "*", effect: "allow" },
+    { action: "read", resource: "*.env", effect: "ask" },
+    { action: "edit", resource: "*permission-edit-denied.ts", effect: "deny" },
+    { action: "edit", resource: "*permission-delete-denied.ts", effect: "deny" },
+    { action: "bash", resource: "*", effect: "deny" },
+  ];
 }
 
 function locationContext(id) {
@@ -832,38 +818,15 @@ function locationContext(id) {
   const rpcRegistrations = [];
   const rpcEvents = [];
   let rpcDisposals = 0;
-  const permissionCreates = [];
-  const subscriptions = [];
-  const replyPlan = ["once", "once", "reject", "reject", "once", "once"]; 
-  const client = {
-    event: {
-      subscribe: async () => {
-        const subscription = permissionStream();
-        subscriptions.push(subscription);
-        return { stream: subscription.stream };
-      },
-    },
-    permission: {
-      create: async (input) => {
-        permissionCreates.push(input);
-        const subscription = subscriptions.shift();
-        if (!subscription) throw new Error("permission.create ran before event.subscribe");
-        const requestID = "permission-" + permissionCreates.length;
-        const reply = replyPlan.shift();
-        queueMicrotask(() => subscription.emit({
-          type: "permission.replied",
-          properties: { sessionID: input.sessionID, requestID, reply },
-        }));
-        return { data: { id: requestID, effect: "ask" } };
-      },
-    },
-  };
+  const agentReads = [];
+  const sessionReads = [];
   return {
     tools,
     rpcRegistrations,
     rpcEvents,
     rpcDisposals: () => rpcDisposals,
-    permissionCreates,
+    agentReads,
+    sessionReads,
     context: {
       location: {
         directory,
@@ -898,7 +861,17 @@ function locationContext(id) {
           remove: () => {},
         })),
       },
+      agent: {
+        get: (input) => Effect.sync(() => {
+          agentReads.push(input.agentID);
+          return { location: { directory }, data: { permissions: permissionRules() } };
+        }),
+      },
       session: {
+        get: (input) => Effect.sync(() => {
+          sessionReads.push(input.sessionID);
+          return { id: input.sessionID, agent: "load-matrix" };
+        }),
         prompt: (input) => Effect.sync(() => {
           appendFileSync(marker, "session-prompt:" + JSON.stringify(input) + "\\n");
           return { id: "wake-" + input.sessionID };
@@ -955,14 +928,19 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     );
   }
   const edit = first.tools.find((tool) => tool.name === "edit");
+  const read = first.tools.find((tool) => tool.name === "read");
   const aftDelete = first.tools.find((tool) => tool.name === "aft_delete");
-  if (!edit || !aftDelete) throw new Error("enabled V2 effect did not register hoisted mutation tools");
+  if (!edit || !read || !aftDelete) throw new Error("enabled V2 effect did not register hoisted tools");
   const editPath = resolve(directory, "permission-edit.ts");
-  const deletePath = resolve(directory, "permission-delete.ts");
+  const deniedEditPath = resolve(directory, "permission-edit-denied.ts");
   const deniedDeletePath = resolve(directory, "permission-delete-denied.ts");
+  const readPath = resolve(directory, "permission-read.ts");
+  const secretPath = resolve(directory, "permission-read.env");
   writeFileSync(editPath, "old\\n");
-  writeFileSync(deletePath, "delete me\\n");
+  writeFileSync(deniedEditPath, "keep me\\n");
   writeFileSync(deniedDeletePath, "keep me\\n");
+  writeFileSync(readPath, "readable\\n");
+  writeFileSync(secretPath, "TOKEN=1\\n");
   const permissionContext = (id) => ({
     sessionID: "permission-session",
     messageID: "permission-message",
@@ -970,28 +948,72 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     id,
     progress: () => Effect.succeed(undefined),
   });
-  const editResult = yield* edit.execute(
+
+  // A rule that allows the action must let the tool run, with no prompt.
+  yield* edit.execute(
     { path: editPath, edits: [{ oldString: "old", newString: "new" }] },
-    permissionContext("edit-refused"),
+    permissionContext("edit-allowed"),
   );
-  const deleteError = yield* Effect.flip(aftDelete.execute(
-    { files: [deletePath] },
-    permissionContext("delete-refused"),
-  ));
-  const permissionFailure = "did not provide a permission request endpoint";
-  const editPayload = JSON.parse(editResult.content);
-  if (editPayload.code !== "permission_denied" || !editPayload.message.includes(permissionFailure)) {
-    throw new Error("GA edit permission classification mismatch: " + editResult.content);
+  if (readFileSync(editPath, "utf8") !== "new\\n") {
+    throw new Error("GA allowed edit did not reach the filesystem");
   }
-  if (!String(deleteError?.message).includes(permissionFailure)) {
-    throw new Error("GA delete permission classification mismatch: " + String(deleteError));
+  const readResult = yield* read.execute({ path: readPath }, permissionContext("read-allowed"));
+  if (!String(readResult.content).includes("readable")) {
+    throw new Error("GA read inside the project root was not served: " + readResult.content);
   }
-  if (readFileSync(editPath, "utf8") !== "old\\n" || !readFileSync(deletePath, "utf8")) {
+  appendFileSync(marker, "permission-gated:allowed:edit,read\\n");
+
+  // Every refusal has to reach the host as a FAILED call whose text is the
+  // rendered sentence. A returned {"success": false} envelope would arrive as a
+  // successful call and read as a result that never happened.
+  const settle = (label, effect) =>
+    Effect.match(effect, {
+      onSuccess: (value) => {
+        throw new Error(
+          "GA refusal " + label + " arrived as a SUCCESSFUL call: " + JSON.stringify(value),
+        );
+      },
+      onFailure: (error) => error,
+    });
+  const refusals = {
+    "edit-denied": yield* settle("edit-denied", edit.execute(
+      { path: deniedEditPath, edits: [{ oldString: "keep", newString: "drop" }] },
+      permissionContext("edit-denied"),
+    )),
+    "delete-denied": yield* settle("delete-denied", aftDelete.execute(
+      { files: [deniedDeletePath] },
+      permissionContext("delete-denied"),
+    )),
+    "read-ask": yield* settle("read-ask", read.execute(
+      { path: secretPath },
+      permissionContext("read-ask"),
+    )),
+  };
+  for (const [label, failure] of Object.entries(refusals)) {
+    const text = String(failure?.message ?? failure);
+    if (text.includes('"success"') || text.trimStart().startsWith("{")) {
+      throw new Error("GA refusal " + label + " arrived as a JSON envelope: " + text);
+    }
+    if (text.includes("did not provide a permission request endpoint")) {
+      throw new Error("GA refusal " + label + " still blames a host endpoint: " + text);
+    }
+    appendFileSync(marker, "permission-refusal:" + label + ":" + text.slice(0, 160) + "\\n");
+  }
+  if (!String(refusals["read-ask"]?.message).includes('"effect": "allow"')) {
+    throw new Error("GA ask refusal did not name the setting that lifts it");
+  }
+  if (
+    readFileSync(deniedEditPath, "utf8") !== "keep me\\n" ||
+    readFileSync(deniedDeletePath, "utf8") !== "keep me\\n"
+  ) {
     throw new Error("GA permission refusal allowed a filesystem mutation");
+  }
+  if (first.agentReads.length === 0 || first.sessionReads.length === 0) {
+    throw new Error("GA permission evaluation did not read the host's configured rules");
   }
   appendFileSync(
     marker,
-    "permission-api:expected_fail:upstream#37164:domain=hook,list,get,reply,rules;create=absent\\n",
+    "permission-api:evaluated:domain=agent.get,session.get;permission.create=absent\\n",
   );
   const live = getBridgeLifecycleTopology();
   const liveHealth = yield* Effect.promise(() => sampleBridgeLifecycleCensus({ settleMs: 0 }));
@@ -1082,11 +1104,11 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   }
   appendFileSync(
     marker,
-    "abort-path:expected_fail:upstream#37164:permission_refused_before_process\\n",
+    "abort-path:rule_denied:refused_before_process\\n",
   );
   appendFileSync(
     marker,
-    "idle-wake:expected_fail:upstream#37164:permission_refused_before_background_start\\n",
+    "idle-wake:rule_denied:refused_before_background_start\\n",
   );
 
   const topology = getBridgeLifecycleTopology();
@@ -1388,7 +1410,12 @@ export default { id: original.id, effect };
     const evidence = events.split(/\r?\n/);
     const abortEvidence = evidence.filter((line) => line.startsWith("abort-path:"));
     const wakeEvidence = evidence.filter((line) => line.startsWith("idle-wake:"));
-    const permissionEvidence = evidence.filter((line) => line.startsWith("permission-api:"));
+    const permissionEvidence = evidence.filter(
+      (line) =>
+        line.startsWith("permission-api:") ||
+        line.startsWith("permission-gated:") ||
+        line.startsWith("permission-refusal:"),
+    );
     const rpcEvidence = evidence.filter(
       (line) =>
         line.startsWith("rpc-call:") ||
@@ -1401,15 +1428,23 @@ export default { id: original.id, effect };
     console.log(`[v2-permission-evidence]\n${permissionEvidence.join("\n")}`);
     console.log(`[v2-rpc-evidence]\n${rpcEvidence.join("\n")}`);
     console.log(`[v2-tool-evidence]\n${toolEvidence.join("\n")}`);
-    expect(abortEvidence).toEqual([
-      "abort-path:expected_fail:upstream#37164:permission_refused_before_process",
+    expect(abortEvidence).toEqual(["abort-path:rule_denied:refused_before_process"]);
+    expect(wakeEvidence).toEqual(["idle-wake:rule_denied:refused_before_background_start"]);
+    // A gated tool the rules allow must complete, and every refusal must arrive
+    // as rendered text naming its real cause.
+    expect(permissionEvidence).toContain("permission-gated:allowed:edit,read");
+    expect(permissionEvidence).toContain(
+      "permission-api:evaluated:domain=agent.get,session.get;permission.create=absent",
+    );
+    const refusals = permissionEvidence.filter((line) => line.startsWith("permission-refusal:"));
+    expect(refusals.map((line) => line.split(":")[1]).sort()).toEqual([
+      "delete-denied",
+      "edit-denied",
+      "read-ask",
     ]);
-    expect(wakeEvidence).toEqual([
-      "idle-wake:expected_fail:upstream#37164:permission_refused_before_background_start",
-    ]);
-    expect(permissionEvidence).toEqual([
-      "permission-api:expected_fail:upstream#37164:domain=hook,list,get,reply,rules;create=absent",
-    ]);
+    expect(refusals.some((line) => line.includes("needs interactive approval"))).toBe(true);
+    expect(events).not.toContain("did not provide a permission request endpoint");
+    expect(events).not.toContain('permission-refusal:edit-denied:{"success"');
     expect(rpcEvidence.filter((line) => line.startsWith("rpc-call:"))).toHaveLength(2);
     expect(rpcEvidence).toContain(
       "rpc-route:context.rpc.register;features.rpc=false;export.rpc=absent",

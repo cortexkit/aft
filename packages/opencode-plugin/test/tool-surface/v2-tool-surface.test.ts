@@ -216,7 +216,7 @@ describe("OpenCode V2 tool surface", () => {
     expect(executedInput).not.toHaveProperty("path");
   });
 
-  test("rejects permission asks when the host has no request endpoint", async () => {
+  test("rejects permission asks when no evaluator is bound", async () => {
     let executed = false;
     const definition = {
       ...sharedDefinitions().read,
@@ -242,7 +242,7 @@ describe("OpenCode V2 tool surface", () => {
         ),
       ),
     ).rejects.toThrow(
-      'The "read" operation was refused because the OpenCode V2 host did not provide a permission request endpoint.',
+      'The "read" operation was refused because this AFT runtime has no permission evaluator bound, so the host\'s permission rules for it could not be consulted.',
     );
     expect(executed).toBe(false);
   });

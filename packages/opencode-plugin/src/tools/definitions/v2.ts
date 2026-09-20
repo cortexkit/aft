@@ -225,9 +225,12 @@ function runtimeFor(
     },
     ask: (request) => {
       if (consumers.requestPermission) return consumers.requestPermission(request, context);
+      // Only our own wiring is observable here, so say that and nothing more:
+      // the previous wording blamed the host for a missing endpoint it was
+      // never asked for.
       return Promise.reject(
         new Error(
-          `The "${request.permission}" operation was refused because the OpenCode V2 host did not provide a permission request endpoint.`,
+          `The "${request.permission}" operation was refused because this AFT runtime has no permission evaluator bound, so the host's permission rules for it could not be consulted.`,
         ),
       );
     },

@@ -1,16 +1,16 @@
-import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
 import type { BridgePool } from "@cortexkit/aft-bridge";
 import { Effect } from "effect";
 
 import {
+  decidePermission,
   PermissionDeniedError,
-  PermissionRejectedError,
+  PermissionPromptUnavailableError,
+  PermissionRulesUnavailableError,
   requestPermission,
-  type V2PermissionClient,
-  type V2PermissionCreateInput,
-  type V2PermissionReply,
+  type V2PermissionHostContext,
+  type V2PermissionRule,
 } from "../../src/permissions/v2.js";
 import { projectV2Tool, type V2ProviderTool } from "../../src/tools/definitions/v2.js";
 import { hoistedV2ToolConsumers } from "../../src/tools/hoisted/v2.js";
@@ -31,84 +31,63 @@ const EXECUTION_CONTEXT = {
 };
 const REQUEST = {
   permission: "edit",
-  patterns: ["/work/project/file.ts"],
-  always: ["/work/project/file.ts"],
+  patterns: ["file.ts"],
+  always: ["file.ts"],
   metadata: { filepath: "/work/project/file.ts", diff: "@@ -1 +1 @@" },
 };
 
-type PermissionEffect = "allow" | "deny" | "ask";
-type PermissionEvent = {
-  type: "permission.replied";
-  properties: { sessionID: string; requestID: string; reply: V2PermissionReply };
+/**
+ * OpenCode's own starting ruleset, copied from `Agent.Info.default` in
+ * `@opencode/schema`. Keeping the real thing here is the point of the suite:
+ * an unmodified GA install must let ordinary tool calls through.
+ */
+const OPENCODE_DEFAULT_RULES: readonly V2PermissionRule[] = [
+  { action: "*", resource: "*", effect: "allow" },
+  { action: "external_directory", resource: "*", effect: "ask" },
+  { action: "read", resource: "*.env", effect: "ask" },
+  { action: "read", resource: "*.env.*", effect: "ask" },
+  { action: "read", resource: "*.env.example", effect: "allow" },
+];
+
+type HostCalls = {
+  readonly agents: string[];
+  readonly sessions: string[];
 };
 
-class EventStream implements AsyncIterable<unknown>, AsyncIterator<unknown> {
-  private readonly queued: unknown[] = [];
-  private readonly waiters: Array<(result: IteratorResult<unknown>) => void> = [];
-  closed = false;
-
-  [Symbol.asyncIterator](): AsyncIterator<unknown> {
-    return this;
-  }
-
-  next(): Promise<IteratorResult<unknown>> {
-    const value = this.queued.shift();
-    if (value !== undefined) return Promise.resolve({ done: false, value });
-    if (this.closed) return Promise.resolve({ done: true, value: undefined });
-    return new Promise((resolveNext) => this.waiters.push(resolveNext));
-  }
-
-  return(): Promise<IteratorResult<unknown>> {
-    this.closed = true;
-    for (const resolveNext of this.waiters.splice(0)) {
-      resolveNext({ done: true, value: undefined });
-    }
-    return Promise.resolve({ done: true, value: undefined });
-  }
-
-  push(value: unknown): void {
-    const waiter = this.waiters.shift();
-    if (waiter) waiter({ done: false, value });
-    else this.queued.push(value);
-  }
-}
-
-function permissionClient(effect: PermissionEffect = "ask") {
-  const stream = new EventStream();
-  const createCalls: V2PermissionCreateInput[] = [];
-  let subscribed = false;
-  const client: V2PermissionClient = {
-    event: {
-      subscribe: async () => {
-        subscribed = true;
-        return { stream };
-      },
+function permissionHost(
+  agentRules: readonly V2PermissionRule[] | undefined,
+  options: {
+    sessionRules?: readonly V2PermissionRule[];
+    sessionAgent?: string;
+    agentFailure?: string;
+    sessionFailure?: string;
+  } = {},
+): { host: V2PermissionHostContext; calls: HostCalls } {
+  const calls: HostCalls = { agents: [], sessions: [] };
+  const host: V2PermissionHostContext = {
+    agent: {
+      get: ({ agentID }) =>
+        Effect.suspend(() => {
+          calls.agents.push(agentID);
+          if (options.agentFailure) return Effect.fail(new Error(options.agentFailure));
+          return Effect.succeed({
+            data: agentRules === undefined ? {} : { permissions: agentRules },
+          });
+        }),
     },
-    permission: {
-      create: async (input) => {
-        expect(subscribed).toBe(true);
-        createCalls.push(input);
-        return { data: { id: `permission-${createCalls.length}`, effect } };
-      },
+    session: {
+      get: ({ sessionID }) =>
+        Effect.suspend(() => {
+          calls.sessions.push(sessionID);
+          if (options.sessionFailure) return Effect.fail(new Error(options.sessionFailure));
+          return Effect.succeed({
+            ...(options.sessionAgent === undefined ? {} : { agent: options.sessionAgent }),
+            ...(options.sessionRules === undefined ? {} : { permissions: options.sessionRules }),
+          });
+        }),
     },
   };
-  const reply = (requestID: string, replyValue: V2PermissionReply) => {
-    stream.push({
-      type: "permission.replied",
-      properties: { sessionID: EXECUTION_CONTEXT.sessionID, requestID, reply: replyValue },
-    } satisfies PermissionEvent);
-  };
-  return { client, stream, createCalls, reply };
-}
-
-async function settles(promise: Promise<unknown>): Promise<boolean> {
-  let settled = false;
-  void promise.finally(() => {
-    settled = true;
-  });
-  await Promise.resolve();
-  await Promise.resolve();
-  return settled;
+  return { host, calls };
 }
 
 function pluginContext(
@@ -132,11 +111,11 @@ function pluginContext(
 }
 
 function projectedFilesystemTools(
-  client: V2PermissionClient,
+  host: V2PermissionHostContext,
   bridgeResponse: (name: string, preview: boolean) => Record<string, unknown>,
 ) {
   const definitions = hoistedTools(pluginContext(bridgeResponse));
-  const consumers = hoistedV2ToolConsumers({ client });
+  const consumers = hoistedV2ToolConsumers(host);
   const project = (name: keyof typeof definitions) =>
     projectV2Tool(name, definitions[name], LOCATION, consumers);
   return {
@@ -152,42 +131,163 @@ async function execute(tool: V2ProviderTool, input: Record<string, unknown>) {
   return await Effect.runPromise(tool.execute(input, EXECUTION_CONTEXT));
 }
 
-function parsedDenied(result: Record<string, unknown>) {
-  return JSON.parse(String(result.content)) as Record<string, unknown>;
-}
+describe("OpenCode V2 permission evaluation", () => {
+  test("allows a request the host's configured rules already allow", async () => {
+    const { host, calls } = permissionHost(OPENCODE_DEFAULT_RULES);
 
-describe("OpenCode V2 permission consumer", () => {
-  test("creates the session-scoped request and waits for its permission.replied event", async () => {
-    const host = permissionClient();
-    const pending = requestPermission({ client: host.client }, REQUEST, EXECUTION_CONTEXT);
+    await requestPermission(host, REQUEST, EXECUTION_CONTEXT);
 
-    expect(await settles(pending)).toBe(false);
-    expect(host.createCalls).toEqual([
-      {
-        sessionID: "session-v2",
-        action: "edit",
-        resources: ["/work/project/file.ts"],
-        save: ["/work/project/file.ts"],
-        metadata: { filepath: "/work/project/file.ts", diff: "@@ -1 +1 @@" },
-        source: { type: "tool", messageID: "message-v2", id: "call-v2" },
-      },
+    expect(calls.agents).toEqual(["agent-v2"]);
+    expect(calls.sessions).toEqual(["session-v2"]);
+  });
+
+  test("reads inside the project root need no permission under the default ruleset", async () => {
+    const { host } = permissionHost(OPENCODE_DEFAULT_RULES);
+
+    await requestPermission(
+      host,
+      { permission: "read", patterns: ["src/index.ts"], always: ["*"], metadata: {} },
+      EXECUTION_CONTEXT,
+    );
+  });
+
+  test("keeps the host's own ask rules, including the dotenv carve-outs", async () => {
+    const { host } = permissionHost(OPENCODE_DEFAULT_RULES);
+    const read = (resource: string) =>
+      requestPermission(
+        host,
+        { permission: "read", patterns: [resource], always: ["*"], metadata: {} },
+        EXECUTION_CONTEXT,
+      );
+
+    await expect(read(".env")).rejects.toBeInstanceOf(PermissionPromptUnavailableError);
+    await expect(read(".env.local")).rejects.toBeInstanceOf(PermissionPromptUnavailableError);
+    await read(".env.example");
+  });
+
+  test("names the refusal cause and the setting that lifts it", async () => {
+    const { host } = permissionHost([{ action: "*", resource: "*", effect: "ask" }]);
+
+    const refusal = await requestPermission(host, REQUEST, EXECUTION_CONTEXT).catch(
+      (error: unknown) => error as Error,
+    );
+
+    expect(refusal).toBeInstanceOf(PermissionPromptUnavailableError);
+    expect(refusal.message).toContain("needs interactive approval");
+    expect(refusal.message).toContain("no way to open a permission prompt");
+    expect(refusal.message).toContain('"effect": "allow"');
+    // The old text blamed the host for a missing endpoint it was never asked for.
+    expect(refusal.message).not.toContain("did not provide a permission request endpoint");
+  });
+
+  test("denies when a rule denies and quotes the deciding rule", async () => {
+    const { host } = permissionHost([
+      { action: "*", resource: "*", effect: "allow" },
+      { action: "edit", resource: "file.ts", effect: "deny" },
     ]);
 
-    host.stream.push({
-      type: "permission.replied",
-      properties: { sessionID: "another-session", requestID: "permission-1", reply: "once" },
+    const denial = await requestPermission(host, REQUEST, EXECUTION_CONTEXT).catch(
+      (error: unknown) => error as Error,
+    );
+
+    expect(denial).toBeInstanceOf(PermissionDeniedError);
+    expect(denial.message).toContain('"edit" on "file.ts" is "deny"');
+  });
+
+  test("lets a session rule override the agent rule that precedes it", async () => {
+    const { host } = permissionHost([{ action: "*", resource: "*", effect: "allow" }], {
+      sessionRules: [{ action: "edit", resource: "*", effect: "deny" }],
     });
-    expect(await settles(pending)).toBe(false);
-    host.reply("permission-1", "once");
-    await pending;
-    expect(host.stream.closed).toBe(true);
+
+    await expect(requestPermission(host, REQUEST, EXECUTION_CONTEXT)).rejects.toBeInstanceOf(
+      PermissionDeniedError,
+    );
   });
 
-  test("keeps direct V2 host contexts fail-closed without a request endpoint", () => {
+  test("falls back to the session's agent when the call names none", async () => {
+    const { host, calls } = permissionHost(OPENCODE_DEFAULT_RULES, {
+      sessionAgent: "agent-from-session",
+    });
+
+    await requestPermission(host, REQUEST, { ...EXECUTION_CONTEXT, agent: undefined });
+
+    expect(calls.agents).toEqual(["agent-from-session"]);
+  });
+
+  test("refuses with the real reason when the rules cannot be read", async () => {
+    const unreadableAgent = permissionHost(OPENCODE_DEFAULT_RULES, {
+      agentFailure: "agent lookup exploded",
+    });
+    const agentFailure = await requestPermission(
+      unreadableAgent.host,
+      REQUEST,
+      EXECUTION_CONTEXT,
+    ).catch((error: unknown) => error as Error);
+    expect(agentFailure).toBeInstanceOf(PermissionRulesUnavailableError);
+    expect(agentFailure.message).toContain("could not read this session's OpenCode permission");
+    expect(agentFailure.message).toContain("agent lookup exploded");
+
+    const namelessAgent = permissionHost(OPENCODE_DEFAULT_RULES);
+    await expect(
+      requestPermission(namelessAgent.host, REQUEST, {
+        ...EXECUTION_CONTEXT,
+        agent: undefined,
+      }),
+    ).rejects.toBeInstanceOf(PermissionRulesUnavailableError);
+
+    const rulelessAgent = permissionHost(undefined);
+    await expect(
+      requestPermission(rulelessAgent.host, REQUEST, EXECUTION_CONTEXT),
+    ).rejects.toBeInstanceOf(PermissionRulesUnavailableError);
+  });
+
+  test("matches actions and resources the way the host's wildcard matcher does", () => {
+    const rules: readonly V2PermissionRule[] = [
+      { action: "*", resource: "*", effect: "allow" },
+      { action: "bash", resource: "git push *", effect: "ask" },
+    ];
+    const ask = (permission: string, resource: string) =>
+      decidePermission({ permission, patterns: [resource], always: [], metadata: {} }, rules)
+        .effect;
+
+    expect(ask("bash", "git push")).toBe("ask");
+    expect(ask("bash", "git push --force origin main")).toBe("ask");
+    expect(ask("bash", "git status")).toBe("allow");
+  });
+
+  test("denies the whole request when any one resource is denied", () => {
+    const decision = decidePermission(
+      { permission: "edit", patterns: ["a.ts", "b.ts"], always: [], metadata: {} },
+      [
+        { action: "*", resource: "*", effect: "allow" },
+        { action: "edit", resource: "b.ts", effect: "deny" },
+      ],
+    );
+
+    expect(decision).toMatchObject({ effect: "deny", resource: "b.ts" });
+  });
+});
+
+describe("OpenCode V2 permission consumer binding", () => {
+  test("binds to the GA domains that carry the host's rules", () => {
+    const { host } = permissionHost(OPENCODE_DEFAULT_RULES);
+
+    expect(typeof hoistedV2ToolConsumers(host).requestPermission).toBe("function");
+  });
+
+  test("does not depend on a `client` member no V2 host defines", () => {
+    expect(hoistedV2ToolConsumers({ client: { permission: {}, event: {} } })).toEqual({});
+  });
+
+  test("stays fail-closed when either rules domain is absent", () => {
+    const { host } = permissionHost(OPENCODE_DEFAULT_RULES);
+
     expect(hoistedV2ToolConsumers({})).toEqual({});
+    expect(hoistedV2ToolConsumers({ agent: host.agent })).toEqual({});
+    expect(hoistedV2ToolConsumers({ session: host.session })).toEqual({});
   });
 
-  test("V2 bash exposes a host-visible Error when the permission endpoint is unavailable", async () => {
+  test("bash surfaces a host-visible Error when no evaluator is bound", async () => {
     const definition = {
       description: "permission refusal probe",
       args: {},
@@ -199,90 +299,39 @@ describe("OpenCode V2 permission consumer", () => {
     const bash = projectV2Tool("bash", definition as never, LOCATION);
 
     await expect(execute(bash, {})).rejects.toThrow(
-      'The "bash" operation was refused because the OpenCode V2 host did not provide a permission request endpoint.',
+      'The "bash" operation was refused because this AFT runtime has no permission evaluator bound',
     );
   });
+});
 
-  test("maps host deny and reject outcomes to distinct failures", async () => {
-    const denied = permissionClient("deny");
-    await expect(
-      requestPermission({ client: denied.client }, REQUEST, EXECUTION_CONTEXT),
-    ).rejects.toBeInstanceOf(PermissionDeniedError);
-
-    const rejected = permissionClient();
-    const pending = requestPermission({ client: rejected.client }, REQUEST, EXECUTION_CONTEXT);
-    await Promise.resolve();
-    rejected.reply("permission-1", "reject");
-    await expect(pending).rejects.toBeInstanceOf(PermissionRejectedError);
-  });
-
-  test("persists always grants by action and resource and reuses a V1-written row", async () => {
-    const db = new Database(":memory:");
-    db.exec(
-      "CREATE TABLE permission_saved (action TEXT NOT NULL, resource TEXT NOT NULL);" +
-        "INSERT INTO permission_saved VALUES ('edit', '/work/project/from-v1.ts');",
-    );
-    const streams: EventStream[] = [];
-    const creates: V2PermissionCreateInput[] = [];
-    const client: V2PermissionClient = {
-      event: {
-        subscribe: async () => {
-          const stream = new EventStream();
-          streams.push(stream);
-          return { stream };
-        },
-      },
-      permission: {
-        create: async (input) => {
-          creates.push(input);
-          const saved = db
-            .query(
-              "SELECT 1 FROM permission_saved WHERE action = ? AND (resource = ? OR resource = '*')",
-            )
-            .get(input.action, input.resources[0]) as unknown;
-          return { data: { id: `permission-${creates.length}`, effect: saved ? "allow" : "ask" } };
-        },
-      },
-    };
-    const v1Request = { ...REQUEST, patterns: ["/work/project/from-v1.ts"] };
-    await requestPermission({ client }, v1Request, EXECUTION_CONTEXT);
-    expect(streams[0]?.closed).toBe(true);
-
-    const first = requestPermission({ client }, REQUEST, EXECUTION_CONTEXT);
-    await Promise.resolve();
-    db.query("INSERT INTO permission_saved VALUES (?, ?)").run("edit", REQUEST.patterns[0]);
-    streams[1]?.push({
-      type: "permission.replied",
-      properties: { sessionID: "session-v2", requestID: "permission-2", reply: "always" },
-    } satisfies PermissionEvent);
-    await first;
-
-    const row = db
-      .query("SELECT action, resource FROM permission_saved WHERE resource = ?")
-      .get(REQUEST.patterns[0]);
-    expect(row).toEqual({ action: "edit", resource: REQUEST.patterns[0] });
-    await requestPermission({ client }, REQUEST, EXECUTION_CONTEXT);
-    expect(creates).toHaveLength(3);
-    expect(streams[2]?.closed).toBe(true);
-    db.close();
-  });
-
+describe("OpenCode V2 projected filesystem tools", () => {
   test("hoisted edit sends PatchDiff metadata through the registration consumer seam", async () => {
-    const host = permissionClient("allow");
-    const tools = projectedFilesystemTools(host.client, (_name, preview) =>
-      preview
-        ? { success: true, preview_diff: "@@ -1 +1 @@\n-old\n+new" }
-        : { success: true, text: "edited" },
+    const seen: unknown[] = [];
+    const { host } = permissionHost(OPENCODE_DEFAULT_RULES);
+    const recording: V2PermissionHostContext = {
+      agent: host.agent,
+      session: host.session,
+    };
+    const consumers = hoistedV2ToolConsumers(recording);
+    const definitions = hoistedTools(
+      pluginContext((_name, preview) =>
+        preview
+          ? { success: true, preview_diff: "@@ -1 +1 @@\n-old\n+new" }
+          : { success: true, text: "edited" },
+      ),
     );
-
-    await execute(tools.edit, {
-      path: "file.ts",
-      edits: [{ oldString: "old", newString: "new" }],
+    const edit = projectV2Tool("edit", definitions.edit, LOCATION, {
+      requestPermission: (request, context) => {
+        seen.push(request);
+        return consumers.requestPermission?.(request, context) ?? Promise.resolve();
+      },
     });
 
-    expect(host.createCalls[0]).toMatchObject({
-      action: "edit",
-      resources: ["file.ts"],
+    await execute(edit, { path: "file.ts", edits: [{ oldString: "old", newString: "new" }] });
+
+    expect(seen[0]).toMatchObject({
+      permission: "edit",
+      patterns: ["file.ts"],
       metadata: {
         filepath: resolve(PROJECT_ROOT, "file.ts"),
         diff: "@@ -1 +1 @@\n-old\n+new",
@@ -290,10 +339,10 @@ describe("OpenCode V2 permission consumer", () => {
     });
   });
 
-  test("read, write, and edit return permission_denied responses", async () => {
+  test("read, write, and edit fail with the rendered denial instead of a JSON envelope", async () => {
     for (const name of ["read", "write", "edit"] as const) {
-      const host = permissionClient("deny");
-      const tools = projectedFilesystemTools(host.client, (_tool, preview) =>
+      const { host } = permissionHost([{ action: "*", resource: "*", effect: "deny" }]);
+      const tools = projectedFilesystemTools(host, (_tool, preview) =>
         preview ? { success: true, preview_diff: "diff" } : { success: true, text: "ok" },
       );
       const input =
@@ -302,27 +351,30 @@ describe("OpenCode V2 permission consumer", () => {
           : name === "write"
             ? { path: "file.ts", content: "new" }
             : { path: "file.ts", edits: [{ oldString: "old", newString: "new" }] };
-      const result = await execute(tools[name], input);
-      expect(parsedDenied(result)).toMatchObject({ success: false, code: "permission_denied" });
+
+      const failure = await execute(tools[name], input).then(
+        (result) => result,
+        (error: unknown) => error as Error,
+      );
+
+      expect(failure, `${name} must fail the call`).toBeInstanceOf(Error);
+      expect((failure as Error).message).toContain("permission_denied");
+      expect((failure as Error).message).not.toContain('"success"');
     }
   });
 
-  test("aft_delete and aft_move reject instead of returning permission_denied", async () => {
+  test("aft_delete and aft_move reject with the deciding rule", async () => {
     for (const name of ["aft_delete", "aft_move"] as const) {
-      const host = permissionClient("deny");
-      const tools = projectedFilesystemTools(host.client, () => ({ success: true, text: "ok" }));
+      const { host } = permissionHost([{ action: "edit", resource: "*", effect: "deny" }]);
+      const tools = projectedFilesystemTools(host, () => ({ success: true, text: "ok" }));
       const input =
         name === "aft_delete"
           ? { files: ["file.ts"] }
           : { path: "file.ts", destination: "moved.ts" };
+
       const denied = execute(tools[name], input);
-      await expect(denied).rejects.toBeInstanceOf(PermissionDeniedError);
-      await expect(denied).rejects.toThrow("Permission denied.");
-      expect(host.createCalls[0]).toMatchObject({
-        action: "edit",
-        metadata: { action: name === "aft_delete" ? "delete" : "move" },
-      });
-      expect(host.createCalls[0]?.action).not.toBe(name);
+      await expect(denied).rejects.toThrow("Permission denied");
+      await expect(denied).rejects.toThrow('"edit" on "*" is "deny"');
     }
   });
 });
