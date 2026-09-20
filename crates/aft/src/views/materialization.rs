@@ -154,7 +154,11 @@ fn materialize(
     });
     let mut connection = crate::db::file_identity::IdentityConnection::open_with_flags(
         database_path,
-        if base.is_some() { rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE } else { rusqlite::OpenFlags::default() },
+        if base.is_some() {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        } else {
+            rusqlite::OpenFlags::default()
+        },
         "views::materialization::materialize",
     )?;
     configure_materialization_connection(&connection)?;
@@ -219,7 +223,10 @@ fn materialize(
             .map(|(path, _)| path.as_bytes().to_vec())
             .collect::<BTreeSet<_>>()
     });
-    let blob_connection = crate::db::file_identity::IdentityConnection::open(callgraph_blob_database, "views::materialization::blob_reader")?;
+    let blob_connection = crate::db::file_identity::IdentityConnection::open(
+        callgraph_blob_database,
+        "views::materialization::blob_reader",
+    )?;
     let reader = ManifestViewBlobReader::new(&blob_connection);
     let mut cached_for_invalidation = None;
     let mut fact_invalidated = BTreeSet::new();

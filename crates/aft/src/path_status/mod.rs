@@ -141,7 +141,10 @@ impl PathStatusStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let connection = crate::db::file_identity::IdentityConnection::open(path, "path_status::PathStatusStore::open_at")?;
+        let connection = crate::db::file_identity::IdentityConnection::open(
+            path,
+            "path_status::PathStatusStore::open_at",
+        )?;
         connection.execute_batch(PATH_STATUS_SCHEMA)?;
         Ok(Self {
             path: path.to_path_buf(),

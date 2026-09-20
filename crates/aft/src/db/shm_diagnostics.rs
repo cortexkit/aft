@@ -181,15 +181,7 @@ unsafe extern "C" fn trace_shm_map(
         } else {
             0
         };
-        emit(
-            b"leave",
-            -1,
-            rc as i64,
-            0,
-            0,
-            0,
-            Some(returned_mapping),
-        );
+        emit(b"leave", -1, rc as i64, 0, 0, 0, Some(returned_mapping));
         CONTEXT.with(|slot| slot.set(previous));
         rc
     }
@@ -380,8 +372,10 @@ mod tests {
         if let Some(path) = std::env::var_os(CHILD) {
             super::install();
             let connection = crate::db::TrackedConnection::open(
-                std::path::Path::new(&path), crate::db::SqliteStore::CallgraphGeneration,
-            ).unwrap();
+                std::path::Path::new(&path),
+                crate::db::SqliteStore::CallgraphGeneration,
+            )
+            .unwrap();
             connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE trace_probe(value); INSERT INTO trace_probe VALUES(42);").unwrap();
             use std::os::unix::fs::MetadataExt;
             let shm = std::fs::metadata(format!("{}-shm", std::path::Path::new(&path).display()))
@@ -394,10 +388,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("trace.sqlite");
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "db::shm_diagnostics::tests::syscall_trace_observes_sqlite_shm_reset", "--nocapture"])
+            .args([
+                "--exact",
+                "db::shm_diagnostics::tests::syscall_trace_observes_sqlite_shm_reset",
+                "--nocapture",
+            ])
             .env("AFT_CAPTURE_CRASH_DIAGNOSTICS", "1")
             .env(CHILD, &path)
-            .output().unwrap();
+            .output()
+            .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "child failed: {stderr}");
         let expected = stderr
@@ -411,6 +410,9 @@ mod tests {
                 && line.contains(&format!(" fd_ino={expected} "))
                 && line.contains(&format!(" arg={reset_size} "))
         });
-        assert!(observed, "SQLite's real WAL-index reset was not traced: {stderr}");
+        assert!(
+            observed,
+            "SQLite's real WAL-index reset was not traced: {stderr}"
+        );
     }
 }

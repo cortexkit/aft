@@ -284,7 +284,11 @@ fn checkpoint_derived(
 /// Run the generation-sized checkpoint after pointer publication. A later
 /// publication cancels a not-yet-started obsolete job; its clone has already
 /// forced the source checkpoint through [`clone_derived`].
-pub(super) fn schedule_derived_checkpoint(path: PathBuf, connection: crate::db::file_identity::IdentityConnection, root: PathBuf) {
+pub(super) fn schedule_derived_checkpoint(
+    path: PathBuf,
+    connection: crate::db::file_identity::IdentityConnection,
+    root: PathBuf,
+) {
     let key = path.parent().unwrap_or(&path).to_path_buf();
     let cancelled = Arc::new(AtomicBool::new(false));
     let job = DeferredCheckpointJob {
@@ -472,14 +476,12 @@ mod tests {
             0,
             "an unknowable TRUNCATE quantity must not receive guessed credit"
         );
-        assert!(
-            crate::write_ledger::seam_labels_for_test(
-                crate::write_ledger::Domain::Other,
-                &source.parent().unwrap().display().to_string(),
-            )
-            .iter()
-            .any(|label| label == DERIVED_CHECKPOINT_RESIDUAL)
-        );
+        assert!(crate::write_ledger::seam_labels_for_test(
+            crate::write_ledger::Domain::Other,
+            &source.parent().unwrap().display().to_string(),
+        )
+        .iter()
+        .any(|label| label == DERIVED_CHECKPOINT_RESIDUAL));
         assert_eq!(
             Connection::open(&source)
                 .unwrap()
@@ -489,7 +491,7 @@ mod tests {
         );
     }
 
-        #[test]
+    #[test]
     fn clone_uses_sqlite_backup_for_committed_wal_with_a_live_source() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source.sqlite");
@@ -562,7 +564,6 @@ mod tests {
             .unwrap();
     }
 }
-
 
 #[cfg(test)]
 mod ownership_tests {

@@ -8615,11 +8615,8 @@ mod tests {
         let project = dir.path().join("project");
         fs::create_dir_all(&project).expect("create project dir");
         let file = project.join("literal-escapes.txt");
-        fs::write(
-            &file,
-            "foo\\.bar\na\\\\b\nfoo\\tbar\nsplit\\(\"x\"\\)\n",
-        )
-        .expect("write literal escape corpus");
+        fs::write(&file, "foo\\.bar\na\\\\b\nfoo\\tbar\nsplit\\(\"x\"\\)\n")
+            .expect("write literal escape corpus");
 
         let index = SearchIndex::build(&project);
         let pattern = match pattern_compile::compile(
@@ -8637,8 +8634,14 @@ mod tests {
         let result = index.search_grep(&pattern, &[], &[], &project, 10);
 
         assert_eq!(result.index_status, IndexStatus::Ready);
-        assert!(!result.fully_degraded, "{needle:?} must use trigram candidates");
-        assert_eq!(result.total_matches, 1, "literal {needle:?} was filtered out");
+        assert!(
+            !result.fully_degraded,
+            "{needle:?} must use trigram candidates"
+        );
+        assert_eq!(
+            result.total_matches, 1,
+            "literal {needle:?} was filtered out"
+        );
         assert_eq!(result.matches.len(), 1);
         assert_eq!(
             result.matches[0].file,

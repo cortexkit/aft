@@ -783,10 +783,7 @@ impl ViewStore {
         // is already durable; syncing it again would be the closure cost the fill
         // exists to avoid.
         if reused.is_none() {
-            sync_database_with_passive_checkpoint(
-                &request.artifacts.derived_database,
-                observer,
-            )?;
+            sync_database_with_passive_checkpoint(&request.artifacts.derived_database, observer)?;
         }
         timing.phase("derived_durability");
         sync_file_and_parent(&request.artifacts.trigram_artifact)?;
@@ -880,7 +877,10 @@ impl ViewStore {
     }
 
     fn open_pointer_connection(&self) -> Result<crate::db::file_identity::IdentityConnection> {
-        let connection = crate::db::file_identity::IdentityConnection::open(self.pointer_path(), "views::ViewStore::open_pointer_connection")?;
+        let connection = crate::db::file_identity::IdentityConnection::open(
+            self.pointer_path(),
+            "views::ViewStore::open_pointer_connection",
+        )?;
         configure_connection(&connection)?;
         Ok(connection)
     }

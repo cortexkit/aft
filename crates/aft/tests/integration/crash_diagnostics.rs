@@ -90,15 +90,30 @@ mod unix {
     }
 
     unsafe fn fault_pc(context: *mut c_void) -> usize {
-        if context.is_null() { return 0; }
+        if context.is_null() {
+            return 0;
+        }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        unsafe { return (*(*(context.cast::<libc::ucontext_t>())).uc_mcontext).__ss.__pc as usize; }
+        unsafe {
+            return (*(*(context.cast::<libc::ucontext_t>())).uc_mcontext)
+                .__ss
+                .__pc as usize;
+        }
         #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-        unsafe { return (*(*(context.cast::<libc::ucontext_t>())).uc_mcontext).__ss.__rip as usize; }
+        unsafe {
+            return (*(*(context.cast::<libc::ucontext_t>())).uc_mcontext)
+                .__ss
+                .__rip as usize;
+        }
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        unsafe { return (*(context.cast::<libc::ucontext_t>())).uc_mcontext.gregs[libc::REG_RIP as usize] as usize; }
+        unsafe {
+            return (*(context.cast::<libc::ucontext_t>())).uc_mcontext.gregs[libc::REG_RIP as usize]
+                as usize;
+        }
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-        unsafe { return (*(context.cast::<libc::ucontext_t>())).uc_mcontext.pc as usize; }
+        unsafe {
+            return (*(context.cast::<libc::ucontext_t>())).uc_mcontext.pc as usize;
+        }
         #[allow(unreachable_code)]
         0
     }
@@ -173,8 +188,7 @@ mod unix {
         );
         assert!(
             stderr.lines().any(|line| {
-                line.contains("integration-")
-                    && !line.contains("AFT integration fatal signal")
+                line.contains("integration-") && !line.contains("AFT integration fatal signal")
             }),
             "backtrace_symbols_fd emitted no symbolized frame: {stderr}"
         );
@@ -270,7 +284,12 @@ mod unix {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn lock_probe_command(role: &str, path: &std::path::Path) -> std::process::Command {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command.args(["--exact", "crash_diagnostics::unix::sqlite_lock_probe_child", "--nocapture"])
+        command
+            .args([
+                "--exact",
+                "crash_diagnostics::unix::sqlite_lock_probe_child",
+                "--nocapture",
+            ])
             .env("AFT_SQLITE_LOCK_ROLE", role)
             .env("AFT_SQLITE_LOCK_PATH", path)
             .env(ENABLE_ENV, "1");
@@ -317,7 +336,10 @@ mod unix {
         let stderr = String::from_utf8_lossy(&output.stderr);
         eprint!("{stderr}");
         assert!(output.status.success(), "{stderr}");
-        assert!(stderr.contains("DMS_LOCK=held"), "credit hook released DMS: {stderr}");
+        assert!(
+            stderr.contains("DMS_LOCK=held"),
+            "credit hook released DMS: {stderr}"
+        );
         assert!(stderr.contains("DMS_WRITE=EAGAIN"), "{stderr}");
     }
 
@@ -337,7 +359,10 @@ mod unix {
         let stderr = String::from_utf8_lossy(&output.stderr);
         eprint!("{stderr}");
         assert!(output.status.success(), "{stderr}");
-        assert!(stderr.contains("CLOSE_SEAM=done"), "fixture never closed a connection: {stderr}");
+        assert!(
+            stderr.contains("CLOSE_SEAM=done"),
+            "fixture never closed a connection: {stderr}"
+        );
         assert!(
             stderr.contains("DMS_LOCK=held"),
             "closing a connection released a sibling's dead-man-switch lock: {stderr}"
@@ -349,8 +374,17 @@ mod unix {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     unsafe fn main_file(connection: &rusqlite::Connection) -> *mut rusqlite::ffi::sqlite3_file {
         let mut file: *mut rusqlite::ffi::sqlite3_file = std::ptr::null_mut();
-        assert_eq!(unsafe { rusqlite::ffi::sqlite3_file_control(connection.handle(), c"main".as_ptr(),
-            rusqlite::ffi::SQLITE_FCNTL_FILE_POINTER, std::ptr::from_mut(&mut file).cast()) }, rusqlite::ffi::SQLITE_OK);
+        assert_eq!(
+            unsafe {
+                rusqlite::ffi::sqlite3_file_control(
+                    connection.handle(),
+                    c"main".as_ptr(),
+                    rusqlite::ffi::SQLITE_FCNTL_FILE_POINTER,
+                    std::ptr::from_mut(&mut file).cast(),
+                )
+            },
+            rusqlite::ffi::SQLITE_OK
+        );
         file
     }
 
@@ -359,27 +393,41 @@ mod unix {
     fn sqlite_lock_probe_child() {
         use std::io::{BufRead, Write};
         use std::os::fd::AsRawFd;
-        let Ok(role) = std::env::var("AFT_SQLITE_LOCK_ROLE") else { return; };
+        let Ok(role) = std::env::var("AFT_SQLITE_LOCK_ROLE") else {
+            return;
+        };
         let path = std::path::PathBuf::from(std::env::var_os("AFT_SQLITE_LOCK_PATH").unwrap());
         install();
         unsafe {
-            let no_core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            let no_core = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
             libc::setrlimit(libc::RLIMIT_CORE, &no_core);
         }
         if role == "observer" || role == "resetter" {
-            let file = std::fs::OpenOptions::new().read(true).write(true)
-                .open(format!("{}-shm", path.display())).unwrap();
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(format!("{}-shm", path.display()))
+                .unwrap();
             let mut lock: libc::flock = unsafe { std::mem::zeroed() };
             lock.l_type = libc::F_WRLCK as _;
             lock.l_whence = libc::SEEK_SET as _;
             lock.l_start = 128; // SQLite's Unix dead-man-switch byte.
             lock.l_len = 1;
-            assert_eq!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) }, 0);
+            assert_eq!(
+                unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) },
+                0
+            );
             let held = lock.l_type != libc::F_UNLCK as libc::c_short;
             eprintln!("DMS_LOCK={}", if held { "held" } else { "free" });
             if held {
                 lock.l_type = libc::F_WRLCK as _;
-                assert_eq!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) }, -1);
+                assert_eq!(
+                    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) },
+                    -1
+                );
                 let error = std::io::Error::last_os_error().raw_os_error().unwrap();
                 assert!(error == libc::EAGAIN || error == libc::EACCES);
                 eprintln!("DMS_WRITE=EAGAIN");
@@ -390,7 +438,10 @@ mod unix {
                 unsafe {
                     let file = main_file(&connection);
                     let mut mapping = std::ptr::null_mut();
-                    assert_eq!(((*(*file).pMethods).xShmMap.unwrap())(file, 0, 32768, 0, &mut mapping), 0);
+                    assert_eq!(
+                        ((*(*file).pMethods).xShmMap.unwrap())(file, 0, 32768, 0, &mut mapping),
+                        0
+                    );
                 }
                 // No extension or recovery: leave SQLite's DMS reset observable
                 // while the first process still owns its original mapping.
@@ -499,13 +550,21 @@ mod unix {
             }
         } else {
             let mut child = lock_probe_command("resetter", &path)
-                .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
             let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
             let mut line = String::new();
             loop {
                 line.clear();
-                assert!(stdout.read_line(&mut line).unwrap() > 0, "resetter ended before reset");
-                if line.contains("RESET_READY") { break; }
+                assert!(
+                    stdout.read_line(&mut line).unwrap() > 0,
+                    "resetter ended before reset"
+                );
+                if line.contains("RESET_READY") {
+                    break;
+                }
             }
             // This is the mapping obtained before the extra descriptor was closed.
             // A volatile touch beyond Darwin's three retained bytes proves SIGBUS.
@@ -515,7 +574,12 @@ mod unix {
             let _ = child.stdin.take();
             child.wait().unwrap();
         }
-        assert_eq!(connection.query_row("SELECT value FROM t", [], |row| row.get::<_, i64>(0)).unwrap(), 42);
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM t", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            42
+        );
         eprintln!("MAPPING_SURVIVED");
     }
 

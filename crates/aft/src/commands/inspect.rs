@@ -1737,7 +1737,10 @@ fn parse_scope(
             missing.push(scope);
             continue;
         }
-        roots.push(std::fs::canonicalize(&validated).unwrap_or(validated));
+        // Never `fs::canonicalize` directly: its Windows result is a verbatim
+        // path, and every downstream comparison (workspace ownership, job
+        // scope, analyzed-file membership) is against non-verbatim roots.
+        roots.push(crate::inspect::job::canonicalize_normalized(&validated));
     }
 
     if !missing.is_empty() {

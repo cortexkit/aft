@@ -294,10 +294,7 @@ impl WalHookState {
             self.residual_counter
                 .note_seam_label(CLOSE_CHECKPOINT_RESIDUAL);
         }
-        if self
-            .generation_credit_ambiguous
-            .load(Ordering::Relaxed)
-        {
+        if self.generation_credit_ambiguous.load(Ordering::Relaxed) {
             self.residual_counter
                 .note_seam_label(AMBIGUOUS_WAL_RESTART_RESIDUAL);
         }
@@ -583,7 +580,6 @@ impl TrackedConnection {
             Ok(result)
         }
     }
-
 }
 
 impl Deref for TrackedConnection {

@@ -1,0 +1,16 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "sqlite-lock-set-fix",
+    "inspect-scope-honest-denominator",
+    "inspect-scope-windows-canonicalize",
+    "sentinel-daemon-pid-resolution",
+    "train-push-land-cwd-heartbeat"
+  ],
+  "note": "Two fence files move and neither touches retrieval. semantic_search/mod.rs swaps one read-only view-database open from rusqlite::Connection to the identity-tracked wrapper so the connection registry can see it; the path, the open flags and every ranking, lexical and fusion path are unchanged. The subc tool-schema artifact changes only the aft_inspect scope description (scope now takes one path or an array, not a space-separated list); aft_search text is untouched. Byte-equality against the reference is the proof."
+}

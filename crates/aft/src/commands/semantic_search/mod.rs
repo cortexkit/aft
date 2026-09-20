@@ -2004,7 +2004,7 @@ fn view_semantic_search(
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         "commands::semantic_search::view_semantic_search",
     )
-        .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string())?;
     let mut results = Vec::new();
     for (rel_path, entry) in manifest.entries() {
         let crate::views::ManifestEntry::Regular { planes, .. } = entry else {

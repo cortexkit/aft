@@ -1,9 +1,9 @@
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 pub mod file_identity;
+pub mod lifecycle;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod shm_diagnostics;
-pub mod lifecycle;
 pub mod write_ledger;
 pub use lifecycle::{
     connection_snapshot, SqliteConnectionSnapshot, SqliteStore, SqliteStoreCount, TrackedConnection,

@@ -3941,7 +3941,9 @@ impl CallGraphStore {
         let conn = self.conn.lock().expect("callgraph store mutex poisoned");
         let _files = crate::db::file_identity::filesystem_guard();
         if crate::db::file_identity::open_connections(&self.sqlite_path) > 1 {
-            return Err(CallGraphStoreError::Unavailable("cannot change journal mode with another live connection".into()));
+            return Err(CallGraphStoreError::Unavailable(
+                "cannot change journal mode with another live connection".into(),
+            ));
         }
         conn.checkpoint_wal_as(
             self.atomic_swap_checkpoint_mode(),
@@ -3949,7 +3951,9 @@ impl CallGraphStore {
         )?;
         let mode: String = conn.query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))?;
         if !mode.eq_ignore_ascii_case("delete") {
-            return Err(CallGraphStoreError::Unavailable(format!("atomic swap requires DELETE journal mode, got {mode}")));
+            return Err(CallGraphStoreError::Unavailable(format!(
+                "atomic swap requires DELETE journal mode, got {mode}"
+            )));
         }
         Ok(())
     }
@@ -8563,7 +8567,8 @@ fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) {
             if aged_out && tmp_prefixes.iter().any(|p| name.starts_with(p)) {
                 // Directory iteration includes sidecars; guard by the database
                 // they belong to rather than treating them as independent temps.
-                let database = name.strip_suffix("-wal")
+                let database = name
+                    .strip_suffix("-wal")
                     .or_else(|| name.strip_suffix("-shm"))
                     .or_else(|| name.strip_suffix("-journal"))
                     .unwrap_or(&name);
@@ -8627,7 +8632,8 @@ fn gc_old_generations(callgraph_dir: &Path, project_key: &str, current: &str) {
 fn ensure_sqlite_files_closed(path: &Path) -> Result<()> {
     if crate::db::file_identity::open_connections(path) != 0 {
         return Err(CallGraphStoreError::Unavailable(format!(
-            "SQLite file set is still open: {}", path.display()
+            "SQLite file set is still open: {}",
+            path.display()
         )));
     }
     Ok(())
@@ -17366,7 +17372,9 @@ export function leaf() {}
         let path = dir.path().join("live.sqlite");
         let connection = TrackedConnection::open(&path, SqliteStore::CallgraphGeneration).unwrap();
         configure_connection(&connection).unwrap();
-        connection.execute_batch("CREATE TABLE t(value); INSERT INTO t VALUES(42);").unwrap();
+        connection
+            .execute_batch("CREATE TABLE t(value); INSERT INTO t VALUES(42);")
+            .unwrap();
         let shm = PathBuf::from(format!("{}-shm", path.display()));
         let wal = PathBuf::from(format!("{}-wal", path.display()));
         let identity = crate::db::file_identity::identity_of(&shm);
@@ -17380,16 +17388,24 @@ export function leaf() {}
         }
         remove_sqlite_sidecars(&path);
         remove_sqlite_file_set(&path);
-        assert!(path.exists() && shm.exists() && wal.exists(), "cleanup removed live SQLite files");
+        assert!(
+            path.exists() && shm.exists() && wal.exists(),
+            "cleanup removed live SQLite files"
+        );
         assert_eq!(crate::db::file_identity::identity_of(&shm), identity);
         assert_eq!(std::fs::metadata(&shm).unwrap().len(), length);
-        assert_eq!(connection.query_row("SELECT value FROM t", [], |row| row.get::<_, i64>(0)).unwrap(), 42);
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM t", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            42
+        );
         drop(connection);
         remove_sqlite_file_set(&path);
         assert!(!path.exists() && !shm.exists() && !wal.exists());
     }
 
-        #[test]
+    #[test]
     fn callgraph_close_cleans_sidecars_before_the_next_opener() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("persist.sqlite");
@@ -17423,14 +17439,37 @@ export function leaf() {}
         std::fs::write(&source, "pub fn staged() {}\n").unwrap();
         let key = crate::search_index::artifact_cache_key(root.path());
         let path = dir.path().join(format!("{key}.staging.sqlite.tmp.resume"));
-        let connection = TrackedConnection::open(&path, SqliteStore::CallgraphColdGeneration).unwrap();
+        let connection =
+            TrackedConnection::open(&path, SqliteStore::CallgraphColdGeneration).unwrap();
         configure_build_connection(&connection).unwrap();
-        connection.execute_batch("CREATE TABLE sentinel(value); INSERT INTO sentinel VALUES(42);").unwrap();
-        let result = CallGraphStore::cold_build_with_lease(dir.path().to_path_buf(), root.path().to_path_buf(), &[source]);
-        let error = result.err().expect("live staging must be refused before adoption");
-        assert!(error.to_string().contains("SQLite file set is still open"), "{error}");
-        assert_eq!(connection.query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
-        assert_eq!(connection.query_row("SELECT value FROM sentinel", [], |row| row.get::<_, i64>(0)).unwrap(), 42);
+        connection
+            .execute_batch("CREATE TABLE sentinel(value); INSERT INTO sentinel VALUES(42);")
+            .unwrap();
+        let result = CallGraphStore::cold_build_with_lease(
+            dir.path().to_path_buf(),
+            root.path().to_path_buf(),
+            &[source],
+        );
+        let error = result
+            .err()
+            .expect("live staging must be refused before adoption");
+        assert!(
+            error.to_string().contains("SQLite file set is still open"),
+            "{error}"
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM sentinel", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            42
+        );
     }
 
     /// A reader arriving after the build closes but before publication must pin
@@ -17458,7 +17497,11 @@ export function leaf() {}
         let staging_for_observer = staging.clone();
         let staging_shm_for_observer = staging_shm.clone();
         set_cold_build_before_publish_observer(Some(Arc::new(move || {
-            let connection = TrackedConnection::open(&staging_for_observer, SqliteStore::CallgraphColdGeneration).unwrap();
+            let connection = TrackedConnection::open(
+                &staging_for_observer,
+                SqliteStore::CallgraphColdGeneration,
+            )
+            .unwrap();
             connection
                 .pragma_update(None, "journal_mode", "WAL")
                 .unwrap();
@@ -17478,7 +17521,10 @@ export function leaf() {}
             &files,
         );
         set_cold_build_before_publish_observer(None);
-        assert!(matches!(published, Err(CallGraphStoreError::Unavailable(_))));
+        assert!(matches!(
+            published,
+            Err(CallGraphStoreError::Unavailable(_))
+        ));
 
         assert!(
             mapped_before_publish.load(AtomicOrdering::SeqCst),
@@ -17488,8 +17534,11 @@ export function leaf() {}
         assert!(staging_shm.exists(), "live WAL-index must not be removed");
         drop(held.lock().unwrap().take());
         let (store, _) = CallGraphStore::cold_build_with_lease(
-            callgraph_dir.path().to_path_buf(), root.path().to_path_buf(), &files,
-        ).expect("closed staging may be adopted and published");
+            callgraph_dir.path().to_path_buf(),
+            root.path().to_path_buf(),
+            &files,
+        )
+        .expect("closed staging may be adopted and published");
         assert!(!staging.exists());
         assert!(!staging_shm.exists());
         drop(store);

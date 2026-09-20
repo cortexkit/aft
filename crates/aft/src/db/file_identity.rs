@@ -122,7 +122,10 @@ impl Opener {
     fn describe(&self) -> String {
         match self.identity {
             Some(identity) => format!("{} on {} attached to {identity}", self.store, self.thread),
-            None => format!("{} on {} (file identity unavailable)", self.store, self.thread),
+            None => format!(
+                "{} on {} (file identity unavailable)",
+                self.store, self.thread
+            ),
         }
     }
 }
@@ -237,7 +240,8 @@ pub(crate) struct OpenRecord {
 
 impl OpenRecord {
     pub(crate) fn new(connection: &rusqlite::Connection, store: SqliteStore) -> Self {
-        let key = connection.path()
+        let key = connection
+            .path()
             .filter(|path| !path.is_empty() && *path != ":memory:")
             .map(|path| note_open(Path::new(path), store));
         Self { key, store }
@@ -266,24 +270,38 @@ impl IdentityConnection {
         Ok(Self::new(rusqlite::Connection::open(path)?, seam))
     }
 
-    pub(crate) fn open_with_flags(path: impl AsRef<Path>, flags: rusqlite::OpenFlags, seam: &'static str) -> rusqlite::Result<Self> {
+    pub(crate) fn open_with_flags(
+        path: impl AsRef<Path>,
+        flags: rusqlite::OpenFlags,
+        seam: &'static str,
+    ) -> rusqlite::Result<Self> {
         let _guard = filesystem_guard();
-        Ok(Self::new(rusqlite::Connection::open_with_flags(path, flags)?, seam))
+        Ok(Self::new(
+            rusqlite::Connection::open_with_flags(path, flags)?,
+            seam,
+        ))
     }
 
     pub(crate) fn new(connection: rusqlite::Connection, seam: &'static str) -> Self {
         let record = OpenRecord::new(&connection, SqliteStore::Unmapped(seam));
-        Self { connection, _record: record }
+        Self {
+            connection,
+            _record: record,
+        }
     }
 }
 
 impl std::ops::Deref for IdentityConnection {
     type Target = rusqlite::Connection;
-    fn deref(&self) -> &Self::Target { &self.connection }
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
 }
 
 impl std::ops::DerefMut for IdentityConnection {
-    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.connection }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
 }
 
 /// Record that a tracked connection has opened `path`, and return the key the
@@ -334,11 +352,7 @@ pub(crate) fn note_close(key: &Path, store: SqliteStore) {
     }
 }
 
-fn replacement_hazard(
-    key: &Path,
-    entry: &OpenDatabase,
-    opener: &Opener,
-) -> Option<DatabaseHazard> {
+fn replacement_hazard(key: &Path, entry: &OpenDatabase, opener: &Opener) -> Option<DatabaseHazard> {
     let identity = opener.identity?;
     let previous = entry
         .openers
@@ -367,9 +381,13 @@ pub fn open_connections(path: &Path) -> usize {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
         .map(|(registered_path, entry)| {
-            entry.openers.iter().filter(|opener| {
-                registered_path == &key || identity.is_some() && opener.identity == identity
-            }).count()
+            entry
+                .openers
+                .iter()
+                .filter(|opener| {
+                    registered_path == &key || identity.is_some() && opener.identity == identity
+                })
+                .count()
         })
         .sum()
 }
@@ -438,7 +456,12 @@ mod tests {
         let path = dir.path().join("raw.sqlite");
         let connection = IdentityConnection::new(Connection::open(&path).unwrap(), "raw test");
         assert_eq!(open_connections(&path), 1);
-        assert_eq!(connection.pragma_query_value(None, "wal_autocheckpoint", |row| row.get::<_, i64>(0)).unwrap(), 1000);
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "wal_autocheckpoint", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1000
+        );
         drop(connection);
         assert_eq!(open_connections(&path), 0);
     }
@@ -448,7 +471,7 @@ mod tests {
         PathBuf::from(format!("{}-shm", path.display()))
     }
 
-        /// The mechanism, stated as an executable fact about SQLite rather than as
+    /// The mechanism, stated as an executable fact about SQLite rather than as
     /// prose: replace the database file at a path while a connection still has
     /// that path's WAL-index mapped, and the next connection truncates the
     /// WAL-index under the first one.
@@ -554,7 +577,6 @@ mod tests {
         std::mem::forget(first);
     }
 
-
     // Windows refuses to unlink or rename a database while a connection holds
     // it open, so the replaced-under-a-live-connection precondition cannot form
     // there; the hazard this registry reports is a POSIX one.
@@ -589,7 +611,9 @@ mod tests {
                 panic!("replacing the database file was not reported; hazards={hazards:?}")
             });
         assert!(
-            replaced.detail.contains(SqliteStore::CallgraphGeneration.label())
+            replaced
+                .detail
+                .contains(SqliteStore::CallgraphGeneration.label())
                 && replaced.detail.contains(SqliteStore::AftDb.label()),
             "the report must name both connections: {}",
             replaced.detail

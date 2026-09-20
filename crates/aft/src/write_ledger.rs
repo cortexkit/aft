@@ -502,11 +502,7 @@ fn census_with_sample(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if logical == 0
-            && physical == 0
-            && !totals.contains_key(&key)
-            && seam_labels.is_empty()
-        {
+        if logical == 0 && physical == 0 && !totals.contains_key(&key) && seam_labels.is_empty() {
             continue;
         }
         let total = totals.entry(key).or_default();
