@@ -56,6 +56,50 @@ EVENT="${WATCH_CI_EVENT:-push}"
 # knobs exist so tests can drive the resolver without waiting out that budget.
 RESOLVE_ATTEMPTS="${WATCH_CI_RESOLVE_ATTEMPTS:-40}"
 RESOLVE_SLEEP="${WATCH_CI_RESOLVE_SLEEP:-15}"
+POLL_SLEEP="${WATCH_CI_POLL_SLEEP:-45}"
+HEARTBEAT="${WATCH_CI_HEARTBEAT:-}"
+HEARTBEAT_TMP=""
+SLEEP_PID=""
+
+watcher_start_time() {
+  ps -p "$$" -o lstart= 2>/dev/null | awk '{$1=$1; print}'
+}
+WATCHER_START="$(watcher_start_time)"
+
+cleanup_watch() {
+  if [ -n "$SLEEP_PID" ]; then
+    kill "$SLEEP_PID" 2>/dev/null || true
+    wait "$SLEEP_PID" 2>/dev/null || true
+  fi
+  [ -z "$HEARTBEAT_TMP" ] || rm -f "$HEARTBEAT_TMP"
+  [ -z "$HEARTBEAT" ] || rm -f "$HEARTBEAT"
+}
+trap cleanup_watch EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+write_heartbeat() {
+  [ -n "$HEARTBEAT" ] || return 0
+  HEARTBEAT_TMP="$HEARTBEAT.tmp.$$"
+  {
+    printf 'pid=%s\n' "$$"
+    printf 'start=%s\n' "$WATCHER_START"
+    printf 'updated=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  } > "$HEARTBEAT_TMP"
+  mv "$HEARTBEAT_TMP" "$HEARTBEAT"
+  HEARTBEAT_TMP=""
+}
+
+watch_sleep() {
+  sleep "$1" &
+  SLEEP_PID=$!
+  wait "$SLEEP_PID"
+  sleep_rc=$?
+  SLEEP_PID=""
+  return "$sleep_rc"
+}
+
 ARG="${1:-}"
 RID=""
 WATCH_SHA=""
@@ -103,7 +147,7 @@ if [ -z "$RID" ]; then
       --json databaseId,headSha \
       --jq ".[] | select(.headSha==\"$WATCH_SHA\") | .databaseId" | head -1)
     [ -n "$RID" ] && break
-    sleep "$RESOLVE_SLEEP"
+    watch_sleep "$RESOLVE_SLEEP"
   done
   if [ -z "$RID" ]; then
     echo "no $WORKFLOW run (event=$EVENT) appeared for $WATCH_SHA" >&2
@@ -120,6 +164,7 @@ if [ -n "$RUN_URL" ] && [ "$RUN_URL" != "null" ]; then
 fi
 
 while true; do
+  write_heartbeat
   STATUS=$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json status --jq '.status' 2>/dev/null || echo poll-error)
   # Advisory (continue-on-error) jobs read 'failure' at the job level but do
   # not gate the run: 'Bash permission e2e (Windows)' in PR mode
@@ -137,7 +182,8 @@ while true; do
     if [ "${WATCH_CI_SETTLE:-0}" = "1" ]; then
       echo "settling: waiting for run completion so a rerun is accepted"
       while [ "$("$OPERATOR_GH" run view "$RID" --repo "$REPO" --json status --jq '.status' 2>/dev/null || echo poll-error)" != "completed" ]; do
-        sleep 45
+        write_heartbeat
+        watch_sleep "$POLL_SLEEP"
       done
     fi
     exit 1
@@ -164,5 +210,5 @@ while true; do
     exit 1
   fi
 
-  sleep 45
+  watch_sleep "$POLL_SLEEP"
 done

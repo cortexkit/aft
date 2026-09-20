@@ -217,7 +217,12 @@ fi
 # only. One operator, one box here; a second machine driving the same remote is
 # invisible to it, which is why leftover refs are still listed below.
 # (Lifted from BROCA's train-push, d588cb6c.)
-train_lock_dir="$(git -C "$REPO" rev-parse --absolute-git-dir 2>/dev/null)/train-push-locks"
+# Absolute so locks and heartbeats remain addressable after the launch cwd is
+# removed; later diagnostics can also name a path usable from anywhere.
+git_dir="$(git -C "$REPO" rev-parse --absolute-git-dir 2>/dev/null)"
+train_lock_dir="$git_dir/train-push-locks"
+watch_name="${train_name//\//-}"
+watch_heartbeat="$git_dir/train-push-$watch_name.watch"
 mkdir -p "$train_lock_dir" 2>/dev/null || true
 train_lock_held="$train_lock_dir/held"
 
@@ -358,6 +363,32 @@ require_repo_after_green() {
   fi
 }
 
+process_start_time() {
+  ps -p "$1" -o lstart= 2>/dev/null | awk '{$1=$1; print}' || true
+}
+
+read_watcher_heartbeat() {
+  heartbeat_pid=""
+  heartbeat_start=""
+  heartbeat_updated=""
+  heartbeat_dead_note=""
+  [ -f "$watch_heartbeat" ] || return 0
+
+  heartbeat_pid="$(sed -n 's/^pid=//p' "$watch_heartbeat" | head -1)"
+  heartbeat_start="$(sed -n 's/^start=//p' "$watch_heartbeat" | head -1)"
+  heartbeat_updated="$(sed -n 's/^updated=//p' "$watch_heartbeat" | head -1)"
+  case "$heartbeat_pid" in
+    '' | *[!0-9]*) heartbeat_now="" ;;
+    *) heartbeat_now="$(process_start_time "$heartbeat_pid")" ;;
+  esac
+
+  if [ -n "$heartbeat_now" ] && [ "$heartbeat_now" = "$heartbeat_start" ] && kill -0 "$heartbeat_pid" 2>/dev/null; then
+    refuse "watcher $heartbeat_pid is still running for $remote/$train_ref; wait for it"
+  fi
+
+  heartbeat_dead_note="watcher ${heartbeat_pid:-unknown} died at ${heartbeat_updated:-an unknown time}"
+}
+
 refuse_non_fast_forward() {
   local sha="$1"
   refuse "$sha is not a fast-forward of $remote/$default_branch; rebase and re-run: scripts/train-push.sh $train_name"
@@ -397,6 +428,7 @@ land_verified_sha() {
   if ! git -C "$REPO" push -q "$remote" --delete "$train_ref"; then
     printf 'train-push: warning — could not delete %s/%s (delete it by hand)\n' "$remote" "$train_ref" >&2
   fi
+  rm -f "$watch_heartbeat"
   say "done"
 }
 
@@ -430,6 +462,7 @@ fi
 
 if [ "$recover_existing" -eq 1 ]; then
   verified_sha="$train_remote_sha"
+  read_watcher_heartbeat
   run_id="$(resolve_ci_run "$verified_sha")"
   run_url=""
   run_status=""
@@ -451,7 +484,8 @@ if [ "$recover_existing" -eq 1 ]; then
     watch_target="${run_id:-$verified_sha}"
     say "attaching to CI for existing $remote/$train_ref at $verified_sha"
     set +e
-    (cd "$REPO" && REPO="$repo_slug" "$script_dir/watch-ci.sh" "$watch_target") 2>&1 | tee "$watch_log"
+    (cd "$REPO" && REPO="$repo_slug" WATCH_CI_HEARTBEAT="$watch_heartbeat" \
+      "$script_dir/watch-ci.sh" "$watch_target") 2>&1 | tee "$watch_log"
     watch_rc="${PIPESTATUS[0]}"
     set -e
     run_url="$(grep -m1 '^CI_RUN_URL ' "$watch_log" 2>/dev/null | sed 's/^CI_RUN_URL //' || true)"
@@ -465,6 +499,9 @@ if [ "$recover_existing" -eq 1 ]; then
   fi
 
   [ -n "$run_url" ] || run_url="(run url not reported)"
+  if [ -n "$heartbeat_dead_note" ]; then
+    say "$heartbeat_dead_note; landing its verified sha $verified_sha"
+  fi
   land_verified_sha "$verified_sha" "$run_url"
   exit 0
 fi
@@ -488,9 +525,6 @@ fi
 # every lift whose gate is not called tests.yml.
 tests_workflow="$REPO/.github/workflows/$tests_workflow_name"
 gate_scanner="$REPO/scripts/lib/workflow-gates.py"
-# Absolute, so the pre-push warning below names a path the reader can act on
-# from anywhere rather than one relative to the repo root.
-git_dir="$(git -C "$REPO" rev-parse --absolute-git-dir)"
 
 command -v python3 >/dev/null 2>&1 ||
   refuse "python3 is required to read the workflow files"
@@ -935,7 +969,8 @@ while true; do
   verified_sha=""
   say "watching CI for $head_sha on $train_ref in $repo_slug (round $round of $max_rounds)"
   set +e
-  (cd "$REPO" && REPO="$repo_slug" "$script_dir/watch-ci.sh" "$head_sha") 2>&1 | tee "$watch_log"
+  (cd "$REPO" && REPO="$repo_slug" WATCH_CI_HEARTBEAT="$watch_heartbeat" \
+    "$script_dir/watch-ci.sh" "$head_sha") 2>&1 | tee "$watch_log"
   watch_rc="${PIPESTATUS[0]}"
   set -e
 
@@ -1047,4 +1082,5 @@ say "landed $head_sha on $remote/$default_branch"
 if ! git -C "$REPO" push -q "$remote" --delete "$train_ref"; then
   printf 'train-push: warning — could not delete %s/%s (delete it by hand)\n' "$remote" "$train_ref" >&2
 fi
+rm -f "$watch_heartbeat"
 say "done"

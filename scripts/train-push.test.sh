@@ -113,7 +113,12 @@ case "$json" in
   status,conclusion)
     printf '%s\t%s\n' "$(cat "$STATE/recorded_status" 2>/dev/null || echo completed)" "$(cat "$STATE/conclusion")"
     ;;
-  status) echo "completed" ;;
+  status)
+    if [ -f "$STATE/capture_heartbeat" ] && [ -n "${WATCH_CI_HEARTBEAT:-}" ] && [ -f "$WATCH_CI_HEARTBEAT" ]; then
+      cp "$WATCH_CI_HEARTBEAT" "$STATE/heartbeat-snapshot"
+    fi
+    cat "$STATE/watch_status" 2>/dev/null || echo "completed"
+    ;;
   jobs) cat "$STATE/failed_job" ;;
   conclusion) cat "$STATE/conclusion" ;;
   *)
@@ -776,12 +781,59 @@ expect_out "actions/runs/4242" "red CI prints the run url"
 dir="$(new_fixture green)"
 add_train_commit "$dir/work" "green"
 train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+: > "$dir/ci-state/capture_heartbeat"
 run_train "$dir" green
 expect_rc 0 "green CI lands"
 [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$train_sha" ] ||
   fail "green CI did not fast-forward origin/main to the tested sha"
 [ -z "$(origin_ref "$dir" refs/heads/train/green)" ] ||
   fail "green CI left the train branch behind"
+if grep -q '^pid=[0-9][0-9]*$' "$dir/ci-state/heartbeat-snapshot" &&
+  grep -q '^start=.' "$dir/ci-state/heartbeat-snapshot" &&
+  grep -q '^updated=.' "$dir/ci-state/heartbeat-snapshot"; then
+  ok "the watcher heartbeat records pid, process start time, and poll time"
+else
+  fail "the watcher heartbeat did not record all liveness fields"
+fi
+[ ! -e "$dir/work/.git/train-push-green.watch" ] ||
+  fail "a clean watcher exit left its heartbeat behind"
+
+# A signalled watch kills its timer child and removes its heartbeat rather than
+# leaving descendants that make the watcher look alive.
+dir="$(new_fixture watch-signal)"
+echo "in_progress" > "$dir/ci-state/watch_status"
+heartbeat="$dir/work/.git/train-push-watch-signal.watch"
+(
+  cd "$dir/work"
+  exec env PATH="$BIN_DIR:$PATH" REPO=example/repo \
+    OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" \
+    TRAIN_PUSH_TEST_STATE="$dir/ci-state" WATCH_CI_HEARTBEAT="$heartbeat" \
+    WATCH_CI_POLL_SLEEP=60 scripts/watch-ci.sh 4242 > "$dir/watch-signal.out" 2>&1
+) &
+watcher_pid=$!
+sleep_child=""
+for _ in $(seq 1 100); do
+  sleep_child="$(pgrep -P "$watcher_pid" -x sleep 2>/dev/null | head -1 || true)"
+  [ -n "$sleep_child" ] && break
+  sleep 0.02
+done
+if [ -z "$sleep_child" ]; then
+  fail "the signalled-watch fixture never reached its timer sleep"
+else
+  kill -TERM "$watcher_pid" 2>/dev/null || true
+  set +e
+  wait "$watcher_pid"
+  watcher_rc=$?
+  set -e
+  [ "$watcher_rc" -eq 143 ] || fail "the signalled watch exited $watcher_rc instead of 143"
+  if kill -0 "$sleep_child" 2>/dev/null; then
+    fail "the signalled watch left sleep child $sleep_child running"
+    kill "$sleep_child" 2>/dev/null || true
+  else
+    ok "a signalled watch leaves no sleep child"
+  fi
+fi
+[ ! -e "$heartbeat" ] || fail "a signalled watch left its heartbeat behind"
 
 # --- the directory the process stands in may disappear during the watch ----
 dir="$(new_fixture deleted-cwd)"
@@ -870,6 +922,52 @@ fi
   fail "--land did not fast-forward the default branch to the recorded green sha"
 [ -z "$(origin_ref "$dir" refs/heads/train/existing-green)" ] ||
   fail "--land left the recovered train branch behind"
+
+# --- recovery reports a dead watcher before updating the default branch -----
+dir="$(new_fixture stale-heartbeat)"
+add_train_commit "$dir/work" "stale-heartbeat"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/stale-heartbeat"
+cat > "$dir/work/.git/train-push-stale-heartbeat.watch" <<HEARTBEAT
+pid=2147483000
+start=Mon Jan  1 00:00:00 2001
+updated=2026-09-19T20:15:00Z
+HEARTBEAT
+run_train "$dir" stale-heartbeat --land
+expect_rc 0 "--land recovers a green sha from a dead watcher"
+expect_out "watcher 2147483000 died at 2026-09-19T20:15:00Z; landing its verified sha $train_sha" \
+  "recovery identifies the dead watcher and its last heartbeat"
+
+# A live pid with a different process start is recycled, not a live watcher.
+dir="$(new_fixture recycled-heartbeat)"
+add_train_commit "$dir/work" "recycled-heartbeat"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/recycled-heartbeat"
+cat > "$dir/work/.git/train-push-recycled-heartbeat.watch" <<HEARTBEAT
+pid=$$
+start=not-the-current-process-start
+updated=2026-09-19T20:16:00Z
+HEARTBEAT
+run_train "$dir" recycled-heartbeat --land
+expect_rc 0 "a recycled heartbeat pid does not masquerade as a live watcher"
+expect_out "watcher $$ died at 2026-09-19T20:16:00Z; landing its verified sha $train_sha" \
+  "watcher liveness compares pid and process start time"
+
+# The same pid and start time is a genuinely live watcher and must not be
+# duplicated by a second process.
+dir="$(new_fixture live-heartbeat)"
+add_train_commit "$dir/work" "live-heartbeat"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/live-heartbeat"
+live_start="$(ps -p "$$" -o lstart= | awk '{$1=$1; print}')"
+cat > "$dir/work/.git/train-push-live-heartbeat.watch" <<HEARTBEAT
+pid=$$
+start=$live_start
+updated=2026-09-19T20:17:00Z
+HEARTBEAT
+run_train "$dir" live-heartbeat --land
+expect_rc 2 "a matching heartbeat pid and process start refuses a duplicate watcher"
+expect_out "watcher $$ is still running" "live watcher refusal names its pid"
 
 # --- existing train: running attaches to its exact run ---------------------
 dir="$(new_fixture existing-running)"
