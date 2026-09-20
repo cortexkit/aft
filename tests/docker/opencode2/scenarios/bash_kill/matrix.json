@@ -6,7 +6,7 @@
     {
       "tool": "bash_kill",
       "trajectories": {
-        "T1": "applicable",
+        "T1": "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
         "T2": "applicable",
         "T3": "n/a:no-permission-operation",
         "T4": "n/a:no-abortable-operation",

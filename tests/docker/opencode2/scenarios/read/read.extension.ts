@@ -43,9 +43,9 @@ async function validateReadScenarios(context: HarnessValidationContext): Promise
   };
   const row = matrix.rows.find((candidate) => candidate.tool === "read");
   const expected = {
-    T1: "applicable",
+    T1: "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
     T2: "applicable",
-    T3: "applicable",
+    T3: "expected_fail:https://github.com/anomalyco/opencode/issues/37164",
     T4: "n/a:no-abortable-operation",
     T5: "n/a:no-background-capability",
     T6: "n/a:no-list-surface",

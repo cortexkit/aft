@@ -1,28 +1,96 @@
 # OpenCode 2 matrix: the real failure set at GA 2.0.11
 
 - Date: 2026-09-20
-- Checkout: `c23b6073f15682e798a54261dc1dfa890734c2e0`
+- Checkout: `d7574617b6623d463468d7bd27b4e507c3e83dff`
 - Pinned V2 host: `@opencode/cli@2.0.11` (from `packages/opencode-plugin/test/load-matrix/load-matrix.ts`, read by `tests/docker/opencode2/harness/pin.ts`)
 - Pinned V1 host: `opencode-ai@1.18.30` (from `.github/opencode-version.txt`)
 - Contract audit this report leans on: `delta-audit-ga-2.0.11.md`
 
 This is the honest list, grouped by mechanism and attributed. It is deliberately not a repair.
 
+An earlier draft of this report argued that the permission rows should be reclassified `applicable` because `permission.create` exists on `@opencode/client`. That was wrong, the reclassification it justified was reverted, and section "Mechanism A" below records why. The fact was right; the inference from it was not.
+
 ## What was actually executed
 
 Docker here is `linux/amd64` under emulation on an `aarch64` host, so everything below is slow and everything below was run.
 
 - A `linux/amd64` release build of `agent-file-tools` was produced once (11m34s) and staged as a same-SHA artifact (`aft`, `aft.real`, `build-info.json`, `source: "same-sha-artifact"`). The harness image was then built with `AFT_BINARY_SOURCE=prebuilt`, so it did not recompile.
-- `tests/docker/run-opencode2-test.sh` with `AFT_E2E_SCENARIO=read/T1`, `AFT_E2E_CONCURRENCY=1`. Inside the container it completed, in order: executable provenance verification and the harness control suite. It then stopped in input validation, before any scenario ran.
-  - Provenance verdict `verified`: `executable_path /aft-artifact/aft`, `observed_sha256` equal to the producer sidecar, `checkout_git_sha` equal to HEAD, `version_output "aft 0.56.2 (c23b6073f15682e798a54261dc1dfa890734c2e0)"`, launch exit 0.
-  - Harness control suite: 15 of 15 controls observed their expected outcomes, including the three provenance negative controls and the four three-state disk transitions.
-- Direct probes of the real pinned host binary (`@opencode/cli-linux-x64@2.0.11`) in a clean `linux/amd64` container, under private `HOME` and XDG roots: `--version`, `serve`, and `api` against three routes with correct, wrong, and absent passwords.
+- Provenance verification and the harness control suite, inside the container at the 2.0.11 pin: provenance verdict `verified` (`version_output "aft 0.56.2 (c23b6073f...)"`, launch exit 0), and 15 of 15 harness controls observed their expected outcomes, including the three provenance negative controls.
+- **Three matrix scenarios executed**, against host **2.0.3** (see the caveat below):
+  - `safety/T1/checkpoint_restore` — **FAIL**, `projection_unparsed: {"success":false,"code":"permission_denied","message":"The \"edit\" operation was refused because the OpenCode V2 host did not provide a permission request endpoint."}`
+  - `ast_replace/T1/happy` — **FAIL**, the same `"edit"` refusal
+  - `import/T1/happy` — **FAIL**, `host exited null; accepted 0` (the host process never exited; a different mechanism, section D)
+- Direct probes of the real pinned 2.0.11 host binary in a clean `linux/amd64` container under private `HOME`/XDG roots: `--version`, `serve`, and `api` against three routes with correct, wrong, and absent passwords.
 
-**Zero matrix scenarios executed.** Not one. Mechanism A below is why, and it blocks every row of every tool, so no per-row pass/fail measurement exists at this pin. Where this report says a row fails, it says so from code and package evidence and labels it as such; it never reports a row as observed.
+**Caveat on those three scenarios.** They ran with the harness pin temporarily moved back to 2.0.3, because at 2.0.11 nothing can run at all (section C). They are therefore evidence about AFT at this checkout on host 2.0.3, not about 2.0.11. They are reported as such and nowhere else in this document is a row described as observed unless it appears above.
 
-## Mechanism A — the captured host contracts still describe 2.0.3. Harness's.
+Separately, the task-giver supplied live results from a running GA host, reproduced in section A. Those are theirs, not mine, and are labelled where used.
 
-The harness refuses to run until three committed contracts carry the pinned host version. They carry `2.0.3`.
+## Mechanism A — a server plugin is not given a client, so no AFT tool can request permission. Upstream's.
+
+This is the dominant mechanism. It explains every denied tool in the live GA evidence and both permission failures I observed.
+
+### The decisive question: full client, narrowed facade, or absent?
+
+**Absent, and not as a narrowing.** Verified against the installed pin (`@opencode/plugin@2.0.11`, `node_modules/.bun/@opencode+plugin@2.0.11+.../dist/effect/plugin.d.ts:25-53`), the Effect `Context` a server plugin receives has twenty-five members: `app`, `location`, `options`, `agent`, `aisdk`, `command`, `event`, `experimental`, `integration`, `mcp`, `model`, `generate`, `permission`, `plugin`, `provider`, `reference`, `rpc`, `session`, `shell`, `skill`, `storage`, `tool`, `vcs`, `websearch`, `worktree`. None of them is `client`.
+
+The context is not a client with members removed. It is a set of separate per-domain facades, each declared as a `Pick<...Api, ...>` sliced from the client's API types, and the permission slice deliberately omits creation: `Pick<PermissionApi<unknown>, "list" | "get" | "reply">` at 2.0.11 (`dist/effect/permission.d.ts:19-21`), the same plus `"rules"` at 2.0.3. The runtime object that populates the context has exactly those top-level keys (`@opencode/core@2.0.11/dist/chunks/snapshot-qgzk9bq2.js:197-503`; permission domain at `:412-417` is `{hook, list, get, reply}`).
+
+So on the object AFT receives, `host.client` is `undefined` and `host.client.permission.create` is not a call that can be made. **Branch (a).** The GA audit's point 8 was right.
+
+What I had verified earlier, and reported as if it settled the question, was the `@opencode/client` `PermissionApi` surface: `create` does exist there, in both 2.0.3 and 2.0.11, with a `PermissionCreateInput` that is field-for-field identical and accepts exactly what `src/permissions/v2.ts:148-155` sends. That client is real, and it is handed to the **TUI** plugin context (`dist/tui/context.d.ts:449`, `readonly client: OpenCodeClient`) — not to the server plugin where AFT's tools execute. Verifying the API surface without verifying who is handed it is the gap that produced the wrong conclusion.
+
+Nor is there a side route: `App` is `{name, version, channel}` with no endpoint, and `@opencode/core@2.0.11/dist` declares no environment variable carrying the server address.
+
+### Trace
+
+`src/entry/server-runtime.mjs:31` passes the plugin Effect context into `hoistedV2ToolConsumers(context)`. That function's first line is `if (!("client" in host)) return {}` (`src/tools/hoisted/v2.ts:20`), which is always taken, so `consumers.requestPermission` is never set. `runtimeFor`'s `ask` then rejects every request with `The "<permission>" operation was refused because the OpenCode V2 host did not provide a permission request endpoint.` (`src/tools/definitions/v2.ts:191-198`). That string is exactly what both of my executed permission failures returned and is the pre-existing capture in `tests/docker/opencode2/contract/probe/bash-t1-permission-refusal.txt`, which also records the pre-guard form of the same defect as a `TypeError` on `host.client.event`.
+
+### Which rows this reaches
+
+Every row whose scenario invokes a tool that reaches an unconditional `context.ask`. Corrected from code — an earlier draft used `V2_PERMISSION_ASK_INVENTORY` (`src/tools/hoisted/v2.ts:7-16`) as a list of *tools*, which it is not: its entries are permission ids and bash sub-sites, so `"edit"` covers every tool that asks through `askEditPermission`, not just the `edit` tool. The actual ask sites and their callers:
+
+| ask site | permission id | tools that reach it unconditionally |
+| --- | --- | --- |
+| `hoisted.ts:442` | `read` | `read` |
+| `permissions.ts:231` via `askEditPermission` | `edit` | `write`, `edit`, `apply_patch` (`hoisted.ts:573,604,767,899,933,1096`), `aft_safety` restore (`safety.ts:112,160`), `ast_replace` (`ast.ts:151`), `aft_import` (`imports.ts:104`) |
+| `hoisted.ts:1196`, `hoisted.ts:1276` | `edit` | `delete`, `move` |
+| `permissions.ts:627` via `askGrepPermission` | `grep` | `grep` (`search.ts:178`) |
+| `permissions.ts:627` via `askSearchPermission` | `aft_search` | `aft_search` (`semantic.ts:161`) |
+| `permissions.ts:686` via `askGlobPermission` | `glob` | `glob` (`search.ts:259`) |
+| `bash.ts:182,435` | `bash`, `external_directory` | `bash` |
+
+`assertExternalDirectoryPermission` (`permissions.ts:465`) is called by almost every tool but only asks for targets outside the project, so it does not fire on in-project fixtures and is not a source of failure here.
+
+Cross-referencing that against what each scenario actually calls:
+
+- T1 for `read`, `write`, `edit`, `apply_patch`, `delete`, `move`, `bash`, `glob`, `grep`, `search`, `import`, `safety`, `ast_replace`
+- T1 for `bash_kill`, `bash_status`, `bash_watch`, `bash_write` — each of these scenarios calls `bash` first to create the task it then operates on, so each hits the `bash` ask before reaching its own tool
+- T3 for `read`, `write`, `edit`, `apply_patch`, `delete`, `move`, `bash`
+- T4, T5, T6 for `bash`; T6 for `glob`, `grep`, `search`
+- The V2 leg of every corresponding T7
+
+That is the complete set of thirty `expected_fail:37164` rows. **All thirty keep the label.** The reclassification in the reverted commit was wrong on every one of them.
+
+### The live GA evidence is consistent with this, with one open question
+
+The task-giver's GA run denied `read`, `write`, `bash`, `aft_import`, and `aft_safety restore`, and found `aft_conflicts`, `aft_inspect`, `aft_outline`, `aft_zoom` and `aft_safety list/checkpoint/history/undo` working. Every denial is a tool in the table above; every working tool has no unconditional ask site. That is exactly what this mechanism predicts.
+
+The two entries that do not fit are `glob` and `grep`, reported working, while the table says both ask unconditionally. The likely explanation is a name collision rather than a contradiction: `V2_BUILTIN_REPLACEMENTS` is `["read", "edit", "write", "apply_patch"]` (`src/tool-registration.ts:24`), and registration calls `editor.remove(name)` only for those four before `editor.add(definition)` (`:183-184`). AFT registers its own tools named `glob` and `grep` without removing the host's natives, so on a GA host there are two candidates for each name and it is not established from here which one a model call reaches. **This is worth settling before anyone acts on the `glob`/`grep` rows**, because the two answers differ: if the host's native tool wins, AFT's `glob`/`grep` are dead code on V2 and the matrix is exercising something other than what a user reaches; if AFT's wins, the working result needs another explanation. The cheapest settling move is a single GA `glob` call whose output is checked for AFT's truncation trailer, which the native tool does not emit.
+
+## Mechanism B — AFT asks for permission on every read, including reads inside the project. Ours.
+
+The task-giver flagged `read` being denied as a tell, and it is one. **Yes, our wrapper requests permission for reads unconditionally.**
+
+`createReadTool` calls `context.ask({permission: "read", patterns: [filePath], always: ["*"], metadata: {}})` at `src/tools/hoisted.ts:440-448` on every invocation, after the external-directory check and before reading anything. There is no in-project short-circuit: the ask does not depend on whether `filePath` is inside the project root, on the presence of a saved rule, or on any argument. The `assertExternalDirectoryPermission` call immediately above it (`:433`) is the check that *is* scoped to external paths, and it is a separate gate.
+
+This is a defect independent of mechanism A, and it survives fixing mechanism A. AFT already sets `options.permission: "read"` on the projected tool (`src/tools/definitions/v2.ts:128-130`), which is the declarative label the host evaluates config rules against (audit point 10). Issuing an explicit ask on top of that is a second gate the host's own read tool does not have, so an in-project read that should be silent would prompt — once per session at best, given `always: ["*"]`.
+
+Attribution: ours, in product code, and out of scope for this task to fix. It is the reason `read/T1/happy` — a scenario that reads `sample.txt` from its own fixture — is a permission row at all.
+
+## Mechanism C — the captured host contracts still describe 2.0.3. Harness's.
+
+At the 2.0.11 pin, no scenario runs. The harness refuses until three committed contracts carry the pinned host version, and they carry `2.0.3`.
 
 Observed, verbatim:
 
@@ -34,11 +102,11 @@ HarnessError: contract_uncaptured:host_cli_contract must carry the pinned host v
 HarnessError details: {"expected_version":"2.0.11","observed_version":"2.0.3","observed_run_id":"oc2-ga-inspect-t4"}
 ```
 
-Affected: `contract/host-cli-contract.json`, `contract/host-provider-config.json`, `contract/host-schema-rejection.json`, each `"host_version": "2.0.3"`. The failure is unsuppressible and sits in `validateHarnessInputs`, so `--validate-only` does not get past it either.
+Affected: `contract/host-cli-contract.json`, `contract/host-provider-config.json`, `contract/host-schema-rejection.json`. The failure is unsuppressible and sits inside `validateHarnessInputs`, so `--validate-only` does not get past it either.
 
-Attribution: the harness's, and squarely a consequence of moving the pin. It is not a defect; it is the harness correctly refusing to credit 2.0.3 observations to a 2.0.11 host.
+Attribution: the harness's, and a direct consequence of moving the pin. It is not a defect — it is the harness correctly refusing to credit 2.0.3 observations to a 2.0.11 host.
 
-**Re-stamping the version is not sufficient.** One of those contracts describes an endpoint the 2.0.11 host no longer serves. Observed against the real 2.0.11 binary:
+**Re-stamping the version is not sufficient.** One of those contracts describes an endpoint 2.0.11 no longer serves. Observed against the real 2.0.11 binary:
 
 | request | 2.0.11 result |
 | --- | --- |
@@ -48,45 +116,23 @@ Attribution: the harness's, and squarely a consequence of moving the pin. It is 
 | `GET /api/info` with a wrong password | exit 1, `Error: Server at <endpoint> did not provide a compatible V2 health response` |
 | `GET /api/info` with no password | exit 1, same error |
 
-That matches the packages: `@opencode/protocol@2.0.3/dist/groups/health.js:13` publishes `health.get` at `/api/health` returning `{healthy: true, version, pid}`; at 2.0.11 the health group is gone from `dist/groups/` entirely and `@opencode/protocol@2.0.11/dist/groups/server.js:13` publishes `server.info` at `/api/info` returning `{version, pid, urls, paths:{tmp}}`. The client mirrors it: `@opencode/client@2.0.3/dist/promise/client.d.ts:13-14` has `health.get`, `@opencode/client@2.0.11/dist/promise/client.d.ts:13-14` has `server.info`.
+That matches the packages: `@opencode/protocol@2.0.3/dist/groups/health.js:13` publishes `health.get` at `/api/health` returning `{healthy: true, version, pid}`; at 2.0.11 the health group is gone from `dist/groups/` entirely and `@opencode/protocol@2.0.11/dist/groups/server.js:13` publishes `server.info` at `/api/info` returning `{version, pid, urls, paths:{tmp}}`.
 
-`contract/host-cli-contract.json:101` sets `shared_server_smoke.path` to `/api/health` with `expected_status: 0`, and `harness/host.ts:310-319` fails the run with `host_failed: "shared-server smoke correct attach failed"` when that call's exit code is not 0. So the moment the version stamp is fixed, every shared-server scenario — `bash/T4/abort`, `bash/T5/completion_wake`, `bash/T5/watch_pattern_once`, `inspect/T4/abort` — dies on the smoke instead, and the smoke would stop proving attachment.
+`contract/host-cli-contract.json:101` sets `shared_server_smoke.path` to `/api/health` with `expected_status: 0`, and `harness/host.ts:310-319` fails the run with `host_failed: "shared-server smoke correct attach failed"` when that call's exit code is not 0. So the moment the version stamp is fixed, every shared-server scenario — `bash/T4/abort`, `bash/T5/completion_wake`, `bash/T5/watch_pattern_once`, `inspect/T4/abort` — dies on the smoke instead, and the smoke stops proving attachment.
 
-The serve handoff itself is unchanged and needs no re-capture: `server listening on http://127.0.0.1:4096` and `server password <redacted>` both still match `endpoint_handoff.stdout_pattern` and `password_handoff.stdout_pattern`, and both negative controls still exit non-zero with the same stable error strings the contract records.
+The serve handoff needs no re-capture: `server listening on http://127.0.0.1:4096` and `server password <redacted>` still match both `stdout_pattern`s, and both password negative controls still exit non-zero with the same stable error strings the contract records.
 
-Next action for whoever repairs this: re-capture the three contracts against 2.0.11, moving `shared_server_smoke` to `GET /api/info` and replacing the `{healthy: true, version}` positive-control assertion with the observed `ServerInfo` body. The provider-config and schema-rejection contracts need real captures rather than a version bump, because neither was re-observed here.
+Next action for whoever repairs this: re-capture the three contracts against 2.0.11, moving `shared_server_smoke` to `GET /api/info` and replacing the `{healthy: true, version}` positive-control assertion with the observed `ServerInfo` body. The provider-config and schema-rejection contracts need real captures rather than a version bump; neither was re-observed here.
 
-## Mechanism B — hoisted mutators cannot request permission. Ours.
+## Mechanism D — `aft_import` does not terminate the host. Ours or the harness's; undetermined.
 
-Every AFT tool that asks for permission refuses on the V2 host, and has since GA. This is the mechanism the retired `expected_fail:37164` label was covering.
+`import/T1/happy` failed differently from every other permission row: `host exited null; accepted 0`. The host process did not exit and was killed at the scenario timeout, rather than returning the permission refusal that `safety/T1` and `ast_replace/T1` returned from the same `askEditPermission` site.
 
-AFT's `requestPermission` needs `host.client.permission.create` and `host.client.event.subscribe` (`src/permissions/v2.ts:36-45`). The server entry hands it the plugin Effect context (`src/entry/server-runtime.mjs:31`), and that context has no `client` — audit point 4, confirmed on both the declared surface (`@opencode/plugin@2.0.11/dist/effect/plugin.d.ts:25-53`) and the runtime object that populates it (`@opencode/core@2.0.11/dist/chunks/snapshot-qgzk9bq2.js:197-503`). `hoistedV2ToolConsumers`' guard `if (!("client" in host)) return {}` (`src/tools/hoisted/v2.ts:20`) therefore always returns no consumer, and `runtimeFor`'s `ask` rejects with `The "<op>" operation was refused because the OpenCode V2 host did not provide a permission request endpoint.` (`src/tools/definitions/v2.ts:191-198`). The harness captured that exact refusal at 2.0.3 in `contract/probe/bash-t1-permission-refusal.txt`, including the plugin's own log of the context keys with no `client` among them.
+`aft_import` asks with permission id `edit` at `src/tools/imports.ts:104`, so mechanism A should produce a clean refusal here as it does for its two siblings. It does not. Something on the `aft_import` path either swallows the rejection or leaves a handle open. One observation is not enough to attribute this between our code and the harness's scenario, and it was not reproduced.
 
-Rows this reaches, from the closed and tested ask inventory (`src/tools/hoisted/v2.ts:7-16`, pinned by `test/permissions/ask-site-inventory.test.ts`) — read, edit, write, apply_patch, aft_delete, aft_move, bash:
+This row was previously `expected_fail:37164`, and the label is retained, but note that the label does not describe what was observed: the observed failure is a hang, not a refusal.
 
-- T1: `read`, `edit`, `write`, `apply_patch`, `delete`, `move`, `bash`
-- T3: `read`, `edit`, `write`, `apply_patch`, `delete`, `move`, `bash`
-- T4, T5, T6: `bash`, whose scenarios all run a command and so all reach the same ask
-- T7: the V2 leg of each of the above, since T7 is materialized from T1
-
-The T1 rows are in that list on code evidence, not on the strength of the label that was just retired. `read` calls `context.ask({permission: "read", ...})` on every invocation before it reads anything (`src/tools/hoisted.ts:440-448`), and the filesystem mutators go through `askEditPermission`, which asks unconditionally too (`src/tools/permissions.ts:222-240`). There is no happy path through those tools that skips the ask. `bash` asks only when the binary answers `permission_required`, which it does under the harness's `bash_permissions: true` configuration — the 2.0.3 probe recorded the refusal for a `printf` fixture command. The four non-asking bash-family tools are not in this list: `V2_BASH_TOOLS` is `{bash, aft_bash}` (`src/tools/definitions/v2.ts:7`), so `bash_write`, `bash_status`, `bash_kill`, and `bash_watch` never enter the permission loop.
-
-Attribution: ours. The capability exists on the API we call, unchanged across both pins: `permission.create` on the client (`@opencode/client@2.0.11/dist/promise/client.d.ts:157-160`), with `PermissionCreateInput` (`.../generated/types.d.ts:7506-7615`) accepting field for field exactly what `src/permissions/v2.ts:148-155` sends, and `POST /api/session/:sessionID/permission` unchanged in the protocol. Nothing upstream is missing. We hand a context where a client is required.
-
-**A fix that only supplies a client will not work.** Audit point 5: `client.event.subscribe(options?)` returns `AsyncIterable<V2Event>` directly in both 2.0.3 and 2.0.11 (`@opencode/client@2.0.11/dist/promise/client.d.ts:10-12`), while `src/permissions/v2.ts:42-45,142-143` declares it as `Promise<{stream}>` and reads `.stream` off the awaited value. Against a real client that read is `undefined`, which is the same shape of dereference failure the 2.0.3 probe already recorded once. Both defects sit on the same path and want fixing together.
-
-## Mechanism C — thirteen rows whose real cause is unknown and was never measured. Unknown.
-
-Thirteen rows across ten tools carried the permission excuse for tools that never request permission: the ask inventory does not contain `search`, `glob`, `grep`, `import`, `safety`, `ast_replace`, `bash_kill`, `bash_status`, `bash_watch`, or `bash_write`, so mechanism B cannot describe them.
-
-- T1: `search`, `glob`, `grep`, `import`, `safety`, `ast_replace`, `bash_kill`, `bash_status`, `bash_watch`, `bash_write`
-- T6: `search`, `glob`, `grep`
-
-These are now `applicable`. Whether they pass, and if not why, is unmeasured — mechanism A stopped the run before any of them executed. Four of them are the interesting case the label may have been hiding a working path on: `import/T1`, `safety/T1`, `ast_replace/T1`, and `bash_write/T1` are plain single-call scenarios with no ask site and no list surface, so they have no obvious reason to fail at all. (`import`, `safety` and `ast_replace` do carry `options.permission: "edit"` and `bash_write` carries `"bash"` from `hostPermission` in `src/tools/definitions/v2.ts:128-147`, but audit point 10 shows the host reads that label only to decide whether config rules disable a tool outright — it never prompts.) If they pass on the first run after mechanism A is cleared, they were green all along and the label was reporting them as expected failures. That is exactly the case worth calling out by name, and this report cannot yet call it either way.
-
-The three T6 rows (`search`, `glob`, `grep`) are truncation-trailer comparisons against the Rust list-surface registry and are the more likely of this group to fail for a real reason.
-
-## Mechanism D — T7's V1 leg. Host's, on the V1 line.
+## Mechanism E — T7's V1 leg. Host's, on the V1 line.
 
 `https://github.com/anomalyco/opencode/issues/48340` is readable and is *not* what the label's placement suggests. It is titled "Plugin dispose is not called after one-shot run final stop", it is open, and it is reported against **`opencode-ai@1.18.29`** — the V1 host, not any `@opencode/*` package. Its claim: after `opencode run ... --auto` emits the final `step_finish` with `reason: "stop"`, the process stays alive and never invokes the plugin's `dispose`, so plugin-owned handles are never released and the CLI does not exit.
 
@@ -95,15 +141,23 @@ T7 is the only trajectory that runs the V1 host. It is materialized from each to
 Two honest qualifications:
 
 1. **No V2 contract point proves it, and none can.** 48340 is a V1 defect. The 2.0.11 pin move neither fixes nor worsens it, because the V1 host is pinned separately in `.github/opencode-version.txt` and did not move. Asking whether 48340 "still holds at the new pin" has the answer: the new pin is not the pin that governs it.
-2. **It was not re-verified at 1.18.30.** The issue names 1.18.29; the harness pins 1.18.30; 1.18.31 exists upstream. An open issue is not proof that a particular later build still hangs, and mechanism A prevented running a T7 scenario to check. The label is therefore retained on the strength of the issue and the path, not on an observation at the pinned version. Re-verifying it is the first thing worth doing once mechanism A is cleared — and if the V1 leg does terminate at 1.18.30, all 23 T7 rows are mislabelled and should follow the 37164 rows to `applicable`.
+2. **It was not re-verified at 1.18.30.** The issue names 1.18.29; the harness pins 1.18.30; 1.18.31 exists upstream. An open issue is not proof that a particular later build still hangs, and mechanism C prevented running a T7 scenario at the current pin to check. The label is retained on the strength of the issue and the path, not on an observation at the pinned version. Re-verifying it is worth doing once mechanism C is cleared; if the V1 leg does terminate at 1.18.30, all 23 T7 rows are mislabelled.
 
-Note also that T7 inherits T1: for the seven tools in mechanism B, the T7 V2 leg fails on the permission refusal before parity is ever compared, so 48340 is not the only thing failing those rows and never was.
+Note also that T7 inherits T1: for every tool in mechanism A, the T7 V2 leg fails on the permission refusal before parity is ever compared, so 48340 is not the only thing failing those rows and never was.
 
 ## Summary
 
 | Mechanism | Attribution | Rows reached | Evidence |
 | --- | --- | --- | --- |
-| A. Host contracts pinned at 2.0.3; `/api/health` removed at 2.0.11 | Harness | All, plus the four shared-server scenarios a second time | Observed `contract_uncaptured` failure; observed 404 on `/api/health`; `@opencode/protocol@2.0.11/dist/groups/server.js:13` |
-| B. No client on the server plugin context; `event.subscribe` shape mismatch | Ours | T1/T3 for 7 mutators, T4/T5/T6 for bash, their T7 legs | Audit points 2, 4, 5; `src/tools/hoisted/v2.ts:20`; `contract/probe/bash-t1-permission-refusal.txt` |
-| C. Unknown cause, never measured | Unknown | 10 tools at T1, 3 at T6 | Ask inventory excludes all of them; no execution at this pin |
-| D. V1 host does not dispose after a one-shot run | Host (V1 line) | All 23 T7 rows | Upstream 48340 against `opencode-ai@1.18.29`; V1 pinned at 1.18.30; not re-verified |
+| A. No client on the server plugin context; permission facade excludes `create` | Upstream | All 30 `37164` rows | `@opencode/plugin@2.0.11/dist/effect/plugin.d.ts:25-53`, `dist/effect/permission.d.ts:19-21`, `@opencode/core@2.0.11/.../snapshot-qgzk9bq2.js:412-417`; observed refusals in `safety/T1` and `ast_replace/T1`; task-giver's GA run |
+| B. Unconditional permission ask on every read | Ours | `read` at T1/T3/T7, and the shape of every read-side prompt | `src/tools/hoisted.ts:440-448` against `src/tools/definitions/v2.ts:128-130` |
+| C. Host contracts pinned at 2.0.3; `/api/health` removed at 2.0.11 | Harness | All rows at the 2.0.11 pin, plus the four shared-server scenarios a second time | Observed `contract_uncaptured`; observed 404 on `/api/health`; `@opencode/protocol@2.0.11/dist/groups/server.js:13` |
+| D. `aft_import` hangs instead of refusing | Undetermined | `import/T1` | Observed `host exited null`; one run, not reproduced |
+| E. V1 host does not dispose after a one-shot run | Host (V1 line) | All 23 T7 rows | Upstream 48340 against `opencode-ai@1.18.29`; V1 pinned at 1.18.30; not re-verified |
+
+## Open questions worth settling before acting
+
+1. Does a GA model call to `glob` or `grep` reach AFT's tool or the host's native one? Decides whether those rows measure anything a user reaches.
+2. Does `aft_import` hang reproducibly, and where? Mechanism D is one observation.
+3. Does `opencode-ai@1.18.30` still fail to dispose? Decides all 23 T7 rows.
+4. Which mechanism should replace the absent `permission.create` — the `permission.hook` the context does expose, or a route to the HTTP endpoint that a server plugin can actually obtain? Mechanism A is a design question, not a wiring fix.

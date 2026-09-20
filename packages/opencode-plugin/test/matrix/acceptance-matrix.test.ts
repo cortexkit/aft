@@ -112,7 +112,7 @@ const acceptanceMatrix: AcceptanceRow[] = [
   {
     sliceId: "S10",
     claim:
-      "GA pin move to @opencode/*@2.0.11 re-derives every relied-on contract point from the unpacked dist, including the client permission.create the 2.0.3 audit reported as absent",
+      "GA pin move to @opencode/*@2.0.11 re-derives every relied-on contract point from the unpacked dist, and confirms from the plugin context type that a server plugin is handed no client and a permission facade without create",
     governingSource: "GA delta audit oc2-ga-2.0.11",
     testFile: "matrix/acceptance-matrix.test.ts",
     testPattern: "oc2-ga-2.0.11",
@@ -170,11 +170,12 @@ describe("OpenCode V2 delta audit evidence", () => {
     expect(content).toContain("@opencode/core@2.0.11/dist/chunks/");
   });
 
-  test("the current audit retires 37164 on the client path and keeps 48340 on the V1 host", () => {
+  test("the current audit keeps 37164 on our path and keeps 48340 on the V1 host", () => {
     const content = readFileSync(currentAuditFile, "utf8");
-    // The audit's second contract point is what decides the matrix's permission
-    // rows: the client API AFT calls does expose permission.create, so an
-    // upstream feature request cannot stand in as the reason those rows fail.
+    // The audit records two independent facts about permissions: that the
+    // @opencode/client package declares permission.create, and that the server
+    // plugin context is never handed that client. Keep both, so the package
+    // declaration is never mistaken for evidence that a plugin can call it.
     expect(content).toContain("PermissionCreateInput");
     expect(content).toContain("issues/37164");
     expect(content).toContain("opencode-ai@1.18.29");
