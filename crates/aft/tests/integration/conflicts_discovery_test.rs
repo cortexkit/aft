@@ -183,6 +183,42 @@ fn mixed_readable_and_deleted_unmerged_files_are_both_reported() {
     assert!(aft.shutdown().success());
 }
 
+#[cfg(unix)]
+#[test]
+fn marker_sweep_permission_error_preserves_unmerged_conflict_as_named_gap() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    create_merge_conflict(dir.path(), "conflict.txt");
+    let unreadable = dir.path().join("packages/b/.keep");
+    let original_mode = fs::metadata(&unreadable)
+        .expect("read original permissions")
+        .permissions()
+        .mode();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0))
+        .expect("make tracked file unreadable");
+
+    let (aft, resp) = configure_and_conflicts(dir.path());
+
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(original_mode))
+        .expect("restore tracked file permissions");
+    assert_eq!(resp["success"], true, "conflicts response: {resp:?}");
+    assert_eq!(resp["complete"], false, "conflicts response: {resp:?}");
+    assert_eq!(resp["file_count"], 1, "conflicts response: {resp:?}");
+    assert_eq!(resp["conflict_count"], 1, "conflicts response: {resp:?}");
+    assert_eq!(resp["unmerged_count"], 1, "conflicts response: {resp:?}");
+    assert!(resp["sweep_error"]
+        .as_str()
+        .expect("sweep_error string")
+        .contains("packages/b/.keep"));
+    let text = response_text(&resp);
+    assert!(text.contains("marker sweep incomplete — see sweep_error"));
+    assert!(text.contains("conflict.txt"));
+    assert!(text.contains("<<<<<<< HEAD"));
+
+    assert!(aft.shutdown().success());
+}
+
 #[test]
 fn staged_but_still_marked_file_is_reported() {
     let dir = tempfile::tempdir().unwrap();

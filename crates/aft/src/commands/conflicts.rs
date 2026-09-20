@@ -69,11 +69,12 @@ fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
 }
 
 /// Find all conflicted files using index-unmerged state plus tracked working-tree markers.
-/// Returns the git toplevel, unique file paths relative to that toplevel, and the
-/// subset reported by Git as index-unmerged paths.
+/// Returns the Git toplevel, unique file paths relative to that toplevel, the
+/// subset reported by Git as index-unmerged paths, and an error when scanning
+/// tracked files for additional conflict markers was incomplete.
 fn discover_conflicted_files(
     base_dir: &Path,
-) -> Result<(PathBuf, Vec<PathBuf>, HashSet<PathBuf>), String> {
+) -> Result<(PathBuf, Vec<PathBuf>, HashSet<PathBuf>, Option<String>), String> {
     let toplevel = git_toplevel(base_dir)?;
     let mut files: Vec<PathBuf> = Vec::new();
     let mut seen = HashSet::new();
@@ -104,31 +105,43 @@ fn discover_conflicted_files(
         }
     }
 
-    let grep_output = crate::effective_path::new_command("git")
+    let mut sweep_error = None;
+    match crate::effective_path::new_command("git")
         .args(["grep", "-z", "-lE", r"^(<<<<<<< |>>>>>>> )"])
         .current_dir(&toplevel)
         .output()
-        .map_err(|e| format!("failed to run git: {}", e))?;
-
-    if grep_output.status.success() {
-        for filename in grep_output.stdout.split(|byte| *byte == b'\0') {
-            if filename.is_empty() {
-                continue;
+    {
+        Ok(grep_output) => {
+            let status = grep_output.status.code();
+            if status == Some(0) {
+                for filename in grep_output.stdout.split(|byte| *byte == b'\0') {
+                    if filename.is_empty() {
+                        continue;
+                    }
+                    let path = path_from_git_bytes(filename);
+                    if seen.insert(path.clone()) {
+                        files.push(path);
+                    }
+                }
             }
-            let path = path_from_git_bytes(filename);
-            if seen.insert(path.clone()) {
-                files.push(path);
+
+            let stderr = String::from_utf8_lossy(&grep_output.stderr);
+            if !stderr.trim().is_empty() {
+                sweep_error = Some(format!("git grep marker sweep: {}", stderr.trim()));
+            } else if !matches!(status, Some(0) | Some(1)) {
+                let status = status
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "terminated by signal".to_string());
+                sweep_error = Some(format!("git grep marker sweep failed with status {status}"));
             }
         }
-    } else {
-        let stderr = String::from_utf8_lossy(&grep_output.stderr);
-        if grep_output.status.code() != Some(1) || !stderr.trim().is_empty() {
-            return Err(format!("git grep failed: {}", stderr.trim()));
+        Err(error) => {
+            sweep_error = Some(format!("failed to run git grep marker sweep: {error}"));
         }
     }
 
     files.sort();
-    Ok((toplevel, files, unmerged_files))
+    Ok((toplevel, files, unmerged_files, sweep_error))
 }
 
 /// Parse a file's content and find all conflict regions (marker line numbers).
@@ -253,35 +266,51 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
     };
 
     // Discover conflicted files
-    let (git_toplevel, files, unmerged_files) = match discover_conflicted_files(&discovery_base) {
-        Ok(result) => result,
-        Err(e) => {
-            if requested_path.is_some() && e == "not a git repository" {
-                return Response::error(
-                    &req.id,
-                    "not_a_git_repository",
-                    format!(
-                        "path is not inside a git repository: {}",
-                        discovery_base.display()
-                    ),
-                );
+    let (git_toplevel, files, unmerged_files, sweep_error) =
+        match discover_conflicted_files(&discovery_base) {
+            Ok(result) => result,
+            Err(e) => {
+                if requested_path.is_some() && e == "not a git repository" {
+                    return Response::error(
+                        &req.id,
+                        "not_a_git_repository",
+                        format!(
+                            "path is not inside a git repository: {}",
+                            discovery_base.display()
+                        ),
+                    );
+                }
+                return Response::error(&req.id, "git_error", e);
             }
-            return Response::error(&req.id, "git_error", e);
-        }
-    };
+        };
     let checked_root = git_toplevel.to_string_lossy().to_string();
 
     if files.is_empty() {
-        return Response::success(
-            &req.id,
-            serde_json::json!({
-                "text": format!("No merge conflicts found.\nChecked repo root: {}", checked_root),
-                "file_count": 0,
-                "conflict_count": 0,
-                "unmerged_count": unmerged_files.len(),
-                "checked_root": checked_root,
-            }),
-        );
+        let text = if sweep_error.is_some() {
+            format!(
+                "No merge conflicts found, but the marker sweep was incomplete — see sweep_error.\nChecked repo root: {}",
+                checked_root
+            )
+        } else {
+            format!(
+                "No merge conflicts found.\nChecked repo root: {}",
+                checked_root
+            )
+        };
+        let mut data = serde_json::json!({
+            "text": text,
+            "file_count": 0,
+            "conflict_count": 0,
+            "unmerged_count": unmerged_files.len(),
+            "checked_root": checked_root,
+        });
+        if let Some(sweep_error) = sweep_error {
+            if let Some(data) = data.as_object_mut() {
+                data.insert("complete".to_string(), serde_json::json!(false));
+                data.insert("sweep_error".to_string(), serde_json::json!(sweep_error));
+            }
+        }
+        return Response::success(&req.id, data);
     }
 
     let mut output = String::new();
@@ -335,17 +364,24 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
         output.push('\n');
     }
 
-    // Put any unreadable unmerged paths in the first line so a partial scan
-    // cannot look like a clean scan to an agent.
-    let skipped_summary = if skipped_files.is_empty() {
-        String::new()
-    } else {
+    // Put incomplete-scan warnings in the first line so readers and automated tools
+    // do not mistake a partial conflict scan for a complete result.
+    let mut gap_summaries = Vec::new();
+    if !skipped_files.is_empty() {
         let skipped_count = skipped_files.len();
-        format!(
-            " ({} unmerged file{} unreadable — see skipped_files)",
+        gap_summaries.push(format!(
+            "{} unmerged file{} unreadable — see skipped_files",
             skipped_count,
             if skipped_count == 1 { "" } else { "s" },
-        )
+        ));
+    }
+    if sweep_error.is_some() {
+        gap_summaries.push("marker sweep incomplete — see sweep_error".to_string());
+    }
+    let gap_summary = if gap_summaries.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", gap_summaries.join("; "))
     };
     let header = format!(
         "{} {}, {} {}{}\nChecked repo root: {}\n\n",
@@ -361,7 +397,7 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
         } else {
             "conflicts"
         },
-        skipped_summary,
+        gap_summary,
         checked_root,
     );
 
@@ -374,13 +410,17 @@ pub fn handle_git_conflicts(ctx: &AppContext, req: &RawRequest) -> Response {
         "unmerged_count": unmerged_files.len(),
         "checked_root": checked_root,
     });
-    if !skipped_files.is_empty() {
-        if let Some(data) = data.as_object_mut() {
+    if let Some(data) = data.as_object_mut() {
+        if !skipped_files.is_empty() {
             data.insert("complete".to_string(), serde_json::json!(false));
             data.insert(
                 "skipped_files".to_string(),
                 serde_json::json!(skipped_files),
             );
+        }
+        if let Some(sweep_error) = sweep_error {
+            data.insert("complete".to_string(), serde_json::json!(false));
+            data.insert("sweep_error".to_string(), serde_json::json!(sweep_error));
         }
     }
 
