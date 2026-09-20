@@ -264,8 +264,11 @@ mod unix {
     fn sqlite_extra_shm_close_loses_dms_lock_and_faults() {
         use std::os::unix::process::ExitStatusExt;
         let dir = tempfile::tempdir().unwrap();
-        let output = lock_probe_command("extra-close", &dir.path().join("probe.sqlite")).output().unwrap();
+        let output = lock_probe_command("extra-close", &dir.path().join("probe.sqlite"))
+            .output()
+            .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
+        eprint!("{stderr}");
         assert!(stderr.contains("DMS_LOCK=free"), "{stderr}");
         assert!(stderr.contains("DMS_RESET=done"), "{stderr}");
         assert_eq!(output.status.signal(), Some(libc::SIGBUS), "{stderr}");
@@ -275,8 +278,11 @@ mod unix {
     #[test]
     fn sqlite_without_extra_close_keeps_dms_lock_and_mapping() {
         let dir = tempfile::tempdir().unwrap();
-        let output = lock_probe_command("control", &dir.path().join("probe.sqlite")).output().unwrap();
+        let output = lock_probe_command("control", &dir.path().join("probe.sqlite"))
+            .output()
+            .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
+        eprint!("{stderr}");
         assert!(output.status.success(), "{stderr}");
         assert!(stderr.contains("DMS_LOCK=held"), "{stderr}");
         assert!(stderr.contains("DMS_WRITE=EAGAIN"), "{stderr}");
@@ -360,7 +366,27 @@ mod unix {
             raw = rusqlite::Connection::open(&path).unwrap();
             &raw
         };
-        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(value); INSERT INTO t VALUES(42); BEGIN; SELECT * FROM t;").unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; CREATE TABLE t(value); INSERT INTO t VALUES(42); BEGIN;",
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT value FROM t", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            42
+        );
+        let mapping = unsafe {
+            let file = main_file(connection);
+            let mut mapping = std::ptr::null_mut();
+            assert_eq!(
+                ((*(*file).pMethods).xShmMap.unwrap())(file, 0, 32768, 0, &mut mapping),
+                rusqlite::ffi::SQLITE_OK
+            );
+            assert!(!mapping.is_null());
+            mapping
+        };
         if role == "extra-close" {
             drop(std::fs::File::open(format!("{}-shm", path.display())).unwrap());
         }
@@ -368,6 +394,10 @@ mod unix {
             let output = lock_probe_command("observer", &path).output().unwrap();
             eprint!("{}", String::from_utf8_lossy(&output.stderr));
             assert!(output.status.success());
+            // The failed exclusive probe must leave the already mapped page readable.
+            unsafe {
+                std::ptr::read_volatile(mapping.cast::<u8>().add(4096));
+            }
         } else {
             let mut child = lock_probe_command("resetter", &path)
                 .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
@@ -378,13 +408,9 @@ mod unix {
                 assert!(stdout.read_line(&mut line).unwrap() > 0, "resetter ended before reset");
                 if line.contains("RESET_READY") { break; }
             }
-            // The mapping belongs to SQLite, not a separately opened descriptor.
+            // This is the mapping obtained before the extra descriptor was closed.
             // A volatile touch beyond Darwin's three retained bytes proves SIGBUS.
             unsafe {
-                let file = main_file(connection);
-                let mut mapping = std::ptr::null_mut();
-                assert_eq!(((*(*file).pMethods).xShmMap.unwrap())(file, 0, 32768, 0, &mut mapping), 0);
-                assert!(!mapping.is_null());
                 std::ptr::read_volatile(mapping.cast::<u8>().add(4096));
             }
             let _ = child.stdin.take();
