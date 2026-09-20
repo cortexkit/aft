@@ -1,0 +1,31 @@
+OpenCode 2 GA host schema-rejection probe
+run_id: oc2-ga-2.0.11-20260920-schema
+checkout_sha: 48f95796160b920874efe30be4f288621994b06c
+platform: linux/amd64 container (node:24-bookworm-slim)
+binary: @opencode/cli-linux-x64@2.0.11/bin/opencode
+session_id: ses_f3ef9c84cffeaHgwabdVgYJkl9
+isolation: HOME, TMPDIR, all four persistent XDG roots, and XDG_RUNTIME_DIR are private; OPENCODE_DB=opencode2.db; OPENCODE_DISABLE_DEFAULT_PLUGINS=true
+
+The probe replays the harness's own read/T2/host_schema_rejection_probe scenario
+(harness/schema-observation.ts): the same prompt, the same tool call id, and the
+same empty arguments object, against the host's native read tool.
+
+The deterministic OpenAI-compatible mock emitted:
+{"name":"read","arguments":"{}"}
+
+$ opencode run --standalone --print-logs --format json --model openai/mock-model --auto "Call read with the supplied arguments, then report the result."
+{"type":"step_start","timestamp":1789944806044,"sessionID":"ses_f3ef9c84cffeaHgwabdVgYJkl9","part":{"id":"prt_0c1063a9c001m4xYAMeNUKELUh","sessionID":"ses_f3ef9c84cffeaHgwabdVgYJkl9","messageID":"msg_0c1063973001GQIPtDnavKzXXB","type":"step-start"}}
+{"type":"tool_use","timestamp":1789944806117,"sessionID":"ses_f3ef9c84cffeaHgwabdVgYJkl9","part":{"partID":"prt_0c1063973001GQIPtDnavKzXXB_tool-host-schema-rejection","sessionID":"ses_f3ef9c84cffeaHgwabdVgYJkl9","messageID":"msg_0c1063973001GQIPtDnavKzXXB","type":"tool","id":"host-schema-rejection","tool":"read","state":{"status":"error","input":{},"error":"Invalid arguments for tool \"read\":\n- path: Missing key\n\nArguments provided:\n{}\n\nUpdate the arguments and call the tool again.","metadata":{},"time":{"start":1789944806087,"end":1789944806112}}}}
+{"type":"text","timestamp":1789944806189,"sessionID":"ses_f3ef9c84cffeaHgwabdVgYJkl9","part":{"id":"prt_0c1063af70017Mau1J0RYmchYX_text-0","sessionID":"ses_f3ef9c84cffeaHgwabdVgYJkl9","messageID":"msg_0c1063af70017Mau1J0RYmchYX","type":"text","text":"Probe complete.","time":{"start":1789944806152,"end":1789944806189}}}
+[exit 0]
+
+Agent-visible tool message, read back from the mock's second request:
+{"role":"tool","tool_call_id":"host-schema-rejection","content":"{\"error\":{\"type\":\"tool.execution\",\"message\":\"Invalid arguments for tool \\\"read\\\":\\n- path: Missing key\\n\\nArguments provided:\\n{}\\n\\nUpdate the arguments and call the tool again.\"},\"content\":[]}"}
+
+Diff from 2.0.3: the validation message for the missing required argument changed
+from "Invalid input: expected string, received undefined" to "Missing key", and
+the tool part's state.metadata is now empty where 2.0.3 carried
+providerCall/providerResult/rawInput. The part also gained a partID field. The
+envelope is otherwise unchanged: rejection still happens before AFT executes,
+the message still uses the same prefix/issue-line/arguments/suffix template, and
+it still reaches the model as a tool.execution error with empty content.

@@ -1,0 +1,74 @@
+OpenCode 2 GA shared-server host contract probe
+run_id: oc2-ga-2.0.11-20260920-shared
+checkout_sha: 48f95796160b920874efe30be4f288621994b06c
+platform: linux/amd64 container (node:24-bookworm-slim)
+binary: @opencode/cli-linux-x64@2.0.11/bin/opencode
+isolation: HOME, TMPDIR, all four persistent XDG roots, and XDG_RUNTIME_DIR are private; OPENCODE_DB=opencode2.db; one foreground serve process only
+secret handling: the ephemeral server password is redacted
+note: each section below started its own serve process, so the ephemeral port differs between sections. The port is the only value that differs.
+
+$ opencode --version
+opencode v2.0.11
+
+$ opencode serve --hostname 127.0.0.1 --port 0
+server listening on http://127.0.0.1:46757
+server password <redacted>
+[process remains running]
+
+$ (count of processes whose command line contains "opencode serve")
+1
+
+$ OPENCODE_SERVER_PASSWORD=<captured> opencode api --server http://127.0.0.1:46757 GET /api/info
+{"version":"2.0.11","pid":190,"urls":["http://127.0.0.1:46757"],"paths":{"tmp":"/probe2/tmp/opencode"}}
+[exit 0]
+
+Endpoints 2.0.3 served that 2.0.11 does not
+
+$ OPENCODE_SERVER_PASSWORD=<captured> opencode api --server http://127.0.0.1:46757 GET /api/health
+HTTP 404 Not Found
+[exit 1]
+
+$ OPENCODE_SERVER_PASSWORD=<captured> opencode api --server http://127.0.0.1:46757 GET /api/server
+HTTP 404 Not Found
+[exit 1]
+
+Ordered negative controls (serve on http://127.0.0.1:46397)
+
+$ OPENCODE_SERVER_PASSWORD=WRONG opencode api --server http://127.0.0.1:46397 GET /api/info
+Error: Server at http://127.0.0.1:46397 did not provide a compatible V2 health response
+[cause: ClientError: UnsupportedContentType]
+[exit 1]
+
+$ env -u OPENCODE_SERVER_PASSWORD opencode api --server http://127.0.0.1:46397 GET /api/info
+Error: Server at http://127.0.0.1:46397 did not provide a compatible V2 health response
+[cause: ClientError: UnsupportedContentType]
+[exit 1]
+
+$ OPENCODE_SERVER_PASSWORD=<captured> opencode api --server http://127.0.0.1:1 GET /api/info
+Error: Could not reach server at http://127.0.0.1:1
+[cause: ClientError: Transport]
+[exit 1]
+
+Password environment precedence (serve on http://127.0.0.1:43729)
+
+$ OPENCODE_PASSWORD=<captured> opencode api --server http://127.0.0.1:43729 GET /api/info
+{"version":"2.0.11","pid":782,"urls":["http://127.0.0.1:43729"],"paths":{"tmp":"/probe6/tmp/opencode"}}
+[exit 0]
+
+$ OPENCODE_PASSWORD=<captured> OPENCODE_SERVER_PASSWORD=WRONG opencode api --server http://127.0.0.1:43729 GET /api/info
+{"version":"2.0.11","pid":782,"urls":["http://127.0.0.1:43729"],"paths":{"tmp":"/probe6/tmp/opencode"}}
+[exit 0]
+
+Session start and idle retention (serve on http://127.0.0.1:42641, provider block from host-provider-config.json)
+
+$ OPENCODE_SERVER_PASSWORD=<captured> opencode run --server http://127.0.0.1:42641 --format json --model openai/mock-model --auto "Call read with the supplied arguments, then report the result."
+{"type":"step_start","timestamp":1789944706557,"sessionID":"ses_f3efb4c86ffeXu4KRN2JlnQFTW","part":{"id":"prt_0c104b5fd001ztV0KZJpGdCAQh","sessionID":"ses_f3efb4c86ffeXu4KRN2JlnQFTW","messageID":"msg_0c104b5ce001NaR84QHAYxK2rs","type":"step-start"}}
+{"type":"text","timestamp":1789944706579,"sessionID":"ses_f3efb4c86ffeXu4KRN2JlnQFTW","part":{"id":"prt_0c104b603001Ie6qiHKioeRox0","sessionID":"ses_f3efb4c86ffeXu4KRN2JlnQFTW","messageID":"msg_0c104b5ce001NaR84QHAYxK2rs","type":"text","text":"Probe complete.","time":{"start":1789944706563,"end":1789944706579}}}
+{"type":"step_finish","timestamp":1789944706589,"sessionID":"ses_f3efb4c86ffeXu4KRN2JlnQFTW","part":{"id":"prt_0c104b61d001tvLtoB1EoaP5Fp","sessionID":"ses_f3efb4c86ffeXu4KRN2JlnQFTW","messageID":"msg_0c104b5ce001NaR84QHAYxK2rs","type":"step-finish","reason":"stop","cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}}}}
+[exit 0, the run client exits with the stream; no record is retained after the final one]
+
+$ OPENCODE_SERVER_PASSWORD=<captured> opencode api --server http://127.0.0.1:42641 GET /api/session/ses_f3efb4c86ffeXu4KRN2JlnQFTW
+{"data":{"id":"ses_f3efb4c86ffeXu4KRN2JlnQFTW","projectID":"8e3a676a95c9dca2f647b2915482fc38d5e8085d","model":{"id":"mock-model","providerID":"openai","variant":"default"},"cost":0,"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"outcome":"succeeded","time":{"created":1789944706204,"updated":1789944706604,"idle":1789944706593},"title":"Probe title","location":{"directory":"/probe4/project"}}}
+[exit 0]
+
+Diff from 2.0.3: the health group is gone. GET /api/health and GET /api/server both 404; GET /api/info answers instead and returns ServerInfo — {version, pid, urls, paths:{tmp}} — where 2.0.3's /api/health returned {healthy, version, pid}. Everything else is unchanged: the serve stdout lines and both patterns, the --server flag for run and api, OPENCODE_SERVER_PASSWORD and the OPENCODE_PASSWORD precedence, the three negative controls with their stable error strings and causes, the step_start first record and its field shape, and the session retained after the run client exits. Volatile stack frames were omitted.

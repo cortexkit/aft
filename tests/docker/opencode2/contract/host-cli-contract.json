@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
-  "run_id": "oc2-ga-inspect-t4",
-  "observed_run_id": "oc2-ga-inspect-t4",
-  "observed_sha": "80723fbe278b5034c7a02bb65cc671cce8d9d27c",
-  "supersedes_beta_version": "0.0.0-beta-19234",
-  "host_version": "2.0.3",
+  "run_id": "oc2-ga-2.0.11-20260920-shared",
+  "observed_run_id": "oc2-ga-2.0.11-20260920-shared",
+  "observed_sha": "48f95796160b920874efe30be4f288621994b06c",
+  "supersedes_host_version": "2.0.3",
+  "host_version": "2.0.11",
   "host": "opencode2",
   "platform": "linux-x64",
-  "transcript": "probe/shared-server-ga-2.0.3.txt",
+  "transcript": "probe/shared-server-ga-2.0.11.txt",
   "endpoint_handoff": {
     "run": {
       "kind": "flag",
@@ -17,7 +17,7 @@
       "kind": "flag",
       "name": "--server"
     },
-    "producer_command": "opencode2 serve --hostname 127.0.0.1 --port 4096",
+    "producer_command": "opencode2 serve --hostname 127.0.0.1 --port 0",
     "stdout_pattern": "^server listening on (?<endpoint>http://127\\.0\\.0\\.1:[0-9]+)$",
     "run_client_arguments": [
       "--server",
@@ -98,9 +98,21 @@
   },
   "shared_server_smoke": {
     "method": "GET",
-    "path": "/api/health",
+    "path": "/api/info",
     "expected_status": 0,
     "serve_processes": 1,
+    "removed_at_this_version": [
+      {
+        "path": "/api/health",
+        "served_at": "2.0.3",
+        "observed_now": "HTTP 404 Not Found, exit 1"
+      },
+      {
+        "path": "/api/server",
+        "served_at": "2.0.3",
+        "observed_now": "HTTP 404 Not Found, exit 1"
+      }
+    ],
     "positive_controls": [
       {
         "order": 1,
@@ -111,13 +123,24 @@
       {
         "order": 2,
         "client": "api",
-        "request": "GET /api/health",
+        "request": "GET /api/info",
         "handoff": "--server plus OPENCODE_SERVER_PASSWORD",
         "exit_status": 0,
         "response": {
-          "healthy": true,
-          "version": "2.0.3"
-        }
+          "version": "2.0.11",
+          "pid": 190,
+          "urls": [
+            "http://127.0.0.1:46757"
+          ],
+          "paths": {
+            "tmp": "/probe2/tmp/opencode"
+          }
+        },
+        "response_volatile_fields": [
+          "pid",
+          "urls",
+          "paths.tmp"
+        ]
       }
     ],
     "negative_controls": [
@@ -127,7 +150,7 @@
         "client": "api",
         "password_environment": "OPENCODE_SERVER_PASSWORD=WRONG",
         "exit_status": 1,
-        "stable_error": "Server at http://127.0.0.1:4096 did not provide a compatible V2 health response",
+        "stable_error": "Server at http://127.0.0.1:46397 did not provide a compatible V2 health response",
         "cause": "UnsupportedContentType"
       },
       {
@@ -136,7 +159,7 @@
         "client": "api",
         "password_environment": "unset",
         "exit_status": 1,
-        "stable_error": "Server at http://127.0.0.1:4096 did not provide a compatible V2 health response",
+        "stable_error": "Server at http://127.0.0.1:46397 did not provide a compatible V2 health response",
         "cause": "UnsupportedContentType"
       },
       {

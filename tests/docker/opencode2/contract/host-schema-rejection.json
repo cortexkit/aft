@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
-  "run_id": "oc2-ga-schema-20260913-03",
-  "observed_run_id": "oc2-ga-schema-20260913-03",
-  "observed_sha": "80723fbe278b5034c7a02bb65cc671cce8d9d27c",
-  "supersedes_beta_version": "0.0.0-beta-19234",
-  "host_version": "2.0.3",
+  "run_id": "oc2-ga-2.0.11-20260920-schema",
+  "observed_run_id": "oc2-ga-2.0.11-20260920-schema",
+  "observed_sha": "48f95796160b920874efe30be4f288621994b06c",
+  "supersedes_host_version": "2.0.3",
+  "host_version": "2.0.11",
   "host": "opencode2",
   "platform": "linux-x64",
-  "session_id": "ses_f65020437ffe4QSTdVp8rVl9yM",
-  "transcript": "probe/host-schema-rejection-ga-2.0.3.txt",
+  "session_id": "ses_f3ef9c84cffeaHgwabdVgYJkl9",
+  "transcript": "probe/host-schema-rejection-ga-2.0.11.txt",
   "guard_transcript": "probe/host-schema-contract-guard.txt",
   "probe": {
     "t2_subcase": "read/T2/host_schema_rejection_probe",
@@ -24,7 +24,8 @@
       "tool_field": "registered tool name",
       "state_status": "error",
       "state_input": "arguments object",
-      "state_error": "message string"
+      "state_error": "message string",
+      "state_metadata": "empty object at this version; 2.0.3 carried providerCall/providerResult/rawInput"
     },
     "message": {
       "prefix_template": "Invalid arguments for tool \"{tool}\":",
@@ -41,13 +42,17 @@
     }
   },
   "observed_instance": {
-    "json_event_error": "Invalid arguments for tool \"read\":\n- path: Invalid input: expected string, received undefined\n\nArguments provided:\n{}\n\nUpdate the arguments and call the tool again.",
+    "json_event_error": "Invalid arguments for tool \"read\":\n- path: Missing key\n\nArguments provided:\n{}\n\nUpdate the arguments and call the tool again.",
     "model_handoff": {
       "error": {
         "type": "tool.execution",
-        "message": "Invalid arguments for tool \"read\":\n- path: Invalid input: expected string, received undefined\n\nArguments provided:\n{}\n\nUpdate the arguments and call the tool again."
+        "message": "Invalid arguments for tool \"read\":\n- path: Missing key\n\nArguments provided:\n{}\n\nUpdate the arguments and call the tool again."
       },
       "content": []
+    },
+    "supersedes": {
+      "host_version": "2.0.3",
+      "json_event_error": "Invalid arguments for tool \"read\":\n- path: Invalid input: expected string, received undefined\n\nArguments provided:\n{}\n\nUpdate the arguments and call the tool again."
     }
   }
 }

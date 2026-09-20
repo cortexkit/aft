@@ -1,0 +1,40 @@
+OpenCode 2 GA native provider configuration probe
+run_id: oc2-ga-2.0.11-20260920-shared
+checkout_sha: 48f95796160b920874efe30be4f288621994b06c
+platform: linux/amd64 container (node:24-bookworm-slim)
+binary: @opencode/cli-linux-x64@2.0.11/bin/opencode
+isolation: HOME, TMPDIR, all four persistent XDG roots, and XDG_RUNTIME_DIR are private; OPENCODE_DB=opencode2.db; OPENCODE_DISABLE_DEFAULT_PLUGINS=true
+
+Exact provider block written to opencode.json:
+{
+  "providers": {
+    "openai": {
+      "name": "Deterministic aimock",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://127.0.0.1:4010/v1",
+        "apiKey": "{env:OPENAI_API_KEY}"
+      },
+      "models": { "mock-model": { "name": "Mock Model" } }
+    }
+  }
+}
+
+The provider is @copilotkit/aimock@1.24.0, the same deterministic mock the harness drives.
+
+$ OPENAI_API_KEY=sk-mock opencode run --server http://127.0.0.1:42641 --format json --model openai/mock-model --auto "Call read with the supplied arguments, then report the result."
+{"type":"step_start","timestamp":1789944706557,"sessionID":"ses_f3efb4c86ffeXu4KRN2JlnQFTW",...}
+{"type":"text",...,"text":"Probe complete."}
+{"type":"step_finish",...,"reason":"stop"}
+[exit 0]
+
+$ OPENCODE_SERVER_PASSWORD=<captured> opencode api --server http://127.0.0.1:42641 GET /api/session/ses_f3efb4c86ffeXu4KRN2JlnQFTW
+{"data":{"id":"ses_f3efb4c86ffeXu4KRN2JlnQFTW",...,"model":{"id":"mock-model","providerID":"openai","variant":"default"},"outcome":"succeeded",...}}
+[exit 0]
+
+A second run of the same provider block through a private server confirms the standalone path accepts it identically:
+
+$ OPENAI_API_KEY=sk-mock opencode run --standalone --print-logs --format json --model openai/mock-model --auto "Call read with the supplied arguments, then report the result."
+[exit 0; server log reports provider.updated then model.updated for /probe5/project]
+
+Diff from 2.0.3: none. The providers/package/settings shape, the @opencode/ai/providers/openai-compatible package id, the {env:OPENAI_API_KEY} indirection and the openai/mock-model selector are all still accepted, and the session still reports model {mock-model, openai, default} with outcome succeeded. The full shared-server transcript is in shared-server-ga-2.0.11.txt; this file quotes the parts that concern the provider.
