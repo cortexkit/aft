@@ -48,7 +48,7 @@ mod unix {
     unsafe extern "C" fn fatal_signal_handler(
         signal: libc::c_int,
         info: *mut libc::siginfo_t,
-        _context: *mut c_void,
+        context: *mut c_void,
     ) {
         // The scalar fields use only stack storage and async-signal-safe writes.
         // backtrace/backtrace_symbols_fd are best-effort diagnostics rather than
@@ -69,17 +69,38 @@ mod unix {
             // faulting thread, so this native handle identifies whose stack
             // backtrace_symbols_fd prints below.
             write_hex(libc::pthread_self() as usize);
+            write_bytes(b" pc=");
+            write_hex(fault_pc(context));
             write_bytes(BACKTRACE);
 
             let mut frames = [std::ptr::null_mut(); 128];
             let frame_count = backtrace(frames.as_mut_ptr(), frames.len() as libc::c_int);
             if frame_count > 0 {
+                for frame in &frames[..frame_count as usize] {
+                    write_bytes(b"AFT raw frame ip=");
+                    write_hex(*frame as usize);
+                    write_bytes(b"\n");
+                }
                 backtrace_symbols_fd(frames.as_ptr(), frame_count, libc::STDERR_FILENO);
             }
 
             libc::signal(signal, libc::SIG_DFL);
             libc::raise(signal);
         }
+    }
+
+    unsafe fn fault_pc(context: *mut c_void) -> usize {
+        if context.is_null() { return 0; }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        unsafe { return (*(*(context.cast::<libc::ucontext_t>())).uc_mcontext).__ss.__pc as usize; }
+        #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+        unsafe { return (*(*(context.cast::<libc::ucontext_t>())).uc_mcontext).__ss.__rip as usize; }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        unsafe { return (*(context.cast::<libc::ucontext_t>())).uc_mcontext.gregs[libc::REG_RIP as usize] as usize; }
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        unsafe { return (*(context.cast::<libc::ucontext_t>())).uc_mcontext.pc as usize; }
+        #[allow(unreachable_code)]
+        0
     }
 
     unsafe fn write_bytes(bytes: &[u8]) {
@@ -145,6 +166,8 @@ mod unix {
             stderr.contains("AFT integration fatal signal: signal=")
                 && stderr.contains(" fault_address=0x")
                 && stderr.contains(" native_thread=0x")
+                && stderr.contains(" pc=0x")
+                && stderr.contains("AFT raw frame ip=0x")
                 && stderr.contains("AFT integration fatal signal backtrace:"),
             "fatal-signal context missing from stderr: {stderr}"
         );
@@ -224,6 +247,151 @@ mod unix {
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .unwrap();
         drop(connection);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn lock_probe_command(role: &str, path: &std::path::Path) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "crash_diagnostics::unix::sqlite_lock_probe_child", "--nocapture"])
+            .env("AFT_SQLITE_LOCK_ROLE", role)
+            .env("AFT_SQLITE_LOCK_PATH", path)
+            .env(ENABLE_ENV, "1");
+        command
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sqlite_extra_shm_close_loses_dms_lock_and_faults() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let output = lock_probe_command("extra-close", &dir.path().join("probe.sqlite")).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("DMS_LOCK=free"), "{stderr}");
+        assert!(stderr.contains("DMS_RESET=done"), "{stderr}");
+        assert_eq!(output.status.signal(), Some(libc::SIGBUS), "{stderr}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sqlite_without_extra_close_keeps_dms_lock_and_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = lock_probe_command("control", &dir.path().join("probe.sqlite")).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert!(stderr.contains("DMS_LOCK=held"), "{stderr}");
+        assert!(stderr.contains("DMS_WRITE=EAGAIN"), "{stderr}");
+        assert!(stderr.contains("MAPPING_SURVIVED"), "{stderr}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sqlite_credit_hook_keeps_dms_read_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = lock_probe_command("tracked", &dir.path().join("probe.sqlite")).output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert!(stderr.contains("DMS_LOCK=held"), "credit hook released DMS: {stderr}");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    unsafe fn main_file(connection: &rusqlite::Connection) -> *mut rusqlite::ffi::sqlite3_file {
+        let mut file: *mut rusqlite::ffi::sqlite3_file = std::ptr::null_mut();
+        assert_eq!(unsafe { rusqlite::ffi::sqlite3_file_control(connection.handle(), c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_FILE_POINTER, std::ptr::from_mut(&mut file).cast()) }, rusqlite::ffi::SQLITE_OK);
+        file
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sqlite_lock_probe_child() {
+        use std::io::{BufRead, Write};
+        use std::os::fd::AsRawFd;
+        let Ok(role) = std::env::var("AFT_SQLITE_LOCK_ROLE") else { return; };
+        let path = std::path::PathBuf::from(std::env::var_os("AFT_SQLITE_LOCK_PATH").unwrap());
+        install();
+        unsafe {
+            let no_core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            libc::setrlimit(libc::RLIMIT_CORE, &no_core);
+        }
+        if role == "observer" || role == "resetter" {
+            let file = std::fs::OpenOptions::new().read(true).write(true)
+                .open(format!("{}-shm", path.display())).unwrap();
+            let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+            lock.l_type = libc::F_WRLCK as _;
+            lock.l_whence = libc::SEEK_SET as _;
+            lock.l_start = 128; // SQLite's Unix dead-man-switch byte.
+            lock.l_len = 1;
+            assert_eq!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) }, 0);
+            let held = lock.l_type != libc::F_UNLCK as libc::c_short;
+            eprintln!("DMS_LOCK={}", if held { "held" } else { "free" });
+            if held {
+                lock.l_type = libc::F_WRLCK as _;
+                assert_eq!(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) }, -1);
+                let error = std::io::Error::last_os_error().raw_os_error().unwrap();
+                assert!(error == libc::EAGAIN || error == libc::EACCES);
+                eprintln!("DMS_WRITE=EAGAIN");
+            }
+            drop(file);
+            if role == "resetter" {
+                let connection = rusqlite::Connection::open(&path).unwrap();
+                unsafe {
+                    let file = main_file(&connection);
+                    let mut mapping = std::ptr::null_mut();
+                    assert_eq!(((*(*file).pMethods).xShmMap.unwrap())(file, 0, 32768, 0, &mut mapping), 0);
+                }
+                // No extension or recovery: leave SQLite's DMS reset observable
+                // while the first process still owns its original mapping.
+                eprintln!("DMS_RESET=done");
+                println!("RESET_READY");
+                std::io::stdout().flush().unwrap();
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+                drop(connection);
+            }
+            return;
+        }
+        let tracked;
+        let raw;
+        let connection: &rusqlite::Connection = if role == "tracked" {
+            tracked = aft::db::TrackedConnection::open(&path, aft::db::SqliteStore::AftDb).unwrap();
+            tracked.set_wal_autocheckpoint(1).unwrap();
+            &tracked
+        } else {
+            raw = rusqlite::Connection::open(&path).unwrap();
+            &raw
+        };
+        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(value); INSERT INTO t VALUES(42); BEGIN; SELECT * FROM t;").unwrap();
+        if role == "extra-close" {
+            drop(std::fs::File::open(format!("{}-shm", path.display())).unwrap());
+        }
+        if role != "extra-close" {
+            let output = lock_probe_command("observer", &path).output().unwrap();
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success());
+        } else {
+            let mut child = lock_probe_command("resetter", &path)
+                .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+            let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert!(stdout.read_line(&mut line).unwrap() > 0, "resetter ended before reset");
+                if line.contains("RESET_READY") { break; }
+            }
+            // The mapping belongs to SQLite, not a separately opened descriptor.
+            // A volatile touch beyond Darwin's three retained bytes proves SIGBUS.
+            unsafe {
+                let file = main_file(connection);
+                let mut mapping = std::ptr::null_mut();
+                assert_eq!(((*(*file).pMethods).xShmMap.unwrap())(file, 0, 32768, 0, &mut mapping), 0);
+                assert!(!mapping.is_null());
+                std::ptr::read_volatile(mapping.cast::<u8>().add(4096));
+            }
+            let _ = child.stdin.take();
+            child.wait().unwrap();
+        }
+        assert_eq!(connection.query_row("SELECT value FROM t", [], |row| row.get::<_, i64>(0)).unwrap(), 42);
+        eprintln!("MAPPING_SURVIVED");
     }
 
     #[test]
