@@ -1398,8 +1398,14 @@ fn batch_line_range_edit_with_bare_cr_replaces_the_requested_lf_line() {
     });
     let resp = aft.send(&serde_json::to_string(&req).unwrap());
 
-    assert_eq!(resp["success"], true, "batch line-range should succeed: {resp:?}");
-    assert_eq!(fs::read_to_string(&target).unwrap(), "alpha\rbeta\nreplacement\n");
+    assert_eq!(
+        resp["success"], true,
+        "batch line-range should succeed: {resp:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "alpha\rbeta\nreplacement\n"
+    );
 
     let status = aft.shutdown();
     assert!(status.success());
