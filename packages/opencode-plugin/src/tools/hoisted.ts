@@ -441,7 +441,13 @@ export function createReadTool(ctx: PluginContext): ToolDefinition {
           await runAsk(
             context.ask({
               permission: "read",
-              patterns: [filePath],
+              // OpenCode states a read permission against the path relative to
+              // the project directory when the file is inside it, and only
+              // falls back to the absolute path for files outside. Sending the
+              // absolute path for a file in the project root instead made every
+              // project-relative read rule unmatchable, so such a read could
+              // never be the one the user had already permitted.
+              patterns: [permissionPath(context, filePath)],
               always: ["*"],
               metadata: {},
             }),
