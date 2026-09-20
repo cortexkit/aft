@@ -171,6 +171,13 @@ mod unix {
                 && stderr.contains("AFT integration fatal signal backtrace:"),
             "fatal-signal context missing from stderr: {stderr}"
         );
+        assert!(
+            stderr.lines().any(|line| {
+                line.contains("integration-")
+                    && !line.contains("AFT integration fatal signal")
+            }),
+            "backtrace_symbols_fd emitted no symbolized frame: {stderr}"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -222,6 +229,16 @@ mod unix {
             .any(|line| line.contains("event=ftruncate_after")
                 && line.contains(&format!(" fd_ino={expected} "))
                 && line.contains(&format!(" file_size={reset_size}"))));
+        let _mapped = stderr
+            .lines()
+            .find(|line| {
+                line.contains("event=leave")
+                    && line.contains("site=xShmMap/unixShmMap")
+                    && line.contains(" region=0 map_size=32768")
+                    && line.contains(" map=0x")
+                    && !line.contains(" map=0x0")
+            })
+            .expect("a successful xShmMap leave must name its returned mapping");
         assert!(stderr.contains("site=xShmUnmap/unixShmUnmap"));
         assert!(stderr.contains("site=xTruncate/unixTruncate"));
     }

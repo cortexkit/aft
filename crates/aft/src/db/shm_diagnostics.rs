@@ -174,9 +174,22 @@ unsafe extern "C" fn trace_shm_map(
     unsafe {
         let original = (*tail(file)).original;
         let previous = enter(file, b"xShmMap/unixShmMap", region as i64, size as i64);
-        emit(b"enter", -1, extend as i64, 0, 0, 0);
+        emit(b"enter", -1, extend as i64, 0, 0, 0, None);
         let rc = ((*original).xShmMap.unwrap())(file, region, size, extend, mapping);
-        emit(b"leave", -1, rc as i64, 0, 0, 0);
+        let returned_mapping = if rc == ffi::SQLITE_OK && !mapping.is_null() {
+            *mapping as usize
+        } else {
+            0
+        };
+        emit(
+            b"leave",
+            -1,
+            rc as i64,
+            0,
+            0,
+            0,
+            Some(returned_mapping),
+        );
         CONTEXT.with(|slot| slot.set(previous));
         rc
     }
@@ -186,9 +199,9 @@ unsafe extern "C" fn trace_shm_unmap(file: *mut ffi::sqlite3_file, delete: c_int
     unsafe {
         let original = (*tail(file)).original;
         let previous = enter(file, b"xShmUnmap/unixShmUnmap", -1, 0);
-        emit(b"enter", -1, delete as i64, 0, 0, 0);
+        emit(b"enter", -1, delete as i64, 0, 0, 0, None);
         let rc = ((*original).xShmUnmap.unwrap())(file, delete);
-        emit(b"leave", -1, rc as i64, 0, 0, 0);
+        emit(b"leave", -1, rc as i64, 0, 0, 0, None);
         CONTEXT.with(|slot| slot.set(previous));
         rc
     }
@@ -198,9 +211,9 @@ unsafe extern "C" fn trace_truncate(file: *mut ffi::sqlite3_file, size: i64) -> 
     unsafe {
         let original = (*tail(file)).original;
         let previous = enter(file, b"xTruncate/unixTruncate", -1, size);
-        emit(b"enter", -1, size, 0, 0, 0);
+        emit(b"enter", -1, size, 0, 0, 0, None);
         let rc = ((*original).xTruncate.unwrap())(file, size);
-        emit(b"leave", -1, rc as i64, 0, 0, 0);
+        emit(b"leave", -1, rc as i64, 0, 0, 0, None);
         CONTEXT.with(|slot| slot.set(previous));
         rc
     }
@@ -220,6 +233,7 @@ unsafe extern "C" fn trace_ftruncate(fd: c_int, length: libc::off_t) -> c_int {
             stat.st_dev as u64,
             stat.st_ino as u64,
             if known { stat.st_size } else { -1 },
+            None,
         );
         *errno_ptr() = errno;
         let rc = original(fd, length);
@@ -232,6 +246,7 @@ unsafe extern "C" fn trace_ftruncate(fd: c_int, length: libc::off_t) -> c_int {
             stat.st_dev as u64,
             stat.st_ino as u64,
             if known { stat.st_size } else { -1 },
+            None,
         );
         *errno_ptr() = errno;
         rc
@@ -251,7 +266,15 @@ unsafe fn errno_ptr() -> *mut c_int {
 // unwinder. The fstat identity is the actual truncated descriptor, not a path
 // probe that could already name a replacement. VFS enter/leave rows distinguish
 // map attempts from completed maps even when recovery faults before returning.
-unsafe fn emit(event: &[u8], fd: c_int, argument: i64, device: u64, inode: u64, length: i64) {
+unsafe fn emit(
+    event: &[u8],
+    fd: c_int,
+    argument: i64,
+    device: u64,
+    inode: u64,
+    length: i64,
+    mapping: Option<usize>,
+) {
     unsafe {
         let saved_errno = *errno_ptr();
         CONTEXT.with(|slot| {
@@ -279,6 +302,9 @@ unsafe fn emit(event: &[u8], fd: c_int, argument: i64, device: u64, inode: u64, 
             line.field(b" fd_dev=", device);
             line.field(b" fd_ino=", inode);
             line.signed(b" file_size=", length);
+            if let Some(mapping) = mapping {
+                line.hex(b" map=", mapping);
+            }
             line.text(b"\n");
             let mut sent = 0;
             while sent < line.len {
@@ -327,6 +353,22 @@ impl Line {
             self.text(b"-");
         }
         self.field(b"", value.unsigned_abs());
+    }
+    fn hex(&mut self, name: &[u8], mut value: usize) {
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        self.text(name);
+        self.text(b"0x");
+        let mut bytes = [0_u8; usize::BITS as usize / 4];
+        let mut start = bytes.len();
+        loop {
+            start -= 1;
+            bytes[start] = DIGITS[value & 0xf];
+            value >>= 4;
+            if value == 0 {
+                break;
+            }
+        }
+        self.text(&bytes[start..]);
     }
 }
 
