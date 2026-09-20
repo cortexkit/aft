@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "opencode2-harness-uses-the-same-sha-artifact",
+    "release-notes-0.57.0"
+  ],
+  "note": "No ranking-fence file changes. The OpenCode 2 Docker harness takes the same-SHA binary the workflow already built instead of compiling a second release copy inside the image, which is what pushed the job past its time cap on every run. The other change is release-note prose."
+}

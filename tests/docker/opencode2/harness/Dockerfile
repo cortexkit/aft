@@ -2,8 +2,14 @@
 ARG AFT_GIT_SHA
 ARG OPENCODE2_VERSION
 ARG OPENCODE1_VERSION
+# Where the harness binary comes from: compile it here (the default, so a
+# checkout alone is enough to run the matrix), or take the same-SHA artifact
+# the caller staged into the build context. The policy admits both as
+# provenance sources; the artifact path exists so CI does not pay a second
+# release build of a binary it has already produced.
+ARG AFT_BINARY_SOURCE=checkout-build
 
-FROM --platform=linux/amd64 rust:1-bookworm AS aft-builder
+FROM --platform=linux/amd64 rust:1-bookworm AS aft-checkout-build
 ARG AFT_GIT_SHA
 ARG CARGO_PROFILE=release
 WORKDIR /build
@@ -23,6 +29,16 @@ RUN mkdir -p /out && cp "/build/target/$CARGO_PROFILE/aft" /out/aft.real && \
     SHA256="$(sha256sum /out/aft | cut -d ' ' -f 1)" && \
     printf '{"git_sha":"%s","build_profile":"%s","sha256":"%s","source":"checkout-build"}\n' \
       "$AFT_GIT_SHA" "$CARGO_PROFILE" "$SHA256" > /out/build-info.json
+
+# The caller stages the artifact directory (aft, aft.real, build-info.json)
+# into the context under this name. Its build-info.json is the producer's,
+# carrying source "same-sha-artifact"; nothing here writes or edits it.
+FROM --platform=linux/amd64 node:24-bookworm-slim AS aft-prebuilt
+COPY .aft-opencode2-artifact/ /out/
+RUN test -f /out/aft && test -f /out/aft.real && test -f /out/build-info.json && \
+    chmod +x /out/aft /out/aft.real
+
+FROM aft-${AFT_BINARY_SOURCE} AS aft-builder
 
 FROM --platform=linux/amd64 node:24-bookworm AS plugin-builder
 WORKDIR /src

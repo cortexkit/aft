@@ -25,14 +25,39 @@ fi
 mkdir -p "$ARTIFACT_ROOT"
 
 printf 'Building OpenCode 2 harness image (%s, checkout %s)...\n' "$HOST_VERSION" "$GIT_SHA"
+
+# A same-SHA artifact makes the image's own release build redundant: the
+# harness exercises the mounted binary, so compiling a second copy inside the
+# image only spends wall clock. Stage it into the build context and select the
+# prebuilt stage; without an artifact the image still builds from the checkout.
+build_args=(
+  --build-arg "AFT_GIT_SHA=$GIT_SHA"
+  --build-arg "OPENCODE2_VERSION=$HOST_VERSION"
+  --build-arg "OPENCODE1_VERSION=$V1_HOST_VERSION"
+)
+staged_artifact="$REPO_ROOT/.aft-opencode2-artifact"
+stage_cleanup() { rm -rf "$staged_artifact"; }
+if [[ -n "${AFT_BINARY_PATH:-}" ]]; then
+  source_dir="$(cd "$(dirname "$AFT_BINARY_PATH")" && pwd)"
+  if [[ ! -f "$source_dir/build-info.json" ]]; then
+    echo "same-SHA artifact requires build-info.json beside AFT_BINARY_PATH" >&2
+    exit 2
+  fi
+  trap stage_cleanup EXIT
+  stage_cleanup
+  mkdir -p "$staged_artifact"
+  cp "$source_dir/aft" "$source_dir/aft.real" "$source_dir/build-info.json" "$staged_artifact/"
+  build_args+=(--build-arg "AFT_BINARY_SOURCE=prebuilt")
+  printf 'Using the same-SHA artifact from %s instead of building in the image\n' "$source_dir"
+fi
+
 docker build \
   --platform linux/amd64 \
-  --build-arg "AFT_GIT_SHA=$GIT_SHA" \
-  --build-arg "OPENCODE2_VERSION=$HOST_VERSION" \
-  --build-arg "OPENCODE1_VERSION=$V1_HOST_VERSION" \
+  "${build_args[@]}" \
   --file "$HARNESS_DIR/Dockerfile" \
   --tag "$IMAGE" \
   "$REPO_ROOT"
+stage_cleanup
 
 run_args=(
   --rm
@@ -53,10 +78,6 @@ fi
 if [[ -n "${AFT_BINARY_PATH:-}" ]]; then
   binary_dir="$(cd "$(dirname "$AFT_BINARY_PATH")" && pwd)"
   binary_name="$(basename "$AFT_BINARY_PATH")"
-  if [[ ! -f "$binary_dir/build-info.json" ]]; then
-    echo "same-SHA artifact requires build-info.json beside AFT_BINARY_PATH" >&2
-    exit 2
-  fi
   run_args+=(--volume "$binary_dir:/aft-artifact:ro" --env "AFT_BINARY_PATH=/aft-artifact/$binary_name")
 fi
 

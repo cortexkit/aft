@@ -91,3 +91,6 @@ spikes/*/Cargo.lock
 
 # Local OpenCode 2 e2e forensics (tests/docker/run-opencode2-test.sh)
 .tmp/
+
+# Same-SHA binary staged into the OpenCode 2 Docker build context
+.aft-opencode2-artifact/
