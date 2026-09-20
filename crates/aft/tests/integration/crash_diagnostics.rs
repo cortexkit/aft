@@ -321,6 +321,31 @@ mod unix {
         assert!(stderr.contains("DMS_WRITE=EAGAIN"), "{stderr}");
     }
 
+    /// Closing one connection must not release the locks its siblings rely on.
+    ///
+    /// The credit-hook role above proves the commit path keeps the dead-man
+    /// switch; it says nothing about close, which is where the original defect
+    /// lived and where a reopened `-shm` costs this process every lock it holds
+    /// on that inode.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sqlite_connection_close_keeps_a_sibling_connections_dms_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = lock_probe_command("tracked-close", &dir.path().join("probe.sqlite"))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eprint!("{stderr}");
+        assert!(output.status.success(), "{stderr}");
+        assert!(stderr.contains("CLOSE_SEAM=done"), "fixture never closed a connection: {stderr}");
+        assert!(
+            stderr.contains("DMS_LOCK=held"),
+            "closing a connection released a sibling's dead-man-switch lock: {stderr}"
+        );
+        assert!(stderr.contains("DMS_WRITE=EAGAIN"), "{stderr}");
+        assert!(stderr.contains("MAPPING_SURVIVED"), "{stderr}");
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     unsafe fn main_file(connection: &rusqlite::Connection) -> *mut rusqlite::ffi::sqlite3_file {
         let mut file: *mut rusqlite::ffi::sqlite3_file = std::ptr::null_mut();
@@ -392,6 +417,45 @@ mod unix {
             assert!(output.status.success());
             assert_eq!(
                 connection
+                    .query_row("SELECT value FROM t", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                42
+            );
+            eprintln!("MAPPING_SURVIVED");
+            return;
+        }
+        if role == "tracked-close" {
+            // The close seam, which the commit-time roles never reach: one process
+            // holding two connections, the first closing while the second still
+            // has its WAL-index mapped. A second descriptor opened anywhere in
+            // that close drops THIS PROCESS's advisory locks on the -shm inode,
+            // including the dead-man-switch byte the surviving connection needs,
+            // and the observer then finds it free. This is the production shape:
+            // the daemon holds many connections per database and closes them
+            // continuously.
+            let closing =
+                aft::db::TrackedConnection::open(&path, aft::db::SqliteStore::AftDb).unwrap();
+            closing.set_wal_autocheckpoint(1).unwrap();
+            closing
+                .execute_batch(
+                    "PRAGMA journal_mode=WAL; CREATE TABLE t(value); INSERT INTO t VALUES(42);",
+                )
+                .unwrap();
+            let surviving =
+                aft::db::TrackedConnection::open(&path, aft::db::SqliteStore::AftDb).unwrap();
+            assert_eq!(
+                surviving
+                    .query_row("SELECT value FROM t", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                42
+            );
+            drop(closing);
+            eprintln!("CLOSE_SEAM=done");
+            let output = lock_probe_command("observer", &path).output().unwrap();
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success());
+            assert_eq!(
+                surviving
                     .query_row("SELECT value FROM t", [], |row| row.get::<_, i64>(0))
                     .unwrap(),
                 42
