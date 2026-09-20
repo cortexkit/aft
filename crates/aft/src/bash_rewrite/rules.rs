@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -128,6 +129,13 @@ impl RewriteRule for FindRule {
                     "find path is outside the project root or missing",
                 );
             }
+        }
+        if !find_shape_is_faithful(ctx, &params) {
+            return decline(
+                "find",
+                "find.decline",
+                "find requires a complete files-only glob result",
+            );
         }
         accept(
             "find",
@@ -875,6 +883,144 @@ fn grep_request(command: &str, binary: &str) -> Option<Value> {
     Some(params)
 }
 
+fn find_shape_is_faithful(ctx: &AppContext, params: &Value) -> bool {
+    let Some(pattern) = params.get("pattern").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(name) = pattern.strip_prefix("**/") else {
+        return false;
+    };
+    if name.is_empty()
+        || name
+            .chars()
+            .any(|ch| matches!(ch, '/' | '\\' | '?' | '[' | ']' | '{' | '}'))
+    {
+        return false;
+    }
+    let Ok(name_pattern) = glob::Pattern::new(name) else {
+        return false;
+    };
+
+    let project_root = grep_project_root(ctx);
+    let search_root = params
+        .get("path")
+        .and_then(Value::as_str)
+        .map(|path| path_candidate(ctx, path))
+        .unwrap_or_else(|| project_root.clone());
+    let search_root = std::fs::canonicalize(search_root).ok();
+    let Some(search_root) = search_root.filter(|path| path.is_dir()) else {
+        return false;
+    };
+    let relative_root = search_root.strip_prefix(&project_root).ok();
+    if relative_root.is_some_and(path_has_glob_skipped_directory)
+        || ctx.gitignore().is_some_and(|matcher| {
+            matcher
+                .matched_path_or_any_parents(&search_root, true)
+                .is_ignore()
+        })
+    {
+        return false;
+    }
+
+    // The glob backend can omit ignored, unindexed, hard-skipped, or capped
+    // files. Compare its complete result with a direct files-only walk and only
+    // rewrite when those candidate sets are identical.
+    let Some(native_candidates) = find_matching_files(&search_root, &name_pattern) else {
+        return false;
+    };
+    let mut glob_params = params.clone();
+    if glob_params.get("path").is_none() {
+        glob_params["path"] = Value::String(project_root.display().to_string());
+    }
+    let response = crate::commands::glob::handle_glob(
+        &RawRequest {
+            id: "bash-rewrite-find-faithfulness".to_string(),
+            command: "glob".to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params: glob_params,
+        },
+        ctx,
+    );
+    if !response.success
+        || response.data.get("complete").and_then(Value::as_bool) != Some(true)
+        || response.data.get("truncated").and_then(Value::as_bool) != Some(false)
+    {
+        return false;
+    }
+    let Some(glob_files) = response.data.get("files").and_then(Value::as_array) else {
+        return false;
+    };
+    let glob_candidates = glob_files
+        .iter()
+        .map(|value| value.as_str().map(PathBuf::from))
+        .collect::<Option<Vec<_>>>()
+        .and_then(|paths| {
+            paths
+                .into_iter()
+                .map(std::fs::canonicalize)
+                .collect::<Result<BTreeSet<_>, _>>()
+                .ok()
+        });
+    glob_candidates.as_ref() == Some(&native_candidates)
+}
+
+fn path_has_glob_skipped_directory(path: &Path) -> bool {
+    // These directory names are pruned by grep_executor's fallback glob walk.
+    // If the requested root is below one of them, the glob would skip files
+    // that native find inspects, so the rewrite must decline.
+    path.components().any(|component| {
+        let name = component.as_os_str().to_string_lossy();
+        matches!(
+            name.as_ref(),
+            "node_modules"
+                | "target"
+                | "venv"
+                | ".venv"
+                | ".git"
+                | "__pycache__"
+                | ".tox"
+                | "dist"
+                | "build"
+        )
+    })
+}
+
+fn find_matching_files(root: &Path, pattern: &glob::Pattern) -> Option<BTreeSet<PathBuf>> {
+    // A large direct walk would erase the optimization's benefit. Declining at
+    // the bound is safe because native find remains the source of truth.
+    const MAX_ENTRIES: usize = 10_000;
+
+    fn visit(
+        directory: &Path,
+        pattern: &glob::Pattern,
+        entries_seen: &mut usize,
+        matches: &mut BTreeSet<PathBuf>,
+    ) -> Option<()> {
+        for entry in std::fs::read_dir(directory).ok()? {
+            let entry = entry.ok()?;
+            *entries_seen = entries_seen.checked_add(1)?;
+            if *entries_seen > MAX_ENTRIES {
+                return None;
+            }
+            let file_name = entry.file_name();
+            let file_name = file_name.to_str()?;
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_dir() {
+                visit(&entry.path(), pattern, entries_seen, matches)?;
+            } else if file_type.is_file() && pattern.matches(file_name) {
+                matches.insert(std::fs::canonicalize(entry.path()).ok()?);
+            }
+        }
+        Some(())
+    }
+
+    let mut entries_seen = 0;
+    let mut matches = BTreeSet::new();
+    visit(root, pattern, &mut entries_seen, &mut matches)?;
+    Some(matches)
+}
+
 fn find_request(command: &str) -> Option<Value> {
     let parsed = parse(command)?;
     if parsed.appends_to.is_some() || parsed.heredoc.is_some() || parsed.args.first()? != "find" {
@@ -907,6 +1053,9 @@ fn find_request(command: &str) -> Option<Value> {
     }
 
     let name = name?;
+    if !saw_type_file {
+        return None;
+    }
     let pattern = format!("**/{name}");
     if path == "." {
         Some(json!({ "pattern": pattern }))
@@ -1218,7 +1367,7 @@ mod tests {
     #[test]
     fn find_relative_path_uses_glob_path_arg() {
         assert_eq!(
-            find_request(r#"find ./src -name "*.go""#),
+            find_request(r#"find ./src -name "*.go" -type f"#),
             Some(json!({ "path": "./src", "pattern": "**/*.go" }))
         );
     }
@@ -1226,17 +1375,22 @@ mod tests {
     #[test]
     fn find_trims_trailing_slash_from_path_arg() {
         assert_eq!(
-            find_request(r#"find /tmp/foo/ -name "*.ts""#),
+            find_request(r#"find /tmp/foo/ -type f -name "*.ts""#),
             Some(json!({ "path": "/tmp/foo", "pattern": "**/*.ts" }))
         );
+    }
+
+    #[test]
+    fn find_requires_explicit_file_type() {
+        assert_eq!(find_request(r#"find . -name sub"#), None);
     }
 
     #[test]
     fn find_filesystem_root_is_not_rewritten() {
         // `find /` must NOT rewrite — trimming the slash would yield "" which
         // resolves as the project root, silently searching the wrong scope.
-        assert_eq!(find_request(r#"find / -name "*.rs""#), None);
-        assert_eq!(find_request(r#"find // -name "*.rs""#), None);
+        assert_eq!(find_request(r#"find / -name "*.rs" -type f"#), None);
+        assert_eq!(find_request(r#"find // -type f -name "*.rs""#), None);
     }
 
     #[test]

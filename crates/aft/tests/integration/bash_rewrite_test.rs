@@ -11,6 +11,7 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
@@ -282,6 +283,103 @@ fn rewrites_find_and_rejects_other_flags() {
     let data = assert_rewritten("find src -name '*.rs' -type f", &ctx, "glob");
     assert!(output(&data).contains("src/main.rs"));
     assert!(rewrite("find src -maxdepth 1 -name '*.rs'", &ctx).is_none());
+}
+
+#[test]
+fn find_declines_ignored_files_directories_and_skipped_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let initialized = Command::new("/usr/bin/git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(initialized.success());
+    fs::write(dir.path().join(".gitignore"), "*.log\nignored/\n").unwrap();
+    fs::write(dir.path().join("ignored.log"), "hidden\n").unwrap();
+    fs::create_dir_all(dir.path().join("ignored/src")).unwrap();
+    fs::write(dir.path().join("ignored/src/inside.rs"), "fn inside() {}\n").unwrap();
+    fs::create_dir_all(dir.path().join("sub")).unwrap();
+    fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
+    fs::write(dir.path().join("node_modules/pkg/package.json"), "{}\n").unwrap();
+    let ctx = context(dir.path(), true);
+    ctx.rebuild_gitignore();
+
+    let ignored = Command::new("/usr/bin/find")
+        .args([".", "-type", "f", "-name", "*.log"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(ignored.status.success());
+    assert_eq!(ignored.stdout, b"./ignored.log\n");
+    assert!(rewrite("find . -type f -name '*.log'", &ctx).is_none());
+
+    let ignored_root = Command::new("/usr/bin/find")
+        .args(["ignored", "-type", "f", "-name", "*.rs"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(ignored_root.status.success());
+    assert_eq!(ignored_root.stdout, b"ignored/src/inside.rs\n");
+    assert!(rewrite("find ignored -type f -name '*.rs'", &ctx).is_none());
+
+    let directory = Command::new("/usr/bin/find")
+        .args([".", "-name", "sub"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(directory.status.success());
+    assert_eq!(directory.stdout, b"./sub\n");
+    assert!(rewrite("find . -name sub", &ctx).is_none());
+
+    assert!(rewrite("find node_modules -type f -name package.json", &ctx).is_none());
+}
+
+#[test]
+fn find_files_only_unignored_tree_matches_native_sorted_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let initialized = Command::new("/usr/bin/git")
+        .args(["init", "-q"])
+        .current_dir(dir.path())
+        .status()
+        .unwrap();
+    assert!(initialized.success());
+    let root = fs::canonicalize(dir.path()).unwrap();
+    fs::create_dir_all(root.join("src/nested")).unwrap();
+    fs::write(root.join("src/lib.rs"), "pub fn lib() {}\n").unwrap();
+    fs::write(root.join("src/nested/main.rs"), "fn main() {}\n").unwrap();
+    fs::write(root.join("README.md"), "fixture\n").unwrap();
+    let ctx = context(&root, true);
+
+    let rewritten = rewrite("find . -type f -name '*.rs'", &ctx)
+        .expect("complete files-only find should rewrite");
+    let mut rewritten_paths = rewritten["files"]
+        .as_array()
+        .expect("glob files")
+        .iter()
+        .map(|path| {
+            let path = Path::new(path.as_str().expect("glob file path"));
+            let relative = path.strip_prefix(&root).expect("path under fixture root");
+            format!("./{}", relative.display())
+        })
+        .collect::<Vec<_>>();
+    rewritten_paths.sort();
+    let rewritten_bytes = format!("{}\n", rewritten_paths.join("\n")).into_bytes();
+
+    let native = Command::new("/usr/bin/find")
+        .args([".", "-type", "f", "-name", "*.rs"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(native.status.success());
+    let mut native_paths = String::from_utf8(native.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    native_paths.sort();
+    let native_bytes = format!("{}\n", native_paths.join("\n")).into_bytes();
+
+    assert_eq!(rewritten_bytes, native_bytes);
 }
 
 #[test]
