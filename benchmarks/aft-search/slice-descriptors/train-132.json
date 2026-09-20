@@ -10,7 +10,11 @@
     "ignore-retirement-at-matcher-publication",
     "ignore-change-scoped-not-corpus",
     "mc-refresh-evidence",
-    "edit-steers-323-324"
+    "edit-steers-323-324",
+    "crash-diagnostics",
+    "shm-truncate-site-fix",
+    "tier2-scheduler-pump",
+    "design-gate-caller"
   ],
   "note": "search_index.rs touched only in the transient scratch-directory sweep (location + scan bound + log field) and in the ignore-retirement filter of pending paths; no ranking, lexical or index-content change. Byte-equality against the reference is the proof. The subc tool-schema artifact changed only in the edit tool description and two edit property descriptions (#323); aft_search text is untouched."
 }
