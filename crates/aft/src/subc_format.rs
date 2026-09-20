@@ -1746,27 +1746,57 @@ fn format_outline_text(data: &Value) -> String {
         return text.to_string();
     };
 
-    let lines: Vec<String> = skipped
-        .iter()
-        .filter_map(|item| {
-            let obj = item.as_object()?;
-            let file = obj.get("file").and_then(Value::as_str)?;
-            let reason = obj
-                .get("reason")
-                .and_then(Value::as_str)
-                .unwrap_or("skipped");
-            Some(format!("  {file} — {reason}"))
-        })
-        .collect();
-    if lines.is_empty() {
+    // A directory outline discovers its own files; an explicit `files` request
+    // does not. Only the walk reports `walk_truncated`, so its presence says
+    // whether the caller chose these paths or we found them.
+    //
+    // That decides how much a skip is worth saying. If the caller named a file,
+    // "I could not parse it" answers their request and belongs in the reply. If
+    // we walked a repository, every .gitignore, LICENSE and lockfile is an
+    // unsupported language, and naming each one spends the caller's context to
+    // tell them something they never asked about: 27 such lines prompted this
+    // change. Those are counted instead, while genuine gaps — unreadable,
+    // unparseable, vanished — keep their names in both modes, because those are
+    // the ones that change what a reader does next.
+    let discovered = data.get("walk_truncated").is_some();
+    let mut named: Vec<String> = Vec::new();
+    let mut unsupported = 0_usize;
+    for item in skipped {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let Some(file) = obj.get("file").and_then(Value::as_str) else {
+            continue;
+        };
+        let reason = obj
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("skipped");
+        if discovered && reason == "unsupported_language" {
+            unsupported += 1;
+            continue;
+        }
+        named.push(format!("  {file} — {reason}"));
+    }
+
+    let mut sections: Vec<String> = Vec::new();
+    if !named.is_empty() {
+        sections.push(format!(
+            "Skipped {} file(s):\n{}",
+            named.len(),
+            named.join("\n")
+        ));
+    }
+    if unsupported > 0 {
+        sections.push(format!(
+            "Skipped {unsupported} file(s) with no supported language."
+        ));
+    }
+    if sections.is_empty() {
         return text.to_string();
     }
     let header = if text.is_empty() { "" } else { "\n\n" };
-    format!(
-        "{text}{header}Skipped {} file(s):\n{}",
-        lines.len(),
-        lines.join("\n")
-    )
+    format!("{text}{header}{}", sections.join("\n"))
 }
 
 // Format zoom responses as plain text so direct calls and server-side calls
@@ -3598,5 +3628,47 @@ mod outline_format_tests {
         let formatted = format_outline(&response, OutlineMode::Files);
         assert!(formatted.contains("walk truncated at 10000 files"));
         assert!(!formatted.contains("walk truncated at 200 files"));
+    }
+
+    /// A repository walk finds many files no parser claims — ignore files,
+    /// licences, lockfiles. Naming each one spends the reader's context on
+    /// something they never asked about, so a discovered outline counts them.
+    #[test]
+    fn directory_outline_counts_unsupported_files_instead_of_naming_them() {
+        let data = serde_json::json!({
+            "text": "src/\n  lib.rs",
+            "walk_truncated": false,
+            "skipped_files": [
+                { "file": ".gitignore", "reason": "unsupported_language" },
+                { "file": "LICENSE", "reason": "unsupported_language" },
+                { "file": "src/broken.rs", "reason": "parse_error" },
+            ],
+        });
+
+        let formatted = format_outline_text(&data);
+
+        assert!(formatted.contains("Skipped 2 file(s) with no supported language."));
+        assert!(!formatted.contains(".gitignore"));
+        assert!(!formatted.contains("LICENSE"));
+        // A real gap still earns its name in the same reply.
+        assert!(formatted.contains("src/broken.rs — parse_error"));
+        assert!(formatted.contains("Skipped 1 file(s):"));
+    }
+
+    /// When the caller named the files, "I could not parse it" answers the
+    /// request they made and has to survive.
+    #[test]
+    fn requested_outline_still_names_every_skipped_file() {
+        let data = serde_json::json!({
+            "text": "",
+            "skipped_files": [
+                { "file": "notes.txt", "reason": "unsupported_language" },
+            ],
+        });
+
+        let formatted = format_outline_text(&data);
+
+        assert!(formatted.contains("notes.txt — unsupported_language"));
+        assert!(!formatted.contains("no supported language"));
     }
 }
