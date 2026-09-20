@@ -384,16 +384,23 @@ describe("semanticTools", () => {
     );
   });
 
-  test("passes includeTests through as a raw tool_call argument", async () => {
+  test("coerces every supported includeTests true shape before tool_call", async () => {
     const sdkCtx = createMockSdkContext(projectRoot);
     const { toolCallCalls, tools } = createMockSemanticHarness({}, () => ({
       success: true,
       text: "ok",
     }));
 
-    await tools.aft_search.execute({ query: "fixtures", includeTests: true }, sdkCtx);
+    for (const includeTests of ["true", "1", 1, true]) {
+      await tools.aft_search.execute({ query: "fixtures", includeTests }, sdkCtx);
+    }
 
-    expect(toolCallCalls[0].rawArgs.includeTests).toBe(true);
+    expect(toolCallCalls.map((call) => call.rawArgs.includeTests)).toEqual([
+      true,
+      true,
+      true,
+      true,
+    ]);
   });
 
   test("rejects blank queries before permission or bridge calls", async () => {

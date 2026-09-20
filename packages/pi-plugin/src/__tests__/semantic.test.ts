@@ -106,6 +106,19 @@ describe("aft_search adapter", () => {
     expect(detailsResults[0].source).toBe("semantic");
   });
 
+  test("coerces every supported includeTests true shape before tool_call", async () => {
+    const { api, tools } = makeMockApi();
+    const { bridge, calls } = makeMockBridge(() => ({ success: true, text: "ok" }));
+    registerSemanticTool(api, makePluginContext(bridge));
+    const tool = tools.get("aft_search")!;
+
+    for (const includeTests of ["true", "1", 1, true]) {
+      await executeTool(tool, { query: "fixtures", includeTests });
+    }
+
+    expect(calls.map((call) => toolArgs(call).includeTests)).toEqual([true, true, true, true]);
+  });
+
   test("forwards offset pages unchanged and matches direct backend paging", async () => {
     const { api, tools } = makeMockApi();
     const { bridge, calls } = makeMockBridge((_command, args) => directBackend(args));

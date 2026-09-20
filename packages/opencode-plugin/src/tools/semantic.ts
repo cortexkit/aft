@@ -1,4 +1,4 @@
-import { canonicalizeProjectRoot } from "@cortexkit/aft-bridge";
+import { canonicalizeProjectRoot, coerceBoolean } from "@cortexkit/aft-bridge";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import type { PluginContext } from "../types.js";
@@ -164,7 +164,9 @@ export function semanticTools(ctx: PluginContext): Record<string, ToolDefinition
       const rawArgs: Record<string, unknown> = { query };
       const topK = coerceOptionalInt(args.topK, "topK", 1, 50);
       const offset = coerceOptionalInt(args.offset, "offset", 0, 100000);
-      const includeTests = typeof args.includeTests === "boolean" ? args.includeTests : undefined;
+      const includeTests = !isEmptyParam(args.includeTests)
+        ? coerceBoolean(args.includeTests)
+        : undefined;
       if (topK !== undefined) rawArgs.topK = topK;
       if (offset !== undefined) rawArgs.offset = offset;
       if (includeTests !== undefined) rawArgs.includeTests = includeTests;

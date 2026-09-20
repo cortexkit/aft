@@ -2100,8 +2100,13 @@ fn translate_search(args: Value) -> Result<Translated, TranslateError> {
     if let Some(offset) = coerce_optional_int_result(map_in.get("offset"), "offset", 0, 100_000)? {
         out.insert("offset".to_string(), Value::Number(offset.into()));
     }
-    if let Some(include_tests) = map_in.get("includeTests").and_then(Value::as_bool) {
-        out.insert("include_tests".to_string(), Value::Bool(include_tests));
+    if let Some(include_tests) = map_in.get("includeTests") {
+        if !is_empty_param(include_tests) {
+            out.insert(
+                "include_tests".to_string(),
+                Value::Bool(coerce_boolean(include_tests)),
+            );
+        }
     }
     if let Some(path) = map_in
         .get("path")
@@ -2138,10 +2143,17 @@ fn translate_outline(args: Value, project_root: &Path) -> Result<Translated, Tra
     let mut out = Map::new();
     if let Some(include_tests) = map_in
         .get("includeTests")
-        .or_else(|| map_in.get("include_tests"))
-        .and_then(Value::as_bool)
+        .filter(|value| !is_empty_param(value))
+        .or_else(|| {
+            map_in
+                .get("include_tests")
+                .filter(|value| !is_empty_param(value))
+        })
     {
-        out.insert("includeTests".to_string(), Value::Bool(include_tests));
+        out.insert(
+            "includeTests".to_string(),
+            Value::Bool(coerce_boolean(include_tests)),
+        );
     }
 
     if let Some(arr) = target.as_array() {

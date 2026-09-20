@@ -6,7 +6,7 @@
 
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
-import { canonicalizeProjectRoot } from "@cortexkit/aft-bridge";
+import { canonicalizeProjectRoot, coerceBoolean } from "@cortexkit/aft-bridge";
 import type { AgentToolResult, ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 
@@ -314,9 +314,12 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
 
         const bridge = bridgeFor(ctx, extCtx.cwd);
         const req: Record<string, unknown> = { query: params.query };
+        const includeTests = !isEmptyParam(params.includeTests)
+          ? coerceBoolean(params.includeTests)
+          : undefined;
         if (params.topK !== undefined) req.topK = params.topK;
         if (params.offset !== undefined) req.offset = params.offset;
-        if (params.includeTests !== undefined) req.includeTests = params.includeTests;
+        if (includeTests !== undefined) req.includeTests = includeTests;
         if (params.path !== undefined) req.path = params.path;
         const response = await callToolCall(
           bridge,
@@ -335,7 +338,7 @@ export function registerSemanticTool(pi: ExtensionAPI, ctx: PluginContext): void
           continuityKey(
             selectedProjectRoot(extCtx.cwd, params.path),
             params.query,
-            params.includeTests,
+            includeTests,
             params.topK,
           ),
         );

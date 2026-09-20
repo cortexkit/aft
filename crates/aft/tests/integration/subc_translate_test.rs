@@ -282,6 +282,30 @@ fn safety_translate_matches_typescript_golden_fixtures() {
 }
 
 #[test]
+fn search_and_outline_translate_every_supported_include_tests_true_shape() {
+    let root = fixture_project_root();
+    for include_tests in [json!("true"), json!("1"), json!(1), json!(true)] {
+        let search = subc_translate_with_context(
+            "search",
+            &json!({ "query": "fixture needle", "includeTests": include_tests.clone() }),
+            &root,
+            TranslateContext::default(),
+        )
+        .expect("translate search includeTests");
+        assert_eq!(search.args.get("include_tests"), Some(&json!(true)));
+
+        let outline = subc_translate_with_context(
+            "outline",
+            &json!({ "target": "src", "includeTests": include_tests }),
+            &root,
+            TranslateContext::default(),
+        )
+        .expect("translate outline includeTests");
+        assert_eq!(outline.args.get("includeTests"), Some(&json!(true)));
+    }
+}
+
+#[test]
 fn main_dispatch_has_no_agent_edit_or_search_aliases() {
     let src = include_str!("../../src/main.rs");
     for pat in ["\"edit\" =>", "\"search\" =>"] {

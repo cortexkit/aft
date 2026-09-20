@@ -3513,6 +3513,14 @@ fn search_response(req: &RawRequest, parts: SearchResponseParts<'_>) -> Response
     object.insert("text".to_string(), serde_json::json!(text));
     object.insert("query".to_string(), serde_json::json!(parts.query));
     object.insert(
+        "include_tests".to_string(),
+        serde_json::json!(req
+            .params
+            .get("include_tests")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)),
+    );
+    object.insert(
         "interpreted_as".to_string(),
         serde_json::json!(parts.interpreted_as),
     );
@@ -6296,6 +6304,35 @@ mod tests {
         assert_eq!(response["query_kind"], "Regex");
         assert_eq!(response["semantic_status"], "disabled");
         assert_eq!(response["results"][0]["kind"], "GrepLine");
+    }
+
+    #[test]
+    fn search_response_echoes_include_tests_and_returns_test_files() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let test_file = project.path().join("tests/search_test.rs");
+        std::fs::create_dir_all(test_file.parent().expect("test parent")).expect("create test dir");
+        std::fs::write(&test_file, "fn included_only_in_test() {}\n").expect("write test file");
+        let ctx = test_context(project.path());
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "include-tests-search",
+            "command": "semantic_search",
+            "query": ".*included_only_in_test",
+            "top_k": 5,
+            "include_tests": true,
+        }))
+        .expect("build include-tests request");
+
+        let response = response_value(handle_semantic_search(&request, &ctx));
+
+        assert_eq!(response["success"], true);
+        assert_eq!(response["include_tests"], true);
+        assert_eq!(response["results"][0]["kind"], "GrepLine");
+        assert!(response["results"][0]["file"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("tests/search_test.rs")));
     }
 
     #[test]
