@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "opencode-ga-host-generation",
+    "bounded-post-teardown-idle-assertion"
+  ],
+  "note": "No ranking-fence file changes. The CLI's OpenCode host-generation detector learns the GA package scope and treats one executable reachable under both names as a single V2 host, so a clean GA-only machine stops reporting both generations and setup stops refusing to write a config. The other change bounds an instantaneous idle assertion in the subc bridge suite that raced cooperative cancellation on a contended Windows runner."
+}
