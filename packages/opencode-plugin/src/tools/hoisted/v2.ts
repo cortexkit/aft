@@ -1,4 +1,5 @@
 import { requestPermission, type V2PermissionHostContext } from "../../permissions/v2.js";
+import { createV2PromptChannel, type V2PromptChannel } from "../../permissions/v2-service.js";
 import type { V2ToolConsumers } from "../definitions/v2.js";
 
 export const V2_BUILTIN_REPLACEMENTS = ["read", "edit", "write", "apply_patch"] as const;
@@ -22,18 +23,22 @@ function domainMethod(host: object, domain: string, method: string): boolean {
 }
 
 /**
- * Bind shared projected definitions to OpenCode 2's permission rules.
+ * Bind shared projected definitions to OpenCode 2's permission service.
  *
- * A V2 plugin context has no endpoint for opening a permission prompt, so the
- * evaluator reads the host's configured rules instead. The probe therefore
- * looks for the two domains that carry those rules, and a context missing
- * either one is left without an evaluator so every ask-site refuses rather
- * than acting unchecked.
+ * The probe looks for the two domains that carry the host's configured rules,
+ * because those decide every call that needs no prompt; a context missing
+ * either one is left without an evaluator so every ask-site refuses rather than
+ * acting unchecked. The prompt channel is created here, once per Location, so
+ * the client it discovers is shared by that Location's tool calls and is
+ * dropped with these consumers when the Location scope ends.
  */
-export function hoistedV2ToolConsumers(host: V2PermissionHostContext | object): V2ToolConsumers {
+export function hoistedV2ToolConsumers(
+  host: V2PermissionHostContext | object,
+  prompt: V2PromptChannel = createV2PromptChannel(),
+): V2ToolConsumers {
   if (!domainMethod(host, "agent", "get") || !domainMethod(host, "session", "get")) return {};
   return {
     requestPermission: (request, context) =>
-      requestPermission(host as V2PermissionHostContext, request, context),
+      requestPermission(host as V2PermissionHostContext, request, context, prompt),
   };
 }

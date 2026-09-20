@@ -19,6 +19,12 @@ export interface V2ExecutionContext {
   sessionID?: string;
   messageID?: string;
   agent?: string;
+  /**
+   * The host's identifier for this tool call. OpenCode 2 always sends it and a
+   * permission request has to quote it back as its source, but it is optional
+   * here because AFT's own fixtures build contexts without one.
+   */
+  id?: string;
   progress(update: Record<string, unknown>): Effect.Effect<void>;
 }
 
