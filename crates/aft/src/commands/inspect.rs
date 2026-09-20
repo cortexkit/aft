@@ -1704,15 +1704,40 @@ fn parse_scope(
     };
 
     let mut roots = Vec::new();
+    let mut missing = Vec::new();
     for scope in raw_scopes {
-        let raw_path = PathBuf::from(scope);
+        let raw_path = PathBuf::from(&scope);
         let candidate = if raw_path.is_absolute() {
             raw_path
         } else {
             project_root.join(raw_path)
         };
         let validated = ctx.validate_path(&req.id, &candidate)?;
+        if !validated.exists() {
+            missing.push(scope);
+            continue;
+        }
         roots.push(std::fs::canonicalize(&validated).unwrap_or(validated));
+    }
+
+    if !missing.is_empty() {
+        let paths = missing
+            .iter()
+            .map(|path| format!("'{path}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (noun, verb) = if missing.len() == 1 {
+            ("path", "does")
+        } else {
+            ("paths", "do")
+        };
+        return Err(Response::error(
+            &req.id,
+            "path_not_found",
+            format!(
+                "inspect: scope {noun} {paths} {verb} not exist (scope accepts one path string or an array of paths)"
+            ),
+        ));
     }
 
     Ok(JobScope::from_roots(project_root.to_path_buf(), roots))
