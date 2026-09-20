@@ -804,11 +804,16 @@ fn append_path_is_safe(ctx: &AppContext, path: &str) -> bool {
 
 fn grep_basic_regex_has_dialect_conflict(pattern: &str) -> bool {
     // Basic grep treats these characters as literals unless escaped, while the
-    // AFT regex engine gives them extended-regex meanings. Native grep is the
-    // only faithful route until the rewrite can translate the complete BRE.
-    pattern
-        .chars()
-        .any(|ch| matches!(ch, '+' | '?' | '|' | '(' | ')' | '{' | '}'))
+    // AFT regex engine gives them extended-regex meanings. BRE also treats `^`
+    // and `$` as anchors only at the beginning and end of the whole pattern.
+    // Native grep is the only faithful route until the rewrite can translate
+    // the complete BRE.
+    let last_index = pattern.chars().count().saturating_sub(1);
+    pattern.chars().enumerate().any(|(index, ch)| {
+        matches!(ch, '+' | '?' | '|' | '(' | ')' | '{' | '}')
+            || (ch == '^' && index != 0)
+            || (ch == '$' && index != last_index)
+    })
 }
 
 fn grep_request(command: &str, binary: &str) -> Option<Value> {
@@ -1086,7 +1091,10 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{find_request, grep_request, should_suppress_grep_footer, HeadRule, TailRule};
+    use super::{
+        find_request, grep_basic_regex_has_dialect_conflict, grep_request,
+        should_suppress_grep_footer, HeadRule, TailRule,
+    };
     use crate::bash_rewrite::{RewriteDecision, RewriteRule};
     use crate::config::Config;
     use crate::context::{default_language_provider_factory, AppContext};
@@ -1163,6 +1171,19 @@ mod tests {
         )
         .unwrap();
         assert!(should_suppress_grep_footer(Some("src/app.ts"), dir.path()));
+    }
+
+    #[test]
+    fn grep_basic_regex_anchor_positions_and_escaped_operators_are_guarded() {
+        for pattern in ["$HOME", "a$b", "x^y"] {
+            assert!(grep_basic_regex_has_dialect_conflict(pattern), "{pattern}");
+        }
+        for pattern in ["foo$", "^fn "] {
+            assert!(!grep_basic_regex_has_dialect_conflict(pattern), "{pattern}");
+        }
+        for pattern in [r"\(a\)", r"\{1\}", r"a\|b"] {
+            assert!(grep_basic_regex_has_dialect_conflict(pattern), "{pattern}");
+        }
     }
 
     #[test]

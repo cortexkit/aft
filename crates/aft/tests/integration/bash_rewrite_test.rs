@@ -200,6 +200,16 @@ fn rewrites_grep_and_rejects_pipes() {
 }
 
 #[test]
+fn grep_with_non_edge_anchor_declines_to_native() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("env.txt");
+    fs::write(&file, "$HOME\n").unwrap();
+    let ctx = context(dir.path(), true);
+
+    assert!(rewrite(&format!("grep '$HOME' {}", file.display()), &ctx).is_none());
+}
+
+#[test]
 fn grep_footer_steers_to_aft_search_when_registered() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
