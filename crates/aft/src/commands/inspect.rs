@@ -31,6 +31,11 @@ const BLOCKING_TIER2_PHASE_TIMEOUT: Duration = Duration::from_secs(120);
 /// plus its transport headroom.
 const INSPECT_TERMINAL_MARGIN: Duration = Duration::from_secs(5);
 
+struct ParsedScope {
+    job: JobScope,
+    roots: Vec<PathBuf>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct InspectRequestDeadline {
     budget: Duration,
@@ -331,7 +336,7 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
     };
     let scope = parse_scope(req, ctx, &snapshot.project_root)
         .expect("inspect preflight already validated the request scope");
-    let scoped_roots = scope_was_provided(req.params.get("scope")).then_some(scope.roots());
+    let scoped_roots = (!scope.roots.is_empty()).then_some(scope.roots.as_slice());
     let applicability = {
         let lsp = ctx.lsp();
         lsp.resolve_applicable_servers_for_inspect(
@@ -388,10 +393,13 @@ fn handle_inspect_payload(
         Ok(snapshot) => snapshot,
         Err(response) => return response.with_id(&req.id),
     };
-    let scope = match parse_scope(req, ctx, &snapshot.project_root) {
+    let parsed_scope = match parse_scope(req, ctx, &snapshot.project_root) {
         Ok(scope) => scope,
         Err(response) => return response,
     };
+    let scope_was_provided = scope_was_provided && !parsed_scope.roots.is_empty();
+    let scope_roots = scope_was_provided.then_some(parsed_scope.roots.as_slice());
+    let scope = parsed_scope.job;
 
     if inspect_cancellation_requested() {
         return inspect_interrupted_response(&req.id);
@@ -572,7 +580,7 @@ fn handle_inspect_payload(
         Err(message) => return Response::error(&req.id, "inspect_not_fresh", message),
     };
 
-    let payload = build_inspect_payload(&snapshot, &payloads, &sections, top_k, ctx);
+    let payload = build_inspect_payload(&snapshot, &payloads, &sections, top_k, ctx, scope_roots);
     Response::success(&req.id, payload)
 }
 
@@ -615,7 +623,7 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
     };
     let scope = parse_scope(req, &ctx, &snapshot.project_root)
         .expect("inspect preflight already validated the request scope");
-    let scoped_roots = scope_was_provided(req.params.get("scope")).then_some(scope.roots());
+    let scoped_roots = (!scope.roots.is_empty()).then_some(scope.roots.as_slice());
     let applicability = {
         let lsp = ctx.lsp();
         lsp.resolve_applicable_servers_for_inspect(
@@ -1667,12 +1675,18 @@ fn parse_scope(
     req: &RawRequest,
     ctx: &AppContext,
     project_root: &Path,
-) -> Result<JobScope, Response> {
+) -> Result<ParsedScope, Response> {
     let Some(value) = req.params.get("scope") else {
-        return Ok(JobScope::for_project(project_root.to_path_buf()));
+        return Ok(ParsedScope {
+            job: JobScope::for_project(project_root.to_path_buf()),
+            roots: Vec::new(),
+        });
     };
     if value.is_null() || empty_string(value) || empty_array(value) {
-        return Ok(JobScope::for_project(project_root.to_path_buf()));
+        return Ok(ParsedScope {
+            job: JobScope::for_project(project_root.to_path_buf()),
+            roots: Vec::new(),
+        });
     }
 
     let raw_scopes = match value {
@@ -1740,7 +1754,24 @@ fn parse_scope(
         ));
     }
 
-    Ok(JobScope::from_roots(project_root.to_path_buf(), roots))
+    roots.sort();
+    roots.dedup();
+    Ok(ParsedScope {
+        job: JobScope::from_roots(project_root.to_path_buf(), roots.clone()),
+        roots,
+    })
+}
+
+fn scope_root_display(project_root: &Path, root: &Path) -> String {
+    let relative = root.strip_prefix(project_root).unwrap_or(root);
+    if relative.as_os_str().is_empty() {
+        return ".".to_string();
+    }
+    relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn build_inspect_payload(
@@ -1749,7 +1780,16 @@ fn build_inspect_payload(
     sections: &Sections,
     top_k: usize,
     ctx: &AppContext,
+    scope_roots: Option<&[PathBuf]>,
 ) -> Value {
+    let scope_files = scope_roots.map(|_| {
+        payloads
+            .get(&InspectCategory::Metrics)
+            .and_then(|payload| payload.get("files"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    });
+    let no_files_matched_scope = scope_files == Some(0);
     let mut summary = Map::new();
     let mut details = Map::new();
     let mut gaps = Vec::new();
@@ -1762,6 +1802,10 @@ fn build_inspect_payload(
             .get(category)
             .expect("all active categories have a fresh inspect payload");
         let mut category_summary = summary_for(*category, payload);
+        if *category == InspectCategory::Duplicates && no_files_matched_scope {
+            category_summary["total_analyzed_lines"] = serde_json::json!(0);
+            category_summary["duplicated_percent"] = serde_json::json!(0.0);
+        }
         if payload.get("complete").and_then(Value::as_bool) == Some(false) {
             category_summary["complete"] = Value::Bool(false);
             if let Some(category_gaps) = payload.get("gaps").and_then(Value::as_array) {
@@ -1855,7 +1899,11 @@ fn build_inspect_payload(
         }
     }
 
-    let text = render_inspect_text(&summary, &details);
+    let text = render_inspect_text(
+        &summary,
+        &details,
+        scope_roots.map(|roots| (roots.len(), scope_files.unwrap_or(0))),
+    );
     let mut payload = serde_json::json!({
         "summary": Value::Object(summary),
         "text": text,
@@ -1868,6 +1916,18 @@ fn build_inspect_payload(
                 .collect::<Vec<_>>(),
         }
     });
+    if let Some(roots) = scope_roots {
+        payload["scope_roots"] = Value::Array(
+            roots
+                .iter()
+                .map(|root| Value::String(scope_root_display(&snapshot.project_root, root)))
+                .collect(),
+        );
+        payload["scope_files"] = serde_json::json!(scope_files.unwrap_or(0));
+        if no_files_matched_scope {
+            payload["no_files_matched_scope"] = Value::Bool(true);
+        }
+    }
     if !details.is_empty() {
         payload["details"] = Value::Object(details);
     }
@@ -1879,13 +1939,37 @@ fn build_inspect_payload(
 }
 
 /// Render the compact agent-facing body. One source of truth for OpenCode + Pi.
-fn render_inspect_text(summary: &Map<String, Value>, details: &Map<String, Value>) -> String {
+fn render_inspect_text(
+    summary: &Map<String, Value>,
+    details: &Map<String, Value>,
+    scope: Option<(usize, u64)>,
+) -> String {
     let mut lines: Vec<String> = Vec::new();
+
+    if let Some((root_count, file_count)) = scope {
+        let root_label = if root_count == 1 { "root" } else { "roots" };
+        let file_label = if file_count == 1 { "file" } else { "files" };
+        let suffix = if file_count == 0 {
+            " (no analyzed files under this scope)"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "scope: {root_count} {root_label}, {file_count} {file_label}{suffix}"
+        ));
+    }
 
     // Counts are emitted only from verified producer results. A failed producer
     // is rendered separately so the remaining findings cannot read as all-clear.
     render_incomplete_categories(&mut lines, summary);
-    render_group_category(&mut lines, "Duplicates", summary, details, "duplicates");
+    render_group_category(
+        &mut lines,
+        "Duplicates",
+        summary,
+        details,
+        "duplicates",
+        scope.is_some_and(|(_, files)| files == 0),
+    );
     render_complexity_category(&mut lines, summary, details);
     render_cycles_category(&mut lines, summary, details);
     render_symbol_category(&mut lines, "Dead code", summary, details, "dead_code");
@@ -2308,9 +2392,10 @@ fn render_group_category(
     summary: &Map<String, Value>,
     details: &Map<String, Value>,
     key: &str,
+    show_zero_denominator: bool,
 ) {
     if key == "duplicates" {
-        render_duplicates_category(lines, label, summary, details, key);
+        render_duplicates_category(lines, label, summary, details, key, show_zero_denominator);
         return;
     }
 
@@ -2349,6 +2434,7 @@ fn render_duplicates_category(
     summary: &Map<String, Value>,
     details: &Map<String, Value>,
     key: &str,
+    show_zero_denominator: bool,
 ) {
     let Some(section) = summary.get(key) else {
         return;
@@ -2401,9 +2487,10 @@ fn render_duplicates_category(
     let group_count = count;
     let suppression_clause = duplicate_suppression_clause(section);
     let suffix = if count > 0 { " (top by cost):" } else { "" };
-    // A zero denominator means analyzed-line counts are missing (pre-v0.44
-    // cached contributions); print no percentage rather than a false "0.0%".
-    let percent_clause = if total_lines > 0 {
+    // Old cached contributions can lack line counts. Suppress their unknown
+    // denominator, but print an explicit zero when a resolved scope contains
+    // no files in the inspect corpus.
+    let percent_clause = if total_lines > 0 || show_zero_denominator {
         format!(
             " ({}% of {total_lines} analyzed lines)",
             format_percent(percent)
@@ -3128,11 +3215,11 @@ mod render_text_tests {
     }
 
     fn render(summary: Value) -> String {
-        render_inspect_text(&summary_map(summary), &Map::new())
+        render_inspect_text(&summary_map(summary), &Map::new(), None)
     }
 
     fn render_with_details(summary: Value, details: Value) -> String {
-        render_inspect_text(&summary_map(summary), &summary_map(details))
+        render_inspect_text(&summary_map(summary), &summary_map(details), None)
     }
 
     #[test]
@@ -3500,7 +3587,7 @@ mod render_text_tests {
 
     #[test]
     fn fresh_text_has_no_cache_state_note() {
-        let text = render_inspect_text(&Map::new(), &Map::new());
+        let text = render_inspect_text(&Map::new(), &Map::new(), None);
         assert!(
             !text.contains("note:"),
             "fresh text must not describe partial state: {text}"
@@ -3664,6 +3751,7 @@ mod fresh_payload_tests {
             &Sections::all(),
             1,
             &ctx,
+            None,
         );
 
         // These containers are the minimum top-level fields required in the
@@ -3802,7 +3890,7 @@ mod fresh_payload_tests {
         let sections = Sections {
             detail_categories: [InspectCategory::DeadCode].into_iter().collect(),
         };
-        let payload = build_inspect_payload(&snapshot(), &payloads, &sections, 2, &ctx);
+        let payload = build_inspect_payload(&snapshot(), &payloads, &sections, 2, &ctx, None);
 
         let details = payload["details"].as_object().expect("details object");
         assert_eq!(details["dead_code"].as_array().map(Vec::len), Some(2));
@@ -3911,7 +3999,7 @@ mod fresh_payload_tests {
         let sections = Sections {
             detail_categories: [InspectCategory::DeadCode].into_iter().collect(),
         };
-        let payload = build_inspect_payload(&snapshot(), &payloads, &sections, 0, &ctx);
+        let payload = build_inspect_payload(&snapshot(), &payloads, &sections, 0, &ctx, None);
 
         let details = payload["details"].as_object().expect("details object");
         assert_eq!(details["dead_code"].as_array().map(Vec::len), Some(0));
@@ -3968,7 +4056,7 @@ mod fresh_payload_tests {
         let sections = Sections {
             detail_categories: [InspectCategory::DeadCode].into_iter().collect(),
         };
-        let payload = build_inspect_payload(&snapshot(), &payloads, &sections, 10, &ctx);
+        let payload = build_inspect_payload(&snapshot(), &payloads, &sections, 10, &ctx, None);
 
         let details = payload["details"].as_object().expect("details object");
         let envelope_keys: Vec<&String> = details
