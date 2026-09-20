@@ -40,7 +40,9 @@ function statusResponse() {
 
 function harness() {
   const claims: Array<{ append: string; render(input: { sessionID?: string }): unknown }> = [];
-  const layers: Array<() => { commands: Array<Record<string, unknown>>; bindings: string[] }> = [];
+  const layers: Array<
+    () => { mode?: string; commands: Array<Record<string, unknown>>; bindings: string[] }
+  > = [];
   const alerts: Array<{ title: string; message: string }> = [];
   const handlers = new Map<EventName, Set<EventHandler>>();
   const calls: Array<{ input: unknown; options: unknown }> = [];
@@ -119,16 +121,28 @@ async function emit(
 }
 
 describe("OpenCode V2 TUI setup", () => {
-  test("registers only the two ruled slots and the intercepted status command", async () => {
+  test("claims its three slots at setup and owns the status command from the app slot", async () => {
     const h = harness();
     const cleanup = await setupV2Tui(h.context as never);
 
     expect(h.claims.map(({ append }) => append)).toEqual([
+      "app",
       "prompt.footer.status",
       "sidebar.content",
     ]);
+
+    // The host's `keymap.layer` is a component-scoped primitive: it is only
+    // legal from inside the host's component tree, which a plugin reaches by
+    // rendering into a slot. Registering during setup throws instead, so the
+    // command must not appear until the app slot actually renders.
+    expect(h.layers).toHaveLength(0);
+    const appClaim = h.claims.find(({ append }) => append === "app");
+    expect(appClaim).toBeDefined();
+    appClaim?.render({});
+
     expect(h.layers).toHaveLength(1);
     const layer = h.layers[0]!();
+    expect(layer.mode).toBe("global");
     expect(layer.bindings).toEqual([]);
     expect(layer.commands).toEqual([
       expect.objectContaining({
@@ -143,7 +157,7 @@ describe("OpenCode V2 TUI setup", () => {
     expect(h.calls[0]?.input).toEqual({ sessionID: "ses_tui" });
 
     cleanup();
-    expect(h.slotCleanups()).toBe(2);
+    expect(h.slotCleanups()).toBe(3);
     expect(h.eventCleanups()).toBe(1);
   });
 

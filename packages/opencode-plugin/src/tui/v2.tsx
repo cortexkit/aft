@@ -34,7 +34,7 @@ type V2TuiContext = {
     dialog: { alert(input: { title: string; message: string }): Promise<void> };
     router: { current(): { type: string; sessionID?: string } };
     slot(claim: {
-      append: "prompt.footer.status" | "sidebar.content";
+      append: "app" | "prompt.footer.status" | "sidebar.content";
       render(input: { sessionID?: string }): unknown;
     }): () => void;
   };
@@ -163,10 +163,53 @@ async function showStatusDialog(
   }
 }
 
+// `keymap.layer` is a Solid primitive, not a plain registration call: it reads
+// the host's keymap context and creates a layer owned by the component that
+// calls it. The host hands that primitive to plugins unbound, and it runs the
+// plugin's `setup` from a detached async continuation, outside both the Solid
+// owner and the provider tree — so calling it from `setup` throws
+// "Keymap.Provider is missing" and takes the whole TUI feature down with it.
+// Rendering this component instead puts the call inside the provider tree,
+// which is where the contract allows it. The component renders nothing; it
+// exists only to own the layer, and is mounted through the `app` slot below.
+function AftStatusCommands(props: { context: V2TuiContext; rpc: AftRpcClient }) {
+  props.context.keymap.layer(() => ({
+    // A layer without a mode is limited to the host's base input mode, and the
+    // command palette runs as a dialog, which switches the mode away from base.
+    // "global" opts out of that limit so the palette entry stays reachable
+    // while the palette itself is open.
+    mode: "global",
+    commands: [
+      {
+        id: "aft.status",
+        title: "AFT: Status",
+        description: "Show AFT status, index health, and cache usage",
+        group: "AFT",
+        palette: true,
+        // The host dispatches slash entries unless `arguments: true` is set;
+        // omitting it prevents this text from remaining in the prompt or being
+        // submitted to the model.
+        slash: { name: "aft-status" },
+        run: () => showStatusDialog(props.context, props.rpc, activeSessionID(props.context)),
+      },
+    ],
+    bindings: [],
+  }));
+  return null;
+}
+
 export async function setupV2Tui(context: V2TuiContext): Promise<() => void> {
   const rpc = context.client.rpc(AftRpc);
   const controller = new AbortController();
   const slotCleanups = [
+    // `app` is the one slot the host keeps mounted for the whole TUI session,
+    // independent of the current route, so a command owned by a component
+    // rendered here stays reachable everywhere the palette and slash
+    // completion are.
+    context.ui.slot({
+      append: "app",
+      render: () => <AftStatusCommands context={context} rpc={rpc} />,
+    }),
     context.ui.slot({
       append: "prompt.footer.status",
       render: (input) => <FooterStatus context={context} rpc={rpc} sessionID={input.sessionID} />,
@@ -182,24 +225,6 @@ export async function setupV2Tui(context: V2TuiContext): Promise<() => void> {
     (event) => showStatusDialog(context, rpc, event.data.sessionID ?? activeSessionID(context)),
     { signal: controller.signal },
   );
-
-  context.keymap.layer(() => ({
-    commands: [
-      {
-        id: "aft.status",
-        title: "AFT: Status",
-        description: "Show AFT status, index health, and cache usage",
-        group: "AFT",
-        palette: true,
-        // V2's KeymapCommand contract (plugin/tui/context.ts:379-385) dispatches
-        // slash entries unless `arguments: true`; omitting it prevents this text
-        // from remaining in the prompt or being submitted to the model.
-        slash: { name: "aft-status" },
-        run: () => showStatusDialog(context, rpc, activeSessionID(context)),
-      },
-    ],
-    bindings: [],
-  }));
 
   return () => {
     controller.abort();
