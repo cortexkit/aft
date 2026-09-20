@@ -298,6 +298,37 @@ export function probeOpenCodeV1Version(
   return output.length > 0 ? output : null;
 }
 
+/// Package names that identify a V2 host. The beta shipped under
+/// `@opencode-ai/cli`; the GA rename moved it to `@opencode/cli`, and an
+/// installation carries exactly one of them.
+const V2_PACKAGE_NAMES = ["@opencode/cli", "@opencode-ai/cli"] as const;
+
+function v2MetadataNearExecutable(executable: string): PackageMetadata | null {
+  for (const name of V2_PACKAGE_NAMES) {
+    const metadata = packageMetadataNearExecutable(executable, name);
+    if (metadata) return metadata;
+  }
+  return null;
+}
+
+/// V2 versions come in two shapes: the pre-rename betas (`0.0.0-beta-<n>`)
+/// and GA, which restarted at 2.0.0. V1 never left 1.x, so a major at or
+/// above 2 is V2 without needing package metadata.
+function isV2Version(version: string | null): boolean {
+  if (!version) return false;
+  if (/^0\.0\.0-(?:beta|dev)-/.test(version)) return true;
+  const major = Number.parseInt(version, 10);
+  return Number.isFinite(major) && major >= 2;
+}
+
+function resolvedPath(executable: string): string {
+  try {
+    return realpathSync(executable);
+  } catch {
+    return executable;
+  }
+}
+
 export function detectOpenCodeHostGeneration(
   dependencies: HostGenerationDependencies = {},
 ): OpenCodeHostDetection {
@@ -309,13 +340,25 @@ export function detectOpenCodeHostGeneration(
   const v2Executable = findExecutable("opencode2");
   const evidence: OpenCodeHostEvidence[] = [];
 
+  // GA maps both names onto one file (`"bin": {"opencode": …, "opencode2": …}`
+  // pointing at the same executable), so the two lookups can describe a single
+  // installation. Counting it twice reported one GA host as both generations
+  // and refused to configure anything. V1's package only ever provided
+  // `opencode`, so reachability under both names is itself proof of V2 — which
+  // keeps a Desktop or non-npm install, where no package metadata sits beside
+  // the binary, from reading as V1.
+  const sharedExecutable =
+    v1Executable !== null &&
+    v2Executable !== null &&
+    resolvedPath(v1Executable) === resolvedPath(v2Executable);
+
   if (v1Executable) {
     const v1Metadata = packageMetadataNearExecutable(v1Executable, "opencode-ai");
-    const v2Metadata = packageMetadataNearExecutable(v1Executable, "@opencode-ai/cli");
+    const v2Metadata = v2MetadataNearExecutable(v1Executable);
     const metadataVersion = packageVersion(v2Metadata) ?? packageVersion(v1Metadata);
     const version =
       metadataVersion ?? (dependencies.probeV1Version ?? probeOpenCodeV1Version)(v1Executable);
-    const isV2 = Boolean(v2Metadata) || /^0\.0\.0-(?:beta|dev)-/.test(version ?? "");
+    const isV2 = Boolean(v2Metadata) || sharedExecutable || isV2Version(version);
     evidence.push({
       generation: isV2 ? "v2" : "v1",
       executable: v1Executable,
@@ -325,8 +368,8 @@ export function detectOpenCodeHostGeneration(
     });
   }
 
-  if (v2Executable) {
-    const version = packageVersion(packageMetadataNearExecutable(v2Executable, "@opencode-ai/cli"));
+  if (v2Executable && !sharedExecutable) {
+    const version = packageVersion(v2MetadataNearExecutable(v2Executable));
     evidence.push({
       generation: "v2",
       executable: v2Executable,

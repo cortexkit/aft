@@ -53,7 +53,7 @@ function tempRoot(label: string): string {
 
 function writeHostPackage(
   root: string,
-  name: "opencode-ai" | "@opencode-ai/cli",
+  name: "opencode-ai" | "@opencode-ai/cli" | "@opencode/cli",
   executableName: "opencode" | "opencode2",
   version: string,
 ): string {
@@ -123,6 +123,63 @@ describe("OpenCode generation detection", () => {
       "utf8",
     ).trim();
     expect(MODERN_V1_VERSION).toBe(repositoryPin);
+  });
+
+  // A clean GA install is the common case for a new user and it used to be
+  // refused: `@opencode/cli` maps `opencode` and `opencode2` onto one file, so
+  // the detector described a single host twice and called it ambiguous.
+  test("reads a GA-only install as one V2 host rather than both generations", () => {
+    const root = tempRoot("aft-cli-host-ga-");
+    const ga = writeHostPackage(root, "@opencode/cli", "opencode", "2.0.11");
+    const probed: string[] = [];
+
+    const result = detectOpenCodeHostGeneration({
+      findExecutable: () => ga,
+      probeV1Version: (executable) => {
+        probed.push(executable);
+        return null;
+      },
+    });
+
+    expect(result.status).toBe("v2");
+    expect(result.generations).toEqual(["v2"]);
+    expect(result.evidence).toHaveLength(1);
+    expect(result.evidence[0]?.version).toBe("2.0.11");
+    expect(probed).toEqual([]);
+  });
+
+  // Desktop and other non-npm installs have no package.json beside the binary,
+  // so the generation has to come from the version alone.
+  test("reads a GA version without package metadata as V2", () => {
+    const root = tempRoot("aft-cli-host-ga-bare-");
+    const bin = join(root, "bin", "opencode");
+    mkdirSync(join(root, "bin"), { recursive: true });
+    writeFileSync(bin, "host fixture\n", { mode: 0o755 });
+
+    const result = detectOpenCodeHostGeneration({
+      findExecutable: (name) => (name === "opencode" ? bin : null),
+      probeV1Version: () => "2.0.11",
+    });
+
+    expect(result.status).toBe("v2");
+    expect(result.evidence).toHaveLength(1);
+  });
+
+  // The refusal still has to fire for the state it was written for: two
+  // different hosts, each its own file.
+  test("still reports both generations when V1 and V2 are separate installs", () => {
+    const root = tempRoot("aft-cli-host-both-");
+    const v1 = writeHostPackage(root, "opencode-ai", "opencode", MODERN_V1_VERSION);
+    const v2 = writeHostPackage(root, "@opencode/cli", "opencode2", "2.0.11");
+
+    const result = detectOpenCodeHostGeneration({
+      findExecutable: (name) => (name === "opencode" ? v1 : v2),
+      probeV1Version: () => null,
+    });
+
+    expect(result.status).toBe("ambiguous");
+    expect(result.generations).toEqual(["v1", "v2"]);
+    expect(result.evidence).toHaveLength(2);
   });
 
   test("classifies package metadata and reports both generations when both are installed", () => {
