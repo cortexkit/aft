@@ -1,5 +1,5 @@
-import { readFileSync } from "node:fs";
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   InvalidRequestError,
   isWellFormedUnicodeString,
@@ -523,12 +523,12 @@ describe("edit boundary preparation", () => {
     });
   });
 
-  test.each(symbolModeValidationCases)(
-    "matches Rust symbol-mode validation for $label",
-    ({ arguments: rawArguments, message }) => {
-      expect(() => prepareCanonicalEditArguments("edit", rawArguments)).toThrow(message);
-    },
-  );
+  test.each(symbolModeValidationCases)("matches Rust symbol-mode validation for $label", ({
+    arguments: rawArguments,
+    message,
+  }) => {
+    expect(() => prepareCanonicalEditArguments("edit", rawArguments)).toThrow(message);
+  });
 
   test("reports null symbol content with the property-specific steer", () => {
     expect(() =>
