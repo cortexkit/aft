@@ -28,6 +28,8 @@ mod unix {
             return;
         }
         INSTALL.call_once(|| unsafe {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            aft::db::shm_diagnostics::install();
             install_for(libc::SIGBUS);
             install_for(libc::SIGSEGV);
         });
@@ -146,6 +148,82 @@ mod unix {
                 && stderr.contains("AFT integration fatal signal backtrace:"),
             "fatal-signal context missing from stderr: {stderr}"
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sqlite_shm_trace_names_the_actual_truncated_inode_and_vfs_site() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "crash_diagnostics::unix::sqlite_shm_trace_child",
+                "--nocapture",
+            ])
+            .env(ENABLE_ENV, "1")
+            .env("AFT_SQLITE_SHM_TRACE_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let expected = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("EXPECTED_SHM_INODE="))
+            .unwrap();
+        // Darwin keeps three bytes when resetting the dead-man-switch file; other Unix
+        // builds truncate to zero. Both invalidate any already-mapped page.
+        let reset_size = if cfg!(target_os = "macos") { 3 } else { 0 };
+        let before = stderr
+            .lines()
+            .find(|line| {
+                line.contains("event=ftruncate_before")
+                    && line.contains("site=xShmMap/unixShmMap")
+                    && line.contains(&format!(" arg={reset_size} "))
+                    && line.contains(" file_size=65536")
+            })
+            .expect(
+                "DMS truncation must be observed inside unixShmMap, not inferred from xTruncate",
+            );
+        assert!(before.contains(&format!(" fd_ino={expected} ")), "{before}");
+        assert!(
+            before.contains(" path=")
+                && before.contains("trace.sqlite")
+                && before.contains(" region=0 map_size=32768"),
+            "{before}"
+        );
+        assert!(stderr
+            .lines()
+            .any(|line| line.contains("event=ftruncate_after")
+                && line.contains(&format!(" fd_ino={expected} "))
+                && line.contains(&format!(" file_size={reset_size}"))));
+        assert!(stderr.contains("site=xShmUnmap/unixShmUnmap"));
+        assert!(stderr.contains("site=xTruncate/unixTruncate"));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sqlite_shm_trace_child() {
+        use std::os::unix::fs::MetadataExt;
+        if std::env::var_os("AFT_SQLITE_SHM_TRACE_CHILD").is_none() {
+            return;
+        }
+        install();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.sqlite");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let shm = std::fs::File::create(dir.path().join("trace.sqlite-shm")).unwrap();
+        shm.set_len(65536).unwrap();
+        eprintln!("EXPECTED_SHM_INODE={}", shm.metadata().unwrap().ino());
+        connection
+            .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES(1);")
+            .unwrap();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(connection);
     }
 
     #[test]
