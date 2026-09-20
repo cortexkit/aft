@@ -188,6 +188,34 @@ fn subc_translate_matches_typescript_golden_fixtures() {
 }
 
 #[test]
+fn symbol_mode_validation_matches_shared_fixture_messages() {
+    let fixture_path = crate::helpers::cargo_manifest_dir()
+        .join("tests")
+        .join("fixtures")
+        .join("symbol-mode-validation.json");
+    let cases: Value = serde_json::from_str(
+        &fs::read_to_string(&fixture_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", fixture_path.display())),
+    )
+    .expect("parse symbol-mode validation fixture");
+
+    for case in cases.as_array().expect("fixture array") {
+        let label = case["label"].as_str().expect("case label");
+        let args = &case["arguments"];
+        let expected = case["message"].as_str().expect("case message");
+        let error = subc_translate_with_context(
+            "edit",
+            args,
+            &fixture_project_root(),
+            TranslateContext::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "invalid_request", "case {label}");
+        assert_eq!(error.message, expected, "case {label}");
+    }
+}
+
+#[test]
 fn zoom_translate_matches_typescript_golden_fixtures() {
     let root = fixtures_root();
     let mut cases: Vec<PathBuf> = fs::read_dir(&root)

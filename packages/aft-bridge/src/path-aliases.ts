@@ -313,12 +313,8 @@ export function prepareCanonicalEditArguments(
     throw new InvalidRequestError(formatUnknownKeys(unknownRootKeys));
   }
 
+  validateSymbolModePair(record);
   const modes = editModesPresent(record);
-  if (hasOrphanedSymbolContent(record)) {
-    throw new InvalidRequestError(
-      "edit: 'content' requires a non-empty string 'symbol' when symbol mode is selected",
-    );
-  }
   if (modes.length > 1) {
     throw new InvalidRequestError(
       `edit: conflicting modes: ${modes.join(", ")}. ${OMIT_OPTIONAL_FIELDS_STEERING}`,
@@ -345,7 +341,8 @@ export function prepareCanonicalEditArguments(
     }
     if (!hasOwn(record, "content") || typeof record.content !== "string") {
       throw new InvalidRequestError(
-        "edit: symbol mode requires both 'symbol' and 'content' string properties",
+        "edit: incomplete symbol mode: property 'content' must be a string. " +
+          "Retry with `symbol` + `content`, or use `edits[]`.",
       );
     }
   } else {
@@ -411,6 +408,41 @@ function validateEditPath(record: Record<string, unknown>): void {
 
 function formatUnknownKeys(keys: string[]): string {
   return `Unrecognized keys: ${keys.map((key) => `"${key}"`).join(", ")}`;
+}
+
+function validateSymbolModePair(record: Record<string, unknown>): void {
+  const completeShapes = "Retry with `symbol` + `content`, or use `edits[]`.";
+  const hasSymbol = isNonEmptyString(record.symbol);
+  const hasContent = isNonEmptyString(record.content);
+
+  if (hasSymbol) {
+    if (!hasOwn(record, "content")) {
+      throw new InvalidRequestError(
+        `edit: incomplete symbol mode: missing property 'content'. ${completeShapes}`,
+      );
+    }
+    if (record.content === null) {
+      throw new InvalidRequestError(
+        `edit: incomplete symbol mode: property 'content' is null. ${completeShapes}`,
+      );
+    }
+    return;
+  }
+
+  if (!hasContent) return;
+  if (!hasOwn(record, "symbol")) {
+    throw new InvalidRequestError(
+      `edit: incomplete symbol mode: missing property 'symbol'. ${completeShapes}`,
+    );
+  }
+  if (record.symbol === null) {
+    throw new InvalidRequestError(
+      `edit: incomplete symbol mode: property 'symbol' is null. ${completeShapes}`,
+    );
+  }
+  throw new InvalidRequestError(
+    `edit: incomplete symbol mode: property 'symbol' must be a non-empty string. ${completeShapes}`,
+  );
 }
 
 function editModesPresent(record: Record<string, unknown>): string[] {
@@ -531,10 +563,6 @@ function normalizeEditArraySentinels(record: Record<string, unknown>): boolean {
     // parser can report its specific validation error instead of no-mode.
     return true;
   }
-}
-
-function hasOrphanedSymbolContent(record: Record<string, unknown>): boolean {
-  return isNonEmptyString(record.content) && !isNonEmptyString(record.symbol);
 }
 
 function parseEditArray(value: unknown): unknown[] {

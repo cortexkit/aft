@@ -1,0 +1,22 @@
+[
+  {
+    "label": "missing content",
+    "arguments": { "path": "src/example.ts", "symbol": "target" },
+    "message": "edit: incomplete symbol mode: missing property 'content'. Retry with `symbol` + `content`, or use `edits[]`."
+  },
+  {
+    "label": "null content",
+    "arguments": { "path": "src/example.ts", "symbol": "target", "content": null },
+    "message": "edit: incomplete symbol mode: property 'content' is null. Retry with `symbol` + `content`, or use `edits[]`."
+  },
+  {
+    "label": "missing symbol",
+    "arguments": { "path": "src/example.ts", "content": "replacement" },
+    "message": "edit: incomplete symbol mode: missing property 'symbol'. Retry with `symbol` + `content`, or use `edits[]`."
+  },
+  {
+    "label": "null symbol",
+    "arguments": { "path": "src/example.ts", "symbol": null, "content": "replacement" },
+    "message": "edit: incomplete symbol mode: property 'symbol' is null. Retry with `symbol` + `content`, or use `edits[]`."
+  }
+]

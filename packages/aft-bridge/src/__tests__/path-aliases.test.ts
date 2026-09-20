@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, test } from "bun:test";
 import {
   InvalidRequestError,
@@ -5,6 +6,17 @@ import {
   prepareCanonicalEditArguments,
   prepareCanonicalPathArguments,
 } from "../path-aliases.js";
+
+const symbolModeValidationCases = JSON.parse(
+  readFileSync(
+    new URL("../../../../crates/aft/tests/fixtures/symbol-mode-validation.json", import.meta.url),
+    "utf8",
+  ),
+) as Array<{
+  label: string;
+  arguments: Record<string, unknown>;
+  message: string;
+}>;
 
 function expectInvalid(tool: string, args: unknown, fields: string[] = ["path", "filePath"]): void {
   try {
@@ -212,7 +224,9 @@ describe("edit boundary preparation", () => {
     {
       label: "content without a symbol is rejected",
       input: { filePath: "src/example.ts", symbol: "", content: "replacement" },
-      error: "requires a non-empty string 'symbol'",
+      error:
+        "edit: incomplete symbol mode: property 'symbol' must be a non-empty string. " +
+        "Retry with `symbol` + `content`, or use `edits[]`.",
     },
     {
       label: "two real modes conflict",
@@ -509,14 +523,24 @@ describe("edit boundary preparation", () => {
     });
   });
 
-  test("reports null symbol content as the missing required property", () => {
+  test.each(symbolModeValidationCases)(
+    "matches Rust symbol-mode validation for $label",
+    ({ arguments: rawArguments, message }) => {
+      expect(() => prepareCanonicalEditArguments("edit", rawArguments)).toThrow(message);
+    },
+  );
+
+  test("reports null symbol content with the property-specific steer", () => {
     expect(() =>
       prepareCanonicalEditArguments("edit", {
         path: "src/example.ts",
         symbol: "greetUser",
         content: null,
       }),
-    ).toThrow("symbol mode requires both 'symbol' and 'content' string properties");
+    ).toThrow(
+      "edit: incomplete symbol mode: property 'content' is null. " +
+        "Retry with `symbol` + `content`, or use `edits[]`.",
+    );
   });
 
   test("applies mode conflict precedence before parsing stringified edits", () => {
