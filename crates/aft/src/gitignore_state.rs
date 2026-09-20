@@ -347,11 +347,14 @@ fn appends_exclusions(old: &[u8], new: &[u8]) -> bool {
         return false;
     }
     if !old.is_empty() && !old.ends_with(b"\n") && !old.ends_with(b"\r") {
-        suffix = suffix
+        let Some(stripped_suffix) = suffix
             .strip_prefix(b"\r\n")
             .or_else(|| suffix.strip_prefix(b"\n"))
             .or_else(|| suffix.strip_prefix(b"\r"))
-            .unwrap_or(&[]);
+        else {
+            return false;
+        };
+        suffix = stripped_suffix;
         if suffix.is_empty() {
             return true;
         }
@@ -462,5 +465,32 @@ mod tests {
         assert!(additions_only(&old, &appended));
         assert!(!additions_only(&old, &removal));
         assert!(!additions_only(&old, &negation));
+    }
+
+    #[test]
+    fn extending_newline_less_exclusion_is_not_add_only() {
+        let root = Path::new("/workspace");
+        let old = snapshot(root, b"build");
+        let extended_rule = snapshot(root, b"build*.log");
+
+        assert!(!additions_only(&old, &extended_rule));
+    }
+
+    #[test]
+    fn extending_newline_less_exclusion_with_negation_is_not_add_only() {
+        let root = Path::new("/workspace");
+        let old = snapshot(root, b"cache");
+        let extended_rule = snapshot(root, b"cache!cache/keep.rs");
+
+        assert!(!additions_only(&old, &extended_rule));
+    }
+
+    #[test]
+    fn newline_before_appended_exclusion_remains_add_only() {
+        let root = Path::new("/workspace");
+        let old = snapshot(root, b"build");
+        let appended_rule = snapshot(root, b"build\n*.log");
+
+        assert!(additions_only(&old, &appended_rule));
     }
 }
