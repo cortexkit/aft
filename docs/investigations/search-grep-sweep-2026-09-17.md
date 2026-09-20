@@ -288,3 +288,13 @@ engine plus the ceiling constant, which is byte-neutral where query embeds
 finish inside the budget): 43 rows, profile `paged`, MRR@10 0.187984 —
 identical to the CI head score that exposed the gap. Rule recorded: the
 train after any `ranking` landing carries the rebaseline.
+
+Second re-record, 2026-09-20 (train 133). The gate's capability row hashes
+`packages/pi-plugin/src/tools/semantic.ts` whole, so the includeTests coercion
+fix in that file (external bug 9) moved `real_query.capability.schema_sha256`
+while every ranked row stayed byte-equal, and the train refused with
+`engine_unwired_mismatch`. Reference pair re-recorded on a release build of
+`8b700f4ac`: 43 rows, `paged`, MRR@10 0.187984, unchanged; the only leaves that
+moved are the baseline sha, the binary sha and the capability schema sha. A
+follow-up worth taking: hash the `aft_search` schema block rather than the file,
+so unrelated edits to the tool file do not read as capability changes.
