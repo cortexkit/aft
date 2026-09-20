@@ -383,6 +383,10 @@ mod tests {
                 std::path::Path::new(&path), crate::db::SqliteStore::CallgraphGeneration,
             ).unwrap();
             connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE trace_probe(value); INSERT INTO trace_probe VALUES(42);").unwrap();
+            use std::os::unix::fs::MetadataExt;
+            let shm = std::fs::metadata(format!("{}-shm", std::path::Path::new(&path).display()))
+                .unwrap();
+            eprintln!("EXPECTED_SHM_INODE={}", shm.ino());
             return;
         }
         // VFS installation is process-global. A child keeps this probe isolated
@@ -396,13 +400,15 @@ mod tests {
             .output().unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(output.status.success(), "child failed: {stderr}");
-        use std::os::unix::fs::MetadataExt;
-        let shm = std::fs::metadata(format!("{}-shm", path.display())).unwrap();
-        let reset_size = if cfg!(target_os = "macos") { 3 } else { 0 };
+        let expected = stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("EXPECTED_SHM_INODE="))
+            .expect("child did not report its live WAL-index inode");
+        let reset_size = 3;
         let observed = stderr.lines().any(|line| {
             line.contains("AFT sqlite shm: event=ftruncate_before site=xShmMap")
                 && line.contains("trace.sqlite")
-                && line.contains(&format!(" fd_ino={} ", shm.ino()))
+                && line.contains(&format!(" fd_ino={expected} "))
                 && line.contains(&format!(" arg={reset_size} "))
         });
         assert!(observed, "SQLite's real WAL-index reset was not traced: {stderr}");

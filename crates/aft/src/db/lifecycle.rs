@@ -413,24 +413,6 @@ impl TrackedConnection {
         store: SqliteStore,
         root_id: impl Into<String>,
     ) -> rusqlite::Result<Self> {
-        if matches!(store, SqliteStore::CallgraphGeneration | SqliteStore::CallgraphColdGeneration) {
-            // Keep WAL files across the last close: another opener may already
-            // have resolved this generation and be about to attach to its index.
-            let mut persist: std::ffi::c_int = 1;
-            let result = unsafe {
-                rusqlite::ffi::sqlite3_file_control(
-                    connection.handle(),
-                    c"main".as_ptr(),
-                    rusqlite::ffi::SQLITE_FCNTL_PERSIST_WAL,
-                    std::ptr::from_mut(&mut persist).cast(),
-                )
-            };
-            if result != rusqlite::ffi::SQLITE_OK
-                && connection.path().is_some_and(|path| !path.is_empty() && path != ":memory:")
-            {
-                return Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(result), None));
-            }
-        }
         // Register before the first PRAGMA: it can enter WAL recovery and fault
         // on a truncated shared-memory mapping before later registration runs.
         let file_identity_key = connection
@@ -1003,9 +985,10 @@ mod tests {
                 .saturating_sub(credited_before);
         let main_growth = std::fs::metadata(&path).unwrap().len() - main_before;
 
-        assert!(wal_path(&path).exists());
-        let (log_frames, backfilled) = shm_checkpoint_state(&path);
-        assert_eq!(log_frames, backfilled);
+        assert!(
+            !wal_path(&path).exists(),
+            "ordinary last-close cleanup should remove the WAL without PERSIST_WAL"
+        );
         assert_eq!(
             credited, 0,
             "an unobservable close checkpoint must not receive guessed credit"
@@ -1086,9 +1069,7 @@ mod tests {
             "residual accounting changed how often SQLite checkpoints"
         );
         assert!(!wal_path(&builtin_path).exists());
-        assert!(wal_path(&tracked_path).exists());
-        let (log_frames, backfilled) = shm_checkpoint_state(&tracked_path);
-        assert_eq!(log_frames, backfilled, "persistent WAL still needs a checkpoint");
+        assert!(!wal_path(&tracked_path).exists());
         assert_eq!(
             std::fs::metadata(&builtin_path).unwrap().len(),
             std::fs::metadata(&tracked_path).unwrap().len(),
@@ -1205,7 +1186,7 @@ mod tests {
         }));
         assert!(SQLITE_UNINSTRUMENTED_OPENERS.iter().any(|opener| {
             opener.contains("views::generation::checkpoint_derived")
-                && opener.contains("credited at call site")
+                && opener.contains("named residual")
         }));
     }
 }

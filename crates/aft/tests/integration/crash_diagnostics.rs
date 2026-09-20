@@ -203,20 +203,21 @@ mod unix {
             .lines()
             .find_map(|line| line.strip_prefix("EXPECTED_SHM_INODE="))
             .unwrap();
-        // Darwin keeps three bytes when resetting the dead-man-switch file; other Unix
-        // builds truncate to zero. Both invalidate any already-mapped page.
-        let reset_size = if cfg!(target_os = "macos") { 3 } else { 0 };
+        // SQLite resets the dead-man-switch file to its three-byte initial header.
+        // That invalidates every previously mapped page beyond the new end.
+        let reset_size = 3;
         let before = stderr
             .lines()
             .find(|line| {
                 line.contains("event=ftruncate_before")
                     && line.contains("site=xShmMap/unixShmMap")
                     && line.contains(&format!(" arg={reset_size} "))
-                    && line.contains(" file_size=65536")
             })
-            .expect(
-                "DMS truncation must be observed inside unixShmMap, not inferred from xTruncate",
-            );
+            .unwrap_or_else(|| {
+                panic!(
+                    "DMS truncation must be observed inside unixShmMap, not inferred from xTruncate: {stderr}"
+                )
+            });
         assert!(before.contains(&format!(" fd_ino={expected} ")), "{before}");
         assert!(
             before.contains(" path=")

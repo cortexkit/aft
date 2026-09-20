@@ -17389,18 +17389,30 @@ export function leaf() {}
         assert!(!path.exists() && !shm.exists() && !wal.exists());
     }
 
-    #[test]
-    fn callgraph_close_persists_wal_for_the_next_opener() {
+        #[test]
+    fn callgraph_close_cleans_sidecars_before_the_next_opener() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("persist.sqlite");
         let connection = TrackedConnection::open(&path, SqliteStore::CallgraphGeneration).unwrap();
         configure_connection(&connection).unwrap();
-        connection.execute_batch("CREATE TABLE t(value); INSERT INTO t VALUES(42);").unwrap();
+        connection
+            .execute_batch("CREATE TABLE t(value); INSERT INTO t VALUES(42);")
+            .unwrap();
         drop(connection);
-        assert!(PathBuf::from(format!("{}-wal", path.display())).exists(), "last close deleted WAL");
-        assert!(PathBuf::from(format!("{}-shm", path.display())).exists(), "last close deleted WAL-index");
+        assert!(
+            !PathBuf::from(format!("{}-wal", path.display())).exists(),
+            "ordinary last-close cleanup retained the WAL"
+        );
+        assert!(
+            !PathBuf::from(format!("{}-shm", path.display())).exists(),
+            "ordinary last-close cleanup retained the WAL-index"
+        );
         let next = TrackedConnection::open(&path, SqliteStore::CallgraphGeneration).unwrap();
-        assert_eq!(next.query_row("SELECT value FROM t", [], |row| row.get::<_, i64>(0)).unwrap(), 42);
+        assert_eq!(
+            next.query_row("SELECT value FROM t", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            42
+        );
     }
 
     #[test]
