@@ -1249,17 +1249,16 @@ impl SourceLineIndex {
 
         while index < bytes.len() {
             match bytes[index] {
-                b'\r' => {
-                    bounds.push((line_start, index));
-                    index += if bytes.get(index + 1) == Some(&b'\n') {
-                        2
-                    } else {
-                        1
-                    };
-                    line_start = index;
-                }
+                // Tree-sitter points only advance rows on `\n`; a lone carriage
+                // return is line content, and the `\r` of a CRLF pair is excluded
+                // from the line's byte extent so a column never lands on it.
                 b'\n' => {
-                    bounds.push((line_start, index));
+                    let line_end = if index > 0 && bytes[index - 1] == b'\r' {
+                        index - 1
+                    } else {
+                        index
+                    };
+                    bounds.push((line_start, line_end));
                     index += 1;
                     line_start = index;
                 }
