@@ -19,7 +19,7 @@ const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
  */
 describe("directory-path plugin entrypoints", () => {
   test("the root entrypoints OpenCode 2 resolves for a directory target exist", async () => {
-    for (const entry of ["index.js", "server.js"]) {
+    for (const entry of ["index.js", "server.js", "tui.js"]) {
       const source = await readFile(join(packageRoot, entry), "utf8");
       expect(source.length).toBeGreaterThan(0);
     }
@@ -36,6 +36,15 @@ describe("directory-path plugin entrypoints", () => {
     );
   });
 
+  test("the TUI entrypoint exposes the sidebar registration shape", async () => {
+    // Resolved at `<dir>/tui`; absent it, the sidebar never appears and the
+    // host says nothing. Imported under Bun because the chain reaches .tsx.
+    const module = await import(join(packageRoot, "tui.js"));
+    const entry = module.default as Record<string, unknown>;
+    expect(Object.keys(entry)).toEqual(expect.arrayContaining(["id", "tui", "setup"]));
+    expect(typeof entry.tui).toBe("function");
+  });
+
   test("the root entrypoint still exposes the V1 plugin function", async () => {
     const module = await import(join(packageRoot, "index.js"));
     expect(typeof module.default).toBe("function");
@@ -46,10 +55,11 @@ describe("directory-path plugin entrypoints", () => {
     // `<node_modules>/@cortexkit/aft-opencode` as a directory, and a user may
     // do the same; omitting these from `files` would reintroduce the silent
     // skip for anyone who installs the package rather than cloning it.
-    const manifest = JSON.parse(
-      await readFile(join(packageRoot, "package.json"), "utf8"),
-    ) as { files?: string[] };
+    const manifest = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8")) as {
+      files?: string[];
+    };
     expect(manifest.files).toContain("index.js");
     expect(manifest.files).toContain("server.js");
+    expect(manifest.files).toContain("tui.js");
   });
 });

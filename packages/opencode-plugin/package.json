@@ -14,6 +14,7 @@
     "dist",
     "index.js",
     "server.js",
+    "tui.js",
     "src/entry",
     "src/tui",
     "src/tui-compiled",
