@@ -308,8 +308,13 @@ fn standalone_ndjson_polls_cold_navigation_off_the_input_loop() {
     );
     aft.send_silent(r#"{"id":"input-loop-probe","command":"ping"}"#);
 
+    // The proof is the ORDER of the two replies, asserted below: a serialized
+    // input loop would answer the hover (after the fake server's 1.5 s init)
+    // before the ping. The read timeout is liveness only, so it stays well above
+    // the init delay; a contended CI runner failed a 1 s bound twice in a row
+    // while the same test ran green in under 4 s on an idle machine.
     let first = aft
-        .try_read_next_timeout(Duration::from_secs(1))
+        .try_read_next_timeout(Duration::from_secs(30))
         .expect("input loop should answer while the cold server initializes");
     assert_eq!(
         first["id"], "input-loop-probe",
