@@ -84,16 +84,7 @@ impl CompiledPattern {
     pub fn raw_pattern_for_trigrams(&self) -> String {
         match self {
             CompiledPattern::Literal(literal) => {
-                String::from_utf8_lossy(&literal.needle).into_owned()
-            }
-            CompiledPattern::Regex { raw_pattern, .. } => raw_pattern.clone(),
-        }
-    }
-
-    pub fn ripgrep_pattern(&self) -> String {
-        match self {
-            CompiledPattern::Literal(literal) => {
-                String::from_utf8_lossy(&literal.needle).into_owned()
+                regex::escape(&String::from_utf8_lossy(&literal.needle))
             }
             CompiledPattern::Regex { raw_pattern, .. } => raw_pattern.clone(),
         }

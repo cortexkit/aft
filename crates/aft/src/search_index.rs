@@ -8610,6 +8610,62 @@ mod tests {
         );
     }
 
+    fn assert_ready_indexed_literal_match(needle: &str) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let project = dir.path().join("project");
+        fs::create_dir_all(&project).expect("create project dir");
+        let file = project.join("literal-escapes.txt");
+        fs::write(
+            &file,
+            "foo\\.bar\na\\\\b\nfoo\\tbar\nsplit\\(\"x\"\\)\n",
+        )
+        .expect("write literal escape corpus");
+
+        let index = SearchIndex::build(&project);
+        let pattern = match pattern_compile::compile(
+            needle,
+            CompileOpts {
+                literal: true,
+                ..CompileOpts::default()
+            },
+        ) {
+            CompileResult::Ok(CompiledPattern::Literal(pattern)) => {
+                CompiledPattern::Literal(pattern)
+            }
+            other => panic!("expected literal pattern for {needle:?}, got {other:?}"),
+        };
+        let result = index.search_grep(&pattern, &[], &[], &project, 10);
+
+        assert_eq!(result.index_status, IndexStatus::Ready);
+        assert!(!result.fully_degraded, "{needle:?} must use trigram candidates");
+        assert_eq!(result.total_matches, 1, "literal {needle:?} was filtered out");
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(
+            result.matches[0].file,
+            fs::canonicalize(file).expect("canonicalize corpus file")
+        );
+    }
+
+    #[test]
+    fn ready_index_keeps_literal_backslash_dot_candidate() {
+        assert_ready_indexed_literal_match(r"foo\.bar");
+    }
+
+    #[test]
+    fn ready_index_keeps_literal_double_backslash_candidate() {
+        assert_ready_indexed_literal_match(r"a\\b");
+    }
+
+    #[test]
+    fn ready_index_keeps_literal_backslash_t_candidate() {
+        assert_ready_indexed_literal_match(r"foo\tbar");
+    }
+
+    #[test]
+    fn ready_index_keeps_literal_escaped_parentheses_candidate() {
+        assert_ready_indexed_literal_match(r#"split\("x"\)"#);
+    }
+
     #[test]
     fn refresh_reindexes_same_size_edit_with_preserved_mtime() {
         let dir = tempfile::tempdir().expect("create temp dir");

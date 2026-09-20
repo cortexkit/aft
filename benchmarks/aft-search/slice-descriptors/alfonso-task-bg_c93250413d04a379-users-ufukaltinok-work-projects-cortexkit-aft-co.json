@@ -1,0 +1,12 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "literal-trigram-admission"
+  ],
+  "note": "Literal regex metacharacters are now escaped only while deriving mandatory trigrams, so indexed literal candidates are no longer falsely excluded. The pinned real-query corpus does not contain an affected literal shape; byte-equality against the reference is the proof."
+}
