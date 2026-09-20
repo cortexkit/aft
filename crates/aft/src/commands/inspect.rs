@@ -1769,6 +1769,16 @@ fn parse_scope(
 }
 
 fn scope_root_display(project_root: &Path, root: &Path) -> String {
+    // Compare normalized copies: on Windows the canonical root carries the
+    // verbatim prefix while a scope root may not, and mixed separators would
+    // defeat a byte-wise strip and leak the absolute spelling into the reply.
+    #[cfg(windows)]
+    let (project_root, root) = (
+        crate::windows_path::normalize_windows_path(project_root),
+        crate::windows_path::normalize_windows_path(root),
+    );
+    #[cfg(windows)]
+    let (project_root, root) = (project_root.as_path(), root.as_path());
     let relative = root.strip_prefix(project_root).unwrap_or(root);
     if relative.as_os_str().is_empty() {
         return ".".to_string();
