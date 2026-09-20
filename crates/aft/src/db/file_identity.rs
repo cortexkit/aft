@@ -353,8 +353,10 @@ pub fn reported_hazards() -> Vec<DatabaseHazard> {
 mod tests {
     use super::*;
     use crate::db::TrackedConnection;
+    #[cfg(unix)]
     use rusqlite::Connection;
 
+    #[cfg(unix)]
     fn shm_path(path: &Path) -> PathBuf {
         PathBuf::from(format!("{}-shm", path.display()))
     }
@@ -376,6 +378,10 @@ mod tests {
     /// The first connection is deliberately never used or dropped after the
     /// truncation: touching it is the fault. Leaking one handle for the rest of
     /// the test binary is the price of observing the state safely.
+    // Windows refuses to unlink or rename a database while a connection holds
+    // it open, so the replaced-under-a-live-connection precondition cannot form
+    // there; the hazard this registry reports is a POSIX one.
+    #[cfg(unix)]
     #[test]
     fn replacing_the_database_file_truncates_the_wal_index_under_a_live_mapping() {
         /// SQLite maps the WAL-index one 32 KiB region at a time.
@@ -462,6 +468,10 @@ mod tests {
     }
 
 
+    // Windows refuses to unlink or rename a database while a connection holds
+    // it open, so the replaced-under-a-live-connection precondition cannot form
+    // there; the hazard this registry reports is a POSIX one.
+    #[cfg(unix)]
     #[test]
     fn a_database_file_replaced_under_a_live_connection_is_reported_with_both_openers() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -537,6 +547,10 @@ mod tests {
         assert_eq!(hazards_for_path(&path).len(), before);
     }
 
+    // Windows refuses to unlink or rename a database while a connection holds
+    // it open, so the replaced-under-a-live-connection precondition cannot form
+    // there; the hazard this registry reports is a POSIX one.
+    #[cfg(unix)]
     #[test]
     fn closing_a_connection_after_its_database_file_is_gone_still_clears_the_registry() {
         let dir = tempfile::tempdir().expect("tempdir");
