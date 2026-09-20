@@ -11,14 +11,17 @@
 #![cfg(unix)]
 
 use std::fs;
+use std::process::Command;
 use std::time::{Duration, SystemTime};
 
+use aft::bash_rewrite::observation::apply_presentation_normalizations;
 use aft::bash_rewrite::{parser, try_rewrite};
 use aft::commands::edit_match::handle_edit_match;
 use aft::config::Config;
 use aft::context::AppContext;
+use aft::hashline::integration::RegistrationRequest;
 use aft::parser::TreeSitterProvider;
-use aft::protocol::RawRequest;
+use aft::protocol::{RawRequest, DEFAULT_SESSION_ID};
 use aft::sandbox_spawn::AuthenticatedPrincipal;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -98,6 +101,74 @@ fn assert_rewritten(command: &str, ctx: &AppContext, tool: &str) -> Value {
         "missing footer: {data:?}"
     );
     data
+}
+
+fn hashline_bash_payload(data: &Value) -> Vec<u8> {
+    let normalized = apply_presentation_normalizations(
+        output(data).as_bytes(),
+        &["gutter-removal", "footer-removal"],
+    )
+    .expect("known presentation normalizations");
+    let text = String::from_utf8(normalized).expect("hashline output is UTF-8");
+    let mut lines = text.lines();
+    let header = lines.next().expect("hashline output header");
+    assert!(header.starts_with('[') && header.contains('#'), "{header}");
+    let mut payload = lines
+        .map(|line| {
+            let (number, content) = line.split_once(':').expect("numbered bash read line");
+            assert!(number.chars().all(|ch| ch.is_ascii_digit()), "{line}");
+            content
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes();
+    if text.ends_with('\n') {
+        payload.push(b'\n');
+    }
+    payload
+}
+
+#[test]
+fn tail_from_line_and_existing_head_tail_forms_match_native_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let file = root.join("lines.txt");
+    fs::write(&file, "one\ntwo\nthree\nfour\nfive\nsix\n").unwrap();
+    let ctx = context(&root, true);
+    ctx.hashline_bindings().register(
+        &root,
+        DEFAULT_SESSION_ID.to_string(),
+        RegistrationRequest {
+            configured_enabled: true,
+            edit_slot_survives: true,
+            read_slot_survives: true,
+        },
+    );
+
+    for (utility, count) in [
+        ("tail", "+2"),
+        ("tail", "2"),
+        ("head", "+3"),
+        ("tail", "+0"),
+        ("tail", "+1"),
+    ] {
+        let command = format!("{utility} -n {count} {}", file.display());
+        let rewritten =
+            rewrite(&command, &ctx).unwrap_or_else(|| panic!("{command} should rewrite"));
+        let native = Command::new(format!("/usr/bin/{utility}"))
+            .args(["-n", count])
+            .arg(&file)
+            .output()
+            .unwrap();
+        assert!(native.status.success());
+        assert_eq!(
+            hashline_bash_payload(&rewritten),
+            native.stdout,
+            "{command}"
+        );
+    }
+
+    assert!(rewrite(&format!("tail -n +7 {}", file.display()), &ctx).is_none());
 }
 
 #[test]

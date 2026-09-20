@@ -253,17 +253,26 @@ impl RewriteRule for TailRule {
         session_id: Option<&str>,
         ctx: &AppContext,
     ) -> crate::bash_rewrite::RewriteDecision {
-        let Some(params) = head_tail_read_request(command, "tail") else {
+        let Some(mut params) = head_tail_read_request(command, "tail") else {
             return decline("tail", "tail.decline", "unsupported tail shape");
         };
         let path = params
             .get("file")
             .and_then(Value::as_str)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_string();
+        if params.get("start_line").is_some() && !resolve_tail_start_range(ctx, &path, &mut params)
+        {
+            return decline(
+                "tail",
+                "tail.decline",
+                "tail start line would produce an empty or unsupported read",
+            );
+        }
         let lines = params.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
         if !effective_hashline_session(ctx, session_id)
-            || !path_is_safe(ctx, path, true)
-            || !head_tail_shape_is_faithful(ctx, path, lines, true)
+            || !path_is_safe(ctx, &path, true)
+            || !head_tail_shape_is_faithful(ctx, &path, lines, true)
         {
             return decline(
                 "tail",
@@ -747,6 +756,27 @@ fn text_file_line_count(path: &Path) -> Option<usize> {
     )
 }
 
+fn resolve_tail_start_range(ctx: &AppContext, path: &str, params: &mut Value) -> bool {
+    let Some(requested_start) = params.get("start_line").and_then(Value::as_u64) else {
+        return false;
+    };
+    let Ok(requested_start) = usize::try_from(requested_start) else {
+        return false;
+    };
+    let start_line = requested_start.max(1);
+    let Some(total_lines) = text_file_line_count(&path_candidate(ctx, path)) else {
+        return false;
+    };
+    if total_lines == 0 || start_line > total_lines {
+        return false;
+    }
+
+    params["start_line"] = Value::from(start_line);
+    params["end_line"] = Value::from(total_lines);
+    params["limit"] = Value::from(total_lines - start_line + 1);
+    true
+}
+
 fn append_path_is_safe(ctx: &AppContext, path: &str) -> bool {
     let root = grep_project_root(ctx);
     let candidate = if Path::new(path).is_absolute() {
@@ -913,6 +943,12 @@ fn head_tail_read_request(command: &str, command_name: &str) -> Option<Value> {
     let (lines, file) = match parsed.args.as_slice() {
         [_command, file] => (10_u64, file.as_str()),
         [_command, flag, count, file] if flag == "-n" => {
+            if command_name == "tail" {
+                if let Some(start_line) = count.strip_prefix('+') {
+                    let start_line = start_line.parse::<u64>().ok()?;
+                    return Some(json!({ "file": file, "start_line": start_line }));
+                }
+            }
             (count.parse::<u64>().ok()?, file.as_str())
         }
         [_command, compact, file] => {
