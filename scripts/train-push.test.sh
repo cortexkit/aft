@@ -175,7 +175,11 @@ new_fixture() {
   # fixture carries a tests.yml shaped like the real one (a pull_request block
   # with its own lists above the push block the check has to read).
   write_tests_workflow "$dir/work" "      - $DEFAULT_BRANCH\n      - \"train/**\""
-  git -C "$dir/work" add base.txt .github/workflows/tests.yml
+  mkdir -p "$dir/work/scripts/lib"
+  cp "$SCRIPT_DIR/watch-ci.sh" "$dir/work/scripts/watch-ci.sh"
+  cp "$SCRIPT_DIR/lib/operator-gh.sh" "$dir/work/scripts/lib/operator-gh.sh"
+  cp "$SCRIPT_DIR/lib/workflow-gates.py" "$dir/work/scripts/lib/workflow-gates.py"
+  git -C "$dir/work" add base.txt .github/workflows/tests.yml scripts
   git -C "$dir/work" commit -qm "base"
   git -C "$dir/work" remote add origin "$dir/origin.git"
   git -C "$dir/work" push -q origin "$DEFAULT_BRANCH"
@@ -230,7 +234,7 @@ run_train() {
   shift
   set +e
   LAST_OUT="$(
-    cd "$dir/work" &&
+    cd "${TRAIN_PUSH_TEST_CWD:-$dir/work}" &&
       PATH="$BIN_DIR:$PATH" \
       REPO="${TRAIN_PUSH_TEST_REPO-example/repo}" \
       OPERATOR_GH_FALLBACK_PATHS="$TMP_ROOT/no-such-fallback" \
@@ -778,6 +782,49 @@ expect_rc 0 "green CI lands"
   fail "green CI did not fast-forward origin/main to the tested sha"
 [ -z "$(origin_ref "$dir" refs/heads/train/green)" ] ||
   fail "green CI left the train branch behind"
+
+# --- the directory the process stands in may disappear during the watch ----
+dir="$(new_fixture deleted-cwd)"
+add_train_commit "$dir/work" "deleted-cwd"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+standing="$dir/work/standing"
+mkdir -p "$standing"
+cat > "$dir/ci-state/on-watch.sh" <<HOOK
+#!/usr/bin/env bash
+set -euo pipefail
+rm -rf "$standing"
+HOOK
+chmod +x "$dir/ci-state/on-watch.sh"
+TRAIN_PUSH_TEST_CWD="$standing" run_train "$dir" deleted-cwd
+expect_rc 0 "a train lands after its starting directory is removed during the watch"
+expect_no_out "Unable to read current working directory" "landing does not ask git to rediscover a deleted cwd"
+[ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$train_sha" ] ||
+  fail "the deleted-cwd train did not land its verified sha"
+
+# Mutation control: remove the explicit checkout path from one post-watch git
+# command; after the current directory is deleted, Git must fail to read it.
+mutant_dir="$TMP_ROOT/cwd-mutant-scripts"
+cp -R "$SCRIPT_DIR" "$mutant_dir"
+mutant="$mutant_dir/train-push.sh"
+sed 's/git -C "$REPO" fetch -q "$remote" "$default_branch"/git fetch -q "$remote" "$default_branch"/g' "$TRAIN_PUSH" > "$mutant"
+chmod +x "$mutant"
+grep -q '^  git fetch -q "$remote" "$default_branch"' "$mutant" ||
+  fail "cwd mutation did not restore a bare post-watch git call"
+dir="$(new_fixture deleted-cwd-mutant)"
+add_train_commit "$dir/work" "deleted-cwd-mutant"
+standing="$dir/work/standing"
+mkdir -p "$standing"
+cat > "$dir/ci-state/on-watch.sh" <<HOOK
+#!/usr/bin/env bash
+set -euo pipefail
+rm -rf "$standing"
+HOOK
+chmod +x "$dir/ci-state/on-watch.sh"
+TRAIN_PUSH_SAVED="$TRAIN_PUSH"; TRAIN_PUSH="$mutant"
+TRAIN_PUSH_TEST_CWD="$standing" run_train "$dir" deleted-cwd-mutant
+TRAIN_PUSH="$TRAIN_PUSH_SAVED"
+expect_out "fatal: Unable to read current working directory: No such file or directory" \
+  "a bare post-watch git call reproduces the deleted-cwd fatal (proves the cwd arm bites)"
 
 # --- existing train: recorded green lands without a push or a watch --------
 dir="$(new_fixture existing-green)"
