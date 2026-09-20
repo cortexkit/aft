@@ -336,6 +336,28 @@ report_existing_red() {
     "$remote" "$train_ref" "$sha" "$train_name" >&2
 }
 
+landing_failed() {
+  local reason="$1"
+  local sha="$2"
+  local run_url="$3"
+  {
+    printf 'train-push: CI green, but landing failed — %s\n' "$reason"
+    printf '  green run: %s\n' "$run_url"
+    printf '  train sha: %s\n' "$sha"
+    printf '  finish without re-running CI:\n'
+    printf '    scripts/train-push.sh %s --land\n' "$train_name"
+  } >&2
+  exit 4
+}
+
+require_repo_after_green() {
+  local sha="$1"
+  local run_url="$2"
+  if [ ! -d "$REPO" ]; then
+    landing_failed "repository path $REPO no longer exists" "$sha" "$run_url"
+  fi
+}
+
 refuse_non_fast_forward() {
   local sha="$1"
   refuse "$sha is not a fast-forward of $remote/$default_branch; rebase and re-run: scripts/train-push.sh $train_name"
@@ -345,7 +367,9 @@ land_verified_sha() {
   local sha="$1"
   local run_url="$2"
 
-  git -C "$REPO" fetch -q "$remote" "$default_branch" || refuse "git fetch $remote $default_branch failed"
+  require_repo_after_green "$sha" "$run_url"
+  git -C "$REPO" fetch -q "$remote" "$default_branch" ||
+    landing_failed "git fetch $remote $default_branch failed" "$sha" "$run_url"
   if ! git -C "$REPO" merge-base --is-ancestor "$remote_default" "$sha"; then
     refuse_non_fast_forward "$sha"
   fi
@@ -356,20 +380,17 @@ land_verified_sha() {
   land_rc="${PIPESTATUS[0]}"
   set -e
   if [ "$land_rc" -ne 0 ]; then
+    land_reason="push of $sha to $remote/$default_branch failed; $remote/$train_ref still holds the tested sha"
     if grep -qE 'GH006|equired status check|rotected branch update failed' "$push_log"; then
-      printf 'refused: %s has no status check on origin. Merge onto the train branch and push there; CI runs on the merge sha, then main fast-forwards.\n' \
-        "$sha" >&2
+      land_reason="refused: $sha has no status check on origin. Merge onto the train branch and push there; CI runs on the merge sha, then main fast-forwards."
     fi
-    printf 'train-push: push of %s to %s/%s failed; %s/%s still holds the tested sha\n' \
-      "$sha" "$remote" "$default_branch" "$remote" "$train_ref" >&2
-    exit 1
+    landing_failed "$land_reason" "$sha" "$run_url"
   fi
 
-  git -C "$REPO" fetch -q "$remote" "$default_branch"
+  git -C "$REPO" fetch -q "$remote" "$default_branch" ||
+    landing_failed "could not verify $remote/$default_branch after push" "$sha" "$run_url"
   if ! git -C "$REPO" merge-base --is-ancestor "$sha" "$remote_default"; then
-    printf 'train-push: push reported success but %s is not on %s/%s — origin did not move\n' \
-      "$sha" "$remote" "$default_branch" >&2
-    exit 1
+    landing_failed "push reported success but $sha is not on $remote/$default_branch" "$sha" "$run_url"
   fi
 
   say "landed previously-verified sha $sha from $run_url on $remote/$default_branch"
@@ -958,7 +979,9 @@ while true; do
   say "CI green: $run_url"
 
   # Re-check right before the push, not just at the start of the script.
-  git -C "$REPO" fetch -q "$remote" "$default_branch" || refuse "git fetch $remote $default_branch failed"
+  require_repo_after_green "$head_sha" "$run_url"
+  git -C "$REPO" fetch -q "$remote" "$default_branch" ||
+    landing_failed "git fetch $remote $default_branch failed" "$head_sha" "$run_url"
   if git -C "$REPO" merge-base --is-ancestor "$remote_default" "$head_sha"; then
     break
   fi
@@ -990,9 +1013,8 @@ done
 # ran against. If any future edit moves HEAD between the watch and this push,
 # this stops main from fast-forwarding to a commit nothing verified.
 if [ "$verified_sha" != "$head_sha" ]; then
-  printf 'train-push: refusing to land %s — the green check ran against %s\n' \
-    "$head_sha" "${verified_sha:-nothing}" >&2
-  exit 1
+  landing_failed "refusing to land $head_sha because the green check ran against ${verified_sha:-nothing}" \
+    "$head_sha" "$run_url"
 fi
 
 say "landing $head_sha on $remote/$default_branch"
@@ -1004,22 +1026,19 @@ if [ "$land_rc" -ne 0 ]; then
   # Branch protection rejecting the sha for want of a check is the one push
   # failure with a specific remedy, so say what it is instead of leaving the
   # operator to decode GH006.
+  land_reason="push of $head_sha to $remote/$default_branch failed; $remote/$train_ref still holds the tested sha"
   if grep -qE 'GH006|equired status check|rotected branch update failed' "$push_log"; then
-    printf 'refused: %s has no status check on origin. Merge onto the train branch and push there; CI runs on the merge sha, then main fast-forwards.\n' \
-      "$head_sha" >&2
+    land_reason="refused: $head_sha has no status check on origin. Merge onto the train branch and push there; CI runs on the merge sha, then main fast-forwards."
   fi
-  printf 'train-push: push of %s to %s/%s failed; %s/%s still holds the tested sha\n' \
-    "$head_sha" "$remote" "$default_branch" "$remote" "$train_ref" >&2
-  exit 1
+  landing_failed "$land_reason" "$head_sha" "$run_url"
 fi
 
 # Outcome check, not just command check: a push can report success through a
 # wrapper (or fail on auth) while origin never moved.
-git -C "$REPO" fetch -q "$remote" "$default_branch"
+git -C "$REPO" fetch -q "$remote" "$default_branch" ||
+  landing_failed "could not verify $remote/$default_branch after push" "$head_sha" "$run_url"
 if ! git -C "$REPO" merge-base --is-ancestor "$head_sha" "$remote_default"; then
-  printf 'train-push: push reported success but %s is not on %s/%s — origin did not move\n' \
-    "$head_sha" "$remote" "$default_branch" >&2
-  exit 1
+  landing_failed "push reported success but $head_sha is not on $remote/$default_branch" "$head_sha" "$run_url"
 fi
 say "landed $head_sha on $remote/$default_branch"
 

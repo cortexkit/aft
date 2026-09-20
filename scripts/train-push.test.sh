@@ -826,6 +826,29 @@ TRAIN_PUSH="$TRAIN_PUSH_SAVED"
 expect_out "fatal: Unable to read current working directory: No such file or directory" \
   "a bare post-watch git call reproduces the deleted-cwd fatal (proves the cwd arm bites)"
 
+# --- repository deletion after CI succeeds preserves a recoverable result ----
+dir="$(new_fixture removed-repo)"
+add_train_commit "$dir/work" "removed-repo"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+base_sha="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+cat > "$dir/ci-state/on-watch.sh" <<HOOK
+#!/usr/bin/env bash
+set -euo pipefail
+rm -rf "$dir/work"
+HOOK
+chmod +x "$dir/ci-state/on-watch.sh"
+run_train "$dir" removed-repo
+expect_rc 4 "a repository removed after green exits in the landing-failed state"
+expect_out "repository path" "a removed repository root is identified distinctly"
+expect_out "no longer exists" "a removed repository root says what disappeared"
+expect_out "green run: https://github.com/example/repo/actions/runs/4242" \
+  "removed-repository failure preserves the green run"
+expect_out "train sha: $train_sha" "removed-repository failure preserves the verified sha"
+expect_out "scripts/train-push.sh removed-repo --land" \
+  "removed-repository failure gives the no-retest recovery command"
+[ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$base_sha" ] ||
+  fail "the removed-repository case moved the default branch"
+
 # --- existing train: recorded green lands without a push or a watch --------
 dir="$(new_fixture existing-green)"
 add_train_commit "$dir/work" "existing-green"
@@ -1110,9 +1133,14 @@ exit 0
 HOOK
 chmod +x "$dir/origin.git/hooks/pre-receive"
 run_train "$dir" protected
-expect_rc 1 "a protection refusal exits 1"
+expect_rc 4 "a protection refusal after green exits in the landing-failed state"
 expect_out "refused: $protected_sha has no status check on origin. Merge onto the train branch and push there; CI runs on the merge sha, then main fast-forwards." \
   "protection refusal prints the merge-as-a-train remedy"
+expect_out "green run: https://github.com/example/repo/actions/runs/4242" \
+  "post-CI failure names the green run"
+expect_out "train sha: $protected_sha" "post-CI failure names the verified train sha"
+expect_out "scripts/train-push.sh protected --land" \
+  "post-CI failure gives the no-retest recovery command"
 [ -n "$(origin_ref "$dir" refs/heads/train/protected)" ] ||
   fail "protection refusal deleted the train branch"
 
