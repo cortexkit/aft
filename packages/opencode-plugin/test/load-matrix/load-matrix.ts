@@ -1488,10 +1488,12 @@ export default { id: original.id, effect };
 
     expect(transcript).toContain(`entrypoint=${pathToFileURL(join(packageRoot, "tui.js")).href}`);
     expect(transcript).toContain(`target=${packageRoot}`);
+    // Whether setup then succeeds is the sibling row's subject. This row asks
+    // only whether the directory branch reached the entry at all, so it stops
+    // at the host having called into it.
     expect(transcript).toMatch(
-      /message="plugin operation completed"[^\n]*stage=setup[^\n]*plugin=aft-opencode/,
+      /message="plugin operation started"[^\n]*stage=setup[^\n]*plugin=aft-opencode/,
     );
-    expect(transcript).not.toContain("Keymap.Provider is missing");
     // This row deliberately runs the shipped entry, so nothing instruments it.
     expect(events).toBe("");
   }, 240_000);
