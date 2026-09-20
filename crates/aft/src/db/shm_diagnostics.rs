@@ -329,3 +329,40 @@ impl Line {
         self.field(b"", value.unsigned_abs());
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn syscall_trace_observes_sqlite_shm_reset() {
+        const CHILD: &str = "AFT_SHM_TRACE_CHILD_PATH";
+        if let Some(path) = std::env::var_os(CHILD) {
+            super::install();
+            let connection = crate::db::TrackedConnection::open(
+                std::path::Path::new(&path), crate::db::SqliteStore::CallgraphGeneration,
+            ).unwrap();
+            connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE trace_probe(value); INSERT INTO trace_probe VALUES(42);").unwrap();
+            return;
+        }
+        // VFS installation is process-global. A child keeps this probe isolated
+        // from other unit tests and lets the parent inspect real fd-2 output.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.sqlite");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "db::shm_diagnostics::tests::syscall_trace_observes_sqlite_shm_reset", "--nocapture"])
+            .env("AFT_CAPTURE_CRASH_DIAGNOSTICS", "1")
+            .env(CHILD, &path)
+            .output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "child failed: {stderr}");
+        use std::os::unix::fs::MetadataExt;
+        let shm = std::fs::metadata(format!("{}-shm", path.display())).unwrap();
+        let reset_size = if cfg!(target_os = "macos") { 3 } else { 0 };
+        let observed = stderr.lines().any(|line| {
+            line.contains("AFT sqlite shm: event=ftruncate_before site=xShmMap")
+                && line.contains("trace.sqlite")
+                && line.contains(&format!(" fd_ino={} ", shm.ino()))
+                && line.contains(&format!(" arg={reset_size} "))
+        });
+        assert!(observed, "SQLite's real WAL-index reset was not traced: {stderr}");
+    }
+}
