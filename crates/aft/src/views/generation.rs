@@ -215,6 +215,8 @@ static DEFERRED_CHECKPOINTS: OnceLock<Mutex<HashMap<PathBuf, DeferredCheckpointJ
     OnceLock::new();
 static CHECKPOINT_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
 const DEFERRED_CHECKPOINT_IDLE_DELAY: Duration = Duration::from_millis(250);
+const DERIVED_CHECKPOINT_RESIDUAL: &str =
+    "views::generation::checkpoint_derived: checkpoint bytes remain uncredited because a successful TRUNCATE result does not expose the prior backfill count";
 
 fn checkpoint_lock(path: &Path) -> Arc<Mutex<()>> {
     let mut locks = CHECKPOINT_LOCKS
@@ -242,40 +244,30 @@ fn checkpoint_derived(
     let connection = if let Some(connection) = connection {
         connection
     } else {
-        owned = crate::db::file_identity::IdentityConnection::open(path, "views::generation::checkpoint_derived")?;
+        owned = crate::db::file_identity::IdentityConnection::open(
+            path,
+            "views::generation::checkpoint_derived",
+        )?;
         &owned
     };
     connection.busy_timeout(Duration::from_secs(5))?;
+    // FULL makes SQLite synchronize the WAL before checkpointing and the main
+    // database after copying frames. Opening either file here to fsync it would
+    // release this process's advisory locks on that inode.
     connection.pragma_update(None, "synchronous", "FULL")?;
-    let page_size: u64 = connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
-    let wal_bytes = fs::metadata(format!("{}-wal", path.display()))
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    let log_frames_before = wal_bytes.saturating_sub(32) / (page_size + 24);
-    let backfilled_before = fs::read(format!("{}-shm", path.display()))
-        .ok()
-        .and_then(|bytes| bytes.get(96..100)?.try_into().ok())
-        .map(u32::from_ne_bytes)
-        .map(u64::from)
-        .unwrap_or(0);
-    let outstanding_before =
-        log_frames_before.saturating_sub(backfilled_before.min(log_frames_before));
     let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
         connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?;
     if let Some(root) = ledger_root {
-        let checkpointed = if busy == 0 {
-            outstanding_before
-        } else {
-            u64::try_from(checkpointed_frames).unwrap_or(0)
-        };
-        crate::write_ledger::credit(
-            crate::write_ledger::Domain::ViewsDerived,
+        // A successful TRUNCATE returns zero counts, and this raw connection has
+        // no WAL hook baseline. Leave the unknown quantity in the named residual
+        // instead of inspecting the live WAL-index through another descriptor.
+        crate::write_ledger::register(
+            crate::write_ledger::Domain::Other,
             root.display().to_string(),
-            0,
-            checkpointed.saturating_mul(page_size),
-        );
+        )
+        .note_seam_label(DERIVED_CHECKPOINT_RESIDUAL);
     }
     if busy != 0 {
         return Err(ViewError::InvalidManifest(format!(
@@ -285,7 +277,6 @@ fn checkpoint_derived(
             checkpointed_frames
         )));
     }
-    super::sync_file(path)?;
     super::sync_parent(path)?;
     Ok(())
 }
@@ -379,25 +370,47 @@ pub(super) fn schedule_derived_checkpoint(path: PathBuf, connection: crate::db::
     }
 }
 
-/// Checkpoint the source before copying its main file. This also recovers a
-/// commit-durable WAL left by a process that exited before detached maintenance.
+/// Copy a coherent SQLite snapshot without opening the source file directly.
+/// The backup API includes committed WAL content while preserving every lock
+/// SQLite holds for other live connections in this process.
 pub(super) fn clone_derived(source: &Path, destination: &Path) -> Result<()> {
-    checkpoint_derived(source, None, None)?;
     let started = Instant::now();
-    let mechanism = if try_clone(source, destination) {
-        if cfg!(target_os = "macos") {
-            "clonefile"
-        } else {
-            "reflink"
+    let source_connection = crate::db::file_identity::IdentityConnection::open(
+        source,
+        "views::generation::clone_derived source",
+    )?;
+    source_connection.busy_timeout(Duration::from_secs(5))?;
+
+    let mut destination_connection = {
+        let _files = crate::db::file_identity::filesystem_guard();
+        let open = crate::db::file_identity::open_connections(destination);
+        if open != 0 {
+            return Err(ViewError::InvalidManifest(format!(
+                "derived clone destination has {open} live SQLite connection(s): {}",
+                destination.display()
+            )));
         }
-    } else {
-        let _ = fs::remove_file(destination);
-        fs::copy(source, destination)?;
-        "copy"
+        for suffix in ["", "-wal", "-shm"] {
+            let mut candidate = destination.as_os_str().to_owned();
+            candidate.push(suffix);
+            match fs::remove_file(PathBuf::from(candidate)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        crate::db::file_identity::IdentityConnection::open(
+            destination,
+            "views::generation::clone_derived destination",
+        )?
     };
+    destination_connection.busy_timeout(Duration::from_secs(5))?;
+    let backup = rusqlite::backup::Backup::new(&source_connection, &mut destination_connection)?;
+    backup.run_to_completion(256, Duration::from_millis(5), None)?;
+    drop(backup);
+
     log::info!(
-        "view derived clone mechanism={} ms={} source={} destination={}",
-        mechanism,
+        "view derived clone mechanism=sqlite_backup ms={} source={} destination={}",
         started.elapsed().as_millis(),
         source.display(),
         destination.display()
@@ -451,6 +464,23 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(
+            crate::write_ledger::pending_for_test(
+                crate::write_ledger::Domain::ViewsDerived,
+                &source.parent().unwrap().display().to_string(),
+            )
+            .1,
+            0,
+            "an unknowable TRUNCATE quantity must not receive guessed credit"
+        );
+        assert!(
+            crate::write_ledger::seam_labels_for_test(
+                crate::write_ledger::Domain::Other,
+                &source.parent().unwrap().display().to_string(),
+            )
+            .iter()
+            .any(|label| label == DERIVED_CHECKPOINT_RESIDUAL)
+        );
+        assert_eq!(
             Connection::open(&source)
                 .unwrap()
                 .query_row("SELECT value FROM state", [], |row| row.get::<_, String>(0))
@@ -459,12 +489,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn clone_checkpoints_committed_wal_before_copying_the_main_file() {
+        #[test]
+    fn clone_uses_sqlite_backup_for_committed_wal_with_a_live_source() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("source.sqlite");
         let destination = directory.path().join("destination.sqlite");
-        let connection = Connection::open(&source).unwrap();
+        let connection = crate::db::file_identity::IdentityConnection::open(
+            &source,
+            "views generation clone test source",
+        )
+        .unwrap();
         connection
             .pragma_update(None, "journal_mode", "WAL")
             .unwrap();
@@ -482,9 +516,15 @@ mod tests {
             .unwrap();
         let wal = PathBuf::from(format!("{}-wal", source.display()));
         assert!(fs::metadata(&wal).unwrap().len() > 0);
+        assert_eq!(crate::db::file_identity::open_connections(&source), 1);
 
         clone_derived(&source, &destination).unwrap();
 
+        assert_eq!(
+            crate::db::file_identity::open_connections(&source),
+            1,
+            "the clone must not close or replace the live source connection"
+        );
         assert_eq!(
             Connection::open(&destination)
                 .unwrap()
@@ -493,47 +533,36 @@ mod tests {
             "committed-in-wal"
         );
     }
-}
 
-#[cfg(target_os = "macos")]
-fn try_clone(source: &Path, destination: &Path) -> bool {
-    use std::{ffi::CString, os::unix::ffi::OsStrExt};
-    let (Ok(source), Ok(destination)) = (
-        CString::new(source.as_os_str().as_bytes()),
-        CString::new(destination.as_os_str().as_bytes()),
-    ) else {
-        return false;
-    };
-    // Both C strings remain alive for the duration of clonefile.
-    unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), 0) == 0 }
-}
+    #[test]
+    fn clone_refuses_to_replace_a_live_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.sqlite");
+        let destination = directory.path().join("destination.sqlite");
+        Connection::open(&source)
+            .unwrap()
+            .execute_batch("CREATE TABLE source(value);")
+            .unwrap();
+        let destination_connection = crate::db::file_identity::IdentityConnection::open(
+            &destination,
+            "views generation clone test destination",
+        )
+        .unwrap();
+        destination_connection
+            .execute_batch("CREATE TABLE destination(value);")
+            .unwrap();
 
-#[cfg(target_os = "linux")]
-fn try_clone(source: &Path, destination: &Path) -> bool {
-    use std::os::fd::AsRawFd;
-    let (Ok(source), Ok(destination)) = (
-        fs::File::open(source),
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(destination),
-    ) else {
-        return false;
-    };
-    // FICLONE takes the source descriptor as its third argument.
-    unsafe {
-        libc::ioctl(
-            destination.as_raw_fd(),
-            0x40049409 as libc::c_ulong,
-            source.as_raw_fd(),
-        ) == 0
+        let error = clone_derived(&source, &destination).unwrap_err();
+        assert!(
+            matches!(&error, ViewError::InvalidManifest(message) if message.contains("live SQLite connection")),
+            "unexpected error: {error}"
+        );
+        destination_connection
+            .query_row("SELECT COUNT(*) FROM destination", [], |_| Ok(()))
+            .unwrap();
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn try_clone(_source: &Path, _destination: &Path) -> bool {
-    false
-}
 
 #[cfg(test)]
 mod ownership_tests {

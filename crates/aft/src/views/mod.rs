@@ -783,7 +783,10 @@ impl ViewStore {
         // is already durable; syncing it again would be the closure cost the fill
         // exists to avoid.
         if reused.is_none() {
-            sync_database_wal_without_checkpoint(&request.artifacts.derived_database, observer)?;
+            sync_database_with_passive_checkpoint(
+                &request.artifacts.derived_database,
+                observer,
+            )?;
         }
         timing.phase("derived_durability");
         sync_file_and_parent(&request.artifacts.trigram_artifact)?;
@@ -853,7 +856,8 @@ impl ViewStore {
         if outcome == PublishOutcome::Published {
             checkpoint_pointer_after_cas(&self.pointer_path())?;
             observe(observer, PublicationStep::PointerCheckpointed);
-            sync_file(&self.pointer_path())?;
+            // The FULL checkpoint synchronized the database through SQLite, so
+            // opening the main file again here would only discard its locks.
             observe(observer, PublicationStep::PointerDatabaseFsynced);
             sync_directory(&self.view_dir)?;
             observe(observer, PublicationStep::PointerDirectoryFsynced);
@@ -1004,7 +1008,7 @@ fn configure_connection(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn sync_database_wal_without_checkpoint(
+fn sync_database_with_passive_checkpoint(
     path: &Path,
     observer: Option<&dyn PublicationObserver>,
 ) -> Result<()> {
@@ -1014,13 +1018,7 @@ fn sync_database_wal_without_checkpoint(
             path.display()
         )));
     }
-    sync_file(path)?;
-    let wal_path = PathBuf::from(format!("{}-wal", path.display()));
-    match open_file_for_sync(&wal_path) {
-        Ok(file) => file.sync_all()?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(ViewError::Io(error)),
-    }
+    sqlite_full_sync_checkpoint(path, "views::sync_database_with_passive_checkpoint")?;
     sync_parent(path)?;
     observe(observer, PublicationStep::DerivedWalFsynced);
     Ok(())
@@ -1037,25 +1035,9 @@ fn checkpoint_and_sync_database(
             path.display()
         )));
     }
-    let connection = crate::db::file_identity::IdentityConnection::open(path, "views::checkpoint_and_sync_database")?;
-    configure_connection(&connection)?;
-    connection.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+    sqlite_full_sync_checkpoint(path, "views::checkpoint_and_sync_database")?;
     if observe_blob_database {
         observe(observer, PublicationStep::BlobWalCheckpointed);
-    }
-    drop(connection);
-    sync_file(path)?;
-    // SQLite deletes the WAL when the last connection to the database closes,
-    // so between an existence probe and the open the file can legitimately
-    // vanish when another connection on the same file closes (the checkpoint
-    // that removal implies already carried its frames into the main file).
-    // Open directly and treat NotFound as "nothing left to sync" instead of
-    // probing first.
-    let wal_path = PathBuf::from(format!("{}-wal", path.display()));
-    match open_file_for_sync(&wal_path) {
-        Ok(file) => file.sync_all()?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(ViewError::Io(error)),
     }
     sync_parent(path)?;
     if observe_blob_database {
@@ -1064,10 +1046,22 @@ fn checkpoint_and_sync_database(
     Ok(())
 }
 
-fn checkpoint_pointer_after_cas(path: &Path) -> Result<()> {
-    let connection = crate::db::file_identity::IdentityConnection::open(path, "views::checkpoint_pointer_after_cas")?;
+fn sqlite_full_sync_checkpoint(path: &Path, seam: &'static str) -> Result<(i64, i64, i64)> {
+    let connection = crate::db::file_identity::IdentityConnection::open(path, seam)?;
     configure_connection(&connection)?;
-    connection.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+    // With FULL synchronization, SQLite flushes the WAL before copying frames
+    // and flushes the main database before the checkpoint returns. Keeping the
+    // operation inside the VFS preserves its process-wide advisory locks.
+    connection.pragma_update(None, "synchronous", "FULL")?;
+    connection
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(ViewError::from)
+}
+
+fn checkpoint_pointer_after_cas(path: &Path) -> Result<()> {
+    sqlite_full_sync_checkpoint(path, "views::checkpoint_pointer_after_cas")?;
     Ok(())
 }
 
