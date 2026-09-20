@@ -56,16 +56,25 @@ RUN bun install --frozen-lockfile && \
 FROM --platform=linux/amd64 node:24-bookworm-slim AS runtime
 ARG OPENCODE2_VERSION
 ARG OPENCODE1_VERSION
+# bun goes to /usr/local, not /root/.bun: tests/docker/run-opencode2-test.sh
+# starts this image as the invoking user's uid/gid so that the artifacts it
+# writes into the mounted run root stay readable outside the container, and
+# /root is mode 0700, so an interpreter installed there is unreachable for every
+# user but root. HOME needs the same treatment: a uid with no passwd entry
+# otherwise lands on HOME=/, which is not writable, and both bun and git write
+# under HOME.
 RUN test -n "$OPENCODE2_VERSION" && test -n "$OPENCODE1_VERSION" && \
     apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git procps unzip && \
     rm -rf /var/lib/apt/lists/* && \
-    curl -fsSL https://bun.sh/install | bash && \
+    curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash && \
     npm install --prefix /opt/opencode --no-audit --no-fund \
       "@copilotkit/aimock@1.24.0" \
       "@opencode/cli@$OPENCODE2_VERSION" \
       "@opencode/cli-linux-x64@$OPENCODE2_VERSION" && \
-    npm install --prefix /opt/opencode1 --no-audit --no-fund "opencode-ai@$OPENCODE1_VERSION"
-ENV PATH="/root/.bun/bin:/opt/aft/bin:$PATH"
+    npm install --prefix /opt/opencode1 --no-audit --no-fund "opencode-ai@$OPENCODE1_VERSION" && \
+    mkdir -p /home/harness && chmod 1777 /home/harness
+ENV PATH="/opt/aft/bin:$PATH"
+ENV HOME=/home/harness
 ENV NODE_PATH="/opt/opencode/node_modules"
 WORKDIR /workspace
 COPY . /workspace

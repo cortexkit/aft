@@ -23,6 +23,10 @@ if [[ ! "$GIT_SHA" =~ ^[0-9a-f]{40}$ ]]; then
   exit 2
 fi
 mkdir -p "$ARTIFACT_ROOT"
+if [[ ! -w "$ARTIFACT_ROOT" ]]; then
+  echo "$ARTIFACT_ROOT is not writable by $(id -un); an earlier root-owned run may still own it" >&2
+  exit 2
+fi
 
 printf 'Building OpenCode 2 harness image (%s, checkout %s)...\n' "$HOST_VERSION" "$GIT_SHA"
 
@@ -59,10 +63,20 @@ docker build \
   "$REPO_ROOT"
 stage_cleanup
 
+# Run as the invoking uid/gid, not root. The scenario roots are mkdtemp'd (mode
+# 0700) under the bind-mounted artifact root, so a root-owned run leaves a
+# forensics tree its own caller cannot traverse: CI's collection step fails with
+# `EACCES: permission denied, scandir` and uploads an empty bundle, and a local
+# run leaves directories the developer has to sudo into. A post-hoc `chown -R`
+# would need privileges the collector does not have; owning the files correctly
+# in the first place works the same way in CI and on a laptop.
+CONTAINER_USER="${AFT_E2E_CONTAINER_USER:-$(id -u):$(id -g)}"
+
 run_args=(
   --rm
   --name "aft-opencode2-$RUN_ID"
   --platform linux/amd64
+  --user "$CONTAINER_USER"
   --volume "$ARTIFACT_ROOT:/artifacts"
   --env "AFT_CHECKOUT_SHA=$GIT_SHA"
   --env "AFT_E2E_RUN_ID=$RUN_ID"
