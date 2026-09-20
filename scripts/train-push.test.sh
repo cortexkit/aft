@@ -59,6 +59,7 @@ cat > "$BIN_DIR/gh" <<'STUB'
 #!/usr/bin/env bash
 set -u
 STATE="${TRAIN_PUSH_TEST_STATE:?gh stub needs TRAIN_PUSH_TEST_STATE}"
+printf '%s\n' "$*" >> "$STATE/gh-calls"
 
 hook="$STATE/on-watch.sh"
 if [ -x "$hook" ]; then
@@ -109,6 +110,9 @@ case "$json" in
     cat "$STATE/run_id"
     ;;
   url) echo "https://github.com/example/repo/actions/runs/$(cat "$STATE/run_id")" ;;
+  status,conclusion)
+    printf '%s\t%s\n' "$(cat "$STATE/recorded_status" 2>/dev/null || echo completed)" "$(cat "$STATE/conclusion")"
+    ;;
   status) echo "completed" ;;
   jobs) cat "$STATE/failed_job" ;;
   conclusion) cat "$STATE/conclusion" ;;
@@ -181,6 +185,7 @@ new_fixture() {
   mkdir -p "$dir/ci-state"
   echo "4242" > "$dir/ci-state/run_id"
   echo "success" > "$dir/ci-state/conclusion"
+  echo "completed" > "$dir/ci-state/recorded_status"
   echo "$DEFAULT_BRANCH" > "$dir/ci-state/default_branch"
   : > "$dir/ci-state/failed_job"
 
@@ -773,6 +778,116 @@ expect_rc 0 "green CI lands"
   fail "green CI did not fast-forward origin/main to the tested sha"
 [ -z "$(origin_ref "$dir" refs/heads/train/green)" ] ||
   fail "green CI left the train branch behind"
+
+# --- existing train: recorded green lands without a push or a watch --------
+dir="$(new_fixture existing-green)"
+add_train_commit "$dir/work" "existing-green"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-green"
+: > "$dir/ci-state/gh-calls"
+run_train "$dir" existing-green --land
+expect_rc 0 "--land finishes an existing green train"
+expect_out "landed previously-verified sha $train_sha" "the recovery names the exact CI-verified sha"
+expect_no_out "creating origin/train/existing-green" "recorded green skips creating the train branch"
+expect_no_out "updating origin/train/existing-green" "recorded green skips updating the train branch"
+expect_no_out "watching CI" "recorded green skips the watch"
+if grep -q -- '--json jobs' "$dir/ci-state/gh-calls"; then
+  fail "recorded green invoked watch-ci instead of spending the verdict"
+else
+  ok "recorded green did not invoke watch-ci"
+fi
+[ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$train_sha" ] ||
+  fail "--land did not fast-forward the default branch to the recorded green sha"
+[ -z "$(origin_ref "$dir" refs/heads/train/existing-green)" ] ||
+  fail "--land left the recovered train branch behind"
+
+# --- existing train: running attaches to its exact run ---------------------
+dir="$(new_fixture existing-running)"
+add_train_commit "$dir/work" "existing-running"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-running"
+echo "in_progress" > "$dir/ci-state/recorded_status"
+: > "$dir/ci-state/gh-calls"
+run_train "$dir" existing-running
+expect_rc 0 "an existing running train is watched and landed"
+expect_out "attaching to CI for existing origin/train/existing-running at $train_sha" \
+  "the running recovery attaches to the exact train tip"
+if grep -q -- '--json jobs' "$dir/ci-state/gh-calls"; then
+  ok "running recovery invoked watch-ci"
+else
+  fail "running recovery landed without attaching watch-ci"
+fi
+
+# --- existing train: recorded red keeps the fix-and-repush contract --------
+dir="$(new_fixture existing-red)"
+add_train_commit "$dir/work" "existing-red"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-red"
+echo "failure" > "$dir/ci-state/conclusion"
+run_train "$dir" existing-red
+expect_rc 1 "an existing red train refuses to land"
+expect_out "fix, commit, and re-run: scripts/train-push.sh existing-red" \
+  "recorded red preserves the fix-and-repush instruction"
+[ "$(origin_ref "$dir" refs/heads/train/existing-red)" = "$train_sha" ] ||
+  fail "recorded red moved or deleted the train branch"
+
+# --- existing green is not landable after the default branch diverges ------
+dir="$(new_fixture existing-diverged)"
+add_train_commit "$dir/work" "existing-diverged"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-diverged"
+advance_origin_main "$dir" "peer-landed-first"
+advanced_sha="$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")"
+run_train "$dir" existing-diverged --land
+expect_rc 2 "--land refuses a green sha that is no longer a fast-forward"
+expect_out "not a fast-forward" "the divergent recovery names the sound refusal"
+expect_out "rebase and re-run" "the divergent recovery names the remedy without guessing why"
+expect_no_out "main moved" "the divergent recovery does not assert why it is not a fast-forward"
+[ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$advanced_sha" ] ||
+  fail "the non-fast-forward recovery moved the default branch"
+
+# Mutation control: ignoring the recorded green verdict must enter watch-ci.
+mutant_dir="$TMP_ROOT/verdict-mutant-scripts"
+cp -R "$SCRIPT_DIR" "$mutant_dir"
+mutant="$mutant_dir/train-push.sh"
+sed 's/\[ "$run_status" != "completed" \]/[ 1 -eq 1 ]/' "$TRAIN_PUSH" > "$mutant"
+chmod +x "$mutant"
+grep -q '\[ 1 -eq 1 \]' "$mutant" || fail "recorded-verdict mutation did not apply"
+dir="$(new_fixture existing-green-mutant)"
+add_train_commit "$dir/work" "existing-green-mutant"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-green-mutant"
+: > "$dir/ci-state/gh-calls"
+TRAIN_PUSH_SAVED="$TRAIN_PUSH"; TRAIN_PUSH="$mutant"
+run_train "$dir" existing-green-mutant --land
+TRAIN_PUSH="$TRAIN_PUSH_SAVED"
+if grep -q -- '--json jobs' "$dir/ci-state/gh-calls"; then
+  ok "ignoring the recorded verdict wrongly invokes watch-ci (proves the green recovery arm bites)"
+else
+  fail "the recorded-verdict mutant did not invoke watch-ci"
+fi
+
+# Mutation control: replacing the non-fast-forward refusal with a force push
+# must move the default branch backwards, which the real negative arm forbids.
+mutant_dir="$TMP_ROOT/force-mutant-scripts"
+cp -R "$SCRIPT_DIR" "$mutant_dir"
+mutant="$mutant_dir/train-push.sh"
+sed 's|    refuse_non_fast_forward "$sha"|    git push --force-with-lease "$remote" "$sha:refs/heads/$default_branch"|' "$TRAIN_PUSH" > "$mutant"
+chmod +x "$mutant"
+grep -q 'git push --force-with-lease "$remote" "$sha:refs/heads/$default_branch"' "$mutant" ||
+  fail "force-push mutation did not apply"
+dir="$(new_fixture existing-diverged-mutant)"
+add_train_commit "$dir/work" "existing-diverged-mutant"
+train_sha="$(git -C "$dir/work" rev-parse HEAD)"
+git -C "$dir/work" push -q origin "HEAD:refs/heads/train/existing-diverged-mutant"
+advance_origin_main "$dir" "peer-landed-before-mutant"
+TRAIN_PUSH_SAVED="$TRAIN_PUSH"; TRAIN_PUSH="$mutant"
+run_train "$dir" existing-diverged-mutant --land
+TRAIN_PUSH="$TRAIN_PUSH_SAVED"
+if [ "$(origin_ref "$dir" "refs/heads/$DEFAULT_BRANCH")" = "$train_sha" ]; then
+  ok "force-push mutant moves the default branch backwards (proves the negative arm bites)"
+else
+  fail "force-push mutant did not violate the negative arm"
+fi
 
 # --- re-queue: main moves during CI, train rebases and lands on round 2 -----
 dir="$(new_fixture requeue)"
