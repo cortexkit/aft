@@ -497,20 +497,22 @@ fn census_with_sample(
         }
         let (logical, physical) = entry.pending();
         let key = (entry.domain, entry.root_id.clone());
-        if logical == 0 && physical == 0 && !totals.contains_key(&key) {
+        let seam_labels = entry
+            .seam_labels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if logical == 0
+            && physical == 0
+            && !totals.contains_key(&key)
+            && seam_labels.is_empty()
+        {
             continue;
         }
         let total = totals.entry(key).or_default();
         total.0 = total.0.saturating_add(logical);
         total.1 = total.1.saturating_add(physical);
-        total.2.extend(
-            entry
-                .seam_labels
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .cloned(),
-        );
+        total.2.extend(seam_labels);
     }
 
     let mut writers = totals
@@ -792,5 +794,28 @@ mod tests {
         assert_eq!(report.attributed_physical_bytes, 40);
         assert_eq!(report.process.physical_bytes, Some(100));
         assert_eq!(report.unattributed_physical_bytes, Some(60));
+    }
+
+    #[test]
+    fn census_keeps_named_zero_byte_residual_rows() {
+        let _guard = test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let root = test_root("named-residual");
+        let counter = register(Domain::Other, root.clone());
+        counter.note_seam_label("fixture residual without a safe byte estimate");
+
+        let report = census_with_sample(&conn, 0, Some(&root), now_ms(), None).unwrap();
+        let row = report
+            .writers
+            .iter()
+            .find(|row| row.domain == Domain::Other.as_str())
+            .expect("the named residual must remain visible without guessed bytes");
+        assert_eq!(row.logical_bytes, 0);
+        assert_eq!(row.physical_bytes, 0);
+        assert_eq!(
+            row.seam_labels,
+            vec!["fixture residual without a safe byte estimate".to_owned()]
+        );
     }
 }

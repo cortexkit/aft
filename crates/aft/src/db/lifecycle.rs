@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::write_ledger::{Counter as WriteCounter, Domain as WriteDomain};
@@ -18,14 +18,10 @@ use serde::Serialize;
 
 pub const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
 
-/// Layout of the WAL-index header: two identical 48-byte copies, the second of
-/// which is a torn-read guard, followed by the checkpoint-info block.
-const WAL_INDEX_HEADER_BYTES: usize = 48;
-const WAL_INDEX_INITIALISED_OFFSET: usize = 12;
-const WAL_INDEX_MX_FRAME_OFFSET: usize = 16;
-const WAL_INDEX_SALT_OFFSET: usize = 32;
-const WAL_INDEX_BACKFILL_OFFSET: usize = 2 * WAL_INDEX_HEADER_BYTES;
-const WAL_INDEX_HEADER_PREFIX_BYTES: usize = WAL_INDEX_BACKFILL_OFFSET + 4;
+const CLOSE_CHECKPOINT_RESIDUAL: &str =
+    "db::TrackedConnection::drop: close-time WAL checkpoint bytes remain uncredited because measuring them would reopen a live SQLite file set";
+const AMBIGUOUS_WAL_RESTART_RESIDUAL: &str =
+    "db::tracked_wal_hook: WAL restart credit remains conservative when commit frame counts cannot distinguish a restart from append growth";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WalCheckpointMode {
@@ -227,57 +223,55 @@ struct WalHookState {
     threshold_pages: AtomicI32,
     last_log_frames: AtomicI32,
     last_checkpointed_frames: AtomicI32,
-    last_generation_salt: AtomicU64,
+    restart_possible: AtomicBool,
+    generation_credit_ambiguous: AtomicBool,
     page_size: u64,
-    /// The WAL-index path, resolved once at open. Used to tell one WAL
-    /// generation from the next; `None` for databases with no WAL-index of
-    /// their own, such as in-memory ones.
-    wal_index_path: Option<PathBuf>,
     checkpoint_counter: WriteCounter,
+    residual_counter: WriteCounter,
 }
 
 impl WalHookState {
-    fn observe_log(&self, log_frames: i32) {
+    /// Record the frame count SQLite supplies to the WAL hook after a commit.
+    ///
+    /// A lower or equal count after a fully backfilled WAL proves that SQLite
+    /// restarted the log, so the checkpoint baseline can be reset. Growth past
+    /// the previous count is ambiguous: it can be either an append or a restart
+    /// that already outgrew the old generation. Keep the old baseline in that
+    /// case so attribution is conservative, and expose the omitted bytes as a
+    /// named residual instead of opening the WAL-index to inspect its salt.
+    fn observe_commit(&self, log_frames: i32) {
         let log_frames = log_frames.max(0);
         let previous = self.last_log_frames.swap(log_frames, Ordering::Relaxed);
-        if log_frames < previous {
+        let restart_possible = self.restart_possible.swap(false, Ordering::Relaxed);
+        if log_frames < previous || (restart_possible && log_frames <= previous) {
             self.last_checkpointed_frames.store(0, Ordering::Relaxed);
+        } else if restart_possible && log_frames > previous {
+            self.generation_credit_ambiguous
+                .store(true, Ordering::Relaxed);
         }
     }
 
+    /// Credit the movement reported by SQLite's checkpoint result triple.
     fn record_checkpoint(&self, log_frames: i32, checkpointed_frames: i32) -> u64 {
         if log_frames < 0 || checkpointed_frames < 0 {
             return 0;
         }
-        self.observe_generation();
-        self.observe_log(log_frames);
         let previous = self.last_checkpointed_frames.load(Ordering::Relaxed).max(0);
-        let checkpointed_frames = checkpointed_frames.max(previous);
+        let baseline = if checkpointed_frames < previous {
+            // nBackfill cannot decrease within one WAL generation, so this is
+            // direct evidence that SQLite restarted the WAL.
+            0
+        } else {
+            previous
+        };
+        self.last_log_frames.store(log_frames, Ordering::Relaxed);
         self.last_checkpointed_frames
             .store(checkpointed_frames, Ordering::Relaxed);
-        u64::try_from(checkpointed_frames.saturating_sub(previous)).unwrap_or(0)
-    }
-
-    /// Rewind the credited-frame baseline when SQLite has started a new WAL.
-    ///
-    /// Once a checkpoint has copied a whole WAL into the main database, the next
-    /// write transaction restarts the log from frame 1 and stamps it with a
-    /// fresh salt. Frame numbers alone cannot see that: a restarted log whose
-    /// frames run past the previous log's high-water mark looks exactly like the
-    /// previous log growing, and subtracting the old mark then throws away every
-    /// frame below it. The salt is what distinguishes the two.
-    fn observe_generation(&self) {
-        let Some(salt) = self
-            .wal_index_path
-            .as_deref()
-            .and_then(wal_index_generation_salt)
-        else {
-            return;
-        };
-        if self.last_generation_salt.swap(salt, Ordering::Relaxed) != salt {
-            self.last_log_frames.store(0, Ordering::Relaxed);
-            self.last_checkpointed_frames.store(0, Ordering::Relaxed);
-        }
+        self.restart_possible.store(
+            log_frames > 0 && checkpointed_frames >= log_frames,
+            Ordering::Relaxed,
+        );
+        u64::try_from(checkpointed_frames.saturating_sub(baseline)).unwrap_or(0)
     }
 
     fn outstanding_frames(&self) -> u64 {
@@ -292,89 +286,26 @@ impl WalHookState {
     fn reset_after_truncate(&self) {
         self.last_log_frames.store(0, Ordering::Relaxed);
         self.last_checkpointed_frames.store(0, Ordering::Relaxed);
-        self.last_generation_salt.store(0, Ordering::Relaxed);
+        self.restart_possible.store(false, Ordering::Relaxed);
+    }
+
+    fn note_residuals_before_close(&self) {
+        if self.outstanding_frames() > 0 {
+            self.residual_counter
+                .note_seam_label(CLOSE_CHECKPOINT_RESIDUAL);
+        }
+        if self
+            .generation_credit_ambiguous
+            .load(Ordering::Relaxed)
+        {
+            self.residual_counter
+                .note_seam_label(AMBIGUOUS_WAL_RESTART_RESIDUAL);
+        }
     }
 
     fn bytes_for_frames(&self, frames: u64) -> u64 {
         frames.saturating_mul(self.page_size)
     }
-}
-
-/// Frames in the current WAL that no checkpoint has copied into the main
-/// database file yet.
-///
-/// Both counts come from the WAL-index rather than from the connection, because
-/// the same measurement has to be taken after the handle is gone: `PRAGMA
-/// wal_checkpoint` is unavailable once SQLite has closed the database, and the
-/// close performs one of the checkpoints whose bytes need attributing.
-///
-/// `mxFrame` is read rather than derived from the WAL file's length. SQLite
-/// restarts a drained WAL from frame 1 without shortening the file, so its
-/// length also counts frames from earlier generations that have already been
-/// copied and credited.
-fn outstanding_wal_frames(path: &Path) -> u64 {
-    let mut shm = path.as_os_str().to_owned();
-    shm.push("-shm");
-    let Some((log_frames, backfilled)) = wal_index_frame_counts(&PathBuf::from(shm)) else {
-        return 0;
-    };
-    log_frames.saturating_sub(backfilled.min(log_frames))
-}
-
-/// `mxFrame` and `nBackfill` from the WAL-index: two identical 48-byte header
-/// copies, then the checkpoint-info block whose first field is the backfilled
-/// frame count.
-///
-/// Returns `None` for a WAL-index that is absent, unreadable, uninitialised, or
-/// caught mid-update, so an unknown state credits nothing rather than guessing.
-/// Only the header prefix is read: a WAL-index is as large as its WAL is long,
-/// and this runs on every connection close.
-fn wal_index_frame_counts(shm_path: &Path) -> Option<(u64, u64)> {
-    let header = wal_index_header_prefix(shm_path)?;
-    if header[WAL_INDEX_INITIALISED_OFFSET] == 0 {
-        return None;
-    }
-    let frames = |offset: usize| -> u32 {
-        u32::from_ne_bytes(
-            header[offset..offset + 4]
-                .try_into()
-                .expect("the field sits inside the WAL-index prefix"),
-        )
-    };
-    let log_frames = frames(WAL_INDEX_MX_FRAME_OFFSET);
-    if log_frames != frames(WAL_INDEX_MX_FRAME_OFFSET + WAL_INDEX_HEADER_BYTES) {
-        return None;
-    }
-    Some((
-        u64::from(log_frames),
-        u64::from(frames(WAL_INDEX_BACKFILL_OFFSET)),
-    ))
-}
-
-/// The salt SQLite stamps on the current WAL, taken from the WAL-index.
-///
-/// Returns `None` unless both copies of the WAL-index header agree, so a header
-/// caught mid-update is reported as unknown rather than as a new WAL.
-fn wal_index_generation_salt(shm_path: &Path) -> Option<u64> {
-    let header = wal_index_header_prefix(shm_path)?;
-    let salt = |offset: usize| -> u64 {
-        u64::from_ne_bytes(
-            header[offset..offset + 8]
-                .try_into()
-                .expect("both salt fields sit inside the WAL-index prefix"),
-        )
-    };
-    let primary = salt(WAL_INDEX_SALT_OFFSET);
-    (primary == salt(WAL_INDEX_SALT_OFFSET + WAL_INDEX_HEADER_BYTES)).then_some(primary)
-}
-
-fn wal_index_header_prefix(shm_path: &Path) -> Option<[u8; WAL_INDEX_HEADER_PREFIX_BYTES]> {
-    use std::io::Read;
-
-    let mut header = [0_u8; WAL_INDEX_HEADER_PREFIX_BYTES];
-    let mut file = std::fs::File::open(shm_path).ok()?;
-    file.read_exact(&mut header).ok()?;
-    Some(header)
 }
 
 unsafe extern "C" fn tracked_wal_hook(
@@ -384,7 +315,7 @@ unsafe extern "C" fn tracked_wal_hook(
     frame_count: c_int,
 ) -> c_int {
     let state = unsafe { &*(context.cast::<WalHookState>()) };
-    state.observe_log(frame_count);
+    state.observe_commit(frame_count);
     if frame_count < state.threshold_pages.load(Ordering::Relaxed) {
         return rusqlite::ffi::SQLITE_OK;
     }
@@ -519,23 +450,18 @@ impl TrackedConnection {
         }
         let checkpoint_counter = crate::write_ledger::register(
             store.checkpoint_domain().unwrap_or(WriteDomain::Other),
-            root_id,
+            root_id.clone(),
         );
+        let residual_counter = crate::write_ledger::register(WriteDomain::Other, root_id);
         let wal_hook = Box::new(WalHookState {
             threshold_pages: AtomicI32::new(DEFAULT_WAL_AUTOCHECKPOINT_PAGES as i32),
             last_log_frames: AtomicI32::new(0),
             last_checkpointed_frames: AtomicI32::new(0),
-            last_generation_salt: AtomicU64::new(0),
+            restart_possible: AtomicBool::new(false),
+            generation_credit_ambiguous: AtomicBool::new(false),
             page_size,
-            wal_index_path: connection
-                .path()
-                .filter(|path| !path.is_empty())
-                .map(|path| {
-                    let mut shm = std::ffi::OsString::from(path);
-                    shm.push("-shm");
-                    PathBuf::from(shm)
-                }),
             checkpoint_counter,
+            residual_counter,
         });
         let context = std::ptr::from_ref(wal_hook.as_ref())
             .cast_mut()
@@ -646,21 +572,13 @@ impl TrackedConnection {
     }
 
     fn checkpoint_outstanding_frames(&self) -> u64 {
-        let Some(path) = self
-            .connection
-            .as_ref()
-            .and_then(Connection::path)
-            .map(Path::new)
-        else {
-            return self.wal_hook.outstanding_frames();
-        };
-        outstanding_wal_frames(path)
+        self.wal_hook.outstanding_frames()
     }
 
     /// Run an explicit WAL checkpoint and credit only frames newly copied into
-    /// the main database. SQLite zeros the frame counts after a successful
-    /// TRUNCATE, so that mode snapshots the WAL-index backfill counter before
-    /// running the requested checkpoint once with its original busy policy.
+    /// the main database. SQLite zeros the returned counts after a successful
+    /// TRUNCATE, so that mode snapshots the outstanding count already observed
+    /// from WAL-hook commits and earlier checkpoint result triples.
     pub fn checkpoint_wal_as(
         &self,
         mode: WalCheckpointMode,
@@ -684,54 +602,6 @@ impl TrackedConnection {
         }
     }
 
-    /// Snapshot the frames a close-time checkpoint would have to copy.
-    ///
-    /// Taken before the handle is dropped, because without persistent WAL,
-    /// SQLite deletes the sidecars and the count is unreadable after close.
-    fn close_checkpoint_probe(&self) -> Option<CloseCheckpointProbe> {
-        let path = PathBuf::from(self.connection.as_ref()?.path()?);
-        let outstanding_frames = outstanding_wal_frames(&path);
-        (outstanding_frames > 0).then_some(CloseCheckpointProbe {
-            path,
-            outstanding_frames,
-        })
-    }
-
-    /// Credit the bytes the close-time checkpoint copied into the main database.
-    ///
-    /// Closing the last connection to a WAL database makes SQLite run a full
-    /// checkpoint (retaining the sidecars when persistent WAL is enabled). That
-    /// copy is neither the autocheckpoint
-    /// the WAL hook models (the hook only runs when a commit appends frames) nor
-    /// an explicit `wal_checkpoint` call, so without this the main-file bytes it
-    /// pushes are never attributed to anything.
-    ///
-    /// The frames are re-counted after the handle is gone instead of assumed:
-    /// that is what separates a close which did checkpoint (frames backfilled,
-    /// WAL emptied or deleted) from one which could not, because another connection to the same
-    /// database is still open or this handle was read-only. A close that
-    /// checkpointed nothing must credit nothing.
-    fn credit_close_checkpoint(&self, probe: Option<CloseCheckpointProbe>) -> u64 {
-        let Some(probe) = probe else {
-            return 0;
-        };
-        let remaining = outstanding_wal_frames(&probe.path);
-        let backfilled = probe.outstanding_frames.saturating_sub(remaining);
-        if backfilled == 0 {
-            return 0;
-        }
-        let bytes = self.wal_hook.bytes_for_frames(backfilled);
-        self.wal_hook.checkpoint_counter.credit(0, bytes);
-        bytes
-    }
-}
-
-/// The WAL state captured just before a tracked handle closes, so the frames
-/// SQLite's close-time checkpoint copies can be measured across the close.
-#[derive(Debug)]
-struct CloseCheckpointProbe {
-    path: PathBuf,
-    outstanding_frames: u64,
 }
 
 impl Deref for TrackedConnection {
@@ -755,11 +625,14 @@ impl DerefMut for TrackedConnection {
 impl Drop for TrackedConnection {
     fn drop(&mut self) {
         self.sample_write_pages();
-        let close_checkpoint = self.close_checkpoint_probe();
+        // SQLite may run a checkpoint as the last handle closes, but there is no
+        // connection API that reports its result afterward. Reopening any member
+        // of the file set to infer it would release this process's advisory locks,
+        // so those bytes intentionally remain in the ledger's residual.
+        self.wal_hook.note_residuals_before_close();
         // Drop the SQLite handle before decrementing so the counter never says
         // closed while rusqlite still owns the descriptor and page cache.
         drop(self.connection.take());
-        self.credit_close_checkpoint(close_checkpoint);
         if let Some(key) = self.file_identity_key.take() {
             crate::db::file_identity::note_close(&key, self.store);
         }
@@ -1076,15 +949,18 @@ mod tests {
         );
     }
 
+    /// Closing may copy outstanding WAL frames into the main file, but SQLite
+    /// exposes no result triple after the handle is gone. The ledger must leave
+    /// those bytes in its named residual rather than reopen the live file set.
     #[test]
-    fn closing_the_last_wal_connection_credits_the_frames_it_backfills() {
+    fn closing_the_last_wal_connection_leaves_checkpoint_bytes_in_residual() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("close-checkpoint.sqlite");
         let root = format!("/close-checkpoint/{}", std::process::id());
         let credited_before =
             crate::write_ledger::pending_for_test(WriteDomain::CallgraphCheckpoint, &root).1;
 
-        let (page_size, outstanding_frames, main_before) = {
+        let (page_size, main_before) = {
             let conn = TrackedConnection::open_attributed(
                 &path,
                 SqliteStore::CallgraphGeneration,
@@ -1092,17 +968,11 @@ mod tests {
             )
             .unwrap();
             conn.pragma_update(None, "journal_mode", "WAL").unwrap();
-            // Park the autocheckpoint threshold out of reach so the WAL hook
-            // credits nothing during the workload. Whatever the ledger ends up
-            // holding for this root is then attributable to the close alone.
             conn.set_wal_autocheckpoint(1_000_000).unwrap();
             let page_size: u64 = conn
                 .pragma_query_value(None, "page_size", |row| row.get(0))
                 .unwrap();
 
-            // One transaction, so each database page reaches the WAL once and
-            // the frame count the credit uses is also the page count the
-            // checkpoint pushes into the main file.
             let tx = conn.unchecked_transaction().unwrap();
             tx.execute_batch("CREATE TABLE payloads(id INTEGER PRIMARY KEY, payload BLOB);")
                 .unwrap();
@@ -1115,19 +985,16 @@ mod tests {
             }
             tx.commit().unwrap();
 
-            let main_before = std::fs::metadata(&path).unwrap().len();
-            let (log_frames, backfilled) = shm_checkpoint_state(&path);
-            assert!(log_frames > 0, "fixture wrote no WAL frames");
-            assert_eq!(
-                backfilled, 0,
-                "fixture checkpointed before the close; the close has nothing left to credit"
+            assert!(
+                conn.wal_hook.outstanding_frames() > 0,
+                "the WAL hook did not observe the fixture's committed frames"
             );
             assert_eq!(
                 crate::write_ledger::pending_for_test(WriteDomain::CallgraphCheckpoint, &root).1,
                 credited_before,
                 "no checkpoint should have been credited before the close"
             );
-            (page_size, u64::from(log_frames - backfilled), main_before)
+            (page_size, std::fs::metadata(&path).unwrap().len())
         };
 
         let credited =
@@ -1136,22 +1003,23 @@ mod tests {
                 .saturating_sub(credited_before);
         let main_growth = std::fs::metadata(&path).unwrap().len() - main_before;
 
-        // Persistent WAL retains the sidecars after close. Check the backfill
-        // count and query a copy of the main file alone to prove its contents
-        // reached the database rather than merely surviving in the WAL.
         assert!(wal_path(&path).exists());
         let (log_frames, backfilled) = shm_checkpoint_state(&path);
         assert_eq!(log_frames, backfilled);
         assert_eq!(
-            credited,
-            outstanding_frames * page_size,
-            "close-checkpoint credit must equal the frames it backfilled \
-             (frames={outstanding_frames}, page_size={page_size}, main_growth={main_growth})"
+            credited, 0,
+            "an unobservable close checkpoint must not receive guessed credit"
         );
         assert!(
-            main_growth.abs_diff(credited) <= 4 * page_size,
-            "credited {credited} bytes but the main file grew by {main_growth}"
+            main_growth > 0 && main_growth % page_size == 0,
+            "fixture did not make the close checkpoint write the main file: {main_growth}"
         );
+        assert!(
+            crate::write_ledger::seam_labels_for_test(WriteDomain::Other, &root)
+                .iter()
+                .any(|label| label == CLOSE_CHECKPOINT_RESIDUAL)
+        );
+
         let standalone = dir.path().join("standalone.sqlite");
         std::fs::copy(&path, &standalone).unwrap();
         let reopened = Connection::open(&standalone).unwrap();
@@ -1161,13 +1029,12 @@ mod tests {
         assert_eq!(rows, 256);
     }
 
-    /// The close-time credit reads the WAL and WAL-index files and issues no
-    /// SQL, so it must not move SQLite's checkpoint policy. Running the same
-    /// workload through a plain connection and a tracked one pins that: both
-    /// have to reach the close having checkpointed the same number of times and
-    /// leave the same main file behind.
+    /// Residual accounting issues no SQL and must not move SQLite's checkpoint
+    /// policy. Running the same workload through a plain connection and a
+    /// tracked one pins that: both have to reach the close having checkpointed
+    /// the same number of times and leave the same main file behind.
     #[test]
-    fn crediting_the_close_checkpoint_does_not_add_a_checkpoint() {
+    fn leaving_close_checkpoint_bytes_unattributed_does_not_add_a_checkpoint() {
         const THRESHOLD: i64 = 8;
         let dir = tempfile::tempdir().unwrap();
 
@@ -1216,7 +1083,7 @@ mod tests {
         );
         assert_eq!(
             tracked_checkpoints, builtin_checkpoints,
-            "crediting the close changed how often SQLite checkpoints"
+            "residual accounting changed how often SQLite checkpoints"
         );
         assert!(!wal_path(&builtin_path).exists());
         assert!(wal_path(&tracked_path).exists());
@@ -1229,12 +1096,11 @@ mod tests {
         );
     }
 
-    /// A restarted WAL whose frames run past the previous WAL's high-water mark
-    /// is the case a frame-number comparison cannot see, so it is the case that
-    /// silently dropped the frames below that mark. Two transactions, the second
-    /// larger than the first, reproduce it.
+    /// A restarted WAL that outgrows the previous generation is indistinguishable
+    /// from an append when only frame counts are available. The safe result is a
+    /// conservative credit plus a named residual, not a WAL-index header read.
     #[test]
-    fn credit_survives_a_wal_restart_into_a_longer_log() {
+    fn longer_wal_restart_drops_ambiguous_credit_into_residual() {
         const THRESHOLD: i64 = 8;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal-restart.sqlite");
@@ -1275,9 +1141,6 @@ mod tests {
             }
             tx.commit().unwrap();
             let (log_frames, backfilled) = shm_checkpoint_state(&path);
-            // Each commit's autocheckpoint has to drain its WAL completely,
-            // otherwise SQLite never restarts the log and the case under test
-            // does not arise.
             assert_eq!(
                 log_frames, backfilled,
                 "commit of {rows} rows left an undrained WAL"
@@ -1289,6 +1152,7 @@ mod tests {
             crate::write_ledger::pending_for_test(WriteDomain::CallgraphCheckpoint, &root)
                 .1
                 .saturating_sub(credited_before);
+        drop(conn);
 
         assert!(
             log_lengths[1] > log_lengths[0],
@@ -1296,9 +1160,17 @@ mod tests {
         );
         assert_eq!(
             credited,
-            backfilled_frames * page_size,
-            "credit lost the frames below the previous log's high-water mark \
-             (logs={log_lengths:?}, frames={backfilled_frames})"
+            u64::from(log_lengths[1]) * page_size,
+            "the conservative baseline should credit only count movement"
+        );
+        assert!(
+            credited < backfilled_frames * page_size,
+            "the ambiguous restarted frames must remain uncredited"
+        );
+        assert!(
+            crate::write_ledger::seam_labels_for_test(WriteDomain::Other, &root)
+                .iter()
+                .any(|label| label == AMBIGUOUS_WAL_RESTART_RESIDUAL)
         );
     }
 

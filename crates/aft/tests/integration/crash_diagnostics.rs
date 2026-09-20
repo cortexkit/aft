@@ -293,10 +293,14 @@ mod unix {
     #[test]
     fn sqlite_credit_hook_keeps_dms_read_lock() {
         let dir = tempfile::tempdir().unwrap();
-        let output = lock_probe_command("tracked", &dir.path().join("probe.sqlite")).output().unwrap();
+        let output = lock_probe_command("tracked", &dir.path().join("probe.sqlite"))
+            .output()
+            .unwrap();
         let stderr = String::from_utf8_lossy(&output.stderr);
+        eprint!("{stderr}");
         assert!(output.status.success(), "{stderr}");
         assert!(stderr.contains("DMS_LOCK=held"), "credit hook released DMS: {stderr}");
+        assert!(stderr.contains("DMS_WRITE=EAGAIN"), "{stderr}");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -356,16 +360,29 @@ mod unix {
             }
             return;
         }
-        let tracked;
-        let raw;
-        let connection: &rusqlite::Connection = if role == "tracked" {
-            tracked = aft::db::TrackedConnection::open(&path, aft::db::SqliteStore::AftDb).unwrap();
-            tracked.set_wal_autocheckpoint(1).unwrap();
-            &tracked
-        } else {
-            raw = rusqlite::Connection::open(&path).unwrap();
-            &raw
-        };
+        if role == "tracked" {
+            let connection =
+                aft::db::TrackedConnection::open(&path, aft::db::SqliteStore::AftDb).unwrap();
+            connection.set_wal_autocheckpoint(1).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode=WAL; CREATE TABLE t(value); INSERT INTO t VALUES(42);",
+                )
+                .unwrap();
+            let output = lock_probe_command("observer", &path).output().unwrap();
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+            assert!(output.status.success());
+            assert_eq!(
+                connection
+                    .query_row("SELECT value FROM t", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                42
+            );
+            eprintln!("MAPPING_SURVIVED");
+            return;
+        }
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        let connection = &raw;
         connection
             .execute_batch(
                 "PRAGMA journal_mode=WAL; CREATE TABLE t(value); INSERT INTO t VALUES(42); BEGIN;",
