@@ -11,14 +11,26 @@ afterAll(() => {
   mock.restore();
 });
 
+// These stand in for a real OpenTUI renderer so sidebar.tsx can be imported
+// without one. They must still behave like JSX: a factory that returns null
+// without invoking its component makes every component in the process inert,
+// and Bun's mock.module outlives mock.restore() (see the CONSTRAINTS note on
+// cross-file mock leakage), so a dishonest factory here silently breaks any
+// later file whose subject renders. Invoking the component and discarding its
+// output keeps this file's isolation while leaving those tests true.
+const renderComponent = (type: unknown, props: unknown): null => {
+  if (typeof type === "function") (type as (p: unknown) => unknown)(props);
+  return null;
+};
+
 mock.module("@opentui/solid/jsx-dev-runtime", () => ({
   Fragment: (props: { children?: unknown }) => props.children,
-  jsxDEV: () => null,
+  jsxDEV: renderComponent,
 }));
 mock.module("@opentui/solid/jsx-runtime", () => ({
   Fragment: (props: { children?: unknown }) => props.children,
-  jsx: () => null,
-  jsxs: () => null,
+  jsx: renderComponent,
+  jsxs: renderComponent,
 }));
 mock.module("solid-js", () => ({
   createEffect: () => undefined,
