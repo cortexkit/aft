@@ -318,6 +318,12 @@ pub fn handle_inspect_tool_call(req: &RawRequest, ctx: &AppContext) -> Response 
     let snapshot = match inspect_preflight(req, ctx) {
         Ok(snapshot) => snapshot,
         Err(response) => {
+            if matches!(
+                response.data.get("code").and_then(Value::as_str),
+                Some("path_not_found" | "path_outside_root")
+            ) {
+                return response;
+            }
             let detail = response
                 .data
                 .get("message")

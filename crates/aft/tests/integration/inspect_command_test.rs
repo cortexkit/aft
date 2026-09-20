@@ -184,6 +184,35 @@ fn configured_context_with_callgraph_store(root: &Path, callgraph_store: bool) -
 /// `configured_context` with an explicit whole-inspect deadline. The server
 /// reserves terminal-egress time inside this value, and timeout detail still
 /// carries the configured budget.
+fn configured_restricted_context(root: &Path) -> AppContext {
+    crate::helpers::disable_in_process_file_watcher();
+    let storage_dir = root.join(".aft-test-storage");
+    let ctx = AppContext::new(
+        Box::new(TreeSitterProvider::new()),
+        Config {
+            storage_dir: Some(storage_dir.clone()),
+            ..Config::default()
+        },
+    );
+    ctx.isolate_cold_build_limiter_for_test(2);
+    let configure = request(json!({
+        "id": "configure-restricted",
+        "command": "configure",
+        "harness": "opencode",
+        "project_root": root.to_string_lossy(),
+        "storage_dir": storage_dir.to_string_lossy(),
+        "config": crate::helpers::user_config(serde_json::json!({
+            "search_index": false,
+            "semantic_search": false,
+            "restrict_to_project_root": true
+        })),
+    }));
+    let response = serde_json::to_value(handle_configure(&configure, &ctx))
+        .expect("configure response serializes");
+    assert_eq!(response["success"], true, "configure failed: {response:#}");
+    ctx
+}
+
 fn configured_context_with_diagnostics_timeout(root: &Path, timeout_ms: u64) -> AppContext {
     crate::helpers::disable_in_process_file_watcher();
     let storage_dir = root.join(".aft-test-storage");
@@ -282,6 +311,19 @@ fn ensure_callgraph_store_ready(ctx: &AppContext) {
             }
         }
     }
+}
+
+fn inspect_tool_call(ctx: &AppContext, payload: Value) -> Value {
+    serde_json::to_value(handle_inspect_tool_call(&request(payload), ctx))
+        .expect("inspect tool_call response serializes")
+}
+
+fn configure_fake_scope_lsp(ctx: &AppContext) {
+    ctx.lsp()
+        .override_binary(ServerKind::Rust, fake_server_path());
+    ctx.lsp()
+        .override_binary(ServerKind::TypeScript, fake_server_path());
+    ctx.lsp().set_extra_env("AFT_FAKE_LSP_PULL", "1");
 }
 
 fn inspect(ctx: &AppContext, payload: Value) -> Value {
@@ -433,7 +475,7 @@ fn inspect_command_todos_summary_uses_production_dispatch() {
         "src/app.ts",
         "// TODO: assert production dispatch reaches todos scanner\nexport function app() { return 1; }\n",
     );
-    let ctx = configured_context(&root);
+    let ctx = configured_restricted_context(&root);
 
     let response = inspect(
         &ctx,
@@ -2058,6 +2100,233 @@ fn inspect_command_dead_code_resolves_extensionless_package_module_entry_after_t
     assert_eq!(
         response["summary"]["dead_code"]["count"], 0,
         "extensionless package module entry should be public API: {response:#}"
+    );
+}
+
+fn alternate_duplicate_fixture_source() -> &'static str {
+    r#"
+export function formatRecords(items: string[]) {
+  let output = "";
+  for (const item of items) {
+    if (item.length > 4) {
+      output += item.toUpperCase();
+    } else {
+      output += item.toLowerCase();
+    }
+    output += ":";
+  }
+  return output;
+}
+"#
+}
+
+#[test]
+fn inspect_tool_call_refuses_space_separated_scope_as_one_missing_path() {
+    let (_temp_dir, root) = fixture_project();
+    write_file(&root, "crates/one/src/lib.rs", "pub fn one() {}\n");
+    write_file(&root, "crates/two/src/lib.rs", "pub fn two() {}\n");
+    let ctx = configured_context(&root);
+    let spelling = "crates/one/src crates/two/src";
+
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-space-separated-scope",
+            "command": "inspect",
+            "scope": spelling,
+            "sections": ["duplicates"],
+        }),
+    );
+
+    assert_eq!(response["success"], false, "response: {response:#}");
+    assert_eq!(response["code"], "path_not_found", "response: {response:#}");
+    let message = response["message"].as_str().expect("error message");
+    assert!(message.contains(spelling), "response: {response:#}");
+    assert!(
+        message.contains("scope accepts one path string or an array of paths"),
+        "response: {response:#}"
+    );
+}
+
+#[test]
+fn inspect_tool_call_distinguishes_outside_root_from_missing_scope() {
+    let (_temp_dir, root) = fixture_project();
+    let outside = tempfile::tempdir().expect("outside project tempdir");
+    let ctx = configured_restricted_context(&root);
+
+    let outside_response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-outside-scope",
+            "command": "inspect",
+            "scope": outside.path().to_string_lossy(),
+        }),
+    );
+    let missing_response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-missing-scope",
+            "command": "inspect",
+            "scope": "missing/src",
+        }),
+    );
+
+    assert_eq!(
+        outside_response["code"], "path_outside_root",
+        "response: {outside_response:#}"
+    );
+    assert_eq!(
+        missing_response["code"], "path_not_found",
+        "response: {missing_response:#}"
+    );
+    assert_ne!(outside_response["code"], missing_response["code"]);
+}
+
+#[test]
+fn inspect_tool_call_refuses_mixed_scope_array_with_missing_element() {
+    let (_temp_dir, root) = fixture_project();
+    fs::create_dir_all(root.join("crates/one/src")).expect("first scope root");
+    fs::create_dir_all(root.join("crates/two/src")).expect("second scope root");
+    let ctx = configured_context(&root);
+
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-partial-scope",
+            "command": "inspect",
+            "scope": ["crates/one/src", "crates/missing/src", "crates/two/src"],
+        }),
+    );
+
+    assert_eq!(response["success"], false, "response: {response:#}");
+    assert_eq!(response["code"], "path_not_found", "response: {response:#}");
+    assert!(
+        response["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("crates/missing/src")),
+        "response: {response:#}"
+    );
+}
+
+#[test]
+fn inspect_tool_call_multiple_roots_reports_combined_corpus_and_duplicates() {
+    let (_temp_dir, root) = fixture_project();
+    for file in ["left.ts", "right.ts"] {
+        write_file(
+            &root,
+            &format!("crates/alpha/src/{file}"),
+            duplicate_fixture_source(),
+        );
+        write_file(
+            &root,
+            &format!("crates/beta/src/{file}"),
+            alternate_duplicate_fixture_source(),
+        );
+    }
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    ensure_callgraph_store_ready(&ctx);
+    configure_fake_scope_lsp(&ctx);
+    tier2_run(
+        &ctx,
+        &[
+            "dead_code",
+            "unused_exports",
+            "duplicates",
+            "cycles",
+            "complexity",
+        ],
+    );
+
+    let call = |id: &str, scope: Value| {
+        inspect_tool_call(
+            &ctx,
+            json!({
+                "id": id,
+                "command": "inspect",
+                "scope": scope,
+                "sections": ["duplicates"],
+            }),
+        )
+    };
+    let alpha = call("inspect-alpha-scope", json!("crates/alpha/src"));
+    let beta = call("inspect-beta-scope", json!("crates/beta/src"));
+    let combined = call(
+        "inspect-combined-scope",
+        json!(["crates/alpha/src", "crates/beta/src"]),
+    );
+
+    for response in [&alpha, &beta, &combined] {
+        assert_eq!(response["success"], true, "response: {response:#}");
+    }
+    assert_eq!(
+        combined["scope_roots"],
+        json!(["crates/alpha/src", "crates/beta/src"])
+    );
+    assert_eq!(combined["scope_files"], 4);
+    assert!(
+        combined["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("scope: 2 roots, 4 files\n")),
+        "response: {combined:#}"
+    );
+    let alpha_count = alpha["summary"]["duplicates"]["count"]
+        .as_u64()
+        .expect("alpha duplicate count");
+    let beta_count = beta["summary"]["duplicates"]["count"]
+        .as_u64()
+        .expect("beta duplicate count");
+    assert!(alpha_count > 0, "response: {alpha:#}");
+    assert!(beta_count > 0, "response: {beta:#}");
+    assert_eq!(
+        combined["summary"]["duplicates"]["count"],
+        alpha_count + beta_count,
+        "disjoint scoped duplicate counts should add: {combined:#}"
+    );
+}
+
+#[test]
+fn inspect_tool_call_empty_analyzed_scope_uses_zero_denominator() {
+    let (_temp_dir, root) = fixture_project();
+    fs::create_dir_all(root.join("docs")).expect("docs-only scope root");
+    write_file(&root, "src/main.ts", "export const outsideScope = 1;\n");
+    let ctx = configured_context_with_callgraph_store(&root, true);
+    ensure_callgraph_store_ready(&ctx);
+    tier2_run(
+        &ctx,
+        &[
+            "dead_code",
+            "unused_exports",
+            "duplicates",
+            "cycles",
+            "complexity",
+        ],
+    );
+
+    let response = inspect_tool_call(
+        &ctx,
+        json!({
+            "id": "inspect-empty-corpus-scope",
+            "command": "inspect",
+            "scope": "docs",
+            "sections": ["duplicates"],
+        }),
+    );
+
+    assert_eq!(response["success"], true, "response: {response:#}");
+    assert_eq!(response["scope_roots"], json!(["docs"]));
+    assert_eq!(response["scope_files"], 0);
+    assert_eq!(response["no_files_matched_scope"], true);
+    assert_eq!(response["summary"]["duplicates"]["total_analyzed_lines"], 0);
+    let text = response["text"].as_str().expect("rendered inspect text");
+    assert!(
+        text.starts_with("scope: 1 root, 0 files (no analyzed files under this scope)\n"),
+        "response: {response:#}"
+    );
+    assert!(
+        text.contains(
+            "Duplicates: 0 duplicated lines (0.0% of 0 analyzed lines) across 0 files, 0 groups"
+        ),
+        "response: {response:#}"
     );
 }
 
