@@ -109,11 +109,20 @@ const acceptanceMatrix: AcceptanceRow[] = [
     testFile: "matrix/acceptance-matrix.test.ts",
     testPattern: "oc2-ga-2.0.3",
   },
+  {
+    sliceId: "S10",
+    claim:
+      "GA pin move to @opencode/*@2.0.11 re-derives every relied-on contract point from the unpacked dist, including the client permission.create the 2.0.3 audit reported as absent",
+    governingSource: "GA delta audit oc2-ga-2.0.11",
+    testFile: "matrix/acceptance-matrix.test.ts",
+    testPattern: "oc2-ga-2.0.11",
+  },
 ];
 
 describe("OpenCode V2 delta audit evidence", () => {
   const betaAuditFile = join(testDir, "delta-audit-beta-19234.md");
   const gaAuditFile = join(testDir, "delta-audit-ga-2.0.3.md");
+  const currentAuditFile = join(testDir, "delta-audit-ga-2.0.11.md");
 
   test("beta evidence remains on disk", () => {
     expect(existsSync(betaAuditFile)).toBe(true);
@@ -141,11 +150,40 @@ describe("OpenCode V2 delta audit evidence", () => {
     expect(content).toContain("dist/effect/plugin.d.ts");
     expect(content).toContain("dist/host.js");
   });
+
+  test("current GA evidence records the exact 2.0.11 pin and source-derived record", () => {
+    expect(existsSync(currentAuditFile)).toBe(true);
+    const content = readFileSync(currentAuditFile, "utf8");
+    expect(content).toContain("@opencode/*@2.0.11");
+    expect(content).toContain("oc2-ga-2.0.11");
+    expect(content).toContain("2026-09-20T08:57:16.764Z");
+  });
+
+  test("current GA evidence diffs every relied-on contract line with dist citations", () => {
+    const content = readFileSync(currentAuditFile, "utf8");
+    for (let line = 1; line <= 15; line += 1) {
+      expect(content).toContain(`${line}. **`);
+    }
+    expect(content).toContain("@opencode/client@2.0.11/dist/promise/client.d.ts");
+    expect(content).toContain("@opencode/plugin@2.0.11/dist/effect/plugin.d.ts");
+    expect(content).toContain("@opencode/plugin@2.0.11/dist/host.js");
+    expect(content).toContain("@opencode/core@2.0.11/dist/chunks/");
+  });
+
+  test("the current audit retires 37164 on the client path and keeps 48340 on the V1 host", () => {
+    const content = readFileSync(currentAuditFile, "utf8");
+    // The audit's second contract point is what decides the matrix's permission
+    // rows: the client API AFT calls does expose permission.create, so an
+    // upstream feature request cannot stand in as the reason those rows fail.
+    expect(content).toContain("PermissionCreateInput");
+    expect(content).toContain("issues/37164");
+    expect(content).toContain("opencode-ai@1.18.29");
+  });
 });
 
 describe("OpenCode V2 acceptance matrix", () => {
-  test("every slice S1 through S9 is represented", () => {
-    const requiredSlices = ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9"];
+  test("every slice S1 through S10 is represented", () => {
+    const requiredSlices = ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10"];
     const presentSlices = new Set(acceptanceMatrix.map((row) => row.sliceId));
     for (const slice of requiredSlices) {
       expect(presentSlices.has(slice as AcceptanceRow["sliceId"])).toBe(true);
