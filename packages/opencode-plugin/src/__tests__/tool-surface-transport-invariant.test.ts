@@ -135,9 +135,7 @@ describe("tool surface transport invariance", () => {
     expect(description).toContain(
       "`symbol` and `content` are only meaningful together; a call carrying one without the other is incomplete.",
     );
-    const editArgs = edit?.args as
-      | Record<string, { description?: string } | undefined>
-      | undefined;
+    const editArgs = edit?.args as Record<string, { description?: string } | undefined> | undefined;
     expect(editArgs?.symbol?.description).toContain("only meaningful together with `content`");
     expect(editArgs?.symbol?.description).toContain("one without the other is incomplete");
     expect(editArgs?.content?.description).toContain("only meaningful together with `symbol`");
