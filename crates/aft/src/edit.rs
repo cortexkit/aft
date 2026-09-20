@@ -18,38 +18,30 @@ use crate::parser::{detect_language, grammar_for, FileParser};
 /// Tree-sitter columns are byte-indexed within the line, so `col` is a byte
 /// offset from the start of the line (not a character offset).
 ///
-/// Scans raw bytes so both LF and CRLF line endings are counted correctly.
-/// Returns `source.len()` if line is beyond the end of the file.
+/// Walks LF-delimited segments so a lone carriage return remains line content.
+/// CRLF line endings still advance past both bytes. Returns `source.len()` if
+/// `line` is beyond the end of the file.
 pub fn line_col_to_byte(source: &str, line: u32, col: u32) -> usize {
-    let bytes = source.as_bytes();
     let target_line = line as usize;
-    let mut current_line = 0usize;
     let mut line_start = 0usize;
 
-    loop {
-        let mut line_end = line_start;
-        while line_end < bytes.len() && bytes[line_end] != b'\n' && bytes[line_end] != b'\r' {
-            line_end += 1;
-        }
-
-        if current_line == target_line {
-            return line_start + (col as usize).min(line_end.saturating_sub(line_start));
-        }
-
-        if line_end >= bytes.len() {
-            return source.len();
-        }
-
-        line_start = if bytes[line_end] == b'\r'
-            && line_end + 1 < bytes.len()
-            && bytes[line_end + 1] == b'\n'
-        {
-            line_end + 2
+    for (index, segment) in source.split_inclusive('\n').enumerate() {
+        let line_with_possible_cr = segment.strip_suffix('\n').unwrap_or(segment);
+        let line_text = if segment.ends_with("\r\n") {
+            line_with_possible_cr
+                .strip_suffix('\r')
+                .unwrap_or(line_with_possible_cr)
         } else {
-            line_end + 1
+            line_with_possible_cr
         };
-        current_line += 1;
+
+        if index == target_line {
+            return line_start + (col as usize).min(line_text.len());
+        }
+        line_start += segment.len();
     }
+
+    source.len()
 }
 
 pub(crate) fn validate_byte_range(source: &str, start: usize, end: usize) -> Result<(), AftError> {
@@ -713,6 +705,17 @@ mod tests {
         let source = "ab\ncd";
         // col=10 on a 2-char line should clamp to 2
         assert_eq!(line_col_to_byte(source, 0, 10), 2);
+    }
+
+    #[test]
+    fn line_col_to_byte_treats_bare_cr_as_content() {
+        let source = "alpha\rbeta\ngamma\n";
+        let offsets = [
+            line_col_to_byte(source, 0, 0),
+            line_col_to_byte(source, 1, 0),
+            line_col_to_byte(source, 2, 0),
+        ];
+        assert_eq!(offsets, [0, 11, 17]);
     }
 
     #[test]

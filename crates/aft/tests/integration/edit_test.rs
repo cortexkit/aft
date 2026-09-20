@@ -1382,6 +1382,30 @@ fn batch_line_range_edit() {
 }
 
 #[test]
+fn batch_line_range_edit_with_bare_cr_replaces_the_requested_lf_line() {
+    let mut aft = AftProcess::spawn();
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch_bare_cr.txt");
+    fs::write(&target, "alpha\rbeta\ngamma\n").unwrap();
+
+    let req = serde_json::json!({
+        "id": "b-bare-cr",
+        "command": "batch",
+        "file": target.display().to_string(),
+        "edits": [
+            { "line_start": 2, "line_end": 2, "content": "replacement" }
+        ]
+    });
+    let resp = aft.send(&serde_json::to_string(&req).unwrap());
+
+    assert_eq!(resp["success"], true, "batch line-range should succeed: {resp:?}");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "alpha\rbeta\nreplacement\n");
+
+    let status = aft.shutdown();
+    assert!(status.success());
+}
+
+#[test]
 fn batch_line_range_append_to_empty_file_does_not_prepend_newline() {
     let mut aft = AftProcess::spawn();
     let dir = tempfile::tempdir().unwrap();
