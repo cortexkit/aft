@@ -112,7 +112,7 @@ const acceptanceMatrix: AcceptanceRow[] = [
   {
     sliceId: "S10",
     claim:
-      "GA pin move to @opencode/*@2.0.11 re-derives every relied-on contract point from the unpacked dist, and confirms from the plugin context type that a server plugin is handed no client and a permission facade without create",
+      "GA pin move to @opencode/*@2.0.11 re-derives every relied-on contract point from the unpacked dist, and records both that the client package declares permission.create and that the server plugin context is never handed that client",
     governingSource: "GA delta audit oc2-ga-2.0.11",
     testFile: "matrix/acceptance-matrix.test.ts",
     testPattern: "oc2-ga-2.0.11",
@@ -170,7 +170,7 @@ describe("OpenCode V2 delta audit evidence", () => {
     expect(content).toContain("@opencode/core@2.0.11/dist/chunks/");
   });
 
-  test("the current audit keeps 37164 on our path and keeps 48340 on the V1 host", () => {
+  test("the current audit separates the client declaration from who receives it", () => {
     const content = readFileSync(currentAuditFile, "utf8");
     // The audit records two independent facts about permissions: that the
     // @opencode/client package declares permission.create, and that the server

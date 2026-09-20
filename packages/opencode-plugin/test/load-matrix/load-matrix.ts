@@ -26,7 +26,7 @@ import {
 const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const repoRoot = join(pluginRoot, "../..");
 const packageName = "@cortexkit/aft-opencode";
-const v2Version = "2.0.11";
+const v2Version = "2.0.3";
 const v2CoreVersion = v2Version;
 const allowLiveOperatorWrites = process.env.AFT_LOAD_MATRIX_ALLOW_LIVE_OPERATOR === "1";
 const suiteTempParent = join(pluginRoot, "tmp");
@@ -993,7 +993,7 @@ describe("packed module shapes", () => {
     expect(Object.keys(manifest.exports).sort()).toEqual([".", "./server", "./tui"]);
     expect(manifest.dependencies.effect).toBe("4.0.0-rc.112");
     expect(manifest.peerDependencies["@opencode-ai/plugin"]).toBe(">=0.0.0-beta-0");
-    expect(manifest.peerDependencies["@opencode/plugin"]).toBe("2.0.11");
+    expect(manifest.peerDependencies["@opencode/plugin"]).toBe("2.0.3");
   });
 
   test("operator canary detects same-size byte changes", async () => {
