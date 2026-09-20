@@ -8,8 +8,10 @@ name or a moving dependency.
 
 ## Reproducible generation
 
-Regeneration uses only Python 3's standard library.  It does not import AFT,
-load a Cargo workspace, access Bun, or read a network checkout:
+Regeneration uses Python 3's standard library and does not import AFT, load a
+Cargo workspace, access Bun, or read a network checkout. If the optional Python
+`xxhash` module is installed, the generator also compares every digest with its
+C binding and refuses to write files when they disagree:
 
 ```text
 python3 crates/aft/src/hashline/oracle/regenerate.py
@@ -49,9 +51,12 @@ explicit owner-decision, written-justification, and two-sided-control process.
 ## xxHash32 parity
 
 `xxhash32_seed_zero.json` contains seed-zero vectors and
-`tag_normalization.json` contains raw/normalized tag vectors.  The three
-literal anchors in the generator and the Rust unit tests (`empty`, `a`, and
-`abc`) are independent cross-language checks.  `xxhash32_vectors.rs` lets the
-Rust tests validate every committed digest without a JSON or AFT dependency.
-The tag implementation strips only `[ \\t\\r]+` immediately before LF and at
-EOF, then renders the low sixteen bits as uppercase hexadecimal.
+`tag_normalization.json` contains raw/normalized tag vectors. The immutable
+anchors in the generator and Rust unit tests include the 16-byte and 17-byte
+accumulator boundary, the 26-byte alphabet (`63A14D5F`), the 43-byte quick-brown
+fox (`E85EA4DE`), and a 4 KiB input. Those expected values come from the
+`xxhash` C binding at seed zero, independently of the generator implementation.
+`xxhash32_vectors.rs` lets the Rust tests validate every committed digest
+without a JSON or AFT dependency. The tag implementation strips only
+`[ \\t\\r]+` immediately before LF and at EOF, then renders the low sixteen bits
+as uppercase hexadecimal.

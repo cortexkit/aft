@@ -8,7 +8,7 @@
   },
   "generator": {
     "path": "regenerate.py",
-    "runtime": "Python 3 standard library only",
+    "runtime": "Python 3 standard library with optional xxhash C-reference check",
     "command": "python3 crates/aft/src/hashline/oracle/regenerate.py --check",
     "uses_aft_crates": false
   },
@@ -16,22 +16,22 @@
     "path": "fixtures.jsonl",
     "format": "one canonical JSON object per line, sorted keys",
     "count": 128,
-    "sha256": "b1ce3a86f913a0346ba985c822577244a344ec35d8f2fae4f0d391e01227bf7d"
+    "sha256": "4e9b8b4cfb5537567b897f238c4282a2b193b261575ffca94072e3ab29fd376f"
   },
   "vectors": {
     "xxhash32_seed_zero": {
       "path": "xxhash32_seed_zero.json",
-      "count": 21,
-      "sha256": "2dce5a981cb52a0bbaefac8785279ba6d0d443fadc28eb6d573ce761d8e9641b"
+      "count": 22,
+      "sha256": "426a28da0d6756811e7842c30d354596d1225d2bc7fd67630b9b75e4c6e49495"
     },
     "tag_normalization": {
       "path": "tag_normalization.json",
       "count": 12,
-      "sha256": "830d1ee5a2553f7a3de34029efc1742e59fd1558a51afcb59ca5535d6b5494d5"
+      "sha256": "b104117c899981dbe1977765bec39eab8418d4bd43d40faa2317d2dc5bef9885"
     },
     "rust_source": {
       "path": "xxhash32_vectors.rs",
-      "sha256": "6e1cbb629615b4a7171312b0ab4e9d8bcf90389f4c89b3cf8ce00931c8d866c2"
+      "sha256": "59abc2a95fd739dbf81ebfe564cca1f4cb5267eb98d80ba217351630a239eade"
     }
   },
   "deviation_categories": [

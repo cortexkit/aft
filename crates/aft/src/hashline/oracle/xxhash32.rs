@@ -21,12 +21,6 @@ fn round(accumulator: u32, lane: u32) -> u32 {
     rotate_left(accumulator.wrapping_add(lane.wrapping_mul(PRIME2)), 13).wrapping_mul(PRIME1)
 }
 
-#[inline]
-fn merge_round(mut accumulator: u32, lane: u32) -> u32 {
-    accumulator ^= round(0, lane);
-    accumulator.wrapping_mul(PRIME1).wrapping_add(PRIME4)
-}
-
 /// Compute xxHash32 with the supplied seed.
 ///
 /// The byte order is explicitly little-endian, matching the pinned Bun
@@ -66,10 +60,6 @@ pub fn xxhash32(input: &[u8], seed: u32) -> u32 {
             .wrapping_add(rotate_left(lane2, 7))
             .wrapping_add(rotate_left(lane3, 12))
             .wrapping_add(rotate_left(lane4, 18));
-        result = merge_round(result, lane1);
-        result = merge_round(result, lane2);
-        result = merge_round(result, lane3);
-        result = merge_round(result, lane4);
     } else {
         result = seed.wrapping_add(PRIME5);
     }
@@ -139,6 +129,37 @@ mod tests {
     }
 
     #[test]
+    fn seed_zero_long_input_anchors_match_the_xxhash_c_binding() {
+        // Independent reference: Python's `xxhash` C binding, seed 0.
+        assert_eq!(
+            xxhash32_seed_zero(b"abcdefghijklmnopqrstuvwxyz"),
+            0x63A1_4D5F,
+            "26-byte alphabet"
+        );
+        assert_eq!(
+            xxhash32_seed_zero(b"The quick brown fox jumps over the lazy dog"),
+            0xE85E_A4DE,
+            "43-byte quick-brown-fox sentence"
+        );
+        assert_eq!(
+            xxhash32_seed_zero(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
+            0xB728_37F4,
+            "16-byte accumulator boundary"
+        );
+        assert_eq!(
+            xxhash32_seed_zero(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,]),
+            0x7C77_ADC2,
+            "17-byte accumulator boundary"
+        );
+        let over_one_kib = (0u8..=u8::MAX).cycle().take(4096).collect::<Vec<_>>();
+        assert_eq!(
+            xxhash32_seed_zero(&over_one_kib),
+            0x693C_0BC2,
+            "4 KiB repeated byte range"
+        );
+    }
+
+    #[test]
     fn committed_vector_source_matches_the_implementation() {
         for &(input, expected) in PINNED_XXHASH32_SEED_ZERO {
             assert_eq!(xxhash32_seed_zero(input), expected);
@@ -161,7 +182,7 @@ mod tests {
     #[test]
     fn tags_are_uppercase_four_hex_digits() {
         let tag = tag_for(b"alpha\nbeta\ngamma\n");
-        assert_eq!(tag, "5794");
+        assert_eq!(tag, "B6C1");
         assert_eq!(tag_for(b"alpha \t\r\nbeta\r\ngamma\r\n"), tag);
         assert_eq!(tag.len(), 4);
         assert!(tag.bytes().all(|byte| byte.is_ascii_hexdigit()));

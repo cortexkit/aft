@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Rebuild the pinned hashline oracle corpus without AFT dependencies.
 
-The generator uses only Python's standard library.  It deliberately keeps the
-oracle revision and every expected digest in the committed output so a local
-regeneration cannot silently follow a moving dependency.
+The generator uses Python's standard library for generation. When the optional
+``xxhash`` C binding is installed, every digest is checked against it before any
+output is written. The oracle revision and every expected digest stay committed
+so a local regeneration cannot silently follow a moving dependency.
 """
 
 from __future__ import annotations
@@ -72,10 +73,6 @@ def xxhash32(data: bytes, seed: int = SEED) -> int:
             + rotl32(v3, 12)
             + rotl32(v4, 18)
         ) & MASK32
-        for lane in (v1, v2, v3, v4):
-            merged = round32(0, lane)
-            result ^= merged
-            result = (result * P1 + P4) & MASK32
     else:
         result = (seed + P5) & MASK32
 
@@ -174,6 +171,7 @@ def build_xxhash_vectors() -> list[dict[str, Any]]:
         b"The quick brown fox jumps over the lazy dog.",
         bytes([0]),
         bytes(range(16)),
+        bytes(range(17)),
         bytes(range(32)),
         bytes(range(64)),
         bytes(range(128)),
@@ -185,21 +183,44 @@ def build_xxhash_vectors() -> list[dict[str, Any]]:
         bytes(range(256)) * 16,
         ("hashline\n" * 257).encode("utf-8"),
     ]
+
+    try:
+        import xxhash as xxhash_reference
+    except ImportError:
+        xxhash_reference = None
+
     vectors = []
     for index, data in enumerate(inputs):
+        digest = xxhash32(data)
+        if xxhash_reference is not None:
+            reference_digest = xxhash_reference.xxh32(data, seed=SEED).intdigest()
+            if digest != reference_digest:
+                raise AssertionError(
+                    f"xxHash32 C-reference mismatch for {data.hex()!r}: "
+                    f"{digest:08X} != {reference_digest:08X}"
+                )
         vectors.append(
             {
                 "id": f"xxh32-{index:03d}",
                 "oracle_revision": ORACLE_REVISION,
                 "seed": SEED,
                 "input_hex": data.hex(),
-                "xxhash32_hex": f"{xxhash32(data):08X}",
+                "xxhash32_hex": f"{digest:08X}",
             }
         )
 
-    # These three values are the immutable cross-language anchors.  Keeping
-    # literals here prevents a generator edit from redefining its own oracle.
-    anchors = {"": "02CC5D05", "61": "550D7456", "616263": "32D153FF"}
+    # Values from the `xxhash` C binding with seed zero. These exercise the
+    # four-lane path and its 16/17-byte boundary as well as a 4 KiB input.
+    anchors = {
+        b"".hex(): "02CC5D05",
+        b"a".hex(): "550D7456",
+        b"abc".hex(): "32D153FF",
+        bytes(range(16)).hex(): "B72837F4",
+        bytes(range(17)).hex(): "7C77ADC2",
+        b"abcdefghijklmnopqrstuvwxyz".hex(): "63A14D5F",
+        b"The quick brown fox jumps over the lazy dog".hex(): "E85EA4DE",
+        (bytes(range(256)) * 16).hex(): "693C0BC2",
+    }
     for vector in vectors:
         expected = anchors.get(vector["input_hex"])
         if expected is not None and vector["xxhash32_hex"] != expected:
@@ -575,7 +596,7 @@ def make_outputs() -> dict[str, bytes]:
         },
         "generator": {
             "path": "regenerate.py",
-            "runtime": "Python 3 standard library only",
+            "runtime": "Python 3 standard library with optional xxhash C-reference check",
             "command": "python3 crates/aft/src/hashline/oracle/regenerate.py --check",
             "uses_aft_crates": False,
         },
