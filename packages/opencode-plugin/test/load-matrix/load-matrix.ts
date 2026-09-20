@@ -1178,11 +1178,19 @@ describe("packed module shapes", () => {
 
   test("packed manifest retains discovery and all public subpaths", async () => {
     const manifest = JSON.parse(await readFile(join(packedRoot, "package.json"), "utf8"));
+    const source = JSON.parse(await readFile(join(pluginRoot, "package.json"), "utf8"));
     expect(manifest["oc-plugin"]).toBeUndefined();
     expect(Object.keys(manifest.exports).sort()).toEqual([".", "./server", "./tui"]);
     expect(manifest.dependencies.effect).toBe("4.0.0-rc.112");
     expect(manifest.peerDependencies["@opencode-ai/plugin"]).toBe(">=0.0.0-beta-0");
-    expect(manifest.peerDependencies["@opencode/plugin"]).toBe("2.0.3");
+    // Compared against the source manifest rather than a literal: this asks
+    // whether packing preserved the pin, which is the question, and a second
+    // copy of the version here is exactly the drift that broke this test when
+    // the GA pin moved to 2.0.11.
+    expect(manifest.peerDependencies["@opencode/plugin"]).toBe(
+      source.peerDependencies["@opencode/plugin"],
+    );
+    expect(manifest.peerDependencies["@opencode/plugin"]).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
   test("operator canary detects same-size byte changes", async () => {
