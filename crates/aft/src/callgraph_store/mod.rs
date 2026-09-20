@@ -7304,6 +7304,12 @@ fn publish_migrated_generation(
 }
 
 fn copy_sqlite_file_set(source: &Path, destination: &Path) -> Result<()> {
+    // Hold the filesystem guard for the entire copy so no tracked descriptor
+    // can open between checking that SQLite files are closed and copying them.
+    // On POSIX, closing any descriptor can discard every advisory lock this
+    // process holds on that inode, including locks from another descriptor.
+    let _files = crate::db::file_identity::filesystem_guard();
+    ensure_sqlite_files_closed(source)?;
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent)?;
     }
