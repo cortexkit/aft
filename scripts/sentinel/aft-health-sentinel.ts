@@ -479,11 +479,29 @@ function commandJson(command: string, args: string[]): any {
   if (result.status !== 0) throw new Error((result.stderr || result.stdout || `exit ${result.status}`).trim());
   return JSON.parse(result.stdout);
 }
-function newestPidLog(): { path: string; pid: number } {
-  const names = readdirSync(join(AFT, "logs")).filter((name) => /^aft-\d+\.log$/.test(name));
-  const path = names.map((name) => join(AFT, "logs", name)).sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)[0];
-  if (!path) throw new Error("no aft pid log");
-  return { path, pid: Number(basename(path).match(/\d+/)?.[0]) };
+// Any `aft` process writes its own `aft-<pid>.log` into the shared logs directory
+// (CLI probes, test binaries, standalone bridges), so the newest log is not
+// the daemon's. The daemon is the process whose command line carries `--subc`;
+// candidates are checked in mtime order and the first live daemon wins.
+export function isSubcDaemon(pid: number, ps: (pid: number) => string = psArgs): boolean {
+  const args = ps(pid);
+  return /(^|\/)(ck-aft|aft)\b/.test(args) && /\s--subc\b/.test(args);
+}
+function psArgs(pid: number): string {
+  const result = spawnSync("ps", ["-o", "args=", "-p", String(pid)], { encoding: "utf8" });
+  return result.status === 0 ? String(result.stdout).trim() : "";
+}
+export function daemonPidLog(
+  logDir = join(AFT, "logs"),
+  ps: (pid: number) => string = psArgs,
+): { path: string; pid: number } {
+  const names = readdirSync(logDir).filter((name) => /^aft-\d+\.log$/.test(name));
+  const paths = names.map((name) => join(logDir, name)).sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+  for (const path of paths) {
+    const pid = Number(basename(path).match(/\d+/)?.[0]);
+    if (isSubcDaemon(pid, ps)) return { path, pid };
+  }
+  throw new Error(`no aft pid log belongs to a running --subc daemon (${paths.length} candidate log(s))`);
 }
 function readNew(path: string, cursor?: { path?: string; offset?: number }): { lines: string[]; offset: number } {
   const size = statSync(path).size;
@@ -581,7 +599,7 @@ function collectSample(state: SentinelState): { sample: SentinelSample; cursors:
     sample.health = status.health ?? {};
   } catch (error) { sample.health_error = String(error); sample.supervisor = { running: false }; }
   try {
-    const current = newestPidLog();
+    const current = daemonPidLog();
     sample.supervisor = { ...(sample.supervisor ?? { running: true }), pid: current.pid };
     const read = readNew(current.path, state.log);
     sample.log_lines = read.lines;

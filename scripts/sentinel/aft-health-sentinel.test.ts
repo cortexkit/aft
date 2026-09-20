@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -26,6 +26,8 @@ import {
   writeGrowthAttribution,
   type SentinelSample,
   type SentinelState,
+  daemonPidLog,
+  isSubcDaemon,
 } from "./aft-health-sentinel";
 
 const NOW = Date.parse("2026-09-17T14:30:00Z");
@@ -355,4 +357,27 @@ test("preserved tier2 wedge replay raises the three causal findings", () => {
   replay.log_lines = [...limiterLines, `2026-09-17T10:42:27Z [aft] inspect-triggered cold-build slot acquired after 1ms wait: request=inspect:${worktree}:1 kind=explicit inspect Tier-2 run`];
   const found = [...detectLimiter({ ...replay, log_lines: limiterLines }), ...detectIndexes(replay), ...detectTier2Overlong({ ...replay, log_lines: replay.log_lines })];
   expect(rules(found)).toEqual(expect.arrayContaining(["limiter.saturated", "index.stuck", "tier2.pass_overlong"]));
+});
+
+describe("daemon pid discovery", () => {
+  test("the newest log is not the daemon when a CLI process wrote it last", () => {
+    const dir = mkdtempSync(join(tmpdir(), "aft-sentinel-pid-"));
+    writeFileSync(join(dir, "aft-74022.log"), "daemon\n");
+    writeFileSync(join(dir, "aft-171.log"), "cli probe\n");
+    const later = Date.now() / 1000 + 5;
+    utimesSync(join(dir, "aft-171.log"), later, later);
+    const ps = (pid: number) => (pid === 74022 ? "/Users/x/.local/share/cortexkit/bin/ck-aft --subc /Users/x/run/subc-connection.json" : pid === 171 ? "/Users/x/aft/target/debug/aft" : "");
+    expect(daemonPidLog(dir, ps).pid).toBe(74022);
+  });
+  test("no live daemon among the logs is an error, not a pid", () => {
+    const dir = mkdtempSync(join(tmpdir(), "aft-sentinel-pid-"));
+    writeFileSync(join(dir, "aft-171.log"), "cli probe\n");
+    expect(() => daemonPidLog(dir, () => "/Users/x/aft/target/debug/aft")).toThrow(/no aft pid log belongs to a running --subc daemon/);
+  });
+  test("isSubcDaemon requires the aft binary and the --subc flag", () => {
+    expect(isSubcDaemon(1, () => "/opt/bin/ck-aft --subc /run/c.json")).toBe(true);
+    expect(isSubcDaemon(1, () => "/opt/bin/ck-aft profile --writes")).toBe(false);
+    expect(isSubcDaemon(1, () => "/usr/libexec/other --subc x")).toBe(false);
+    expect(isSubcDaemon(1, () => "")).toBe(false);
+  });
 });
