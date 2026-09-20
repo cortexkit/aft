@@ -307,7 +307,7 @@ pub enum AliasWrite {
 /// SQLite storage for proven `(git_oid -> blake3(bytes))` aliases.
 pub struct AliasStore {
     path: PathBuf,
-    connection: Connection,
+    connection: crate::db::file_identity::IdentityConnection,
 }
 
 impl AliasStore {
@@ -322,7 +322,7 @@ impl AliasStore {
             fs::create_dir_all(parent)?;
         }
 
-        let connection = Connection::open(&path)?;
+        let connection = crate::db::file_identity::IdentityConnection::new(Connection::open(&path)?, "alias::AliasStore::open");
         connection.busy_timeout(std::time::Duration::from_millis(5_000))?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=OFF;",
@@ -630,7 +630,7 @@ impl Manifest {
 /// SQLite representation for raw manifest paths. `rel_path` is deliberately a
 /// BLOB column so SQLite never applies text collation or Unicode normalization.
 pub struct ManifestSqliteStore {
-    connection: Connection,
+    connection: crate::db::file_identity::IdentityConnection,
 }
 
 impl ManifestSqliteStore {
@@ -638,7 +638,7 @@ impl ManifestSqliteStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let connection = Connection::open(path)?;
+        let connection = crate::db::file_identity::IdentityConnection::new(Connection::open(path)?, "alias::ManifestSqliteStore::open");
         connection.execute_batch(MANIFEST_SCHEMA)?;
         Ok(Self { connection })
     }

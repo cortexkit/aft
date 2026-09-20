@@ -2003,7 +2003,8 @@ fn view_semantic_search(
         database,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
-    .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?;
+    let connection = crate::db::file_identity::IdentityConnection::new(connection, "commands::semantic_search::view_semantic_search");
     let mut results = Vec::new();
     for (rel_path, entry) in manifest.entries() {
         let crate::views::ManifestEntry::Regular { planes, .. } = entry else {

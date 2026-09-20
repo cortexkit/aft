@@ -242,7 +242,7 @@ fn checkpoint_derived(
     let connection = if let Some(connection) = connection {
         connection
     } else {
-        owned = Connection::open(path)?;
+        owned = crate::db::file_identity::IdentityConnection::new(Connection::open(path)?, "views::generation::checkpoint_derived");
         &owned
     };
     connection.busy_timeout(Duration::from_secs(5))?;
@@ -293,7 +293,7 @@ fn checkpoint_derived(
 /// Run the generation-sized checkpoint after pointer publication. A later
 /// publication cancels a not-yet-started obsolete job; its clone has already
 /// forced the source checkpoint through [`clone_derived`].
-pub(super) fn schedule_derived_checkpoint(path: PathBuf, connection: Connection, root: PathBuf) {
+pub(super) fn schedule_derived_checkpoint(path: PathBuf, connection: crate::db::file_identity::IdentityConnection, root: PathBuf) {
     let key = path.parent().unwrap_or(&path).to_path_buf();
     let cancelled = Arc::new(AtomicBool::new(false));
     let job = DeferredCheckpointJob {
@@ -434,7 +434,7 @@ mod tests {
 
         schedule_derived_checkpoint(
             source.clone(),
-            connection,
+            crate::db::file_identity::IdentityConnection::new(connection, "checkpoint test"),
             source.parent().unwrap().to_path_buf(),
         );
 

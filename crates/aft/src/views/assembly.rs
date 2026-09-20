@@ -73,7 +73,7 @@ pub struct PreparedAssembly {
     report: AssemblyReport,
     publication: Option<super::PreparedPublication>,
     files: Option<(ViewStore, String)>,
-    derived_checkpoint: Option<(PathBuf, Connection)>,
+    derived_checkpoint: Option<(PathBuf, crate::db::file_identity::IdentityConnection)>,
     pin: Option<AssemblyPin>,
     _base_pin: Option<crate::pins::QueryPin>,
     profile: PublicationProfile,
@@ -490,7 +490,7 @@ pub fn prepare_checkout(
         prepared.profile.derived_clone_ms = clone_started.elapsed().as_millis();
         // Keep one connection alive so SQLite does not checkpoint the committed WAL
         // when the materializer closes its writer before pointer publication.
-        let derived_keeper = Connection::open(&derived)?;
+        let derived_keeper = crate::db::file_identity::IdentityConnection::new(Connection::open(&derived)?, "views::assembly::assemble");
         derived_keeper.busy_timeout(std::time::Duration::from_secs(5))?;
         // Opening a handle or setting journal_mode alone does not attach its
         // pager to the WAL. Read the schema so closing the materializer is not

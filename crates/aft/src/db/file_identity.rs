@@ -217,6 +217,56 @@ fn write_stderr_line(line: &str) {
     eprint!("{line}");
 }
 
+/// Identity-only accounting for connections that retain SQLite's native WAL policy.
+/// Kept after the raw connection in `IdentityConnection`, so close completes before
+/// the registry forgets the handle, including on early returns and worker moves.
+#[derive(Debug)]
+pub(crate) struct OpenRecord {
+    key: Option<PathBuf>,
+    store: SqliteStore,
+}
+
+impl OpenRecord {
+    pub(crate) fn new(connection: &rusqlite::Connection, store: SqliteStore) -> Self {
+        let key = connection.path()
+            .filter(|path| !path.is_empty() && *path != ":memory:")
+            .map(|path| note_open(Path::new(path), store));
+        Self { key, store }
+    }
+}
+
+impl Drop for OpenRecord {
+    fn drop(&mut self) {
+        if let Some(key) = &self.key {
+            note_close(key, self.store);
+        }
+    }
+}
+
+/// Own the raw handle and its identity record together without installing a WAL hook.
+/// Field order matters: Rust drops the connection before its registration.
+#[derive(Debug)]
+pub(crate) struct IdentityConnection {
+    connection: rusqlite::Connection,
+    _record: OpenRecord,
+}
+
+impl IdentityConnection {
+    pub(crate) fn new(connection: rusqlite::Connection, seam: &'static str) -> Self {
+        let record = OpenRecord::new(&connection, SqliteStore::Unmapped(seam));
+        Self { connection, _record: record }
+    }
+}
+
+impl std::ops::Deref for IdentityConnection {
+    type Target = rusqlite::Connection;
+    fn deref(&self) -> &Self::Target { &self.connection }
+}
+
+impl std::ops::DerefMut for IdentityConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.connection }
+}
+
 /// Record that a tracked connection has opened `path`, and return the key the
 /// matching [`note_close`] must use.
 ///
@@ -353,8 +403,18 @@ pub fn reported_hazards() -> Vec<DatabaseHazard> {
 mod tests {
     use super::*;
     use crate::db::TrackedConnection;
-    #[cfg(unix)]
     use rusqlite::Connection;
+
+    #[test]
+    fn identity_only_connection_tracks_lifetime_without_changing_wal_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw.sqlite");
+        let connection = IdentityConnection::new(Connection::open(&path).unwrap(), "raw test");
+        assert_eq!(open_connections(&path), 1);
+        assert_eq!(connection.pragma_query_value(None, "wal_autocheckpoint", |row| row.get::<_, i64>(0)).unwrap(), 1000);
+        drop(connection);
+        assert_eq!(open_connections(&path), 0);
+    }
 
     #[cfg(unix)]
     fn shm_path(path: &Path) -> PathBuf {

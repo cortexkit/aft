@@ -191,7 +191,7 @@ fn sweep_plane(
     references: &BTreeSet<[u8; 32]>,
     report: &mut SweepReport,
 ) -> Result<(), SweepError> {
-    let connection = Connection::open(path)?;
+    let connection = crate::db::file_identity::IdentityConnection::new(Connection::open(path)?, "gc::sweep_plane");
     let mut candidates = Vec::new();
     let mut total_bytes = 0_u64;
     {

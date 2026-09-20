@@ -126,7 +126,7 @@ impl From<rusqlite::Error> for PathStatusError {
 #[derive(Debug)]
 pub struct PathStatusStore {
     path: PathBuf,
-    connection: Connection,
+    connection: crate::db::file_identity::IdentityConnection,
 }
 
 impl PathStatusStore {
@@ -141,7 +141,7 @@ impl PathStatusStore {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let connection = Connection::open(path)?;
+        let connection = crate::db::file_identity::IdentityConnection::new(Connection::open(path)?, "path_status::PathStatusStore::open_at");
         connection.execute_batch(PATH_STATUS_SCHEMA)?;
         Ok(Self {
             path: path.to_path_buf(),

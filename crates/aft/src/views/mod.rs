@@ -595,7 +595,7 @@ pub struct PreparedPublication {
     store: ViewStore,
     generation: String,
     base_generation: Option<String>,
-    pointer: Connection,
+    pointer: crate::db::file_identity::IdentityConnection,
 }
 
 impl PreparedPublication {
@@ -875,8 +875,8 @@ impl ViewStore {
         Ok(())
     }
 
-    fn open_pointer_connection(&self) -> Result<Connection> {
-        let connection = Connection::open(self.pointer_path())?;
+    fn open_pointer_connection(&self) -> Result<crate::db::file_identity::IdentityConnection> {
+        let connection = crate::db::file_identity::IdentityConnection::new(Connection::open(self.pointer_path())?, "views::ViewStore::open_pointer_connection");
         configure_connection(&connection)?;
         Ok(connection)
     }
@@ -1037,7 +1037,7 @@ fn checkpoint_and_sync_database(
             path.display()
         )));
     }
-    let connection = Connection::open(path)?;
+    let connection = crate::db::file_identity::IdentityConnection::new(Connection::open(path)?, "views::checkpoint_and_sync_database");
     configure_connection(&connection)?;
     connection.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
     if observe_blob_database {
@@ -1065,7 +1065,7 @@ fn checkpoint_and_sync_database(
 }
 
 fn checkpoint_pointer_after_cas(path: &Path) -> Result<()> {
-    let connection = Connection::open(path)?;
+    let connection = crate::db::file_identity::IdentityConnection::new(Connection::open(path)?, "views::checkpoint_pointer_after_cas");
     configure_connection(&connection)?;
     connection.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
     Ok(())

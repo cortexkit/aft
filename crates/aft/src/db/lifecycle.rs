@@ -128,7 +128,9 @@ pub struct SqliteConnectionSnapshot {
 /// Production `rusqlite::Connection::open*` call sites that intentionally do
 /// not pass through [`TrackedConnection`]. Read-only probes are listed because
 /// they retain SQLite's built-in WAL policy; write-capable seams name the
-/// accounting mechanism or residual explicitly.
+/// accounting mechanism or residual explicitly. These seams have identity-only
+/// RAII records in `file_identity`; this list concerns WAL/health accounting,
+/// not the database replacement detector.
 pub const SQLITE_UNINSTRUMENTED_OPENERS: &[&str] = &[
     "alias::AliasStore::open: WAL writer retains SQLite's built-in autocheckpoint and remains a named residual",
     "alias::ManifestSqliteStore::open: rollback-journal bytes remain a named residual",
@@ -477,6 +479,12 @@ impl TrackedConnection {
         store: SqliteStore,
         root_id: impl Into<String>,
     ) -> rusqlite::Result<Self> {
+        // Register before the first PRAGMA: it can enter WAL recovery and fault
+        // on a truncated shared-memory mapping before later registration runs.
+        let file_identity_key = connection
+            .path()
+            .filter(|path| !path.is_empty() && *path != ":memory:")
+            .map(|path| crate::db::file_identity::note_open(Path::new(path), store));
         let page_size = connection
             .pragma_query_value(None, "page_size", |row| row.get::<_, u64>(0))
             .unwrap_or(4096);
@@ -514,10 +522,6 @@ impl TrackedConnection {
         unsafe {
             rusqlite::ffi::sqlite3_wal_hook(connection.handle(), Some(tracked_wal_hook), context);
         }
-        let file_identity_key = connection
-            .path()
-            .filter(|path| !path.is_empty() && *path != ":memory:")
-            .map(|path| crate::db::file_identity::note_open(Path::new(path), store));
         register_open(store);
         let tracked = Self {
             connection: Some(connection),
