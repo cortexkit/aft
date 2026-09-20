@@ -2714,6 +2714,15 @@ fn subc_bridge_health_check_returns_root_status_report() {
                 ctx.subc_unbound_quiesced(),
                 "channel-0 Goodbye must quiesce every installed route"
             );
+            // Cancellation is cooperative: a maintenance job already inside the
+            // executor when the connection tore down finishes its current step
+            // before it observes the cancel. Asserting idleness instantly is a
+            // race the test loses on a contended runner, so bound the wait and
+            // keep the failure for an actor that never goes idle.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !executor.actor_is_idle(&root_id) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+            }
             assert!(
                 executor.actor_is_idle(&root_id),
                 "connection teardown must cancel queued root maintenance"
