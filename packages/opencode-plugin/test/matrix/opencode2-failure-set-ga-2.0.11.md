@@ -136,18 +136,49 @@ The serve handoff needs no re-capture: `server listening on http://127.0.0.1:409
 
 Whoever repairs this: re-capture all three contracts against 2.0.11, move `shared_server_smoke` to `GET /api/info`, and replace the `{healthy: true, version}` positive-control assertion with the observed `ServerInfo` body. The provider-config and schema-rejection contracts need real captures, not a version bump; neither was re-observed here.
 
-## Mechanism E — T7's V1 leg. Host's, on the V1 line.
+## Mechanism E — the V1 host does not exit after a one-shot run in a git-tracked project. Host's, on the V1 line.
 
 `https://github.com/anomalyco/opencode/issues/48340` is readable and is not what its placement suggests. It is titled "Plugin dispose is not called after one-shot run final stop", it is open, and it is filed against **`opencode-ai@1.18.29`** — the V1 host, not any `@opencode/*` package. Its claim: after `opencode run … --auto` emits the final `step_finish` with `reason: "stop"`, the process stays alive and never invokes the plugin's `dispose`.
 
-T7 is the only trajectory that runs the V1 host. It is materialized from each tool's T1 scenario (`harness/scenario-loader.ts:299-308`), run once on each host, and its projected text compared (`harness/driver.ts:1050-1096`); the V1 leg uses `OPENCODE1_BIN`, installed at `opencode-ai@1.18.30`. A V1 host that does not exit cannot yield a text to compare, so the label describes a real defect on a path T7 uses. The 23 T7 rows keep it.
+T7 is the only trajectory that runs the V1 host. It is materialized from each tool's T1 scenario (`harness/scenario-loader.ts:299-308`), run once on each host, and its projected text compared (`harness/driver.ts:1050-1096`); the V1 leg uses `OPENCODE1_BIN`, installed at `opencode-ai@1.18.30`.
 
-Two qualifications:
+An earlier draft of this section said the label "describes a real defect on a path T7 uses" and kept it "on the strength of the issue and the path, not an observation at the pinned version" — the rows had never run far enough to hit anything. They have now. The V1 leg serves a whole scenario and then never exits, so the rows do hit a real V1 non-exit at the pinned build. The mechanism is not the one the issue title names, and it is not ours.
 
-1. **No V2 contract point proves it, and none can.** 48340 is a V1 defect; the V1 host is pinned separately and did not move. "Does it still hold at the new pin" has the answer: the new pin is not the pin that governs it.
-2. **It was not re-verified at the pinned build.** The issue names 1.18.29; the harness pins a later 1.18.x (see `.github/opencode-version.txt`), and a later build exists again. An open issue is not proof a later build still hangs, and no T7 scenario was executed. The label is retained on the strength of the issue and the path, not an observation at the pinned version.
+### What was run
 
-T7 also inherits T1: for every tool in mechanism A the T7 V2 leg fails on the refusal before parity is compared, so 48340 was never the only thing failing those rows.
+2026-09-21, image `aft-e2e-opencode2-linux` built from `ebbcd34839b2a14bf1e9e05e939d32e783ac7a37`, `linux/amd64` under emulation. V1 host `opencode-ai@1.18.30` at `/opt/opencode1/node_modules/.bin/opencode`, the provider block and model captured in `contract/host1-provider-config.json`, the same `@copilotkit/aimock` server the harness drives, and private `HOME`, `TMPDIR` and XDG roots per run.
+
+1. **The harness row.** `AFT_E2E_SCENARIO=read/T7`. The V1 leg serves the scenario — the `read` call completes with `1: alpha\n2: beta`, then `step_finish` — and the host's own `--print-logs` output ends on `message="disposing instance"`. Nothing follows. The row records `exit_code: null`, `signal: "SIGKILL"`, `timed_out: true`.
+2. **Does our `dispose` run?** The same row against a plugin build whose every returned hook logs its entry and exit. `event`, `tool.execute.before`, `tool.execute.after`, `chat.message`, `experimental.chat.system.transform` and `config` all enter and exit normally through the last event of the run. `dispose` never logs its entry line — the host stalls in its own instance teardown *before* it reaches plugin disposal.
+3. **Elimination.** The same row with the plugin replaced by `export default async () => ({ tool: {} })` — a plugin that loads, registers no tool, spawns no bridge, opens no socket and arms no timer. Identical hang, same last log line.
+4. **Standalone one-shot runs**, outside the harness, same image and provider. This is where the mechanism is:
+
+| project | plugin | run | result |
+| --- | --- | --- | --- |
+| plain directory | none | `--auto`, scripted `read` call | exit 0 in 3.6s |
+| plain directory | full AFT plugin | `--auto`, scripted `read` call | exit 0 in ~10s, and the plugin's `dispose` is called and returns |
+| `git init` + one commit | none | `--auto`, scripted `read` call | never exits; SIGKILLed at the cap |
+| `git init` + one commit | none | `--auto`, no tool call | never exits |
+| `git init` + one commit | none | no `--auto`, no tool call | never exits |
+| `git init` + one commit | `{ tool: {} }` stub | `--auto`, scripted `read` call | never exits |
+| `git init` + one commit | full AFT plugin | `--auto`, scripted `read` call | never exits |
+
+**The trigger is a git-tracked project. No plugin is required, no tool call is required, and `--auto` is not required.**
+
+### Why it looked like the plugin
+
+The bare-run control that exits 0 — the provider probe in `contract/probe/host1-provider-config-1.18.30.txt` — ran in a bare temp directory. `createScenarioIsolation` runs `git init`, `git add -A` and `git commit` over every scenario fixture (`harness/isolation.ts:73-102`), so every harness project is a git repository and no harness row has ever been the bare-run control's twin. The host's own log shows the split: a non-git project is `projectID=global` and logs neither `message=initialized` nor `message=tracking`; a git project gets a real project id and both lines, and it is that instance that never finishes disposing.
+
+### What this does to the label
+
+- 48340's **symptom** is confirmed at the pinned 1.18.30: on a hanging run the host never calls plugin `dispose`. Its **framing** is narrower than the defect. `dispose` is called, and returns, on a one-shot V1 run that can finish disposing (row 2 of the standalone table), and the hang reproduces with no plugin in the process at all. "Plugin dispose is not called" is a consequence of an instance that never finishes disposal, not a plugin-lifecycle bug.
+- **Nothing here is AFT's.** The failure reproduces with no AFT code loaded. AFT's `dispose` was never reached on a hanging run, so nothing it does or fails to do can be the cause.
+- The 23 T7 rows keep an expected-failure label, and the attribution — host, V1 line — now rests on an observation at the pinned version instead of on the issue text. The issue number is the closest published match but describes the symptom, not the trigger; a V1 issue naming the git-tracked project would fit the rows better. `scenarios/*/matrix.json` was outside this task's fence, so the labels are unchanged.
+- The stall point varies. Five of the six git-project standalone runs stopped at `disposing instance`; one stopped earlier, at `project copy refresh started`, after a single provider request. What is stable across every git-project run is that the process never terminates on its own.
+
+One qualification carries over unchanged: **no V2 contract point proves any of this, and none can.** 48340 is a V1 defect, the V1 host is pinned separately in `.github/opencode-version.txt`, and it did not move with the V2 pin.
+
+T7 also inherits T1: for every tool in mechanism A the T7 V2 leg fails on the refusal before parity is compared, so the V1 non-exit was never the only thing failing those rows.
 
 ## Summary
 
@@ -157,11 +188,11 @@ T7 also inherits T1: for every tool in mechanism A the T7 V2 leg fails on the re
 | B. Unconditional permission ask on every read | Ours | `read` at T1/T3/T7 | `read/T1/happy` executed; `hoisted.ts:440-448` against `definitions/v2.ts:128-130` |
 | C. `aft_import` hangs instead of refusing | Undetermined | `import/T1` | `host exited null`, one run, not reproduced |
 | D. Host contracts pinned at 2.0.3; `/api/health` removed at 2.0.11 | Harness | All rows once the pin moves, plus the four shared-server scenarios again | Observed `contract_uncaptured`; observed 404; `protocol@2.0.11/dist/groups/server.js:13` |
-| E. V1 host does not dispose after a one-shot run | Host (V1 line) | All 23 T7 rows | Upstream 48340 against `opencode-ai@1.18.29`; not re-verified at 1.18.30 |
+| E. V1 host never exits after a one-shot run in a git-tracked project | Host (V1 line) | All 23 T7 rows | `read/T7` V1 leg killed at the timeout after `disposing instance`; the same hang with a `{ tool: {} }` stub plugin and with no plugin at all; exit 0 from the same run in a non-git project |
 
 ## Open questions
 
 1. Does a GA model call to `glob`/`grep` reach AFT's tool or the host's native? The harness says AFT's; the live GA run implies otherwise. Decides whether those rows measure anything a user reaches.
 2. Does a supported GA mechanism exist for a plugin to initiate a permission decision? Owned by the task holding `src/permissions/v2.ts`. Decides whether the thirty rows stay `applicable`.
 3. Does `aft_import` hang reproducibly, and where?
-4. Does the pinned `opencode-ai` build still fail to dispose? Decides all 23 T7 rows.
+4. Answered (mechanism E): the pinned `opencode-ai@1.18.30` never exits after a one-shot run whose project is a git repository, with or without a plugin. The remaining question belongs upstream — where in instance disposal it stalls, and whether an issue narrower than 48340 should carry the 23 T7 rows.
