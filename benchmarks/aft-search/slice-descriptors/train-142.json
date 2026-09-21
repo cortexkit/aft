@@ -1,15 +1,15 @@
 {
-  "slice_class": "non_ranking",
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "harness-goldens",
-    "profile-grammar",
-    "paging"
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
   ],
   "slices": [
     "oc2-permission-approve-hang",
-    "sentinel-log-silent-gating"
+    "sentinel-log-silent-gating",
+    "bash-metadata-open-retry-yield",
+    "configure-cancellation-mechanism-assertion"
   ],
-  "note": "No ranking-fence file changes: the V2 permission prompt now attaches its event subscription before announcing the request (V2 subscriptions are lazy and the host keeps no backlog, so an approval reply was lost and the call hung), the reply wait is bounded and refuses with what it observed, and the health sentinel reports a silent daemon log only when the log actually grew."
+  "note": "The only ranking-fence file touched is search_index.rs, and only its #[cfg(test)] git-probe stub: the signal it hands a caller changes from a started flag to an attempt counter so a test can assert cancellation stopped the probe ladder rather than that it finished quickly. No indexing, query, lane or ranking code is reached, so search rows are byte-identical to the reference (the predicate is the proof). The V2 permission ordering fix, the sentinel gating, and the bash metadata-open retry are all outside the fence."
 }
