@@ -97,6 +97,93 @@ class Regression:
     limit: float | None
     reason: str
     run: RunData | None = None
+    # A tolerance regression says a number grew. A bimodal finding says the two
+    # runs disagreed about which state the metric was in, which is a different
+    # statement and must not be printed as if it were the first one.
+    kind: str = "tolerance"
+
+
+@dataclass
+class BimodalFinding:
+    metric: str
+    band: tuple[float, float]
+    values: list[float]
+    verdict: str
+    evidence: str
+
+
+# A metric measured into two separated states, with the band between them
+# recorded as empty because no observation has ever landed in it.
+#
+# A tolerance is the wrong instrument for this shape: it is a band around a
+# centre, and a metric with two states has no centre to scatter around. The
+# two-run minimum is wrong for it as well -- it exists so one slow scheduler
+# interval does not page anyone, and it turns "we saw both states" into a pass
+# that reports only the lower one. So the states are named here and compared
+# directly, and a run that reaches the high state fails whether or not the high
+# state happens to fit under the tolerance that night.
+#
+# An entry is a claim about measurements, so it carries the measurements. Delete
+# it when the metric stops having two states; the gate reports an observation
+# inside the band as a falsified claim rather than quietly re-classifying it.
+BIMODAL_BANDS: dict[tuple[str, str], tuple[float, float, str]] = {
+    ("jupyterlab", "peak_rss_mb"): (
+        606.1,
+        668.0,
+        "16 full-matrix observations on github-hosted ubuntu-24.04, 2026-09-20 to 2026-09-21: "
+        "8 at 596.3-606.1 and 8 at 668.0-779.5, none in between; see scripts/telemetry/README.md",
+    ),
+}
+
+
+def classify_bimodal(repo: str, runs: list[RunData]) -> list[BimodalFinding]:
+    """Say which recorded state each run landed in, for every declared band."""
+    findings: list[BimodalFinding] = []
+    for (band_repo, metric), (low_edge, high_edge, evidence) in sorted(BIMODAL_BANDS.items()):
+        if band_repo != repo:
+            continue
+        values = [value for value in (run.metrics.get(metric) for run in runs if run.ready) if value is not None]
+        if not values:
+            continue
+        if any(low_edge < value < high_edge for value in values):
+            verdict = "inside"
+        elif all(value <= low_edge for value in values):
+            verdict = "low"
+        elif all(value >= high_edge for value in values):
+            verdict = "high"
+        else:
+            verdict = "straddle"
+        findings.append(BimodalFinding(metric, (low_edge, high_edge), values, verdict, evidence))
+    return findings
+
+
+BIMODAL_REASONS = {
+    "straddle": (
+        "the two runs landed in different recorded states, so the two-run minimum would "
+        "report the low one and pass on a metric that was also observed high"
+    ),
+    "high": "every run reached the high state, which the baseline does not describe",
+    "inside": (
+        "an observation landed inside a band recorded as empty, so the recorded states no "
+        "longer describe this metric and must be re-derived before it can gate"
+    ),
+}
+
+
+def bimodal_line(repo: str, finding: BimodalFinding) -> str:
+    values = "/".join(f"{value:g}" for value in finding.values)
+    low_edge, high_edge = finding.band
+    if finding.verdict == "low":
+        detail = (
+            "every run is in the low state; this is not evidence that the high state is gone, "
+            f"only that neither run reached it (recorded high state starts at {high_edge:g})"
+        )
+    else:
+        detail = BIMODAL_REASONS[finding.verdict]
+    return (
+        f"BIMODAL {repo} {finding.metric}: runs {values} against recorded states "
+        f"low<={low_edge:g} high>={high_edge:g} -> {finding.verdict}; {detail}"
+    )
 
 
 def run_command(argv: list[str], *, cwd: Path | None = None, timeout: int = 300) -> subprocess.CompletedProcess[str]:
@@ -316,6 +403,18 @@ def compare_repo(repo: str, baseline_repo: dict[str, Any], runs: list[RunData]) 
         limit = max(before * (1.0 + tolerance / 100.0), floor)
         if observed > limit:
             regressions.append(Regression(metric, before, observed, limit, "observed value exceeded tolerance/floor", selected_run))
+    for finding in classify_bimodal(repo, ready_runs):
+        if finding.verdict == "low":
+            continue
+        regressions.append(Regression(
+            finding.metric,
+            None,
+            max(finding.values),
+            None,
+            BIMODAL_REASONS[finding.verdict],
+            ready_runs[0],
+            kind="bimodal",
+        ))
     return regressions
 
 
@@ -679,7 +778,14 @@ def observation_line(repo: str, runs: list[RunData]) -> str:
 def print_regressions(repo: str, regressions: list[Regression], baseline_repo: dict[str, Any]) -> None:
     for regression in regressions:
         observed_events = regression.run.events if regression.run else {}
-        if regression.baseline is None or regression.observed is None:
+        if regression.kind == "bimodal":
+            observed = "n/a" if regression.observed is None else f"{regression.observed:g}"
+            print(
+                f"REGRESSION {repo} {regression.metric}: highest observation={observed} "
+                f"({regression.reason}); see the BIMODAL line for both runs and the recorded states",
+                file=sys.stderr,
+            )
+        elif regression.baseline is None or regression.observed is None:
             baseline = "n/a" if regression.baseline is None else f"{regression.baseline:g}"
             print(
                 f"REGRESSION {repo} {regression.metric}: "
@@ -815,6 +921,43 @@ def self_test() -> int:
         blessed = repo_metrics_from_runs("fixture", baseline_from_file, runs)
         assert "peak_rss_hwm_mb" not in blessed, sorted(blessed)
 
+        # A metric with two recorded states cannot be read off a two-run
+        # minimum. The straddling pair here is a real night -- 597.9 and 678.1,
+        # dispatch 35629011191 -- whose minimum sits inside every tolerance and
+        # whose maximum is 82 MB above the baseline.
+        jupyterlab_baseline = {
+            "metrics": {"peak_rss_mb": {"value": 596.3, "tolerance_pct": 20, "absolute_floor": 128.0}},
+            "index_events": {},
+        }
+
+        def jupyterlab_runs(values: list[float]) -> list[RunData]:
+            return [
+                RunData(csv_path, "jupyterlab", {"peak_rss_mb": value}, {}, True, {"peak_rss_mb": f"{value}"})
+                for value in values
+            ]
+
+        straddle = compare_repo("jupyterlab", jupyterlab_baseline, jupyterlab_runs([597.9, 678.1]))
+        assert [failure.kind for failure in straddle] == ["bimodal"], straddle
+        assert classify_bimodal("jupyterlab", jupyterlab_runs([597.9, 678.1]))[0].verdict == "straddle"
+        # No tolerance was exceeded on that night: passing it is exactly the
+        # flap this check exists to remove.
+        assert all(failure.kind != "tolerance" for failure in straddle), straddle
+        # Both runs high is not a pass either, even while the high state still
+        # fits under the tolerance, because the baseline describes the low one.
+        both_high = compare_repo("jupyterlab", jupyterlab_baseline, jupyterlab_runs([669.8, 701.2]))
+        assert [failure.kind for failure in both_high] == ["bimodal"], both_high
+        # Two low runs are the only pass, and the line says what it is a pass of.
+        both_low = jupyterlab_runs([597.9, 598.0])
+        assert compare_repo("jupyterlab", jupyterlab_baseline, both_low) == []
+        low_line = bimodal_line("jupyterlab", classify_bimodal("jupyterlab", both_low)[0])
+        assert "-> low" in low_line and "not evidence that the high state is gone" in low_line, low_line
+        # An observation between the states falsifies the record rather than
+        # picking a side, so it asks for the record to be re-derived.
+        inside = compare_repo("jupyterlab", jupyterlab_baseline, jupyterlab_runs([598.0, 640.0]))
+        assert [failure.reason for failure in inside] == [BIMODAL_REASONS["inside"]], inside
+        # Only the declared repository and metric are classified this way.
+        assert classify_bimodal("hugo", jupyterlab_runs([597.9, 678.1])) == []
+
         print("cost-gate self-test metrics: pass=6 fail=3")
         print("cost-gate self-test passed")
         return 0
@@ -892,6 +1035,11 @@ def main() -> int:
     # exactly as a run that exceeds them does.
     for name in names:
         print(observation_line(name, runs_by_repo[name]))
+        # Printed on every run, pass or fail: a row whose metric has two
+        # recorded states cannot be read from a single verdict, and a green
+        # night on it means only that neither run reached the high state.
+        for finding in classify_bimodal(name, runs_by_repo[name]):
+            print(bimodal_line(name, finding))
     if args.write_baseline:
         write_baseline(args.baseline.resolve(), baseline, names, runs_by_repo, binary, repo_root)
         return 0
