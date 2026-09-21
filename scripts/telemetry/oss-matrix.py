@@ -21,7 +21,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -205,9 +205,8 @@ class ProcessSampler:
                     self.gaps.append("disk write bytes unavailable: /proc/<pid>/io")
 
 
-# Phases are sampled four times a second. The callgraph cold build runs for
-# 70-110 seconds on the runner, so this resolves a stage boundary to well under
-# a percent of the build while costing two small /proc reads per tick.
+# Phases are sampled four times a second: fine enough to separate two builds
+# that overlap for a second or two, cheap enough to be two small /proc reads.
 PHASE_SAMPLE_INTERVAL_S = 0.25
 PHASE_TRACE_FIELDS = ("elapsed_ms", "rss_kb", "hwm_kb", "callgraph_stage", "search_stage", "tier2_stage", "phase")
 # The planes whose work can land inside a measured cold build. `search` and
@@ -215,11 +214,9 @@ PHASE_TRACE_FIELDS = ("elapsed_ms", "rss_kb", "hwm_kb", "callgraph_stage", "sear
 # the process schedules for itself and which therefore shows up in the same
 # peak without appearing anywhere in the matrix's own timings.
 TRACKED_PLANES = ("callgraph", "search", "tier2")
-# Terminal or not-yet-started plane states. A plane in one of these is not
-# building, so it cannot be contributing build memory.
-IDLE_STAGES = ("idle", "ready", "failed", "suspended", "superseded")
 INDEX_EVENT_MARKER = "index_event "
 INDEX_EVENT_FIELD_RE = re.compile(r"([a-z_]+)=(\S+)")
+LOG_TIMESTAMP_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z")
 
 
 def index_event_fields(line: str) -> dict[str, str] | None:
@@ -276,8 +273,9 @@ class PhaseSample:
     elapsed_ms: int
     rss_kb: int
     hwm_kb: int
-    callgraph_stage: str
-    search_stage: str
+    wall_s: float = 0.0
+    callgraph_stage: str = "idle"
+    search_stage: str = "idle"
     tier2_stage: str = "idle"
 
     @property
@@ -287,6 +285,94 @@ class PhaseSample:
             "search": self.search_stage,
             "tier2": self.tier2_stage,
         })
+
+
+def log_seconds(line: str) -> float | None:
+    """Wall clock of a log line, estimated at the middle of the second it stamps.
+
+    The log stamps whole seconds, so a line written at any point inside second
+    N reads as N. Taking the middle rather than the edge keeps the error
+    symmetric and never worse than half a second.
+    """
+    stamp = LOG_TIMESTAMP_RE.match(line)
+    if not stamp:
+        return None
+    parsed = datetime.strptime(stamp.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    return parsed.timestamp() + 0.5
+
+
+@dataclass
+class LogTimeline:
+    """What each plane was doing over time, rebuilt from a finished log."""
+
+    stages: list[tuple[float, dict[str, str]]] = field(default_factory=list)
+    tier2_windows: list[tuple[float, float, str]] = field(default_factory=list)
+
+    def is_empty(self) -> bool:
+        return not self.stages and not self.tier2_windows
+
+
+def build_timeline(lines: Iterable[str]) -> LogTimeline:
+    """Rebuild plane activity from the timestamps the process wrote.
+
+    Attribution cannot use the moment the harness read a line. The log is
+    written through a buffer, so a stretch that emits few lines holds them
+    until something else forces a flush, and everything that happened during
+    the silence then arrives at once.
+
+    The two planes the matrix builds announce each stage as they enter it, so
+    their boundaries are the line timestamps. The Tier-2 plane does not: it
+    logs a category's `build_started` and `build_ready` together once the
+    category is finished, both stamped with the same second. Reading those in
+    order would say the category was never running. Its window is taken from
+    the `elapsed_ms` the completion carries instead, which is the only record
+    of when the work actually happened.
+    """
+    stages = {plane: "idle" for plane in TRACKED_PLANES if plane != "tier2"}
+    timeline = LogTimeline()
+    for line in lines:
+        seconds = log_seconds(line)
+        if seconds is None:
+            continue
+        fields = index_event_fields(line)
+        if not fields:
+            continue
+        if fields.get("plane") == "tier2":
+            if fields.get("kind") == "build_ready":
+                try:
+                    elapsed_s = int(fields.get("elapsed_ms", "0")) / 1000
+                except ValueError:
+                    continue
+                timeline.tier2_windows.append(
+                    (seconds - elapsed_s, seconds, fields.get("category", "unknown"))
+                )
+            continue
+        apply_stage_event(stages, fields)
+        if timeline.stages and timeline.stages[-1][0] == seconds:
+            timeline.stages[-1] = (seconds, dict(stages))
+        else:
+            timeline.stages.append((seconds, dict(stages)))
+    timeline.tier2_windows.sort()
+    return timeline
+
+
+def label_samples(samples: list[PhaseSample], timeline: LogTimeline) -> None:
+    """Give every sample the stages that were current when it was taken."""
+    index = 0
+    stages = {plane: "idle" for plane in TRACKED_PLANES}
+    for sample in samples:
+        while index < len(timeline.stages) and timeline.stages[index][0] <= sample.wall_s:
+            stages = timeline.stages[index][1]
+            index += 1
+        sample.callgraph_stage = stages.get("callgraph", "idle")
+        sample.search_stage = stages.get("search", "idle")
+        sample.tier2_stage = "idle"
+        for start, end, category in timeline.tier2_windows:
+            if start > sample.wall_s:
+                break
+            if sample.wall_s <= end:
+                sample.tier2_stage = category
+                break
 
 
 @dataclass
@@ -369,9 +455,6 @@ class PhaseSampler:
     interval_s: float = PHASE_SAMPLE_INTERVAL_S
     samples: list[PhaseSample] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
-    _stages: dict[str, str] = field(default_factory=lambda: {plane: "idle" for plane in TRACKED_PLANES})
-    _offsets: dict[Path, int] = field(default_factory=dict)
-    _pending: dict[Path, str] = field(default_factory=dict)
     _started: float = 0.0
     _stop: threading.Event = field(default_factory=threading.Event)
     _thread: threading.Thread | None = None
@@ -385,9 +468,26 @@ class PhaseSampler:
         self._thread.start()
 
     def stop(self) -> None:
+        """Stop sampling, then label the samples from the finished log."""
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=3)
+        if not self.samples:
+            return
+        timeline = build_timeline(self._log_lines())
+        if timeline.is_empty():
+            self.gaps.append("phase memory trace unlabelled: no index_event records in the AFT log")
+            return
+        label_samples(self.samples, timeline)
+
+    def _log_lines(self) -> list[str]:
+        lines: list[str] = []
+        for path in sorted((self.storage / "logs").glob("aft-*.log")):
+            try:
+                lines.extend(path.read_text(encoding="utf-8", errors="replace").splitlines())
+            except OSError as error:
+                self.gaps.append(f"phase memory trace could not read {path.name}: {error}")
+        return lines
 
     def _loop(self) -> None:
         self._sample_once()
@@ -397,7 +497,6 @@ class PhaseSampler:
     def _sample_once(self) -> None:
         if self.proc.poll() is not None:
             return
-        self._drain_logs()
         rss_kb, hwm_kb = self._read_memory()
         if rss_kb is None or hwm_kb is None:
             return
@@ -405,9 +504,7 @@ class PhaseSampler:
             elapsed_ms=int((time.monotonic() - self._started) * 1000),
             rss_kb=rss_kb,
             hwm_kb=hwm_kb,
-            callgraph_stage=self._stages["callgraph"],
-            search_stage=self._stages["search"],
-            tier2_stage=self._stages["tier2"],
+            wall_s=time.time(),
         ))
 
     def _read_memory(self) -> tuple[int | None, int | None]:
@@ -430,34 +527,6 @@ class PhaseSampler:
             if rss_kb is not None and hwm_kb is not None:
                 break
         return rss_kb, hwm_kb
-
-    def _drain_logs(self) -> None:
-        """Read whatever the build has logged since the last tick.
-
-        Stage boundaries are taken from the live log rather than reconciled
-        afterwards from its timestamps: the log stamps whole seconds, and a
-        stage of a 70-second build deserves better than a one-second alignment
-        error against the memory samples.
-        """
-        for path in sorted((self.storage / "logs").glob("aft-*.log")):
-            try:
-                with path.open("rb") as handle:
-                    handle.seek(self._offsets.get(path, 0))
-                    chunk = handle.read()
-                    self._offsets[path] = handle.tell()
-            except OSError:
-                continue
-            if not chunk:
-                continue
-            # A tick usually lands mid-line. Hold the unterminated tail back so
-            # a stage boundary is never lost to the sampling cadence.
-            text = self._pending.pop(path, "") + chunk.decode("utf-8", errors="replace")
-            lines = text.split("\n")
-            self._pending[path] = lines.pop()
-            for line in lines:
-                fields = index_event_fields(line)
-                if fields:
-                    apply_stage_event(self._stages, fields)
 
 
 def parse_cpu_time(value: str) -> float:
@@ -836,7 +905,7 @@ def write_markdown(path: Path, rows: list[dict[str, str]], scratch: Path) -> Non
             )
         gaps = [(row["repo"], row["gaps"]) for row in rows if row["gaps"] != "none"]
         handle.write("\n## Peak memory by build phase\n\n")
-        handle.write("High-water growth charged to the phase that took it, largest first. `callgraph_stage/search_stage`, so a phase that only exists while the two builds overlap is named as one.\n\n")
+        handle.write("High-water growth charged to the phase that took it, largest first. `callgraph_stage/search_stage`, with `+tier2:<category>` where an inspect category overlapped, so a phase that only exists while two builds run at once is named as one.\n\n")
         handle.write("| Repo | Polled peak RSS MB | Kernel high-water MB | High-water growth by phase |\n| --- | ---: | ---: | --- |\n")
         for row in rows:
             handle.write(
@@ -934,13 +1003,22 @@ def phase_self_test() -> int:
     assert "views" not in stages, stages
 
     samples = [
-        PhaseSample(0, 40_000, 40_000, "idle", "streaming"),
-        PhaseSample(250, 60_000, 60_000, "idle", "streaming"),
-        PhaseSample(500, 50_000, 60_000, "extraction", "ready"),
-        PhaseSample(750, 140_000, 140_000, "extraction", "ready"),
-        PhaseSample(1000, 90_000, 140_000, "resolution", "ready"),
-        PhaseSample(1250, 190_000, 190_000, "resolution", "ready", "duplicates"),
+        PhaseSample(0, 40_000, 40_000, 1000.0),
+        PhaseSample(250, 60_000, 60_000, 1000.25),
+        PhaseSample(500, 50_000, 60_000, 1000.5),
+        PhaseSample(750, 140_000, 140_000, 1000.75),
+        PhaseSample(1000, 90_000, 140_000, 1001.0),
+        PhaseSample(1250, 190_000, 190_000, 1001.25),
     ]
+    for sample, stage in zip(samples, (
+        ("idle", "streaming", "idle"),
+        ("idle", "streaming", "idle"),
+        ("extraction", "ready", "idle"),
+        ("extraction", "ready", "idle"),
+        ("resolution", "ready", "idle"),
+        ("resolution", "ready", "duplicates"),
+    )):
+        sample.callgraph_stage, sample.search_stage, sample.tier2_stage = stage
     rollups = {rollup.phase: rollup for rollup in attribute_phases(samples)}
     # The first sample carries the cost of reaching it, and each later step is
     # charged to the phase that was running when the mark moved.
@@ -960,28 +1038,54 @@ def phase_self_test() -> int:
     ), summary
     assert format_phase_summary([]) == "n/a"
 
-    # The log is tailed live, so a tick that lands mid-line must not lose the
-    # stage boundary that line carries.
+    # The log arrives in bursts and the Tier-2 plane logs a category only once
+    # it has finished, with both of its records stamped the same second. Read
+    # in order those records say the category was never running, so its window
+    # comes from the elapsed_ms its completion carries.
+    log_lines = [
+        "2026-09-21T16:58:30Z [aft] index_event kind=build_started plane=callgraph build_id=b1 root=/tmp/x key=k",
+        "2026-09-21T16:58:31Z [aft] index_event kind=build_progress plane=callgraph build_id=b1 root=/tmp/x key=k stage=extraction completed=1 total=9 elapsed_ms=1000",
+        "2026-09-21T16:58:33Z [aft] index_event kind=build_progress plane=callgraph build_id=b1 root=/tmp/x key=k stage=resolution completed=0 total=99 elapsed_ms=3000",
+        "2026-09-21T16:58:36Z [aft] index_event kind=build_started plane=tier2 build_id=b2 root=/tmp/x key=k category=duplicates files=9",
+        "2026-09-21T16:58:36Z [aft] index_event kind=build_ready plane=tier2 build_id=b2 root=/tmp/x key=k category=duplicates elapsed_ms=2000 files=9",
+        "2026-09-21T16:58:38Z [aft] index_event kind=build_ready plane=callgraph build_id=b1 root=/tmp/x key=k elapsed_ms=8000",
+        "not a log line at all",
+    ]
+    timeline = build_timeline(log_lines)
+    assert timeline.tier2_windows and timeline.tier2_windows[0][2] == "duplicates", timeline
+    base = datetime(2026, 9, 21, 16, 58, 30, tzinfo=timezone.utc).timestamp()
+    offsets = [-0.5 + index * 0.5 for index in range(19)]
+    traced = [PhaseSample(index * 500, 1, 1, base + offset) for index, offset in enumerate(offsets)]
+    label_samples(traced, timeline)
+    by_offset = {round(sample.wall_s - base, 2): sample.phase for sample in traced}
+    # A sample taken before anything was logged belongs to no build.
+    assert by_offset[-0.5] == "idle/idle", by_offset
+    assert by_offset[1.0] == "started/idle", by_offset
+    assert by_offset[2.0] == "extraction/idle", by_offset
+    assert by_offset[4.0] == "resolution/idle", by_offset
+    # The category finished during second 36 after two seconds of work, so the
+    # samples it was running through are the ones before its own records.
+    assert by_offset[5.0] == "resolution/idle+tier2:duplicates", by_offset
+    assert by_offset[6.0] == "resolution/idle+tier2:duplicates", by_offset
+    assert by_offset[7.0] == "resolution/idle", by_offset
+    assert by_offset[8.5] == "ready/idle", by_offset
+
     temporary = Path(tempfile.mkdtemp(prefix="aft-oss-matrix-phase-self-test-"))
     try:
         (temporary / "logs").mkdir()
-        log = temporary / "logs" / "aft-42.log"
-        prefix = "2026-09-21T16:58:32Z [aft] index_event kind=build_progress plane=callgraph build_id=b1 root=/tmp/x key=k stage="
-        log.write_text(f"{prefix}extraction completed=1 total=9 elapsed_ms=1\n{prefix}resol", encoding="utf-8")
+        (temporary / "logs" / "aft-42.log").write_text("\n".join(log_lines) + "\n", encoding="utf-8")
         sampler = PhaseSampler(proc=None, storage=temporary)  # type: ignore[arg-type]
-        sampler._drain_logs()
-        assert sampler._stages["callgraph"] == "extraction", sampler._stages
-        with log.open("a", encoding="utf-8") as handle:
-            handle.write("ution completed=5 total=9 elapsed_ms=2\n")
-            handle.write(
-                "2026-09-21T16:58:33Z [aft] index_event kind=build_started plane=tier2 build_id=b2 "
-                "root=/tmp/x key=k category=duplicates files=2079\n"
-            )
-        sampler._drain_logs()
-        assert sampler._stages["callgraph"] == "resolution", sampler._stages
-        assert sampler._stages["tier2"] == "duplicates", sampler._stages
-        sampler._drain_logs()
-        assert sampler._stages["callgraph"] == "resolution", sampler._stages
+        sampler.samples = [PhaseSample(500, 1, 1, base + 5.5)]
+        sampler.stop()
+        assert sampler.samples[0].phase == "resolution/idle+tier2:duplicates", sampler.samples
+        assert sampler.gaps == [], sampler.gaps
+        # A run whose log carries no index_event records must say so rather
+        # than reporting every sample as idle.
+        (temporary / "logs" / "aft-42.log").write_text("2026-09-21T16:58:30Z [aft] started\n", encoding="utf-8")
+        unlabelled = PhaseSampler(proc=None, storage=temporary)  # type: ignore[arg-type]
+        unlabelled.samples = [PhaseSample(500, 1, 1, base + 4.5)]
+        unlabelled.stop()
+        assert unlabelled.gaps and "no index_event records" in unlabelled.gaps[0], unlabelled.gaps
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
     print("oss-matrix phase self-test passed")
