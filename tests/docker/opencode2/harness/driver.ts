@@ -319,6 +319,34 @@ function assertScriptedToolsRegistered(scenario: ScenarioDefinition, hostStream:
   }
 }
 
+/**
+ * Require an interrupted run to say it was interrupted, in its own words.
+ *
+ * A one-shot run that is cut off mid-tool does not exit 0, and the exit code
+ * alone cannot tell an interruption apart from a host that fell over: both are
+ * a non-zero number. The host does say which happened — it writes an error
+ * part naming the abort onto its event stream — so a row that accepts the
+ * wider exit set names the error it expects and is held to finding it.
+ */
+function assertAbortEnding(scenario: ScenarioDefinition, hostStream: string): void {
+  const expected = asRecord(scenario.metadata?.t4)?.expected_error_type;
+  if (typeof expected !== "string") return;
+  const observed = hostStream.split(/\r?\n/).some((line) => {
+    if (!line.trim()) return false;
+    try {
+      const event = asRecord(JSON.parse(line));
+      return event?.type === "error" && asRecord(event.error)?.type === expected;
+    } catch {
+      return false;
+    }
+  });
+  if (!observed) {
+    throw new Error(
+      `${scenario.id}: the host's event stream carries no ${expected} error, so the run's ending is not the interruption the row claims`,
+    );
+  }
+}
+
 function errorRecord(error: unknown): ScenarioResult["failure"] {
   if (error instanceof HarnessError) {
     return {
@@ -820,6 +848,7 @@ async function runOneScenario(options: {
       );
     }
     assertScriptedToolsRegistered(scenario, hostStream);
+    assertAbortEnding(scenario, hostStream);
     // Scoped to the rows whose host behaviour was observed. The check itself
     // describes any wholly-denying rule and can be widened once another tool's
     // rows have been watched doing the same thing.

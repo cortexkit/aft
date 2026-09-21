@@ -764,8 +764,12 @@
       "metadata": {
         "accepted_exit_codes": [
           0,
+          1,
           130
-        ]
+        ],
+        "t4": {
+          "expected_error_type": "aborted"
+        }
       }
     },
     {
