@@ -638,6 +638,30 @@ def print_regressions(repo: str, regressions: list[Regression], baseline_repo: d
             print(f"  index_event delta {key}: baseline={before:g} observed={after:g} delta={delta:+g}", file=sys.stderr)
 
 
+def self_test_baseline() -> dict[str, Any]:
+    """The smallest payload validate_baseline accepts, for the rejection cases."""
+    repos: dict[str, Any] = {}
+    for name in REPO_ORDER:
+        expected = FIXED_REPOSITORIES[name]
+        config: dict[str, Any] = {"kind": expected["kind"], "metrics": {}}
+        if expected["kind"] == "git":
+            config.update({"url": expected["url"], "sha": "0" * 40})
+        else:
+            config["version"] = SYNTHETIC_VERSION
+        repos[name] = config
+    return {"schema": SCHEMA_VERSION, PLATFORM_KEY: {"platform": "linux-x86_64"}, "repos": repos}
+
+
+def assert_rejected(payload: dict[str, Any], fragment: str) -> None:
+    """Fail unless validate_baseline refuses the payload and says why."""
+    try:
+        validate_baseline(payload)
+    except ValueError as error:
+        assert fragment in str(error), (fragment, str(error))
+        return
+    raise AssertionError(f"validate_baseline accepted a payload it must reject ({fragment})")
+
+
 def self_test() -> int:
     """Test CSV extraction, two-run minimum selection, tolerances, and floors."""
     temporary = Path(tempfile.mkdtemp(prefix="aft-cost-gate-self-test-"))
@@ -691,6 +715,34 @@ def self_test() -> int:
         # The minimum of 140 and 130 is exactly the relative limit, so this
         # proves that a slower first run does not page the gate.
         assert all(failure.metric != "search_build_ready_ms" for failure in failures)
+
+        # A metric marked ungated keeps its recorded value but is not compared.
+        # callgraph_build_ready_ms is deliberately one of the three that failed
+        # above, so an ignored exclusion would show up as a failure again.
+        ungated = json.loads(json.dumps(baseline_from_file))
+        ungated["metrics"]["callgraph_build_ready_ms"]["gated"] = False
+        ungated["metrics"]["callgraph_build_ready_ms"]["ungated_reason"] = "self-test fixture"
+        still_failing = {failure.metric for failure in compare_repo("fixture", ungated, runs)}
+        assert still_failing == expected - {"callgraph_build_ready_ms"}, still_failing
+
+        # Whole-file rules: a baseline must say which platform measured it, and
+        # must not drop a metric from the gate without writing down why.
+        validate_baseline(self_test_baseline())
+        no_platform = self_test_baseline()
+        del no_platform[PLATFORM_KEY]
+        assert_rejected(no_platform, "platform")
+        silent_exclusion = self_test_baseline()
+        silent_exclusion["repos"]["redox"]["metrics"]["peak_rss_mb"] = {
+            "value": 1, "tolerance_pct": 20, "absolute_floor": 1, "gated": False,
+        }
+        assert_rejected(silent_exclusion, "ungated_reason")
+
+        # Event deltas are diagnostics printed beside a regression.  With no
+        # recorded counts to compare against, every observed event would print
+        # as a change from zero and read as part of the diagnosis.
+        assert event_deltas({}, {"callgraph.build_ready.count": 1.0}) == []
+        assert event_deltas({"callgraph.build_ready.count": 0.0}, {"callgraph.build_ready.count": 1.0})
+
         print("cost-gate self-test metrics: pass=6 fail=3")
         print("cost-gate self-test passed")
         return 0
