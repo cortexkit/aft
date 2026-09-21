@@ -1,0 +1,16 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "oc2-t7-parity-vacuity",
+    "oc2-t7-verdict-exclusion",
+    "release-notes-0570"
+  ],
+  "note": "No ranking-fence file changes. OpenCode 2 parity harness only: 21 of 23 T7 rows were comparing an empty projection because each allowlisted the single field it projected; the allowlist is emptied and a row that allowlists everything it projects is now refused. Plus the V1 host-exit verdict exclusion and two V1-leg defects it had been hiding."
+}
