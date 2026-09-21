@@ -664,6 +664,14 @@ def main() -> int:
         "back to per-byte ones, so a character costs about a token",
     )
     parser.add_argument(
+        "--stop-after-idle-s",
+        type=float,
+        default=0.0,
+        help="stop this many seconds after the embed phase reaches its last "
+        "batch, instead of running the full --seconds. The settling tail is "
+        "still sampled, but a run does not sit idle once the build is done",
+    )
+    parser.add_argument(
         "--smaps",
         action="store_true",
         help="capture /proc/<pid>/smaps_rollup beside every sample (Linux only). "
@@ -776,6 +784,7 @@ def main() -> int:
     total_batches = 0
     start = time.monotonic()
     smaps_path = workdir / f"{args.label}-smaps-rollup.txt"
+    finished_at = None
     try:
         while time.monotonic() < deadline and daemon.proc.poll() is None:
             time.sleep(args.interval)
@@ -810,6 +819,16 @@ def main() -> int:
                 f"rss={sample['rss_bytes'] / 1e6:>9.1f} MB",
                 flush=True,
             )
+            if args.stop_after_idle_s > 0 and total_batches and last_batch >= total_batches:
+                finished_at = finished_at or time.monotonic()
+                if time.monotonic() - finished_at >= args.stop_after_idle_s:
+                    print(
+                        f"{args.label} embed phase reached batch "
+                        f"{last_batch}/{total_batches}; stopping after the "
+                        f"{args.stop_after_idle_s:.0f}s settling tail",
+                        flush=True,
+                    )
+                    break
     finally:
         stop.set()
         time.sleep(0.5)
