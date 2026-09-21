@@ -2,13 +2,20 @@
 // @ts-nocheck
 
 import { createEffect, createSignal, onCleanup } from "solid-js";
+import { version as packageVersion } from "../../package.json";
 import {
   type AftStatusSnapshot,
   coerceAftStatus,
   formatStatusDialogMessage,
 } from "../shared/status";
 import { AftRpc } from "./aft-rpc";
-import { formatAftStatusSegment, summarizeAftSidebar } from "./v2-status";
+import {
+  AftSidebarPanel,
+  createSidebarPreferences,
+  type SidebarColor,
+  type SidebarPalette,
+} from "./sidebar-view";
+import { formatAftStatusSegment } from "./v2-status";
 
 type AftRpcClient = {
   getStatus(
@@ -24,9 +31,37 @@ type AftRpcClient = {
   };
 };
 
+/**
+ * The colour tokens the sidebar needs out of the host's `ResolvedTheme` — the
+ * type `Context.theme` carries, exported by `@opencode/theme/tui`. That
+ * package is an optional peer of `@opencode/plugin` and is not installed
+ * alongside this plugin, so the shape is written out here instead of imported;
+ * the key names are the theme package's own. They are nested token groups,
+ * unlike the flat colour names the slot-plugin host in ./sidebar.tsx reads.
+ * Every level is optional so a host that ships a partial theme degrades to the
+ * fallback palette below instead of throwing during a render.
+ */
+type GaFeedbackKind = "error" | "warning" | "success" | "info";
+
+type GaResolvedTheme = {
+  text?: {
+    base?: SidebarColor;
+    muted?: SidebarColor;
+    feedback?: Partial<Record<GaFeedbackKind, { base?: SidebarColor }>>;
+  };
+  background?: {
+    base?: SidebarColor;
+    action?: { primary?: { base?: SidebarColor } };
+  };
+  border?: { base?: SidebarColor };
+};
+
 type V2TuiContext = {
   location?: unknown;
   client: { rpc(definition: typeof AftRpc): AftRpcClient };
+  /** Resolved for the active theme mode by the host; see GaResolvedTheme. */
+  theme?: GaResolvedTheme;
+  themeMode?: "dark" | "light";
   keymap: {
     layer(input: () => { commands: Array<Record<string, unknown>>; bindings: string[] }): void;
   };
@@ -39,6 +74,64 @@ type V2TuiContext = {
     }): () => void;
   };
 };
+
+// Last resort for a host that declares a theme mode but hands over no resolved
+// theme. Inheriting the terminal default instead is what made the panel white
+// on white in light mode, so there has to be a legible colour for every role
+// even when the theme is missing.
+const FALLBACK_PALETTES: Record<"dark" | "light", SidebarPalette> = {
+  dark: {
+    text: "#e6edf3",
+    textMuted: "#9198a1",
+    success: "#3fb950",
+    warning: "#d29922",
+    error: "#f85149",
+    accent: "#1f6feb",
+    background: "#0d1117",
+    border: "#3d444d",
+  },
+  light: {
+    text: "#1f2328",
+    textMuted: "#59636e",
+    success: "#1a7f37",
+    warning: "#9a6700",
+    error: "#cf222e",
+    accent: "#0969da",
+    background: "#ffffff",
+    border: "#d1d9e0",
+  },
+};
+
+/**
+ * Host theme → the panel's palette. The host resolves its theme for the active
+ * mode before handing it over, so light mode arrives as light colours here;
+ * what matters is that every text line asks for one of them instead of
+ * inheriting the terminal default.
+ *
+ * `success` falls back to the accent exactly as ./sidebar.tsx's mapping does.
+ */
+export function resolveV2Palette(
+  theme: GaResolvedTheme | undefined,
+  themeMode: "dark" | "light" | undefined,
+): SidebarPalette {
+  const fallback = FALLBACK_PALETTES[themeMode === "light" ? "light" : "dark"];
+  if (!theme) return { ...fallback };
+
+  const accent = theme.background?.action?.primary?.base ?? fallback.accent;
+  const feedback = theme.text?.feedback;
+  return {
+    text: theme.text?.base ?? fallback.text,
+    textMuted: theme.text?.muted ?? fallback.textMuted,
+    success: feedback?.success?.base ?? accent,
+    warning: feedback?.warning?.base ?? fallback.warning,
+    error: feedback?.error?.base ?? fallback.error,
+    accent,
+    background: theme.background?.base ?? fallback.background,
+    // This theme has one border colour; ./sidebar.tsx's host distinguishes an
+    // active one, and the panel only ever draws the active border.
+    border: theme.border?.base ?? fallback.border,
+  };
+}
 
 function eventMatchesSession(
   eventSessionID: string | undefined,
@@ -125,17 +218,16 @@ function FooterStatus(props: { context: V2TuiContext; rpc: AftRpcClient; session
 
 function SidebarStatus(props: { context: V2TuiContext; rpc: AftRpcClient; sessionID: string }) {
   const status = useAftStatus(props.context, props.rpc, () => props.sessionID);
-  const summary = () => summarizeAftSidebar(status());
+  const preferences = createSidebarPreferences();
   return (
-    <box width="100%" flexDirection="column">
-      <text>
-        <b>{summary().title}</b>
-        {summary().version ? ` v${summary().version}` : ""}
-      </text>
-      <text>Search: {summary().search}</text>
-      <text>Semantic: {summary().semantic}</text>
-      <text>Health: {summary().health}</text>
-    </box>
+    <AftSidebarPanel
+      palette={resolveV2Palette(props.context.theme, props.context.themeMode)}
+      snapshot={status()}
+      prefs={preferences.prefs()}
+      collapsed={preferences.collapsed()}
+      onToggleCollapsed={preferences.toggleCollapsed}
+      pluginVersion={packageVersion}
+    />
   );
 }
 

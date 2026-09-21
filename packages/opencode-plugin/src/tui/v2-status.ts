@@ -22,7 +22,6 @@ export type AftSidebarSummary = {
   semantic: string;
   health: string;
 };
-
 function healthSummary(bar: StatusBar | undefined): string {
   if (!bar) return "health pending";
   const stale = bar.tier2_stale ? "~" : "";
@@ -33,6 +32,14 @@ function healthSummary(bar: StatusBar | undefined): string {
   );
 }
 
+/**
+ * A one-line-per-field digest of the status snapshot.
+ *
+ * This is no longer what the sidebar draws: the sidebar now renders the shared
+ * panel in ./sidebar-view, which labels each section and reuses the status
+ * wording ./sidebar.tsx established. The digest is still pinned by
+ * test/tui/v2-status.test.ts.
+ */
 export function summarizeAftSidebar(status: AftStatusSnapshot | null): AftSidebarSummary {
   if (!status || status.cache_role === "not_initialized") {
     return {
