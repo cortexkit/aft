@@ -12,6 +12,8 @@
     "provenance-missing-source",
     "provenance-disallowed-source",
     "provenance-substituted-revision",
+    "dead-transport-stub-accepts-then-dies",
+    "refusing-row-rejects-host-fallback-output",
     "three-state-create",
     "three-state-delete",
     "three-state-edit",

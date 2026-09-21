@@ -1,9 +1,15 @@
 import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { Subprocess } from "bun";
 
 import { assertThreeStateRestore, DiskStateObserver, type PathState } from "./disk-state.js";
 import { HarnessError, type HarnessFailureCode } from "./errors.js";
+import {
+  assertBashExecutionPathIdentity,
+  HOST_FALLBACK_OUTPUT_MARKER,
+} from "./permission-plan.js";
 import { verifyExecutableProvenance } from "./provenance.js";
+import { makeTransportDeadStub, pointTransportDeadStub } from "./transport-stub.js";
 import type { ScenarioDefinition, ToolCallPlan } from "./types.js";
 import { applyMutatingTestOverride, validateMutatingDeclarations } from "./validation.js";
 import { sha256File } from "./util.js";
@@ -391,6 +397,98 @@ export async function runHarnessControlSuite(root: string): Promise<HarnessContr
           policyPath: fixture.policy,
           manifestPath: join(fixture.repo, "manifest.json"),
         }).then(() => undefined),
+      ),
+    );
+  }
+
+  // Spawn the stand-in a transport-dead window installs at `AFT_BINARY_PATH`
+  // and watch what it does, because its behaviour is what the rows using that
+  // window are able to assert. Those rows assert that bash REFUSES the
+  // command, which only holds for a transport failure whose outcome cannot be
+  // determined. A stand-in that died before the bridge handed it anything
+  // would instead prove the command was never sent - the one case bash is
+  // allowed to re-run it through the host shell - and the row would then
+  // report whichever outcome the timing happened to produce.
+  {
+    const project = await freshProject(root, "dead-transport-stub");
+    const stub = await makeTransportDeadStub(project, process.execPath);
+    await pointTransportDeadStub(stub, true);
+
+    let child: Subprocess<"pipe", "pipe", "ignore">;
+    try {
+      child = Bun.spawn([stub.executable], { stdin: "pipe", stdout: "pipe", stderr: "ignore" });
+    } catch (error) {
+      throw new Error(
+        `the transport-dead stand-in could not be spawned, so a dead window would fail before the bridge sent it anything: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
+    await Bun.sleep(250);
+    if (child.exitCode !== null) {
+      throw new Error(
+        `the transport-dead stand-in exited (${child.exitCode}) before any request was written, which proves nothing was sent and lets the break-glass path run the command`,
+      );
+    }
+
+    child.stdin.write('{"id":"1","command":"configure"}\n');
+    await child.stdin.flush();
+    const exitCode = await child.exited;
+    const answered = await new Response(child.stdout).text();
+    if (exitCode === 0 || answered.length > 0) {
+      throw new Error(
+        `the transport-dead stand-in answered the request (exit ${exitCode}, ${answered.length} bytes), so the transport would report an outcome instead of leaving it undetermined`,
+      );
+    }
+    evidence.push({
+      control: "dead-transport-stub-accepts-then-dies",
+      expected: "pass",
+      observed: `accepted one request, then exited ${exitCode} without answering`,
+      outcome: "passed",
+    });
+  }
+
+  // The other half of the same claim: a row that declares a refusal has to
+  // FAIL if the break-glass path runs the command after all. This is the
+  // assertion a real run makes over the text the model received, driven here
+  // with the banner the fallback puts on its own output.
+  {
+    const refusing: ScenarioDefinition = {
+      schema_version: 1,
+      id: "bash/T3/fallback_refusal_control",
+      tool: "bash",
+      trajectory: "T3",
+      execution: "shared-server",
+      prompt: "fallback refusal control",
+      turns: [
+        {
+          label: "control-call",
+          response: {
+            kind: "tool_calls",
+            calls: [call({ name: "bash", arguments: { command: "printf control" } })],
+          },
+        },
+      ],
+      metadata: {
+        permission: { operation: "bash:host-fallback", reply: "once" },
+        dead_transport: {
+          outcome: "refusal",
+          refusal_names: ["Binary (crashed|killed)", "outcome is UNKNOWN"],
+          host_fallback_coverage: "n/a:control-row",
+          reason: "control row: the refusal is what this control mutates against",
+        },
+      },
+    };
+    evidence.push(
+      await expectFailure(
+        "refusing-row-rejects-host-fallback-output",
+        "no_effect_observed",
+        async () => {
+          assertBashExecutionPathIdentity(refusing, {
+            resultText: `${HOST_FALLBACK_OUTPUT_MARKER} - module transport down]\ncontrol`,
+            events: [],
+          });
+        },
+        "dead-transport-stub-accepts-then-dies",
       ),
     );
   }
