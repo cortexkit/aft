@@ -126,14 +126,7 @@ class BimodalFinding:
 # An entry is a claim about measurements, so it carries the measurements. Delete
 # it when the metric stops having two states; the gate reports an observation
 # inside the band as a falsified claim rather than quietly re-classifying it.
-BIMODAL_BANDS: dict[tuple[str, str], tuple[float, float, str]] = {
-    ("jupyterlab", "peak_rss_mb"): (
-        606.1,
-        668.0,
-        "16 full-matrix observations on github-hosted ubuntu-24.04, 2026-09-20 to 2026-09-21: "
-        "8 at 596.3-606.1 and 8 at 668.0-779.5, none in between; see scripts/telemetry/README.md",
-    ),
-}
+BIMODAL_BANDS: dict[tuple[str, str], tuple[float, float, str]] = {}
 
 
 def classify_bimodal(repo: str, runs: list[RunData]) -> list[BimodalFinding]:

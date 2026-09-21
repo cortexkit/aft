@@ -635,3 +635,30 @@ write down what is known, as the `jupyterlab` entry above does.
 `main` push workflows. The dispatch input can select one repository when
 triaging a regression. Workflow artifacts retain the CSV, Markdown summary,
 runner output, and isolated AFT logs.
+
+### jupyterlab peak_rss_mb stopped being bimodal (2026-09-21)
+
+The recorded band (low at or below 606.1, high at or above 668.0) was measured
+before the Tier-2 overlap fix landed. That fix stops a code-health scan starting
+while the same project's callgraph cold build is still filling the store it
+reads; jupyterlab's build runs about 97 seconds against a 90-second timer, so
+the scan used to land on top of it.
+
+Eight observations on main with the fix in place, across four full-matrix runs:
+
+| run | observations (MB) |
+|---|---|
+| 35653903593 | 659.7, 589.7 |
+| 35665060494 | 597.3, 657.7 |
+| 35666564457 | 597.9, 608.7 |
+| 35668013437 | 634.8, 598.8 |
+
+Range 589.7 to 659.7. None reached the recorded high state, and four of the
+eight landed inside the band recorded as empty. The two states have collapsed
+into one, so the entry is deleted rather than re-banded — per the rule above it,
+an entry is a claim about measurements and this one is falsified.
+
+The baseline value stays at 596.3 with its 20 percent tolerance, giving a
+ceiling of 715.6 MB. Every post-fix observation is under it. Re-centring on the
+post-fix mean (about 618) would raise that ceiling to roughly 742 MB and weaken
+the gate, so the tighter existing centre is kept.
