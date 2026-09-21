@@ -29,6 +29,16 @@ export type RootHealth = {
   root_ttl_ms?: number;
 };
 export type LimiterEntry = { domain?: string; root?: string; kind?: string; acquired_at_ms?: number; age_ms?: number };
+/** One completed or in-flight GitHub Actions run, as `gh run list --json` reports it. */
+export type ScheduledRun = {
+  workflow?: string;
+  branch?: string;
+  event?: string;
+  status?: string;
+  conclusion?: string | null;
+  created_at?: string;
+  run_id?: number;
+};
 export type SentinelSample = {
   now_ms: number;
   supervisor?: { running: boolean; pid?: number; last_exit_code?: number | null; placement_recorded?: boolean };
@@ -49,6 +59,9 @@ export type SentinelSample = {
   disk?: { free_bytes?: number; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; artifact_roots?: Record<string, string> };
   disk_error?: string;
   dsym?: { requested_uuid?: string; found_uuid?: string; path?: string; error?: string };
+  /** Newest-first scheduled workflow runs on the main branch; see detectScheduledCi. */
+  ci_runs?: ScheduledRun[];
+  ci_error?: string;
 };
 export type FindingLedger = Record<string, { last_alerted_at: number; last_seen_at: number; severity: Severity; rule: string; text: string; cleared_at?: number }>;
 export type SentinelState = {
@@ -56,6 +69,8 @@ export type SentinelState = {
   log?: { path?: string; offset?: number; size?: number };
   plugin_log?: { path?: string; offset?: number; size?: number };
   previous?: { pid?: number; unreachable_runs?: number; sampled_at_ms?: number; bytes_written?: number; write_rate_runs?: number; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; watcher?: Record<string, [number, number]> };
+  /** Last scheduled-run listing and when it was fetched, so the poll can be slower than the tick. */
+  ci?: { checked_at_ms?: number; runs?: ScheduledRun[]; error?: string };
 };
 
 const HOME = homedir();
@@ -478,11 +493,75 @@ export function detectDsym(sample: SentinelSample): Finding[] {
   return [];
 }
 
+/** The branch whose scheduled runs gate nothing and are therefore watched by nobody. */
+const SCHEDULED_BRANCH = "main";
+// A single red scheduled run is a bad night on the runner fleet: an evicted
+// build cache, a transient clone, one repository that overran its budget. A
+// workflow that is genuinely broken stays broken, so the alert waits for a
+// streak rather than paging on the first red. Three consecutive runs is the
+// shortest streak no single bad night can produce. On a nightly cadence that
+// costs two nights of delay, which is the price of not training the reader to
+// ignore the channel.
+const SCHEDULED_FAILURE_STREAK = 3;
+// `cancelled` and `skipped` are not verdicts about the workflow's subject, and
+// a run still in flight has no conclusion at all; all three are dropped before
+// counting rather than being read as either outcome.
+const SCHEDULED_FAILED = new Set(["failure", "timed_out", "startup_failure"]);
+const SCHEDULED_SUCCEEDED = new Set(["success", "neutral"]);
+
+/**
+ * A scheduled workflow whose failures nothing else reports.
+ *
+ * Push and pull-request checks are read the moment someone waits on them. A
+ * workflow that only runs on a schedule gates no merge, so its failures are
+ * seen only if something goes looking -- and `scripts/watch-ci.sh` filters to
+ * the push run on purpose, which means it cannot see them either.
+ */
+export function detectScheduledCi(sample: SentinelSample): Finding[] {
+  if (sample.ci_error) return [instrument("scheduled-ci", sample.ci_error)];
+  // collectSample always sets one of ci_runs/ci_error; undefined means this
+  // sample came from a source that does not carry CI state (a --specimen file).
+  if (!sample.ci_runs) return [];
+  const byWorkflow = new Map<string, ScheduledRun[]>();
+  for (const run of sample.ci_runs) {
+    const workflow = run.workflow?.trim();
+    // A run on another branch or another trigger is a different subject.
+    if (!workflow || run.event !== "schedule" || run.branch !== SCHEDULED_BRANCH) continue;
+    const conclusion = String(run.conclusion ?? "");
+    // A run still in flight has no conclusion yet, and `cancelled`/`skipped`
+    // are not verdicts about the workflow's subject: none of the three extends
+    // a streak, and none of them breaks one either.
+    if (!SCHEDULED_FAILED.has(conclusion) && !SCHEDULED_SUCCEEDED.has(conclusion)) continue;
+    byWorkflow.set(workflow, [...(byWorkflow.get(workflow) ?? []), run]);
+  }
+  const out: Finding[] = [];
+  for (const [workflow, runs] of byWorkflow) {
+    const newestFirst = [...runs].sort((left, right) => (Date.parse(right.created_at ?? "") || 0) - (Date.parse(left.created_at ?? "") || 0));
+    let streak = 0;
+    while (streak < newestFirst.length && SCHEDULED_FAILED.has(String(newestFirst[streak].conclusion ?? ""))) streak++;
+    if (streak < SCHEDULED_FAILURE_STREAK) continue;
+    // Every run we were given failed, so the real streak reaches back past the
+    // listing; say so rather than reporting the page size as the length.
+    const bounded = streak === newestFirst.length;
+    const oldest = newestFirst[streak - 1];
+    const since = oldest.created_at ? `since ${oldest.created_at.slice(0, 10)}` : "since an unrecorded date";
+    out.push(finding(
+      "ci.scheduled_failing",
+      "WARNING",
+      `ci:${workflow}`,
+      `scheduled workflow "${workflow}" has failed ${bounded ? "at least " : ""}${streak} consecutive runs on ${SCHEDULED_BRANCH}, unbroken ${since}`,
+      `a scheduled run of "${workflow}" on ${SCHEDULED_BRANCH} succeeds`,
+    ));
+  }
+  return out.sort((left, right) => left.fingerprint.localeCompare(right.fingerprint));
+}
+
 export function detectAll(sample: SentinelSample, state: SentinelState): Finding[] {
   return [
     ...detectDaemon(sample, state), ...detectLogHealth(sample), ...detectLimiter(sample), ...detectIndexes(sample),
     ...detectTier2Overlong(sample), ...detectExecutor(sample, state), ...detectWakes(sample), ...detectWatcher(sample, state),
     ...detectStorage(sample, state), ...detectProcess(sample, state), ...detectSearchAndTools(sample), ...detectDeadSessions(sample), ...detectDsym(sample),
+    ...detectScheduledCi(sample),
   ].filter((value, index, all) => all.findIndex((other) => other.fingerprint === value.fingerprint) === index);
 }
 
@@ -582,6 +661,38 @@ function artifactCensus(storage: string): { sizes: Record<string, number>; roots
   return { sizes, roots };
 }
 
+// The sentinel's launchd PATH is deliberately short and does not carry
+// Homebrew, so `gh` is looked for in the usual install directories before
+// falling back to whatever PATH resolves.
+const GH_CANDIDATES = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", join(HOME, ".local", "bin", "gh")];
+// The tick runs every two minutes; a nightly workflow changes verdict once a
+// day. Polling the API on every tick would spend hundreds of requests a day to
+// learn nothing, so the listing is refetched on this interval and reused in
+// between.
+const CI_POLL_INTERVAL = 15 * 60_000;
+const CI_RUN_WINDOW = 30;
+
+function collectScheduledRuns(): ScheduledRun[] {
+  const gh = GH_CANDIDATES.find((path) => existsSync(path)) ?? "gh";
+  const rows = commandJson(gh, [
+    "run", "list",
+    "--branch", SCHEDULED_BRANCH,
+    "--event", "schedule",
+    "--limit", String(CI_RUN_WINDOW),
+    "--json", "workflowName,headBranch,event,status,conclusion,createdAt,databaseId",
+  ]);
+  if (!Array.isArray(rows)) throw new Error("gh run list did not return an array");
+  return rows.map((row: Record<string, unknown>) => ({
+    workflow: typeof row.workflowName === "string" ? row.workflowName : undefined,
+    branch: typeof row.headBranch === "string" ? row.headBranch : undefined,
+    event: typeof row.event === "string" ? row.event : undefined,
+    status: typeof row.status === "string" ? row.status : undefined,
+    conclusion: typeof row.conclusion === "string" ? row.conclusion : null,
+    created_at: typeof row.createdAt === "string" ? row.createdAt : undefined,
+    run_id: typeof row.databaseId === "number" ? row.databaseId : undefined,
+  }));
+}
+
 function diskFree(path: string): number {
   const result = spawnSync("df", ["-Pk", path], { encoding: "utf8" });
   if (result.status !== 0) throw new Error(result.stderr.trim());
@@ -674,6 +785,19 @@ function collectSample(state: SentinelState): { sample: SentinelSample; cursors:
     };
   } catch (error) { sample.disk_error = String(error); }
   try { sample.dsym = collectDsym(sample.supervisor?.pid ?? 0, sample.process?.image); } catch (error) { sample.dsym = { error: String(error) }; }
+  // A listing older than the poll interval is refetched; otherwise the stored
+  // one is reused so the finding neither clears nor re-raises between polls.
+  const ciAge = sample.now_ms - Number(state.ci?.checked_at_ms ?? 0);
+  if (ciAge < CI_POLL_INTERVAL && (state.ci?.runs || state.ci?.error)) {
+    sample.ci_runs = state.ci.runs;
+    sample.ci_error = state.ci.error;
+    cursors.ci = state.ci;
+  } else {
+    try {
+      sample.ci_runs = collectScheduledRuns();
+    } catch (error) { sample.ci_error = String(error); }
+    cursors.ci = { checked_at_ms: sample.now_ms, runs: sample.ci_runs, error: sample.ci_error };
+  }
   return { sample, cursors };
 }
 function readState(): SentinelState {

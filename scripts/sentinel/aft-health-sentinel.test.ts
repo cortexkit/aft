@@ -16,6 +16,7 @@ import {
   detectLogHealth,
   detectProcess,
   detectSearchAndTools,
+  detectScheduledCi,
   detectStorage,
   detectTier2Overlong,
   detectWakes,
@@ -26,6 +27,7 @@ import {
   writeGrowthAttribution,
   type SentinelSample,
   type SentinelState,
+  type ScheduledRun,
   daemonPidLog,
   isSubcDaemon,
 } from "./aft-health-sentinel";
@@ -342,6 +344,81 @@ describe("health sentinel pure detectors", () => {
     const missing = detectDsym(sample({ dsym: { requested_uuid: "2CD06659" } }))[0];
     expect(missing.rule).toBe("dsym.missing");
     expect(missing.fingerprint).toBe("dsym:2CD06659");
+  });
+
+  test("a scheduled workflow raises only once its failures become a streak", () => {
+    // Nightly runs, newest first. The gate runs on a schedule and blocks no
+    // merge, so nothing else in the toolchain reports these.
+    const night = (day: number, conclusion: string, patch: Partial<ScheduledRun> = {}): ScheduledRun => ({
+      workflow: "Nightly OSS cost gate",
+      branch: "main",
+      event: "schedule",
+      status: "completed",
+      conclusion,
+      created_at: `2026-09-${String(day).padStart(2, "0")}T02:17:00Z`,
+      run_id: 35000000000 + day,
+      ...patch,
+    });
+    const green = night(15, "success");
+
+    const oneRed = detectScheduledCi(sample({ ci_runs: [night(18, "failure"), night(17, "success"), green] }));
+    expect(oneRed).toEqual([]);
+    const twoRed = detectScheduledCi(sample({ ci_runs: [night(18, "failure"), night(17, "failure"), green] }));
+    expect(twoRed).toEqual([]);
+
+    const streak = detectScheduledCi(sample({ ci_runs: [night(18, "failure"), night(17, "timed_out"), night(16, "failure"), green] }))[0];
+    expect(streak.rule).toBe("ci.scheduled_failing");
+    expect(streak.severity).toBe("WARNING");
+    expect(streak.fingerprint).toBe("ci:Nightly OSS cost gate");
+    expect(streak.text).toContain("Nightly OSS cost gate");
+    expect(streak.text).toContain("3 consecutive runs");
+    expect(streak.text).toContain("since 2026-09-16");
+    expect(streak.clears_when).toContain("succeeds");
+
+    // One green night at the top ends the streak whatever came before it.
+    const recovered = detectScheduledCi(sample({ ci_runs: [night(19, "success"), night(18, "failure"), night(17, "failure"), night(16, "failure")] }));
+    expect(recovered).toEqual([]);
+  });
+
+  test("the streak counts scheduled main runs only, and is a lower bound when every listed run failed", () => {
+    const row = (patch: Partial<ScheduledRun>): ScheduledRun => ({
+      workflow: "Nightly OSS cost gate",
+      branch: "main",
+      event: "schedule",
+      status: "completed",
+      conclusion: "failure",
+      created_at: "2026-09-18T02:17:00Z",
+      ...patch,
+    });
+    // Each disqualifying axis gets a full streak's worth of reds, so dropping
+    // any one of the three filters would raise a finding.
+    const three = (patch: Partial<ScheduledRun>): ScheduledRun[] =>
+      [18, 17, 16].map((day) => row({ ...patch, created_at: `2026-09-${day}T02:17:00Z` }));
+    expect(detectScheduledCi(sample({ ci_runs: three({ event: "push" }) }))).toEqual([]);
+    expect(detectScheduledCi(sample({ ci_runs: three({ branch: "release/0.57" }) }))).toEqual([]);
+    expect(detectScheduledCi(sample({ ci_runs: three({ status: "in_progress", conclusion: null }) }))).toEqual([]);
+    expect(detectScheduledCi(sample({ ci_runs: three({ conclusion: "cancelled" }) }))).toEqual([]);
+
+    // A cancelled run is not a verdict about the workflow's subject, so it
+    // neither extends the streak nor breaks it.
+    const withCancel = [
+      row({ created_at: "2026-09-18T02:17:00Z" }),
+      row({ conclusion: "cancelled", created_at: "2026-09-17T02:17:00Z" }),
+      row({ created_at: "2026-09-16T02:17:00Z" }),
+      row({ created_at: "2026-09-15T02:17:00Z" }),
+    ];
+    const bounded = detectScheduledCi(sample({ ci_runs: withCancel }))[0];
+    expect(bounded.text).toContain("at least 3 consecutive runs");
+    expect(bounded.text).toContain("since 2026-09-15");
+  });
+
+  test("an unreadable run listing is an instrument finding, not silence", () => {
+    const blind = detectScheduledCi(sample({ ci_error: "Error: gh: command not found" }))[0];
+    expect(blind.rule).toBe("instrument");
+    expect(blind.fingerprint).toBe("instrument:scheduled-ci");
+    expect(blind.text).toContain("gh: command not found");
+    // A sample that carries no CI state at all (a --specimen replay) stays quiet.
+    expect(detectScheduledCi(sample())).toEqual([]);
   });
 
   test("dedupe alerts once, clears absent fingerprints, and stays quiet on a return inside the cooldown", () => {
