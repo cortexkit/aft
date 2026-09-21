@@ -188,12 +188,16 @@ export function ensurePinnedPluginConfig(
   }
 
   // Nothing AFT under the key this host reads. A local checkout registered
-  // under the other generation's key is carried over in this key's shape so
-  // the developer keeps the checkout they chose; the entry there is left in
-  // place for the host that still reads it.
+  // under the other generation's key MOVES into this key's shape rather than
+  // being copied: GA folds a V1 `plugin` list into `plugins`, so the same
+  // checkout under both keys is ambiguous — it either registers twice or lets
+  // the converted V1 list stand in for the V2 one. Our own entry is ours to
+  // relocate; every other plugin's entry stays where the user wrote it.
   const sibling = value[otherOpenCodePluginKey(key)];
-  const carried = Array.isArray(sibling) ? findLocalAftEntry(sibling, hasLocalAftEntry) : null;
+  const siblingList = Array.isArray(sibling) ? sibling : null;
+  const carried = siblingList ? findLocalAftEntry(siblingList, hasLocalAftEntry) : null;
   list.push(carried ? shapePluginEntry(key, carried.packageSpec, carried.options) : entry);
+  if (carried && siblingList) siblingList.splice(carried.index, 1);
   return { action: "added", changed: true, entry, key };
 }
 
