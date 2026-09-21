@@ -16,9 +16,9 @@
     },
     {
       "id": "bash_write-parity-shape",
-      "mutated_input": "bash_write/T7 projected fixture marker",
+      "mutated_input": "bash_write/T7 V1 leg byte count",
       "expected_failure": "projected V1/V2 parity mismatch",
-      "unaffected_positive_control": "bash_write/T1/happy"
+      "unaffected_positive_control": "read/T7/happy"
     }
   ]
 }

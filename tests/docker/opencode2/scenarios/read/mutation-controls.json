@@ -19,6 +19,12 @@
       "mutated_input": "read/T7 agent-visible text",
       "expected_failure": "exact V1/V2 parity mismatch",
       "unaffected_positive_control": "read/T1/happy"
+    },
+    {
+      "id": "read-parity-v1-serve",
+      "mutated_input": "read/T7 V1 leg tool result",
+      "expected_failure": "mock never observed tool result for read-happy",
+      "unaffected_positive_control": "read/T1/happy"
     }
   ]
 }
