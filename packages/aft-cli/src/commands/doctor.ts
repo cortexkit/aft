@@ -94,6 +94,8 @@ export interface DoctorOptions {
   collectDiagnostics?: typeof collectDiagnostics;
   collectRemovalHealth?: typeof collectRemovalHealth;
   detectOpenCodeHost?: () => OpenCodeHostDetection;
+  /** Optional ONNX repair override lets tests exercise --fix without a download. */
+  applyOnnxFix?: typeof runOnnxFix;
 }
 
 function openCodeAdapter(adapters: HarnessAdapter[]): HarnessAdapter | undefined {
@@ -206,6 +208,7 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
       options.detectOpenCodeHost,
       options.resolveAdapters,
       options.collectDiagnostics,
+      options.applyOnnxFix,
     );
   }
 
@@ -1029,15 +1032,27 @@ async function runFixFlow(
   detectOpenCodeHost?: () => OpenCodeHostDetection,
   resolveAdapters: typeof resolveAdaptersForCommand = resolveAdaptersForCommand,
   collect: typeof collectDiagnostics = collectDiagnostics,
+  applyOnnxFix: typeof runOnnxFix = runOnnxFix,
 ): Promise<number> {
   const adapters = await resolveAdapters(argv, {
     allowMulti: false,
     verb: "auto-fix issues for",
   });
   const hostDetection = detectOpenCodeForCommand(adapters, detectOpenCodeHost);
-  if (refuseAmbiguousOpenCodeWrites(hostDetection)) {
-    outro("Done — no changes made.");
-    return 1;
+  // The ambiguity guard answers exactly one question: which config key an
+  // OpenCode host reads its plugin registration from. Nothing else --fix does
+  // depends on the answer — the ONNX Runtime download, the aft binary
+  // download, the storage directory and the `$schema` line are the same work
+  // on either generation — so only the registration write is withheld here.
+  // Aborting the whole run instead left a user whose ONNX Runtime was missing
+  // with no supported way to install it: doctor told them to run --fix, and
+  // --fix reported that it had changed nothing.
+  const configWritesRefused = refuseAmbiguousOpenCodeWrites(hostDetection);
+  const skipped: string[] = [];
+  if (configWritesRefused) {
+    skipped.push(
+      "plugin registration in the OpenCode config (leave one OpenCode generation on PATH and re-run)",
+    );
   }
   if (hostDetection?.status === "unknown") {
     log.warn(
@@ -1053,7 +1068,10 @@ async function runFixFlow(
     logUnmatchedBinaryCandidates(report.cliVersion);
   }
 
-  const plan = buildDoctorFixPlan(adapters, report);
+  // A withheld fix is not a planned change, so it never reaches the prompt.
+  const plan = buildDoctorFixPlan(adapters, report).filter(
+    (item) => !(configWritesRefused && item.kind === "plugin"),
+  );
   if (plan.length > 0) {
     log.warn("Planned changes:");
     for (const item of plan) {
@@ -1066,7 +1084,9 @@ async function runFixFlow(
     }
   }
 
-  await fixPluginEntries(adapters);
+  const pluginEntrySummary = configWritesRefused
+    ? { changed: 0, errors: 0 }
+    : await fixPluginEntries(adapters);
   const pluginUpdateSummary = await applyPluginUpdates(findPluginUpdateTargets(adapters, report));
   const storageSummary = ensureStorageDirsForRegisteredPlugins(adapters);
 
@@ -1087,6 +1107,7 @@ async function runFixFlow(
     const shouldDownload = await confirmBinaryDownloadDespitePluginSkew(report, argv);
     if (!shouldDownload) {
       binaryDownloadSkipped = true;
+      skipped.push("aft binary download (declined because the installed plugin would not use it)");
     } else {
       log.info("AFT binary not found. Downloading…");
       try {
@@ -1116,13 +1137,21 @@ async function runFixFlow(
   }
 
   // Apply the ONNX Runtime repair when diagnostics found a managed-runtime issue.
-  const onnxResult = await runOnnxFix(adapters, report, { yes: true });
+  const onnxResult = await applyOnnxFix(adapters, report, { yes: true });
+
+  const applied: string[] = [];
+  if (pluginEntrySummary.changed > 0) applied.push("plugin registration");
+  if (pluginUpdateSummary.updated > 0) applied.push("plugin package update");
+  if (storageSummary.created > 0) applied.push("AFT storage directory");
+  if (schemaSummary.changed > 0) applied.push("AFT config $schema");
+  if (binaryDownloaded) applied.push("aft binary download");
+  if ((onnxResult?.installed ?? 0) > 0) applied.push("ONNX Runtime install");
 
   // Decide outro state based on combined results. We can have any
   // combination of: ONNX fix attempted/skipped/failed, binary
   // downloaded/skipped/failed, plus pre-existing harness issues left over
   // that this --fix run can't remediate (plugin entry, host install, etc).
-  if (
+  const nothingAttempted =
     onnxResult === null &&
     !binaryDownloaded &&
     !binaryDownloadSkipped &&
@@ -1131,18 +1160,18 @@ async function runFixFlow(
     storageSummary.errors === 0 &&
     schemaSummary.changed === 0 &&
     schemaSummary.errors === 0 &&
+    pluginEntrySummary.changed === 0 &&
+    pluginEntrySummary.errors === 0 &&
     pluginUpdateSummary.updated === 0 &&
-    pluginUpdateSummary.errors === 0
-  ) {
+    pluginUpdateSummary.errors === 0;
+  if (nothingAttempted && skipped.length === 0) {
     log.info("No auto-fixable issues detected.");
     note(
       `If you're still seeing 'Semantic Index: failed' in the TUI sidebar, run \`${CLI} doctor\` (without --fix) for a full diagnostic dump.`,
       "Tip",
     );
-    const afterReport = await collect(adapters);
-    const stillHasProblems = hasDoctorProblems(afterReport);
-    outro(stillHasProblems ? "Done — some issues remain." : "Done.");
-    return stillHasProblems ? 1 : 0;
+  } else {
+    logDoctorFixSummary(applied, skipped);
   }
 
   const hadErrors =
@@ -1150,17 +1179,29 @@ async function runFixFlow(
     binaryDownloadError !== null ||
     storageSummary.errors > 0 ||
     schemaSummary.errors > 0 ||
+    pluginEntrySummary.errors > 0 ||
     pluginUpdateSummary.errors > 0;
-  const afterReport = await collectDiagnostics(adapters);
+  const afterReport = await collect(adapters);
   const stillHasProblems = hasDoctorProblems(afterReport);
   outro(
     hadErrors
       ? "Done — some fixes failed."
-      : stillHasProblems
-        ? "Done — some issues remain."
-        : "Done.",
+      : skipped.length > 0
+        ? "Done — some fixes were skipped."
+        : stillHasProblems
+          ? "Done — some issues remain."
+          : "Done.",
   );
-  return hadErrors || stillHasProblems ? 1 : 0;
+  return hadErrors || stillHasProblems || configWritesRefused ? 1 : 0;
+}
+
+/**
+ * Name what this run changed and what it deliberately left alone, so a run
+ * that withheld one fix can never read as a run that had nothing to do.
+ */
+function logDoctorFixSummary(applied: string[], skipped: string[]): void {
+  log.info(applied.length > 0 ? `Applied: ${applied.join(", ")}.` : "Applied: no changes.");
+  if (skipped.length > 0) log.warn(`Skipped: ${skipped.join("; ")}.`);
 }
 
 function logDoctorIssues(report: DiagnosticReport): void {
@@ -1296,20 +1337,31 @@ function reportLspCacheClear(cleanup: ClearResult): void {
   }
 }
 
-export async function fixPluginEntries(adapters: HarnessAdapter[]): Promise<void> {
+export async function fixPluginEntries(
+  adapters: HarnessAdapter[],
+): Promise<{ changed: number; errors: number }> {
+  const summary = { changed: 0, errors: 0 };
   for (const adapter of adapters) {
-    await maybeFixPlugin(adapter);
+    const result = await maybeFixPlugin(adapter);
+    summary.changed += result.changed;
+    summary.errors += result.errors;
   }
+  return summary;
 }
 
-async function maybeFixPlugin(adapter: HarnessAdapter): Promise<void> {
-  if (!adapter.isInstalled()) return;
+async function maybeFixPlugin(
+  adapter: HarnessAdapter,
+): Promise<{ changed: number; errors: number }> {
+  const summary = { changed: 0, errors: 0 };
+  if (!adapter.isInstalled()) return summary;
   if (!adapter.hasPluginEntry() || adapterConfigNeedsUpdate(adapter)) {
     log.info(`${adapter.displayName}: attempting to register or update plugin config…`);
     const result = await adapter.ensurePluginEntry();
     if (result.ok) {
+      if (result.action === "added" || result.action === "updated") summary.changed += 1;
       log.success(`${adapter.displayName}: ${result.message}`);
     } else {
+      summary.errors += 1;
       log.error(`${adapter.displayName}: ${result.message}`);
     }
   }
@@ -1320,12 +1372,15 @@ async function maybeFixPlugin(adapter: HarnessAdapter): Promise<void> {
     if (!hasTuiEntry || adapterConfigNeedsUpdate(adapter, true)) {
       const result = await adapter.ensureTuiPluginEntry();
       if (result.ok && (result.action === "added" || result.action === "updated")) {
+        summary.changed += 1;
         log.success(`${adapter.displayName}: ${result.message}`);
       } else if (!result.ok) {
+        summary.errors += 1;
         log.error(`${adapter.displayName}: ${result.message}`);
       }
     }
   }
+  return summary;
 }
 
 function describeAdapterInstallHint(kind: string): string {

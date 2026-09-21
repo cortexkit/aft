@@ -13,6 +13,8 @@ import { runSetup } from "../commands/setup.js";
 import { diagnoseOpenCodeLoad, OPENCODE_LOAD_PATHS } from "../doctor/opencode.js";
 import type { DiagnosticReport, HarnessDiagnostic } from "../lib/diagnostics.js";
 import { AFT_SCHEMA_URL } from "../lib/jsonc.js";
+import { getOnnxLibraryName, ONNX_RUNTIME_VERSION } from "../lib/onnx.js";
+import { runOnnxFix } from "../lib/onnx-fix.js";
 import { getSelfVersion } from "../lib/self-version.js";
 import {
   detectOpenCodeHostGeneration,
@@ -793,10 +795,11 @@ describe("OpenCode doctor generation and load path", () => {
     expect(output).toContain(`plugin version: ${getSelfVersion()}`);
   });
 
-  test("doctor --fix reports both generations and refuses configuration writes", async () => {
+  test("doctor --fix under an ambiguous host repairs ONNX and skips only the config write", async () => {
     const root = tempRoot("aft-cli-doctor-fix-ambiguous-");
     const fixture = doctorFixture(root);
     let ensureCalls = 0;
+    fixture.adapter.hasPluginEntry = () => false;
     fixture.adapter.ensurePluginEntry = async () => {
       ensureCalls += 1;
       return {
@@ -806,6 +809,17 @@ describe("OpenCode doctor generation and load path", () => {
         configPath: fixture.harness.configPaths.harnessConfig,
       };
     };
+    // The state the reporting machine was in: an unregistered plugin (which
+    // needs the generation to write) and a missing ONNX Runtime (which does
+    // not). Only the first may be withheld.
+    fixture.harness.pluginRegistered = false;
+    fixture.harness.onnxRuntime = { ...fixture.harness.onnxRuntime, required: true };
+    const installedLibrary = join(
+      fixture.harness.storageDir.path,
+      "onnxruntime",
+      ONNX_RUNTIME_VERSION,
+      getOnnxLibraryName(),
+    );
     const lines = captureOutput();
 
     const code = await runDoctor({
@@ -815,13 +829,36 @@ describe("OpenCode doctor generation and load path", () => {
       issue: false,
       argv: ["--fix", "--yes"],
       resolveAdapters: async () => [fixture.adapter],
+      collectDiagnostics: async () => fixture.report,
       detectOpenCodeHost: () => detection("ambiguous"),
+      // The real repair runs; only the download itself is stubbed, so the
+      // staging, swap and published path are all exercised.
+      applyOnnxFix: (adapters, report, options) =>
+        runOnnxFix(adapters, report, {
+          ...options,
+          ensureFn: async (storageDir) => {
+            const directory = join(storageDir, "onnxruntime", ONNX_RUNTIME_VERSION);
+            mkdirSync(directory, { recursive: true });
+            const library = join(directory, getOnnxLibraryName());
+            writeFileSync(library, "fixture runtime\n");
+            return library;
+          },
+        }),
     });
 
-    expect(code).toBe(1);
+    const output = lines.join("\n");
+    const appliedLine = output.split("\n").find((line) => line.includes("Applied:")) ?? "";
     expect(ensureCalls).toBe(0);
-    expect(lines.join("\n")).toContain("host generation ambiguous (V1, V2)");
-    expect(lines.join("\n")).toContain("no changes made");
+    expect(existsSync(installedLibrary)).toBe(true);
+    expect(output).toContain("host generation ambiguous (V1, V2)");
+    expect(appliedLine).toContain("ONNX Runtime install");
+    expect(appliedLine).toContain("AFT config $schema");
+    expect(output).toContain("Skipped: plugin registration in the OpenCode config");
+    // The withheld plugin-registration write is never offered as a planned
+    // change either.
+    expect(output).not.toContain(`to ${fixture.harness.configPaths.harnessConfig}`);
+    expect(output).not.toContain("no changes made");
+    expect(code).toBe(1);
   });
 
   test("ambiguous doctor output reports V1 and V2 and remains non-zero", async () => {
