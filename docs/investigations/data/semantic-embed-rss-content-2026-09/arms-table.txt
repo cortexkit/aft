@@ -1,0 +1,21 @@
+arm                  corpus MB  batches  MB/batch  (w/ save)  peak MB  settled  KB/chunk  requests  rejected  row tok
+---------------------------------------------------------------------------------------------------------------------
+base64                    82.8      413    -0.040      0.072      419      417      15.4       414         0      314
+cyrillic                  48.2      413     0.288      0.431      668      668      24.7       414         0      466
+cyrillic-recovery         48.2      413     0.192      0.295      630      554      20.5     77588     51187      466
+java-ascii                25.2      413     0.527      0.643      633      633      23.4       414         0      314
+java-recovery             25.2      413     0.134      0.225      588      406      15.0    102688     76287      314
+mixed                     74.2      413     0.203      0.282      485      473      17.5       414         0      466
+rust-baseline             10.6      375     0.023      0.078      433      433      17.6       376         0      170
+sidecar-mixed             71.2      413     0.312      0.459      656      619      22.9       414         0      314
+xml                       91.6      413     0.229      0.297      450      450      16.6       414         0      314
+
+base64               embed window batch 12->405, 157.3 -> 192.3 MB; widest row 1097 chars / 1097 bytes / 314 tokens (limit none)
+cyrillic             embed window batch 12->406, 181.1 -> 299.0 MB; widest row 744 chars / 1097 bytes / 466 tokens (limit none)
+cyrillic-recovery    embed window batch 7->406, 178.2 -> 277.0 MB; widest row 744 chars / 1097 bytes / 466 tokens (limit 320)
+java-ascii           embed window batch 12->407, 181.1 -> 349.4 MB; widest row 1097 chars / 1097 bytes / 314 tokens (limit none)
+java-recovery        embed window batch 5->407, 173.5 -> 262.2 MB; widest row 1097 chars / 1097 bytes / 314 tokens (limit 150)
+mixed                embed window batch 12->408, 168.8 -> 240.2 MB; widest row 1097 chars / 1097 bytes / 466 tokens (limit none)
+rust-baseline        embed window batch 13->362, 138.1 -> 142.2 MB; widest row 594 chars / 594 bytes / 170 tokens (limit none)
+sidecar-mixed        embed window batch 12->407, 182.5 -> 302.9 MB; widest row 1097 chars / 1097 bytes / 314 tokens (limit none)
+xml                  embed window batch 12->404, 157.4 -> 266.2 MB; widest row 1097 chars / 1097 bytes / 314 tokens (limit none)
