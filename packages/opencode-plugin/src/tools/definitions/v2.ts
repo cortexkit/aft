@@ -85,6 +85,47 @@ function failure(error: unknown): Error {
   return new Error(`V2 tool execution rejected with a non-Error value: ${detail}`);
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== "object" || value === null) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/**
+ * Drop the metadata values the host has no way to store.
+ *
+ * A tool part's metadata is held as a record of JSON values, and `undefined`
+ * is not one of them. A key that is PRESENT but undefined therefore fails the
+ * whole record: the part never reaches its completed state, and the model is
+ * handed the host's `Tool result missing` placeholder in place of the output.
+ * The tool itself ran and its side effects landed, so nothing on either side
+ * reports a problem — the output simply disappears.
+ *
+ * Tools assemble metadata out of optional fields, and writing
+ * `description: maybeUndefined` is the obvious way to express "the caller did
+ * not give me one". Cleaning that up here, at the single seam where our
+ * metadata crosses into the host, fixes it for every tool at once; doing it
+ * key by key in each tool would make silence the penalty for forgetting.
+ *
+ * An absent key is exactly what an absent optional field means, so undefined
+ * keys are dropped. An array has no absent element, so an undefined entry
+ * becomes null, which is what writing the same array out as JSON would give.
+ * Values that are neither — a Date, say — are left alone rather than mangled
+ * into something that merely looks storable.
+ */
+function jsonSafeMetadata(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((entry) => (entry === undefined ? null : jsonSafeMetadata(entry)));
+  }
+  if (!isPlainObject(value)) return value;
+  const cleaned: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (entry === undefined) continue;
+    cleaned[key] = jsonSafeMetadata(entry);
+  }
+  return cleaned;
+}
+
 function resultContent(result: ToolResult): Record<string, unknown> {
   if (typeof result === "string") return { content: result };
 
@@ -97,10 +138,10 @@ function resultContent(result: ToolResult): Record<string, unknown> {
   const content = attachments.length
     ? [{ type: "text", text: result.output }, ...attachments]
     : result.output;
-  const metadata = {
+  const metadata = jsonSafeMetadata({
     ...(result.metadata ?? {}),
     ...(result.title ? { title: result.title } : {}),
-  };
+  }) as Record<string, unknown>;
   return {
     content,
     ...(Object.keys(metadata).length ? { metadata } : {}),
@@ -223,10 +264,12 @@ function runtimeFor(
     effectAbort: signal,
     metadata: (update) => {
       void Effect.runPromise(
-        context.progress({
-          ...(update.metadata ?? {}),
-          ...(update.title ? { title: update.title } : {}),
-        }),
+        context.progress(
+          jsonSafeMetadata({
+            ...(update.metadata ?? {}),
+            ...(update.title ? { title: update.title } : {}),
+          }) as Record<string, unknown>,
+        ),
       );
     },
     ask: (request) => {
