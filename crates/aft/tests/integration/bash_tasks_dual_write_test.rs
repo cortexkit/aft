@@ -259,10 +259,40 @@ fn bash_tasks_dual_write_spawn_writes_both_json_and_db_row() {
     let (registry, conn) = registry_with_db(storage.path(), Harness::Opencode);
 
     let task_id = spawn_task(&registry, storage.path(), project.path(), "echo dual-write");
-    let row = wait_for_status(&conn, "opencode", SESSION, &task_id, "completed");
-    let task = read_task(&resolved_paths(storage.path(), SESSION, &task_id).json).unwrap();
+    wait_for_status(&conn, "opencode", SESSION, &task_id, "completed");
 
-    assert_row_matches_task(&row, &task, project.path(), storage.path());
+    // Both stores must agree, but they are not written together: persist_task
+    // writes the JSON first and the row second, and completion is not the last
+    // write -- the watchdog compresses the output afterwards and persists again.
+    // Holding the row from the moment it first read `completed` and comparing it
+    // against JSON read later therefore compares two different instants, and any
+    // write landing between them shows up as a field mismatch. Re-read the pair
+    // until they agree, so the assertion is about the stores agreeing rather
+    // than about how much time passed between two reads.
+    let started = Instant::now();
+    let json_path = resolved_paths(storage.path(), SESSION, &task_id).json;
+    loop {
+        let task = read_task(&json_path).unwrap();
+        let row =
+            fetch_row(&conn, "opencode", SESSION, &task_id).expect("row exists once completed");
+        let coherent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_row_matches_task(&row, &task, project.path(), storage.path());
+        }))
+        .is_ok();
+        if coherent {
+            break;
+        }
+        // Give the final assertion a real failure to print rather than a timeout.
+        if started.elapsed() >= Duration::from_secs(8) {
+            let task = read_task(&json_path).unwrap();
+            let row =
+                fetch_row(&conn, "opencode", SESSION, &task_id).expect("row exists once completed");
+            assert_row_matches_task(&row, &task, project.path(), storage.path());
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
     registry.detach();
 }
 

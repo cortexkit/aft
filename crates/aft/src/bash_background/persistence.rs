@@ -15,7 +15,7 @@ use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -1106,7 +1106,9 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// How many times an open of a task's metadata re-tries a concurrent
 /// replacement before giving up. An attempt only loses if another rename lands
 /// in the microseconds between this open and its link-count check, so a handful
-/// of attempts outlasts even a writer republishing metadata in a loop.
+/// of attempts outlasts even a writer republishing metadata in a loop —
+/// provided the attempts actually sample different moments, which is what the
+/// yield between them is for.
 const METADATA_OPEN_ATTEMPTS: u32 = 8;
 
 /// Open a task's metadata file by name, tolerating a concurrent atomic replace.
@@ -1133,7 +1135,23 @@ fn open_metadata_through_replacement(dir: &PinnedDir, name: &OsStr) -> io::Resul
             Err(error)
                 if attempts < METADATA_OPEN_ATTEMPTS
                     && error.kind() == io::ErrorKind::Interrupted
-                    && error.to_string().contains(ARTIFACT_CONCURRENTLY_REPLACED) => {}
+                    && error.to_string().contains(ARTIFACT_CONCURRENTLY_REPLACED) =>
+            {
+                // Retrying in a tight loop samples one instant several times:
+                // every attempt can land inside the same scheduling quantum, so
+                // eight of them are worth about one whenever the writer is
+                // descheduled mid-rename -- exactly the case on a loaded
+                // machine, which is the case this retry exists for. Yield first,
+                // then sleep in growing steps, so the attempts span the rename
+                // rather than racing it. The total stays under ~2ms, and losing
+                // here is not cosmetic: a caller that reads this as a damaged
+                // layout can quarantine a live task's whole bundle.
+                if attempts <= 2 {
+                    std::thread::yield_now();
+                } else {
+                    std::thread::sleep(Duration::from_micros(50 << (attempts - 3).min(5)));
+                }
+            }
             other => return other,
         }
     }
