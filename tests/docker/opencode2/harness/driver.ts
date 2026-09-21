@@ -76,6 +76,17 @@ import { asRecord, createRunId, runCommand } from "./util.js";
 const harnessRoot = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(harnessRoot, "../../../..");
 
+/**
+ * How long a host whose exit is excluded is given to end itself once it has
+ * served the whole scenario.
+ *
+ * Long enough that a host which does terminate is recorded as having
+ * terminated, rather than killed by a harness in a hurry; short enough that a
+ * host which never terminates costs the row seconds instead of its whole
+ * timeout.
+ */
+const SERVED_HOST_SETTLE_MS = 5_000;
+
 interface DriverConfig {
   executable: string;
   nativeExecutable: string;
@@ -566,6 +577,19 @@ async function runOneScenario(options: {
   let transportDeadActive = false;
   let excludedHostExit: Record<string, unknown> | undefined;
 
+  /**
+   * Resolves once the mock has answered the scenario's last scripted turn.
+   *
+   * That is the moment the host has been given everything the row asks of it:
+   * every turn has been delivered, and each tool result came back inside the
+   * request for the turn after it. Nothing the harness still has to read comes
+   * off this process afterwards.
+   */
+  let markServed: () => void = () => {};
+  const scenarioServed = new Promise<void>((resolvePromise) => {
+    markServed = resolvePromise;
+  });
+
   const recordFailure = (error: unknown) => {
     firstFailure ??= error;
   };
@@ -714,6 +738,7 @@ async function runOneScenario(options: {
         if (turn) materializeTurnPlaceholders(turn, controlPathValues);
       },
       afterResponse: async (exchange) => {
+        if (exchange.index === scenario.turns.length - 1) markServed();
         if (!server || !isolation || !options.hostContract) return;
         const controlServer = server;
         const controlIsolation = isolation;
@@ -835,7 +860,18 @@ async function runOneScenario(options: {
       typeof scenario.metadata?.host_timeout_ms === "number"
         ? scenario.metadata.host_timeout_ms
         : 45_000;
-    const host = await client.wait(hostTimeoutMs);
+    // A leg whose row has already taken this host's exit out of its verdict is
+    // not waited on to the row timeout. Once the scenario has been served the
+    // harness has everything it judges, so it allows a short settling window —
+    // enough for a host that does mean to exit to do so, and to be recorded as
+    // having exited — and then stops waiting. The pinned V1 host does not exit
+    // inside a git repository, and paying its full row timeout on every parity
+    // row was most of what the matrix spent. A leg that never serves resolves
+    // nothing here and still runs out its own timeout.
+    const stopWaiting = options.excludedHostExit
+      ? scenarioServed.then(() => Bun.sleep(SERVED_HOST_SETTLE_MS))
+      : undefined;
+    const host = await client.wait(hostTimeoutMs, stopWaiting);
     hostCompletedAt = Date.now();
     await emit({ kind: "host_exit", at: hostCompletedAt, output: host });
     hostStream = host.stdout;
@@ -870,9 +906,11 @@ async function runOneScenario(options: {
       // A killed host reports no exit code, and "exited null" reads like a
       // crash; saying it ran out of time is the difference between looking for
       // a fatal error and looking for what it was still waiting on.
-      const ending = host.timed_out
-        ? `host was still running after ${hostTimeoutMs}ms and was killed`
-        : `host exited ${host.exit_code}`;
+      const ending = host.stopped_early
+        ? `host was still running ${SERVED_HOST_SETTLE_MS}ms after it had served the whole scenario, and was stopped`
+        : host.timed_out
+          ? `host was still running after ${hostTimeoutMs}ms and was killed`
+          : `host exited ${host.exit_code}`;
       if (options.excludedHostExit) {
         // The row says this host's exit is not part of its verdict, so the
         // ending is recorded and the run carries on to the checks that are.
@@ -885,6 +923,8 @@ async function runOneScenario(options: {
           exit_code: host.exit_code,
           signal: host.signal,
           timed_out: host.timed_out,
+          stopped_after_serving: host.stopped_early === true,
+          settle_ms: SERVED_HOST_SETTLE_MS,
         };
         await forensics.writeJson("excluded-host-exit.json", excludedHostExit);
       } else {

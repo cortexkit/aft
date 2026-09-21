@@ -79,6 +79,8 @@ export interface CommandOutput {
   stdout: string;
   stderr: string;
   timed_out: boolean;
+  /** The caller stopped waiting and killed the process; it did not end itself. */
+  stopped_early?: boolean;
 }
 
 export async function runCommand(

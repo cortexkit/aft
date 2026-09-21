@@ -16,6 +16,7 @@ interface CapturedChild {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  stoppedEarly: boolean;
   /** Resolves once both pipes have ended, so nothing written at exit is lost. */
   stdioClosed: Promise<void>;
 }
@@ -106,6 +107,7 @@ function spawnCaptured(
     stdout: "",
     stderr: "",
     timedOut: false,
+    stoppedEarly: false,
     stdioClosed: Promise.resolve(),
   };
   captured.child = spawn(executable, args, {
@@ -127,28 +129,42 @@ function spawnCaptured(
   return captured;
 }
 
-async function waitCaptured(captured: CapturedChild, timeoutMs: number): Promise<CommandOutput> {
+async function waitCaptured(
+  captured: CapturedChild,
+  timeoutMs: number,
+  stopWaiting?: Promise<void>,
+): Promise<CommandOutput> {
+  const killGroup = () => {
+    if (captured.child.pid && process.platform !== "win32") {
+      try {
+        process.kill(-captured.child.pid, "SIGKILL");
+      } catch {}
+    } else {
+      captured.child.kill("SIGKILL");
+    }
+  };
   const result =
     captured.child.exitCode !== null || captured.child.signalCode !== null
       ? { code: captured.child.exitCode, signal: captured.child.signalCode }
       : await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
           (resolvePromise, reject) => {
             let timer: NodeJS.Timeout | undefined;
+            let done = false;
             const finish = (code: number | null, signal: NodeJS.Signals | null) => {
+              done = true;
               if (timer) clearTimeout(timer);
               resolvePromise({ code, signal });
             };
             captured.child.once("error", reject);
             captured.child.once("exit", finish);
+            void stopWaiting?.then(() => {
+              if (done) return;
+              captured.stoppedEarly = true;
+              killGroup();
+            });
             timer = setTimeout(() => {
               captured.timedOut = true;
-              if (captured.child.pid && process.platform !== "win32") {
-                try {
-                  process.kill(-captured.child.pid, "SIGKILL");
-                } catch {}
-              } else {
-                captured.child.kill("SIGKILL");
-              }
+              killGroup();
             }, timeoutMs);
             timer.unref();
           },
@@ -162,6 +178,7 @@ async function waitCaptured(captured: CapturedChild, timeoutMs: number): Promise
     stdout: captured.stdout,
     stderr: captured.stderr,
     timed_out: captured.timedOut,
+    stopped_early: captured.stoppedEarly,
   };
 }
 
@@ -263,7 +280,16 @@ export function startScenarioClient(options: {
   server?: SharedServerHandle;
   hostGeneration?: "v1" | "v2";
   model?: string;
-}): { child: ChildProcess; wait: (timeoutMs?: number) => Promise<CommandOutput> } {
+}): {
+  child: ChildProcess;
+  /**
+   * Wait for the host to finish. `stopWaiting` is for a caller that already
+   * has everything the row needs from this host: when it resolves the process
+   * group is killed instead of being waited on to the timeout, and the result
+   * says `stopped_early` so the ending is not mistaken for a clean exit.
+   */
+  wait: (timeoutMs?: number, stopWaiting?: Promise<void>) => Promise<CommandOutput>;
+} {
   const baseArgs = ["run"];
   let args: string[];
   let env: NodeJS.ProcessEnv;
@@ -299,7 +325,8 @@ export function startScenarioClient(options: {
   options.processObserver.trackChild("opencode2-run", captured.child, "host");
   return {
     child: captured.child,
-    wait: (timeoutMs = 120_000) => waitCaptured(captured, timeoutMs),
+    wait: (timeoutMs = 120_000, stopWaiting?: Promise<void>) =>
+      waitCaptured(captured, timeoutMs, stopWaiting),
   };
 }
 

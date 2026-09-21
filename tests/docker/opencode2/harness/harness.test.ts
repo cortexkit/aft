@@ -294,6 +294,56 @@ describe("scenario isolation and liveness", () => {
     ]);
   });
 
+  // The pinned V1 host serves a whole scenario and then never ends inside a
+  // git project. A row that has already taken that ending out of its verdict
+  // does not buy it with its own timeout: once the caller has what it judges,
+  // the wait stops. Nothing stops a wait the caller has not finished with.
+  describe("a host the caller is finished with is stopped, not waited out", () => {
+    async function sleeper(): Promise<{ executable: string; cwd: string }> {
+      const parent = await root();
+      const executable = join(parent, "never-ends");
+      await writeFile(executable, "#!/bin/sh\nsleep 30\n");
+      await chmod(executable, 0o755);
+      return { executable, cwd: parent };
+    }
+
+    test("the wait ends when the caller says it has everything", async () => {
+      const { executable, cwd } = await sleeper();
+      const client = startScenarioClient({
+        executable,
+        scenario: scenario(call()),
+        cwd,
+        env: { ...process.env },
+        processObserver: { trackChild() {} } as never,
+        hostGeneration: "v1",
+      });
+
+      const startedAt = Date.now();
+      const output = await client.wait(20_000, Bun.sleep(200));
+
+      expect(output.stopped_early).toBe(true);
+      expect(output.timed_out).toBe(false);
+      expect(Date.now() - startedAt).toBeLessThan(10_000);
+    });
+
+    test("a wait with nothing to stop it still runs to the timeout", async () => {
+      const { executable, cwd } = await sleeper();
+      const client = startScenarioClient({
+        executable,
+        scenario: scenario(call()),
+        cwd,
+        env: { ...process.env },
+        processObserver: { trackChild() {} } as never,
+        hostGeneration: "v1",
+      });
+
+      const output = await client.wait(700);
+
+      expect(output.timed_out).toBe(true);
+      expect(output.stopped_early).toBe(false);
+    });
+  });
+
   test("scenario tool aliases use the registered host names", () => {
     expect(hostToolName("ast_search")).toBe("ast_grep_search");
     expect(hostToolName("ast_replace")).toBe("ast_grep_replace");
