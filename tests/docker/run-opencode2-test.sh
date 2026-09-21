@@ -4,7 +4,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 HARNESS_DIR="$SCRIPT_DIR/opencode2/harness"
-IMAGE="${AFT_OPENCODE2_IMAGE:-aft-e2e-opencode2-linux}"
+# The repository the harness tags its images under. The tag is derived from
+# the inputs the image was built from, so this is a name, not an identity; see
+# the build below.
+IMAGE_REPOSITORY="${AFT_OPENCODE2_IMAGE:-aft-e2e-opencode2-linux}"
+# Every image this script builds carries this label, which is how the reaper
+# finds the ones it is allowed to remove. Images built before the label
+# existed are not ours to recognise and have to be removed by hand once.
+HARNESS_IMAGE_LABEL="org.cortexkit.aft-e2e=opencode2"
+# Set once the build has produced one; the reaper does nothing until then.
+IMAGE=""
 ARTIFACT_ROOT="${AFT_E2E_ARTIFACT_ROOT:-$REPO_ROOT/.tmp/opencode2-e2e}"
 RUN_ID="${AFT_E2E_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_RUN_ID:-local}-$$}"
 
@@ -55,13 +64,56 @@ if [[ -n "${AFT_BINARY_PATH:-}" ]]; then
   printf 'Using the same-SHA artifact from %s instead of building in the image\n' "$source_dir"
 fi
 
+# Name the image after the inputs that produced it, not after the run.
+#
+# A per-run name is how several 4GB images pile up in a day: nothing ever
+# supersedes anything. Naming by inputs means a re-run lands on the tag it used
+# last time and a changed input lands on a new one, so each build replaces its
+# predecessor rather than joining it. The build itself still decides what is in
+# the image — an uncommitted edit does not move this key, and does not have to:
+# the build runs either way and the tag simply follows whatever came out of it.
+# Reaping below is what turns "supersedes" into "replaces".
+BINARY_IDENTITY="checkout-build"
+if [[ -n "${AFT_BINARY_PATH:-}" ]]; then
+  BINARY_IDENTITY="$(tr -d '[:space:]' < "$(cd "$(dirname "$AFT_BINARY_PATH")" && pwd)/build-info.json")"
+fi
+digest_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi
+}
+CONTENT_KEY="$(printf '%s\n' "$GIT_SHA" "$HOST_VERSION" "$V1_HOST_VERSION" "$BINARY_IDENTITY" |
+  digest_stdin | cut -c1-12)"
+IMAGE="$IMAGE_REPOSITORY:$CONTENT_KEY"
+
 docker build \
   --platform linux/amd64 \
   "${build_args[@]}" \
+  --label "$HARNESS_IMAGE_LABEL" \
   --file "$HARNESS_DIR/Dockerfile" \
   --tag "$IMAGE" \
   "$REPO_ROOT"
 stage_cleanup
+printf 'Harness image: %s\n' "$IMAGE"
+
+# Remove the harness images this one supersedes, so the steady state is one
+# image rather than one per run: the other tags in this repository named builds
+# this one replaces, and a rebuild onto the same tag leaves its predecessor
+# untagged. Nothing is removed forcibly, so an image another run still has a
+# container on stays where it is; the narrow case this cannot protect is a
+# concurrent run that has built but not yet started its container, which loses
+# a rebuild rather than its results.
+reap_superseded_images() {
+  local ref id
+  [[ -z "$IMAGE" ]] && return 0
+  while IFS= read -r ref; do
+    [[ -z "$ref" || "$ref" == "$IMAGE" || "$ref" == *":<none>" ]] && continue
+    docker image rm "$ref" >/dev/null 2>&1 || true
+  done < <(docker image ls "$IMAGE_REPOSITORY" --format '{{.Repository}}:{{.Tag}}' 2>/dev/null || true)
+  while IFS= read -r id; do
+    [[ -z "$id" ]] && continue
+    docker image rm "$id" >/dev/null 2>&1 || true
+  done < <(docker image ls --all --no-trunc --format '{{.ID}}' \
+    --filter "label=$HARNESS_IMAGE_LABEL" --filter "dangling=true" 2>/dev/null || true)
+}
 
 # Run as the invoking uid/gid, not root. The scenario roots are mkdtemp'd (mode
 # 0700) under the bind-mounted artifact root, so a root-owned run leaves a
@@ -99,6 +151,11 @@ printf 'Running OpenCode 2 matrix; forensics: %s/%s\n' "$ARTIFACT_ROOT" "$RUN_ID
 # `docker run` in the foreground does not forward the signal that kills this
 # script (a caller's outer time cap, ctrl-c): the container keeps running its
 # host processes for hours and loads the box. Name it and remove it on exit.
-cleanup() { docker rm -f "aft-opencode2-$RUN_ID" >/dev/null 2>&1 || true; }
+# The superseded images go the same way, so a killed run reaps what it replaced
+# rather than leaving it on disk.
+cleanup() {
+  docker rm -f "aft-opencode2-$RUN_ID" >/dev/null 2>&1 || true
+  reap_superseded_images
+}
 trap cleanup EXIT INT TERM
 docker run "${run_args[@]}" "$IMAGE" "$@"

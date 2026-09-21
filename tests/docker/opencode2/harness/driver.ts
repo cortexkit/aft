@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { parseE2EConcurrency, mapWithConcurrency } from "./concurrency.js";
@@ -14,7 +14,7 @@ import { DiskStateObserver, ThreeStateRecorder } from "./disk-state.js";
 import { fail, HarnessError } from "./errors.js";
 import { HostEventRecorder } from "./event-stream.js";
 import { loadHarnessExtensions } from "./extensions.js";
-import { ScenarioForensics } from "./forensics.js";
+import { ScenarioForensics, parseArtifactRetention, pruneOldRunRoots } from "./forensics.js";
 import {
   runApiCommand,
   runApiControl,
@@ -95,6 +95,8 @@ interface DriverConfig {
   pluginTarball: string;
   pluginDirectory: string;
   runRoot: string;
+  /** How many run roots the artifact store keeps, including this run's own. */
+  artifactRetention: number;
   selector?: string;
   concurrency: number;
   validateOnly: boolean;
@@ -127,6 +129,7 @@ async function configuration(): Promise<DriverConfig> {
     pluginTarball: resolve(requiredEnvironment("AFT_OPENCODE2_PLUGIN_TARBALL")),
     pluginDirectory: resolve(requiredEnvironment("AFT_OPENCODE2_PLUGIN_DIRECTORY")),
     runRoot,
+    artifactRetention: parseArtifactRetention(process.env.AFT_E2E_ARTIFACT_RETAIN),
     selector: process.env.AFT_E2E_SCENARIO ?? argumentValue("--scenario"),
     concurrency: parseE2EConcurrency(process.env.AFT_E2E_CONCURRENCY),
     validateOnly: process.argv.includes("--validate-only"),
@@ -1275,6 +1278,21 @@ async function main(): Promise<void> {
   }
   const config = await configuration();
   await mkdir(config.runRoot, { recursive: true });
+  // Forensics are worth keeping for the run being read and the couple before
+  // it. Older run roots are scenario trees nobody opens again, and nothing
+  // else removes them, so the artifact store only grows.
+  const removedRunRoots = await pruneOldRunRoots({
+    parent: dirname(config.runRoot),
+    keep: config.artifactRetention,
+    current: config.runRoot,
+  });
+  if (removedRunRoots.length > 0) {
+    console.log(
+      `removed ${removedRunRoots.length} run root(s) beyond the newest ${config.artifactRetention}: ${removedRunRoots
+        .map((path) => basename(path))
+        .join(", ")}`,
+    );
+  }
   await verifyExecutableProvenance({
     executable: config.executable,
     repoRoot,

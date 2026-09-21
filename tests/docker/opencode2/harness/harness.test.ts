@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from 'node:url';
@@ -21,6 +21,7 @@ import {
   type PathState,
 } from "./disk-state.js";
 import { HarnessError, type HarnessFailureCode } from "./errors.js";
+import { parseArtifactRetention, pruneOldRunRoots } from "./forensics.js";
 import type { HostEvent } from "./event-stream.js";
 import { runApiControl, startScenarioClient, startSharedServer } from "./host.js";
 import { readPermissionAskInventory } from "./inventory.js";
@@ -1488,6 +1489,77 @@ describe("permission scenarios reach the host's own rules", () => {
         }),
       "host_failed",
     );
+  });
+});
+
+describe("the artifact store keeps the newest run roots and nothing older", () => {
+  const HOUR = 60 * 60 * 1000;
+
+  async function runRoot(parent: string, name: string, ageMs: number, now: number) {
+    const path = join(parent, name);
+    await mkdir(join(path, "scenarios"), { recursive: true });
+    const at = new Date(now - ageMs);
+    await utimes(join(path, "scenarios"), at, at);
+    await utimes(path, at, at);
+    return path;
+  }
+
+  test("older roots go, the newest ones and this run's own stay", async () => {
+    const parent = await root();
+    const now = Date.now();
+    const current = await runRoot(parent, "run-current", 0, now);
+    await runRoot(parent, "run-newest", 2 * HOUR, now);
+    await runRoot(parent, "run-middle", 5 * HOUR, now);
+    const oldest = await runRoot(parent, "run-oldest", 9 * HOUR, now);
+
+    const removed = await pruneOldRunRoots({ parent, keep: 3, current, now });
+
+    expect(removed).toEqual([oldest]);
+    expect((await readdir(parent)).sort()).toEqual(["run-current", "run-middle", "run-newest"]);
+  });
+
+  // A run writes into its subdirectories, not into its root, so the root's own
+  // timestamp stops moving early. Reading the children is what keeps a
+  // concurrent run's evidence from being deleted underneath it.
+  test("a root something is still writing to is left alone", async () => {
+    const parent = await root();
+    const now = Date.now();
+    const current = await runRoot(parent, "run-current", 0, now);
+    const stale = await runRoot(parent, "run-elderly-root", 9 * HOUR, now);
+    const busy = new Date(now - 60 * 1000);
+    await utimes(join(stale, "scenarios"), busy, busy);
+    await runRoot(parent, "run-abandoned", 9 * HOUR, now);
+
+    const removed = await pruneOldRunRoots({ parent, keep: 1, current, now });
+
+    expect(removed).toEqual([join(parent, "run-abandoned")]);
+    expect((await readdir(parent)).sort()).toEqual(["run-current", "run-elderly-root"]);
+  });
+
+  // A run that just finished holds a place in the quota even though it is too
+  // recent to remove, so the roots that go are the oldest ones rather than
+  // whatever happens to be over the line.
+  test("a recent run counts against the quota it is too young to be removed for", async () => {
+    const parent = await root();
+    const now = Date.now();
+    const current = await runRoot(parent, "run-current", 0, now);
+    await runRoot(parent, "run-minutes-ago", 10 * 60 * 1000, now);
+    await runRoot(parent, "run-older", 5 * HOUR, now);
+    await runRoot(parent, "run-oldest", 9 * HOUR, now);
+
+    const removed = await pruneOldRunRoots({ parent, keep: 2, current, now });
+
+    expect(removed.map((path) => path.split("/").at(-1)).sort()).toEqual([
+      "run-older",
+      "run-oldest",
+    ]);
+    expect((await readdir(parent)).sort()).toEqual(["run-current", "run-minutes-ago"]);
+  });
+
+  test("retention is a positive count, and three by default", () => {
+    expect(parseArtifactRetention(undefined)).toBe(3);
+    expect(parseArtifactRetention("1")).toBe(1);
+    expect(() => parseArtifactRetention("0")).toThrow("AFT_E2E_ARTIFACT_RETAIN");
   });
 });
 
