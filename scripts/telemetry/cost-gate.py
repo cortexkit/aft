@@ -775,6 +775,26 @@ def observation_line(repo: str, runs: list[RunData]) -> str:
     return f"OBSERVED {repo}: " + " ".join(parts)
 
 
+def phase_line(repo: str, runs: list[RunData]) -> str | None:
+    """Where each run's high-water mark was taken, phase by phase.
+
+    A peak RSS number says how much a run used; it cannot say which part of the
+    build used it, and the difference between two runs of one binary is exactly
+    that second question. The harness charges each step of the kernel
+    high-water mark to the phase that took it, so printing the breakdown beside
+    the values turns "these two runs disagree" into "they disagree here"
+    without downloading half a gigabyte of artifacts.
+
+    Read straight from the CSV row, like the high-water mark itself: anything
+    row_metrics returns can be written into a future baseline and would then
+    acquire a tolerance, and this is a diagnostic, not a budget.
+    """
+    values = [run.row.get("hwm_by_phase", "") or "n/a" for run in runs if run.ready]
+    if not values or all(value == "n/a" for value in values):
+        return None
+    return f"PHASES {repo}: " + " | ".join(values)
+
+
 def print_regressions(repo: str, regressions: list[Regression], baseline_repo: dict[str, Any]) -> None:
     for regression in regressions:
         observed_events = regression.run.events if regression.run else {}
@@ -833,20 +853,22 @@ def self_test() -> int:
         csv_path = temporary / "synthetic.csv"
         fields = [
             "repo", "outcome", "search_wall_ms", "callgraph_wall_ms",
-            "callgraph_resolution_share_pct", "peak_rss_mb", "peak_rss_hwm_mb", "cpu_s",
+            "callgraph_resolution_share_pct", "peak_rss_mb", "peak_rss_hwm_mb", "hwm_by_phase", "cpu_s",
             "search_first_query_ms", "callgraph_first_query_ms", "waiting_on", "log_path",
         ]
         rows = [
             {
                 "repo": "fixture", "outcome": "ready", "search_wall_ms": "1/140/140",
                 "callgraph_wall_ms": "1/126/126", "callgraph_resolution_share_pct": "1/11/11",
-                "peak_rss_mb": "119", "peak_rss_hwm_mb": "171", "cpu_s": "13", "search_first_query_ms": "1/126/126",
+                "peak_rss_mb": "119", "peak_rss_hwm_mb": "171", "hwm_by_phase": "extraction/ready=+80.0",
+                "cpu_s": "13", "search_first_query_ms": "1/126/126",
                 "callgraph_first_query_ms": "1/90/90", "waiting_on": "build=1", "log_path": "",
             },
             {
                 "repo": "fixture", "outcome": "ready", "search_wall_ms": "1/130/130",
                 "callgraph_wall_ms": "1/126/126", "callgraph_resolution_share_pct": "1/11/11",
-                "peak_rss_mb": "118", "peak_rss_hwm_mb": "170", "cpu_s": "12", "search_first_query_ms": "1/127/127",
+                "peak_rss_mb": "118", "peak_rss_hwm_mb": "170", "hwm_by_phase": "extraction/ready=+60.0",
+                "cpu_s": "12", "search_first_query_ms": "1/127/127",
                 "callgraph_first_query_ms": "1/91/91", "waiting_on": "build=1", "log_path": "",
             },
         ]
@@ -920,6 +942,11 @@ def self_test() -> int:
         assert "peak_rss_hwm_mb(ungated)=171/170" in line, line
         blessed = repo_metrics_from_runs("fixture", baseline_from_file, runs)
         assert "peak_rss_hwm_mb" not in blessed, sorted(blessed)
+        # The per-phase breakdown is a diagnostic beside the values, and like
+        # the high-water mark it must not become a budget.
+        assert phase_line("fixture", runs) == "PHASES fixture: extraction/ready=+80.0 | extraction/ready=+60.0"
+        assert "hwm_by_phase" not in blessed, sorted(blessed)
+        assert phase_line("fixture", []) is None
 
         # A metric with two recorded states cannot be read off a two-run
         # minimum. The straddling pair here is a real night -- 597.9 and 678.1,
@@ -1035,6 +1062,9 @@ def main() -> int:
     # exactly as a run that exceeds them does.
     for name in names:
         print(observation_line(name, runs_by_repo[name]))
+        phases = phase_line(name, runs_by_repo[name])
+        if phases:
+            print(phases)
         # Printed on every run, pass or fail: a row whose metric has two
         # recorded states cannot be read from a single verdict, and a green
         # night on it means only that neither run reached the high state.
