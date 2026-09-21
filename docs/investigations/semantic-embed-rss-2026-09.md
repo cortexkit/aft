@@ -134,26 +134,35 @@ catches is buffering on the order of a vector or a response body per row.
   the other builds on this box. **This is recorded as an observation, not as a
   finding, and no claim is made that it is a product difference.**
 
-## Workaround for shipped 0.56.1 and 0.56.2 users
+## Workaround for shipped 0.56.1 and 0.56.2 users — REPORTED, NOT VERIFIED
 
-From the reporter's own matrix, not from anything measured here:
+**Everything in this section is the reporter's observation, reproduced here so
+it is not lost. None of it has been tested by us.** We could not reproduce the
+leak at all, so we are in no position to confirm that any configuration avoids
+it. Treat these as the reporter's claims when relaying them, and say so.
 
-- **On 0.56.1 there is a workaround: the local fastembed backend.** One full
-  3h+ CPU build completed stably in a 2.4–2.6 GB band. On that version the leak
-  was remote-only.
-- **On 0.56.2 there is no known backend configuration that avoids it.** Runs A
+What their matrix reports:
+
+- **On 0.56.1 they report the local fastembed backend completing.** One full
+  3h+ CPU build, stable in a 2.4–2.6 GB band. On that version they saw the leak
+  only on remote backends. We have not run a local fastembed build of that
+  length on any harness, so we cannot say whether it is genuinely leak-free or
+  merely slow enough that the leak had not yet dominated.
+- **On 0.56.2 they report no backend configuration that avoids it.** Runs A
   and B leaked on `openai_compatible` and run C leaked on local fastembed, on
   the same tree.
 
 The remaining levers on 0.56.2 do not fix the leak, they only keep the daemon
-under the watchdog by making the build smaller or by not running it:
+under the watchdog by making the build smaller or by not running it. These
+follow from how the build is shaped rather than from any measurement of theirs
+or ours:
 
 - Lower `semantic.max_files` below the corpus size, at the cost of coverage.
 - Set `semantic_search: false`, which turns the feature off.
 
-Downgrading to 0.56.0 restores memory stability but reintroduces the
-oversize-row build aborts that #318 fixed, so it is not a clean escape for this
-reporter.
+The reporter also notes that downgrading to 0.56.0 restores memory stability but
+reintroduces the oversize-row build aborts that #318 fixed, so it is not a clean
+escape for them.
 
 ## Where the next attempt should start
 
