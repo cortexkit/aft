@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "jupyterlab-bimodal-band-deleted",
+    "write-census-residual-split"
+  ],
+  "note": "Telemetry gate model and write-census reporting. No engine or ranking code changed."
+}
