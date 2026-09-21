@@ -223,7 +223,8 @@ within 9.8 MB of one another. Eight at the new head and `main` sit between
 So the honest statement is about frequency, not about two clean ranges. The old
 head produced a high reading zero times in four; the new head and `main`
 produced one seven times in eight. That difference is unlikely enough to be
-chance (Fisher exact, p ≈ 0.003) that the binary is clearly implicated, but the
+chance (Fisher exact on 4 low / 0 high against 1 low / 7 high, p = 0.010) that
+the binary is clearly implicated, but the
 newer binary does not produce the high value *every* time, and any claim that
 the two heads occupy non-overlapping ranges is wrong. An earlier revision of
 this entry said exactly that, on the first six observations; the seventh and
@@ -288,7 +289,8 @@ with two states.
 
 What the binary changes is how often the high state is reached — zero times in
 four at the old head, seven times in eight at the new head and `main`. That is
-enough to implicate the binary (Fisher exact, p ≈ 0.003) and not enough to
+enough to implicate the binary (Fisher exact on 4 low / 0 high against 1 low /
+7 high, two-tailed p = 0.010) and not enough to
 classify a single candidate, which is what a bisect needs.
 
 The two interior candidates show the cost directly. Each split its own two runs
