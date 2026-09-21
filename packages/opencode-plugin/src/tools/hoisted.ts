@@ -34,6 +34,7 @@ import {
   permissionDeniedResponse,
   permissionPath,
   permissionRuleDenial,
+  resolveRelativePatterns,
   runAsk,
 } from "./permissions.js";
 
@@ -1198,10 +1199,16 @@ function createDeleteTool(ctx: PluginContext): ToolDefinition {
         }
       }
 
+      // A permission rule is matched against the path a tool states, so a
+      // delete has to state it the same way edit and write do: relative to the
+      // project root when the file is inside it, absolute only when it is
+      // outside. Stating the absolute path for an in-project file made a rule
+      // like {action: "edit", resource: "src/*"} cover edits but silently miss
+      // deletes of the very same files.
       await runAsk(
         context.ask({
           permission: "edit",
-          patterns: absolutePaths,
+          patterns: resolveRelativePatterns(context, absolutePaths),
           always: ["*"],
           metadata: { action: "delete", count: absolutePaths.length },
         }),
@@ -1278,10 +1285,13 @@ function createMoveTool(ctx: PluginContext): ToolDefinition {
         }
       }
 
+      // Source and destination are stated the same way edit, write, and delete
+      // state their paths — project-relative inside the root, absolute outside —
+      // so one rule covers every filesystem mutation of the same files.
       await runAsk(
         context.ask({
           permission: "edit",
-          patterns: [filePath, destPath],
+          patterns: resolveRelativePatterns(context, [filePath, destPath]),
           always: ["*"],
           metadata: { action: "move" },
         }),
