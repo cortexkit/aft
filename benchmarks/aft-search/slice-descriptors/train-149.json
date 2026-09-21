@@ -1,0 +1,16 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "oc2-t7-final-three",
+    "semantic-status-leftovers",
+    "cost-gate-jupyterlab-bistability",
+    "windows-absolute-root-test",
+    "real-query-reference-recapture"
+  ],
+  "note": "Fence files are status vocabulary and a test-only path fix. The real-query reference is re-recorded in this train: commit 0b14e8b2d changed the indexed corpus by provisioning .aftignore into the evidence tree, which moved 26 of 43 rows; proven by a two-arm replay on one binary where the no-ignore arm reproduces the old reference byte-for-byte."
+}
