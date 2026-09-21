@@ -388,6 +388,27 @@ async function readPackageVersion(): Promise<string> {
   return manifest.version;
 }
 
+/**
+ * The part of a host's own output that says why it stopped.
+ *
+ * "host exited 1" alone sends the next reader into the forensics tree to find
+ * out what happened, and a host that dies during startup has usually already
+ * written the reason. Level-tagged lines come first because that is where both
+ * host generations put their diagnostics; the plain tail is the fallback for
+ * output that carries no levels.
+ */
+function hostFailureMechanism(output: { stdout: string; stderr: string }): string {
+  const lines = `${output.stderr}\n${output.stdout}`
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  const diagnostics = lines.filter((line) => /level=(ERROR|WARN)|"type":"error"/.test(line));
+  return (diagnostics.length > 0 ? diagnostics : lines)
+    .slice(-3)
+    .map((line) => (line.length > 200 ? `${line.slice(0, 200)}…` : line))
+    .join(" | ");
+}
+
 async function runOneScenario(options: {
   scenario: ScenarioDefinition;
   config: DriverConfig;
@@ -690,11 +711,11 @@ async function runOneScenario(options: {
       await forensics.writeJson("shared-server-smoke.json", smoke);
       smokeRan = true;
     }
-    const host = await client.wait(
+    const hostTimeoutMs =
       typeof scenario.metadata?.host_timeout_ms === "number"
         ? scenario.metadata.host_timeout_ms
-        : 45_000,
-    );
+        : 45_000;
+    const host = await client.wait(hostTimeoutMs);
     hostCompletedAt = Date.now();
     await emit({ kind: "host_exit", at: hostCompletedAt, output: host });
     hostStream = host.stdout;
@@ -705,7 +726,18 @@ async function runOneScenario(options: {
       ? scenario.metadata.accepted_exit_codes
       : [0];
     if (!acceptedExitCodes.includes(host.exit_code)) {
-      throw new Error(`host exited ${host.exit_code}; accepted ${acceptedExitCodes.join(",")}`);
+      const mechanism = hostFailureMechanism(host);
+      // A killed host reports no exit code, and "exited null" reads like a
+      // crash; saying it ran out of time is the difference between looking for
+      // a fatal error and looking for what it was still waiting on.
+      const ending = host.timed_out
+        ? `host was still running after ${hostTimeoutMs}ms and was killed`
+        : `host exited ${host.exit_code}`;
+      throw new Error(
+        `${ending}; accepted ${acceptedExitCodes.join(",")}${
+          mechanism ? `; host said: ${mechanism}` : ""
+        }`,
+      );
     }
     assertScriptedToolsRegistered(scenario, hostStream);
     if (hostEvents) assertPermissionPromptObserved(scenario, hostEvents.events);

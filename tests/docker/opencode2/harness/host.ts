@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import type { Readable } from "node:stream";
 
 import { applyHandoff, type HostCliContract } from "./contracts.js";
 import { fail } from "./errors.js";
@@ -15,6 +16,29 @@ interface CapturedChild {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** Resolves once both pipes have ended, so nothing written at exit is lost. */
+  stdioClosed: Promise<void>;
+}
+
+/**
+ * How long to keep reading a child's pipes after it has exited.
+ *
+ * `exit` fires when the process is gone, not when everything it wrote has been
+ * read: a host that prints a diagnostic and dies immediately can lose that
+ * last chunk, which is the one worth having. The cap only matters when a pipe
+ * stays open because some other process inherited it; the normal case resolves
+ * as soon as the pipes end.
+ */
+const STDIO_FLUSH_TIMEOUT_MS = 2_000;
+
+function streamEnded(stream: Readable | null | undefined): Promise<void> {
+  if (!stream || stream.readableEnded || stream.destroyed) return Promise.resolve();
+  return new Promise<void>((resolvePromise) => {
+    const finish = () => resolvePromise();
+    stream.once("end", finish);
+    stream.once("close", finish);
+    stream.once("error", finish);
+  });
 }
 
 export interface SharedServerHandle {
@@ -82,6 +106,7 @@ function spawnCaptured(
     stdout: "",
     stderr: "",
     timedOut: false,
+    stdioClosed: Promise.resolve(),
   };
   captured.child = spawn(executable, args, {
     cwd,
@@ -95,6 +120,10 @@ function spawnCaptured(
   captured.child.stderr?.on("data", (chunk) => {
     captured.stderr += String(chunk);
   });
+  captured.stdioClosed = Promise.all([
+    streamEnded(captured.child.stdout),
+    streamEnded(captured.child.stderr),
+  ]).then(() => undefined);
   return captured;
 }
 
@@ -124,6 +153,7 @@ async function waitCaptured(captured: CapturedChild, timeoutMs: number): Promise
             timer.unref();
           },
         );
+  await Promise.race([captured.stdioClosed, Bun.sleep(STDIO_FLUSH_TIMEOUT_MS)]);
   return {
     command: captured.command,
     cwd: captured.cwd,
@@ -238,9 +268,14 @@ export function startScenarioClient(options: {
   let args: string[];
   let env: NodeJS.ProcessEnv;
   if (options.scenario.execution === "standalone") {
+    // `--standalone` is a V2 flag; a V1 `run` already starts its own host.
+    // Both take `--print-logs`, and that flag is the only way the host's own
+    // diagnostics reach the harness: without it a host that dies during
+    // startup exits 1 with nothing but an opaque "Unexpected server error"
+    // line on stdout and an empty stderr log.
     args =
       options.hostGeneration === "v1"
-        ? [...baseArgs]
+        ? [...baseArgs, "--print-logs"]
         : [...baseArgs, "--standalone", "--print-logs"];
     env = { ...options.env };
   } else {
