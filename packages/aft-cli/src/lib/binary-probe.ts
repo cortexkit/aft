@@ -188,6 +188,16 @@ export function platformKey(
 /** The `v<semver>` directory names `aft doctor --fix` creates in the binary cache. */
 const CACHE_VERSION_DIR = /^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/;
 
+/** One place a native binary can live, described well enough to report it. */
+interface BinarySearchLocation {
+  /** Short name of the location, for error messages. */
+  label: string;
+  /** Candidate binary paths this location offers, in probe order. */
+  paths: string[];
+  /** What to tell the reader when the location offers nothing. */
+  emptyReason: string;
+}
+
 /**
  * Newest binary cached under `<cache>/v<semver>/<name>`.
  *
@@ -220,56 +230,144 @@ function newestCachedBinary(cacheDir: string, binaryName: string): string | null
   return best?.path ?? null;
 }
 
-function aftBinaryCandidates(preferredVersion?: string): string[] {
-  const candidates: string[] = [];
+/**
+ * The binary cache is where `aft doctor --fix` downloads to, so it is searched
+ * even when the caller names no version — otherwise a freshly fixed machine
+ * with no other install source still reports a missing binary.
+ */
+function cacheLocation(preferredVersion?: string): BinarySearchLocation {
   const cacheDir = getAftBinaryCacheDir();
   const binaryName = getAftBinaryName();
+  const label = "binary cache";
+  const installedHere = "`aft doctor --fix` installs here";
+
   if (preferredVersion) {
     const tag = preferredVersion.startsWith("v") ? preferredVersion : `v${preferredVersion}`;
-    pushCandidate(candidates, join(cacheDir, tag, binaryName));
-  } else {
-    // The cache is where `aft doctor --fix` downloads to, so it is searched
-    // even when the caller names no version. Skipping it meant that on a
-    // machine with no other install source — no platform package, no `aft` on
-    // PATH, no cargo install — a successful `doctor --fix` was invisible to
-    // the very next command.
-    pushCandidate(candidates, newestCachedBinary(cacheDir, binaryName));
+    return {
+      label,
+      paths: [join(cacheDir, tag, binaryName)],
+      emptyReason: `no ${tag}/${binaryName} under ${cacheDir} (${installedHere})`,
+    };
   }
 
+  const newest = newestCachedBinary(cacheDir, binaryName);
+  return {
+    label,
+    paths: newest ? [newest] : [],
+    emptyReason: `no v<version>/${binaryName} under ${cacheDir} (${installedHere})`,
+  };
+}
+
+function platformPackageLocation(): BinarySearchLocation {
+  const label = "npm platform package";
   const key = platformKey();
-  if (key) {
-    try {
-      const require = createRequire(import.meta.url);
-      pushCandidate(candidates, require.resolve(`@cortexkit/aft-${key}/bin/${getAftBinaryName()}`));
-    } catch {
-      // platform package is optional
-    }
+  if (!key) {
+    return {
+      label,
+      paths: [],
+      emptyReason: `no package published for ${process.platform}-${process.arch}`,
+    };
   }
 
+  const packageName = `@cortexkit/aft-${key}`;
   try {
-    const lookup = process.platform === "win32" ? "where aft" : "which aft";
+    const require = createRequire(import.meta.url);
+    return {
+      label,
+      paths: [require.resolve(`${packageName}/bin/${getAftBinaryName()}`)],
+      emptyReason: `${packageName} not installed`,
+    };
+  } catch {
+    // The platform package is optional; installs can come from anywhere else.
+    return { label, paths: [], emptyReason: `${packageName} not installed` };
+  }
+}
+
+function pathLocation(): BinarySearchLocation {
+  const lookup = process.platform === "win32" ? "where aft" : "which aft";
+  const label = "PATH";
+  let hits: string[] = [];
+  try {
     const resolved = execSync(lookup, {
       stdio: "pipe",
       encoding: "utf-8",
       env: process.env,
     }).trim();
-    // Guard against self-resolution recursion: `aft` on PATH may be THIS CLI's
-    // own node-script shim (npx prepends node_modules/.bin to PATH, and the
-    // CLI's bin is named `aft`). Probing it with --version re-enters the CLI and
-    // fork-bombs. Only accept native executables. Iterate all lines so a real
-    // native binary after a `.cmd`/script shim (Windows `where`) is still found.
-    for (const line of resolved.split(/\r?\n/)) {
-      const candidate = line.trim();
-      if (candidate && isNativeExecutable(candidate)) {
-        pushCandidate(candidates, candidate);
-      }
-    }
+    hits = resolved
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
   } catch {
     // ignore — PATH lookup is best-effort
   }
 
-  pushCandidate(candidates, join(homedir(), ".cargo", "bin", getAftBinaryName()));
+  // Guard against self-resolution recursion: `aft` on PATH may be THIS CLI's
+  // own node-script shim (npx prepends node_modules/.bin to PATH, and the
+  // CLI's bin is named `aft`). Probing it with --version re-enters the CLI and
+  // fork-bombs. Only accept native executables. Iterate all lines so a real
+  // native binary after a `.cmd`/script shim (Windows `where`) is still found.
+  const native = hits.filter((candidate) => isNativeExecutable(candidate));
+  return {
+    label,
+    paths: native,
+    emptyReason:
+      hits.length > 0
+        ? `only non-native \`aft\` entries on PATH (${hits.join(", ")}), skipped because running them would re-enter this CLI`
+        : `no \`aft\` on PATH (\`${lookup}\` found nothing)`,
+  };
+}
+
+function cargoLocation(): BinarySearchLocation {
+  const path = join(homedir(), ".cargo", "bin", getAftBinaryName());
+  return { label: "cargo install", paths: [path], emptyReason: `no ${path}` };
+}
+
+/** Every place a binary may live, in resolution order. */
+function aftBinarySearchLocations(preferredVersion?: string): BinarySearchLocation[] {
+  return [
+    cacheLocation(preferredVersion),
+    platformPackageLocation(),
+    pathLocation(),
+    cargoLocation(),
+  ];
+}
+
+function aftBinaryCandidates(preferredVersion?: string): string[] {
+  const candidates: string[] = [];
+  for (const location of aftBinarySearchLocations(preferredVersion)) {
+    for (const path of location.paths) pushCandidate(candidates, path);
+  }
   return candidates;
+}
+
+/** One line per searched location: what was found there, or why nothing was. */
+export function describeAftBinarySearch(preferredVersion?: string): string[] {
+  return aftBinarySearchLocations(preferredVersion).map((location) => {
+    const found = location.paths.filter((path) => {
+      try {
+        return existsSync(path);
+      } catch {
+        return false;
+      }
+    });
+    return `${location.label}: ${found.length > 0 ? found.join(", ") : location.emptyReason}`;
+  });
+}
+
+/**
+ * Error text for a command that needs the native binary and found none.
+ *
+ * It lists every location searched instead of only naming a remedy. A reader
+ * who just ran the suggested command successfully needs to know which location
+ * we looked in and found empty; "run aft doctor" alone reads as "you did it
+ * wrong" and sends them around the same loop again.
+ */
+export function missingAftBinaryMessage(command: string, preferredVersion?: string): string {
+  return [
+    `${command} requires a native AFT binary and none was found. Searched:`,
+    ...describeAftBinarySearch(preferredVersion).map((line) => `  - ${line}`),
+    "`aft doctor --fix` installs into the binary cache directory named above; if it already reported success, that line is the directory this command searched — AFT_CACHE_DIR and XDG_CACHE_HOME change it.",
+  ].join("\n");
 }
 
 export function findAftBinary(preferredVersion?: string): string | null {

@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { findAftBinary } from "../lib/binary-probe.js";
+import { findAftBinary, missingAftBinaryMessage } from "../lib/binary-probe.js";
 
 /**
  * Run the native finite snapshot command. The npm CLI deliberately forwards no
@@ -9,9 +9,7 @@ import { findAftBinary } from "../lib/binary-probe.js";
 export function runIndex(argv: string[]): number {
   const binary = findAftBinary();
   if (!binary) {
-    console.error(
-      "aft index requires a native AFT binary; run `aft doctor` to install or repair it.",
-    );
+    console.error(missingAftBinaryMessage("aft index"));
     return 1;
   }
 

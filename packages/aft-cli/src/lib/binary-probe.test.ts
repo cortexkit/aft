@@ -2,11 +2,12 @@
 
 import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { withEnv } from "../../../aft-bridge/src/__tests__/test-utils/env-guard.js";
 import {
   findAftBinary,
+  missingAftBinaryMessage,
   normalizeBinaryVersion,
   probeAftBinary,
   probeBinaryVersion,
@@ -25,6 +26,8 @@ interface IsolatedInstall {
   cached(versionDir: string): string;
   root: string;
   cacheBinDir: string;
+  /** The cargo path this process will search; it is read from the real home. */
+  cargoBinary: string;
 }
 
 /**
@@ -32,9 +35,10 @@ interface IsolatedInstall {
  * cache, with no `aft` on PATH and no platform package.
  *
  * The `~/.cargo/bin` lookup cannot be redirected from inside a running
- * process, so these tests assert on resolution order rather than on a globally
- * empty machine; the cache is searched first, so a cargo install on the
- * developer's machine cannot make them pass.
+ * process, so these tests assert on resolution order and message content
+ * rather than on a globally empty machine; the end-to-end fixture in
+ * `__tests__/native-binary-resolution.test.ts` controls the home directory by
+ * launching a child process.
  */
 function isolatedInstall(prefix: string, versionDirs: string[]): IsolatedInstall {
   const root = mkdtempSync(join(tmpdir(), prefix));
@@ -57,6 +61,7 @@ function isolatedInstall(prefix: string, versionDirs: string[]): IsolatedInstall
     cached,
     root,
     cacheBinDir,
+    cargoBinary: join(homedir(), ".cargo", "bin", getAftBinaryName()),
   };
 }
 
@@ -199,6 +204,25 @@ describe("preferred version resolution", () => {
     await withEnv(install.env, () => {
       expect(findAftBinary("0.9.0")).toBe(install.cached("v0.9.0"));
       expect(findAftBinary("v0.9.0")).toBe(install.cached("v0.9.0"));
+    });
+  });
+});
+
+describe("missing binary message", () => {
+  test("names every location that was searched", async () => {
+    const install = isolatedInstall("aft-cli-missing-binary-", []);
+
+    await withEnv(install.env, () => {
+      const message = missingAftBinaryMessage("aft index");
+
+      expect(message).toContain("aft index requires a native AFT binary");
+      expect(message).toContain(install.cacheBinDir);
+      expect(message).toContain("npm platform package");
+      expect(message).toContain("PATH");
+      expect(message).toContain(install.cargoBinary);
+      // The remedy has to point at the directory we searched, because the
+      // reporting user had already run `aft doctor --fix` successfully.
+      expect(message).toContain("aft doctor --fix");
     });
   });
 });

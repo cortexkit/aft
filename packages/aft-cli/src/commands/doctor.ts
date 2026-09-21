@@ -25,7 +25,7 @@ import type { HarnessAdapter } from "../adapters/types.js";
 import { diagnoseOpenCodeLoad } from "../doctor/opencode.js";
 import { type AftResponse, sendAftRequest } from "../lib/aft-bridge.js";
 import { getBinaryCacheInfo } from "../lib/binary-cache.js";
-import { findAftBinary, probeAftBinary } from "../lib/binary-probe.js";
+import { findAftBinary, missingAftBinaryMessage, probeAftBinary } from "../lib/binary-probe.js";
 import { buildRecentAftToolFailuresSectionFromLog } from "../lib/bridge-tool-failures.js";
 import {
   DOCTOR_BUILD_BREAKER_RESET_COMMAND,
@@ -180,9 +180,7 @@ export function buildDoctorProfileArgs(argv: string[]): string[] {
 export function runDoctorProfile(argv: string[]): number {
   const binary = findAftBinary();
   if (!binary) {
-    console.error(
-      "aft doctor --profile requires a native AFT binary; run `aft doctor --fix` first.",
-    );
+    console.error(missingAftBinaryMessage("aft doctor --profile"));
     return 1;
   }
   const result = spawnSync(binary, buildDoctorProfileArgs(argv), {
