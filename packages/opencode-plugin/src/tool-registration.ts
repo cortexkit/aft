@@ -21,6 +21,17 @@ import { semanticTools } from "./tools/semantic.js";
 import type { PluginContext } from "./types.js";
 
 const ALL_ONLY_TOOLS = ["aft_callgraph", "aft_delete", "aft_move"] as const;
+/**
+ * Host tool names AFT removes before adding its own.
+ *
+ * `bash` is deliberately absent. Two things were observed on a real OpenCode 2
+ * host rather than reasoned about: its own shell surface registers under the
+ * name `shell`, so nothing the host owns is displaced by AFT taking `bash`;
+ * and when a second plugin does claim `bash` first, the registry keeps the
+ * later registration, because adding a tool overwrites any entry already under
+ * that name. AFT's `bash` is the one the host holds either way, so a preceding
+ * remove would change nothing. The load matrix keeps that observation as a row.
+ */
 const V2_BUILTIN_REPLACEMENTS = new Set(["read", "edit", "write", "apply_patch"]);
 
 export interface V2ToolEditor {

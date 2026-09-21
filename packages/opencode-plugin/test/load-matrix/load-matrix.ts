@@ -642,12 +642,34 @@ async function runV2TuiHost(input: {
   label: string;
   packageRoot: string;
   timeoutMs?: number;
+  /**
+   * Plugin targets loaded ahead of the AFT package, in host config order.
+   *
+   * The host applies each plugin's registration in load order, so a target
+   * listed here registers before AFT does.
+   */
+  pluginsBefore?: string[];
+  aftConfig?: Record<string, unknown>;
+  env?: Record<string, string>;
+  /**
+   * Stop condition for rows whose subject is written by an observer plugin.
+   *
+   * The default stop signals fire as soon as the host has settled its plugin
+   * passes, which is earlier than an observer that has to wait for another
+   * plugin's registration; such a row supplies its own signal instead.
+   */
+  ready?: (events: string) => boolean;
 }): Promise<{ transcript: string; events: string }> {
   const { v2 } = await ensureHostInstalls();
   const isolation = await makeIsolation(input.label);
   const marker = join(isolation.root, "tui-entry.log");
   isolation.env.AFT_LOAD_MATRIX_MARKER = marker;
-  await writeV2HostConfig(isolation, [input.packageRoot], { enabled: false });
+  Object.assign(isolation.env, input.env ?? {});
+  await writeV2HostConfig(
+    isolation,
+    [...(input.pluginsBefore ?? []), input.packageRoot],
+    input.aftConfig ?? { enabled: false },
+  );
 
   const result = await withOperatorCanary(input.label, async () => {
     let stderr = "";
@@ -665,6 +687,7 @@ async function runV2TuiHost(input: {
     const deadline = Date.now() + (input.timeoutMs ?? 120_000);
     const done = (): boolean => {
       const observed = existsSync(marker) ? readFileSync(marker, "utf8") : "";
+      if (input.ready) return input.ready(observed);
       if (observed.includes("slot-rendered:app")) return true;
       // A row that does not instrument the entry has no marker to wait on, so
       // the host's own setup verdict is the stop signal.
@@ -694,6 +717,81 @@ async function runV2TuiHost(input: {
   console.log(`[${input.label}-transcript]\n${transcript}`);
   console.log(`[${input.label}-events]\n${events.trim()}`);
   return { transcript: result, events };
+}
+
+/**
+ * A second plugin that claims the `bash` tool name before AFT loads.
+ *
+ * Its subject is what the host does when two registrations want one name. It
+ * also registers `aft_load_matrix_rival` under a name nobody contests, so a
+ * census that is missing its `bash` but still holds that tool says the rival
+ * plugin really did register and was overwritten -- as opposed to never having
+ * registered at all, which looks the same from the `bash` entry alone.
+ *
+ * The census runs from inside the host, through the same `tool.list` the host
+ * gives every plugin, so it reports the registry the host actually holds
+ * rather than what either plugin asked for. It is taken once AFT's own tools
+ * are visible, because a census taken before that would report an ordering
+ * accident instead of the settled registry. It lives in the host install so
+ * `effect` resolves to the host's copy.
+ */
+async function writeV2ToolOwnershipRival(hostRoot: string, label: string): Promise<string> {
+  const packageRoot = join(hostRoot, "node_modules", ".load-matrix-packages", label);
+  await mkdir(packageRoot, { recursive: true });
+  await writeFile(
+    join(packageRoot, "package.json"),
+    `${JSON.stringify(
+      {
+        name: `aft-load-matrix-${label}`,
+        private: true,
+        type: "module",
+        main: "./index.mjs",
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  await writeFile(
+    join(packageRoot, "index.mjs"),
+    `
+import { appendFileSync } from "node:fs";
+import { Effect, Schema } from "effect";
+
+const record = (line) => appendFileSync(process.env.AFT_LOAD_MATRIX_MARKER, line + "\\n");
+const stub = (name, description) => ({
+  name,
+  description,
+  input: Schema.Struct({ command: Schema.optionalKey(Schema.String) }),
+  options: { codemode: false, permission: "bash" },
+  execute: () => Effect.succeed({ content: [{ type: "text", text: description }] }),
+});
+
+export default {
+  id: "aft.load-matrix.tool-ownership-rival",
+  effect: (context) => Effect.gen(function* () {
+    yield* context.tool.transform((editor) => {
+      editor.add(stub("bash", "RIVAL BASH"));
+      editor.add(stub("aft_load_matrix_rival", "RIVAL CONTROL"));
+    });
+    record("ownership-claimed:bash");
+    yield* Effect.forkScoped(Effect.gen(function* () {
+      const deadline = Date.now() + 90_000;
+      let tools = yield* context.tool.list();
+      while (Date.now() < deadline && !tools.some((tool) => tool.name === "aft_outline")) {
+        yield* Effect.sleep("250 millis");
+        tools = yield* context.tool.list();
+      }
+      for (const tool of tools) {
+        const description = String(tool.description ?? "").replace(/\\s+/g, " ").slice(0, 60);
+        record("ownership-tool:" + tool.name + "::" + description);
+      }
+      record("ownership-census-complete");
+    }));
+  }),
+};
+`,
+  );
+  return packageRoot;
 }
 
 async function writeV2CoreProbe(hostRoot: string, mode: "load" | "reject"): Promise<string> {
@@ -1817,6 +1915,71 @@ export default { id: original.id, effect };
     expect(events).toBe("");
   }, 240_000);
 
+  test("GA host holds AFT's bash when another plugin claimed that name first", async () => {
+    const { v2 } = await ensureHostInstalls();
+    const packageRoot = await copyInstalledPlugin(v2, "v2-tool-ownership");
+    const rivalRoot = await writeV2ToolOwnershipRival(v2, "v2-tool-ownership-rival");
+    const binaryPath =
+      process.env.AFT_BINARY_PATH?.trim() ||
+      join(repoRoot, "target", "debug", process.platform === "win32" ? "aft.exe" : "aft");
+    expect(existsSync(binaryPath)).toBe(true);
+
+    const { events } = await runV2TuiHost({
+      label: "v2-tool-ownership",
+      packageRoot,
+      pluginsBefore: [rivalRoot],
+      aftConfig: {
+        enabled: true,
+        search_index: false,
+        semantic_search: false,
+        tool_surface: "all",
+        hoist_builtin_tools: true,
+        bash: true,
+        lsp: { auto_install: false },
+      },
+      env: { AFT_BINARY_PATH: binaryPath },
+      ready: (observed) => observed.includes("ownership-census-complete"),
+      timeoutMs: 240_000,
+    });
+
+    expect(events).toContain("ownership-claimed:bash\n");
+    expect(events).toContain("ownership-census-complete\n");
+
+    const census = new Map<string, Set<string>>();
+    for (const line of events.split(/\r?\n/)) {
+      if (!line.startsWith("ownership-tool:")) continue;
+      const [name, description] = line.slice("ownership-tool:".length).split("::");
+      const descriptions = census.get(name) ?? new Set<string>();
+      descriptions.add(description ?? "");
+      census.set(name, descriptions);
+    }
+    const describe = (name: string): string[] => [...(census.get(name) ?? [])];
+    console.log(
+      `[v2-tool-ownership-census]\nbash=${JSON.stringify(describe("bash"))}\nshell=${JSON.stringify(
+        describe("shell"),
+      )}\nrival=${JSON.stringify(describe("aft_load_matrix_rival"))}`,
+    );
+
+    // The rival's uncontested tool is the control: it proves the rival plugin
+    // registered successfully here, so its `bash` was overwritten by AFT's
+    // rather than never having been registered at all.
+    expect(describe("aft_load_matrix_rival")).toEqual(["RIVAL CONTROL"]);
+    expect(census.has("aft_outline")).toBe(true);
+
+    // The answer this row exists for: the host holds AFT's bash, not the
+    // registration that claimed the name first.
+    const bash = describe("bash");
+    expect(bash).toHaveLength(1);
+    expect(bash[0]).toStartWith("Execute shell commands.");
+    expect(bash).not.toContain("RIVAL BASH");
+
+    // The host's own shell surface is registered as `shell`, so nothing the
+    // host owns is displaced by AFT taking `bash`.
+    const shell = describe("shell");
+    expect(shell).toHaveLength(1);
+    expect(shell[0]).toStartWith("Execute a shell command");
+  }, 300_000);
+
   test("manifest mutation converges multiple V1 root invocations on one daemon owner", async () => {
     // This is the one row that needs a real subconscious daemon. The sibling
     // subc lanes skip their whole describe when the core binary is absent
@@ -2043,6 +2206,7 @@ export default entry;
       "v2-permission-prompt",
       "v2-tui-keymap",
       "v2-tui-directory",
+      "v2-tool-ownership",
       "v1-root-mutation",
       "v2-function-negative",
       "v1-core-bare",
