@@ -121,6 +121,34 @@ python3 -m unittest -v test_run_real_query.RealQueryRunnerTests.test_missing_exa
 python3 -m unittest -v test_run_real_query.RealQueryRunnerTests.test_recorded_include_tests_changes_ranked_paths
 ```
 
+### Re-recording the reference
+
+`real-query-baseline.json` and its `manifest.sha256` sidecar are the byte-equality
+reference: the `engine_unwired` class asserts every ranked row is byte-equal to
+it. Moving that pair is an audited act, never a repair to make a red gate green.
+Re-record only after the cause of the difference is established, on one binary,
+with `cost-gate.sh --search-quality --mode record-reference`, and say in the
+commit message which change moved the rows and why it was the right direction.
+
+Re-records so far:
+
+- 2026-09-18, after ranking slice 3, and 2026-09-20, after the `includeTests`
+  coercion moved the capability schema hash. Both are written up in
+  `docs/investigations/search-grep-sweep-2026-09-17.md`.
+- 2026-09-21, after the answer-key corpus exclusion in commit `0b14e8b2d`. That
+  commit stopped the benchmark's own fixtures and recorded reports from being
+  indexed for the real-query replay, which changed the candidate pool and moved
+  26 of the 43 rows; see the corpus hygiene section below. Cause established by
+  running the replay twice on one binary, once with and once without the
+  evidence-tree ignore list, against the same manifest, vector pack and pinned
+  tree digest: without it every row is byte-equal to the old reference, with it
+  the score reproduces the numbers CI reported. Re-recorded on a release build of
+  `aft 0.56.2`: 43 rows, `paged`, MRR@10 0.187984 -> 0.188760, census-weighted
+  MRR 0.151837 -> 0.152462. Exact recall and concept recall were re-measured in
+  the same run and are unchanged at 1.000; the ignore list is copied only into
+  the real-query evidence tree, and those two families score against the pinned
+  external clones and the offline vector pack instead.
+
 ## Search-fusion quality sub-benchmark
 
 `run-fusion-quality` is a focused investigation harness for hybrid fusion
@@ -157,6 +185,23 @@ the exclusion `run-fusion-quality` already applies to its bench-only
 exact-match oracle. `run_real_query.py` copies the same list into the runtime
 copy of the evidence tree, after the pinned digest has been verified, so the
 digest is unaffected.
+
+Changing what the harness indexes is a ranking change, even when the query sets
+do not intersect. The evidence-tree copy was added on the reasoning that no
+real-query row shares a query with a fusion fixture, so it could not matter; that
+does not follow. Non-intersecting queries say nothing about the corpus, and
+removing documents changes the candidate pool every query competes in. It moved
+26 of the 43 real-query rows. Twelve of them had an excluded file inside their
+own recorded result list; the other 14 never named one and moved through the
+pool alone. One row's metrics moved, because `results/aft-vera-suite-baseline.json`
+had been ranked above the file that episode opened and pushed it out of the top
+five; the other 25 rows changed bytes in the deeper recorded list without moving
+a metric, which is why the reference asserts byte equality rather than metrics.
+The change landed under a `non_ranking` descriptor, which does not compare rows,
+so the drift went unmeasured until the next `engine_unwired` descriptor refused
+on it. A commit that adds or removes an ignore entry, or otherwise changes which
+files reach the index, belongs under a descriptor class that compares rows and
+carries the re-recorded reference with it.
 
 The deflation this prevents runs in the dangerous direction: a suppressed
 baseline makes every candidate ranking change look better than it is. Any new
