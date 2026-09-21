@@ -181,7 +181,7 @@ jobs:
           if-no-files-found: warn
 
   # ---------------------------------------------------------------------------
-  # OpenCode 2 Linux Docker e2e — the 15-minute budget applies to this job,
+  # OpenCode 2 Linux Docker e2e — the 25-minute budget applies to this job,
   # excluding the shared binary producer it depends on. The same local runner
   # builds the image and executes every applicable matrix row.
   # ---------------------------------------------------------------------------
@@ -189,7 +189,7 @@ jobs:
     name: OpenCode 2 (Linux Docker)
     needs: e2e-linux-binary
     runs-on: ubuntu-22.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     # Advisory until the scenario matrix is green end to end and the check is
     # registered as required on main (the harness itself renders
     # `required check: NOT MET (advisory only)` until then). Remove with that
@@ -262,12 +262,18 @@ jobs:
       - name: Run OpenCode 2 matrix
         env:
           AFT_BINARY_PATH: ${{ runner.temp }}/aft-opencode2/aft
-        # A matrix that overruns the job budget is cancelled by the runner,
-        # and a cancelled job reads as a cancelled run for every consumer
-        # (train-push refuses the fast-forward). While the matrix is red on
-        # the pinned beta, bound the run one minute inside the job budget so
-        # an overrun is a step failure the advisory job absorbs.
-        run: timeout --signal=TERM --kill-after=30s 12m bash tests/docker/run-opencode2-test.sh
+        # The cap bounds the step so an overrun is a step failure with a log
+        # rather than a cancelled job, because a cancelled job reads as a
+        # cancelled run for every consumer (train-push refuses the
+        # fast-forward). It covers the image build as well as the matrix.
+        # The matrix measured 2119 row-seconds after the parity rows stopped
+        # waiting out the V1 host that never exits — about 8.8 minutes at the
+        # concurrency of 4 above, down from 2878 — so 22m leaves room for the
+        # build, for a slower runner, and for the host-startup stalls that
+        # cost a row its 45s timeout. Concurrency stays at 4: the stalls look
+        # like contention during host startup, so running more rows at once is
+        # the wrong place to buy time.
+        run: timeout --signal=TERM --kill-after=30s 22m bash tests/docker/run-opencode2-test.sh
 
       - name: Dump per-scenario failure forensics
         if: failure()
