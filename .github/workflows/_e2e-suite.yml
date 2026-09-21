@@ -190,11 +190,6 @@ jobs:
     needs: e2e-linux-binary
     runs-on: ubuntu-22.04
     timeout-minutes: 25
-    # Advisory until the scenario matrix is green end to end and the check is
-    # registered as required on main (the harness itself renders
-    # `required check: NOT MET (advisory only)` until then). Remove with that
-    # registration so a red matrix blocks the train.
-    continue-on-error: true
     permissions:
       actions: read
       contents: read
@@ -266,13 +261,15 @@ jobs:
         # rather than a cancelled job, because a cancelled job reads as a
         # cancelled run for every consumer (train-push refuses the
         # fast-forward). It covers the image build as well as the matrix.
-        # The matrix measured 2119 row-seconds after the parity rows stopped
-        # waiting out the V1 host that never exits — about 8.8 minutes at the
-        # concurrency of 4 above, down from 2878 — so 22m leaves room for the
-        # build, for a slower runner, and for the host-startup stalls that
-        # cost a row its 45s timeout. Concurrency stays at 4: the stalls look
-        # like contention during host startup, so running more rows at once is
-        # the wrong place to buy time.
+        # Taking each row's fastest observed run across five local sweeps, the
+        # matrix costs about 1560 row-seconds — 6.5 minutes at the concurrency
+        # of 4 above — and about 1820 at the median, against roughly 2050
+        # before the parity rows stopped waiting out a V1 host that never
+        # exits. Those sweeps measured 2119 to 2886 in total because a host
+        # that stalls at startup costs its row the full 45s timeout, which a
+        # runner with nothing else on it should not be paying. Concurrency
+        # stays at 4: the stalls look like contention during host startup, so
+        # running more rows at once is the wrong place to buy time.
         run: timeout --signal=TERM --kill-after=30s 22m bash tests/docker/run-opencode2-test.sh
 
       - name: Dump per-scenario failure forensics
