@@ -209,7 +209,12 @@ class ProcessSampler:
 # 70-110 seconds on the runner, so this resolves a stage boundary to well under
 # a percent of the build while costing two small /proc reads per tick.
 PHASE_SAMPLE_INTERVAL_S = 0.25
-PHASE_TRACE_FIELDS = ("elapsed_ms", "rss_kb", "hwm_kb", "callgraph_stage", "search_stage", "phase")
+PHASE_TRACE_FIELDS = ("elapsed_ms", "rss_kb", "hwm_kb", "callgraph_stage", "search_stage", "tier2_stage", "phase")
+# The planes whose work can land inside a measured cold build. `search` and
+# `callgraph` are what the matrix asks for; `tier2` is the inspect plane, which
+# the process schedules for itself and which therefore shows up in the same
+# peak without appearing anywhere in the matrix's own timings.
+TRACKED_PLANES = ("callgraph", "search", "tier2")
 # Terminal or not-yet-started plane states. A plane in one of these is not
 # building, so it cannot be contributing build memory.
 IDLE_STAGES = ("idle", "ready", "failed", "suspended", "superseded")
@@ -228,9 +233,18 @@ def index_event_fields(line: str) -> dict[str, str] | None:
 def apply_stage_event(stages: dict[str, str], fields: dict[str, str]) -> None:
     """Advance one plane's current stage from an ``index_event`` field map."""
     plane = fields.get("plane", "")
-    if plane not in PLANES:
+    if plane not in TRACKED_PLANES:
         return
     kind = fields.get("kind", "")
+    if plane == "tier2":
+        # Each Tier-2 category is its own short build inside the process, so the
+        # category name is the stage: "which category was running" is the
+        # question a peak taken during one of them has to answer.
+        if kind == "build_started":
+            stages[plane] = fields.get("category", "unknown")
+        elif kind in ("build_ready", "build_failed", "build_suspended", "build_superseded"):
+            stages[plane] = "idle"
+        return
     if kind == "build_started":
         stages[plane] = "started"
     elif kind == "build_progress":
@@ -242,13 +256,19 @@ def apply_stage_event(stages: dict[str, str], fields: dict[str, str]) -> None:
 
 
 def phase_label(stages: dict[str, str]) -> str:
-    """Name what both planes were doing, because they overlap.
+    """Name what every plane was doing, because they overlap.
 
-    The search (trigram) build and the callgraph build run at the same time, so
-    a per-plane breakdown would hide a peak that only exists while the two
-    coincide. One composite label per sample keeps that case visible.
+    The search (trigram) build, the callgraph build and the Tier-2 inspect
+    categories all run in one process, so a per-plane breakdown would hide a
+    peak that only exists while two of them coincide. One composite label per
+    sample keeps that case visible, and an overlap is what a peak with two
+    states looks like from the inside.
     """
-    return f"{stages.get('callgraph', 'idle')}/{stages.get('search', 'idle')}"
+    label = f"{stages.get('callgraph', 'idle')}/{stages.get('search', 'idle')}"
+    tier2 = stages.get("tier2", "idle")
+    if tier2 != "idle":
+        label += f"+tier2:{tier2}"
+    return label
 
 
 @dataclass
@@ -258,10 +278,15 @@ class PhaseSample:
     hwm_kb: int
     callgraph_stage: str
     search_stage: str
+    tier2_stage: str = "idle"
 
     @property
     def phase(self) -> str:
-        return phase_label({"callgraph": self.callgraph_stage, "search": self.search_stage})
+        return phase_label({
+            "callgraph": self.callgraph_stage,
+            "search": self.search_stage,
+            "tier2": self.tier2_stage,
+        })
 
 
 @dataclass
@@ -320,6 +345,7 @@ def write_phase_trace(path: Path, samples: list[PhaseSample]) -> None:
                 "hwm_kb": sample.hwm_kb,
                 "callgraph_stage": sample.callgraph_stage,
                 "search_stage": sample.search_stage,
+                "tier2_stage": sample.tier2_stage,
                 "phase": sample.phase,
             })
 
@@ -343,7 +369,7 @@ class PhaseSampler:
     interval_s: float = PHASE_SAMPLE_INTERVAL_S
     samples: list[PhaseSample] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
-    _stages: dict[str, str] = field(default_factory=lambda: {plane: "idle" for plane in PLANES})
+    _stages: dict[str, str] = field(default_factory=lambda: {plane: "idle" for plane in TRACKED_PLANES})
     _offsets: dict[Path, int] = field(default_factory=dict)
     _pending: dict[Path, str] = field(default_factory=dict)
     _started: float = 0.0
@@ -381,6 +407,7 @@ class PhaseSampler:
             hwm_kb=hwm_kb,
             callgraph_stage=self._stages["callgraph"],
             search_stage=self._stages["search"],
+            tier2_stage=self._stages["tier2"],
         ))
 
     def _read_memory(self) -> tuple[int | None, int | None]:
@@ -884,20 +911,27 @@ def phase_self_test() -> int:
     assert fields["kind"] == "build_progress" and fields["plane"] == "callgraph", fields
     assert index_event_fields("2026-09-21T16:58:32Z [aft] search index cold streaming build: 1 files") is None
 
-    stages = {plane: "idle" for plane in PLANES}
+    stages = {plane: "idle" for plane in TRACKED_PLANES}
     apply_stage_event(stages, {"kind": "build_started", "plane": "search"})
     apply_stage_event(stages, {"kind": "build_progress", "plane": "search", "stage": "streaming"})
     apply_stage_event(stages, {"kind": "build_progress", "plane": "callgraph", "stage": "extraction"})
     assert phase_label(stages) == "extraction/streaming", stages
     apply_stage_event(stages, {"kind": "build_ready", "plane": "search"})
     assert phase_label(stages) == "extraction/ready", stages
+    # The inspect plane runs inside the same process and its memory lands in
+    # the same peak, so an overlap has to be named rather than attributed to
+    # whatever the callgraph happened to be doing at the time.
+    apply_stage_event(stages, {"kind": "build_started", "plane": "tier2", "category": "duplicates"})
+    assert phase_label(stages) == "extraction/ready+tier2:duplicates", stages
+    apply_stage_event(stages, {"kind": "build_ready", "plane": "tier2", "category": "duplicates"})
+    assert phase_label(stages) == "extraction/ready", stages
     # A plane that is not building must not keep claiming a stage.
     apply_stage_event(stages, {"kind": "build_superseded", "plane": "callgraph"})
     assert phase_label(stages) == "superseded/ready", stages
-    # Only the two planes this matrix builds are tracked; anything else the
-    # process logs must not create a stage of its own.
-    apply_stage_event(stages, {"kind": "build_progress", "plane": "tier2", "stage": "dead_code"})
-    assert "tier2" not in stages, stages
+    # Only the planes whose work can land in a measured cold build are tracked;
+    # anything else the process logs must not create a stage of its own.
+    apply_stage_event(stages, {"kind": "build_progress", "plane": "views", "stage": "assembly"})
+    assert "views" not in stages, stages
 
     samples = [
         PhaseSample(0, 40_000, 40_000, "idle", "streaming"),
@@ -905,6 +939,7 @@ def phase_self_test() -> int:
         PhaseSample(500, 50_000, 60_000, "extraction", "ready"),
         PhaseSample(750, 140_000, 140_000, "extraction", "ready"),
         PhaseSample(1000, 90_000, 140_000, "resolution", "ready"),
+        PhaseSample(1250, 190_000, 190_000, "resolution", "ready", "duplicates"),
     ]
     rollups = {rollup.phase: rollup for rollup in attribute_phases(samples)}
     # The first sample carries the cost of reaching it, and each later step is
@@ -914,10 +949,15 @@ def phase_self_test() -> int:
     # A phase that only holds memory someone else allocated is charged nothing,
     # which is what makes the largest entry an answer rather than a ranking.
     assert rollups["resolution/ready"].hwm_growth_kb == 0, rollups["resolution/ready"]
+    # Memory taken while an inspect category overlaps the callgraph build is
+    # charged to the overlap, not to the callgraph stage underneath it.
+    assert rollups["resolution/ready+tier2:duplicates"].hwm_growth_kb == 50_000, rollups
     assert rollups["extraction/ready"].rss_max_kb == 140_000, rollups["extraction/ready"]
     assert rollups["idle/streaming"].elapsed_ms == 250, rollups["idle/streaming"]
     summary = format_phase_summary(attribute_phases(samples))
-    assert summary == "extraction/ready=+78.1;idle/streaming=+58.6", summary
+    assert summary == (
+        "extraction/ready=+78.1;idle/streaming=+58.6;resolution/ready+tier2:duplicates=+48.8"
+    ), summary
     assert format_phase_summary([]) == "n/a"
 
     # The log is tailed live, so a tick that lands mid-line must not lose the
@@ -933,8 +973,13 @@ def phase_self_test() -> int:
         assert sampler._stages["callgraph"] == "extraction", sampler._stages
         with log.open("a", encoding="utf-8") as handle:
             handle.write("ution completed=5 total=9 elapsed_ms=2\n")
+            handle.write(
+                "2026-09-21T16:58:33Z [aft] index_event kind=build_started plane=tier2 build_id=b2 "
+                "root=/tmp/x key=k category=duplicates files=2079\n"
+            )
         sampler._drain_logs()
         assert sampler._stages["callgraph"] == "resolution", sampler._stages
+        assert sampler._stages["tier2"] == "duplicates", sampler._stages
         sampler._drain_logs()
         assert sampler._stages["callgraph"] == "resolution", sampler._stages
     finally:
