@@ -1,0 +1,23 @@
+# Keep the benchmark's own answer key out of the corpus AFT indexes.
+#
+# fixtures.json, identifier-fusion-fixtures.json, baseline.json and the result
+# reports each contain every fixture's query AND its expected_top_files, so
+# indexing them turns a fixture query into a self-fulfilling exact hit: the
+# answer-key file crowds the top of the list and pushes down the file the
+# fixture is actually looking for. That deflates the measured baseline, which
+# is the dangerous direction -- it makes every candidate ranking change look
+# better than it is.
+#
+# run-fusion-quality already excludes these files from its bench-only
+# exact-match oracle for the same reason. This applies the same exclusion to
+# the index of the system under measurement.
+#
+# Patterns are relative to this directory, as in .gitignore. The .alfonso/
+# reports that quote fixture queries sit above it and are already excluded by
+# the repository .gitignore, which AFT's walker honors.
+baseline.json
+external-fixtures.json
+fixtures.json
+identifier-fusion-fixtures.json
+real-query-baseline.json
+results/

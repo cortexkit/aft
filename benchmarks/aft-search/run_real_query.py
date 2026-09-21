@@ -514,7 +514,30 @@ def runtime_evidence_tree(tree: Path) -> Iterator[Path]:
     with tempfile.TemporaryDirectory(prefix="aft-real-query-tree-") as directory:
         root = Path(directory) / "tree"
         shutil.copytree(tree, root, ignore=shutil.ignore_patterns(".git"))
+        copy_answer_key_ignore(root)
         yield root
+
+
+# Where the answer-key ignore list is copied inside the evidence tree, which is
+# a projection of this repository and so has the same relative layout.
+BENCH_IGNORE_RELATIVE = "benchmarks/aft-search/.aftignore"
+
+
+def copy_answer_key_ignore(root: Path) -> Optional[Path]:
+    """Keep the benchmark's own fixtures out of the index AFT builds here.
+
+    The pinned tree predates the ignore list and its digest is verified before
+    this copy exists, so the list is added to the copy rather than to the tree
+    itself. No real-query row shares a query with those fixtures today; adding
+    the list keeps that true by construction instead of by coincidence.
+    """
+    source = HERE / ".aftignore"
+    if not source.is_file():
+        return None
+    destination = root / BENCH_IGNORE_RELATIVE
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(source.read_bytes())
+    return destination
 
 
 @contextmanager
