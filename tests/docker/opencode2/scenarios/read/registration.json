@@ -18,7 +18,7 @@
       ],
       "expected_turns": ["call-read", "finish"],
       "compare_call_id": "read-happy",
-      "comparison": {"mode": "exact", "expected": "1: alpha\n2: beta"},
+      "comparison": {"mode": "exact", "expected": "1: alpha\n2: beta\n"},
       "metadata": {"path_identity": {"requested": "sample.txt", "expected_project_relative": "sample.txt"}}
     },
     {
