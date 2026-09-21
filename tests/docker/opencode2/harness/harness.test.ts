@@ -258,6 +258,10 @@ describe("scenario isolation and liveness", () => {
     );
     expect(legacyWrapper).toContain("dist/index.js");
     expect(legacyWrapper).not.toContain("dist/entry/server.js");
+    // V1 takes a plugin function, not the V2 object carrying `effect`.
+    expect(legacyWrapper).toContain("export default (context) => {");
+    expect(legacyWrapper).not.toContain("plugin.effect");
+    expect(serverWrapper).toContain("plugin.effect");
   });
 
   test("the scenario client uses the provider contract model", async () => {

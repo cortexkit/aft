@@ -112,18 +112,34 @@ export async function createScenarioIsolation(options: {
       ? join(options.pluginDirectory, "dist", "entry", "server.js")
       : join(options.pluginDirectory, "dist", "index.js"),
   ).href;
-  const wrapperModule = (resolvedEntry: string) =>
+  // The wrapper has to be the shape its host accepts, and the two hosts do not
+  // agree: V1 takes a plugin function and refuses anything else with "Plugin
+  // export is not a function", while V2 takes an object carrying `effect`.
+  // Handing every host the object form loads nothing on V1 — the import runs,
+  // so the source line still reaches the log, but no tool is ever registered.
+  const wrapperPreamble = (resolvedEntry: string) =>
     `import { appendFileSync } from "node:fs";\n` +
     `import plugin from ${JSON.stringify(resolvedEntry)};\n` +
     `const pluginLog = process.env.AFT_E2E_PLUGIN_LOG;\n` +
     `if (pluginLog) appendFileSync(pluginLog, ${JSON.stringify(
       `plugin source=${pluginUrl} resolvedEntry=${resolvedEntry} PLUGIN_VERSION=${options.pluginVersion}\n`,
     )});\n` +
-    `const effect = plugin.effect;\n` +
-    `export default { ...plugin, effect: effect && ((context) => {\n` +
-    `  if (pluginLog) appendFileSync(pluginLog, "context keys=" + Object.keys(context).sort().join(",") + "\\n");\n` +
-    `  return effect(context);\n` +
-    `}) };\n`;
+    `const recordContext = (context) => {\n` +
+    `  if (pluginLog) appendFileSync(pluginLog, "context keys=" + Object.keys(context ?? {}).sort().join(",") + "\\n");\n` +
+    `};\n`;
+  const wrapperModule = (resolvedEntry: string) =>
+    options.hostGeneration === "v1"
+      ? `${wrapperPreamble(resolvedEntry)}` +
+        `export default (context) => {\n` +
+        `  recordContext(context);\n` +
+        `  return plugin(context);\n` +
+        `};\n`
+      : `${wrapperPreamble(resolvedEntry)}` +
+        `const effect = plugin.effect;\n` +
+        `export default { ...plugin, effect: effect && ((context) => {\n` +
+        `  recordContext(context);\n` +
+        `  return effect(context);\n` +
+        `}) };\n`;
   await mkdir(pluginWrapper, { recursive: true });
   await Promise.all([
     writeFile(
