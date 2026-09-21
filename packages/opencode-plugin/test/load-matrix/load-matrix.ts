@@ -984,6 +984,10 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
       { files: [deniedDeletePath] },
       permissionContext("delete-denied"),
     )),
+    // No OpenCode service runs beside this probe, so an "ask" here cannot be
+    // put to anyone. The sibling prompt row is the one that starts a service
+    // and proves the prompt; this row's subject is that the refusal says what
+    // was observed instead of blaming the host.
     "read-ask": yield* settle("read-ask", read.execute(
       { path: secretPath },
       permissionContext("read-ask"),
@@ -997,10 +1001,21 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     if (text.includes("did not provide a permission request endpoint")) {
       throw new Error("GA refusal " + label + " still blames a host endpoint: " + text);
     }
-    appendFileSync(marker, "permission-refusal:" + label + ":" + text.slice(0, 160) + "\\n");
+    if (text.includes("no way to open a permission prompt")) {
+      throw new Error("GA refusal " + label + " still claims a capability gap: " + text);
+    }
+    // 240 characters rather than a shorter excerpt: the ask refusal names what
+    // stopped the prompt only after it has quoted the action and the resource,
+    // and the row asserts on that phrase.
+    appendFileSync(marker, "permission-refusal:" + label + ":" + text.slice(0, 240) + "\\n");
   }
   if (!String(refusals["read-ask"]?.message).includes('"effect": "allow"')) {
     throw new Error("GA ask refusal did not name the setting that lifts it");
+  }
+  if (!String(refusals["read-ask"]?.message).includes("could not reach the OpenCode service")) {
+    throw new Error(
+      "GA ask refusal did not name what stopped the prompt: " + String(refusals["read-ask"]?.message),
+    );
   }
   if (
     readFileSync(deniedEditPath, "utf8") !== "keep me\\n" ||
@@ -1013,7 +1028,7 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
   }
   appendFileSync(
     marker,
-    "permission-api:evaluated:domain=agent.get,session.get;permission.create=absent\\n",
+    "permission-api:evaluated:domain=agent.get,session.get;prompt=service.discover\\n",
   );
   const live = getBridgeLifecycleTopology();
   const liveHealth = yield* Effect.promise(() => sampleBridgeLifecycleCensus({ settleMs: 0 }));
@@ -1126,6 +1141,196 @@ if (Object.values(settled).some((count) => count !== 0)) {
   throw new Error("Location lifecycle leak after 2s settle: " + JSON.stringify(settled));
 }
 console.log("[load-matrix-host:v2-lifecycle] resolvedEntry=" + entrypoints.server + " features=" + JSON.stringify(loaded.features));
+`,
+  );
+  return probe;
+}
+
+/**
+ * Drive a real "ask" rule against a running OpenCode service.
+ *
+ * The sibling lifecycle probe runs with no service, so the only thing it can
+ * observe about an ask is the refusal. This one starts the host's own
+ * background service, creates a session on it carrying the same ruleset AFT
+ * reads, and then calls a gated tool: the request AFT raises has to appear in
+ * the host's own `permission.list`, answering it with `reply` has to let the
+ * tool finish, and a call the rules allow has to raise nothing at all.
+ */
+async function writeV2PromptProbe(hostRoot: string): Promise<string> {
+  const probe = join(hostRoot, "core-loader-prompt.mjs");
+  await writeFile(
+    probe,
+    `
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { Effect } from "effect";
+import { PluginModule } from "@opencode/core/plugin/module";
+import { Watcher } from "@opencode/core/filesystem/watcher";
+import { Npm } from "@opencode/util/npm";
+import { OpenCode } from "@opencode/client";
+import { discover, ensure, headers, stop } from "@opencode/client/service";
+
+const packageRoot = process.argv[2];
+const directory = process.argv[3];
+const hostBinary = process.argv[4];
+const marker = process.env.AFT_LOAD_MATRIX_MARKER;
+const record = (line) => appendFileSync(marker, line + "\\n");
+const pause = (ms) => new Promise((settle) => setTimeout(settle, ms));
+
+// One ruleset for both evaluations. AFT reads it from the agent domain and the
+// session carries it on the service, so the plugin and the host agree about
+// which of these two reads needs a prompt.
+const rules = [
+  { action: "*", resource: "*", effect: "allow" },
+  { action: "read", resource: "*.env", effect: "ask" },
+];
+
+const installed = {
+  directory: packageRoot,
+  name: ${JSON.stringify(packageName)},
+  version: ${JSON.stringify(v2Version)},
+  revision: "prompt-matrix",
+};
+const npm = {
+  add: () => Effect.succeed(installed),
+  resolve: () => Effect.succeed(installed),
+  check: () => Effect.succeed(true),
+  update: () => Effect.succeed(installed),
+  which: () => Effect.succeed(undefined),
+};
+const { load } = await Effect.runPromise(
+  Effect.scoped(PluginModule.make()).pipe(Effect.provide(Watcher.testLayer)),
+);
+const loaded = await Effect.runPromise(
+  load({ type: "add", target: ${JSON.stringify(packageName)}, options: {} }, { install: false })
+    .pipe(Effect.provideService(Npm.Service, npm)),
+);
+if (loaded.pending) throw new Error("host loader returned pending");
+
+await ensure({ command: [hostBinary, "serve", "--service"] });
+try {
+  const endpoint = await discover();
+  if (!endpoint) throw new Error("the probe could not reach the service it just started");
+  const control = OpenCode.make({ baseUrl: endpoint.url, headers: headers(endpoint) });
+  // Loading the location first is what makes the host's agents and config
+  // available. A permission evaluated before that lands on an empty ruleset
+  // and comes back denied for reasons that have nothing to do with the rules.
+  await control.location.get({ location: { directory } });
+  await control.agent.list({ location: { directory } });
+  const session = await control.session.create({
+    title: "load-matrix-prompt",
+    location: { directory },
+    permissions: rules,
+  });
+  record("service-session:" + session.id);
+
+  const tools = [];
+  const context = {
+    location: {
+      directory,
+      project: { id: "prompt-matrix", directory, canonical: directory },
+    },
+    rpc: {
+      register: () =>
+        Effect.sync(() => ({
+          events: { emit: () => Effect.void },
+          dispose: Effect.void,
+        })),
+    },
+    permission: {
+      hook: () => Effect.succeed({ dispose: Effect.void }),
+      list: () => Effect.succeed([]),
+      get: () => Effect.succeed(undefined),
+      reply: () => Effect.void,
+      rules: () => Effect.void,
+    },
+    tool: {
+      transform: (register) =>
+        Effect.sync(() => register({ add: (tool) => tools.push(tool), remove: () => {} })),
+    },
+    agent: {
+      get: () => Effect.sync(() => ({ location: { directory }, data: { permissions: rules } })),
+    },
+    session: {
+      get: (input) => Effect.sync(() => ({ id: input.sessionID, agent: "load-matrix" })),
+      prompt: (input) => Effect.sync(() => ({ id: "wake-" + input.sessionID })),
+      synthetic: (input) => Effect.sync(() => ({ id: "status-" + input.sessionID })),
+    },
+  };
+
+  await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+    yield* loaded.effect(context);
+    const read = tools.find((tool) => tool.name === "read");
+    if (!read) throw new Error("enabled V2 effect did not register read");
+
+    const ordinaryPath = resolve(directory, "prompt-ordinary.ts");
+    const secretPath = resolve(directory, "prompt-secret.env");
+    writeFileSync(ordinaryPath, "ordinary\\n");
+    writeFileSync(secretPath, "TOKEN=prompted\\n");
+    const callContext = (id) => ({
+      sessionID: session.id,
+      messageID: "prompt-message",
+      agent: "load-matrix",
+      id,
+      progress: () => Effect.succeed(undefined),
+    });
+    const raisedRequests = () =>
+      Effect.promise(() => control.permission.list({ sessionID: session.id }));
+
+    const ordinary = yield* read.execute({ path: ordinaryPath }, callContext("prompt-allowed"));
+    if (!String(ordinary.content).includes("ordinary")) {
+      throw new Error("GA allowed read was not served: " + JSON.stringify(ordinary));
+    }
+    const afterAllowed = yield* raisedRequests();
+    if (afterAllowed.length !== 0) {
+      throw new Error("an allowed read raised a prompt: " + JSON.stringify(afterAllowed));
+    }
+    record("prompt-allowed-silently:read");
+
+    // The gated call is started but not awaited: its own completion is what the
+    // reply below unblocks. \`settled\` also lets the poll stop immediately when
+    // the call fails instead of waiting out the deadline.
+    const pending = Effect.runPromise(read.execute({ path: secretPath }, callContext("prompt-call")));
+    let settled;
+    pending.then(
+      () => { settled = { completed: true }; },
+      (error) => { settled = { failed: String(error?.message ?? error) }; },
+    );
+
+    let raised;
+    for (let attempt = 0; attempt < 100 && !raised && !settled; attempt += 1) {
+      const requests = yield* raisedRequests();
+      raised = requests.find((request) => request.source?.id === "prompt-call");
+      if (!raised) yield* Effect.promise(() => pause(100));
+    }
+    if (!raised) {
+      record("prompt-missing:" + JSON.stringify(settled ?? "no request within 10s"));
+      throw new Error("no permission request reached the host");
+    }
+    record(
+      "prompt-raised:" + raised.action + ":" + raised.resources.join(",") + ":" + raised.source.id,
+    );
+
+    yield* Effect.promise(() =>
+      control.permission.reply({
+        sessionID: session.id,
+        requestID: raised.id,
+        decision: "once",
+      }),
+    );
+    const secret = yield* Effect.promise(() => pending);
+    if (!String(secret.content).includes("TOKEN=prompted")) {
+      throw new Error("the answered read did not return the file: " + JSON.stringify(secret));
+    }
+    if (readFileSync(secretPath, "utf8") !== "TOKEN=prompted\\n") {
+      throw new Error("the prompted read changed the file it read");
+    }
+    record("prompt-answered:once:read-completed");
+  })));
+} finally {
+  await stop().catch((error) => record("service-stop-failed:" + String(error)));
+}
+console.log("[load-matrix-host:v2-prompt] prompt round trip completed");
 `,
   );
   return probe;
@@ -1442,7 +1647,7 @@ export default { id: original.id, effect };
     // as rendered text naming its real cause.
     expect(permissionEvidence).toContain("permission-gated:allowed:edit,read");
     expect(permissionEvidence).toContain(
-      "permission-api:evaluated:domain=agent.get,session.get;permission.create=absent",
+      "permission-api:evaluated:domain=agent.get,session.get;prompt=service.discover",
     );
     const refusals = permissionEvidence.filter((line) => line.startsWith("permission-refusal:"));
     expect(refusals.map((line) => line.split(":")[1]).sort()).toEqual([
@@ -1451,7 +1656,11 @@ export default { id: original.id, effect };
       "read-ask",
     ]);
     expect(refusals.some((line) => line.includes("needs interactive approval"))).toBe(true);
+    expect(refusals.some((line) => line.includes("could not reach the OpenCode service"))).toBe(
+      true,
+    );
     expect(events).not.toContain("did not provide a permission request endpoint");
+    expect(events).not.toContain("no way to open a permission prompt");
     expect(events).not.toContain('permission-refusal:edit-denied:{"success"');
     expect(rpcEvidence.filter((line) => line.startsWith("rpc-call:"))).toHaveLength(2);
     expect(rpcEvidence).toContain(
@@ -1485,6 +1694,67 @@ export default { id: original.id, effect };
     );
     expect(events).not.toContain("permissions:");
   }, 180_000);
+
+  test("GA host raises a real prompt for an ask rule and the tool completes once answered", async () => {
+    const { v2 } = await ensureHostInstalls();
+    const packageRoot = await copyInstalledPlugin(v2, "v2-permission-prompt");
+    const isolation = await makeIsolation("v2-permission-prompt");
+    const marker = join(isolation.root, "prompt.log");
+    const binaryPath =
+      process.env.AFT_BINARY_PATH?.trim() ||
+      join(repoRoot, "target", "debug", process.platform === "win32" ? "aft.exe" : "aft");
+    expect(existsSync(binaryPath)).toBe(true);
+    // The service this row starts is found by the port in the isolated config
+    // root, which is the only thing keeping it off the operator's own editor:
+    // `discover()` locates a service by that registration, so an unisolated run
+    // would hand the plugin the operator's process. The plugin list is empty
+    // because the probe loads AFT itself; the service must not load it again.
+    await writeV2HostConfig(isolation, [], {
+      enabled: true,
+      search_index: false,
+      semantic_search: false,
+      tool_surface: "all",
+      hoist_builtin_tools: true,
+      bash: true,
+      lsp: { auto_install: false },
+    });
+    const probe = await writeV2PromptProbe(v2);
+
+    const result = await withOperatorCanary("v2-permission-prompt", () =>
+      run("node", [probe, packageRoot, isolation.project, v2Binary(v2)], v2, {
+        env: {
+          ...isolation.env,
+          AFT_BINARY_PATH: binaryPath,
+          AFT_LOAD_MATRIX_MARKER: marker,
+        },
+        // A probe that cannot raise the prompt still has to report through the
+        // marker below, so its exit status is not what decides this row.
+        allowFailure: true,
+        timeoutMs: 240_000,
+      }),
+    );
+    const transcript = `${result.stdout}\n${result.stderr}`;
+    console.log(`[v2-prompt-host-transcript]\n${transcript}`);
+    const events = existsSync(marker) ? await readFile(marker, "utf8") : "";
+    const promptEvidence = events
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith("prompt-") || line.startsWith("service-"));
+    console.log(`[v2-prompt-evidence]\n${promptEvidence.join("\n")}`);
+
+    // A read the rules allow must still go straight through.
+    expect(promptEvidence).toContain("prompt-allowed-silently:read");
+    // The prompt itself: raised by AFT, seen in the host's own request list,
+    // and answered there. The resource is matched loosely at the front because
+    // a read states its path relative to the project root only when the two
+    // spellings of that root agree through symlinks.
+    const raisedLine = promptEvidence.find((line) => line.startsWith("prompt-raised:"));
+    expect(raisedLine).toBeDefined();
+    expect(raisedLine).toMatch(/^prompt-raised:read:.*prompt-secret\.env:prompt-call$/);
+    expect(promptEvidence).toContain("prompt-answered:once:read-completed");
+    expect(promptEvidence.filter((line) => line.startsWith("prompt-missing:"))).toEqual([]);
+    expect(transcript).toContain("[load-matrix-host:v2-prompt]");
+    expect(result.status).toBe(0);
+  }, 300_000);
 
   test("GA TUI host mounts the sidebar and its status command without a keymap error", async () => {
     const { v2 } = await ensureHostInstalls();
@@ -1764,6 +2034,7 @@ export default entry;
       "v2-bun",
       "v2-node",
       "v2-lifecycle",
+      "v2-permission-prompt",
       "v2-tui-keymap",
       "v2-tui-directory",
       "v1-root-mutation",
