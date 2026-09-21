@@ -512,13 +512,14 @@ build. That is two problems with two owners:
   598 MB for `jupyterlab`, which is what the committed baseline already says.
 - **The behaviour.** Whether a ninety-second warm timer should start a
   five-category scan on top of a still-running cold build is a question about
-  `crates/**`, not about this directory: the callgraph build and the inspect
-  refresh are admitted independently, so their peaks add. The files are
-  `crates/aft/src/inspect/tier2_scheduler.rs` (the ninety-second
-  `TIER2_REFRESH_COLD_CACHE_DELAY`, and the `pull` trigger) and
-  `crates/aft/src/context.rs` (`start_tier2_refresh`, and the
-  `request_tier2_refresh_pull` call on callgraph-store ready). Nothing in this
-  directory changes them.
+  `crates/**`, not about this directory. The cold-build limiter admits two
+  concurrent builds, so the inspect refresh is let through while the callgraph
+  build is still going and their peaks add; nothing was deferred in any run
+  measured here. The files are `crates/aft/src/inspect/tier2_scheduler.rs`
+  (`TIER2_REFRESH_COLD_CACHE_DELAY`, and the `pull` trigger, which is not
+  behind that delay) and `crates/aft/src/context.rs` (`start_tier2_refresh`,
+  and the `request_tier2_refresh_pull` call on callgraph-store ready). Nothing
+  in this directory changes them.
 
 What is settled either way: the 89 MB was never a cold-build cost, so nothing
 about it belongs in a cold-build baseline.
