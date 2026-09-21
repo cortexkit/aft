@@ -414,8 +414,8 @@
             "Binary (crashed|killed)",
             "outcome is UNKNOWN"
           ],
-          "host_fallback_coverage": "n/a:standalone-transport-reports-every-failure-as-unknown-outcome",
-          "reason": "bash.host_fallback may only run a command the transport provably never sent. The standalone bridge cannot report that: it writes the request to the binary it spawned, so when that binary crashes or is killed the outcome is unknown, and bash refuses rather than risk running the command twice. The shapes the classifier does admit - module down, bind timed out, route closed before dispatch - are daemon-transport replies, and this harness drives the standalone bridge through AFT_BINARY_PATH. Break-glass execution therefore has no coverage on this transport; covering it needs a harness that runs the daemon transport."
+      "host_fallback_coverage": "n/a:this-row-installs-a-failure-whose-outcome-cannot-be-determined",
+        "reason": "bash.host_fallback may only run a command the transport provably never sent, so this row installs the opposite failure: the stand-in the transport-dead window points AFT_BINARY_PATH at reads the bridge's request and only then exits, without answering it. The request has been handed over by the time the process dies, so nothing can say whether it ran, and bash refuses rather than risk running it twice. Break-glass execution therefore has no coverage here by construction - it needs a failure that proves nothing was sent, such as a binary that cannot start at all, which the OpenCode plugin's own e2e suite covers directly. An earlier version of this row left the dead window pointing at a missing binary, which is exactly that provably-never-sent failure: whether it refused or fell back depended on whether the bridge had already noticed its killed child, and on a CI runner it had, so the break-glass path opened and ran the command."
         }
       }
     },
@@ -474,8 +474,8 @@
             "Binary (crashed|killed)",
             "outcome is UNKNOWN"
           ],
-          "host_fallback_coverage": "n/a:standalone-transport-reports-every-failure-as-unknown-outcome",
-          "reason": "Same transport, opposite permission posture: this session would refuse any ask it were shown. Neither posture reaches an ask, because bash refuses the command before either ask site, which is what makes the refusal a property of the transport failure rather than of the answer. See the allow row for why no admitted shape is reachable here."
+      "host_fallback_coverage": "n/a:this-row-installs-a-failure-whose-outcome-cannot-be-determined",
+        "reason": "Same transport, opposite permission posture: this session would refuse any ask it were shown. Neither posture reaches an ask, because bash refuses the command before either ask site, which is what makes the refusal a property of the transport failure rather than of the answer. See the allow row for what the dead window installs and why a failure that proves nothing was sent would be the wrong one here."
         }
       }
     },
