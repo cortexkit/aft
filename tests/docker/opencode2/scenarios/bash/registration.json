@@ -637,10 +637,12 @@
             "calls": [
               {
                 "id": "bash-watch-status",
-                "name": "status",
-                "arguments": {},
+                "name": "aft_outline",
+                "arguments": {
+                  "target": "sample.ts"
+                },
                 "non_mutating_evidence": {
-                  "reason": "status keeps the scripted turn open while the task id is captured"
+                  "reason": "this call only keeps the scripted turn open while the task id is captured, and outline reads fixture state"
                 }
               }
             ]
