@@ -39,6 +39,8 @@ export type SentinelSample = {
   writes_census?: Record<string, any>;
   writes_error?: string;
   log_lines?: string[];
+  /** Bytes the pid log gained since the previous run; distinguishes an idle daemon from an unreadable log. */
+  log_bytes_added?: number;
   log_error?: string;
   plugin_lines?: string[];
   plugin_error?: string;
@@ -137,8 +139,14 @@ export function detectLogHealth(sample: SentinelSample): Finding[] {
   if (sample.log_error) return [instrument("daemon-log", sample.log_error)];
   const lines = sample.log_lines ?? [];
   const out: Finding[] = [];
-  if (sample.supervisor?.running && sample.health && lines.length === 0) {
-    out.push(instrument("log-silent", "daemon is serving but its pid log produced zero new lines"));
+  // A silent log only means the instrument is broken if there was something to
+  // read. An idle daemon legitimately writes nothing -- at night, with no
+  // session bound and no maintenance due, silence is the correct state, and
+  // warning about it teaches the reader to skip the channel. Bytes appended
+  // with no lines parsed is the real failure: we are reading the wrong file,
+  // or the cursor is wrong.
+  if (sample.supervisor?.running && sample.health && lines.length === 0 && Number(sample.log_bytes_added ?? 0) > 0) {
+    out.push(instrument("log-silent", `daemon log grew by ${sample.log_bytes_added} bytes but no lines could be read from it`));
   }
   for (const line of lines) {
     if (/panicked at|actor_fatal|fatal executor/i.test(line)) {
@@ -632,6 +640,9 @@ function collectSample(state: SentinelState): { sample: SentinelSample; cursors:
     sample.supervisor = { ...(sample.supervisor ?? { running: true }), pid: current.pid };
     const read = readNew(current.path, state.log);
     sample.log_lines = read.lines;
+    // Growth is measured only across the same file: a rotation or a new pid
+    // resets the cursor to 0, and the whole file then reads as "added".
+    sample.log_bytes_added = state.log?.path === current.path ? Math.max(0, read.offset - Number(state.log?.offset ?? 0)) : read.offset;
     cursors.log = { path: current.path, offset: read.offset, size: read.offset };
   } catch (error) { sample.log_error = String(error); }
   // The plugin's own structured log, not the OpenCode host log: the host log

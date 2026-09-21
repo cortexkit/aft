@@ -112,8 +112,13 @@ describe("health sentinel pure detectors", () => {
     ] }), { findings: {}, previous: { pid: 42 } }))).toEqual(expect.arrayContaining(["daemon.restarted", "daemon.panic", "bind.stall", "sandbox.refusal"]));
   });
 
-  test("serving daemon with no new pid-log lines is an instrument warning", () => {
-    expect(detectLogHealth(sample({ log_lines: [] }))[0].fingerprint).toBe("instrument:log-silent");
+  test("a silent log is only an instrument warning when the log actually grew", () => {
+    // An idle daemon writes nothing, and that is not a fault to report.
+    expect(detectLogHealth(sample({ log_lines: [], log_bytes_added: 0 }))).toEqual([]);
+    // Bytes appended that yield no lines means we cannot read what was written.
+    const broken = detectLogHealth(sample({ log_lines: [], log_bytes_added: 4096 }));
+    expect(broken[0].fingerprint).toBe("instrument:log-silent");
+    expect(broken[0].text).toContain("4096");
   });
 
   test("limiter saturation raises without turnover", () => {
