@@ -140,8 +140,76 @@ python3 run-fusion-quality \
 
 The script auto-detects the managed ONNX Runtime at
 `~/.local/share/cortexkit/aft/onnxruntime/1.24.4/` when `ORT_DYLIB_PATH` is not
-set. It writes a detailed JSON run manifest plus a TSV aggregate summary used by
+set (on Windows, `%LOCALAPPDATA%\cortexkit\aft\onnxruntime\1.24.4\onnxruntime.dll`).
+It writes a detailed JSON run manifest plus a TSV aggregate summary used by
 `.alfonso/reports/search-fusion-quality.md`.
+
+## Corpus hygiene: the benchmark's own answer key
+
+`fixtures.json`, `identifier-fusion-fixtures.json`, `baseline.json` and the
+recorded reports each contain every fixture's query **and** its
+`expected_top_files`. When they are part of the indexed corpus they become
+self-fulfilling exact hits for their own queries, crowd the top of the result
+list, and push down the file the fixture is actually looking for.
+
+`.aftignore` in this directory keeps them out of the index AFT builds, matching
+the exclusion `run-fusion-quality` already applies to its bench-only
+exact-match oracle. `run_real_query.py` copies the same list into the runtime
+copy of the evidence tree, after the pinned digest has been verified, so the
+digest is unaffected.
+
+The deflation this prevents runs in the dangerous direction: a suppressed
+baseline makes every candidate ranking change look better than it is. Any new
+file in this directory that carries `expected_top_files` has to be added to
+`.aftignore`; `test_harness_integrity.py` fails until it is.
+
+`baseline.json` records where its numbers came from in a `measured_on` block,
+the way the cost-gate baselines do, including whether the answer-key files were
+excluded from the indexed corpus at capture time.
+
+## Running on Windows
+
+All stages except the real-query replay run on Windows.
+
+- The NDJSON clients read the aft process's stdout on a reader thread rather
+  than with `select.select()`, which on Windows accepts sockets only and fails
+  a pipe with `WinError 10038`.
+- AFT returns absolute paths in the `\\?\C:\...` verbatim form.
+  `normalize_result_path` strips that prefix, without which every comparison
+  against a relative `expected_top_files` entry misses and the run reports a
+  clean 0.000 on a healthy index.
+- `.gitattributes` pins the benchmark JSON to LF, so the vector pack still
+  matches its `embedding_pack_sha256` under `core.autocrlf=true`.
+- The real-query replay refuses to start and exits **3**: its vector pack and
+  baseline are Unix-captured, and the text AFT embeds bakes the OS-native
+  relative path into every chunk header, so a Windows run cannot reproduce
+  them. Exit 3 is distinct from the exit 2 used for ordinary input faults.
+
+The platform-independent cases live in `test_harness_integrity.py` and run
+everywhere:
+
+```bash
+cd benchmarks/aft-search
+python3 -m unittest -v test_harness_integrity
+```
+
+## Method notes
+
+**Patches must be installed before the harness is imported.** The runners do
+`from run import normalize_result_path`, which binds the name at import time.
+Driving one of them from an external script and patching
+`run.normalize_result_path` afterwards leaves the harness holding the original
+function, and the run looks like an ordinary 0.000 rather than a failed patch.
+The same applies to anything else imported by name. For the same reason a fix
+belongs in the primitive rather than in a caller: `run_search_quality.py`
+spawns each stage as its own `python <script>.py`, so a second client class
+running as `__main__` never sees a patch applied to the first.
+
+**A zero is refused, not reported.** The baseline and fusion-quality runners
+refuse to write a report in which no fixture matched at all while the semantic
+index held entries. A well-formed all-unmatched report is indistinguishable
+from a catastrophic ranking regression, and the likelier cause is that result
+paths never compared equal to expected paths.
 
 ## External Vera-comparable benchmark
 
