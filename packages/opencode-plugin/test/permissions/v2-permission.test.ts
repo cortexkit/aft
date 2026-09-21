@@ -5,6 +5,7 @@ import { Effect } from "effect";
 import {
   decidePermission,
   PermissionDeniedError,
+  PermissionPromptUnansweredError,
   PermissionPromptUnavailableError,
   PermissionRejectedError,
   PermissionRulesUnavailableError,
@@ -100,50 +101,76 @@ function permissionHost(
 }
 
 /**
- * A pushable stand-in for the service's event stream.
+ * A stand-in for the service's event stream that keeps the real one's laziness.
  *
- * The prompt code holds this open across `permission.create`, so the test has
- * to be able to deliver a reply after the request exists, and to observe that
- * the iterator was closed again afterwards.
+ * `@opencode/client` returns a lazy async generator from `event.subscribe()`:
+ * taking the iterator performs no I/O, and the HTTP request that attaches the
+ * subscription is only made by the first `next()`. The host forwards events to
+ * whoever is attached at the moment they are emitted and keeps no backlog, so
+ * anything pushed before that first pull is dropped here too. A double that
+ * buffers from the moment it is created cannot fail the way the service does,
+ * which is what let an unbounded, late-attaching wait look correct.
+ *
+ * The first pull answers with the greeting OpenCode sends every new subscriber.
  */
-function eventFeed() {
-  const queued: unknown[] = [];
-  let pending: ((result: IteratorResult<unknown>) => void) | undefined;
+function eventFeed(onAttach?: () => void) {
+  interface Attachment {
+    readonly queued: unknown[];
+    pending?: (result: IteratorResult<unknown>) => void;
+  }
+  let live: Attachment | undefined;
   let closed = false;
 
   return {
     push(event: unknown): void {
-      if (pending) {
-        const deliver = pending;
-        pending = undefined;
+      if (!live) return;
+      if (live.pending) {
+        const deliver = live.pending;
+        live.pending = undefined;
         deliver({ value: event, done: false });
         return;
       }
-      queued.push(event);
+      live.queued.push(event);
+    },
+    get attached(): boolean {
+      return live !== undefined;
     },
     get closed(): boolean {
       return closed;
     },
     stream: {
-      [Symbol.asyncIterator]: () => ({
-        next(): Promise<IteratorResult<unknown>> {
-          if (queued.length > 0) {
-            return Promise.resolve({ value: queued.shift(), done: false });
-          }
-          return new Promise<IteratorResult<unknown>>((deliver) => {
-            pending = deliver;
-          });
-        },
-        return(): Promise<IteratorResult<unknown>> {
-          closed = true;
-          if (pending) {
-            const deliver = pending;
-            pending = undefined;
-            deliver({ value: undefined, done: true });
-          }
-          return Promise.resolve({ value: undefined, done: true });
-        },
-      }),
+      [Symbol.asyncIterator]: () => {
+        let own: Attachment | undefined;
+        return {
+          next(): Promise<IteratorResult<unknown>> {
+            if (!own) {
+              own = { queued: [] };
+              live = own;
+              onAttach?.();
+              return Promise.resolve({
+                value: { id: "evt-hello", created: 0, type: "server.connected", data: {} },
+                done: false,
+              });
+            }
+            if (own.queued.length > 0) {
+              return Promise.resolve({ value: own.queued.shift(), done: false });
+            }
+            return new Promise<IteratorResult<unknown>>((deliver) => {
+              if (own) own.pending = deliver;
+            });
+          },
+          return(): Promise<IteratorResult<unknown>> {
+            closed = true;
+            if (own?.pending) {
+              const deliver = own.pending;
+              own.pending = undefined;
+              deliver({ value: undefined, done: true });
+            }
+            if (live === own) live = undefined;
+            return Promise.resolve({ value: undefined, done: true });
+          },
+        };
+      },
     } as AsyncIterable<unknown>,
   };
 }
@@ -163,20 +190,32 @@ type PromptService = {
   readonly creates: V2PermissionCreateInput[];
   readonly order: string[];
   readonly feed: ReturnType<typeof eventFeed>;
+  /** Resolves once the request exists on the service. */
+  raised(): Promise<void>;
   discoveries(): number;
 };
 
-function promptService(effects: readonly V2PermissionEffect[] = ["ask"]): PromptService {
+function promptService(
+  effects: readonly V2PermissionEffect[] = ["ask"],
+  options: { readonly onCreate?: (requestID: string, service: PromptService) => void } = {},
+): PromptService {
   const creates: V2PermissionCreateInput[] = [];
   const order: string[] = [];
-  const feed = eventFeed();
+  const feed = eventFeed(() => order.push("listen"));
   let discoveries = 0;
+  let announce: (() => void) | undefined;
+  const raised = new Promise<void>((resolve) => {
+    announce = resolve;
+  });
   const client: V2PermissionClient = {
     permission: {
       create: async (input) => {
         order.push("create");
         creates.push(input);
-        return { id: `per-${creates.length}`, effect: effects[creates.length - 1] ?? "ask" };
+        const id = `per-${creates.length}`;
+        announce?.();
+        options.onCreate?.(id, service);
+        return { id, effect: effects[creates.length - 1] ?? "ask" };
       },
     },
     event: {
@@ -190,7 +229,15 @@ function promptService(effects: readonly V2PermissionEffect[] = ["ask"]): Prompt
     discoveries += 1;
     return { client };
   });
-  return { channel, creates, order, feed, discoveries: () => discoveries };
+  const service: PromptService = {
+    channel,
+    creates,
+    order,
+    feed,
+    raised: () => raised,
+    discoveries: () => discoveries,
+  };
+  return service;
 }
 
 function unreachableService(
@@ -401,8 +448,7 @@ describe("OpenCode V2 permission prompts", () => {
     const pending = requestPermission(host, REQUEST, EXECUTION_CONTEXT, service.channel);
     // The reply can only be sent once the request exists, which is also what
     // makes this a test of the wait rather than of the create response.
-    await Promise.resolve();
-    await Promise.resolve();
+    await service.raised();
     service.feed.push(repliedEvent("session-v2", "per-1", "once"));
 
     await pending;
@@ -420,15 +466,30 @@ describe("OpenCode V2 permission prompts", () => {
     expect(service.feed.closed).toBe(true);
   });
 
-  test("subscribes to the event stream before creating the request", async () => {
+  test("is listening on the event stream before the request is created", async () => {
     const { host } = permissionHost(askEverything);
     const service = promptService(["allow"]);
 
     await requestPermission(host, REQUEST, EXECUTION_CONTEXT, service.channel);
 
-    // A headless client can answer faster than a listener attached afterwards
-    // would start, so the order here is the whole point.
-    expect(service.order).toEqual(["subscribe", "create"]);
+    // Holding a subscription object is not listening: the client's stream only
+    // attaches when it is first pulled, and the host tells nobody about an
+    // answer that was given before they attached. "listen" is that first pull.
+    expect(service.order).toEqual(["subscribe", "listen", "create"]);
+  });
+
+  test("hears a reply sent the instant the request is created", async () => {
+    const { host } = permissionHost(askEverything);
+    // A headless client answers from its own already-open stream, which is
+    // faster than anything that starts listening after `create` returns.
+    const service = promptService(["ask"], {
+      onCreate: (requestID, created) =>
+        created.feed.push(repliedEvent("session-v2", requestID, "once")),
+    });
+
+    await requestPermission(host, REQUEST, EXECUTION_CONTEXT, service.channel);
+
+    expect(service.feed.closed).toBe(true);
   });
 
   test("an edit request carries its diff so the host renders its own patch view", async () => {
@@ -464,8 +525,7 @@ describe("OpenCode V2 permission prompts", () => {
     const service = promptService(["ask"]);
 
     const pending = requestPermission(host, REQUEST, EXECUTION_CONTEXT, service.channel);
-    await Promise.resolve();
-    await Promise.resolve();
+    await service.raised();
     service.feed.push(repliedEvent("session-v2", "per-1", "reject"));
 
     await expect(pending).rejects.toBeInstanceOf(PermissionRejectedError);
@@ -476,8 +536,7 @@ describe("OpenCode V2 permission prompts", () => {
     const service = promptService(["ask"]);
 
     const pending = requestPermission(host, REQUEST, EXECUTION_CONTEXT, service.channel);
-    await Promise.resolve();
-    await Promise.resolve();
+    await service.raised();
     service.feed.push(repliedEvent("session-v2", "per-other", "reject"));
     service.feed.push(repliedEvent("other-session", "per-1", "reject"));
     service.feed.push({ type: "session.idle", data: {} });
@@ -540,6 +599,140 @@ describe("OpenCode V2 permission prompts", () => {
     await requestPermission(host, REQUEST, EXECUTION_CONTEXT, channel);
 
     expect(attempts).toBe(2);
+  });
+});
+
+describe("OpenCode V2 unanswered prompts", () => {
+  const askEverything: readonly V2PermissionRule[] = [
+    { action: "*", resource: "*", effect: "ask" },
+  ];
+
+  test("refuses a prompt nobody answers once the wait bound expires", async () => {
+    const { host } = permissionHost(askEverything);
+    const service = promptService(["ask"]);
+
+    const refusal = await requestPermission(host, REQUEST, EXECUTION_CONTEXT, service.channel, {
+      replyTimeoutMs: 50,
+    }).catch((error: unknown) => error as Error);
+
+    // An answer nobody gave is not permission: the call has to end as a
+    // refusal, and it has to say that a prompt was raised and went unanswered
+    // rather than reporting a denial nobody made.
+    expect(refusal).toBeInstanceOf(PermissionPromptUnansweredError);
+    expect(refusal.message).toContain("raised a prompt and received no reply");
+    expect(refusal.message).toContain("waited 50ms after raising it");
+    expect(refusal.message).toContain("nothing was permitted");
+    expect(service.creates).toHaveLength(1);
+    expect(service.feed.closed).toBe(true);
+  });
+
+  test("an unanswered prompt refuses instead of returning quietly", async () => {
+    const { host } = permissionHost(askEverything);
+    const service = promptService(["ask"]);
+    let allowed = false;
+
+    await requestPermission(host, REQUEST, EXECUTION_CONTEXT, service.channel, {
+      replyTimeoutMs: 50,
+    })
+      .then(() => {
+        allowed = true;
+      })
+      .catch(() => undefined);
+
+    expect(allowed).toBe(false);
+  });
+
+  test("ends the wait when the operation it belongs to is cancelled", async () => {
+    const { host } = permissionHost(askEverything);
+    const service = promptService(["ask"]);
+    const controller = new AbortController();
+
+    const pending = requestPermission(host, REQUEST, EXECUTION_CONTEXT, service.channel, {
+      // Long enough that only the abort can end this wait.
+      replyTimeoutMs: 60_000,
+      signal: controller.signal,
+    }).catch((error: unknown) => error as Error);
+    await service.raised();
+    controller.abort();
+
+    const refusal = await pending;
+    expect(refusal).toBeInstanceOf(PermissionPromptUnansweredError);
+    expect(refusal.message).toContain("cancelled while the prompt was still open");
+    expect(service.feed.closed).toBe(true);
+  });
+
+  test("reads the abort signal a tool runtime carries on its context", async () => {
+    const { host } = permissionHost(askEverything);
+    const service = promptService(["ask"]);
+    const controller = new AbortController();
+    const runtimeContext = { ...EXECUTION_CONTEXT, abort: controller.signal };
+
+    const pending = requestPermission(host, REQUEST, runtimeContext, service.channel, {
+      replyTimeoutMs: 60_000,
+    }).catch((error: unknown) => error as Error);
+    await service.raised();
+    controller.abort();
+
+    expect(await pending).toBeInstanceOf(PermissionPromptUnansweredError);
+  });
+
+  test("refuses when the event stream cannot be opened at all", async () => {
+    const { host } = permissionHost(askEverything);
+    const client: V2PermissionClient = {
+      permission: { create: async () => ({ id: "per-1", effect: "ask" as const }) },
+      event: {
+        subscribe: async () => {
+          throw new Error("connection refused");
+        },
+      },
+    };
+    const channel = createV2PromptChannel(async () => ({ client }));
+
+    const refusal = await requestPermission(host, REQUEST, EXECUTION_CONTEXT, channel).catch(
+      (error: unknown) => error as Error,
+    );
+
+    expect(refusal).toBeInstanceOf(PermissionPromptUnavailableError);
+    expect(refusal.message).toContain("subscribing to the event stream failed");
+    expect(refusal.message).toContain("connection refused");
+  });
+
+  test("a settled effect still needs no event stream", async () => {
+    const { host } = permissionHost(askEverything);
+    const client: V2PermissionClient = {
+      permission: { create: async () => ({ id: "per-1", effect: "allow" as const }) },
+      event: {
+        subscribe: async () => {
+          throw new Error("connection refused");
+        },
+      },
+    };
+    const channel = createV2PromptChannel(async () => ({ client }));
+
+    // A saved grant answers inside `create`, so a stream AFT could not open is
+    // not a reason to refuse a call the host already allowed.
+    await requestPermission(host, REQUEST, EXECUTION_CONTEXT, channel);
+  });
+
+  test("raises the request even when the stream never greets the subscriber", async () => {
+    const { host } = permissionHost(askEverything);
+    const silent: AsyncIterable<unknown> = {
+      [Symbol.asyncIterator]: () => ({
+        next: () => new Promise<IteratorResult<unknown>>(() => {}),
+        return: () => Promise.resolve({ value: undefined, done: true as const }),
+      }),
+    };
+    const client: V2PermissionClient = {
+      permission: { create: async () => ({ id: "per-1", effect: "deny" as const }) },
+      event: { subscribe: async () => ({ stream: silent }) },
+    };
+    const channel = createV2PromptChannel(async () => ({ client }));
+
+    // The listen step is a bound, not a precondition: a host that greets nobody
+    // must still get the request, and the configured deny must still land.
+    await expect(
+      requestPermission(host, REQUEST, EXECUTION_CONTEXT, channel, { listenTimeoutMs: 20 }),
+    ).rejects.toBeInstanceOf(PermissionDeniedError);
   });
 });
 

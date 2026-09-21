@@ -99,10 +99,45 @@ export class PermissionPromptUnavailableError extends Error {
   override readonly name = "PermissionPromptUnavailableError";
 }
 
+/**
+ * Raised when the prompt was shown and no answer ever came back.
+ *
+ * Like the unavailable-prompt refusal this keeps its own text, because that
+ * text is the only place the user learns that a prompt was raised on their
+ * behalf and went unanswered. Never an allow: an answer nobody gave is not
+ * permission.
+ */
+export class PermissionPromptUnansweredError extends Error {
+  override readonly name = "PermissionPromptUnansweredError";
+}
+
 /** Raised when the host's rules for this call could not be read at all. */
 export class PermissionRulesUnavailableError extends Error {
   override readonly name = "PermissionRulesUnavailableError";
 }
+
+/**
+ * How long a raised prompt may stay unanswered before the call is refused.
+ *
+ * A prompt is a question for a person, and a person may be away from the
+ * machine: ten minutes is well beyond the minutes a real answer takes, so an
+ * answer that is coming still arrives in time. The bound exists for the answer
+ * that is not coming, which used to hold the tool call open for the life of the
+ * session.
+ */
+export const V2_PROMPT_REPLY_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * How long AFT waits for its event subscription to start delivering before it
+ * raises the request anyway.
+ *
+ * OpenCode greets a new subscriber immediately, so this is normally over in a
+ * millisecond or two on a loopback connection. It is a bound rather than an
+ * unconditional wait so a host that greets nobody cannot stop prompts from
+ * being raised at all; a request raised without a confirmed subscription is
+ * still bounded by the reply timeout, and refuses rather than allows.
+ */
+export const V2_PROMPT_LISTEN_TIMEOUT_MS = 5_000;
 
 /**
  * OpenCode's permission pattern matcher, kept byte-compatible with the host.
@@ -269,6 +304,36 @@ function promptUnavailableMessage(
   );
 }
 
+/**
+ * The refusal for a prompt that was raised and never answered.
+ *
+ * It states what was observed rather than a verdict, because the difference
+ * matters to whoever reads it: the operation was not denied by anyone, the
+ * answer simply never reached AFT, and nothing was permitted in the meantime.
+ */
+function promptUnansweredMessage(
+  request: V2PermissionRequest,
+  decision: V2PermissionDecision,
+  observed: string,
+): string {
+  const resource = decision.resource ?? "*";
+  return (
+    `The ${JSON.stringify(request.permission)} operation was refused: this session's permission ` +
+    `rules resolve it to "ask" for ${JSON.stringify(resource)}, AFT raised a prompt and received ` +
+    `no reply (${observed}), so nothing was permitted. Answer the prompt and run the operation ` +
+    "again, or run it without a prompt by adding " +
+    `{"action": ${JSON.stringify(request.permission)}, "resource": ${JSON.stringify(resource)}, ` +
+    '"effect": "allow"} to the "permissions" list of the agent or session in your OpenCode config.'
+  );
+}
+
+/** Render a wait bound the way a refusal quotes it back. */
+function waitDuration(ms: number): string {
+  if (ms >= 60_000 && ms % 60_000 === 0) return `${ms / 60_000}m`;
+  if (ms >= 1_000 && ms % 1_000 === 0) return `${ms / 1_000}s`;
+  return `${ms}ms`;
+}
+
 function requiredContextID(
   context: V2ExecutionContext,
   key: "sessionID" | "messageID" | "id",
@@ -316,22 +381,163 @@ async function closeStream(iterator: AsyncIterator<unknown>): Promise<void> {
   if (typeof iterator.return === "function") await iterator.return();
 }
 
+/**
+ * One pull from the event stream, with its failure folded into the value.
+ *
+ * A pull is started before anyone is ready to await it, so it must never be a
+ * promise that can reject while unobserved.
+ */
+type StreamPull =
+  | { readonly kind: "event"; readonly result: IteratorResult<unknown> }
+  | { readonly kind: "failed"; readonly error: unknown };
+
+function pull(iterator: AsyncIterator<unknown>): Promise<StreamPull> {
+  return iterator.next().then(
+    (result) => ({ kind: "event", result }) as const,
+    (error) => ({ kind: "failed", error }) as const,
+  );
+}
+
+interface Countdown {
+  readonly expired: Promise<void>;
+  cancel(): void;
+}
+
+function countdown(ms: number): Countdown {
+  let handle: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<void>((resolve) => {
+    handle = setTimeout(resolve, ms);
+  });
+  return {
+    expired,
+    cancel: () => {
+      if (handle !== undefined) clearTimeout(handle);
+    },
+  };
+}
+
+interface Cancellation {
+  readonly cancelled: Promise<void>;
+  dispose(): void;
+}
+
+function cancellation(signal: AbortSignal | undefined): Cancellation {
+  if (!signal) return { cancelled: new Promise<void>(() => {}), dispose: () => {} };
+  if (signal.aborted) return { cancelled: Promise.resolve(), dispose: () => {} };
+  let listener: (() => void) | undefined;
+  const cancelled = new Promise<void>((resolve) => {
+    listener = () => resolve();
+    signal.addEventListener("abort", listener, { once: true });
+  });
+  return {
+    cancelled,
+    dispose: () => {
+      if (listener) signal.removeEventListener("abort", listener);
+    },
+  };
+}
+
+/**
+ * Open the event stream and wait until it is actually delivering.
+ *
+ * The generated client's `event.subscribe()` hands back a lazy async generator:
+ * holding it, or even taking its iterator, performs no I/O at all, and the HTTP
+ * request that attaches the subscription is only made by the first `next()`.
+ * The host forwards events to whoever is attached when they are emitted and
+ * keeps no backlog, so a subscription that attaches after a request has been
+ * announced can never be told how that request was answered.
+ *
+ * Pulling one event is therefore what subscribing means here. OpenCode greets
+ * every new subscriber, so the pull settles as soon as the stream is live. The
+ * pulled event is not thrown away: it is handed to the wait as its first item,
+ * so a greeting and a real event are treated the same way and nothing can be
+ * swallowed by the handshake.
+ */
+async function startListening(
+  client: V2PermissionClient,
+  listenTimeoutMs: number,
+): Promise<
+  | { readonly iterator: AsyncIterator<unknown>; readonly first: Promise<StreamPull> }
+  | { readonly unavailable: string }
+> {
+  let iterator: AsyncIterator<unknown>;
+  try {
+    const subscription = await client.event.subscribe();
+    iterator = subscription.stream[Symbol.asyncIterator]();
+  } catch (error) {
+    return { unavailable: `subscribing to the event stream failed: ${detail(error)}` };
+  }
+
+  const first = pull(iterator);
+  const ready = countdown(listenTimeoutMs);
+  try {
+    const settled = await Promise.race([first, ready.expired.then(() => undefined)]);
+    if (settled?.kind === "failed") {
+      await closeStream(iterator);
+      return { unavailable: `reading the event stream failed: ${detail(settled.error)}` };
+    }
+  } finally {
+    ready.cancel();
+  }
+  return { iterator, first };
+}
+
+interface ReplyWaitLimits {
+  readonly replyTimeoutMs: number;
+  readonly signal?: AbortSignal;
+}
+
+/**
+ * Wait for this request's answer, for as long as the bound allows.
+ *
+ * `first` is the pull that made the subscription live; it is examined like any
+ * other event so the handshake cannot hide one.
+ */
 async function waitForReply(
-  stream: AsyncIterable<unknown>,
+  iterator: AsyncIterator<unknown>,
+  first: Promise<StreamPull>,
   sessionID: string,
   requestID: string,
+  limits: ReplyWaitLimits,
 ): Promise<void> {
-  const iterator = stream[Symbol.asyncIterator]();
+  const deadline = countdown(limits.replyTimeoutMs);
+  const abort = cancellation(limits.signal);
+  let pending: Promise<StreamPull> | undefined = first;
   try {
     while (true) {
-      const next = await iterator.next();
-      if (next.done) throw new Error("Permission event stream ended before a reply arrived");
-      const event = repliedEvent(next.value);
+      const next = pending ?? pull(iterator);
+      pending = undefined;
+      const settled = await Promise.race([
+        next,
+        deadline.expired.then(() => ({ kind: "unanswered" }) as const),
+        abort.cancelled.then(() => ({ kind: "cancelled" }) as const),
+      ]);
+      if (settled.kind === "unanswered") {
+        throw new PermissionPromptUnansweredError(
+          `waited ${waitDuration(limits.replyTimeoutMs)} after raising it`,
+        );
+      }
+      if (settled.kind === "cancelled") {
+        throw new PermissionPromptUnansweredError(
+          "the operation was cancelled while the prompt was still open",
+        );
+      }
+      if (settled.kind === "failed") {
+        throw new PermissionPromptUnansweredError(
+          `reading the event stream failed: ${detail(settled.error)}`,
+        );
+      }
+      if (settled.result.done) {
+        throw new PermissionPromptUnansweredError("the event stream ended before a reply arrived");
+      }
+      const event = repliedEvent(settled.result.value);
       if (!event || event.sessionID !== sessionID || event.requestID !== requestID) continue;
       if (event.reply === "reject") throw new PermissionRejectedError("Permission denied.");
       return;
     }
   } finally {
+    deadline.cancel();
+    abort.dispose();
     await closeStream(iterator);
   }
 }
@@ -339,9 +545,12 @@ async function waitForReply(
 /**
  * Put the question to the user through OpenCode's own permission service.
  *
- * Subscribing before `permission.create` prevents a fast headless reply from
- * racing past the event listener. The create response handles saved-rule allows
- * and configured denies immediately; only an `ask` waits for its matching reply.
+ * Listening starts before `permission.create`, and listening means a stream
+ * that has already delivered something — a headless client answers within a
+ * millisecond or two of the request being announced, and an answer delivered
+ * before the subscription attaches is gone for good. The create response still
+ * handles saved-rule allows and configured denies immediately; only an `ask`
+ * waits for its matching reply, and that wait is bounded.
  *
  * `request.metadata` is forwarded unchanged, which is what gives an edit-class
  * request its `diff` and makes the host render its built-in patch view.
@@ -349,13 +558,14 @@ async function waitForReply(
 async function raisePrompt(
   client: V2PermissionClient,
   request: V2PermissionRequest,
+  decision: V2PermissionDecision,
   context: V2ExecutionContext,
+  limits: ResolvedPromptLimits,
 ): Promise<void> {
   const sessionID = requiredContextID(context, "sessionID");
   const messageID = requiredContextID(context, "messageID");
   const id = requiredContextID(context, "id");
-  const subscription = await client.event.subscribe();
-  const iterator = subscription.stream[Symbol.asyncIterator]();
+  const listening = await startListening(client, limits.listenTimeoutMs);
   let streamClaimed = false;
 
   try {
@@ -373,11 +583,61 @@ async function raisePrompt(
     if (result.effect === "allow") return;
     if (result.effect === "deny") throw new PermissionDeniedError("Permission denied.");
 
+    // Only an answer we could hear is worth raising a prompt for. A settled
+    // effect above needed no stream, so this refusal is deliberately reached
+    // after the create call rather than before it.
+    if ("unavailable" in listening) {
+      throw new PermissionPromptUnavailableError(
+        promptUnavailableMessage(request, decision, listening.unavailable),
+      );
+    }
+
     streamClaimed = true;
-    await waitForReply({ [Symbol.asyncIterator]: () => iterator }, sessionID, result.id);
+    try {
+      await waitForReply(listening.iterator, listening.first, sessionID, result.id, limits);
+    } catch (error) {
+      if (!(error instanceof PermissionPromptUnansweredError)) throw error;
+      throw new PermissionPromptUnansweredError(
+        promptUnansweredMessage(request, decision, error.message),
+      );
+    }
   } finally {
-    if (!streamClaimed) await closeStream(iterator);
+    if (!streamClaimed && "iterator" in listening) await closeStream(listening.iterator);
   }
+}
+
+/** The wait bounds and cancellation one prompt runs under. */
+export interface V2PromptLimits {
+  readonly replyTimeoutMs?: number;
+  readonly listenTimeoutMs?: number;
+  /** Ends the wait when the tool call it belongs to is cancelled. */
+  readonly signal?: AbortSignal;
+}
+
+interface ResolvedPromptLimits extends ReplyWaitLimits {
+  readonly listenTimeoutMs: number;
+}
+
+/**
+ * The tool call's own cancellation signal, when its context carries one.
+ *
+ * The runtime object a V2 tool executes against exposes the host's abort signal
+ * as `abort`; the plain execution contexts AFT's own fixtures build do not have
+ * one. Reading it defensively is what keeps a cancelled call from leaving a
+ * prompt wait running behind it, without requiring every caller to thread the
+ * signal through by hand.
+ */
+function contextAbortSignal(context: V2ExecutionContext): AbortSignal | undefined {
+  const candidate = (context as { abort?: unknown }).abort;
+  return candidate instanceof AbortSignal ? candidate : undefined;
+}
+
+function resolveLimits(context: V2ExecutionContext, limits: V2PromptLimits): ResolvedPromptLimits {
+  return {
+    replyTimeoutMs: limits.replyTimeoutMs ?? V2_PROMPT_REPLY_TIMEOUT_MS,
+    listenTimeoutMs: limits.listenTimeoutMs ?? V2_PROMPT_LISTEN_TIMEOUT_MS,
+    signal: limits.signal ?? contextAbortSignal(context),
+  };
 }
 
 /**
@@ -394,6 +654,7 @@ export async function requestPermission(
   request: V2PermissionRequest,
   context: V2ExecutionContext,
   prompt: V2PromptChannel,
+  limits: V2PromptLimits = {},
 ): Promise<void> {
   let rules: readonly V2PermissionRule[];
   try {
@@ -417,5 +678,5 @@ export async function requestPermission(
       promptUnavailableMessage(request, decision, channel.unavailable),
     );
   }
-  await raisePrompt(channel.client, request, context);
+  await raisePrompt(channel.client, request, decision, context, resolveLimits(context, limits));
 }
