@@ -231,9 +231,13 @@ function probeCreatedIsolatedState(dataRoot: string, stateRoot: string): boolean
 }
 
 /**
- * Run the V1 version probe in disposable host roots. CI can enable the strict
- * operator canary used by the load matrix, while production tolerates writes
- * from an OpenCode process that is already using the live operator store.
+ * Ask the executable at `executable` for its version, in disposable host
+ * roots. Both generations answer `--standalone --version` on stdout and exit
+ * 0, and the answer is what decides the generation, so the probe is named for
+ * the historical caller only — it makes no assumption about which host it is
+ * talking to. CI can enable the strict operator canary used by the load
+ * matrix, while production tolerates writes from an OpenCode process that is
+ * already using the live operator store.
  */
 export function probeOpenCodeV1Version(
   executable: string,
@@ -294,8 +298,24 @@ export function probeOpenCodeV1Version(
   if (probeError) throw probeError;
 
   if (!result || result.error || result.status !== 0) return null;
-  const output = String(result.stdout ?? "").trim();
-  return output.length > 0 ? output : null;
+  return parseHostVersion(String(result.stdout ?? ""));
+}
+
+/**
+ * The version number a host reports for `--version`, lifted out of whatever
+ * else it prints on that line.
+ *
+ * The two generations do not print the same thing. OpenCode 1 prints a bare
+ * `1.18.30`; OpenCode 2 prints `opencode v2.0.12`. Returning that second
+ * string verbatim left the caller with something `Number.parseInt` reads as
+ * NaN, so a machine running only OpenCode 2 had no usable version signal and
+ * its host was filed as the older generation. Strip a leading program name
+ * and an optional `v`, and keep the pre-rename beta shape intact.
+ */
+export function parseHostVersion(output: string | null | undefined): string | null {
+  if (!output) return null;
+  const match = output.match(/(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z][0-9A-Za-z.-]*)?)/);
+  return match ? match[1] : null;
 }
 
 /// Package names that identify a V2 host. The beta shipped under
@@ -312,12 +332,21 @@ function v2MetadataNearExecutable(executable: string): PackageMetadata | null {
 }
 
 /// V2 versions come in two shapes: the pre-rename betas (`0.0.0-beta-<n>`)
-/// and GA, which restarted at 2.0.0. V1 never left 1.x, so a major at or
-/// above 2 is V2 without needing package metadata.
+/// and GA, which restarted at 2.0.0. Those betas shipped under the old npm
+/// scope as `@opencode-ai/*@0.0.0-beta-<n>` and only moved to `@opencode/*`
+/// at GA, so a `0.0.0-…` version meaning "generation 2" is real history, not
+/// a typo. V1 never left 1.x, so a major at or above 2 is V2 without needing
+/// package metadata, whichever executable name reported it.
+///
+/// Both tests run against the parsed version, never the raw output: the
+/// pre-release shape is anchored, so a host that prints `opencode v0.0.0-beta-19234`
+/// would fail it for the prefix alone if the string were normalised only on
+/// the way into the number parse.
 function isV2Version(version: string | null): boolean {
-  if (!version) return false;
-  if (/^0\.0\.0-(?:beta|dev)-/.test(version)) return true;
-  const major = Number.parseInt(version, 10);
+  const parsed = parseHostVersion(version);
+  if (!parsed) return false;
+  if (/^0\.0\.0-(?:beta|dev)-/.test(parsed)) return true;
+  const major = Number.parseInt(parsed, 10);
   return Number.isFinite(major) && major >= 2;
 }
 
@@ -336,43 +365,54 @@ export function detectOpenCodeHostGeneration(
     dependencies.findExecutable ??
     ((name: "opencode" | "opencode2") =>
       findExecutableOnPath(name, dependencies.path, dependencies.platform));
-  const v1Executable = findExecutable("opencode");
-  const v2Executable = findExecutable("opencode2");
+  const openCodeExecutable = findExecutable("opencode");
+  const openCode2Executable = findExecutable("opencode2");
   const evidence: OpenCodeHostEvidence[] = [];
 
-  // GA maps both names onto one file (`"bin": {"opencode": …, "opencode2": …}`
-  // pointing at the same executable), so the two lookups can describe a single
-  // installation. Counting it twice reported one GA host as both generations
-  // and refused to configure anything. V1's package only ever provided
-  // `opencode`, so reachability under both names is itself proof of V2 — which
-  // keeps a Desktop or non-npm install, where no package metadata sits beside
-  // the binary, from reading as V1.
+  // The executable NAME is not evidence of a generation: OpenCode 2 installs
+  // as plain `opencode` and puts a small `opencode2` shim beside it, so the
+  // common install has a V2 binary under the name that used to mean V1. What
+  // the host reports for `--version` decides the generation, package metadata
+  // beside it is the secondary signal, and the name only says where to look.
+  //
+  // GA's npm package also maps both names onto one file
+  // (`"bin": {"opencode": …, "opencode2": …}` pointing at the same
+  // executable), so the two lookups can describe a single installation.
+  // Counting it twice reported one GA host as both generations and refused to
+  // configure anything. Note this catches only the npm shape: a standalone
+  // install's `opencode2` shim is a different file that execs the same binary,
+  // which is why the version has to carry the decision.
   const sharedExecutable =
-    v1Executable !== null &&
-    v2Executable !== null &&
-    resolvedPath(v1Executable) === resolvedPath(v2Executable);
+    openCodeExecutable !== null &&
+    openCode2Executable !== null &&
+    resolvedPath(openCodeExecutable) === resolvedPath(openCode2Executable);
 
-  if (v1Executable) {
-    const v1Metadata = packageMetadataNearExecutable(v1Executable, "opencode-ai");
-    const v2Metadata = v2MetadataNearExecutable(v1Executable);
+  if (openCodeExecutable) {
+    const v1Metadata = packageMetadataNearExecutable(openCodeExecutable, "opencode-ai");
+    const v2Metadata = v2MetadataNearExecutable(openCodeExecutable);
     const metadataVersion = packageVersion(v2Metadata) ?? packageVersion(v1Metadata);
     const version =
-      metadataVersion ?? (dependencies.probeV1Version ?? probeOpenCodeV1Version)(v1Executable);
+      metadataVersion ??
+      (dependencies.probeV1Version ?? probeOpenCodeV1Version)(openCodeExecutable);
     const isV2 = Boolean(v2Metadata) || sharedExecutable || isV2Version(version);
     evidence.push({
       generation: isV2 ? "v2" : "v1",
-      executable: v1Executable,
+      executable: openCodeExecutable,
       version,
       runtime: "bun",
       modernV1: !isV2 && version === MODERN_V1_VERSION,
     });
   }
 
-  if (v2Executable && !sharedExecutable) {
-    const version = packageVersion(v2MetadataNearExecutable(v2Executable));
+  // V1's package never provided `opencode2`, so the name existing at all means
+  // a V2 install put it there — as its own binary, or as the alias shim that
+  // ships beside a standalone V2. It is never executed: booting the other host
+  // to ask its version is exactly what this detector exists to avoid.
+  if (openCode2Executable && !sharedExecutable) {
+    const version = packageVersion(v2MetadataNearExecutable(openCode2Executable));
     evidence.push({
       generation: "v2",
-      executable: v2Executable,
+      executable: openCode2Executable,
       version,
       runtime: "bun",
       modernV1: false,

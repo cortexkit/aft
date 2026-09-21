@@ -17,6 +17,7 @@ import { getSelfVersion } from "../lib/self-version.js";
 import {
   detectOpenCodeHostGeneration,
   type OpenCodeHostDetection,
+  parseHostVersion,
   probeOpenCodeV1Version,
 } from "../setup/host-generation.js";
 import {
@@ -191,6 +192,119 @@ describe("OpenCode generation detection", () => {
     expect(result.status).toBe("ambiguous");
     expect(result.generations).toEqual(["v1", "v2"]);
     expect(result.evidence).toHaveLength(2);
+  });
+
+  // The shape reported from a machine that never had V1. The standalone
+  // installer writes the real OpenCode 2 binary to ~/.opencode/bin/opencode
+  // (168 MB there) and a 47-byte `opencode2` shim beside it, so the two names
+  // are different files and no npm package metadata sits beside either. That
+  // leaves the version the host prints as the only signal, and it prints
+  // `opencode v2.0.12` — recorded from the affected machine; a local
+  // @opencode/cli install prints the same shape at its own version. Reading
+  // that string as a version is what failed, and the machine came out as
+  // ambiguous (V1, V2) with V1 nowhere on it.
+  test("reads a standalone V2 binary with a separate opencode2 shim as V2", () => {
+    const root = tempRoot("aft-cli-host-standalone-v2-");
+    const binDir = join(root, ".opencode", "bin");
+    mkdirSync(binDir, { recursive: true });
+    const host = join(binDir, "opencode");
+    const shim = join(binDir, "opencode2");
+    writeFileSync(host, "compiled host fixture\n", { mode: 0o755 });
+    writeFileSync(shim, `#!/bin/sh\nexec "$(dirname "$0")/opencode" "$@"\n`, { mode: 0o755 });
+    const probed: string[] = [];
+
+    const result = detectOpenCodeHostGeneration({
+      findExecutable: (name) => (name === "opencode" ? host : shim),
+      probeV1Version: (executable) => {
+        probed.push(executable);
+        return probeOpenCodeV1Version(executable, {
+          operatorHome: join(root, "operator"),
+          tempParent: root,
+          spawn: () => ({ status: 0, stdout: "opencode v2.0.12\n" }),
+        });
+      },
+    });
+
+    expect(result.status).toBe("v2");
+    expect(result.generations).toEqual(["v2"]);
+    expect(result.evidence.map((item) => item.version)).toEqual(["2.0.12", null]);
+    // The shim is never executed; only the host under the plain name is asked.
+    expect(probed).toEqual([host]);
+  });
+
+  // The generation must not depend on who trimmed the string. A version that
+  // reaches the rule still decorated (program name, leading `v`) decides the
+  // generation the same way, whichever executable name reported it — including
+  // the pre-rename betas, whose `0.0.0-beta-<n>` shape is checked from the
+  // start of the string and so only matches once the prefix is gone.
+  test("classifies a decorated version string as V2 wherever it came from", () => {
+    const root = tempRoot("aft-cli-host-decorated-version-");
+    const host = join(root, "bin", "opencode");
+    mkdirSync(join(root, "bin"), { recursive: true });
+    writeFileSync(host, "compiled host fixture\n", { mode: 0o755 });
+    const detect = (reported: string): OpenCodeHostDetection =>
+      detectOpenCodeHostGeneration({
+        findExecutable: (name) => (name === "opencode" ? host : null),
+        probeV1Version: () => reported,
+      });
+
+    const ga = detect("opencode v2.0.12");
+    expect(ga.status).toBe("v2");
+    expect(ga.evidence).toHaveLength(1);
+
+    expect(detect("opencode v0.0.0-beta-19234").status).toBe("v2");
+    expect(detect("0.0.0-dev-42").status).toBe("v2");
+    expect(detect(`opencode v${MODERN_V1_VERSION}`).status).toBe("v1");
+  });
+
+  // Both generations answer `--standalone --version` on stdout and exit 0, in
+  // two different formats. Byte-for-byte captures: `1.18.30\n` from the
+  // standalone V1 binary, `opencode v2.0.11\n` from @opencode/cli@2.0.11.
+  test("parses the version out of what each generation actually prints", () => {
+    const root = tempRoot("aft-cli-host-version-output-");
+    const probe = (stdout: string): string | null =>
+      probeOpenCodeV1Version("/fixture/opencode", {
+        operatorHome: join(root, "operator"),
+        tempParent: root,
+        spawn: () => ({ status: 0, stdout }),
+      });
+
+    expect(probe("1.18.30\n")).toBe("1.18.30");
+    expect(probe("opencode v2.0.11\n")).toBe("2.0.11");
+    expect(probe("\n")).toBeNull();
+
+    expect(parseHostVersion("2.0.12")).toBe("2.0.12");
+    expect(parseHostVersion("v2.0.12")).toBe("2.0.12");
+    expect(parseHostVersion("opencode v2.0.12")).toBe("2.0.12");
+    expect(parseHostVersion("0.0.0-beta-19234")).toBe("0.0.0-beta-19234");
+    expect(parseHostVersion("opencode v0.0.0-beta-19234")).toBe("0.0.0-beta-19234");
+    expect(parseHostVersion("0.0.0-dev-42")).toBe("0.0.0-dev-42");
+    expect(parseHostVersion("no version here")).toBeNull();
+  });
+
+  // A real dual install does not always carry metadata on both sides: V1 from
+  // the standalone installer has none, so its generation also comes from the
+  // probed version. That must still read as two generations.
+  test("still reports both generations for a standalone V1 beside an npm V2", () => {
+    const root = tempRoot("aft-cli-host-both-standalone-");
+    const v1 = join(root, ".opencode", "bin", "opencode");
+    mkdirSync(join(root, ".opencode", "bin"), { recursive: true });
+    writeFileSync(v1, "compiled host fixture\n", { mode: 0o755 });
+    const v2 = writeHostPackage(root, "@opencode/cli", "opencode2", "2.0.11");
+
+    const result = detectOpenCodeHostGeneration({
+      findExecutable: (name) => (name === "opencode" ? v1 : v2),
+      probeV1Version: (executable) =>
+        probeOpenCodeV1Version(executable, {
+          operatorHome: join(root, "operator"),
+          tempParent: root,
+          spawn: () => ({ status: 0, stdout: `${MODERN_V1_VERSION}\n` }),
+        }),
+    });
+
+    expect(result.status).toBe("ambiguous");
+    expect(result.generations).toEqual(["v1", "v2"]);
+    expect(result.evidence[0]?.modernV1).toBe(true);
   });
 
   test("classifies package metadata and reports both generations when both are installed", () => {
