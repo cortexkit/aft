@@ -8,8 +8,20 @@ import type {
 } from "./types.js";
 import { asRecord } from "./util.js";
 
+/**
+ * The one shape a truncation trailer is allowed to take.
+ *
+ * The `narrow:` clause is optional because the product's own surface registry
+ * has entries with nothing to suggest: `crates/aft/src/list_surfaces.rs` gives
+ * the bash output surface `narrow: &[]`, and a trailer for it correctly ends
+ * at the reason. Requiring the clause made that surface's trailer unmatchable,
+ * so a row watching it saw no trailer at all rather than the one it had. Every
+ * surface that does declare knobs still has to print them: the T6 validator
+ * compares the clause against the registry, and an incomplete fixture still
+ * pins its whole trailer line character for character.
+ */
 export const TRUNCATION_TRAILER_PATTERN =
-  "^shown (?<shown>\\d+) of (?:≥)?(?<total>\\d+) (?<unit>[^ ]+) \\((?<reason>cap|depth|budget|walk)\\) · narrow: (?<narrow>.+)$";
+  "^shown (?<shown>\\d+) of (?:≥)?(?<total>\\d+) (?<unit>[^ ]+) \\((?<reason>cap|depth|budget|walk)\\)(?: · narrow: (?<narrow>.+))?$";
 
 function convert(value: string, type: "boolean" | "number" | "string" | undefined): unknown {
   if (type === "number") {

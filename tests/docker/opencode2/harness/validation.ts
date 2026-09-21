@@ -638,7 +638,7 @@ export function validateT6(
         if (
           match.groups?.reason !== reason ||
           match.groups?.unit !== surface.unit ||
-          match.groups?.narrow !== surface.narrow.join(", ")
+          (match.groups?.narrow ?? "") !== surface.narrow.join(", ")
         ) {
           fail("matrix_invalid", `${fixture.scenario.id} expected trailer disagrees with the registry`);
         }
