@@ -22,7 +22,7 @@
                 "id": "bash_watch-setup",
                 "name": "bash",
                 "arguments": {
-                  "command": "sleep 2; printf 'watch fixture\\n'",
+                  "command": "sleep 30; printf 'watch fixture\\n'",
                   "background": true
                 },
                 "non_mutating_evidence": {
