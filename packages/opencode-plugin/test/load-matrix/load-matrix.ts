@@ -634,6 +634,156 @@ export default {
 };
 `;
 
+/**
+ * A TUI entry that reads the host's own `context.theme` and writes it out.
+ *
+ * It records what is there rather than looking for what the plugin expects to
+ * find: every key the object carries, own or inherited, down to the colours,
+ * which are written as their channel values so the recording is JSON. The
+ * theme arrives resolved for one mode, so the entry also asks the host to
+ * switch modes through the host's own command and records the second
+ * resolution, which is the only way to see both without a terminal to detect.
+ *
+ * Its output is the fixture beside this file, and the row that runs this entry
+ * compares the two: a host that resolves different tokens than the recording
+ * turns that row red instead of leaving every probe below testing a shape no
+ * host has.
+ */
+const v2ThemeCaptureEntry = `
+import { appendFileSync } from "node:fs";
+import original from "./src/entry/tui.mjs";
+
+const record = (line) =>
+  appendFileSync(process.env.AFT_LOAD_MATRIX_MARKER, String(line).replace(/[\\r\\n]+/g, " ") + "\\n");
+
+// Own and inherited keys: a theme built as a class instance keeps its colours
+// on the prototype, where Object.keys cannot see them.
+function keysOf(value) {
+  const keys = [];
+  let current = value;
+  while (current && current !== Object.prototype) {
+    for (const key of Object.getOwnPropertyNames(current)) {
+      if (key === "constructor") continue;
+      if (!keys.includes(key)) keys.push(key);
+    }
+    current = Object.getPrototypeOf(current);
+  }
+  return keys;
+}
+
+function hex(ints) {
+  return "#" + ints.map((channel) => Math.round(channel).toString(16).padStart(2, "0")).join("");
+}
+
+function serialize(value, depth) {
+  if (value === null || value === undefined) return null;
+  const type = typeof value;
+  if (type === "string" || type === "number" || type === "boolean") return value;
+  if (type === "function") return "<function>";
+  if (type !== "object") return "<" + type + ">";
+  // A colour is anything that can state its own channels; that is how the
+  // renderer's colour type is told apart from a group of tokens.
+  if (typeof value.toInts === "function") {
+    try {
+      return { rgba: hex(value.toInts()) };
+    } catch (error) {
+      return "<colour threw: " + String(error) + ">";
+    }
+  }
+  if (Array.isArray(value)) return value.map((entry) => serialize(entry, depth + 1));
+  if (depth > 8) return "<deeper than 8 levels>";
+  const out = {};
+  for (const key of keysOf(value)) {
+    try {
+      out[key] = serialize(value[key], depth + 1);
+    } catch (error) {
+      out[key] = "<threw: " + String(error) + ">";
+    }
+  }
+  return out;
+}
+
+const recorded = {};
+let capturing = false;
+
+function finish() {
+  record("theme-capture:" + JSON.stringify(recorded));
+  record("theme-capture-final");
+}
+
+// The host re-renders every slot when the theme mode changes, so this runs on
+// a latch: without it the switch below would be dispatched again by the render
+// it causes, and the two modes would keep trading places.
+function captureBothModes(context) {
+  if (capturing) return;
+  capturing = true;
+  const first = String(context.themeMode);
+  recorded[first] = serialize(context.theme, 0);
+  try {
+    context.keymap.dispatch("theme.switch_mode");
+  } catch (error) {
+    record("theme-capture-error:dispatching theme.switch_mode: " + String(error));
+    finish();
+    return;
+  }
+  let waitedMs = 0;
+  const poll = setInterval(() => {
+    waitedMs += 100;
+    const current = String(context.themeMode);
+    if (current !== first) {
+      recorded[current] = serialize(context.theme, 0);
+      clearInterval(poll);
+      finish();
+      return;
+    }
+    if (waitedMs >= 10000) {
+      clearInterval(poll);
+      record("theme-capture-error:host stayed in " + first + " after theme.switch_mode");
+      finish();
+    }
+  }, 100);
+}
+
+function observe(context) {
+  const ui = new Proxy(context.ui, {
+    get(target, property) {
+      if (property !== "slot") return Reflect.get(target, property, target);
+      return (claim) => {
+        if (claim.append !== "app") return target.slot(claim);
+        // The app slot render is inside the host's component tree, which is
+        // where a dispatched command reaches the host's keymap.
+        return target.slot({
+          ...claim,
+          render: (input) => {
+            const node = claim.render(input);
+            try {
+              captureBothModes(context);
+            } catch (error) {
+              record("theme-capture-error:" + String(error));
+            }
+            return node;
+          },
+        });
+      };
+    },
+  });
+  return new Proxy(context, {
+    get: (target, property) => (property === "ui" ? ui : Reflect.get(target, property, target)),
+  });
+}
+
+export default {
+  ...original,
+  setup: async (context) => {
+    record(
+      "theme-capture-host:" +
+        JSON.stringify({ version: context.app?.version, channel: context.app?.channel }),
+    );
+    return original.setup(observe(context));
+  },
+};
+`;
+
 const v2TuiSetupOutcome =
   /message="plugin operation (?:completed|failed)"[^\n]*stage=setup[^\n]*plugin=aft-opencode/;
 // Reconciliation 1 runs before the configured plugins are known and 2 is the
@@ -727,6 +877,52 @@ const sidebarSections = [
 ];
 
 /**
+ * What a GA host hands a plugin as `context.theme`, recorded from a running
+ * host by the entry above.
+ *
+ * The probes below render with this instead of a theme written out here by
+ * hand. A hand-written one is shaped by what the plugin expects the host to
+ * publish, which is how the sidebar came to fill its badge with a token that
+ * is fully transparent on every real host while this file's rows stayed green.
+ */
+type RecordedThemeMode = "dark" | "light";
+type RecordedColor = { rgba: string };
+type RecordedThemeTokens = {
+  hue: { accent: Record<string, RecordedColor> };
+  text: {
+    base: RecordedColor;
+    muted: RecordedColor;
+    feedback: Record<string, { base: RecordedColor }>;
+  };
+  background: { base: RecordedColor };
+  border: { base: RecordedColor };
+};
+type RecordedHostTheme = {
+  recorded: Record<string, string>;
+  topLevelKeys: string[];
+  modes: Record<RecordedThemeMode, RecordedThemeTokens>;
+};
+const recordedHostTheme = JSON.parse(
+  readFileSync(join(pluginRoot, "test", "load-matrix", "ga-host-theme.json"), "utf8"),
+) as RecordedHostTheme;
+
+/**
+ * The accent step src/tui/v2.tsx fills the badge with, stated again here so a
+ * row can name the colour the badge has to come out in. Changing the step in
+ * the sidebar without changing it here is meant to turn the badge rows red:
+ * which shade the badge wears is a decision, not an implementation detail.
+ */
+const badgeAccentStep = "200";
+
+/** A recorded colour in the probe's own spelling: 0-255 per channel. */
+function recordedColorKey(color: RecordedColor): string {
+  const hex = color.rgba.replace(/^#/, "");
+  const rgb = Number.parseInt(hex.slice(0, 6), 16);
+  const alpha = hex.length === 8 ? Number.parseInt(hex.slice(6, 8), 16) : 255;
+  return [(rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255, alpha].join(",");
+}
+
+/**
  * A TUI entry that renders the sidebar and reports what came out of it.
  *
  * The host only mounts `sidebar.content` inside a session view, which a
@@ -737,10 +933,11 @@ const sidebarSections = [
  * of the plugin's own RPC client, so the real component takes its real data
  * path to a payload the row controls.
  *
- * `themeMode` also picks the colours handed over as the host's resolved theme,
- * because the host resolves a theme for the active mode before a plugin sees
- * it. The same palette is offered twice, once in each host's theme shape, so
- * the two sidebars can be rendered side by side from one payload.
+ * `themeMode` picks which recorded resolution of the host's theme is handed
+ * over, because the host resolves a theme for the active mode before a plugin
+ * sees it. The recorded colours are also projected into the slot-plugin host's
+ * flat theme shape, so the two sidebars can be rendered side by side from one
+ * payload and one set of colours.
  *
  * What gets recorded is read off the renderables the render produced: each
  * text line's resolved foreground and the background in effect behind it, not
@@ -748,7 +945,7 @@ const sidebarSections = [
  * still resolves to the renderer's default white, which is precisely the
  * failure this exists to catch.
  */
-function v2TuiSidebarProbeEntry(themeMode: "dark" | "light"): string {
+function v2TuiSidebarProbeEntry(themeMode: RecordedThemeMode): string {
   return `
 import { appendFileSync } from "node:fs";
 import original from "./src/entry/tui.mjs";
@@ -758,57 +955,52 @@ const record = (line) =>
 
 const THEME_MODE = ${JSON.stringify(themeMode)};
 const STATUS = ${JSON.stringify(sidebarProbeStatus)};
+const RECORDED_THEME = ${JSON.stringify(recordedHostTheme.modes[themeMode])};
+const BADGE_ACCENT_STEP = ${JSON.stringify(badgeAccentStep)};
 
-const PALETTES = {
-  light: {
-    text: "#1f2328",
-    muted: "#59636e",
-    success: "#1a7f37",
-    warning: "#9a6700",
-    error: "#cf222e",
-    accent: "#0969da",
-    background: "#ffffff",
-    border: "#d1d9e0",
-  },
-  dark: {
-    text: "#e6edf3",
-    muted: "#9198a1",
-    success: "#3fb950",
-    warning: "#d29922",
-    error: "#f85149",
-    accent: "#1f6feb",
-    background: "#0d1117",
-    border: "#3d444d",
-  },
-};
-const COLORS = PALETTES[THEME_MODE];
+// The recording keeps colours as text, so they are turned back into the
+// renderer's own colour type before anything is drawn with them -- that is
+// what a host passes, and a hex string and an RGBA are not read the same way
+// by the contrast helper. Anything the recorder could not write down as data
+// is restored as something that says so if it is ever called; the sidebar
+// reads colours only.
+let RGBA = null;
+try {
+  ({ RGBA } = await import("opentui:runtime-module:" + encodeURIComponent("@opentui/core")));
+} catch (error) {
+  record("sidebar-probe-error:no renderer colour type to rebuild the recorded theme: " + String(error));
+}
 
-// The shape Context.theme carries: nested token groups.
-const hostTheme = {
-  text: {
-    base: COLORS.text,
-    muted: COLORS.muted,
-    feedback: {
-      success: { base: COLORS.success },
-      warning: { base: COLORS.warning },
-      error: { base: COLORS.error },
-      info: { base: COLORS.accent },
-    },
-  },
-  background: { base: COLORS.background, action: { primary: { base: COLORS.accent } } },
-  border: { base: COLORS.border },
-};
+function rehydrate(value) {
+  if (value === "<function>") {
+    return () => {
+      throw new Error("the recorded host theme holds no value for this token");
+    };
+  }
+  if (value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map(rehydrate);
+  if (typeof value.rgba === "string") return RGBA ? RGBA.fromHex(value.rgba) : value.rgba;
+  const out = {};
+  for (const key of Object.keys(value)) out[key] = rehydrate(value[key]);
+  return out;
+}
 
-// The shape the slot-plugin host publishes: one flat colour per role.
+const hostTheme = rehydrate(RECORDED_THEME);
+
+// The slot-plugin host publishes one flat colour per role instead of a token
+// tree. Its own theme object is a different host's and is not recorded here,
+// so the panel rendered beside the claim is driven by the same recorded
+// colours projected into that flat shape: one payload, one set of colours,
+// two sidebars.
 const flatTheme = {
-  text: COLORS.text,
-  textMuted: COLORS.muted,
-  success: COLORS.success,
-  warning: COLORS.warning,
-  error: COLORS.error,
-  accent: COLORS.accent,
-  background: COLORS.background,
-  borderActive: COLORS.border,
+  text: hostTheme.text.base,
+  textMuted: hostTheme.text.muted,
+  success: hostTheme.text.feedback.success.base,
+  warning: hostTheme.text.feedback.warning.base,
+  error: hostTheme.text.feedback.error.base,
+  accent: hostTheme.hue.accent[BADGE_ACCENT_STEP],
+  background: hostTheme.background.base,
+  borderActive: hostTheme.border.base,
 };
 
 const rpcStub = {
@@ -938,7 +1130,7 @@ function probe() {
       return;
     }
 
-    const rootBackground = colorKey(COLORS.background);
+    const rootBackground = colorKey(hostTheme.background.base);
     runtime.solid.createRoot((dispose) => {
       const fromClaim = sidebarClaim.render({ sessionID: "ses_probe" });
       const fromPanel = runtime.view.AftSidebarPanel({
@@ -1112,7 +1304,7 @@ function parseSidebarProbe(events: string): {
 
 async function runV2SidebarProbe(
   label: string,
-  themeMode: "dark" | "light",
+  themeMode: RecordedThemeMode,
 ): Promise<ReturnType<typeof parseSidebarProbe> & { transcript: string }> {
   const { v2 } = await ensureHostInstalls();
   const packageRoot = await copyInstalledPlugin(v2, label);
@@ -1126,6 +1318,36 @@ async function runV2SidebarProbe(
   });
 
   return { ...parseSidebarProbe(events), transcript };
+}
+
+/**
+ * Checks the header badge from what the render produced.
+ *
+ * The badge has to be painted, not merely asked for: the renderer accepts a
+ * fully transparent fill and draws the page through it, so a badge filled from
+ * the wrong theme token comes out as bare label text on the page and nothing
+ * throws. Two things are read off the row the label was drawn on -- the colour
+ * in effect behind it must be the accent the recorded host theme publishes,
+ * not the plugin's own fallback and not the page.
+ */
+function expectPaintedBadge(
+  probe: ReturnType<typeof parseSidebarProbe>,
+  mode: RecordedThemeMode,
+  label: string,
+): void {
+  const badge = probe.rows.find((row) => row.which === "claim" && row.text === "▼ AFT");
+  if (!badge) {
+    const drawn = probe.rows.filter((row) => row.which === "claim").map((row) => row.text);
+    throw new Error(`[${label}] the host sidebar drew no "▼ AFT" header: ${JSON.stringify(drawn)}`);
+  }
+  console.log(
+    `[${label}-badge] fill=${badge.background} label=${badge.fg} page=${probe.background}`,
+  );
+  expect(badge.background).toBe(
+    recordedColorKey(recordedHostTheme.modes[mode].hue.accent[badgeAccentStep]),
+  );
+  expect(badge.background).not.toBe(probe.background);
+  expect(badge.fg).not.toBe(badge.background);
 }
 
 /**
@@ -2297,6 +2519,47 @@ export default { id: original.id, effect };
     expect(events).not.toContain("slot-render-failed:");
   }, 240_000);
 
+  test("GA TUI host hands over the theme tokens the recording beside this file holds", async () => {
+    const { v2 } = await ensureHostInstalls();
+    const packageRoot = await copyInstalledPlugin(v2, "v2-theme-capture");
+    await writeFile(join(packageRoot, "tui.js"), v2ThemeCaptureEntry);
+
+    const { events } = await runV2TuiHost({
+      label: "v2-theme-capture",
+      packageRoot,
+      ready: (observed) => observed.includes("theme-capture-final"),
+      timeoutMs: 120_000,
+    });
+
+    const lines = events.split(/\r?\n/);
+    expect(lines.filter((line) => line.startsWith("theme-capture-error:"))).toEqual([]);
+
+    // The recording is pinned to the host release this matrix installs, so a
+    // version bump has to re-record rather than inherit the old tokens.
+    const host = lines.find((line) => line.startsWith("theme-capture-host:"));
+    expect(host).toBeDefined();
+    expect(JSON.parse((host ?? "").slice("theme-capture-host:".length)).version).toBe(v2Version);
+    expect(recordedHostTheme.recorded.version).toBe(v2Version);
+
+    const captured = lines.find((line) => line.startsWith("theme-capture:"));
+    expect(captured).toBeDefined();
+    if (!captured) throw new Error("the host recorded no theme");
+    const live = JSON.parse(captured.slice("theme-capture:".length)) as Record<string, unknown>;
+
+    // Both modes, because a theme arrives resolved for one of them and the
+    // sidebar has to be legible in either.
+    expect(Object.keys(live).sort()).toEqual(["dark", "light"]);
+    expect(Object.keys(live.dark as object)).toEqual(recordedHostTheme.topLevelKeys);
+    expect(Object.keys(live.light as object)).toEqual(recordedHostTheme.topLevelKeys);
+
+    // The recording is what every sidebar probe below renders with. When this
+    // row fails, those probes have started testing a theme no host publishes:
+    // re-record the fixture from this row's output rather than adjusting the
+    // probes to keep it green.
+    expect(live.dark).toEqual(recordedHostTheme.modes.dark);
+    expect(live.light).toEqual(recordedHostTheme.modes.light);
+  }, 300_000);
+
   test("GA TUI host sidebar draws no line in the background colour under a light theme", async () => {
     const probe = await runV2SidebarProbe("v2-tui-light-theme", "light");
 
@@ -2317,6 +2580,19 @@ export default { id: original.id, effect };
     expect(unreadable).toEqual([]);
     expect(rendered.filter((row) => row.fg === "unset")).toEqual([]);
   }, 300_000);
+
+  test("GA TUI host sidebar paints its header badge in both theme modes", async () => {
+    // Two hosts, one per resolution of the recorded theme: the badge's fill is
+    // the one colour in the panel that the page has to show through if it is
+    // wrong, and the two modes disagree about which accent shade that is.
+    const light = await runV2SidebarProbe("v2-tui-badge-light", "light");
+    expect(light.errors).toEqual([]);
+    expectPaintedBadge(light, "light", "v2-tui-badge-light");
+
+    const dark = await runV2SidebarProbe("v2-tui-badge-dark", "dark");
+    expect(dark.errors).toEqual([]);
+    expectPaintedBadge(dark, "dark", "v2-tui-badge-dark");
+  }, 600_000);
 
   test("GA TUI host sidebar carries the same sections as the slot-plugin sidebar", async () => {
     const probe = await runV2SidebarProbe("v2-tui-sidebar-parity", "dark");
@@ -2688,7 +2964,10 @@ export default entry;
       "v2-lifecycle",
       "v2-permission-prompt",
       "v2-tui-keymap",
+      "v2-theme-capture",
       "v2-tui-light-theme",
+      "v2-tui-badge-light",
+      "v2-tui-badge-dark",
       "v2-tui-sidebar-parity",
       "v2-tui-directory",
       "v2-tool-ownership",
