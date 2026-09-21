@@ -257,10 +257,34 @@ fn finish_semantic_index_build(
     }
 }
 
+/// Opening words of every missing-runtime message this crate produces.
+///
+/// `is_onnx_runtime_unavailable` treats this prefix as proof on its own, and
+/// readers outside the daemon (the OpenCode sidebar) key on the same prefix to
+/// tell "the runtime is not installed" apart from an ordinary backend failure.
+/// Changing it changes that contract.
+pub const ONNX_RUNTIME_MISSING_PREFIX: &str = "ONNX Runtime not found.";
+
+/// What the daemon tells a user whose ONNX Runtime is missing.
+///
+/// It deliberately names no per-platform install command. Whether AFT can fetch
+/// the runtime itself is answered in exactly one place — the downloader's
+/// platform table behind `isOrtAutoDownloadSupported`
+/// (packages/aft-bridge/src/onnx-runtime.ts), which
+/// packages/aft-cli/src/lib/onnx.ts asks before it prints any manual
+/// instruction. The daemon cannot consult that table from here, and guessing it
+/// is how the old hint came to recommend Homebrew to Apple Silicon users whose
+/// runtime AFT downloads for them, in the same sentence as saying the download
+/// is automatic. `doctor --fix` is the command that asks the owner: it installs
+/// the runtime where AFT can fetch one and prints the manual route where it
+/// cannot, so pointing at it is the whole answer on every platform.
+///
+/// Starts with `ONNX_RUNTIME_MISSING_PREFIX` so readers can classify it; a test
+/// holds the two together.
 const ONNX_RUNTIME_INSTALL_HINT: &str =
-    "ONNX Runtime not found. Install via: brew install onnxruntime (macOS), \
-     apt install libonnxruntime (Linux), or place onnxruntime.dll in your PATH (Windows). \
-     AFT can auto-download ONNX Runtime — run `npx @cortexkit/aft doctor` to diagnose.";
+    "ONNX Runtime not found. Run `npx @cortexkit/aft doctor --fix`: it installs \
+     the runtime where AFT can download one for this platform and prints the \
+     manual install command where it cannot.";
 
 const SEMANTIC_INDEX_VERSION_V1: u8 = 1;
 const SEMANTIC_INDEX_VERSION_V2: u8 = 2;
@@ -2683,8 +2707,8 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
                     std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned()
                 };
                 return Err(format!(
-                    "ONNX Runtime not found. dlopen('{}') failed: {}. \
-                     Run `npx @cortexkit/aft doctor` to diagnose.",
+                    "{ONNX_RUNTIME_MISSING_PREFIX} dlopen('{}') failed: {}. \
+                     Run `npx @cortexkit/aft doctor --fix` to install it.",
                     lib_name, msg
                 ));
             }
@@ -2784,8 +2808,8 @@ pub fn pre_validate_onnx_runtime() -> Result<(), String> {
             if handle.is_null() {
                 let err = std::io::Error::last_os_error();
                 return Err(format!(
-                    "ONNX Runtime not found. LoadLibraryExW('{}') failed: {}. \
-                     Run `npx @cortexkit/aft doctor` to diagnose.",
+                    "{ONNX_RUNTIME_MISSING_PREFIX} LoadLibraryExW('{}') failed: {}. \
+                     Run `npx @cortexkit/aft doctor --fix` to install it.",
                     lib_name, err
                 ));
             }
@@ -2983,7 +3007,10 @@ pub(crate) fn format_ort_version_mismatch(version: &str, lib_name: &str) -> Stri
 }
 
 pub fn is_onnx_runtime_unavailable(message: &str) -> bool {
-    if message.trim_start().starts_with("ONNX Runtime not found.") {
+    if message
+        .trim_start()
+        .starts_with(ONNX_RUNTIME_MISSING_PREFIX)
+    {
         return true;
     }
 
@@ -11128,8 +11155,35 @@ public class Greeter {
             "Failed to load ONNX Runtime shared library libonnxruntime.so via dlopen: no such file",
         );
 
-        assert!(message.starts_with("ONNX Runtime not found. Install via:"));
+        assert!(message.starts_with(ONNX_RUNTIME_MISSING_PREFIX));
+        assert!(message.contains("npx @cortexkit/aft doctor --fix"));
         assert!(message.contains("Original error:"));
+    }
+
+    /// The hint must not answer "can AFT download the runtime here?" itself.
+    /// That question has one owner (`isOrtAutoDownloadSupported` in
+    /// packages/aft-bridge/src/onnx-runtime.ts, asked by the CLI before it
+    /// prints anything manual), and the daemon cannot reach it. The old hint
+    /// guessed: it listed brew/apt/PATH instructions and then said the download
+    /// was automatic, which is wrong advice on every platform AFT downloads for.
+    #[test]
+    fn onnx_install_hint_leaves_the_platform_question_to_its_one_owner() {
+        let hint = ONNX_RUNTIME_INSTALL_HINT;
+
+        for manual_advice in ["brew", "apt", "in your PATH", "onnxruntime.dll"] {
+            assert!(
+                !hint.contains(manual_advice),
+                "hint names a platform-specific install route ({manual_advice}) it cannot know applies: {hint}"
+            );
+        }
+        assert!(
+            hint.contains("npx @cortexkit/aft doctor --fix"),
+            "hint must name the command that installs the runtime, not just one that diagnoses: {hint}"
+        );
+        // Readers classify by this prefix; the hint is one of the messages they
+        // classify, so it has to carry it.
+        assert!(hint.starts_with(ONNX_RUNTIME_MISSING_PREFIX));
+        assert!(is_onnx_runtime_unavailable(hint));
     }
 
     #[test]
