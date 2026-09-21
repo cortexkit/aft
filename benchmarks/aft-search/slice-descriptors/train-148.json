@@ -1,0 +1,14 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs"
+  ],
+  "slices": [
+    "oc2-t7-final-three",
+    "semantic-status-leftovers",
+    "cost-gate-jupyterlab-bistability"
+  ],
+  "note": "Fence files touched are status vocabulary only: semantic_index.rs status_label plus its word list, and the semantic_search Failed arm's detail text. No chunking, scoring, candidate selection or ordering code changed, so ranked rows are byte-equal to the reference."
+}
