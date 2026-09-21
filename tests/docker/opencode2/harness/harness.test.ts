@@ -1674,6 +1674,40 @@ describe("a parity row compares the two hosts", () => {
       "parity allowlist leaves write/T7/happy comparing nothing between the hosts",
     );
   });
+
+  // The V1 host hands the background-completion reminder back inside the tool
+  // result; the V2 host delivers it as a message of its own. Both are right for
+  // their host, and the row asks about the tool's behaviour, so the projection
+  // reads past the wrapper instead of the allowlist dropping the one field the
+  // row exists to compare.
+  describe("text a host wraps around the result is projected away", () => {
+    const V1_RESULT =
+      "Task bash-288f1800f1a302ff: killed\n\n<system-reminder>\n[BACKGROUND BASH COMPLETED]\n- task bash-288f1800f1a302ff (killed)\n</system-reminder>";
+    const V2_RESULT = "Task bash-288f1800f1a302ff: killed";
+
+    async function killRules() {
+      const scenarios = materializeParityScenarios(
+        await loadScenarios(join(import.meta.dir, "..", "scenarios", "bash_kill")),
+      );
+      const parity = scenarios.find((candidate) => candidate.id === "bash_kill/T7/happy");
+      if (parity?.comparison?.mode !== "shape") throw new Error("bash_kill/T7 lost its projection");
+      return parity.comparison.rules;
+    }
+
+    test("both hosts project to the outcome the tool reported", async () => {
+      const rules = await killRules();
+
+      expect(projectText(V1_RESULT, rules)).toEqual({ task_state: "killed" });
+      expect(projectText(V2_RESULT, rules)).toEqual({ task_state: "killed" });
+    });
+
+    test("the outcome line itself is still read, not swallowed with the reminder", async () => {
+      const rules = await killRules();
+      const stillRunning = V1_RESULT.replace("a302ff: killed", "a302ff: running");
+
+      expect(() => projectText(stillRunning, rules)).toThrow("projection_unparsed");
+    });
+  });
 });
 
 describe("the run reports a verdict for every row", () => {

@@ -72,6 +72,12 @@
             "kind": "field",
             "field": "task_state",
             "pattern": "^Task bash-[0-9a-f]+: (?<value>killed)$"
+          },
+          {
+            "kind": "ignore",
+            "pattern": "^\\n<system-reminder>\\n\\[BACKGROUND BASH COMPLETED\\]\\n- task bash-[0-9a-f]+ \\(killed\\)\\n</system-reminder>$",
+            "min_lines": 5,
+            "max_lines": 5
           }
         ],
         "expected": {
