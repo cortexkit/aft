@@ -40,10 +40,18 @@ scripts/telemetry/cost-gate.sh --repo redox --budget-min 15
 ```
 
 The comparator self-test uses synthetic CSV and baseline files and exercises
-pass/fail decisions for every core metric, including the absolute-floor rule:
+pass/fail decisions for every core metric, including the absolute-floor rule
+and the two-state reporting described below:
 
 ```bash
 scripts/telemetry/cost-gate.sh --self-test
+```
+
+The harness's phase attribution has its own check, which needs no corpus, no
+binary and no `/proc`:
+
+```bash
+scripts/telemetry/oss-matrix.sh --self-test-phases
 ```
 
 ## A baseline belongs to the machine that measured it
@@ -84,6 +92,19 @@ human-readable log message is used as a gate input.
   The run additionally prints the core count and total memory it measured on,
   since peak RSS and CPU seconds depend on both and the job log names only the
   runner image.
+- A `PHASES` line beside it says where each run's high-water mark was taken.
+  The runner samples `VmHWM` and `VmRSS` four times a second and labels every
+  sample with what each plane was doing — the callgraph stage, the search
+  (trigram) build, and any Tier-2 inspect category — so each step of the mark
+  is charged to the phase that took it. Two builds overlapping is a shape peak
+  RSS alone cannot show, and it is what a peak with two states turned out to
+  be. Labels come from the timestamps the process wrote rather than from when
+  the harness read them, because the log is buffered and a quiet stretch
+  delivers everything at once. The full per-run trace is written beside each
+  repository's AFT log as `phase-memory.csv`.
+- A `BIMODAL` line appears for any metric recorded as having two separated
+  states, saying which one the run landed in. See
+  [the row no longer flaps](#the-row-no-longer-flaps).
 
 The committed tolerance is per metric. Timing uses a 3,000 ms floor because
 process startup and the first scheduler poll dominate tiny runs.
@@ -184,7 +205,7 @@ already failing for an unrelated reason. A gate that is always red cannot
 report a regression; that is the whole cost of leaving a broken baseline in
 place.
 
-### The second step: `jupyterlab` peak RSS, still open on cause
+### The second step: `jupyterlab` peak RSS, and what it turned out to be
 
 On 2026-09-21 `jupyterlab` moved from 596.3/598.0 MB to 719.8/753.2 MB with CPU
 seconds going 119/120 to 137/138 and callgraph wall time up only 2.8%. Both
@@ -194,7 +215,11 @@ locally gave 540.5 → 556.1 MB, +2.9%: the effect did not reproduce off the
 runner, and the next step it named was to bisect it on the runner.
 
 Measured on the runner it reproduces exactly, and it is a code step rather than
-noise or a change of machine.
+noise or a change of machine. It is not a cost of the cold build: it is the
+Tier-2 inspect plane running inside the measured process, sometimes on top of
+the build and sometimes after it. [The mechanism](#the-mechanism-measured) is
+below; the A/B that led there is kept because the numbers in it are still the
+record of what the runner measured.
 
 #### The A/B
 
@@ -230,22 +255,27 @@ the two heads occupy non-overlapping ranges is wrong. An earlier revision of
 this entry said exactly that, on the first six observations; the seventh and
 eighth refuted it.
 
-#### Why it never reproduced
+#### Why it never reproduced, and the control that broke the explanation
 
-The last row is the reason. Current `main` measuring `jupyterlab` **on its
-own** reads 599.3/598.8 — the old head's number, from a binary that contains the
-step. The extra memory only appears when `jupyterlab` is indexed inside the full
-five-repository matrix. Any A/B that measures the repository by itself, locally
-or on the runner, sees nothing, which is exactly what the earlier +2.9% local
-comparison reported.
+The last row of the A/B looked like the reason. `main` measuring `jupyterlab`
+**on its own** reads 599.3/598.8 — the old head's number, from a binary that
+contains the step — so the entry concluded that the extra memory only appears
+inside the full five-repository matrix, and that any A/B measuring the
+repository by itself sees nothing. That is what the earlier +2.9% local
+comparison had reported too.
 
-What the matrix adds is machine state, not AFT state: each repository gets a
-fresh process and a cold storage directory, but the job clones all five
-repositories up front and `jupyterlab` is indexed third, after `redox` and
-`typescript-eslint` have already run. Naming the mechanism means naming which
-part of that the step is sensitive to, and that is not yet established.
+That explanation is wrong, and the same configuration refutes it. Dispatch
+`35632895025` is `--repo jupyterlab` alone, on `main`, with everything else
+held — and it reads **719.4 / 740.9**. The difference from `35616093361` is the
+host: the callgraph build took 102.7/101.9 s there against 68.4/67.6 s here.
+The matrix was never the variable. Elapsed build time is, because it is what
+decides whether the ninety-second inspect timer below goes off inside the build
+or after it. What the matrix usually adds is simply *time*: it runs the same
+build on a busier machine, and a longer build wins the race. Measured alone on
+a fast host the callgraph build takes 68,417/67,559 ms; inside the matrix it
+has taken 85,060 to 106,834 ms.
 
-#### It is only `jupyterlab`, and it is not the host
+#### It is only `jupyterlab`, and the host matters only through the clock
 
 The same runs, old head against `main`, for every other repository:
 
@@ -256,16 +286,19 @@ The same runs, old head against `main`, for every other repository:
 | `hugo` | 420.7 / 421.1 | 430.4 / 424.7 | 432.1 / 458.1 |
 | `synthetic-24k` | 59.3 / 59.9 | 59.1 / 59.7 | 60.1 / 60.2 |
 
-Every one of those overlaps between the two heads. Only `jupyterlab` separates.
+Every one of those overlaps between the two heads. Only `jupyterlab` separates,
+and the reason is below: it is the only corpus in the matrix whose callgraph
+build is still running when the process's own Tier-2 clock goes off at ninety
+seconds.
 
-Host speed is not the variable either, and the two `main` runs prove it: they
-differ by 100 seconds of job wall time (402.2 s against 299.6 s) and by 54 CPU
-seconds on `jupyterlab` itself, yet both land in the high range. The old head
-ran on the slowest host of the five dispatches (438.3 s, and the longest
-`jupyterlab` callgraph build of any run at 106.8 s) and still landed in the low
-range. A slower machine did not produce more memory; a different binary did.
+Host speed alone is not the variable, and the old head proves it: it ran on the
+slowest host of the five dispatches (438.3 s, and the longest `jupyterlab`
+callgraph build of any run at 106.8 s) and still landed in the low range. A
+slow machine was not sufficient. On `main` it is: a build long enough to still
+be running at ninety seconds is exactly what produces the high state, which is
+why the same binary reads high on one host and low on another.
 
-#### The bisect does not converge, and that is itself the finding
+#### The bisect does not converge, and the mechanism did instead
 
 Every full-matrix measurement taken, one row per dispatch, in window order.
 "Low" means a reading near 598, "high" means 668 or above; no observation has
@@ -281,11 +314,15 @@ ever landed between 606.1 and 668.0.
 | main | `947a55b59` | 779.5 / 729.8 | 0 | 2 |
 | main | `947a55b59` | 669.8 / 701.2 | 0 | 2 |
 | main | `947a55b59` | 597.9 / 678.1 | 1 | 1 |
+| after main | `52eca0200` | 731.3 / 719.5 | 0 | 2 |
+| after main | `52eca0200` | 740.7 / 721.9 | 0 | 2 |
+| after main | `52eca0200` | 754.3 / 748.3 | 0 | 2 |
 
-The empty band between 606 and 668 is the thing to notice. Across sixteen
+The empty band between 606 and 668 is the thing to notice. Across twenty-two
 observations the metric has never once landed in the middle: it is either about
 598 or it is 668 and up. This is not a value with a wide spread, it is a value
-with two states.
+with two states. The last three rows are the phase-instrumented dispatches that
+named the cause, and they did not fill the band either.
 
 What the binary changes is how often the high state is reached — zero times in
 four at the old head, seven times in eight at the new head and `main`. That is
@@ -304,9 +341,9 @@ proof that the split does not mean "before".
 
 So the bisect is not slow, it is blocked, and it was blocked from the first
 interior measurement onwards. Two more halvings on a two-run verdict would have
-named a commit with confidence and no basis. Localising a bistable effect needs
-enough runs per candidate to estimate how often it fires, which at roughly
-twenty minutes a run is a different and much larger piece of work than a bisect.
+named a commit with confidence and no basis. What localised it instead was
+asking what the two states *are*, which took two dispatches rather than
+sixteen.
 
 #### The split is real memory, not a missed sample
 
@@ -345,65 +382,198 @@ Switching the *gated* metric to `VmHWM` is still worth doing on its own merits
 at once and it would not have answered this question, so it is not part of this
 change.
 
-#### The leading mechanism, unmeasured
+The phase data strengthens that case rather than weakening it. Sampling
+resident memory four times a second instead of every two seconds recovers only
+part of what the poll misses: on `jupyterlab` in dispatch `35632877267` the
+two-second poll saw 731.3 MB, the quarter-second trace saw 754.4 MB, and the
+kernel's mark was 814.9 MB. The peak that matters is a transient allocation
+inside a single Tier-2 category, so no polling cadence anyone would run in a
+gate catches it reliably, and a faster poll mostly buys a number that is wrong
+by less. What the phase data does *not* say is that `VmHWM` would have stopped
+this row flapping: it is bistable too, for the same reason the polled figure
+is. The two decisions are independent.
 
-A bistable peak wants a bistable cause: something that either happens before the
-build's high-water moment or after it, with nothing in between. Two phases whose
-overlap is a matter of timing would produce exactly this shape — peaks that add
-when they coincide and do not when they do not — and an 89 MB gap is the size of
-a structure, not of drift.
+#### The mechanism, measured
 
-The window holds a cluster of SQLite WAL and mapping changes: `914d42a9c`
-"protect live SQLite file sets and persist callgraph WAL", `7625ae313` "drop
-unnecessary persistent WAL policy", `1c8e5df50` "keep view durability inside
-SQLite", `cd55a386e` "preserve SQLite locks during WAL accounting". A WAL that
-is retained rather than checkpointed is a file-backed mapping, resident
-file-backed pages count in RSS, and the charge would fall hardest on the largest
-callgraph database in the matrix, which is `jupyterlab`'s. Whether the
-checkpoint lands before or after the extract set is dropped is a race, which is
-the bistable shape being looked for.
+The step is not in the cold build. It is the Tier-2 inspect plane —
+`dead_code`, `unused_exports`, `duplicates`, `cycles`, `complexity` — running
+inside the same process the matrix is measuring, sometimes on top of the
+callgraph build instead of after it. Two peaks that add when they coincide is
+the shape the previous entry predicted; it just was not the WAL.
 
-Nobody has measured any of this. It is recorded to say where to look, not as an
-answer. Note also that these commits straddle position 73, so they sit on both
-sides of the window a two-run verdict would have chosen — another reason not to
-trust that verdict.
+Sampling per phase rather than per process is what shows it. `oss-matrix.py`
+now reads `VmHWM` and `VmRSS` from `/proc` four times a second and labels every
+sample with what each plane was doing, so every step of the high-water mark is
+charged to the phase that took it, and the trace is written beside the AFT log
+as `phase-memory.csv`. The high-water mark is what makes that work: it is
+monotonic, so growth between two samples belongs to whatever ran between them.
 
-The next step is no longer a bisect. It is to find what differs between a low
-run and a high run of the *same* binary, where both are reproducible on demand
-at `main` and need no A/B at all: instrument the cold build's phases, run the
-matrix until both states have been captured, and compare. A named mechanism
-would then localise the commit far more cheaply than sixteen more dispatches.
+Two triggers put Tier-2 work inside the measured window:
 
-#### The row stays red
+- `configure_warm`, which comes due `TIER2_REFRESH_COLD_CACHE_DELAY` — ninety
+  seconds — after configure (`crates/aft/src/inspect/tier2_scheduler.rs`);
+- `pull`, requested the moment the callgraph store becomes ready
+  (`crates/aft/src/context.rs`, in the callgraph-store access path).
 
-The baseline is unchanged at 596.3 MB and `jupyterlab` keeps failing at
-719.8 MB against a 715.6 MB limit.
+The harness closes stdin about a second after the callgraph's first query, so
+the process normally dies before a refresh can do much. What decides the
+outcome is how long the callgraph build runs:
 
-That is deliberate. The high state is real memory, reproducible, reached far
-more often by our newer binaries than by the old one, and still present in
-`main` — which is the definition of something a cost gate should be red about.
-Re-baselining to 730 MB would record the step as a price without anyone having
-established what was bought, and this file already says why that is the wrong
-move: blessing a number you cannot explain is how a detector becomes a rubber
-stamp. A deliberate price gets re-baselined with its reason; a defect gets
-fixed; this one is not yet sorted into either, so it stays red.
+| Dispatch | `jupyterlab` callgraph build | Tier-2 inside the measured window | peak RSS MB |
+| --- | ---: | --- | ---: |
+| `35616093361`, `--repo jupyterlab` | 68.4 / 67.6 s | none: the process exits at ~70 s | 599.3 / 598.8 |
+| `35629011191`, full matrix | 85.6 / 84.9 s | run-2 only: `pull` at ready, one 641 ms snapshot | 597.9 / **686.9** |
+| `35632877267`, full matrix | 105.7 / 104.7 s | both runs: `configure_warm` at 90 s, all five categories | **814.9 / 802.9** |
+| `35640483469`, full matrix | 97.6 / 98.9 s | both runs: `configure_warm` at 90 s, all five categories | **814.1 / 807.9** |
 
-It is worth being plain that this leaves the gate flapping rather than merely
-red. With the high state reached on roughly seven runs in eight, a two-run
-minimum lands low about one night in thirty, so `jupyterlab` will pass
-occasionally for no reason anyone should trust. A green night on this row is
-currently not evidence of anything. That is a bad property for a detector and it
-is the strongest argument for treating the bistability itself as the defect to
-chase, ahead of naming a commit.
+The last column is `VmHWM` where it was recorded, and the polled figure for the
+first row, which predates it.
 
-The tolerance is also untouched. A 20% band is meant to absorb scatter around a
+`jupyterlab` is the only corpus in the matrix that can reach the ninety-second
+trigger at all. `synthetic-24k` is ready in 10 ms, `redox` in 4.4 s, `hugo` in
+41.7 s, `typescript-eslint` in 52.2 s, and every one of those processes exits a
+second or two after its own build. `jupyterlab` takes 67 to 107 seconds, so
+ninety seconds falls *inside* its build on a slow host and *after* it on a fast
+one. That is the whole of "only `jupyterlab` separates", and it is why the
+repository measured on its own never showed it: alone it builds in 68 seconds.
+
+When the trigger lands inside the build, the two peaks add, and the trace
+charges the overlap rather than the stage underneath it. Dispatch
+`35640483469`, high-water growth in MB per phase:
+
+| Phase | run-1 | run-2 |
+| --- | ---: | ---: |
+| `extraction/ready` | +393.9 | +364.8 |
+| `extraction/streaming` | +95.7 | +100.7 |
+| `resolution/ready` | +107.0 | +143.3 |
+| `resolution/ready+tier2:unused_exports` | +60.4 | +63.1 |
+| `resolution/ready+tier2:duplicates` | +20.7 | +20.0 |
+| `resolution/ready+tier2:dead_code` | +0.7 | +8.1 |
+| **charged to a Tier-2 overlap** | **81.9** | **91.2** |
+
+Against an 89 MB gap between the two states. The allocation is also transient
+— in dispatch `35632877267` resident memory at the largest single step was
+754 MB while the mark went to 814.9 — which is why the two-second poll reported
+731.3 MB for a run the kernel scored at 814.9.
+
+When it lands after the build instead, the build's own transient memory has
+already been freed and only the Tier-2 structure is added. Dispatch
+`35629011191` run-2 shows the `pull` trigger firing at ready, one
+`tier2_callgraph_snapshot` over 2,079 files / 3,886 exports / 104,207 edges,
+and +89 MB. Its run-1 shut down before the snapshot started and stayed at
+597.9 MB. Those are the two states the twenty-two observations are split
+between.
+
+The same dispatch shows why no other repository moves even when its refresh
+does fire. `typescript-eslint` ran the snapshot in run-2 and not in run-1, and
+its exact pair still agrees to 0.5 MB (905.8 against 906.3): peak RSS is a
+maximum, and a 25,778-edge snapshot added after a build that already peaked at
+906 MB never becomes the maximum. `jupyterlab` is the one corpus with both the
+largest callgraph in the matrix and a build peak small enough not to hide it.
+
+#### Why the old head never reached either state
+
+The old head does not schedule Tier-2 work in this harness at all. In dispatch
+`35622032508` (`7a936156c`, full matrix) no git repository logs a single
+`tier2 refresh scheduled` line — not `jupyterlab`, whose build ran 106.7 s and
+so passed ninety seconds twice over, and not any of the others. On `main` every
+repository logs one.
+
+The Tier-2 scheduler is ticked from the watcher drain, and this corpus is
+static: nothing changes on disk during a run. Before commit `1e0b39cb9`
+("mason: pump the tier-2 refresh scheduler while a root is quiet") every tick
+site sat behind a drain that had paths to apply, so with no file changes the
+scheduler was never asked whether anything was due. That commit added the
+missing one: a drain pass that finds nothing left to apply now evaluates the
+scheduler. It sits at position 26 of the 207-commit bisect window, and it is
+why the frequency went from 0-in-4 to 7-in-8.
+
+So the binary really was implicated, the p = 0.010 was not a coincidence, and
+the commit lies inside the window a two-run *maximum* would have returned
+(1–73) rather than the two-run minimum's (111–146). That is worth keeping. When
+the effect is "a race became possible", a candidate that reaches the high state
+even once is after the step, while a candidate that never reaches it is only
+weak evidence of being before it — the minimum, which is the gate's own rule,
+is the wrong summary for that question. It is the same lesson as the flapping
+row below.
+
+#### What it is, and who owns it
+
+It is not a price of the cold build and it is not noise. It is real work AFT
+does for itself — pre-warming inspect results so the first `dead_code` query is
+cheap — landing inside a measurement that claims to be about a cold index
+build. That is two problems with two owners:
+
+- **The measurement.** The matrix measures a process, and the process does more
+  than the matrix asked it for. Whether the gate should include the Tier-2
+  pre-warm (always, by waiting for it) or exclude it (always, by configuring it
+  off) is a scope change that moves every baseline, so it is written down here
+  rather than taken quietly. For reference, excluding it should read about
+  598 MB for `jupyterlab`, which is what the committed baseline already says.
+- **The behaviour.** Whether a ninety-second warm timer should start a
+  five-category scan on top of a still-running cold build is a question about
+  `crates/**`, not about this directory: the callgraph build and the inspect
+  refresh are admitted independently, so their peaks add. The files are
+  `crates/aft/src/inspect/tier2_scheduler.rs` (the ninety-second
+  `TIER2_REFRESH_COLD_CACHE_DELAY`, and the `pull` trigger) and
+  `crates/aft/src/context.rs` (`start_tier2_refresh`, and the
+  `request_tier2_refresh_pull` call on callgraph-store ready). Nothing in this
+  directory changes them.
+
+What is settled either way: the 89 MB was never a cold-build cost, so nothing
+about it belongs in a cold-build baseline.
+
+#### The row no longer flaps
+
+The baseline is unchanged at 596.3 MB and `jupyterlab` keeps failing.
+
+That is deliberate. The high state is real memory, reproducible, and still
+present in `main` — which is the definition of something a cost gate should be
+red about. Re-baselining to 730 MB would record the step as a price without
+anyone having established what was bought, and now that the cause is known it
+would be recording an inspect pre-warm as the cost of a cold build.
+
+What has changed is that a green night on this row now means something. With
+the high state reached on roughly seven runs in eight, a two-run minimum landed
+low often enough that `jupyterlab` passed occasionally for no reason anyone
+should trust: the run that observed 597.9 and 678.1 passed every tolerance,
+because the minimum was compared and the other observation was dropped.
+
+The comparator now records that this metric has two states and reports which
+one it observed, on every run:
+
+```
+BIMODAL jupyterlab peak_rss_mb: runs 597.9/678.1 against recorded states
+low<=606.1 high>=668 -> straddle; the two runs landed in different recorded
+states, so the two-run minimum would report the low one and pass on a metric
+that was also observed high
+```
+
+The rule is in `BIMODAL_BANDS` in `cost-gate.py`, with the observations behind
+it. A run that reaches the high state fails whether or not the high state fits
+under the tolerance that night — several high readings do fit, which is the
+other half of why this row used to flap. Two low runs still pass, and the line
+says that is all they are. An observation *inside* the band fails too, with a
+different message: the band is a claim about measurements, so a measurement
+that contradicts it has to be re-derived rather than absorbed. Delete the entry
+when the metric stops having two states.
+
+Every run also prints where its high-water mark was taken:
+
+```
+PHASES jupyterlab: extraction/ready=+393.9;method-dispatch/ready=+108.1;
+                   resolution/ready=+107.0;extraction/streaming=+95.7;
+                   resolution/ready+tier2:unused_exports=+60.4;... | ...
+```
+
+which is the same argument as the `OBSERVED` line one level down: the night
+that needs a phase breakdown is the night nobody downloaded the artifacts for.
+
+The tolerance is untouched. A 20% band is meant to absorb scatter around a
 central value, and this metric has no central value to scatter around: it has
-two states 89 MB apart with an empty gap between them. Widening the band to
-span both would not be calibrating a tolerance, it would be hiding a bimodality
-inside one, and the band would then be wide enough to swallow a real change on
-top. The tolerance is the wrong instrument for this shape of problem, and the
-right response is to remove the second state rather than to build a band around
-it.
+two states with an empty gap between them. Widening the band to span both would
+not be calibrating a tolerance, it would be hiding a bimodality inside one, and
+the band would then be wide enough to swallow a real change on top.
 
 ## Blessing an intentional cost change
 
