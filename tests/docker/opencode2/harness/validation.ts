@@ -694,6 +694,19 @@ function callsForScenario(scenario: ScenarioDefinition): ToolCallPlan[] {
   );
 }
 
+/**
+ * Every approved row that CHANGES the tree has to prove the product can put it
+ * back.
+ *
+ * The subject is a call that declares disk effects, not merely a call to a tool
+ * that is capable of them. A row whose calls all declare
+ * `non_mutating_evidence` leaves the tree byte-identical — the classification
+ * is exclusive and enforced by `validateMutatingDeclarations` — so there is no
+ * intermediate state for three-state evidence to describe, and demanding a
+ * checkpoint/restore pair there would only add a restore of nothing. Rows that
+ * do change the tree are unaffected: their mutating calls declare the paths,
+ * which is exactly what this still requires evidence for.
+ */
 function validateRestoreCoverage(
   scenarios: readonly ScenarioDefinition[],
   mutatingTools: ReadonlySet<string>,
@@ -703,8 +716,8 @@ function validateRestoreCoverage(
       scenario.id === "safety/T1/checkpoint_restore" ||
       (scenario.trajectory === "T3" && scenario.id.endsWith("_ask_allow"));
     if (!requiresRestore) continue;
-    const mutatingCalls = callsForScenario(scenario).filter((call) =>
-      mutatingTools.has(canonicalToolName(call.name)),
+    const mutatingCalls = callsForScenario(scenario).filter(
+      (call) => mutatingTools.has(canonicalToolName(call.name)) && call.disk_effects !== undefined,
     );
     if (mutatingCalls.length === 0) continue;
     if (!scenario.restore_evidence) {
