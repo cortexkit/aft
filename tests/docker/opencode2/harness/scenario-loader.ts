@@ -105,8 +105,19 @@ export function validateScenarioDefinition(
   if (scenario.execution !== requiredMode) {
     fail("scenario_invalid", `${scenario.id}: ${scenario.trajectory} requires ${requiredMode}`);
   }
-  if (scenario.trajectory === "T3" && scenario.auto) {
-    fail("scenario_invalid", `${scenario.id}: permission scenarios must not enable --auto`);
+  // `opencode run` answers every permission request itself: with `--auto` it
+  // approves anything the rules do not deny, and without it the run rejects.
+  // A permission scenario therefore says which answer it wants by whether it
+  // asks for `--auto`, and the two must agree or the row asserts the opposite
+  // of what it claims.
+  if (scenario.trajectory === "T3") {
+    const reply = asRecord(scenario.metadata?.permission)?.reply;
+    if (reply === "once" && !scenario.auto) {
+      fail("scenario_invalid", `${scenario.id}: an approved prompt needs --auto`);
+    }
+    if (reply !== "once" && scenario.auto) {
+      fail("scenario_invalid", `${scenario.id}: only an approved prompt may enable --auto`);
+    }
   }
   if (!Array.isArray(scenario.turns) || scenario.turns.length === 0) {
     fail("scenario_invalid", `${scenario.id}: no scripted turns`);

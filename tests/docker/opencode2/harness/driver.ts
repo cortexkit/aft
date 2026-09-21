@@ -8,6 +8,7 @@ import { loadHostCliContract, loadHostProviderConfigContract } from "./contracts
 import { assertHarnessControlCoverage, runHarnessControlSuite } from "./control-suite.js";
 import { DiskStateObserver, ThreeStateRecorder } from "./disk-state.js";
 import { fail, HarnessError } from "./errors.js";
+import { HostEventRecorder } from "./event-stream.js";
 import { loadHarnessExtensions } from "./extensions.js";
 import { ScenarioForensics } from "./forensics.js";
 import {
@@ -27,8 +28,14 @@ import {
   toolCallsInTurn,
   toolResultForCall,
 } from "./mock-server.js";
+import {
+  assertPermissionPromptObserved,
+  controlPlans,
+  sessionPermissionRules,
+} from "./permission-plan.js";
 import { readPinnedHostVersion } from "./pin.js";
 import { ProcessObserver } from "./process-observer.js";
+import { reportTable } from "./report.js";
 import { AftTaskProbe } from "./task-probe.js";
 import { assertComparison, assertT6Trailer, projectText } from "./projection.js";
 import { verifyExecutableProvenance } from "./provenance.js";
@@ -45,15 +52,10 @@ import type {
   ScenarioDefinition,
   ScenarioLifecycleContext,
   ScenarioResult,
+  SessionPermissionRule,
   ToolCallPlan,
 } from "./types.js";
-import { TRAJECTORIES } from "./types.js";
-import {
-  type ApplicabilityMatrix,
-  type MatrixClassification,
-  type ParityAllowlistEntry,
-  validateHarnessInputs,
-} from "./validation.js";
+import { type ParityAllowlistEntry, validateHarnessInputs } from "./validation.js";
 import { asRecord, createRunId, runCommand } from "./util.js";
 
 const harnessRoot = dirname(fileURLToPath(import.meta.url));
@@ -121,47 +123,34 @@ function plannedCalls(scenario: ScenarioDefinition): ToolCallPlan[] {
   return scenario.turns.flatMap(toolCallsInTurn);
 }
 
-function scenarioToolName(name: string): string {
-  const bare = name.startsWith("aft_") ? name.slice(4) : name;
-  if (bare === "ast_grep_search") return "ast_search";
-  if (bare === "ast_grep_replace") return "ast_replace";
-  return bare;
-}
-
-function controlPlans(scenario: ScenarioDefinition): ApiControlPlan[] {
-  const controls = [...(scenario.controls ?? [])];
-  const permission = asRecord(scenario.metadata?.permission);
-  const reply = permission?.reply;
-  if (
-    scenario.trajectory !== "T3" ||
-    (reply !== "once" && reply !== "reject") ||
-    controls.some((control) => control.purpose === "permission")
-  ) {
-    return controls;
-  }
-  const subject = scenario.turns.find((turn) => {
-    if (turn.response.kind !== "tool_calls") return false;
-    return turn.response.calls.some((call) => scenarioToolName(call.name) === scenario.tool);
+/**
+ * Put a scenario's permission rules on the host session before its first call.
+ *
+ * Installing them from the model's first request is what makes this race-free:
+ * the host has created the session by then and cannot start a tool call before
+ * the response that carries it, so the rules are in place by the time anything
+ * is gated.
+ */
+async function installSessionPermissionRules(
+  scenario: ScenarioDefinition,
+  rules: readonly SessionPermissionRule[],
+  sessionId: string,
+  options: Omit<Parameters<typeof runApiCommand>[0], "method" | "path" | "body">,
+): Promise<void> {
+  const applied = await runApiCommand({
+    ...options,
+    method: "PATCH",
+    path: `/api/session/${encodeURIComponent(sessionId)}`,
+    body: { permissions: rules },
+    timeoutMs: 10_000,
   });
-  const subjectCall = subject?.response.kind === "tool_calls"
-    ? subject.response.calls.find((call) => scenarioToolName(call.name) === scenario.tool)
-    : undefined;
-  if (!subject || !subjectCall) {
-    fail("scenario_invalid", `${scenario.id}: permission scenario has no subject tool call`);
+  if (applied.exit_code !== 0) {
+    fail("host_failed", `${scenario.id}: installing session permission rules failed`, {
+      rules,
+      session_id: sessionId,
+      output: applied,
+    });
   }
-  const id = `${scenario.id.replaceAll("/", "-")}-permission`;
-  if (controls.some((control) => control.id === id)) return controls;
-  controls.push({
-    id,
-    after_turn: subject.label,
-    delay_ms: 100,
-    method: "POST",
-    path: `/api/session/{{session_id}}/permission/{{permission_id:${subjectCall.id}}}/reply`,
-    body: { reply },
-    expected_status: 0,
-    purpose: "permission",
-  });
-  return controls;
 }
 
 function observeControlPathValues(
@@ -244,52 +233,6 @@ async function discoverActiveSessionId(
   }
   fail("host_failed", `${control.id}: active session id was not observed`);
 }
-
-async function discoverPermissionRequestId(
-  control: ApiControlPlan,
-  values: Record<string, string>,
-  options: Omit<Parameters<typeof runApiCommand>[0], "method" | "path" | "body">,
-): Promise<void> {
-  const placeholder = control.path.match(/\{\{permission_id(?::([^{}]+))?\}\}/);
-  if (!placeholder) return;
-  const qualifier = placeholder[1];
-  const key = qualifier ? `permission_id:${qualifier}` : "permission_id";
-  if (values[key]) return;
-
-  const deadline = Date.now() + 5_000;
-  while (!values.session_id && Date.now() < deadline) await Bun.sleep(25);
-  const sessionId = values.session_id;
-  if (!sessionId) {
-    fail("host_failed", `${control.id}: active session id was not observed before permission reply`);
-  }
-  while (Date.now() < deadline) {
-    const result = await runApiCommand({
-      ...options,
-      method: "GET",
-      path: `/api/session/${encodeURIComponent(sessionId)}/permission`,
-      timeoutMs: 2_000,
-    });
-    if (result.exit_code === 0) {
-      try {
-        const data = asRecord(JSON.parse(result.stdout))?.data;
-        if (Array.isArray(data)) {
-          const requests = data.map(asRecord).filter((request) => request !== undefined);
-          const matching = qualifier
-            ? requests.find((request) => asRecord(request.source)?.id === qualifier)
-            : requests.at(-1);
-          if (typeof matching?.id === "string") {
-            values.permission_id = matching.id;
-            values[key] = matching.id;
-            return;
-          }
-        }
-      } catch {}
-    }
-    await Bun.sleep(50);
-  }
-  fail("host_failed", `${control.id}: pending permission request id was not observed`);
-}
-
 function restoreCallSequence(scenario: ScenarioDefinition): ToolCallPlan[] {
   if (!scenario.restore_evidence) return [];
   const available = [...plannedCalls(scenario)];
@@ -333,9 +276,38 @@ function assertT2ProductContract(
   }
 }
 
+/**
+ * Refuse a run whose scripted tool was never registered.
+ *
+ * The host answers a call for an unknown tool with "No tool named ...", which
+ * looks like a clean run to every assertion a scenario makes about not
+ * mutating anything: nothing ran, so nothing changed. A row that passes that
+ * way has tested the host's error message, not the product, so the absence is
+ * reported by name instead.
+ */
+function assertScriptedToolsRegistered(scenario: ScenarioDefinition, hostStream: string): void {
+  const missing = [
+    ...new Set(
+      [...hostStream.matchAll(/No tool named \\?"([^"\\]+)\\?" is currently available/g)].map(
+        (match) => match[1],
+      ),
+    ),
+  ];
+  if (missing.length > 0) {
+    fail("host_failed", `${scenario.id}: the host registered none of ${missing.join(", ")}`, {
+      missing_tools: missing,
+    });
+  }
+}
+
 function errorRecord(error: unknown): ScenarioResult["failure"] {
   if (error instanceof HarnessError) {
-    return { code: error.code, message: error.message, details: { ...error.details } };
+    return {
+      code: error.code,
+      message: error.message,
+      details: { ...error.details },
+      unsuppressible: error.unsuppressible,
+    };
   }
   return {
     code: error instanceof Error ? error.name : "NonError",
@@ -447,6 +419,7 @@ async function runOneScenario(options: {
   let processObserver: ProcessObserver | undefined;
   let threeState: ThreeStateRecorder | undefined;
   let server: SharedServerHandle | undefined;
+  let hostEvents: HostEventRecorder | undefined;
   let isolation: Awaited<ReturnType<typeof createScenarioIsolation>> | undefined;
   let lifecycleContext: ScenarioLifecycleContext | undefined;
   let hostStream = "";
@@ -462,6 +435,9 @@ async function runOneScenario(options: {
   let abortIssuedAt: number | undefined;
   let hostCompletedAt: number | undefined;
   const controlPathValues: Record<string, string> = {};
+  const permissionRules = sessionPermissionRules(scenario);
+  const rejectedPermission = asRecord(scenario.metadata?.permission)?.reply === "reject";
+  let permissionRulesInstalled = false;
   const transportDeadWindow = resolveTransportDeadWindow(scenario);
   let transportDeadStub: TransportDeadStub | undefined;
   let transportDeadActive = false;
@@ -497,6 +473,43 @@ async function runOneScenario(options: {
   try {
     mock = new DeterministicScenarioMock(scenario, turnLogPath, {
       beforeTurn: async (turn, request) => {
+        // The host has created the session by the time it asks for a response
+        // and cannot run a tool before receiving one, so this is the last
+        // moment that is both late enough to name the session and early enough
+        // to precede every gated call.
+        if (
+          permissionRules &&
+          !permissionRulesInstalled &&
+          server &&
+          isolation &&
+          hostEvents &&
+          options.hostContract
+        ) {
+          permissionRulesInstalled = true;
+          try {
+            const sessionId = await hostEvents.awaitSessionId(20_000);
+            if (!sessionId) {
+              fail("host_failed", `${scenario.id}: the host announced no session to gate`, {
+                event_stream_failure: hostEvents.failure,
+              });
+            }
+            controlPathValues.session_id = sessionId;
+            await installSessionPermissionRules(scenario, permissionRules, sessionId, {
+              executable: hostExecutable,
+              cwd: isolation.project,
+              env: isolation.env,
+              contract: options.hostContract,
+              endpoint: server.endpoint,
+              password: server.password,
+            });
+            await forensics.writeJson("session-permission-rules.json", {
+              session_id: sessionId,
+              rules: permissionRules,
+            });
+          } catch (error) {
+            recordFailure(error);
+          }
+        }
         if (transportDeadWindow && transportDeadStub) {
           const shouldBeDead = transportDeadAtTurn(scenario, transportDeadWindow, turn.label);
           if (shouldBeDead !== transportDeadActive) {
@@ -577,7 +590,6 @@ async function runOneScenario(options: {
               endpoint: controlServer.endpoint,
               password: controlServer.password,
             };
-            await discoverPermissionRequestId(control, controlPathValues, apiOptions);
             await discoverActiveSessionId(control, controlPathValues, apiOptions);
             await emit({ kind: "control_started", control, at: Date.now() });
             if (control.purpose === "abort") abortIssuedAt ??= Date.now();
@@ -647,7 +659,13 @@ async function runOneScenario(options: {
         cwd: isolation.project,
         env: isolation.env,
         processObserver,
+        stateRoot: isolation.state,
       });
+      await forensics.writeJson("service-registration.json", server.registration);
+      // Opened before the client starts so a request that is created and
+      // answered in the same instant is still on record.
+      hostEvents = new HostEventRecorder();
+      await hostEvents.start(server.endpoint, server.password);
     }
     const client = startScenarioClient({
       executable: hostExecutable,
@@ -689,6 +707,8 @@ async function runOneScenario(options: {
     if (!acceptedExitCodes.includes(host.exit_code)) {
       throw new Error(`host exited ${host.exit_code}; accepted ${acceptedExitCodes.join(",")}`);
     }
+    assertScriptedToolsRegistered(scenario, hostStream);
+    if (hostEvents) assertPermissionPromptObserved(scenario, hostEvents.events);
     await Promise.all(controlPromises);
     if (
       scenario.trajectory === "T4" &&
@@ -705,6 +725,11 @@ async function runOneScenario(options: {
     for (const call of plannedCalls(scenario)) {
       const observed = toolResultForCall(mock.exchanges, call.id);
       if (!observed && scenario.trajectory === "T4") continue;
+      // A rejected permission ends the run at the gated call: the host abandons
+      // the session instead of feeding the tool result back to the model, so
+      // there is no later request carrying it. What the row asserts instead is
+      // the permission event pair and the absence of a disk effect.
+      if (!observed && rejectedPermission) continue;
       if (!observed) throw new Error(`mock never observed tool result for ${call.id}`);
       observedTexts[call.id] = observed.text;
       assertT2ProductContract(scenario, call, observed.text, hostStream);
@@ -772,6 +797,19 @@ async function runOneScenario(options: {
         recordFailure(error);
       }
     }
+    if (hostEvents) {
+      try {
+        await hostEvents.stop();
+        await forensics.writeJson("host-events.json", {
+          failure: hostEvents.failure,
+          permission_asked: hostEvents.ofType("permission.asked"),
+          permission_replied: hostEvents.ofType("permission.replied"),
+          types: [...new Set(hostEvents.events.map((event) => event.type))].sort(),
+        });
+      } catch (error) {
+        recordFailure(error);
+      }
+    }
     try {
       await mock?.stop();
     } catch (error) {
@@ -816,6 +854,23 @@ async function runOneScenario(options: {
         );
       }
       if (disk) {
+        // A rejected permission ends the run at the gated call, so no later
+        // model request carries its result and the usual result-phase
+        // checkpoint never happens. The host has exited by now, so the tree is
+        // final and this checkpoint is what proves the refused call changed
+        // nothing.
+        if (rejectedPermission) {
+          for (const call of plannedCalls(scenario).filter(
+            (candidate) => begun.has(candidate.id) && !resultObserved.has(candidate.id),
+          )) {
+            try {
+              await disk.checkpointCall(call.id, "result-after-rejected-permission", "result");
+              resultObserved.add(call.id);
+            } catch (error) {
+              recordFailure(error);
+            }
+          }
+        }
         for (const call of plannedCalls(scenario).filter(
           (candidate) => candidate.outlives_result && begun.has(candidate.id),
         )) {
@@ -912,61 +967,6 @@ function assertDualHostParity(
       `${scenario.id}: projected V1/V2 parity mismatch\nV1 ${JSON.stringify(v1Shape)}\nV2 ${JSON.stringify(v2Shape)}`,
     );
   }
-}
-
-function parentDisposition(
-  classification: MatrixClassification,
-  results: readonly ScenarioResult[],
-): "expected_fail" | "fail" | "n/a" | "pass" {
-  if (classification.startsWith("n/a:")) return "n/a";
-  if (classification.startsWith("expected_fail:")) {
-    const failed = results.filter((result) => result.status === "failed");
-    return failed.length > 0 ? "expected_fail" : "fail";
-  }
-  return results.length > 0 && results.every((result) => result.status === "passed")
-    ? "pass"
-    : "fail";
-}
-
-function reportTable(
-  matrix: ApplicabilityMatrix,
-  results: readonly ScenarioResult[],
-  selector?: string,
-): { text: string; failed: boolean } {
-  const lines = ["tool | trajectory | applicable/n-a(reason) | pass/fail/expected_fail(issue)"];
-  let failed = false;
-  for (const row of matrix.rows.toSorted((left, right) => left.tool.localeCompare(right.tool))) {
-    for (const trajectory of TRAJECTORIES) {
-      const parent = `${row.tool}/${trajectory}`;
-      if (
-        selector &&
-        parent !== selector.replace(/\/$/, "") &&
-        !selector.startsWith(`${parent}/`)
-      ) {
-        continue;
-      }
-      const classification = row.trajectories[trajectory];
-      const children = results.filter(
-        (result) => result.id === parent || result.id.startsWith(`${parent}/`),
-      );
-      const disposition = parentDisposition(classification, children);
-      if (disposition === "fail") failed = true;
-      const applicability = classification.startsWith("n/a:") ? classification : "applicable";
-      const renderedDisposition =
-        disposition === "expected_fail"
-          ? classification
-          : disposition === "n/a"
-            ? "n/a"
-            : disposition;
-      lines.push(`${row.tool} | ${trajectory} | ${applicability} | ${renderedDisposition}`);
-      for (const child of children) {
-        lines.push(
-          `  ${child.id} | ${child.status}${child.failure ? ` | ${child.failure.code}` : ""} | ${child.elapsed_ms ?? 0}ms`,
-        );
-      }
-    }
-  }
-  return { text: lines.join("\n"), failed };
 }
 
 async function main(): Promise<void> {

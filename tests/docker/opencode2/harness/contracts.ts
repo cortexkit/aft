@@ -17,6 +17,8 @@ export interface HostCliContract {
   password_handoff: { run: HandoffContract; api: HandoffContract };
   session_start: Record<string, unknown>;
   idle_retention: Record<string, unknown>;
+  /** The flag `opencode api` takes a request body on. */
+  request_body_flag: string;
   shared_server_smoke: {
     method: string;
     path: string;
@@ -87,6 +89,7 @@ export async function loadHostCliContract(
   const endpoint = asRecord(record.endpoint_handoff);
   const password = asRecord(record.password_handoff);
   const smoke = asRecord(record.shared_server_smoke);
+  const bodyHandoff = asRecord(record.request_body_handoff);
   const missingFields = [
     ...(!endpoint ? ["endpoint_handoff"] : []),
     ...(!asRecord(endpoint?.run) ? ["endpoint_handoff.run"] : []),
@@ -96,6 +99,7 @@ export async function loadHostCliContract(
     ...(!asRecord(password?.api) ? ["password_handoff.api"] : []),
     ...(!asRecord(record.session_start) ? ["session_start"] : []),
     ...(!asRecord(record.idle_retention) ? ["idle_retention"] : []),
+    ...(typeof bodyHandoff?.api !== "string" ? ["request_body_handoff.api"] : []),
     ...(typeof smoke?.method !== "string" ? ["shared_server_smoke.method"] : []),
     ...(typeof smoke?.path !== "string" ? ["shared_server_smoke.path"] : []),
   ];
@@ -121,6 +125,7 @@ export async function loadHostCliContract(
     },
     session_start: record.session_start as Record<string, unknown>,
     idle_retention: record.idle_retention as Record<string, unknown>,
+    request_body_flag: bodyHandoff?.api as string,
     shared_server_smoke: {
       method: smoke?.method as string,
       path: smoke?.path as string,

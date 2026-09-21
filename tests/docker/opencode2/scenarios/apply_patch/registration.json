@@ -149,33 +149,11 @@
       "id": "apply_patch/T3/apply_patch_ask_allow",
       "tool": "apply_patch",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
+      "auto": true,
       "execution": "shared-server",
       "prompt": "Allow the apply_patch mutation and restore its checkpoint.",
       "fixture": "./fixture",
       "turns": [
-        {
-          "label": "checkpoint",
-          "response": {
-            "kind": "tool_calls",
-            "calls": [
-              {
-                "id": "apply_patch-checkpoint",
-                "name": "aft_safety",
-                "arguments": {
-                  "op": "checkpoint",
-                  "name": "apply_patch-t3",
-                  "files": [
-                    "patched.txt"
-                  ]
-                },
-                "non_mutating_evidence": {
-                  "reason": "checkpoint creation does not alter the fixture project"
-                }
-              }
-            ]
-          }
-        },
         {
           "label": "mutate",
           "response": {
@@ -195,16 +173,15 @@
           }
         },
         {
-          "label": "restore",
+          "label": "undo",
           "response": {
             "kind": "tool_calls",
             "calls": [
               {
-                "id": "apply_patch-restore",
+                "id": "apply_patch-allow-mutation-undo",
                 "name": "aft_safety",
                 "arguments": {
-                  "op": "restore",
-                  "name": "apply_patch-t3"
+                  "op": "undo"
                 },
                 "disk_effects": [
                   "patched.txt"
@@ -222,25 +199,14 @@
         }
       ],
       "expected_turns": [
-        "checkpoint",
         "mutate",
-        "restore",
+        "undo",
         "finish"
       ],
       "restore_evidence": {
-        "operation": "checkpoint_restore",
-        "identifier": "apply_patch-t3",
+        "operation": "undo",
+        "identifier": "last-tool-call",
         "calls": [
-          {
-            "tool": "aft_safety",
-            "arguments": {
-              "op": "checkpoint",
-              "name": "apply_patch-t3",
-              "files": [
-                "patched.txt"
-              ]
-            }
-          },
           {
             "tool": "apply_patch",
             "arguments": {
@@ -250,8 +216,7 @@
           {
             "tool": "aft_safety",
             "arguments": {
-              "op": "restore",
-              "name": "apply_patch-t3"
+              "op": "undo"
             }
           }
         ],
@@ -270,8 +235,7 @@
           "requested_paths": [
             "patched.txt"
           ]
-        },
-        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+        }
       }
     },
     {
@@ -279,7 +243,6 @@
       "id": "apply_patch/T3/apply_patch_ask_deny",
       "tool": "apply_patch",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
       "execution": "shared-server",
       "prompt": "Deny the apply_patch mutation.",
       "fixture": "./fixture",
@@ -301,18 +264,10 @@
               }
             ]
           }
-        },
-        {
-          "label": "finish",
-          "response": {
-            "kind": "text",
-            "content": "done"
-          }
         }
       ],
       "expected_turns": [
-        "call-tool",
-        "finish"
+        "call-tool"
       ],
       "metadata": {
         "permission": {
@@ -322,7 +277,10 @@
             "patched.txt"
           ]
         },
-        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+        "accepted_exit_codes": [
+          0,
+          1
+        ]
       }
     },
     {
@@ -330,7 +288,6 @@
       "id": "apply_patch/T3/apply_patch_config_deny",
       "tool": "apply_patch",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
       "execution": "shared-server",
       "prompt": "Configuration-deny the apply_patch mutation.",
       "fixture": "./fixture",

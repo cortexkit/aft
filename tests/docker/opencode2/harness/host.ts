@@ -1,9 +1,11 @@
 import { type ChildProcess, spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 
 import { applyHandoff, type HostCliContract } from "./contracts.js";
 import { fail } from "./errors.js";
 import type { ApiControlPlan, ScenarioDefinition } from "./types.js";
-import type { CommandOutput } from "./util.js";
+import { asRecord, type CommandOutput } from "./util.js";
 import { ProcessObserver } from "./process-observer.js";
 
 interface CapturedChild {
@@ -19,8 +21,52 @@ export interface SharedServerHandle {
   child: ChildProcess;
   endpoint: string;
   password: string;
+  /** The service registration the host published for this server. */
+  registration: ServiceRegistration;
   stdout: () => string;
   stderr: () => string;
+}
+
+/**
+ * What `opencode serve --service` writes so other processes can find it.
+ *
+ * This is the file `discover()` in @opencode/client/service reads, at
+ * `$XDG_STATE_HOME/opencode/service.json`.
+ */
+export interface ServiceRegistration {
+  url: string;
+  password: string;
+  pid: number;
+  version?: string;
+}
+
+export function serviceRegistrationPath(stateRoot: string): string {
+  return join(stateRoot, "opencode", "service.json");
+}
+
+async function readServiceRegistration(path: string): Promise<ServiceRegistration | undefined> {
+  const text = await readFile(path, "utf8").catch(() => undefined);
+  if (text === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  const record = asRecord(parsed);
+  if (
+    typeof record?.url !== "string" ||
+    typeof record.password !== "string" ||
+    typeof record.pid !== "number"
+  ) {
+    return undefined;
+  }
+  return {
+    url: record.url,
+    password: record.password,
+    pid: record.pid,
+    version: typeof record.version === "string" ? record.version : undefined,
+  };
 }
 
 function spawnCaptured(
@@ -89,39 +135,64 @@ async function waitCaptured(captured: CapturedChild, timeoutMs: number): Promise
   };
 }
 
+/**
+ * Start the shared host for a scenario as a registered background service.
+ *
+ * `--service` is what makes the host publish its registration file, and that
+ * file is the only thing `discover()` in @opencode/client/service looks at. A
+ * plain `serve` listens on the same API but registers nothing, so a plugin
+ * running inside it cannot find the service it is part of and can never raise
+ * an interactive permission prompt. Starting it the way a real installation
+ * does is what puts that path under test.
+ *
+ * The registration is also where the password now comes from: `--service`
+ * stops printing `server password` on stdout and writes it into the file
+ * instead. Waiting for the file therefore doubles as proof that the service
+ * registered at all.
+ */
 export async function startSharedServer(options: {
   executable: string;
   cwd: string;
   env: NodeJS.ProcessEnv;
   processObserver: ProcessObserver;
+  /** XDG state root for this scenario; the registration is written under it. */
+  stateRoot: string;
   timeoutMs?: number;
 }): Promise<SharedServerHandle> {
-  const args = ["serve", "--hostname", "127.0.0.1", "--port", "0", "--print-logs"];
+  const args = ["serve", "--hostname", "127.0.0.1", "--port", "0", "--service", "--print-logs"];
   const captured = spawnCaptured(options.executable, args, options.cwd, options.env);
   options.processObserver.trackChild("opencode2-serve", captured.child, "host");
+  const registrationPath = serviceRegistrationPath(options.stateRoot);
   const deadline = Date.now() + (options.timeoutMs ?? 30_000);
   let endpoint: string | undefined;
-  let password: string | undefined;
+  let registration: ServiceRegistration | undefined;
   while (Date.now() < deadline && captured.child.exitCode === null) {
     const output = `${captured.stdout}\n${captured.stderr}`;
     endpoint = output.match(/server listening on (http:\/\/127\.0\.0\.1:\d+)/)?.[1];
-    password = output.match(/server password ([^\s]+)/)?.[1];
-    if (endpoint && password) break;
+    registration = await readServiceRegistration(registrationPath);
+    if (endpoint && registration && registration.url === endpoint) break;
     await Bun.sleep(50);
   }
-  if (!endpoint || !password) {
+  if (!endpoint || !registration || registration.url !== endpoint) {
     captured.child.kill("SIGTERM");
     fail(
       "host_failed",
-      "shared server did not publish endpoint and password",
-      { stdout: captured.stdout, stderr: captured.stderr },
+      "shared server did not publish a service registration matching its endpoint",
+      {
+        endpoint,
+        registration,
+        registration_path: registrationPath,
+        stdout: captured.stdout,
+        stderr: captured.stderr,
+      },
       true,
     );
   }
   return {
     child: captured.child,
     endpoint,
-    password,
+    password: registration.password,
+    registration,
     stdout: () => captured.stdout,
     stderr: () => captured.stderr,
   };
@@ -219,7 +290,12 @@ export async function runApiCommand(options: {
     options.contract.password_handoff.api,
   );
   attached.args.push(options.method, options.path);
-  if (options.body !== undefined) attached.args.push("--body", JSON.stringify(options.body));
+  // `opencode api` names its body flag `--data`; `--body` is rejected as an
+  // unrecognised flag before the request is made, which turns a control into a
+  // silent no-op. The spelling is read from the captured CLI contract.
+  if (options.body !== undefined) {
+    attached.args.push(options.contract.request_body_flag, JSON.stringify(options.body));
+  }
   const captured = spawnCaptured(options.executable, attached.args, options.cwd, attached.env);
   return waitCaptured(captured, options.timeoutMs ?? 10_000);
 }

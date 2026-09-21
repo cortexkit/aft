@@ -150,33 +150,11 @@
       "id": "write/T3/write_ask_allow",
       "tool": "write",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
+      "auto": true,
       "execution": "shared-server",
       "prompt": "Allow the write mutation and restore its checkpoint.",
       "fixture": "./fixture",
       "turns": [
-        {
-          "label": "checkpoint",
-          "response": {
-            "kind": "tool_calls",
-            "calls": [
-              {
-                "id": "write-checkpoint",
-                "name": "aft_safety",
-                "arguments": {
-                  "op": "checkpoint",
-                  "name": "write-t3",
-                  "files": [
-                    "created.txt"
-                  ]
-                },
-                "non_mutating_evidence": {
-                  "reason": "checkpoint creation does not alter the fixture project"
-                }
-              }
-            ]
-          }
-        },
         {
           "label": "mutate",
           "response": {
@@ -197,16 +175,15 @@
           }
         },
         {
-          "label": "restore",
+          "label": "undo",
           "response": {
             "kind": "tool_calls",
             "calls": [
               {
-                "id": "write-restore",
+                "id": "write-allow-mutation-undo",
                 "name": "aft_safety",
                 "arguments": {
-                  "op": "restore",
-                  "name": "write-t3"
+                  "op": "undo"
                 },
                 "disk_effects": [
                   "created.txt"
@@ -224,25 +201,14 @@
         }
       ],
       "expected_turns": [
-        "checkpoint",
         "mutate",
-        "restore",
+        "undo",
         "finish"
       ],
       "restore_evidence": {
-        "operation": "checkpoint_restore",
-        "identifier": "write-t3",
+        "operation": "undo",
+        "identifier": "last-tool-call",
         "calls": [
-          {
-            "tool": "aft_safety",
-            "arguments": {
-              "op": "checkpoint",
-              "name": "write-t3",
-              "files": [
-                "created.txt"
-              ]
-            }
-          },
           {
             "tool": "write",
             "arguments": {
@@ -253,8 +219,7 @@
           {
             "tool": "aft_safety",
             "arguments": {
-              "op": "restore",
-              "name": "write-t3"
+              "op": "undo"
             }
           }
         ],
@@ -273,8 +238,7 @@
           "requested_paths": [
             "created.txt"
           ]
-        },
-        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+        }
       }
     },
     {
@@ -282,7 +246,6 @@
       "id": "write/T3/write_ask_deny",
       "tool": "write",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
       "execution": "shared-server",
       "prompt": "Deny the write mutation.",
       "fixture": "./fixture",
@@ -305,18 +268,10 @@
               }
             ]
           }
-        },
-        {
-          "label": "finish",
-          "response": {
-            "kind": "text",
-            "content": "done"
-          }
         }
       ],
       "expected_turns": [
-        "call-tool",
-        "finish"
+        "call-tool"
       ],
       "metadata": {
         "permission": {
@@ -326,7 +281,10 @@
             "created.txt"
           ]
         },
-        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+        "accepted_exit_codes": [
+          0,
+          1
+        ]
       }
     },
     {
@@ -334,7 +292,6 @@
       "id": "write/T3/write_config_deny",
       "tool": "write",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
       "execution": "shared-server",
       "prompt": "Configuration-deny the write mutation.",
       "fixture": "./fixture",

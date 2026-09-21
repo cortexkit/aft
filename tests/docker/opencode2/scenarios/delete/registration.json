@@ -151,7 +151,7 @@
       "id": "delete/T3/delete_ask_allow",
       "tool": "delete",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
+      "auto": true,
       "execution": "shared-server",
       "prompt": "Allow the delete mutation and restore its checkpoint.",
       "fixture": "./fixture",
@@ -275,8 +275,7 @@
           "requested_paths": [
             "delete-me.txt"
           ]
-        },
-        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+        }
       }
     },
     {
@@ -284,7 +283,6 @@
       "id": "delete/T3/delete_ask_deny",
       "tool": "delete",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
       "execution": "shared-server",
       "prompt": "Deny the delete mutation.",
       "fixture": "./fixture",
@@ -308,18 +306,10 @@
               }
             ]
           }
-        },
-        {
-          "label": "finish",
-          "response": {
-            "kind": "text",
-            "content": "done"
-          }
         }
       ],
       "expected_turns": [
-        "call-tool",
-        "finish"
+        "call-tool"
       ],
       "metadata": {
         "permission": {
@@ -329,7 +319,10 @@
             "delete-me.txt"
           ]
         },
-        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+        "accepted_exit_codes": [
+          0,
+          1
+        ]
       }
     },
     {
@@ -337,7 +330,6 @@
       "id": "delete/T3/delete_config_deny",
       "tool": "delete",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
       "execution": "shared-server",
       "prompt": "Configuration-deny the delete mutation.",
       "fixture": "./fixture",

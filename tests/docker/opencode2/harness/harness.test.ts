@@ -18,7 +18,8 @@ import {
   type PathState,
 } from "./disk-state.js";
 import { HarnessError, type HarnessFailureCode } from "./errors.js";
-import { runApiControl, startScenarioClient } from "./host.js";
+import type { HostEvent } from "./event-stream.js";
+import { runApiControl, startScenarioClient, startSharedServer } from "./host.js";
 import { readPermissionAskInventory } from "./inventory.js";
 import { createScenarioIsolation } from "./isolation.js";
 import {
@@ -35,6 +36,14 @@ import {
   toolResultForCall,
 } from "./mock-server.js";
 import { assertT6Trailer, projectText, TRUNCATION_TRAILER_PATTERN } from "./projection.js";
+import {
+  assertPermissionPromptObserved,
+  controlPlans,
+  permissionAction,
+  sessionPermissionRules,
+} from "./permission-plan.js";
+import { ProcessObserver } from "./process-observer.js";
+import { parentDisposition, reportTable } from "./report.js";
 import { verifyExecutableProvenance } from "./provenance.js";
 import {
   addCallgraphWarmup,
@@ -43,7 +52,7 @@ import {
 } from "./scenario-loader.js";
 import { assertTurnLog } from "./turn-log.js";
 import { resolveTransportDeadWindow, transportDeadAtTurn } from "./transport-window.js";
-import type { ScenarioDefinition, ScriptedTurn, ToolCallPlan } from "./types.js";
+import type { ScenarioDefinition, ScenarioResult, ScriptedTurn, ToolCallPlan } from "./types.js";
 import {
   applyMutatingTestOverride,
   deriveListSurfaces,
@@ -377,6 +386,7 @@ describe("shared-server controls", () => {
       },
       session_start: {},
       idle_retention: {},
+      request_body_flag: "--data",
       shared_server_smoke: { method: "GET", path: "/api/health" },
     };
 
@@ -408,6 +418,60 @@ describe("shared-server controls", () => {
       "http://127.0.0.1:4096",
       "POST",
       "/api/session/session%2Fone/permission/permission%20two/task/bash-three",
+    ]);
+  });
+
+  test("a control body is passed on the flag the captured contract names", async () => {
+    const parent = await root();
+    const executable = join(parent, "capture-body-arguments");
+    const argumentsPath = join(parent, "body-arguments.txt");
+    await writeFile(executable, '#!/bin/sh\nprintf "%s\\n" "$@" > "$ARGUMENTS_PATH"\n');
+    await chmod(executable, 0o755);
+    const handoff = { kind: "flag", name: "--server" } as const;
+    const contract: HostCliContract = {
+      schema_version: 1,
+      host_version: "test",
+      observed_run_id: "test",
+      endpoint_handoff: { run: handoff, api: handoff },
+      password_handoff: {
+        run: { kind: "env", name: "OPENCODE_SERVER_PASSWORD" },
+        api: { kind: "env", name: "OPENCODE_SERVER_PASSWORD" },
+      },
+      session_start: {},
+      idle_retention: {},
+      request_body_flag: "--data",
+      shared_server_smoke: { method: "GET", path: "/api/health" },
+    };
+
+    await runApiControl(
+      {
+        id: "body-control",
+        after_turn: "turn",
+        method: "POST",
+        path: "/api/session/one/permission/two/reply",
+        body: { decision: "once" },
+        purpose: "permission",
+      },
+      {
+        executable,
+        cwd: parent,
+        env: { ...process.env, ARGUMENTS_PATH: argumentsPath },
+        contract,
+        endpoint: "http://127.0.0.1:4096",
+      },
+    );
+
+    // A body sent on a flag the host does not recognise never reaches it: the
+    // command exits 1 before making the request, so the control answers
+    // nothing.
+    expect((await readFile(argumentsPath, "utf8")).trim().split("\n")).toEqual([
+      "api",
+      "--server",
+      "http://127.0.0.1:4096",
+      "POST",
+      "/api/session/one/permission/two/reply",
+      "--data",
+      '{"decision":"once"}',
     ]);
   });
 
@@ -1082,6 +1146,7 @@ test("legacy host CLI capture names every field required by the runner", async (
     "endpoint_handoff.api",
     "password_handoff.run",
     "password_handoff.api",
+    "request_body_handoff.api",
     "shared_server_smoke.method",
     "shared_server_smoke.path",
   ]);
@@ -1113,4 +1178,271 @@ test("missing host schema rejection contract fails validation instead of earning
     () => loadHostSchemaRejectionContract(contractRoot, "0.0.0-beta-test"),
     "contract_uncaptured",
   );
+});
+
+describe("permission scenarios reach the host's own rules", () => {
+  const permissionScenario = (
+    id: string,
+    tool: string,
+    permission: Record<string, unknown>,
+    calls: ToolCallPlan[],
+  ): ScenarioDefinition => ({
+    schema_version: 1,
+    id,
+    tool,
+    trajectory: "T3",
+    execution: "shared-server",
+    prompt: "permission",
+    turns: [{ label: "call-tool", response: { kind: "tool_calls", calls } }],
+    metadata: { permission },
+  });
+
+  test("an ask scenario installs one ask rule for the operation it gates", () => {
+    const rules = sessionPermissionRules(
+      permissionScenario(
+        "apply_patch/T3/apply_patch_ask_allow",
+        "apply_patch",
+        { operation: "apply_patch", reply: "once", requested_paths: ["patched.txt"] },
+        [call({ id: "mutate", name: "apply_patch", arguments: {} })],
+      ),
+    );
+
+    // The resource stays "*" because the tools disagree about how they name
+    // one: a rule naming "patched.txt" matches the edit tool's relative path
+    // but misses aft_delete's absolute path and bash's command line.
+    expect(rules).toEqual([{ action: "edit", resource: "*", effect: "ask" }]);
+  });
+
+  test("every mutating operation asks under edit; read and bash ask under their own names", () => {
+    expect(permissionAction("apply_patch")).toBe("edit");
+    expect(permissionAction("write")).toBe("edit");
+    expect(permissionAction("aft_move")).toBe("edit");
+    expect(permissionAction("read")).toBe("read");
+    expect(permissionAction("bash:withPermissionLoop")).toBe("bash");
+    expect(permissionAction("bash:host-fallback")).toBe("bash");
+  });
+
+  test("a configured denial installs a deny rule and leaves nothing to answer", () => {
+    const denial = permissionScenario(
+      "read/T3/read_config_deny",
+      "read",
+      { operation: "read", reply: "config_deny", requested_path: "sample.txt" },
+      [call({ id: "deny-call", name: "read", arguments: { filePath: "sample.txt" } })],
+    );
+
+    expect(sessionPermissionRules(denial)).toEqual([
+      { action: "read", resource: "*", effect: "deny" },
+    ]);
+    expect(controlPlans(denial)).toEqual([]);
+  });
+
+  test("a scenario with no permission metadata installs no rules", () => {
+    expect(sessionPermissionRules(scenario(call()))).toBeUndefined();
+  });
+
+  test("the approved and the rejected prompt are both read off the host's event stream", () => {
+    const approved = permissionScenario(
+      "apply_patch/T3/apply_patch_ask_allow",
+      "apply_patch",
+      { operation: "apply_patch", reply: "once", requested_paths: ["patched.txt"] },
+      [call({ id: "mutate", name: "apply_patch", arguments: {} })],
+    );
+    const rejected = permissionScenario(
+      "read/T3/read_ask_deny",
+      "read",
+      { operation: "read", reply: "reject", requested_path: "sample.txt" },
+      [call({ id: "read-ask_deny", name: "read", arguments: { filePath: "sample.txt" } })],
+    );
+    const asked = (id: string, action: string, sourceId: string): HostEvent => ({
+      type: "permission.asked",
+      data: { id, action, resources: ["whatever the tool calls it"], source: { id: sourceId } },
+    });
+    const replied = (requestID: string, reply: string): HostEvent => ({
+      type: "permission.replied",
+      data: { requestID, reply },
+    });
+
+    assertPermissionPromptObserved(approved, [
+      asked("per_1", "edit", "mutate"),
+      replied("per_1", "once"),
+    ]);
+    assertPermissionPromptObserved(rejected, [
+      asked("per_2", "read", "read-ask_deny"),
+      replied("per_2", "reject"),
+    ]);
+
+    // A tool that completed without asking is the defect these rows exist to
+    // catch, and it leaves no event behind.
+    expect(() => assertPermissionPromptObserved(approved, [])).toThrow("no_effect_observed");
+    // A prompt raised by some other call is not this row's prompt.
+    expect(() =>
+      assertPermissionPromptObserved(approved, [
+        asked("per_3", "edit", "some-other-call"),
+        replied("per_3", "once"),
+      ]),
+    ).toThrow("no_effect_observed");
+    // Raised but answered the other way round is a different outcome than the
+    // row declares.
+    expect(() =>
+      assertPermissionPromptObserved(approved, [
+        asked("per_4", "edit", "mutate"),
+        replied("per_4", "reject"),
+      ]),
+    ).toThrow("no_effect_observed");
+  });
+
+  test("a configured denial is expected to raise no prompt at all", () => {
+    const denial = permissionScenario(
+      "read/T3/read_config_deny",
+      "read",
+      { operation: "read", reply: "config_deny", requested_path: "sample.txt" },
+      [call({ id: "deny-call", name: "read", arguments: { filePath: "sample.txt" } })],
+    );
+
+    assertPermissionPromptObserved(denial, []);
+  });
+
+  test("a permission scenario adds no control of its own", () => {
+    expect(
+      controlPlans(
+        permissionScenario(
+          "read/T3/read_ask_deny",
+          "read",
+          { operation: "read", reply: "reject", requested_path: "sample.txt" },
+          [call({ id: "read-ask_deny", name: "read", arguments: { filePath: "sample.txt" } })],
+        ),
+      ),
+    ).toEqual([]);
+  });
+
+  test("the shared server registers as a service and hands over that password", async () => {
+    const parent = await root();
+    const stateRoot = join(parent, "xdg-state");
+    const argumentsPath = join(parent, "serve-arguments.txt");
+    const executable = join(parent, "fake-opencode");
+    await writeFile(
+      executable,
+      `#!/bin/sh\n` +
+        `printf '%s\\n' "$@" > ${JSON.stringify(argumentsPath)}\n` +
+        `mkdir -p "$XDG_STATE_HOME/opencode"\n` +
+        `printf '%s' '{"id":"x","version":"2.0.11","url":"http://127.0.0.1:4242",` +
+        `"pid":1,"password":"from-registration"}' > "$XDG_STATE_HOME/opencode/service.json"\n` +
+        `echo "server listening on http://127.0.0.1:4242"\n` +
+        `sleep 30\n`,
+    );
+    await chmod(executable, 0o755);
+
+    const server = await startSharedServer({
+      executable,
+      cwd: parent,
+      env: { ...process.env, XDG_STATE_HOME: stateRoot },
+      processObserver: new ProcessObserver("registration-test"),
+      stateRoot,
+      timeoutMs: 10_000,
+    });
+
+    try {
+      // `--service` is the flag that makes the host publish the registration
+      // file `discover()` reads; a plain `serve` is invisible to the plugin
+      // running inside it.
+      expect((await readFile(argumentsPath, "utf8")).trim().split("\n")).toContain("--service");
+      expect(server.endpoint).toBe("http://127.0.0.1:4242");
+      expect(server.password).toBe("from-registration");
+      expect(server.registration.pid).toBe(1);
+    } finally {
+      server.child.kill("SIGKILL");
+    }
+  });
+
+  test("a server that listens without registering is rejected", async () => {
+    const parent = await root();
+    const executable = join(parent, "unregistered-opencode");
+    await writeFile(
+      executable,
+      '#!/bin/sh\necho "server listening on http://127.0.0.1:4242"\nsleep 30\n',
+    );
+    await chmod(executable, 0o755);
+
+    await expectCode(
+      () =>
+        startSharedServer({
+          executable,
+          cwd: parent,
+          env: { ...process.env, XDG_STATE_HOME: join(parent, "xdg-state") },
+          processObserver: new ProcessObserver("unregistered-test"),
+          stateRoot: join(parent, "xdg-state"),
+          timeoutMs: 2_000,
+        }),
+      "host_failed",
+    );
+  });
+});
+
+describe("the run reports a verdict for every row", () => {
+  const matrix = {
+    rows: [
+      {
+        tool: "alpha",
+        trajectories: {
+          T1: "applicable",
+          T2: "applicable",
+          T3: "expected_fail:https://example.invalid/1",
+          T4: "expected_fail:https://example.invalid/1",
+          T5: "n/a:no-background-capability",
+          T6: "n/a:no-list-surface",
+          T7: "n/a:no-list-surface",
+        },
+      },
+    ],
+  } as unknown as Parameters<typeof reportTable>[0];
+
+  const result = (
+    id: string,
+    status: ScenarioResult["status"],
+    failure?: ScenarioResult["failure"],
+  ): ScenarioResult => ({ id, status, failure, forensic_dir: "/dev/null" });
+
+  test("a failed row does not stop the rows after it, and the counts are stated", () => {
+    const report = reportTable(matrix, [
+      result("alpha/T1/happy", "failed", { code: "host_failed", message: "first row broke" }),
+      result("alpha/T2/happy", "passed"),
+      result("alpha/T3/gated", "failed", { code: "host_failed", message: "known upstream gap" }),
+      result("alpha/T4/gated", "failed", { code: "host_failed", message: "known upstream gap" }),
+    ]);
+
+    expect(report.text).toContain("alpha | T1 | applicable | fail");
+    expect(report.text).toContain("alpha | T2 | applicable | pass");
+    expect(report.text).toContain("rows: 1 passed, 1 failed, 2 expected-failed, 3 not-applicable (of 7)");
+    expect(report.text).toContain("scenarios: 1 passed, 3 failed (of 4)");
+    expect(report.failed).toBe(true);
+  });
+
+  test("an expected-failure label cannot excuse a harness-integrity failure", () => {
+    const productGap = result("alpha/T3/gated", "failed", {
+      code: "host_failed",
+      message: "known upstream gap",
+    });
+    const integrityBreach = result("alpha/T3/gated", "failed", {
+      code: "executable_provenance",
+      message: "producer sidecar missing",
+      unsuppressible: true,
+    });
+    // An unsuppressible product outcome is still a product outcome: the label
+    // is about the product, so it may cover this one.
+    const unparsedOutput = result("alpha/T3/gated", "failed", {
+      code: "projection_unparsed",
+      message: "Created new file.",
+      unsuppressible: true,
+    });
+
+    expect(parentDisposition("expected_fail:https://example.invalid/1", [productGap])).toBe(
+      "expected_fail",
+    );
+    expect(parentDisposition("expected_fail:https://example.invalid/1", [integrityBreach])).toBe(
+      "fail",
+    );
+    expect(parentDisposition("expected_fail:https://example.invalid/1", [unparsedOutput])).toBe(
+      "expected_fail",
+    );
+  });
 });

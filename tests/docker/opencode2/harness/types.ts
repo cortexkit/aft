@@ -93,6 +93,13 @@ export interface ApiControlPlan {
   purpose: "abort" | "permission" | "smoke";
 }
 
+/** One entry of the ordered ruleset OpenCode evaluates for a session. */
+export interface SessionPermissionRule {
+  action: string;
+  resource: string;
+  effect: "allow" | "ask" | "deny";
+}
+
 export interface ThreeStatePathExpectation {
   path: string;
   transition:
@@ -158,7 +165,16 @@ export interface ScenarioResult {
   id: string;
   status: "failed" | "passed";
   issue?: string;
-  failure?: { code: string; message: string; details?: Record<string, unknown> };
+  failure?: {
+    code: string;
+    message: string;
+    details?: Record<string, unknown>;
+    /**
+     * A harness-integrity breach rather than a product outcome. These are
+     * never excused by a row's expected-failure label.
+     */
+    unsuppressible?: boolean;
+  };
   forensic_dir: string;
   elapsed_ms?: number;
 }

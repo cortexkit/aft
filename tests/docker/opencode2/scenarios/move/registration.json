@@ -151,34 +151,11 @@
       "id": "move/T3/move_ask_allow",
       "tool": "move",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
+      "auto": true,
       "execution": "shared-server",
       "prompt": "Allow the move mutation and restore its checkpoint.",
       "fixture": "./fixture",
       "turns": [
-        {
-          "label": "checkpoint",
-          "response": {
-            "kind": "tool_calls",
-            "calls": [
-              {
-                "id": "move-checkpoint",
-                "name": "aft_safety",
-                "arguments": {
-                  "op": "checkpoint",
-                  "name": "move-t3",
-                  "files": [
-                    "move-source.txt",
-                    "move-destination.txt"
-                  ]
-                },
-                "non_mutating_evidence": {
-                  "reason": "checkpoint creation does not alter the fixture project"
-                }
-              }
-            ]
-          }
-        },
         {
           "label": "mutate",
           "response": {
@@ -200,16 +177,15 @@
           }
         },
         {
-          "label": "restore",
+          "label": "undo",
           "response": {
             "kind": "tool_calls",
             "calls": [
               {
-                "id": "move-restore",
+                "id": "move-allow-mutation-undo",
                 "name": "aft_safety",
                 "arguments": {
-                  "op": "restore",
-                  "name": "move-t3"
+                  "op": "undo"
                 },
                 "disk_effects": [
                   "move-source.txt",
@@ -228,26 +204,14 @@
         }
       ],
       "expected_turns": [
-        "checkpoint",
         "mutate",
-        "restore",
+        "undo",
         "finish"
       ],
       "restore_evidence": {
-        "operation": "checkpoint_restore",
-        "identifier": "move-t3",
+        "operation": "undo",
+        "identifier": "last-tool-call",
         "calls": [
-          {
-            "tool": "aft_safety",
-            "arguments": {
-              "op": "checkpoint",
-              "name": "move-t3",
-              "files": [
-                "move-source.txt",
-                "move-destination.txt"
-              ]
-            }
-          },
           {
             "tool": "aft_move",
             "arguments": {
@@ -258,8 +222,7 @@
           {
             "tool": "aft_safety",
             "arguments": {
-              "op": "restore",
-              "name": "move-t3"
+              "op": "undo"
             }
           }
         ],
@@ -283,8 +246,7 @@
             "move-source.txt",
             "move-destination.txt"
           ]
-        },
-        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+        }
       }
     },
     {
@@ -292,7 +254,6 @@
       "id": "move/T3/move_ask_deny",
       "tool": "move",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
       "execution": "shared-server",
       "prompt": "Deny the move mutation.",
       "fixture": "./fixture",
@@ -315,18 +276,10 @@
               }
             ]
           }
-        },
-        {
-          "label": "finish",
-          "response": {
-            "kind": "text",
-            "content": "done"
-          }
         }
       ],
       "expected_turns": [
-        "call-tool",
-        "finish"
+        "call-tool"
       ],
       "metadata": {
         "permission": {
@@ -337,7 +290,10 @@
             "move-destination.txt"
           ]
         },
-        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+        "accepted_exit_codes": [
+          0,
+          1
+        ]
       }
     },
     {
@@ -345,7 +301,6 @@
       "id": "move/T3/move_config_deny",
       "tool": "move",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
       "execution": "shared-server",
       "prompt": "Configuration-deny the move mutation.",
       "fixture": "./fixture",

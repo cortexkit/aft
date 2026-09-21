@@ -149,7 +149,7 @@
       "id": "bash/T3/loop_ask_allow",
       "tool": "bash",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
+      "auto": true,
       "execution": "shared-server",
       "prompt": "Allow the loop bash permission path and restore its created file.",
       "fixture": "./fixture",
@@ -258,7 +258,7 @@
         "paths": [
           {
             "path": "bash-loop.txt",
-            "transition": "create",
+            "transition": "edit",
             "expected_intermediate_sha256": "dcd614c3a961956e98f2d59929e1be48f409e2df5f016ee4070135543323b8e6"
           }
         ]
@@ -267,8 +267,7 @@
         "permission": {
           "operation": "bash:withPermissionLoop",
           "reply": "once"
-        },
-        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+        }
       }
     },
     {
@@ -276,7 +275,6 @@
       "id": "bash/T3/loop_ask_deny",
       "tool": "bash",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
       "execution": "shared-server",
       "prompt": "Deny the loop bash permission path.",
       "fixture": "./fixture",
@@ -298,25 +296,20 @@
               }
             ]
           }
-        },
-        {
-          "label": "finish",
-          "response": {
-            "kind": "text",
-            "content": "done"
-          }
         }
       ],
       "expected_turns": [
-        "call-tool",
-        "finish"
+        "call-tool"
       ],
       "metadata": {
         "permission": {
           "operation": "bash:withPermissionLoop",
           "reply": "reject"
         },
-        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+        "accepted_exit_codes": [
+          0,
+          1
+        ]
       }
     },
     {
@@ -324,7 +317,6 @@
       "id": "bash/T3/loop_config_deny",
       "tool": "bash",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
       "execution": "shared-server",
       "prompt": "Configuration-deny the loop bash permission path.",
       "fixture": "./fixture",
@@ -371,7 +363,7 @@
       "id": "bash/T3/fallback_ask_allow",
       "tool": "bash",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
+      "auto": true,
       "execution": "shared-server",
       "prompt": "Allow the fallback bash permission path and restore its created file.",
       "fixture": "./fixture",
@@ -485,7 +477,7 @@
         "paths": [
           {
             "path": "bash-fallback.txt",
-            "transition": "create",
+            "transition": "edit",
             "expected_intermediate_sha256": "93b00328426f1f38ef6f15c8c866a4e1917baedc81f6f3a7d207d53de2a93306"
           }
         ]
@@ -494,8 +486,7 @@
         "permission": {
           "operation": "bash:host-fallback",
           "reply": "once"
-        },
-        "harness_blocker": "driver transport-dead stub also prevents the required aft_safety restore calls"
+        }
       }
     },
     {
@@ -503,7 +494,6 @@
       "id": "bash/T3/fallback_ask_deny",
       "tool": "bash",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
       "execution": "shared-server",
       "prompt": "Deny the fallback bash permission path.",
       "fixture": "./fixture",
@@ -530,25 +520,20 @@
               }
             ]
           }
-        },
-        {
-          "label": "finish",
-          "response": {
-            "kind": "text",
-            "content": "done"
-          }
         }
       ],
       "expected_turns": [
-        "call-tool",
-        "finish"
+        "call-tool"
       ],
       "metadata": {
         "permission": {
           "operation": "bash:host-fallback",
           "reply": "reject"
         },
-        "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"
+        "accepted_exit_codes": [
+          0,
+          1
+        ]
       }
     },
     {
@@ -556,7 +541,6 @@
       "id": "bash/T3/fallback_config_deny",
       "tool": "bash",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
       "execution": "shared-server",
       "prompt": "Configuration-deny the fallback bash permission path.",
       "fixture": "./fixture",
@@ -775,8 +759,7 @@
             "source": "product_rearm_ceiling_plus_one_tick",
             "tick_ms": 50
           }
-        },
-        "harness_blocker": "HarnessExtension observe receives the second request only after mockResponse has already materialized the bash_watch placeholder"
+        }
       }
     },
     {

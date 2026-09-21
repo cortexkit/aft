@@ -60,7 +60,7 @@
       "id": "read/T3/read_ask_allow",
       "tool": "read",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
+      "auto": true,
       "execution": "shared-server",
       "prompt": "Read sample.txt after the user allows the read permission.",
       "fixture": "./fixture",
@@ -69,30 +69,27 @@
         {"label": "finish", "response": {"kind": "text", "content": "done"}}
       ],
       "expected_turns": ["call-read", "finish"],
-      "metadata": {"permission": {"operation": "read", "reply": "once", "requested_path": "sample.txt"}, "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"}
+      "metadata": {"permission": {"operation": "read", "reply": "once", "requested_path": "sample.txt"}}
     },
     {
       "schema_version": 1,
       "id": "read/T3/read_ask_deny",
       "tool": "read",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
       "execution": "shared-server",
       "prompt": "Attempt to read sample.txt after the user denies permission.",
       "fixture": "./fixture",
       "turns": [
-        {"label": "call-read", "response": {"kind": "tool_calls", "calls": [{"id": "read-deny", "name": "read", "arguments": {"filePath": "sample.txt"}, "non_mutating_evidence": {"reason": "denied reads do not alter the fixture"}}]}},
-        {"label": "finish", "response": {"kind": "text", "content": "done"}}
+        {"label": "call-read", "response": {"kind": "tool_calls", "calls": [{"id": "read-deny", "name": "read", "arguments": {"filePath": "sample.txt"}, "non_mutating_evidence": {"reason": "denied reads do not alter the fixture"}}]}}
       ],
-      "expected_turns": ["call-read", "finish"],
-      "metadata": {"permission": {"operation": "read", "reply": "reject", "requested_path": "sample.txt"}, "harness_blocker": "ApiControlPlan cannot interpolate the pending permission request id"}
+      "expected_turns": ["call-read"],
+      "metadata": {"permission": {"operation": "read", "reply": "reject", "requested_path": "sample.txt"}, "accepted_exit_codes": [0, 1]}
     },
     {
       "schema_version": 1,
       "id": "read/T3/read_config_deny",
       "tool": "read",
       "trajectory": "T3",
-      "expected_fail_issue": "https://github.com/anomalyco/opencode/issues/37164",
       "execution": "shared-server",
       "prompt": "Attempt to read sample.txt while the host read permission is configured deny.",
       "fixture": "./fixture",

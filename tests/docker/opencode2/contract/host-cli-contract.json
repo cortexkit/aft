@@ -17,7 +17,7 @@
       "kind": "flag",
       "name": "--server"
     },
-    "producer_command": "opencode2 serve --hostname 127.0.0.1 --port 0",
+    "producer_command": "opencode2 serve --hostname 127.0.0.1 --port 0 --service",
     "stdout_pattern": "^server listening on (?<endpoint>http://127\\.0\\.0\\.1:[0-9]+)$",
     "run_client_arguments": [
       "--server",
@@ -38,6 +38,14 @@
       "name": "OPENCODE_SERVER_PASSWORD"
     },
     "stdout_pattern": "^server password (?<password>\\S+)$",
+    "service_registration": {
+      "path": "$XDG_STATE_HOME/opencode/service.json",
+      "written_by": "opencode2 serve --service",
+      "fields": ["id", "version", "url", "pid", "password"],
+      "stdout_password_line": "absent under --service",
+      "read_by": "discover() in @opencode/client/service, and the harness for the server password",
+      "observed_on": "GA 2.0.11 darwin-arm64; re-observed by every shared-server scenario, which fails when the registration does not appear"
+    },
     "preferred_client_environment": "OPENCODE_PASSWORD=${password}",
     "observed_run_client_environment": "OPENCODE_SERVER_PASSWORD=${password}",
     "observed_api_client_environment": "OPENCODE_SERVER_PASSWORD=${password}",
@@ -49,6 +57,18 @@
     "basic_auth_username": "opencode",
     "source_evidence": "https://github.com/anomalyco/opencode/blob/d86c3041c948f17a8a02d01d08925c893eaf1bdf/packages/cli/src/env.ts#L7-L13",
     "transcript_redaction": "The ephemeral password is replaced with <redacted>; its presence and use are retained."
+  },
+  "permission_prompt": {
+    "answered_by": "opencode run itself: --auto approves anything the rules do not deny, and a run without it rejects",
+    "stderr_line": "! permission requested: edit (patched.txt); auto-rejecting",
+    "stderr_line_under_auto": "not printed",
+    "observed_on": "GA 2.0.11 linux-x64 in this harness; `opencode run --help` documents --auto as 'Auto-approve permissions that are not explicitly denied'",
+    "observation_channel": "GET /api/event (SSE): permission.asked carries the request, permission.replied carries the answer. No external client can reply first, so the event stream is where a raised prompt is observed."
+  },
+  "request_body_handoff": {
+    "api": "--data",
+    "rejected_spellings": ["--body"],
+    "observed": "opencode api --help lists `--data, -d string  Request body`; `--body` exits 1 with `Unrecognized flag: --body in command opencode api`"
   },
   "session_start": {
     "stream": "opencode2 run --format json NDJSON",
