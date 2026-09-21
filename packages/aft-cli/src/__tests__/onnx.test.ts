@@ -4,11 +4,15 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { __test__ as bridgeOnnxTest } from "../../../aft-bridge/src/onnx-runtime.js";
+import {
+  __test__ as bridgeOnnxTest,
+  isOrtAutoDownloadSupported,
+} from "../../../aft-bridge/src/onnx-runtime.js";
 import {
   findCachedOnnxRuntime,
   findIgnoredWindowsSystemOnnxRuntime,
   findSystemOnnxRuntime,
+  getManualInstallHint,
   getOnnxLibraryName,
   ONNX_RUNTIME_VERSION,
 } from "../lib/onnx.js";
@@ -47,6 +51,16 @@ function withPlatform<T>(platform: NodeJS.Platform, fn: () => T): T {
     return fn();
   } finally {
     if (descriptor) Object.defineProperty(process, "platform", descriptor);
+  }
+}
+
+function withArch<T>(arch: string, fn: () => T): T {
+  const descriptor = Object.getOwnPropertyDescriptor(process, "arch");
+  Object.defineProperty(process, "arch", { configurable: true, value: arch });
+  try {
+    return fn();
+  } finally {
+    if (descriptor) Object.defineProperty(process, "arch", descriptor);
   }
 }
 
@@ -215,5 +229,47 @@ describe("bridge ONNX cached resolution (#71 stale metadata)", () => {
 
     expect(existsSync(join(versionDir, bridgeOnnxTest.ONNX_INSTALLED_META_FILE))).toBe(true);
     expect(existsSync(join(libDir, libName))).toBe(true);
+  });
+});
+
+describe("CLI ONNX manual install hint", () => {
+  // Every platform the hint is asked about, including the ones the downloader
+  // does not cover, so the two tables are compared over the same ground.
+  const targets: Array<[NodeJS.Platform, string]> = [
+    ["darwin", "arm64"],
+    ["darwin", "x64"],
+    ["linux", "x64"],
+    ["linux", "arm64"],
+    ["linux", "ia32"],
+    ["win32", "x64"],
+    ["win32", "arm64"],
+    ["win32", "ia32"],
+    ["freebsd", "x64"],
+  ];
+
+  const hintOn = (platform: NodeJS.Platform, arch: string): string =>
+    withPlatform(platform, () => withArch(arch, () => getManualInstallHint()));
+
+  test("promises an auto-download exactly where the downloader supports one", () => {
+    // The downloader's own predicate is the authority: a hint that claims an
+    // auto-download the downloader will not do, or sends the user to install
+    // by hand on a platform it would have fetched, is wrong either way.
+    const disagreeing = targets.filter(([platform, arch]) => {
+      const promisesDownload = hintOn(platform, arch).includes("auto-downloads");
+      const canDownload = withPlatform(platform, () =>
+        withArch(arch, () => isOrtAutoDownloadSupported()),
+      );
+      return promisesDownload !== canDownload;
+    });
+
+    expect(disagreeing).toEqual([]);
+  });
+
+  test("names Homebrew only on the Mac Microsoft publishes no build for", () => {
+    // macOS x64 is the single platform with no published ONNX Runtime archive.
+    // Apple Silicon is an auto-download platform and was being told to brew it.
+    const brewed = targets.filter(([platform, arch]) => hintOn(platform, arch).includes("brew"));
+
+    expect(brewed).toEqual([["darwin", "x64"]]);
   });
 });

@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
 import { basename, isAbsolute, join, resolve, win32 } from "node:path";
+import { isOrtAutoDownloadSupported } from "@cortexkit/aft-bridge";
 
 export const ONNX_RUNTIME_VERSION = "1.24.4";
 
@@ -9,23 +10,28 @@ export function getOnnxLibraryName(): string {
   return "libonnxruntime.so";
 }
 
+/**
+ * What to tell a user whose ONNX Runtime is missing.
+ *
+ * The downloader's platform table decides this, not the platform name: the
+ * hint is asked for on every platform, and on one where AFT would have
+ * fetched the runtime itself, a manual install instruction sends the user
+ * after a package that may not exist. Microsoft publishes no macOS x64 build,
+ * which is the one platform where Homebrew really is the only route; macOS
+ * arm64 is an auto-download platform and used to be told to brew it anyway.
+ */
 export function getManualInstallHint(): string {
   const p = process.platform;
   const a = process.arch;
-  if (p === "darwin") {
-    if (a === "arm64") return "brew install onnxruntime (Apple Silicon)";
-    return "Intel Mac requires manual install — see docs";
+  if (isOrtAutoDownloadSupported()) {
+    if (p === "darwin") return "AFT auto-downloads ONNX Runtime on Apple Silicon";
+    if (p === "linux") return "AFT auto-downloads ONNX Runtime on supported Linux (glibc)";
+    if (p === "win32") return "AFT auto-downloads ONNX Runtime on Windows";
+    return `AFT auto-downloads ONNX Runtime on ${p}/${a}`;
   }
-  if (p === "linux") {
-    if (a === "x64" || a === "arm64") {
-      return "AFT auto-downloads ONNX Runtime on supported Linux (glibc)";
-    }
-    return "manual install required for this Linux arch";
-  }
-  if (p === "win32") {
-    if (a === "x64" || a === "arm64") return "AFT auto-downloads ONNX Runtime on Windows";
-    return "manual install required for this Windows arch";
-  }
+  if (p === "darwin") return "brew install onnxruntime (Intel Mac — no published build)";
+  if (p === "linux") return `manual install required for this Linux arch (${a})`;
+  if (p === "win32") return `manual install required for this Windows arch (${a})`;
   return "ONNX Runtime must be installed manually for this platform";
 }
 
