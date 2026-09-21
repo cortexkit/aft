@@ -34,7 +34,8 @@ import {
 } from "./mock-server.js";
 import {
   assertBashAftExecutionIdentity,
-  assertBashFallbackAskIdentity,
+  assertBashDeadTransportRefusal,
+  assertBashExecutionPathIdentity,
   assertConfigDenyHidesTool,
   assertPermissionPromptObserved,
   controlPlans,
@@ -826,11 +827,15 @@ async function runOneScenario(options: {
     // Ahead of the generic permission assertion: when a bash row's declared
     // execution path (the AFT loop, or the break-glass fallback) is the one
     // that raises its own ask, "which ask is missing" is the more specific
-    // account of the same absence.
-    assertBashFallbackAskIdentity(scenario, {
+    // account of the same absence. A row whose dead transport is declared to
+    // produce a refusal instead has no ask to miss, and the second assertion
+    // is what reads that refusal back out of the model's own view of the call.
+    const bashExecutionPath = {
       resultText: scriptedResultText(scenario, mock.exchanges),
       events: hostEvents?.events ?? [],
-    });
+    };
+    assertBashExecutionPathIdentity(scenario, bashExecutionPath);
+    assertBashDeadTransportRefusal(scenario, bashExecutionPath);
     if (hostEvents) assertPermissionPromptObserved(scenario, hostEvents.events);
     await Promise.all(controlPromises);
     if (

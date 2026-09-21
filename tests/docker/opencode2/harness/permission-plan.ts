@@ -168,7 +168,11 @@ export function assertConfigDenyHidesTool(
  * tool gives its resources.
  *
  * A configured denial is decided before anything is raised, so it declares no
- * events and none are required.
+ * events and none are required. So is a row whose declared outcome is a
+ * refusal: the command is declined before either ask site, so the session's
+ * rule is installed and never consulted. That absence is not taken on trust
+ * here - `assertBashDeadTransportRefusal` asserts that nothing was asked for
+ * that call at all, which is a stronger claim than this one.
  */
 export function assertPermissionPromptObserved(
   scenario: ScenarioDefinition,
@@ -178,6 +182,12 @@ export function assertPermissionPromptObserved(
   const rules = sessionPermissionRules(scenario);
   const reply = permission?.reply;
   if (!rules || (reply !== "once" && reply !== "reject")) return;
+  if (
+    bashPermissionFamily(scenario) === "fallback" &&
+    bashDeadTransportDeclaration(scenario).outcome === "refusal"
+  ) {
+    return;
+  }
   const action = rules[0].action;
   const callId = gatedCallId(scenario);
   if (!callId) {
@@ -250,6 +260,79 @@ function bashPermissionFamily(scenario: ScenarioDefinition): "loop" | "fallback"
   return undefined;
 }
 
+/**
+ * What a fallback row declares its dead transport produces.
+ *
+ * `host_fallback` is the break-glass path executing the command in the host.
+ * `refusal` is bash declining to run it at all, which is the correct outcome
+ * for a transport failure whose result cannot be determined: the command may
+ * already have been sent, and running it again would apply a mutation twice.
+ * `not_dispatched` is the configured denial, settled by the host before the
+ * tool runs, so no transport state is reached.
+ */
+export type BashDeadTransportOutcome = "host_fallback" | "refusal" | "not_dispatched";
+
+export interface BashDeadTransportDeclaration {
+  outcome: BashDeadTransportOutcome;
+  /** Patterns the refusal handed back to the model must all match. */
+  refusalNames: string[];
+  /** `n/a:<reason>` when the row does not exercise break-glass execution. */
+  hostFallbackCoverage?: string;
+}
+
+/**
+ * Read a fallback row's declaration of what its dead transport produces.
+ *
+ * Declared per row rather than derived from the id, because the two are not
+ * the same claim: the id says which path the row configures, and this says
+ * what that path is expected to do on the transport the harness can actually
+ * produce. A row that expects a refusal also has to record why break-glass
+ * execution is not covered instead, so the capability is visibly accounted
+ * for rather than quietly dropped.
+ */
+export function bashDeadTransportDeclaration(
+  scenario: ScenarioDefinition,
+): BashDeadTransportDeclaration {
+  const declared = asRecord(scenario.metadata?.dead_transport);
+  const outcome = declared?.outcome;
+  if (
+    !declared ||
+    (outcome !== "host_fallback" && outcome !== "refusal" && outcome !== "not_dispatched")
+  ) {
+    fail(
+      "scenario_invalid",
+      `${scenario.id}: a fallback row must declare what its dead transport produces`,
+      { declared },
+    );
+  }
+  const refusalNames = Array.isArray(declared.refusal_names)
+    ? declared.refusal_names.filter((name): name is string => typeof name === "string")
+    : [];
+  if (outcome === "refusal" && refusalNames.length === 0) {
+    fail(
+      "scenario_invalid",
+      `${scenario.id}: a refusal row must declare what the refusal has to name`,
+    );
+  }
+  const coverage = declared.host_fallback_coverage;
+  const reason = declared.reason;
+  if (outcome === "refusal" && (typeof coverage !== "string" || !/^n\/a:[^:]+$/.test(coverage))) {
+    fail(
+      "scenario_invalid",
+      `${scenario.id}: a row that refuses instead of falling back must record its break-glass coverage as n/a:<reason>`,
+      { host_fallback_coverage: coverage },
+    );
+  }
+  if (typeof reason !== "string" || reason.length === 0) {
+    fail("scenario_invalid", `${scenario.id}: the declared dead-transport outcome needs a reason`);
+  }
+  return {
+    outcome,
+    refusalNames,
+    hostFallbackCoverage: typeof coverage === "string" ? coverage : undefined,
+  };
+}
+
 /** True when the row's permission answer lets the command run. */
 function bashPermissionAllowed(scenario: ScenarioDefinition): boolean {
   return asRecord(scenario.metadata?.permission)?.reply === "once";
@@ -261,32 +344,45 @@ function bashPermissionAllowed(scenario: ScenarioDefinition): boolean {
  * The two families are selected by declared configuration, and each has its
  * own ask site. The loop family keeps AFT's transport alive, so the engine
  * declares the asks and AFT executes what the answer allows. The fallback
- * family kills that transport, so the only way the command can run is the
- * plugin's break-glass path, which announces itself in the ask it raises
- * ("AFT UNAVAILABLE") and banners the output it returns. A row wearing the
- * other family's mark ran the other path, whatever its file effects look like.
+ * family kills that transport, and what happens next is the row's own
+ * declaration: the break-glass path announces itself in the ask it raises
+ * ("AFT UNAVAILABLE") and banners the output it returns, so a row wearing the
+ * other outcome's mark took the other path, whatever its file effects look
+ * like.
  *
- * A fallback row is asserted to REACH that ask whether its answer allows the
- * command or refuses it: the ask is the site the row exists to cover, and a
- * refusal only means the command was not run after it was raised. The one
- * fallback row that must not see it is the configured denial, which the host
- * settles before the tool is dispatched at all — an ask there would be a way
+ * A fallback row only reaches that ask when the failure is one the product can
+ * prove was never sent. On a transport that cannot say so, running the command
+ * in the host would risk applying it twice, and the mark's ABSENCE is the
+ * outcome under test: the rows that declare `refusal` assert exactly that, and
+ * seeing the mark there is the defect. The configured denial is settled by the
+ * host before the tool is dispatched at all, so a mark there would be a way
  * around the rule rather than the path under test.
  *
  * This half is asserted as soon as the host has finished, before the disk
  * proofs read their snapshots, because a row that took the wrong path makes
  * every later file claim unreadable.
  */
-export function assertBashFallbackAskIdentity(
+export function assertBashExecutionPathIdentity(
   scenario: ScenarioDefinition,
   observed: BashPermissionPathObservation,
 ): void {
   const family = bashPermissionFamily(scenario);
   if (!family) return;
-  const configured = asRecord(scenario.metadata?.permission)?.reply === "config_deny";
   const details = { result_text: observed.resultText.slice(0, 600) };
-  if (!bashHostFallbackObserved(observed)) {
-    if (family === "fallback" && !configured) {
+  const fellBack = bashHostFallbackObserved(observed);
+  if (family === "loop") {
+    if (fellBack) {
+      fail(
+        "no_effect_observed",
+        `${scenario.id}: the loop row fell back to host execution`,
+        details,
+      );
+    }
+    return;
+  }
+  const declared = bashDeadTransportDeclaration(scenario);
+  if (declared.outcome === "host_fallback") {
+    if (!fellBack) {
       fail(
         "no_effect_observed",
         `${scenario.id}: the dead transport raised no host-fallback ask, so bash refused the command instead of falling back`,
@@ -295,14 +391,60 @@ export function assertBashFallbackAskIdentity(
     }
     return;
   }
-  if (family === "loop") {
-    fail("no_effect_observed", `${scenario.id}: the loop row fell back to host execution`, details);
+  if (!fellBack) return;
+  fail(
+    "no_effect_observed",
+    declared.outcome === "refusal"
+      ? `${scenario.id}: bash fell back to host execution after a transport failure whose outcome is undetermined, which can run a command that was already sent`
+      : `${scenario.id}: a rule-denied command raised the host-fallback ask, which would run it anyway`,
+    details,
+  );
+}
+
+/**
+ * Assert that a refusing row refused, in the model's own view of the call.
+ *
+ * Two things make the refusal the right outcome rather than a silent nothing,
+ * and both are read here. No ask was raised at all for the gated call: the
+ * command is declined before either ask site, so neither the engine's
+ * permission loop nor the break-glass prompt was reached, and the session's
+ * standing answer never came into it. And the text the model received names
+ * what was observed - the transport that failed, and the undetermined outcome
+ * that makes re-running it unsafe - rather than a bare failure the agent
+ * cannot act on.
+ *
+ * That the command did not RUN is proven elsewhere, and deliberately not from
+ * this text: the row declares no disk effects, so the whole-tree snapshots
+ * taken around the call refuse any change, and the task rows AFT keeps are
+ * read once its processes have stopped.
+ */
+export function assertBashDeadTransportRefusal(
+  scenario: ScenarioDefinition,
+  observed: BashPermissionPathObservation,
+): void {
+  if (bashPermissionFamily(scenario) !== "fallback") return;
+  const declared = bashDeadTransportDeclaration(scenario);
+  if (declared.outcome !== "refusal") return;
+  const callId = gatedCallId(scenario);
+  if (!callId) {
+    fail("scenario_invalid", `${scenario.id}: permission scenario has no subject tool call`);
   }
-  if (configured) {
+  const asked = observed.events.filter(
+    (event) => event.type === "permission.asked" && asRecord(event.data.source)?.id === callId,
+  );
+  if (asked.length > 0) {
     fail(
       "no_effect_observed",
-      `${scenario.id}: a rule-denied command raised the host-fallback ask, which would run it anyway`,
-      details,
+      `${scenario.id}: the refused call still raised a permission request, so it reached an ask site instead of being declined`,
+      { observed: asked.map((event) => event.data) },
+    );
+  }
+  for (const name of declared.refusalNames) {
+    if (new RegExp(name).test(observed.resultText)) continue;
+    fail(
+      "no_effect_observed",
+      `${scenario.id}: the refusal the model received does not name ${name}`,
+      { result_text: observed.resultText.slice(0, 600) },
     );
   }
 }
@@ -313,6 +455,11 @@ export function assertBashFallbackAskIdentity(
  * The other half of the path identity above, and the half that has to wait
  * until the run is over: the task rows are read from AFT's own database once
  * its processes have been confirmed stopped.
+ *
+ * For a fallback row this is process-state evidence that AFT ran nothing, and
+ * only that: the break-glass path runs the command in the host and leaves no
+ * task row either, so what separates a refusal from a host execution is the
+ * unchanged fixture tree, not this.
  *
  * The loop rows used to require the pair `permission_required` -> `retry` in
  * the plugin log instead. Nothing writes those words to that log:

@@ -365,7 +365,7 @@
       "trajectory": "T3",
       "auto": true,
       "execution": "shared-server",
-      "prompt": "Allow the fallback bash permission path and restore its created file.",
+      "prompt": "Run the fallback bash path in a session that approves the asks it is shown.",
       "fixture": "./fixture",
       "project_config": {
         "bash": {
@@ -374,29 +374,7 @@
       },
       "turns": [
         {
-          "label": "checkpoint",
-          "response": {
-            "kind": "tool_calls",
-            "calls": [
-              {
-                "id": "bash-fallback-checkpoint",
-                "name": "aft_safety",
-                "arguments": {
-                  "op": "checkpoint",
-                  "name": "bash-fallback-t3",
-                  "files": [
-                    "bash-fallback.txt"
-                  ]
-                },
-                "non_mutating_evidence": {
-                  "reason": "checkpoint creation leaves fixture bytes unchanged"
-                }
-              }
-            ]
-          }
-        },
-        {
-          "label": "mutate",
+          "label": "call-tool",
           "response": {
             "kind": "tool_calls",
             "calls": [
@@ -406,28 +384,9 @@
                 "arguments": {
                   "command": "printf 'fallback permission fixture\\n' > bash-fallback.txt"
                 },
-                "disk_effects": [
-                  "bash-fallback.txt"
-                ]
-              }
-            ]
-          }
-        },
-        {
-          "label": "restore",
-          "response": {
-            "kind": "tool_calls",
-            "calls": [
-              {
-                "id": "bash-fallback-restore",
-                "name": "aft_safety",
-                "arguments": {
-                  "op": "restore",
-                  "name": "bash-fallback-t3"
-                },
-                "disk_effects": [
-                  "bash-fallback.txt"
-                ]
+                "non_mutating_evidence": {
+                  "reason": "the refused command never runs, so bash-fallback.txt keeps its fixture bytes and the whole-tree snapshot stays unchanged"
+                }
               }
             ]
           }
@@ -441,51 +400,22 @@
         }
       ],
       "expected_turns": [
-        "checkpoint",
-        "mutate",
-        "restore",
+        "call-tool",
         "finish"
       ],
-      "restore_evidence": {
-        "operation": "checkpoint_restore",
-        "identifier": "bash-fallback-t3",
-        "calls": [
-          {
-            "tool": "aft_safety",
-            "arguments": {
-              "op": "checkpoint",
-              "name": "bash-fallback-t3",
-              "files": [
-                "bash-fallback.txt"
-              ]
-            }
-          },
-          {
-            "tool": "bash",
-            "arguments": {
-              "command": "printf 'fallback permission fixture\\n' > bash-fallback.txt"
-            }
-          },
-          {
-            "tool": "aft_safety",
-            "arguments": {
-              "op": "restore",
-              "name": "bash-fallback-t3"
-            }
-          }
-        ],
-        "paths": [
-          {
-            "path": "bash-fallback.txt",
-            "transition": "edit",
-            "expected_intermediate_sha256": "67d0e4331da22521cdc1b8c8c535b22b5b32a7c89d45aba4b61b525e78aa5af8"
-          }
-        ]
-      },
       "metadata": {
         "permission": {
           "operation": "bash:host-fallback",
           "reply": "once"
+        },
+        "dead_transport": {
+          "outcome": "refusal",
+          "refusal_names": [
+            "Binary (crashed|killed)",
+            "outcome is UNKNOWN"
+          ],
+          "host_fallback_coverage": "n/a:standalone-transport-reports-every-failure-as-unknown-outcome",
+          "reason": "bash.host_fallback may only run a command the transport provably never sent. The standalone bridge cannot report that: it writes the request to the binary it spawned, so when that binary crashes or is killed the outcome is unknown, and bash refuses rather than risk running the command twice. The shapes the classifier does admit - module down, bind timed out, route closed before dispatch - are daemon-transport replies, and this harness drives the standalone bridge through AFT_BINARY_PATH. Break-glass execution therefore has no coverage on this transport; covering it needs a harness that runs the daemon transport."
         }
       }
     },
@@ -495,7 +425,7 @@
       "tool": "bash",
       "trajectory": "T3",
       "execution": "shared-server",
-      "prompt": "Deny the fallback bash permission path.",
+      "prompt": "Run the fallback bash path in a session that refuses the asks it is shown.",
       "fixture": "./fixture",
       "project_config": {
         "bash": {
@@ -515,25 +445,38 @@
                   "command": "printf 'fallback permission fixture\\n' > bash-fallback.txt"
                 },
                 "non_mutating_evidence": {
-                  "reason": "reject prevents the bash write"
+                  "reason": "the refused command never runs, so bash-fallback.txt keeps its fixture bytes and the whole-tree snapshot stays unchanged"
                 }
               }
             ]
           }
+        },
+        {
+          "label": "finish",
+          "response": {
+            "kind": "text",
+            "content": "done"
+          }
         }
       ],
       "expected_turns": [
-        "call-tool"
+        "call-tool",
+        "finish"
       ],
       "metadata": {
         "permission": {
           "operation": "bash:host-fallback",
           "reply": "reject"
         },
-        "accepted_exit_codes": [
-          0,
-          1
-        ]
+        "dead_transport": {
+          "outcome": "refusal",
+          "refusal_names": [
+            "Binary (crashed|killed)",
+            "outcome is UNKNOWN"
+          ],
+          "host_fallback_coverage": "n/a:standalone-transport-reports-every-failure-as-unknown-outcome",
+          "reason": "Same transport, opposite permission posture: this session would refuse any ask it were shown. Neither posture reaches an ask, because bash refuses the command before either ask site, which is what makes the refusal a property of the transport failure rather than of the answer. See the allow row for why no admitted shape is reachable here."
+        }
       }
     },
     {
@@ -584,6 +527,10 @@
         "permission": {
           "operation": "bash:host-fallback",
           "reply": "config_deny"
+        },
+        "dead_transport": {
+          "outcome": "not_dispatched",
+          "reason": "The session's rule denies bash outright, so the host settles the call before the tool is dispatched and the dead transport is never reached. An ask from the break-glass path here would be a way around the rule."
         }
       }
     },

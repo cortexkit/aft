@@ -3,7 +3,8 @@ import { resolve } from "node:path";
 import type { HostEvent } from "../../harness/event-stream.js";
 import {
   assertBashAftExecutionIdentity,
-  assertBashFallbackAskIdentity,
+  assertBashDeadTransportRefusal,
+  assertBashExecutionPathIdentity,
   assertConfigDenyHidesTool,
   HOST_FALLBACK_ASK_MARKER,
   HOST_FALLBACK_OUTPUT_MARKER,
@@ -37,6 +38,20 @@ function exchange(label: string, offeredTools: readonly string[]): RecordedMockE
 function askedFor(text: string): HostEvent {
   return { type: "permission.asked", data: { action: "bash", resources: [text] } };
 }
+
+/**
+ * What the plugin hands the model when the standalone transport dies.
+ *
+ * The bridge writes the request to the binary it spawned, so a binary that
+ * then crashes or is killed leaves the outcome undetermined; the message
+ * carries that disposition, and it is the whole reason bash refuses rather
+ * than re-running the command in the host.
+ */
+const refusal =
+  "[aft-plugin] Binary crashed (restarts: 0): spawn aft-removed ENOENT (see plugin.log) " +
+  "The standalone AFT transport failed after this call may have been sent, so its outcome is " +
+  "UNKNOWN: it may or may not have executed. Verify actual state before re-running, and never " +
+  "blind-retry a mutation.";
 
 describe("bash OpenCode 2 scenarios", () => {
   test("load through the harness loader and satisfy the slice validator", async () => {
@@ -94,10 +109,10 @@ describe("a configured denial hides the tool it names", () => {
   });
 });
 
-describe("the break-glass ask belongs to the fallback path alone", () => {
+describe("the break-glass ask belongs to the path that can prove the command was never sent", () => {
   test("a loop row that fell back to host execution is the wrong path", () => {
     expect(() =>
-      assertBashFallbackAskIdentity(scenario("bash/T3/loop_ask_allow"), {
+      assertBashExecutionPathIdentity(scenario("bash/T3/loop_ask_allow"), {
         resultText: `${HOST_FALLBACK_OUTPUT_MARKER} - module transport down]\nok`,
         events: [],
       }),
@@ -106,56 +121,154 @@ describe("the break-glass ask belongs to the fallback path alone", () => {
 
   test("a rule-denied row that raised the break-glass ask found a way around the denial", () => {
     expect(() =>
-      assertBashFallbackAskIdentity(scenario("bash/T3/fallback_config_deny"), {
+      assertBashExecutionPathIdentity(scenario("bash/T3/fallback_config_deny"), {
         resultText: "",
         events: [askedFor(`${HOST_FALLBACK_ASK_MARKER} (transport down) - host fallback`)],
       }),
     ).toThrow("raised the host-fallback ask");
   });
 
-  test("a refused fallback row still has to reach the ask it refuses", () => {
-    expect(() =>
-      assertBashFallbackAskIdentity(scenario("bash/T3/fallback_ask_deny"), {
-        resultText: "[aft-bridge] Binary crashed (restarts: 0)",
-        events: [],
-      }),
-    ).toThrow("raised no host-fallback ask");
-  });
-
   test("a rule-denied fallback row needs no ask, because the host never dispatches the tool", () => {
     expect(() =>
-      assertBashFallbackAskIdentity(scenario("bash/T3/fallback_config_deny"), {
+      assertBashExecutionPathIdentity(scenario("bash/T3/fallback_config_deny"), {
         resultText: "Permission denied: this session's permission rules deny bash",
         events: [],
       }),
     ).not.toThrow();
   });
 
-  test("an allowed fallback row that raised no break-glass ask never reached the path", () => {
-    expect(() =>
-      assertBashFallbackAskIdentity(scenario("bash/T3/fallback_ask_allow"), {
-        resultText: "[aft-bridge] Binary crashed (restarts: 0)",
-        events: [],
-      }),
-    ).toThrow("raised no host-fallback ask");
+  test("a row declaring a refusal accepts the absence of the mark, under either answer", () => {
+    for (const id of ["bash/T3/fallback_ask_allow", "bash/T3/fallback_ask_deny"]) {
+      expect(() =>
+        assertBashExecutionPathIdentity(scenario(id), { resultText: refusal, events: [] }),
+      ).not.toThrow();
+    }
   });
 
-  test("an allowed fallback row that raised the ask reached the break-glass path", () => {
+  test("a row declaring a refusal refuses the mark: the command may already have been sent", () => {
+    for (const id of ["bash/T3/fallback_ask_allow", "bash/T3/fallback_ask_deny"]) {
+      expect(() =>
+        assertBashExecutionPathIdentity(scenario(id), {
+          resultText: `${HOST_FALLBACK_OUTPUT_MARKER} - transport down]\nfallback permission fixture`,
+          events: [],
+        }),
+      ).toThrow("which can run a command that was already sent");
+    }
+  });
+
+  test("a row declaring the break-glass path still has to reach its ask", () => {
+    const declared = scenario("bash/T3/fallback_ask_allow");
+    const exercised: ScenarioDefinition = {
+      ...declared,
+      metadata: {
+        ...declared.metadata,
+        dead_transport: { outcome: "host_fallback", reason: "an admitted pre-dispatch failure" },
+      },
+    };
+
     expect(() =>
-      assertBashFallbackAskIdentity(scenario("bash/T3/fallback_ask_allow"), {
+      assertBashExecutionPathIdentity(exercised, { resultText: refusal, events: [] }),
+    ).toThrow("raised no host-fallback ask");
+    expect(() =>
+      assertBashExecutionPathIdentity(exercised, {
         resultText: "",
-        events: [askedFor(`${HOST_FALLBACK_ASK_MARKER} (transport down) - host fallback`)],
+        events: [askedFor(`${HOST_FALLBACK_ASK_MARKER} (module down) - host fallback`)],
       }),
     ).not.toThrow();
   });
 
   test("a loop row with neither mark ran through AFT, as its configuration declares", () => {
     expect(() =>
-      assertBashFallbackAskIdentity(scenario("bash/T3/loop_ask_allow"), {
+      assertBashExecutionPathIdentity(scenario("bash/T3/loop_ask_allow"), {
         resultText: "loop permission fixture",
         events: [askedFor("printf 'loop permission fixture' > bash-loop.txt")],
       }),
     ).not.toThrow();
+  });
+
+  test("a fallback row must say what its dead transport produces", () => {
+    const declared = scenario("bash/T3/fallback_ask_deny");
+    const undeclared: ScenarioDefinition = {
+      ...declared,
+      metadata: { permission: declared.metadata?.permission },
+    };
+
+    expect(() =>
+      assertBashExecutionPathIdentity(undeclared, { resultText: refusal, events: [] }),
+    ).toThrow("must declare what its dead transport produces");
+  });
+
+  test("a refusing row must record why break-glass execution is not covered instead", () => {
+    const declared = scenario("bash/T3/fallback_ask_deny");
+    const unrecorded: ScenarioDefinition = {
+      ...declared,
+      metadata: {
+        ...declared.metadata,
+        dead_transport: {
+          outcome: "refusal",
+          refusal_names: ["outcome is UNKNOWN"],
+          reason: "the transport cannot say the command was never sent",
+        },
+      },
+    };
+
+    expect(() =>
+      assertBashExecutionPathIdentity(unrecorded, { resultText: refusal, events: [] }),
+    ).toThrow("n/a:<reason>");
+  });
+});
+
+describe("a refusing row refused, in the model's own view of the call", () => {
+  test("the refusal names the transport that failed and the outcome nobody can determine", () => {
+    for (const id of ["bash/T3/fallback_ask_allow", "bash/T3/fallback_ask_deny"]) {
+      expect(() =>
+        assertBashDeadTransportRefusal(scenario(id), { resultText: refusal, events: [] }),
+      ).not.toThrow();
+    }
+  });
+
+  test("a bare transport failure leaves the agent with nothing to act on", () => {
+    expect(() =>
+      assertBashDeadTransportRefusal(scenario("bash/T3/fallback_ask_allow"), {
+        resultText: "[aft-plugin] Binary crashed (restarts: 0): spawn aft-removed ENOENT",
+        events: [],
+      }),
+    ).toThrow("does not name outcome is UNKNOWN");
+  });
+
+  test("a refusal that names no observed failure could be any refusal at all", () => {
+    expect(() =>
+      assertBashDeadTransportRefusal(scenario("bash/T3/fallback_ask_allow"), {
+        resultText: "bash failed",
+        events: [],
+      }),
+    ).toThrow("does not name Binary (crashed|killed)");
+  });
+
+  test("an ask raised by the refused call means it reached an ask site", () => {
+    expect(() =>
+      assertBashDeadTransportRefusal(scenario("bash/T3/fallback_ask_deny"), {
+        resultText: refusal,
+        events: [
+          {
+            type: "permission.asked",
+            data: {
+              action: "bash",
+              resources: ["printf 'fallback permission fixture' > bash-fallback.txt"],
+              source: { id: "bash-fallback-ask_deny" },
+            },
+          },
+        ],
+      }),
+    ).toThrow("still raised a permission request");
+  });
+
+  test("says nothing about the rows that declare another outcome", () => {
+    for (const id of ["bash/T3/fallback_config_deny", "bash/T3/loop_ask_allow"]) {
+      expect(() =>
+        assertBashDeadTransportRefusal(scenario(id), { resultText: "", events: [] }),
+      ).not.toThrow();
+    }
   });
 });
 
