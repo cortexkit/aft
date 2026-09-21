@@ -126,18 +126,48 @@ def display_path(path: str | Path) -> str:
         return str(path)
 
 
+ORT_VERSION = "1.24.4"
+
+
+def ort_library_name(platform: Optional[str] = None) -> str:
+    """File name of the ONNX Runtime shared library on `platform`."""
+    platform = platform or sys.platform
+    if platform == "darwin":
+        return "libonnxruntime.dylib"
+    if platform.startswith("win") or platform == "cygwin":
+        return "onnxruntime.dll"
+    return "libonnxruntime.so"
+
+
+def ort_library_candidates(
+    platform: Optional[str] = None,
+    environ: Optional[Dict[str, str]] = None,
+) -> List[Path]:
+    """Where the managed ONNX Runtime is installed, per platform.
+
+    The managed runtime lives under the platform's own user data directory and
+    its file name differs on each one, so this is the single place in the
+    benchmark that has to know which platform it is running on.
+    """
+    platform = platform or sys.platform
+    environ = os.environ if environ is None else environ
+    lib_name = ort_library_name(platform)
+    if platform.startswith("win") or platform == "cygwin":
+        local_app_data = environ.get("LOCALAPPDATA") or str(Path.home() / "AppData/Local")
+        return [Path(local_app_data) / "cortexkit/aft/onnxruntime" / ORT_VERSION / lib_name]
+    return [
+        Path.home() / ".local/share/cortexkit/aft/onnxruntime" / ORT_VERSION / lib_name,
+        Path.home() / "Library/Application Support/cortexkit/aft/onnxruntime" / ORT_VERSION / lib_name,
+        Path("/opt/homebrew/lib") / lib_name,
+        Path("/usr/local/lib") / lib_name,
+    ]
+
+
 def ensure_ort_env() -> JsonObject:
     if os.environ.get("ORT_DYLIB_PATH"):
         return {"source": "env", "ort_dylib_path": display_path(os.environ["ORT_DYLIB_PATH"])}
 
-    lib_name = "libonnxruntime.dylib" if sys.platform == "darwin" else "libonnxruntime.so"
-    candidates = [
-        Path.home() / ".local/share/cortexkit/aft/onnxruntime/1.24.4" / lib_name,
-        Path.home() / "Library/Application Support/cortexkit/aft/onnxruntime/1.24.4" / lib_name,
-        Path("/opt/homebrew/lib") / lib_name,
-        Path("/usr/local/lib") / lib_name,
-    ]
-    for candidate in candidates:
+    for candidate in ort_library_candidates():
         if candidate.exists():
             os.environ["ORT_DYLIB_PATH"] = str(candidate)
             return {"source": "auto", "ort_dylib_path": display_path(candidate)}
