@@ -136,6 +136,11 @@ export class AftRpcServer {
 
     this.bunServer = server;
     this.port = server.port ?? 0;
+    // Match startNode's unref: the RPC server is a side channel and must not be
+    // the reason a one-shot run refuses to end. Bun added unref() on its server
+    // after this code was written, so guard for older runtimes rather than
+    // assume it; a runtime without it keeps the previous behaviour.
+    (server as { unref?: () => void }).unref?.();
     this.afterServerStarted();
     return this.port;
   }
