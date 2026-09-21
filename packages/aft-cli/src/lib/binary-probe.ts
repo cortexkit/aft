@@ -1,9 +1,9 @@
 import { execSync, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { isNativeExecutable } from "@cortexkit/aft-bridge";
+import { compareSemver, isNativeExecutable } from "@cortexkit/aft-bridge";
 import { getAftBinaryCacheDir, getAftBinaryName } from "./paths.js";
 
 async function loadPluginVersion(): Promise<string> {
@@ -185,11 +185,55 @@ export function platformKey(
   return table[platform]?.[arch] ?? null;
 }
 
+/** The `v<semver>` directory names `aft doctor --fix` creates in the binary cache. */
+const CACHE_VERSION_DIR = /^v(\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/;
+
+/**
+ * Newest binary cached under `<cache>/v<semver>/<name>`.
+ *
+ * Versions are compared semantically, not lexically or by mtime: `v0.9.0` must
+ * not beat `v0.10.0`, and a leftover `v0.0.0` directory must not win by sorting.
+ * Only directories that actually hold the binary are considered, so an
+ * interrupted download cannot shadow a complete older install.
+ */
+function newestCachedBinary(cacheDir: string, binaryName: string): string | null {
+  let entries: string[];
+  try {
+    entries = readdirSync(cacheDir);
+  } catch {
+    // Cache directory absent or unreadable — nothing has been installed here.
+    return null;
+  }
+
+  let best: { version: string; path: string } | null = null;
+  for (const entry of entries) {
+    const version = entry.match(CACHE_VERSION_DIR)?.[1];
+    if (!version) continue;
+    const path = join(cacheDir, entry, binaryName);
+    try {
+      if (!existsSync(path)) continue;
+    } catch {
+      continue;
+    }
+    if (!best || compareSemver(version, best.version) > 0) best = { version, path };
+  }
+  return best?.path ?? null;
+}
+
 function aftBinaryCandidates(preferredVersion?: string): string[] {
   const candidates: string[] = [];
+  const cacheDir = getAftBinaryCacheDir();
+  const binaryName = getAftBinaryName();
   if (preferredVersion) {
     const tag = preferredVersion.startsWith("v") ? preferredVersion : `v${preferredVersion}`;
-    pushCandidate(candidates, join(getAftBinaryCacheDir(), tag, getAftBinaryName()));
+    pushCandidate(candidates, join(cacheDir, tag, binaryName));
+  } else {
+    // The cache is where `aft doctor --fix` downloads to, so it is searched
+    // even when the caller names no version. Skipping it meant that on a
+    // machine with no other install source — no platform package, no `aft` on
+    // PATH, no cargo install — a successful `doctor --fix` was invisible to
+    // the very next command.
+    pushCandidate(candidates, newestCachedBinary(cacheDir, binaryName));
   }
 
   const key = platformKey();
