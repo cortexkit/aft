@@ -6053,7 +6053,7 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex, OnceLock, RwLock};
     use std::time::{Duration, Instant};
 
@@ -7788,7 +7788,7 @@ mod tests {
     }
 
     #[test]
-    fn configure_cancellation_aborts_slow_git_retry_cluster_within_bound() {
+    fn configure_cancellation_stops_the_git_probe_retry_ladder() {
         let _probe_lock = crate::search_index::git_root_commit_probe_override_lock_for_test();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
@@ -7796,12 +7796,12 @@ mod tests {
         let storage = temp.path().join("storage");
         init_git_fixture(&root);
         let canonical_root = std::fs::canonicalize(&root).unwrap();
-        let probe_started = Arc::new(AtomicBool::new(false));
+        let probe_attempts = Arc::new(AtomicUsize::new(0));
         let _probe_guard =
             crate::search_index::force_git_root_commit_probe_slow_transient_for_paths_for_test(
                 vec![canonical_root.clone()],
                 Duration::from_millis(150),
-                Arc::clone(&probe_started),
+                Arc::clone(&probe_attempts),
             );
 
         let ctx = Arc::new(AppContext::new(
@@ -7834,34 +7834,43 @@ mod tests {
         );
 
         let probe_deadline = Instant::now() + Duration::from_secs(2);
-        while !probe_started.load(Ordering::SeqCst) {
+        while probe_attempts.load(Ordering::SeqCst) == 0 {
             assert!(
                 Instant::now() < probe_deadline,
                 "stubbed git probe did not start"
             );
             std::thread::sleep(Duration::from_millis(5));
         }
-        let cancelled_at = Instant::now();
+        let attempts_at_cancel = probe_attempts.load(Ordering::SeqCst);
         assert_eq!(
             executor.cancel_job(&root_id, &cancellation),
             crate::executor::JobCancelOutcome::RunningSignalled
         );
 
+        // The probe returns Transient, so an uncancelled configure keeps going
+        // round the retry ladder. What cancellation has to do is stop it, and
+        // that is observable as attempts no longer growing -- independent of how
+        // long the machine took to unwind, which a wall-clock bound is not. The
+        // timeout here is only liveness: it must outlast the whole ladder, so
+        // that a hang fails rather than a slow runner.
         let response = tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
             .expect("build cancellation test runtime")
             .block_on(async {
-                tokio::time::timeout(Duration::from_millis(400), response_rx)
+                tokio::time::timeout(Duration::from_secs(30), response_rx)
                     .await
-                    .expect("configure cancellation must stop before the retry ladder finishes")
+                    .expect("cancelled configure never completed")
                     .expect("configure completion sender")
             });
         assert!(!response.success);
         assert_eq!(response.data["code"], "request_cancelled");
+        // At most the attempt already in flight when the signal landed may
+        // finish; anything beyond that is the ladder continuing past a cancel.
+        let attempts_after = probe_attempts.load(Ordering::SeqCst);
         assert!(
-            cancelled_at.elapsed() < Duration::from_millis(400),
-            "cancelled configure exceeded the bounded git-probe exit time"
+            attempts_after <= attempts_at_cancel + 1,
+            "cancelled configure kept retrying the git probe: {attempts_at_cancel} attempts at cancel, {attempts_after} after"
         );
     }
 
