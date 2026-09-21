@@ -35,7 +35,7 @@ CSV_FIELDS = (
     "callgraph_status", "search_wall_ms", "search_first_query_ms", "callgraph_wall_ms",
     "callgraph_first_query_ms", "callgraph_resolution_share_pct", "search_superseded", "search_failed", "search_suspended",
     "callgraph_superseded", "callgraph_failed", "callgraph_suspended", "waiting_on",
-    "peak_rss_mb", "cpu_s", "disk_write_bytes", "outcome", "log_path", "gaps",
+    "peak_rss_mb", "peak_rss_hwm_mb", "cpu_s", "disk_write_bytes", "outcome", "log_path", "gaps",
 )
 TEXT_SUFFIXES = {
     ".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js", ".jsx", ".kt",
@@ -134,6 +134,13 @@ class NdjsonClient:
 class ProcessSampler:
     proc: subprocess.Popen[bytes]
     peak_rss_kb: int = 0
+    # The kernel's own high-water mark, recorded beside the sampled maximum.
+    # peak_rss_kb is the largest value a two-second poll happened to see, so it
+    # can only ever be at or below the true peak, and a short-lived spike
+    # between two polls is invisible to it. VmHWM is exact and monotonic, which
+    # makes the difference between the two a direct measure of how much the
+    # poll missed. Linux only, which is the only platform this gate compares on.
+    peak_rss_hwm_kb: int = 0
     cpu_seconds: float = 0.0
     disk_write_bytes: int | None = None
     gaps: list[str] = field(default_factory=list)
@@ -178,6 +185,16 @@ class ProcessSampler:
             if "ps resource sampling unavailable" not in self.gaps:
                 self.gaps.append("ps resource sampling unavailable")
         if sys.platform.startswith("linux"):
+            try:
+                # Read while the process is alive: /proc entries vanish on exit,
+                # and the caller closes the client before stopping the sampler.
+                for line in Path(f"/proc/{self.proc.pid}/status").read_text(encoding="utf-8").splitlines():
+                    if line.startswith("VmHWM:"):
+                        self.peak_rss_hwm_kb = max(self.peak_rss_hwm_kb, int(line.split()[1]))
+                        break
+            except (OSError, ValueError, IndexError):
+                if "peak RSS high-water mark unavailable: /proc/<pid>/status" not in self.gaps:
+                    self.gaps.append("peak RSS high-water mark unavailable: /proc/<pid>/status")
             try:
                 for line in Path(f"/proc/{self.proc.pid}/io").read_text(encoding="utf-8").splitlines():
                     if line.startswith("write_bytes:"):
@@ -481,6 +498,7 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
             sampler.stop()
             gaps.extend(sampler.gaps)
             row["peak_rss_mb"] = f"{sampler.peak_rss_kb / 1024:.1f}"
+            row["peak_rss_hwm_mb"] = f"{sampler.peak_rss_hwm_kb / 1024:.1f}" if sampler.peak_rss_hwm_kb else "n/a"
             row["cpu_s"] = f"{sampler.cpu_seconds:.2f}"
             row["disk_write_bytes"] = str(sampler.disk_write_bytes) if sampler.disk_write_bytes is not None else "n/a"
     metrics = census_metrics(script_dir, root, storage, git, gaps)

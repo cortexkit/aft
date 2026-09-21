@@ -666,6 +666,13 @@ def observation_line(repo: str, runs: list[RunData]) -> str:
             value = run.metrics.get(metric) if run.ready else None
             values.append("n/a" if value is None else f"{value:g}")
         parts.append(f"{metric}={'/'.join(values)}")
+    # Read straight from the CSV row rather than through row_metrics, so this
+    # stays a recorded observation: anything row_metrics returns is eligible to
+    # be written into a future baseline by repo_metrics_from_runs, and would
+    # then silently acquire a tolerance and start gating.
+    hwm = [run.row.get("peak_rss_hwm_mb", "n/a") or "n/a" for run in runs if run.ready]
+    if any(value != "n/a" for value in hwm):
+        parts.append(f"peak_rss_hwm_mb(ungated)={'/'.join(hwm)}")
     return f"OBSERVED {repo}: " + " ".join(parts)
 
 
@@ -720,20 +727,20 @@ def self_test() -> int:
         csv_path = temporary / "synthetic.csv"
         fields = [
             "repo", "outcome", "search_wall_ms", "callgraph_wall_ms",
-            "callgraph_resolution_share_pct", "peak_rss_mb", "cpu_s",
+            "callgraph_resolution_share_pct", "peak_rss_mb", "peak_rss_hwm_mb", "cpu_s",
             "search_first_query_ms", "callgraph_first_query_ms", "waiting_on", "log_path",
         ]
         rows = [
             {
                 "repo": "fixture", "outcome": "ready", "search_wall_ms": "1/140/140",
                 "callgraph_wall_ms": "1/126/126", "callgraph_resolution_share_pct": "1/11/11",
-                "peak_rss_mb": "119", "cpu_s": "13", "search_first_query_ms": "1/126/126",
+                "peak_rss_mb": "119", "peak_rss_hwm_mb": "171", "cpu_s": "13", "search_first_query_ms": "1/126/126",
                 "callgraph_first_query_ms": "1/90/90", "waiting_on": "build=1", "log_path": "",
             },
             {
                 "repo": "fixture", "outcome": "ready", "search_wall_ms": "1/130/130",
                 "callgraph_wall_ms": "1/126/126", "callgraph_resolution_share_pct": "1/11/11",
-                "peak_rss_mb": "118", "cpu_s": "12", "search_first_query_ms": "1/127/127",
+                "peak_rss_mb": "118", "peak_rss_hwm_mb": "170", "cpu_s": "12", "search_first_query_ms": "1/127/127",
                 "callgraph_first_query_ms": "1/91/91", "waiting_on": "build=1", "log_path": "",
             },
         ]
@@ -802,6 +809,11 @@ def self_test() -> int:
         assert "peak_rss_mb=119/118" in line, line
         assert "cpu_seconds=13/12" in line, line
         assert observation_line("fixture", []) == "OBSERVED fixture: no ready run"
+        # The high-water mark is recorded beside the sampled peak, and must stay
+        # out of the gate: it has no baseline and must not acquire one.
+        assert "peak_rss_hwm_mb(ungated)=171/170" in line, line
+        blessed = repo_metrics_from_runs("fixture", baseline_from_file, runs)
+        assert "peak_rss_hwm_mb" not in blessed, sorted(blessed)
 
         print("cost-gate self-test metrics: pass=6 fail=3")
         print("cost-gate self-test passed")
