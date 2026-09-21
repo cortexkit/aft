@@ -572,7 +572,8 @@
           "response": {
             "kind": "text",
             "content": "Waiting for the completion wake."
-          }
+          },
+          "delay_ms": 12000
         },
         {
           "label": "wake-observed",
@@ -674,7 +675,8 @@
           "response": {
             "kind": "text",
             "content": "Waiting for the watch delivery."
-          }
+          },
+          "delay_ms": 12000
         },
         {
           "label": "finish-watch",
