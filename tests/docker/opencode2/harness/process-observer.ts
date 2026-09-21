@@ -51,6 +51,24 @@ export function processGroupAlive(pgid: number): boolean {
   }
 }
 
+/**
+ * Whether a task could still be writing.
+ *
+ * A task row's status is written by the AFT daemon, and the daemon does not
+ * outlive the host: a task deliberately left running past the end of a run —
+ * the ones a scenario marks `outlives_result` — keeps the status it had when
+ * the daemon went away, however thoroughly the harness has since killed it.
+ * Waiting for that field to say `cancelled` waits forever. The process group
+ * is the thing the check is actually about, and the harness can read it
+ * directly, so a row whose group is gone counts as stopped whatever its
+ * status says. A task with no recorded group cannot be shown to have stopped,
+ * so it counts as running.
+ */
+function taskStopped(task: TaskState): boolean {
+  if (TERMINAL_TASK_STATES.has(task.status)) return true;
+  return task.pgid !== undefined && !processGroupAlive(task.pgid);
+}
+
 export class ProcessObserver {
   readonly scenario: string;
   readonly processes: TrackedProcess[] = [];
@@ -112,7 +130,7 @@ export class ProcessObserver {
     let tasks: TaskState[] = [];
     for (;;) {
       tasks = (await this.taskProbe?.states()) ?? [];
-      const tasksStopped = tasks.every((task) => TERMINAL_TASK_STATES.has(task.status));
+      const tasksStopped = tasks.every((task) => taskStopped(task));
       const processesStopped = this.processes.every((processRecord) => {
         const stopped = !processGroupAlive(processRecord.pgid);
         if (stopped) processRecord.terminal = true;
