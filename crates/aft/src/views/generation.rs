@@ -476,6 +476,23 @@ mod tests {
             0,
             "an unknowable TRUNCATE quantity must not receive guessed credit"
         );
+        // The residual label is recorded when the accounting window closes, which
+        // happens after the WAL is truncated and the keeper connection is dropped.
+        // A zero-length WAL therefore does not yet prove the seam was credited, so
+        // wait on the label itself rather than on a proxy for it.
+        while !crate::write_ledger::seam_labels_for_test(
+            crate::write_ledger::Domain::Other,
+            &source.parent().unwrap().display().to_string(),
+        )
+        .iter()
+        .any(|label| label == DERIVED_CHECKPOINT_RESIDUAL)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "detached derived checkpoint never recorded its residual seam label"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(crate::write_ledger::seam_labels_for_test(
             crate::write_ledger::Domain::Other,
             &source.parent().unwrap().display().to_string(),
