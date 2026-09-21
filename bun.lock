@@ -38,7 +38,7 @@
       },
       "dependencies": {
         "@clack/prompts": "^1.6.0",
-        "@cortexkit/aft-bridge": "0.56.2",
+        "@cortexkit/aft-bridge": "0.57.0",
         "comment-json": "^4.6.2",
       },
       "devDependencies": {
