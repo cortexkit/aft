@@ -295,8 +295,24 @@ describe("health sentinel pure detectors", () => {
   });
 
   test("process footprint, cpu, and write rate are independent", () => {
-    const state: SentinelState = { findings: {}, previous: { sampled_at_ms: NOW - 3_600_000, bytes_written: 0 } };
+    // The write rate now needs a prior window already over the ceiling, because
+    // one hard-writing window is a build rather than a regression.
+    const state: SentinelState = { findings: {}, previous: { sampled_at_ms: NOW - 3_600_000, bytes_written: 0, write_rate_runs: 1 } };
     expect(rules(detectProcess(sample({ process: { pid: 42, phys_footprint_bytes: 7 * 1024 ** 3, cpu_percent: 151, bytes_written: 2 * 1024 ** 3 } }), state))).toEqual(expect.arrayContaining(["process.footprint", "process.cpu", "process.writes"]));
+  });
+
+  test("one window over the write ceiling is a burst, two consecutive is a regression", () => {
+    const busy = { pid: 42, bytes_written: 2 * 1024 ** 3 };
+    const firstWindow: SentinelState = { findings: {}, previous: { sampled_at_ms: NOW - 3_600_000, bytes_written: 0 } };
+    expect(rules(detectProcess(sample({ process: busy }), firstWindow))).not.toContain("process.writes");
+
+    const secondWindow: SentinelState = { findings: {}, previous: { sampled_at_ms: NOW - 3_600_000, bytes_written: 0, write_rate_runs: 1 } };
+    expect(rules(detectProcess(sample({ process: busy }), secondWindow))).toContain("process.writes");
+
+    // A quiet window clears the streak, so a later burst starts over rather
+    // than firing on the strength of an unrelated build an hour ago.
+    const quiet: SentinelState = { findings: {}, previous: { sampled_at_ms: NOW - 3_600_000, bytes_written: 2 * 1024 ** 3, write_rate_runs: 1 } };
+    expect(rules(detectProcess(sample({ process: busy }), quiet))).not.toContain("process.writes");
   });
 
   test("degraded search ratio and slow-call count are root scoped", () => {

@@ -53,7 +53,7 @@ export type SentinelState = {
   findings: FindingLedger;
   log?: { path?: string; offset?: number; size?: number };
   plugin_log?: { path?: string; offset?: number; size?: number };
-  previous?: { pid?: number; unreachable_runs?: number; sampled_at_ms?: number; bytes_written?: number; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; watcher?: Record<string, [number, number]> };
+  previous?: { pid?: number; unreachable_runs?: number; sampled_at_ms?: number; bytes_written?: number; write_rate_runs?: number; sizes?: Record<string, number>; artifact_sizes?: Record<string, number>; watcher?: Record<string, [number, number]> };
 };
 
 const HOME = homedir();
@@ -378,6 +378,27 @@ export function writeGrowthAttribution(sample: SentinelSample, state: SentinelSt
   return lines.length > 0 ? `\n${lines.join("\n")}` : "\nremainder: in-place rewrites (WAL churn)";
 }
 
+const WRITE_RATE_CEILING = GB;
+// One window of hard writing is a build, a branch switch, or a worktree warming
+// its indexes. The regression this watches for -- an O(corpus) rewrite on an
+// O(1) event -- does not stop after one window.
+const WRITE_RATE_SUSTAINED_RUNS = 2;
+
+/**
+ * How many consecutive windows the write rate has stayed above the ceiling,
+ * including this one. Zero resets it.
+ *
+ * Shared by the detector and the state writer so the count they act on and the
+ * count they persist cannot drift apart.
+ */
+function writeRateRunCount(sample: SentinelSample, previous: SentinelState["previous"]): number {
+  const written = sample.process?.bytes_written;
+  if (typeof written !== "number" || typeof previous?.bytes_written !== "number" || !previous.sampled_at_ms) return 0;
+  const hours = Math.max(1 / 3600, (sample.now_ms - previous.sampled_at_ms) / 3_600_000);
+  const rate = (written - previous.bytes_written) / hours;
+  return rate > WRITE_RATE_CEILING ? (previous.write_rate_runs ?? 0) + 1 : 0;
+}
+
 export function detectProcess(sample: SentinelSample, state: SentinelState): Finding[] {
   if (sample.process_error) return [instrument("process", sample.process_error)];
   const out: Finding[] = [];
@@ -389,9 +410,17 @@ export function detectProcess(sample: SentinelSample, state: SentinelState): Fin
     const hours = Math.max(1 / 3600, (sample.now_ms - previous.sampled_at_ms) / 3_600_000);
     const writeDelta = proc.bytes_written - previous.bytes_written;
     const rate = writeDelta / hours;
-    if (rate > GB) {
+    // Fire on SUSTAINED amplification, not on a burst. A build, a branch
+    // switch, or a mason worktree warming its indexes all write hard for one
+    // window and then stop; the regression this watches for -- an O(corpus)
+    // rewrite on an O(1) event -- does not stop. Requiring two consecutive
+    // windows costs one interval of delay on a real regression and removes the
+    // class of alert that trains a reader to ignore the channel. (Three fired
+    // in one evening at 2.9, 1.6 and 1.1 GiB/h, every one of them a build.)
+    const consecutive = writeRateRunCount(sample, previous);
+    if (consecutive >= WRITE_RATE_SUSTAINED_RUNS) {
       const attribution = writeGrowthAttribution(sample, state, writeDelta);
-      out.push(finding("process.writes", "WARNING", `process:${proc.pid ?? "aft"}:writes`, `AFT physical write rate is ${(rate / GB).toFixed(1)} GiB/h${attribution}`, "physical write rate is at most 1 GiB/h"));
+      out.push(finding("process.writes", "WARNING", `process:${proc.pid ?? "aft"}:writes`, `AFT physical write rate is ${(rate / GB).toFixed(1)} GiB/h across ${consecutive} consecutive windows${attribution}`, "physical write rate is at most 1 GiB/h sustained"));
     }
   } else if (proc.bytes_written === undefined) out.push(instrument("process-writes", "health metrics.process_io has no available bytes-written counter"));
   return out;
@@ -698,7 +727,7 @@ function nextPrevious(sample: SentinelSample, state: SentinelState): SentinelSta
   const watcher = Object.fromEntries(roots(sample).map((root) => [root.project_root ?? "unknown", [Number(root.watcher?.rescans_kernel_dropped_total ?? 0), Number(root.watcher?.rescans_user_dropped_total ?? 0)] as [number, number]]));
   const executor = executorHealth(sample);
   const previous = state.previous;
-  return { pid: sample.supervisor?.pid, unreachable_runs: sample.health_error ? (previous?.unreachable_runs ?? 0) + 1 : 0, sampled_at_ms: sample.now_ms, bytes_written: sample.process?.bytes_written, sizes: sample.disk?.sizes, artifact_sizes: sample.disk?.artifact_sizes, watcher, ...(executor.inflight > 0 && executor.workersIdle ? { phantom_inflight: true } : {}) } as SentinelState["previous"];
+  return { pid: sample.supervisor?.pid, unreachable_runs: sample.health_error ? (previous?.unreachable_runs ?? 0) + 1 : 0, sampled_at_ms: sample.now_ms, write_rate_runs: writeRateRunCount(sample, previous), bytes_written: sample.process?.bytes_written, sizes: sample.disk?.sizes, artifact_sizes: sample.disk?.artifact_sizes, watcher, ...(executor.inflight > 0 && executor.workersIdle ? { phantom_inflight: true } : {}) } as SentinelState["previous"];
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<number> {
