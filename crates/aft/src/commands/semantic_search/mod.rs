@@ -3024,8 +3024,17 @@ fn handle_semantic_or_hybrid_search(
             );
         }
         SemanticIndexStatus::Failed(error) => {
-            let retrying_read_only_snapshot = ctx.shared_artifacts_read_only()
-                && super::configure::trigger_semantic_index_reload_if_evicted(ctx);
+            // A read-only root can lose its snapshot to idle eviction and get it
+            // back by reloading, which is why this branch exists. A missing ONNX
+            // Runtime is a different kind of failure: the reload would re-read
+            // the same shared artifact with the same absent runtime, so telling
+            // the reader to retry shortly sends them back to a lane that cannot
+            // recover until the runtime is installed. Skip the reload entirely
+            // and report what is missing instead.
+            let retrying_read_only_snapshot =
+                !crate::semantic_index::is_onnx_runtime_unavailable(&error)
+                    && ctx.shared_artifacts_read_only()
+                    && super::configure::trigger_semantic_index_reload_if_evicted(ctx);
             let (semantic_status, status, detail, footer_reason) = if retrying_read_only_snapshot {
                 (
                     "building",
@@ -4510,6 +4519,19 @@ fn apply_natural_language_diversity_cap(results: &mut Vec<SemanticResult>) {
     });
 }
 
+/// The "retry in a few seconds" nudge on an empty lexical fallback assumes the
+/// semantic lane comes back on its own. That holds for an index still building
+/// or a backend blip; it does not hold when the embedding runtime is not
+/// installed, where nothing changes until the reader runs the install the
+/// detail already names.
+fn retry_nudge_for_unavailable_detail(detail: &str) -> &'static str {
+    if crate::semantic_index::is_onnx_runtime_unavailable(detail) {
+        ""
+    } else {
+        " Retry in a few seconds."
+    }
+}
+
 fn format_lexical_unavailable_text(
     detail: &str,
     results: &[HybridResult],
@@ -4517,8 +4539,9 @@ fn format_lexical_unavailable_text(
     footer_reason: &str,
 ) -> String {
     if results.is_empty() {
+        let retry = retry_nudge_for_unavailable_detail(detail);
         return format!(
-            "{detail}\n0 lexical matches; the semantic lane is unavailable ({footer_reason}), so prose-style queries may match only via semantic. Retry in a few seconds. [semantic: {footer_reason}]"
+            "{detail}\n0 lexical matches; the semantic lane is unavailable ({footer_reason}), so prose-style queries may match only via semantic.{retry} [semantic: {footer_reason}]"
         );
     }
 
@@ -4536,8 +4559,9 @@ fn format_grep_lexical_unavailable_text(
     footer_reason: &str,
 ) -> String {
     if result.matches.is_empty() {
+        let retry = retry_nudge_for_unavailable_detail(detail);
         return format!(
-            "{detail}\n0 lexical matches; the semantic lane is unavailable ({footer_reason}), so prose-style queries may match only via semantic. Retry in a few seconds. [semantic: {footer_reason}]"
+            "{detail}\n0 lexical matches; the semantic lane is unavailable ({footer_reason}), so prose-style queries may match only via semantic.{retry} [semantic: {footer_reason}]"
         );
     }
 
@@ -6250,6 +6274,9 @@ mod tests {
         worker.join().expect("cancelled search joins");
     }
 
+    /// A reload is the right answer for an evicted shared snapshot: the artifact
+    /// is on disk and re-opening it works. The sibling test below pins the case
+    /// it is wrong for, so neither can pass by turning reloads off entirely.
     #[test]
     fn read_only_failed_snapshot_retries_on_semantic_query() {
         let project = tempfile::tempdir().expect("create project dir");
@@ -6279,6 +6306,50 @@ mod tests {
             .expect("semantic fallback text")
             .contains("semantic lane is unavailable"));
         assert!(ctx.semantic_index_rx().lock().is_some());
+        ctx.mark_subc_unbound();
+        ctx.cancel_unbound_artifact_work();
+    }
+
+    /// Same read-only root, different failure: no reload can install an ONNX
+    /// Runtime that is not on the machine, so the reply must name what is
+    /// missing instead of asking for another attempt.
+    #[test]
+    fn read_only_missing_runtime_reports_the_runtime_instead_of_a_reload() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let storage = tempfile::tempdir().expect("create storage dir");
+        let ctx = test_context(project.path());
+        ctx.update_config(|config| {
+            config.semantic_search = true;
+            config.storage_dir = Some(storage.path().to_path_buf());
+        });
+        ctx.set_canonical_cache_root(project.path().to_path_buf());
+        ctx.set_cache_writer_capabilities(false, true);
+        // The message the embedding init actually produces, so the test cannot
+        // drift from the wording the daemon puts in the status.
+        let missing_runtime = crate::semantic_index::format_embedding_init_error(
+            "Failed to load ONNX Runtime shared library libonnxruntime.dylib via dlopen: no such file",
+        );
+        *ctx.semantic_index_status()
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            SemanticIndexStatus::Failed(missing_runtime);
+
+        let response = response_value(handle_semantic_search(
+            &semantic_request_with_hint("retry snapshot", 5, "semantic"),
+            &ctx,
+        ));
+
+        assert_eq!(response["success"], true);
+        assert_eq!(response["semantic_status"], "unavailable");
+        let text = response["text"].as_str().expect("semantic fallback text");
+        assert!(text.contains("ONNX Runtime not found"), "{text}");
+        assert!(text.contains("npx @cortexkit/aft doctor --fix"), "{text}");
+        assert!(!text.contains("reloading"), "{text}");
+        assert!(!text.contains("retry shortly"), "{text}");
+        assert!(!text.contains("Retry in a few seconds"), "{text}");
+        // The reload was not merely reported differently, it was never started:
+        // the receiver a scheduled reload installs is still absent.
+        assert!(ctx.semantic_index_rx().lock().is_none());
         ctx.mark_subc_unbound();
         ctx.cancel_unbound_artifact_work();
     }
