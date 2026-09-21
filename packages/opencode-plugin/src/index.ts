@@ -199,11 +199,11 @@ const PLUGIN_VERSION: string = resolvePluginVersion(import.meta.url);
  * dismisses an announcement, patch releases that don't bump ANNOUNCEMENT_VERSION
  * will not re-show it.
  */
-const ANNOUNCEMENT_VERSION = "0.56.0";
+const ANNOUNCEMENT_VERSION = "0.57.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Callgraph stays consistent under load: edits arriving mid-rebuild can no longer be silently lost from navigation results.",
-  "aft_zoom handles real-world .jsonc: files with comment banners above the opening brace now resolve, and not-found errors point at the segment that actually failed (thanks @iceteaSA).",
-  "Disk hygiene: stale per-checkout inspect caches from old worktrees are now swept automatically \u2014 one machine reclaimed 21 GB.",
+  "OpenCode 2 is supported: tools, permission prompts, the sidebar and cancellation all work on the GA host, and an end-to-end matrix guards them.",
+  "`doctor` configures a machine that has only OpenCode 2 installed, and `--fix` no longer skips unrelated repairs when it cannot decide the generation.",
+  "A code-health scan no longer starts while the same project is still building its call graph, which cost about 90 MB of peak memory on large repositories.",
 ];
 
 /**
