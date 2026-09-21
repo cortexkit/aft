@@ -40,21 +40,41 @@ type AftRpcClient = {
  * unlike the flat colour names the slot-plugin host in ./sidebar.tsx reads.
  * Every level is optional so a host that ships a partial theme degrades to the
  * fallback palette below instead of throwing during a render.
+ *
+ * What a host really hands over is recorded, token for token, in
+ * test/load-matrix/ga-host-theme.json; that record is what this type and the
+ * mapping below are written against, and the load matrix compares it to a live
+ * host on every run.
  */
 type GaFeedbackKind = "error" | "warning" | "success" | "info";
 
+/**
+ * One step of a hue scale. The steps are ordered by how far the shade stands
+ * off the page rather than by lightness: 100 contrasts with the page most and
+ * 900 blends into it, in both theme modes. So the host's dark theme resolves
+ * accent 100 to its lightest purple and its light theme resolves accent 100 to
+ * its darkest orange, and a step chosen for one mode keeps its role in the
+ * other.
+ */
+type GaHueStep = "100" | "200" | "300" | "400" | "500" | "600" | "700" | "800" | "900";
+
 type GaResolvedTheme = {
+  hue?: { accent?: Partial<Record<GaHueStep, SidebarColor>> };
   text?: {
     base?: SidebarColor;
     muted?: SidebarColor;
     feedback?: Partial<Record<GaFeedbackKind, { base?: SidebarColor }>>;
   };
-  background?: {
-    base?: SidebarColor;
-    action?: { primary?: { base?: SidebarColor } };
-  };
+  background?: { base?: SidebarColor };
   border?: { base?: SidebarColor };
 };
+
+/**
+ * The accent shade the AFT badge is filled with. A low step is what keeps the
+ * fill standing off the page in both theme modes (see GaHueStep), and 200 is
+ * the step the host itself draws its own accent-coloured UI in.
+ */
+const BADGE_ACCENT_STEP: GaHueStep = "200";
 
 type V2TuiContext = {
   location?: unknown;
@@ -117,7 +137,13 @@ export function resolveV2Palette(
   const fallback = FALLBACK_PALETTES[themeMode === "light" ? "light" : "dark"];
   if (!theme) return { ...fallback };
 
-  const accent = theme.background?.action?.primary?.base ?? fallback.accent;
+  // The accent comes out of the hue scales, not out of `background.action`.
+  // The action groups describe how the host paints a button, and this theme
+  // paints one as bare text: its `background.action.primary.base` is a fully
+  // transparent colour. Filling the badge with that drew no badge at all, and
+  // nothing caught it, because a present-but-transparent colour never reaches
+  // the fallback below.
+  const accent = theme.hue?.accent?.[BADGE_ACCENT_STEP] ?? fallback.accent;
   const feedback = theme.text?.feedback;
   return {
     text: theme.text?.base ?? fallback.text,
