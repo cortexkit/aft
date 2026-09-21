@@ -212,12 +212,22 @@ image `20260907.300.1`, 4 cores, 15.6 GiB, and every dispatch ran on
 | `8802cf0fb` | full matrix, nightly `35575393418` (09-21) | 719.8 / 753.2 | 137/138 | 99,290 |
 | `947a55b59` (`main`) | full matrix, dispatch `35618067728` | 779.5 / 729.8 | 138/138 | 99,270/99,469 |
 | `947a55b59` (`main`) | full matrix, dispatch `35620290379` | 669.8 / 701.2 | 84/85 | 71,150/69,802 |
+| `947a55b59` (`main`) | full matrix, dispatch `35629011191` | 597.9 / 678.1 | 101/100 | 85,702/85,060 |
 | `947a55b59` (`main`) | **`--repo jupyterlab` alone**, dispatch `35616093361` | 599.3 / 598.8 | 78/76 | 68,417/67,559 |
 
-Four full-matrix observations at the old head span 596.3–606.1 MB, a spread of
-1.6%. Six at the new head span 669.8–779.5 MB. **The two ranges do not
-overlap**, and the gap between them is larger than either. This is not the tail
-of a wide distribution; it is two distributions.
+Four full-matrix observations at the old head sit between 596.3 and 606.1 MB,
+within 9.8 MB of one another. Eight at the new head and `main` sit between
+597.9 and 779.5 MB. Seven of those eight are at 669.8 or above; the eighth is
+597.9, squarely in the old head's range.
+
+So the honest statement is about frequency, not about two clean ranges. The old
+head produced a high reading zero times in four; the new head and `main`
+produced one seven times in eight. That difference is unlikely enough to be
+chance (Fisher exact, p ≈ 0.003) that the binary is clearly implicated, but the
+newer binary does not produce the high value *every* time, and any claim that
+the two heads occupy non-overlapping ranges is wrong. An earlier revision of
+this entry said exactly that, on the first six observations; the seventh and
+eighth refuted it.
 
 #### Why it never reproduced
 
@@ -254,63 +264,144 @@ ran on the slowest host of the five dispatches (438.3 s, and the longest
 `jupyterlab` callgraph build of any run at 106.8 s) and still landed in the low
 range. A slower machine did not produce more memory; a different binary did.
 
-#### Where the bisect stands
+#### The bisect does not converge, and that is itself the finding
 
-Classifying a candidate by the gate's own statistic, the two-run minimum:
+Every full-matrix measurement taken, one row per dispatch, in window order.
+"Low" means a reading near 598, "high" means 668 or above; no observation has
+ever landed between 606.1 and 668.0.
 
-| Position in the 146-commit window | Commit | Peak RSS MB | Verdict |
-| ---: | --- | ---: | --- |
-| 0 | `7a936156c` | 596.3 / 598.0, 606.1 / 599.3 | before the step |
-| 73 | `f5c051dd4` | 601.2 / 668.0 | before the step |
-| 146 | `8802cf0fb` | 719.8 / 753.2 | after the step |
+| Position | Commit | Peak RSS MB, run-1 / run-2 | Low | High |
+| ---: | --- | ---: | ---: | ---: |
+| 0 | `7a936156c` | 596.3 / 598.0 | 2 | 0 |
+| 0 | `7a936156c` | 606.1 / 599.3 | 2 | 0 |
+| 73 | `f5c051dd4` | 601.2 / 668.0 | 1 | 1 |
+| 110 | `908f04034` | 680.9 / 595.8 | 1 | 1 |
+| 146 | `8802cf0fb` | 719.8 / 753.2 | 0 | 2 |
+| main | `947a55b59` | 779.5 / 729.8 | 0 | 2 |
+| main | `947a55b59` | 669.8 / 701.2 | 0 | 2 |
+| main | `947a55b59` | 597.9 / 678.1 | 1 | 1 |
 
-Commit 73 is classified by its two-run minimum of 601.2, but it deserves a
-warning label: its two runs sit 66.8 MB apart, where the old head's four runs
-sit within 9.8 MB of each other. A candidate whose own two runs straddle the gap
-is not cleanly on either side, so the upper-half conclusion rests on one
-measurement that a second dispatch should confirm before anything is built on
-it.
+The empty band between 606 and 668 is the thing to notice. Across sixteen
+observations the metric has never once landed in the middle: it is either about
+598 or it is 668 and up. This is not a value with a wide spread, it is a value
+with two states.
 
-The remaining window is commits 74–146. It contains a cluster of SQLite WAL and
-mapping changes (`914d42a9c` "protect live SQLite file sets and persist
-callgraph WAL", `7625ae313` "drop unnecessary persistent WAL policy",
-`1c8e5df50` "keep view durability inside SQLite", `cd55a386e` "preserve SQLite
-locks during WAL accounting"). That is a candidate mechanism and not a finding:
-a WAL that is retained rather than checkpointed is a file-backed mapping, and
-`ps` counts resident file-backed pages in RSS, which would charge the largest
-callgraph database in the matrix the most. `jupyterlab` has that database.
-Nobody has measured this; it is written down to say where to look next, not to
-claim the answer.
+What the binary changes is how often the high state is reached — zero times in
+four at the old head, seven times in eight at the new head and `main`. That is
+enough to implicate the binary (Fisher exact, p ≈ 0.003) and not enough to
+classify a single candidate, which is what a bisect needs.
+
+The two interior candidates show the cost directly. Each split its own two runs
+across the empty band — 601.2 against 668.0, and 680.9 against 595.8. Judging
+them by the gate's two-run minimum puts both "before the step" and returns a
+window of commits 111–146; judging them by the maximum puts both "after" and
+returns commits 1–73. The same measurements yield opposite windows depending on
+an arbitrary choice, so they yield neither. `main` itself later produced a
+597.9/678.1 run, which is the same split at a head that is definitely "after":
+proof that the split does not mean "before".
+
+So the bisect is not slow, it is blocked, and it was blocked from the first
+interior measurement onwards. Two more halvings on a two-run verdict would have
+named a commit with confidence and no basis. Localising a bistable effect needs
+enough runs per candidate to estimate how often it fires, which at roughly
+twenty minutes a run is a different and much larger piece of work than a bisect.
+
+#### The split is real memory, not a missed sample
+
+The obvious suspicion was the instrument. `peak_rss_mb` is the maximum of a
+`ps -o rss=` poll taken every two seconds — 35 to 50 glimpses across a 70–107
+second callgraph build — so a spike that opens and closes between two polls is
+invisible, and "caught it on one run, missed it on the other" would explain a
+split perfectly. The runs now also record `VmHWM`, the kernel's exact,
+monotonic high-water mark, beside the polled figure. Dispatch `35629011191`:
+
+| Repo | polled `peak_rss_mb` | exact `VmHWM` | poll missed |
+| --- | ---: | ---: | ---: |
+| `redox` | 142.9 / 141.4 | 142.9 / 141.4 | 0 / 0 |
+| `typescript-eslint` | 812.4 / 841.8 | 905.8 / 906.3 | 93.4 / 64.5 |
+| `jupyterlab` | 597.9 / 678.1 | 597.9 / 686.9 | 0 / 8.8 |
+| `hugo` | 420.6 / 448.4 | 420.6 / 448.4 | 0 / 0 |
+| `synthetic-24k` | 60.1 / 60.3 | 72.1 / 70.7 | 12.0 / 10.4 |
+
+The suspicion was sound in general and wrong here. The poll really does miss
+peaks: it loses 93 MB on `typescript-eslint`, whose polled pair scatters by
+29.4 MB while its exact pair agrees to 0.5 MB. That is precisely the artefact
+that was suspected — just on a different repository.
+
+On `jupyterlab` the exact measurement straddles as well: 597.9 against 686.9.
+The high-water mark is the true peak by construction, so the low run genuinely
+never allocated what the high run allocated. The 89 MB is real memory, and the
+two states are two different behaviours of the build, not two different views of
+one behaviour.
+
+That kills the cheap fix. Re-running the bisect against `VmHWM` would not
+converge either, because `VmHWM` is bistable too.
+
+Switching the *gated* metric to `VmHWM` is still worth doing on its own merits
+— it is exact, free, and would stop the gate under-reporting
+`typescript-eslint` by up to 93 MB — but it would invalidate all five baselines
+at once and it would not have answered this question, so it is not part of this
+change.
+
+#### The leading mechanism, unmeasured
+
+A bistable peak wants a bistable cause: something that either happens before the
+build's high-water moment or after it, with nothing in between. Two phases whose
+overlap is a matter of timing would produce exactly this shape — peaks that add
+when they coincide and do not when they do not — and an 89 MB gap is the size of
+a structure, not of drift.
+
+The window holds a cluster of SQLite WAL and mapping changes: `914d42a9c`
+"protect live SQLite file sets and persist callgraph WAL", `7625ae313` "drop
+unnecessary persistent WAL policy", `1c8e5df50` "keep view durability inside
+SQLite", `cd55a386e` "preserve SQLite locks during WAL accounting". A WAL that
+is retained rather than checkpointed is a file-backed mapping, resident
+file-backed pages count in RSS, and the charge would fall hardest on the largest
+callgraph database in the matrix, which is `jupyterlab`'s. Whether the
+checkpoint lands before or after the extract set is dropped is a race, which is
+the bistable shape being looked for.
+
+Nobody has measured any of this. It is recorded to say where to look, not as an
+answer. Note also that these commits straddle position 73, so they sit on both
+sides of the window a two-run verdict would have chosen — another reason not to
+trust that verdict.
+
+The next step is no longer a bisect. It is to find what differs between a low
+run and a high run of the *same* binary, where both are reproducible on demand
+at `main` and need no A/B at all: instrument the cold build's phases, run the
+matrix until both states have been captured, and compare. A named mechanism
+would then localise the commit far more cheaply than sixteen more dispatches.
 
 #### The row stays red
 
 The baseline is unchanged at 596.3 MB and `jupyterlab` keeps failing at
 719.8 MB against a 715.6 MB limit.
 
-That is deliberate. The number the gate reports is real, reproducible, caused by
-a change in our code, and still present in `main` — which is the definition of
-something a cost gate should be red about. Re-baselining it to 730 MB would
-record the step as a price without anyone having established what was bought,
-and this file already says why that is the wrong move: blessing a number you
-cannot explain is how a detector becomes a rubber stamp. A deliberate price gets
-re-baselined with its reason; a defect gets fixed; this one is not yet sorted
-into either, so it stays red until the bisect names the commit.
+That is deliberate. The high state is real memory, reproducible, reached far
+more often by our newer binaries than by the old one, and still present in
+`main` — which is the definition of something a cost gate should be red about.
+Re-baselining to 730 MB would record the step as a price without anyone having
+established what was bought, and this file already says why that is the wrong
+move: blessing a number you cannot explain is how a detector becomes a rubber
+stamp. A deliberate price gets re-baselined with its reason; a defect gets
+fixed; this one is not yet sorted into either, so it stays red.
 
-The tolerance is also untouched. The observed spread at a fixed head is 1.6%
-against a 20% band, so nothing here is evidence that the band is too tight.
-Widening it to fit 730 MB would take a measured 20% step and declare it inside
-the noise, when the measurement says the noise is an order of magnitude smaller.
+It is worth being plain that this leaves the gate flapping rather than merely
+red. With the high state reached on roughly seven runs in eight, a two-run
+minimum lands low about one night in thirty, so `jupyterlab` will pass
+occasionally for no reason anyone should trust. A green night on this row is
+currently not evidence of anything. That is a bad property for a detector and it
+is the strongest argument for treating the bistability itself as the defect to
+chase, ahead of naming a commit.
 
-#### A caveat about this metric's instrument
-
-Worth recording while it is in view: `peak_rss_mb` is the maximum of a
-`ps -o rss=` poll taken every two seconds, not the kernel's high-water mark from
-`/proc/<pid>/status`. Over a 70–107 second callgraph build that is 35–50 samples
-of a moving value, so the reported peak is a sample of the peak and never
-exceeds it. `VmHWM` is exact, free, and already available on the only platform
-this gate runs on. Changing it would invalidate all five baselines at once, so
-it is not part of this change, but it is the reason a single dispatch is weak
-evidence about a metric whose two runs disagree by 66.8 MB.
+The tolerance is also untouched. A 20% band is meant to absorb scatter around a
+central value, and this metric has no central value to scatter around: it has
+two states 89 MB apart with an empty gap between them. Widening the band to
+span both would not be calibrating a tolerance, it would be hiding a bimodality
+inside one, and the band would then be wide enough to swallow a real change on
+top. The tolerance is the wrong instrument for this shape of problem, and the
+right response is to remove the second state rather than to build a band around
+it.
 
 ## Blessing an intentional cost change
 
