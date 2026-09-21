@@ -35,7 +35,7 @@ CSV_FIELDS = (
     "callgraph_status", "search_wall_ms", "search_first_query_ms", "callgraph_wall_ms",
     "callgraph_first_query_ms", "callgraph_resolution_share_pct", "search_superseded", "search_failed", "search_suspended",
     "callgraph_superseded", "callgraph_failed", "callgraph_suspended", "waiting_on",
-    "peak_rss_mb", "peak_rss_hwm_mb", "cpu_s", "disk_write_bytes", "outcome", "log_path", "gaps",
+    "peak_rss_mb", "peak_rss_hwm_mb", "hwm_by_phase", "cpu_s", "disk_write_bytes", "outcome", "log_path", "gaps",
 )
 TEXT_SUFFIXES = {
     ".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js", ".jsx", ".kt",
@@ -203,6 +203,234 @@ class ProcessSampler:
             except (OSError, ValueError):
                 if "disk write bytes unavailable: /proc/<pid>/io" not in self.gaps:
                     self.gaps.append("disk write bytes unavailable: /proc/<pid>/io")
+
+
+# Phases are sampled four times a second. The callgraph cold build runs for
+# 70-110 seconds on the runner, so this resolves a stage boundary to well under
+# a percent of the build while costing two small /proc reads per tick.
+PHASE_SAMPLE_INTERVAL_S = 0.25
+PHASE_TRACE_FIELDS = ("elapsed_ms", "rss_kb", "hwm_kb", "callgraph_stage", "search_stage", "phase")
+# Terminal or not-yet-started plane states. A plane in one of these is not
+# building, so it cannot be contributing build memory.
+IDLE_STAGES = ("idle", "ready", "failed", "suspended", "superseded")
+INDEX_EVENT_MARKER = "index_event "
+INDEX_EVENT_FIELD_RE = re.compile(r"([a-z_]+)=(\S+)")
+
+
+def index_event_fields(line: str) -> dict[str, str] | None:
+    """Field map of one ``index_event`` log line, or None for any other line."""
+    marker = line.find(INDEX_EVENT_MARKER)
+    if marker < 0:
+        return None
+    return dict(INDEX_EVENT_FIELD_RE.findall(line[marker + len(INDEX_EVENT_MARKER):]))
+
+
+def apply_stage_event(stages: dict[str, str], fields: dict[str, str]) -> None:
+    """Advance one plane's current stage from an ``index_event`` field map."""
+    plane = fields.get("plane", "")
+    if plane not in PLANES:
+        return
+    kind = fields.get("kind", "")
+    if kind == "build_started":
+        stages[plane] = "started"
+    elif kind == "build_progress":
+        stages[plane] = fields.get("stage", "unknown")
+    elif kind == "build_ready":
+        stages[plane] = "ready"
+    elif kind in ("build_failed", "build_suspended", "build_superseded"):
+        stages[plane] = kind[len("build_"):]
+
+
+def phase_label(stages: dict[str, str]) -> str:
+    """Name what both planes were doing, because they overlap.
+
+    The search (trigram) build and the callgraph build run at the same time, so
+    a per-plane breakdown would hide a peak that only exists while the two
+    coincide. One composite label per sample keeps that case visible.
+    """
+    return f"{stages.get('callgraph', 'idle')}/{stages.get('search', 'idle')}"
+
+
+@dataclass
+class PhaseSample:
+    elapsed_ms: int
+    rss_kb: int
+    hwm_kb: int
+    callgraph_stage: str
+    search_stage: str
+
+    @property
+    def phase(self) -> str:
+        return phase_label({"callgraph": self.callgraph_stage, "search": self.search_stage})
+
+
+@dataclass
+class PhaseRollup:
+    phase: str
+    samples: int = 0
+    elapsed_ms: int = 0
+    rss_max_kb: int = 0
+    hwm_growth_kb: int = 0
+    hwm_end_kb: int = 0
+
+
+def attribute_phases(samples: list[PhaseSample]) -> list[PhaseRollup]:
+    """Charge each step of the kernel high-water mark to the phase that took it.
+
+    ``VmHWM`` only ever rises, so the growth between two samples was caused by
+    whatever ran between them. An increment is charged to the later sample's
+    phase: a boundary increment then lands on the phase that had just begun,
+    which is the phase that allocated it.
+    """
+    rollups: dict[str, PhaseRollup] = {}
+    previous: PhaseSample | None = None
+    for sample in samples:
+        rollup = rollups.setdefault(sample.phase, PhaseRollup(sample.phase))
+        rollup.samples += 1
+        rollup.rss_max_kb = max(rollup.rss_max_kb, sample.rss_kb)
+        rollup.hwm_end_kb = max(rollup.hwm_end_kb, sample.hwm_kb)
+        if previous is not None:
+            rollup.elapsed_ms += max(0, sample.elapsed_ms - previous.elapsed_ms)
+            rollup.hwm_growth_kb += max(0, sample.hwm_kb - previous.hwm_kb)
+        else:
+            # Nothing observed the process before its first sample, so its
+            # starting high-water mark is the cost of getting to that sample.
+            rollup.hwm_growth_kb += sample.hwm_kb
+        previous = sample
+    return sorted(rollups.values(), key=lambda item: (-item.hwm_growth_kb, item.phase))
+
+
+def format_phase_summary(rollups: list[PhaseRollup], limit: int = 6) -> str:
+    """Compact ``phase=+MB`` record of where the high-water mark was taken."""
+    if not rollups:
+        return "n/a"
+    parts = [f"{rollup.phase}=+{rollup.hwm_growth_kb / 1024:.1f}" for rollup in rollups[:limit] if rollup.hwm_growth_kb]
+    return ";".join(parts) or "none"
+
+
+def write_phase_trace(path: Path, samples: list[PhaseSample]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PHASE_TRACE_FIELDS, lineterminator="\n")
+        writer.writeheader()
+        for sample in samples:
+            writer.writerow({
+                "elapsed_ms": sample.elapsed_ms,
+                "rss_kb": sample.rss_kb,
+                "hwm_kb": sample.hwm_kb,
+                "callgraph_stage": sample.callgraph_stage,
+                "search_stage": sample.search_stage,
+                "phase": sample.phase,
+            })
+
+
+@dataclass
+class PhaseSampler:
+    """Resolve peak memory by build phase instead of by process.
+
+    ``ProcessSampler`` answers how much memory a run used. It cannot answer
+    which part of the build used it, and a peak with two reproducible states
+    needs that second answer: the phase whose high-water growth differs between
+    a low run and a high run is the phase that owns the difference.
+
+    This reads ``VmHWM`` rather than ``VmRSS`` for attribution because the
+    high-water mark is exact and monotonic, so no spike can open and close
+    between two samples without being counted.
+    """
+
+    proc: subprocess.Popen[bytes]
+    storage: Path
+    interval_s: float = PHASE_SAMPLE_INTERVAL_S
+    samples: list[PhaseSample] = field(default_factory=list)
+    gaps: list[str] = field(default_factory=list)
+    _stages: dict[str, str] = field(default_factory=lambda: {plane: "idle" for plane in PLANES})
+    _offsets: dict[Path, int] = field(default_factory=dict)
+    _pending: dict[Path, str] = field(default_factory=dict)
+    _started: float = 0.0
+    _stop: threading.Event = field(default_factory=threading.Event)
+    _thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if not sys.platform.startswith("linux"):
+            self.gaps.append("phase memory trace unavailable: /proc/<pid>/status is Linux only")
+            return
+        self._started = time.monotonic()
+        self._thread = threading.Thread(target=self._loop, name="oss-matrix-phase-sampler", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=3)
+
+    def _loop(self) -> None:
+        self._sample_once()
+        while not self._stop.wait(self.interval_s):
+            self._sample_once()
+
+    def _sample_once(self) -> None:
+        if self.proc.poll() is not None:
+            return
+        self._drain_logs()
+        rss_kb, hwm_kb = self._read_memory()
+        if rss_kb is None or hwm_kb is None:
+            return
+        self.samples.append(PhaseSample(
+            elapsed_ms=int((time.monotonic() - self._started) * 1000),
+            rss_kb=rss_kb,
+            hwm_kb=hwm_kb,
+            callgraph_stage=self._stages["callgraph"],
+            search_stage=self._stages["search"],
+        ))
+
+    def _read_memory(self) -> tuple[int | None, int | None]:
+        rss_kb: int | None = None
+        hwm_kb: int | None = None
+        try:
+            text = Path(f"/proc/{self.proc.pid}/status").read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            if "phase memory trace incomplete: /proc/<pid>/status" not in self.gaps:
+                self.gaps.append("phase memory trace incomplete: /proc/<pid>/status")
+            return None, None
+        for line in text.splitlines():
+            try:
+                if line.startswith("VmRSS:"):
+                    rss_kb = int(line.split()[1])
+                elif line.startswith("VmHWM:"):
+                    hwm_kb = int(line.split()[1])
+            except (IndexError, ValueError):
+                return None, None
+            if rss_kb is not None and hwm_kb is not None:
+                break
+        return rss_kb, hwm_kb
+
+    def _drain_logs(self) -> None:
+        """Read whatever the build has logged since the last tick.
+
+        Stage boundaries are taken from the live log rather than reconciled
+        afterwards from its timestamps: the log stamps whole seconds, and a
+        stage of a 70-second build deserves better than a one-second alignment
+        error against the memory samples.
+        """
+        for path in sorted((self.storage / "logs").glob("aft-*.log")):
+            try:
+                with path.open("rb") as handle:
+                    handle.seek(self._offsets.get(path, 0))
+                    chunk = handle.read()
+                    self._offsets[path] = handle.tell()
+            except OSError:
+                continue
+            if not chunk:
+                continue
+            # A tick usually lands mid-line. Hold the unterminated tail back so
+            # a stage boundary is never lost to the sampling cadence.
+            text = self._pending.pop(path, "") + chunk.decode("utf-8", errors="replace")
+            lines = text.split("\n")
+            self._pending[path] = lines.pop()
+            for line in lines:
+                fields = index_event_fields(line)
+                if fields:
+                    apply_stage_event(self._stages, fields)
 
 
 def parse_cpu_time(value: str) -> float:
@@ -407,11 +635,14 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
     queried = {plane: False for plane in PLANES}
     client: NdjsonClient | None = None
     sampler: ProcessSampler | None = None
+    phases: PhaseSampler | None = None
     outcome = "failed"
     try:
         client = NdjsonClient(binary, root, storage, allow_non_git_callgraph=not git)
         sampler = ProcessSampler(client.proc)
         sampler.start()
+        phases = PhaseSampler(client.proc, storage)
+        phases.start()
         config_doc = json.dumps({"search_index": True, "callgraph_store": True, "semantic_search": False})
         configured = client.request(
             "configure",
@@ -494,6 +725,13 @@ def run_repo(binary: Path, script_dir: Path, root: Path, storage: Path, budget_s
             close_gap = client.close()
             if close_gap:
                 gaps.append(close_gap)
+        if phases is not None:
+            phases.stop()
+            gaps.extend(phases.gaps)
+            rollups = attribute_phases(phases.samples)
+            row["hwm_by_phase"] = format_phase_summary(rollups)
+            if phases.samples:
+                write_phase_trace(storage / "phase-memory.csv", phases.samples)
         if sampler is not None:
             sampler.stop()
             gaps.extend(sampler.gaps)
@@ -570,6 +808,13 @@ def write_markdown(path: Path, rows: list[dict[str, str]], scratch: Path) -> Non
                 f"| {row['repo']} | {row['search_superseded']} / {row['search_failed']} / {row['search_suspended']} | {row['callgraph_superseded']} / {row['callgraph_failed']} / {row['callgraph_suspended']} | {row['waiting_on']} |\n"
             )
         gaps = [(row["repo"], row["gaps"]) for row in rows if row["gaps"] != "none"]
+        handle.write("\n## Peak memory by build phase\n\n")
+        handle.write("High-water growth charged to the phase that took it, largest first. `callgraph_stage/search_stage`, so a phase that only exists while the two builds overlap is named as one.\n\n")
+        handle.write("| Repo | Polled peak RSS MB | Kernel high-water MB | High-water growth by phase |\n| --- | ---: | ---: | --- |\n")
+        for row in rows:
+            handle.write(
+                f"| {row['repo']} | {row['peak_rss_mb']} | {row.get('peak_rss_hwm_mb', 'n/a')} | {row.get('hwm_by_phase', 'n/a')} |\n"
+            )
         handle.write("\n## Gaps\n\n")
         handle.write(f"- Scratch root: `{scratch}`.\n")
         handle.write("- Semantic indexing is intentionally disabled: no embedding backend is measured.\n")
@@ -620,6 +865,82 @@ def compact_p50(value: str) -> int:
         return int(parts[1])
     except ValueError:
         return 0
+
+
+def phase_self_test() -> int:
+    """Check phase attribution without a corpus, a binary, or a Linux kernel.
+
+    The sampler itself can only run where /proc exists, but every decision it
+    makes -- which line is a stage boundary, which phase a high-water step
+    belongs to -- is pure and testable anywhere, which is where the mistakes
+    would be.
+    """
+    line = (
+        "2026-09-21T16:58:32Z [aft] index_event kind=build_progress plane=callgraph "
+        "build_id=b1 root=/tmp/jupyterlab key=k1 stage=resolution completed=10 total=99 elapsed_ms=4200"
+    )
+    fields = index_event_fields(line)
+    assert fields is not None and fields["stage"] == "resolution", fields
+    assert fields["kind"] == "build_progress" and fields["plane"] == "callgraph", fields
+    assert index_event_fields("2026-09-21T16:58:32Z [aft] search index cold streaming build: 1 files") is None
+
+    stages = {plane: "idle" for plane in PLANES}
+    apply_stage_event(stages, {"kind": "build_started", "plane": "search"})
+    apply_stage_event(stages, {"kind": "build_progress", "plane": "search", "stage": "streaming"})
+    apply_stage_event(stages, {"kind": "build_progress", "plane": "callgraph", "stage": "extraction"})
+    assert phase_label(stages) == "extraction/streaming", stages
+    apply_stage_event(stages, {"kind": "build_ready", "plane": "search"})
+    assert phase_label(stages) == "extraction/ready", stages
+    # A plane that is not building must not keep claiming a stage.
+    apply_stage_event(stages, {"kind": "build_superseded", "plane": "callgraph"})
+    assert phase_label(stages) == "superseded/ready", stages
+    # Only the two planes this matrix builds are tracked; anything else the
+    # process logs must not create a stage of its own.
+    apply_stage_event(stages, {"kind": "build_progress", "plane": "tier2", "stage": "dead_code"})
+    assert "tier2" not in stages, stages
+
+    samples = [
+        PhaseSample(0, 40_000, 40_000, "idle", "streaming"),
+        PhaseSample(250, 60_000, 60_000, "idle", "streaming"),
+        PhaseSample(500, 50_000, 60_000, "extraction", "ready"),
+        PhaseSample(750, 140_000, 140_000, "extraction", "ready"),
+        PhaseSample(1000, 90_000, 140_000, "resolution", "ready"),
+    ]
+    rollups = {rollup.phase: rollup for rollup in attribute_phases(samples)}
+    # The first sample carries the cost of reaching it, and each later step is
+    # charged to the phase that was running when the mark moved.
+    assert rollups["idle/streaming"].hwm_growth_kb == 60_000, rollups["idle/streaming"]
+    assert rollups["extraction/ready"].hwm_growth_kb == 80_000, rollups["extraction/ready"]
+    # A phase that only holds memory someone else allocated is charged nothing,
+    # which is what makes the largest entry an answer rather than a ranking.
+    assert rollups["resolution/ready"].hwm_growth_kb == 0, rollups["resolution/ready"]
+    assert rollups["extraction/ready"].rss_max_kb == 140_000, rollups["extraction/ready"]
+    assert rollups["idle/streaming"].elapsed_ms == 250, rollups["idle/streaming"]
+    summary = format_phase_summary(attribute_phases(samples))
+    assert summary == "extraction/ready=+78.1;idle/streaming=+58.6", summary
+    assert format_phase_summary([]) == "n/a"
+
+    # The log is tailed live, so a tick that lands mid-line must not lose the
+    # stage boundary that line carries.
+    temporary = Path(tempfile.mkdtemp(prefix="aft-oss-matrix-phase-self-test-"))
+    try:
+        (temporary / "logs").mkdir()
+        log = temporary / "logs" / "aft-42.log"
+        prefix = "2026-09-21T16:58:32Z [aft] index_event kind=build_progress plane=callgraph build_id=b1 root=/tmp/x key=k stage="
+        log.write_text(f"{prefix}extraction completed=1 total=9 elapsed_ms=1\n{prefix}resol", encoding="utf-8")
+        sampler = PhaseSampler(proc=None, storage=temporary)  # type: ignore[arg-type]
+        sampler._drain_logs()
+        assert sampler._stages["callgraph"] == "extraction", sampler._stages
+        with log.open("a", encoding="utf-8") as handle:
+            handle.write("ution completed=5 total=9 elapsed_ms=2\n")
+        sampler._drain_logs()
+        assert sampler._stages["callgraph"] == "resolution", sampler._stages
+        sampler._drain_logs()
+        assert sampler._stages["callgraph"] == "resolution", sampler._stages
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+    print("oss-matrix phase self-test passed")
+    return 0
 
 
 def self_test(args: argparse.Namespace) -> int:
@@ -698,6 +1019,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aft-binary", help="Release binary (default: $AFT_BINARY or target/release/aft)")
     parser.add_argument("--date", help="Output date suffix, YYYY-MM-DD (default: today)")
     parser.add_argument("--self-test", action="store_true", help="Run tmignore-rs positive and short-budget negative controls")
+    parser.add_argument("--self-test-phases", action="store_true", help="Check the phase-attribution helpers; needs no corpus, binary, or /proc")
     args = parser.parse_args()
     if args.budget_min <= 0:
         parser.error("--budget-min must be greater than zero")
@@ -707,6 +1029,8 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     try:
         arguments = parse_args()
+        if arguments.self_test_phases:
+            raise SystemExit(phase_self_test())
         raise SystemExit(self_test(arguments) if arguments.self_test else (run_matrix(arguments) and 0))
     except (AssertionError, RuntimeError, OSError, ValueError) as error:
         print(f"oss-matrix: {error}", file=sys.stderr)
