@@ -33,6 +33,10 @@ class AftProtocolError(RuntimeError):
     pass
 
 
+class UnmatchedReportError(RuntimeError):
+    """Every fixture missed while the index was healthy: refuse to report it."""
+
+
 class AftClient:
     def __init__(
         self,
@@ -241,14 +245,67 @@ def run_text(args: List[str], timeout_secs: float = 10.0) -> Optional[str]:
     return result.stdout.strip() or None
 
 
+VERBATIM_PATH_PREFIXES = ("\\\\?\\", "//?/")
+
+
+def strip_verbatim_prefix(raw_path: str) -> str:
+    """Drop the Windows verbatim (`\\\\?\\`) prefix AFT returns for absolute paths.
+
+    `Path.resolve()` keeps the prefix, so `relative_to()` raises and the caller
+    falls back to an absolute string that can never equal a relative expected
+    path: every fixture then misses and the report is a plausible zero. The
+    strip happens here, where a result path first enters the harness, because
+    the runners do `from run import normalize_result_path` and bind the name at
+    import time -- a patch applied later leaves them holding the original.
+    """
+    for prefix in VERBATIM_PATH_PREFIXES:
+        if raw_path.startswith(prefix):
+            return raw_path[len(prefix):]
+    return raw_path
+
+
 def normalize_result_path(raw_path: str, project_root: Path) -> str:
-    path = Path(raw_path)
+    path = Path(strip_verbatim_prefix(raw_path))
     if path.is_absolute():
         try:
             return path.resolve().relative_to(project_root).as_posix()
         except ValueError:
             return path.as_posix()
     return path.as_posix()
+
+
+def index_entry_count(semantic_status: Any) -> int:
+    """Indexed entries reported by `status`, 0 when the index reported none."""
+    if not isinstance(semantic_status, dict):
+        return 0
+    entries = semantic_status.get("entries")
+    return int(entries) if isinstance(entries, int) else 0
+
+
+def refuse_all_unmatched(
+    first_match_ranks: Sequence[Optional[int]],
+    index_entries: int,
+    report: str,
+) -> None:
+    """Refuse a report where nothing matched but the index held entries.
+
+    A well-formed report with every fixture unmatched is indistinguishable from
+    a catastrophic ranking regression, and the likelier cause is that result
+    paths never compared equal to expected paths at all. Writing it hides a
+    harness defect behind a plausible zero, so the run fails loudly instead.
+    An index with no entries is a different, already-visible problem and is
+    left to report itself.
+    """
+    if not first_match_ranks or not index_entries:
+        return
+    if any(rank is not None for rank in first_match_ranks):
+        return
+    raise UnmatchedReportError(
+        f"refusing to write {report}: 0 of {len(first_match_ranks)} fixtures matched "
+        f"while the semantic index held {index_entries} entries. Check that result "
+        "paths normalize to project-relative form before comparing them with "
+        "expected_top_files."
+    )
 
 
 def evaluate_fixture(
@@ -530,6 +587,11 @@ def run_harness(args: argparse.Namespace) -> JsonObject:
         results = [evaluate_fixture(client, fixture, project_root) for fixture in fixtures]
     finally:
         client.close()
+    refuse_all_unmatched(
+        [result["first_match_rank"] for result in results],
+        index_entry_count(semantic_status),
+        "the aft-search baseline report",
+    )
     return build_output(args, fixtures, results, semantic_status, protocol_version)
 
 

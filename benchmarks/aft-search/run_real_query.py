@@ -21,6 +21,7 @@ from embedding_fixture_server import Server
 from evidence_tree import evidence_tree_sha256
 from ndjson_stream import NdjsonStream
 from provision_evidence import evidence_root
+from run import strip_verbatim_prefix
 from search_quality_lib import (
     EVIDENCE_SHA,
     INVARIANCE_DEPTH,
@@ -227,7 +228,7 @@ def _display_path(path: Path) -> str:
 def _result_path(result: Any, project_root: Path) -> str:
     if not isinstance(result, Mapping):
         return ""
-    raw = str(result.get("file", result.get("path", "")))
+    raw = strip_verbatim_prefix(str(result.get("file", result.get("path", ""))))
     path = Path(raw)
     if path.is_absolute():
         try:

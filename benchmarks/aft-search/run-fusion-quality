@@ -24,8 +24,10 @@ from run import (  # type: ignore
     binary_sha256,
     binary_version,
     git_rev,
+    index_entry_count,
     normalize_result_path,
     percentile,
+    refuse_all_unmatched,
 )
 
 JsonObject = Dict[str, Any]
@@ -593,6 +595,11 @@ def main(argv: Sequence[str]) -> int:
         client.close()
 
     aggregates = aggregate_by_suite(rows, args.top_k)
+    refuse_all_unmatched(
+        [row["candidate_results"]["current"]["first_match_rank"] for row in rows],
+        index_entry_count(status.get("semantic_index")),
+        "the aft-search fusion-quality report",
+    )
     output: JsonObject = {
         "schema_version": 1,
         "benchmark": "aft-search-fusion-quality",
