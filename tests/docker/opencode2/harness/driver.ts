@@ -540,17 +540,21 @@ async function runOneScenario(options: {
     }
   };
 
+  /**
+   * Take the three-state snapshots that are keyed to a call's result.
+   *
+   * Only the first and last of them are: the state before the sequence starts,
+   * read once the opening call has reported, and the restored state, read once
+   * the restoring call has. The middle state is taken when the restoring call
+   * BEGINS instead — see the capture in the turn hook for why the mutating
+   * call's own result is too late a moment to use.
+   */
   const captureRestoreResult = async (call: ToolCallPlan) => {
     if (!threeState) return;
     const index = restoreCalls.findIndex((candidate) => candidate.id === call.id);
     if (index === -1) return;
-    if (restoreCalls.length === 2) {
-      await threeState.capture(index === 0 ? "intermediate" : "restored");
-      return;
-    }
-    if (index === 0) await threeState.capture("before");
-    else if (index === restoreCalls.length - 2) await threeState.capture("intermediate");
-    else if (index === restoreCalls.length - 1) await threeState.capture("restored");
+    if (index === restoreCalls.length - 1) await threeState.capture("restored");
+    else if (index === 0 && restoreCalls.length > 2) await threeState.capture("before");
   };
 
   try {
@@ -644,6 +648,18 @@ async function runOneScenario(options: {
           try {
             if (threeState && restoreCalls.length === 2 && call.id === restoreCalls[0]?.id) {
               await threeState.capture("before");
+            }
+            // The mutated state, read at the last moment before the restoring
+            // call is issued. Reading it when the mutating call's RESULT is
+            // observed instead loses rows whose host hands that result back
+            // late: the host can start the next tool call, and answer the
+            // model's next request, while a tool part still carries no output,
+            // and by the time the result turns up the restore has already run
+            // — which reads as a mutation that never happened. A capture taken
+            // too early is still caught, because a mutation that has not
+            // landed leaves this state equal to the one before it.
+            if (threeState && call.id === restoreCalls.at(-1)?.id && !threeState.intermediate) {
+              await threeState.capture("intermediate");
             }
             await disk.beginCall(call);
             begun.add(call.id);

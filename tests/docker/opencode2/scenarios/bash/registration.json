@@ -259,7 +259,7 @@
           {
             "path": "bash-loop.txt",
             "transition": "edit",
-            "expected_intermediate_sha256": "dcd614c3a961956e98f2d59929e1be48f409e2df5f016ee4070135543323b8e6"
+            "expected_intermediate_sha256": "c4bee254c2554c6c5f704580a6f2900e5fc1cdf0d4afbfa48f538cf7ce1fbe7c"
           }
         ]
       },
@@ -478,7 +478,7 @@
           {
             "path": "bash-fallback.txt",
             "transition": "edit",
-            "expected_intermediate_sha256": "93b00328426f1f38ef6f15c8c866a4e1917baedc81f6f3a7d207d53de2a93306"
+            "expected_intermediate_sha256": "67d0e4331da22521cdc1b8c8c535b22b5b32a7c89d45aba4b61b525e78aa5af8"
           }
         ]
       },
