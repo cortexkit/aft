@@ -18,6 +18,7 @@ import {
   formatSemanticRefreshing,
   type StatusBar,
   type StatusCompression,
+  semanticIndexStatusKind,
   worktreeCacheRoleNote,
 } from "../shared/status";
 import { badgeTextColor } from "./badge-contrast";
@@ -160,25 +161,34 @@ export function formatCompressionSidebarRows(
   return rows;
 }
 
-// Map index status → (label, theme color name). The label is what we want
-// the user to see; the color encodes severity so the eye lands on warnings.
+// Map an index status word to (label, theme color name). The label is what we
+// want the user to see; the color encodes severity so the eye lands on trouble.
+//
+// The tone comes from the same classification the label uses
+// (`semanticIndexStatusKind` in @cortexkit/aft-bridge), so a word cannot be
+// readable in one column and unrecognised grey in the other.
+// `backend_unavailable` used to fall through to the default arm: a real
+// embedding-backend outage was drawn in the same muted grey as a word the
+// renderer has no idea about, which reads as noise rather than as a condition
+// the user has to act on.
 export function statusDisplay(status: string): {
   label: string;
   tone: "ok" | "warn" | "err" | "muted";
 } {
-  switch (status) {
+  const label = status || "unknown";
+  switch (semanticIndexStatusKind(status)) {
     case "ready":
-      return { label: "ready", tone: "ok" };
-    case "loading":
-    case "building":
-      return { label: status, tone: "warn" };
-    case "failed":
-    case "error":
-      return { label: status, tone: "err" };
-    case "disabled":
-      return { label: "disabled", tone: "muted" };
+      return { label, tone: "ok" };
+    case "progress":
+      return { label, tone: "warn" };
+    case "failure":
+      return { label, tone: "err" };
+    case "inactive":
+      return { label, tone: "muted" };
     default:
-      return { label: status || "unknown", tone: "muted" };
+      // Nothing is known about this word, so grey is honest here: it says the
+      // renderer has no reading to offer, not that everything is fine.
+      return { label, tone: "muted" };
   }
 }
 
