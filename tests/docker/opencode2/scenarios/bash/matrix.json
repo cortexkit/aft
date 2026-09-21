@@ -12,7 +12,14 @@
         "T4": "applicable",
         "T5": "applicable",
         "T6": "applicable",
-        "T7": "expected_fail:https://github.com/anomalyco/opencode/issues/48340"
+        "T7": "applicable"
+      },
+      "verdict_exclusions": {
+        "T7": {
+          "subject": "v1_host_process_exit",
+          "issue": "https://github.com/anomalyco/opencode/issues/48340",
+          "reason": "The pinned OpenCode 1 host serves the whole scenario and then never terminates inside a git repository, which every scenario project is, so the harness kills it at the row timeout. This row compares tool behaviour across the two host generations, and the served scenario answers that in full, so the V1 process exit and the kill that follows it are left out of the verdict. Serving is still required: both turns must be delivered and the tool result must arrive and match the other host, or the row fails."
+        }
       }
     }
   ]

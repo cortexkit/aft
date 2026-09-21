@@ -59,6 +59,7 @@ import {
   deriveListSurfaces,
   deriveMutatingTools,
   deriveV2HarnessProjection,
+  loadApplicabilityMatrix,
   loadToolSchemas,
   validateHarnessInputs,
   validateParityAllowlist,
@@ -1434,6 +1435,137 @@ describe("permission scenarios reach the host's own rules", () => {
         }),
       "host_failed",
     );
+  });
+});
+
+describe("a row may take one named thing out of its own verdict", () => {
+  const UPSTREAM = "https://github.com/anomalyco/opencode/issues/48340";
+
+  const exclusion = (overrides: Record<string, unknown> = {}) => ({
+    subject: "v1_host_process_exit",
+    issue: UPSTREAM,
+    reason: "The V1 host serves the scenario and then never exits in a git project.",
+    ...overrides,
+  });
+
+  async function matrixRoot(row: Record<string, unknown>): Promise<string> {
+    const directory = await root();
+    await writeFile(
+      join(directory, "applicability.json"),
+      JSON.stringify({
+        schema_version: 1,
+        platform: "linux",
+        rows: [
+          {
+            trajectories: Object.fromEntries(
+              ["T1", "T2", "T3", "T4", "T5", "T6", "T7"].map((trajectory) => [
+                trajectory,
+                "applicable",
+              ]),
+            ),
+            ...row,
+          },
+        ],
+      }),
+    );
+    return directory;
+  }
+
+  test("the row states what is excluded, the issue it rests on, and why", async () => {
+    const matrix = await loadApplicabilityMatrix(
+      await matrixRoot({ tool: "bash", verdict_exclusions: { T7: exclusion() } }),
+    );
+
+    expect(matrix?.rows[0].verdict_exclusions?.T7).toEqual({
+      subject: "v1_host_process_exit",
+      issue: UPSTREAM,
+      reason: "The V1 host serves the scenario and then never exits in a git project.",
+    });
+  });
+
+  test("a row cannot exclude something the harness does not know how to leave out", async () => {
+    const directory = await matrixRoot({
+      tool: "bash",
+      verdict_exclusions: { T7: exclusion({ subject: "slow_rows" }) },
+    });
+
+    await expect(loadApplicabilityMatrix(directory)).rejects.toThrow(
+      "the harness excludes nothing called slow_rows",
+    );
+  });
+
+  test("an exclusion is refused on a trajectory that never applies it", async () => {
+    const directory = await matrixRoot({ tool: "bash", verdict_exclusions: { T1: exclusion() } });
+
+    await expect(loadApplicabilityMatrix(directory)).rejects.toThrow(
+      "v1_host_process_exit is only excluded on T7",
+    );
+  });
+
+  test("an exclusion without the upstream issue behind it is refused", async () => {
+    const directory = await matrixRoot({
+      tool: "bash",
+      verdict_exclusions: { T7: exclusion({ issue: "https://github.com/anomalyco/opencode" }) },
+    });
+
+    await expect(loadApplicabilityMatrix(directory)).rejects.toThrow(
+      "a verdict exclusion needs the upstream issue it rests on",
+    );
+  });
+
+  test("a row that already expects failure cannot also exclude part of its verdict", async () => {
+    const directory = await matrixRoot({
+      tool: "bash",
+      trajectories: {
+        T1: "applicable",
+        T2: "applicable",
+        T3: "applicable",
+        T4: "applicable",
+        T5: "applicable",
+        T6: "applicable",
+        T7: `expected_fail:${UPSTREAM}`,
+      },
+      verdict_exclusions: { T7: exclusion() },
+    });
+
+    await expect(loadApplicabilityMatrix(directory)).rejects.toThrow(
+      "only an applicable row excludes part of its verdict",
+    );
+  });
+
+  test("the report names the declared exclusion and the one the run applied", () => {
+    const excluded = {
+      rows: [
+        {
+          tool: "bash",
+          trajectories: {
+            T1: "n/a:test",
+            T2: "n/a:test",
+            T3: "n/a:test",
+            T4: "n/a:test",
+            T5: "n/a:test",
+            T6: "n/a:test",
+            T7: "applicable",
+          },
+          verdict_exclusions: { T7: exclusion() },
+        },
+      ],
+    } as unknown as Parameters<typeof reportTable>[0];
+
+    const report = reportTable(excluded, [
+      {
+        id: "bash/T7/happy",
+        status: "passed",
+        exclusions: ["v1_host_process_exit"],
+        forensic_dir: "/dev/null",
+      },
+    ]);
+
+    expect(report.text).toContain(
+      `bash | T7 | applicable (excludes v1_host_process_exit: ${UPSTREAM}) | pass`,
+    );
+    expect(report.text).toContain("bash/T7/happy | passed | excluded v1_host_process_exit");
+    expect(report.failed).toBe(false);
   });
 });
 

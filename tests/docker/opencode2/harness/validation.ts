@@ -22,9 +22,41 @@ import { asRecord, readJson } from "./util.js";
 
 export type MatrixClassification = "applicable" | `expected_fail:${string}` | `n/a:${string}`;
 
+/**
+ * Something a row says is not part of its verdict, and why.
+ *
+ * This is not an expected-failure label. A label claims the row fails, so a
+ * row that passes with one is reported as a failure; an exclusion claims
+ * nothing about what happens, it only takes one named thing out of the
+ * judgement. Everything else the row checks still decides pass or fail.
+ */
+export interface VerdictExclusion {
+  /** What is left out. Only the subjects below can be named. */
+  subject: string;
+  /** The upstream report the exclusion rests on. */
+  issue: string;
+  /** Why leaving it out does not change what the row measures. */
+  reason: string;
+}
+
+/**
+ * Every subject a row may exclude, and the trajectories where the harness
+ * knows how to leave it out.
+ *
+ * A row cannot invent an exclusion: naming anything absent from this table, or
+ * naming one of these on a trajectory that does not apply it, fails
+ * validation. That keeps an exclusion from widening into a blanket excuse for
+ * whatever a row happens to fail on.
+ */
+export const VERDICT_EXCLUSION_SUBJECTS: Readonly<Record<string, readonly Trajectory[]>> = {
+  v1_host_process_exit: ["T7"],
+};
+
 export interface MatrixRow {
   tool: string;
   trajectories: Record<Trajectory, MatrixClassification>;
+  /** Absent on the rows that judge everything, which is nearly all of them. */
+  verdict_exclusions?: Partial<Record<Trajectory, VerdictExclusion>>;
 }
 
 export interface ApplicabilityMatrix {
@@ -110,6 +142,53 @@ function parseClassification(value: unknown, label: string): MatrixClassificatio
   return classification as MatrixClassification;
 }
 
+function parseVerdictExclusions(
+  raw: unknown,
+  tool: string,
+  trajectories: Record<Trajectory, MatrixClassification>,
+): Partial<Record<Trajectory, VerdictExclusion>> {
+  if (raw === undefined) return {};
+  const record = asRecord(raw);
+  if (!record) fail("matrix_invalid", `${tool}: verdict_exclusions must be an object`);
+  const exclusions: Partial<Record<Trajectory, VerdictExclusion>> = {};
+  for (const [key, value] of Object.entries(record)) {
+    const trajectory = TRAJECTORIES.find((candidate) => candidate === key);
+    if (!trajectory) {
+      fail("matrix_invalid", `${tool}: verdict_exclusions names no trajectory called ${key}`);
+    }
+    const label = `${tool}/${trajectory}`;
+    const entry = asRecord(value);
+    if (
+      typeof entry?.subject !== "string" ||
+      typeof entry.issue !== "string" ||
+      typeof entry.reason !== "string" ||
+      entry.reason.trim().length === 0
+    ) {
+      fail("matrix_invalid", `${label}: a verdict exclusion needs a subject, issue, and reason`);
+    }
+    const appliedOn = VERDICT_EXCLUSION_SUBJECTS[entry.subject];
+    if (!appliedOn) {
+      fail("matrix_invalid", `${label}: the harness excludes nothing called ${entry.subject}`);
+    }
+    if (!appliedOn.includes(trajectory)) {
+      fail(
+        "matrix_invalid",
+        `${label}: ${entry.subject} is only excluded on ${appliedOn.join(",")}`,
+      );
+    }
+    // The issue is what a reader follows to check the exclusion is still the
+    // right call, so it has to name one report rather than a project page.
+    if (!/^https:\/\/\S+\/\d+$/.test(entry.issue)) {
+      fail("matrix_invalid", `${label}: a verdict exclusion needs the upstream issue it rests on`);
+    }
+    if (trajectories[trajectory] !== "applicable") {
+      fail("matrix_invalid", `${label}: only an applicable row excludes part of its verdict`);
+    }
+    exclusions[trajectory] = { subject: entry.subject, issue: entry.issue, reason: entry.reason };
+  }
+  return exclusions;
+}
+
 function parseMatrix(value: unknown): ApplicabilityMatrix {
   const record = asRecord(value);
   if (record?.schema_version !== 1 || typeof record.platform !== "string") {
@@ -123,14 +202,20 @@ function parseMatrix(value: unknown): ApplicabilityMatrix {
       const trajectories = asRecord(row?.trajectories);
       if (typeof row?.tool !== "string" || !trajectories)
         fail("matrix_invalid", "matrix row is invalid");
+      const classifications = Object.fromEntries(
+        TRAJECTORIES.map((trajectory) => [
+          trajectory,
+          parseClassification(trajectories[trajectory], `${row.tool}/${trajectory}`),
+        ]),
+      ) as Record<Trajectory, MatrixClassification>;
       rows.push({
         tool: row.tool,
-        trajectories: Object.fromEntries(
-          TRAJECTORIES.map((trajectory) => [
-            trajectory,
-            parseClassification(trajectories[trajectory], `${row.tool}/${trajectory}`),
-          ]),
-        ) as Record<Trajectory, MatrixClassification>,
+        trajectories: classifications,
+        verdict_exclusions: parseVerdictExclusions(
+          row.verdict_exclusions,
+          row.tool,
+          classifications,
+        ),
       });
     }
   } else {
@@ -139,18 +224,35 @@ function parseMatrix(value: unknown): ApplicabilityMatrix {
     for (const [tool, raw] of Object.entries(rowMap)) {
       const trajectories = asRecord(asRecord(raw)?.trajectories ?? raw);
       if (!trajectories) fail("matrix_invalid", `${tool}: matrix row is invalid`);
+      const classifications = Object.fromEntries(
+        TRAJECTORIES.map((trajectory) => [
+          trajectory,
+          parseClassification(trajectories[trajectory], `${tool}/${trajectory}`),
+        ]),
+      ) as Record<Trajectory, MatrixClassification>;
       rows.push({
         tool,
-        trajectories: Object.fromEntries(
-          TRAJECTORIES.map((trajectory) => [
-            trajectory,
-            parseClassification(trajectories[trajectory], `${tool}/${trajectory}`),
-          ]),
-        ) as Record<Trajectory, MatrixClassification>,
+        trajectories: classifications,
+        verdict_exclusions: parseVerdictExclusions(
+          asRecord(raw)?.verdict_exclusions,
+          tool,
+          classifications,
+        ),
       });
     }
   }
   return { schema_version: 1, platform: record.platform, rows };
+}
+
+/**
+ * The exclusion a row declares for one of its trajectories, if any.
+ */
+export function verdictExclusionFor(
+  matrix: ApplicabilityMatrix,
+  tool: string,
+  trajectory: Trajectory,
+): VerdictExclusion | undefined {
+  return matrix.rows.find((row) => row.tool === tool)?.verdict_exclusions?.[trajectory];
 }
 
 async function firstExisting(paths: string[]): Promise<string | undefined> {
@@ -178,6 +280,50 @@ export async function loadApplicabilityMatrix(
     return undefined;
   }
   return parseMatrix(await readJson(path));
+}
+
+/**
+ * Hold every tool slice's own copy of its row to the central matrix.
+ *
+ * Each `scenarios/<slice>/matrix.json` repeats the row its slice owns, and the
+ * run reads only the central file. Without this the two can disagree, and the
+ * copy a slice owner reads would say something the run never acts on — which
+ * matters most for a row that excludes part of its verdict, because the reason
+ * for the exclusion is written where the slice owner looks.
+ */
+async function validateSliceMatrices(
+  scenarioRoot: string,
+  matrix: ApplicabilityMatrix,
+): Promise<void> {
+  const entries = await readdir(scenarioRoot, { withFileTypes: true }).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const path = join(scenarioRoot, entry.name, "matrix.json");
+    const value = await readJson(path).catch(() => undefined);
+    if (value === undefined) continue;
+    for (const slice of parseMatrix(value).rows) {
+      const central = matrix.rows.find((row) => row.tool === slice.tool);
+      if (!central) {
+        fail("matrix_invalid", `${path}: names ${slice.tool}, which the central matrix does not`);
+      }
+      if (JSON.stringify(slice.trajectories) !== JSON.stringify(central.trajectories)) {
+        fail("matrix_invalid", `${path}: ${slice.tool} row disagrees with the central matrix`, {
+          slice: slice.trajectories,
+          central: central.trajectories,
+        });
+      }
+      if (
+        JSON.stringify(slice.verdict_exclusions ?? {}) !==
+        JSON.stringify(central.verdict_exclusions ?? {})
+      ) {
+        fail(
+          "matrix_invalid",
+          `${path}: ${slice.tool} verdict exclusions disagree with the central matrix`,
+          { slice: slice.verdict_exclusions, central: central.verdict_exclusions },
+        );
+      }
+    }
+  }
 }
 
 export async function loadToolSchemas(
@@ -860,6 +1006,10 @@ export async function validateHarnessInputs(options: {
       await validatePermissionInventory(options.repoRoot, matrixRoot, options.scenarios);
       validateT6(matrix, options.scenarios, surfaces);
       parityAllowlist = await validateParityAllowlist(matrixRoot, options.scenarios);
+      await validateSliceMatrices(
+        join(options.repoRoot, "tests", "docker", "opencode2", "scenarios"),
+        matrix,
+      );
     }
     requiredCheckStatus = await validateRequiredCheckRecord(matrixRoot);
     configuredMutatingTools = await loadMutatingTools(matrixRoot);

@@ -64,7 +64,13 @@ import type {
   SessionPermissionRule,
   ToolCallPlan,
 } from "./types.js";
-import { type ParityAllowlistEntry, validateHarnessInputs } from "./validation.js";
+import {
+  type ParityAllowlistEntry,
+  type ValidatedInputs,
+  type VerdictExclusion,
+  validateHarnessInputs,
+  verdictExclusionFor,
+} from "./validation.js";
 import { asRecord, createRunId, runCommand } from "./util.js";
 
 const harnessRoot = dirname(fileURLToPath(import.meta.url));
@@ -510,6 +516,11 @@ async function runOneScenario(options: {
   hostGeneration?: "v1" | "v2";
   hostExecutable?: string;
   applyComparison?: boolean;
+  /**
+   * Set only for a leg whose row declares that this host's process exit is not
+   * part of its verdict. Absent, an unaccepted exit fails the leg as usual.
+   */
+  excludedHostExit?: VerdictExclusion;
   providerConfig: Record<string, unknown>;
   providerConfigKey: string;
   providerModel: string;
@@ -553,6 +564,7 @@ async function runOneScenario(options: {
   const transportDeadWindow = resolveTransportDeadWindow(scenario);
   let transportDeadStub: TransportDeadStub | undefined;
   let transportDeadActive = false;
+  let excludedHostExit: Record<string, unknown> | undefined;
 
   const recordFailure = (error: unknown) => {
     firstFailure ??= error;
@@ -841,11 +853,27 @@ async function runOneScenario(options: {
       const ending = host.timed_out
         ? `host was still running after ${hostTimeoutMs}ms and was killed`
         : `host exited ${host.exit_code}`;
-      throw new Error(
-        `${ending}; accepted ${acceptedExitCodes.join(",")}${
-          mechanism ? `; host said: ${mechanism}` : ""
-        }`,
-      );
+      if (options.excludedHostExit) {
+        // The row says this host's exit is not part of its verdict, so the
+        // ending is recorded and the run carries on to the checks that are.
+        // Nothing else is relaxed: the assertions below still require this
+        // host to have served the whole scenario.
+        excludedHostExit = {
+          ...options.excludedHostExit,
+          host_generation: hostGeneration,
+          observed_ending: `${ending}${mechanism ? `; host said: ${mechanism}` : ""}`,
+          exit_code: host.exit_code,
+          signal: host.signal,
+          timed_out: host.timed_out,
+        };
+        await forensics.writeJson("excluded-host-exit.json", excludedHostExit);
+      } else {
+        throw new Error(
+          `${ending}; accepted ${acceptedExitCodes.join(",")}${
+            mechanism ? `; host said: ${mechanism}` : ""
+          }`,
+        );
+      }
     }
     assertScriptedToolsRegistered(scenario, hostStream);
     assertAbortEnding(scenario, hostStream);
@@ -1045,11 +1073,13 @@ async function runOneScenario(options: {
     }
   }
 
+  const applied = excludedHostExit ? [String(excludedHostExit.subject)] : undefined;
   let result: ScenarioResult = firstFailure
     ? {
         id: scenario.id,
         status: "failed",
         issue: scenario.expected_fail_issue,
+        exclusions: applied,
         failure: errorRecord(firstFailure),
         forensic_dir: forensics.directory,
       }
@@ -1057,6 +1087,7 @@ async function runOneScenario(options: {
         id: scenario.id,
         status: "passed",
         issue: scenario.expected_fail_issue,
+        exclusions: applied,
         forensic_dir: forensics.directory,
       };
   if (firstFailure) await forensics.recordFailure(firstFailure);
@@ -1070,6 +1101,7 @@ async function runOneScenario(options: {
           id: scenario.id,
           status: "failed",
           issue: scenario.expected_fail_issue,
+          exclusions: applied,
           failure: errorRecord(error),
           forensic_dir: forensics.directory,
         };
@@ -1079,6 +1111,33 @@ async function runOneScenario(options: {
   }
   result.elapsed_ms = Date.now() - startedAt;
   return { result, smokeRan, observedTexts };
+}
+
+/**
+ * The V1 host's process exit, when the row has taken it out of its verdict.
+ *
+ * T7 asks one question: do the two host generations produce the same tool
+ * behaviour? The served scenario answers it in full — the turns are delivered,
+ * the tool runs, and its result comes back to be compared. The pinned
+ * OpenCode 1 build then never terminates inside a git repository, which every
+ * scenario project is, so the harness kills it at the row's timeout. That
+ * ending is an upstream teardown defect, and judging parity by it means the
+ * row reports on something it does not exist to measure.
+ *
+ * So a row may declare that this leg's exit is not its business, and the
+ * harness leaves out the exit status and its own kill of a host that has
+ * already served — nothing else. Both turns still have to be delivered, the
+ * tool result still has to arrive, and it still has to match the other host's,
+ * or the row fails. A leg that never served fails on those checks, which is
+ * what keeps "served but did not exit" apart from "did not serve".
+ */
+function v1ExitExclusion(
+  matrix: ValidatedInputs["matrix"],
+  scenario: ScenarioDefinition,
+): VerdictExclusion | undefined {
+  if (!matrix) return undefined;
+  const declared = verdictExclusionFor(matrix, scenario.tool, scenario.trajectory);
+  return declared?.subject === "v1_host_process_exit" ? declared : undefined;
 }
 
 function assertDualHostParity(
@@ -1229,6 +1288,7 @@ async function main(): Promise<void> {
               providerConfigKey: v1ProviderContract.config_key,
               providerModel: v1ProviderContract.model,
               applyComparison: false,
+              excludedHostExit: v1ExitExclusion(validated.matrix, scenario),
             })
           : {
               result: {
@@ -1255,6 +1315,7 @@ async function main(): Promise<void> {
             id: scenario.id,
             status: "passed",
             issue: scenario.expected_fail_issue,
+            exclusions: v1.result.exclusions,
             forensic_dir: dirname(v2.result.forensic_dir),
           };
         } catch (error) {
@@ -1265,6 +1326,7 @@ async function main(): Promise<void> {
             id: scenario.id,
             status: "failed",
             issue: scenario.expected_fail_issue,
+            exclusions: v1.result.exclusions,
             failure: errorRecord(error),
             forensic_dir: parityForensics.directory,
           };

@@ -165,6 +165,12 @@ export interface ScenarioResult {
   id: string;
   status: "failed" | "passed";
   issue?: string;
+  /**
+   * Subjects the row declared outside its verdict that this run actually left
+   * out. Empty or absent when the run judged everything, so the report can say
+   * which exclusion was used rather than only which one was available.
+   */
+  exclusions?: string[];
   failure?: {
     code: string;
     message: string;

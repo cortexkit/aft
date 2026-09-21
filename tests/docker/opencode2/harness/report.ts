@@ -86,7 +86,13 @@ export function reportTable(
       const disposition = parentDisposition(classification, children);
       if (disposition === "fail") failed = true;
       rowCounts[disposition] += 1;
-      const applicability = classification.startsWith("n/a:") ? classification : "applicable";
+      const exclusion = row.verdict_exclusions?.[trajectory];
+      // A row that leaves something out of its verdict says so on its own
+      // line, with the report it rests on. An exclusion nobody can see while
+      // reading the result is indistinguishable from a check quietly dropped.
+      const applicability =
+        (classification.startsWith("n/a:") ? classification : "applicable") +
+        (exclusion ? ` (excludes ${exclusion.subject}: ${exclusion.issue})` : "");
       const renderedDisposition =
         disposition === "expected_fail"
           ? classification
@@ -95,8 +101,11 @@ export function reportTable(
             : disposition;
       lines.push(`${row.tool} | ${trajectory} | ${applicability} | ${renderedDisposition}`);
       for (const child of children) {
+        const excluded = child.exclusions?.length
+          ? ` | excluded ${child.exclusions.join(",")}`
+          : "";
         lines.push(
-          `  ${child.id} | ${child.status}${child.failure ? ` | ${child.failure.code}` : ""} | ${child.elapsed_ms ?? 0}ms`,
+          `  ${child.id} | ${child.status}${child.failure ? ` | ${child.failure.code}` : ""}${excluded} | ${child.elapsed_ms ?? 0}ms`,
         );
       }
     }

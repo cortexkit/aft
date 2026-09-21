@@ -20,6 +20,20 @@
               "type": "string",
               "pattern": "^(applicable|n/a:[^:]+|expected_fail:.+)$"
             }
+          },
+          "verdict_exclusions": {
+            "description": "Parts of a trajectory's verdict this row does not judge. Unlike expected_fail it claims nothing about the outcome: it names one thing the harness leaves out, the upstream issue it rests on, and why leaving it out does not change what the row measures. Only subjects the harness implements may be named.",
+            "type": "object",
+            "additionalProperties": {
+              "type": "object",
+              "required": ["subject", "issue", "reason"],
+              "properties": {
+                "subject": { "enum": ["v1_host_process_exit"] },
+                "issue": { "type": "string", "pattern": "^https://\\S+/[0-9]+$" },
+                "reason": { "type": "string", "minLength": 1 }
+              },
+              "additionalProperties": false
+            }
           }
         },
         "additionalProperties": false
