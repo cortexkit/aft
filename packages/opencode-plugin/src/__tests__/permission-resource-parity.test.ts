@@ -7,6 +7,10 @@
  * and move stated `/Users/.../project/src/app.ts`, a rule such as
  * `{action: "edit", resource: "src/*"}` covered part of the class the user
  * thought it covered and silently missed the rest.
+ *
+ * The rule evaluation below reuses `decidePermission`, which carries the
+ * host's own wildcard matching, rather than a second copy of those semantics
+ * written for this test.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
@@ -14,6 +18,7 @@ import * as path from "node:path";
 import type { BridgePool, ToolCallOptions } from "@cortexkit/aft-bridge";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 
+import { decidePermission, type V2PermissionRule } from "../permissions/v2.js";
 import { _resetSessionDirectoryCacheForTest } from "../shared/session-directory.js";
 import { hoistedTools } from "../tools/hoisted.js";
 import type { PluginContext } from "../types.js";
@@ -201,6 +206,14 @@ async function statedResources(
   return { edit: editAsk?.patterns ?? [], asks };
 }
 
+/** How a ruleset answers a mutation that stated these resources. */
+function ruleEffect(resources: string[], rules: V2PermissionRule[]): string {
+  return decidePermission(
+    { permission: "edit", patterns: resources, always: ["*"], metadata: {} },
+    rules,
+  ).effect;
+}
+
 describe("filesystem mutations state one permission resource shape", () => {
   for (const mutation of MUTATIONS) {
     test(`${mutation.tool} states a project-relative resource for a file in the project`, async () => {
@@ -225,4 +238,36 @@ describe("filesystem mutations state one permission resource shape", () => {
       expect(asks.some((call) => call.permission === "external_directory")).toBe(true);
     });
   }
+
+  test("one edit rule scoped to src/* covers write, edit, apply_patch, delete, and move", async () => {
+    const { project } = await makeProjectAndExternalDirs();
+    const rules: V2PermissionRule[] = [{ action: "edit", resource: "src/*", effect: "allow" }];
+    const effects: Record<string, string> = {};
+
+    for (const mutation of MUTATIONS) {
+      const { edit } = await statedResources(mutation, project, "src/app.ts", "src/moved.ts");
+      effects[mutation.tool] = ruleEffect(edit, rules);
+    }
+
+    expect(effects).toEqual({
+      write: "allow",
+      edit: "allow",
+      apply_patch: "allow",
+      aft_delete: "allow",
+      aft_move: "allow",
+    });
+  });
+
+  test("the same src/* rule still leaves an outside-project delete to be asked", async () => {
+    const { project, external } = await makeProjectAndExternalDirs();
+    const rules: V2PermissionRule[] = [{ action: "edit", resource: "src/*", effect: "allow" }];
+    const outside = path.join(external, "app.ts");
+
+    const { edit } = await statedResources(DELETE_CASE, project, outside, outside);
+
+    // Guards the test above: the shared rule allows because the resource is
+    // stated relative to the project, not because every resource happens to
+    // match `src/*`.
+    expect(ruleEffect(edit, rules)).toBe("ask");
+  });
 });
