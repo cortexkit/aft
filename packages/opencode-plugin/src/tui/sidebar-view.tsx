@@ -386,7 +386,13 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
     const display = statusDisplay(rawStatus);
     return {
       ...display,
-      label: formatSemanticIndexStatus(rawStatus, s()?.semantic_index?.stage),
+      // The error is passed through so a capability failure (a missing ONNX
+      // Runtime) is named here instead of arriving as a bare status word.
+      label: formatSemanticIndexStatus(
+        rawStatus,
+        s()?.semantic_index?.stage,
+        s()?.semantic_index?.error,
+      ),
     };
   };
   const semanticRefreshing = () =>

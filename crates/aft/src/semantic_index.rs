@@ -257,6 +257,36 @@ fn finish_semantic_index_build(
     }
 }
 
+/// Every `semantic_index.status` word the daemon can put on the wire, named in
+/// one place so a reader can be checked against it.
+///
+/// The producers, all of which map into this set:
+/// - `commands/status.rs`: `busy` (status lock contention), `disabled`,
+///   `loading` (a cold build in progress), `ready`, `failed`,
+///   `backend_unavailable`, and `empty`/`ready` from
+///   [`SemanticIndex::status_label`] when an index object is already loaded.
+/// - the root-health snapshot in `context.rs`: `backend_unavailable`, `ready`,
+///   `building`, `disabled`, `degraded`.
+/// - semantic search replies: `ready`, `building`, `disabled`, `unavailable`.
+///
+/// A reader that does not recognise a word has nothing to render but the raw
+/// word itself, which is how `backend_unavailable` reached users as grey
+/// unexplained text. packages/opencode-plugin/src/shared/status.ts checks its
+/// own mapping against this list, so adding a word here without teaching the
+/// sidebar about it fails that test instead of shipping.
+pub const SEMANTIC_INDEX_STATUS_WORDS: &[&str] = &[
+    "backend_unavailable",
+    "building",
+    "busy",
+    "degraded",
+    "disabled",
+    "empty",
+    "failed",
+    "loading",
+    "ready",
+    "unavailable",
+];
+
 /// Opening words of every missing-runtime message this crate produces.
 ///
 /// `is_onnx_runtime_unavailable` treats this prefix as proof on its own, and
@@ -11158,6 +11188,31 @@ public class Greeter {
         assert!(message.starts_with(ONNX_RUNTIME_MISSING_PREFIX));
         assert!(message.contains("npx @cortexkit/aft doctor --fix"));
         assert!(message.contains("Original error:"));
+    }
+
+    /// The sidebar checks its rendering against this list, so the list has to
+    /// stay a superset of what the daemon's own status producers say. The two
+    /// words below are produced here, by `status_label`; the rest come from the
+    /// status, health, and search surfaces named on the constant.
+    #[test]
+    fn semantic_status_words_include_the_labels_this_module_produces() {
+        let empty = SemanticIndex::new(PathBuf::from("/tmp/project"), 384);
+        assert_eq!(empty.status_label(), "empty");
+        for label in ["empty", "ready"] {
+            assert!(
+                SEMANTIC_INDEX_STATUS_WORDS.contains(&label),
+                "{label} is emitted but not listed"
+            );
+        }
+
+        let mut sorted = SEMANTIC_INDEX_STATUS_WORDS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.as_slice(),
+            SEMANTIC_INDEX_STATUS_WORDS,
+            "keep the list sorted and duplicate-free; readers parse it as a set"
+        );
     }
 
     /// The hint must not answer "can AFT download the runtime here?" itself.

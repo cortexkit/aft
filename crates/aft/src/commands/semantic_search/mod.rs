@@ -5308,6 +5308,9 @@ fn semantic_status_label(status: &SemanticIndexStatus) -> &'static str {
         SemanticIndexStatus::Ready { .. } => "ready",
         SemanticIndexStatus::Building { .. } => "building",
         SemanticIndexStatus::Disabled => "disabled",
+        // A failed index needs an install, a reconfigure, or a restart; no word
+        // here should suggest an attempt is under way. `unavailable` is the
+        // existing search-reply word for "this lane will not serve your query".
         SemanticIndexStatus::Failed(_) => "unavailable",
     }
 }
@@ -6272,6 +6275,37 @@ mod tests {
             .expect("cancelled wait completes promptly");
         assert_eq!(response["code"], "request_cancelled");
         worker.join().expect("cancelled search joins");
+    }
+
+    /// Every word this module puts in a search reply is one the shared
+    /// vocabulary lists, so a reader checked against that list can render all of
+    /// them.
+    #[test]
+    fn search_reply_status_words_are_all_in_the_shared_vocabulary() {
+        let statuses = [
+            SemanticIndexStatus::ready(),
+            SemanticIndexStatus::Building {
+                stage: "loading_artifacts".to_string(),
+                files: None,
+                entries_done: None,
+                entries_total: None,
+            },
+            SemanticIndexStatus::Disabled,
+            SemanticIndexStatus::Failed("ONNX Runtime not found.".to_string()),
+        ];
+
+        for status in statuses {
+            let label = semantic_status_label(&status);
+            assert!(
+                crate::semantic_index::SEMANTIC_INDEX_STATUS_WORDS.contains(&label),
+                "{label} is sent to readers but is not in the shared vocabulary"
+            );
+        }
+        // A failed index must not borrow a progress word to describe itself.
+        assert_eq!(
+            semantic_status_label(&SemanticIndexStatus::Failed("boom".to_string())),
+            "unavailable"
+        );
     }
 
     /// A reload is the right answer for an evicted shared snapshot: the artifact

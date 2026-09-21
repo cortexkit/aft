@@ -205,9 +205,106 @@ export function worktreeCacheRoleNote(role: string | undefined): string | null {
   return null;
 }
 
-export function formatSemanticIndexStatus(status: string, stage?: string | null): string {
-  if ((status === "loading" || status === "building") && stage === "fingerprint_change") {
-    return "Rebuilding (model changed)";
+/**
+ * Opening words of every missing-runtime message the daemon produces
+ * (`ONNX_RUNTIME_MISSING_PREFIX` in crates/aft/src/semantic_index.rs). It
+ * arrives wrapped in other text — as a build stage, as a status error, inside a
+ * search reply — so callers match it anywhere in the string.
+ */
+const MISSING_ONNX_RUNTIME_MARKER = "ONNX Runtime not found.";
+
+/**
+ * What a reader with no ONNX Runtime needs: the fact, and the one command that
+ * fixes it. `doctor --fix` is also the command that knows whether AFT can
+ * download the runtime for this platform — that question has a single owner
+ * (`isOrtAutoDownloadSupported` in @cortexkit/aft-bridge), so neither the
+ * daemon nor this sidebar keeps its own copy of the platform table to guess at
+ * brew/apt advice.
+ */
+const MISSING_ONNX_RUNTIME_LABEL =
+  "unavailable — ONNX Runtime missing (npx @cortexkit/aft doctor --fix)";
+
+const REBUILDING_LABEL = "Rebuilding (model changed)";
+
+/**
+ * How the sidebar treats each status word the daemon can emit.
+ *
+ * `progress` means an attempt is under way and waiting is the right response;
+ * `failure` means it is not, and nothing in the failure family may borrow a
+ * progress rendering. The daemon's own list of words is
+ * `SEMANTIC_INDEX_STATUS_WORDS` in crates/aft/src/semantic_index.rs, and a test
+ * checks this mapping covers all of it — so a word the daemon can send but the
+ * sidebar cannot classify is a failing test rather than raw text in the UI.
+ */
+export type SemanticIndexStatusKind =
+  | "ready"
+  | "progress"
+  | "failure"
+  | "inactive"
+  | "unrecognized";
+
+const SEMANTIC_PROGRESS_STATUSES = new Set(["building", "loading"]);
+const SEMANTIC_READY_STATUSES = new Set(["ready", "empty"]);
+const SEMANTIC_INACTIVE_STATUSES = new Set(["disabled", "busy"]);
+
+/**
+ * Failure words and what the sidebar shows for each. The labels stay close to
+ * the wire words so a bug report and the daemon log still line up; the point of
+ * the table is that every word in it is known to be a failure, so none of them
+ * can be rendered as progress.
+ */
+const SEMANTIC_FAILURE_LABELS: Record<string, string> = {
+  backend_unavailable: "backend unavailable",
+  degraded: "degraded",
+  error: "error",
+  failed: "failed",
+  unavailable: "unavailable",
+};
+
+export function semanticIndexStatusKind(status: string): SemanticIndexStatusKind {
+  if (SEMANTIC_READY_STATUSES.has(status)) return "ready";
+  if (SEMANTIC_PROGRESS_STATUSES.has(status)) return "progress";
+  if (status in SEMANTIC_FAILURE_LABELS) return "failure";
+  if (SEMANTIC_INACTIVE_STATUSES.has(status)) return "inactive";
+  return "unrecognized";
+}
+
+function mentionsMissingOnnxRuntime(...values: Array<string | null | undefined>): boolean {
+  return values.some(
+    (value) => typeof value === "string" && value.includes(MISSING_ONNX_RUNTIME_MARKER),
+  );
+}
+
+/**
+ * The label for a semantic index that is not going to serve, or null when the
+ * snapshot describes no failure.
+ *
+ * The missing-runtime check reads the stage and the error, not just the status
+ * word: a build that died still carries the stage it died in, and a reader that
+ * looked only at the status word would report that dead attempt as progress.
+ */
+function semanticFailureLabel(
+  status: string,
+  stage?: string | null,
+  error?: string | null,
+): string | null {
+  if (mentionsMissingOnnxRuntime(error, stage)) return MISSING_ONNX_RUNTIME_LABEL;
+  return SEMANTIC_FAILURE_LABELS[status] ?? null;
+}
+
+export function formatSemanticIndexStatus(
+  status: string,
+  stage?: string | null,
+  error?: string | null,
+): string {
+  // A failure outranks any progress stage. Telling the reader the index is
+  // rebuilding when the build cannot start asks them to wait for something that
+  // will never finish.
+  const failure = semanticFailureLabel(status, stage, error);
+  if (failure) return failure;
+
+  if (semanticIndexStatusKind(status) === "progress" && stage === "fingerprint_change") {
+    return REBUILDING_LABEL;
   }
   return status;
 }
@@ -340,7 +437,7 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     `- trigrams: ${formatCount(status.search_index.trigrams)}`,
     "",
     "Semantic index",
-    `- status: ${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage)}`,
+    `- status: ${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage, status.semantic_index.error)}`,
   );
   const refreshing = formatSemanticRefreshing(status.semantic_index.refreshing_count);
   if (refreshing) {
@@ -451,7 +548,7 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     `- **Trigrams:** ${formatCount(status.search_index.trigrams)}`,
     "",
     "### Semantic index",
-    `- **Status:** \`${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage)}\``,
+    `- **Status:** \`${formatSemanticIndexStatus(status.semantic_index.status, status.semantic_index.stage, status.semantic_index.error)}\``,
   );
   const refreshing = formatSemanticRefreshing(status.semantic_index.refreshing_count);
   if (refreshing) {

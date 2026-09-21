@@ -383,6 +383,7 @@ const StatusDialog = (props: StatusDialogProps) => {
               value={formatSemanticIndexStatus(
                 status()!.semantic_index.status,
                 status()!.semantic_index.stage,
+                status()!.semantic_index.error,
               )}
               tone={statusTone(status()!.semantic_index.status)}
             />
