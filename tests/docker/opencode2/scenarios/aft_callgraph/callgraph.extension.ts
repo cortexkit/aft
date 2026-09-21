@@ -1,7 +1,7 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { HarnessExtension, HarnessValidationContext, ScenarioLifecycleContext } from "../../harness/types.js";
+import type { HarnessExtension, HarnessValidationContext } from "../../harness/types.js";
 const here = dirname(fileURLToPath(import.meta.url));
 const expectedIds = ["callgraph/T1/happy","callgraph/T2/invalid_arguments","callgraph/T2/missing_target","callgraph/T6/callgraph-call-tree-payload-tree/complete","callgraph/T6/callgraph-call-tree-payload-tree/incomplete","callgraph/T6/callgraph-callers-payload-callers/complete","callgraph/T6/callgraph-callers-payload-callers/incomplete","callgraph/T6/callgraph-impact-payload-sites/complete","callgraph/T6/callgraph-impact-payload-sites/incomplete","callgraph/T6/callgraph-trace-data-payload-hops/complete","callgraph/T6/callgraph-trace-data-payload-hops/incomplete","callgraph/T6/callgraph-trace-to-payload-paths/complete","callgraph/T6/callgraph-trace-to-payload-paths/incomplete","callgraph/T7/happy"];
 async function validate(context: HarnessValidationContext): Promise<void> {
@@ -17,12 +17,5 @@ async function validate(context: HarnessValidationContext): Promise<void> {
   const controls = JSON.parse(await readFile(join(here, "mutation-controls.json"), "utf8"));
   if (!Array.isArray(controls.controls) || controls.controls.length < 3) throw new Error("callgraph" + " mutation controls missing");
 }
-async function beforeScenario(context: ScenarioLifecycleContext): Promise<void> {
-  if (!context.scenario.id.endsWith("_config_deny")) return;
-  const path = join(dirname(context.project_root), "xdg-config", "opencode", "opencode.json");
-  const config = JSON.parse(await readFile(path, "utf8"));
-  config.permission = { edit: "deny" };
-  await writeFile(path, JSON.stringify(config, null, 2) + "\n");
-}
-const extension: HarnessExtension = { name: "callgraph-scenarios-v1", validate, beforeScenario };
+const extension: HarnessExtension = { name: "callgraph-scenarios-v1", validate };
 export default extension;

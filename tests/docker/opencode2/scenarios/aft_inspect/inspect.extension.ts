@@ -25,11 +25,6 @@ async function beforeScenario(context: ScenarioLifecycleContext): Promise<void> 
     );
     await writeFile(join(context.project_root, "abort-load.ts"), `${lines.join("\n")}\n`);
   }
-  if (!context.scenario.id.endsWith("_config_deny")) return;
-  const path = join(dirname(context.project_root), "xdg-config", "opencode", "opencode.json");
-  const config = JSON.parse(await readFile(path, "utf8"));
-  config.permission = { edit: "deny" };
-  await writeFile(path, JSON.stringify(config, null, 2) + "\n");
 }
 const extension: HarnessExtension = { name: "inspect-scenarios-v1", validate, beforeScenario };
 export default extension;

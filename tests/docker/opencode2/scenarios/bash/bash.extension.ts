@@ -1,7 +1,7 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { HarnessExtension, HarnessValidationContext, ScenarioLifecycleContext } from "../../harness/types.js";
+import type { HarnessExtension, HarnessValidationContext } from "../../harness/types.js";
 const here = dirname(fileURLToPath(import.meta.url));
 const expectedIds = ["bash/T1/happy","bash/T2/invalid_arguments","bash/T2/missing_target","bash/T3/fallback_ask_allow","bash/T3/fallback_ask_deny","bash/T3/fallback_config_deny","bash/T3/loop_ask_allow","bash/T3/loop_ask_deny","bash/T3/loop_config_deny","bash/T4/abort","bash/T5/completion_wake","bash/T5/watch_pattern_once","bash/T6/bash-bash-output/complete","bash/T6/bash-bash-output/incomplete","bash/T7/happy"];
 async function validate(context: HarnessValidationContext): Promise<void> {
@@ -17,12 +17,5 @@ async function validate(context: HarnessValidationContext): Promise<void> {
   const controls = JSON.parse(await readFile(join(here, "mutation-controls.json"), "utf8"));
   if (!Array.isArray(controls.controls) || controls.controls.length < 3) throw new Error("bash" + " mutation controls missing");
 }
-async function beforeScenario(context: ScenarioLifecycleContext): Promise<void> {
-  if (!context.scenario.id.endsWith("_config_deny")) return;
-  const path = join(dirname(context.project_root), "xdg-config", "opencode", "opencode.json");
-  const config = JSON.parse(await readFile(path, "utf8"));
-  config.permission = { edit: "deny" };
-  await writeFile(path, JSON.stringify(config, null, 2) + "\n");
-}
-const extension: HarnessExtension = { name: "bash-scenarios-v1", validate, beforeScenario };
+const extension: HarnessExtension = { name: "bash-scenarios-v1", validate };
 export default extension;

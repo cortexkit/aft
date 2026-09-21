@@ -1,12 +1,8 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type {
-  HarnessExtension,
-  HarnessValidationContext,
-  ScenarioLifecycleContext,
-} from "../../harness/types.js";
+import type { HarnessExtension, HarnessValidationContext } from "../../harness/types.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const EXPECTED_IDS = new Set([
@@ -68,18 +64,9 @@ async function validateReadScenarios(context: HarnessValidationContext): Promise
   }
 }
 
-async function configureReadDenial(context: ScenarioLifecycleContext): Promise<void> {
-  if (context.scenario.id !== "read/T3/read_config_deny") return;
-  const hostConfig = join(dirname(context.project_root), "xdg-config", "opencode", "opencode.json");
-  const config = JSON.parse(await readFile(hostConfig, "utf8")) as Record<string, unknown>;
-  config.permission = { read: "deny" };
-  await writeFile(hostConfig, `${JSON.stringify(config, null, 2)}\n`);
-}
-
 const extension: HarnessExtension = {
   name: "read-scenarios-v1",
   validate: validateReadScenarios,
-  beforeScenario: configureReadDenial,
 };
 
 export default extension;

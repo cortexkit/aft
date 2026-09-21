@@ -40,11 +40,6 @@ async function writeBudgetBulk(projectRoot: string): Promise<void> {
 
 async function beforeScenario(context: ScenarioLifecycleContext): Promise<void> {
   if (context.scenario.id === BUDGET_SCENARIO_ID) await writeBudgetBulk(context.project_root);
-  if (!context.scenario.id.endsWith("_config_deny")) return;
-  const path = join(dirname(context.project_root), "xdg-config", "opencode", "opencode.json");
-  const config = JSON.parse(await readFile(path, "utf8"));
-  config.permission = { edit: "deny" };
-  await writeFile(path, JSON.stringify(config, null, 2) + "\n");
 }
 const extension: HarnessExtension = { name: "outline-scenarios-v1", validate, beforeScenario };
 export default extension;
