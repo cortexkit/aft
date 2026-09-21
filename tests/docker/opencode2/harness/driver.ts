@@ -847,6 +847,26 @@ async function runOneScenario(options: {
       : [0];
     if (!acceptedExitCodes.includes(host.exit_code)) {
       const mechanism = hostFailureMechanism(host);
+      // A host that ran out of time without ever reaching the model has not
+      // failed at anything the row is about: it never started serving. Saying
+      // so by name is what lets a reader tell a stalled start from a product
+      // failure at a glance, instead of reading the same "still running" line
+      // for both. The two counts are the evidence for the name.
+      if (host.timed_out && mock.exchanges.length === 0 && mock.requests.length === 0) {
+        fail(
+          "host_startup_stall",
+          `${scenario.id}: the host served zero turns and the model saw zero requests in ${hostTimeoutMs}ms${
+            mechanism ? `; host said: ${mechanism}` : ""
+          }`,
+          {
+            host_generation: hostGeneration,
+            mock_requests: mock.requests.length,
+            scripted_turns: scenario.turns.length,
+            served_turns: mock.exchanges.length,
+            timeout_ms: hostTimeoutMs,
+          },
+        );
+      }
       // A killed host reports no exit code, and "exited null" reads like a
       // crash; saying it ran out of time is the difference between looking for
       // a fatal error and looking for what it was still waiting on.

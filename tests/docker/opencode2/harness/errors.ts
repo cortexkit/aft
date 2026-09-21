@@ -4,6 +4,7 @@ export type HarnessFailureCode =
   | "executable_provenance"
   | "fixture_invalid"
   | "host_failed"
+  | "host_startup_stall"
   | "matrix_absent"
   | "matrix_invalid"
   | "no_effect_observed"
