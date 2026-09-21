@@ -133,10 +133,12 @@ impl AppContext {
                         let refreshing_count = status.refreshing_count();
                         match index.as_ref() {
                             Some(idx) => {
-                                let status_label = match status {
-                                    SemanticIndexStatus::Ready { .. } => "ready",
-                                    _ => idx.status_label(),
-                                };
+                                // The loaded index object cannot decide this
+                                // word on its own: it has no way to say
+                                // "failed", so a dead index used to report
+                                // `ready` here while every other surface said
+                                // otherwise.
+                                let status_label = idx.status_label(&status);
                                 serde_json::json!({
                                     "status": status_label,
                                     "state": status_label,
@@ -645,6 +647,26 @@ mod tests {
         );
         assert!(semantic["since_ms"].is_u64());
         assert!(semantic["next_retry_ms"].is_u64());
+    }
+
+    /// `aft status` is where a user goes to ask whether semantic search works.
+    /// It used to label a loaded index object by its entry count alone, which
+    /// cannot express failure at all: a root whose index had failed answered
+    /// `ready` here while the sidebar and a search reply both said `failed`.
+    #[test]
+    fn status_reports_a_failed_semantic_index_as_failed_not_ready() {
+        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let project = std::env::current_dir().expect("current dir");
+        *ctx.semantic_index().write().unwrap() =
+            Some(crate::semantic_index::SemanticIndex::new(project, 384));
+        *ctx.semantic_index_status().write().unwrap() = crate::context::SemanticIndexStatus::Failed(
+            "embedding backend died mid-build".to_string(),
+        );
+
+        let semantic = ctx.build_status_snapshot()["semantic_index"].clone();
+
+        assert_eq!(semantic["status"], "failed");
+        assert_eq!(semantic["state"], "failed");
     }
 
     #[test]
