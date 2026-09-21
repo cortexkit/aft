@@ -56,6 +56,17 @@ const BARE_TOOL_ORDER = [
 
 export type SubcBareToolName = (typeof BARE_TOOL_ORDER)[number];
 
+/**
+ * Context used to render the subc tool manifest.
+ *
+ * This manifest is generated once and compiled into the binary, so unlike the
+ * per-directory plugin surface it is ONE contract for every project a subc
+ * consumer may bind. Config-gated arguments therefore have to be declared here
+ * whenever the runtime honours them in any project, or a consumer working in a
+ * project that does enable the feature could never see it. `sandbox.enabled` is
+ * exactly that case: it is project-settable one-way hardening, and the subc
+ * bash path reads a passed `sandbox` argument regardless of this manifest.
+ */
 export function makeSubcSchemaStubCtx(): PluginContext {
   return {
     pool: {
@@ -65,7 +76,10 @@ export function makeSubcSchemaStubCtx(): PluginContext {
         }) as unknown as ReturnType<BridgePool["getBridge"]>,
     } as unknown as BridgePool,
     client: { lsp: {}, find: {} } as PluginContext["client"],
-    config: { hoist_builtin_tools: true } as PluginContext["config"],
+    config: {
+      hoist_builtin_tools: true,
+      sandbox: { enabled: true },
+    } as PluginContext["config"],
     storageDir: "/tmp/aft-subc-schema",
   };
 }
