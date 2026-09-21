@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "announce-0570"
+  ],
+  "note": "Announcement strings for the 0.57.0 minor release. No engine or benchmark code changed."
+}
