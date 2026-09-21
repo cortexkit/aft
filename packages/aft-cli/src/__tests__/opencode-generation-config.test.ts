@@ -12,6 +12,7 @@ import { runDoctor } from "../commands/doctor.js";
 import { runSetup } from "../commands/setup.js";
 import { diagnoseOpenCodeLoad, OPENCODE_LOAD_PATHS } from "../doctor/opencode.js";
 import type { DiagnosticReport, HarnessDiagnostic } from "../lib/diagnostics.js";
+import { AFT_SCHEMA_URL } from "../lib/jsonc.js";
 import { getSelfVersion } from "../lib/self-version.js";
 import {
   detectOpenCodeHostGeneration,
@@ -22,6 +23,7 @@ import {
   AFT_OPENCODE_PACKAGE,
   ensurePinnedPluginConfig,
   MODERN_V1_VERSION,
+  openCodePluginKey,
   pinnedPluginEntry,
 } from "../setup/opencode-config.js";
 
@@ -110,10 +112,19 @@ class ConfiguredOpenCodeAdapter extends OpenCodeAdapter {
     };
   }
 
+  /** Keep every doctor run inside the fixture root, never the operator's storage. */
+  override getStorageDir(): string {
+    return this.root;
+  }
+
   override async ensurePluginEntry(): Promise<PluginEntryResult> {
     this.ensureCalls += 1;
     return super.ensurePluginEntry();
   }
+}
+
+function readConfig(path: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
 }
 
 describe("OpenCode generation detection", () => {
@@ -288,43 +299,112 @@ describe("OpenCode generation detection", () => {
 });
 
 describe("exact OpenCode config pins", () => {
-  test("replaces unpinned, ranged, and duplicate entries in place and is idempotent", () => {
-    const exact = pinnedPluginEntry(getSelfVersion());
-    for (const existing of [
-      AFT_OPENCODE_PACKAGE,
-      `${AFT_OPENCODE_PACKAGE}@latest`,
-      `${AFT_OPENCODE_PACKAGE}@^${getSelfVersion()}`,
-      `${AFT_OPENCODE_PACKAGE}@0.0.0-older`,
-    ]) {
-      const value: Record<string, unknown> = {
-        plugin: ["before", existing, `${AFT_OPENCODE_PACKAGE}@latest`, "after"],
-      };
-      const first = ensurePinnedPluginConfig(value, getSelfVersion());
-      expect(first.action).toBe("updated");
-      expect(value.plugin).toEqual(["before", exact, "after"]);
-
-      const snapshot = JSON.stringify(value);
-      const second = ensurePinnedPluginConfig(value, getSelfVersion());
-      expect(second.action).toBe("already_present");
-      expect(JSON.stringify(value)).toBe(snapshot);
-    }
-  });
-
-  test("migrates the plural key to singular for server and TUI-shaped documents", () => {
-    for (const otherPlugin of ["server-plugin", "tui-plugin"]) {
-      const value: Record<string, unknown> = {
-        plugins: [otherPlugin, `${AFT_OPENCODE_PACKAGE}@latest`],
-      };
-
-      ensurePinnedPluginConfig(value, getSelfVersion());
-
-      expect(value.plugins).toBeUndefined();
-      expect(value.plugin).toEqual([otherPlugin, pinnedPluginEntry(getSelfVersion())]);
-    }
-  });
-
-  test("setup detects V1 and V2, writes exact singular pins, and is idempotent", async () => {
+  // The rename is the whole point: a V1 host reads `plugin`, a V2 host reads
+  // `plugins`, and an entry under the other name is not loaded at all.
+  test("writes the entry under the key the detected generation reads", () => {
     for (const generation of ["v1", "v2"] as const) {
+      const key = openCodePluginKey(generation);
+      const other = key === "plugin" ? "plugins" : "plugin";
+      const value: Record<string, unknown> = {};
+
+      const update = ensurePinnedPluginConfig(value, getSelfVersion(), () => false, generation);
+
+      expect(update.key).toBe(key);
+      expect(value[key]).toEqual([pinnedPluginEntry(getSelfVersion())]);
+      expect(value[other]).toBeUndefined();
+    }
+  });
+
+  // One machine can run both hosts against one config file. Folding the other
+  // generation's key into this one, or deleting it, unregisters AFT on the
+  // host that is not being configured.
+  test("leaves the other generation's key and its entries untouched", () => {
+    for (const generation of ["v1", "v2"] as const) {
+      const other = generation === "v2" ? "plugin" : "plugins";
+      const value: Record<string, unknown> = {
+        [other]: ["other-plugin", `${AFT_OPENCODE_PACKAGE}@0.0.0-older`],
+      };
+
+      ensurePinnedPluginConfig(value, getSelfVersion(), () => false, generation);
+
+      expect(value[other]).toEqual(["other-plugin", `${AFT_OPENCODE_PACKAGE}@0.0.0-older`]);
+      expect(value[openCodePluginKey(generation)]).toEqual([pinnedPluginEntry(getSelfVersion())]);
+    }
+  });
+
+  test("pins in place and stays idempotent under both generations", () => {
+    const exact = pinnedPluginEntry(getSelfVersion());
+    for (const generation of ["v1", "v2"] as const) {
+      const key = openCodePluginKey(generation);
+      for (const existing of [
+        AFT_OPENCODE_PACKAGE,
+        `${AFT_OPENCODE_PACKAGE}@latest`,
+        `${AFT_OPENCODE_PACKAGE}@^${getSelfVersion()}`,
+        `${AFT_OPENCODE_PACKAGE}@0.0.0-older`,
+      ]) {
+        const value: Record<string, unknown> = {
+          [key]: ["before", existing, `${AFT_OPENCODE_PACKAGE}@latest`, "after"],
+        };
+        const first = ensurePinnedPluginConfig(value, getSelfVersion(), () => false, generation);
+        expect(first.action).toBe("updated");
+        expect(value[key]).toEqual(["before", exact, "after"]);
+
+        const snapshot = JSON.stringify(value);
+        const second = ensurePinnedPluginConfig(value, getSelfVersion(), () => false, generation);
+        expect(second.action).toBe("already_present");
+        expect(JSON.stringify(value)).toBe(snapshot);
+      }
+    }
+  });
+
+  // A developer who registered a checkout keeps that checkout after a host
+  // upgrade, in the entry shape the new host can read: V1 pairs options in a
+  // tuple, V2 in a `package`/`options` object.
+  test("carries a local checkout to the host's key in that key's entry shape", () => {
+    const local = "/dev/aft/packages/opencode-plugin";
+    const value: Record<string, unknown> = {
+      plugin: ["other-plugin", [local, { enabled: true }]],
+    };
+
+    const update = ensurePinnedPluginConfig(
+      value,
+      getSelfVersion(),
+      (entry) => entry === local,
+      "v2",
+    );
+
+    expect(update.action).toBe("added");
+    expect(value.plugins).toEqual([{ package: local, options: { enabled: true } }]);
+    expect(value.plugin).toEqual(["other-plugin", [local, { enabled: true }]]);
+  });
+
+  test("rewrites AFT's own V1 tuple under the V2 key and leaves another plugin's alone", () => {
+    const local = "/dev/aft/packages/opencode-plugin";
+    const value: Record<string, unknown> = {
+      plugins: [
+        ["other-plugin", { enabled: true }],
+        [local, { enabled: false }],
+      ],
+    };
+
+    const update = ensurePinnedPluginConfig(
+      value,
+      getSelfVersion(),
+      (entry) => entry === local,
+      "v2",
+    );
+
+    expect(update.changed).toBe(true);
+    expect(value.plugins).toEqual([
+      ["other-plugin", { enabled: true }],
+      { package: local, options: { enabled: false } },
+    ]);
+  });
+
+  test("setup detects V1 and V2, writes each host's key, and is idempotent", async () => {
+    for (const generation of ["v1", "v2"] as const) {
+      const key = openCodePluginKey(generation);
+      const other = key === "plugin" ? "plugins" : "plugin";
       const root = tempRoot(`aft-cli-setup-${generation}-`);
       const adapter = new ConfiguredOpenCodeAdapter(root);
       const lines = captureOutput();
@@ -336,12 +416,13 @@ describe("exact OpenCode config pins", () => {
       expect(await runSetup([], options)).toBe(0);
       const serverPath = join(root, "opencode.json");
       const tuiPath = join(root, "tui.json");
-      const server = JSON.parse(readFileSync(serverPath, "utf8")) as Record<string, unknown>;
-      const tui = JSON.parse(readFileSync(tuiPath, "utf8")) as Record<string, unknown>;
-      expect(server).toEqual({ plugin: [pinnedPluginEntry(getSelfVersion())] });
-      expect(tui).toEqual({ plugin: [pinnedPluginEntry(getSelfVersion())] });
-      expect(server.plugins).toBeUndefined();
-      expect(tui.plugins).toBeUndefined();
+      const server = readConfig(serverPath);
+      const tui = readConfig(tuiPath);
+      expect(server).toEqual({ [key]: [pinnedPluginEntry(getSelfVersion())] });
+      expect(tui).toEqual({ [key]: [pinnedPluginEntry(getSelfVersion())] });
+      expect(server[other]).toBeUndefined();
+      expect(tui[other]).toBeUndefined();
+      expect(adapter.hasPluginEntry()).toBe(true);
       expect(lines.join("\n")).toContain(`host generation ${generation === "v1" ? "V1" : "V2"}`);
 
       const before = [readFileSync(serverPath, "utf8"), readFileSync(tuiPath, "utf8")];
@@ -368,6 +449,7 @@ describe("exact OpenCode config pins", () => {
 function doctorFixture(
   root: string,
   pluginEntry = pinnedPluginEntry(getSelfVersion()),
+  generation: OpenCodeHostDetection["status"] = "v2",
 ): {
   adapter: HarnessAdapter;
   harness: HarnessDiagnostic;
@@ -383,7 +465,10 @@ function doctorFixture(
     tuiConfig: join(root, "tui.json"),
     tuiConfigFormat: "none",
   };
-  writeFileSync(configPaths.harnessConfig, JSON.stringify({ plugin: [pluginEntry] }));
+  writeFileSync(
+    configPaths.harnessConfig,
+    JSON.stringify({ [openCodePluginKey(generation)]: [pluginEntry] }),
+  );
   const adapter: HarnessAdapter = {
     kind: "opencode",
     displayName: "OpenCode",
@@ -500,7 +585,7 @@ describe("OpenCode doctor generation and load path", () => {
 
   test("accepts V1 latest registration on a logged root-default load", async () => {
     const root = tempRoot("aft-cli-doctor-v1-latest-");
-    const fixture = doctorFixture(root, `${AFT_OPENCODE_PACKAGE}@latest`);
+    const fixture = doctorFixture(root, `${AFT_OPENCODE_PACKAGE}@latest`, "v1");
     writeFileSync(fixture.harness.logFile.path, "load path: root-default\n");
     const lines = captureOutput();
 
@@ -525,7 +610,7 @@ describe("OpenCode doctor generation and load path", () => {
 
   test("accepts an explicit semver registration on V1", () => {
     const root = tempRoot("aft-cli-doctor-v1-semver-");
-    const fixture = doctorFixture(root);
+    const fixture = doctorFixture(root, pinnedPluginEntry(getSelfVersion()), "v1");
     writeFileSync(fixture.harness.logFile.path, "load path: root-default\n");
 
     const result = diagnoseOpenCodeLoad({
@@ -641,5 +726,220 @@ describe("OpenCode doctor generation and load path", () => {
 
     expect(code).toBe(1);
     expect(lines.join("\n")).toContain("host generation: ambiguous (V1, V2)");
+  });
+});
+
+/**
+ * Run `doctor --fix` against a real adapter over `config`, and return the
+ * config file as the run left it. The AFT config is pre-seeded with its schema
+ * and storage points at the fixture root so the run has nothing else to
+ * change: the subject is only what --fix does to plugin registration.
+ */
+async function runFixOverConfig(
+  label: string,
+  generation: "v1" | "v2",
+  config: Record<string, unknown>,
+): Promise<{
+  root: string;
+  adapter: ConfiguredOpenCodeAdapter;
+  server: Record<string, unknown>;
+  output: string;
+}> {
+  const root = tempRoot(label);
+  const fixture = doctorFixture(root, pinnedPluginEntry(getSelfVersion()), generation);
+  writeFileSync(fixture.harness.configPaths.harnessConfig, JSON.stringify(config, null, 2));
+  writeFileSync(fixture.harness.configPaths.aftConfig, JSON.stringify({ $schema: AFT_SCHEMA_URL }));
+  const adapter = new ConfiguredOpenCodeAdapter(root);
+  const lines = captureOutput();
+
+  await runDoctor({
+    clear: false,
+    fix: true,
+    force: false,
+    issue: false,
+    argv: ["--fix", "--yes"],
+    resolveAdapters: async () => [adapter],
+    collectDiagnostics: async () => fixture.report,
+    collectRemovalHealth: async () => ({ available: false, message: "fixture" }),
+    detectOpenCodeHost: () => detection(generation),
+  });
+
+  return {
+    root,
+    adapter,
+    server: readConfig(fixture.harness.configPaths.harnessConfig),
+    output: lines.join("\n"),
+  };
+}
+
+describe("OpenCode plugin registration follows the host's key", () => {
+  test("a V2 host reads `plugins` and a V1 host reads `plugin`", () => {
+    const root = tempRoot("aft-cli-registered-key-");
+    const entry = pinnedPluginEntry(getSelfVersion());
+    writeFileSync(join(root, "opencode.json"), JSON.stringify({ plugins: [entry] }));
+
+    const registered = (generation: "v1" | "v2"): boolean => {
+      const adapter = new ConfiguredOpenCodeAdapter(root);
+      adapter.useHostDetection(detection(generation));
+      return adapter.hasPluginEntry();
+    };
+
+    // The GA report this fixes: a working `plugins` entry read as unregistered.
+    expect(registered("v2")).toBe(true);
+    // And the mirror image, so the answer is the key and not a new default.
+    expect(registered("v1")).toBe(false);
+  });
+
+  test("a V2 registration in the object entry shape is recognised", () => {
+    const root = tempRoot("aft-cli-registered-object-");
+    const pluginRoot = join(root, "plugin");
+    mkdirSync(pluginRoot, { recursive: true });
+    writeFileSync(
+      join(pluginRoot, "package.json"),
+      JSON.stringify({ name: AFT_OPENCODE_PACKAGE, version: getSelfVersion() }),
+    );
+    const configPath = join(root, "opencode.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({ plugins: [{ package: pluginRoot, options: { enabled: true } }] }),
+    );
+
+    const result = diagnoseOpenCodeLoad({
+      detection: detection("v2", "node"),
+      configPath,
+      logPath: join(root, "missing.log"),
+      pluginCachePath: join(root, "missing-cache"),
+    });
+
+    expect(result.pluginVersion).toBe(getSelfVersion());
+    expect(result.problems).toEqual([]);
+  });
+
+  test("doctor --fix keeps a V2 `plugins` registration and writes no `plugin` key", async () => {
+    const entry = pinnedPluginEntry(getSelfVersion());
+    const result = await runFixOverConfig("aft-cli-fix-v2-", "v2", {
+      plugins: ["other-plugin", entry],
+    });
+
+    expect(result.server).toEqual({ plugins: ["other-plugin", entry] });
+    expect(result.server.plugin).toBeUndefined();
+    expect(result.adapter.hasPluginEntry()).toBe(true);
+    // The TUI config is created by the same rule, under the same key.
+    expect(readConfig(join(result.root, "tui.json"))).toEqual({ plugins: [entry] });
+  });
+
+  test("doctor --fix keeps a V1 `plugin` registration and writes no `plugins` key", async () => {
+    const entry = pinnedPluginEntry(getSelfVersion());
+    const result = await runFixOverConfig("aft-cli-fix-v1-", "v1", {
+      plugin: ["other-plugin", entry],
+    });
+
+    expect(result.server).toEqual({ plugin: ["other-plugin", entry] });
+    expect(result.server.plugins).toBeUndefined();
+    expect(result.adapter.hasPluginEntry()).toBe(true);
+  });
+
+  test("doctor --fix leaves both generations' keys intact in one config", async () => {
+    const entry = pinnedPluginEntry(getSelfVersion());
+    // The V2 entry is stale on purpose. A config that already holds the exact
+    // pin is never rewritten, so only a config that forces a write can show
+    // what that write does to the other generation's key.
+    const result = await runFixOverConfig("aft-cli-fix-both-keys-", "v2", {
+      plugin: ["v1-only-plugin", entry],
+      plugins: ["v2-only-plugin", `${AFT_OPENCODE_PACKAGE}@latest`],
+    });
+
+    // Both hosts may be run against this file, so --fix repairs the key of the
+    // host in front of it and leaves the other host's registration alone.
+    expect(result.server).toEqual({
+      plugin: ["v1-only-plugin", entry],
+      plugins: ["v2-only-plugin", entry],
+    });
+  });
+
+  test("doctor --fix on a V1 host leaves a V2 `plugins` registration intact", async () => {
+    const entry = pinnedPluginEntry(getSelfVersion());
+    const result = await runFixOverConfig("aft-cli-fix-both-keys-v1-", "v1", {
+      plugin: ["v1-only-plugin", `${AFT_OPENCODE_PACKAGE}@latest`],
+      plugins: ["v2-only-plugin", entry],
+    });
+
+    expect(result.server).toEqual({
+      plugin: ["v1-only-plugin", entry],
+      plugins: ["v2-only-plugin", entry],
+    });
+  });
+
+  test("doctor --fix registers under `plugins` without disturbing the V1 entry", async () => {
+    const entry = pinnedPluginEntry(getSelfVersion());
+    const result = await runFixOverConfig("aft-cli-fix-v1-config-on-v2-", "v2", {
+      plugin: ["other-plugin", `${AFT_OPENCODE_PACKAGE}@0.0.0-older`],
+    });
+
+    expect(result.server).toEqual({
+      plugin: ["other-plugin", `${AFT_OPENCODE_PACKAGE}@0.0.0-older`],
+      plugins: [entry],
+    });
+    expect(result.adapter.hasPluginEntry()).toBe(true);
+  });
+
+  test("doctor names the key a V2 host reads when AFT sits under `plugin`", () => {
+    const root = tempRoot("aft-cli-doctor-wrong-key-");
+    const configPath = join(root, "opencode.json");
+    writeFileSync(configPath, JSON.stringify({ plugin: [pinnedPluginEntry(getSelfVersion())] }));
+
+    const result = diagnoseOpenCodeLoad({
+      detection: detection("v2", "node"),
+      configPath,
+      logPath: join(root, "missing.log"),
+      pluginCachePath: join(root, "missing-cache"),
+    });
+
+    expect(result.problems).toContain(
+      "AFT is registered under `plugin`, which a V2 host does not read; run doctor --fix to register it under `plugins`",
+    );
+  });
+
+  test("doctor reports another plugin's V1 tuple under `plugins` instead of rewriting it", () => {
+    const root = tempRoot("aft-cli-doctor-foreign-tuple-");
+    const configPath = join(root, "opencode.json");
+    const config = {
+      plugins: [["other-plugin", { enabled: true }], pinnedPluginEntry(getSelfVersion())],
+    };
+    writeFileSync(configPath, JSON.stringify(config));
+
+    const result = diagnoseOpenCodeLoad({
+      detection: detection("v2", "node"),
+      configPath,
+      logPath: join(root, "missing.log"),
+      pluginCachePath: join(root, "missing-cache"),
+    });
+
+    expect(result.problems).toContain(
+      "plugin entry other-plugin under `plugins` uses the V1 entry shape, which a V2 host cannot load; left unchanged because AFT did not register it",
+    );
+
+    ensurePinnedPluginConfig(config, getSelfVersion(), () => false, "v2");
+    expect(config.plugins[0]).toEqual(["other-plugin", { enabled: true }]);
+  });
+
+  test("the ambiguous doctor line names the key each host would use", () => {
+    const root = tempRoot("aft-cli-doctor-ambiguous-keys-");
+    const configPath = join(root, "opencode.json");
+    writeFileSync(configPath, JSON.stringify({ plugins: [pinnedPluginEntry(getSelfVersion())] }));
+
+    const result = diagnoseOpenCodeLoad({
+      detection: detection("ambiguous"),
+      configPath,
+      logPath: join(root, "missing.log"),
+      pluginCachePath: join(root, "missing-cache"),
+    });
+
+    expect(result.problems).toContain(
+      "both OpenCode V1 and V2 hosts were detected; refusing configuration writes (a V1 host reads `plugin`, a V2 host reads `plugins`)",
+    );
+    // No migration advice while the generation is unsettled: either key may be
+    // the right one, and writes stay refused.
+    expect(result.problems.some((problem) => problem.includes("run doctor --fix"))).toBe(false);
   });
 });

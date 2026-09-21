@@ -34,6 +34,9 @@ export async function runSetup(argv: string[], options: SetupOptions = {}): Prom
       const detection = options.detectOpenCodeHost
         ? options.detectOpenCodeHost()
         : adapter.detectHostGeneration();
+      // The adapter writes the key this generation's host reads, so it has to
+      // see the same detection this command reported.
+      adapter.useHostDetection(detection);
       log.info(`${adapter.displayName}: host generation ${formatHostGenerations(detection)}`);
       if (detection.status === "ambiguous") {
         log.error(

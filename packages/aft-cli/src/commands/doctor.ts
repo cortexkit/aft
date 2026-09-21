@@ -106,8 +106,12 @@ function detectOpenCodeForCommand(
 ): OpenCodeHostDetection | null {
   const adapter = openCodeAdapter(adapters);
   if (!adapter) return null;
-  if (override) return override();
-  return adapter instanceof OpenCodeAdapter ? adapter.detectHostGeneration() : null;
+  if (!(adapter instanceof OpenCodeAdapter)) return override ? override() : null;
+  const detection = override ? override() : adapter.detectHostGeneration();
+  // Config reads and writes pick their key from the generation, so the adapter
+  // works from the same detection this command reports.
+  adapter.useHostDetection(detection);
+  return detection;
 }
 
 function refuseAmbiguousOpenCodeWrites(detection: OpenCodeHostDetection | null): boolean {

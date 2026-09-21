@@ -22,8 +22,12 @@ import {
   AFT_OPENCODE_PACKAGE,
   ensurePinnedPluginConfig,
   isAftNpmEntry,
+  type OpenCodeConfigGeneration,
+  openCodePluginKey,
+  openCodePluginReadKeys,
   pinnedPluginEntry,
   pluginConfigNeedsUpdate,
+  pluginEntryPackage,
 } from "../setup/opencode-config.js";
 import type {
   HarnessAdapter,
@@ -168,6 +172,28 @@ function matchesPluginEntry(entry: string): boolean {
   return pathPointsToOurPlugin(entry);
 }
 
+/**
+ * True when any plugin list the given host generation reads registers AFT.
+ *
+ * Entries are unwrapped first: besides a bare string, a registration may be a
+ * V1 `[package, options]` tuple or a V2 `{ package, options }` object, and all
+ * three name the same package.
+ */
+function configRegistersAft(
+  value: Record<string | symbol, unknown> | null,
+  generation: OpenCodeConfigGeneration,
+): boolean {
+  if (!value) return false;
+  return openCodePluginReadKeys(generation).some((key) => {
+    const list = value[key];
+    if (!Array.isArray(list)) return false;
+    return list.some((entry) => {
+      const packageSpec = pluginEntryPackage(entry);
+      return packageSpec !== null && matchesPluginEntry(packageSpec);
+    });
+  });
+}
+
 export class OpenCodeAdapter implements HarnessAdapter {
   readonly kind = "opencode" as const;
   readonly displayName = "OpenCode";
@@ -191,6 +217,22 @@ export class OpenCodeAdapter implements HarnessAdapter {
   detectHostGeneration(): OpenCodeHostDetection {
     this.hostDetection ??= detectOpenCodeHostGeneration();
     return this.hostDetection;
+  }
+
+  /**
+   * Adopt a host detection the caller already made.
+   *
+   * Config reads and writes need the generation to pick the key the host
+   * reads, but must never boot a host to learn it: the command that is already
+   * detecting (setup, doctor) hands its result in, and until then the
+   * generation stays unresolved.
+   */
+  useHostDetection(detection: OpenCodeHostDetection): void {
+    this.hostDetection = detection;
+  }
+
+  private configGeneration(): OpenCodeConfigGeneration {
+    return this.hostDetection?.status ?? "unknown";
   }
 
   getHostVersion(): string | null {
@@ -224,8 +266,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
   hasPluginEntry(): boolean {
     const paths = this.detectConfigPaths();
     const { value } = readJsoncFile(paths.harnessConfig);
-    const plugins = Array.isArray(value?.plugin) ? value.plugin : [];
-    return plugins.some((entry) => typeof entry === "string" && matchesPluginEntry(entry));
+    return configRegistersAft(value, this.configGeneration());
   }
 
   async ensurePluginEntry(): Promise<PluginEntryResult> {
@@ -242,8 +283,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
     const paths = this.detectConfigPaths();
     if (!paths.tuiConfig) return false;
     const { value } = readJsoncFile(paths.tuiConfig);
-    const plugins = Array.isArray(value?.plugin) ? value.plugin : [];
-    return plugins.some((entry) => typeof entry === "string" && matchesPluginEntry(entry));
+    return configRegistersAft(value, this.configGeneration());
   }
 
   /**
@@ -276,12 +316,14 @@ export class OpenCodeAdapter implements HarnessAdapter {
     format: HarnessConfigPaths["harnessConfigFormat"],
     label: string,
   ): PluginEntryResult {
+    const generation = this.configGeneration();
+    const key = openCodePluginKey(generation);
     if (format === "none") {
-      writeJsoncFile(configPath, { plugin: [PLUGIN_ENTRY] }, "json");
+      writeJsoncFile(configPath, { [key]: [PLUGIN_ENTRY] }, "json");
       return {
         ok: true,
         action: "added",
-        message: `Created ${configPath} and added ${PLUGIN_ENTRY} (${label})`,
+        message: `Created ${configPath} and added ${PLUGIN_ENTRY} under \`${key}\` (${label})`,
         configPath,
       };
     }
@@ -296,12 +338,17 @@ export class OpenCodeAdapter implements HarnessAdapter {
       };
     }
 
-    const update = ensurePinnedPluginConfig(value, getSelfVersion(), pathPointsToOurPlugin);
+    const update = ensurePinnedPluginConfig(
+      value,
+      getSelfVersion(),
+      pathPointsToOurPlugin,
+      generation,
+    );
     if (!update.changed) {
       return {
         ok: true,
         action: "already_present",
-        message: `${PLUGIN_ENTRY} is already registered in ${configPath}`,
+        message: `${PLUGIN_ENTRY} is already registered under \`${update.key}\` in ${configPath}`,
         configPath,
       };
     }
@@ -310,7 +357,7 @@ export class OpenCodeAdapter implements HarnessAdapter {
     return {
       ok: true,
       action: update.action,
-      message: `${update.action === "added" ? "Added" : "Updated"} ${PLUGIN_ENTRY} in ${configPath} (${label})`,
+      message: `${update.action === "added" ? "Added" : "Updated"} ${PLUGIN_ENTRY} under \`${update.key}\` in ${configPath} (${label})`,
       configPath,
     };
   }
@@ -322,15 +369,21 @@ export class OpenCodeAdapter implements HarnessAdapter {
     if (format === "none") return true;
     const { value, error } = readJsoncFile(configPath);
     if (error || !value) return false;
-    return pluginConfigNeedsUpdate(value, getSelfVersion(), pathPointsToOurPlugin);
+    return pluginConfigNeedsUpdate(
+      value,
+      getSelfVersion(),
+      pathPointsToOurPlugin,
+      this.configGeneration(),
+    );
   }
 
   getPluginCacheInfo(): PluginCacheInfo {
     const configPath = this.detectConfigPaths().harnessConfig;
     const { value } = readJsoncFile(configPath);
-    const configuredEntry = Array.isArray(value?.plugin)
-      ? value.plugin.find(isAftNpmEntry)
-      : undefined;
+    const configuredEntry = openCodePluginReadKeys(this.configGeneration())
+      .flatMap((key) => (Array.isArray(value?.[key]) ? (value[key] as unknown[]) : []))
+      .map(pluginEntryPackage)
+      .find(isAftNpmEntry);
     const path = join(getOpenCodeCacheDir(), "packages", configuredEntry ?? PLUGIN_ENTRY);
     let cached: string | undefined;
     try {

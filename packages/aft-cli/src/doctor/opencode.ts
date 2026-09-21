@@ -4,7 +4,17 @@ import { fileURLToPath } from "node:url";
 
 import { readJsoncFile } from "../lib/jsonc.js";
 import type { OpenCodeHostDetection, OpenCodeHostRuntime } from "../setup/host-generation.js";
-import { AFT_OPENCODE_PACKAGE, isAftNpmEntry } from "../setup/opencode-config.js";
+import {
+  AFT_OPENCODE_PACKAGE,
+  isAftNpmEntry,
+  type OpenCodeConfigGeneration,
+  type OpenCodePluginKey,
+  openCodePluginKey,
+  openCodePluginReadKeys,
+  otherOpenCodePluginKey,
+  pluginEntryFitsKey,
+  pluginEntryPackage,
+} from "../setup/opencode-config.js";
 
 export const OPENCODE_LOAD_PATHS = [
   "root-default",
@@ -40,14 +50,53 @@ function isLoadPath(value: string): value is OpenCodeLoadPath {
   return (OPENCODE_LOAD_PATHS as readonly string[]).includes(value);
 }
 
-function configuredAftEntry(value: Record<string | symbol, unknown> | null): string | null {
-  if (!Array.isArray(value?.plugin)) return null;
-  for (const entry of value.plugin) {
-    if (isAftNpmEntry(entry)) return entry;
-    const root = localPluginRoot(entry);
-    if (root && manifestFromLocalPath(root)) return entry as string;
+/**
+ * The AFT registration under one config key, whatever shape it was written in:
+ * an npm spec, a local directory or `file://` path, a V1 `[package, options]`
+ * tuple, or a V2 `{ package, options }` object.
+ */
+function aftEntryUnderKey(
+  value: Record<string | symbol, unknown> | null,
+  key: OpenCodePluginKey,
+): string | null {
+  const list = value?.[key];
+  if (!Array.isArray(list)) return null;
+  for (const entry of list) {
+    const packageSpec = pluginEntryPackage(entry);
+    if (packageSpec === null) continue;
+    if (isAftNpmEntry(packageSpec)) return packageSpec;
+    const root = localPluginRoot(packageSpec);
+    if (root && manifestFromLocalPath(root)) return packageSpec;
   }
   return null;
+}
+
+/** The AFT registration the detected host would actually load. */
+function configuredAftEntry(
+  value: Record<string | symbol, unknown> | null,
+  generation: OpenCodeConfigGeneration,
+): string | null {
+  for (const key of openCodePluginReadKeys(generation)) {
+    const entry = aftEntryUnderKey(value, key);
+    if (entry) return entry;
+  }
+  return null;
+}
+
+/** Entries under `key` written in the other generation's options shape. */
+function misshapenEntries(
+  value: Record<string | symbol, unknown> | null,
+  key: OpenCodePluginKey,
+): string[] {
+  const list = value?.[key];
+  if (!Array.isArray(list)) return [];
+  const packages: string[] = [];
+  for (const entry of list) {
+    if (pluginEntryFitsKey(entry, key)) continue;
+    const packageSpec = pluginEntryPackage(entry);
+    if (packageSpec !== null) packages.push(packageSpec);
+  }
+  return packages;
 }
 
 function localPluginRoot(entry: unknown): string | null {
@@ -142,15 +191,16 @@ export function expectedOpenCodeLoadPath(
 
 export function diagnoseOpenCodeLoad(input: OpenCodeDoctorInput): OpenCodeDoctorResult {
   const expectedLoadPath = expectedOpenCodeLoadPath(input.detection);
+  const generation = input.detection.status;
   const config = readJsoncFile(input.configPath).value;
-  const entry = configuredAftEntry(config);
+  const entry = configuredAftEntry(config, generation);
   const manifest = pluginManifest(entry, input.pluginCachePath);
   const logged = latestLoggedLoadPath(input.logPath);
   let takenLoadPath = logged;
 
-  if (!takenLoadPath && input.detection.status === "v1") {
+  if (!takenLoadPath && generation === "v1") {
     takenLoadPath = "root-default";
-  } else if (!takenLoadPath && input.detection.status === "v2") {
+  } else if (!takenLoadPath && generation === "v2") {
     takenLoadPath = expectedLoadPath;
   }
 
@@ -159,10 +209,7 @@ export function diagnoseOpenCodeLoad(input: OpenCodeDoctorInput): OpenCodeDoctor
     input.cachedPluginVersion ??
     configuredVersion(entry) ??
     null;
-  const problems: string[] = [];
-  if (config && Object.hasOwn(config, "plugins")) {
-    problems.push("config uses unsupported `plugins`; run doctor --fix to migrate it to `plugin`");
-  }
+  const problems: string[] = [...describePluginKeyProblems(config, generation)];
   if (
     entry &&
     isAftNpmEntry(entry) &&
@@ -174,9 +221,11 @@ export function diagnoseOpenCodeLoad(input: OpenCodeDoctorInput): OpenCodeDoctor
       `plugin entry ${entry} is not the required exact pin ${input.expectedPluginEntry}`,
     );
   }
-  if (input.detection.status === "ambiguous") {
-    problems.push("both OpenCode V1 and V2 hosts were detected; refusing configuration writes");
-  } else if (input.detection.status === "unknown") {
+  if (generation === "ambiguous") {
+    problems.push(
+      "both OpenCode V1 and V2 hosts were detected; refusing configuration writes (a V1 host reads `plugin`, a V2 host reads `plugins`)",
+    );
+  } else if (generation === "unknown") {
     problems.push("OpenCode host generation could not be detected");
   }
   if (expectedLoadPath && takenLoadPath && expectedLoadPath !== takenLoadPath) {
@@ -186,4 +235,37 @@ export function diagnoseOpenCodeLoad(input: OpenCodeDoctorInput): OpenCodeDoctor
   }
 
   return { expectedLoadPath, takenLoadPath, pluginVersion, problems };
+}
+
+/**
+ * Report registrations the detected host cannot load: AFT under the other
+ * generation's key, and entries written in the other generation's options
+ * shape. Entries AFT did not write are reported and left alone — rewriting a
+ * user's other plugins is not doctor's call.
+ */
+function describePluginKeyProblems(
+  config: Record<string | symbol, unknown> | null,
+  generation: OpenCodeConfigGeneration,
+): string[] {
+  if (!config || generation === "ambiguous" || generation === "unknown") return [];
+  const hostKey = openCodePluginKey(generation);
+  const otherKey = otherOpenCodePluginKey(hostKey);
+  const host = generation.toUpperCase();
+  const problems: string[] = [];
+
+  if (!aftEntryUnderKey(config, hostKey) && aftEntryUnderKey(config, otherKey)) {
+    problems.push(
+      `AFT is registered under \`${otherKey}\`, which a ${host} host does not read; run doctor --fix to register it under \`${hostKey}\``,
+    );
+  }
+
+  const aftEntry = aftEntryUnderKey(config, hostKey);
+  for (const packageSpec of misshapenEntries(config, hostKey)) {
+    problems.push(
+      packageSpec === aftEntry
+        ? `plugin entry ${packageSpec} under \`${hostKey}\` uses the ${host === "V1" ? "V2" : "V1"} entry shape; run doctor --fix to rewrite it`
+        : `plugin entry ${packageSpec} under \`${hostKey}\` uses the ${host === "V1" ? "V2" : "V1"} entry shape, which a ${host} host cannot load; left unchanged because AFT did not register it`,
+    );
+  }
+  return problems;
 }
