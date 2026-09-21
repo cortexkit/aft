@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "views-deferred-checkpoint-wait"
+  ],
+  "note": "Test-only: the deferred-checkpoint test now waits on the residual seam label instead of the WAL length that precedes it. No product code changed."
+}
