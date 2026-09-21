@@ -17,12 +17,15 @@ import { homedir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
-
 import {
   prepareSubcLane,
   type SubcRig,
   startSubcRig,
 } from "../../../aft-bridge/src/__tests__/e2e/subc-rig.js";
+import {
+  ensurePinnedPluginConfig,
+  openCodePluginKey,
+} from "../../../aft-cli/src/setup/opencode-config.js";
 
 const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const repoRoot = join(pluginRoot, "../..");
@@ -558,6 +561,7 @@ async function writeV2HostConfig(
   isolation: HostIsolation,
   targets: string[],
   aftConfig: Record<string, unknown>,
+  pluginKey: "plugin" | "plugins" = "plugin",
 ): Promise<void> {
   const configDir = join(isolation.env.XDG_CONFIG_HOME ?? "", "opencode");
   await mkdir(configDir, { recursive: true });
@@ -575,7 +579,7 @@ async function writeV2HostConfig(
   );
   await writeFile(
     join(configDir, "opencode.json"),
-    `${JSON.stringify({ plugin: targets }, null, 2)}\n`,
+    `${JSON.stringify({ [pluginKey]: targets }, null, 2)}\n`,
   );
   await writeAftConfig(isolation, aftConfig);
 }
@@ -990,6 +994,12 @@ async function runV2TuiHost(input: {
    * listed here registers before AFT does.
    */
   pluginsBefore?: string[];
+  /**
+   * Config key the plugin list is written under. V2 renamed `plugin` to
+   * `plugins`, so this is what a row varies to boot the host on the key the
+   * CLI writes for this generation.
+   */
+  pluginKey?: "plugin" | "plugins";
   aftConfig?: Record<string, unknown>;
   env?: Record<string, string>;
   /**
@@ -1010,6 +1020,7 @@ async function runV2TuiHost(input: {
     isolation,
     [...(input.pluginsBefore ?? []), input.packageRoot],
     input.aftConfig ?? { enabled: false },
+    input.pluginKey,
   );
 
   const result = await withOperatorCanary(input.label, async () => {
@@ -2326,6 +2337,39 @@ export default { id: original.id, effect };
     // section together.
     expect(sidebarSections.filter((section) => !hostSidebar.includes(section))).toEqual([]);
   }, 300_000);
+
+  test("GA TUI host loads the registration doctor --fix writes for a V2 host", async () => {
+    const { v2 } = await ensureHostInstalls();
+    const packageRoot = await copyInstalledPlugin(v2, "v2-tui-plugins-key");
+    await writeFile(join(packageRoot, "tui.js"), v2TuiObserverEntry);
+
+    // The registration under test is produced by the CLI, not written by hand:
+    // a config that only carries the V1 key is handed to the same function
+    // `doctor --fix` calls, and whatever it writes for a V2 host is what this
+    // host is booted on. So a CLI that writes the wrong key, or the wrong
+    // entry shape, fails here rather than on a user's machine.
+    const config: Record<string, unknown> = { plugin: [packageRoot] };
+    ensurePinnedPluginConfig(config, "0.0.0-load-matrix", (entry) => entry === packageRoot, "v2");
+    const key = openCodePluginKey("v2");
+    expect(key).toBe("plugins");
+    expect(config[key]).toEqual([packageRoot]);
+    // A V1 host on the same machine reads `plugin` and would lose AFT if the
+    // migration moved that entry instead of adding the V2 one beside it.
+    expect(config.plugin).toEqual([packageRoot]);
+
+    const { transcript, events } = await runV2TuiHost({
+      label: "v2-tui-plugins-key",
+      packageRoot,
+      pluginKey: key,
+    });
+
+    expect(transcript).not.toMatch(/message="plugin operation failed"[^\n]*plugin=aft-opencode/);
+    expect(transcript).toMatch(
+      /message="plugin operation completed"[^\n]*stage=setup[^\n]*plugin=aft-opencode/,
+    );
+    expect(events).toContain("tui-setup-start\n");
+    expect(events).toContain("tui-setup-complete\n");
+  }, 240_000);
 
   test("GA TUI host loads a directory target through its root tui entrypoint", async () => {
     const { v2 } = await ensureHostInstalls();
