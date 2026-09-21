@@ -61,6 +61,7 @@ import {
   deriveV2HarnessProjection,
   loadToolSchemas,
   validateHarnessInputs,
+  validateParityAllowlist,
   validateT6,
   validateInventory,
   validateMutatingDeclarations,
@@ -1432,6 +1433,74 @@ describe("permission scenarios reach the host's own rules", () => {
           timeoutMs: 2_000,
         }),
       "host_failed",
+    );
+  });
+});
+
+describe("a parity row compares the two hosts", () => {
+  function parityScenario(): ScenarioDefinition {
+    return {
+      schema_version: 1,
+      id: "write/T7/happy",
+      tool: "write",
+      trajectory: "T7",
+      execution: "standalone",
+      prompt: "parity",
+      turns: [{ label: "finish", response: { kind: "text", content: "done" } }],
+      compare_call_id: "call-1",
+      comparison: {
+        mode: "shape",
+        rules: [
+          { kind: "field", field: "write_outcome", pattern: "^(?<value>Created new file\\.)$" },
+        ],
+        expected: { write_outcome: "Created new file." },
+      },
+    };
+  }
+
+  async function allowlistRoot(entries: unknown[]): Promise<string> {
+    const directory = await root();
+    await writeFile(
+      join(directory, "parity-allowlist.json"),
+      JSON.stringify({ schema_version: 1, entries }),
+    );
+    return directory;
+  }
+
+  test("a field the two hosts may differ on is allowed by name", async () => {
+    const scenario = parityScenario();
+    scenario.comparison = {
+      mode: "shape",
+      rules: [
+        { kind: "field", field: "write_outcome", pattern: "^(?<value>Created new file\\.)$" },
+        { kind: "field", field: "elapsed", pattern: "^took (?<value>\\d+)ms$" },
+      ],
+      expected: { write_outcome: "Created new file.", elapsed: 1 },
+    };
+    const directory = await allowlistRoot([
+      {
+        scenario: "write/T7/happy",
+        tool: "write",
+        field: "elapsed",
+        reason: "Wall clock is not a product output.",
+      },
+    ]);
+
+    expect(await validateParityAllowlist(directory, [scenario])).toHaveLength(1);
+  });
+
+  test("an allowlist that drops every projected field is refused, because it compares nothing", async () => {
+    const directory = await allowlistRoot([
+      {
+        scenario: "write/T7/happy",
+        tool: "write",
+        field: "write_outcome",
+        reason: "Host transports add presentation text around the tool result.",
+      },
+    ]);
+
+    await expect(validateParityAllowlist(directory, [parityScenario()])).rejects.toThrow(
+      "parity allowlist leaves write/T7/happy comparing nothing between the hosts",
     );
   });
 });

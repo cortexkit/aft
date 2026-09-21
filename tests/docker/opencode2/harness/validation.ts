@@ -459,7 +459,7 @@ export async function deriveListSurfaces(repoRoot: string): Promise<ListSurface[
   });
 }
 
-async function validateParityAllowlist(
+export async function validateParityAllowlist(
   matrixRoot: string,
   scenarios: readonly ScenarioDefinition[],
 ): Promise<ParityAllowlistEntry[]> {
@@ -525,11 +525,26 @@ async function validateParityAllowlist(
   for (const scenario of scenarios.filter((candidate) => candidate.trajectory === "T7")) {
     if (!scenario.comparison) fail("matrix_invalid", `T7 requires comparison: ${scenario.id}`);
     const allowedForScenario = validated.filter((entry) => entry.scenario === scenario.id);
-    if (scenario.comparison.mode === "shape" && allowedForScenario.length === 0) {
-      fail("matrix_invalid", `shape comparison must name a parity allowlist reason: ${scenario.id}`);
-    }
     if (scenario.comparison.mode === "exact" && allowedForScenario.length > 0) {
       fail("matrix_invalid", `exact comparison cannot carry parity allowlist: ${scenario.id}`);
+    }
+    // An allowed field is dropped from both sides before the two hosts are
+    // compared, so a row that allows every field it projects compares nothing.
+    // A parity row that measures nothing is worse than an absent one: it
+    // reports a pass.
+    const projected = new Set(
+      scenario.comparison.mode === "shape"
+        ? scenario.comparison.rules
+            .filter((rule) => rule.kind !== "ignore")
+            .map((rule) => (rule.kind === "trailer" ? (rule.field ?? "trailer") : rule.field))
+        : [],
+    );
+    for (const entry of allowedForScenario) projected.delete(entry.field);
+    if (scenario.comparison.mode === "shape" && projected.size === 0) {
+      fail(
+        "matrix_invalid",
+        `parity allowlist leaves ${scenario.id} comparing nothing between the hosts`,
+      );
     }
   }
   return validated;
