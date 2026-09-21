@@ -17,6 +17,11 @@ on:
           - jupyterlab
           - hugo
           - synthetic-24k
+      write_baseline:
+        description: "Bless this run's numbers: upload a regenerated baseline instead of gating"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: nightly-oss-cost-gate
@@ -53,6 +58,7 @@ jobs:
       - name: Compare fixed OSS matrix
         env:
           REPO_INPUT: ${{ inputs.repo }}
+          WRITE_BASELINE: ${{ inputs.write_baseline }}
           AFT_COST_GATE_CACHE_DIR: ${{ runner.temp }}/aft-cost-gate-cache
         run: |
           set -euo pipefail
@@ -60,9 +66,20 @@ jobs:
           if [[ -n "${REPO_INPUT:-}" && "$REPO_INPUT" != "all" ]]; then
             args+=(--repo "$REPO_INPUT")
           fi
+          # Peak RSS and CPU seconds belong to the machine that measured them,
+          # so a baseline meant to bound this runner has to be captured on it.
+          # The regenerated file is uploaded for review rather than committed.
+          if [[ "${WRITE_BASELINE:-false}" == "true" ]]; then
+            args+=(--write-baseline)
+          fi
           scripts/telemetry/cost-gate.sh "${args[@]}"
+          if [[ "${WRITE_BASELINE:-false}" == "true" ]]; then
+            mkdir -p "$AFT_COST_GATE_RESULTS_DIR"
+            cp scripts/telemetry/cost-baselines.json "$AFT_COST_GATE_RESULTS_DIR/cost-baselines.candidate.json"
+          fi
 
       - name: Gate exact lexical recall
+        if: ${{ inputs.write_baseline != true }}
         run: |
           python3 benchmarks/aft-search/setup_corpus.py
           scripts/telemetry/cost-gate.sh --exact-recall \

@@ -46,18 +46,24 @@ pass/fail decisions for every core metric, including the absolute-floor rule:
 scripts/telemetry/cost-gate.sh --self-test
 ```
 
-## Local smoke evidence
+## A baseline belongs to the machine that measured it
 
-A real local release-binary capture on 2026-09-04 covered the two smallest
-public corpus members. The gate ran each twice and selected the lower value per
-metric (wall time is the complete two-run wall time):
+Peak RSS, CPU seconds and wall time are properties of the machine as much as of
+the code. The baseline therefore records `measured_on.platform`, and the gate
+refuses to compare against a baseline captured elsewhere (exit 2, distinct from
+a regression's exit 1) rather than reporting the difference between two
+machines as a code change.
 
-| Repo | Files | Two-run wall | Search ready ms | Callgraph ready ms | Resolution share | Peak RSS MB | CPU s |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `hugo` | 2,554 | 143.4 s (73.0 + 70.3) | 986 | 68,433 | 50.493% | 341.3 | 47.38 |
-| `jupyterlab` | 3,057 | 479.7 s (230.6 + 249.1) | 431 | 228,328 | 86.512% | 523.9 | 243.09 |
+This is not hypothetical. The first committed baseline was a local capture on
+the development machine, and the gate measures on github-hosted `ubuntu-24.04`.
+On the same pinned `hugo` revision the capture machine needed 68,433 ms to
+build the callgraph and CI needs about 38,700, while CI's peak RSS runs roughly
+24% higher. Every one of the first seventeen scheduled runs failed, and the
+first of them was already over limit on the night the gate landed: nothing had
+regressed, the two numbers were answers to different questions.
 
-These values are also the corresponding entries in the committed baseline.
+A local run is still useful for triage. Pass `--ignore-platform` and it will
+measure and print, but it will not gate, because it cannot.
 
 ## What is measured
 
@@ -78,24 +84,169 @@ The effective upper limit is
 `max(baseline * (1 + tolerance_pct), absolute_floor)`, which keeps tiny timing
 and resource values from flapping. All metrics are lower-is-better.
 
+A metric can also be recorded without being compared, by setting `gated: false`
+and an `ungated_reason` beside it. The gate refuses a baseline that excludes a
+metric without writing down why. `synthetic-24k`'s
+`callgraph_resolution_share_pct` is the only current one: that corpus holds a
+single Rust file, its callgraph build takes about 10 ms, and the resolution
+stage rounds to 1 ms, so the metric can only ever report 1/9 through 1/14 — a
+smallest possible step of about eight percentage points inside a twenty percent
+tolerance band. No baseline value survives a metric whose quantum exceeds its
+tolerance. The timing metrics it is derived from are still gated.
+
+### Where the floor binds, and where the tolerance does
+
+`peak_rss_mb` carries `absolute_floor: 128.0` for every repository, so the
+effective limit is the tolerance only once the baseline passes 106.7 MB. That
+splits the corpus in two:
+
+| Repo | Baseline MB | 20% tolerance | Effective limit | Governed by |
+| --- | ---: | ---: | ---: | --- |
+| `redox` | 126.4 | 151.7 | 151.7 | tolerance |
+| `synthetic-24k` | 59.2 | 71.0 | 128.0 | **floor (+116%)** |
+| `hugo` | 420.0 | 504.0 | 504.0 | tolerance |
+| `jupyterlab` | 596.3 | 715.6 | 715.6 | tolerance |
+| `typescript-eslint` | 799.3 | 959.2 | 959.2 | tolerance |
+
+The floor is deliberate for a small corpus: a process's fixed cost — binary,
+runtime, allocator arenas, one thread stack per worker — is tens of megabytes
+regardless of how little it indexes, so a 20% band around a small number is
+mostly a band around that fixed cost, and it would flap. But it is worth being
+explicit that where the floor binds it *replaces* the tolerance rather than
+backing it up: `synthetic-24k` may more than double its peak RSS before the
+gate says anything.
+
+This mattered. Under the previous, development-machine baseline `redox` sat at
+79.7 MB, so its limit was the 128 MB floor and not the 95.6 MB the tolerance
+asked for — 60% of headroom that nobody chose. A real +35% step (see below)
+landed inside that headroom, and `redox` then hovered a hair under 128 for
+nights on end, crossing on 2026-09-15 at 128.1 and again on 2026-09-21 at
+134.5. The crossing dates were noise around a threshold that had nothing to do
+with the change. On the re-captured baseline `redox` is above the floor and its
+limit is once again the tolerance it was given.
+
+## What the seventeen red nights actually contained
+
+Separating the broken instrument from the real movement leaves one measured
+cause and one open item.
+
+### The step: the TOML language lane, 2026-09-07
+
+`git bisect` over the window between the 2026-09-04 capture and the 2026-09-20
+nightly, building each candidate and measuring `redox` peak RSS with a fixed
+harness, lands on `70a0d7e7a` ("mason: add TOML language lane", crate version
+0.55.1). Local two-run minima on one machine, same corpus, same harness:
+
+| Revision | Date | `redox` peak RSS MB |
+| --- | --- | ---: |
+| `84907c391` (the capture's own commit) | 2026-09-04 | 82.8 |
+| `fcd9fb76b` (parent of the lane) | 2026-09-07 | 77.5 |
+| `70a0d7e7a` (**the lane**) | 2026-09-07 | **104.8** |
+| `40511e0f6` | 2026-09-07 | 104.3 |
+| `28c05a80a` | 2026-09-08 | 103.4 |
+| `696c238ef` | 2026-09-12 | 105.9 |
+| `7a936156c` | 2026-09-20 | 105.5 |
+
+The cause is not subtle once the corpus is looked at: **3,514 of `redox`'s
+3,815 files are `.toml`**. Adding the lane made 92% of that repository
+indexable for the first time. Holding the binary fixed at current `main` and
+varying only the corpus:
+
+| Corpus | Peak RSS MB | CPU s |
+| --- | ---: | ---: |
+| `redox` as pinned | 113.6 | 5.93 |
+| the same tree with its `.toml` files removed | 72.1 | 2.39 |
+
+So this is the deliberate price of indexing a language, charged in proportion
+to how much of a repository that language covers. It is recorded rather than
+fixed. Three properties are worth stating because they are what rules other
+explanations out:
+
+- **Not a static footprint.** One binary, two corpora, 41.5 MB apart. The cost
+  is the work, not the grammar.
+- **Not an accumulator.** The series above is flat for the thirteen days after
+  the step. `synthetic-24k`, which holds one `.toml` among 24,000 files, sits
+  between 59.2 and 60.0 MB on every one of the seventeen nights while having
+  the longest search build in the matrix — a build-time accumulator would show
+  there first.
+- **Not the semantic plane.** The matrix configures `semantic_search: false`,
+  so no measurement here touches the embed path.
+
+The gate should have reported this on 2026-09-08 and did not, because it was
+already failing for an unrelated reason. A gate that is always red cannot
+report a regression; that is the whole cost of leaving a broken baseline in
+place.
+
+### Open: `jupyterlab` peak RSS, 2026-09-21
+
+One finding survives the re-capture. On 2026-09-21 `jupyterlab` moved from
+596.3/598.0 MB to 719.8/753.2 MB with CPU seconds going 119/120 to 137/138 and
+callgraph wall time up only 2.8%. Both runs moved together, so it is not a
+single noisy sample, and it is more CPU for nearly the same wall time.
+
+What is known: the runner image was identical on both nights
+(`20260907.300.1`); `synthetic-24k` did not move; the other three repositories
+moved 1.7–6.4% while `jupyterlab` moved 20.7%. An A/B of the two nightly
+revisions built and measured locally gives 540.5 → 556.1 MB, +2.9%, inside the
+run-to-run band — the effect does not reproduce off the runner.
+
+Because it does not reproduce locally, the next step is to bisect it *on the
+runner*: dispatch this workflow with `repo: jupyterlab` at the two nightly
+heads (`7a936156c` and `8802cf0fb`) and bisect the 146 commits between them
+from there. The gate keeps reporting it in the meantime, which is the correct
+behaviour for a step nobody has explained.
+
 ## Blessing an intentional cost change
 
-After reviewing an intentional cost change, run the same two-run measurement
-and regenerate the auditable baseline:
+Bless on the runner that does the gating. A local `--write-baseline` writes
+`measured_on.platform` as the local platform, and the scheduled gate will then
+refuse it — which is the behaviour that stops a repeat of the first seventeen
+nights, not an obstacle to work around.
+
+Dispatch the workflow with `write_baseline: true`, then take its result:
+
+```bash
+gh workflow run cost-gate.yml -f write_baseline=true
+# when it finishes, download the run's artifact and inspect the candidate
+gh run download <run-id> -D /tmp/cost-gate
+diff -u scripts/telemetry/cost-baselines.json /tmp/cost-gate/cost-baselines.candidate.json
+```
+
+The candidate is uploaded for review, never committed by CI. If it is right,
+copy it over `cost-baselines.json` and commit it with the change it blesses.
+
+An already-finished run can also be blessed from its uploaded CSVs, which is
+how a regression is signed off after the fact:
+
+```bash
+scripts/telemetry/cost-gate.sh --write-baseline-from /tmp/cost-gate \
+  --measured-on linux-x86_64 \
+  --provenance "nightly run <id>, <date>, <runner image>, head <sha>"
+```
+
+That path records `measured_on` from the arguments, so the file always says
+where its numbers came from. It refuses anything that is not a complete
+two-run matrix, and it reports `index_event` counts as absent when the results
+carry no per-repository AFT logs rather than keeping an older capture's counts
+beside new values.
+
+A local `--write-baseline` remains available for a machine whose own baseline
+you want:
 
 ```bash
 scripts/telemetry/cost-gate.sh --write-baseline
-# Or update only one corpus member:
 scripts/telemetry/cost-gate.sh --repo redox --write-baseline
-
 git diff -- scripts/telemetry/cost-baselines.json
 ```
 
 The baseline records the AFT binary SHA-256, source commit, UTC date, the
-repository commit SHAs, tolerances, floors, and the two-run selection rule.
-Review those fields and commit the JSON with the intentional code change.
+platform it was measured on, the repository commit SHAs, tolerances, floors,
+and the two-run selection rule. Review those fields and commit the JSON with
+the intentional code change.
 Do not bless a budget timeout or a missing structured event; fix the measurement
-or the code first.
+or the code first. Blessing a number you cannot explain is how a detector
+becomes a rubber stamp — if a step has no named cause, leave the gate red and
+write down what is known, as the `jupyterlab` entry above does.
 
 ## Scheduled gate
 
