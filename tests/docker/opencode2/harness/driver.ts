@@ -33,6 +33,9 @@ import {
   toolResultForCall,
 } from "./mock-server.js";
 import {
+  assertBashAftExecutionIdentity,
+  assertBashFallbackAskIdentity,
+  assertConfigDenyHidesTool,
   assertPermissionPromptObserved,
   controlPlans,
   sessionPermissionRules,
@@ -53,6 +56,7 @@ import { resolveTransportDeadWindow, transportDeadAtTurn } from "./transport-win
 import type {
   ApiControlPlan,
   HarnessRuntimeEvent,
+  RecordedMockExchange,
   ScenarioDefinition,
   ScenarioLifecycleContext,
   ScenarioResult,
@@ -125,6 +129,16 @@ function fixturePath(scenario: ScenarioDefinition): string | undefined {
 
 function plannedCalls(scenario: ScenarioDefinition): ToolCallPlan[] {
   return scenario.turns.flatMap(toolCallsInTurn);
+}
+
+/** Everything the scenario's scripted calls handed back to the model. */
+function scriptedResultText(
+  scenario: ScenarioDefinition,
+  exchanges: readonly RecordedMockExchange[],
+): string {
+  return plannedCalls(scenario)
+    .map((call) => toolResultForCall(exchanges, call.id)?.text ?? "")
+    .join("\n");
 }
 
 /**
@@ -789,6 +803,17 @@ async function runOneScenario(options: {
       );
     }
     assertScriptedToolsRegistered(scenario, hostStream);
+    // Scoped to the rows whose host behaviour was observed. The check itself
+    // describes any wholly-denying rule and can be widened once another tool's
+    // rows have been watched doing the same thing.
+    if (scenario.id.startsWith("bash/T3/")) assertConfigDenyHidesTool(scenario, mock.exchanges);
+    // Ahead of the generic permission assertion: when a bash row's declared
+    // path is the one that raises its own ask, "which ask is missing" is the
+    // more specific account of the same absence.
+    assertBashFallbackAskIdentity(scenario, {
+      resultText: scriptedResultText(scenario, mock.exchanges),
+      events: hostEvents?.events ?? [],
+    });
     if (hostEvents) assertPermissionPromptObserved(scenario, hostEvents.events);
     await Promise.all(controlPromises);
     if (
@@ -902,27 +927,14 @@ async function runOneScenario(options: {
       );
       await forensics.writeJson("termination.json", termination);
       await emit({ kind: "termination", at: Date.now(), evidence: termination });
-      if (scenario.id.startsWith("bash/T3/loop_")) {
-        const permissionRequired = pluginLog.indexOf("permission_required");
-        const retry = pluginLog.indexOf("retry", permissionRequired + 1);
-        if (permissionRequired === -1 || retry === -1 || termination.tasks.length === 0) {
-          recordFailure(
-            new Error(
-              `${scenario.id}: loop identity lacks permission_required -> retry or AFT task row`,
-            ),
+      if (scenario.id.startsWith("bash/T3/")) {
+        try {
+          assertBashAftExecutionIdentity(
+            scenario,
+            termination.tasks.map((task) => task.id),
           );
-        }
-      }
-      if (scenario.id.startsWith("bash/T3/fallback_")) {
-        const fallbackText = plannedCalls(scenario)
-          .map((call) => toolResultForCall(mock?.exchanges ?? [], call.id)?.text ?? "")
-          .join("\n");
-        if (!fallbackText.includes("AFT UNAVAILABLE") || termination.tasks.length !== 0) {
-          recordFailure(
-            new Error(
-              `${scenario.id}: fallback identity requires AFT UNAVAILABLE and no AFT task row`,
-            ),
-          );
+        } catch (error) {
+          recordFailure(error);
         }
       }
       if (
