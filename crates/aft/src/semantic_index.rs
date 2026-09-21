@@ -266,23 +266,26 @@ fn finish_semantic_index_build(
 ///   `loading` (a cold build in progress), `ready`, `failed`,
 ///   `backend_unavailable`, and — when an index object is already loaded —
 ///   whatever [`SemanticIndex::status_label`] reports for the daemon-held
-///   status (`disabled`, `loading`, `failed`, `empty`, or `ready`).
+///   status (`disabled`, `loading`, `failed`, or `ready`).
 /// - the root-health snapshot in `context.rs`: `backend_unavailable`, `ready`,
 ///   `building`, `disabled`, `degraded`.
 /// - semantic search replies: `ready`, `building`, `disabled`, `unavailable`.
 ///
 /// A reader that does not recognise a word has nothing to render but the raw
 /// word itself, which is how `backend_unavailable` reached users as grey
-/// unexplained text. packages/opencode-plugin/src/shared/status.ts checks its
-/// own mapping against this list, so adding a word here without teaching the
-/// sidebar about it fails that test instead of shipping.
+/// unexplained text. packages/aft-bridge/src/semantic-status.ts checks its own
+/// mapping against this list, so adding a word here without teaching the
+/// readers about it fails that test instead of shipping.
+///
+/// `empty` is absent on purpose: it was the loaded index object's entry count
+/// wearing a status word, and it is no longer emitted. Readers still recognise
+/// it, because a daemon older than that change can still send it.
 pub const SEMANTIC_INDEX_STATUS_WORDS: &[&str] = &[
     "backend_unavailable",
     "building",
     "busy",
     "degraded",
     "disabled",
-    "empty",
     "failed",
     "loading",
     "ready",
@@ -4115,22 +4118,23 @@ impl SemanticIndex {
 
     /// Status word for an index object the daemon has already loaded.
     ///
-    /// The daemon-held status decides the word; the entry count only chooses
-    /// between the two healthy ones. Deciding from the entry count alone could
-    /// not say "failed" at all, so `aft status` answered "is semantic search
-    /// working?" with `ready` for a root whose index had died — while the
-    /// sidebar and a search reply both reported the failure correctly. The
-    /// surface a user checks first was the one surface that could not say no.
+    /// The daemon-held status decides the word, and nothing else does.
+    /// Deciding it from the index's entry count could not say "failed" at all,
+    /// so `aft status` answered "is semantic search working?" with `ready` for
+    /// a root whose index had died — while the sidebar and a search reply both
+    /// reported the failure correctly. The surface a user checks first was the
+    /// one surface that could not say no.
     ///
-    /// A build in progress reports `loading` even when a previous index object
-    /// is still installed: that object is not what the daemon is serving from,
-    /// and reporting it as `ready` is the same substitution in a milder form.
+    /// An entry count of zero is not a status: a ready index with nothing in it
+    /// is still queryable and still answers `ready`, which is what callers
+    /// waiting for readiness have always polled for. A build in progress
+    /// reports `loading` even when a previous index object is still installed,
+    /// because that object is not what the daemon is serving from.
     pub fn status_label(&self, status: &SemanticIndexStatus) -> &'static str {
         match status {
             SemanticIndexStatus::Failed(_) => "failed",
             SemanticIndexStatus::Disabled => "disabled",
             SemanticIndexStatus::Building { .. } => "loading",
-            SemanticIndexStatus::Ready { .. } if self.entry_count() == 0 => "empty",
             SemanticIndexStatus::Ready { .. } => "ready",
         }
     }
@@ -11205,20 +11209,24 @@ public class Greeter {
         assert!(message.contains("Original error:"));
     }
 
-    /// The sidebar checks its rendering against this list, so the list has to
+    /// Readers check their rendering against this list, so the list has to
     /// stay a superset of what the daemon's own status producers say. The words
     /// below are produced here, by `status_label`; the rest come from the
     /// status, health, and search surfaces named on the constant.
     #[test]
     fn semantic_status_words_include_the_labels_this_module_produces() {
-        let empty = SemanticIndex::new(PathBuf::from("/tmp/project"), 384);
-        assert_eq!(empty.status_label(&SemanticIndexStatus::ready()), "empty");
-        for label in ["disabled", "empty", "failed", "loading", "ready"] {
+        let index = SemanticIndex::new(PathBuf::from("/tmp/project"), 384);
+        assert_eq!(index.status_label(&SemanticIndexStatus::ready()), "ready");
+        for label in ["disabled", "failed", "loading", "ready"] {
             assert!(
                 SEMANTIC_INDEX_STATUS_WORDS.contains(&label),
                 "{label} is emitted but not listed"
             );
         }
+        assert!(
+            !SEMANTIC_INDEX_STATUS_WORDS.contains(&"empty"),
+            "nothing emits `empty` any more; listing it asks readers to cover a word that never arrives"
+        );
 
         let mut sorted = SEMANTIC_INDEX_STATUS_WORDS.to_vec();
         sorted.sort_unstable();
@@ -11231,10 +11239,10 @@ public class Greeter {
     }
 
     /// `aft status` is the surface a user checks to answer "is semantic search
-    /// working?". While this label was decided by the entry count alone it had
-    /// no way to say no: a root whose index had failed reported `ready` there
-    /// (or `empty`, for a failure that left nothing behind) while the sidebar
-    /// and a search reply both reported the failure.
+    /// working?". While this label was decided by the index's entry count it
+    /// had no way to say no: a root whose index had failed reported `ready`
+    /// there (or `empty`, for a failure that left nothing behind) while the
+    /// sidebar and a search reply both reported the failure.
     #[test]
     fn failed_index_reports_the_failure_instead_of_its_entry_count() {
         let root = test_project_root();
@@ -11264,13 +11272,11 @@ public class Greeter {
             );
         }
 
-        // The healthy words are unchanged: the entry count still separates an
-        // index that can answer a query from one that holds nothing.
-        assert_eq!(
-            populated.status_label(&SemanticIndexStatus::ready()),
-            "ready"
-        );
-        assert_eq!(empty.status_label(&SemanticIndexStatus::ready()), "empty");
+        // A ready index answers `ready` whether or not it holds anything: it is
+        // queryable either way, and callers poll this word for readiness.
+        for index in [&populated, &empty] {
+            assert_eq!(index.status_label(&SemanticIndexStatus::ready()), "ready");
+        }
         assert_eq!(
             populated.status_label(&SemanticIndexStatus::Disabled),
             "disabled"

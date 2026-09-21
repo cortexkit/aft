@@ -47,6 +47,10 @@ export type SemanticIndexStatusKind =
   | "unrecognized";
 
 const SEMANTIC_PROGRESS_STATUSES = new Set(["building", "loading"]);
+// `empty` is not in the daemon's current word list: it used to mean a loaded
+// index holding nothing, and that index now reports `ready` like any other
+// queryable one. It stays recognised here because a plugin can be talking to a
+// daemon older than that change.
 const SEMANTIC_READY_STATUSES = new Set(["ready", "empty"]);
 const SEMANTIC_INACTIVE_STATUSES = new Set(["disabled", "busy"]);
 
