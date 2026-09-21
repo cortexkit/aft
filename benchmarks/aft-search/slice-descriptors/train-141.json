@@ -1,0 +1,15 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "slices": [
+    "permission-resource-naming",
+    "sentinel-sustained-write-rate"
+  ],
+  "note": "No ranking-fence file changes: aft_delete and aft_move now state project-relative permission resources so one {action: edit, resource: src/*} rule covers every filesystem mutation, and the health sentinel's write-rate rule fires on two consecutive windows over the ceiling instead of a single busy one."
+}
