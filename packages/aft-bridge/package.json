@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/aft-bridge",
-  "version": "0.56.2",
+  "version": "0.57.0",
   "type": "module",
   "description": "Shared NDJSON bridge transport, binary resolution, and ONNX runtime helpers for AFT agent-host plugins (OpenCode, Pi)",
   "license": "MIT",

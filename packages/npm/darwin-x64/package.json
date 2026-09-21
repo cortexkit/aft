@@ -1,6 +1,6 @@
 {
   "name": "@cortexkit/aft-darwin-x64",
-  "version": "0.56.2",
+  "version": "0.57.0",
   "description": "AFT binary for macOS x64 (Intel)",
   "os": [
     "darwin"
